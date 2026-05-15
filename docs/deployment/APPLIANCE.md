@@ -6,6 +6,158 @@ SpatiumDDI can be shipped as a **self-contained OS appliance image** — a boota
 
 ---
 
+## Post-#170 architecture (2026-05-14)
+
+The architecture below was reshaped end-to-end by [issue #170](https://github.com/spatiumddi/spatiumddi/issues/170). Three threads converged:
+
+1. **The agent containers do far too much.** `dns-bind9` / `dns-powerdns` / `dhcp-kea` each used to carry their own copy of host-side concerns (slot-state reads, nftables drop-ins, reboot-pending watch, docker-socket-aware logic). Three implementations of the same logic.
+2. **The install-time role decision is too early.** Operators picked `dns-agent-bind9` / `dns-agent-powerdns` / `dhcp-agent` at the installer prompt, baked into role-config. Switching meant a reinstall.
+3. **No authoritative identity for agents.** A leaked PSK was the only thing standing between a real agent and an attacker registering a rogue one.
+
+The fix:
+
+- **A new `spatium-supervisor` container** runs on every Application appliance. It owns *all* host-side concerns: slot telemetry on heartbeat, slot-upgrade trigger writes, reboot trigger, nftables drop-in rendering, future docker-compose lifecycle on service containers. The DNS / DHCP service containers become pure service workers with no host bind mounts.
+- **One generic "Application" install role** replaces `dns-agent-bind9` / `dns-agent-powerdns` / `dhcp-agent`. The installer asks for a control-plane URL + an 8-digit pairing code. Roles are assigned post-approval from the **Fleet** tab on `/appliance`.
+- **The installer's role list collapses from 5 to 3**:
+  - **Full stack** (was `control`): control plane + bundled BIND9 + Kea (AIO).
+  - **Frontend / core** (was `control-only`): control plane only.
+  - **Application**: supervisor only; pairs against a remote control plane.
+- **Pairing codes** are kind-agnostic (no more `deployment_kind` field) with two flavours: ephemeral (single-use, short expiry) and persistent (multi-claim, optional max_claims, disable/enable, password-gated reveal).
+- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. (The mTLS *verifier* middleware lands in a follow-up — the cert pipeline is in place; heartbeat + poll endpoints currently auth via session-token.)
+- **Per-role nftables firewall**. The supervisor renders `/etc/nftables.d/spatium-role.nft` every heartbeat with always-open management rules (tcp/22, icmp echo, loopback) + per-role service ports (udp+tcp/53 for DNS, udp/67-68 for DHCP) + an operator-pasted override fragment. `nft -c -f` dry-run before live-swap rejects syntax errors without putting the firewall in a half-rendered state.
+- **Baked-in container images**. Every container image needed for any install role is baked into the OS rootfs at release time at `/usr/lib/spatiumddi/images/*.tar.zst`. First boot loads them into the local docker daemon; subsequent boots never reach out to ghcr.io. Air-gapped installs are first-class.
+- **A/B slot upgrades and container upgrades are one unit**. A slot upgrade is also a container upgrade — operators can't get out of sync between OS and container versions.
+
+### Fleet management surface
+
+`/appliance` → **Fleet** tab is the primary management surface. Operators see every Application appliance with state (pending / approved), advertised capabilities, assigned roles, deployment kind, slot info, last-seen. A pending row pins at the top with Approve / Reject. A drilldown modal on each approved row carries:
+
+- Identity (hostname, full cert fingerprint, paired-at + paired-from-ip, last-seen).
+- **Role assignment** — pick a subset of `dns-bind9` / `dns-powerdns` / `dhcp` / `observer`. DNS engines are mutually exclusive; chips for capabilities the supervisor doesn't advertise dim with a tooltip. DNS / DHCP group dropdowns appear conditionally on the selection.
+- **Firewall preview + operator override** — live preview of the role-driven profile (idle / dns-only / dhcp-only / dns-and-dhcp), always-open + per-role port summary, raw-nft textarea for operator overrides.
+- **OS & lifecycle** — installed appliance version, running + durable-default slots (with trial-boot chip), last upgrade state, Schedule OS upgrade form, Cancel pending upgrade, Reboot host (with a double-confirm modal requiring an "I understand this will go offline" checkbox).
+- **Certificate** — serial, issued/expires timestamps. Re-key + Delete actions on the modal footer.
+
+### Operator Copilot tools (#170 Wave D2)
+
+Four MCP tools surface the fleet to the Operator Copilot (superadmin-gated):
+
+- `find_pending_appliances` — read-only list of pending pairings + advertised capabilities.
+- `find_appliance_fleet` — full state across the fleet with filters (state / role / tag key:value).
+- `propose_approve_appliance` — apply-gated write proposal. The operator clicks Apply in the chat drawer to actually sign the cert.
+- `propose_assign_role` — apply-gated write proposal for role + group assignment.
+
+### Superseded issues
+
+Closed by #170's landings:
+
+- The legacy `dns-agent-bind9` / `dns-agent-powerdns` / `dhcp-agent` installer roles + their per-service slot-state collectors are gone.
+- The PSK-based agent registration (`DNS_AGENT_KEY` / `SPATIUM_AGENT_KEY`) is the *legacy* path; new installs go through `/supervisor/register` + admin approval.
+- Pre-#170 pairing codes' `deployment_kind` field (per #169 wave 2) is dropped.
+
+## Post-2026.05.14-1 fleet shake-out + Wave E (in-flight on `dev-mzac`)
+
+Field-testing the first Application appliance against a control plane uncovered three bugs and motivated a Wave E watchdog layer. All landed since the `2026.05.14-1` release tag.
+
+### DNS record propagation across all agents in a group
+
+`enqueue_record_op` previously queued one op against `is_primary=True`, and the agent's pending-op shipper gated on the same flag. Under #170 every agent in a DNS group renders its zone as `type master` (independent authoritative copy), so secondaries' on-disk zone files stayed frozen at whatever bundle they received on initial register — record CRUD never propagated. Fixed: one `DNSRecordOp` row per enabled agent-based server in the group; `agent_config.py` ships pending ops to every server regardless of `is_primary`. See [`docs/deployment/DNS_AGENT.md`](DNS_AGENT.md) for the corrected dispatch flow.
+
+### Supervisor → service-container auth key delivery
+
+`/etc/spatiumddi/.env` writes an empty `DNS_AGENT_KEY` at firstboot (the install wizard doesn't know what the control plane's PSK is). Without an explicit key the DNS / DHCP service container would fall back to the deleted-in-Wave-A3 `POST /api/v1/appliance/pair` endpoint and crash-loop. Fixed by extending `SupervisorRoleAssignment` (the heartbeat-response block) to carry `dns_agent_key` / `dhcp_agent_key` — only when the matching role is assigned — and the supervisor writes them into `role-compose.env`. Service containers interpolate `${DNS_AGENT_KEY}` / `${DHCP_AGENT_KEY}` on first boot with zero operator action.
+
+### Docker.sock supplementary-group fix
+
+`su-exec spatium:spatium` (with explicit `:group` suffix) clears supplementary groups, so the unprivileged supervisor user couldn't read `/var/run/docker.sock` (owned `root:103` on Debian). `_docker_image_present` silently returned False for every probe → `can_run_dns_bind9 / can_run_dns_powerdns / can_run_dhcp` all reported as False → role-assignment checkboxes were grayed out in the Fleet UI. Two-line fix in the entrypoint: detect the host docker.sock's gid at startup, ensure a matching `docker` group exists in `/etc/group`, add `spatium` to it, then drop the `:spatium` suffix from `su-exec` so `initgroups()` pulls the new supplementary group. The supervisor image also gained `docker-cli-compose` — without it every `apply_role_assignment` failed with `docker: unknown command: docker compose`.
+
+### Profile → service mapping (DHCP)
+
+`apply_role_assignment` intersected compose *profile* names (`dhcp`) against `SUPERVISED_SERVICES` (`dhcp-kea`), so DHCP role assignments silently no-op'd. Fixed: new `_PROFILE_TO_SERVICE` table — identity for BIND9 + PowerDNS, `dhcp → dhcp-kea` for DHCP. Shared with the new `watchdog.py` module so both code paths agree.
+
+### Docker poll storm reduction
+
+The supervisor was firing 5 `docker` CLI subprocesses per heartbeat (3× `docker images` + 1× `docker compose ps` + 1× `docker compose up -d`). On a 1-CPU appliance VM each subprocess paid ~300 ms of Go-binary startup. Plus the dashboard's `docker ps` poll was hitting a 3 s timeout, killing dockerd mid-response, generating `superfluous response.WriteHeader call from go.opentelemetry.io/contrib/...` log spam, which the dashboard then tailed into its live-log pane (self-feeding loop). Fix:
+
+- **New `agent/supervisor/spatium_supervisor/docker_api.py`** — talks to `/var/run/docker.sock` directly via `http.client.HTTPConnection` over a unix-socket-aware subclass. No fork/exec; ~10 ms per call instead of ~300 ms.
+- **5-minute cache** on `_docker_image_present` — image set on an appliance changes only on slot upgrade.
+- **Env-file content hash sidecar** (`role-compose.env.hash`) — `apply_role_assignment` skips the `docker compose ps` + `up -d` subprocess pair when the rendered env file's SHA-256 hasn't shifted from the last successful apply. Resets on supervisor restart so a fresh boot always re-applies once.
+- **Dashboard `docker_ps`** moved off the CLI to the same direct-socket pattern.
+
+Steady-state: 5 docker calls/min → 0–1.
+
+### Wave E — supervisor watchdog (in-process + external)
+
+Two layers, different blind spots they cover.
+
+**In-process watchdog** (`agent/supervisor/spatium_supervisor/watchdog.py`). Runs inside the supervisor's heartbeat loop every 5 min:
+
+1. Reads the assigned compose profiles from the supervisor's own `role-compose.env`.
+2. Maps profile → compose service name via `_PROFILE_TO_SERVICE`.
+3. Snapshots running containers via `docker_api.list_running_containers()` — one socket call shared with the heartbeat tier.
+4. Per service derives a verdict — `healthy` / `missing` / `unhealthy` / `starting` — from `State` + `Status` engine-API fields. Tracks `since` (first-observed timestamp) in process-local memory.
+5. Auto-heal: when one or more services are `missing`, fires `apply_role_assignment` — `docker compose up -d` is idempotent so healthy services no-op, only the missing ones come up.
+6. Cached verdict rides on every heartbeat as `role_health`; the backend persists it to a new `appliance.role_health` JSONB column (migration `c4e2b7f81a39`); the Fleet drilldown renders a per-service health table with status chip + `since X ago`.
+
+Cache invalidates on `apply_role_assignment` running (state just changed → re-probe next heartbeat rather than wait 5 min).
+
+**External watchdog** — host-side bash script + systemd timer. Catches the case the in-process watchdog can't: a Python deadlock where the supervisor process is alive (pgrep passes, `restart: unless-stopped` doesn't fire) but the heartbeat loop has wedged.
+
+| Piece | Path | Role |
+| --- | --- | --- |
+| Liveness marker | `/var/persist/spatium-supervisor/last-loop-at` | Supervisor `touch()`es at the top of every heartbeat-loop iteration |
+| Script | `/usr/local/bin/spatiumddi-supervisor-watchdog` | Stats the liveness file; restarts container if mtime > 5 min old; rate-limits to 3 restarts per 30 min |
+| Service unit | `/etc/systemd/system/spatiumddi-supervisor-watchdog.service` | Oneshot, runs the script, requires `docker.service` |
+| Timer unit | `/etc/systemd/system/spatiumddi-supervisor-watchdog.timer` | Fires 60 s after boot, then every 2 min |
+| Rate-limit state | `/var/lib/spatiumddi/release-state/supervisor-watchdog-attempts` | Append-only list of restart timestamps; the script drops entries older than 30 min |
+| Alert trigger | `/var/lib/spatiumddi/release-state/supervisor-watchdog-alert` | Written when the restart cap is hit; the in-process watchdog surfaces this as a `Watchdog: Restart cap hit` red chip on the console dashboard |
+
+The script is intentionally `bash` + stdlib (no Python, no docker SDK, no compose CLI) so it survives anything that breaks the supervisor's own runtime stack. Enabled at install time by `mkosi.postinst`.
+
+### Firewall drift detection
+
+Per heartbeat the supervisor compared the live `/etc/nftables.d/spatium-role.nft` body against the desired body — but that only proves the FILE is right, not that the kernel-active ruleset includes those rules (e.g. an operator `nft flush ruleset` during a debugging session, or the master conf's `include` directive stops matching the drop-in path). Every 5 min the supervisor now reads the live ruleset via `nft -j list chain inet filter input`, confirms each expected per-role service port is present, and forces a re-apply if anything's missing. Logs `supervisor.firewall.drift_detected` with the missing tcp/udp port set. `FirewallProfile` now carries `expected_tcp_ports` + `expected_udp_ports` frozensets so the comparison is straightforward.
+
+### Console dashboard polish
+
+The Talos-style console got a wave of usability fixes:
+
+- F9 / Diag chip removed (handler was a no-op).
+- Live-log noise filter — Python traceback frames, caret indicators, systemd restart-counter spam dropped before they hit the renderer; `--since` window 10 min → 2 min so crash spam clears 5× faster.
+- CPU usage 92 % → 1.4 % — Rich Live had its background `auto_refresh` thread + main loop both rendering at 4 Hz. Fixed with `auto_refresh=False` + main-loop tick 0.25 s → 0.5 s.
+- Build line collapses to a single value when `APPLIANCE_VERSION == SPATIUMDDI_VERSION`.
+- `slot_a` → `A` in the slot indicator.
+- IPv6 SLAAC addresses fold into a `+N IPv6` chip alongside the IPv4 list.
+- Agent panel deleted; Control plane URL + Identity status fold into a one-line `Agent http://… Approved ✓` row in the header.
+- Vitals + Disks merged into one row.
+- Services row gains a ports / network-mode column: `53/tcp 53/udp` for published-port containers, `host net` in bold cyan for DHCP-kea (positive signal — host mode is the expected shape for broadcast-relay reachability).
+- Disk dedupe — `/home` / `/root` bind mounts collapse to the underlying `/var` device; `/var/lib/spatiumddi/docker-overlay/lower` hidden as an implementation detail.
+- New `Watchdog` header line surfacing the external watchdog state — green `Loop ticking · Ns ago`, yellow `Loop stale · Ns ago`, red `Restart cap hit` when the rate-limit alert trigger is present.
+- Services panel unions whichever supervisor-managed service is either in `docker ps` or listed in `role-compose.env`'s `COMPOSE_PROFILES`, so a crashed / removed container surfaces as `(not running)` rather than disappearing entirely.
+
+### Fleet UI updates
+
+- File rename `frontend/src/pages/appliance/ApprovalsTab.tsx` → `FleetTab.tsx` (component + React-Query keys + URL hash all migrated from `approvals` → `fleet`). The original "Approvals" framing predates the full Fleet management surface that now lives in the tab.
+- Sidebar regrouped into two sub-headings — **Infrastructure** (Appliances / Pairing codes / Slot images) and **Services** (NTP / SNMP) — so future Wave-E host-config surfaces (#155–#166) drop into Services without restructuring.
+- New **Services** column on the Appliances list with per-role chips coloured by `role_switch_state` (green `ready` ✓ / amber `pending` / rose `failed` / neutral `observer`) so operators see at a glance what's actually configured and running on each box.
+- **Service health** section in the per-appliance drilldown rendering one row per `role_health` entry — service name · role · status chip · relative `since` (e.g. "3m ago") · short container id.
+- **Approve + sign cert** mutation now refreshes the drilldown row on success (was leaving the operator staring at a stale `pending_approval` modal).
+- **Role assignment Save** shows a transient `✓ Saved` indicator and re-baselines the `dirty` check against the refreshed row.
+- **Slot image Delete** gated behind a `ConfirmModal` (destructive tone, shows version + notes + SHA-256 prefix, loading spinner during the mutation). The previous one-click delete wiped a ~700 MiB cached release on a misclick.
+
+### Misc
+
+- `spatiumddi-firstboot` writes `/etc/spatiumddi/.env` mode 644 (was 600) so the supervisor's unprivileged user can read it through the `/etc/spatiumddi:/etc/spatiumddi-host:ro` bind mount. `service_lifecycle.py` passes the host `.env` as an additional `--env-file` to `docker compose` so service containers' `${SPATIUMDDI_VERSION}` / `${DOCKER_GID}` interpolation resolves without re-emitting every var into the role env.
+- Pre-existing CodeQL false positive on `audit_chain_broken` — not relevant here, listed for completeness against the release log.
+
+### Open Wave E follow-ups
+
+- nftables base-config strip — `/etc/nftables.conf` currently has hardcoded DNS / DHCP / HTTP "belt-and-braces" rules from the pre-#170 5-role world; on Application appliances the supervisor's drop-in should be the sole source of truth so the operator can verify role-driven rules are actually being enforced.
+- Per-appliance scoped agent keys — current implementation passes the platform-wide global `DNS_AGENT_KEY` / `DHCP_AGENT_KEY`; a per-appliance scoped key would limit blast radius if a supervisor cert ever leaked.
+- Host-OS config plane (#155–#166) — APT sources / proxy, syslog forwarder, SSH `authorized_keys`, static routes, etc. The supervisor's existing `ConfigBundle long-poll → trigger-file → host runner` pattern (already used by SNMP / NTP) generalises to the rest.
+
+---
+
 ## 1. Base OS Selection
 
 ### Decision (2026-05): Debian for the appliance, Alpine for containers

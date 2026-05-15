@@ -3,12 +3,55 @@
 > Design spec for how SpatiumDDI ships, enrolls, configures, and operates the
 > managed DNS service containers (BIND9) that sit on the data plane.
 >
-> **Status:** Design — no implementation yet. This document is the handoff
-> contract for Wave 2 implementation agents.
+> **Status:** Implemented — see post-#170 architecture note below.
 >
 > **Related:** `CLAUDE.md` (#5 config caching, #8 incremental DNS, #10 driver
 > abstraction, #11 multi-arch), `docs/features/DNS.md`,
 > `docs/drivers/DNS_DRIVERS.md`, `docs/OBSERVABILITY.md`.
+
+---
+
+## Post-#170 architecture (2026-05-14)
+
+The Application appliance role + `spatium-supervisor` from
+[#170](https://github.com/spatiumddi/spatiumddi/issues/170)
+reshape this document's scope. Read this first; the historical
+sections below describe the pre-#170 agent surface (still
+functional for in-field installs — they keep registering against
+`/dns/agents/register` with the long PSK).
+
+**What stays in the DNS service container**: the agent sidecar
+(`agent/dns/spatium_dns_agent/`) still owns every DNS-service-level
+call: `POST /dns/agents/register` (the *service* identity, distinct
+from the supervisor's appliance identity), the ConfigBundle long-poll
+(`GET /dns/agents/config`), DDNS lease events, per-zone serial
+reporting on `POST /dns/agents/zone-state`, BIND9 query-log shipping,
+and metrics push. None of those changed in #170 wave C.
+
+**What moved to the supervisor (#170 Wave C1)**: every
+appliance-host concern. Slot telemetry, slot-upgrade trigger writes,
+reboot trigger, SNMP / chrony reload triggers, deployment-kind
+detection. The DNS service container drops the four host bind mounts
+(`/etc/spatiumddi-host`, `/boot/efi-host`,
+`/var/lib/spatiumddi/release-state`, `/run/udev`); the supervisor
+mounts them instead and is the single producer of host-side state.
+
+**Service heartbeats** (`POST /dns/agents/heartbeat`) no longer
+carry the slot / deployment / upgrade-state block. The supervisor's
+new `POST /api/v1/appliance/supervisor/heartbeat` is the single
+producer of appliance-row telemetry now.
+
+**Installer wizard** for fresh installs uses the new **Application**
+role (one of three: Full stack / Frontend / core / Application).
+Operators no longer pick `dns-agent-bind9` / `dns-agent-powerdns` at
+the installer prompt; the control plane assigns roles after admin
+approval in the Fleet tab. The legacy `dns-agent-*` role names alias
+to `application` in firstboot so existing in-field appliances keep
+booting through a slot upgrade.
+
+The rest of this document — driver protocol, config layout, etc. —
+is unchanged and still authoritative for the service-container half
+of the split.
 
 ---
 
@@ -164,14 +207,14 @@ Three channels:
 
 **Agent-local.** The control-plane BIND9 driver does **not** connect to `named` directly. Instead:
 
-1. Control plane computes the record delta and writes `pending_record_ops` rows.
-2. The agent pulls them via config long-poll.
-3. The agent invokes `nsupdate` (or the 0.0.1:8081`) **against its own daemon over loopback**.
+1. Control plane computes the record delta and writes one `pending_record_ops` row **per enabled agent-based server in the zone's group** (per-server queue keyed on `server_id`). Pre-2026.05.14-1 the queue only went to the `is_primary=True` server, which silently broke multi-server (and supervised-appliance) groups — secondaries' on-disk zone files stayed frozen at the bundle they received on initial register. Under #170 every DNS agent renders the zone as `type master` (independent authoritative copy) so record CRUD has to land on every one.
+2. Each agent pulls its own queued ops via config long-poll (the bundle ships `pending_record_ops` for any agent-based server regardless of `is_primary`; the `is_primary` flag now only matters for the agentless / Windows-DNS path where exactly one server writes).
+3. The agent invokes `nsupdate` **against its own daemon over loopback**.
 4. The agent ACKs success/failure per-op on the next heartbeat.
 
 Rationale: loopback `nsupdate` is simpler, never traverses the network as a TSIG-sensitive payload, and makes the agent the single enforcer of the local daemon state. The TSIG key lives only on the container.
 
-The control-plane `DNSDriverBase` implementations become **thin**: they translate the DB model into a canonical `AgentConfigBundle` + `RecordOp` list. They do not speak `nsupdate via RFC 2136 directly.
+The control-plane `DNSDriverBase` implementations become **thin**: they translate the DB model into a canonical `AgentConfigBundle` + `RecordOp` list. They do not speak `nsupdate` via RFC 2136 directly.
 
 ### Local disk cache (non-negotiable #5)
 

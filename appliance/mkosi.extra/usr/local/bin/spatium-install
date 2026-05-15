@@ -106,31 +106,30 @@ NET_PREFIX="24"
 NET_GATEWAY=""
 NET_DNS="1.1.1.1 1.0.0.1"
 TIMEZONE="UTC"
-# Role-split appliance (Phase 6, issue #134). One of:
-#   control     — full SpatiumDDI stack (api + worker + beat + db
-#                 + redis + frontend + bundled DNS/DHCP agents).
-#   dns-agent   — BIND9 agent only; needs to register with a
-#                 remote control plane via CONTROL_PLANE_URL +
-#                 DNS_AGENT_KEY. Minimal HTTPS landing page.
-#   dhcp-agent  — Kea agent only; same shape as dns-agent but with
-#                 DHCP_AGENT_KEY.
+# No default ROLE — every install must actively pick one. Hitting OK
+# without selecting an option on the role picker would otherwise
+# default to "full-stack" silently, and that's the wrong shape for any
+# Frontend-core or Application install. ask_role() loops until the
+# operator makes a selection.
+ROLE=""
+# Installer roles (#170):
+#   full-stack    — Full SpatiumDDI stack: api + worker + beat + db
+#                   + redis + frontend + bundled BIND9 + Kea (AIO).
+#   frontend-core — Control plane only, no bundled service workers.
+#   application   — Supervisor only. Pairs with a remote control
+#                   plane via a pairing code and sits in
+#                   pending_approval until an admin clicks Approve
+#                   in the fleet UI. The control plane assigns the
+#                   role(s) + group(s) after approval — operators
+#                   no longer pick DNS / DHCP / engine at install
+#                   time. Replaces the three per-service agent roles.
 # Every role still creates an OS admin account so the operator can
 # SSH in and manage the appliance, irrespective of which web UI runs.
-ROLE="control"
 CONTROL_PLANE_URL=""
-DNS_AGENT_KEY=""
-DHCP_AGENT_KEY=""
-# Phase 4 of #169 — operator may paste a short pairing code instead
-# of the long agent key. firstboot writes whichever the operator
-# supplied into .env; the agent's bootstrap chain (Phase 3) resolves
-# code → key on first contact with the control plane.
+# Pairing code claimed by the supervisor on first boot. 8 decimal
+# digits — single-use ephemeral or persistent depending on what the
+# control-plane admin minted. Only meaningful when ROLE=application.
 BOOTSTRAP_PAIRING_CODE=""
-# Agent group on the control plane this appliance joins. Auto-
-# created on first registration if it doesn't exist. Operators
-# managing multiple sites (us-east-dns / eu-prod-dhcp / lab-dns)
-# pick a group name at install time; the value drives which
-# zones / scopes get pushed to this agent.
-AGENT_GROUP=""
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
@@ -140,7 +139,7 @@ welcome() {
         --msgbox "Welcome to the SpatiumDDI Appliance Installer.\n\n\
 This installer will ERASE a target disk and install SpatiumDDI to it.\n\n\
 You'll be asked for:\n\
-  - Role (full control plane, or DNS / DHCP agent)\n\
+  - Role (Full stack / Frontend-core / Application)\n\
   - Target disk\n\
   - Hostname\n\
   - Admin OS user + password (for SSH access)\n\
@@ -152,143 +151,97 @@ Press OK to begin, or Cancel to drop to a shell." 18 70 \
 
 ask_role() {
     log "Step: ask_role"
-    # whiptail --radiolist returns the selected tag on stdout. The third
-    # column is the initial-selection flag (ON for control, OFF for the
-    # others). Five roles:
-    #   control              — control plane + bundled BIND9 + Kea
-    #                          (single-box AIO; default).
-    #   control-only         — control plane only, no bundled agents.
-    #                          Agent keys are still generated so the
-    #                          operator can register external agents
-    #                          via the Settings reveal UI.
-    #   dns-agent-bind9      — BIND9 agent only; needs a remote control
-    #                          plane.
-    #   dns-agent-powerdns   — PowerDNS agent only; needs a remote
-    #                          control plane. Group features differ
-    #                          (DNSSEC sign/unsign, ALIAS, LUA, catalog
-    #                          zones gate on the powerdns driver).
-    #   dhcp-agent           — Kea agent only; needs a remote control
-    #                          plane.
-    ROLE=$(whiptail --backtitle "$BACKTITLE" --title "Appliance role" \
-        --radiolist "What role does this appliance play?\n\nAll-in-one runs everything on one box (default — good for labs / small sites). Control-plane-only suits distributed deployments where DNS and DHCP live closer to the clients they serve as separate agent appliances.\n\nDNS-agent (BIND9) is the universal default. DNS-agent (PowerDNS) is the alternative engine — group features like DNSSEC sign/unsign + ALIAS + LUA + catalog zones gate on every server in a group running powerdns." \
-        24 80 5 \
-        "control"             "Control plane + bundled BIND9 + Kea (all-in-one)" ON \
-        "control-only"        "Control plane only (no bundled agents)"           OFF \
-        "dns-agent-bind9"     "DNS agent — BIND9 + agent process"                OFF \
-        "dns-agent-powerdns"  "DNS agent — PowerDNS + agent process"             OFF \
-        "dhcp-agent"          "DHCP agent — Kea + agent process"                 OFF \
-        3>&1 1>&2 2>&3) \
-        || on_cancel "role selection"
+    # whiptail --radiolist returns the selected tag on stdout. There is
+    # no default — every install must actively pick one of the three
+    # roles. Three roles (#170 Wave B2):
+    #   full-stack    — control plane + bundled BIND9 + Kea
+    #                   (single-box AIO).
+    #   frontend-core — control plane only. Pairs with remote
+    #                   Application appliances via the fleet UI.
+    #   application   — supervisor only. Submits an Ed25519 pubkey
+    #                   against a pairing code, sits in pending until
+    #                   an admin clicks Approve; the control plane
+    #                   then assigns role(s) + group(s) and the
+    #                   supervisor pulls the matching service
+    #                   containers on its next poll.
+    #
+    # The per-row ON/OFF flag reflects the current $ROLE so backing in
+    # from a later step preserves the previous selection. On the first
+    # pass $ROLE is empty so every row is OFF — whiptail returns ""
+    # and we re-prompt with a "pick one" msgbox until they choose.
+    local pick
+    while true; do
+        pick=$(whiptail --backtitle "$BACKTITLE" --title "Appliance role" \
+            --cancel-button "Back" \
+            --radiolist "What role does this appliance play?\n\nFull stack runs everything on one box (good for labs / small sites). Frontend / core runs just the control plane — pair Application appliances against it from the fleet UI for distributed deployments.\n\nApplication is the generic agent role: the supervisor pairs with a remote control plane, sits in pending approval, and is assigned its role(s) (DNS-BIND9 / DNS-PowerDNS / DHCP / multi-role) by an admin in the fleet UI. No DNS or DHCP pre-pick at install time." \
+            22 82 3 \
+            "full-stack"    "Full stack — control plane + BIND9 + Kea (AIO)" "$([ "$ROLE" = "full-stack"    ] && echo ON || echo OFF)" \
+            "frontend-core" "Frontend / core — control plane only"          "$([ "$ROLE" = "frontend-core" ] && echo ON || echo OFF)" \
+            "application"   "Application — supervisor only (pairs remote)"  "$([ "$ROLE" = "application"   ] && echo ON || echo OFF)" \
+            3>&1 1>&2 2>&3) || return 1
+        if [ -z "$pick" ]; then
+            whiptail --msgbox "Please pick a role to continue. There is no default — each role produces a meaningfully different appliance." 10 64 || true
+            continue
+        fi
+        ROLE="$pick"
+        break
+    done
     log "Selected role: $ROLE"
 }
 
-ask_agent_config() {
-    # Only fires for agent roles (dns-agent / dhcp-agent). The control
-    # and control-only roles ARE the control plane — they don't need
-    # to be told where one is.
-    case "$ROLE" in
-        control|control-only) return 0 ;;
-    esac
-    log "Step: ask_agent_config (role=$ROLE)"
-
-    CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
-        --title "Control plane URL" \
-        --inputbox "Where does this agent register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this agent connects to. The agent posts heartbeats + long-polls /config from here.\n\nUse https:// in production; http:// is acceptable for lab installs but the agent key crosses the wire in clear." \
-        14 72 "https://" 3>&1 1>&2 2>&3) \
-        || on_cancel "control-plane URL"
-    if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
-        whiptail --msgbox "Control-plane URL is required for agent installs." 8 60 || true
-        ask_agent_config
-        return
+ask_application_config() {
+    # Only fires for the Application role. The full-stack and
+    # frontend-core roles ARE control planes — they don't need to be
+    # told where one is.
+    if [ "$ROLE" != "application" ]; then
+        return 0
     fi
+    log "Step: ask_application_config"
 
-    local key_label is_dns
-    case "$ROLE" in
-        dns-agent-bind9|dns-agent-powerdns)
-            key_label="DNS agent key"
-            is_dns=1
-            ;;
-        dhcp-agent)
-            key_label="DHCP agent key"
-            is_dns=0
-            ;;
-    esac
-
-    # Bootstrap-method radio (Phase 4 of #169). Pairing code is the
-    # default — 8 digits operators can type without typos over an
-    # IPMI / serial console where copy-paste is unreliable. The long
-    # hex key is the fallback for re-installs, air-gapped sites where
-    # the operator has the key saved out of band, or cases where a
-    # pairing code generated earlier expired before install reached
-    # this step.
-    local bootstrap_method
-    bootstrap_method=$(whiptail --backtitle "$BACKTITLE" --title "Bootstrap method" \
-        --radiolist "Pick how this agent authenticates on first contact with the control plane.\n\nPairing code: ask the control plane operator to click 'New pairing code' on /appliance -> Pairing — they give you the 8 digits. Single-use, 15-minute default expiry.\n\nBootstrap key: paste the long ${key_label,,} (64-char hex). Reveal it on the control plane under Settings -> Security -> Agent bootstrap keys (requires a password re-confirm). Use this for re-installs, air-gapped sites with a saved key, or cases where the code expired." \
-        18 80 2 \
-        "code" "Pairing code (8-digit, recommended)" ON \
-        "key"  "Bootstrap key (long hex, advanced)"  OFF \
-        3>&1 1>&2 2>&3) \
-        || on_cancel "bootstrap method"
-    log "Bootstrap method: $bootstrap_method"
-
-    if [ "$bootstrap_method" = "code" ]; then
-        local code_val
-        while true; do
-            code_val=$(whiptail --backtitle "$BACKTITLE" --title "Pairing code" \
-                --inputbox "Enter the 8-digit pairing code from the control plane.\n\nGenerate one at https://<control-plane>/appliance -> Pairing -> 'New pairing code'. Codes expire after the duration set at generation time (default 15 min) and are single-use, so generate fresh if this one has been sitting around." \
-                14 78 "" 3>&1 1>&2 2>&3) \
-                || on_cancel "pairing code"
-            code_val=$(echo "$code_val" | tr -d '[:space:]')
-            if [ -z "$code_val" ]; then
-                whiptail --msgbox "Pairing code is required for this method." 8 60 || true
-                continue
-            fi
-            # Validate: exactly 8 decimal digits. Catch typos before
-            # firstboot tries to redeem the code and fails with a
-            # generic 403 (which we'd then surface on the console).
-            if ! [[ "$code_val" =~ ^[0-9]{8}$ ]]; then
-                whiptail --msgbox "Pairing code must be exactly 8 decimal digits.\n\nGot: $code_val" 10 60 || true
-                continue
-            fi
-            break
-        done
-        BOOTSTRAP_PAIRING_CODE="$code_val"
-    else
-        local key_val
-        key_val=$(whiptail --backtitle "$BACKTITLE" --title "$key_label" \
-            --inputbox "Pre-shared $key_label for first-boot registration.\n\nReveal it on the control plane: Settings -> Security -> Agent bootstrap keys -> type your password -> Reveal keys.\n\nThe agent exchanges this key for a rotating JWT on first contact + caches the JWT under /var/lib/spatium-{dns,dhcp}-agent/ for subsequent runs." \
-            16 78 "" 3>&1 1>&2 2>&3) \
-            || on_cancel "agent key"
-        if [ -z "$key_val" ]; then
-            whiptail --msgbox "$key_label is required when 'Bootstrap key' is selected. Re-running the prompt." 9 64 || true
-            ask_agent_config
-            return
+    local default_url="${CONTROL_PLANE_URL:-https://}"
+    while true; do
+        CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
+            --title "Control plane URL" \
+            --cancel-button "Back" \
+            --inputbox "Where does this Application appliance register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nUse https:// in production; http:// is acceptable for lab installs." \
+            16 76 "$default_url" 3>&1 1>&2 2>&3) \
+            || return 1
+        if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
+            whiptail --msgbox "Control-plane URL is required for an Application install." 8 60 || true
+            continue
         fi
-        if [ "$is_dns" = 1 ]; then
-            DNS_AGENT_KEY="$key_val"
-        else
-            DHCP_AGENT_KEY="$key_val"
-        fi
-    fi
+        break
+    done
 
-    # Per-role default group name. powerdns uses a separate default
-    # because group-level features gate on every server in a group
-    # running the same driver (mixing bind9 + powerdns in one group
-    # is invalid).
-    local default_group
-    case "$ROLE" in
-        dns-agent-powerdns) default_group="default-powerdns" ;;
-        *)                  default_group="default" ;;
-    esac
-    AGENT_GROUP=$(whiptail --backtitle "$BACKTITLE" --title "Agent group" \
-        --inputbox "Which group on the control plane should this agent join?\n\nEnter an existing group's name to register this agent into it. Type a new name to have the control plane auto-create the group on first registration.\n\nMultiple agents in the same group serve the same zones / scopes (DNS) or share lease state (DHCP HA pair). Leave the default for single-site deployments; pick a descriptive name for multi-site / multi-tenant ('us-east-dns', 'lab-dhcp', 'site-toronto')." \
-        16 76 "$default_group" 3>&1 1>&2 2>&3) \
-        || on_cancel "agent group"
-    AGENT_GROUP=$(echo "$AGENT_GROUP" | tr -d '[:space:]')
-    if [ -z "$AGENT_GROUP" ]; then
-        AGENT_GROUP="$default_group"
-    fi
-    log "Agent group: $AGENT_GROUP"
+    # Pairing code only — Application appliances never paste a long
+    # bootstrap key. The supervisor generates its own Ed25519 keypair
+    # on first boot and submits the pubkey against the code; the
+    # control plane stores it and waits for admin approval. The 8-digit
+    # code is the only thing the operator types over an IPMI / serial
+    # console.
+    local code_val
+    while true; do
+        code_val=$(whiptail --backtitle "$BACKTITLE" --title "Pairing code" \
+            --cancel-button "Back" \
+            --inputbox "Enter the 8-digit pairing code from the control plane.\n\nMint one at https://<control-plane>/appliance → Pairing → 'New pairing code'. Single-use ephemeral codes expire after 15 min by default; persistent codes (multi-claim) stay valid until disabled or revoked.\n\nAfter the supervisor claims the code, the appliance sits in pending — ask the control plane admin to click Approve in the fleet UI to issue the identity cert and assign a role." \
+            18 78 "$BOOTSTRAP_PAIRING_CODE" 3>&1 1>&2 2>&3) \
+            || return 1
+        code_val=$(echo "$code_val" | tr -d '[:space:]')
+        if [ -z "$code_val" ]; then
+            whiptail --msgbox "Pairing code is required for an Application install." 8 60 || true
+            continue
+        fi
+        # Validate: exactly 8 decimal digits. Catch typos before
+        # firstboot tries to redeem the code and fails with a
+        # generic 403 (which we'd then surface on the console).
+        if ! [[ "$code_val" =~ ^[0-9]{8}$ ]]; then
+            whiptail --msgbox "Pairing code must be exactly 8 decimal digits.\n\nGot: $code_val" 10 60 || true
+            continue
+        fi
+        break
+    done
+    BOOTSTRAP_PAIRING_CODE="$code_val"
+    log "Application paired against $CONTROL_PLANE_URL with an 8-digit pairing code"
 }
 
 pick_disk() {
@@ -326,21 +279,22 @@ pick_disk() {
     # back to the menu — used to fire much later from inside
     # do_install AFTER the operator had already filled out hostname /
     # admin user / network / timezone, which was wasted typing.
-    local MIN_BYTES=$((16 * 1024 * 1024 * 1024))
+    local MIN_BYTES=$((24 * 1024 * 1024 * 1024))
     while true; do
         TARGET_DISK=$(whiptail --backtitle "$BACKTITLE" --title "Target Disk" \
+            --cancel-button "Back" \
             --menu "Select the disk to install SpatiumDDI to.\nALL DATA on the chosen disk will be DESTROYED." \
             20 70 10 "${options[@]}" 3>&1 1>&2 2>&3) \
-            || on_cancel "target disk"
+            || return 1
         local DISK_BYTES
         DISK_BYTES=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
         if [ "$DISK_BYTES" -ge "$MIN_BYTES" ]; then
             log "Picked target disk $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB)"
             break
         fi
-        log "Operator picked $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB) — below 16 GiB minimum; re-prompting"
+        log "Operator picked $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB) — below 24 GiB minimum; re-prompting"
         whiptail --backtitle "$BACKTITLE" --title "Disk too small" --msgbox \
-            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 16 GiB:\n  ESP        512 MiB\n  root_A       4 GiB\n  root_B       4 GiB\n  var       remainder (≥7 GiB usable)\n\nPick a different disk, or Cancel out to attach a larger one." 16 70
+            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 24 GiB:\n  ESP        512 MiB\n  root_A       8 GiB\n  root_B       8 GiB\n  var       remainder (≥7 GiB usable)\n\nThe slots are sized to carry the full container image set (issue #170 Wave A4) so the appliance works air-gapped without ghcr.io.\n\nPick a different disk, or Cancel out to attach a larger one." 18 76
     done
 }
 
@@ -352,9 +306,10 @@ ask_hostname() {
     # two agents on the same name conflict). Require operator input.
     while true; do
         HOSTNAME=$(whiptail --backtitle "$BACKTITLE" --title "Hostname" \
+            --cancel-button "Back" \
             --inputbox "System hostname (also used as the SERVER_NAME this appliance registers under for DNS / DHCP agent roles, and shown in shell prompts + audit logs).\n\nGive each appliance a unique name (e.g. dns-east-1, dhcp-prod-a, ddi-control)." \
             14 72 "$HOSTNAME" 3>&1 1>&2 2>&3) \
-            || on_cancel "hostname"
+            || return 1
         HOSTNAME=$(echo "$HOSTNAME" | tr -d '[:space:]')
         if [ -z "$HOSTNAME" ]; then
             whiptail --msgbox "Hostname is required. Pick something descriptive for this appliance — it shouldn't collide with any other SpatiumDDI box." 9 60 || true
@@ -380,20 +335,23 @@ ask_hostname() {
 ask_user_password() {
     log "Step: ask_user_password"
     ADMIN_USER=$(whiptail --backtitle "$BACKTITLE" --title "Admin OS user" \
+        --cancel-button "Back" \
         --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately - change it on first login." \
         12 70 "$ADMIN_USER" 3>&1 1>&2 2>&3) \
-        || on_cancel "admin user"
+        || return 1
     [ -z "$ADMIN_USER" ] && ADMIN_USER="admin"
 
     while true; do
         local p1 p2
         p1=$(whiptail --backtitle "$BACKTITLE" --title "Admin password" \
+            --cancel-button "Back" \
             --passwordbox "Password for '$ADMIN_USER' (and root):" 10 60 \
             3>&1 1>&2 2>&3) \
-            || on_cancel "password"
+            || return 1
         p2=$(whiptail --backtitle "$BACKTITLE" --title "Confirm password" \
+            --cancel-button "Back" \
             --passwordbox "Repeat:" 10 60 3>&1 1>&2 2>&3) \
-            || on_cancel "password confirmation"
+            || return 1
         if [ "$p1" = "$p2" ] && [ -n "$p1" ]; then
             ADMIN_PASSWORD="$p1"
             break
@@ -407,11 +365,12 @@ ask_user_password() {
 ask_network() {
     log "Step: ask_network"
     NET_MODE=$(whiptail --backtitle "$BACKTITLE" --title "Network" \
+        --cancel-button "Back" \
         --menu "How should the appliance configure its network?" 12 70 2 \
         "dhcp"   "Automatic via DHCP (recommended for evaluation)" \
         "static" "Static IP" \
         3>&1 1>&2 2>&3) \
-        || on_cancel "network mode"
+        || return 1
 
     if [ "$NET_MODE" = "static" ]; then
         local ifs=()
@@ -421,54 +380,68 @@ ask_network() {
         if [ ${#ifs[@]} -eq 0 ]; then
             whiptail --msgbox "No ethernet interfaces found - falling back to DHCP." 8 60 || true
             NET_MODE="dhcp"
-            return
+            return 0
         fi
         NET_INTERFACE=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -interface" \
+            --cancel-button "Back" \
             --menu "Pick an interface:" 12 60 5 "${ifs[@]}" 3>&1 1>&2 2>&3) \
-            || on_cancel "static interface"
+            || return 1
         NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -address" \
-            --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 "" 3>&1 1>&2 2>&3) \
-            || on_cancel "static IP"
+            --cancel-button "Back" \
+            --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 "$NET_IP" 3>&1 1>&2 2>&3) \
+            || return 1
         NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -prefix" \
+            --cancel-button "Back" \
             --inputbox "Prefix length:" 10 60 "$NET_PREFIX" 3>&1 1>&2 2>&3) \
-            || on_cancel "static prefix"
+            || return 1
         NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -gateway" \
-            --inputbox "Gateway:" 10 60 "" 3>&1 1>&2 2>&3) \
-            || on_cancel "static gateway"
+            --cancel-button "Back" \
+            --inputbox "Gateway:" 10 60 "$NET_GATEWAY" 3>&1 1>&2 2>&3) \
+            || return 1
         NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -DNS" \
+            --cancel-button "Back" \
             --inputbox "DNS servers (space-separated):" 10 60 "$NET_DNS" 3>&1 1>&2 2>&3) \
-            || on_cancel "static DNS"
+            || return 1
     fi
 }
 
 ask_timezone() {
     log "Step: ask_timezone"
     TIMEZONE=$(whiptail --backtitle "$BACKTITLE" --title "Timezone" \
+        --cancel-button "Back" \
         --inputbox "Timezone (IANA name, e.g. America/Toronto, Europe/Berlin, UTC):" \
         10 70 "$TIMEZONE" 3>&1 1>&2 2>&3) \
-        || on_cancel "timezone"
-    [ -z "$TIMEZONE" ] && TIMEZONE="UTC"
+        || return 1
+    # ``[ -z "$TIMEZONE" ] && TIMEZONE="UTC"`` here would return 1 when
+    # TIMEZONE is non-empty (the [ test fails, && short-circuits, the
+    # function inherits the [ test's exit code), and the state machine
+    # would then treat OK as Back — infinite-looping the operator back
+    # into ask_network. Use an if/then so the function always exits 0
+    # on success.
+    if [ -z "$TIMEZONE" ]; then
+        TIMEZONE="UTC"
+    fi
 }
 
 confirm() {
     log "Step: confirm"
     local role_label
     case "$ROLE" in
-        control)             role_label="Control plane + BIND9 + Kea (all-in-one)" ;;
-        control-only)        role_label="Control plane only (no bundled agents)" ;;
-        dns-agent-bind9)     role_label="DNS agent (BIND9)" ;;
-        dns-agent-powerdns)  role_label="DNS agent (PowerDNS)" ;;
-        dhcp-agent)          role_label="DHCP agent (Kea)" ;;
-        *)                   role_label="$ROLE" ;;
+        full-stack)    role_label="Full stack — control plane + BIND9 + Kea (AIO)" ;;
+        frontend-core) role_label="Frontend / core — control plane only" ;;
+        application)   role_label="Application — supervisor only (pairs remote)" ;;
+        *)             role_label="$ROLE" ;;
     esac
     local s
     s="Role:        $role_label\n"
-    case "$ROLE" in
-        dns-agent-bind9|dns-agent-powerdns|dhcp-agent)
-            s+="Control URL: $CONTROL_PLANE_URL\n"
-            s+="Agent group: $AGENT_GROUP\n"
-            ;;
-    esac
+    if [ "$ROLE" = "application" ]; then
+        s+="Control URL: $CONTROL_PLANE_URL\n"
+        # Mask the code in the confirmation screen — the IPMI / serial
+        # console operator already typed it; no need to flash all 8
+        # digits back at them. ●●●●●●●● is enough confirmation that
+        # something landed.
+        s+="Pair code:   ●●●●●●●●\n"
+    fi
     s+="Target disk: $TARGET_DISK\n"
     s+="Hostname:    $HOSTNAME\n"
     s+="OS user:     $ADMIN_USER\n"
@@ -480,8 +453,9 @@ confirm() {
     s+="WARNING: $TARGET_DISK will be ERASED. There is no undo.\n\n"
     s+="Proceed with installation?"
     whiptail --backtitle "$BACKTITLE" --title "Confirm" \
+        --no-button "Back" \
         --yesno "$s" 20 72 \
-        || on_cancel "final confirmation"
+        || return 1
 }
 
 # ── Install ───────────────────────────────────────────────────────────────────
@@ -507,19 +481,23 @@ do_install() {
     #
     #   p1  BIOS Boot     1 MiB     ef02   legacy chain-load (grub i386-pc)
     #   p2  ESP          512 MiB    ef00   FAT32, /boot/efi
-    #   p3  root_A         4 GiB    8304   active slot (this install lands here)
-    #   p4  root_B         4 GiB    8304   inactive slot (staging next image)
+    #   p3  root_A         8 GiB    8304   active slot (this install lands here)
+    #   p4  root_B         8 GiB    8304   inactive slot (staging next image)
     #   p5  var          rest       8300   /var, persisted across slot swaps
     #
-    # Slot sizing — current rootfs is ~1.8 GiB (Python, kernel, system
-    # packages, /etc baseline). 4 GiB gives ~2.2× headroom which covers
-    # the Phase 4-7 roadmap (additional daemons, expanded Python stack,
-    # future kernel upgrades). If we ever outgrow it, "spatium-upgrade-
-    # slot --grow" is a future affordance — easier to grow than shrink.
+    # Slot sizing — #170 Phase A4 bakes every container image into the
+    # rootfs (~800 MB-1.2 GB compressed depending on third-party
+    # versions); base Debian + Python + system packages is ~1.8 GiB.
+    # 8 GiB per slot gives ~2.7× headroom over the current ~3 GiB
+    # working set and accommodates Wave B+ growth (CA tooling, the
+    # supervisor's expanded toolset, future kernel upgrades).
+    # Previous 4 GiB slots predated baking and are too tight once
+    # the full container set lives on-rootfs.
     #
-    # Hard floor: 16 GiB target disk (= 1 MiB BBP + 512 MiB ESP + 2× 4
+    # Hard floor: 24 GiB target disk (= 1 MiB BBP + 512 MiB ESP + 2× 8
     # GiB slots + at least 7 GiB usable /var). Below that, postgres +
-    # docker volumes + audit log outgrow /var quickly.
+    # docker volumes + audit log outgrow /var quickly. Bumped from
+    # the pre-A4 16 GiB floor.
     local BBP ESP ROOT_A ROOT_B VAR
     BBP=$(partition_node 1)
     ESP=$(partition_node 2)
@@ -586,8 +564,8 @@ do_install() {
         #                                      partition discoverable.)
         sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
                -n2:0:+512M  -t2:ef00 -c2:ESP \
-               -n3:0:+4G    -t3:8304 -c3:root_A \
-               -n4:0:+4G    -t4:8304 -c4:root_B \
+               -n3:0:+8G    -t3:8304 -c3:root_A \
+               -n4:0:+8G    -t4:8304 -c4:root_B \
                -n5:0:0      -t5:8310 -c5:var \
                "$TARGET_DISK"               >> "$INSTALL_LOG" 2>&1
         partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true
@@ -772,14 +750,10 @@ EOF
         cat > "$MOUNT/etc/spatiumddi/role-config" <<EOF
 ROLE=$ROLE
 CONTROL_PLANE_URL=$CONTROL_PLANE_URL
-DNS_AGENT_KEY=$DNS_AGENT_KEY
-DHCP_AGENT_KEY=$DHCP_AGENT_KEY
 BOOTSTRAP_PAIRING_CODE=$BOOTSTRAP_PAIRING_CODE
-AGENT_GROUP=$AGENT_GROUP
 EOF
-        # Operator-supplied agent key / pairing code are sensitive
-        # even before firstboot transcribes them into .env —
-        # restrict the role-config file to root.
+        # The pairing code is sensitive even before firstboot
+        # transcribes it into .env — restrict role-config to root.
         chmod 0600 "$MOUNT/etc/spatiumddi/role-config"
         cat > "$MOUNT/etc/hosts" <<EOF
 127.0.0.1 localhost
@@ -1261,16 +1235,62 @@ main() {
         echo "Run as root." >&2
         exit 1
     fi
-    welcome
-    ask_role
-    pick_disk
-    ask_hostname
-    ask_user_password
-    ask_network
-    ask_timezone
-    ask_agent_config
-    confirm
-    do_install
+
+    # State-machine wizard. Each step is one function that returns:
+    #   0 — operator pressed OK / Yes / made a valid selection
+    #   1 — operator pressed Back (or Cancel/Esc on Welcome, which
+    #       exits the wizard entirely via on_cancel).
+    # Cancel on Welcome is the only exit-installer path; every other
+    # screen's Cancel button is renamed "Back" and walks the wizard
+    # back one step. ask_application_config is conditional on
+    # ROLE=application — it returns 0 immediately for the other roles
+    # so Back from confirm walks through it transparently to
+    # ask_timezone.
+    local step="welcome"
+    while [ -n "$step" ]; do
+        log "Wizard state: $step"
+        case "$step" in
+            welcome)
+                # welcome only returns 0 — Cancel here calls on_cancel
+                # which exec's a shell (never returns). That's the
+                # explicit "I changed my mind, don't install" path.
+                welcome
+                step="ask_role"
+                ;;
+            ask_role)
+                if ask_role; then step="pick_disk"; else step="welcome"; fi
+                ;;
+            pick_disk)
+                if pick_disk; then step="ask_hostname"; else step="ask_role"; fi
+                ;;
+            ask_hostname)
+                if ask_hostname; then step="ask_user_password"; else step="pick_disk"; fi
+                ;;
+            ask_user_password)
+                if ask_user_password; then step="ask_network"; else step="ask_hostname"; fi
+                ;;
+            ask_network)
+                if ask_network; then step="ask_timezone"; else step="ask_user_password"; fi
+                ;;
+            ask_timezone)
+                if ask_timezone; then step="ask_application_config"; else step="ask_network"; fi
+                ;;
+            ask_application_config)
+                # Returns 0 immediately when ROLE != application — so
+                # forward navigation moves straight to confirm and
+                # backward navigation from confirm walks through here
+                # without showing any whiptail screen.
+                if ask_application_config; then step="confirm"; else step="ask_timezone"; fi
+                ;;
+            confirm)
+                if confirm; then step="do_install"; else step="ask_application_config"; fi
+                ;;
+            do_install)
+                do_install
+                step=""
+                ;;
+        esac
+    done
 }
 
 on_failure() {

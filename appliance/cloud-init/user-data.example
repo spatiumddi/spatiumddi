@@ -36,18 +36,30 @@ users:
 #     content: |
 #       SPATIUMDDI_VERSION=2026.05.07-1
 
-# ── Optional: distributed agent appliance ─────────────────────────────────────
-# Phase 4 of the appliance roadmap (not Phase 1). Placeholder for
-# forward-compat — point a DNS-only or DHCP-only appliance at an
-# external control plane.
+# ── Optional: distributed Application appliance ───────────────────────────────
+# An Application appliance runs the spatium-supervisor only; it pairs
+# with a remote control plane via an 8-digit pairing code, sits in
+# pending_approval until an admin clicks Approve in the fleet UI, then
+# accepts a role assignment (DNS-BIND9 / DNS-PowerDNS / DHCP /
+# multi-role) and starts the matching service container.
+#
+# Drop the file below (mode 0600 — the pairing code is sensitive even
+# before firstboot transcribes it into .env) and the firstboot script
+# wires COMPOSE_PROFILES=supervisor,agent automatically. Mint a code
+# at https://<control-plane>/appliance → Pairing → 'New pairing code'.
 #
 # write_files:
-#   - path: /etc/spatiumddi/agent.env
+#   - path: /etc/spatiumddi/role-config
 #     permissions: '0600'
 #     content: |
-#       APPLIANCE_ROLE=dns
+#       ROLE=application
 #       CONTROL_PLANE_URL=https://spatiumddi.example.com
-#       DNS_AGENT_KEY=<paste-key-from-control-plane>
+#       BOOTSTRAP_PAIRING_CODE=12345678
+#
+# Other supported ROLE values:
+#   full-stack    — control plane + bundled BIND9 + Kea (default).
+#   frontend-core — control plane only; pair Application appliances
+#                   against it from the fleet UI.
 
 # ── First-boot behaviour ──────────────────────────────────────────────────────
 # Nothing else required. The spatiumddi-firstboot OpenRC service runs

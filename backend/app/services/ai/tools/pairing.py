@@ -1,7 +1,7 @@
 """Operator Copilot read tool for the appliance pairing-code surface
-(issue #169).
+(issues #169 + #170 Wave A3).
 
-Surfaces the ``pairing_code`` table — pending + recently-terminal
+Surfaces the ``pairing_code`` table — active + recently-terminal
 rows — so a superadmin can ask the Copilot "any active pairing
 codes?" / "did dns-west-2 successfully pair?" / "list claimed codes
 from the last hour" through chat instead of clicking into the
@@ -9,17 +9,16 @@ Appliance UI.
 
 Restricted to superadmin because pairing codes are agent bootstrap
 auth: even the redacted shape leaks "there are N pending codes
-right now for the DNS group at <id>", which is signal an attacker
-could use to time a brute-force window. The runtime gate inside the
-executor (``user.is_superadmin``) is the only thing standing
-between a regular operator's LLM session and that data — see
-``admin._superadmin_gate`` for the canonical pattern; the LLM
-itself has no input on this.
+right now", which is signal an attacker could use to time a
+brute-force window. The runtime gate inside the executor
+(``user.is_superadmin``) is the only thing standing between a regular
+operator's LLM session and that data — see ``admin._superadmin_gate``
+for the canonical pattern; the LLM itself has no input on this.
 
 No ``propose_create_pairing_code`` write tool by design. Issuing a
 pairing code returns the cleartext code in the response, and we don't
 want the operator's copilot transcript carrying a live bootstrap-auth
-secret. The dedicated Settings → Appliance flow is the friendly path.
+secret. The dedicated Appliance → Pairing UI flow is the friendly path.
 """
 
 from __future__ import annotations
@@ -28,10 +27,11 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+from sqlalchemy import func as sa_func
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.appliance import PairingCode
+from app.models.appliance import PairingClaim, PairingCode
 from app.models.auth import User
 from app.services.ai.tools.base import register_tool
 
@@ -48,31 +48,39 @@ def _superadmin_gate(user: User) -> dict[str, Any] | None:
     return None
 
 
-def _state_for(
-    row: PairingCode, now: datetime
-) -> Literal["pending", "claimed", "expired", "revoked"]:
-    if row.used_at is not None:
-        return "claimed"
+PairingCodeState = Literal["pending", "claimed", "expired", "revoked", "disabled", "exhausted"]
+
+
+def _state_for(row: PairingCode, claim_count: int, now: datetime) -> PairingCodeState:
+    """Mirror of the API-side state derivation; see
+    ``app.api.v1.appliance.pairing._state_for``.
+    """
     if row.revoked_at is not None:
         return "revoked"
-    if row.expires_at <= now:
+    if row.persistent and not row.enabled:
+        return "disabled"
+    if row.expires_at is not None and row.expires_at <= now:
         return "expired"
+    if row.persistent and row.max_claims is not None and claim_count >= row.max_claims:
+        return "exhausted"
+    if not row.persistent and claim_count > 0:
+        return "claimed"
     return "pending"
 
 
 class FindPairingCodesArgs(BaseModel):
-    deployment_kind: Literal["dns", "dhcp", "both"] | None = Field(
+    persistent: bool | None = Field(
         default=None,
         description=(
-            "Filter by agent kind: 'dns', 'dhcp', or 'both' (combined "
-            "BIND9 + Kea). Omit to return every kind."
+            "Filter by code flavour: True = persistent (multi-claim), "
+            "False = ephemeral (single-use). Omit for both flavours."
         ),
     )
-    state: Literal["pending", "claimed", "expired", "revoked"] | None = Field(
+    state: PairingCodeState | None = Field(
         default=None,
         description=(
-            "Filter by code state. 'pending' is the only state that's "
-            "still actively usable. Omit for all states."
+            "Filter by code state. 'pending' / 'active' codes are still "
+            "actively usable. Omit for all states."
         ),
     )
     limit: int = Field(default=25, ge=1, le=200)
@@ -82,22 +90,20 @@ class FindPairingCodesArgs(BaseModel):
     name="find_pairing_codes",
     description=(
         "List appliance pairing codes (superadmin only). Each row "
-        "carries the last two digits of the code, deployment_kind "
-        "(dns / dhcp / both), state (pending / claimed / expired / "
-        "revoked), pre-assigned server_group_id (nullable; always "
-        "null for kind='both'), expires_at, and — for claimed rows "
-        "— the claiming agent's IP + hostname. Use to answer 'any "
-        "active pairing codes?', 'who claimed code ending in 47?', "
-        "or 'how many codes have expired without being claimed "
-        "today?'. Defaults to the 25 most recent rows across every "
-        "state; filter with deployment_kind + state."
+        "carries the last two digits of the code, persistent flag, "
+        "enabled flag, state (pending / claimed / expired / revoked / "
+        "disabled / exhausted), max_claims (nullable), claim_count, "
+        "expires_at (nullable for persistent), and note. Use to "
+        "answer 'any active pairing codes?', 'how many supervisors "
+        "have claimed the staging-fleet code?', or 'how many codes "
+        "have expired today?'. Defaults to the 25 most recent rows "
+        "across every state; filter with persistent + state."
     ),
     args_model=FindPairingCodesArgs,
     category="admin",
     # Default enabled (NN #13) — read-only, no secrets in response
-    # (cleartext code never surfaced; code_hash never surfaced), no
-    # off-prem calls. Admins discover it without opt-in. The
-    # superadmin gate is the real auth.
+    # (cleartext code never surfaced), no off-prem calls. Admins
+    # discover it without opt-in. The superadmin gate is the real auth.
     default_enabled=True,
     module="appliance.pairing",
 )
@@ -108,28 +114,39 @@ async def find_pairing_codes(
         return err
 
     stmt = select(PairingCode).order_by(PairingCode.created_at.desc())
-    if args.deployment_kind is not None:
-        stmt = stmt.where(PairingCode.deployment_kind == args.deployment_kind)
-    rows = (await db.execute(stmt)).scalars().all()
+    if args.persistent is not None:
+        stmt = stmt.where(PairingCode.persistent == args.persistent)
+    rows = list((await db.execute(stmt)).scalars().all())
+
+    # Bulk claim-count query: one trip vs N.
+    claim_counts: dict[str, int] = {}
+    if rows:
+        cstmt = (
+            select(PairingClaim.pairing_code_id, sa_func.count())
+            .where(PairingClaim.pairing_code_id.in_([r.id for r in rows]))
+            .group_by(PairingClaim.pairing_code_id)
+        )
+        for code_id, count in (await db.execute(cstmt)).all():
+            claim_counts[str(code_id)] = int(count)
 
     now = datetime.now(UTC)
     out: list[dict[str, Any]] = []
     for row in rows:
-        state = _state_for(row, now)
+        count = claim_counts.get(str(row.id), 0)
+        state = _state_for(row, count, now)
         if args.state is not None and state != args.state:
             continue
         out.append(
             {
                 "id": str(row.id),
                 "code_last_two": row.code_last_two,
-                "deployment_kind": row.deployment_kind,
+                "persistent": row.persistent,
+                "enabled": row.enabled,
                 "state": state,
-                "server_group_id": (str(row.server_group_id) if row.server_group_id else None),
+                "max_claims": row.max_claims,
+                "claim_count": count,
                 "note": row.note,
-                "expires_at": row.expires_at.isoformat(),
-                "used_at": row.used_at.isoformat() if row.used_at else None,
-                "used_by_ip": row.used_by_ip,
-                "used_by_hostname": row.used_by_hostname,
+                "expires_at": row.expires_at.isoformat() if row.expires_at else None,
                 "revoked_at": row.revoked_at.isoformat() if row.revoked_at else None,
                 "created_at": row.created_at.isoformat(),
             }
@@ -142,5 +159,5 @@ async def find_pairing_codes(
         "count": len(out),
         # Quick "is there a code an agent could be redeeming right now?"
         # rollup for the LLM's summarisation.
-        "pending_count": sum(1 for c in out if c["state"] == "pending"),
+        "active_count": sum(1 for c in out if c["state"] in ("pending", "active")),
     }

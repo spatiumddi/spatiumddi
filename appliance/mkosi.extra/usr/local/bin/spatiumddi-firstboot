@@ -43,8 +43,26 @@ fi
 gen_hex()    { openssl rand -hex "${1:-32}"; }
 gen_fernet() { openssl rand 32 | base64 | tr -d '\n' | tr '+/' '-_'; }
 
-# Read optional release pin dropped by cloud-init.
+# Resolve which image tag the appliance should run. Three sources, in
+# priority order (lowest first; each overrides the prior):
+#
+#   1. Hardcoded "latest" default — used by clean ISOs that pull from
+#      ghcr on first boot.
+#   2. ``/usr/lib/spatiumddi/docker-overlay.version`` — sidecar
+#      written by appliance/scripts/bake-images.sh recording what
+#      SPATIUMDDI_VERSION the baked docker overlay was built against.
+#      For local-build ISOs this is "dev"; for release ISOs it's the
+#      CalVer tag (e.g. "2026.05.14-1"). Without this fall-through,
+#      compose's ``image: ghcr.io/.../:${SPATIUMDDI_VERSION}`` resolves
+#      to ``:latest`` and pulls the latest *published* image set from
+#      ghcr — defeating the entire bake and silently running the wrong
+#      software.
+#   3. ``/etc/spatiumddi/release`` — operator override (e.g. set via
+#      cloud-init) to pin to a specific older / pre-release version.
 SPATIUMDDI_VERSION="latest"
+if [ -f /usr/lib/spatiumddi/docker-overlay.version ]; then
+    SPATIUMDDI_VERSION="$(cat /usr/lib/spatiumddi/docker-overlay.version)"
+fi
 if [ -f /etc/spatiumddi/release ]; then
     # shellcheck disable=SC1091
     . /etc/spatiumddi/release
@@ -103,81 +121,53 @@ if [ ! -f "$ENV_FILE" ]; then
     # yet (firstboot races docker.service); the compose group_add
     # has the same default.
     DOCKER_GID_VAL=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo "999")
-    # Phase 6 role-split — spatium-install dropped /etc/spatiumddi/
-    # role-config carrying ROLE + (for agents) CONTROL_PLANE_URL +
-    # the operator-supplied agent key. Default to ``control`` when
-    # the file isn't present (fresh build before any installer wizard
-    # ran — happens during dev iteration without the installer).
-    ROLE=control
+    # spatium-install drops /etc/spatiumddi/role-config with ROLE
+    # (full-stack / frontend-core / application) +
+    # CONTROL_PLANE_URL + BOOTSTRAP_PAIRING_CODE (application only).
+    ROLE=full-stack
     INSTALL_CONTROL_PLANE_URL=""
-    INSTALL_DNS_AGENT_KEY=""
-    INSTALL_DHCP_AGENT_KEY=""
     INSTALL_BOOTSTRAP_PAIRING_CODE=""
-    INSTALL_AGENT_GROUP=""
     if [ -f /etc/spatiumddi/role-config ]; then
         # shellcheck disable=SC1091
         . /etc/spatiumddi/role-config
-        INSTALL_CONTROL_PLANE_URL="$CONTROL_PLANE_URL"
-        INSTALL_DNS_AGENT_KEY="$DNS_AGENT_KEY"
-        INSTALL_DHCP_AGENT_KEY="$DHCP_AGENT_KEY"
-        # #169 Phase 4 — operator may have chosen to paste a short
-        # pairing code instead of the long agent key. Empty when the
-        # operator went the long-key route; the agent honours
-        # whichever is non-empty (with the long key winning when
-        # both are set, per the Phase 3 resolver).
+        INSTALL_CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-}"
         INSTALL_BOOTSTRAP_PAIRING_CODE="${BOOTSTRAP_PAIRING_CODE:-}"
-        INSTALL_AGENT_GROUP="$AGENT_GROUP"
     fi
 
     # COMPOSE_PROFILES drives which services come up.
-    #   control     → full stack + bundled DNS+DHCP agents (today's
-    #                 default), so the control-plane appliance is a
-    #                 self-contained box.
-    #   dns-agent   → only dns-bind9 + the agent-landing static page
-    #                 (CONTROL_PLANE_URL points at a remote api).
-    #   dhcp-agent  → only dhcp-kea + the agent-landing static page.
-    # The agent keys: on control mode we generate fresh ones; on
-    # agent modes we re-use whatever the operator pasted at install
-    # time (writing nothing for the OTHER agent's key — the unused
-    # service won't run, so an empty value is harmless).
-    # BOOTSTRAP_PAIRING_CODE only flows on agent roles — the control
-    # / control-only roles ARE the control plane (they hand out
-    # pairing codes; they don't claim them). Default empty.
+    #   full-stack    → full control plane + bundled BIND9 + Kea.
+    #   frontend-core → control plane only.
+    #   application   → spatium-supervisor + agent-landing static
+    #                   page; no service container until the control
+    #                   plane assigns a role (Wave C).
+    # Agent keys: control planes (full-stack / frontend-core)
+    # generate fresh DNS+DHCP agent keys for any legacy in-field
+    # agents still using the PSK path; Application appliances don't
+    # need them — the supervisor's Ed25519 keypair + control-plane-CA-
+    # signed cert is the only identity. .env still carries empty
+    # values so compose's env subst doesn't error.
     BOOTSTRAP_PAIRING_CODE_VAL=""
     case "$ROLE" in
-        dns-agent-bind9)
-            COMPOSE_PROFILES_VAL="dns-bind9,agent"
-            DNS_AGENT_KEY_VAL="$INSTALL_DNS_AGENT_KEY"
-            DHCP_AGENT_KEY_VAL=""
-            BOOTSTRAP_PAIRING_CODE_VAL="$INSTALL_BOOTSTRAP_PAIRING_CODE"
-            CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
-            AGENT_GROUP_VAL="${INSTALL_AGENT_GROUP:-default}"
-            ;;
-        dns-agent-powerdns)
-            COMPOSE_PROFILES_VAL="dns-powerdns,agent"
-            DNS_AGENT_KEY_VAL="$INSTALL_DNS_AGENT_KEY"
-            DHCP_AGENT_KEY_VAL=""
-            BOOTSTRAP_PAIRING_CODE_VAL="$INSTALL_BOOTSTRAP_PAIRING_CODE"
-            CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
-            AGENT_GROUP_VAL="${INSTALL_AGENT_GROUP:-default-powerdns}"
-            ;;
-        dhcp-agent)
-            COMPOSE_PROFILES_VAL="dhcp,agent"
+        application)
+            # Supervisor (mandatory) + agent-landing static page so
+            # ``curl http://<appliance>/`` confirms the box is up +
+            # which control plane it pairs against. Role assignment
+            # (DNS / DHCP / multi-role) happens later from the fleet
+            # UI; service containers start then.
+            COMPOSE_PROFILES_VAL="supervisor,agent"
             DNS_AGENT_KEY_VAL=""
-            DHCP_AGENT_KEY_VAL="$INSTALL_DHCP_AGENT_KEY"
+            DHCP_AGENT_KEY_VAL=""
             BOOTSTRAP_PAIRING_CODE_VAL="$INSTALL_BOOTSTRAP_PAIRING_CODE"
             CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
-            AGENT_GROUP_VAL="${INSTALL_AGENT_GROUP:-default}"
+            AGENT_GROUP_VAL="default"
             ;;
-        control-only)
+        frontend-core)
             # Control plane only — no bundled DNS/DHCP. Agent keys
             # are still generated because the operator's whole reason
             # for picking this role is to register external agents.
-            # They reveal the keys via Settings -> Security -> Agent
-            # bootstrap keys and paste them into agent installs
-            # elsewhere. AGENT_GROUP is irrelevant here (no local
-            # agent to register) but the .env carries a default
-            # value so the compose env subst doesn't error.
+            # They reveal the keys via Settings → Security → Agent
+            # bootstrap keys (or mint pairing codes under
+            # /appliance → Pairing for B2+ Application appliances).
             COMPOSE_PROFILES_VAL="control"
             DNS_AGENT_KEY_VAL=$(gen_hex 24)
             DHCP_AGENT_KEY_VAL=$(gen_hex 24)
@@ -185,11 +175,11 @@ if [ ! -f "$ENV_FILE" ]; then
             AGENT_GROUP_VAL="default"
             ;;
         *)
-            # ``control`` (default) — control plane + bundled DNS +
-            # DHCP. Single-box AIO deployment. Bundled agents register
-            # into the same default group so an external agent joining
-            # later lands alongside them.
-            ROLE=control
+            # ``full-stack`` (default) — control plane + bundled
+            # BIND9 + Kea. Single-box AIO deployment. Bundled agents
+            # register into the same default group so an external
+            # agent joining later lands alongside them.
+            ROLE=full-stack
             COMPOSE_PROFILES_VAL="control,dns-bind9,dhcp"
             DNS_AGENT_KEY_VAL=$(gen_hex 24)
             DHCP_AGENT_KEY_VAL=$(gen_hex 24)
@@ -200,7 +190,7 @@ if [ ! -f "$ENV_FILE" ]; then
     cat > "$ENV_FILE" <<EOF
 # Auto-generated by spatiumddi-firstboot on $(date -Iseconds).
 # Edit + run \`docker-compose -f $COMPOSE_DIR/docker-compose.yml up -d\` to apply.
-# Appliance role (Phase 6): $ROLE
+# Appliance role (#170 Wave B2): $ROLE
 SPATIUMDDI_VERSION=${SPATIUMDDI_VERSION}
 POSTGRES_PASSWORD=$(gen_hex 24)
 SECRET_KEY=$(gen_hex 32)
@@ -217,13 +207,24 @@ APPLIANCE_HOSTNAME=${APPLIANCE_HOSTNAME_VAL}
 APPLIANCE_HOST_IPS=${APPLIANCE_HOST_IPS_VAL}
 DOCKER_GID=${DOCKER_GID_VAL}
 EOF
-    chmod 600 "$ENV_FILE"
+    # #170 Wave D follow-up — mode 644 (not 600) so the
+    # spatium-supervisor's unprivileged container user (uid 100, gid 101)
+    # can read it through the ``/etc/spatiumddi:/etc/spatiumddi-host:ro``
+    # bind mount. ``service_lifecycle.py`` passes the host .env as an
+    # additional ``--env-file`` to ``docker compose`` so service
+    # containers' ``${SPATIUMDDI_VERSION}`` / ``${CONTROL_PLANE_URL}`` /
+    # ``${DOCKER_GID}`` / ``${DNS_AGENT_KEY}`` interpolation resolves.
+    # The file's AIO-mode secrets (POSTGRES_PASSWORD / SECRET_KEY /
+    # CREDENTIAL_ENCRYPTION_KEY) are reachable from the postgres data
+    # dir + api container env regardless, so 600 → 644 is a negligible
+    # security delta on a single-tenant appliance.
+    chmod 644 "$ENV_FILE"
 
-    # Phase 6 — for agent-mode installs only, render the agent landing
-    # page from the template into /var/lib/spatiumddi/agent-landing/
-    # where the agent-landing nginx:alpine container mounts it
-    # read-only. ``control-only`` doesn't need the landing page —
-    # the SpatiumDDI frontend serves the web UI on that role.
+    # #170 Wave B2 — for Application installs, render the agent
+    # landing page from the template into /var/lib/spatiumddi/
+    # agent-landing/ where the nginx:alpine sidecar mounts it
+    # read-only. Frontend-core / full-stack don't need it — the
+    # SpatiumDDI frontend serves the web UI on those roles.
     #
     # The ``umask 077`` set earlier (for the .env's secrets) leaks
     # into the mkdir + sed > index.html and would leave the file
@@ -232,14 +233,17 @@ EOF
     # landing page would return 403. Reset umask before the write.
     umask 022
     case "$ROLE" in
-        dns-agent-bind9|dns-agent-powerdns|dhcp-agent)
+        application)
             mkdir -p /var/lib/spatiumddi/agent-landing
             chmod 0755 /var/lib/spatiumddi/agent-landing
-            case "$ROLE" in
-                dns-agent-bind9)    ROLE_LABEL="DNS (BIND9)";    ROLE_SHORT="dns-bind9" ;;
-                dns-agent-powerdns) ROLE_LABEL="DNS (PowerDNS)"; ROLE_SHORT="dns-powerdns" ;;
-                dhcp-agent)         ROLE_LABEL="DHCP (Kea)";     ROLE_SHORT="dhcp-kea" ;;
-            esac
+            # Role-specific labels for the static landing page. The
+            # supervisor doesn't know its assigned service role yet
+            # (control plane decides post-approval); the landing
+            # surface reflects "supervisor, awaiting role" until the
+            # fleet UI assigns one. The Wave-D fleet UI will rewrite
+            # the page on role assignment.
+            ROLE_LABEL="Application (awaiting approval)"
+            ROLE_SHORT="supervisor"
             sed \
                 -e "s|__ROLE__|${ROLE}|g" \
                 -e "s|__ROLE_LABEL__|${ROLE_LABEL}|g" \
@@ -302,50 +306,21 @@ getent hosts registry-1.docker.io >/dev/null 2>&1 || {
     echo "      Check 'resolvectl status' and 'nmcli device status'."
 }
 
-# Phase 4 dev-iteration support — if this ISO was built with
-# ``bake-images.sh``, it ships locally-built image tarballs at
-# /usr/local/share/spatiumddi/images/*.tar.zst. Load each one
-# into the daemon BEFORE attempting any pull, so the operator's
-# in-flight changes take precedence over whatever's pullable
-# from ghcr.io. The marker file ``BAKED_AT`` is dropped by
-# bake-images.sh; its presence is the signal "this slot carries
-# offline images". When present we skip docker-compose pull
-# entirely (pulls of unpublished tags would 404 against ghcr).
+# #170 Phase E1 — the docker-overlay.img bake produces a populated
+# /var/lib/docker snapshot that ``spatium-docker-overlay.service``
+# loop-mounts on top of /var/lib/docker BEFORE docker.service runs.
+# By the time firstboot reaches this point the appliance's docker
+# daemon already has every baked image available — no ``docker load``
+# step needed, no slot-skew risk between the rootfs and /var.
 #
-# Slot-upgrade aware: each slot rootfs ships its own BAKED_AT
-# stamp. We persist the last-loaded BAKED_AT timestamp on the
-# shared /var partition; if the rootfs's BAKED_AT is newer, we
-# re-load the tarballs even on a non-first boot. This is what
-# makes ``spatium-upgrade-slot apply`` followed by a reboot
-# actually pick up the new container images — without it, the
-# previous slot's STAMP shorts out the load and docker-compose
-# happily reuses the stale images already on /var/lib/docker.
-IMAGES_DIR=/usr/local/share/spatiumddi/images
-BAKED_AT_FILE="$IMAGES_DIR/BAKED_AT"
-LOADED_AT_FILE=/var/lib/spatiumddi/images-loaded-at
+# The presence of /usr/lib/spatiumddi/docker-overlay.img is the
+# "this slot carries offline images" signal. Without it (dev runs
+# without baked images), firstboot falls through to ``docker-compose
+# pull`` against ghcr.io.
+OVERLAY_IMG=/usr/lib/spatiumddi/docker-overlay.img
 BAKED=0
-LOAD_REASON=""
-
-if [ -f "$BAKED_AT_FILE" ]; then
-    rootfs_baked_at=$(cat "$BAKED_AT_FILE")
-    loaded_baked_at=""
-    [ -f "$LOADED_AT_FILE" ] && loaded_baked_at=$(cat "$LOADED_AT_FILE")
-    if [ ! -f "$STAMP" ]; then
-        LOAD_REASON="first boot (baked $rootfs_baked_at)"
-    elif [ "$rootfs_baked_at" != "$loaded_baked_at" ]; then
-        LOAD_REASON="rootfs BAKED_AT changed (was $loaded_baked_at, now $rootfs_baked_at) — slot upgrade detected"
-    fi
-
-    if [ -n "$LOAD_REASON" ]; then
-        echo "Loading pre-baked container images from $IMAGES_DIR — $LOAD_REASON"
-        for img in "$IMAGES_DIR"/*.tar.zst; do
-            [ -f "$img" ] || continue
-            echo "  → $(basename "$img")"
-            zstd -dc "$img" | docker load
-        done
-        echo "$rootfs_baked_at" > "$LOADED_AT_FILE"
-        BAKED=1
-    fi
+if [ -f "$OVERLAY_IMG" ]; then
+    BAKED=1
 fi
 
 if [ ! -f "$STAMP" ] && [ "$BAKED" = 0 ]; then
@@ -386,16 +361,16 @@ fi
 
 # Role-aware readiness check.
 #
-# Control / control-only roles run the api container, which exposes
-# /health/live on port 8000 (port-mapped to the host). Poll until it
-# answers; that's the "the operator can sign in now" signal.
+# full-stack / frontend-core roles run the api container, which
+# exposes /health/live on port 8000 (port-mapped to the host). Poll
+# until it answers; that's the "the operator can sign in now" signal.
 #
-# Agent roles (dns-* / dhcp-*) don't run a local api — there's no
-# /health/live to poll on this box. Instead, confirm every container
-# in the active compose profile reports state=running. The agent
-# itself retries forever against the remote control plane, so
-# "containers up" is the strongest signal we can give without a
-# round trip across the LAN.
+# application doesn't run a local api — there's no /health/live to
+# poll on this box. Instead, confirm every container in the active
+# compose profile reports state=running. The supervisor itself
+# retries forever against the remote control plane, so "containers
+# up" is the strongest signal we can give without a round trip across
+# the LAN.
 # Phase 8c — commit the active slot as the durable default after a
 # successful trial boot. spatium-upgrade-slot set-next-boot writes a
 # one-shot saved_entry to grubenv via grub-reboot; that's auto-cleared
@@ -440,8 +415,8 @@ commit_slot_if_healthy() {
         >> "$LOG" 2>&1 || true
 }
 
-case "${APPLIANCE_ROLE:-control}" in
-    control|control-only)
+case "${APPLIANCE_ROLE:-full-stack}" in
+    full-stack|frontend-core)
         echo "Waiting for control plane on http://127.0.0.1:8000/health/live …"
         for i in $(seq 1 60); do
             if curl -fsS --max-time 3 http://127.0.0.1:8000/health/live >/dev/null 2>&1; then

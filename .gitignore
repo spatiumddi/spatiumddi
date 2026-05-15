@@ -51,4 +51,13 @@ scripts/take_screenshots.py
 # only meaningful as build inputs to the next mkosi run, so they
 # don't belong in git history.
 appliance/build/
+# Pre-E1 tarball layout (gitignored; legacy, removed by
+# ``make appliance-clean-baked-images`` if any operator's tree
+# still has it).
 appliance/mkosi.extra/usr/local/share/spatiumddi/images/
+# #170 Phase E1 — per-slot baked docker overlay (gitignored; built
+# by appliance/scripts/bake-images.sh, copied verbatim into the
+# rootfs by ``make appliance``).
+appliance/mkosi.extra/usr/lib/spatiumddi/docker-overlay.img
+appliance/mkosi.extra/usr/lib/spatiumddi/docker-overlay.manifest
+appliance/mkosi.extra/usr/lib/spatiumddi/docker-overlay.version

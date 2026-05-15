@@ -1,11 +1,14 @@
 """SpatiumDDI OS appliance management models — Phase 4 (issue #134).
 
-Two persistence surfaces live here:
+Three persistence surfaces live here:
 
 * ``ApplianceCertificate`` (Phase 4b.1) — Web UI TLS cert with a
   Fernet-encrypted private key.
 * ``PairingCode`` (#169) — short-lived, single-use 8-digit codes that
   swap for the real agent bootstrap key. See the model docstring.
+* ``Appliance`` (#170 Wave A2) — one row per supervisor that's claimed
+  a pairing code. Carries the supervisor's Ed25519 public key +
+  identity metadata. See the model docstring.
 
 The broader management surface (releases, container state, host
 network config, maintenance mode) doesn't need DB persistence — those
@@ -18,7 +21,17 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, LargeBinary, String, Text, func
+import sqlalchemy as sa
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    LargeBinary,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -134,38 +147,39 @@ class ApplianceCertificate(Base):
     csr_subject: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
-# Deployment kinds a pairing code may target. ``"both"`` provisions an
-# agent appliance that runs BIND9 + Kea simultaneously (one box, both
-# services) — the consume endpoint returns both bootstrap keys in that
-# case. The fully generic ``"agent"`` role (post-join role assignment
-# from the control plane) is #170.
-PAIRING_KIND_DNS = "dns"
-PAIRING_KIND_DHCP = "dhcp"
-PAIRING_KIND_BOTH = "both"
-PAIRING_KINDS = (PAIRING_KIND_DNS, PAIRING_KIND_DHCP, PAIRING_KIND_BOTH)
-
-
 class PairingCode(Base):
-    """Short-lived, single-use code that an agent installer swaps for
-    the real ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` bootstrap key.
+    """Pairing code minted by an admin so a new supervisor appliance
+    can join the fleet (#169 + #170 Wave A3 reshape).
 
-    Operator generates the code on the control plane (8 decimal
-    digits, default 15-min expiry, optional pre-assigned group). Agent
-    POSTs ``/api/v1/appliance/pair {code, hostname}`` to redeem it.
+    Two flavours:
+
+    * **Ephemeral** (``persistent=False``, today's behaviour). Single-
+      use, short expiry (default 15 min). Operator mints one per
+      install. Consumed via ``POST /api/v1/appliance/supervisor/
+      register`` — the consume side writes a ``pairing_claim`` row
+      against the new ``appliance`` and the code is dead.
+    * **Persistent** (``persistent=True``). Re-usable across N
+      appliances (think "the staging-fleet code"). Default no expiry;
+      admin can set one. ``enabled`` toggles whether new claims are
+      accepted without revoking the code. ``max_claims`` optionally
+      caps the number of claims; NULL = unlimited.
 
     Security model:
 
     * Code is stored as sha256 — the cleartext is shown exactly once
-      on creation and never persisted. An attacker with read access
-      to this table can't trivially replay a pending code, though
-      sha256 of 8-digit decimal IS rainbow-tableable; this is
-      defense-in-depth, not the primary gate.
-    * Single-use: ``used_at`` non-null disqualifies subsequent
-      attempts.
-    * Time-bound: ``expires_at`` enforced at consume time, plus a
-      Celery reaper that DELETEs old rows.
-    * Audit log captures create / claim / revoke / expire so abusive
-      consume attempts are at least visible after the fact.
+      on creation and persisted nowhere. Persistent codes can be
+      *re-displayed* via a password-gated reveal endpoint that rotates
+      the code (mint a new cleartext + replace code_hash atomically;
+      existing claims are unaffected since FKs live on ``id``).
+      Ephemeral codes are NOT re-displayable — losing the cleartext
+      means minting a new ephemeral code.
+    * ``revoked_at`` permanently kills a code. ``enabled=False`` on
+      a persistent code temporarily pauses new claims without
+      losing the row.
+    * Claim accounting lives in the ``pairing_claim`` child table —
+      one row per (code, supervisor) successful claim. The presence
+      of any claim against an ephemeral code disqualifies it from
+      future claims.
     """
 
     __tablename__ = "pairing_code"
@@ -182,35 +196,40 @@ class PairingCode(Base):
     # from the full 8 digits + expiry + single-use, not from this.
     code_last_two: Mapped[str] = mapped_column(String(2), nullable=False)
 
-    # ``dns`` | ``dhcp`` — picks which bootstrap key the consume endpoint
-    # returns. Enforced at the DB layer by a CHECK constraint (see
-    # migration) so we can never silently issue a code for an unknown
-    # kind even if the API layer bug-paths around its own validator.
-    deployment_kind: Mapped[str] = mapped_column(String(16), nullable=False)
-
-    # Optional pre-assignment. Stored as a free-form UUID rather than
-    # a FK because the column is polymorphic across
-    # ``dns_server_group`` and ``dhcp_server_group``; the kind picks
-    # which table the UUID points into. The create endpoint validates
-    # the group actually exists for the given kind.
-    server_group_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
-
-    # Wall-clock expiry. Codes past their expiry are refused at consume
-    # time even before the reaper sweeps them.
-    expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
+    # Wall-clock expiry. NULL = no expiry (persistent codes default
+    # to this; admin can override). Ephemeral codes always carry an
+    # expiry — validated at the API layer.
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
     )
 
-    # Claim state. All three set atomically when the consume endpoint
-    # succeeds; ``used_at`` non-null is the canonical "this code is
-    # dead" signal.
-    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    used_by_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    used_by_hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # When True the code can be claimed by N appliances; when False
+    # it's single-use (today's #169 default). A claim sweep at the
+    # supervisor-register endpoint enforces single-use by checking
+    # for any existing pairing_claim row.
+    persistent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
-    # Operator-driven cancellation. Independent of ``used_at`` —
-    # revoking a code that's already been claimed is a no-op for the
-    # consume endpoint but still useful audit signal.
+    # Only meaningful for persistent=True. Admin can pause new claims
+    # without deleting the code (e.g. "freeze the staging fleet code
+    # until the migration finishes"). Already-claimed appliances are
+    # unaffected — their cert lives on its own track.
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # Optional ceiling on claims for persistent codes. NULL = unlimited.
+    # Lets an operator hand out a "this code admits up to 50 boxes"
+    # token without re-issuing.
+    max_claims: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Fernet-encrypted cleartext of the 8-digit code. Populated ONLY
+    # for persistent codes — the /reveal endpoint decrypts it after a
+    # password re-check. Ephemeral codes leave this NULL (cleartext is
+    # shown once on create and gone forever, matching #169 semantics).
+    code_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+
+    # Operator-driven cancellation. Independent of enabled —
+    # revoking a code is permanent ("dead row"), disabling is
+    # reversible ("paused"). Revoking a claimed code is a no-op for
+    # already-issued certs but still useful audit signal.
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
@@ -226,3 +245,352 @@ class PairingCode(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class PairingClaim(Base):
+    """One row per (pairing_code, supervisor) successful claim.
+
+    Ephemeral codes: at most one row (subsequent claim attempts hit
+    the single-use gate). Persistent codes: many rows, one per
+    registered supervisor. The UNIQUE(pairing_code_id, appliance_id)
+    constraint makes the re-register-from-cache idempotent path
+    (supervisor restarts mid-claim, retries with same pubkey) safe:
+    the second call hits the existing row instead of writing a
+    duplicate.
+
+    ON DELETE CASCADE both ways — deleting a pairing code drops its
+    claim audit; deleting an approved appliance drops its claim row.
+    The permanent audit-log row carries the durable history.
+    """
+
+    __tablename__ = "pairing_claim"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    pairing_code_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pairing_code.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    appliance_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("appliance.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    claimed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    claimed_from_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+# Supervisor lifecycle states (#170 Wave A2). State machine:
+#
+#   pending_approval ──(admin Approve in B1)──▶ approved
+#         │                                        │
+#         └────────(admin Reject)─────────────┐    │
+#                                             ▼    ▼
+#                                          (row DELETEd, supervisor
+#                                           re-bootstraps on next poll)
+#
+# ``rejected`` is reserved for an optional intermediate state in B1
+# where admin "rejects but retains audit trail" — A2 never writes it.
+APPLIANCE_STATE_PENDING_APPROVAL = "pending_approval"
+APPLIANCE_STATE_APPROVED = "approved"
+APPLIANCE_STATE_REJECTED = "rejected"
+APPLIANCE_STATES = (
+    APPLIANCE_STATE_PENDING_APPROVAL,
+    APPLIANCE_STATE_APPROVED,
+    APPLIANCE_STATE_REJECTED,
+)
+
+
+class Appliance(Base):
+    """One row per supervisor that's claimed a pairing code (#170).
+
+    The supervisor generates an Ed25519 keypair on first boot, posts
+    its public key + a pairing code to
+    ``POST /api/v1/appliance/supervisor/register``, and the control
+    plane lands an ``Appliance`` row in ``pending_approval`` state.
+    Wave B1 wires admin approval + cert signing on top.
+
+    Identity model:
+
+    * ``public_key_der`` is the supervisor's Ed25519 pubkey, DER-
+      encoded. Stored verbatim so the B1 cert signer can re-derive
+      identity material without re-parsing.
+    * ``public_key_fingerprint`` is sha256(public_key_der) hex-encoded.
+      UNIQUE — a supervisor that resubmits the same pubkey (typical
+      restart-after-crash) hits the same row and the register endpoint
+      replies "already registered" idempotently. A NEW pubkey from the
+      same hostname creates a NEW row (admin sees two pending entries
+      and approves the real one).
+
+    Reject / delete semantics:
+
+    * The state column carries ``pending_approval`` → ``approved`` /
+      ``rejected``, but in practice admins drop pending or approved
+      rows by DELETE — the supervisor sees its ``appliance_id`` 404
+      on next poll and falls back into "waiting for pairing code"
+      state. We keep the column for audit-trail-style states the B1
+      / Wave-D fleet UI may want.
+
+    No FK to ``pairing_code`` is enforced beyond ON DELETE SET NULL,
+    so Wave A3's pairing-code reaper sweeping terminal codes doesn't
+    take down the appliances those codes provisioned.
+    """
+
+    __tablename__ = "appliance"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    hostname: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # Raw Ed25519 public key, DER-encoded.
+    public_key_der: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+    # sha256(public_key_der) hex-encoded — 64 chars. Globally unique
+    # across the fleet; a duplicate submission = re-register-from-cache
+    # and short-circuits to "you already exist".
+    public_key_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
+
+    # Free-form version string reported by the supervisor at register
+    # time, e.g. "2026.05.14-1". Used by the fleet UI's needs-upgrade
+    # banner.
+    supervisor_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    paired_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    paired_from_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Pointer at the pairing_code row that admitted this register. ON
+    # DELETE SET NULL — Wave A3's pairing-code reaper sweeps old
+    # terminal codes; we don't want those sweeps to take down the
+    # appliances they provisioned.
+    paired_via_code_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pairing_code.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=APPLIANCE_STATE_PENDING_APPROVAL
+    )
+
+    # Updated by Wave A2+'s supervisor heartbeat path. Stays NULL
+    # until the supervisor's first post-register check-in.
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_seen_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Wave B1 — supervisor-reported capabilities (can_run_dns_bind9,
+    # has_baked_images, cpu_count, host_nics, …). Populated on
+    # register + every heartbeat; the fleet UI's role picker filters
+    # against this column. Free-form JSONB (no DB-side validation) so
+    # additive supervisor versions don't need a migration each time
+    # a new fact gets reported.
+    capabilities: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+
+    # sha256 of the unauth session token the supervisor uses between
+    # register and approval. The register response returns the
+    # cleartext once; subsequent /supervisor/poll calls present it
+    # for constant-time verification. Cleared after cert issuance —
+    # all post-approval calls authenticate via mTLS.
+    session_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Cert lifecycle (#170 B1). Populated by the approve endpoint:
+    # CA signs an X.509 cert binding the supervisor's Ed25519 pubkey
+    # to the appliance_id (subject CN). 90-day default validity; the
+    # supervisor auto-renews 30 days before expiry (Wave C polish).
+    cert_pem: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cert_serial: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cert_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cert_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Approval audit columns (the canonical state is still `state` —
+    # these timestamps are for UI relative-time chips).
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # Slot telemetry — #170 Wave C1 moves this off dns_server /
+    # dhcp_server (the per-service agents used to report it
+    # independently in #138 Phase 8f-2). The supervisor's heartbeat
+    # is now the single producer; the fleet UI reads these columns
+    # to drive the Upgrade affordance, slot chips, and reboot button.
+    deployment_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    installed_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    current_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    durable_default: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    is_trial_boot: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.text("false")
+    )
+    last_upgrade_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    last_upgrade_state_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    snmpd_running: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    ntp_sync_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    # Operator-driven desired state. Set via the fleet UI / API;
+    # supervisor's heartbeat poll picks them up + writes the matching
+    # trigger files on the appliance host. Heartbeat handler auto-
+    # clears once installed catches up (upgrade) or a fresh heartbeat
+    # arrives post-reboot.
+    desired_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    desired_slot_image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reboot_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.text("false")
+    )
+    reboot_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # Role assignment — #170 Wave C2. Operator picks a subset of
+    # ``dns-bind9`` / ``dns-powerdns`` / ``dhcp`` / ``observer`` /
+    # ``custom``. Mutually-exclusive pairs (one DNS engine per box)
+    # enforced at the role-assignment endpoint, not via a CHECK
+    # constraint (operator intent should be a one-line API error,
+    # not a Postgres exception).
+    assigned_roles: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa.text("'[]'::jsonb")
+    )
+    assigned_dns_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_server_group.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    assigned_dhcp_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Operator-defined free-form key:value (string) pairs for fleet
+    # targeting. ``{"site": "prod-east", "tier": "edge"}``. No
+    # semantic interpretation; consumed by future fleet-UI filters +
+    # MCP `tags_match` query arg.
+    tags: Mapped[dict[str, str]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=sa.text("'{}'::jsonb")
+    )
+
+    # #170 Wave C3 — free-form nftables fragment the supervisor
+    # renders **after** the role-driven block in
+    # /etc/nftables.d/spatium-role.nft. Empty / NULL → role-driven
+    # rules only. Operator typo-rejected via ``nft -c -f`` dry-run
+    # on the supervisor before live-swap; rejection never opens or
+    # closes the firewall mid-render.
+    firewall_extra: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # #170 Phase E2 — supervisor-reported host-side port conflicts.
+    # Shape: ``{"udp_67": "<users-from-ss>", ...}``. Surfaces a red
+    # banner on the Fleet drilldown's role-assignment section when
+    # the operator's chosen DHCP server-group is in bridged mode AND
+    # udp_67 is non-empty.
+    port_conflicts: Mapped[dict[str, str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=sa.text("'{}'::jsonb"),
+    )
+
+    # #170 Wave D follow-up — outcome of the supervisor's last
+    # docker-compose apply against the assigned roles. ``idle`` /
+    # ``ready`` / ``failed``. ``role_switch_reason`` carries the
+    # first stderr line on failures so the Fleet UI can render it
+    # in the red banner.
+    role_switch_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    role_switch_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # #170 Wave E — service-container watchdog payload from the
+    # supervisor. Free-form ``{<compose-service>: {role, status,
+    # since, container_id}}``; keyed by compose service name so a
+    # mixed-role appliance can report independently for each. Empty
+    # dict on observer-only / idle appliances. The Fleet drilldown
+    # surfaces per-service status chips alongside the role-assignment
+    # section; ``status=missing`` + a long ``since`` is the signal
+    # that the watchdog's auto-heal failed.
+    role_health: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class ApplianceCA(Base):
+    """Internal CA singleton (#170 Wave B1).
+
+    One row, id=1. Carries the RSA-2048 root cert + Fernet-encrypted
+    private key that signs every supervisor's identity cert. Generated
+    lazily on first need (first approve attempt) so a fresh-install
+    control plane that never approves a supervisor doesn't pay the
+    cost.
+
+    Lifetime: 10 years by default. The CA's own rotation is a Wave-D
+    polish — not in scope here. Operators wanting to migrate to a
+    new CA today would re-key every approved supervisor manually.
+    """
+
+    __tablename__ = "appliance_ca"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    subject_cn: Mapped[str] = mapped_column(String(255), nullable=False)
+    algorithm: Mapped[str] = mapped_column(String(32), nullable=False)
+    cert_pem: Mapped[str] = mapped_column(Text, nullable=False)
+    key_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ApplianceSlotImage(Base):
+    """Slot image (.raw.xz) uploaded by an operator for an air-gapped
+    appliance upgrade (#170 follow-up).
+
+    Bytes live on disk under ``/var/lib/spatiumddi/slot-images/{id}.raw.xz``;
+    this row carries metadata + SHA-256 verification + audit linkage.
+    The supervisor downloads via the internal authenticated URL
+    ``GET /api/v1/appliance/slot-images/{id}/raw.xz`` once an operator
+    schedules an upgrade pointing at this row.
+
+    SHA-256 is computed server-side on the uploaded byte stream + verified
+    against the operator-supplied value before the row commits — mismatches
+    raise 422 and the partial file is deleted from disk. The hash also acts
+    as a uniqueness anchor (UNIQUE index) so a duplicate upload short-
+    circuits to the existing row rather than wasting disk.
+    """
+
+    __tablename__ = "appliance_slot_image"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    appliance_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    uploaded_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    uploaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)

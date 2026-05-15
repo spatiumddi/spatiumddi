@@ -1,14 +1,30 @@
-.PHONY: help up down dev build migrate lint test lint-backend lint-frontend test-backend \
+.PHONY: help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend \
         ci ci-backend-lint ci-frontend-lint ci-frontend-build screenshots \
         appliance appliance-builder appliance-iso appliance-clean \
         appliance-bake-images appliance-clean-baked-images appliance-dev-iso \
-        appliance-stamp-dev appliance-slot-image
+        appliance-baked-iso appliance-stamp-dev appliance-slot-image
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 COMPOSE        = docker compose
 COMPOSE_DEV    = docker compose -f docker-compose.yml -f docker-compose.dev.yml
 BACKEND_DIR    = backend
 FRONTEND_DIR   = frontend
+
+# Per-build identifier used as the image tag (compose substitutes via
+# ``${SPATIUMDDI_VERSION}``). Computed once per ``make`` invocation —
+# git short sha + 4 random hex chars — so each ISO cut produces a
+# distinct tag visible in ``docker ps`` (e.g. ``ghcr.io/spatiumddi/
+# spatiumddi-api:dev-148c437-a3f2``). Mirrors how ISOs are tracked
+# by build-NN; gives operators an in-container way to confirm which
+# build a running stack came from.
+#
+# Override by exporting SPATIUMDDI_VERSION before invoking make. CI
+# release builds set it to the CalVer tag (e.g. 2026.05.14-1) and
+# BAKE_SOURCE=ghcr to pull pre-published images.
+ifeq ($(origin SPATIUMDDI_VERSION), undefined)
+SPATIUMDDI_VERSION := dev-$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)-$(shell openssl rand -hex 2 2>/dev/null || date +%s | tail -c5)
+endif
+export SPATIUMDDI_VERSION
 
 # ── Help ───────────────────────────────────────────────────────────────────────
 help:
@@ -37,8 +53,22 @@ down:
 dev:
 	$(COMPOSE_DEV) up
 
-build:
+build: build-supervisor
 	$(COMPOSE) build
+
+# Build the standalone spatium-supervisor image (#170). The image
+# isn't in docker-compose.yml — it ships out of band as part of the
+# appliance bake — so ``make build`` (which is ``docker compose
+# build``) wouldn't otherwise rebuild it. Without this, edits to
+# ``agent/supervisor/`` go in unnoticed because the bake reuses
+# whatever ``spatium-supervisor:dev`` already sits in local docker
+# from an earlier manual build. Tag both the bare name and the
+# ghcr canonical name so ``appliance/scripts/bake-images.sh``'s
+# local-source resolver finds it under either form.
+build-supervisor:
+	docker build -t spatium-supervisor:dev \
+	             -t ghcr.io/spatiumddi/spatium-supervisor:dev \
+	             -f agent/supervisor/images/supervisor/Dockerfile .
 
 # ── Database ───────────────────────────────────────────────────────────────────
 migrate:
@@ -63,14 +93,26 @@ lint-frontend:
 	  npm run format:check
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
+#
+# pytest runs *inside* the api container so the suite is exactly the
+# version-pinned interpreter + deps the rest of CI uses, without
+# requiring the operator to have python3 + pyproject's [dev] extras
+# installed on the host. The dev compose's api ``build.target: dev``
+# bakes pytest into the image; ``TEST_DATABASE_URL`` is pre-set on the
+# environment so the conftest carves its per-worker test DB against
+# the dev compose's postgres service.
+#
+# ``-T`` on ``docker compose exec`` disables TTY allocation so the
+# output streams cleanly on CI runners + pipes to ``tee`` / grep
+# without ANSI artefacts.
 test: test-backend
 
 test-backend:
-	cd $(BACKEND_DIR) && python -m pytest -n auto
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml exec -T api python -m pytest -n auto
 
 test-one:
 	@test -n "$(T)" || (echo "Usage: make test-one T=tests/test_health.py::test_liveness"; exit 1)
-	cd $(BACKEND_DIR) && python -m pytest $(T) -v
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml exec -T api python -m pytest $(T) -v
 
 # ── CI parity ──────────────────────────────────────────────────────────────────
 # `make ci` runs the same lint + typecheck + build jobs GitHub Actions runs on
@@ -144,22 +186,28 @@ appliance:
 	    --output-directory=build --force build
 	@raw=$$(ls $(APPLIANCE_OUT)/spatiumddi-appliance*.raw 2>/dev/null | head -1); \
 	if [ -n "$$raw" ]; then \
-	  qcow2=$${raw%.raw}.qcow2; \
-	  echo "→ Converting raw → qcow2…"; \
-	  docker run --rm --entrypoint qemu-img \
-	      -v $(PWD)/$(APPLIANCE_OUT):/build \
-	      $(APPLIANCE_BUILDER) \
-	      convert -O qcow2 "/build/$$(basename $$raw)" "/build/$$(basename $$qcow2)"; \
-	  ls -lh "$$qcow2"; \
+	  ls -lh "$$raw"; \
 	  echo ""; \
-	  echo "✓ Built: $$qcow2"; \
-	  echo "  Boot it with: qemu-system-x86_64 -enable-kvm -m 4G -smp 2 \\"; \
-	  echo "                -drive file=$$qcow2,if=virtio \\"; \
-	  echo "                -nic user,hostfwd=tcp::8080-:80,hostfwd=tcp::2222-:22"; \
+	  echo "✓ Built: $$raw"; \
+	  echo "  Wrap as ISO with: make appliance-iso"; \
 	else \
 	  echo "✗ mkosi did not produce a .raw file in $(APPLIANCE_OUT) — check the log above."; \
 	  exit 1; \
 	fi
+	@# qcow2 sidecar (disabled — not needed when shipping the ISO; ~1 GB
+	@# disk + a qemu-img convert pass per build). Uncomment to restore.
+	@# raw=$$(ls $(APPLIANCE_OUT)/spatiumddi-appliance*.raw 2>/dev/null | head -1); \
+	# qcow2=$${raw%.raw}.qcow2; \
+	# echo "→ Converting raw → qcow2…"; \
+	# docker run --rm --entrypoint qemu-img \
+	#     -v $(PWD)/$(APPLIANCE_OUT):/build \
+	#     $(APPLIANCE_BUILDER) \
+	#     convert -O qcow2 "/build/$$(basename $$raw)" "/build/$$(basename $$qcow2)"; \
+	# ls -lh "$$qcow2"; \
+	# echo "✓ Built: $$qcow2"; \
+	# echo "  Boot it with: qemu-system-x86_64 -enable-kvm -m 4G -smp 2 \\"; \
+	# echo "                -drive file=$$qcow2,if=virtio \\"; \
+	# echo "                -nic user,hostfwd=tcp::8080-:80,hostfwd=tcp::2222-:22"
 
 # Build the builder container locally (e.g. when iterating on its
 # Dockerfile before pushing to ghcr.io).
@@ -216,52 +264,71 @@ appliance-clean:
 	  rm -rf $(APPLIANCE_OUT) 2>/dev/null || sudo rm -rf $(APPLIANCE_OUT); \
 	fi
 
-# Bake the local ``spatiumddi-{api,frontend}:dev`` images into the
-# appliance overlay so the next ``make appliance`` ships them inside
-# the ISO. Avoids needing to push WIP images to ghcr.io during
-# iteration. See appliance/scripts/bake-images.sh for details.
-appliance-bake-images:
+# Bake every container image into the appliance rootfs overlay so the
+# next ``make appliance`` ships them inside the ISO. See
+# appliance/scripts/bake-images.sh for what's covered + how source
+# selection (local :dev tags vs pulled :<calver> from ghcr) works.
+#
+# Source defaults to ``local`` (uses spatiumddi-*:dev) when
+# SPATIUMDDI_VERSION is empty/dev; the release workflow sets
+# SPATIUMDDI_VERSION=<calver> + BAKE_SOURCE=ghcr to pull the cut
+# tag from the just-published images.
+#
+# Depends on ``build-supervisor`` so a stale supervisor image (the
+# only service container not in docker-compose.yml + not rebuilt by
+# ``make build`` before that target gained build-supervisor as a
+# dep) can't slip into the baked overlay. The Docker layer cache
+# makes the no-op case ~3 s; full rebuild ~30 s.
+appliance-bake-images: build-supervisor
 	@bash $(APPLIANCE_DIR)/scripts/bake-images.sh
 
-# Convenience for the Phase 4 iteration loop — appliance-level changes
-# (installer, firstboot, console dashboard, partition layout, networking
-# stack, etc) where you want a bootable ISO without re-pushing api +
-# frontend images:
-#   1. Build the appliance raw image (without baking docker images in)
-#   2. Wrap as a hybrid USB/CD ISO
-# After this completes, copy the ISO to a NAS share / hypervisor library
-# and boot a VM from it. firstboot pulls api + frontend (and the DNS /
-# DHCP agent images) from ghcr.io on first boot, same as a real release.
-#
-# NOTE: this target used to depend on ``appliance-bake-images`` (which
-# tarballs the local ``spatiumddi-{api,frontend}:dev`` images into the
-# rootfs at /usr/local/share/spatiumddi/images/). That worked when the
-# rootfs was a single open-ended partition. Phase 8a-1 (#138) carved
-# the disk into ESP + root_A 4 GiB + root_B 4 GiB + var; the baked
-# image tarballs push the slot rootfs past the 4 GiB ceiling and the
-# slot build either fails or doesn't fit the partition. Operators
-# iterating on the api + frontend specifically should push WIP tags
-# to ghcr.io and pin SPATIUMDDI_VERSION in /etc/spatiumddi/.env on the
-# booted appliance, or call ``make appliance-bake-images`` directly and
-# then ``make appliance appliance-iso`` (accepting that the slot raw.xz
-# build will fail — useful for first-boot-only ISO testing).
+# Convenience for fast laptop iteration on appliance-level changes
+# (installer, firstboot, console dashboard, partition layout,
+# networking stack) where you don't want to wait on the docker-image
+# rebuild + bake cycle. Skips the bake — firstboot falls back to
+# ``docker compose pull`` from ghcr.io on first boot. NOT how releases
+# are cut (the release pipeline always bakes — #170 Phase A4).
 appliance-dev-iso: appliance-clean-baked-images appliance-stamp-dev appliance appliance-iso
 	@echo ""
 	@echo "✓ Dev-flavored appliance ISO ready at $(APPLIANCE_OUT)/spatiumddi-appliance_0.1.0.iso"
 	@echo "  All container images (api / frontend / DNS / DHCP agents) pull from"
 	@echo "  ghcr.io on first boot. Copy this ISO to your NAS / hypervisor library"
-	@echo "  and boot a VM from it."
+	@echo "  and boot a VM from it. Use 'make appliance-baked-iso' instead to"
+	@echo "  produce a self-contained (air-gap-ready) ISO."
 
-# Wipe any tarballs that a previous ``appliance-bake-images`` left
-# under the mkosi.extra overlay. mkosi copies the overlay verbatim
-# into the rootfs, so leftover tarballs would still be baked even
-# after we dropped the ``appliance-bake-images`` dep from
-# ``appliance-dev-iso``. The directory itself is gitignored.
+# Release-style local build — bakes every image at the local :dev tag
+# (run ``make build`` first to produce them) into the rootfs, then
+# builds the ISO + slot image. Mirrors what the release workflow
+# produces, just driven by your local :dev images instead of ghcr.io's
+# cut tag. ~1 GB larger than appliance-dev-iso.
+appliance-baked-iso: appliance-stamp-dev appliance-bake-images appliance appliance-iso appliance-slot-image
+	@echo ""
+	@echo "✓ Baked appliance ISO ready at $(APPLIANCE_OUT)/"
+	@echo "  All container images embedded. Air-gap-ready. First boot does no docker pull."
+	@echo "  Mirrors what the .github/workflows/release.yml ``build-appliance-iso`` job"
+	@echo "  does on CI — stamps appliance-release with the local commit, bakes the"
+	@echo "  docker overlay image, builds the raw image, wraps as ISO, builds the"
+	@echo "  slot-upgrade .raw.xz + .sha256. Difference: BAKE_SOURCE=local (uses your"
+	@echo "  ``make build`` :dev tags) vs CI's BAKE_SOURCE=ghcr (pulls the cut tag)."
+
+# Wipe any baked overlay artefacts that a previous
+# ``appliance-bake-images`` left under the mkosi.extra overlay. mkosi
+# copies the overlay verbatim into the rootfs, so a stale image file
+# would still be baked even after we dropped the ``appliance-bake-
+# images`` dep from ``appliance-dev-iso``. The artefacts are
+# gitignored.
 appliance-clean-baked-images:
-	@d=$(APPLIANCE_DIR)/mkosi.extra/usr/local/share/spatiumddi/images; \
-	if ls $$d/*.tar.zst >/dev/null 2>&1 || [ -f $$d/BAKED_AT ]; then \
-	  echo "→ Cleaning previously-baked image tarballs from $$d …"; \
-	  rm -f $$d/*.tar.zst $$d/BAKED_AT; \
+	@d=$(APPLIANCE_DIR)/mkosi.extra/usr/lib/spatiumddi; \
+	if [ -f $$d/docker-overlay.img ] || [ -f $$d/docker-overlay.manifest ]; then \
+	  echo "→ Cleaning previously-baked docker overlay from $$d …"; \
+	  rm -f $$d/docker-overlay.img $$d/docker-overlay.manifest $$d/docker-overlay.version; \
+	fi
+	@# Pre-E1 tarball layout — wipe any leftovers from an older bake.
+	@d2=$(APPLIANCE_DIR)/mkosi.extra/usr/local/share/spatiumddi/images; \
+	if ls $$d2/*.tar.zst >/dev/null 2>&1 || [ -f $$d2/BAKED_AT ]; then \
+	  echo "→ Cleaning pre-E1 image tarballs from $$d2 …"; \
+	  rm -f $$d2/*.tar.zst $$d2/BAKED_AT $$d2/VERSION $$d2/MANIFEST; \
+	  rmdir $$d2 2>/dev/null || true; \
 	fi
 
 # Stamp a dev version into mkosi.extra/etc/spatiumddi/appliance-release
@@ -273,11 +340,10 @@ appliance-clean-baked-images:
 # ``appliance/.gitignore``.
 appliance-stamp-dev:
 	@f=$(APPLIANCE_DIR)/mkosi.extra/etc/spatiumddi/appliance-release; \
-	sha=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown); \
 	mkdir -p $$(dirname $$f); \
 	{ \
 	  echo "# Generated by ``make appliance-stamp-dev`` for local-build ISOs."; \
 	  echo "# CI release builds overwrite this with the real CalVer tag."; \
-	  echo "APPLIANCE_VERSION=\"dev-$$sha\""; \
+	  echo "APPLIANCE_VERSION=\"$(SPATIUMDDI_VERSION)\""; \
 	} > $$f; \
 	echo "→ Stamped appliance-release: $$(cat $$f | grep APPLIANCE_VERSION)"

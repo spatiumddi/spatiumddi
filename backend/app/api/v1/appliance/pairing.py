@@ -1,72 +1,64 @@
-"""Appliance agent pairing — short-lived single-use codes (#169).
+"""Pairing-code admin surface (#169 + #170 Wave A3 reshape).
 
-Operator-facing problem: registering a new DNS / DHCP agent appliance
-with the control plane currently means typing the long opaque
-``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string into the installer
-wizard on the agent's console. On IPMI / Proxmox / serial consoles
-copy-paste is awkward, and the 64-char hex string is easy to typo.
+The original #169 design coupled every pairing code to a
+``deployment_kind`` (``dns`` / ``dhcp`` / ``both``) because the
+consume endpoint had to hand back the matching long-PSK bootstrap
+key. Wave A2's supervisor identity model removed the long PSK
+entirely — supervisors prove identity via Ed25519 public-key
+submission, not a shared secret — so codes are now kind-agnostic.
 
-This module adds a thin layer on top: operator clicks "Add appliance"
-in the control plane UI → server mints an 8-digit single-use pairing
-code with a 15-min expiry → operator notes the 8 digits → agent's
-installer asks for the code instead of the hex key → agent POSTs
-``/api/v1/appliance/pair`` to swap the code for the real bootstrap
-key, which it then uses with the existing bootstrap → JWT flow
-unchanged.
+What this module owns:
 
-Endpoints:
+* ``POST /api/v1/appliance/pairing-codes`` — mint a code. Required:
+  ``persistent: bool``. Optional: ``expires_in_minutes`` (defaults:
+  15 min for ephemeral, no expiry for persistent), ``max_claims``
+  (only for persistent; NULL = unlimited), ``note``.
+* ``GET /api/v1/appliance/pairing-codes`` — list every code with
+  redacted shape (``code_last_two`` only) + claim count + derived
+  ``state`` (pending / claimed / expired / revoked / disabled).
+* ``DELETE /api/v1/appliance/pairing-codes/{id}`` — revoke (permanent;
+  no-op on already-revoked rows).
+* ``POST /api/v1/appliance/pairing-codes/{id}/enable`` — re-enable a
+  paused persistent code. 404 for ephemeral codes.
+* ``POST /api/v1/appliance/pairing-codes/{id}/disable`` — pause a
+  persistent code; new claims rejected but already-claimed
+  appliances unaffected.
+* ``POST /api/v1/appliance/pairing-codes/{id}/reveal`` —
+  password-gated re-reveal of a persistent code's cleartext value.
+  Mirrors agent-bootstrap-keys reveal: superadmin only, local-auth
+  only, audited. Ephemeral codes are NOT re-revealable (the cleartext
+  is shown exactly once at create time).
 
-* ``POST /api/v1/appliance/pairing-codes`` — superadmin creates a
-  code. Required ``deployment_kind`` (``dns`` | ``dhcp`` | ``both``),
-  optional ``server_group_id``, ``expires_in_minutes``, ``note``.
-  ``both`` provisions an agent that runs BIND9 + Kea simultaneously
-  and rejects ``server_group_id`` (per-service groups go through the
-  existing DNS / DHCP UI after registration).
-* ``GET  /api/v1/appliance/pairing-codes`` — superadmin lists every
-  code (active + recent claimed/expired/revoked rows). The cleartext
-  code is never re-displayed — only "last 2 digits" + state.
-* ``DELETE /api/v1/appliance/pairing-codes/{id}`` — superadmin revokes
-  a pending code (no-op on already-used / already-revoked rows).
-* ``POST /api/v1/appliance/pair`` — UNAUTHENTICATED. The agent's
-  install wizard hits this with ``{code, hostname}``. On success the
-  endpoint atomically marks the row claimed and returns the real
-  bootstrap key + pre-assigned group (if any). On failure the
-  response is a generic 403 so an attacker can't distinguish
-  "expired" from "wrong code" from "revoked" via timing or response
-  shape. A short constant-time-ish sleep blunts brute-force attempts
-  without needing a separate rate-limit table.
+What this module no longer owns:
 
-Why ``code_hash`` and not the cleartext code: defense-in-depth.
-sha256 of an 8-digit decimal is rainbow-tableable in seconds, so this
-isn't a real cryptographic gate — but a DB read attacker who's
-trying to claim an active code from a backup snapshot has to do at
-least a tiny bit of work, and the audit log captures every consume
-attempt. Anyone with full DB read already has the bootstrap keys
-themselves via ``platform_settings``, so this is hygiene, not security.
+* The consume endpoint (``POST /api/v1/appliance/pair``) is gone —
+  all pairing now flows through ``POST /api/v1/appliance/supervisor/
+  register`` (Wave A2), which writes ``pairing_claim`` rows
+  directly. Existing dns / dhcp installers that used /pair stop
+  working with Wave A3 control planes; per the alpha-stage caveat
+  on #170 we don't carry compat shims.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import hmac
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
-from app.config import settings
+from app.core.crypto import decrypt_str, encrypt_str
 from app.core.permissions import require_permission
-from app.models.appliance import PairingCode
+from app.core.security import verify_password
+from app.models.appliance import PairingClaim, PairingCode
 from app.models.audit import AuditLog
-from app.models.dhcp import DHCPServerGroup
-from app.models.dns import DNSServerGroup
+from app.models.auth import User
 
 logger = structlog.get_logger(__name__)
 
@@ -78,106 +70,85 @@ router = APIRouter()
 
 _CODE_LENGTH = 8
 _CODE_ALPHABET = "0123456789"
-# Bounds on caller-supplied ``expires_in_minutes``.
-_MIN_EXPIRY_MINUTES = 5
-_MAX_EXPIRY_MINUTES = 60
-_DEFAULT_EXPIRY_MINUTES = 15
-# Brute-force-friction sleep on every failed consume. Constant time so
-# we don't leak distinguishing latency between failure modes.
-_CONSUME_FAILURE_DELAY_S = 0.5
+_EPHEMERAL_MIN_EXPIRY_MINUTES = 5
+_EPHEMERAL_MAX_EXPIRY_MINUTES = 60
+_EPHEMERAL_DEFAULT_EXPIRY_MINUTES = 15
+# Persistent codes can carry an optional expiry — we cap it
+# at 5 years so an admin can't accidentally mint a code that
+# survives every operator currently working at the org.
+_PERSISTENT_MAX_EXPIRY_MINUTES = 60 * 24 * 365 * 5
 
 
 def _generate_code() -> str:
-    """Cryptographically-secure 8-decimal-digit pairing code."""
     return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LENGTH))
 
 
 def _hash_code(code: str) -> str:
-    """sha256 hex digest. Codes are short + low-entropy by themselves,
-    so the hash is defense-in-depth (audit-log distinguishability for a
-    DB-snapshot attacker), not a real cryptographic gate.
-    """
     return hashlib.sha256(code.encode("ascii")).hexdigest()
-
-
-def _client_ip(request: Request) -> str | None:
-    """Real source IP via uvicorn ``--proxy-headers`` (configured in
-    the API Dockerfile); falls back to the raw socket address."""
-    return request.client.host if request.client else None
 
 
 # ── Schemas ────────────────────────────────────────────────────────
 
 
-DeploymentKind = Literal["dns", "dhcp", "both"]
+CodeState = Literal["pending", "claimed", "expired", "revoked", "disabled"]
 
 
 class PairingCodeCreate(BaseModel):
-    deployment_kind: DeploymentKind = Field(
+    persistent: bool = Field(
+        default=False,
         description=(
-            "Which agent kind this code provisions: 'dns', 'dhcp', or "
-            "'both' (BIND9 + Kea on the same appliance)."
-        )
-    )
-    server_group_id: uuid.UUID | None = Field(
-        default=None,
-        description=(
-            "Optional pre-assignment to a DNS or DHCP server group. "
-            "Must match the deployment_kind. Rejected when "
-            "deployment_kind='both' — combined agents configure their "
-            "per-service groups through the existing DNS / DHCP UI "
-            "after registration."
+            "False = single-use code with a short expiry (today's "
+            "default). True = multi-claim code that can admit N "
+            "appliances; default no expiry; admin can disable / "
+            "re-reveal."
         ),
     )
-    expires_in_minutes: int = Field(
-        default=_DEFAULT_EXPIRY_MINUTES,
-        ge=_MIN_EXPIRY_MINUTES,
-        le=_MAX_EXPIRY_MINUTES,
+    expires_in_minutes: int | None = Field(
+        default=None,
         description=(
-            f"Code validity window. Default {_DEFAULT_EXPIRY_MINUTES} min; "
-            f"range {_MIN_EXPIRY_MINUTES}-{_MAX_EXPIRY_MINUTES}."
+            f"Ephemeral codes: defaults to {_EPHEMERAL_DEFAULT_EXPIRY_MINUTES} "
+            f"min, range {_EPHEMERAL_MIN_EXPIRY_MINUTES}-"
+            f"{_EPHEMERAL_MAX_EXPIRY_MINUTES}. Persistent codes: NULL "
+            "= no expiry (default); 0 also means no expiry; any "
+            "positive integer up to 5 years caps the validity window."
         ),
     )
-    note: str | None = Field(
+    max_claims: int | None = Field(
         default=None,
-        max_length=255,
-        description="Free-form operator note, e.g. 'for dns-west-2'.",
+        ge=1,
+        description=(
+            "Optional ceiling on claims for persistent codes. NULL = "
+            "unlimited. Ignored for ephemeral codes."
+        ),
     )
+    note: str | None = Field(default=None, max_length=255)
 
 
 class PairingCodeCreated(BaseModel):
-    """Response from a successful create — the only response that
-    carries the cleartext code. Re-fetching the row later returns the
-    redacted shape (``code_last_two`` only)."""
+    """Carries the cleartext code — shown ONCE for ephemeral, also
+    available via /reveal for persistent."""
 
     id: uuid.UUID
-    code: str = Field(description="8-digit cleartext code; shown ONCE, never persisted.")
-    deployment_kind: DeploymentKind
-    server_group_id: uuid.UUID | None
+    code: str
+    persistent: bool
+    enabled: bool
+    expires_at: datetime | None
+    max_claims: int | None
     note: str | None
-    expires_at: datetime
     created_at: datetime
 
 
 class PairingCodeRow(BaseModel):
-    """Redacted shape used by the list endpoint. ``code_last_two`` is
-    the only fragment of the code surfaced so a glance can correlate
-    a code an operator has written down to its row, without re-exposing
-    the secret.
-    """
-
     id: uuid.UUID
-    code_last_two: str = Field(description="Last two digits, e.g. '47'; for visual correlation.")
-    deployment_kind: DeploymentKind
-    server_group_id: uuid.UUID | None
-    server_group_name: str | None = None
-    note: str | None
-    state: Literal["pending", "claimed", "expired", "revoked"]
-    expires_at: datetime
-    used_at: datetime | None
-    used_by_ip: str | None
-    used_by_hostname: str | None
+    code_last_two: str
+    persistent: bool
+    enabled: bool
+    state: CodeState
+    expires_at: datetime | None
+    max_claims: int | None
+    claim_count: int
     revoked_at: datetime | None
+    note: str | None
     created_at: datetime
     created_by_user_id: uuid.UUID | None
 
@@ -186,102 +157,23 @@ class PairingCodeList(BaseModel):
     codes: list[PairingCodeRow]
 
 
-class PairConsumeRequest(BaseModel):
-    code: str = Field(min_length=_CODE_LENGTH, max_length=_CODE_LENGTH)
-    hostname: str | None = Field(
-        default=None,
-        max_length=255,
-        description="Optional hostname the agent reports; captured for audit + UI.",
-    )
-
-    @field_validator("code")
-    @classmethod
-    def _digits_only(cls, v: str) -> str:
-        if not v.isdigit():
-            raise ValueError("Pairing code must be 8 decimal digits.")
-        return v
+class PairingCodeRevealRequest(BaseModel):
+    password: str = Field(min_length=1, description="Caller's current password.")
 
 
-class PairConsumeResponse(BaseModel):
-    """Returned on successful pair. The agent persists each key in
-    ``bootstrap_keys`` to its existing on-disk config (same path it
-    would write a pasted key) and continues with the existing
-    bootstrap → JWT flow for each service it's running.
-
-    ``bootstrap_keys`` is a map ``{kind: key}``:
-
-    * ``deployment_kind='dns'``  → ``{"dns": <DNS_AGENT_KEY>}``
-    * ``deployment_kind='dhcp'`` → ``{"dhcp": <DHCP_AGENT_KEY>}``
-    * ``deployment_kind='both'`` → both keys are present.
+class PairingCodeRevealResponse(BaseModel):
+    """Returns the original cleartext code stored Fernet-encrypted
+    on the row at create time. No rotation happens — the same 8
+    digits the operator saw originally are what's surfaced again.
+    Only persistent codes carry an encrypted cleartext; ephemeral
+    codes leave ``code_encrypted=NULL`` and reveal 422s on them.
     """
 
-    bootstrap_keys: dict[str, str]
-    deployment_kind: DeploymentKind
-    server_group_id: uuid.UUID | None
+    id: uuid.UUID
+    code: str
 
 
 # ── Helpers ────────────────────────────────────────────────────────
-
-
-def _state_for(
-    row: PairingCode, now: datetime
-) -> Literal["pending", "claimed", "expired", "revoked"]:
-    """Derive the operator-facing state from the row's nullable columns
-    + wall clock. Precedence: claimed > revoked > expired > pending.
-    """
-    if row.used_at is not None:
-        return "claimed"
-    if row.revoked_at is not None:
-        return "revoked"
-    if row.expires_at <= now:
-        return "expired"
-    return "pending"
-
-
-async def _resolve_group_name(db: DB, kind: str, group_id: uuid.UUID | None) -> str | None:
-    if group_id is None:
-        return None
-    if kind == "dns":
-        dns_row = await db.get(DNSServerGroup, group_id)
-        return dns_row.name if dns_row is not None else None
-    if kind == "dhcp":
-        dhcp_row = await db.get(DHCPServerGroup, group_id)
-        return dhcp_row.name if dhcp_row is not None else None
-    return None
-
-
-def _bootstrap_keys_for(kind: str) -> dict[str, str] | None:
-    """Resolve the bootstrap key(s) the consume endpoint should return
-    for a given deployment_kind. Returns None when ANY required key is
-    unset — the caller turns that into a 409 / 503.
-
-    For ``kind='both'`` BOTH keys must be present; a half-configured
-    control plane (only DNS key set, no DHCP key) can't satisfy a
-    combined-agent pairing, so we refuse rather than handing back a
-    partial response that the agent would later trip over.
-    """
-    dns_key = settings.dns_agent_key or None
-    dhcp_key = settings.dhcp_agent_key or None
-    if kind == "dns":
-        return {"dns": dns_key} if dns_key else None
-    if kind == "dhcp":
-        return {"dhcp": dhcp_key} if dhcp_key else None
-    if kind == "both":
-        if dns_key and dhcp_key:
-            return {"dns": dns_key, "dhcp": dhcp_key}
-        return None
-    return None
-
-
-def _missing_keys_label(kind: str) -> str:
-    """Operator-facing string of which ``*_AGENT_KEY`` env vars are
-    missing for the given kind. Used in the 409 body of create."""
-    needs = []
-    if kind in ("dns", "both") and not settings.dns_agent_key:
-        needs.append("DNS_AGENT_KEY")
-    if kind in ("dhcp", "both") and not settings.dhcp_agent_key:
-        needs.append("DHCP_AGENT_KEY")
-    return " + ".join(needs) if needs else ""
 
 
 def _require_superadmin(user: CurrentUser) -> None:
@@ -290,6 +182,30 @@ def _require_superadmin(user: CurrentUser) -> None:
             status.HTTP_403_FORBIDDEN,
             "Pairing-code management is restricted to superadmins.",
         )
+
+
+def _state_for(row: PairingCode, now: datetime, claim_count: int) -> CodeState:
+    """Derive the operator-facing state.
+
+    Precedence: revoked > disabled > expired > claimed > pending. The
+    "claimed" terminal state only applies to ephemeral codes; for
+    persistent codes any claim count is just informational and the
+    state stays pending/disabled/etc.
+    """
+    if row.revoked_at is not None:
+        return "revoked"
+    if row.persistent and not row.enabled:
+        return "disabled"
+    if row.expires_at is not None and row.expires_at <= now:
+        return "expired"
+    if not row.persistent and claim_count > 0:
+        return "claimed"
+    return "pending"
+
+
+async def _get_claim_count(db: DB, code_id: uuid.UUID) -> int:
+    stmt = select(func.count()).where(PairingClaim.pairing_code_id == code_id)
+    return int((await db.execute(stmt)).scalar_one())
 
 
 # ── Create ─────────────────────────────────────────────────────────
@@ -309,66 +225,62 @@ async def create_pairing_code(
 ) -> PairingCodeCreated:
     _require_superadmin(current_user)
 
-    # Validate the optional pre-assigned group resolves to a real row
-    # of the right kind. Reject early with a clear 422 rather than
-    # silently issuing a code that can't be redeemed.
-    if body.server_group_id is not None:
-        if body.deployment_kind == "both":
-            # Combined agents would need TWO group IDs (one DNS, one
-            # DHCP). One column can't carry that without ambiguity, so
-            # we reject pre-assignment for ``both`` and let the operator
-            # configure per-service groups through the existing UI
-            # after the agent registers. #170 is the natural place to
-            # extend two-group pre-assignment.
+    now = datetime.now(UTC)
+    expires_at: datetime | None
+    if body.persistent:
+        # Persistent code: NULL or 0 means no expiry. Positive value
+        # caps validity; values above the 5-year ceiling rejected.
+        minutes = body.expires_in_minutes
+        if minutes is None or minutes == 0:
+            expires_at = None
+        elif minutes < 0:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "server_group_id is not supported for deployment_kind='both'. "
-                "Configure the agent's per-service groups through the DNS / "
-                "DHCP UI after it registers.",
+                "expires_in_minutes must be non-negative.",
             )
-        group_exists: bool
-        if body.deployment_kind == "dns":
-            dns_grp = await db.get(DNSServerGroup, body.server_group_id)
-            group_exists = dns_grp is not None
+        elif minutes > _PERSISTENT_MAX_EXPIRY_MINUTES:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"expires_in_minutes capped at {_PERSISTENT_MAX_EXPIRY_MINUTES} "
+                "(5 years) for persistent codes.",
+            )
         else:
-            dhcp_grp = await db.get(DHCPServerGroup, body.server_group_id)
-            group_exists = dhcp_grp is not None
-        if not group_exists:
+            expires_at = now + timedelta(minutes=minutes)
+    else:
+        # Ephemeral: range-validated; default 15 min.
+        minutes = body.expires_in_minutes
+        if minutes is None:
+            minutes = _EPHEMERAL_DEFAULT_EXPIRY_MINUTES
+        if not (_EPHEMERAL_MIN_EXPIRY_MINUTES <= minutes <= _EPHEMERAL_MAX_EXPIRY_MINUTES):
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"server_group_id does not match any {body.deployment_kind} server group.",
+                f"Ephemeral codes: expires_in_minutes must be in "
+                f"{_EPHEMERAL_MIN_EXPIRY_MINUTES}-{_EPHEMERAL_MAX_EXPIRY_MINUTES}.",
             )
+        expires_at = now + timedelta(minutes=minutes)
 
-    # Refuse if the corresponding bootstrap key isn't configured —
-    # otherwise the code would be unredeemable at consume time, which
-    # is worse UX than a clear "configure the env var first" message.
-    # For kind='both' BOTH keys must be present.
-    if _bootstrap_keys_for(body.deployment_kind) is None:
-        missing = _missing_keys_label(body.deployment_kind)
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"No {missing} configured on the control plane. "
-            "Set it in /etc/spatiumddi/.env and restart the api before issuing codes.",
-        )
+        if body.max_claims is not None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "max_claims is only valid for persistent codes.",
+            )
 
     code = _generate_code()
-    code_hash = _hash_code(code)
-    now = datetime.now(UTC)
-    expires_at = now + timedelta(minutes=body.expires_in_minutes)
-
-    # Materialise the row's UUID up-front so the audit row we add in
-    # the same flush carries the right resource_id. SQLAlchemy's
-    # ``default=uuid.uuid4`` on the mapped_column fires during flush
-    # (after this block), which is too late for the audit row's
-    # resource_id we're computing right now.
     row_id = uuid.uuid4()
+    # Persistent codes carry a Fernet-encrypted cleartext so the
+    # operator can re-distribute them via /reveal later. Ephemeral
+    # codes leave code_encrypted=NULL — the cleartext is shown once
+    # on create and lost forever (#169 semantics preserved).
+    code_encrypted = encrypt_str(code) if body.persistent else None
     row = PairingCode(
         id=row_id,
-        code_hash=code_hash,
+        code_hash=_hash_code(code),
         code_last_two=code[-2:],
-        deployment_kind=body.deployment_kind,
-        server_group_id=body.server_group_id,
+        persistent=body.persistent,
+        enabled=True,
         expires_at=expires_at,
+        max_claims=body.max_claims if body.persistent else None,
+        code_encrypted=code_encrypted,
         note=body.note,
         created_by_user_id=current_user.id,
     )
@@ -381,34 +293,34 @@ async def create_pairing_code(
             action="appliance.pairing_code_created",
             resource_type="pairing_code",
             resource_id=str(row_id),
-            resource_display=f"{body.deployment_kind} pairing code (••{code[-2:]})",
+            resource_display=("persistent pairing code" if body.persistent else "pairing code")
+            + f" (••{code[-2:]})",
             result="success",
             new_value={
-                "deployment_kind": body.deployment_kind,
-                "server_group_id": str(body.server_group_id) if body.server_group_id else None,
-                "expires_in_minutes": body.expires_in_minutes,
+                "persistent": body.persistent,
+                "expires_at": expires_at.isoformat() if expires_at else None,
+                "max_claims": row.max_claims,
                 "note": body.note,
             },
         )
     )
     await db.commit()
     await db.refresh(row)
-
     logger.info(
         "pairing_code_created",
         id=str(row.id),
-        deployment_kind=body.deployment_kind,
-        expires_at=expires_at.isoformat(),
+        persistent=body.persistent,
+        expires_at=expires_at.isoformat() if expires_at else None,
         user=current_user.username,
     )
-
     return PairingCodeCreated(
         id=row.id,
         code=code,
-        deployment_kind=body.deployment_kind,
-        server_group_id=body.server_group_id,
-        note=body.note,
+        persistent=body.persistent,
+        enabled=True,
         expires_at=expires_at,
+        max_claims=row.max_claims,
+        note=body.note,
         created_at=row.created_at,
     )
 
@@ -425,38 +337,47 @@ async def create_pairing_code(
 async def list_pairing_codes(
     current_user: CurrentUser,
     db: DB,
-    include_terminal: bool = Query(
-        default=True,
-        description="Include claimed/expired/revoked rows alongside pending.",
-    ),
+    include_terminal: bool = Query(default=True),
 ) -> PairingCodeList:
     _require_superadmin(current_user)
 
-    stmt = select(PairingCode).order_by(PairingCode.created_at.desc())
-    rows = (await db.execute(stmt)).scalars().all()
-    now = datetime.now(UTC)
+    rows = (
+        (await db.execute(select(PairingCode).order_by(PairingCode.created_at.desc())))
+        .scalars()
+        .all()
+    )
 
+    # Bulk claim-count query: one trip vs N. Returns a dict
+    # {code_id: count}; missing keys default to 0.
+    claim_counts: dict[uuid.UUID, int] = {}
+    if rows:
+        cstmt = (
+            select(PairingClaim.pairing_code_id, func.count())
+            .where(PairingClaim.pairing_code_id.in_([r.id for r in rows]))
+            .group_by(PairingClaim.pairing_code_id)
+        )
+        for code_id, count in (await db.execute(cstmt)).all():
+            claim_counts[code_id] = int(count)
+
+    now = datetime.now(UTC)
     out: list[PairingCodeRow] = []
     for row in rows:
-        state = _state_for(row, now)
-        if not include_terminal and state != "pending":
+        count = claim_counts.get(row.id, 0)
+        state = _state_for(row, now, count)
+        if not include_terminal and state in ("claimed", "expired", "revoked"):
             continue
         out.append(
             PairingCodeRow(
                 id=row.id,
                 code_last_two=row.code_last_two,
-                deployment_kind=row.deployment_kind,  # type: ignore[arg-type]
-                server_group_id=row.server_group_id,
-                server_group_name=await _resolve_group_name(
-                    db, row.deployment_kind, row.server_group_id
-                ),
-                note=row.note,
+                persistent=row.persistent,
+                enabled=row.enabled,
                 state=state,
                 expires_at=row.expires_at,
-                used_at=row.used_at,
-                used_by_ip=row.used_by_ip,
-                used_by_hostname=row.used_by_hostname,
+                max_claims=row.max_claims,
+                claim_count=count,
                 revoked_at=row.revoked_at,
+                note=row.note,
                 created_at=row.created_at,
                 created_by_user_id=row.created_by_user_id,
             )
@@ -471,7 +392,7 @@ async def list_pairing_codes(
     "/pairing-codes/{code_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(require_permission("admin", "appliance"))],
-    summary="Revoke a pending pairing code (superadmin)",
+    summary="Revoke a pairing code (superadmin)",
 )
 async def revoke_pairing_code(
     code_id: uuid.UUID,
@@ -479,17 +400,11 @@ async def revoke_pairing_code(
     db: DB,
 ) -> None:
     _require_superadmin(current_user)
-
     row = await db.get(PairingCode, code_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Pairing code not found.")
-
-    # Revoke is idempotent on terminal states — already-claimed and
-    # already-revoked rows return 204 with no DB change. ``used_at``
-    # always wins over ``revoked_at`` for state derivation.
-    if row.used_at is not None or row.revoked_at is not None:
+    if row.revoked_at is not None:
         return None
-
     now = datetime.now(UTC)
     row.revoked_at = now
     row.revoked_by_user_id = current_user.id
@@ -501,157 +416,162 @@ async def revoke_pairing_code(
             action="appliance.pairing_code_revoked",
             resource_type="pairing_code",
             resource_id=str(row.id),
-            resource_display=f"{row.deployment_kind} pairing code",
+            resource_display=("persistent pairing code" if row.persistent else "pairing code"),
             result="success",
         )
     )
     await db.commit()
-    logger.info(
-        "pairing_code_revoked",
-        id=str(row.id),
-        user=current_user.username,
-    )
+    logger.info("pairing_code_revoked", id=str(row.id), user=current_user.username)
     return None
 
 
-# ── Consume (unauthenticated) ──────────────────────────────────────
+# ── Enable / Disable (persistent codes only) ───────────────────────
 
 
-@router.post(
-    "/pair",
-    response_model=PairConsumeResponse,
-    summary="Exchange a pairing code for the agent bootstrap key (unauthenticated)",
-)
-async def consume_pairing_code(
-    body: PairConsumeRequest,
-    request: Request,
+async def _toggle_persistent_code(
+    code_id: uuid.UUID,
+    *,
+    enable: bool,
+    current_user: User,
     db: DB,
-) -> PairConsumeResponse:
-    """Agent-side endpoint. No auth — the pairing code IS the auth.
-
-    Failure modes are deliberately collapsed into a single 403 with a
-    generic message so an attacker brute-forcing the namespace can't
-    distinguish "this code doesn't exist" from "this code expired"
-    from "this code is already used". A constant short sleep on
-    failure adds friction without needing a separate rate-limit table.
-    """
-    submitted_hash = _hash_code(body.code)
-    client_ip = _client_ip(request)
-    now = datetime.now(UTC)
-
-    # Look up by hash. Single-row index hit; collision is statistically
-    # impossible (sha256 of distinct 8-digit codes).
-    stmt = select(PairingCode).where(PairingCode.code_hash == submitted_hash)
-    row = (await db.execute(stmt)).scalar_one_or_none()
-
-    failure_reason: str | None = None
+) -> None:
+    _require_superadmin(current_user)
+    row = await db.get(PairingCode, code_id)
     if row is None:
-        failure_reason = "unknown_code"
-    elif row.used_at is not None:
-        failure_reason = "already_used"
-    elif row.revoked_at is not None:
-        failure_reason = "revoked"
-    elif row.expires_at <= now:
-        failure_reason = "expired"
-
-    if failure_reason is not None:
-        # Audit the denial — operator-facing signal for "someone tried
-        # to redeem a code they shouldn't have". Capture IP + reason
-        # but NOT the submitted code (it might be a typo close to a
-        # real code).
-        db.add(
-            AuditLog(
-                user_id=None,
-                user_display_name="anonymous",
-                auth_source="anonymous",
-                source_ip=client_ip,
-                action="appliance.pairing_code_consume_denied",
-                resource_type="pairing_code",
-                resource_id=str(row.id) if row is not None else "unknown",
-                resource_display=(
-                    f"{row.deployment_kind} pairing code"
-                    if row is not None
-                    else "unknown pairing code"
-                ),
-                result="forbidden",
-                new_value={"reason": failure_reason, "hostname": body.hostname},
-            )
-        )
-        await db.commit()
-        logger.warning(
-            "pairing_code_consume_denied",
-            reason=failure_reason,
-            ip=client_ip,
-            hostname=body.hostname,
-        )
-        # Constant delay regardless of which failure path we took, so
-        # response-timing doesn't leak distinguishability.
-        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Pairing code not found.")
+    if not row.persistent:
         raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Pairing code is invalid, expired, or already used. "
-            "Ask your platform admin to generate a new code.",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Enable / disable only applies to persistent codes.",
         )
-
-    # Sanity: the bootstrap key(s) must be configured server-side. We
-    # already check this at create time, but the env var could have
-    # been blanked between then and now. Treat as 503 — server-side
-    # operational issue, not the caller's fault. For kind='both' this
-    # also catches the case where one of the two required keys was
-    # cleared between create and consume.
-    assert row is not None  # narrow for type checker — failure_reason path returned above
-    bootstrap_keys = _bootstrap_keys_for(row.deployment_kind)
-    if bootstrap_keys is None:
-        logger.error(
-            "pairing_code_consume_no_bootstrap_key",
-            id=str(row.id),
-            deployment_kind=row.deployment_kind,
-        )
+    if row.revoked_at is not None:
         raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Control plane has no bootstrap key configured for this deployment kind. "
-            "Contact your platform admin.",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Cannot toggle a revoked code. Mint a new one.",
         )
-
-    # Constant-time compare on the hash (already done above via index
-    # lookup, but ``hmac.compare_digest`` is the canonical idiom here
-    # so future refactors don't regress to plain ``==``).
-    if not hmac.compare_digest(row.code_hash, submitted_hash):  # pragma: no cover
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Hash mismatch.")
-
-    row.used_at = now
-    row.used_by_ip = client_ip
-    row.used_by_hostname = body.hostname
-
+    if row.enabled == enable:
+        return  # idempotent
+    row.enabled = enable
     db.add(
         AuditLog(
-            user_id=None,
-            user_display_name=body.hostname or "anonymous agent",
-            auth_source="pairing_code",
-            source_ip=client_ip,
-            action="appliance.pairing_code_claimed",
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action=(
+                "appliance.pairing_code_enabled" if enable else "appliance.pairing_code_disabled"
+            ),
             resource_type="pairing_code",
             resource_id=str(row.id),
-            resource_display=f"{row.deployment_kind} pairing code",
+            resource_display="persistent pairing code",
             result="success",
-            new_value={
-                "deployment_kind": row.deployment_kind,
-                "server_group_id": str(row.server_group_id) if row.server_group_id else None,
-                "hostname": body.hostname,
-            },
         )
     )
     await db.commit()
     logger.info(
-        "pairing_code_claimed",
+        "pairing_code_enabled" if enable else "pairing_code_disabled",
         id=str(row.id),
-        deployment_kind=row.deployment_kind,
-        ip=client_ip,
-        hostname=body.hostname,
+        user=current_user.username,
     )
 
-    return PairConsumeResponse(
-        bootstrap_keys=bootstrap_keys,
-        deployment_kind=row.deployment_kind,  # type: ignore[arg-type]
-        server_group_id=row.server_group_id,
+
+@router.post(
+    "/pairing-codes/{code_id}/enable",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Re-enable a paused persistent pairing code (superadmin)",
+)
+async def enable_pairing_code(code_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+    await _toggle_persistent_code(code_id, enable=True, current_user=current_user, db=db)
+
+
+@router.post(
+    "/pairing-codes/{code_id}/disable",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Pause a persistent pairing code (superadmin)",
+)
+async def disable_pairing_code(code_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+    await _toggle_persistent_code(code_id, enable=False, current_user=current_user, db=db)
+
+
+# ── Reveal (persistent codes only) ─────────────────────────────────
+
+
+@router.post(
+    "/pairing-codes/{code_id}/reveal",
+    response_model=PairingCodeRevealResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Reveal a persistent pairing code by re-minting it (superadmin)",
+)
+async def reveal_pairing_code(
+    code_id: uuid.UUID,
+    body: PairingCodeRevealRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> PairingCodeRevealResponse:
+    """Re-display a persistent code's original cleartext.
+
+    Returns the same 8 digits the operator saw at create time —
+    Fernet-decrypted from ``code_encrypted``. Ephemeral codes carry
+    no encrypted cleartext (shown once on create); reveal 422s on
+    them.
+
+    Gated: superadmin + local-auth + current-password re-check +
+    audited. Mirrors agent-bootstrap-keys reveal.
+    """
+    _require_superadmin(current_user)
+
+    if current_user.auth_source != "local":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Reveal requires a local-auth account; SSO accounts cannot re-verify password.",
+        )
+    if not verify_password(body.password, current_user.hashed_password or ""):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password verification failed.")
+
+    row = await db.get(PairingCode, code_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Pairing code not found.")
+    if not row.persistent or row.code_encrypted is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Reveal only applies to persistent codes. Ephemeral codes "
+            "are shown once on creation; mint a new one if lost.",
+        )
+    if row.revoked_at is not None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Cannot reveal a revoked code. Mint a new one.",
+        )
+
+    try:
+        cleartext = decrypt_str(row.code_encrypted)
+    except Exception as exc:  # InvalidToken or related Fernet errors
+        # Decrypt failure should never happen under normal operation —
+        # would mean the SECRET_KEY changed between create + reveal.
+        # Log + 500 so the operator notices.
+        logger.error(
+            "pairing_code_reveal_decrypt_failed",
+            id=str(row.id),
+            error=str(exc),
+        )
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Failed to decrypt stored code. SECRET_KEY may have changed.",
+        ) from exc
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.pairing_code_revealed",
+            resource_type="pairing_code",
+            resource_id=str(row.id),
+            resource_display="persistent pairing code",
+            result="success",
+        )
     )
+    await db.commit()
+    logger.info("pairing_code_revealed", id=str(row.id), user=current_user.username)
+    return PairingCodeRevealResponse(id=row.id, code=cleartext)

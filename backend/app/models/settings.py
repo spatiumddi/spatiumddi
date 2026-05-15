@@ -423,3 +423,16 @@ class PlatformSettings(Base):
     aggregation_snooze: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
     )
+
+    # ── Supervisor registration feature flag (#170 Wave A2) ─────────
+    # Gates ``POST /api/v1/appliance/supervisor/register``. Default
+    # FALSE so Wave A's landing doesn't change behaviour for any
+    # existing dns / dhcp agent install (which still uses
+    # ``/dns/agents/register`` / ``/dhcp/agents/register`` + the long
+    # PSK). Operators flip this on when they're ready to try the new
+    # supervisor path. The endpoint returns 404 while disabled — same
+    # shape as "endpoint does not exist" so a probing attacker can't
+    # distinguish "disabled" from "doesn't exist."
+    supervisor_registration_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )

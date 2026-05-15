@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spatium-supervisor"
+version = "2026.05.14.1"
+description = "SpatiumDDI appliance supervisor — holds host-side concerns (identity, docker compose, nftables) for a generic 'Application' appliance"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "SpatiumDDI Contributors" }]
+dependencies = [
+  "httpx>=0.27",
+  "structlog>=24.1",
+  "cryptography>=42",
+  "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.4", "mypy>=1.10"]
+
+[project.scripts]
+spatium-supervisor = "spatium_supervisor.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["spatium_supervisor*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

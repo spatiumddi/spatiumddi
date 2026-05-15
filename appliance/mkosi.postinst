@@ -37,6 +37,7 @@ mkdir -p "$BUILDROOT/etc/systemd/system/multi-user.target.wants"
 # so only one runs per boot, depending on the GRUB menu choice.
 for unit in docker.service chrony.service ssh.service \
             NetworkManager.service \
+            spatium-docker-overlay.service \
             spatiumddi-firstboot.service \
             spatiumddi-update.path \
             spatiumddi-reboot.path \
@@ -45,6 +46,7 @@ for unit in docker.service chrony.service ssh.service \
             spatiumddi-reboot-agent.path \
             spatiumddi-snmp-reload.path \
             spatiumddi-chrony-reload.path \
+            spatiumddi-supervisor-watchdog.timer \
             spatium-install.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
@@ -150,6 +152,18 @@ cat > "$BUILDROOT/usr/lib/tmpfiles.d/spatium-etc-overlay.conf" <<'EOF'
 d /var/persist           0755 root root - -
 d /var/persist/etc       0755 root root - -
 d /var/persist/etc-work  0755 root root - -
+EOF
+
+# #170 Wave A1 — supervisor identity dir. Bind-mounted into the
+# spatium-supervisor container at /var/lib/spatium-supervisor. Lives
+# on /var/persist so the Ed25519 keypair + control-plane-signed cert
+# (Wave A2) survive slot swaps verbatim. Mode 0755 root:root because
+# docker would auto-create it as root:root anyway; the supervisor
+# entrypoint chowns the dir contents to the in-container ``spatium``
+# uid on first start.
+cat > "$BUILDROOT/usr/lib/tmpfiles.d/spatium-supervisor.conf" <<'EOF'
+# #170 Wave A1 — supervisor identity directory. Survives slot swaps.
+d /var/persist/spatium-supervisor 0755 root root - -
 EOF
 
 # ── Hardening (subset of APPLIANCE.md §7 — full pass in Phase 1.x) ────────────

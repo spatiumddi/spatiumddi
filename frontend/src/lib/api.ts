@@ -5094,6 +5094,12 @@ export interface DHCPServerGroup {
   // mode is the HA mode when the group has ≥ 2 Kea members:
   //   "hot-standby" | "load-balancing" | "standalone".
   mode: string;
+  // #170 Wave C2 — supervisor-side container networking mode.
+  // "host" = container shares host netns for L2 broadcasts (default).
+  // "bridged" = container listens on host UDP/67 only (relayed
+  // unicast deployments). Surfaces in the role-assignment UI on
+  // the Approvals tab so the operator knows what they're picking.
+  network_mode?: string;
   heartbeat_delay_ms: number;
   max_response_delay_ms: number;
   max_ack_delay_ms: number;
@@ -7037,49 +7043,64 @@ export const applianceFleetApi = {
 };
 
 // ── Appliance: pairing codes (issue #169) ──────────────────────────
-// Short-lived 8-digit codes the agent installer swaps for the real
-// DNS_AGENT_KEY / DHCP_AGENT_KEY bootstrap key. The cleartext code is
-// returned exactly once in the create response — the list endpoint
-// only ever surfaces the last two digits.
-// ``both`` mints a single code that hands back both DNS + DHCP
-// bootstrap keys on consume — for an appliance running BIND9 + Kea
-// simultaneously.
-export type PairingDeploymentKind = "dns" | "dhcp" | "both";
-export type PairingCodeState = "pending" | "claimed" | "expired" | "revoked";
+// Pairing codes (#169 + #170 Wave A3 reshape).
+//
+// Two flavours:
+//   * Ephemeral (persistent=false) — single-use, short expiry,
+//     cleartext shown once on create.
+//   * Persistent (persistent=true) — multi-claim; default no expiry;
+//     admin can disable / re-reveal the cleartext via Fernet decrypt
+//     after a password re-check.
+//
+// The consume side is no longer /pair — supervisors claim via
+// POST /api/v1/appliance/supervisor/register (Wave A2). Legacy
+// /pair is gone in Wave A3.
+export type PairingCodeState =
+  | "pending"
+  | "claimed"
+  | "expired"
+  | "revoked"
+  | "disabled";
 
 export interface PairingCodeCreate {
-  deployment_kind: PairingDeploymentKind;
-  server_group_id?: string | null;
-  expires_in_minutes?: number;
+  persistent: boolean;
+  expires_in_minutes?: number | null;
+  max_claims?: number | null;
   note?: string | null;
 }
 
 export interface PairingCodeCreated {
   id: string;
-  // 8-digit cleartext code. Shown once on create + never persisted.
+  // 8-digit cleartext code. Shown once on create. For persistent
+  // codes the cleartext is also recoverable via /reveal; for
+  // ephemeral codes this is the only chance to record it.
   code: string;
-  deployment_kind: PairingDeploymentKind;
-  server_group_id: string | null;
+  persistent: boolean;
+  enabled: boolean;
+  expires_at: string | null;
+  max_claims: number | null;
   note: string | null;
-  expires_at: string;
   created_at: string;
 }
 
 export interface PairingCodeRow {
   id: string;
   code_last_two: string;
-  deployment_kind: PairingDeploymentKind;
-  server_group_id: string | null;
-  server_group_name: string | null;
-  note: string | null;
+  persistent: boolean;
+  enabled: boolean;
   state: PairingCodeState;
-  expires_at: string;
-  used_at: string | null;
-  used_by_ip: string | null;
-  used_by_hostname: string | null;
+  expires_at: string | null;
+  max_claims: number | null;
+  claim_count: number;
   revoked_at: string | null;
+  note: string | null;
   created_at: string;
   created_by_user_id: string | null;
+}
+
+export interface PairingCodeRevealResponse {
+  id: string;
+  code: string;
 }
 
 export const appliancePairingApi = {
@@ -7093,6 +7114,226 @@ export const appliancePairingApi = {
       .then((r) => r.data),
   revoke: (id: string) =>
     api.delete<void>(`/appliance/pairing-codes/${id}`).then((r) => r.data),
+  enable: (id: string) =>
+    api.post<void>(`/appliance/pairing-codes/${id}/enable`).then((r) => r.data),
+  disable: (id: string) =>
+    api
+      .post<void>(`/appliance/pairing-codes/${id}/disable`)
+      .then((r) => r.data),
+  reveal: (id: string, password: string) =>
+    api
+      .post<PairingCodeRevealResponse>(
+        `/appliance/pairing-codes/${id}/reveal`,
+        { password },
+      )
+      .then((r) => r.data),
+};
+
+// ── Appliance: approval workflow (#170 Wave B1 backend, B3 UI) ─────
+// Supervisors land here after claiming a pairing code via
+// /api/v1/appliance/supervisor/register. They sit in
+// pending_approval until an admin clicks Approve — the control
+// plane's internal CA signs an X.509 cert against the supervisor's
+// submitted Ed25519 pubkey + the supervisor picks the cert up on its
+// next /supervisor/poll. Reject = delete the row + the supervisor
+// falls back to bootstrapping.
+export type ApplianceState = "pending_approval" | "approved" | "rejected";
+
+export interface SupervisorCapabilities {
+  can_run_dns_bind9?: boolean;
+  can_run_dns_powerdns?: boolean;
+  can_run_dhcp?: boolean;
+  can_run_observer?: boolean;
+  has_baked_images?: boolean;
+  baked_images_version?: string;
+  supervisor_version?: string;
+  cpu_count?: number;
+  memory_mb?: number;
+  storage_type?: string;
+  host_nics?: string[];
+  [k: string]: unknown;
+}
+
+export interface ApplianceRow {
+  id: string;
+  hostname: string;
+  state: ApplianceState;
+  public_key_fingerprint: string;
+  supervisor_version: string | null;
+  capabilities: SupervisorCapabilities;
+  paired_at: string;
+  paired_from_ip: string | null;
+  last_seen_at: string | null;
+  last_seen_ip: string | null;
+  approved_at: string | null;
+  approved_by_user_id: string | null;
+  rejected_at: string | null;
+  cert_serial: string | null;
+  cert_issued_at: string | null;
+  cert_expires_at: string | null;
+  // #170 Wave C1 — slot telemetry surfaced from the supervisor's
+  // heartbeat. Pre-C1 (Wave A4-era) Application appliances never
+  // run the supervisor heartbeat path, so these stay null on those
+  // rows.
+  deployment_kind: string | null;
+  installed_appliance_version: string | null;
+  current_slot: string | null;
+  durable_default: string | null;
+  is_trial_boot: boolean;
+  last_upgrade_state: string | null;
+  last_upgrade_state_at: string | null;
+  snmpd_running: boolean | null;
+  ntp_sync_state: string | null;
+  desired_appliance_version: string | null;
+  desired_slot_image_url: string | null;
+  reboot_requested: boolean;
+  reboot_requested_at: string | null;
+  // #170 Wave C2 — role assignment + free-form tags.
+  assigned_roles: string[];
+  assigned_dns_group_id: string | null;
+  assigned_dhcp_group_id: string | null;
+  tags: Record<string, string>;
+  // #170 Wave C3 — operator-pasted nft fragment rendered after the
+  // role-driven mgmt + per-role blocks.
+  firewall_extra: string | null;
+  // #170 Phase E2 — supervisor-reported host-side port conflicts.
+  // Keyed by ``<proto>_<port>`` (e.g. ``udp_53`` / ``tcp_53`` /
+  // ``udp_67``); values are the ss ``users`` string (pid+name when
+  // available, else local-address fallback).
+  port_conflicts: Record<string, string>;
+  // #170 Wave D follow-up — outcome of the supervisor's last
+  // docker-compose lifecycle apply. ``idle`` / ``ready`` / ``failed``
+  // or null on the first heartbeat / before any role assignment.
+  role_switch_state: string | null;
+  role_switch_reason: string | null;
+  // #170 Wave E — supervisor's service-container watchdog. Free-form
+  // map keyed by compose service name (``dns-bind9`` / ``dns-powerdns``
+  // / ``dhcp-kea``); each value carries the per-service health verdict.
+  // Empty when the supervisor hasn't run a watchdog probe yet or the
+  // appliance is idle (no roles assigned).
+  role_health: Record<
+    string,
+    {
+      role: string;
+      status: "healthy" | "missing" | "unhealthy" | "starting";
+      since: string;
+      container_id: string | null;
+    }
+  >;
+  created_at: string;
+}
+
+export interface ApplianceRolesUpdate {
+  roles?: string[];
+  dns_group_id?: string | null;
+  dhcp_group_id?: string | null;
+  tags?: Record<string, string>;
+  firewall_extra?: string | null;
+}
+
+export const applianceApprovalApi = {
+  list: () =>
+    api
+      .get<{ appliances: ApplianceRow[] }>("/appliance/appliances")
+      .then((r) => r.data.appliances),
+  get: (id: string) =>
+    api.get<ApplianceRow>(`/appliance/appliances/${id}`).then((r) => r.data),
+  approve: (id: string) =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/approve`)
+      .then((r) => r.data),
+  reject: (id: string) =>
+    api.post<void>(`/appliance/appliances/${id}/reject`).then((r) => r.data),
+  remove: (id: string, password: string) =>
+    api
+      .delete<void>(`/appliance/appliances/${id}`, {
+        data: { password },
+      })
+      .then((r) => r.data),
+  rekey: (id: string) =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/rekey`)
+      .then((r) => r.data),
+  updateRoles: (id: string, body: ApplianceRolesUpdate) =>
+    api
+      .put<ApplianceRow>(`/appliance/appliances/${id}/roles`, body)
+      .then((r) => r.data),
+  // #170 Wave D1 — OS slot upgrade + reboot affordances on the
+  // Fleet drilldown. Appliance-only deployments; the API surfaces a
+  // 409 with a useful message on docker / k8s rows.
+  scheduleUpgrade: (
+    id: string,
+    desired_appliance_version: string,
+    source:
+      | { kind: "url"; url: string }
+      | { kind: "uploaded"; slot_image_id: string },
+  ) =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/upgrade`, {
+        desired_appliance_version,
+        ...(source.kind === "url"
+          ? { desired_slot_image_url: source.url }
+          : { slot_image_id: source.slot_image_id }),
+      })
+      .then((r) => r.data),
+  clearUpgrade: (id: string) =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/clear-upgrade`)
+      .then((r) => r.data),
+  scheduleReboot: (id: string) =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/reboot`)
+      .then((r) => r.data),
+};
+
+// ── Slot image uploads (#170 follow-up) ────────────────────────────
+// Air-gapped operators upload the .raw.xz directly to the control
+// plane; the backend stores it on a local volume + serves it back
+// under an authenticated internal URL. The supervisor's existing
+// heartbeat → trigger-file → host runner pipeline picks it up
+// unchanged via the appliance row's ``desired_slot_image_url``.
+export interface SlotImage {
+  id: string;
+  filename: string;
+  size_bytes: number;
+  sha256: string;
+  appliance_version: string;
+  uploaded_by_user_id: string | null;
+  uploaded_at: string;
+  notes: string | null;
+}
+
+export const applianceSlotImagesApi = {
+  list: () =>
+    api
+      .get<{ images: SlotImage[] }>("/appliance/slot-images")
+      .then((r) => r.data.images),
+  upload: (
+    file: File,
+    sha256: string,
+    appliance_version: string,
+    notes: string | undefined,
+    onProgress?: (loaded: number, total: number) => void,
+  ) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("sha256", sha256);
+    fd.append("appliance_version", appliance_version);
+    if (notes) fd.append("notes", notes);
+    return api
+      .post<SlotImage>("/appliance/slot-images", fd, {
+        // Axios picks the right multipart boundary automatically
+        // when the body is a FormData; explicit Content-Type would
+        // strip the boundary.
+        headers: { "Content-Type": undefined },
+        onUploadProgress: (e) => {
+          if (onProgress && e.total) onProgress(e.loaded, e.total);
+        },
+      })
+      .then((r) => r.data);
+  },
+  remove: (id: string) =>
+    api.delete<void>(`/appliance/slot-images/${id}`).then((r) => r.data),
 };
 
 // ── Appliance: container management (Phase 4d) ─────────────────────

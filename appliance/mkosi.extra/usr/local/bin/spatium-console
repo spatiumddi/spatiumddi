@@ -8,24 +8,25 @@
 # the spatium-console@.service template for serial consoles.
 # F1 hands off to agetty for traditional login (the only way to
 # get a shell on this appliance — by design). F5 / F6 reboot /
-# poweroff with a confirm modal. F2 / F3 / F4 / F9 surface
-# operator-useful read-only views (monitor / containers / network /
-# diagnostic bundle).
+# poweroff with a confirm modal. F2 / F3 / F4 surface operator-
+# useful read-only views (htop / docker stats / nmtui). F8 re-pairs
+# the appliance against a fresh pairing code.
 #
 # Role-awareness reads APPLIANCE_ROLE from /etc/spatiumddi/.env —
 # the same value spatiumddi-firstboot writes after the installer
-# wizard picked a role (control / control-only / dns-agent-bind9 /
-# dns-agent-powerdns / dhcp-agent). Each role gets a different
-# Services pane.
+# wizard picked a role. Three roles: full-stack / frontend-core /
+# application. Each role gets a different Services pane.
 
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
 import select
 import signal
+import socket
 import subprocess
 import sys
 import termios
@@ -57,11 +58,9 @@ APPLIANCE_RELEASE = Path("/etc/spatiumddi/appliance-release")
 
 
 ROLE_LABELS = {
-    "control": "Control plane + BIND9 + Kea (all-in-one)",
-    "control-only": "Control plane only",
-    "dns-agent-bind9": "DNS agent (BIND9)",
-    "dns-agent-powerdns": "DNS agent (PowerDNS)",
-    "dhcp-agent": "DHCP agent (Kea)",
+    "full-stack": "Full stack — control plane + BIND9 + Kea (AIO)",
+    "frontend-core": "Frontend / core — control plane only",
+    "application": "Application — supervisor (pairs remote)",
 }
 
 # Container service names we render per role. Names match the
@@ -70,17 +69,126 @@ ROLE_LABELS = {
 # expected set so a missing-from-`docker ps` service shows up as
 # `(not running)` instead of being silently absent.
 ROLE_SERVICES = {
-    "control": [
+    "full-stack": [
         "postgres", "redis", "migrate", "api", "worker", "beat",
         "frontend", "dns-bind9", "dhcp-kea",
     ],
-    "control-only": [
+    "frontend-core": [
         "postgres", "redis", "migrate", "api", "worker", "beat", "frontend",
     ],
-    "dns-agent-bind9": ["dns-bind9", "agent-landing"],
-    "dns-agent-powerdns": ["dns-powerdns", "agent-landing"],
-    "dhcp-agent": ["dhcp-kea", "agent-landing"],
+    # Application = supervisor + the agent-landing static page. The
+    # service container (dns-bind9 / dns-powerdns / dhcp-kea) starts
+    # only after admin approval + role assignment in the fleet UI
+    # (#170 Wave C); render_services unions any role-supervised
+    # container currently in ``docker ps`` so the operator sees them
+    # when they're running, without cluttering the dashboard with
+    # ``(not running)`` rows for roles the supervisor hasn't been
+    # given.
+    "application": ["spatium-supervisor", "agent-landing"],
 }
+
+# Compose service names the supervisor manages dynamically (#170
+# Wave C+). On an Application appliance these only show up after
+# admin approval + role assignment, so the dashboard unions whichever
+# of these is actually in ``docker ps`` onto the base
+# ``ROLE_SERVICES["application"]`` list rather than rendering a
+# permanent ``(not running)`` row for every unassigned role.
+SUPERVISOR_DYNAMIC_SERVICES = ("dns-bind9", "dns-powerdns", "dhcp-kea")
+
+# Supervisor's role-compose.env on the host (the dashboard reads it
+# read-only to discover the watchdog-expected services so a
+# missing-but-expected container renders as "(not running)" instead
+# of silently absent). The supervisor writes this file atomically on
+# every heartbeat that returns a role_assignment.
+_SUPERVISOR_ROLE_ENV = Path("/var/persist/spatium-supervisor/role-compose.env")
+
+# Compose profile → compose service name. Mirrors the supervisor's
+# own ``watchdog._PROFILE_TO_SERVICE`` map — keep them in sync.
+_PROFILE_TO_SERVICE_DASH: dict[str, str] = {
+    "dns-bind9": "dns-bind9",
+    "dns-powerdns": "dns-powerdns",
+    "dhcp": "dhcp-kea",
+}
+
+
+# External supervisor watchdog (#170 Wave E) — host-side bash
+# script + systemd timer that restarts the supervisor container when
+# its main loop wedges (different signal from the
+# in-process watchdog which only watches the supervisor-managed
+# service containers). The supervisor writes ``last-loop-at`` at the
+# top of every heartbeat-loop iteration; the host timer checks that
+# mtime every 2 min and force-restarts the container if it's
+# >5 min stale. Surface a one-line status so the operator at the
+# physical console can see at a glance whether the loop is ticking.
+_SUPERVISOR_LIVENESS_FILE = Path("/var/persist/spatium-supervisor/last-loop-at")
+_SUPERVISOR_WATCHDOG_ALERT = Path(
+    "/var/lib/spatiumddi/release-state/supervisor-watchdog-alert"
+)
+
+
+def supervisor_watchdog_status() -> tuple[str, str] | None:
+    """Return a ``(label, rich-style)`` tuple summarising the
+    external watchdog state, or ``None`` when nothing useful to show
+    (non-application role, or supervisor never started).
+
+    Three outcomes:
+
+    * ``Loop ticking · N s ago`` (green) — liveness file fresh.
+    * ``Loop stale · N s ago`` (yellow) — liveness file older than
+      the heartbeat interval; the host timer will restart on its
+      next fire.
+    * ``Restart cap hit`` (red) — alert trigger file present; the
+      external watchdog gave up after MAX_RESTARTS_PER_WINDOW.
+    """
+    # Alert trigger trumps the staleness check — operator needs to
+    # see the bad-news state regardless of what the liveness file
+    # currently says.
+    if _SUPERVISOR_WATCHDOG_ALERT.exists():
+        return ("Restart cap hit — manual intervention required", "bold red")
+    if not _SUPERVISOR_LIVENESS_FILE.exists():
+        return None
+    try:
+        mtime = _SUPERVISOR_LIVENESS_FILE.stat().st_mtime
+    except OSError:
+        return None
+    age = int(time.time() - mtime)
+    if age < 0:
+        age = 0
+    # The host-side script's STALE_THRESHOLD_S is 300 s; use the
+    # same threshold here so the chip flips colour at the same
+    # moment the host watchdog decides to act.
+    if age >= 300:
+        return (f"Loop stale · {age}s ago", "bold yellow")
+    return (f"Loop ticking · {age}s ago", "bold green")
+
+
+def watchdog_expected_services() -> list[str]:
+    """Read the supervisor's role-compose.env to discover which
+    service containers the watchdog expects to be running.
+
+    Returns ``[]`` on missing file, empty COMPOSE_PROFILES, or any
+    read error. Used by ``render_frame`` to union the
+    watchdog-expected set into the dashboard's Services panel so a
+    crashed / removed container surfaces as "(not running)" rather
+    than disappearing entirely.
+    """
+    if not _SUPERVISOR_ROLE_ENV.exists():
+        return []
+    try:
+        for line in _SUPERVISOR_ROLE_ENV.read_text(encoding="utf-8").splitlines():
+            if line.startswith("COMPOSE_PROFILES="):
+                val = line.split("=", 1)[1].strip()
+                if not val:
+                    return []
+                services: list[str] = []
+                for p in val.split(","):
+                    svc = _PROFILE_TO_SERVICE_DASH.get(p.strip())
+                    if svc is not None:
+                        services.append(svc)
+                return services
+    except OSError:
+        pass
+    return []
 
 # journalctl units the live-log pane tails. Same set on every role —
 # operators want to see firstboot / release manager output regardless
@@ -94,9 +202,23 @@ JOURNAL_UNITS = [
     "spatium-console.service",
 ]
 
-REFRESH_INTERVAL = 0.25  # seconds — render tick (drives spinner animation)
+# 0.5 s (2 Hz) is plenty for a system dashboard. The previous 0.25 s
+# (4 Hz) tick combined with Rich Live's default auto-refresh thread
+# (also 4 Hz) produced two full-layout re-renders per tick and burned
+# ~90 % of a CPU on a 1-CPU appliance VM. Spinner animation stays
+# usable at 2 Hz.
+REFRESH_INTERVAL = 0.5
 VITALS_EVERY = 1.0       # seconds — CPU / RAM / Load / clock / disk poll
-DATA_REFRESH_EVERY = 2.0 # seconds — docker / env poll cadence
+# 5 s (not 2 s) so a slow ``docker ps`` (parsing JSON output of every
+# container on a 1-CPU VM can take >3 s) doesn't starve the rest of
+# the loop. The previous 2 s cadence + 3 s subprocess timeout created
+# a feedback loop where every dashboard tick timed out dockerd mid-
+# response, which dockerd then logged as "superfluous
+# response.WriteHeader call from go.opentelemetry.io/contrib/
+# instrumentation/..." — the loop kept itself fed because the console
+# tails docker.service journal output and re-rendered those errors
+# in its live-log pane.
+DATA_REFRESH_EVERY = 5.0
 SPINNER_CHARS = "|/-\\"
 
 
@@ -117,8 +239,8 @@ def read_env(path: Path = ENV_FILE) -> dict[str, str]:
 
 
 def role_from_env(env: dict[str, str]) -> str:
-    raw = (env.get("APPLIANCE_ROLE") or "control").strip()
-    return raw if raw in ROLE_LABELS else "control"
+    raw = (env.get("APPLIANCE_ROLE") or "full-stack").strip()
+    return raw if raw in ROLE_LABELS else "full-stack"
 
 
 def role_label(role: str) -> str:
@@ -131,32 +253,126 @@ def role_label(role: str) -> str:
 _STATUS_HEALTH_RE = re.compile(r"\(([^)]+)\)")
 
 
-def docker_ps() -> list[dict]:
-    """Run `docker ps --format` and parse one JSON object per line.
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """``http.client.HTTPConnection`` over a unix socket — the
+    docker engine API speaks HTTP/1.1 over /var/run/docker.sock.
+    Replaces the ``subprocess.run(["docker", "ps", ...])`` pattern
+    with a direct API call (~30× faster on a 1-CPU appliance VM,
+    no Go binary startup + arg parsing + JSON formatting overhead).
+    The previous shell-out cadence on a 1-CPU VM created a feedback
+    loop with dockerd's OpenTelemetry middleware — see ``docker_ps``
+    for the full story."""
 
-    Returns [] on any failure (daemon down, docker binary missing,
-    parse error). The renderer surfaces this as "(not running)" rows
+    def __init__(self, socket_path: str, timeout: float = 5.0) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self._socket_path = socket_path
+
+    def connect(self) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self._socket_path)
+
+
+def docker_ps() -> list[dict]:
+    """Return the currently-running containers via the docker engine
+    API. One HTTP GET to /var/run/docker.sock — much cheaper than the
+    old ``docker ps --format`` subprocess.
+
+    Returns [] on any failure (daemon down, EACCES on socket, etc.).
+    The renderer surfaces missing containers as "(not running)" rows
     so the dashboard stays usable even when docker is fully broken.
+
+    The previous subprocess form's 3 s timeout fired mid-response on
+    a slow 1-CPU VM, dockerd logged "superfluous
+    response.WriteHeader call from go.opentelemetry.io/contrib/..."
+    on every kill, and the journal-tail rendered those errors in the
+    live-log pane creating an infinite feedback loop. Direct API
+    talk side-steps the whole problem: no fork, no exec, no Go
+    binary startup, no JSON re-serialisation through the CLI.
     """
     try:
-        proc = subprocess.run(
-            ["docker", "ps", "--all", "--format", "{{json .}}"],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
-    if proc.returncode != 0:
-        return []
-    rows: list[dict] = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+        conn = _UnixHTTPConnection("/var/run/docker.sock", timeout=10.0)
         try:
-            rows.append(json.loads(line))
-        except json.JSONDecodeError:
+            conn.request("GET", "/v1.45/containers/json", headers={"Host": "localhost"})
+            resp = conn.getresponse()
+            body = resp.read()
+            if resp.status != 200:
+                return []
+            data = json.loads(body)
+        finally:
+            conn.close()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    # Translate the engine-API shape into the same dict shape
+    # ``docker ps --format '{{json .}}'`` used to emit so the
+    # downstream renderer keeps working unchanged. The renderer
+    # cares about: Names, Image, Status, Labels (for compose
+    # project/service stamps via ``container_service_name``), State.
+    out: list[dict] = []
+    for c in data:
+        # Names from the API come as ``["/some-name"]`` with a leading
+        # slash; the CLI's --format strips it. Match that.
+        raw_names = c.get("Names") or []
+        name = (raw_names[0].lstrip("/") if raw_names else "")
+        # Engine-API ``Labels`` is a flat ``{key: value}`` dict; the
+        # CLI's --format collapses it to a comma-separated string of
+        # ``key=value`` pairs. ``container_service_name`` already
+        # handles both shapes (dict via .get, fallback string parse),
+        # so passing the dict through is fine — keeping the original
+        # dict is cheaper than re-flattening.
+        hostcfg = c.get("HostConfig") or {}
+        out.append({
+            "Names": name,
+            "Image": c.get("Image", ""),
+            "Status": c.get("Status", ""),
+            "Labels": c.get("Labels") or {},
+            "State": c.get("State", ""),
+            # Engine API ``Ports`` is a list of {IP, PrivatePort,
+            # PublicPort, Type} dicts. The renderer's
+            # ``container_port_summary`` collapses them into a short
+            # human string for the Services row.
+            "Ports": c.get("Ports") or [],
+            # ``HostConfig.NetworkMode`` is "default" / "host" /
+            # "bridge" / "<network-name>" / "container:<id>". The
+            # supervisor's DHCP role specifically runs in ``host``
+            # mode for broadcast-relay reachability; surface that
+            # signal in the Services row so operators can spot a
+            # mis-deployed bridged DHCP at a glance.
+            "NetworkMode": hostcfg.get("NetworkMode") or "",
+        })
+    return out
+
+
+def container_port_summary(row: dict) -> str:
+    """Return a compact ports / network-mode string for the Services
+    column.
+
+    Output shapes:
+
+    * ``host net`` — container in ``NetworkMode=host`` (DHCP-kea
+      runs here for broadcast-relay reachability).
+    * ``53/tcp 53/udp`` — bridge-mode container with published
+      ports; dedupes IPv4/IPv6 entries that the engine API returns
+      twice for the same port.
+    * ``""`` (empty) — no published ports + not host mode (the
+      supervisor itself, internal-only containers).
+    """
+    if row.get("NetworkMode") == "host":
+        return "host net"
+    pairs: set[tuple[int, str]] = set()
+    for p in row.get("Ports") or []:
+        pub = p.get("PublicPort")
+        # Skip rows without a PublicPort — those are exposed-only
+        # (declared in EXPOSE but not published to host). The
+        # operator-visible signal is "what's reachable from outside
+        # the container", which only matters when PublicPort is set.
+        if pub is None:
             continue
-    return rows
+        ptype = p.get("Type") or "tcp"
+        pairs.add((int(pub), str(ptype)))
+    if not pairs:
+        return ""
+    return " ".join(f"{port}/{proto}" for port, proto in sorted(pairs))
 
 
 def container_service_name(row: dict) -> str:
@@ -210,8 +426,17 @@ def health_from_status(status: str) -> str:
     return "unknown"
 
 
-def host_ips() -> list[str]:
-    out: list[str] = []
+def host_ips() -> tuple[list[str], list[str]]:
+    """Return ``(ipv4_addresses, ipv6_addresses)``. Splits the two
+    families so the header can render the IPv4 list inline + a
+    compact ``+N IPv6`` summary chip — listing every SLAAC IPv6
+    inline blew past the available width on standard 80-col TTYs.
+
+    Skips: loopback, docker bridges, veth pairs, virbr, link-local
+    IPv4 (169.254/16), link-local IPv6 (fe80::/10).
+    """
+    v4: list[str] = []
+    v6: list[str] = []
     for name, addrs in psutil.net_if_addrs().items():
         if name == "lo" or name.startswith("docker") or name.startswith("br-") \
                 or name.startswith("veth") or name.startswith("virbr"):
@@ -221,16 +446,15 @@ def host_ips() -> list[str]:
             value = addr.address
             if not value:
                 continue
-            # Strip the IPv6 scope-id suffix on link-local addresses.
             v = value.split("%", 1)[0]
             # IPv4 = AF_INET = 2 ; IPv6 = AF_INET6 = 10 on Linux. Use
             # the value rather than psutil's enum so a heredoc / mocked
             # test doesn't depend on AF_PACKET being 17.
-            if fam in (2,) and not v.startswith("169.254."):
-                out.append(v)
-            elif fam in (10,) and not v.startswith("fe80"):
-                out.append(v)
-    return out
+            if fam == 2 and not v.startswith("169.254."):
+                v4.append(v)
+            elif fam == 10 and not v.startswith("fe80"):
+                v6.append(v)
+    return v4, v6
 
 
 def uptime_str() -> str:
@@ -260,18 +484,39 @@ def disk_summary() -> list[tuple[str, float, float, float]]:
         "binfmt_misc", "autofs", "nsfs", "hugetlbfs", "fuse.gvfsd-fuse",
     }
     skip_mounts = {"/boot/efi"}
+    # Skip the loop-mounted baked-image overlay — it's an internal
+    # implementation detail (Phase 8 firstboot loop-mounts the
+    # /usr/lib/spatiumddi/docker-overlay.img read-only as a lower
+    # layer for the docker storage driver). The operator-visible
+    # storage signal is /, /var, and ESP; the overlay's capacity
+    # doesn't change once the image is laid down at boot.
+    skip_mount_prefixes = ("/var/lib/spatiumddi/docker-overlay/",)
     rows: list[tuple[str, float, float, float]] = []
-    for part in psutil.disk_partitions(all=False):
+    # Dedupe by device — bind mounts (e.g. /home → /var/home, /root →
+    # /var/root per #170 Phase 8a) report the SAME underlying device
+    # as the parent, just at a different mountpoint. Listing them all
+    # overflows the dashboard's Disk row with three identical 3.9/15.2
+    # GiB cells. Keep the first occurrence (shortest mountpoint wins
+    # after the sort below).
+    seen_devices: set[str] = set()
+    parts = list(psutil.disk_partitions(all=False))
+    # Sort so dedupe keeps the canonical (shorter / earlier) mount.
+    parts.sort(key=lambda p: (len(p.mountpoint), p.mountpoint))
+    for part in parts:
         if part.fstype in skip_fstypes:
             continue
         if part.mountpoint in skip_mounts:
             continue
+        if any(part.mountpoint.startswith(p) for p in skip_mount_prefixes):
+            continue
+        if part.device in seen_devices:
+            continue
+        seen_devices.add(part.device)
         try:
             u = psutil.disk_usage(part.mountpoint)
         except OSError:
             continue
         rows.append((part.mountpoint, u.used / 2**30, u.total / 2**30, u.percent))
-    rows.sort(key=lambda r: (len(r[0]), r[0]))
     return rows
 
 
@@ -358,8 +603,11 @@ def appliance_version_string(env: dict[str, str]) -> str:
 
     /etc/spatiumddi/appliance-release is the build-time stamp written
     by mkosi.postinst. SPATIUMDDI_VERSION in .env is the container
-    image tag (CalVer or "latest"). Show both because they DO diverge
-    after a release apply (Phase 4c) without a partition re-image.
+    image tag (CalVer or "latest"). Collapse to one value when they
+    match (the normal case — every release pins them together); only
+    spell out both when they diverge, which signals an in-flight
+    Phase 4c release-apply that updated the docker image tag without
+    a partition re-image.
     """
     appliance = env.get("APPLIANCE_VERSION") or "?"
     spddi = env.get("SPATIUMDDI_VERSION") or "?"
@@ -373,6 +621,8 @@ def appliance_version_string(env: dict[str, str]) -> str:
             # to whatever .env carried in `appliance` (default "?"). A
             # missing release stamp shouldn't blank the header.
             pass
+    if appliance == spddi:
+        return appliance
     return f"appliance {appliance} · stack {spddi}"
 
 
@@ -383,12 +633,37 @@ class JournalTail(threading.Thread):
     """Tail journalctl into a deque so the renderer can read recent
     lines without blocking on subprocess I/O each refresh."""
 
+    # Operator-hostile log lines (rich/python tracebacks, "Active:" /
+    # "Restart " systemd state spam) that we filter out before the
+    # renderer sees them. Internal stack traces from a crash-looping
+    # spatium-console process used to flood the Live log pane with
+    # multi-line ``File "/usr/lib/.../rich/live.py"`` entries that
+    # tell the operator nothing useful — only the originating
+    # ``OSError`` / ``Exception`` summary line is worth surfacing.
+    _NOISE_PATTERNS = (
+        # Python traceback frames + caret indicators + raise lines.
+        re.compile(r"\bFile \"/usr/lib/python[\d.]+/"),
+        re.compile(r"^\s*\^+~*\^*\s*$"),
+        re.compile(r"^\s+(self\.|with |return |elif |if |except |raise )"),
+        re.compile(r"^Traceback \(most recent call last\):"),
+        # systemd transient state churn (re-emitted on every restart).
+        re.compile(r"Active: (activating|deactivating|inactive)"),
+        re.compile(r"Scheduled restart job, restart counter is at \d+"),
+        re.compile(r"Main process exited, code=exited, status="),
+        re.compile(r"Failed with result 'exit-code'"),
+        re.compile(r"Started spatium-console\.service"),
+    )
+
     def __init__(self, units: Iterable[str], maxlen: int = 200):
         super().__init__(daemon=True)
         self.units = list(units)
         self.lines: deque[str] = deque(maxlen=maxlen)
         self._stop = threading.Event()
         self._proc: subprocess.Popen | None = None
+
+    @classmethod
+    def _is_noise(cls, line: str) -> bool:
+        return any(p.search(line) for p in cls._NOISE_PATTERNS)
 
     def stop(self) -> None:
         self._stop.set()
@@ -407,7 +682,15 @@ class JournalTail(threading.Thread):
                 "journalctl",
                 "--no-pager",
                 "--output", "short-iso",
-                "--since", "10 minutes ago",
+                # 2 min (not 10) so a crash-loop on an earlier instance
+                # of spatium-console clears out of the live-log pane
+                # within ~2 min of recovery, rather than sitting on
+                # screen for 10 min until the journal window naturally
+                # rolls forward. Steady-state output from
+                # firstboot/update/reboot units lands in real time so
+                # the shortened window doesn't lose anything
+                # operator-relevant.
+                "--since", "2 minutes ago",
                 "-f",
             ]
             for u in self.units:
@@ -429,7 +712,7 @@ class JournalTail(threading.Thread):
                 if self._stop.is_set():
                     break
                 line = line.rstrip("\n")
-                if line:
+                if line and not self._is_noise(line):
                     self.lines.append(line)
             # Subprocess exited (rotate / journald restart). Restart in
             # 2 s unless we're stopping.
@@ -574,7 +857,7 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     env = state.env
     role = state.role
     hostname = env.get("APPLIANCE_HOSTNAME") or os.uname().nodename
-    ips = host_ips()
+    v4_ips, v6_ips = host_ips()
     cpu = state.cpu_percent
     load = " ".join(f"{x:.2f}" for x in state.load_avg)
     build = appliance_version_string(env)
@@ -596,34 +879,89 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     right1.append(spinner, style="bold bright_yellow")
     line1.add_row(left1, right1)
 
-    # Line 2 — IPs
+    # Line 2 — IPs. IPv4 inline; IPv6 collapsed to a ``+N IPv6``
+    # chip so SLAAC's typically-40-char addresses don't push the
+    # header off-screen on standard 80-col TTYs. Operators who need
+    # the full list can hit F4 (nmtui) for the per-NIC view.
     line2 = Text()
     line2.append("IPs  ", style="dim")
-    line2.append(", ".join(ips) if ips else "—")
+    if v4_ips:
+        line2.append(", ".join(v4_ips))
+        if v6_ips:
+            line2.append(f"  +{len(v6_ips)} IPv6", style="dim")
+    elif v6_ips:
+        # IPv6-only host (rare): show the first; the chip carries
+        # the rest.
+        line2.append(v6_ips[0])
+        if len(v6_ips) > 1:
+            line2.append(f"  +{len(v6_ips) - 1} IPv6", style="dim")
+    else:
+        line2.append("—")
 
     # Line 3 — build / version
     line3 = Text()
     line3.append("Build ", style="dim")
     line3.append(build)
 
+    # Line 3a — Control plane + Identity (only on application
+    # appliances; #170 Wave D). Inlining these into the header lets
+    # us drop the separate Agent panel, saving ~4 rows of vertical
+    # space the operator would otherwise spend looking at one panel
+    # title + two values.
+    agent_line: Text | None = None
+    if role == "application":
+        cp_url = env.get("CONTROL_PLANE_URL") or "(not configured)"
+        pairing = pairing_status(env, role, state.ps_rows)
+        agent_line = Text()
+        agent_line.append("Agent ", style="dim")
+        agent_line.append(cp_url, style="bold")
+        if pairing is not None:
+            label, pstyle = pairing
+            agent_line.append("  ", style="dim")
+            agent_line.append(label, style=pstyle)
+
+    # Line 3a-2 — External supervisor watchdog status (Wave E). Only
+    # renders on application appliances + only when we have a
+    # supervisor liveness file to read. The host-side timer keeps
+    # the supervisor process alive across deadlocks; surfacing the
+    # mtime delta here gives the physical-console operator the same
+    # signal the host watchdog acts on.
+    watchdog_line: Text | None = None
+    if role == "application":
+        wd_status = supervisor_watchdog_status()
+        if wd_status is not None:
+            label, wstyle = wd_status
+            watchdog_line = Text()
+            watchdog_line.append("Watchdog ", style="dim")
+            watchdog_line.append(label, style=wstyle)
+
     # Line 3b — Phase 8c A/B slot indicator. Only renders on the
     # appliance (where slot detection succeeds). On dev/non-appliance
     # boxes detect_slot_info() returns None and we skip the line.
+    def _slot_letter(s: str) -> str:
+        # ``slot_a`` → ``A``, ``slot_b`` → ``B``. Falls through
+        # untouched on anything else so a future ``slot_c`` doesn't
+        # render as empty.
+        if s.startswith("slot_") and len(s) > 5:
+            return s[5:].upper()
+        return s
+
     slots = slot_info()
     slot_line: Text | None = None
     if slots is not None:
         current, durable = slots
         slot_line = Text()
         slot_line.append("Slot  ", style="dim")
-        slot_line.append(current, style="bold cyan")
+        slot_line.append(_slot_letter(current), style="bold cyan")
         if durable and durable != current:
             slot_line.append("  ", style="dim")
             slot_line.append(
-                f"TRIAL — durable default is {durable}", style="bold bright_yellow"
+                f"TRIAL — durable default is {_slot_letter(durable)}",
+                style="bold bright_yellow",
             )
         elif durable:
             slot_line.append("  ", style="dim")
-            slot_line.append("(committed default)", style="dim")
+            slot_line.append("· committed default", style="dim")
         else:
             slot_line.append("  ", style="dim")
             slot_line.append("(grubenv unreadable)", style="dim")
@@ -631,39 +969,48 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # Rule — horizontal divider between identity and vitals.
     rule = Rule(style="cyan dim", characters="─")
 
-    # Line 4 — vitals: uptime / cpu / ram / load
-    line4 = Text()
-    line4.append("Up ", style="dim"); line4.append(uptime_str(), style="bold")
-    line4.append("   CPU ", style="dim"); line4.append(f"{cpu:.0f}%", style="bold")
-    line4.append("   RAM ", style="dim")
-    line4.append(f"{state.ram_used_gib:.1f}/{state.ram_total_gib:.1f} GiB ({state.ram_percent:.0f}%)", style="bold")
-    line4.append("   Load ", style="dim"); line4.append(load, style="bold")
-
-    # Line 5 — disks. Skip if no real partitions surface (shouldn't
-    # happen on a Debian appliance install but keeps the dashboard
-    # resilient).
-    disks = state.disks
-    line5 = Text()
-    line5.append("Disk ", style="dim")
-    if disks:
-        bits: list[str] = []
-        for mp, used_g, total_g, pct in disks:
-            bits.append(f"{mp} {used_g:.1f}/{total_g:.1f} GiB ({pct:.0f}%)")
-        line5.append("   ".join(bits))
-    else:
-        line5.append("—")
+    # Vitals line — uptime / cpu / ram / load / disks all on one row.
+    # Previously disks were on a separate ``line5`` but with the bind-
+    # mount dedupe + docker-overlay skip there are typically only 2-3
+    # mount entries, easily fitting alongside the vitals on the same
+    # row on any 80+ col TTY. Saves one vertical row on the dashboard.
+    vitals = Text()
+    vitals.append("Up ", style="dim"); vitals.append(uptime_str(), style="bold")
+    vitals.append("   CPU ", style="dim"); vitals.append(f"{cpu:.0f}%", style="bold")
+    vitals.append("   RAM ", style="dim")
+    vitals.append(
+        f"{state.ram_used_gib:.1f}/{state.ram_total_gib:.1f} GiB ({state.ram_percent:.0f}%)",
+        style="bold",
+    )
+    vitals.append("   Load ", style="dim"); vitals.append(load, style="bold")
+    if state.disks:
+        vitals.append("   Disk ", style="dim")
+        disk_bits = [
+            f"{mp} {used_g:.1f}/{total_g:.1f} GiB ({pct:.0f}%)"
+            for mp, used_g, total_g, pct in state.disks
+        ]
+        vitals.append("  ".join(disk_bits))
 
     body_parts: list = [line1, line2, line3]
+    if agent_line is not None:
+        body_parts.append(agent_line)
+    if watchdog_line is not None:
+        body_parts.append(watchdog_line)
     if slot_line is not None:
         body_parts.append(slot_line)
-    body_parts += [rule, line4, line5]
+    body_parts += [rule, vitals]
     body = Group(*body_parts)
     return Panel(body, box=SQUARE, border_style="cyan", padding=(0, 1),
                  title="[bold]SpatiumDDI[/bold]", title_align="left")
 
 
 def render_services(role: str, ps_rows: list[dict]) -> Panel:
-    expected = ROLE_SERVICES.get(role, ROLE_SERVICES["control"])
+    # ``dict.get(k, default)`` evaluates ``default`` eagerly. The
+    # previous ``ROLE_SERVICES["control"]`` fallback was an orphan
+    # from the pre-#170 5-role world and raised ``KeyError`` on every
+    # render — *before* ``get`` could return a hit on a valid role
+    # — so the dashboard crash-looped on every appliance.
+    expected = list(ROLE_SERVICES.get(role, ROLE_SERVICES["full-stack"]))
     # Index ps by compose-service name.
     by_service: dict[str, dict] = {}
     for r in ps_rows:
@@ -671,11 +1018,33 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         # Pick the most-recently-created replica if multiple exist.
         if svc not in by_service:
             by_service[svc] = r
+    # #170 Wave D follow-up — on the Application role the supervisor
+    # spawns role-aligned service containers dynamically after admin
+    # role assignment in the fleet UI. Surface them alongside the
+    # static base set so the dashboard reflects what's actually
+    # running. The supervisor-managed services that aren't present
+    # right now stay off the list — otherwise every Application
+    # appliance would carry permanent ``(not running)`` rows for
+    # roles it was never assigned.
+    #
+    # #170 Wave E watchdog tie-in: also union services the supervisor
+    # *expects* to be running (per role-compose.env) but that aren't
+    # in docker ps. Those render as ``(not running)`` so a crashed /
+    # removed container is visible from the console without
+    # SSH-ing in. ``watchdog_expected_services`` reads the env file
+    # the supervisor maintains; an absent file (idle appliance, no
+    # role assigned yet) returns ``[]``.
+    if role == "application":
+        watchdog_expected = set(watchdog_expected_services())
+        for svc in SUPERVISOR_DYNAMIC_SERVICES:
+            if (svc in by_service or svc in watchdog_expected) and svc not in expected:
+                expected.append(svc)
 
     tbl = Table.grid(padding=(0, 1), expand=True)
     tbl.add_column(width=2, no_wrap=True)        # health glyph
     tbl.add_column(width=14, no_wrap=True)       # service name
     tbl.add_column(width=11, no_wrap=True)       # state
+    tbl.add_column(width=18, no_wrap=True)       # ports / net mode
     tbl.add_column(min_width=14, no_wrap=False)  # image / detail
     tbl.add_column(justify="right", no_wrap=True)  # status text
 
@@ -688,6 +1057,7 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
                 Text(glyph, style=style),
                 Text(svc, style="dim"),
                 Text("not running", style="dim"),
+                Text("", style="dim"),
                 Text("", style="dim"),
                 Text("—", style="dim"),
             )
@@ -705,115 +1075,60 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         short_image = image
         if "/" in short_image:
             short_image = short_image.rsplit("/", 1)[1]
+        ports = container_port_summary(row)
+        # Colour the ports cell so ``host net`` reads visually
+        # different from a published port list — operators learn at a
+        # glance that DHCP is in host mode (the expected/correct
+        # state) vs accidentally bridged.
+        ports_style = "bold cyan" if ports == "host net" else "dim"
         tbl.add_row(
             Text(glyph, style=style),
             Text(svc, style="bold"),
             Text(verdict, style=style),
+            Text(ports or "—", style=ports_style),
             Text(short_image, style="dim"),
             Text(status, style="dim"),
         )
 
     return Panel(tbl, box=SQUARE, border_style="cyan",
-                 title=f"[bold]Services[/bold]  ({role_label(role)})",
+                 title="[bold]Services[/bold]",
                  title_align="left")
 
 
-# Per-agent-role docker volume names + container names — the path
-# under /var/lib/docker/volumes/ is the project-prefixed volume name;
-# compose project = ``spatiumddi`` on the appliance.
-_AGENT_VOLUME = {
-    "dns-agent-bind9":    "spatiumddi_dns_bind9_state",
-    "dns-agent-powerdns": "spatiumddi_dns_powerdns_state",
-    "dhcp-agent":         "spatiumddi_dhcp_kea_state",
-}
-_AGENT_CONTAINER = {
-    "dns-agent-bind9":    "dns-bind9",
-    "dns-agent-powerdns": "dns-powerdns",
-    "dhcp-agent":         "dhcp-kea",
-}
-
-
 def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple[str, str] | None:
-    """#169 Phase 4 — derive a (label, style) tuple for the console's
-    'Pairing' row, or ``None`` when the operator pasted the long
-    bootstrap key instead of a pairing code (nothing to show).
+    """#170 — derive a (label, style) tuple for the console's
+    'Identity' row, or ``None`` when the role doesn't pair against
+    a remote control plane.
 
-    Reads three signals:
-
-    * ``BOOTSTRAP_PAIRING_CODE`` in .env — was a pairing code in play
-      at all? Empty → operator went the long-key route → return None.
-    * ``agent_token.jwt`` in the agent's docker volume — non-empty
-      means the agent has registered successfully. The pairing code
-      did its job; we're paired.
-    * ``bootstrap.key`` in the agent's docker volume — non-empty but
-      no JWT means the /pair call succeeded (resolver cached the
-      key) but the register call hasn't yet.
-    * Container state from ``docker ps`` — if the agent container has
-      exited non-zero with no cached key, the pairing-code exchange
-      itself failed (almost always 403 → dead / expired / claimed
-      code). Surface a clear "regenerate" hint.
+    Reads the supervisor's identity dir under
+    ``/var/persist/spatium-supervisor/identity/``. The ``appliance_id``
+    file is created when the supervisor's claim succeeds;
+    ``tls/cert.pem`` (written by the supervisor's poll loop once
+    admin approves) marks the approved state.
 
     Returns ``(label, rich-style)`` so the renderer can colour the row.
     """
-    if role not in _AGENT_VOLUME:
+    if role != "application":
         return None
-    if not env.get("BOOTSTRAP_PAIRING_CODE"):
-        # Long-key route — pairing didn't apply, no row to surface.
-        return None
-
-    vol = _AGENT_VOLUME[role]
-    data_dir = Path(f"/var/lib/docker/volumes/{vol}/_data")
-    jwt = data_dir / "agent_token.jwt"
-    cached_key = data_dir / "bootstrap.key"
-
-    if jwt.exists() and jwt.stat().st_size > 0:
-        return ("Paired ✓", "bold green")
-    if cached_key.exists() and cached_key.stat().st_size > 0:
-        # Pair succeeded, register may still be in flight.
-        return ("Registering…", "bold yellow")
-
-    # No cached key yet. If the container is in an exited / errored
-    # state, the /pair call failed — surface the actionable hint.
-    container = _AGENT_CONTAINER[role]
+    identity_dir = Path("/var/persist/spatium-supervisor/identity")
+    appliance_id_file = identity_dir / "appliance_id"
+    cert_file = Path("/var/persist/spatium-supervisor/tls/cert.pem")
+    if cert_file.exists() and cert_file.stat().st_size > 0:
+        return ("Approved ✓", "bold green")
+    if appliance_id_file.exists() and appliance_id_file.stat().st_size > 0:
+        return ("Awaiting approval", "bold yellow")
+    # No appliance_id yet — supervisor either hasn't claimed the
+    # code or the claim failed. Surface container exit as the
+    # actionable hint.
     for row in ps_rows:
-        if container_service_name(row) != container:
+        if container_service_name(row) != "spatium-supervisor":
             continue
         state = (row.get("State") or "").lower()
         status = (row.get("Status") or "").lower()
         if "exited" in state or "dead" in state or "exited" in status:
             return ("Pair failed — regenerate code on control plane", "bold red")
         break
-
-    return ("Pairing in progress…", "bold yellow")
-
-
-def render_agent_context(
-    env: dict[str, str], role: str, ps_rows: list[dict]
-) -> Panel | None:
-    """Render the small 'Control plane' panel agent roles show.
-
-    Returns None for control / control-only — there's nothing to
-    surface there beyond what Services already shows.
-    """
-    if role in ("control", "control-only"):
-        return None
-    url = env.get("CONTROL_PLANE_URL") or "(not configured)"
-    group = env.get("AGENT_GROUP") or "default"
-
-    grid = Table.grid(padding=(0, 2), expand=True)
-    grid.add_column(width=14, no_wrap=True)
-    grid.add_column(no_wrap=False)
-    grid.add_row(Text("Control plane", style="dim"), Text(url, style="bold"))
-    grid.add_row(Text("Group", style="dim"), Text(group))
-    grid.add_row(Text("Hostname", style="dim"),
-                 Text(env.get("APPLIANCE_HOSTNAME") or os.uname().nodename))
-    pairing = pairing_status(env, role, ps_rows)
-    if pairing is not None:
-        label, style = pairing
-        grid.add_row(Text("Pairing", style="dim"), Text(label, style=style))
-
-    return Panel(grid, box=SQUARE, border_style="cyan",
-                 title="[bold]Agent[/bold]", title_align="left")
+    return ("Bootstrapping…", "bold yellow")
 
 
 def render_log(tail: JournalTail, height: int) -> Panel:
@@ -842,7 +1157,7 @@ def render_footer(message: str = "") -> Text:
         ("F4", "Network"),
         ("F5", "Reboot"),
         ("F6", "Shutdown"),
-        ("F9", "Diag"),
+        ("F8", "Re-pair"),
     ]
     t = Text(no_wrap=True, overflow="ellipsis")
     t.append(" ")
@@ -863,16 +1178,36 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # many rows. Each panel claims exactly content + 2 border rows;
     # footer is a borderless 1-row strip.
     services_count = len(ROLE_SERVICES.get(state.role, []))
-    # Header layout: 5-6 content lines (slot line added on appliance) +
-    # 1 horizontal rule + 2 panel border. Detect slot presence and
-    # size accordingly so we don't waste a row on non-appliance dev runs.
-    HEADER_ROWS = 9 if slot_info() is not None else 8
-    # Agent panel: 3 base rows (control plane / group / hostname) + 2
-    # border. #169 Phase 4 adds a "Pairing" row when the operator
-    # used a pairing code at install time — bump to 4 content rows
-    # whenever that signal is present.
-    has_pairing_row = pairing_status(state.env, state.role, state.ps_rows) is not None
-    AGENT_ROWS = (4 if has_pairing_row else 3) + 2
+    # #170 Wave D + Wave E — render_services unions any supervisor-
+    # spawned service container (dns-bind9 / dns-powerdns / dhcp-kea)
+    # that's either currently in docker ps OR that the supervisor's
+    # watchdog expects to be running (per role-compose.env). Mirror
+    # that here so the Services panel is tall enough to show every
+    # row without truncation, including any missing/expected entries.
+    if state.role == "application":
+        ps_index = {container_service_name(r) for r in state.ps_rows}
+        watchdog_expected = set(watchdog_expected_services())
+        for svc in SUPERVISOR_DYNAMIC_SERVICES:
+            if svc in ps_index or svc in watchdog_expected:
+                services_count += 1
+    # Header layout: 4 base content lines (host+role / IPs / Build /
+    # vitals+disks) + 1 horizontal rule + 2 panel border. ``Slot``,
+    # ``Agent``, and ``Watchdog`` lines each add a row when present.
+    # Pre-#170 fold this carried a separate Agent panel; collapsing
+    # its 2-3 rows into one inline header line saves ~4 visual rows.
+    # Vitals + Disk were merged into one row in the same pass (the
+    # bind-mount dedupe + docker-overlay skip keeps disk entries to 2-3
+    # which fit alongside Up/CPU/RAM/Load on any 80+ col TTY).
+    has_agent_line = state.role == "application"
+    has_watchdog_line = (
+        state.role == "application" and supervisor_watchdog_status() is not None
+    )
+    HEADER_ROWS = (
+        7
+        + (1 if slot_info() is not None else 0)
+        + (1 if has_agent_line else 0)
+        + (1 if has_watchdog_line else 0)
+    )
     SVC_ROWS = services_count + 2   # tight: just borders, no padding
     FOOTER_ROWS = 1   # single-line borderless strip
 
@@ -882,22 +1217,13 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
         Layout(name="body", ratio=1),
         Layout(name="footer", size=FOOTER_ROWS),
     )
-    agent_panel = render_agent_context(state.env, state.role, state.ps_rows)
-    if agent_panel is None:
-        layout["body"].split_column(
-            Layout(name="services", size=SVC_ROWS),
-            Layout(name="log", ratio=1),
-        )
-    else:
-        layout["body"].split_column(
-            Layout(name="agent", size=AGENT_ROWS),
-            Layout(name="services", size=SVC_ROWS),
-            Layout(name="log", ratio=1),
-        )
-        layout["body"]["agent"].update(agent_panel)
+    layout["body"].split_column(
+        Layout(name="services", size=SVC_ROWS),
+        Layout(name="log", ratio=1),
+    )
     layout["header"].update(render_header(state, mono_t))
     layout["body"]["services"].update(render_services(state.role, state.ps_rows))
-    fixed = HEADER_ROWS + SVC_ROWS + FOOTER_ROWS + (AGENT_ROWS if agent_panel else 0)
+    fixed = HEADER_ROWS + SVC_ROWS + FOOTER_ROWS
     log_height = max(state.term_size[1] - fixed, 4)
     layout["body"]["log"].update(render_log(state.tail, log_height))
     layout["footer"].update(render_footer(state.status_message))
@@ -1198,6 +1524,45 @@ def do_network(console: Console) -> None:
         time.sleep(4)
 
 
+def do_pair(console: Console) -> None:
+    """Run ``spatium-pair`` to re-enter control-plane URL + pairing code.
+
+    Strict appliance-application gate — refuses on full-stack /
+    frontend-core boxes (those ARE the control plane; nothing to
+    pair against). The CLI itself prints a useful error if invoked
+    on a non-application role, so the gate here is purely a UX
+    polish to avoid running the tool when it can't help.
+    """
+    role_config = Path("/etc/spatiumddi/role-config")
+    if not role_config.exists():
+        console.print(
+            "[yellow]spatium-pair is only available on Application "
+            "appliances; this box has no /etc/spatiumddi/role-config.[/yellow]"
+        )
+        time.sleep(3)
+        return
+    try:
+        text = role_config.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    is_application = any(
+        line.strip() == "ROLE=application" for line in text.splitlines()
+    )
+    if not is_application:
+        console.print(
+            "[yellow]This appliance isn't an Application role — "
+            "spatium-pair only applies to remote-paired boxes.[/yellow]"
+        )
+        time.sleep(3)
+        return
+    console.clear()
+    try:
+        subprocess.run(["spatium-pair"], check=False)
+    except FileNotFoundError:
+        console.print("[red]spatium-pair not installed[/red]")
+        time.sleep(3)
+
+
 # ── main loop ─────────────────────────────────────────────────────────
 
 
@@ -1213,8 +1578,37 @@ def main() -> int:
     # briefly during the F1 → agetty handoff. SIGTERM is honoured.
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
+    # Probe the target TTY before doing anything expensive (docker
+    # subprocess calls, journal-tail thread, psutil sampler). The
+    # kernel always creates /dev/ttyS0 + /dev/ttyS1 + ... when boot
+    # cmdline carries ``console=ttyS0,…`` even if the VM has no
+    # actual serial device attached — systemd-getty-generator spawns
+    # serial-getty@ttyS0 unconditionally, and the corresponding
+    # spatium-console@ttyS0 instance inherits the same fate.
+    # Without this guard the dashboard goes Live(...) → first frame
+    # render → EIO on stdout.flush() → exit 1 → systemd Restart=always
+    # respawns in 2 s, repeat forever. Each spawn calls docker_ps()
+    # once before failing, which generates a broken-pipe entry on
+    # docker.sock — and at 2 s intervals that's ~30 noise lines/min
+    # in the docker daemon journal for the no-op crash loop. Bailing
+    # out cleanly with exit 0 plus systemd's Restart=on-failure
+    # semantics would be cleaner, but the existing unit uses
+    # Restart=always so we end the loop via RestartPreventExitStatus
+    # — a separate unit-file change adds 75 to that list.
+    if not args.dev:
+        try:
+            with open(args.tty, "wb", buffering=0) as probe:
+                probe.write(b"")
+        except OSError as exc:
+            print(
+                f"spatium-console: {args.tty} not usable ({exc.strerror}); "
+                "skipping dashboard render.",
+                file=sys.stderr,
+            )
+            return 75  # EX_TEMPFAIL — paired with RestartPreventExitStatus=75
+
     env = read_env() if not args.dev else {
-        "APPLIANCE_ROLE": "control",
+        "APPLIANCE_ROLE": "full-stack",
         "APPLIANCE_HOSTNAME": "ddi-dev-01",
         "APPLIANCE_VERSION": "0.1.0-dev",
         "SPATIUMDDI_VERSION": "dev",
@@ -1249,21 +1643,33 @@ def main() -> int:
             state.set_action("containers")
         elif key == "F4":
             state.set_action("network")
-        elif key == "F9":
-            state.set_action("diag")
+        elif key == "F8":
+            state.set_action("pair")
 
     keys = KeyReader(on_key)
     keys.start()
 
     try:
         first_t = time.monotonic()
+        # ``auto_refresh=False`` disables Rich's background refresh
+        # thread — we drive every frame from the main loop's
+        # ``live.update()`` call below. With auto_refresh on (the
+        # default), Rich's internal thread spins at refresh_per_second
+        # AND the main loop re-renders on every REFRESH_INTERVAL tick,
+        # doubling the render cost for no visual benefit. CPU on a
+        # 1-CPU appliance VM dropped from ~92 % to ~30 % after the
+        # toggle.
         with Live(render_frame(state, first_t), console=console,
-                  refresh_per_second=4, screen=True, transient=False) as live:
+                  refresh_per_second=4, auto_refresh=False,
+                  screen=True, transient=False) as live:
             while True:
                 mono_t = time.monotonic()
                 state.refresh()  # self-throttling — only polls docker every DATA_REFRESH_EVERY
                 state.term_size = console.size
-                live.update(render_frame(state, mono_t))
+                # ``refresh=True`` is required when Live is constructed
+                # with ``auto_refresh=False`` — otherwise update() just
+                # stores the new renderable and the screen stays stale.
+                live.update(render_frame(state, mono_t), refresh=True)
 
                 # Drain pending action if any.
                 action = None
@@ -1292,9 +1698,34 @@ def main() -> int:
                                 do_containers(console)
                             elif action == "network":
                                 do_network(console)
-                            elif action == "diag":
-                                do_diag(console)
+                            elif action == "pair":
+                                do_pair(console)
                         finally:
+                            # Hard-reset the terminal state before
+                            # re-entering Live. whiptail (do_pair) +
+                            # nmtui (do_network) + htop (do_monitor)
+                            # can leave the TTY in altscreen-on / raw
+                            # mode / corrupted colour state if they
+                            # exit abnormally; without an explicit
+                            # reset the next ``live.start()`` either
+                            # renders against the wrong cursor coords
+                            # or crashes on the first flush — and
+                            # systemd's Restart=always burns through
+                            # the start-limit before the dashboard
+                            # recovers, leaving operators staring at
+                            # a black tty1. ``stty sane`` + the
+                            # ``\x1b[?1049l`` (exit-altscreen) + ESC c
+                            # (full reset) sequence are cheap and
+                            # idempotent on a working TTY.
+                            try:
+                                subprocess.run(
+                                    ["stty", "sane"], check=False, timeout=2
+                                )
+                                with open(args.tty, "w") as tty_out:
+                                    tty_out.write("\x1b[?1049l\x1bc")
+                                    tty_out.flush()
+                            except OSError:
+                                pass
                             # Re-arm keypress capture, re-enter Live.
                             keys = KeyReader(on_key)
                             keys.start()

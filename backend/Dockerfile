@@ -74,22 +74,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && setcap cap_net_raw,cap_net_bind_service+eip /usr/bin/nmap \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /install /usr/local
-COPY . .
-
 # Non-root user. Pre-create + chown the on-volume paths so the
 # matching named volumes inherit app-user ownership on first attach.
 # Docker only propagates the underlying directory's mode/owner to a
 # fresh volume when the path exists on the image; without these
 # mkdirs the api / worker hit EACCES on the first write attempt.
 #
-#   /var/lib/spatiumddi/backups  — issue #117 (backup archive volume)
-#   /var/lib/spatiumddi/certs    — issue #134 Phase 4b.2 (appliance TLS
-#                                  cert volume, shared with the frontend
-#                                  nginx container at /etc/nginx/certs)
+#   /var/lib/spatiumddi/backups      — issue #117 (backup archive volume)
+#   /var/lib/spatiumddi/certs        — issue #134 Phase 4b.2 (appliance TLS
+#                                      cert volume, shared with the frontend
+#                                      nginx container at /etc/nginx/certs)
+#   /var/lib/spatiumddi/slot-images  — #170 follow-up (air-gap appliance
+#                                      slot-image upload storage)
+#
+# The user is created BEFORE the COPYs so we can use BuildKit's
+# ``--chown=app:app`` flag and avoid a trailing ``chown -R /app``
+# pass — that rewrite would materialise a duplicate copy of every
+# file in a new layer (~550 MB doubled). Setting ownership at COPY
+# time keeps the source layer authoritative.
 RUN useradd --no-create-home --shell /bin/false app \
-    && mkdir -p /var/lib/spatiumddi/backups /var/lib/spatiumddi/certs \
-    && chown -R app:app /app /var/lib/spatiumddi
+    && mkdir -p /var/lib/spatiumddi/backups /var/lib/spatiumddi/certs /var/lib/spatiumddi/slot-images \
+    && chown app:app /app \
+    && chown -R app:app /var/lib/spatiumddi
+
+COPY --from=builder /install /usr/local
+COPY --chown=app:app . .
+
 USER app
 
 EXPOSE 8000
@@ -105,3 +115,22 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # from inside the compose / k8s network — the frontend nginx is the
 # only entity talking to it, and nginx is under our control.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]
+
+
+# ── Stage 3: dev (used by docker-compose.dev.yml) ─────────────────────────────
+# Adds the ``[dev]`` extras (pytest + pytest-asyncio + pytest-xdist +
+# pytest-cov) on top of the runtime stage so ``make test`` can run pytest
+# inside the api container without bloating the production image. The dev
+# compose's ``build.target: dev`` selects this stage; the release pipeline
+# stops at ``runtime``.
+#
+# We install as root (the runtime stage's USER app would block site-packages
+# writes), then switch back to ``app`` so the runtime CMD stays unchanged.
+FROM runtime AS dev
+USER root
+RUN pip install --no-cache-dir --root-user-action=ignore \
+        "pytest>=8.3.0" \
+        "pytest-asyncio>=0.24.0" \
+        "pytest-cov>=6.0.0" \
+        "pytest-xdist>=3.6.0"
+USER app

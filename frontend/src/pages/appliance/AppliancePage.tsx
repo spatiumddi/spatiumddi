@@ -2,29 +2,23 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
   Box,
-  Clock,
   Container as ContainerIcon,
-  Gauge,
-  KeyRound,
   Network,
   ScrollText,
-  Server,
   ShieldCheck,
+  Stamp,
   Wrench,
 } from "lucide-react";
 
 import { applianceApi } from "@/lib/api";
 import { useSessionState } from "@/lib/useSessionState";
+import { FleetTab } from "./FleetTab";
 import { CertificatesTab } from "./CertificatesTab";
 import { ContainersTab } from "./ContainersTab";
-import { FleetTab } from "./FleetTab";
 import { LogsTab } from "./LogsTab";
 import { MaintenanceTab } from "./MaintenanceTab";
 import { NetworkTab } from "./NetworkTab";
-import { NTPTab } from "./NTPTab";
-import { PairingTab } from "./PairingTab";
 import { ReleasesTab } from "./ReleasesTab";
-import { SNMPTab } from "./SNMPTab";
 
 /**
  * SpatiumDDI OS appliance management hub (issue #134, Phase 4).
@@ -43,11 +37,8 @@ import { SNMPTab } from "./SNMPTab";
  */
 type Tab =
   | "tls"
-  | "releases"
   | "fleet"
-  | "pairing"
-  | "snmp"
-  | "ntp"
+  | "releases"
   | "containers"
   | "logs"
   | "network"
@@ -79,6 +70,19 @@ interface TabSpec {
 // includes selfOnly tabs in the same sort order — hiding them on
 // docker / k8s control planes happens at render time, not here.
 const TABS: TabSpec[] = [
+  {
+    // Issue #170 Wave D1 — Fleet tab (renamed from Approvals).
+    // Pending pairings pin at the top with Approve / Reject; approved
+    // rows expose role assignment, OS upgrade, reboot, re-key, and
+    // delete via the per-row drilldown. Not selfOnly: docker / k8s
+    // control planes still manage remote Application appliances here.
+    key: "fleet",
+    label: "Fleet",
+    phase: "170-D1",
+    icon: Stamp,
+    summary:
+      "Manage the Application appliance fleet — approve / reject pending pairings, assign roles + groups, schedule OS slot upgrades + reboots, re-key + delete. Pending rows pin at the top; approved rows open a per-appliance drilldown with capability detail + role assignment + firewall preview + OS upgrade controls.",
+  },
   {
     key: "containers",
     label: "Containers",
@@ -116,60 +120,12 @@ const TABS: TabSpec[] = [
       "Hostname, DNS resolvers, IPv4/IPv6 mode (DHCP vs static, with the wizard's same form), nftables drop-in editor for /etc/nftables.d/, SSH key upload, proxy config, and a reboot-pending banner.",
   },
   {
-    // Issue #154 — fleet-wide chrony config (singleton
-    // platform_settings drives every appliance host). Not selfOnly:
-    // hybrid deployments (docker / k8s control plane with appliance
-    // agents in the fleet) still need to configure NTP for those
-    // agents; the form shows a "chrony is only on appliance hosts"
-    // banner explaining what runs where.
-    key: "ntp",
-    label: "NTP",
-    phase: "154",
-    icon: Clock,
-    summary:
-      "Configure chrony on every appliance host. Pool / unicast servers / mixed; optional NTP-server mode that opens UDP 123 inbound for isolated networks. Rendered chrony.conf ships through the ConfigBundle long-poll, validated host-side before activation, reloaded without a daemon restart.",
-  },
-  {
-    key: "fleet",
-    label: "OS Versions",
-    phase: "8f",
-    icon: Server,
-    summary:
-      "Manage the OS version on this appliance and every registered DNS + DHCP agent from one screen. The pinned self row at the top opens the full A/B slot detail (versions per slot, apply log, rollback) in a modal — same machinery the per-row Upgrade button uses for remote agents. Roll a release out to multiple agents at once via the checkbox column + 'Apply to selected'. Docker / k8s rows show copy-paste commands instead.",
-  },
-  {
-    // Issue #169 — short-lived pairing codes that replace hand-typed
-    // DNS_AGENT_KEY / DHCP_AGENT_KEY entry on the agent installer.
-    // Not selfOnly: a docker / k8s control plane still mints codes
-    // for its remote appliance agents.
-    key: "pairing",
-    label: "Pairing",
-    phase: "169",
-    icon: KeyRound,
-    summary:
-      "Mint short-lived single-use 8-digit codes that an agent installer swaps for the real bootstrap key. Operators no longer have to retype the 64-char hex key over IPMI / Proxmox consoles. Phase 1+2 (this tab) ships the mint + table; Phase 4 wires the installer wizard so the workflow is one-click on both ends.",
-  },
-  {
     key: "releases",
     label: "Releases",
     phase: "4c",
     icon: Box,
     summary:
       "GitHub Releases list with one-click pull-and-recycle, a rollback target picker, and the release notes inline so operators see what they're applying before they apply it.",
-  },
-  {
-    // Issue #153 — fleet-wide config (singleton platform_settings
-    // drives every appliance host's snmpd), so not selfOnly. On
-    // docker / k8s control planes the SNMP form is visible with a
-    // banner explaining the local control plane doesn't run snmpd
-    // but the settings still flow to any registered appliance agents
-    // (hybrid topology).
-    key: "snmp",
-    label: "SNMP",
-    phase: "153",
-    icon: Gauge,
-    summary:
-      "Configure snmpd on every appliance host — local + every registered remote agent. v2c with community + source-CIDR allowlist, or v3 USM with per-user auth/priv. Rendered snmpd.conf ships through the ConfigBundle long-poll, validated host-side before activation. Disabled by default — operators opt in here.",
   },
   {
     key: "tls",
@@ -276,16 +232,10 @@ export function AppliancePage() {
       <div className="flex-1 overflow-auto bg-background p-6">
         {effectiveTab === "tls" ? (
           <CertificatesTab />
-        ) : effectiveTab === "releases" ? (
-          <ReleasesTab applianceMode={isApplianceHost} />
         ) : effectiveTab === "fleet" ? (
           <FleetTab />
-        ) : effectiveTab === "pairing" ? (
-          <PairingTab />
-        ) : effectiveTab === "snmp" ? (
-          <SNMPTab />
-        ) : effectiveTab === "ntp" ? (
-          <NTPTab />
+        ) : effectiveTab === "releases" ? (
+          <ReleasesTab applianceMode={isApplianceHost} />
         ) : effectiveTab === "containers" ? (
           <ContainersTab />
         ) : effectiveTab === "logs" ? (

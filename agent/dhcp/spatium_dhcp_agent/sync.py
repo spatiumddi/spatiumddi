@@ -83,56 +83,15 @@ class SyncLoop:
                     reload_retry_timeout=_BOOTSTRAP_RELOAD_TIMEOUT,
                 )
                 log.info("dhcp_agent_bootstrap_from_cache", etag=etag)
-                # Phase 8f-4 — re-evaluate the cached bundle's
-                # ``fleet_upgrade`` block at startup. The poll-loop
-                # only calls maybe_fire_fleet_upgrade on 200
-                # responses; without this, an agent restart while a
-                # desired_appliance_version is already stamped on the
-                # control plane sees 304-forever (cached etag matches
-                # current bundle) and the trigger file never gets
-                # written. Idempotent — skips when the trigger
-                # already exists or installed equals desired.
-                fleet = bundle.get("fleet_upgrade") or {}
-                if fleet.get("desired_appliance_version"):
-                    from .slot_state import maybe_fire_fleet_upgrade
-
-                    if maybe_fire_fleet_upgrade(
-                        fleet.get("desired_appliance_version"),
-                        fleet.get("desired_slot_image_url"),
-                    ):
-                        log.info(
-                            "fleet_upgrade_triggered_from_cache",
-                            desired_version=fleet.get("desired_appliance_version"),
-                        )
-                if fleet.get("reboot_requested"):
-                    from .slot_state import maybe_fire_reboot
-
-                    if maybe_fire_reboot(True):
-                        log.info("fleet_reboot_triggered_from_cache")
-                # Issue #153 — SNMP config rollout (cache-bootstrap
-                # path; mirrors the 200-response path below). Without
-                # this an agent restart while a non-default SNMP
-                # config is cached would 304-forever and never write
-                # the snmp-config trigger file.
-                snmp_block = bundle.get("snmp_settings")
-                if snmp_block:
-                    from .slot_state import maybe_fire_snmp_reload
-
-                    if maybe_fire_snmp_reload(snmp_block):
-                        log.info(
-                            "snmp_reload_triggered_from_cache",
-                            config_hash=snmp_block.get("config_hash"),
-                        )
-                # Issue #154 — same cache-bootstrap path for NTP.
-                ntp_block = bundle.get("ntp_settings")
-                if ntp_block:
-                    from .slot_state import maybe_fire_ntp_reload
-
-                    if maybe_fire_ntp_reload(ntp_block):
-                        log.info(
-                            "ntp_reload_triggered_from_cache",
-                            config_hash=ntp_block.get("config_hash"),
-                        )
+                # #170 Wave C1 — fleet-upgrade / reboot / SNMP / NTP
+                # trigger-file writes moved to the supervisor's
+                # heartbeat loop. The DHCP service container drops its
+                # host bind mounts (``/etc/spatiumddi-host``,
+                # ``/boot/efi-host``, ``/var/lib/spatiumddi-host/
+                # release-state``, ``/run/udev``) in C1 so it can no
+                # longer write the trigger surface anyway; the
+                # supervisor's appliance-state module is the single
+                # producer of appliance-host trigger files now.
             except Exception:
                 log.exception("bootstrap_cache_apply_failed")
 
@@ -299,50 +258,14 @@ class SyncLoop:
 
         save_config(self.cfg.state_dir, bundle, etag)
 
-        # Phase 8f-4 — fleet upgrade trigger. The control plane stamps
-        # desired_appliance_version on the server row via the Fleet
-        # view; the bundle's ``fleet_upgrade`` block carries it down
-        # here. If the desired version doesn't match what's installed
-        # AND we're on an appliance AND no trigger is already pending,
-        # write the slot-upgrade trigger file. The host-side
-        # spatiumddi-slot-upgrade.path unit picks it up (same path as
-        # the manual /appliance OS Image card).
-        fleet = bundle.get("fleet_upgrade") or {}
-        if fleet.get("desired_appliance_version"):
-            from .slot_state import maybe_fire_fleet_upgrade
-            fired = maybe_fire_fleet_upgrade(
-                fleet.get("desired_appliance_version"),
-                fleet.get("desired_slot_image_url"),
-            )
-            if fired:
-                log.info(
-                    "fleet_upgrade_triggered",
-                    desired_version=fleet.get("desired_appliance_version"),
-                )
-        # Phase 8f-8 — operator-triggered reboot. Same pattern.
-        if fleet.get("reboot_requested"):
-            from .slot_state import maybe_fire_reboot
-            if maybe_fire_reboot(True):
-                log.info("fleet_reboot_triggered")
-        # Issue #153 — SNMP config rollout. Same idempotent shape as
-        # the cache-bootstrap path above; safe to call on every 200.
-        snmp_block = bundle.get("snmp_settings")
-        if snmp_block:
-            from .slot_state import maybe_fire_snmp_reload
-            if maybe_fire_snmp_reload(snmp_block):
-                log.info(
-                    "snmp_reload_triggered",
-                    config_hash=snmp_block.get("config_hash"),
-                )
-        # Issue #154 — same shape for NTP / chrony.
-        ntp_block = bundle.get("ntp_settings")
-        if ntp_block:
-            from .slot_state import maybe_fire_ntp_reload
-            if maybe_fire_ntp_reload(ntp_block):
-                log.info(
-                    "ntp_reload_triggered",
-                    config_hash=ntp_block.get("config_hash"),
-                )
+        # #170 Wave C1 — fleet-upgrade / reboot / SNMP / NTP trigger
+        # writes moved to the supervisor's heartbeat loop. The
+        # ConfigBundle's ``fleet_upgrade`` / ``snmp_settings`` /
+        # ``ntp_settings`` blocks remain in the wire shape for
+        # backwards compatibility with pre-C1 in-field agents; C1+
+        # DHCP service containers ignore them because the supervisor's
+        # appliance_state module is the only producer of appliance-
+        # host trigger files now.
 
         try:
             self._apply_bundle(bundle, reload_kea=True)

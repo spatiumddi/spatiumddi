@@ -77,12 +77,14 @@ SIZE_BYTES=$((SIZE_SECTORS * 512))
 echo "  start=${START_SECTORS}s (${START_BYTES}b) size=${SIZE_SECTORS}s (${SIZE_BYTES}b)"
 
 # Slot size matches the installed system's root_A/root_B size from
-# Phase 8a-1 (4 GiB). spatium-upgrade-slot dd's this image directly
-# into the inactive 4 GiB partition.
-SLOT_BYTES=$((4 * 1024 * 1024 * 1024))
+# the installer's partition layout. #170 Phase A4 bumped the slots
+# 4 GiB → 8 GiB so the full baked container image set fits on-rootfs.
+# ``spatium-upgrade-slot apply`` dd's this image directly into the
+# inactive 8 GiB partition — bytes must match exactly.
+SLOT_BYTES=$((8 * 1024 * 1024 * 1024))
 SLOT_IMG="$WORK/slot.raw"
 
-echo "→ Creating ${SLOT_BYTES} B (4 GiB) slot image…"
+echo "→ Creating ${SLOT_BYTES} B (8 GiB) slot image…"
 truncate -s "$SLOT_BYTES" "$SLOT_IMG"
 mkfs.ext4 -F -L root_a "$SLOT_IMG" >/dev/null 2>&1
 

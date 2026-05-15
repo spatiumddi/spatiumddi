@@ -1,0 +1,117 @@
+#!/bin/bash
+# Host-side external watchdog for the spatium-supervisor container
+# (#170 Wave E).
+#
+# Catches the "supervisor process is alive but its main loop wedged"
+# case that docker's own ``restart: unless-stopped`` + ``HEALTHCHECK
+# pgrep`` misses. The supervisor writes
+# ``/var/persist/spatium-supervisor/last-loop-at`` at the top of
+# every heartbeat-loop iteration; this script checks the file's
+# mtime every 2 minutes (via the matching .timer unit) and force-
+# restarts the supervisor container if the loop hasn't ticked in
+# > STALE_THRESHOLD_S.
+#
+# Restart attempts are rate-limited: at most MAX_RESTARTS_PER_WINDOW
+# in WINDOW_SECONDS. Hitting the cap logs an alert + writes a
+# trigger file the in-process watchdog reports back to the control
+# plane on its next heartbeat.
+
+set -eu
+
+LIVENESS_FILE=/var/persist/spatium-supervisor/last-loop-at
+STATE_DIR=/var/lib/spatiumddi/release-state
+ATTEMPT_LOG="$STATE_DIR/supervisor-watchdog-attempts"
+ALERT_TRIGGER="$STATE_DIR/supervisor-watchdog-alert"
+
+# Stale threshold — supervisor loop iterates roughly every 60 s
+# (heartbeat_interval_seconds default). Restart if mtime is older
+# than 5 min, which gives the supervisor 4 missed loops worth of
+# slack for normal network jitter / docker daemon pauses.
+STALE_THRESHOLD_S=300
+
+# Restart cap: at most 3 restarts in 30 min. Beyond that we're
+# probably restart-looping for some non-transient reason and we
+# should leave the operator a clear breadcrumb instead of churning
+# the container indefinitely.
+WINDOW_SECONDS=1800
+MAX_RESTARTS_PER_WINDOW=3
+
+mkdir -p "$STATE_DIR"
+
+log() {
+    # systemd-journald picks up stderr; tag the line so journalctl
+    # filtering on the unit shows clean output.
+    echo "[supervisor-watchdog] $*" >&2
+}
+
+now=$(date +%s)
+
+# Liveness check ----------------------------------------------------
+
+if [ ! -e "$LIVENESS_FILE" ]; then
+    # First boot or persistent volume wiped — the supervisor will
+    # create the file on its first loop iteration. Don't trigger
+    # a restart yet; give it the start-period grace window.
+    log "liveness file missing — supervisor hasn't completed a loop yet, skipping check"
+    exit 0
+fi
+
+mtime=$(stat -c %Y "$LIVENESS_FILE" 2>/dev/null || echo 0)
+age=$(( now - mtime ))
+
+if [ "$age" -lt "$STALE_THRESHOLD_S" ]; then
+    # Loop is alive — nothing to do.
+    exit 0
+fi
+
+log "supervisor loop is stale (age=${age}s, threshold=${STALE_THRESHOLD_S}s)"
+
+# Rate limiting -----------------------------------------------------
+
+# Read attempts log; drop entries older than the window.
+recent_count=0
+new_log=""
+if [ -f "$ATTEMPT_LOG" ]; then
+    while IFS= read -r ts; do
+        # Skip blank / non-numeric lines defensively.
+        case "$ts" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        if [ "$(( now - ts ))" -lt "$WINDOW_SECONDS" ]; then
+            recent_count=$(( recent_count + 1 ))
+            new_log="$new_log$ts"$'\n'
+        fi
+    done < "$ATTEMPT_LOG"
+fi
+
+if [ "$recent_count" -ge "$MAX_RESTARTS_PER_WINDOW" ]; then
+    log "restart cap reached ($recent_count/$MAX_RESTARTS_PER_WINDOW in ${WINDOW_SECONDS}s) — NOT restarting; writing alert trigger"
+    {
+        echo "ts=$now"
+        echo "recent_count=$recent_count"
+        echo "loop_age_s=$age"
+        echo "max_per_window=$MAX_RESTARTS_PER_WINDOW"
+        echo "window_s=$WINDOW_SECONDS"
+    } > "$ALERT_TRIGGER".tmp
+    mv -f "$ALERT_TRIGGER".tmp "$ALERT_TRIGGER"
+    exit 0
+fi
+
+# Restart -----------------------------------------------------------
+
+log "restarting spatium-supervisor (attempt $((recent_count + 1))/${MAX_RESTARTS_PER_WINDOW} in window)"
+if docker restart spatium-supervisor >/dev/null 2>&1; then
+    log "restart succeeded"
+    # Append the new attempt timestamp before persisting.
+    new_log="$new_log$now"$'\n'
+    printf '%s' "$new_log" > "$ATTEMPT_LOG".tmp
+    mv -f "$ATTEMPT_LOG".tmp "$ATTEMPT_LOG"
+    # Clear any prior alert — the operator-visible signal should
+    # match the current state, and "we just successfully restarted"
+    # is a step back from "cap reached".
+    rm -f "$ALERT_TRIGGER"
+else
+    rc=$?
+    log "docker restart failed with rc=$rc"
+    exit "$rc"
+fi

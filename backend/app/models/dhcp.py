@@ -56,6 +56,21 @@ class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # mode: load-balancing | hot-standby (only rendered when the group has >= 2 Kea peers)
     mode: Mapped[str] = mapped_column(String(20), nullable=False, default="hot-standby")
 
+    # #170 Wave C2 — appliance-side container networking mode. The
+    # supervisor reads this off the heartbeat response when rendering
+    # the dhcp-kea compose snippet on a host with the ``dhcp`` role
+    # assigned. Two values:
+    #   * ``host`` — container shares the host's network namespace
+    #     (today's behaviour). Required for receiving raw L2
+    #     broadcasts from clients on the same broadcast domain.
+    #   * ``bridged`` — container listens on the host IP UDP/67 only.
+    #     For deployments where the DHCP server sits behind a relay
+    #     (``ip helper-address`` / ``dhcrelay``) or a DMZ NAT. Does
+    #     NOT receive local L2 broadcasts.
+    network_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="host", server_default="host"
+    )
+
     # Kea HA hook tuning — rendered into libdhcp_ha.so config when the
     # group is an HA pair. Defaults mirror Kea's documented recommendations.
     heartbeat_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)

@@ -29,6 +29,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
@@ -1689,5 +1690,305 @@ register(
         preview=_preview_allocate_multicast_groups,
         apply=_apply_allocate_multicast_groups,
         category="multicast",
+    )
+)
+
+
+# ── approve_appliance operation (#170 Wave D2) ────────────────────
+
+
+class ApproveApplianceArgs(BaseModel):
+    """Args for the ``approve_appliance`` operation. The LLM passes the
+    appliance_id as a string; we resolve to UUID inside preview/apply."""
+
+    appliance_id: str = Field(description="UUID of the pending appliance row.")
+
+
+async def _preview_approve_appliance(
+    db: AsyncSession, user: User, args: ApproveApplianceArgs
+) -> PreviewResult:
+    from app.models.appliance import (  # noqa: PLC0415 — avoid cycle
+        APPLIANCE_STATE_APPROVED,
+        APPLIANCE_STATE_PENDING_APPROVAL,
+        Appliance,
+    )
+
+    try:
+        appliance_uuid = UUID(args.appliance_id)
+    except ValueError:
+        return PreviewResult(
+            ok=False, detail=f"appliance_id must be a UUID, got {args.appliance_id!r}"
+        )
+    row = await db.get(Appliance, appliance_uuid)
+    if row is None:
+        return PreviewResult(ok=False, detail=f"No appliance with id {args.appliance_id}.")
+    if row.state == APPLIANCE_STATE_APPROVED:
+        return PreviewResult(
+            ok=False,
+            detail=(
+                f"Appliance {row.hostname!r} is already approved. Use "
+                "the Re-key action (UI: Fleet tab drilldown) if you "
+                "need a fresh cert."
+            ),
+        )
+    if row.state != APPLIANCE_STATE_PENDING_APPROVAL:
+        return PreviewResult(
+            ok=False,
+            detail=f"Appliance {row.hostname!r} is in state {row.state!r}; only pending appliances can be approved.",
+        )
+
+    caps = row.capabilities or {}
+    cap_summary = ", ".join(sorted(k for k, v in caps.items() if k.startswith("can_run_") and v))
+    preview_lines = [
+        f"Approve **{row.hostname}** ({appliance_uuid})",
+        f"fingerprint: `{row.public_key_fingerprint[:12]}…`",
+        f"supervisor_version: {row.supervisor_version or '(unknown)'}",
+        f"paired_from_ip: {row.paired_from_ip or '(unknown)'}",
+        f"capabilities: {cap_summary or '(none advertised)'}",
+        "",
+        # Explicit ``+`` concatenation rather than implicit
+        # adjacent-string-literal joining — CodeQL flags the latter
+        # in list literals as a possible missing-comma bug.
+        "This will sign an X.509 cert against the supervisor's "
+        + "Ed25519 pubkey using the control plane's internal CA. "
+        + "The serial is recorded in the audit log; the cert is "
+        + "valid for 90 days. The supervisor picks it up on its "
+        + "next /supervisor/poll and switches from session-token "
+        + "auth to mTLS.",
+    ]
+    return PreviewResult(ok=True, detail="ready", preview_text="\n".join(preview_lines))
+
+
+async def _apply_approve_appliance(
+    db: AsyncSession, user: User, args: ApproveApplianceArgs
+) -> dict[str, Any]:
+    """Mirror the ``approve_appliance`` REST endpoint. Lazy CA
+    bootstrap on first approve; signs a cert against the existing
+    pubkey; writes the cert columns + audit row."""
+    from app.models.appliance import (  # noqa: PLC0415
+        APPLIANCE_STATE_APPROVED,
+        Appliance,
+    )
+    from app.models.audit import AuditLog  # noqa: PLC0415
+    from app.services.appliance.ca import (  # noqa: PLC0415
+        ensure_ca,
+        sign_supervisor_cert,
+    )
+
+    appliance_uuid = UUID(args.appliance_id)
+    row = await db.get(Appliance, appliance_uuid)
+    if row is None:
+        raise ValueError(f"Appliance {args.appliance_id} not found.")
+    if row.state == APPLIANCE_STATE_APPROVED:
+        # Apply is idempotent on the rare race where the operator
+        # clicked Approve in the UI between preview + apply.
+        return {"appliance_id": str(row.id), "already_approved": True}
+
+    ca = await ensure_ca(db)
+    cert_pem, serial_hex, issued_at, expires_at = sign_supervisor_cert(
+        ca=ca,
+        appliance_id=row.id,
+        public_key_der=row.public_key_der,
+        public_key_fingerprint=row.public_key_fingerprint,
+        hostname=row.hostname,
+    )
+    row.cert_pem = cert_pem
+    row.cert_serial = serial_hex
+    row.cert_issued_at = issued_at
+    row.cert_expires_at = expires_at
+    row.state = APPLIANCE_STATE_APPROVED
+    row.approved_at = issued_at
+    row.approved_by_user_id = user.id
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=getattr(user, "auth_source", "local") or "local",
+            action="appliance.approved",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={
+                "hostname": row.hostname,
+                "fingerprint": row.public_key_fingerprint,
+                "cert_serial": serial_hex,
+                "cert_expires_at": expires_at.isoformat(),
+                "via": "ai_proposal",
+            },
+        )
+    )
+    await db.commit()
+    return {
+        "appliance_id": str(row.id),
+        "hostname": row.hostname,
+        "cert_serial": serial_hex,
+        "cert_expires_at": expires_at.isoformat(),
+    }
+
+
+register(
+    Operation(
+        name="approve_appliance",
+        description=(
+            "Approve a pending Application appliance. Signs an X.509 "
+            "cert against the supervisor's Ed25519 pubkey using the "
+            "control plane's internal CA."
+        ),
+        args_model=ApproveApplianceArgs,
+        preview=_preview_approve_appliance,
+        apply=_apply_approve_appliance,
+        category="admin",
+    )
+)
+
+
+# ── assign_appliance_role operation ───────────────────────────────
+
+
+class AssignApplianceRoleArgs(BaseModel):
+    """Args for the ``assign_appliance_role`` operation. Mirrors the
+    REST endpoint's body shape but typed looser (string UUIDs)."""
+
+    appliance_id: str = Field(description="UUID of the approved appliance row.")
+    roles: list[str] = Field(
+        description=(
+            "Subset of dns-bind9 / dns-powerdns / dhcp / observer / "
+            "custom. dns-bind9 + dns-powerdns are mutually exclusive."
+        )
+    )
+    dns_group_id: str | None = None
+    dhcp_group_id: str | None = None
+
+
+_APPL_VALID_ROLES = {"dns-bind9", "dns-powerdns", "dhcp", "observer", "custom"}
+_APPL_DNS_ROLES = {"dns-bind9", "dns-powerdns"}
+
+
+async def _preview_assign_appliance_role(
+    db: AsyncSession, user: User, args: AssignApplianceRoleArgs
+) -> PreviewResult:
+    from app.models.appliance import (  # noqa: PLC0415
+        APPLIANCE_STATE_APPROVED,
+        Appliance,
+    )
+
+    try:
+        appliance_uuid = UUID(args.appliance_id)
+    except ValueError:
+        return PreviewResult(
+            ok=False, detail=f"appliance_id must be a UUID, got {args.appliance_id!r}"
+        )
+    row = await db.get(Appliance, appliance_uuid)
+    if row is None:
+        return PreviewResult(ok=False, detail=f"No appliance with id {args.appliance_id}.")
+    if row.state != APPLIANCE_STATE_APPROVED:
+        return PreviewResult(
+            ok=False,
+            detail=f"Appliance is in state {row.state!r}; only approved appliances can be assigned roles.",
+        )
+    for r in args.roles:
+        if r not in _APPL_VALID_ROLES:
+            return PreviewResult(
+                ok=False, detail=f"Unknown role {r!r}. Valid: {sorted(_APPL_VALID_ROLES)}."
+            )
+    if len(_APPL_DNS_ROLES.intersection(args.roles)) > 1:
+        return PreviewResult(
+            ok=False,
+            detail="dns-bind9 + dns-powerdns are mutually exclusive — one engine per appliance.",
+        )
+    caps = row.capabilities or {}
+    for r in args.roles:
+        cap_key = {
+            "dns-bind9": "can_run_dns_bind9",
+            "dns-powerdns": "can_run_dns_powerdns",
+            "dhcp": "can_run_dhcp",
+            "observer": "can_run_observer",
+        }.get(r)
+        if cap_key is not None and not caps.get(cap_key, False):
+            return PreviewResult(
+                ok=False,
+                detail=(
+                    f"Appliance {row.hostname!r} doesn't advertise "
+                    f"{cap_key}=true; cannot assign role {r!r}."
+                ),
+            )
+
+    preview_lines = [
+        f"Assign roles to **{row.hostname}** ({appliance_uuid})",
+        f"roles: {', '.join(args.roles) if args.roles else '(idle)'}",
+    ]
+    if args.dns_group_id:
+        preview_lines.append(f"dns_group_id: {args.dns_group_id}")
+    if args.dhcp_group_id:
+        preview_lines.append(f"dhcp_group_id: {args.dhcp_group_id}")
+    preview_lines.append(
+        "The supervisor's next heartbeat reads the new role set + "
+        "starts / stops service containers accordingly."
+    )
+    return PreviewResult(ok=True, detail="ready", preview_text="\n".join(preview_lines))
+
+
+async def _apply_assign_appliance_role(
+    db: AsyncSession, user: User, args: AssignApplianceRoleArgs
+) -> dict[str, Any]:
+    from app.models.appliance import Appliance  # noqa: PLC0415
+    from app.models.audit import AuditLog  # noqa: PLC0415
+    from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
+    from app.models.dns import DNSServerGroup  # noqa: PLC0415
+
+    appliance_uuid = UUID(args.appliance_id)
+    row = await db.get(Appliance, appliance_uuid)
+    if row is None:
+        raise ValueError(f"Appliance {args.appliance_id} not found.")
+    row.assigned_roles = list(args.roles)
+    if args.dns_group_id:
+        dns_group = await db.get(DNSServerGroup, UUID(args.dns_group_id))
+        if dns_group is None:
+            raise ValueError(f"DNS group {args.dns_group_id} not found.")
+        row.assigned_dns_group_id = dns_group.id
+    if args.dhcp_group_id:
+        dhcp_group = await db.get(DHCPServerGroup, UUID(args.dhcp_group_id))
+        if dhcp_group is None:
+            raise ValueError(f"DHCP group {args.dhcp_group_id} not found.")
+        row.assigned_dhcp_group_id = dhcp_group.id
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=getattr(user, "auth_source", "local") or "local",
+            action="appliance.role_assigned",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={
+                "roles": list(args.roles),
+                "dns_group_id": args.dns_group_id,
+                "dhcp_group_id": args.dhcp_group_id,
+                "via": "ai_proposal",
+            },
+        )
+    )
+    await db.commit()
+    return {
+        "appliance_id": str(row.id),
+        "hostname": row.hostname,
+        "roles": list(args.roles),
+    }
+
+
+register(
+    Operation(
+        name="assign_appliance_role",
+        description=(
+            "Assign roles + groups to an approved appliance. "
+            "Validates against advertised capabilities + the "
+            "one-DNS-engine-per-box rule before applying."
+        ),
+        args_model=AssignApplianceRoleArgs,
+        preview=_preview_assign_appliance_role,
+        apply=_apply_assign_appliance_role,
+        category="admin",
     )
 )

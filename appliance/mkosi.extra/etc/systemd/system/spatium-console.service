@@ -52,6 +52,12 @@ TTYVTDisallocate=yes
 # the dashboard back on the next tty1 switch.
 Restart=always
 RestartSec=2
+# Bail out of the restart loop when the script exits with 75
+# (EX_TEMPFAIL). spatium-console probes the target TTY at startup and
+# returns 75 on EIO so we don't crash-loop the dashboard on a TTY that
+# isn't usable (rare on tty1 itself, but mirrors the @.service
+# instance template for consistency).
+RestartPreventExitStatus=75
 UtmpIdentifier=spc1
 UtmpMode=user
 # Same nicety getty@.service applies — keep us out of the OOM killer

@@ -2,11 +2,14 @@ from app.models.acme import ACMEAccount
 from app.models.ai import AIChatMessage, AIChatSession, AIProvider
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.appliance import (
-    PAIRING_KIND_BOTH,
-    PAIRING_KIND_DHCP,
-    PAIRING_KIND_DNS,
-    PAIRING_KINDS,
+    APPLIANCE_STATE_APPROVED,
+    APPLIANCE_STATE_PENDING_APPROVAL,
+    APPLIANCE_STATE_REJECTED,
+    APPLIANCE_STATES,
+    Appliance,
+    ApplianceCA,
     ApplianceCertificate,
+    PairingClaim,
     PairingCode,
 )
 from app.models.asn import ASN, ASNRpkiRoa, BGPCommunity, BGPPeering
@@ -107,12 +110,15 @@ __all__ = [
     "AuditForwardTarget",
     "AlertRule",
     "AlertEvent",
+    "Appliance",
+    "ApplianceCA",
     "ApplianceCertificate",
+    "APPLIANCE_STATE_APPROVED",
+    "APPLIANCE_STATE_PENDING_APPROVAL",
+    "APPLIANCE_STATE_REJECTED",
+    "APPLIANCE_STATES",
+    "PairingClaim",
     "PairingCode",
-    "PAIRING_KIND_DNS",
-    "PAIRING_KIND_DHCP",
-    "PAIRING_KIND_BOTH",
-    "PAIRING_KINDS",
     "ASN",
     "ASNRpkiRoa",
     "BGPCommunity",
