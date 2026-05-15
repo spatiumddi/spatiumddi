@@ -1556,16 +1556,32 @@ def do_monitor(console: Console, tty: str) -> None:
     console.print("[bold]Launching htop — q or F10 to exit.[/bold]\n")
     _prepare_tty_for_subprocess(tty)
     try:
-        subprocess.run(
-            ["runuser", "-u", "admin", "--", "htop"], check=False, env=_term_env()
-        )
-    except FileNotFoundError:
-        # htop missing on this image — fall back to top, which is in
-        # procps and effectively always present on Debian.
-        console.print("[yellow]htop not installed; falling back to top.[/yellow]")
-        subprocess.run(
-            ["runuser", "-u", "admin", "--", "top"], check=False, env=_term_env()
-        )
+        with open(tty, "r+b", buffering=0) as tty_io:
+            try:
+                subprocess.run(
+                    ["runuser", "-u", "admin", "--", "htop"],
+                    check=False,
+                    env=_term_env(),
+                    stdin=tty_io,
+                    stdout=tty_io,
+                    stderr=tty_io,
+                )
+            except FileNotFoundError:
+                # htop missing on this image — fall back to top.
+                console.print(
+                    "[yellow]htop not installed; falling back to top.[/yellow]"
+                )
+                subprocess.run(
+                    ["runuser", "-u", "admin", "--", "top"],
+                    check=False,
+                    env=_term_env(),
+                    stdin=tty_io,
+                    stdout=tty_io,
+                    stderr=tty_io,
+                )
+    except OSError as exc:
+        console.print(f"[red]Failed to open {tty}: {exc}[/red]")
+        time.sleep(3)
 
 
 def do_containers(console: Console, tty: str) -> None:
@@ -1579,7 +1595,18 @@ def do_containers(console: Console, tty: str) -> None:
     console.clear()
     console.print("[bold]docker stats — Ctrl-C to return to the dashboard.[/bold]\n")
     _prepare_tty_for_subprocess(tty)
-    subprocess.run(["docker", "stats"], check=False)
+    try:
+        with open(tty, "r+b", buffering=0) as tty_io:
+            subprocess.run(
+                ["docker", "stats"],
+                check=False,
+                stdin=tty_io,
+                stdout=tty_io,
+                stderr=tty_io,
+            )
+    except OSError as exc:
+        console.print(f"[red]Failed to open {tty}: {exc}[/red]")
+        time.sleep(3)
 
 
 def do_network(console: Console, tty: str) -> None:
@@ -1595,8 +1622,19 @@ def do_network(console: Console, tty: str) -> None:
     """
     console.clear()
     _prepare_tty_for_subprocess(tty)
+    # Same TTY-redirect pattern as do_pair — keep stderr off the
+    # journald pipe so ncurses error / status output reaches the
+    # screen.
     try:
-        subprocess.run(["nmtui"], check=False, env=_term_env())
+        with open(tty, "r+b", buffering=0) as tty_io:
+            subprocess.run(
+                ["nmtui"],
+                check=False,
+                env=_term_env(),
+                stdin=tty_io,
+                stdout=tty_io,
+                stderr=tty_io,
+            )
     except FileNotFoundError:
         console.print(
             "[red]nmtui not installed — this appliance image predates the "
@@ -1604,6 +1642,9 @@ def do_network(console: Console, tty: str) -> None:
             "`systemctl restart systemd-networkd` to reconfigure.[/red]"
         )
         time.sleep(4)
+    except OSError as exc:
+        console.print(f"[red]Failed to open {tty}: {exc}[/red]")
+        time.sleep(3)
 
 
 def do_pair(console: Console, tty: str) -> None:
@@ -1639,10 +1680,30 @@ def do_pair(console: Console, tty: str) -> None:
         return
     console.clear()
     _prepare_tty_for_subprocess(tty)
+    # CRITICAL: explicitly route stdin / stdout / stderr to the TTY.
+    # The systemd unit sets ``StandardError=journal`` so the Python
+    # process's stderr is a pipe to journald, NOT the terminal.
+    # spatium-pair uses the standard bash whiptail idiom ``3>&1 1>&2
+    # 2>&3`` which swaps stdout ↔ stderr so whiptail's UI (drawn on
+    # whatever ends up as fd 2 post-swap) reaches the terminal. With
+    # stderr → journald inherited, the swap puts whiptail's UI on the
+    # journald pipe instead — operator sees a blank screen. Forcing
+    # all three streams to the TTY here bypasses the journald redirect.
     try:
-        subprocess.run(["spatium-pair"], check=False, env=_term_env())
+        with open(tty, "r+b", buffering=0) as tty_io:
+            subprocess.run(
+                ["spatium-pair"],
+                check=False,
+                env=_term_env(),
+                stdin=tty_io,
+                stdout=tty_io,
+                stderr=tty_io,
+            )
     except FileNotFoundError:
         console.print("[red]spatium-pair not installed[/red]")
+        time.sleep(3)
+    except OSError as exc:
+        console.print(f"[red]Failed to open {tty}: {exc}[/red]")
         time.sleep(3)
 
 
