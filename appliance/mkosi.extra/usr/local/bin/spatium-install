@@ -412,7 +412,15 @@ ask_timezone() {
         --inputbox "Timezone (IANA name, e.g. America/Toronto, Europe/Berlin, UTC):" \
         10 70 "$TIMEZONE" 3>&1 1>&2 2>&3) \
         || return 1
-    [ -z "$TIMEZONE" ] && TIMEZONE="UTC"
+    # ``[ -z "$TIMEZONE" ] && TIMEZONE="UTC"`` here would return 1 when
+    # TIMEZONE is non-empty (the [ test fails, && short-circuits, the
+    # function inherits the [ test's exit code), and the state machine
+    # would then treat OK as Back — infinite-looping the operator back
+    # into ask_network. Use an if/then so the function always exits 0
+    # on success.
+    if [ -z "$TIMEZONE" ]; then
+        TIMEZONE="UTC"
+    fi
 }
 
 confirm() {
