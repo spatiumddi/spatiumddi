@@ -43,7 +43,7 @@ from typing import Any
 import httpx
 import structlog
 
-from . import appliance_state, docker_api
+from . import appliance_state, approval_state, docker_api
 from .cert_auth import build_auth_headers, load_cert, save_cert
 from .config import SupervisorConfig
 from .firewall_renderer import FirewallProfile, render_drop_in
@@ -590,23 +590,56 @@ def heartbeat_once(
     try:
         resp = client.post(url, json=body, headers=headers, timeout=10.0)
     except httpx.HTTPError as exc:
+        # Transient network / DNS / timeout — don't count toward
+        # revocation strikes. The control plane is unreachable, not
+        # rejecting us; once it comes back the 200 path resumes.
         log.warning("supervisor.heartbeat.failed", error=str(exc))
         return
-    if resp.status_code == 403:
-        # Approval revoked / row deleted. The supervisor's next
-        # registration attempt would land it back in pending — but we
-        # don't tear down the local identity here. C2/D's deeper
-        # state machine handles the "fall back to pairing" path.
-        log.warning("supervisor.heartbeat.forbidden", appliance_id=str(appliance_id))
-        return
-    if resp.status_code == 404:
-        # Module disabled (supervisor_registration_enabled flipped
-        # off mid-flight) or row deleted. Same shape as 403 — log +
-        # keep idling so a re-enable picks the supervisor back up
-        # without a restart.
-        log.warning("supervisor.heartbeat.not_found")
+    if resp.status_code == 403 or resp.status_code == 404:
+        # 403 = approval revoked or cert no longer valid for any
+        # known appliance row. 404 = appliance row deleted, or the
+        # control plane's supervisor_registration_enabled flag is
+        # off. Both mean "you shouldn't be talking to me anymore" —
+        # increment the consecutive-strike counter; flip to
+        # ``revoked`` once REVOCATION_STRIKE_LIMIT in a row, which
+        # de-noises a short control-plane restart.
+        prior_state = approval_state.read_state(cfg.state_dir)
+        new_state, strikes = approval_state.record_revocation_signal(cfg.state_dir)
+        log.warning(
+            "supervisor.heartbeat.rejected",
+            status_code=resp.status_code,
+            strikes=strikes,
+            new_state=new_state,
+            appliance_id=str(appliance_id),
+        )
+        # Tear down any supervised service containers when crossing
+        # the threshold from approved → revoked. The control plane
+        # has explicitly disowned us; leaving the DNS/DHCP daemons
+        # running would have them serve stale config against clients
+        # that no longer have a config sync path. Explicit operator
+        # intent (deleted the row) is distinct from Non-negotiable #5
+        # (cache + keep running when control plane is unreachable);
+        # rejection isn't unreachable.
+        if new_state == "revoked" and prior_state != "revoked":
+            if appliance_state.detect_deployment_kind() == "appliance":
+                try:
+                    env_path = cfg.state_dir / _ROLE_ENV_FILENAME
+                    lifecycle = apply_role_assignment([], env_path)
+                    log.warning(
+                        "supervisor.heartbeat.revoked_teardown",
+                        state=lifecycle.state,
+                        stopped=list(lifecycle.stopped),
+                        reason=lifecycle.reason,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "supervisor.heartbeat.revoked_teardown_failed",
+                        error=str(exc),
+                    )
         return
     if resp.status_code >= 500:
+        # 5xx is the control plane crashing mid-flight, not a
+        # deliberate rejection — don't count toward revocation.
         log.warning(
             "supervisor.heartbeat.server_error",
             status_code=resp.status_code,
@@ -618,6 +651,9 @@ def heartbeat_once(
             status_code=resp.status_code,
         )
         return
+    # Heartbeat accepted — clear any prior strike counter and stamp
+    # ``approved`` if we weren't there yet.
+    approval_state.record_success(cfg.state_dir)
 
     try:
         body_out = resp.json()
@@ -720,6 +756,20 @@ def heartbeat_once(
     # = ~14 minutes of wasted CPU per day on a fleet that wasn't
     # transitioning anything. The sidecar hash file is reset on
     # supervisor restart so a fresh boot always re-applies once.
+    # #170 Wave E follow-up — if the appliance row was deleted on the
+    # control plane and we tripped the revocation threshold above
+    # (well, on a prior heartbeat — the 200 path above wouldn't have
+    # been reached if we were rejected now), stop touching the local
+    # compose state. The cached role-compose.env is stale by
+    # definition and re-applying it just keeps the supervisor sliding
+    # toward a state the control plane no longer expects. The console
+    # dashboard surfaces the red ``Approval revoked`` chip so the
+    # operator knows the recovery is "re-pair from /appliance/pairing".
+    if approval_state.read_state(cfg.state_dir) == "revoked":
+        log.info("supervisor.heartbeat.lifecycle_skipped_revoked")
+        _ = identity
+        return
+
     if not env_write_failed and appliance_state.detect_deployment_kind() == "appliance":
         env_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
         last_hash = _read_last_apply_hash(cfg.state_dir)

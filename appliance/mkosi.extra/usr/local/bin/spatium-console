@@ -1100,19 +1100,40 @@ def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple
     'Identity' row, or ``None`` when the role doesn't pair against
     a remote control plane.
 
-    Reads the supervisor's identity dir under
-    ``/var/persist/spatium-supervisor/identity/``. The ``appliance_id``
-    file is created when the supervisor's claim succeeds;
-    ``tls/cert.pem`` (written by the supervisor's poll loop once
-    admin approves) marks the approved state.
+    Reads the supervisor's state dir under
+    ``/var/persist/spatium-supervisor/``:
+
+    * ``approval-state`` — when present and ``revoked``, the control
+      plane has rejected our heartbeats long enough that the
+      supervisor flipped to the revoked state (issue #170 Wave E
+      follow-up). Takes precedence over cert.pem so a stale-cert
+      "Approved ✓" can't mislead the operator after a server-side
+      deletion.
+    * ``identity/appliance_id`` — created when the supervisor's
+      pairing-code claim succeeds.
+    * ``tls/cert.pem`` — created when the admin approves the row.
 
     Returns ``(label, rich-style)`` so the renderer can colour the row.
     """
     if role != "application":
         return None
-    identity_dir = Path("/var/persist/spatium-supervisor/identity")
+    state_dir = Path("/var/persist/spatium-supervisor")
+    approval_state_file = state_dir / "approval-state"
+    identity_dir = state_dir / "identity"
     appliance_id_file = identity_dir / "appliance_id"
-    cert_file = Path("/var/persist/spatium-supervisor/tls/cert.pem")
+    cert_file = state_dir / "tls" / "cert.pem"
+
+    # Revoked is the loudest signal — read it first so an operator
+    # who deleted the row but didn't yet ``rm`` cert.pem doesn't see
+    # a stale green chip. The recovery path is documented in the
+    # label text (re-pair from /appliance/pairing).
+    try:
+        approval_state_text = approval_state_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        approval_state_text = ""
+    if approval_state_text == "revoked":
+        return ("Approval revoked — re-pair from /appliance/pairing", "bold red")
+
     if cert_file.exists() and cert_file.stat().st_size > 0:
         return ("Approved ✓", "bold green")
     if appliance_id_file.exists() and appliance_id_file.stat().st_size > 0:
