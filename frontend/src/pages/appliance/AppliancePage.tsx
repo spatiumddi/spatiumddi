@@ -2,9 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
   Box,
-  Clock,
   Container as ContainerIcon,
-  Gauge,
   Network,
   ScrollText,
   ShieldCheck,
@@ -20,9 +18,7 @@ import { ContainersTab } from "./ContainersTab";
 import { LogsTab } from "./LogsTab";
 import { MaintenanceTab } from "./MaintenanceTab";
 import { NetworkTab } from "./NetworkTab";
-import { NTPTab } from "./NTPTab";
 import { ReleasesTab } from "./ReleasesTab";
-import { SNMPTab } from "./SNMPTab";
 
 /**
  * SpatiumDDI OS appliance management hub (issue #134, Phase 4).
@@ -43,8 +39,6 @@ type Tab =
   | "tls"
   | "approvals"
   | "releases"
-  | "snmp"
-  | "ntp"
   | "containers"
   | "logs"
   | "network"
@@ -126,40 +120,12 @@ const TABS: TabSpec[] = [
       "Hostname, DNS resolvers, IPv4/IPv6 mode (DHCP vs static, with the wizard's same form), nftables drop-in editor for /etc/nftables.d/, SSH key upload, proxy config, and a reboot-pending banner.",
   },
   {
-    // Issue #154 — fleet-wide chrony config (singleton
-    // platform_settings drives every appliance host). Not selfOnly:
-    // hybrid deployments (docker / k8s control plane with appliance
-    // agents in the fleet) still need to configure NTP for those
-    // agents; the form shows a "chrony is only on appliance hosts"
-    // banner explaining what runs where.
-    key: "ntp",
-    label: "NTP",
-    phase: "154",
-    icon: Clock,
-    summary:
-      "Configure chrony on every appliance host. Pool / unicast servers / mixed; optional NTP-server mode that opens UDP 123 inbound for isolated networks. Rendered chrony.conf ships through the ConfigBundle long-poll, validated host-side before activation, reloaded without a daemon restart.",
-  },
-  {
     key: "releases",
     label: "Releases",
     phase: "4c",
     icon: Box,
     summary:
       "GitHub Releases list with one-click pull-and-recycle, a rollback target picker, and the release notes inline so operators see what they're applying before they apply it.",
-  },
-  {
-    // Issue #153 — fleet-wide config (singleton platform_settings
-    // drives every appliance host's snmpd), so not selfOnly. On
-    // docker / k8s control planes the SNMP form is visible with a
-    // banner explaining the local control plane doesn't run snmpd
-    // but the settings still flow to any registered appliance agents
-    // (hybrid topology).
-    key: "snmp",
-    label: "SNMP",
-    phase: "153",
-    icon: Gauge,
-    summary:
-      "Configure snmpd on every appliance host — local + every registered remote agent. v2c with community + source-CIDR allowlist, or v3 USM with per-user auth/priv. Rendered snmpd.conf ships through the ConfigBundle long-poll, validated host-side before activation. Disabled by default — operators opt in here.",
   },
   {
     key: "tls",
@@ -270,10 +236,6 @@ export function AppliancePage() {
           <ApprovalsTab />
         ) : effectiveTab === "releases" ? (
           <ReleasesTab applianceMode={isApplianceHost} />
-        ) : effectiveTab === "snmp" ? (
-          <SNMPTab />
-        ) : effectiveTab === "ntp" ? (
-          <NTPTab />
         ) : effectiveTab === "containers" ? (
           <ContainersTab />
         ) : effectiveTab === "logs" ? (

@@ -32,7 +32,9 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
+import { NTPTab } from "./NTPTab";
 import { PairingTab } from "./PairingTab";
+import { SNMPTab } from "./SNMPTab";
 
 /**
  * Appliance → Fleet tab (#170 Wave D1; supersedes Wave B3 "Approvals").
@@ -132,12 +134,14 @@ export function ApprovalsTab() {
   });
 
   // #170 follow-up — left-sidebar nav mirroring SettingsPage's
-  // shape. Three sections: the appliance fleet table, pairing-code
-  // management, and air-gap slot-image uploads. ``useSessionState``
+  // shape. Sections: the appliance fleet table, pairing-code
+  // management, air-gap slot-image uploads, plus NTP + SNMP
+  // (fleet-wide platform_settings the supervisor pushes to every
+  // appliance host via the ConfigBundle long-poll). ``useSessionState``
   // persists the operator's pick so a refresh inside the same tab
   // lands them back on the same section.
   const [view, setView] = useSessionState<
-    "appliances" | "pairing" | "slot-images"
+    "appliances" | "pairing" | "slot-images" | "ntp" | "snmp"
   >("appliance.fleet.section", "appliances");
 
   const [drilldown, setDrilldown] = useState<ApplianceRow | null>(null);
@@ -205,7 +209,7 @@ export function ApprovalsTab() {
   }
 
   const navItems: {
-    key: "appliances" | "pairing" | "slot-images";
+    key: "appliances" | "pairing" | "slot-images" | "ntp" | "snmp";
     label: string;
     summary: string;
     badge?: string | number;
@@ -225,6 +229,16 @@ export function ApprovalsTab() {
       key: "slot-images",
       label: "Slot images",
       summary: "Air-gap .raw.xz upload + browse.",
+    },
+    {
+      key: "ntp",
+      label: "NTP",
+      summary: "Fleet-wide chrony config.",
+    },
+    {
+      key: "snmp",
+      label: "SNMP",
+      summary: "Fleet-wide snmpd config.",
     },
   ];
 
@@ -292,6 +306,34 @@ export function ApprovalsTab() {
                 upgrade points at the uploaded row.
               </p>
               <SlotImageManager />
+            </div>
+          )}
+
+          {view === "ntp" && (
+            <div>
+              <h2 className="mb-1 text-base font-semibold">NTP (chrony)</h2>
+              <p className="mb-4 text-xs text-muted-foreground">
+                Fleet-wide chrony configuration. The rendered{" "}
+                <code>chrony.conf</code> ships through the ConfigBundle
+                long-poll to every appliance host (local + every registered
+                supervisor), validated host-side before activation. Reloaded
+                without a daemon restart.
+              </p>
+              <NTPTab />
+            </div>
+          )}
+
+          {view === "snmp" && (
+            <div>
+              <h2 className="mb-1 text-base font-semibold">SNMP (snmpd)</h2>
+              <p className="mb-4 text-xs text-muted-foreground">
+                Fleet-wide snmpd configuration — v2c with community +
+                source-CIDR allowlist, or v3 USM with per-user auth/priv. The
+                rendered <code>snmpd.conf</code> ships through the ConfigBundle
+                long-poll to every appliance host. Disabled by default —
+                operators opt in here.
+              </p>
+              <SNMPTab />
             </div>
           )}
 
