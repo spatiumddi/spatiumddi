@@ -1746,12 +1746,15 @@ async def _preview_approve_appliance(
         f"paired_from_ip: {row.paired_from_ip or '(unknown)'}",
         f"capabilities: {cap_summary or '(none advertised)'}",
         "",
+        # Explicit ``+`` concatenation rather than implicit
+        # adjacent-string-literal joining — CodeQL flags the latter
+        # in list literals as a possible missing-comma bug.
         "This will sign an X.509 cert against the supervisor's "
-        "Ed25519 pubkey using the control plane's internal CA. "
-        "The serial is recorded in the audit log; the cert is "
-        "valid for 90 days. The supervisor picks it up on its "
-        "next /supervisor/poll and switches from session-token "
-        "auth to mTLS.",
+        + "Ed25519 pubkey using the control plane's internal CA. "
+        + "The serial is recorded in the audit log; the cert is "
+        + "valid for 90 days. The supervisor picks it up on its "
+        + "next /supervisor/poll and switches from session-token "
+        + "auth to mTLS.",
     ]
     return PreviewResult(ok=True, detail="ready", preview_text="\n".join(preview_lines))
 
