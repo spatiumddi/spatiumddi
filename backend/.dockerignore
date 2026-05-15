@@ -1,0 +1,50 @@
+# Keep the docker build context (and the ``COPY . .`` layer in
+# Dockerfile) lean. Without this file, the host's local ``.venv`` +
+# ``.mypy_cache`` alone add ~470 MB to the api image and propagate
+# into every shared tag (worker / beat / migrate), inflating the
+# appliance docker-overlay + ISO by the same amount.
+
+# ── Python virtualenvs (host-side dev tools — never run inside the container)
+.venv/
+venv/
+env/
+.python-version
+
+# ── Lint / type-check / test caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# ── Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ── Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# ── Secrets and ad-hoc local files — never bake into images
+.env
+.env.*
+*.local
+
+# ── Git metadata (the image doesn't need a working tree)
+.git/
+.gitignore
+
+# ── Docker config files (already in the layer that consumes them)
+Dockerfile
+Dockerfile.*
+.dockerignore
+
+# ── Build / dist outputs
+build/
+dist/
+*.egg-info/

@@ -344,11 +344,18 @@ jobs:
           BAKE_SOURCE: ghcr
         run: |
           set -euo pipefail
-          echo "→ Pulling every image at ${SPATIUMDDI_VERSION} + saving zstd tarballs"
+          echo "→ Pulling every image at ${SPATIUMDDI_VERSION} + baking docker-overlay.img"
           chmod +x appliance/scripts/bake-images.sh
-          appliance/scripts/bake-images.sh
-          echo "→ Baked image set:"
-          ls -lh appliance/mkosi.extra/usr/local/share/spatiumddi/images/
+          # #170 Phase E1 — bake-images.sh runs a sandboxed docker:dind
+          # to populate /var/lib/docker, then mkfs.ext4 + rsync into
+          # a per-slot overlay image. The runner needs nested-docker +
+          # loop-mount privileges; GitHub-hosted ubuntu-latest runners
+          # have both. ``sudo`` is required for the loop-mount step.
+          sudo appliance/scripts/bake-images.sh
+          echo "→ Baked overlay image:"
+          ls -lh appliance/mkosi.extra/usr/lib/spatiumddi/docker-overlay.img
+          echo "→ Manifest:"
+          cat appliance/mkosi.extra/usr/lib/spatiumddi/docker-overlay.manifest
       - name: Build raw image (mkosi)
         run: |
           set -euo pipefail

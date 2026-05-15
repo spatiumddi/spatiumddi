@@ -74,9 +74,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && setcap cap_net_raw,cap_net_bind_service+eip /usr/bin/nmap \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /install /usr/local
-COPY . .
-
 # Non-root user. Pre-create + chown the on-volume paths so the
 # matching named volumes inherit app-user ownership on first attach.
 # Docker only propagates the underlying directory's mode/owner to a
@@ -89,9 +86,19 @@ COPY . .
 #                                      nginx container at /etc/nginx/certs)
 #   /var/lib/spatiumddi/slot-images  — #170 follow-up (air-gap appliance
 #                                      slot-image upload storage)
+#
+# The user is created BEFORE the COPYs so we can use BuildKit's
+# ``--chown=app:app`` flag and avoid a trailing ``chown -R /app``
+# pass — that rewrite would materialise a duplicate copy of every
+# file in a new layer (~550 MB doubled). Setting ownership at COPY
+# time keeps the source layer authoritative.
 RUN useradd --no-create-home --shell /bin/false app \
     && mkdir -p /var/lib/spatiumddi/backups /var/lib/spatiumddi/certs /var/lib/spatiumddi/slot-images \
-    && chown -R app:app /app /var/lib/spatiumddi
+    && chown -R app:app /var/lib/spatiumddi
+
+COPY --from=builder /install /usr/local
+COPY --chown=app:app . .
+
 USER app
 
 EXPOSE 8000

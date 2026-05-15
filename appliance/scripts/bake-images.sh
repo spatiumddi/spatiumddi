@@ -103,15 +103,39 @@ ensure_image() {
     fi
     # SpatiumDDI image — append the release tag.
     if [ "$BAKE_SOURCE" = "local" ]; then
-        local local_name dev_tag
-        local_name=$(basename "$published")
-        dev_tag="${local_name}:dev"
-        if docker image inspect "$dev_tag" >/dev/null 2>&1; then
+        local base candidates dev_tag
+        base=$(basename "$published")
+        # Local image naming in this repo is inconsistent:
+        #   * ``ghcr.io/spatiumddi/spatiumddi-api`` → ``spatiumddi-api:dev``
+        #     (basename already includes the ``spatiumddi-`` prefix)
+        #   * ``ghcr.io/spatiumddi/spatium-supervisor`` → ``spatium-supervisor:dev``
+        #     (basename matches verbatim)
+        #   * ``ghcr.io/spatiumddi/dns-bind9`` → ``spatiumddi-dns-bind9:dev``
+        #     (docker-compose.dev.yml prepends ``spatiumddi-`` to the
+        #      bare service name to namespace the dev tag)
+        # So we try both forms — basename verbatim, and basename with a
+        # ``spatiumddi-`` prefix when not already present — and accept
+        # whichever exists.
+        candidates=("${base}:dev")
+        case "$base" in
+            spatiumddi-*|spatium-*) ;;
+            *) candidates+=("spatiumddi-${base}:dev") ;;
+        esac
+        dev_tag=""
+        for candidate in "${candidates[@]}"; do
+            if docker image inspect "$candidate" >/dev/null 2>&1; then
+                dev_tag="$candidate"
+                break
+            fi
+        done
+        if [ -n "$dev_tag" ]; then
             # Make sure the canonical release-tag exists too for the
             # appliance compose's image: pin to substitute against.
             docker tag "$dev_tag" "${published}:${VERSION}" >/dev/null 2>&1 || true
         elif ! docker image inspect "${published}:${VERSION}" >/dev/null 2>&1; then
-            echo "✗ neither $dev_tag nor ${published}:${VERSION} found locally" >&2
+            echo "✗ no local dev image found for ${published}" >&2
+            echo "  tried: ${candidates[*]}" >&2
+            echo "  hint: run 'make build' first." >&2
             return 1
         fi
         printf '%s\n' "${published}:${VERSION}"

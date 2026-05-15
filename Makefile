@@ -156,22 +156,28 @@ appliance:
 	    --output-directory=build --force build
 	@raw=$$(ls $(APPLIANCE_OUT)/spatiumddi-appliance*.raw 2>/dev/null | head -1); \
 	if [ -n "$$raw" ]; then \
-	  qcow2=$${raw%.raw}.qcow2; \
-	  echo "→ Converting raw → qcow2…"; \
-	  docker run --rm --entrypoint qemu-img \
-	      -v $(PWD)/$(APPLIANCE_OUT):/build \
-	      $(APPLIANCE_BUILDER) \
-	      convert -O qcow2 "/build/$$(basename $$raw)" "/build/$$(basename $$qcow2)"; \
-	  ls -lh "$$qcow2"; \
+	  ls -lh "$$raw"; \
 	  echo ""; \
-	  echo "✓ Built: $$qcow2"; \
-	  echo "  Boot it with: qemu-system-x86_64 -enable-kvm -m 4G -smp 2 \\"; \
-	  echo "                -drive file=$$qcow2,if=virtio \\"; \
-	  echo "                -nic user,hostfwd=tcp::8080-:80,hostfwd=tcp::2222-:22"; \
+	  echo "✓ Built: $$raw"; \
+	  echo "  Wrap as ISO with: make appliance-iso"; \
 	else \
 	  echo "✗ mkosi did not produce a .raw file in $(APPLIANCE_OUT) — check the log above."; \
 	  exit 1; \
 	fi
+	@# qcow2 sidecar (disabled — not needed when shipping the ISO; ~1 GB
+	@# disk + a qemu-img convert pass per build). Uncomment to restore.
+	@# raw=$$(ls $(APPLIANCE_OUT)/spatiumddi-appliance*.raw 2>/dev/null | head -1); \
+	# qcow2=$${raw%.raw}.qcow2; \
+	# echo "→ Converting raw → qcow2…"; \
+	# docker run --rm --entrypoint qemu-img \
+	#     -v $(PWD)/$(APPLIANCE_OUT):/build \
+	#     $(APPLIANCE_BUILDER) \
+	#     convert -O qcow2 "/build/$$(basename $$raw)" "/build/$$(basename $$qcow2)"; \
+	# ls -lh "$$qcow2"; \
+	# echo "✓ Built: $$qcow2"; \
+	# echo "  Boot it with: qemu-system-x86_64 -enable-kvm -m 4G -smp 2 \\"; \
+	# echo "                -drive file=$$qcow2,if=virtio \\"; \
+	# echo "                -nic user,hostfwd=tcp::8080-:80,hostfwd=tcp::2222-:22"
 
 # Build the builder container locally (e.g. when iterating on its
 # Dockerfile before pushing to ghcr.io).
@@ -259,10 +265,15 @@ appliance-dev-iso: appliance-clean-baked-images appliance-stamp-dev appliance ap
 # builds the ISO + slot image. Mirrors what the release workflow
 # produces, just driven by your local :dev images instead of ghcr.io's
 # cut tag. ~1 GB larger than appliance-dev-iso.
-appliance-baked-iso: appliance-bake-images appliance appliance-iso appliance-slot-image
+appliance-baked-iso: appliance-stamp-dev appliance-bake-images appliance appliance-iso appliance-slot-image
 	@echo ""
 	@echo "✓ Baked appliance ISO ready at $(APPLIANCE_OUT)/"
 	@echo "  All container images embedded. Air-gap-ready. First boot does no docker pull."
+	@echo "  Mirrors what the .github/workflows/release.yml ``build-appliance-iso`` job"
+	@echo "  does on CI — stamps appliance-release with the local commit, bakes the"
+	@echo "  docker overlay image, builds the raw image, wraps as ISO, builds the"
+	@echo "  slot-upgrade .raw.xz + .sha256. Difference: BAKE_SOURCE=local (uses your"
+	@echo "  ``make build`` :dev tags) vs CI's BAKE_SOURCE=ghcr (pulls the cut tag)."
 
 # Wipe any baked overlay artefacts that a previous
 # ``appliance-bake-images`` left under the mkosi.extra overlay. mkosi
