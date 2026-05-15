@@ -35,6 +35,15 @@ TTYReset=yes
 TTYVHangup=yes
 Restart=always
 RestartSec=2
+# Bail out of the restart loop when the script exits with 75
+# (EX_TEMPFAIL). spatium-console probes the target TTY at startup and
+# returns 75 on EIO so we don't crash-loop the dashboard on a
+# /dev/ttyS0 with no actual serial device attached (kernel-cmdline
+# ``console=ttyS0`` creates the device node unconditionally; the VM
+# may have no serial port). Without this every respawn fires a
+# docker_ps() call that gets terminated mid-flight and spams the
+# docker daemon journal with "broken pipe" entries.
+RestartPreventExitStatus=75
 UtmpIdentifier=%I
 UtmpMode=user
 OOMScoreAdjust=-100

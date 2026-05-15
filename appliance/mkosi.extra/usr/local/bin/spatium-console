@@ -1224,6 +1224,35 @@ def main() -> int:
     # briefly during the F1 → agetty handoff. SIGTERM is honoured.
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
+    # Probe the target TTY before doing anything expensive (docker
+    # subprocess calls, journal-tail thread, psutil sampler). The
+    # kernel always creates /dev/ttyS0 + /dev/ttyS1 + ... when boot
+    # cmdline carries ``console=ttyS0,…`` even if the VM has no
+    # actual serial device attached — systemd-getty-generator spawns
+    # serial-getty@ttyS0 unconditionally, and the corresponding
+    # spatium-console@ttyS0 instance inherits the same fate.
+    # Without this guard the dashboard goes Live(...) → first frame
+    # render → EIO on stdout.flush() → exit 1 → systemd Restart=always
+    # respawns in 2 s, repeat forever. Each spawn calls docker_ps()
+    # once before failing, which generates a broken-pipe entry on
+    # docker.sock — and at 2 s intervals that's ~30 noise lines/min
+    # in the docker daemon journal for the no-op crash loop. Bailing
+    # out cleanly with exit 0 plus systemd's Restart=on-failure
+    # semantics would be cleaner, but the existing unit uses
+    # Restart=always so we end the loop via RestartPreventExitStatus
+    # — a separate unit-file change adds 75 to that list.
+    if not args.dev:
+        try:
+            with open(args.tty, "wb", buffering=0) as probe:
+                probe.write(b"")
+        except OSError as exc:
+            print(
+                f"spatium-console: {args.tty} not usable ({exc.strerror}); "
+                "skipping dashboard render.",
+                file=sys.stderr,
+            )
+            return 75  # EX_TEMPFAIL — paired with RestartPreventExitStatus=75
+
     env = read_env() if not args.dev else {
         "APPLIANCE_ROLE": "full-stack",
         "APPLIANCE_HOSTNAME": "ddi-dev-01",
