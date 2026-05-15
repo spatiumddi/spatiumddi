@@ -8,9 +8,12 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import {
+  Cpu,
   HardDrive,
+  Pause,
   Pencil,
   Phone,
+  Play,
   Plus,
   RefreshCw,
   Server,
@@ -48,6 +51,7 @@ import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { CreateServerGroupModal } from "./CreateServerGroupModal";
 import { CreateServerModal } from "./CreateServerModal";
 import { ServerDetailModal } from "./ServerDetailModal";
+import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
 import { CreateOptionTemplateModal } from "./CreateOptionTemplateModal";
@@ -84,6 +88,7 @@ function GroupSidebar({
   onSelect: (s: Selection) => void;
   onCreateGroup: () => void;
 }) {
+  const qc = useQueryClient();
   const [expanded, setExpanded] = useSessionState<Set<string>>(
     "spatium.dhcp.expandedGroups",
     new Set(),
@@ -112,13 +117,29 @@ function GroupSidebar({
         <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
           DHCP Server Groups
         </span>
-        <button
-          className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent"
-          onClick={onCreateGroup}
-          title="New group"
-        >
-          <Plus className="h-3.5 w-3.5" />
-        </button>
+        <div className="flex gap-1">
+          <button
+            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            onClick={() => {
+              // Force refetch — bare invalidate only marks queries
+              // stale, which isn't enough when the user pressed
+              // Refresh after external changes (API, another tab).
+              qc.refetchQueries({ queryKey: ["dhcp-groups"] });
+              qc.refetchQueries({ queryKey: ["dhcp-servers"] });
+              qc.refetchQueries({ queryKey: ["dhcp-scopes"] });
+            }}
+            title="Refresh"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+          </button>
+          <button
+            className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent"
+            onClick={onCreateGroup}
+            title="New group"
+          >
+            <Plus className="h-3.5 w-3.5" />
+          </button>
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto py-1">
@@ -319,12 +340,16 @@ function GroupDetailView({
   onDelete,
   onAddServer,
   onSelectServer,
+  onEditServer,
+  onDeleteServer,
 }: {
   group: DHCPServerGroup;
   onEdit: () => void;
   onDelete: () => void;
   onAddServer: () => void;
   onSelectServer: (s: DHCPServer) => void;
+  onEditServer: (s: DHCPServer) => void;
+  onDeleteServer: (s: DHCPServer) => void;
 }) {
   const qc = useQueryClient();
   const navigate = useNavigate();
@@ -402,17 +427,14 @@ function GroupDetailView({
               PXE Profiles
             </HeaderButton>
             <HeaderButton icon={Pencil} onClick={onEdit}>
-              Edit
+              Edit Group
             </HeaderButton>
             <HeaderButton
               variant="destructive"
               icon={Trash2}
               onClick={onDelete}
             >
-              Delete
-            </HeaderButton>
-            <HeaderButton variant="primary" icon={Plus} onClick={onAddServer}>
-              Add Server
+              Delete Group
             </HeaderButton>
           </div>
         </div>
@@ -476,6 +498,8 @@ function GroupDetailView({
             servers={servers}
             onAddServer={onAddServer}
             onSelectServer={onSelectServer}
+            onEditServer={onEditServer}
+            onDeleteServer={onDeleteServer}
           />
         )}
         {isKea && tab === "scopes" && <ServerScopesTab groupId={group.id} />}
@@ -508,100 +532,274 @@ function useSessionStateGroupTab(
   return useSessionState<GroupTab>(key, "servers");
 }
 
+// Health pill colour tokens — kept aligned with the DNS ServersTab so
+// active / unreachable / syncing / error all render the same green /
+// red / blue / red across both pages.
+const SERVER_STATUS_PILL_CLS: Record<string, string> = {
+  active: "bg-emerald-500/15 text-emerald-600",
+  unreachable: "bg-red-500/15 text-red-600",
+  syncing: "bg-blue-500/15 text-blue-600",
+  error: "bg-red-500/15 text-red-600",
+  disabled: "bg-muted text-muted-foreground",
+};
+
+const SERVER_STATUS_DOT_CLS: Record<string, string> = {
+  active: "bg-emerald-500",
+  unreachable: "bg-red-500",
+  syncing: "bg-blue-500",
+  error: "bg-red-500",
+  disabled: "bg-muted-foreground/40",
+};
+
 function GroupServersList({
   servers,
   onAddServer,
   onSelectServer,
+  onEditServer,
+  onDeleteServer,
 }: {
   servers: DHCPServer[];
   onAddServer: () => void;
   onSelectServer: (s: DHCPServer) => void;
+  onEditServer: (s: DHCPServer) => void;
+  onDeleteServer: (s: DHCPServer) => void;
 }) {
+  const qc = useQueryClient();
+  const pauseMutId = useRef<string | null>(null);
+  // Pause / resume mutations — shared instance for every row so the
+  // ``isPending`` flag can target a single button at a time without
+  // multiplying React Query keys. The ``pauseMutId`` ref records which
+  // server id is in flight so the buttons stay disabled only on the
+  // row being mutated.
+  const pauseMut = useMutation({
+    mutationFn: ({ id, reason }: { id: string; reason: string }) =>
+      dhcpApi.pauseServer(id, reason),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["dhcp-servers"] }),
+    onSettled: () => {
+      pauseMutId.current = null;
+    },
+  });
+  const resumeMut = useMutation({
+    mutationFn: (id: string) => dhcpApi.resumeServer(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["dhcp-servers"] }),
+    onSettled: () => {
+      pauseMutId.current = null;
+    },
+  });
+  const [pausePrompt, setPausePrompt] = useState<DHCPServer | null>(null);
+
+  // Health rollup mirrors the DNS ServersTab summary so a fleet-glance
+  // matches between the two pages.
+  const healthCounts = servers.reduce<Record<string, number>>((acc, s) => {
+    acc[s.status] = (acc[s.status] ?? 0) + 1;
+    return acc;
+  }, {});
+
   return (
-    <div className="rounded-lg border">
-      <div className="border-b px-4 py-2 bg-muted/30">
-        <h2 className="text-sm font-semibold">Servers</h2>
-      </div>
-      {servers.length === 0 ? (
-        <div className="p-8 text-center">
-          <p className="text-sm text-muted-foreground">
-            No servers in this group yet.
-          </p>
-          <button
-            onClick={onAddServer}
-            className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
-          >
-            <Plus className="h-3 w-3" /> Add Server
-          </button>
+    <div>
+      {servers.length > 0 && (
+        <div className="mb-4 rounded-md border bg-card p-3">
+          <div className="flex items-center gap-4 flex-wrap text-xs">
+            <span className="font-medium text-muted-foreground uppercase tracking-wider">
+              Health
+            </span>
+            {(["active", "unreachable", "syncing", "error"] as const).map(
+              (s) =>
+                healthCounts[s] ? (
+                  <span key={s} className="flex items-center gap-1.5">
+                    <span
+                      className={`inline-block h-2 w-2 rounded-full ${SERVER_STATUS_DOT_CLS[s]}`}
+                    />
+                    {healthCounts[s]} {s}
+                  </span>
+                ) : null,
+            )}
+          </div>
         </div>
+      )}
+
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+            DHCP Servers
+          </span>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            Servers can also be auto-registered by Kea agent containers using
+            the <code className="font-mono">SPATIUM_AGENT_KEY</code> env var.
+          </p>
+        </div>
+        <button
+          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+          onClick={onAddServer}
+        >
+          <Plus className="h-3 w-3" /> Add Server
+        </button>
+      </div>
+
+      {servers.length === 0 ? (
+        <p className="text-sm text-muted-foreground italic">
+          No servers. Add one manually or start a Kea agent container.
+        </p>
       ) : (
-        <div className="divide-y">
+        <div className="space-y-2">
           {servers.map((s) => {
             // Kea agents send heartbeats; their ``agent_last_seen`` is
             // the right liveness signal. Windows DHCP is polled, so
-            // ``last_sync_at`` (set when lease pull completes) is
-            // meaningful. Fall back to whichever is set.
+            // ``last_sync_at`` is meaningful. Fall back to whichever
+            // is set.
             const seenAt =
               s.driver === "kea"
                 ? (s.agent_last_seen ?? s.last_sync_at)
                 : (s.last_sync_at ?? s.agent_last_seen);
-            const label =
+            const seenLabel =
               s.driver === "kea"
                 ? seenAt
-                  ? `seen ${new Date(seenAt).toLocaleString()}`
+                  ? `seen ${new Date(seenAt).toLocaleTimeString()}`
                   : "never heard from"
                 : seenAt
-                  ? `synced ${new Date(seenAt).toLocaleString()}`
+                  ? `synced ${new Date(seenAt).toLocaleTimeString()}`
                   : "never synced";
+            const pauseInFlight =
+              (pauseMut.isPending || resumeMut.isPending) &&
+              pauseMutId.current === s.id;
             return (
-              <button
-                type="button"
+              <div
                 key={s.id}
+                className="flex items-center justify-between rounded-md border bg-card px-3 py-2.5 group cursor-pointer hover:bg-accent/40"
                 onClick={() => onSelectServer(s)}
-                className="flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors hover:bg-accent/40"
+                title="Click to view details"
               >
-                <StatusDot status={s.status} />
-                <span className="w-48 truncate text-sm font-medium">
-                  {s.name}
-                </span>
-                <span className="w-48 truncate font-mono text-xs text-muted-foreground">
-                  {s.host}:{s.port}
-                </span>
-                {s.last_seen_ip && (
-                  <span
-                    className="truncate font-mono text-xs text-muted-foreground"
-                    title="Source IP of the most recent agent heartbeat"
+                <div className="flex items-center gap-3 min-w-0">
+                  <Cpu className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span
+                        className={`inline-block h-2 w-2 rounded-full ${SERVER_STATUS_DOT_CLS[s.status] ?? "bg-muted"}`}
+                        title={`status: ${s.status}`}
+                      />
+                      <span className="text-sm font-medium">{s.name}</span>
+                      <span
+                        className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${SERVER_STATUS_PILL_CLS[s.status] ?? "bg-muted text-muted-foreground"}`}
+                      >
+                        {s.status}
+                      </span>
+                      <span className="inline-flex items-center rounded border px-1.5 py-0.5 text-xs">
+                        {s.driver}
+                      </span>
+                      {s.ha_state && (
+                        <span
+                          className="inline-flex items-center rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground"
+                          title={
+                            s.ha_last_heartbeat_at
+                              ? `Last HA heartbeat ${new Date(
+                                  s.ha_last_heartbeat_at,
+                                ).toLocaleString()}`
+                              : "No HA heartbeat received yet"
+                          }
+                        >
+                          HA: {s.ha_state}
+                        </span>
+                      )}
+                      {s.maintenance_mode && (
+                        <span
+                          className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
+                          title={
+                            s.maintenance_reason
+                              ? `Paused: ${s.maintenance_reason}`
+                              : "In operator-set maintenance mode"
+                          }
+                        >
+                          Maintenance
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-muted-foreground truncate">
+                      <span className="font-mono">
+                        {s.host}:{s.port}
+                      </span>
+                      {s.last_seen_ip && (
+                        <span
+                          className="ml-1.5 font-mono"
+                          title="Source IP of the most recent agent heartbeat"
+                        >
+                          ({s.last_seen_ip})
+                        </span>
+                      )}
+                      {` · ${seenLabel}`}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-1 flex-shrink-0">
+                  {s.maintenance_mode ? (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        pauseMutId.current = s.id;
+                        resumeMut.mutate(s.id);
+                      }}
+                      disabled={pauseInFlight}
+                      className="inline-flex items-center gap-1 rounded border border-emerald-600/40 bg-emerald-500/10 px-1.5 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-500/20 disabled:opacity-50 dark:text-emerald-400"
+                      title="Resume — exit maintenance mode"
+                    >
+                      <Play className="h-3 w-3" />
+                      {pauseInFlight ? "…" : "Resume"}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setPausePrompt(s);
+                      }}
+                      className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-1.5 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                      title="Pause — enter maintenance mode"
+                    >
+                      <Pause className="h-3 w-3" />
+                      Pause
+                    </button>
+                  )}
+                  <button
+                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onEditServer(s);
+                    }}
+                    title="Edit server"
                   >
-                    ({s.last_seen_ip})
-                  </span>
-                )}
-                <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
-                  {s.driver}
-                </span>
-                {s.ha_state && (
-                  <span className="rounded-full bg-muted/60 px-2 py-0.5 text-[11px] text-muted-foreground">
-                    HA: {s.ha_state}
-                  </span>
-                )}
-                {s.maintenance_mode && (
-                  <span
-                    className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
-                    title={
-                      s.maintenance_reason
-                        ? `Paused: ${s.maintenance_reason}`
-                        : "In operator-set maintenance mode"
-                    }
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDeleteServer(s);
+                    }}
+                    title="Delete server"
                   >
-                    Maintenance
-                  </span>
-                )}
-                <span className="ml-auto text-xs text-muted-foreground">
-                  {label}
-                </span>
-              </button>
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
             );
           })}
         </div>
+      )}
+
+      {pausePrompt && (
+        <PauseServerModal
+          serverName={pausePrompt.name}
+          serverKind="DHCP"
+          isPending={pauseMut.isPending}
+          onConfirm={(reason) => {
+            pauseMutId.current = pausePrompt.id;
+            pauseMut.mutate(
+              { id: pausePrompt.id, reason },
+              { onSuccess: () => setPausePrompt(null) },
+            );
+          }}
+          onCancel={() => setPausePrompt(null)}
+        />
       )}
     </div>
   );
@@ -2222,6 +2420,8 @@ export function DHCPPage() {
             // navigating to the full standalone server view. Mirrors
             // the DNS Servers tab UX.
             onSelectServer={(s) => setModalServer(s)}
+            onEditServer={(s) => setEditServer(s)}
+            onDeleteServer={(s) => setDelServer(s)}
           />
         )}
         {selection?.type === "server" && effectiveServer && (
