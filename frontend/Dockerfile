@@ -29,7 +29,23 @@ RUN npm run build
 FROM nginx:1.27-alpine AS runtime
 
 COPY --from=builder /app/dist /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# Issue #176: the API upstream + DNS resolver are now templated so the
+# same image works on Docker Compose (defaults below) and Kubernetes
+# (Helm chart overrides API_UPSTREAM_HOST to ``{{ fullname }}-api`` via
+# env). The official nginx image's entrypoint renders
+# /etc/nginx/templates/*.template → /etc/nginx/conf.d/* via envsubst.
+COPY default.conf.template /etc/nginx/templates/default.conf.template
+# Replacement for the upstream 15-local-resolvers.envsh — ours
+# respects an operator-supplied NGINX_LOCAL_RESOLVERS so the resolver
+# IP can be pinned via env var. See the script's header comment.
+COPY 15-local-resolvers.envsh /docker-entrypoint.d/15-local-resolvers.envsh
+
+# Sensible defaults that keep Docker Compose working without operator
+# config — Compose's service-discovery puts the api at ``api:8000``.
+# Helm chart, Kustomize manifests, or operators on a custom platform
+# override these at deploy time.
+ENV API_UPSTREAM_HOST=api \
+    API_UPSTREAM_PORT=8000
 
 EXPOSE 80
 

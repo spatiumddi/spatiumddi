@@ -65,6 +65,29 @@ frontend:
     type: LoadBalancer
 ```
 
+The frontend Pod's embedded nginx proxies `/api/` (plus `/health` and
+`/metrics`) to the api Service — same shape as Docker Compose. The
+upstream host + port come from values; the cluster DNS resolver is
+auto-detected from `/etc/resolv.conf` at container start. Defaults
+work out of the box (`{{ fullname }}-api` on `api.service.port`).
+
+Override only for non-default topologies — separate namespace, custom
+api Service name, pinned external resolver:
+
+```yaml
+frontend:
+  apiUpstream:
+    host: my-api.shared-ns.svc.cluster.local
+    port: 8000
+  nginxLocalResolvers: "10.96.0.10"   # optional; auto-detected if empty
+```
+
+If you'd rather skip the frontend's proxy and split routing at the
+ingress controller (`/` → frontend, `/api/` → api Service), the
+existing `ingress.hosts[].paths` list accepts both — just declare the
+`/api/` path with a manual `backend.service.name = "<release>-api"`
+override via a strategic-merge patch or a separate Ingress.
+
 ### Using an external Postgres
 
 Point the chart at an existing database and skip the bundled subchart:
@@ -178,6 +201,9 @@ dhcpAgents:
 | `api.autoscaling.minReplicas` / `maxReplicas` | `2` / `10` |  |
 | `frontend.replicas` | `2` |  |
 | `frontend.service.type` / `.port` | `ClusterIP` / `80` |  |
+| `frontend.apiUpstream.host` | `""` (→ `{{ fullname }}-api`) | nginx-proxy target Service name |
+| `frontend.apiUpstream.port` | `0` (→ `api.service.port`) | nginx-proxy target port |
+| `frontend.nginxLocalResolvers` | `""` (auto-detect) | DNS resolver IPs for nginx |
 | `worker.replicas` | `2` |  |
 | `worker.concurrency` | `4` |  |
 | `worker.queues` | `"ipam,dns,dhcp,default"` |  |

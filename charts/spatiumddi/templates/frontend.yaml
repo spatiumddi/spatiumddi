@@ -31,6 +31,22 @@ spec:
           ports:
             - name: http
               containerPort: 80
+          env:
+            # Issue #176: tell the frontend nginx where the api Service
+            # is. The image defaults to ``api:8000`` (Docker Compose's
+            # service-discovery name), which doesn't resolve on K8s.
+            - name: API_UPSTREAM_HOST
+              value: {{ .Values.frontend.apiUpstream.host | default (printf "%s-api" (include "spatiumddi.fullname" .)) | quote }}
+            - name: API_UPSTREAM_PORT
+              value: {{ .Values.frontend.apiUpstream.port | default .Values.api.service.port | quote }}
+            {{- with .Values.frontend.nginxLocalResolvers }}
+            # Explicit DNS resolver override. Leave unset to let the
+            # image's 15-local-resolvers.envsh auto-detect from
+            # /etc/resolv.conf — which already points at cluster DNS
+            # (kube-dns / CoreDNS) inside a Pod.
+            - name: NGINX_LOCAL_RESOLVERS
+              value: {{ . | quote }}
+            {{- end }}
           livenessProbe:
             httpGet: { path: /, port: http }
             initialDelaySeconds: 5
