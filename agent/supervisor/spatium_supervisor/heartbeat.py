@@ -54,7 +54,7 @@ from .role_orchestrator import (
     render_env_file,
 )
 from . import watchdog
-from .service_lifecycle import apply_role_assignment
+from .service_lifecycle import apply_role_assignment, tear_down_supervised_services
 
 # #170 Wave C2 — role-driven compose env file. Written under the
 # supervisor's state-dir so it survives slot swaps; the operator's
@@ -612,25 +612,30 @@ def heartbeat_once(
             new_state=new_state,
             appliance_id=str(appliance_id),
         )
-        # Tear down any supervised service containers when crossing
-        # the threshold from approved → revoked. The control plane
-        # has explicitly disowned us; leaving the DNS/DHCP daemons
-        # running would have them serve stale config against clients
-        # that no longer have a config sync path. Explicit operator
-        # intent (deleted the row) is distinct from Non-negotiable #5
-        # (cache + keep running when control plane is unreachable);
-        # rejection isn't unreachable.
-        if new_state == "revoked" and prior_state != "revoked":
+        # Tear down any supervised service containers whenever we're
+        # in the revoked state and any are still running. The first
+        # invocation is the threshold crossing; subsequent invocations
+        # catch host-reboot recovery (dockerd auto-restarted containers
+        # we'd previously ``stop``'d before the migration to ``rm``).
+        #
+        # ``tear_down_supervised_services`` uses ``docker compose rm
+        # -fsv`` so the container records are removed from dockerd's
+        # state entirely — no auto-restart on the next host reboot.
+        # Idempotent via the cached docker_api running-container
+        # snapshot, so calling on every heartbeat costs ~10 ms when
+        # nothing's running.
+        if new_state == "revoked":
             if appliance_state.detect_deployment_kind() == "appliance":
                 try:
-                    env_path = cfg.state_dir / _ROLE_ENV_FILENAME
-                    lifecycle = apply_role_assignment([], env_path)
-                    log.warning(
-                        "supervisor.heartbeat.revoked_teardown",
-                        state=lifecycle.state,
-                        stopped=list(lifecycle.stopped),
-                        reason=lifecycle.reason,
-                    )
+                    lifecycle = tear_down_supervised_services()
+                    if lifecycle.stopped:
+                        log.warning(
+                            "supervisor.heartbeat.revoked_teardown",
+                            state=lifecycle.state,
+                            stopped=list(lifecycle.stopped),
+                            reason=lifecycle.reason,
+                            transition=(prior_state != "revoked"),
+                        )
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
                         "supervisor.heartbeat.revoked_teardown_failed",

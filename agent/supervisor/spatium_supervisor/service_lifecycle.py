@@ -242,6 +242,72 @@ def apply_role_assignment(
     )
 
 
+def tear_down_supervised_services(
+    *,
+    compose_file: Path = _DEFAULT_COMPOSE_FILE,
+) -> LifecycleResult:
+    """Stop AND remove every running supervised service container
+    (#170 Wave E follow-up — revoke teardown).
+
+    ``apply_role_assignment([], env_path)`` alone only runs
+    ``docker compose stop``, which leaves the containers in their
+    state with the original restart policy intact. On a subsequent
+    host reboot, dockerd brings them back up — exactly the bug an
+    operator hit after revoking + rebooting a paired appliance.
+
+    This function does ``stop`` followed by ``rm -fsv`` so the
+    container records are removed from dockerd's state entirely.
+    The compose service definition stays in the compose file (the
+    operator hasn't deleted the role assignment, just the appliance
+    row on the control plane) — but no container exists to auto-
+    restart. A subsequent re-authorize on the control plane → 200
+    heartbeat → ``apply_role_assignment(profiles, env_path)`` will
+    bring fresh containers back up cleanly.
+
+    Idempotent: returns ``idle`` when nothing is running. Safe to
+    call on every heartbeat in revoked state.
+    """
+    available, reason = _compose_available(compose_file)
+    if not available:
+        return LifecycleResult(state="idle", reason=reason)
+
+    running = _running_supervised_services(compose_file)
+    if not running:
+        return LifecycleResult(state="idle")
+
+    # ``docker compose rm -fsv`` does stop + remove + volume cleanup
+    # in one shot; ``-s`` stops first, ``-f`` skips the y/n prompt,
+    # ``-v`` removes anonymous volumes. The container's state
+    # volumes are named volumes (not anonymous) so ``-v`` is a
+    # no-op for the supervised services — the BIND9 / PowerDNS /
+    # Kea persistent state survives. Verified by inspecting the
+    # compose file's volume definitions.
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file),
+                "rm",
+                "-fsv",
+                *running,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return LifecycleResult(state="failed", reason=f"rm: {exc}")
+    if result.returncode != 0:
+        first = result.stderr.strip().splitlines()[:1]
+        return LifecycleResult(
+            state="failed",
+            reason=f"rm failed: {(first[0] if first else 'no stderr')}",
+        )
+    return LifecycleResult(state="ready", stopped=tuple(running))
+
+
 def lifecycle_state_for_assignment(role_assignment: dict[str, Any] | None) -> str:
     """Helper for the heartbeat-skip case: when the supervisor has
     a role assignment but compose isn't available, we still need to
@@ -261,4 +327,5 @@ __all__ = [
     "SUPERVISED_SERVICES",
     "apply_role_assignment",
     "lifecycle_state_for_assignment",
+    "tear_down_supervised_services",
 ]
