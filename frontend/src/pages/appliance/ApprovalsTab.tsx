@@ -162,12 +162,36 @@ export function ApprovalsTab() {
       setRejectTarget(null);
     },
   });
+  // #170 follow-up — password re-auth required for delete (the
+  // destructive action that removes a fleet row + breaks the
+  // supervisor's mTLS chain to the control plane). The mutation
+  // takes a {id, password} pair; the ConfirmModal's password input
+  // surfaces the server's 403 response inline so a typo doesn't
+  // bounce the operator out of the modal.
+  const [deletePwError, setDeletePwError] = useState<string | null>(null);
   const remove = useMutation({
-    mutationFn: (id: string) => applianceApprovalApi.remove(id),
+    mutationFn: ({ id, password }: { id: string; password: string }) =>
+      applianceApprovalApi.remove(id, password),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
       setDeleteTarget(null);
       setDrilldown(null);
+      setDeletePwError(null);
+    },
+    onError: (err: unknown) => {
+      // FastAPI 403 lands in axios as ``{response: {status, data:
+      // {detail}}}``. Surface the detail inline; fall back to a
+      // generic message otherwise.
+      const e = err as {
+        response?: { status?: number; data?: { detail?: string } };
+      };
+      if (e?.response?.status === 403) {
+        setDeletePwError(
+          e.response.data?.detail || "Current password incorrect.",
+        );
+      } else {
+        setDeletePwError("Delete failed. Try again.");
+      }
     },
   });
   const rekey = useMutation({
@@ -522,8 +546,16 @@ export function ApprovalsTab() {
           confirmLabel="Delete"
           tone="destructive"
           loading={remove.isPending}
-          onConfirm={() => remove.mutate(deleteTarget.id)}
-          onClose={() => setDeleteTarget(null)}
+          requireCheckboxLabel={`I understand this permanently removes ${deleteTarget.hostname} and breaks its mTLS chain to the control plane.`}
+          requirePassword
+          passwordError={deletePwError}
+          onConfirm={(password) =>
+            remove.mutate({ id: deleteTarget.id, password: password ?? "" })
+          }
+          onClose={() => {
+            setDeleteTarget(null);
+            setDeletePwError(null);
+          }}
         />
       )}
 

@@ -7230,8 +7230,12 @@ export const applianceApprovalApi = {
       .then((r) => r.data),
   reject: (id: string) =>
     api.post<void>(`/appliance/appliances/${id}/reject`).then((r) => r.data),
-  remove: (id: string) =>
-    api.delete<void>(`/appliance/appliances/${id}`).then((r) => r.data),
+  remove: (id: string, password: string) =>
+    api
+      .delete<void>(`/appliance/appliances/${id}`, {
+        data: { password },
+      })
+      .then((r) => r.data),
   rekey: (id: string) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/rekey`)

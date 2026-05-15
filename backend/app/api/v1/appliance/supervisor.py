@@ -1150,18 +1150,62 @@ async def reject_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, d
     )
 
 
+class DeleteApplianceRequest(BaseModel):
+    """Body for ``DELETE /appliances/{id}`` — operator's current
+    password gates the destructive action. Same shape as the
+    factory-reset re-auth and the agent-bootstrap-key reveal: the
+    server verifies against the caller's ``hashed_password`` so a
+    leaked session token alone can't drop fleet rows."""
+
+    password: str = Field(min_length=1, max_length=256)
+
+
 @router.delete(
     "/appliances/{appliance_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(require_permission("admin", "appliance"))],
-    summary="Delete an approved appliance (superadmin)",
+    summary="Delete an approved appliance (superadmin + password re-auth)",
 )
-async def delete_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def delete_appliance(
+    appliance_id: uuid.UUID,
+    body: DeleteApplianceRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> None:
     """Permanently remove an approved appliance from the fleet. The
     supervisor's next mTLS call will fail (cert chain still valid but
     no matching DB row); supervisor falls back to bootstrapping +
-    needs a fresh pairing code to re-join."""
+    needs a fresh pairing code to re-join.
+
+    Requires the operator's current password in the request body —
+    a UI mis-click can't drop a fleet row even with the per-row
+    Delete button + checkbox guard, the password check is the final
+    safety valve. ``verify_password`` is constant-time; we leak no
+    timing on the result through the 403."""
+    from app.core.security import verify_password  # noqa: PLC0415
+
     _require_superadmin(current_user)
+    if not current_user.hashed_password or not verify_password(
+        body.password, current_user.hashed_password
+    ):
+        # Audit the failed attempt so a brute-force shows up.
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="appliance.delete_denied",
+                resource_type="appliance",
+                resource_id=str(appliance_id),
+                result="denied",
+                error_message="bad_password",
+            )
+        )
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Current password incorrect.",
+        )
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
