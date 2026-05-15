@@ -106,6 +106,12 @@ NET_PREFIX="24"
 NET_GATEWAY=""
 NET_DNS="1.1.1.1 1.0.0.1"
 TIMEZONE="UTC"
+# No default ROLE — every install must actively pick one. Hitting OK
+# without selecting an option on the role picker would otherwise
+# default to "full-stack" silently, and that's the wrong shape for any
+# Frontend-core or Application install. ask_role() loops until the
+# operator makes a selection.
+ROLE=""
 # Installer roles (#170):
 #   full-stack    — Full SpatiumDDI stack: api + worker + beat + db
 #                   + redis + frontend + bundled BIND9 + Kea (AIO).
@@ -119,7 +125,6 @@ TIMEZONE="UTC"
 #                   time. Replaces the three per-service agent roles.
 # Every role still creates an OS admin account so the operator can
 # SSH in and manage the appliance, irrespective of which web UI runs.
-ROLE="full-stack"
 CONTROL_PLANE_URL=""
 # Pairing code claimed by the supervisor on first boot. 8 decimal
 # digits — single-use ephemeral or persistent depending on what the
@@ -146,11 +151,11 @@ Press OK to begin, or Cancel to drop to a shell." 18 70 \
 
 ask_role() {
     log "Step: ask_role"
-    # whiptail --radiolist returns the selected tag on stdout. The third
-    # column is the initial-selection flag (ON for full-stack, OFF for
-    # the others). Three roles (#170 Wave B2):
+    # whiptail --radiolist returns the selected tag on stdout. There is
+    # no default — every install must actively pick one of the three
+    # roles. Three roles (#170 Wave B2):
     #   full-stack    — control plane + bundled BIND9 + Kea
-    #                   (single-box AIO; default).
+    #                   (single-box AIO).
     #   frontend-core — control plane only. Pairs with remote
     #                   Application appliances via the fleet UI.
     #   application   — supervisor only. Submits an Ed25519 pubkey
@@ -159,14 +164,28 @@ ask_role() {
     #                   then assigns role(s) + group(s) and the
     #                   supervisor pulls the matching service
     #                   containers on its next poll.
-    ROLE=$(whiptail --backtitle "$BACKTITLE" --title "Appliance role" \
-        --radiolist "What role does this appliance play?\n\nFull stack runs everything on one box (default — good for labs / small sites). Frontend / core runs just the control plane — pair Application appliances against it from the fleet UI for distributed deployments.\n\nApplication is the generic agent role: the supervisor pairs with a remote control plane, sits in pending approval, and is assigned its role(s) (DNS-BIND9 / DNS-PowerDNS / DHCP / multi-role) by an admin in the fleet UI. No DNS or DHCP pre-pick at install time." \
-        22 82 3 \
-        "full-stack"    "Full stack — control plane + BIND9 + Kea (AIO)" ON \
-        "frontend-core" "Frontend / core — control plane only"          OFF \
-        "application"   "Application — supervisor only (pairs remote)"  OFF \
-        3>&1 1>&2 2>&3) \
-        || on_cancel "role selection"
+    #
+    # The per-row ON/OFF flag reflects the current $ROLE so backing in
+    # from a later step preserves the previous selection. On the first
+    # pass $ROLE is empty so every row is OFF — whiptail returns ""
+    # and we re-prompt with a "pick one" msgbox until they choose.
+    local pick
+    while true; do
+        pick=$(whiptail --backtitle "$BACKTITLE" --title "Appliance role" \
+            --cancel-button "Back" \
+            --radiolist "What role does this appliance play?\n\nFull stack runs everything on one box (good for labs / small sites). Frontend / core runs just the control plane — pair Application appliances against it from the fleet UI for distributed deployments.\n\nApplication is the generic agent role: the supervisor pairs with a remote control plane, sits in pending approval, and is assigned its role(s) (DNS-BIND9 / DNS-PowerDNS / DHCP / multi-role) by an admin in the fleet UI. No DNS or DHCP pre-pick at install time." \
+            22 82 3 \
+            "full-stack"    "Full stack — control plane + BIND9 + Kea (AIO)" "$([ "$ROLE" = "full-stack"    ] && echo ON || echo OFF)" \
+            "frontend-core" "Frontend / core — control plane only"          "$([ "$ROLE" = "frontend-core" ] && echo ON || echo OFF)" \
+            "application"   "Application — supervisor only (pairs remote)"  "$([ "$ROLE" = "application"   ] && echo ON || echo OFF)" \
+            3>&1 1>&2 2>&3) || return 1
+        if [ -z "$pick" ]; then
+            whiptail --msgbox "Please pick a role to continue. There is no default — each role produces a meaningfully different appliance." 10 64 || true
+            continue
+        fi
+        ROLE="$pick"
+        break
+    done
     log "Selected role: $ROLE"
 }
 
@@ -179,16 +198,20 @@ ask_application_config() {
     fi
     log "Step: ask_application_config"
 
-    CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
-        --title "Control plane URL" \
-        --inputbox "Where does this Application appliance register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nUse https:// in production; http:// is acceptable for lab installs." \
-        16 76 "https://" 3>&1 1>&2 2>&3) \
-        || on_cancel "control-plane URL"
-    if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
-        whiptail --msgbox "Control-plane URL is required for an Application install." 8 60 || true
-        ask_application_config
-        return
-    fi
+    local default_url="${CONTROL_PLANE_URL:-https://}"
+    while true; do
+        CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
+            --title "Control plane URL" \
+            --cancel-button "Back" \
+            --inputbox "Where does this Application appliance register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nUse https:// in production; http:// is acceptable for lab installs." \
+            16 76 "$default_url" 3>&1 1>&2 2>&3) \
+            || return 1
+        if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
+            whiptail --msgbox "Control-plane URL is required for an Application install." 8 60 || true
+            continue
+        fi
+        break
+    done
 
     # Pairing code only — Application appliances never paste a long
     # bootstrap key. The supervisor generates its own Ed25519 keypair
@@ -199,9 +222,10 @@ ask_application_config() {
     local code_val
     while true; do
         code_val=$(whiptail --backtitle "$BACKTITLE" --title "Pairing code" \
+            --cancel-button "Back" \
             --inputbox "Enter the 8-digit pairing code from the control plane.\n\nMint one at https://<control-plane>/appliance → Pairing → 'New pairing code'. Single-use ephemeral codes expire after 15 min by default; persistent codes (multi-claim) stay valid until disabled or revoked.\n\nAfter the supervisor claims the code, the appliance sits in pending — ask the control plane admin to click Approve in the fleet UI to issue the identity cert and assign a role." \
-            18 78 "" 3>&1 1>&2 2>&3) \
-            || on_cancel "pairing code"
+            18 78 "$BOOTSTRAP_PAIRING_CODE" 3>&1 1>&2 2>&3) \
+            || return 1
         code_val=$(echo "$code_val" | tr -d '[:space:]')
         if [ -z "$code_val" ]; then
             whiptail --msgbox "Pairing code is required for an Application install." 8 60 || true
@@ -258,9 +282,10 @@ pick_disk() {
     local MIN_BYTES=$((24 * 1024 * 1024 * 1024))
     while true; do
         TARGET_DISK=$(whiptail --backtitle "$BACKTITLE" --title "Target Disk" \
+            --cancel-button "Back" \
             --menu "Select the disk to install SpatiumDDI to.\nALL DATA on the chosen disk will be DESTROYED." \
             20 70 10 "${options[@]}" 3>&1 1>&2 2>&3) \
-            || on_cancel "target disk"
+            || return 1
         local DISK_BYTES
         DISK_BYTES=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
         if [ "$DISK_BYTES" -ge "$MIN_BYTES" ]; then
@@ -281,9 +306,10 @@ ask_hostname() {
     # two agents on the same name conflict). Require operator input.
     while true; do
         HOSTNAME=$(whiptail --backtitle "$BACKTITLE" --title "Hostname" \
+            --cancel-button "Back" \
             --inputbox "System hostname (also used as the SERVER_NAME this appliance registers under for DNS / DHCP agent roles, and shown in shell prompts + audit logs).\n\nGive each appliance a unique name (e.g. dns-east-1, dhcp-prod-a, ddi-control)." \
             14 72 "$HOSTNAME" 3>&1 1>&2 2>&3) \
-            || on_cancel "hostname"
+            || return 1
         HOSTNAME=$(echo "$HOSTNAME" | tr -d '[:space:]')
         if [ -z "$HOSTNAME" ]; then
             whiptail --msgbox "Hostname is required. Pick something descriptive for this appliance — it shouldn't collide with any other SpatiumDDI box." 9 60 || true
@@ -309,20 +335,23 @@ ask_hostname() {
 ask_user_password() {
     log "Step: ask_user_password"
     ADMIN_USER=$(whiptail --backtitle "$BACKTITLE" --title "Admin OS user" \
+        --cancel-button "Back" \
         --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately - change it on first login." \
         12 70 "$ADMIN_USER" 3>&1 1>&2 2>&3) \
-        || on_cancel "admin user"
+        || return 1
     [ -z "$ADMIN_USER" ] && ADMIN_USER="admin"
 
     while true; do
         local p1 p2
         p1=$(whiptail --backtitle "$BACKTITLE" --title "Admin password" \
+            --cancel-button "Back" \
             --passwordbox "Password for '$ADMIN_USER' (and root):" 10 60 \
             3>&1 1>&2 2>&3) \
-            || on_cancel "password"
+            || return 1
         p2=$(whiptail --backtitle "$BACKTITLE" --title "Confirm password" \
+            --cancel-button "Back" \
             --passwordbox "Repeat:" 10 60 3>&1 1>&2 2>&3) \
-            || on_cancel "password confirmation"
+            || return 1
         if [ "$p1" = "$p2" ] && [ -n "$p1" ]; then
             ADMIN_PASSWORD="$p1"
             break
@@ -336,11 +365,12 @@ ask_user_password() {
 ask_network() {
     log "Step: ask_network"
     NET_MODE=$(whiptail --backtitle "$BACKTITLE" --title "Network" \
+        --cancel-button "Back" \
         --menu "How should the appliance configure its network?" 12 70 2 \
         "dhcp"   "Automatic via DHCP (recommended for evaluation)" \
         "static" "Static IP" \
         3>&1 1>&2 2>&3) \
-        || on_cancel "network mode"
+        || return 1
 
     if [ "$NET_MODE" = "static" ]; then
         local ifs=()
@@ -350,32 +380,38 @@ ask_network() {
         if [ ${#ifs[@]} -eq 0 ]; then
             whiptail --msgbox "No ethernet interfaces found - falling back to DHCP." 8 60 || true
             NET_MODE="dhcp"
-            return
+            return 0
         fi
         NET_INTERFACE=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -interface" \
+            --cancel-button "Back" \
             --menu "Pick an interface:" 12 60 5 "${ifs[@]}" 3>&1 1>&2 2>&3) \
-            || on_cancel "static interface"
+            || return 1
         NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -address" \
-            --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 "" 3>&1 1>&2 2>&3) \
-            || on_cancel "static IP"
+            --cancel-button "Back" \
+            --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 "$NET_IP" 3>&1 1>&2 2>&3) \
+            || return 1
         NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -prefix" \
+            --cancel-button "Back" \
             --inputbox "Prefix length:" 10 60 "$NET_PREFIX" 3>&1 1>&2 2>&3) \
-            || on_cancel "static prefix"
+            || return 1
         NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -gateway" \
-            --inputbox "Gateway:" 10 60 "" 3>&1 1>&2 2>&3) \
-            || on_cancel "static gateway"
+            --cancel-button "Back" \
+            --inputbox "Gateway:" 10 60 "$NET_GATEWAY" 3>&1 1>&2 2>&3) \
+            || return 1
         NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -DNS" \
+            --cancel-button "Back" \
             --inputbox "DNS servers (space-separated):" 10 60 "$NET_DNS" 3>&1 1>&2 2>&3) \
-            || on_cancel "static DNS"
+            || return 1
     fi
 }
 
 ask_timezone() {
     log "Step: ask_timezone"
     TIMEZONE=$(whiptail --backtitle "$BACKTITLE" --title "Timezone" \
+        --cancel-button "Back" \
         --inputbox "Timezone (IANA name, e.g. America/Toronto, Europe/Berlin, UTC):" \
         10 70 "$TIMEZONE" 3>&1 1>&2 2>&3) \
-        || on_cancel "timezone"
+        || return 1
     [ -z "$TIMEZONE" ] && TIMEZONE="UTC"
 }
 
@@ -409,8 +445,9 @@ confirm() {
     s+="WARNING: $TARGET_DISK will be ERASED. There is no undo.\n\n"
     s+="Proceed with installation?"
     whiptail --backtitle "$BACKTITLE" --title "Confirm" \
+        --no-button "Back" \
         --yesno "$s" 20 72 \
-        || on_cancel "final confirmation"
+        || return 1
 }
 
 # ── Install ───────────────────────────────────────────────────────────────────
@@ -1190,16 +1227,62 @@ main() {
         echo "Run as root." >&2
         exit 1
     fi
-    welcome
-    ask_role
-    pick_disk
-    ask_hostname
-    ask_user_password
-    ask_network
-    ask_timezone
-    ask_application_config
-    confirm
-    do_install
+
+    # State-machine wizard. Each step is one function that returns:
+    #   0 — operator pressed OK / Yes / made a valid selection
+    #   1 — operator pressed Back (or Cancel/Esc on Welcome, which
+    #       exits the wizard entirely via on_cancel).
+    # Cancel on Welcome is the only exit-installer path; every other
+    # screen's Cancel button is renamed "Back" and walks the wizard
+    # back one step. ask_application_config is conditional on
+    # ROLE=application — it returns 0 immediately for the other roles
+    # so Back from confirm walks through it transparently to
+    # ask_timezone.
+    local step="welcome"
+    while [ -n "$step" ]; do
+        log "Wizard state: $step"
+        case "$step" in
+            welcome)
+                # welcome only returns 0 — Cancel here calls on_cancel
+                # which exec's a shell (never returns). That's the
+                # explicit "I changed my mind, don't install" path.
+                welcome
+                step="ask_role"
+                ;;
+            ask_role)
+                if ask_role; then step="pick_disk"; else step="welcome"; fi
+                ;;
+            pick_disk)
+                if pick_disk; then step="ask_hostname"; else step="ask_role"; fi
+                ;;
+            ask_hostname)
+                if ask_hostname; then step="ask_user_password"; else step="pick_disk"; fi
+                ;;
+            ask_user_password)
+                if ask_user_password; then step="ask_network"; else step="ask_hostname"; fi
+                ;;
+            ask_network)
+                if ask_network; then step="ask_timezone"; else step="ask_user_password"; fi
+                ;;
+            ask_timezone)
+                if ask_timezone; then step="ask_application_config"; else step="ask_network"; fi
+                ;;
+            ask_application_config)
+                # Returns 0 immediately when ROLE != application — so
+                # forward navigation moves straight to confirm and
+                # backward navigation from confirm walks through here
+                # without showing any whiptail screen.
+                if ask_application_config; then step="confirm"; else step="ask_timezone"; fi
+                ;;
+            confirm)
+                if confirm; then step="do_install"; else step="ask_application_config"; fi
+                ;;
+            do_install)
+                do_install
+                step=""
+                ;;
+        esac
+    done
 }
 
 on_failure() {

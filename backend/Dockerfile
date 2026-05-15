@@ -94,6 +94,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # time keeps the source layer authoritative.
 RUN useradd --no-create-home --shell /bin/false app \
     && mkdir -p /var/lib/spatiumddi/backups /var/lib/spatiumddi/certs /var/lib/spatiumddi/slot-images \
+    && chown app:app /app \
     && chown -R app:app /var/lib/spatiumddi
 
 COPY --from=builder /install /usr/local

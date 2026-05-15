@@ -174,12 +174,30 @@ mkdir -p "$DATAROOT"
 
 echo "  starting sandbox dockerd to populate data-root …"
 SANDBOX_NAME="spatium-bake-$$"
+# Storage driver MUST match the appliance's runtime driver, because
+# docker's per-driver graph lives at /var/lib/docker/<driver>/ and
+# /var/lib/docker/image/<driver>/. The appliance runs with
+# storage-driver=fuse-overlayfs (selected via /etc/docker/daemon.json
+# because the appliance's /var/lib/docker is itself a kernel overlay,
+# and overlay2 cannot nest on overlay). If we baked with overlay2,
+# the appliance daemon would see /var/lib/docker/overlay2/ on disk
+# but look at /var/lib/docker/fuse-overlayfs/ — finding zero images
+# — and compose would silently fall through to pulling ``:dev`` from
+# ghcr (where ``:dev`` doesn't exist as a published tag, hence
+# "manifest unknown" → install wedged).
+#
+# fuse-overlayfs isn't in docker:dind's base image, so install it
+# inside the sandbox before exec'ing dockerd-entrypoint.
 docker run -d --rm --privileged --name "$SANDBOX_NAME" \
     -v "$DATAROOT":/var/lib/docker \
     -v "$COMBINED":/combined.tar:ro \
-    docker:dind dockerd-entrypoint.sh \
-        --host=unix:///var/run/docker.sock \
-        --storage-driver=overlay2 >/dev/null
+    docker:dind sh -c '
+        apk add --no-cache fuse-overlayfs >/dev/null 2>&1 \
+            || { echo "✗ apk add fuse-overlayfs failed" >&2; exit 1; }
+        exec dockerd-entrypoint.sh \
+            --host=unix:///var/run/docker.sock \
+            --storage-driver=fuse-overlayfs
+    ' >/dev/null
 
 # Wait for the sandbox daemon to be ready.
 for _ in $(seq 1 30); do
