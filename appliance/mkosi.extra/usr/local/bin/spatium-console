@@ -1339,6 +1339,31 @@ def main() -> int:
                             elif action == "diag":
                                 do_diag(console)
                         finally:
+                            # Hard-reset the terminal state before
+                            # re-entering Live. whiptail (do_pair) +
+                            # nmtui (do_network) + htop (do_monitor)
+                            # can leave the TTY in altscreen-on / raw
+                            # mode / corrupted colour state if they
+                            # exit abnormally; without an explicit
+                            # reset the next ``live.start()`` either
+                            # renders against the wrong cursor coords
+                            # or crashes on the first flush — and
+                            # systemd's Restart=always burns through
+                            # the start-limit before the dashboard
+                            # recovers, leaving operators staring at
+                            # a black tty1. ``stty sane`` + the
+                            # ``\x1b[?1049l`` (exit-altscreen) + ESC c
+                            # (full reset) sequence are cheap and
+                            # idempotent on a working TTY.
+                            try:
+                                subprocess.run(
+                                    ["stty", "sane"], check=False, timeout=2
+                                )
+                                with open(args.tty, "w") as tty_out:
+                                    tty_out.write("\x1b[?1049l\x1bc")
+                                    tty_out.flush()
+                            except OSError:
+                                pass
                             # Re-arm keypress capture, re-enter Live.
                             keys = KeyReader(on_key)
                             keys.start()

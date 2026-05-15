@@ -74,17 +74,58 @@ _NFT_DROPIN_PATH = Path("/etc/nftables.d/spatium-role.nft")
 _NFT_LAST_PROFILE_PATH = Path("/etc/nftables.d/spatium-role.profile")
 
 
+_CAPABILITY_IMAGES = {
+    "can_run_dns_bind9": "ghcr.io/spatiumddi/dns-bind9",
+    "can_run_dns_powerdns": "ghcr.io/spatiumddi/dns-powerdns",
+    "can_run_dhcp": "ghcr.io/spatiumddi/dhcp-kea",
+}
+
+
+def _docker_image_present(repo: str) -> bool:
+    """Return True if at least one tag of ``repo`` is loaded into the
+    host docker daemon. Uses the bind-mounted /var/run/docker.sock.
+
+    ``docker image inspect`` with a bare repo (no tag) silently
+    matches nothing — we have to list + grep instead. ``docker images
+    --format '{{.Repository}}'`` enumerates every local image's repo;
+    a substring-aware match handles both fully-qualified
+    (``ghcr.io/spatiumddi/dns-bind9``) and short-form
+    (``spatiumddi/dns-bind9``, ``dns-bind9``) tagging the bake might
+    produce on different rebuild paths.
+    """
+    try:
+        proc = subprocess.run(
+            ["docker", "images", "--format", "{{.Repository}}"],
+            capture_output=True, text=True, timeout=4,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    repos = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    short = repo.rsplit("/", 1)[-1]
+    return any(r == repo or r.endswith("/" + short) or r == short for r in repos)
+
+
 def _capabilities_payload() -> dict[str, Any]:
     """Build the supervisor-capabilities block reported on every
-    heartbeat. The fields are read locally — psutil for hardware,
-    docker image inspect would tell us about can_run_* but the C1
-    cut doesn't ship that yet (it lands with role assignment in C2).
-    For now we ship just the host-level facts the supervisor can
-    cheaply derive."""
+    heartbeat. Fields:
+
+    * ``can_run_*`` — true when the corresponding service image is
+      already loaded in the host docker daemon (appliance bake
+      pre-loads every service image so all three flags come back
+      true on Application appliances). The Fleet drilldown disables
+      role checkboxes when these are false.
+    * ``has_baked_images`` / ``baked_images_version`` — from the
+      slot rootfs sidecar dropped by ``bake-images.sh``.
+    * ``cpu_count`` / ``memory_mb`` — host capacity from /proc.
+    """
     out: dict[str, Any] = {
         "has_baked_images": appliance_state.detect_deployment_kind() == "appliance",
         "supervisor_version": _supervisor_version(),
     }
+    for cap_field, repo in _CAPABILITY_IMAGES.items():
+        out[cap_field] = _docker_image_present(repo)
     try:
         import os
 
@@ -161,15 +202,35 @@ def _maybe_apply_firewall(
         _NFT_DROPIN_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = _NFT_DROPIN_PATH.with_suffix(".new")
         tmp.write_text(body, encoding="utf-8")
-        # Dry-run validate before swap. nft's -c flag means
-        # check-only; -f reads from the file. Returns 0 on parse
-        # success, non-zero with the parse error on stderr.
+        # Dry-run validate before swap. The drop-in is included from
+        # inside ``table inet filter { chain input { ... } }`` in the
+        # host's ``/etc/nftables.conf``, so the body itself is a chain
+        # fragment — not a complete nft script. Running ``nft -c -f``
+        # against the fragment alone fails with "syntax error,
+        # unexpected tcp" because nft expects a top-level table
+        # declaration. Wrap the fragment in the same chain context
+        # the live config uses, write the wrapped form to a *second*
+        # temp file, validate that, then swap the *unwrapped* form
+        # into the live drop-in path.
+        wrapped_tmp = _NFT_DROPIN_PATH.with_suffix(".check.new")
+        wrapped_body = (
+            "table inet filter {\n"
+            "    chain input {\n"
+            + "\n".join("        " + line for line in body.splitlines())
+            + "\n    }\n"
+            + "}\n"
+        )
+        wrapped_tmp.write_text(wrapped_body, encoding="utf-8")
         result = subprocess.run(
-            ["nft", "-c", "-f", str(tmp)],
+            ["nft", "-c", "-f", str(wrapped_tmp)],
             capture_output=True,
             text=True,
             timeout=10,
         )
+        try:
+            wrapped_tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         if result.returncode != 0:
             log.warning(
                 "supervisor.firewall.dry_run_failed",

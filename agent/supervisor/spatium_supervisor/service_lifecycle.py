@@ -33,10 +33,12 @@ from pathlib import Path
 from typing import Any
 
 # Default compose file on the appliance — the ISO drops it under
-# /etc/spatiumddi/. Operators on docker / k8s deployments don't run
-# this lifecycle path; ``apply_role_assignment`` short-circuits when
-# the compose file is missing.
-_DEFAULT_COMPOSE_FILE = Path("/etc/spatiumddi/docker-compose.yml")
+# /usr/local/share/spatiumddi/. (Earlier comments wrongly said
+# /etc/spatiumddi/; the actual install path is /usr/local/share/.)
+# Operators on docker / k8s deployments don't run this lifecycle
+# path; ``apply_role_assignment`` short-circuits when the compose
+# file is missing.
+_DEFAULT_COMPOSE_FILE = Path("/usr/local/share/spatiumddi/docker-compose.yml")
 
 # Every service the supervisor can start. Names match the
 # ``services:`` keys in the appliance compose. The active subset

@@ -445,6 +445,16 @@ services:
       - /boot/efi:/boot/efi-host:ro
       - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:rw
       - /run/udev:/run/udev:ro
+      # Wave D follow-up — the supervisor's service_lifecycle module
+      # invokes ``docker compose -f <compose>`` to bring the per-role
+      # service containers up + down. ``docker compose`` (v2) reads
+      # the file from the *caller's* filesystem (it's just a CLI that
+      # talks to the daemon), so the compose file must be visible
+      # inside the supervisor container at the same path the host
+      # sees. Without this mount, every heartbeat logs
+      # ``state=idle reason="compose file missing: …"`` and role
+      # assignment can't actually start anything.
+      - /usr/local/share/spatiumddi:/usr/local/share/spatiumddi:ro
     group_add:
       - "${DOCKER_GID:-999}"
     # Wave C+ needs CAP_NET_ADMIN to apply nftables rulesets. The

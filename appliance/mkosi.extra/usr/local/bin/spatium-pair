@@ -152,14 +152,30 @@ if [ "$RESET_IDENTITY" -eq 1 ]; then
 fi
 
 # Bounce the supervisor container so it re-reads the env + role-
-# config on its next boot. The compose project name is fixed by the
-# appliance's docker-compose at /etc/spatiumddi/docker-compose.yml.
-COMPOSE_FILE=/etc/spatiumddi/docker-compose.yml
-if [ -f "$COMPOSE_FILE" ] && command -v docker-compose >/dev/null 2>&1; then
-    echo "spatium-pair: restarting spatium-supervisor container…"
-    ( cd "$(dirname "$COMPOSE_FILE")" \
-      && docker-compose -f "$COMPOSE_FILE" up -d --force-recreate spatium-supervisor \
-      ) || echo "spatium-pair: WARN compose restart failed; reboot to apply"
+# config on its next boot. The appliance ships its compose at
+# /usr/local/share/spatiumddi/docker-compose.yml; an earlier comment
+# in this file wrongly said /etc/spatiumddi/docker-compose.yml and
+# the restart silently no-op'd as a result.
+COMPOSE_FILE=/usr/local/share/spatiumddi/docker-compose.yml
+# Accept either v1 ``docker-compose`` (legacy) or v2 ``docker
+# compose`` (current). The appliance ships v2 — selecting v1 only
+# would also silently no-op the restart.
+if [ -f "$COMPOSE_FILE" ]; then
+    if command -v docker-compose >/dev/null 2>&1; then
+        COMPOSE="docker-compose"
+    elif docker compose version >/dev/null 2>&1; then
+        COMPOSE="docker compose"
+    else
+        COMPOSE=""
+    fi
+    if [ -n "$COMPOSE" ]; then
+        echo "spatium-pair: restarting spatium-supervisor container…"
+        ( cd "$(dirname "$COMPOSE_FILE")" \
+          && $COMPOSE -f "$COMPOSE_FILE" up -d --force-recreate spatium-supervisor \
+          ) || echo "spatium-pair: WARN compose restart failed; reboot to apply"
+    else
+        echo "spatium-pair: WARN neither docker-compose v1 nor v2 found; reboot to apply"
+    fi
 fi
 
 cat <<EOF

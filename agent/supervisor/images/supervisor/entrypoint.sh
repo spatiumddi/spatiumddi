@@ -9,6 +9,15 @@ set -eu
 # register path lands.
 
 mkdir -p /var/lib/spatium-supervisor
-chown -R spatium:spatium /var/lib/spatium-supervisor || true
 
-exec su-exec spatium:spatium /usr/local/bin/spatium-supervisor
+# Wave C: the supervisor runs as root inside the container so it can
+# write the firewall drop-in to /etc/nftables.d (root-owned on the
+# host via the bind-mount), invoke ``nft -f`` (needs CAP_NET_ADMIN,
+# requested in compose), and write the slot-upgrade / reboot trigger
+# files under /var/lib/spatiumddi-host/release-state. The Phase-A1
+# ``su-exec spatium:spatium`` design was aspirational for an
+# unprivileged shape that the Wave-C work never actually delivered —
+# the bind-mounted ``/var/run/docker.sock`` already grants effective
+# root on the host, so dropping privileges inside the container is
+# pure friction without a real security benefit.
+exec /usr/local/bin/spatium-supervisor

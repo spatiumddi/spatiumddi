@@ -55,7 +55,15 @@ mkdir -p "$DEST"
 
 VERSION="${SPATIUMDDI_VERSION:-dev}"
 if [ -z "${BAKE_SOURCE:-}" ]; then
-    if [ "$VERSION" = "dev" ]; then BAKE_SOURCE=local; else BAKE_SOURCE=ghcr; fi
+    # Any ``dev`` or ``dev-*`` tag (e.g. ``dev-148c437-a3f2``) means
+    # local-source — the Makefile mints a per-build unique tag like
+    # that on every ``make appliance-baked-iso`` invocation so the
+    # image tag visible in ``docker ps`` ties back to the ISO.
+    # Release CalVer tags pull from ghcr.
+    case "$VERSION" in
+        dev|dev-*) BAKE_SOURCE=local ;;
+        *) BAKE_SOURCE=ghcr ;;
+    esac
 fi
 OVERLAY_SIZE_GB="${OVERLAY_SIZE_GB:-4}"
 
