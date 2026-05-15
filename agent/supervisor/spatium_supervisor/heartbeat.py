@@ -53,7 +53,6 @@ from .role_orchestrator import (
 )
 from .service_lifecycle import apply_role_assignment
 
-
 # #170 Wave C2 — role-driven compose env file. Written under the
 # supervisor's state-dir so it survives slot swaps; the operator's
 # baked compose file references it via ``--env-file`` (Wave C3
@@ -96,7 +95,9 @@ def _docker_image_present(repo: str) -> bool:
     try:
         proc = subprocess.run(
             ["docker", "images", "--format", "{{.Repository}}"],
-            capture_output=True, text=True, timeout=4,
+            capture_output=True,
+            text=True,
+            timeout=4,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
@@ -107,22 +108,90 @@ def _docker_image_present(repo: str) -> bool:
     return any(r == repo or r.endswith("/" + short) or r == short for r in repos)
 
 
+def _detect_storage_type() -> str:
+    """Return ``"ssd"`` / ``"hdd"`` / ``"unknown"`` based on the root
+    block device's ``rotational`` flag. The supervisor reads /sys/
+    via the host bind mount; rotational=0 → ssd, =1 → hdd."""
+    try:
+        # /proc/mounts identifies what's mounted on / — first whitespace
+        # field is the source device. Strip ``/dev/`` + any trailing
+        # digits (sda3 → sda, nvme0n1p3 → nvme0n1).
+        with open("/proc/mounts", "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == "/":
+                    dev = parts[0]
+                    if dev.startswith("/dev/"):
+                        name = dev[5:]
+                        # Strip trailing partition digits, but preserve
+                        # nvme's pN suffix by stripping until a non-digit.
+                        while name and name[-1].isdigit():
+                            name = name[:-1]
+                        # nvme0n1p3 → nvme0n1p → nvme0n1 (one more strip)
+                        if name.endswith("p"):
+                            name = name[:-1]
+                        rot_path = f"/sys/block/{name}/queue/rotational"
+                        try:
+                            with open(rot_path, "r", encoding="utf-8") as r:
+                                return "hdd" if r.read().strip() == "1" else "ssd"
+                        except OSError:
+                            return "unknown"
+                    break
+    except OSError:
+        pass
+    return "unknown"
+
+
+def _detect_host_nics() -> list[str]:
+    """Return the appliance's physical / virtual NIC names (e.g.
+    ``["ens18", "eth0"]``). Skips loopback, docker bridges, virtual
+    veth pairs, and the container's own bridge interface so the list
+    is the operator-visible host hardware."""
+    nics: list[str] = []
+    try:
+        import os
+
+        for name in sorted(os.listdir("/sys/class/net")):
+            if name == "lo":
+                continue
+            if name.startswith(("docker", "br-", "veth", "virbr", "tailscale")):
+                continue
+            nics.append(name)
+    except OSError:
+        pass
+    return nics
+
+
 def _capabilities_payload() -> dict[str, Any]:
     """Build the supervisor-capabilities block reported on every
-    heartbeat. Fields:
+    heartbeat. Matches the schema in issue #170 ("Multi-role +
+    capability reporting"):
 
-    * ``can_run_*`` — true when the corresponding service image is
-      already loaded in the host docker daemon (appliance bake
-      pre-loads every service image so all three flags come back
-      true on Application appliances). The Fleet drilldown disables
-      role checkboxes when these are false.
-    * ``has_baked_images`` / ``baked_images_version`` — from the
-      slot rootfs sidecar dropped by ``bake-images.sh``.
+    * ``can_run_dns_bind9`` / ``can_run_dns_powerdns`` /
+      ``can_run_dhcp`` — true when the corresponding service image
+      is loaded in the host docker daemon (appliance bake pre-loads
+      every service image so all three come back true on
+      Application appliances). The Fleet drilldown disables role
+      checkboxes when these are false.
+    * ``can_run_observer`` — always true. The observer role is a
+      pure supervisor-side metrics/log shipper with no separate
+      service container, so any approved supervisor can run it.
+    * ``has_baked_images`` — true on appliance deployments (where
+      ``spatium-docker-overlay.service`` loop-mounts the baked
+      docker-overlay.img).
+    * ``supervisor_version`` — packaging metadata.
     * ``cpu_count`` / ``memory_mb`` — host capacity from /proc.
+    * ``storage_type`` — ``"ssd"`` / ``"hdd"`` / ``"unknown"``.
+    * ``host_nics`` — physical / virtual NIC names (lo + docker
+      bridges filtered out).
     """
     out: dict[str, Any] = {
         "has_baked_images": appliance_state.detect_deployment_kind() == "appliance",
         "supervisor_version": _supervisor_version(),
+        # observer is always compatible (#170 multi-role table:
+        # "always compatible") — no service container needed, the
+        # supervisor itself is the observer.
+        "can_run_observer": True,
     }
     for cap_field, repo in _CAPABILITY_IMAGES.items():
         out[cap_field] = _docker_image_present(repo)
@@ -135,18 +204,17 @@ def _capabilities_payload() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
     try:
-        import os
-
         # /proc/meminfo is small + parseable without psutil.
-        meminfo = open("/proc/meminfo", "r", encoding="utf-8").read()
-        for line in meminfo.splitlines():
-            if line.startswith("MemTotal:"):
-                kb = int(line.split()[1])
-                out["memory_mb"] = kb // 1024
-                break
-        del os
-    except Exception:  # noqa: BLE001
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    out["memory_mb"] = kb // 1024
+                    break
+    except OSError:
         pass
+    out["storage_type"] = _detect_storage_type()
+    out["host_nics"] = _detect_host_nics()
     return out
 
 
@@ -462,9 +530,7 @@ def heartbeat_once(
 _LIFECYCLE_STATE_FILE = "role-switch-state"
 
 
-def _persist_lifecycle_state(
-    state_dir: Path, state: str, reason: str | None
-) -> None:
+def _persist_lifecycle_state(state_dir: Path, state: str, reason: str | None) -> None:
     """Write the most recent compose-lifecycle outcome to disk so the
     NEXT heartbeat reports it (this one has already left)."""
     path = state_dir / _LIFECYCLE_STATE_FILE

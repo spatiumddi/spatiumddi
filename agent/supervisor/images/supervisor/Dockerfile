@@ -26,12 +26,19 @@ RUN apk add --no-cache \
       tini su-exec \
       python3 py3-pip \
       docker-cli \
-      nftables \
+      nftables libcap \
       ca-certificates tzdata \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
  && mkdir -p /var/lib/spatium-supervisor \
- && chown -R spatium:spatium /var/lib/spatium-supervisor
+ && chown -R spatium:spatium /var/lib/spatium-supervisor \
+ && setcap cap_net_admin+eip /usr/sbin/nft
+# ``libcap`` ships ``setcap``; the file cap on /usr/sbin/nft lets the
+# unprivileged ``spatium`` user (issue #170 design) actually exercise
+# the CAP_NET_ADMIN the compose entry requests. Without the file
+# cap, compose's ``cap_add: NET_ADMIN`` only adds the cap to the
+# container's bounding set — a non-root process still needs file
+# caps to use it. Same shape as the api image's setcap on nmap.
 
 COPY --from=build /install /usr/local
 COPY agent/supervisor/images/supervisor/entrypoint.sh /usr/local/bin/spatium-supervisor-entrypoint
