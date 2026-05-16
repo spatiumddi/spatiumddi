@@ -118,8 +118,9 @@ EOF
 chmod 0600 "$TMP"
 mv "$TMP" "$ROLE_CONFIG"
 
-# Mirror into .env so the supervisor compose entry's env_file picks
-# up the new values when docker-compose restarts the service.
+# Mirror into .env so the supervisor pod's entrypoint picks up the
+# new values when the pod restarts (it sources /etc/spatiumddi-host/
+# .env at startup).
 if [ -f "$ENV_FILE" ]; then
     # Replace lines if present; otherwise append. Use a temp file
     # so a crash mid-edit doesn't truncate .env.
@@ -157,31 +158,30 @@ if [ "$RESET_IDENTITY" -eq 1 ]; then
     fi
 fi
 
-# Bounce the supervisor container so it re-reads the env + role-
-# config on its next boot. The appliance ships its compose at
-# /usr/local/share/spatiumddi/docker-compose.yml; an earlier comment
-# in this file wrongly said /etc/spatiumddi/docker-compose.yml and
-# the restart silently no-op'd as a result.
-COMPOSE_FILE=/usr/local/share/spatiumddi/docker-compose.yml
-# Accept either v1 ``docker-compose`` (legacy) or v2 ``docker
-# compose`` (current). The appliance ships v2 — selecting v1 only
-# would also silently no-op the restart.
-if [ -f "$COMPOSE_FILE" ]; then
-    if command -v docker-compose >/dev/null 2>&1; then
-        COMPOSE="docker-compose"
-    elif docker compose version >/dev/null 2>&1; then
-        COMPOSE="docker compose"
-    else
-        COMPOSE=""
+# Issue #183 Phase 7 — bounce the supervisor pod via kubectl so it
+# re-reads .env + role-config on its next start. The pod entrypoint
+# sources /etc/spatiumddi-host/.env at process start; a delete-pod
+# triggers the DaemonSet to recreate it, picking up the new values.
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+export KUBECONFIG
+if [ -r "$KUBECONFIG" ] && command -v kubectl >/dev/null 2>&1; then
+    echo "spatium-pair: restarting spatium-supervisor pod via kubectl…"
+    # ``kubectl rollout restart`` on the DaemonSet is the canonical
+    # k8s "restart with the current config" gesture — it bumps the
+    # pod template's restartedAt annotation, triggering a controlled
+    # roll.
+    if ! kubectl -n spatium rollout restart daemonset spatium-supervisor \
+            2>/dev/null; then
+        # Fallback: delete pods directly. Useful before the chart
+        # has applied (first boot / mid-bootstrap) when the
+        # DaemonSet might not exist yet — operator will see the pod
+        # show up via the bootstrap HelmChart instead.
+        kubectl -n spatium delete pod -l app.kubernetes.io/component=supervisor \
+            2>/dev/null || \
+            echo "spatium-pair: WARN supervisor pod restart failed; reboot to apply"
     fi
-    if [ -n "$COMPOSE" ]; then
-        echo "spatium-pair: restarting spatium-supervisor container…"
-        ( cd "$(dirname "$COMPOSE_FILE")" \
-          && $COMPOSE -f "$COMPOSE_FILE" up -d --force-recreate spatium-supervisor \
-          ) || echo "spatium-pair: WARN compose restart failed; reboot to apply"
-    else
-        echo "spatium-pair: WARN neither docker-compose v1 nor v2 found; reboot to apply"
-    fi
+else
+    echo "spatium-pair: WARN kubectl/kubeconfig not available; reboot to apply"
 fi
 
 cat <<EOF
@@ -192,7 +192,7 @@ spatium-pair: done.
   Pairing code:  (claimed by the supervisor)
 
 Watch the supervisor's identity pickup with:
-  docker logs -f spatium-supervisor
+  kubectl -n spatium logs -f -l app.kubernetes.io/component=supervisor
 
 On the control plane operator's side, the appliance should now appear
 in /appliance → Fleet as pending_approval. Ask them to click Approve

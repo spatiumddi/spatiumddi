@@ -38,7 +38,6 @@ mkdir -p "$BUILDROOT/etc/systemd/system/multi-user.target.wants"
 for unit in chrony.service ssh.service \
             NetworkManager.service \
             spatiumddi-firstboot.service \
-            spatiumddi-update.path \
             spatiumddi-reboot.path \
             spatiumddi-slot-upgrade.path \
             spatiumddi-slot-rollback.path \
@@ -48,7 +47,6 @@ for unit in chrony.service ssh.service \
             k3s.service \
             spatiumddi-snmp-reload.path \
             spatiumddi-chrony-reload.path \
-            spatiumddi-supervisor-watchdog.timer \
             spatium-install.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
@@ -201,7 +199,6 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-stack-status"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-install"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-banner"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-bootstrap"
-chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-update"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-slot-upgrade"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-console"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etc-reconcile"
@@ -210,8 +207,6 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firstboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-install.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-bootstrap.service"
-chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-update.path"
-chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-update.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-rollback.path"

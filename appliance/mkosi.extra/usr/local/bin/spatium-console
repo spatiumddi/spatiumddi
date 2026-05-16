@@ -49,7 +49,6 @@ from rich.text import Text
 
 
 ENV_FILE = Path("/etc/spatiumddi/.env")
-COMPOSE_FILE = Path("/usr/local/share/spatiumddi/docker-compose.yml")
 FIRSTBOOT_LOG = Path("/var/log/spatiumddi/firstboot.log")
 FIRSTBOOT_STAMP = Path("/var/lib/spatiumddi/firstboot.done")
 APPLIANCE_RELEASE = Path("/etc/spatiumddi/appliance-release")
@@ -189,13 +188,14 @@ def watchdog_expected_services() -> list[str]:
     return []
 
 # journalctl units the live-log pane tails. Same set on every role —
-# operators want to see firstboot / release manager output regardless
-# of which containers ran. docker.service catches everything else
-# (every container's stdout/stderr is shipped to docker → journald).
+# operators want to see firstboot / k3s / reboot output regardless of
+# which pods ran. k3s.service captures cluster-level events; per-pod
+# logs come from ``kubectl logs`` (via the journal too once
+# ``log-level=info`` is set, but that's noisier than the per-unit
+# tail this surface aims for).
 JOURNAL_UNITS = [
-    "docker.service",
+    "k3s.service",
     "spatiumddi-firstboot.service",
-    "spatiumddi-update.service",
     "spatiumddi-reboot.service",
     "spatium-console.service",
 ]

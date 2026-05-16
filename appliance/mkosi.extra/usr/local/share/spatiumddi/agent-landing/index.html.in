@@ -99,7 +99,7 @@
   <p class="note">
     To check live agent state — heartbeat status, last config push,
     cached JWT validity — SSH in as the OS admin user you created at
-    install and run <code>docker logs spatiumddi-__ROLE_SHORT__-1</code>.
+    install and run <code>kubectl -n spatium logs -l app.kubernetes.io/component=__ROLE_SHORT__</code>.
     For the full SpatiumDDI UI, browse to the control plane URL above.
   </p>
 </main>
