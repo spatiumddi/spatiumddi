@@ -73,16 +73,37 @@ echo "$SPATIUMDDI_VERSION" > "$VERSION_FILE"
 echo "→ SPATIUMDDI_VERSION = $SPATIUMDDI_VERSION (stamped at $VERSION_FILE)"
 
 resolve_source_tag() {
-    # ``BAKE_SOURCE=local``: use the operator's ``make build`` :dev
-    # images. ``BAKE_SOURCE=ghcr``: pull from ghcr at the requested
-    # version (CI release path).
+    # ``BAKE_SOURCE=local``: use the operator's local :dev images.
+    # Three naming conventions in the wild:
+    #   * ``ghcr.io/spatiumddi/<short>:dev`` — ``make build-supervisor``
+    #     dual-tags this form, and dev-iso flows that tag manually.
+    #   * ``spatiumddi-<short>:dev`` — ``docker compose build`` uses
+    #     the compose project name (``spatiumddi``) as the image
+    #     prefix.
+    #   * ``<short>:dev`` — direct ``docker build`` without prefix.
+    # Try them in order of specificity; the first one that exists
+    # locally is the source tag we save from. On total miss the
+    # caller fails with a clear error.
+    #
+    # ``BAKE_SOURCE=ghcr``: pull from ghcr at the requested version
+    # (CI release path). Always the fully-qualified canonical name.
     local repo="$1"
     local short
     short="$(basename "$repo")"
     case "$BAKE_SOURCE" in
         local)
-            # ``make build`` tags as ``<short>:dev`` (no ghcr.io prefix).
-            echo "${short}:dev"
+            for candidate in \
+                "${repo}:dev" \
+                "spatiumddi-${short}:dev" \
+                "${short}:dev"; do
+                if docker image inspect "$candidate" >/dev/null 2>&1; then
+                    echo "$candidate"
+                    return 0
+                fi
+            done
+            # Nothing matched — return the canonical name so the
+            # error message points at the most-likely-correct tag.
+            echo "${repo}:dev"
             ;;
         ghcr)
             echo "${repo}:${SPATIUMDDI_VERSION}"
@@ -104,7 +125,12 @@ for repo in "${IMAGES[@]}"; do
         echo "→ Pulling $source_tag …"
         docker pull "$source_tag" >/dev/null
     elif ! docker image inspect "$source_tag" >/dev/null 2>&1; then
-        echo "ERROR: $source_tag not in local docker. Run 'make build' first." >&2
+        echo "ERROR: no local image found for $repo. Tried:" >&2
+        echo "         ${repo}:dev" >&2
+        echo "         spatiumddi-${short}:dev" >&2
+        echo "         ${short}:dev" >&2
+        echo "       Run 'make build' (control plane :dev images)" >&2
+        echo "       and 'make build-supervisor' (supervisor :dev) first." >&2
         exit 3
     fi
 

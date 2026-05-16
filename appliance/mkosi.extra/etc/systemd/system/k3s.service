@@ -15,7 +15,13 @@
 # operator can ``systemctl enable --now k3s`` to validate.
 Description=Lightweight Kubernetes (k3s)
 Documentation=https://docs.k3s.io
-After=network-online.target nss-lookup.target firstboot.service spatium-etc-reconcile.service
+# Issue #183 Phase 7 — start in parallel with firstboot. firstboot
+# writes the bootstrap HelmChart manifest into the manifests dir;
+# k3s's helm-controller watches that dir continuously, so order
+# doesn't matter (whatever lands gets applied). Pre-Phase-7 we
+# ordered k3s.service After=firstboot, but firstboot waits for
+# kubeapi /readyz at the end — that's a deadlock.
+After=network-online.target nss-lookup.target spatium-etc-reconcile.service
 Wants=network-online.target nss-lookup.target
 # Skip on the live ISO — installer environment, no slot partitions,
 # no kubeapi state to bootstrap. firstboot also writes /etc/rancher/
