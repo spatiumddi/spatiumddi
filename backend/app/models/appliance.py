@@ -625,6 +625,31 @@ class Appliance(Base):
         LargeBinary, nullable=True
     )
 
+    # Issue #183 Phase 6 — k3s server-cert expiry + direct-kubeapi
+    # firewall allowlist.
+    #
+    # ``k3s_api_cert_expires_at`` is the supervisor-reported ``Not
+    # After`` of the local k3s serving cert. Drives the
+    # ``k3s_api_cert_expiring`` alert rule (30 / 7 day thresholds).
+    #
+    # ``kubeapi_expose_cidrs`` is the operator-controlled list of
+    # CIDRs allowed to reach the appliance's kubeapi on tcp/6443.
+    # Empty list (the default) = proxy-only mode: kubeapi binds to
+    # 127.0.0.1 + only the supervisor's outbound proxy channel can
+    # drive it. Non-empty list = additional direct-network access
+    # for operators who want sub-millisecond local-network ops.
+    # The supervisor's firewall renderer emits one
+    # ``ip saddr { ... } tcp dport 6443 accept`` rule per heartbeat.
+    k3s_api_cert_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    kubeapi_expose_cidrs: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=sa.text("'[]'::jsonb"),
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

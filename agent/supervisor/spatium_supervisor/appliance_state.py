@@ -693,6 +693,66 @@ def read_kubeconfig() -> str | None:
     return None
 
 
+# Issue #183 Phase 6 — k3s server cert expiry probe. The k3s
+# default serving cert lives at one of two paths depending on
+# whether the supervisor's host bind mount picked up /var/lib/
+# rancher (the standard layout) or /var/lib/spatiumddi-host/
+# rancher (the bind-mount-everything fallback). Probe both.
+_K3S_SERVING_CERT_CANDIDATES = (
+    Path("/var/lib/spatiumddi-host/rancher/k3s/server/tls/serving-kube-apiserver.crt"),
+    Path("/var/lib/rancher/k3s/server/tls/serving-kube-apiserver.crt"),
+)
+
+
+def read_k3s_api_cert_expiry() -> str | None:
+    """Issue #183 Phase 6 — k3s server-cert ``Not After`` timestamp.
+
+    k3s rotates this cert automatically (1-year default). Surfacing
+    the expiry on the heartbeat lets the Fleet UI render an
+    "expires in N days" chip + drives the
+    ``k3s_api_cert_expiring`` alert rule at 30 / 7 day thresholds.
+
+    Returns the ISO-8601 UTC timestamp string the backend stores in
+    ``Appliance.k3s_api_cert_expires_at``. ``None`` when the cert
+    isn't readable (not k3s, no bind mount, file missing, parse
+    error). The backend's "only update when not None" semantics
+    leave the column untouched in those cases.
+    """
+    if detect_runtime() != "k3s":
+        return None
+    for path in _K3S_SERVING_CERT_CANDIDATES:
+        if not path.exists():
+            continue
+        try:
+            pem = path.read_bytes()
+        except OSError:
+            continue
+        try:
+            # cryptography is already a supervisor dep (cert_auth
+            # signs heartbeat bodies with the supervisor's Ed25519
+            # key). Lazy-import so non-cert-bearing imports stay
+            # fast.
+            from cryptography import x509  # noqa: PLC0415
+
+            cert = x509.load_pem_x509_certificate(pem)
+        except (ValueError, ImportError):
+            return None
+        # cert.not_valid_after_utc lands in cryptography 42+; the
+        # older naïve-datetime accessor is deprecated but still
+        # works as a fallback for forks that pin an older version.
+        not_after = getattr(cert, "not_valid_after_utc", None) or getattr(
+            cert, "not_valid_after", None
+        )
+        if not_after is None:
+            return None
+        if not_after.tzinfo is None:
+            from datetime import timezone  # noqa: PLC0415
+
+            not_after = not_after.replace(tzinfo=timezone.utc)
+        return not_after.isoformat()
+    return None
+
+
 def read_cluster_health() -> dict[str, object] | None:
     """Issue #183 Phase 4 — local k3s health summary for the
     heartbeat's slow drift channel.
@@ -798,6 +858,7 @@ def collect() -> dict[str, object]:
     cluster_health = read_cluster_health() if is_appliance else None
     k3s_version = read_k3s_version() if is_appliance else None
     kubeconfig = read_kubeconfig() if is_appliance else None
+    k3s_api_cert_expires_at = read_k3s_api_cert_expiry() if is_appliance else None
 
     return {
         "deployment_kind": deployment_kind,
@@ -834,4 +895,9 @@ def collect() -> dict[str, object]:
         # the column untouched).
         "k3s_version": k3s_version,
         "kubeconfig": kubeconfig,
+        # Issue #183 Phase 6 — k3s server-cert ``Not After``
+        # timestamp (ISO-8601 UTC) so the backend can drive expiry
+        # alerts. None when not k3s; the backend leaves the column
+        # untouched on null.
+        "k3s_api_cert_expires_at": k3s_api_cert_expires_at,
     }

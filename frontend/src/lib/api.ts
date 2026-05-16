@@ -7355,6 +7355,13 @@ export interface ApplianceRow {
   // Issue #183 Phase 5 — boolean "supervisor has shipped a kubeconfig".
   // The ciphertext itself only crosses the wire on the reveal endpoint.
   kubeconfig_set: boolean;
+  // Issue #183 Phase 6 — k3s server-cert ``Not After`` timestamp
+  // (ISO-8601 UTC). Drives the cluster-health "expires in N days"
+  // chip + the ``k3s_api_cert_expiring`` alert rule.
+  k3s_api_cert_expires_at: string | null;
+  // Issue #183 Phase 6 — operator-controlled CIDR allowlist for
+  // direct kubeapi access on tcp/6443. Empty = proxy-only.
+  kubeapi_expose_cidrs: string[];
   // Issue #170 Wave E follow-up — soft-delete timestamp. Non-null on
   // ``state=revoked`` rows; cleared by re-authorize.
   revoked_at: string | null;
@@ -7480,6 +7487,14 @@ export const applianceApprovalApi = {
         kubeconfig: string | null;
         hostname: string;
       }>(`/appliance/appliances/${id}/k8s/kubeconfig/reveal`, { password })
+      .then((r) => r.data),
+  // Issue #183 Phase 6 — operator-controlled CIDR allowlist for
+  // direct kubeapi access. Empty = proxy-only (default).
+  updateKubeapiCidrs: (id: string, cidrs: string[]) =>
+    api
+      .put<ApplianceRow>(`/appliance/appliances/${id}/kubeapi-cidrs`, {
+        cidrs,
+      })
       .then((r) => r.data),
 };
 

@@ -653,6 +653,10 @@ class SupervisorHeartbeatRequest(BaseModel):
     # this tick (legacy compose / pre-Phase-5 / k3s not yet started).
     k3s_version: str | None = None
     kubeconfig: str | None = None
+    # Issue #183 Phase 6 — k3s server-cert ``Not After`` timestamp
+    # (ISO-8601 UTC). None when not k3s; the heartbeat handler
+    # leaves the column untouched in that case.
+    k3s_api_cert_expires_at: datetime | None = None
 
 
 class SupervisorRoleAssignment(BaseModel):
@@ -692,6 +696,12 @@ class SupervisorRoleAssignment(BaseModel):
     # role-driven mgmt + per-role blocks. NULL / empty → role-driven
     # rules only.
     firewall_extra: str | None = None
+    # Issue #183 Phase 6 — operator-allowed CIDRs for direct kubeapi
+    # access on tcp/6443. Empty = proxy-only (kubeapi stays on
+    # 127.0.0.1, only the supervisor's outbound proxy channel can
+    # drive it). The supervisor's firewall renderer emits one
+    # ``ip saddr { ... } tcp dport 6443 accept`` rule per heartbeat.
+    kubeapi_expose_cidrs: list[str] = Field(default_factory=list)
 
 
 class SupervisorHeartbeatResponse(BaseModel):
@@ -905,6 +915,12 @@ async def supervisor_heartbeat(
     # Phase-5 supervisors don't blank the columns out.
     if body.k3s_version is not None:
         row.k3s_version = body.k3s_version
+    if body.k3s_api_cert_expires_at is not None:
+        # Issue #183 Phase 6 — k3s serving-cert expiry. Drives the
+        # ``k3s_api_cert_expiring`` alert rule. Overwrite-verbatim so
+        # k3s cert rotation (1-year default) propagates on the next
+        # tick.
+        row.k3s_api_cert_expires_at = body.k3s_api_cert_expires_at
     if body.kubeconfig is not None:
         from app.core.crypto import encrypt_str  # noqa: PLC0415
 
@@ -1068,6 +1084,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
         dhcp_network_mode=dhcp_network_mode,
         dhcp_agent_key=dhcp_agent_key,
         firewall_extra=row.firewall_extra,
+        kubeapi_expose_cidrs=list(row.kubeapi_expose_cidrs or []),
     )
 
 
@@ -1141,6 +1158,13 @@ class ApplianceRow(BaseModel):
     # text itself never leaves the server outside the reveal endpoint;
     # the row schema only exposes a "have I got one" bit.
     kubeconfig_set: bool
+    # Issue #183 Phase 6 — k3s server-cert ``Not After`` timestamp.
+    # NULL on legacy compose appliances; drives the
+    # ``k3s_api_cert_expiring`` alert rule.
+    k3s_api_cert_expires_at: datetime | None
+    # Issue #183 Phase 6 — operator-controlled CIDR allowlist for
+    # direct kubeapi access on tcp/6443. Empty = proxy-only.
+    kubeapi_expose_cidrs: list[str]
     # #170 Wave E follow-up — soft-delete timestamp. Non-null on
     # ``state=revoked`` rows; cleared by re-authorize.
     revoked_at: datetime | None = None
@@ -1206,6 +1230,8 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         cluster_health=dict(row.cluster_health or {}),
         k3s_version=row.k3s_version,
         kubeconfig_set=row.kubeconfig_encrypted is not None,
+        k3s_api_cert_expires_at=row.k3s_api_cert_expires_at,
+        kubeapi_expose_cidrs=list(row.kubeapi_expose_cidrs or []),
         revoked_at=row.revoked_at,
         created_at=row.created_at,
     )
@@ -2637,3 +2663,98 @@ async def reveal_appliance_kubeconfig(
     return RevealKubeconfigResponse(
         configured=True, kubeconfig=plaintext, hostname=row.hostname
     )
+
+
+# ── Issue #183 Phase 6 — kubeapi-expose CIDR editor ──
+
+
+class ApplianceKubeapiCidrsRequest(BaseModel):
+    """Operator-supplied list of CIDRs allowed to reach this
+    appliance's kubeapi on tcp/6443. Validated as a list of strings;
+    empty list = proxy-only (the default, recommended posture)."""
+
+    cidrs: list[str] = Field(default_factory=list, max_length=32)
+
+
+def _validate_cidr(value: str) -> str:
+    """Light CIDR validation — operator may type ``10.0.0.0/8`` or
+    a bare host ``192.168.1.50`` (which nftables accepts inline).
+    Strips whitespace, refuses anything that doesn't parse as an
+    ip_network or ip_address. Returns the normalised string the
+    nft renderer will emit verbatim."""
+    import ipaddress  # noqa: PLC0415
+
+    text = value.strip()
+    if not text:
+        raise ValueError("empty CIDR")
+    try:
+        return str(ipaddress.ip_network(text, strict=False))
+    except ValueError:
+        # Bare host — nft accepts a single-IP rule the same way.
+        try:
+            return str(ipaddress.ip_address(text))
+        except ValueError as exc:
+            raise ValueError(f"{text!r} isn't a valid CIDR or IP address") from exc
+
+
+@router.put(
+    "/appliances/{appliance_id}/kubeapi-cidrs",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Set the kubeapi-direct-access CIDR allowlist on an appliance",
+)
+async def update_appliance_kubeapi_cidrs(
+    appliance_id: uuid.UUID,
+    body: ApplianceKubeapiCidrsRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceRow:
+    """Update the operator-controlled CIDR allowlist for direct
+    kubeapi access. The supervisor's firewall renderer reads this
+    list on every heartbeat + emits ``ip saddr { ... } tcp dport
+    6443 accept`` rules.
+
+    Empty list = proxy-only (the recommended default): kubeapi stays
+    on 127.0.0.1 and the only path into it is the supervisor's
+    outbound proxy channel (Phase 4). Non-empty list = direct
+    access for operators who want sub-millisecond local-network
+    ops; the supervisor's mTLS proxy still works alongside.
+    """
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+
+    normalised: list[str] = []
+    for value in body.cidrs:
+        try:
+            normalised.append(_validate_cidr(value))
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                str(exc),
+            ) from exc
+
+    row.kubeapi_expose_cidrs = normalised
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.kubeapi_cidrs_updated",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={"kubeapi_expose_cidrs": normalised},
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance.kubeapi_cidrs_updated",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        cidr_count=len(normalised),
+        user=current_user.username,
+    )
+    return _row_to_schema(row)

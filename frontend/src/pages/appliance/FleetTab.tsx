@@ -1419,6 +1419,7 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
   const [revealOpen, setRevealOpen] = useState(false);
+  const [cidrEditorOpen, setCidrEditorOpen] = useState(false);
 
   const ch = row.cluster_health ?? {};
   const ready = ch.kubeapi_ready === true;
@@ -1480,6 +1481,33 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
             </dd>
           </>
         )}
+        {row.k3s_api_cert_expires_at && (
+          <>
+            <dt className="text-muted-foreground">API cert</dt>
+            <dd>
+              <CertExpiryChip iso={row.k3s_api_cert_expires_at} />
+            </dd>
+          </>
+        )}
+        <dt className="text-muted-foreground">Direct access</dt>
+        <dd>
+          {row.kubeapi_expose_cidrs.length === 0 ? (
+            <span className="text-[11px] text-muted-foreground">
+              proxy-only
+            </span>
+          ) : (
+            <span className="font-mono text-[11px]">
+              {row.kubeapi_expose_cidrs.join(", ")}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => setCidrEditorOpen(true)}
+            className="ml-2 text-[11px] text-primary underline decoration-dotted underline-offset-2 hover:text-foreground"
+          >
+            Edit
+          </button>
+        </dd>
       </dl>
       <p className="mt-2 text-[11px] text-muted-foreground">
         Direct kubeapi proxy via the supervisor's mTLS channel — actions are
@@ -1531,7 +1559,128 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
           onClose={() => setRevealOpen(false)}
         />
       )}
+      {cidrEditorOpen && (
+        <KubeapiCidrEditorModal
+          appliance={row}
+          onClose={() => setCidrEditorOpen(false)}
+        />
+      )}
     </div>
+  );
+}
+
+// Issue #183 Phase 6 — cert-expiry chip. Colour scales with
+// days-remaining: emerald > 30 d, amber 7-30 d, rose < 7 d, red on
+// already-expired. k3s rotates the cert automatically on
+// k3s.service restart so the red state is rarely reachable in
+// practice.
+function CertExpiryChip({ iso }: { iso: string }) {
+  const expiresAt = new Date(iso);
+  const now = new Date();
+  const days = Math.floor(
+    (expiresAt.getTime() - now.getTime()) / (1000 * 60 * 60 * 24),
+  );
+  let cls: string;
+  let label: string;
+  if (days < 0) {
+    cls = "bg-rose-500/10 text-rose-700 dark:text-rose-300";
+    label = `expired ${-days}d ago`;
+  } else if (days < 7) {
+    cls = "bg-rose-500/10 text-rose-700 dark:text-rose-300";
+    label = `expires in ${days}d`;
+  } else if (days < 30) {
+    cls = "bg-amber-500/10 text-amber-700 dark:text-amber-300";
+    label = `expires in ${days}d`;
+  } else {
+    cls = "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
+    label = `${days}d remaining`;
+  }
+  return (
+    <span
+      className={cn("rounded-full px-1.5 py-0.5 font-mono text-[10px]", cls)}
+      title={`k3s API server cert expires ${expiresAt.toLocaleString()}`}
+    >
+      {label}
+    </span>
+  );
+}
+
+// Issue #183 Phase 6 — CIDR allowlist editor. Empty list = proxy-
+// only (the recommended posture). Operators with sub-millisecond
+// local-network kubectl needs add their CIDRs; the supervisor's
+// firewall renderer picks them up on the next heartbeat + emits one
+// ``ip saddr {…} tcp dport 6443 accept`` rule.
+function KubeapiCidrEditorModal({
+  appliance,
+  onClose,
+}: {
+  appliance: ApplianceRow;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [text, setText] = useState(appliance.kubeapi_expose_cidrs.join("\n"));
+  const save = useMutation({
+    mutationFn: () => {
+      const cidrs = text
+        .split("\n")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      return applianceApprovalApi.updateKubeapiCidrs(appliance.id, cidrs);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+      onClose();
+    },
+  });
+  return (
+    <Modal
+      title={`Direct kubeapi access · ${appliance.hostname}`}
+      onClose={onClose}
+    >
+      <div className="space-y-3 text-sm">
+        <p className="text-xs text-muted-foreground">
+          One CIDR or IP per line. Each entry opens this appliance's tcp/6443
+          kubeapi port to that source range — bypassing the supervisor's mTLS
+          proxy for sub-millisecond local-network <code>kubectl</code>. Leave
+          empty for proxy-only (the recommended posture; kubeapi stays on
+          127.0.0.1 and only the supervisor's outbound channel can drive it).
+        </p>
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          rows={6}
+          placeholder="10.0.0.0/8&#10;192.168.1.50"
+          className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
+        />
+        {save.error && (
+          <p className="text-xs text-rose-700 dark:text-rose-300">
+            {(save.error as Error).message}
+          </p>
+        )}
+        <div className="flex items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={() => save.mutate()}
+            disabled={save.isPending}
+            className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {save.isPending ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <CheckCircle2 className="h-3.5 w-3.5" />
+            )}
+            Save
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
