@@ -302,7 +302,9 @@ async def supervisor_register(
     # force a fresh registration they delete the row in the fleet UI,
     # which causes the supervisor to clear its identity + claim a new
     # pairing code on next boot.
-    existing_stmt = select(Appliance).where(Appliance.public_key_fingerprint == pubkey_fingerprint)
+    existing_stmt = select(Appliance).where(
+        Appliance.public_key_fingerprint == pubkey_fingerprint
+    )
     existing = (await db.execute(existing_stmt)).scalar_one_or_none()
     if existing is not None:
         # Idempotent re-register. Touch last_seen_at so the heartbeat
@@ -388,7 +390,9 @@ async def supervisor_register(
                 resource_type="pairing_code",
                 resource_id=str(code_row.id) if code_row is not None else "unknown",
                 resource_display=(
-                    "supervisor pairing code" if code_row is not None else "unknown pairing code"
+                    "supervisor pairing code"
+                    if code_row is not None
+                    else "unknown pairing code"
                 ),
                 result="forbidden",
                 new_value={
@@ -538,7 +542,9 @@ async def supervisor_poll(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
 
     row = await db.get(Appliance, body.appliance_id)
-    valid = row is not None and verify_session_token(body.session_token, row.session_token_hash)
+    valid = row is not None and verify_session_token(
+        body.session_token, row.session_token_hash
+    )
     if not valid:
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
@@ -596,6 +602,16 @@ class SupervisorHeartbeatRequest(BaseModel):
     installed_appliance_version: str | None = None
     current_slot: Literal["slot_a", "slot_b"] | None = None
     durable_default: Literal["slot_a", "slot_b"] | None = None
+    # Per-slot installed version — read by the supervisor from the
+    # ``slot-versions.json`` sidecar maintained by
+    # ``spatium-upgrade-slot sync-versions``. Either / both may be
+    # ``None`` (sidecar missing, or freshly imaged inactive slot has
+    # never been stamped). The empty-string-mapped values used by the
+    # CLI sidecar (``"unstamped"`` / ``"unreadable"`` / ``"unknown"``)
+    # are accepted verbatim — the UI's ``slotVersion`` helper renders
+    # them as ``"—"``.
+    slot_a_version: str | None = None
+    slot_b_version: str | None = None
     is_trial_boot: bool | None = None
     last_upgrade_state: Literal["ready", "in-flight", "done", "failed"] | None = None
     last_upgrade_state_at: datetime | None = None
@@ -675,6 +691,21 @@ class SupervisorHeartbeatResponse(BaseModel):
     state: Literal["pending_approval", "approved", "rejected"]
     desired_appliance_version: str | None = None
     desired_slot_image_url: str | None = None
+    # Operator's per-slot boot intents. The supervisor writes the
+    # matching trigger file when non-null + the current state doesn't
+    # already satisfy the request. Both auto-clear in the heartbeat
+    # handler once the supervisor reports back that the action landed.
+    #
+    # ``desired_next_boot_slot`` = one-shot (``grub-reboot``, reverts
+    # on the NEXT reboot if the operator doesn't commit). Used to
+    # test an inactive slot. Cleared once the supervisor reports the
+    # target slot as ``current_slot``.
+    # ``desired_default_slot`` = durable (``grub-set-default``,
+    # survives reboots). Used to commit a trial boot, or to durably
+    # revert. Cleared once the supervisor reports the target slot as
+    # ``durable_default``.
+    desired_next_boot_slot: Literal["slot_a", "slot_b"] | None = None
+    desired_default_slot: Literal["slot_a", "slot_b"] | None = None
     reboot_requested: bool = False
     # #170 Wave D follow-up — supervisor's signed cert + CA chain.
     # Populated when the appliance has been approved + the supervisor
@@ -691,7 +722,9 @@ class SupervisorHeartbeatResponse(BaseModel):
     # uses this to bring up dns-bind9 / dns-powerdns / dhcp-kea
     # service containers via docker compose. Empty roles list = idle
     # (approved but no service running).
-    role_assignment: SupervisorRoleAssignment = Field(default_factory=SupervisorRoleAssignment)
+    role_assignment: SupervisorRoleAssignment = Field(
+        default_factory=SupervisorRoleAssignment
+    )
 
 
 @router.post(
@@ -776,7 +809,9 @@ async def supervisor_heartbeat(
         )
         if not valid:
             await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "Invalid appliance or session."
+            )
 
     assert row is not None
     # Issue #170 Wave E follow-up — reject heartbeats from soft-deleted
@@ -808,6 +843,10 @@ async def supervisor_heartbeat(
         row.current_slot = body.current_slot
     if body.durable_default is not None:
         row.durable_default = body.durable_default
+    if body.slot_a_version is not None:
+        row.slot_a_version = body.slot_a_version
+    if body.slot_b_version is not None:
+        row.slot_b_version = body.slot_b_version
     if body.is_trial_boot is not None:
         row.is_trial_boot = body.is_trial_boot
     if body.last_upgrade_state is not None:
@@ -851,6 +890,25 @@ async def supervisor_heartbeat(
         row.desired_appliance_version = None
         row.desired_slot_image_url = None
 
+    # Auto-clear desired_next_boot_slot once the supervisor reports
+    # the requested slot as ``current_slot`` — the operator's intent
+    # was "boot into this slot next", and we got there. ``durable_
+    # default`` is irrelevant here (next-boot is one-shot by design).
+    if (
+        row.desired_next_boot_slot is not None
+        and row.current_slot == row.desired_next_boot_slot
+    ):
+        row.desired_next_boot_slot = None
+
+    # Auto-clear desired_default_slot once the supervisor reports the
+    # requested slot as ``durable_default`` — grub-set-default landed
+    # and survives subsequent reboots.
+    if (
+        row.desired_default_slot is not None
+        and row.durable_default == row.desired_default_slot
+    ):
+        row.desired_default_slot = None
+
     # Auto-clear reboot_requested 15 s after the stamp — by that
     # point the heartbeat is itself proof the reboot landed (or that
     # the reboot trigger has been written + the host runner is about
@@ -890,6 +948,8 @@ async def supervisor_heartbeat(
         state=row.state,  # type: ignore[arg-type]
         desired_appliance_version=row.desired_appliance_version,
         desired_slot_image_url=row.desired_slot_image_url,
+        desired_next_boot_slot=row.desired_next_boot_slot,  # type: ignore[arg-type]
+        desired_default_slot=row.desired_default_slot,  # type: ignore[arg-type]
         reboot_requested=row.reboot_requested,
         cert_pem=row.cert_pem,
         ca_chain_pem=ca_chain_pem,
@@ -908,7 +968,9 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
     from app.models.dns import DNSServerGroup
 
     assigned_roles = list(row.assigned_roles or [])
-    dns_role_assigned = "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
+    dns_role_assigned = (
+        "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
+    )
     dhcp_role_assigned = "dhcp" in assigned_roles
 
     dns_engine: str | None = None
@@ -985,6 +1047,8 @@ class ApplianceRow(BaseModel):
     installed_appliance_version: str | None
     current_slot: str | None
     durable_default: str | None
+    slot_a_version: str | None
+    slot_b_version: str | None
     is_trial_boot: bool
     last_upgrade_state: str | None
     last_upgrade_state_at: datetime | None
@@ -992,6 +1056,8 @@ class ApplianceRow(BaseModel):
     ntp_sync_state: str | None
     desired_appliance_version: str | None
     desired_slot_image_url: str | None
+    desired_next_boot_slot: str | None
+    desired_default_slot: str | None
     reboot_requested: bool
     reboot_requested_at: datetime | None
     # #170 Wave C2 — role assignment + free-form tags.
@@ -1053,6 +1119,8 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         installed_appliance_version=row.installed_appliance_version,
         current_slot=row.current_slot,
         durable_default=row.durable_default,
+        slot_a_version=row.slot_a_version,
+        slot_b_version=row.slot_b_version,
         is_trial_boot=row.is_trial_boot,
         last_upgrade_state=row.last_upgrade_state,
         last_upgrade_state_at=row.last_upgrade_state_at,
@@ -1060,6 +1128,8 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         ntp_sync_state=row.ntp_sync_state,
         desired_appliance_version=row.desired_appliance_version,
         desired_slot_image_url=row.desired_slot_image_url,
+        desired_next_boot_slot=row.desired_next_boot_slot,
+        desired_default_slot=row.desired_default_slot,
         reboot_requested=row.reboot_requested,
         reboot_requested_at=row.reboot_requested_at,
         assigned_roles=list(row.assigned_roles or []),
@@ -1085,7 +1155,9 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
 async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     _require_superadmin(current_user)
     rows = (
-        (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc()))).scalars().all()
+        (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc())))
+        .scalars()
+        .all()
     )
     return ApplianceList(appliances=[_row_to_schema(r) for r in rows])
 
@@ -1096,7 +1168,9 @@ async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Fetch a single appliance (superadmin)",
 )
-async def get_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> ApplianceRow:
+async def get_appliance(
+    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> ApplianceRow:
     _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
@@ -1185,7 +1259,9 @@ async def approve_appliance(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Reject a pending appliance (deletes the row, superadmin)",
 )
-async def reject_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def reject_appliance(
+    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> None:
     """Reject = DELETE the row. Supervisor's next poll gets 403 +
     falls back to bootstrapping. Distinct from delete (next endpoint)
     only in the audit verb — operationally identical."""
@@ -1675,10 +1751,14 @@ async def update_appliance_roles(
             new_value={
                 "roles": list(row.assigned_roles or []),
                 "dns_group_id": (
-                    str(row.assigned_dns_group_id) if row.assigned_dns_group_id else None
+                    str(row.assigned_dns_group_id)
+                    if row.assigned_dns_group_id
+                    else None
                 ),
                 "dhcp_group_id": (
-                    str(row.assigned_dhcp_group_id) if row.assigned_dhcp_group_id else None
+                    str(row.assigned_dhcp_group_id)
+                    if row.assigned_dhcp_group_id
+                    else None
                 ),
                 "tags": dict(row.tags or {}),
             },
@@ -1834,7 +1914,9 @@ async def schedule_appliance_upgrade(
             new_value={
                 "desired_appliance_version": body.desired_appliance_version,
                 "desired_slot_image_url": resolved_url,
-                "slot_image_id": (str(body.slot_image_id) if body.slot_image_id else None),
+                "slot_image_id": (
+                    str(body.slot_image_id) if body.slot_image_id else None
+                ),
             },
         )
     )
@@ -1882,6 +1964,156 @@ async def clear_appliance_upgrade(
         )
     )
     await db.commit()
+    return _row_to_schema(row)
+
+
+class ApplianceSlotActionRequest(BaseModel):
+    """Pick which A/B slot the operator wants to act on.
+
+    Used by both ``/set-next-boot`` (one-shot, ``grub-reboot``) and
+    ``/set-default-slot`` (durable, ``grub-set-default``). The
+    supervisor's next heartbeat picks the desired field up and writes
+    the matching trigger file the host runner watches.
+    """
+
+    slot: Literal["slot_a", "slot_b"]
+
+
+def _check_appliance_slot_action_allowed(row: Appliance) -> None:
+    """Shared guards for both ``/set-next-boot`` + ``/set-default-slot``.
+
+    A slot action only makes sense on an approved appliance host: a
+    docker / k8s row has no A/B partition layout, and a pending /
+    revoked / rejected row is offline to the supervisor heartbeat
+    cycle that delivers the intent.
+    """
+    if row.state != APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Cannot change boot slot on appliance in state {row.state!r}.",
+        )
+    if row.deployment_kind not in (None, "appliance"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            (
+                f"Appliance reports deployment_kind={row.deployment_kind!r}; "
+                "A/B slot operations are only available on the SpatiumDDI "
+                "appliance OS."
+            ),
+        )
+
+
+@router.post(
+    "/appliances/{appliance_id}/set-next-boot",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Boot a specific A/B slot on the next reboot (one-shot)",
+)
+async def schedule_appliance_set_next_boot(
+    appliance_id: uuid.UUID,
+    body: ApplianceSlotActionRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceRow:
+    """Stamps ``desired_next_boot_slot`` on the appliance row. The
+    supervisor's heartbeat picks it up + writes the
+    ``slot-set-next-boot-pending`` trigger; the host runner invokes
+    ``spatium-upgrade-slot set-next-boot <slot>`` (``grub-reboot``).
+
+    Semantics: one-shot. The slot is set for exactly the next boot.
+    If the operator doesn't commit (via ``/set-default-slot``) before
+    the boot AFTER that, grub auto-reverts to the previous durable
+    default — that's the safety net behind trial-boot upgrades.
+
+    The actual reboot is NOT triggered by this call. Operator
+    either reboots manually (``/reboot`` endpoint) or waits for the
+    next planned reboot window."""
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    _check_appliance_slot_action_allowed(row)
+    row.desired_next_boot_slot = body.slot
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.set_next_boot_scheduled",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={"desired_next_boot_slot": body.slot},
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_set_next_boot_scheduled",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        slot=body.slot,
+        user=current_user.username,
+    )
+    return _row_to_schema(row)
+
+
+@router.post(
+    "/appliances/{appliance_id}/set-default-slot",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Durably set the default A/B boot slot (commit / revert)",
+)
+async def schedule_appliance_set_default_slot(
+    appliance_id: uuid.UUID,
+    body: ApplianceSlotActionRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceRow:
+    """Stamps ``desired_default_slot`` on the appliance row. The
+    supervisor's heartbeat picks it up + writes the
+    ``slot-set-default-pending`` trigger; the host runner invokes
+    ``spatium-upgrade-slot set-default <slot>``
+    (``grub-set-default``).
+
+    Semantics: durable. The grub default flips and survives subsequent
+    reboots. Two common uses:
+
+    * **Commit a trial boot** — operator booted the trial slot via
+      ``/set-next-boot``, validated it, calls this against the
+      currently-running slot to make it durable. (``firstboot.service``
+      also does this automatically when ``/health/live`` passes; this
+      endpoint exists for the explicit operator-action case.)
+    * **Durable revert** — operator wants to go back to the previous
+      slot for good (not just one boot). Calls this against the
+      previous slot."""
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    _check_appliance_slot_action_allowed(row)
+    row.desired_default_slot = body.slot
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.set_default_slot_scheduled",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={"desired_default_slot": body.slot},
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_set_default_slot_scheduled",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        slot=body.slot,
+        user=current_user.username,
+    )
     return _row_to_schema(row)
 
 

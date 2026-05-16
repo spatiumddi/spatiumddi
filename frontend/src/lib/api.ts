@@ -7285,6 +7285,12 @@ export interface ApplianceRow {
   installed_appliance_version: string | null;
   current_slot: string | null;
   durable_default: string | null;
+  // Per-slot installed version, surfaced from the supervisor's
+  // ``slot-versions.json`` sidecar. Two side-by-side slot cards in
+  // the Fleet drilldown read these; ``slotVersionLabel`` normalises
+  // ``"unstamped"`` / ``"unreadable"`` / ``"unknown"`` to ``"—"``.
+  slot_a_version: string | null;
+  slot_b_version: string | null;
   is_trial_boot: boolean;
   last_upgrade_state: string | null;
   last_upgrade_state_at: string | null;
@@ -7292,6 +7298,13 @@ export interface ApplianceRow {
   ntp_sync_state: string | null;
   desired_appliance_version: string | null;
   desired_slot_image_url: string | null;
+  // Operator's per-slot boot intents. Non-null means the Fleet UI
+  // has asked the appliance to switch boot slots; the supervisor's
+  // next heartbeat picks the field up + writes a host-side trigger.
+  // Auto-clears in the heartbeat handler once the supervisor reports
+  // back that the action landed.
+  desired_next_boot_slot: string | null;
+  desired_default_slot: string | null;
   reboot_requested: boolean;
   reboot_requested_at: string | null;
   // #170 Wave C2 — role assignment + free-form tags.
@@ -7402,6 +7415,21 @@ export const applianceApprovalApi = {
   clearUpgrade: (id: string) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/clear-upgrade`)
+      .then((r) => r.data),
+  // Per-slot boot intents (operator-facing affordances on the two
+  // slot cards in the Fleet drilldown). Both ride the same heartbeat-
+  // pickup pipeline as ``scheduleUpgrade`` — the backend stamps a
+  // desired-state column on the appliance row, the supervisor's next
+  // heartbeat reads it + writes the host-side trigger file.
+  setNextBootSlot: (id: string, slot: "slot_a" | "slot_b") =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/set-next-boot`, { slot })
+      .then((r) => r.data),
+  setDefaultSlot: (id: string, slot: "slot_a" | "slot_b") =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/set-default-slot`, {
+        slot,
+      })
       .then((r) => r.data),
   scheduleReboot: (id: string) =>
     api

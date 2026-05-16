@@ -685,6 +685,8 @@ def heartbeat_once(
 
     desired_version = body_out.get("desired_appliance_version")
     desired_url = body_out.get("desired_slot_image_url")
+    desired_next_boot_slot = body_out.get("desired_next_boot_slot")
+    desired_default_slot = body_out.get("desired_default_slot")
     reboot_requested = bool(body_out.get("reboot_requested"))
 
     if desired_version and desired_url:
@@ -692,6 +694,27 @@ def heartbeat_once(
             log.info(
                 "supervisor.heartbeat.upgrade_trigger_fired",
                 desired_version=desired_version,
+            )
+    # Per-slot boot intents. Both compare against the freshly-collected
+    # local state (snapshotted at the top of this function) so a
+    # supervisor that just rebooted into the requested slot doesn't
+    # re-fire — the backend will auto-clear the desired field on the
+    # next heartbeat once it sees current_slot / durable_default match.
+    if desired_next_boot_slot:
+        if appliance_state.maybe_fire_set_next_boot(
+            desired_next_boot_slot, state.get("current_slot")  # type: ignore[arg-type]
+        ):
+            log.info(
+                "supervisor.heartbeat.set_next_boot_trigger_fired",
+                desired_slot=desired_next_boot_slot,
+            )
+    if desired_default_slot:
+        if appliance_state.maybe_fire_set_default(
+            desired_default_slot, state.get("durable_default")  # type: ignore[arg-type]
+        ):
+            log.info(
+                "supervisor.heartbeat.set_default_trigger_fired",
+                desired_slot=desired_default_slot,
             )
     if reboot_requested:
         if appliance_state.maybe_fire_reboot(True):

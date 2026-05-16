@@ -43,6 +43,8 @@ for unit in docker.service chrony.service ssh.service \
             spatiumddi-reboot.path \
             spatiumddi-slot-upgrade.path \
             spatiumddi-slot-rollback.path \
+            spatiumddi-slot-set-next-boot.path \
+            spatiumddi-slot-set-default.path \
             spatiumddi-reboot-agent.path \
             spatiumddi-snmp-reload.path \
             spatiumddi-chrony-reload.path \
@@ -216,6 +218,12 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-rollback.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-rollback.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-slot-rollback"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-slot-set-next-boot"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-set-next-boot.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-set-next-boot.service"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-slot-set-default"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-set-default.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-set-default.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-reboot-agent"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot-agent.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot-agent.service"

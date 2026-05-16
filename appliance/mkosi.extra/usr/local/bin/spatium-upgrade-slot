@@ -588,6 +588,52 @@ def cmd_rollback(_args) -> int:
     return 0
 
 
+def cmd_set_default(args) -> int:
+    """Durably set ANY slot as the default boot — generalised
+    ``rollback`` that takes the target slot as an argument.
+
+    Unlike ``rollback`` (which always targets the inactive slot),
+    this accepts the slot explicitly. Two main uses:
+
+      * **Commit a trial boot.** Operator booted via ``set-next-boot``
+        and validated; calling ``set-default <current_slot>`` makes
+        the trial durable so subsequent reboots stay on the new slot.
+      * **Durable revert.** Operator wants to go back to the previous
+        slot for good; ``set-default <previous_slot>`` is the explicit
+        spelling of ``rollback``.
+
+    grub-set-default writes ``saved_entry`` to grubenv — survives
+    reboots until another set-default / rollback / upgrade rewrites it.
+    """
+    if os.geteuid() != 0:
+        print("ERROR: must run as root (writes to grubenv)", file=sys.stderr)
+        return 2
+
+    target = (args.slot or "").lower()
+    if target in ("slot_a", "root_a", "a"):
+        target = "slot_a"
+    elif target in ("slot_b", "root_b", "b"):
+        target = "slot_b"
+    else:
+        print(
+            f"ERROR: unknown slot '{args.slot}', expected slot_a / slot_b / a / b",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"Setting durable default boot to {target}")
+    try:
+        subprocess.run(
+            ["grub-set-default", "--boot-directory=" + GRUB_BOOT_DIR, target],
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        print(f"ERROR: grub-set-default failed: {exc}", file=sys.stderr)
+        return 3
+    print(f"  grubenv saved_entry = {_read_grubenv_default()}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -606,6 +652,16 @@ def main() -> int:
     sub.add_parser("rollback",
                    help="durably set the inactive slot as default (grub-set-default — commits the swap)")
 
+    set_default = sub.add_parser(
+        "set-default",
+        help="durably set the named slot as the default (grub-set-default). "
+             "Use to commit a trial boot or to explicitly revert.",
+    )
+    set_default.add_argument(
+        "slot",
+        help="slot_a / slot_b / a / b — the slot to make the durable default",
+    )
+
     sub.add_parser("sync-versions",
                    help="refresh /var/lib/spatiumddi/release-state/slot-versions.json "
                         "(both slots' installed APPLIANCE_VERSION). Called by "
@@ -617,6 +673,7 @@ def main() -> int:
         "apply": cmd_apply,
         "set-next-boot": cmd_set_next_boot,
         "rollback": cmd_rollback,
+        "set-default": cmd_set_default,
         "sync-versions": cmd_sync_versions,
     }[args.cmd](args)
 
