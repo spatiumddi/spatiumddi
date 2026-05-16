@@ -458,7 +458,22 @@ export function FleetTab() {
 
           {view === "slot-images" && (
             <div>
-              <h2 className="mb-1 text-base font-semibold">Upgrade images</h2>
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <h2 className="text-base font-semibold">Upgrade images</h2>
+                <button
+                  type="button"
+                  onClick={() =>
+                    qc.invalidateQueries({
+                      queryKey: ["appliance", "slot-images"],
+                    })
+                  }
+                  title="Refresh the upgrade images list"
+                  className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-muted"
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  Refresh
+                </button>
+              </div>
               <p className="mb-4 text-xs text-muted-foreground">
                 Air-gap support — upload <code>.raw.xz</code> upgrade images for
                 offline appliance upgrades. The supervisor downloads through the
