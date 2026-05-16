@@ -54,7 +54,35 @@ from .role_orchestrator import (
     render_env_file,
 )
 from . import watchdog
-from .service_lifecycle import apply_role_assignment, tear_down_supervised_services
+from . import service_lifecycle as _compose_lifecycle
+from . import service_lifecycle_k3s as _k3s_lifecycle
+from .service_lifecycle import LifecycleResult
+
+
+def _select_lifecycle():
+    """Issue #183 Phase 3 — pick the lifecycle backend for this tick.
+
+    Reads ``appliance_state.detect_runtime()`` (k3s vs docker_compose)
+    and returns the module whose ``apply_role_assignment`` +
+    ``tear_down_supervised_services`` functions match. The
+    discriminator runs every heartbeat, so an operator who flips
+    ``systemctl enable --now k3s`` between heartbeats sees the
+    supervisor switch paths on the next pass.
+    """
+    return (
+        _k3s_lifecycle
+        if appliance_state.detect_runtime() == "k3s"
+        else _compose_lifecycle
+    )
+
+
+def apply_role_assignment(profiles, env_file):
+    return _select_lifecycle().apply_role_assignment(profiles, env_file)
+
+
+def tear_down_supervised_services() -> LifecycleResult:
+    return _select_lifecycle().tear_down_supervised_services()
+
 
 # #170 Wave C2 — role-driven compose env file. Written under the
 # supervisor's state-dir so it survives slot swaps; the operator's

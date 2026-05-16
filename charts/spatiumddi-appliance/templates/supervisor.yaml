@@ -26,10 +26,12 @@ spec:
     spec:
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}
-      # ServiceAccount with RBAC scoped to this namespace + the
-      # spatium.io/* CRDs lives in Phase 3. For now the supervisor
-      # talks to k3s via the cluster admin kubeconfig that lives on
-      # /etc/rancher/k3s/k3s.yaml (host bind mount).
+      # Issue #183 Phase 3 — in-cluster auth via the SA the matching
+      # supervisor-rbac template provisions. The auto-mounted SA
+      # token + ca.crt give the supervisor's k8s_api module enough
+      # to PATCH HelmChart CRs in kube-system + read pods in the
+      # spatium namespace, no external kubeconfig needed.
+      serviceAccountName: spatium-supervisor
       hostPID: true
       containers:
         - name: spatium-supervisor

@@ -3,7 +3,7 @@
         appliance appliance-builder appliance-iso appliance-clean \
         appliance-bake-images appliance-clean-baked-images appliance-dev-iso \
         appliance-baked-iso appliance-stamp-dev appliance-slot-image \
-        appliance-fetch-k3s
+        appliance-fetch-k3s appliance-bake-chart
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 COMPOSE        = docker compose
@@ -295,6 +295,15 @@ K3S_VERSION ?= v1.35.4+k3s1
 appliance-fetch-k3s:
 	@K3S_VERSION="$(K3S_VERSION)" bash $(APPLIANCE_DIR)/scripts/fetch-k3s.sh
 
+# Issue #183 Phase 3 — chart bake. Packages
+# charts/spatiumddi-appliance/ into a stable tgz at
+# mkosi.extra/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz
+# so the supervisor's service_lifecycle_k3s module can base64-encode
+# it into a HelmChart CR. Air-gap: chart ships in the slot image,
+# no chart repo lookup at runtime.
+appliance-bake-chart:
+	@bash $(APPLIANCE_DIR)/scripts/bake-chart.sh
+
 appliance-bake-images: build-supervisor
 	@bash $(APPLIANCE_DIR)/scripts/bake-images.sh
 
@@ -304,7 +313,7 @@ appliance-bake-images: build-supervisor
 # rebuild + bake cycle. Skips the bake — firstboot falls back to
 # ``docker compose pull`` from ghcr.io on first boot. NOT how releases
 # are cut (the release pipeline always bakes — #170 Phase A4).
-appliance-dev-iso: appliance-clean-baked-images appliance-stamp-dev appliance-fetch-k3s appliance appliance-iso
+appliance-dev-iso: appliance-clean-baked-images appliance-stamp-dev appliance-fetch-k3s appliance-bake-chart appliance appliance-iso
 	@echo ""
 	@echo "✓ Dev-flavored appliance ISO ready at $(APPLIANCE_OUT)/spatiumddi-appliance_0.1.0.iso"
 	@echo "  All container images (api / frontend / DNS / DHCP agents) pull from"
@@ -317,7 +326,7 @@ appliance-dev-iso: appliance-clean-baked-images appliance-stamp-dev appliance-fe
 # builds the ISO + slot image. Mirrors what the release workflow
 # produces, just driven by your local :dev images instead of ghcr.io's
 # cut tag. ~1 GB larger than appliance-dev-iso.
-appliance-baked-iso: appliance-stamp-dev appliance-fetch-k3s appliance-bake-images appliance appliance-iso appliance-slot-image
+appliance-baked-iso: appliance-stamp-dev appliance-fetch-k3s appliance-bake-chart appliance-bake-images appliance appliance-iso appliance-slot-image
 	@echo ""
 	@echo "✓ Baked appliance ISO ready at $(APPLIANCE_OUT)/"
 	@echo "  All container images embedded. Air-gap-ready. First boot does no docker pull."
@@ -362,6 +371,12 @@ appliance-clean-baked-images:
 	        $$d3/usr/share/doc/k3s/NOTICE \
 	        $$d3/usr/share/doc/k3s/k3s-images.txt \
 	        $$d3/usr/share/doc/k3s/.version; \
+	fi
+	@# Issue #183 Phase 3 — baked Helm chart tarball.
+	@d4=$(APPLIANCE_DIR)/mkosi.extra/usr/lib/spatiumddi/charts; \
+	if [ -f $$d4/spatiumddi-appliance.tgz ]; then \
+	  echo "→ Cleaning baked Helm chart from $$d4 …"; \
+	  rm -f $$d4/spatiumddi-appliance.tgz; \
 	fi
 
 # Stamp a dev version into mkosi.extra/etc/spatiumddi/appliance-release

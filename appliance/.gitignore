@@ -38,3 +38,8 @@ mkosi.extra/usr/share/doc/k3s/LICENSE
 mkosi.extra/usr/share/doc/k3s/NOTICE
 mkosi.extra/usr/share/doc/k3s/k3s-images.txt
 mkosi.extra/usr/share/doc/k3s/.version
+
+# Issue #183 Phase 3 — baked Helm chart tarball. Reproducible
+# via ``make appliance-bake-chart`` from the tracked
+# charts/spatiumddi-appliance/ source.
+mkosi.extra/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz

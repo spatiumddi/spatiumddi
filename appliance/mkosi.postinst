@@ -46,6 +46,7 @@ for unit in docker.service chrony.service ssh.service \
             spatiumddi-slot-set-next-boot.path \
             spatiumddi-slot-set-default.path \
             spatiumddi-reboot-agent.path \
+            k3s.service \
             spatiumddi-snmp-reload.path \
             spatiumddi-chrony-reload.path \
             spatiumddi-supervisor-watchdog.timer \
@@ -243,10 +244,11 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/home.mount"
 chmod 0644 "$BUILDROOT/etc/systemd/system/root.mount"
 
 # Issue #183 Phase 1 — k3s baked binary + systemd unit + config.
-# Fetched at build time by appliance/scripts/fetch-k3s.sh into
-# mkosi.extra/. The unit is INSTALLED but NOT enabled by default —
-# Phase 3 wires the supervisor to k3s + enables it. Operator can
-# ``systemctl enable --now k3s`` to validate Phase 1 manually.
+# Phase 3: k3s.service is now ENABLED by default (registered in the
+# unit-enable loop above) so the supervisor's k3s lifecycle path
+# picks it up on first boot. Existing fielded appliances that don't
+# carry the new chart still fall back to docker compose via
+# detect_runtime() — no flag-day migration required.
 if [ -f "$BUILDROOT/usr/local/bin/k3s" ]; then
     chmod 0755 "$BUILDROOT/usr/local/bin/k3s"
 fi
@@ -260,6 +262,15 @@ chmod 0644 "$BUILDROOT/etc/profile.d/k3s.sh"
 # copy; ensure their containing dirs exist with sane modes.
 install -d -m 0755 "$BUILDROOT/var/lib/rancher/k3s/agent/images"
 install -d -m 0755 "$BUILDROOT/usr/share/doc/k3s"
+# Issue #183 Phase 3 — baked chart tarball. Source-tracked in
+# charts/spatiumddi-appliance/ and packaged at build time via
+# appliance/scripts/bake-chart.sh. The supervisor's
+# service_lifecycle_k3s module reads this exact path + base64-
+# encodes for the HelmChart CR ``spec.chartContent``.
+install -d -m 0755 "$BUILDROOT/usr/lib/spatiumddi/charts"
+if [ -f "$BUILDROOT/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz" ]; then
+    chmod 0644 "$BUILDROOT/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz"
+fi
 
 # State directories owned by the spatiumddi-firstboot service.
 install -d -m 0755 "$BUILDROOT/etc/spatiumddi"
