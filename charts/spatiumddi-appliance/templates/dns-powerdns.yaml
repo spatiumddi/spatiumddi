@@ -1,0 +1,98 @@
+{{- /* Issue #183 Phase 2 — PowerDNS DNS agent (alternative to BIND9).
+       Mutually exclusive with dnsBind9.enabled at the supervisor-CRD
+       level (server-side validation). */}}
+{{- if .Values.dnsPowerdns.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dns-powerdns
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dns-powerdns
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dns-powerdns
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        app.kubernetes.io/name: dns-powerdns
+        app.kubernetes.io/component: dns-powerdns
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+      containers:
+        - name: dns-powerdns
+          image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dnsPowerdns.image.repository) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - name: CONTROL_PLANE_URL
+              value: {{ .Values.dnsPowerdns.controlPlaneUrl | quote }}
+            - name: DNS_AGENT_KEY
+              value: {{ .Values.dnsPowerdns.agentKey | quote }}
+            - name: AGENT_GROUP
+              value: {{ .Values.dnsPowerdns.serverGroupName | quote }}
+            {{- with .Values.global.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: dns-udp
+              containerPort: 53
+              protocol: UDP
+            - name: dns-tcp
+              containerPort: 53
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/powerdns
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: dns-powerdns-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-powerdns
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dns-powerdns
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: dns-powerdns
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dns-powerdns-data
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: {{ .Values.dnsPowerdns.persistence.data.size }}
+{{- end }}

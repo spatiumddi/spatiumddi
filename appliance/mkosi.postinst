@@ -242,6 +242,25 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-reconcile.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/home.mount"
 chmod 0644 "$BUILDROOT/etc/systemd/system/root.mount"
 
+# Issue #183 Phase 1 — k3s baked binary + systemd unit + config.
+# Fetched at build time by appliance/scripts/fetch-k3s.sh into
+# mkosi.extra/. The unit is INSTALLED but NOT enabled by default —
+# Phase 3 wires the supervisor to k3s + enables it. Operator can
+# ``systemctl enable --now k3s`` to validate Phase 1 manually.
+if [ -f "$BUILDROOT/usr/local/bin/k3s" ]; then
+    chmod 0755 "$BUILDROOT/usr/local/bin/k3s"
+fi
+chmod 0644 "$BUILDROOT/etc/systemd/system/k3s.service"
+chmod 0644 "$BUILDROOT/etc/rancher/k3s/config.yaml"
+chmod 0644 "$BUILDROOT/etc/profile.d/k3s.sh"
+# kubectl / crictl / ctr are symlinks to /usr/local/bin/k3s created
+# by fetch-k3s.sh — chmod the underlying binary is enough since
+# symlinks inherit on execve.
+# Air-gap images tarball + LICENSE/manifest land via mkosi.extra/
+# copy; ensure their containing dirs exist with sane modes.
+install -d -m 0755 "$BUILDROOT/var/lib/rancher/k3s/agent/images"
+install -d -m 0755 "$BUILDROOT/usr/share/doc/k3s"
+
 # State directories owned by the spatiumddi-firstboot service.
 install -d -m 0755 "$BUILDROOT/etc/spatiumddi"
 install -d -m 0755 "$BUILDROOT/var/lib/spatiumddi"

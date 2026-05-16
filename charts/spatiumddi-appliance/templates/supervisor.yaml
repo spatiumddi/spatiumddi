@@ -1,0 +1,81 @@
+{{- /* Issue #183 Phase 2 scaffold — spatium-supervisor.
+       Deferred: Phase 3 ports the supervisor onto k3s + wires the
+       CRD reconciler. This template ships the eventual pod spec
+       (privileged DaemonSet, hostPath mounts identical to today's
+       docker-compose volume mounts) so the chart structure is
+       stable + Phase 3 only flips supervisor.enabled to true.
+       Phase 2 keeps it ``enabled: false`` by default. */}}
+{{- if .Values.supervisor.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: spatium-supervisor
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supervisor
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spatium-supervisor
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        app.kubernetes.io/name: spatium-supervisor
+        app.kubernetes.io/component: supervisor
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+      # ServiceAccount with RBAC scoped to this namespace + the
+      # spatium.io/* CRDs lives in Phase 3. For now the supervisor
+      # talks to k3s via the cluster admin kubeconfig that lives on
+      # /etc/rancher/k3s/k3s.yaml (host bind mount).
+      hostPID: true
+      containers:
+        - name: spatium-supervisor
+          image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.supervisor.image.repository) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          # Privileged because the supervisor writes host-side
+          # trigger files + reads /run/udev. Phase 3 narrows this
+          # down once the controller pattern lands.
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: etc-spatiumddi-host
+              mountPath: /etc/spatiumddi-host
+              readOnly: true
+            - name: release-state
+              mountPath: /var/lib/spatiumddi-host/release-state
+            - name: boot-efi
+              mountPath: /boot/efi-host
+              readOnly: true
+            - name: run-udev
+              mountPath: /run/udev
+              readOnly: true
+            # Phase 3 will mount /etc/rancher/k3s/k3s.yaml here so the
+            # supervisor can talk to its local kubeapi.
+            - name: kubeconfig
+              mountPath: /etc/rancher/k3s
+              readOnly: true
+      volumes:
+        - name: etc-spatiumddi-host
+          hostPath:
+            path: {{ .Values.supervisor.hostMounts.etcSpatiumddiHost }}
+            type: Directory
+        - name: release-state
+          hostPath:
+            path: {{ .Values.supervisor.hostMounts.releaseState }}
+            type: DirectoryOrCreate
+        - name: boot-efi
+          hostPath:
+            path: {{ .Values.supervisor.hostMounts.bootEfi }}
+            type: Directory
+        - name: run-udev
+          hostPath:
+            path: {{ .Values.supervisor.hostMounts.runUdev }}
+            type: Directory
+        - name: kubeconfig
+          hostPath:
+            path: /etc/rancher/k3s
+            type: Directory
+{{- end }}

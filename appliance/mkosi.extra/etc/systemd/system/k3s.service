@@ -1,0 +1,54 @@
+[Unit]
+# Issue #183 Phase 1 — single-node k3s on the appliance.
+#
+# k3s lives at /usr/local/bin/k3s (baked from the upstream release
+# pin in Makefile / fetch-k3s.sh). Config in /etc/rancher/k3s/
+# config.yaml controls the flag set; this unit just dispatches.
+#
+# The air-gap images tarball at /var/lib/rancher/k3s/agent/images/
+# k3s-airgap-images-<arch>.tar.zst is auto-imported by k3s on first
+# start, so CoreDNS / local-path-provisioner / metrics-server / pause
+# / traefik are all available without an outbound network call.
+#
+# We do NOT enable k3s.service in mkosi.postinst yet — Phase 3 wires
+# the supervisor to it. Phase 1 only proves the slot ships k3s; an
+# operator can ``systemctl enable --now k3s`` to validate.
+Description=Lightweight Kubernetes (k3s)
+Documentation=https://docs.k3s.io
+After=network-online.target nss-lookup.target firstboot.service spatium-etc-reconcile.service
+Wants=network-online.target nss-lookup.target
+# Skip on the live ISO — installer environment, no slot partitions,
+# no kubeapi state to bootstrap. firstboot also writes /etc/rancher/
+# /k3s after install; until then k3s would hit a read-only config dir.
+ConditionKernelCommandLine=!boot=live
+# Skip when there's no slot rootfs yet — fresh-out-of-box live boots
+# before install also lack the persistent paths.
+ConditionPathExists=/etc/spatiumddi/appliance-release
+
+[Service]
+Type=notify
+EnvironmentFile=-/etc/default/k3s
+EnvironmentFile=-/etc/rancher/k3s/k3s.env
+KillMode=process
+Delegate=yes
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+TimeoutStartSec=0
+Restart=always
+RestartSec=5s
+# Pre-create dirs so k3s doesn't have to. ExecStartPre is in the
+# main unit (not in /etc/systemd/system/k3s.service.d/) so a slot
+# upgrade carrying a new unit file picks up the same pre-step.
+ExecStartPre=-/sbin/modprobe br_netfilter
+ExecStartPre=-/sbin/modprobe overlay
+ExecStartPre=/bin/mkdir -p /etc/rancher/k3s /var/lib/rancher/k3s /var/log/spatiumddi
+# ``server`` boots an all-in-one node (control plane + agent). Single
+# node — no joining a cluster. All other flags live in /etc/rancher/
+# k3s/config.yaml so they're operator-editable without touching the
+# unit.
+ExecStart=/usr/local/bin/k3s server
+
+[Install]
+WantedBy=multi-user.target

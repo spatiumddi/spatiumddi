@@ -1,0 +1,90 @@
+{{- /* Issue #183 Phase 2 — Kea DHCP agent.
+       DaemonSet so Kea binds the host network namespace via
+       ``hostNetwork: true`` + ``CAP_NET_BIND_SERVICE`` for udp/67.
+       Same shape as today's docker-compose ``network_mode: host``
+       entry. Single node on the appliance, so DaemonSet
+       degenerates to one pod. */}}
+{{- if .Values.dhcpKea.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dhcp-kea
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dhcp-kea
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dhcp-kea
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        app.kubernetes.io/name: dhcp-kea
+        app.kubernetes.io/component: dhcp-kea
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+      # ``hostNetwork: true`` lets Kea see DHCP-discover broadcasts on
+      # the host NIC. Required: relayed deployments would use a
+      # different mode (Phase 5).
+      hostNetwork: true
+      # ``dnsPolicy: ClusterFirstWithHostNet`` so the pod can still
+      # resolve in-cluster service names even though it lives in the
+      # host net namespace.
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: dhcp-kea
+          image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dhcpKea.image.repository) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          # NET_BIND_SERVICE — bind udp/67 (privileged port). NET_RAW
+          # is needed by Kea's raw-socket DHCPDISCOVER read path when
+          # not behind a relay agent.
+          securityContext:
+            capabilities:
+              add:
+                - NET_BIND_SERVICE
+                - NET_RAW
+          env:
+            - name: CONTROL_PLANE_URL
+              value: {{ .Values.dhcpKea.controlPlaneUrl | quote }}
+            - name: SPATIUM_AGENT_KEY
+              value: {{ .Values.dhcpKea.agentKey | quote }}
+            - name: AGENT_GROUP
+              value: {{ .Values.dhcpKea.serverGroupName | quote }}
+            {{- with .Values.global.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # Liveness via ``kea-ctrl-agent``'s status-get over the
+          # control channel socket. Phase 3 wires this in for real;
+          # Phase 2 ships a minimal tcpSocket-based liveness against
+          # the v4 server.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "ss -lun | grep -q ':67 '"
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          volumeMounts:
+            - name: leases
+              mountPath: /var/lib/kea
+      volumes:
+        - name: leases
+          persistentVolumeClaim:
+            claimName: dhcp-kea-leases
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dhcp-kea-leases
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: {{ .Values.dhcpKea.persistence.leases.size }}
+{{- end }}

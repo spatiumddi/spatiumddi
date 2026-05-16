@@ -23,3 +23,18 @@ mkosi.workspace/
 # a stale stamp would either get clobbered by the next CI run or
 # ship as the real APPLIANCE_VERSION on a production cut.
 mkosi.extra/etc/spatiumddi/appliance-release
+
+# Issue #183 — k3s baked artefacts (~210 MiB total). Fetched at
+# build time by appliance/scripts/fetch-k3s.sh; the version is
+# pinned in Makefile's K3S_VERSION, so re-running the fetch is
+# deterministic. Never tracked — too large for git + would drift
+# from the pinned version anyway.
+mkosi.extra/usr/local/bin/k3s
+mkosi.extra/usr/local/bin/kubectl
+mkosi.extra/usr/local/bin/crictl
+mkosi.extra/usr/local/bin/ctr
+mkosi.extra/var/lib/rancher/k3s/agent/images/*.tar.zst
+mkosi.extra/usr/share/doc/k3s/LICENSE
+mkosi.extra/usr/share/doc/k3s/NOTICE
+mkosi.extra/usr/share/doc/k3s/k3s-images.txt
+mkosi.extra/usr/share/doc/k3s/.version
