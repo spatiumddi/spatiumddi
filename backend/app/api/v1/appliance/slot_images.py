@@ -395,12 +395,12 @@ async def download_slot_image(
                 "Invalid slot-image download token.",
             )
     else:
-        # No token — browser-direct access path. Reuse the
-        # require_permission gate by importing the dep + calling it.
-        # Keeps the auth surface identical to the upload / list /
-        # delete endpoints when an operator hits this URL by hand.
-        from fastapi import Request  # noqa: PLC0415
-
+        # No token — browser-direct access path is rejected with 401.
+        # Operators who want a direct-download path can re-add the
+        # CurrentUser dep alongside the token check in a follow-up;
+        # for now the token-only path keeps the function signature
+        # minimal for the supervisor's host-side runner (its only
+        # legitimate caller).
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             "Slot-image downloads require either a ``?t=<token>`` "
@@ -409,12 +409,6 @@ async def download_slot_image(
             "browser downloads can use the /api/v1/appliance/slot-images "
             "list endpoint plus a manually-presented session.",
         )
-        # NOTE: leaving the Request import + an explicit 401 here
-        # instead of plumbing the require_permission dep keeps the
-        # function signature minimal for the token-auth common case.
-        # Operators who want a direct-download path can re-add the
-        # CurrentUser dep alongside the token check in a follow-up.
-        _ = Request  # noqa: F841
 
     path = _image_path(row.id)
     if not path.exists():

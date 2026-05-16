@@ -1140,6 +1140,9 @@ def upgrade_status() -> tuple[str, str] | None:
     try:
         state_text = state_file.read_text(encoding="utf-8").strip()
     except OSError:
+        # Sidecar missing or unreadable → treat as "no upgrade state".
+        # The dashboard is best-effort observability; a stat() race
+        # against the host runner's rename shouldn't crash the panel.
         pass
     parts = state_text.split(None, 1)
     state_val = parts[0] if parts else ""
@@ -1156,8 +1159,15 @@ def upgrade_status() -> tuple[str, str] | None:
                 if now - f.stat().st_mtime < 3600:
                     failed_recent += 1
             except OSError:
+                # Sidecar disappeared between glob() and stat() — the
+                # host runner rotates these on each apply. Skip and
+                # keep counting the rest.
                 pass
     except OSError:
+        # /var/lib/spatiumddi/release-state isn't readable (fresh
+        # boot before firstboot, or unprivileged execution path).
+        # Fall through with failed_recent=0; the dashboard then
+        # rolls up to whatever state_val we managed to read above.
         pass
 
     # In-flight beats everything else — the trigger file's still
@@ -1626,6 +1636,10 @@ def _prepare_tty_for_subprocess(tty: str) -> None:
         sys.stdout.flush()
         sys.stderr.flush()
     except OSError:
+        # Best-effort flush before handing the TTY to a subprocess.
+        # A broken stdout/stderr here means Rich already failed to
+        # write its altscreen exit sequence, which is a much bigger
+        # problem the subprocess will surface in its own output.
         pass
 
 

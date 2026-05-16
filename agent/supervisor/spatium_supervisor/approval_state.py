@@ -95,6 +95,11 @@ def _atomic_write(path: Path, body: str) -> None:
         tmp.write_text(body, encoding="utf-8")
         tmp.replace(path)
     except OSError:
+        # Intentional: the strike-counter + state files are diagnostic,
+        # not load-bearing. A read-only / full /var partition shouldn't
+        # crash the supervisor's heartbeat loop. The next successful
+        # write will catch up; in the meantime in-memory state remains
+        # authoritative for this process.
         pass
 
 
@@ -102,6 +107,9 @@ def _atomic_delete(path: Path) -> None:
     try:
         path.unlink(missing_ok=True)
     except OSError:
+        # Same rationale as _atomic_write: best-effort cleanup. A
+        # leftover .strikes file from a previous run is harmless
+        # (read_strikes() handles missing + bogus content).
         pass
 
 
