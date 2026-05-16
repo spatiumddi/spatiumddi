@@ -26,10 +26,7 @@ def test_first_boot_generates_keypair(tmp_path: Path) -> None:
     assert generated is True
     assert isinstance(identity.private_key, Ed25519PrivateKey)
     assert identity.public_key_der  # non-empty
-    assert (
-        identity.fingerprint
-        == hashlib.sha256(identity.public_key_der).hexdigest()
-    )
+    assert identity.fingerprint == hashlib.sha256(identity.public_key_der).hexdigest()
 
     # Files persisted with expected names + modes.
     identity_dir = tmp_path / "identity"
@@ -83,7 +80,5 @@ def test_save_load_clear_appliance_id_round_trip(tmp_path: Path) -> None:
 
 def test_load_appliance_id_returns_none_on_corrupt_file(tmp_path: Path) -> None:
     load_or_generate(tmp_path)
-    (tmp_path / "identity" / APPLIANCE_ID_FILENAME).write_text(
-        "not-a-uuid\n"
-    )
+    (tmp_path / "identity" / APPLIANCE_ID_FILENAME).write_text("not-a-uuid\n")
     assert load_appliance_id(tmp_path) is None

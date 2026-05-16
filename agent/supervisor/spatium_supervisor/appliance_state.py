@@ -54,42 +54,15 @@ _UUID_RE = re.compile(r"root=UUID=([0-9a-fA-F-]+)")
 
 
 def detect_runtime() -> str:
-    """Issue #183 Phase 3 — pick the container runtime the supervisor
-    drives on this appliance.
+    """Issue #183 Phase 7 — the appliance is k3s-only.
 
-    Returns one of:
-
-    * ``"k3s"`` — k3s binary baked into the slot AND ``k3s.service``
-      reports ``active`` via systemctl. Lifecycle goes through the
-      kubeapi (``service_lifecycle_k3s``).
-    * ``"docker_compose"`` — every other case. Lifecycle stays on
-      docker compose (``service_lifecycle``). Includes appliances
-      that ship k3s but the operator hasn't enabled it yet (Phase 1
-      default), pre-#183 fielded appliances, and dev / docker / k8s
-      deploys where the supervisor doesn't run on an appliance at all.
-
-    The discriminator runs every heartbeat (~60s). When an operator
-    flips ``systemctl enable --now k3s`` between heartbeats, the
-    next pass picks up k3s as the runtime + the supervisor switches
-    paths cleanly. The compose path stays so the transition is
-    reversible (``systemctl disable --now k3s`` swings back).
+    Pre-Phase-7 this function branched on systemctl-is-active-k3s to
+    pick between the docker-compose and k3s lifecycle paths. Phase 7
+    retires the compose path entirely; the function survives as a
+    pure constant for any caller that still reads the runtime tag
+    (heartbeat telemetry, console rendering, etc.).
     """
-    if not Path("/usr/local/bin/k3s").exists():
-        return "docker_compose"
-    try:
-        import subprocess  # noqa: PLC0415
-
-        proc = subprocess.run(
-            ["systemctl", "is-active", "k3s.service"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        if proc.stdout.strip() == "active":
-            return "k3s"
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
-    return "docker_compose"
+    return "k3s"
 
 
 def detect_deployment_kind() -> str:

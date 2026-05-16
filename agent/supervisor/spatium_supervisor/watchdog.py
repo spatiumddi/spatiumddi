@@ -1,44 +1,45 @@
-"""Service container watchdog (#170 Wave E).
+"""Service container watchdog (#170 Wave E, #183 Phase 7).
 
 Bridges the gap between ``role_switch_state`` (set once when
 ``apply_role_assignment`` runs) and the *current* runtime state of
-the supervisor-managed service containers. Without this watchdog, a
-container that crashed / got removed / had its image purged between
-heartbeats would leave the supervisor reporting a stale
-``role_switch_state=ready`` indefinitely — ``apply_role_assignment``
-no-ops on every subsequent heartbeat because the env-hash skip
-short-circuits when nothing in the desired set changed.
+the supervisor-managed service pods. Without this watchdog, a pod
+that crashed / got removed / had its image purged between heartbeats
+would leave the supervisor reporting a stale ``role_switch_state=
+ready`` indefinitely — ``apply_role_assignment`` no-ops on every
+subsequent heartbeat because the chart-content hash hasn't moved.
+
+Phase 7 retired the docker-compose path; this watchdog is k3s-only.
+Pre-Phase-7 the module branched on ``detect_runtime()`` to choose
+between a ``docker_api.list_running_containers()`` poll and a
+``k8s_api.list_pods()`` poll. Now it's just the kubeapi path.
 
 Algorithm:
 
-1. Read the assigned compose profiles from the supervisor's
+1. Read the assigned profiles from the supervisor's
    ``role-compose.env`` (the file the supervisor itself writes on
-   every role-assignment apply). Maps profile → compose service
-   (dhcp profile → dhcp-kea service; everything else is identity).
-2. Snapshot the running containers via ``docker_api`` — same
-   ``/var/run/docker.sock`` HTTP call the heartbeat uses, so the
-   watchdog adds zero subprocess overhead on the 1-CPU appliance VM.
-3. For each desired service, derive a ``status`` verdict:
-   * ``missing`` — no container in the running set.
-   * ``starting`` — engine reports ``(health: starting)``.
-   * ``unhealthy`` — engine reports ``(unhealthy)``, exited, or
-     restart-looping.
-   * ``healthy`` — running + healthcheck passing (or no healthcheck
-     declared).
-4. Track when each (service, status) tuple was first observed in a
-   process-local history map. The supervisor reports ``since`` as
-   the ISO-8601 of the first-observed timestamp, so the Fleet UI
-   can show "missing for 3 m 24 s" rather than just a static
-   verdict. History resets on supervisor restart — acceptable, the
-   watchdog re-observes within one cadence.
+   every role-assignment apply). Map profile → chart-component name
+   (dhcp profile → dhcp-kea, etc.).
+2. Probe kubeapi ``/readyz``. If kubeapi is wedged, mark every
+   desired service ``missing`` so the Fleet UI shows the cluster-
+   level fault loud + skip the rest of the probe.
+3. Enumerate pods in ``spatium`` via the chart's
+   ``app.kubernetes.io/part-of=spatiumddi`` selector. For each
+   desired service, derive a ``status`` verdict from the matching
+   Pod's phase + container statuses:
+   * ``missing`` — no pod found.
+   * ``starting`` — Pending or Running-but-not-ready.
+   * ``unhealthy`` — CrashLoopBackOff / ErrImagePull / Failed.
+   * ``healthy`` — Running + all containers ready.
+4. Track first-observed timestamps per (service, status) in a
+   process-local history map. ``since`` rides every heartbeat.
 5. Optionally auto-heal: when one or more services are ``missing``,
-   re-fire ``apply_role_assignment`` with the current profile set.
-   ``up -d`` is idempotent, so present-and-healthy services no-op
-   and only the missing ones come up.
+   re-fire ``apply_role_assignment`` (PATCH the HelmChart CR). helm-
+   controller diffs internally — present-and-healthy services
+   no-op, missing ones come up.
 
-The heartbeat decides cadence — typically every 5 minutes (5
-heartbeats at the default 60 s interval). Steady-state cost is one
-docker_api call + dict bookkeeping; ~10 ms total.
+Cadence: 5 min (5 heartbeats at the default 60 s interval). Steady-
+state cost is one ``GET /api/v1/namespaces/spatium/pods`` + dict
+bookkeeping; sub-100 ms.
 """
 
 from __future__ import annotations
@@ -50,28 +51,21 @@ from typing import Any
 
 import structlog
 
-from . import appliance_state, docker_api, k8s_api
-from . import service_lifecycle as _compose_lifecycle
-from . import service_lifecycle_k3s as _k3s_lifecycle
+from . import k8s_api
+from .service_lifecycle import apply_role_assignment
 
 log = structlog.get_logger(__name__)
 
 
-# Compose profile → compose service name. ``COMPOSE_PROFILES`` in
-# role-compose.env carries profile values; container labels use the
-# service name. The two are identical for DNS but DHCP's profile is
-# ``dhcp`` while its service is ``dhcp-kea``.
+# Compose-profile-name → chart-component name. ``COMPOSE_PROFILES``
+# in role-compose.env carries profile values; pod labels carry the
+# chart component. ``dhcp`` profile maps to ``dhcp-kea`` component;
+# everything else is identity.
 _PROFILE_TO_SERVICE: dict[str, str] = {
     "dns-bind9": "dns-bind9",
     "dns-powerdns": "dns-powerdns",
     "dhcp": "dhcp-kea",
 }
-
-# Issue #183 Phase 3 — k3s parallel mapping. compose service names
-# happen to match the chart's pod ``app.kubernetes.io/component``
-# labels, so the dict above doubles as the k3s selector lookup.
-# Keep this comment alongside any future divergence so the mapping
-# stays clear (k3s component label = compose service name today).
 
 
 @dataclass(frozen=True)
@@ -120,32 +114,10 @@ def read_assigned_profiles(env_file: Path) -> list[str]:
     return []
 
 
-def _derive_status(container: dict[str, Any]) -> str:
-    """Translate the engine API's container state + status fields
-    into the watchdog's compact verdict."""
-    state = (container.get("State") or "").lower()
-    api_status = container.get("Status") or ""
-    if state != "running":
-        return "unhealthy"
-    # Status string carries the healthcheck verdict in parens —
-    # "Up 5 minutes (healthy)" / "Up 4 seconds (health: starting)" /
-    # "Up 1 hour (unhealthy)" / "Up 10 days" (no healthcheck).
-    if "(unhealthy)" in api_status:
-        return "unhealthy"
-    if "(health: starting)" in api_status:
-        return "starting"
-    if "(healthy)" in api_status:
-        return "healthy"
-    # Running, no healthcheck declared → treat as healthy. Pre-#170
-    # service compose entries declared healthchecks on every container,
-    # but operator-pasted custom overrides might not.
-    return "healthy"
-
-
 def _derive_pod_status(pod: k8s_api.PodStatus) -> str:
-    """k3s analog of ``_derive_status``. Maps a Pod's phase +
-    containerStatuses into the same four-value verdict the Fleet
-    drilldown renders (healthy / starting / unhealthy / missing).
+    """Translate a Pod's phase + containerStatuses into the four-
+    value verdict the Fleet drilldown renders (healthy / starting /
+    unhealthy / missing).
     """
     phase = pod.status
     if phase == "Pending":
@@ -172,87 +144,13 @@ def _derive_pod_status(pod: k8s_api.PodStatus) -> str:
     return "healthy"
 
 
-def _dispatch_apply(profiles: list[str], env_file: Path):
-    """Runtime-aware apply — same shape as the heartbeat's wrapper.
-    Watchdog needs this because we auto-heal here, not in heartbeat.
-    """
-    if appliance_state.detect_runtime() == "k3s":
-        return _k3s_lifecycle.apply_role_assignment(profiles, env_file)
-    return _compose_lifecycle.apply_role_assignment(profiles, env_file)
-
-
-def _check_health_compose(
-    env_file: Path,
-    desired_services: dict[str, str],
-    *,
-    auto_heal: bool,
-) -> dict[str, dict[str, Any]]:
-    """docker compose health-check path (legacy / non-k3s runtime).
-
-    Reads /var/run/docker.sock for running containers; filters on the
-    compose-service label. Same algorithm as pre-#183 — extracted
-    into its own function so the k3s path can mirror the structure.
-    """
-    by_service: dict[str, dict[str, Any]] = {}
-    for c in docker_api.list_running_containers():
-        labels = c.get("Labels") or {}
-        svc = labels.get("com.docker.compose.service")
-        if svc in desired_services:
-            by_service[svc] = c
-
-    out: dict[str, dict[str, Any]] = {}
-    missing_services: list[str] = []
-    now_wall = time.time()
-    now_mono = time.monotonic()
-
-    for svc, role in desired_services.items():
-        container = by_service.get(svc)
-        if container is None:
-            status = "missing"
-            container_id = None
-            missing_services.append(svc)
-        else:
-            status = _derive_status(container)
-            container_id = (container.get("Id") or "")[:12] or None
-
-        prev = _status_history.get(svc)
-        if prev is None or prev[0] != status:
-            _status_history[svc] = (status, now_mono)
-            since_wall = now_wall
-        else:
-            since_wall = now_wall - (now_mono - prev[1])
-
-        out[svc] = {
-            "role": role,
-            "status": status,
-            "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since_wall)),
-            "container_id": container_id,
-        }
-
-    if auto_heal and missing_services:
-        log.warning(
-            "supervisor.watchdog.missing_services",
-            missing=missing_services,
-            runtime="docker_compose",
-        )
-        result = _dispatch_apply(list(desired_services.values()), env_file)
-        log.info(
-            "supervisor.watchdog.heal_attempted",
-            state=result.state,
-            reason=result.reason,
-            started=list(result.started),
-        )
-
-    return out
-
-
 def _check_health_k3s(
     env_file: Path,
     desired_services: dict[str, str],
     *,
     auto_heal: bool,
 ) -> dict[str, dict[str, Any]]:
-    """k3s health-check path (#183 Phase 3).
+    """One k3s health-check pass.
 
     Probes ``/readyz`` first — if kubeapi itself is wedged, mark
     every desired service as ``missing`` so the Fleet UI carries a
@@ -260,9 +158,7 @@ def _check_health_k3s(
     workload) is the problem. Then enumerates pods in the
     ``spatium`` namespace via the kubeapi label selector
     ``app.kubernetes.io/part-of=spatiumddi`` and matches against the
-    ``app.kubernetes.io/component`` label, which the chart sets to
-    the same compose service names (``dns-bind9`` / ``dns-powerdns``
-    / ``dhcp-kea``).
+    ``app.kubernetes.io/component`` label.
     """
     out: dict[str, dict[str, Any]] = {}
     now_wall = time.time()
@@ -327,13 +223,12 @@ def _check_health_k3s(
         log.warning(
             "supervisor.watchdog.missing_services",
             missing=missing_services,
-            runtime="k3s",
         )
         # Re-applying the HelmChart CR is cheap (helm-controller
         # short-circuits when nothing changed) but lets the
         # supervisor re-assert desired state when a pod's been
         # ``kubectl delete``'d out from under us.
-        result = _dispatch_apply(list(desired_services.values()), env_file)
+        result = apply_role_assignment(list(desired_services.values()), env_file)
         log.info(
             "supervisor.watchdog.heal_attempted",
             state=result.state,
@@ -354,12 +249,10 @@ def check_health(
     Returns a JSON-serialisable ``role_health`` dict keyed by service
     name. Empty dict when no roles are assigned (idle appliance —
     nothing to watch). ``auto_heal=False`` lets tests drive the
-    watcher without re-firing the apply subprocess.
+    watcher without re-firing the apply path.
 
-    Branches on ``appliance_state.detect_runtime()``: k3s path
-    probes the local kubeapi for pod state; docker_compose path
-    walks the docker socket for running containers (legacy / pre-
-    #183 fielded appliances).
+    Phase 7: k3s-only. The pre-Phase-7 runtime branch (compose vs
+    k3s) is gone with the rest of docker.
     """
     profiles = read_assigned_profiles(env_file)
     desired_services: dict[str, str] = {}  # service → role(profile)
@@ -373,11 +266,7 @@ def check_health(
         _status_history.clear()
         return {}
 
-    runtime = appliance_state.detect_runtime()
-    if runtime == "k3s":
-        out = _check_health_k3s(env_file, desired_services, auto_heal=auto_heal)
-    else:
-        out = _check_health_compose(env_file, desired_services, auto_heal=auto_heal)
+    out = _check_health_k3s(env_file, desired_services, auto_heal=auto_heal)
 
     # Garbage-collect stale entries (operator switched roles).
     for stale in list(_status_history):

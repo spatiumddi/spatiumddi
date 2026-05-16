@@ -79,12 +79,7 @@ def test_main_module_importable() -> None:
 
 
 def test_dockerfile_is_multi_arch_capable() -> None:
-    df = (
-        Path(__file__).resolve().parents[1]
-        / "images"
-        / "supervisor"
-        / "Dockerfile"
-    )
+    df = Path(__file__).resolve().parents[1] / "images" / "supervisor" / "Dockerfile"
     text = df.read_text()
     # Non-negotiable #11 — multi-arch builds. The release workflow
     # passes ``--platform linux/amd64,linux/arm64``; the Dockerfile
@@ -94,12 +89,7 @@ def test_dockerfile_is_multi_arch_capable() -> None:
 
 
 def test_entrypoint_drops_to_unprivileged_user() -> None:
-    ep = (
-        Path(__file__).resolve().parents[1]
-        / "images"
-        / "supervisor"
-        / "entrypoint.sh"
-    )
+    ep = Path(__file__).resolve().parents[1] / "images" / "supervisor" / "entrypoint.sh"
     text = ep.read_text()
     # The supervisor must not run as root in the container — only the
     # bind-mounted sockets/dirs we mount in get root-capable access,

@@ -43,7 +43,7 @@ from typing import Any
 import httpx
 import structlog
 
-from . import appliance_state, approval_state, docker_api
+from . import appliance_state, approval_state
 from .cert_auth import build_auth_headers, load_cert, save_cert
 from .config import SupervisorConfig
 from .firewall_renderer import FirewallProfile, render_drop_in
@@ -54,35 +54,14 @@ from .role_orchestrator import (
     render_env_file,
 )
 from . import watchdog
-from . import service_lifecycle as _compose_lifecycle
-from . import service_lifecycle_k3s as _k3s_lifecycle
-from .service_lifecycle import LifecycleResult
 
-
-def _select_lifecycle():
-    """Issue #183 Phase 3 — pick the lifecycle backend for this tick.
-
-    Reads ``appliance_state.detect_runtime()`` (k3s vs docker_compose)
-    and returns the module whose ``apply_role_assignment`` +
-    ``tear_down_supervised_services`` functions match. The
-    discriminator runs every heartbeat, so an operator who flips
-    ``systemctl enable --now k3s`` between heartbeats sees the
-    supervisor switch paths on the next pass.
-    """
-    return (
-        _k3s_lifecycle
-        if appliance_state.detect_runtime() == "k3s"
-        else _compose_lifecycle
-    )
-
-
-def apply_role_assignment(profiles, env_file):
-    return _select_lifecycle().apply_role_assignment(profiles, env_file)
-
-
-def tear_down_supervised_services() -> LifecycleResult:
-    return _select_lifecycle().tear_down_supervised_services()
-
+# Issue #183 Phase 7 — k3s-only lifecycle. The pre-Phase-7 dispatcher
+# (compose vs k3s on ``detect_runtime()``) is gone with the rest of
+# docker; this is the only path now.
+from .service_lifecycle import (
+    apply_role_assignment,
+    tear_down_supervised_services,
+)
 
 # #170 Wave C2 — role-driven compose env file. Written under the
 # supervisor's state-dir so it survives slot swaps; the operator's
@@ -104,59 +83,14 @@ _NFT_DROPIN_PATH = Path("/etc/nftables.d/spatium-role.nft")
 _NFT_LAST_PROFILE_PATH = Path("/etc/nftables.d/spatium-role.profile")
 
 
-_CAPABILITY_IMAGES = {
-    "can_run_dns_bind9": "ghcr.io/spatiumddi/dns-bind9",
-    "can_run_dns_powerdns": "ghcr.io/spatiumddi/dns-powerdns",
-    "can_run_dhcp": "ghcr.io/spatiumddi/dhcp-kea",
-}
-
-
-# 5-min cache of the docker daemon's repo list. Image set on an
-# appliance changes only on slot upgrade or operator ``docker pull``;
-# re-probing per heartbeat is wasted CPU on a 1-CPU VM. Cache keyed
-# on monotonic time so wall-clock skew can't fool it.
-_REPO_CACHE_TTL_S = 300.0
-_repo_cache: tuple[float, set[str]] | None = None
-
-
-def _cached_image_repos() -> set[str]:
-    """Return the set of repo names loaded in the docker daemon,
-    cached for ``_REPO_CACHE_TTL_S`` to avoid hammering /var/run/
-    docker.sock with one HTTP round-trip per ``can_run_*`` probe per
-    heartbeat. ``capabilities`` reporting + role-checkbox enablement
-    on the Fleet drilldown are the only callers; both can tolerate a
-    5-minute staleness window in exchange for ~70 % less docker
-    daemon traffic during steady-state heartbeats."""
-    global _repo_cache
-    now = time.monotonic()
-    if _repo_cache is not None:
-        ts, repos = _repo_cache
-        if now - ts < _REPO_CACHE_TTL_S:
-            return repos
-    repos = docker_api.list_image_repos()
-    _repo_cache = (now, repos)
-    return repos
-
-
-def _docker_image_present(repo: str) -> bool:
-    """Return True if at least one tag of ``repo`` is loaded into the
-    host docker daemon, using the cached repo list.
-
-    Uses the docker engine API directly via /var/run/docker.sock
-    instead of shelling out to the ``docker`` CLI — same data, ~30×
-    faster per call (no Go binary startup + arg parsing). The
-    capability path queries this for three repos per heartbeat;
-    batching through the cache makes it effectively one call per
-    5 minutes during steady state.
-
-    A substring-aware match handles both fully-qualified
-    (``ghcr.io/spatiumddi/dns-bind9``) and short-form
-    (``spatiumddi/dns-bind9``, ``dns-bind9``) tagging the bake might
-    produce on different rebuild paths.
-    """
-    repos = _cached_image_repos()
-    short = repo.rsplit("/", 1)[-1]
-    return any(r == repo or r.endswith("/" + short) or r == short for r in repos)
+# Issue #183 Phase 7 — capability reporting is now trivially true on
+# any baked appliance. The slot's containerd content store is
+# preloaded with every service image (see appliance/scripts/bake-
+# images.sh + k3s's airgap-images auto-import). If we got far enough
+# to be sending heartbeats, the images are there. Hardcoded to True
+# instead of probing /var/run/docker.sock (which doesn't exist
+# anymore — the appliance is k3s-only).
+_CAPABILITY_FLAGS = ("can_run_dns_bind9", "can_run_dns_powerdns", "can_run_dhcp")
 
 
 def _detect_storage_type() -> str:
@@ -219,17 +153,15 @@ def _capabilities_payload() -> dict[str, Any]:
     capability reporting"):
 
     * ``can_run_dns_bind9`` / ``can_run_dns_powerdns`` /
-      ``can_run_dhcp`` — true when the corresponding service image
-      is loaded in the host docker daemon (appliance bake pre-loads
-      every service image so all three come back true on
-      Application appliances). The Fleet drilldown disables role
-      checkboxes when these are false.
+      ``can_run_dhcp`` — hardcoded ``True`` post-Phase-7. The slot's
+      containerd content store is preloaded with every service
+      image; if we're heartbeating, the images are there.
     * ``can_run_observer`` — always true. The observer role is a
       pure supervisor-side metrics/log shipper with no separate
       service container, so any approved supervisor can run it.
-    * ``has_baked_images`` — true on appliance deployments (where
-      ``spatium-docker-overlay.service`` loop-mounts the baked
-      docker-overlay.img).
+    * ``has_baked_images`` — true on appliance deployments. The
+      slot's ``/var/lib/rancher/k3s/agent/images/*.tar.zst`` archives
+      pre-load containerd; nothing pulls at runtime.
     * ``supervisor_version`` — packaging metadata.
     * ``cpu_count`` / ``memory_mb`` — host capacity from /proc.
     * ``storage_type`` — ``"ssd"`` / ``"hdd"`` / ``"unknown"``.
@@ -244,8 +176,11 @@ def _capabilities_payload() -> dict[str, Any]:
         # supervisor itself is the observer.
         "can_run_observer": True,
     }
-    for cap_field, repo in _CAPABILITY_IMAGES.items():
-        out[cap_field] = _docker_image_present(repo)
+    # Every baked appliance has every service image preloaded; the
+    # control plane's role-checkbox UI uses these flags to gate
+    # operator choice, and the answer is "yes, you can pick any role".
+    for cap_field in _CAPABILITY_FLAGS:
+        out[cap_field] = True
     try:
         import os
 
@@ -643,15 +578,14 @@ def heartbeat_once(
         # Tear down any supervised service containers whenever we're
         # in the revoked state and any are still running. The first
         # invocation is the threshold crossing; subsequent invocations
-        # catch host-reboot recovery (dockerd auto-restarted containers
-        # we'd previously ``stop``'d before the migration to ``rm``).
+        # catch host-reboot recovery.
         #
-        # ``tear_down_supervised_services`` uses ``docker compose rm
-        # -fsv`` so the container records are removed from dockerd's
-        # state entirely — no auto-restart on the next host reboot.
-        # Idempotent via the cached docker_api running-container
-        # snapshot, so calling on every heartbeat costs ~10 ms when
-        # nothing's running.
+        # Phase 7 retired the docker compose teardown: ``tear_down_
+        # supervised_services`` now ``DELETE``s the HelmChart CR via
+        # the local kubeapi. helm-controller catches the delete +
+        # runs ``helm uninstall`` against the spatium namespace.
+        # Idempotent — calling on every revoked heartbeat is a no-op
+        # once the CR is gone.
         if new_state == "revoked":
             if appliance_state.detect_deployment_kind() == "appliance":
                 try:

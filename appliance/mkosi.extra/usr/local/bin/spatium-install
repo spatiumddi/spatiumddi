@@ -496,8 +496,9 @@ do_install() {
     #
     # Hard floor: 24 GiB target disk (= 1 MiB BBP + 512 MiB ESP + 2× 8
     # GiB slots + at least 7 GiB usable /var). Below that, postgres +
-    # docker volumes + audit log outgrow /var quickly. Bumped from
-    # the pre-A4 16 GiB floor.
+    # k3s state (containerd content store, local-path PV dirs) +
+    # audit log outgrow /var quickly. Bumped from the pre-A4 16 GiB
+    # floor.
     local BBP ESP ROOT_A ROOT_B VAR
     BBP=$(partition_node 1)
     ESP=$(partition_node 2)
@@ -818,8 +819,9 @@ EOF
             mount --bind "/$d" "$MOUNT/$d"
         done
 
-        # User + password. -m creates home; -G adds to sudo + docker groups.
-        chroot "$MOUNT" useradd -m -G sudo,docker -s /bin/bash "$ADMIN_USER" \
+        # User + password. -m creates home; -G adds to sudo only.
+        # (Issue #183 Phase 7 — no docker group on the appliance.)
+        chroot "$MOUNT" useradd -m -G sudo -s /bin/bash "$ADMIN_USER" \
             >> "$INSTALL_LOG" 2>&1 || true
         echo "$ADMIN_USER:$ADMIN_PASSWORD" | chroot "$MOUNT" chpasswd \
             >> "$INSTALL_LOG" 2>&1
@@ -1073,7 +1075,7 @@ menuentry "$SLOT_TITLE_PREFIX (slot A, verbose boot)" --id=slot_a_verbose {
 
 menuentry "$SLOT_TITLE_PREFIX (rescue / single-user)" --id=rescue {
     # Boots slot_a into rescue.target — single-user, root shell only,
-    # no docker, no getty@tty1.
+    # no k3s, no getty@tty1.
     search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
     linux /boot/vmlinuz root=UUID=$ROOT_A_UUID rw \\
         console=tty0 console=ttyS0,115200n8 systemd.unit=rescue.target

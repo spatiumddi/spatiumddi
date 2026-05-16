@@ -1,11 +1,17 @@
 #!/bin/sh
-# SpatiumDDI appliance first-boot orchestrator.
+# SpatiumDDI appliance first-boot orchestrator (#183 Phase 7 — k3s only).
 #
-# Runs on every boot but only performs first-boot setup once. On first
-# run: generates secrets, writes /etc/spatiumddi/.env, pulls the
-# ghcr.io image set, and brings up the docker-compose stack. On
-# subsequent boots: just `docker-compose up -d` to ensure the stack is
-# running.
+# Runs on every boot. On first run: generates secrets, writes /etc/
+# spatiumddi/.env, renders /var/lib/rancher/k3s/server/manifests/
+# spatium-bootstrap.yaml (HelmChart CR that brings up the supervisor
+# pod on the local k3s). On every boot: reconciles SPATIUMDDI_VERSION
+# + APPLIANCE_VERSION in .env (so a slot upgrade picks up the new
+# tags), refreshes per-slot version sidecar, and (post-trial-boot)
+# commits the active slot as durable once k3s reports Ready.
+#
+# No docker. No docker-compose. k3s.service comes up first (After=
+# ordering in spatiumddi-firstboot.service); k3s's helm-controller
+# applies the bootstrap manifest the moment k3s is reachable.
 #
 # Output is mirrored to /var/log/spatiumddi/firstboot.log so the
 # operator can debug from the console without journalctl.
@@ -14,17 +20,21 @@ set -eu
 
 LOG=/var/log/spatiumddi/firstboot.log
 ENV_FILE=/etc/spatiumddi/.env
-COMPOSE_DIR=/usr/local/share/spatiumddi
 STAMP=/var/lib/spatiumddi/firstboot.done
+CHART_TGZ=/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz
+K3S_MANIFESTS_DIR=/var/lib/rancher/k3s/server/manifests
+BOOTSTRAP_MANIFEST="$K3S_MANIFESTS_DIR/spatium-bootstrap.yaml"
+SPATIUMDDI_VERSION_FILE=/usr/lib/spatiumddi/spatiumddi-version
 
 mkdir -p "$(dirname "$LOG")" "$(dirname "$STAMP")"
 exec >>"$LOG" 2>&1
 echo "=== spatiumddi-firstboot $(date -Iseconds) ==="
 
 # ── Swap (created once, idempotent) ──────────────────────────────────────────
-# 2 GiB swapfile if the system has no active swap. Protects docker
-# containers (Postgres / api / worker) from OOM when memory tightens.
-# Sized small — operators with bigger workloads can grow it.
+# 2 GiB swapfile if the system has no active swap. Protects k3s
+# control-plane components (etcd-like kine, kubeapi, helm-controller)
+# from OOM under memory pressure. Sized small — operators with bigger
+# workloads grow it.
 SWAPFILE=/var/lib/spatiumddi/swapfile
 if [ "$(swapon --show=NAME --noheadings | wc -l)" = "0" ] && [ ! -f "$SWAPFILE" ]; then
     echo "Creating 2 GiB swapfile at $SWAPFILE"
@@ -43,56 +53,46 @@ fi
 gen_hex()    { openssl rand -hex "${1:-32}"; }
 gen_fernet() { openssl rand 32 | base64 | tr -d '\n' | tr '+/' '-_'; }
 
-# Resolve which image tag the appliance should run. Three sources, in
-# priority order (lowest first; each overrides the prior):
-#
-#   1. Hardcoded "latest" default — used by clean ISOs that pull from
-#      ghcr on first boot.
-#   2. ``/usr/lib/spatiumddi/docker-overlay.version`` — sidecar
-#      written by appliance/scripts/bake-images.sh recording what
-#      SPATIUMDDI_VERSION the baked docker overlay was built against.
-#      For local-build ISOs this is "dev"; for release ISOs it's the
-#      CalVer tag (e.g. "2026.05.14-1"). Without this fall-through,
-#      compose's ``image: ghcr.io/.../:${SPATIUMDDI_VERSION}`` resolves
-#      to ``:latest`` and pulls the latest *published* image set from
-#      ghcr — defeating the entire bake and silently running the wrong
-#      software.
-#   3. ``/etc/spatiumddi/release`` — operator override (e.g. set via
+# ── Resolve SPATIUMDDI_VERSION (image tag for the chart) ─────────────────────
+# Two sources, in priority order:
+#   1. /usr/lib/spatiumddi/spatiumddi-version — written by the bake
+#      script at build time; matches the tag every preloaded image
+#      carries inside /var/lib/rancher/k3s/agent/images/*.tar.zst.
+#   2. /etc/spatiumddi/release — operator override (e.g. via
 #      cloud-init) to pin to a specific older / pre-release version.
-SPATIUMDDI_VERSION="latest"
-if [ -f /usr/lib/spatiumddi/docker-overlay.version ]; then
-    SPATIUMDDI_VERSION="$(cat /usr/lib/spatiumddi/docker-overlay.version)"
+# Without (1), the chart's ``image: ghcr.io/.../:${SPATIUMDDI_VERSION}``
+# would resolve to ``:latest`` + try to pull from ghcr.io. Air-gap:
+# fatal. The bake stamps this sidecar precisely so the chart can pull
+# locally.
+SPATIUMDDI_VERSION="dev"
+if [ -f "$SPATIUMDDI_VERSION_FILE" ]; then
+    SPATIUMDDI_VERSION="$(cat "$SPATIUMDDI_VERSION_FILE")"
 fi
 if [ -f /etc/spatiumddi/release ]; then
     # shellcheck disable=SC1091
     . /etc/spatiumddi/release
 fi
 
-# Host-side state dirs the api container bind-mounts (Phase 4c/4e/4f).
-# 1000 is the uid+gid of the ``app`` user inside the api image —
-# chown'ing here lets the unprivileged container write trigger files
-# / read diagnostic data without anyone running docker exec --user root.
+# ── Host-side state dirs ─────────────────────────────────────────────────────
+# /var/lib/spatiumddi/release-state — trigger files for slot upgrades,
+# host runner state sidecars. Sticky-bit world-write so the supervisor
+# pod (uid varies per image) can drop trigger files without us tracking
+# its in-pod uid.
 mkdir -p /var/lib/spatiumddi/release-state /var/log/spatiumddi
-chown -R 1000:1000 /var/lib/spatiumddi/release-state
-# 1777 (rwxrwxrwt) — Phase 8f-4 fleet upgrade also has the DNS / DHCP
-# agent containers write into this directory (their unprivileged
-# ``spatium`` user has a different uid than the api's ``app`` user, so
-# 0755 + chown 1000:1000 wouldn't let them through). Sticky bit
-# prevents one container from removing another's pending trigger. The
-# directory only carries trigger files + state sidecars — no secrets,
-# no operator data — so world-write is acceptable here.
 chmod 1777 /var/lib/spatiumddi/release-state
 chmod 0755 /var/log/spatiumddi
 
+# k3s's auto-deploy manifests dir. k3s creates this on first start,
+# but firstboot races k3s.service so we may get here first. Pre-
+# create with permissive perms so the supervisor / helm-controller
+# can write status sidecars.
+mkdir -p "$K3S_MANIFESTS_DIR"
+chmod 0700 "$K3S_MANIFESTS_DIR"
+
+# ── First-boot only: generate .env ───────────────────────────────────────────
 if [ ! -f "$ENV_FILE" ]; then
     echo "Generating $ENV_FILE (first boot)"
     umask 077
-    # Appliance metadata for the Phase 4 management hub. APPLIANCE_VERSION
-    # tracks the ISO release (set from /etc/spatiumddi/appliance-release
-    # if dropped at build time, otherwise the placeholder 0.1.0).
-    # APPLIANCE_HOSTNAME is the kernel's view of `hostname` at first
-    # boot; the management UI displays it as a chip next to the title.
-    # Both flow through the api container's compose env into Settings.
     APPLIANCE_VERSION_VAL="0.1.0"
     if [ -f /etc/spatiumddi/appliance-release ]; then
         # shellcheck disable=SC1091
@@ -100,30 +100,15 @@ if [ ! -f "$ENV_FILE" ]; then
         APPLIANCE_VERSION_VAL="${APPLIANCE_VERSION:-0.1.0}"
     fi
     APPLIANCE_HOSTNAME_VAL=$(hostname 2>/dev/null || echo "spatiumddi")
-    # Host's globally-scoped IPv4/IPv6 addresses, comma-separated.
-    # The api container is on docker's bridge network and can't see
-    # the host's real IPs from inside; without this env var the
-    # self-signed cert (Phase 4b.5) would only carry the docker-bridge
-    # IP (e.g. 172.18.0.5) as a SAN, which browsers pointing at the
-    # host IP see as a SAN mismatch. By exporting the real host IPs
-    # here, ensure_self_signed_cert() puts the right SANs in the cert
-    # and the warning becomes just "unknown CA" instead of
-    # "subject mismatch + unknown CA". Operator-uploaded certs are
-    # unaffected (the operator supplies whatever SANs they need).
+    # Host's globally-scoped IPs — surfaced as SANs on the self-
+    # signed cert the appliance generates so browser warnings are
+    # "unknown CA" instead of "subject mismatch". Comma-separated.
     APPLIANCE_HOST_IPS_VAL=$(ip -o addr show scope global 2>/dev/null \
         | awk '{print $4}' | cut -d/ -f1 | paste -sd, -)
-    # Docker socket gid — the api container's `app` user needs
-    # supplementary group access to /var/run/docker.sock for the
-    # Phase 4b.2 cert-deployer SIGHUP + Phase 4d container management.
-    # Read the gid off the live socket so we track whatever the
-    # docker.io package install picked (defaults to 999 on Debian
-    # but can drift). Falls back to 999 if the socket doesn't exist
-    # yet (firstboot races docker.service); the compose group_add
-    # has the same default.
-    DOCKER_GID_VAL=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo "999")
-    # spatium-install drops /etc/spatiumddi/role-config with ROLE
-    # (full-stack / frontend-core / application) +
-    # CONTROL_PLANE_URL + BOOTSTRAP_PAIRING_CODE (application only).
+    # spatium-install drops /etc/spatiumddi/role-config with ROLE +
+    # CONTROL_PLANE_URL + BOOTSTRAP_PAIRING_CODE for Application
+    # appliances. The .env carries them so the supervisor pod's
+    # entrypoint can source the file + propagate to the pod env.
     ROLE=full-stack
     INSTALL_CONTROL_PLANE_URL=""
     INSTALL_BOOTSTRAP_PAIRING_CODE=""
@@ -134,27 +119,9 @@ if [ ! -f "$ENV_FILE" ]; then
         INSTALL_BOOTSTRAP_PAIRING_CODE="${BOOTSTRAP_PAIRING_CODE:-}"
     fi
 
-    # COMPOSE_PROFILES drives which services come up.
-    #   full-stack    → full control plane + bundled BIND9 + Kea.
-    #   frontend-core → control plane only.
-    #   application   → spatium-supervisor + agent-landing static
-    #                   page; no service container until the control
-    #                   plane assigns a role (Wave C).
-    # Agent keys: control planes (full-stack / frontend-core)
-    # generate fresh DNS+DHCP agent keys for any legacy in-field
-    # agents still using the PSK path; Application appliances don't
-    # need them — the supervisor's Ed25519 keypair + control-plane-CA-
-    # signed cert is the only identity. .env still carries empty
-    # values so compose's env subst doesn't error.
     BOOTSTRAP_PAIRING_CODE_VAL=""
     case "$ROLE" in
         application)
-            # Supervisor (mandatory) + agent-landing static page so
-            # ``curl http://<appliance>/`` confirms the box is up +
-            # which control plane it pairs against. Role assignment
-            # (DNS / DHCP / multi-role) happens later from the fleet
-            # UI; service containers start then.
-            COMPOSE_PROFILES_VAL="supervisor,agent"
             DNS_AGENT_KEY_VAL=""
             DHCP_AGENT_KEY_VAL=""
             BOOTSTRAP_PAIRING_CODE_VAL="$INSTALL_BOOTSTRAP_PAIRING_CODE"
@@ -162,25 +129,13 @@ if [ ! -f "$ENV_FILE" ]; then
             AGENT_GROUP_VAL="default"
             ;;
         frontend-core)
-            # Control plane only — no bundled DNS/DHCP. Agent keys
-            # are still generated because the operator's whole reason
-            # for picking this role is to register external agents.
-            # They reveal the keys via Settings → Security → Agent
-            # bootstrap keys (or mint pairing codes under
-            # /appliance → Pairing for B2+ Application appliances).
-            COMPOSE_PROFILES_VAL="control"
             DNS_AGENT_KEY_VAL=$(gen_hex 24)
             DHCP_AGENT_KEY_VAL=$(gen_hex 24)
             CONTROL_PLANE_URL_VAL=""
             AGENT_GROUP_VAL="default"
             ;;
         *)
-            # ``full-stack`` (default) — control plane + bundled
-            # BIND9 + Kea. Single-box AIO deployment. Bundled agents
-            # register into the same default group so an external
-            # agent joining later lands alongside them.
             ROLE=full-stack
-            COMPOSE_PROFILES_VAL="control,dns-bind9,dhcp"
             DNS_AGENT_KEY_VAL=$(gen_hex 24)
             DHCP_AGENT_KEY_VAL=$(gen_hex 24)
             CONTROL_PLANE_URL_VAL=""
@@ -189,7 +144,7 @@ if [ ! -f "$ENV_FILE" ]; then
     esac
     cat > "$ENV_FILE" <<EOF
 # Auto-generated by spatiumddi-firstboot on $(date -Iseconds).
-# Edit + run \`docker-compose -f $COMPOSE_DIR/docker-compose.yml up -d\` to apply.
+# Sourced by the spatium-supervisor pod entrypoint at startup.
 # Appliance role (#170 Wave B2): $ROLE
 SPATIUMDDI_VERSION=${SPATIUMDDI_VERSION}
 POSTGRES_PASSWORD=$(gen_hex 24)
@@ -198,87 +153,27 @@ CREDENTIAL_ENCRYPTION_KEY=$(gen_fernet)
 DNS_AGENT_KEY=${DNS_AGENT_KEY_VAL}
 DHCP_AGENT_KEY=${DHCP_AGENT_KEY_VAL}
 BOOTSTRAP_PAIRING_CODE=${BOOTSTRAP_PAIRING_CODE_VAL}
-COMPOSE_PROFILES=${COMPOSE_PROFILES_VAL}
 CONTROL_PLANE_URL=${CONTROL_PLANE_URL_VAL}
 AGENT_GROUP=${AGENT_GROUP_VAL}
 APPLIANCE_ROLE=${ROLE}
 APPLIANCE_VERSION=${APPLIANCE_VERSION_VAL}
 APPLIANCE_HOSTNAME=${APPLIANCE_HOSTNAME_VAL}
 APPLIANCE_HOST_IPS=${APPLIANCE_HOST_IPS_VAL}
-DOCKER_GID=${DOCKER_GID_VAL}
 EOF
-    # #170 Wave D follow-up — mode 644 (not 600) so the
-    # spatium-supervisor's unprivileged container user (uid 100, gid 101)
-    # can read it through the ``/etc/spatiumddi:/etc/spatiumddi-host:ro``
-    # bind mount. ``service_lifecycle.py`` passes the host .env as an
-    # additional ``--env-file`` to ``docker compose`` so service
-    # containers' ``${SPATIUMDDI_VERSION}`` / ``${CONTROL_PLANE_URL}`` /
-    # ``${DOCKER_GID}`` / ``${DNS_AGENT_KEY}`` interpolation resolves.
-    # The file's AIO-mode secrets (POSTGRES_PASSWORD / SECRET_KEY /
-    # CREDENTIAL_ENCRYPTION_KEY) are reachable from the postgres data
-    # dir + api container env regardless, so 600 → 644 is a negligible
-    # security delta on a single-tenant appliance.
+    # Mode 644 so the supervisor pod's unprivileged user (uid varies
+    # per image) can read the file through the hostPath bind mount
+    # at /etc/spatiumddi-host/.env.
     chmod 644 "$ENV_FILE"
-
-    # #170 Wave B2 — for Application installs, render the agent
-    # landing page from the template into /var/lib/spatiumddi/
-    # agent-landing/ where the nginx:alpine sidecar mounts it
-    # read-only. Frontend-core / full-stack don't need it — the
-    # SpatiumDDI frontend serves the web UI on those roles.
-    #
-    # The ``umask 077`` set earlier (for the .env's secrets) leaks
-    # into the mkdir + sed > index.html and would leave the file
-    # mode 600 + dir 700 — nginx-the-process runs as uid 101 inside
-    # the alpine image and can't read root-owned 600 files, so the
-    # landing page would return 403. Reset umask before the write.
-    umask 022
-    case "$ROLE" in
-        application)
-            mkdir -p /var/lib/spatiumddi/agent-landing
-            chmod 0755 /var/lib/spatiumddi/agent-landing
-            # Role-specific labels for the static landing page. The
-            # supervisor doesn't know its assigned service role yet
-            # (control plane decides post-approval); the landing
-            # surface reflects "supervisor, awaiting role" until the
-            # fleet UI assigns one. The Wave-D fleet UI will rewrite
-            # the page on role assignment.
-            ROLE_LABEL="Application (awaiting approval)"
-            ROLE_SHORT="supervisor"
-            sed \
-                -e "s|__ROLE__|${ROLE}|g" \
-                -e "s|__ROLE_LABEL__|${ROLE_LABEL}|g" \
-                -e "s|__ROLE_SHORT__|${ROLE_SHORT}|g" \
-                -e "s|__HOSTNAME__|${APPLIANCE_HOSTNAME_VAL}|g" \
-                -e "s|__CONTROL_PLANE_URL__|${INSTALL_CONTROL_PLANE_URL}|g" \
-                -e "s|__APPLIANCE_VERSION__|${APPLIANCE_VERSION_VAL}|g" \
-                /usr/local/share/spatiumddi/agent-landing/index.html.in \
-                > /var/lib/spatiumddi/agent-landing/index.html
-            chmod 0644 /var/lib/spatiumddi/agent-landing/index.html
-            ;;
-    esac
 fi
 
-# #138 Phase 8b — reconcile SPATIUMDDI_VERSION + APPLIANCE_VERSION in
-# .env on EVERY boot, not just first install. Without this, a slot
-# upgrade lands new container images on the rootfs (tagged with the
-# new CalVer) but ``${SPATIUMDDI_VERSION}`` in .env still points at
-# the pre-upgrade tag — docker compose looks up the OLD image tag,
-# doesn't find it, and the whole stack fails with ``No such image:
-# ghcr.io/spatiumddi/spatium-supervisor:<old-tag>``. The .env lives
-# on /var (shared across slots) so it persists across upgrades and
-# never gets refreshed by the "first boot" guard above.
-#
-# Authoritative source for the slot's bundled software version is
-# /usr/lib/spatiumddi/docker-overlay.version (image tag set by the
-# bake) for SPATIUMDDI_VERSION, and /etc/spatiumddi/appliance-release
-# (ISO version set by the release pipeline) for APPLIANCE_VERSION.
-# Both files live on the rootfs (per-slot), so a slot swap
-# automatically swings them to the new slot's values. We re-sed the
-# matching lines in .env every boot so the operator can never end
-# up running stale image tags.
+# ── Every boot: reconcile SPATIUMDDI_VERSION + APPLIANCE_VERSION ─────────────
+# A slot upgrade lands new container images on the new rootfs but
+# .env (on /var, shared across slots) still points at the OLD tag.
+# Re-sed the matching lines so the chart's ``image: ...:${VERSION}``
+# always resolves to bytes preloaded in containerd.
 if [ -f "$ENV_FILE" ]; then
-    if [ -f /usr/lib/spatiumddi/docker-overlay.version ]; then
-        CURRENT_SPATIUMDDI_VERSION="$(cat /usr/lib/spatiumddi/docker-overlay.version)"
+    if [ -f "$SPATIUMDDI_VERSION_FILE" ]; then
+        CURRENT_SPATIUMDDI_VERSION="$(cat "$SPATIUMDDI_VERSION_FILE")"
         sed -i "s|^SPATIUMDDI_VERSION=.*|SPATIUMDDI_VERSION=${CURRENT_SPATIUMDDI_VERSION}|" "$ENV_FILE"
     fi
     if [ -f /etc/spatiumddi/appliance-release ]; then
@@ -289,119 +184,61 @@ if [ -f "$ENV_FILE" ]; then
     fi
 fi
 
-# docker-compose looks for .env in the compose file's directory.
-ln -sfn "$ENV_FILE" "$COMPOSE_DIR/.env"
-
-cd "$COMPOSE_DIR"
-
-# Re-runs of firstboot (post-reboot) need APPLIANCE_ROLE to drive
-# the role-aware readiness check below. The fresh-install branch
-# already sets it inline; on re-runs we reload it from .env so the
-# variable is in scope no matter which path got us here.
-if [ -z "${APPLIANCE_ROLE:-}" ] && [ -f "$ENV_FILE" ]; then
-    APPLIANCE_ROLE=$(grep -E '^APPLIANCE_ROLE=' "$ENV_FILE" | tail -1 | cut -d= -f2-)
-    CONTROL_PLANE_URL=$(grep -E '^CONTROL_PLANE_URL=' "$ENV_FILE" | tail -1 | cut -d= -f2-)
-    export APPLIANCE_ROLE CONTROL_PLANE_URL
-fi
-
-# Wait for the docker daemon socket to be ready. systemd's
-# After=docker.service only means docker.service was STARTED, not
-# that dockerd has finished initialising and accepting connections
-# on /var/run/docker.sock. Without this wait, docker-compose pull
-# can race and emit "Cannot connect to the Docker daemon" for a
-# subset of services.
-echo "Waiting for docker daemon..."
-for i in $(seq 1 30); do
-    if docker info >/dev/null 2>&1; then break; fi
-    sleep 1
-done
-docker info >/dev/null 2>&1 || {
-    echo "ERROR: docker daemon never came up after 30 s"
-    exit 1
-}
-
-# Wait for DNS resolution. systemd-resolved is the resolver but it
-# needs NetworkManager to have an IP + DNS info from DHCP first
-# (NM hands DNS info to resolved over D-Bus). With a slow DHCP
-# server we'd otherwise race and `docker-compose pull` would fail
-# on the first image with "lookup registry-1.docker.io on ::1:53:
-# read: connection refused" because /etc/resolv.conf is resolved's
-# symlink and resolved hasn't been told a DNS server yet.
-echo "Waiting for DNS resolution..."
-for i in $(seq 1 30); do
-    if getent hosts registry-1.docker.io >/dev/null 2>&1; then break; fi
-    sleep 2
-done
-getent hosts registry-1.docker.io >/dev/null 2>&1 || {
-    echo "WARN: DNS for registry-1.docker.io didn't resolve after 60 s — pull will likely fail."
-    echo "      Check 'resolvectl status' and 'nmcli device status'."
-}
-
-# #170 Phase E1 — the docker-overlay.img bake produces a populated
-# /var/lib/docker snapshot that ``spatium-docker-overlay.service``
-# loop-mounts on top of /var/lib/docker BEFORE docker.service runs.
-# By the time firstboot reaches this point the appliance's docker
-# daemon already has every baked image available — no ``docker load``
-# step needed, no slot-skew risk between the rootfs and /var.
+# ── Render the bootstrap HelmChart manifest ──────────────────────────────────
+# k3s's helm-controller watches /var/lib/rancher/k3s/server/manifests/
+# for ``HelmChart`` CRs + reconciles them into Helm releases at
+# startup. We base64-encode the baked chart tarball into
+# ``spec.chartContent`` so the chart applies inline (no registry
+# lookup, no chart repo — air-gap-clean).
 #
-# The presence of /usr/lib/spatiumddi/docker-overlay.img is the
-# "this slot carries offline images" signal. Without it (dev runs
-# without baked images), firstboot falls through to ``docker-compose
-# pull`` against ghcr.io.
-OVERLAY_IMG=/usr/lib/spatiumddi/docker-overlay.img
-BAKED=0
-if [ -f "$OVERLAY_IMG" ]; then
-    BAKED=1
+# ``supervisor.enabled: true`` is the only operator-driven flag — the
+# control plane assigns role flags (dnsBind9.enabled, dnsPowerdns.
+# enabled, dhcpKea.enabled) later via the supervisor's lifecycle
+# module once the appliance is paired.
+#
+# We re-render on every boot. The chart bytes don't change between
+# boots on the same slot, but a slot upgrade swings in a new tgz +
+# we want the bootstrap manifest to reflect that without an extra
+# step. Atomic-rename via .new so a partial write doesn't break
+# helm-controller's parse.
+if [ -f "$CHART_TGZ" ]; then
+    echo "Rendering $BOOTSTRAP_MANIFEST from $CHART_TGZ"
+    CHART_B64=$(base64 -w0 "$CHART_TGZ")
+    tmp="${BOOTSTRAP_MANIFEST}.new"
+    cat > "$tmp" <<EOF
+# Auto-generated by spatiumddi-firstboot — do not hand-edit.
+# Re-rendered on every boot from the slot-baked chart tarball.
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: spatium-bootstrap
+  namespace: kube-system
+spec:
+  chartContent: ${CHART_B64}
+  targetNamespace: spatium
+  createNamespace: true
+  valuesContent: |
+    global:
+      imageTag: ${SPATIUMDDI_VERSION}
+      imagePullPolicy: Never
+    supervisor:
+      enabled: true
+EOF
+    mv "$tmp" "$BOOTSTRAP_MANIFEST"
+    chmod 0600 "$BOOTSTRAP_MANIFEST"
+else
+    echo "WARN: $CHART_TGZ missing — supervisor pod won't auto-deploy. Is the chart baked?"
 fi
 
-if [ ! -f "$STAMP" ] && [ "$BAKED" = 0 ]; then
-    # No locally-baked images present (clean ISO from ghcr.io
-    # release artefact) — first boot must pull.
-    echo "Pulling SpatiumDDI image set (first boot)..."
-    # Retry pull on transient failures (slow image hosts, partial
-    # download). set -e at the script top would otherwise kill us
-    # on the first transient blip.
-    pull_ok=0
-    for i in 1 2 3; do
-        if docker-compose pull; then
-            pull_ok=1
-            break
-        fi
-        echo "Pull attempt $i failed; retrying in 10 s..."
-        sleep 10
-    done
-    [ "$pull_ok" = 1 ] || {
-        echo "ERROR: docker-compose pull failed 3 times. Check network + DNS."
-        exit 1
-    }
-elif [ "$BAKED" = 1 ]; then
-    echo "Skipping docker-compose pull (locally-baked images installed)."
-fi
-
-echo "Bringing stack up..."
-docker-compose up -d
-
-# Phase 8 — refresh /var/lib/spatiumddi/release-state/slot-versions.json
-# so the OS Image card + Fleet view show the right APPLIANCE_VERSION
-# per slot. Best-effort: a failure here doesn't block the stack from
-# coming up, the api just falls back to "unknown" for both slots.
+# ── Phase 8 — refresh per-slot version sidecar ──────────────────────────────
+# Best-effort: a failure here doesn't block — the api just falls back
+# to "unknown" for the slot the operator hasn't booted into recently.
 if [ -x /usr/local/bin/spatium-upgrade-slot ] && [ -e /etc/spatiumddi/role-config ]; then
     /usr/local/bin/spatium-upgrade-slot sync-versions || \
         echo "WARN: sync-versions failed — OS Image card will show 'unknown' for slot versions"
 fi
 
-# Role-aware readiness check.
-#
-# full-stack / frontend-core roles run the api container, which
-# exposes /health/live on port 8000 (port-mapped to the host). Poll
-# until it answers; that's the "the operator can sign in now" signal.
-#
-# application doesn't run a local api — there's no /health/live to
-# poll on this box. Instead, confirm every container in the active
-# compose profile reports state=running. The supervisor itself
-# retries forever against the remote control plane, so "containers
-# up" is the strongest signal we can give without a round trip across
-# the LAN.
+# ── Readiness wait + slot commit ─────────────────────────────────────────────
 # Phase 8c — commit the active slot as the durable default after a
 # successful trial boot. spatium-upgrade-slot set-next-boot writes a
 # one-shot saved_entry to grubenv via grub-reboot; that's auto-cleared
@@ -411,15 +248,11 @@ fi
 commit_slot_if_healthy() {
     local grub_boot_dir=/boot/efi
     if [ ! -f "${grub_boot_dir}/grub/grubenv" ]; then
-        # Pre-Phase-8c install (grub.cfg on /boot/grub) — nothing to commit.
         return 0
     fi
-    # Which slot are we booted from? Read root= partition UUID from
-    # /proc/cmdline, look it up against partition labels.
     local root_uuid="" current_slot=""
     root_uuid=$(awk 'BEGIN{RS=" "} /^root=UUID=/{print substr($0,11)}' /proc/cmdline 2>/dev/null | head -1)
     if [ -n "$root_uuid" ]; then
-        # blkid returns the device; lsblk gives us PARTLABEL.
         local root_dev
         root_dev=$(blkid -U "$root_uuid" 2>/dev/null)
         if [ -n "$root_dev" ]; then
@@ -431,8 +264,6 @@ commit_slot_if_healthy() {
         root_b) current_slot=slot_b ;;
         *)      return 0 ;;
     esac
-    # Read grubenv's current default. If it already matches us,
-    # nothing to do (we're the durable default — no in-flight upgrade).
     local saved
     saved=$(grub-editenv "${grub_boot_dir}/grub/grubenv" list 2>/dev/null \
             | awk -F= '/^saved_entry=/{print $2}')
@@ -441,50 +272,34 @@ commit_slot_if_healthy() {
         return 0
     fi
     echo "  trial boot detected (booted=$current_slot, durable=${saved:-unset})."
-    echo "  /health/live passed — committing $current_slot as the new default."
+    echo "  k3s reports Ready — committing $current_slot as the new default."
     grub-set-default --boot-directory="$grub_boot_dir" "$current_slot" \
         >> "$LOG" 2>&1 || true
 }
 
-case "${APPLIANCE_ROLE:-full-stack}" in
-    full-stack|frontend-core)
-        echo "Waiting for control plane on http://127.0.0.1:8000/health/live …"
-        for i in $(seq 1 60); do
-            if curl -fsS --max-time 3 http://127.0.0.1:8000/health/live >/dev/null 2>&1; then
-                date -Iseconds > "$STAMP"
-                IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
-                echo "Ready: http://${IP:-<appliance-ip>}/"
-                commit_slot_if_healthy
-                exit 0
-            fi
-            sleep 5
-        done
-        echo "WARN: /health/live did not respond within 5 minutes." >&2
-        echo "      Check 'docker-compose -f $COMPOSE_DIR/docker-compose.yml logs'." >&2
-        exit 1
-        ;;
-    *)
-        echo "Waiting for agent container(s) to start (role=${APPLIANCE_ROLE}) …"
-        for i in $(seq 1 30); do
-            # Every service that COULD be running per the profile set
-            # must report state=running. Allow up to 2.5 min before we
-            # give up; agent images may need to docker-pull on first
-            # boot if they weren't baked into the ISO.
-            non_running=$(docker-compose ps --status=created --status=exited --status=dead --status=restarting -q 2>/dev/null | wc -l)
-            total=$(docker-compose ps -q 2>/dev/null | wc -l)
-            if [ "$total" -gt 0 ] && [ "$non_running" -eq 0 ]; then
-                date -Iseconds > "$STAMP"
-                IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
-                echo "Ready: agent appliance up at http://${IP:-<appliance-ip>}/"
-                echo "       Agent registers against: ${CONTROL_PLANE_URL:-<not set>}"
-                echo "       Live state: docker logs spatiumddi-*-1"
-                commit_slot_if_healthy
-                exit 0
-            fi
-            sleep 5
-        done
-        echo "WARN: agent containers did not all report 'running' within 2.5 minutes." >&2
-        echo "      Check 'docker-compose -f $COMPOSE_DIR/docker-compose.yml logs'." >&2
-        exit 1
-        ;;
-esac
+# Wait for k3s to come up + helm-controller to apply the bootstrap
+# manifest. ``kubectl get --raw=/readyz`` is the canonical readiness
+# probe; once it returns 200 the supervisor pod can be scheduled.
+# Up to 5 min — first boot has to pull no images (everything's in
+# containerd via the airgap-import path) but k3s itself + helm-
+# controller + the supervisor pod still need to settle.
+echo "Waiting for k3s /readyz …"
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+ready=0
+for _ in $(seq 1 60); do
+    if /usr/local/bin/k3s kubectl get --raw=/readyz 2>/dev/null | grep -q '^ok'; then
+        ready=1
+        break
+    fi
+    sleep 5
+done
+if [ "$ready" = 1 ]; then
+    date -Iseconds > "$STAMP"
+    IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
+    echo "Ready: k3s up on ${IP:-<appliance-ip>}; supervisor pod auto-deploys via $BOOTSTRAP_MANIFEST"
+    commit_slot_if_healthy
+    exit 0
+fi
+echo "WARN: k3s /readyz did not respond within 5 minutes." >&2
+echo "      Check 'systemctl status k3s' + 'journalctl -u k3s'." >&2
+exit 1
