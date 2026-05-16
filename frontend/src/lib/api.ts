@@ -7349,6 +7349,12 @@ export interface ApplianceRow {
     pods_total?: number;
     pods_by_phase?: Record<string, number>;
   };
+  // Issue #183 Phase 5 — installed k3s version (e.g. ``v1.35.4+k3s1``).
+  // Null on legacy compose / pre-#183 supervisors.
+  k3s_version: string | null;
+  // Issue #183 Phase 5 — boolean "supervisor has shipped a kubeconfig".
+  // The ciphertext itself only crosses the wire on the reveal endpoint.
+  kubeconfig_set: boolean;
   // Issue #170 Wave E follow-up — soft-delete timestamp. Non-null on
   // ``state=revoked`` rows; cleared by re-authorize.
   revoked_at: string | null;
@@ -7463,6 +7469,17 @@ export const applianceApprovalApi = {
         kind: string;
         name: string;
       }>(`/appliance/appliances/${id}/k8s/restart`, body)
+      .then((r) => r.data),
+  // Issue #183 Phase 5 — reveal the stored kubeconfig after a
+  // password re-confirmation. Same shape as the SNMP-community and
+  // agent-bootstrap-key reveal endpoints.
+  revealKubeconfig: (id: string, password: string) =>
+    api
+      .post<{
+        configured: boolean;
+        kubeconfig: string | null;
+        hostname: string;
+      }>(`/appliance/appliances/${id}/k8s/kubeconfig/reveal`, { password })
       .then((r) => r.data),
 };
 

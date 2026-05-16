@@ -38,6 +38,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -643,6 +644,15 @@ class SupervisorHeartbeatRequest(BaseModel):
     # Empty dict on legacy compose appliances; None / omitted = the
     # supervisor didn't run the probe this tick (pre-#183 supervisors).
     cluster_health: dict[str, Any] | None = None
+    # Issue #183 Phase 5 — operator-facing k3s metadata.
+    # ``k3s_version`` is the upstream release tag the slot was baked
+    # against (e.g. ``v1.35.4+k3s1``). ``kubeconfig`` is the raw
+    # admin kubeconfig YAML straight off the appliance — the backend
+    # rewrites ``server:`` for operator reachability + Fernet-encrypts
+    # before persisting. Both ``None`` = supervisor didn't ship them
+    # this tick (legacy compose / pre-Phase-5 / k3s not yet started).
+    k3s_version: str | None = None
+    kubeconfig: str | None = None
 
 
 class SupervisorRoleAssignment(BaseModel):
@@ -890,6 +900,37 @@ async def supervisor_heartbeat(
         # is a meaningful signal (legacy compose; clear stale state).
         row.cluster_health = dict(body.cluster_health)
 
+    # Issue #183 Phase 5 — k3s version + kubeconfig persist. Both
+    # follow "only update when not None" so legacy compose / pre-
+    # Phase-5 supervisors don't blank the columns out.
+    if body.k3s_version is not None:
+        row.k3s_version = body.k3s_version
+    if body.kubeconfig is not None:
+        from app.core.crypto import encrypt_str  # noqa: PLC0415
+
+        # Rewrite ``server: https://127.0.0.1:6443`` → the appliance's
+        # last-seen IP so the operator's downloaded kubeconfig
+        # actually works against the appliance over the wire. Falls
+        # back to localhost when last_seen_ip is unknown (operator
+        # can edit themselves). Same IP we surface in the row chip.
+        rewritten = body.kubeconfig
+        if row.last_seen_ip:
+            # k3s.yaml's server line is structured + greppable; the
+            # supervisor doesn't run a port-7443 listener so 6443 is
+            # always the right target port.
+            new_server = f"server: https://{row.last_seen_ip}:6443"
+            rewritten = re.sub(
+                r"server:\s*https://127\.0\.0\.1:6443",
+                new_server,
+                rewritten,
+            )
+            rewritten = re.sub(
+                r"server:\s*https://0\.0\.0\.0:6443",
+                new_server,
+                rewritten,
+            )
+        row.kubeconfig_encrypted = encrypt_str(rewritten)
+
     # Auto-clear desired_appliance_version once installed matches +
     # the upgrade landed cleanly. Same shape as #138 Phase 8f-4's
     # legacy dns_server / dhcp_server auto-clear.
@@ -1092,6 +1133,14 @@ class ApplianceRow(BaseModel):
     role_health: dict[str, dict[str, Any]]
     # Issue #183 Phase 4 — local k3s cluster health summary.
     cluster_health: dict[str, Any]
+    # Issue #183 Phase 5 — installed k3s version (plain text, public).
+    # NULL on legacy compose appliances / pre-#183 supervisors.
+    k3s_version: str | None
+    # Issue #183 Phase 5 — boolean indicating whether the supervisor
+    # has shipped a kubeconfig the operator can reveal. The cipher-
+    # text itself never leaves the server outside the reveal endpoint;
+    # the row schema only exposes a "have I got one" bit.
+    kubeconfig_set: bool
     # #170 Wave E follow-up — soft-delete timestamp. Non-null on
     # ``state=revoked`` rows; cleared by re-authorize.
     revoked_at: datetime | None = None
@@ -1155,6 +1204,8 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         role_switch_reason=row.role_switch_reason,
         role_health=dict(row.role_health or {}),
         cluster_health=dict(row.cluster_health or {}),
+        k3s_version=row.k3s_version,
+        kubeconfig_set=row.kubeconfig_encrypted is not None,
         revoked_at=row.revoked_at,
         created_at=row.created_at,
     )
@@ -2445,3 +2496,144 @@ async def k8s_rollout_restart(
         user=current_user.username,
     )
     return {"ok": True, "status": status_code, "kind": body.kind, "name": body.name}
+
+
+# ── Issue #183 Phase 5 — kubeconfig reveal ──
+
+
+class RevealKubeconfigRequest(BaseModel):
+    """Operator's local-auth password — re-verified before we hand
+    back the cleartext kubeconfig. Same gate the SNMP-community and
+    agent-bootstrap-key reveals use."""
+
+    password: str
+
+
+class RevealKubeconfigResponse(BaseModel):
+    """Payload of a successful reveal. ``hostname`` is the operator-
+    visible name we surface in the suggested download filename
+    (``<hostname>.kubeconfig``)."""
+
+    configured: bool
+    kubeconfig: str | None
+    hostname: str
+
+
+@router.post(
+    "/appliances/{appliance_id}/k8s/kubeconfig/reveal",
+    response_model=RevealKubeconfigResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Reveal an appliance's k3s admin kubeconfig (superadmin + password)",
+)
+async def reveal_appliance_kubeconfig(
+    appliance_id: uuid.UUID,
+    body: RevealKubeconfigRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> RevealKubeconfigResponse:
+    """Return the appliance's stored kubeconfig after password
+    re-verification. Same shape as ``POST /admin/agent-keys/reveal``
+    and ``POST /settings/snmp/reveal-community``:
+
+    * Superadmin gate
+    * Local-auth gate (external-auth users have no password to
+      re-confirm)
+    * Password re-verification
+    * Every denial path emits an audit row + a 100 ms friction sleep
+
+    The kubeconfig's ``server:`` field has already been rewritten to
+    the appliance's last-seen IP on the way in (see the heartbeat
+    handler). Operators on the appliance's network can use the
+    downloaded file directly; operators on a different network may
+    need to edit the server line to a reachable address.
+    """
+    from app.core.crypto import decrypt_str  # noqa: PLC0415
+    from app.core.security import verify_password  # noqa: PLC0415
+
+    def _audit_denied(reason: str, *, row: Appliance | None = None) -> None:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="appliance_kubeconfig_reveal_denied",
+                resource_type="appliance",
+                resource_id=str(appliance_id),
+                resource_display=row.hostname if row else str(appliance_id),
+                result="forbidden",
+                new_value={"reason": reason},
+            )
+        )
+
+    if not current_user.is_superadmin:
+        _audit_denied("non_superadmin")
+        await db.commit()
+        await asyncio.sleep(0.1)
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only superadmins can reveal an appliance kubeconfig.",
+        )
+    if current_user.auth_source != "local":
+        _audit_denied("external_auth")
+        await db.commit()
+        await asyncio.sleep(0.1)
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Kubeconfig reveal requires a local-auth superadmin "
+            f"(your account authenticates via {current_user.auth_source}). "
+            "Log in as a local admin to reveal the kubeconfig.",
+        )
+    if not current_user.hashed_password or not verify_password(
+        body.password, current_user.hashed_password
+    ):
+        _audit_denied("password_mismatch")
+        await db.commit()
+        await asyncio.sleep(0.1)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password is incorrect.")
+
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        _audit_denied("appliance_not_found")
+        await db.commit()
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.kubeconfig_encrypted is None:
+        # Clean "nothing to reveal" — supervisor hasn't shipped a
+        # kubeconfig yet (legacy compose / pre-Phase-5 / k3s not
+        # started). Surface as a friendly state, not an error.
+        return RevealKubeconfigResponse(
+            configured=False, kubeconfig=None, hostname=row.hostname
+        )
+
+    try:
+        plaintext = decrypt_str(row.kubeconfig_encrypted)
+    except Exception:  # noqa: BLE001
+        _audit_denied("decrypt_failed", row=row)
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Stored kubeconfig could not be decrypted (key mismatch?). "
+            "The supervisor will re-ship it on the next heartbeat.",
+        ) from None
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance_kubeconfig_revealed",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_kubeconfig_revealed",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        user=current_user.username,
+    )
+    return RevealKubeconfigResponse(
+        configured=True, kubeconfig=plaintext, hostname=row.hostname
+    )

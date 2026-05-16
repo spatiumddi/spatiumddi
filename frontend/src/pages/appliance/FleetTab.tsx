@@ -1418,6 +1418,7 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
+  const [revealOpen, setRevealOpen] = useState(false);
 
   const ch = row.cluster_health ?? {};
   const ready = ch.kubeapi_ready === true;
@@ -1450,6 +1451,11 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
           >
             {ready ? "ready" : "unreachable"}
           </span>
+          {row.k3s_version && (
+            <span className="ml-2 font-mono text-[11px] text-muted-foreground">
+              {row.k3s_version}
+            </span>
+          )}
         </dd>
         {nodesTotal !== undefined && (
           <>
@@ -1494,6 +1500,20 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
           )}
           Restart bind9
         </button>
+        <button
+          type="button"
+          onClick={() => setRevealOpen(true)}
+          disabled={!row.kubeconfig_set}
+          title={
+            row.kubeconfig_set
+              ? "Reveal + download the admin kubeconfig (password-gated)"
+              : "Supervisor hasn't shipped a kubeconfig yet"
+          }
+          className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <KeyRound className="h-3 w-3" />
+          Reveal kubeconfig
+        </button>
         {restartBind9.error && (
           <span className="text-[11px] text-rose-700 dark:text-rose-300">
             {(restartBind9.error as Error).message}
@@ -1505,7 +1525,134 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
           </span>
         )}
       </div>
+      {revealOpen && (
+        <RevealKubeconfigModal
+          appliance={row}
+          onClose={() => setRevealOpen(false)}
+        />
+      )}
     </div>
+  );
+}
+
+// Issue #183 Phase 5 — password-gated reveal + download for the
+// appliance's admin kubeconfig. Mirrors Settings → Security ↘ Reveal
+// SNMP community / agent bootstrap keys.
+function RevealKubeconfigModal({
+  appliance,
+  onClose,
+}: {
+  appliance: ApplianceRow;
+  onClose: () => void;
+}) {
+  const [password, setPassword] = useState("");
+  const [shown, setShown] = useState<string | null>(null);
+  const reveal = useMutation({
+    mutationFn: () =>
+      applianceApprovalApi.revealKubeconfig(appliance.id, password),
+    onSuccess: (data) => {
+      setShown(data.kubeconfig ?? "");
+    },
+  });
+  function download() {
+    if (!shown) return;
+    const blob = new Blob([shown], { type: "application/yaml" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${appliance.hostname}.kubeconfig`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  return (
+    <Modal
+      title={`Reveal kubeconfig · ${appliance.hostname}`}
+      onClose={onClose}
+    >
+      <div className="space-y-3 text-sm">
+        <p className="text-xs text-muted-foreground">
+          Re-confirm your password to reveal the admin kubeconfig the supervisor
+          shipped for this appliance. The reveal is audit-logged and
+          local-auth-only. The downloaded file works against the appliance from
+          its current network; for cross-network use, edit the{" "}
+          <code>server:</code> line to a reachable address.
+        </p>
+        {!shown && (
+          <>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Your password"
+              className="w-full rounded-md border bg-background px-2 py-1 text-sm"
+              autoFocus
+            />
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => reveal.mutate()}
+                disabled={!password.trim() || reveal.isPending}
+                className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {reveal.isPending ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <KeyRound className="h-3.5 w-3.5" />
+                )}
+                Reveal
+              </button>
+            </div>
+            {reveal.error && (
+              <p className="text-xs text-rose-700 dark:text-rose-300">
+                {(reveal.error as Error).message}
+              </p>
+            )}
+          </>
+        )}
+        {shown !== null && (
+          <>
+            {shown ? (
+              <>
+                <textarea
+                  readOnly
+                  value={shown}
+                  rows={14}
+                  className="w-full rounded-md border bg-muted/30 px-2 py-1 font-mono text-[11px]"
+                />
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => navigator.clipboard.writeText(shown)}
+                    className="rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted"
+                  >
+                    Copy
+                  </button>
+                  <button
+                    type="button"
+                    onClick={download}
+                    className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs hover:bg-primary/20"
+                  >
+                    Download {appliance.hostname}.kubeconfig
+                  </button>
+                </div>
+              </>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                Supervisor hasn't shipped a kubeconfig yet — wait for the next
+                heartbeat after k3s.service is up.
+              </p>
+            )}
+          </>
+        )}
+      </div>
+    </Modal>
   );
 }
 
@@ -1875,6 +2022,18 @@ function ApplianceSlotsCell({ row }: { row: ApplianceRow }) {
       {row.is_trial_boot && (
         <span className="rounded-full bg-amber-500/10 px-1.5 py-0 text-[10px] font-medium uppercase text-amber-700 dark:text-amber-300">
           trial boot
+        </span>
+      )}
+      {row.k3s_version && (
+        <span
+          className="rounded-full bg-sky-500/10 px-1.5 py-0 font-mono text-[10px] text-sky-700 dark:text-sky-300"
+          title={
+            row.cluster_health?.kubeapi_ready
+              ? `k3s ready · ${row.cluster_health?.nodes_ready ?? 0}/${row.cluster_health?.nodes_total ?? 0} nodes`
+              : "k3s baked, kubeapi unreachable"
+          }
+        >
+          k3s {row.k3s_version}
         </span>
       )}
     </div>

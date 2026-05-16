@@ -613,6 +613,18 @@ class Appliance(Base):
         server_default="{}",
     )
 
+    # Issue #183 Phase 5 — operator-facing k3s metadata.
+    # ``k3s_version`` is the upstream release tag the slot was baked
+    # against (e.g. ``v1.35.4+k3s1``); Fleet UI shows it on the row.
+    # ``kubeconfig_encrypted`` is the supervisor-supplied admin
+    # kubeconfig, Fernet-encrypted at rest. NULL until the supervisor
+    # ships one (legacy compose / pre-#183 supervisors / k3s not yet
+    # started).
+    k3s_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    kubeconfig_encrypted: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

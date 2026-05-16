@@ -638,6 +638,61 @@ def read_ntp_sync_state() -> str | None:
     return None
 
 
+_HOST_K3S_KUBECONFIG = Path("/etc/spatiumddi-host/rancher/k3s/k3s.yaml")
+# Fallback when the bind mount is the supervisor compose's
+# ``/etc/rancher/k3s`` path-through instead of the
+# ``/etc/spatiumddi-host`` mount. Both layouts exist in the wild.
+_DIRECT_K3S_KUBECONFIG = Path("/etc/rancher/k3s/k3s.yaml")
+_K3S_VERSION_SIDECAR = Path("/usr/share/doc/k3s/.version")
+
+
+def read_k3s_version() -> str | None:
+    """Issue #183 Phase 5 — installed k3s version stamped by the
+    build-time ``fetch-k3s.sh`` script. Single value per slot; the
+    Fleet UI shows it next to the appliance row.
+
+    Returns ``None`` when the sidecar is missing — pre-#183 slots or
+    non-appliance deploys.
+    """
+    if not _K3S_VERSION_SIDECAR.exists():
+        return None
+    try:
+        text = _K3S_VERSION_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def read_kubeconfig() -> str | None:
+    """Issue #183 Phase 5 — operator kubeconfig payload.
+
+    Reads ``k3s.yaml`` straight off the slot's /etc overlay (the
+    admin kubeconfig k3s writes on first start). Returns the raw
+    YAML text — the backend rewrites the ``server:`` field for
+    operator reachability (using the appliance's last-seen IP) and
+    Fernet-encrypts before persisting.
+
+    Returns ``None`` when:
+      * The supervisor isn't on a k3s appliance (``detect_runtime()
+        != "k3s"``)
+      * The kubeconfig file doesn't exist yet (k3s.service hasn't
+        started, or first-boot is still warming up)
+
+    Shipping the cleartext kubeconfig over the heartbeat is safe —
+    the heartbeat channel is already mTLS-encrypted end-to-end with
+    the supervisor's cert. At-rest encryption is the backend's job.
+    """
+    if detect_runtime() != "k3s":
+        return None
+    for path in (_HOST_K3S_KUBECONFIG, _DIRECT_K3S_KUBECONFIG):
+        if path.exists():
+            try:
+                return path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+    return None
+
+
 def read_cluster_health() -> dict[str, object] | None:
     """Issue #183 Phase 4 — local k3s health summary for the
     heartbeat's slow drift channel.
@@ -741,6 +796,8 @@ def collect() -> dict[str, object]:
 
     slot_a_version, slot_b_version = read_slot_versions()
     cluster_health = read_cluster_health() if is_appliance else None
+    k3s_version = read_k3s_version() if is_appliance else None
+    kubeconfig = read_kubeconfig() if is_appliance else None
 
     return {
         "deployment_kind": deployment_kind,
@@ -770,4 +827,11 @@ def collect() -> dict[str, object]:
         # so the backend's "overwrite verbatim" semantics clear stale
         # health when k3s is disabled.
         "cluster_health": cluster_health if cluster_health is not None else {},
+        # Issue #183 Phase 5 — operator-facing k3s metadata. The
+        # backend rewrites the kubeconfig's ``server:`` field for
+        # operator reachability + Fernet-encrypts before persisting.
+        # ``None`` when k3s isn't the runtime (backend then leaves
+        # the column untouched).
+        "k3s_version": k3s_version,
+        "kubeconfig": kubeconfig,
     }
