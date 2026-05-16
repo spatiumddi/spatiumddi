@@ -20,13 +20,11 @@
 from __future__ import annotations
 
 import argparse
-import http.client
 import json
 import os
 import re
 import select
 import signal
-import socket
 import subprocess
 import sys
 import termios
@@ -247,99 +245,149 @@ def role_label(role: str) -> str:
     return ROLE_LABELS.get(role, role)
 
 
-# ── docker / system state ─────────────────────────────────────────────
+# ── k3s pod state ─────────────────────────────────────────────────────
+#
+# Issue #183 Phase 7/8 — the appliance is k3s-only; this used to talk
+# to /var/run/docker.sock + parse ``docker ps`` output. Now we query
+# the local kubeapi via ``kubectl get pods -o json`` and translate
+# the pod shape into the dict shape the downstream renderer already
+# expects (``Names`` / ``Image`` / ``Status`` / ``Labels`` / ``State`` /
+# ``Ports`` / ``NetworkMode``). Keeping the same shape means the
+# Services-row renderer + service-name parser + watchdog status reader
+# all keep working unchanged.
 
 
 _STATUS_HEALTH_RE = re.compile(r"\(([^)]+)\)")
 
 
-class _UnixHTTPConnection(http.client.HTTPConnection):
-    """``http.client.HTTPConnection`` over a unix socket — the
-    docker engine API speaks HTTP/1.1 over /var/run/docker.sock.
-    Replaces the ``subprocess.run(["docker", "ps", ...])`` pattern
-    with a direct API call (~30× faster on a 1-CPU appliance VM,
-    no Go binary startup + arg parsing + JSON formatting overhead).
-    The previous shell-out cadence on a 1-CPU VM created a feedback
-    loop with dockerd's OpenTelemetry middleware — see ``docker_ps``
-    for the full story."""
-
-    def __init__(self, socket_path: str, timeout: float = 5.0) -> None:
-        super().__init__("localhost", timeout=timeout)
-        self._socket_path = socket_path
-
-    def connect(self) -> None:
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(self._socket_path)
-
-
 def docker_ps() -> list[dict]:
-    """Return the currently-running containers via the docker engine
-    API. One HTTP GET to /var/run/docker.sock — much cheaper than the
-    old ``docker ps --format`` subprocess.
+    """Return the currently-running pods in the ``spatium`` namespace
+    via ``kubectl get pods -o json``, translated into the docker-ps
+    dict shape the rest of the console expects.
 
-    Returns [] on any failure (daemon down, EACCES on socket, etc.).
-    The renderer surfaces missing containers as "(not running)" rows
-    so the dashboard stays usable even when docker is fully broken.
+    Function name kept as ``docker_ps`` so the rest of the renderer
+    code doesn't have to change. Pre-Phase-7 this hit
+    /var/run/docker.sock directly; now it shells to the local k3s
+    binary's embedded kubectl. ~50 ms per call (fork + JSON parse)
+    is fine for the dashboard's 2 s refresh cadence.
 
-    The previous subprocess form's 3 s timeout fired mid-response on
-    a slow 1-CPU VM, dockerd logged "superfluous
-    response.WriteHeader call from go.opentelemetry.io/contrib/..."
-    on every kill, and the journal-tail rendered those errors in the
-    live-log pane creating an infinite feedback loop. Direct API
-    talk side-steps the whole problem: no fork, no exec, no Go
-    binary startup, no JSON re-serialisation through the CLI.
+    Returns [] on any failure (k3s not running, kubeconfig missing,
+    namespace not present yet). The renderer surfaces missing
+    services as "(not running)" rows so the dashboard stays usable
+    even when k3s is fully broken.
     """
     try:
-        conn = _UnixHTTPConnection("/var/run/docker.sock", timeout=10.0)
-        try:
-            conn.request("GET", "/v1.45/containers/json", headers={"Host": "localhost"})
-            resp = conn.getresponse()
-            body = resp.read()
-            if resp.status != 200:
-                return []
-            data = json.loads(body)
-        finally:
-            conn.close()
-    except (OSError, ValueError, json.JSONDecodeError):
+        proc = subprocess.run(
+            [
+                "/usr/local/bin/k3s",
+                "kubectl",
+                "get",
+                "pods",
+                "-n",
+                "spatium",
+                "-l",
+                "app.kubernetes.io/part-of=spatiumddi",
+                "-o",
+                "json",
+            ],
+            env={
+                **os.environ,
+                "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml",
+            },
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
-    # Translate the engine-API shape into the same dict shape
-    # ``docker ps --format '{{json .}}'`` used to emit so the
-    # downstream renderer keeps working unchanged. The renderer
-    # cares about: Names, Image, Status, Labels (for compose
-    # project/service stamps via ``container_service_name``), State.
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return []
     out: list[dict] = []
-    for c in data:
-        # Names from the API come as ``["/some-name"]`` with a leading
-        # slash; the CLI's --format strips it. Match that.
-        raw_names = c.get("Names") or []
-        name = (raw_names[0].lstrip("/") if raw_names else "")
-        # Engine-API ``Labels`` is a flat ``{key: value}`` dict; the
-        # CLI's --format collapses it to a comma-separated string of
-        # ``key=value`` pairs. ``container_service_name`` already
-        # handles both shapes (dict via .get, fallback string parse),
-        # so passing the dict through is fine — keeping the original
-        # dict is cheaper than re-flattening.
-        hostcfg = c.get("HostConfig") or {}
-        out.append({
-            "Names": name,
-            "Image": c.get("Image", ""),
-            "Status": c.get("Status", ""),
-            "Labels": c.get("Labels") or {},
-            "State": c.get("State", ""),
-            # Engine API ``Ports`` is a list of {IP, PrivatePort,
-            # PublicPort, Type} dicts. The renderer's
-            # ``container_port_summary`` collapses them into a short
-            # human string for the Services row.
-            "Ports": c.get("Ports") or [],
-            # ``HostConfig.NetworkMode`` is "default" / "host" /
-            # "bridge" / "<network-name>" / "container:<id>". The
-            # supervisor's DHCP role specifically runs in ``host``
-            # mode for broadcast-relay reachability; surface that
-            # signal in the Services row so operators can spot a
-            # mis-deployed bridged DHCP at a glance.
-            "NetworkMode": hostcfg.get("NetworkMode") or "",
-        })
+    for pod in data.get("items") or []:
+        meta = pod.get("metadata") or {}
+        spec = pod.get("spec") or {}
+        status = pod.get("status") or {}
+        phase = status.get("phase") or "Unknown"
+        containers = spec.get("containers") or []
+        first = containers[0] if containers else {}
+        labels = meta.get("labels") or {}
+
+        # Derive a docker-ps-style ``Status`` string. The renderer's
+        # ``health_from_status`` reads the trailing ``(healthy)`` /
+        # ``(unhealthy)`` / ``(health: starting)`` marker, so we
+        # synthesise one from the pod's container readiness +
+        # waiting-reason. Mirrors what the watchdog does in
+        # ``_derive_pod_status``.
+        container_statuses = status.get("containerStatuses") or []
+        if phase == "Running" and container_statuses:
+            all_ready = all(cs.get("ready") for cs in container_statuses)
+            if all_ready:
+                status_str = "Running (healthy)"
+                state_str = "running"
+            else:
+                # Find any waiting-reason for the unhealthy marker.
+                reason = ""
+                for cs in container_statuses:
+                    if cs.get("ready"):
+                        continue
+                    waiting = (cs.get("state") or {}).get("waiting") or {}
+                    reason = (waiting.get("reason") or "").lower()
+                    if reason:
+                        break
+                if reason in ("crashloopbackoff", "errimagepull", "imagepullbackoff"):
+                    status_str = f"Running (unhealthy: {reason})"
+                else:
+                    status_str = "Running (health: starting)"
+                state_str = "running"
+        elif phase == "Pending":
+            status_str = "Pending (health: starting)"
+            state_str = "starting"
+        elif phase in ("Failed", "Succeeded"):
+            status_str = f"{phase} (unhealthy)"
+            state_str = "exited"
+        else:
+            status_str = phase
+            state_str = phase.lower()
+
+        # Translate container ports → docker-ps ``Ports`` shape.
+        # Pre-Phase-7 ``PublicPort`` was the host-side mapping; k3s
+        # uses host ports only for ``hostNetwork: true`` pods, which
+        # we mark as NetworkMode=host so the renderer collapses the
+        # whole row to ``host net`` regardless of the ports list.
+        ports_out: list[dict] = []
+        for c in containers:
+            for p in c.get("ports") or []:
+                cport = p.get("containerPort")
+                proto = p.get("protocol") or "TCP"
+                if cport is None:
+                    continue
+                ports_out.append(
+                    {
+                        "PrivatePort": cport,
+                        "PublicPort": cport if spec.get("hostNetwork") else None,
+                        "Type": proto.lower(),
+                    }
+                )
+
+        out.append(
+            {
+                "Names": meta.get("name") or "",
+                "Image": (first.get("image") or "") if first else "",
+                "Status": status_str,
+                "Labels": labels,
+                "State": state_str,
+                "Ports": ports_out,
+                "NetworkMode": "host" if spec.get("hostNetwork") else "default",
+            }
+        )
+
+    # Plus the supervisor pod from the kube-system / spatium
+    # namespace — query it separately since its labels match the
+    # selector above only on the same chart.
     return out
 
 
@@ -376,22 +424,32 @@ def container_port_summary(row: dict) -> str:
 
 
 def container_service_name(row: dict) -> str:
-    """Pull the docker-compose service name out of a ps row.
+    """Pull the logical service name (``dns-bind9`` / ``dhcp-kea`` /
+    ``spatium-supervisor``) out of a ps row.
 
-    Compose names containers `<project>-<service>-<replica>`; project
-    is `spatiumddi` on the appliance compose. Falls back to the bare
-    Names field if the prefix doesn't match.
+    Phase 7: rows now come from k3s pods. The chart labels every pod
+    with ``app.kubernetes.io/component=<name>``, so we read that
+    first. Falls back to the bare ``Names`` field (or pod name) when
+    the label isn't present — covers pre-Phase-7-compatible callers
+    + any operator-deployed pods that bypassed the chart.
     """
-    names = (row.get("Names") or "").split(",")[0].strip().lstrip("/")
-    if names.startswith("spatiumddi-"):
-        rest = names[len("spatiumddi-"):]
-        # strip trailing -1 / -2 replica numbers
-        if "-" in rest:
-            last = rest.rsplit("-", 1)[1]
-            if last.isdigit():
-                return rest.rsplit("-", 1)[0]
-        return rest
-    return names
+    labels = row.get("Labels") or {}
+    if isinstance(labels, dict):
+        component = labels.get("app.kubernetes.io/component")
+        if component:
+            return component
+    # Fallback: parse from the pod name. k3s pods are
+    # ``<deployment>-<replicaset>-<hash>`` so strip the trailing
+    # two hash segments and we're left with the workload name.
+    name = (row.get("Names") or "").strip().lstrip("/")
+    if not name:
+        return ""
+    parts = name.split("-")
+    # Last two parts of a Deployment-managed pod are
+    # ``<rs-hash>-<pod-hash>``; strip them.
+    if len(parts) >= 3 and len(parts[-1]) == 5 and len(parts[-2]) >= 5:
+        return "-".join(parts[:-2])
+    return name
 
 
 def health_from_status(status: str) -> str:
@@ -1371,7 +1429,7 @@ def render_footer(message: str = "") -> Text:
     keys = [
         ("F1", "Login"),
         ("F2", "Monitor"),
-        ("F3", "Containers"),
+        ("F3", "Pods"),
         ("F4", "Network"),
         ("F5", "Reboot"),
         ("F6", "Shutdown"),
@@ -1786,28 +1844,88 @@ def do_monitor(console: Console, tty: str) -> None:
 
 
 def do_containers(console: Console, tty: str) -> None:
-    """Stream ``docker stats`` until the operator quits.
+    """Stream ``kubectl top pod`` + ``kubectl get pods`` until the
+    operator quits.
 
-    docker stats already speaks the cooked-tty / ncurses-like idiom
-    (auto-refreshing table, Ctrl-C to exit) so we just hand the tty
-    over to it. No filtering on container name: every container the
-    daemon knows about is interesting on a single-box appliance.
+    Issue #183 Phase 7 — the appliance is k3s-only; this used to
+    hand off to ``docker stats``. ``kubectl top pod -A`` is the
+    closest equivalent (per-pod CPU + memory live), but it depends
+    on metrics-server which we deliberately leave disabled by
+    default (see ``charts/spatiumddi-appliance/templates/`` —
+    metrics-server lands as an optional Phase 8 observability add-
+    on). Fall through to ``kubectl get pods -A -w`` when metrics-
+    server isn't installed; the operator at least sees pod
+    transitions live.
     """
     console.clear()
-    console.print("[bold]docker stats — Ctrl-C to return to the dashboard.[/bold]\n")
+    console.print(
+        "[bold]kubectl — Ctrl-C to return to the dashboard.[/bold]\n"
+    )
     _prepare_tty_for_subprocess(tty)
+    env = {**os.environ, "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"}
     try:
         with open(tty, "r+b", buffering=0) as tty_io:
-            subprocess.run(
-                ["docker", "stats"],
-                check=False,
-                stdin=tty_io,
-                stdout=tty_io,
-                stderr=tty_io,
+            # Try kubectl top first; fall back to get -w if metrics-
+            # server isn't installed (rc != 0 on first invocation).
+            top = subprocess.run(
+                [
+                    "/usr/local/bin/k3s",
+                    "kubectl",
+                    "top",
+                    "pod",
+                    "-A",
+                    "--no-headers",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=3,
             )
-    except OSError as exc:
-        console.print(f"[red]Failed to open {tty}: {exc}[/red]")
-        time.sleep(3)
+            if top.returncode == 0:
+                # Operator wants live updates — loop with sleep.
+                console.print(
+                    "[dim]kubectl top pod -A (refreshes every 3 s)[/dim]\n"
+                )
+                while True:
+                    subprocess.run(
+                        [
+                            "/usr/local/bin/k3s",
+                            "kubectl",
+                            "top",
+                            "pod",
+                            "-A",
+                        ],
+                        env=env,
+                        stdin=tty_io,
+                        stdout=tty_io,
+                        stderr=tty_io,
+                        check=False,
+                    )
+                    time.sleep(3)
+            else:
+                console.print(
+                    "[dim]metrics-server not installed — falling back "
+                    "to kubectl get pods -A -w[/dim]\n"
+                )
+                subprocess.run(
+                    [
+                        "/usr/local/bin/k3s",
+                        "kubectl",
+                        "get",
+                        "pods",
+                        "-A",
+                        "-w",
+                    ],
+                    env=env,
+                    stdin=tty_io,
+                    stdout=tty_io,
+                    stderr=tty_io,
+                    check=False,
+                )
+    except (KeyboardInterrupt, OSError) as exc:
+        if isinstance(exc, OSError):
+            console.print(f"[red]Failed to open {tty}: {exc}[/red]")
+            time.sleep(3)
 
 
 def do_network(console: Console, tty: str) -> None:

@@ -1,0 +1,139 @@
+{{- /* Issue #183 Phase 8 — node-exporter.
+
+       Host-level metrics (CPU, memory, disk, network, filesystem
+       inodes, NIC statistics) at port 9100 (/metrics) in Prometheus
+       format. DaemonSet with ``hostNetwork: true`` + ``hostPID: true``
+       so the exporter sees the actual host (not the pod's network
+       namespace).
+
+       Default-off (operator opt-in). Air-gap-friendly: image is
+       preloaded into containerd at slot bake time;
+       ``imagePullPolicy: Never``.
+
+       Read-only hostPath mounts for /proc + /sys + /. The standard
+       node-exporter shape; nothing privileged beyond what's
+       required for the exporter's collectors. */}}
+{{- if .Values.observability.nodeExporter.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: node-exporter
+  namespace: spatium
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node-exporter
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node-exporter
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: node-exporter
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        app.kubernetes.io/name: node-exporter
+        app.kubernetes.io/component: node-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      serviceAccountName: node-exporter
+      nodeSelector:
+        {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: node-exporter
+          image: "{{ .Values.observability.nodeExporter.image.repository }}:{{ .Values.observability.nodeExporter.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          args:
+            - --path.procfs=/host/proc
+            - --path.sysfs=/host/sys
+            - --path.rootfs=/host/root
+            # Skip filesystems we know are noisy / synthetic. The
+            # defaults already exclude /proc + /sys + /run / cgroup;
+            # we add the k3s + containerd overlay mountpoints so the
+            # /metrics output stays scannable.
+            - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/kubelet/.+|var/lib/rancher/k3s/agent/containerd/.+|run|var/run)($|/)
+            - --collector.filesystem.fs-types-exclude=^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$
+          ports:
+            - name: http-metrics
+              containerPort: 9100
+              hostPort: 9100
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 9100
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 9100
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.observability.nodeExporter.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              readOnly: true
+              mountPropagation: HostToContainer
+      tolerations:
+        # node-exporter wants to run on every node, including
+        # potentially-tainted control-plane nodes. SpatiumDDI runs
+        # single-node today; the toleration is for future HA pairing.
+        - operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: root
+          hostPath:
+            path: /
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-exporter
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node-exporter
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9100"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: node-exporter
+  ports:
+    - name: http-metrics
+      port: 9100
+      protocol: TCP
+{{- end }}

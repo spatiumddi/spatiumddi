@@ -86,6 +86,45 @@ dhcpKea:
 observer:
   enabled: false
 
+# Issue #183 Phase 8 — cluster observability add-ons. Both default
+# OFF (operator opt-in via the Fleet UI's "Observability" toggle
+# once Phase 8 wires it). When enabled they expose Prometheus-shape
+# metrics at the standard endpoints; future Phase 8 work adds a
+# control-plane Prometheus scraper that federates across appliances.
+observability:
+  # kube-state-metrics exposes cluster-state metrics (pod count,
+  # deployment status, restart counts, …) at /metrics. ~30 MB RSS.
+  # Standard k8s observability primitive.
+  kubeStateMetrics:
+    enabled: false
+    image:
+      repository: registry.k8s.io/kube-state-metrics/kube-state-metrics
+      tag: v2.13.0
+    # Resource cap — appliance VMs are typically 2-4 GB; KSM has a
+    # bounded memory profile but a runaway pod shouldn't dent the
+    # service pods' headroom.
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        memory: 128Mi
+
+  # node-exporter exposes host-level metrics (CPU, memory, disk,
+  # network) at /metrics. DaemonSet with hostNetwork so the metrics
+  # reflect the host (not the pod's network namespace). ~10 MB RSS.
+  nodeExporter:
+    enabled: false
+    image:
+      repository: quay.io/prometheus/node-exporter
+      tag: v1.8.2
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+      limits:
+        memory: 64Mi
+
 # Supervisor — privileged DaemonSet that reconciles the operator's
 # CRD assignment + ships heartbeats to the control plane.
 #
