@@ -1704,7 +1704,11 @@ function slotLabel(slot: string | null): string {
 // ``"—"`` since the actual content isn't useful to the operator.
 function slotVersionLabel(version: string | null | undefined): string {
   if (!version) return "—";
-  if (version === "unstamped" || version === "unreadable" || version === "unknown") {
+  if (
+    version === "unstamped" ||
+    version === "unreadable" ||
+    version === "unknown"
+  ) {
     return "—";
   }
   return version;
@@ -1823,7 +1827,12 @@ function ApplianceSlotCard({
   const version = rowSlotVersion(row, slot);
 
   return (
-    <div className={cn("flex flex-col rounded-md border p-2.5 text-xs", borderClass)}>
+    <div
+      className={cn(
+        "flex flex-col rounded-md border p-2.5 text-xs",
+        borderClass,
+      )}
+    >
       <div className="flex items-center justify-between gap-2">
         <div className="font-mono font-semibold">Slot {slotLabel(slot)}</div>
         <div className="flex flex-wrap items-center gap-1">
@@ -1853,8 +1862,17 @@ function ApplianceSlotCard({
           supervisor reports the requested state landed. */}
       {(desiredNext || desiredDefault) && (
         <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-700 dark:text-amber-300">
-          {desiredNext && <div>Boot-once requested · supervisor will arm on next heartbeat.</div>}
-          {desiredDefault && <div>Set-as-default requested · supervisor will commit on next heartbeat.</div>}
+          {desiredNext && (
+            <div>
+              Boot-once requested · supervisor will arm on next heartbeat.
+            </div>
+          )}
+          {desiredDefault && (
+            <div>
+              Set-as-default requested · supervisor will commit on next
+              heartbeat.
+            </div>
+          )}
         </div>
       )}
 
@@ -1904,7 +1922,6 @@ function ApplianceSlotCard({
     </div>
   );
 }
-
 
 function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
   const qc = useQueryClient();

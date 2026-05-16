@@ -302,9 +302,7 @@ async def supervisor_register(
     # force a fresh registration they delete the row in the fleet UI,
     # which causes the supervisor to clear its identity + claim a new
     # pairing code on next boot.
-    existing_stmt = select(Appliance).where(
-        Appliance.public_key_fingerprint == pubkey_fingerprint
-    )
+    existing_stmt = select(Appliance).where(Appliance.public_key_fingerprint == pubkey_fingerprint)
     existing = (await db.execute(existing_stmt)).scalar_one_or_none()
     if existing is not None:
         # Idempotent re-register. Touch last_seen_at so the heartbeat
@@ -390,9 +388,7 @@ async def supervisor_register(
                 resource_type="pairing_code",
                 resource_id=str(code_row.id) if code_row is not None else "unknown",
                 resource_display=(
-                    "supervisor pairing code"
-                    if code_row is not None
-                    else "unknown pairing code"
+                    "supervisor pairing code" if code_row is not None else "unknown pairing code"
                 ),
                 result="forbidden",
                 new_value={
@@ -542,9 +538,7 @@ async def supervisor_poll(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
 
     row = await db.get(Appliance, body.appliance_id)
-    valid = row is not None and verify_session_token(
-        body.session_token, row.session_token_hash
-    )
+    valid = row is not None and verify_session_token(body.session_token, row.session_token_hash)
     if not valid:
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
@@ -722,9 +716,7 @@ class SupervisorHeartbeatResponse(BaseModel):
     # uses this to bring up dns-bind9 / dns-powerdns / dhcp-kea
     # service containers via docker compose. Empty roles list = idle
     # (approved but no service running).
-    role_assignment: SupervisorRoleAssignment = Field(
-        default_factory=SupervisorRoleAssignment
-    )
+    role_assignment: SupervisorRoleAssignment = Field(default_factory=SupervisorRoleAssignment)
 
 
 @router.post(
@@ -809,9 +801,7 @@ async def supervisor_heartbeat(
         )
         if not valid:
             await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN, "Invalid appliance or session."
-            )
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
 
     assert row is not None
     # Issue #170 Wave E follow-up — reject heartbeats from soft-deleted
@@ -894,19 +884,13 @@ async def supervisor_heartbeat(
     # the requested slot as ``current_slot`` — the operator's intent
     # was "boot into this slot next", and we got there. ``durable_
     # default`` is irrelevant here (next-boot is one-shot by design).
-    if (
-        row.desired_next_boot_slot is not None
-        and row.current_slot == row.desired_next_boot_slot
-    ):
+    if row.desired_next_boot_slot is not None and row.current_slot == row.desired_next_boot_slot:
         row.desired_next_boot_slot = None
 
     # Auto-clear desired_default_slot once the supervisor reports the
     # requested slot as ``durable_default`` — grub-set-default landed
     # and survives subsequent reboots.
-    if (
-        row.desired_default_slot is not None
-        and row.durable_default == row.desired_default_slot
-    ):
+    if row.desired_default_slot is not None and row.durable_default == row.desired_default_slot:
         row.desired_default_slot = None
 
     # Auto-clear reboot_requested 15 s after the stamp — by that
@@ -968,9 +952,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
     from app.models.dns import DNSServerGroup
 
     assigned_roles = list(row.assigned_roles or [])
-    dns_role_assigned = (
-        "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
-    )
+    dns_role_assigned = "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
     dhcp_role_assigned = "dhcp" in assigned_roles
 
     dns_engine: str | None = None
@@ -1155,9 +1137,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
 async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     _require_superadmin(current_user)
     rows = (
-        (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc())))
-        .scalars()
-        .all()
+        (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc()))).scalars().all()
     )
     return ApplianceList(appliances=[_row_to_schema(r) for r in rows])
 
@@ -1168,9 +1148,7 @@ async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Fetch a single appliance (superadmin)",
 )
-async def get_appliance(
-    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
-) -> ApplianceRow:
+async def get_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> ApplianceRow:
     _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
@@ -1259,9 +1237,7 @@ async def approve_appliance(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Reject a pending appliance (deletes the row, superadmin)",
 )
-async def reject_appliance(
-    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
-) -> None:
+async def reject_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
     """Reject = DELETE the row. Supervisor's next poll gets 403 +
     falls back to bootstrapping. Distinct from delete (next endpoint)
     only in the audit verb — operationally identical."""
@@ -1751,14 +1727,10 @@ async def update_appliance_roles(
             new_value={
                 "roles": list(row.assigned_roles or []),
                 "dns_group_id": (
-                    str(row.assigned_dns_group_id)
-                    if row.assigned_dns_group_id
-                    else None
+                    str(row.assigned_dns_group_id) if row.assigned_dns_group_id else None
                 ),
                 "dhcp_group_id": (
-                    str(row.assigned_dhcp_group_id)
-                    if row.assigned_dhcp_group_id
-                    else None
+                    str(row.assigned_dhcp_group_id) if row.assigned_dhcp_group_id else None
                 ),
                 "tags": dict(row.tags or {}),
             },
@@ -1914,9 +1886,7 @@ async def schedule_appliance_upgrade(
             new_value={
                 "desired_appliance_version": body.desired_appliance_version,
                 "desired_slot_image_url": resolved_url,
-                "slot_image_id": (
-                    str(body.slot_image_id) if body.slot_image_id else None
-                ),
+                "slot_image_id": (str(body.slot_image_id) if body.slot_image_id else None),
             },
         )
     )
