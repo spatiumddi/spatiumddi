@@ -299,10 +299,17 @@ class PairingClaim(Base):
 APPLIANCE_STATE_PENDING_APPROVAL = "pending_approval"
 APPLIANCE_STATE_APPROVED = "approved"
 APPLIANCE_STATE_REJECTED = "rejected"
+# #170 Wave E follow-up — soft-delete state. Heartbeats from a
+# ``revoked`` row return 403, which trips the supervisor's three-
+# strike revocation detector and tears down its service containers.
+# Admin can Re-authorize (back to ``approved``) or Permanently
+# delete (hard DELETE).
+APPLIANCE_STATE_REVOKED = "revoked"
 APPLIANCE_STATES = (
     APPLIANCE_STATE_PENDING_APPROVAL,
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_REJECTED,
+    APPLIANCE_STATE_REVOKED,
 )
 
 
@@ -380,6 +387,12 @@ class Appliance(Base):
     state: Mapped[str] = mapped_column(
         String(32), nullable=False, default=APPLIANCE_STATE_PENDING_APPROVAL
     )
+    # #170 Wave E follow-up — soft-delete timestamp. Set when an
+    # operator hits the Fleet UI's Delete button; the row stays so
+    # an admin can Re-authorize (clear ``revoked_at`` + state back
+    # to ``approved``). A retention cron hard-deletes after
+    # ``platform_settings.appliance_revoked_retention_days``.
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Updated by Wave A2+'s supervisor heartbeat path. Stays NULL
     # until the supervisor's first post-register check-in.
@@ -432,6 +445,15 @@ class Appliance(Base):
     installed_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     current_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
     durable_default: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Per-slot installed version — supervisor reads the
+    # ``/var/lib/spatiumddi/release-state/slot-versions.json`` sidecar
+    # maintained by ``spatium-upgrade-slot sync-versions`` (called by
+    # spatiumddi-firstboot at every boot + after every apply) and ships
+    # both values on every heartbeat. Lets the Fleet UI render two
+    # per-slot version cards in the drilldown without falling back to
+    # only knowing the currently-running slot's version.
+    slot_a_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    slot_b_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     is_trial_boot: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa.text("false")
     )
@@ -455,6 +477,21 @@ class Appliance(Base):
     reboot_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Per-slot boot control. Operator sets one of these via the Fleet
+    # UI; supervisor reads from the heartbeat response + writes the
+    # matching trigger file the host runners watch.
+    #
+    # ``desired_next_boot_slot`` is the *one-shot* "boot this slot
+    # next" intent (``grub-reboot``) — auto-reverts on the boot AFTER
+    # the trial. Use to test an inactive slot or swap to it temporarily.
+    # ``desired_default_slot`` is the *durable* "make this slot the
+    # default" intent (``grub-set-default``) — survives subsequent
+    # reboots. Use to commit a trial boot, or to durably revert.
+    #
+    # Both auto-clear in the heartbeat handler once the supervisor's
+    # reported state matches what was requested.
+    desired_next_boot_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    desired_default_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # Role assignment — #170 Wave C2. Operator picks a subset of
     # ``dns-bind9`` / ``dns-powerdns`` / ``dhcp`` / ``observer`` /

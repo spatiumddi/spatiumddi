@@ -220,6 +220,21 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     pending_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # Per-server maintenance mode (issue #182). Operator-set intent —
+    # NOT derived from heartbeat staleness. When true:
+    #   * pending DNSRecordOp rows aren't shipped to the agent
+    #   * heartbeat-stale alerts auto-resolve + skip re-emission
+    #   * the server is excluded from is_primary cluster-math
+    # ``maintenance_started_at`` stamps the UI's "Paused Nh ago" badge;
+    # ``maintenance_reason`` carries the operator's free-text reason.
+    maintenance_mode: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    maintenance_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    maintenance_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Phase 8f fleet upgrade orchestration (issue #138). Operator-intent
     # fields (``desired_*``) are set from the Fleet view in /appliance and
     # carried to the agent via ConfigBundle long-poll; agent-reality

@@ -155,15 +155,21 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # it. Failure ack resets to pending (with attempt++); after 5
     # failures it becomes "failed" and stays out.
     pending_ops: list[dict[str, Any]] = []
-    op_res = await db.execute(
-        select(DNSRecordOp)
-        .where(
-            DNSRecordOp.server_id == server.id,
-            DNSRecordOp.state == "pending",
+    # Issue #182: pause pending-op dispatch when the server is in
+    # operator-set maintenance mode. Ops accumulate in ``state=pending``
+    # and ship as soon as the operator resumes — no work is lost.
+    if server.maintenance_mode:
+        ops_to_dispatch: list[DNSRecordOp] = []
+    else:
+        op_res = await db.execute(
+            select(DNSRecordOp)
+            .where(
+                DNSRecordOp.server_id == server.id,
+                DNSRecordOp.state == "pending",
+            )
+            .order_by(DNSRecordOp.created_at)
         )
-        .order_by(DNSRecordOp.created_at)
-    )
-    ops_to_dispatch = list(op_res.scalars().all())
+        ops_to_dispatch = list(op_res.scalars().all())
     for op in ops_to_dispatch:
         pending_ops.append(
             {

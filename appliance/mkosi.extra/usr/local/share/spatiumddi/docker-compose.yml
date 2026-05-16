@@ -14,6 +14,13 @@
 #     unicast endpoint
 #   - dns-bind9 on host port 53 (not 1053): the appliance serves
 #     DNS for downstream clients on the standard port
+#   - every service carries ``pull_policy: never`` — the appliance
+#     bakes every image tarball into the rootfs at build time and
+#     loads them via ``docker load`` in spatiumddi-firstboot. A pull
+#     from ghcr.io would either fail (air-gapped install) or fetch a
+#     newer release than the operator approved via the OS A/B slot
+#     upgrade flow. Pinning ``never`` makes the appliance a fully
+#     offline-capable artifact.
 #   - no docker-socket / spatium_backups mount commentary —
 #     operators bake those in via /etc/spatiumddi/.env or the
 #     compose-file override path
@@ -33,6 +40,7 @@ services:
     # for the landing page) for the matching agent roles.
     profiles: ["control"]
     image: postgres:16-alpine
+    pull_policy: never
     restart: unless-stopped
     networks: [spatiumddi]
     environment:
@@ -50,6 +58,7 @@ services:
   redis:
     profiles: ["control"]
     image: redis:7-alpine
+    pull_policy: never
     restart: unless-stopped
     networks: [spatiumddi]
     command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
@@ -64,6 +73,7 @@ services:
   migrate:
     profiles: ["control"]
     image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    pull_policy: never
     networks: [spatiumddi]
     env_file: .env
     environment:
@@ -77,6 +87,7 @@ services:
   api:
     profiles: ["control"]
     image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    pull_policy: never
     restart: unless-stopped
     networks: [spatiumddi]
     ports: ["8000:8000"]
@@ -186,6 +197,7 @@ services:
   worker:
     profiles: ["control"]
     image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    pull_policy: never
     restart: unless-stopped
     networks: [spatiumddi]
     # CRITICAL: subscribe to all four queues. Production routes
@@ -218,6 +230,7 @@ services:
   beat:
     profiles: ["control"]
     image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    pull_policy: never
     restart: unless-stopped
     networks: [spatiumddi]
     command: celery -A app.celery_app beat --loglevel=info
@@ -242,6 +255,7 @@ services:
   frontend:
     profiles: ["control"]
     image: ghcr.io/spatiumddi/spatiumddi-frontend:${SPATIUMDDI_VERSION:-latest}
+    pull_policy: never
     container_name: spatiumddi-frontend
     restart: unless-stopped
     networks: [spatiumddi]
@@ -275,6 +289,7 @@ services:
   dns-bind9:
     profiles: ["dns", "dns-bind9"]
     image: ghcr.io/spatiumddi/dns-bind9:${SPATIUMDDI_VERSION:-latest}
+    pull_policy: never
     restart: unless-stopped
     networks: [spatiumddi]
     ports:
@@ -323,6 +338,7 @@ services:
   dns-powerdns:
     profiles: ["dns-powerdns"]
     image: ghcr.io/spatiumddi/dns-powerdns:${SPATIUMDDI_VERSION:-latest}
+    pull_policy: never
     restart: unless-stopped
     networks: [spatiumddi]
     ports:
@@ -359,6 +375,7 @@ services:
   dhcp-kea:
     profiles: ["dhcp"]
     image: ghcr.io/spatiumddi/dhcp-kea:${SPATIUMDDI_VERSION:-latest}
+    pull_policy: never
     restart: unless-stopped
     network_mode: host
     environment:
@@ -409,6 +426,7 @@ services:
   spatium-supervisor:
     profiles: ["supervisor"]
     image: ghcr.io/spatiumddi/spatium-supervisor:${SPATIUMDDI_VERSION:-latest}
+    pull_policy: never
     restart: unless-stopped
     container_name: spatium-supervisor
     networks: [spatiumddi]
@@ -477,6 +495,7 @@ services:
   agent-landing:
     profiles: ["agent"]
     image: nginx:1.27-alpine
+    pull_policy: never
     container_name: spatiumddi-agent-landing
     restart: unless-stopped
     networks: [spatiumddi]

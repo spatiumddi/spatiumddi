@@ -147,6 +147,21 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     agent_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     agent_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     agent_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # Per-server maintenance mode (issue #182). Same shape as on
+    # ``DNSServer`` — see that class for the design notes. Pausing a
+    # DHCP server stops pending DHCPConfigOp dispatch + suppresses the
+    # heartbeat-stale alert, but the row stays in its group so HA peer
+    # accounting still treats it as expected-but-quiet rather than
+    # absent.
+    maintenance_mode: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    maintenance_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    maintenance_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     config_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
     config_pushed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

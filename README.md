@@ -14,7 +14,7 @@
   <a href="https://github.com/spatiumddi/spatiumddi/security/code-scanning"><img src="https://img.shields.io/badge/security-CodeQL-1f6feb" alt="CodeQL"/></a>
   <a href="https://github.com/spatiumddi/spatiumddi/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
   <a href="https://spatiumddi.github.io"><img src="https://img.shields.io/badge/docs-github.io-informational" alt="Docs"/></a>
-  <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status"/>
+  <img src="https://img.shields.io/badge/status-beta-blue" alt="Status"/>
 </p>
 
 <p align="center">
@@ -179,7 +179,7 @@ SpatiumDDI is built on nights and weekends with no commercial backing — every 
 |---|---|---|
 | 🐳 | **Docker Compose** | `docker compose up -d` |
 | ☸️ | **Kubernetes** | Helm umbrella chart, OCI-published |
-| 🖥 | **Bare metal / OS appliance** | bare metal today · self-contained appliance ISO (alpha — Debian 13 + full stack, hybrid USB/CD, see [Getting Started](#quick-start-with-the-os-appliance-iso)) |
+| 🖥 | **Bare metal / OS appliance** | bare metal today · self-contained appliance ISO (beta — Debian 13 + full stack, hybrid USB/CD, see [Getting Started](#quick-start-with-the-os-appliance-iso)) |
 
 ---
 
@@ -600,7 +600,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Docker Compose
   - Kubernetes — Helm umbrella chart, OCI-published
   - Bare metal
-  - OS appliance ISO — alpha (Debian 13 + full stack pre-installed, dedicated `/appliance` management hub with TLS, releases, containers, logs, host config; see [Getting Started](#quick-start-with-the-os-appliance-iso) + [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md))
+  - OS appliance ISO — beta (Debian 13 + full stack pre-installed, dedicated `/appliance` management hub with TLS, releases, containers, logs, host config; see [Getting Started](#quick-start-with-the-os-appliance-iso) + [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md))
 
 ---
 
@@ -642,7 +642,7 @@ The driver abstraction is backend-neutral — services speak to `DNSDriver` / `D
 
 ## Getting Started
 
-> ⚠️ SpatiumDDI is **alpha** (first release: `2026.04.16-1`). Commands and APIs may still shift between releases.
+> ⚠️ SpatiumDDI is **beta**. The alpha cut on `2026.04.16-1` (first release) and the project has since stabilised across IPAM / DNS / DHCP / appliance surfaces. Commands and APIs may still shift between releases.
 
 > 📘 For the full setup order (servers → zones/scopes → subnets → addresses) see **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)**. For Windows DC integration see **[docs/deployment/WINDOWS.md](docs/deployment/WINDOWS.md)**.
 
@@ -849,7 +849,7 @@ created during install and check `journalctl -u spatiumddi-firstboot`
 or
 `docker compose -f /usr/local/share/spatiumddi/docker-compose.yml ps`.
 
-> The appliance is alpha — see issue
+> The appliance is beta — see issue
 > [#134](https://github.com/spatiumddi/spatiumddi/issues/134) for the
 > roadmap and [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md)
 > for the full design, build pipeline, and known limitations.

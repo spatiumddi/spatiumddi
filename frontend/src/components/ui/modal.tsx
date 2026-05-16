@@ -93,7 +93,12 @@ export function Modal({
     <div className={MODAL_BACKDROP_CLS}>
       <div
         className={cn(
-          "w-full rounded-lg border bg-card p-4 sm:p-6 shadow-lg max-h-[90vh] overflow-y-auto max-w-[95vw]",
+          // Flex column with header pinned + body scroll so the
+          // ``Appliance · <name>`` title + close button stay visible
+          // while the operator scrolls through long drilldown bodies.
+          // Without flex-column, ``overflow-y-auto`` on the outer
+          // container scrolled the header out of view.
+          "flex w-full flex-col rounded-lg border bg-card shadow-lg max-h-[90vh] max-w-[95vw]",
           wide ? "sm:max-w-2xl" : "sm:max-w-md",
         )}
         style={dialogStyle}
@@ -101,7 +106,7 @@ export function Modal({
         <div
           {...dragHandleProps}
           className={cn(
-            "mb-4 flex items-center justify-between",
+            "flex flex-shrink-0 items-center justify-between border-b px-4 py-3 sm:px-6",
             dragHandleProps.className,
           )}
         >
@@ -113,7 +118,7 @@ export function Modal({
             <X className="h-4 w-4" />
           </button>
         </div>
-        {children}
+        <div className="flex-1 overflow-y-auto p-4 sm:p-6">{children}</div>
       </div>
     </div>
   );

@@ -59,6 +59,7 @@ from app.core.permissions import require_permission
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
+    APPLIANCE_STATE_REVOKED,
     Appliance,
     PairingClaim,
     PairingCode,
@@ -595,6 +596,16 @@ class SupervisorHeartbeatRequest(BaseModel):
     installed_appliance_version: str | None = None
     current_slot: Literal["slot_a", "slot_b"] | None = None
     durable_default: Literal["slot_a", "slot_b"] | None = None
+    # Per-slot installed version — read by the supervisor from the
+    # ``slot-versions.json`` sidecar maintained by
+    # ``spatium-upgrade-slot sync-versions``. Either / both may be
+    # ``None`` (sidecar missing, or freshly imaged inactive slot has
+    # never been stamped). The empty-string-mapped values used by the
+    # CLI sidecar (``"unstamped"`` / ``"unreadable"`` / ``"unknown"``)
+    # are accepted verbatim — the UI's ``slotVersion`` helper renders
+    # them as ``"—"``.
+    slot_a_version: str | None = None
+    slot_b_version: str | None = None
     is_trial_boot: bool | None = None
     last_upgrade_state: Literal["ready", "in-flight", "done", "failed"] | None = None
     last_upgrade_state_at: datetime | None = None
@@ -674,6 +685,21 @@ class SupervisorHeartbeatResponse(BaseModel):
     state: Literal["pending_approval", "approved", "rejected"]
     desired_appliance_version: str | None = None
     desired_slot_image_url: str | None = None
+    # Operator's per-slot boot intents. The supervisor writes the
+    # matching trigger file when non-null + the current state doesn't
+    # already satisfy the request. Both auto-clear in the heartbeat
+    # handler once the supervisor reports back that the action landed.
+    #
+    # ``desired_next_boot_slot`` = one-shot (``grub-reboot``, reverts
+    # on the NEXT reboot if the operator doesn't commit). Used to
+    # test an inactive slot. Cleared once the supervisor reports the
+    # target slot as ``current_slot``.
+    # ``desired_default_slot`` = durable (``grub-set-default``,
+    # survives reboots). Used to commit a trial boot, or to durably
+    # revert. Cleared once the supervisor reports the target slot as
+    # ``durable_default``.
+    desired_next_boot_slot: Literal["slot_a", "slot_b"] | None = None
+    desired_default_slot: Literal["slot_a", "slot_b"] | None = None
     reboot_requested: bool = False
     # #170 Wave D follow-up — supervisor's signed cert + CA chain.
     # Populated when the appliance has been approved + the supervisor
@@ -778,6 +804,17 @@ async def supervisor_heartbeat(
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
 
     assert row is not None
+    # Issue #170 Wave E follow-up — reject heartbeats from soft-deleted
+    # appliances even when the cert chain still validates. The
+    # supervisor's three-strike detector turns the 403 into local
+    # ``revoked`` state + tears down service containers. Keeps the
+    # cert-auth path simple (still trust the cert) while honouring
+    # the operator's soft-delete intent at the API boundary.
+    if row.state == APPLIANCE_STATE_REVOKED:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Appliance has been revoked. Re-authorize on the Fleet page to restore.",
+        )
 
     row.last_seen_at = datetime.now(UTC)
     row.last_seen_ip = _client_ip(request)
@@ -796,6 +833,10 @@ async def supervisor_heartbeat(
         row.current_slot = body.current_slot
     if body.durable_default is not None:
         row.durable_default = body.durable_default
+    if body.slot_a_version is not None:
+        row.slot_a_version = body.slot_a_version
+    if body.slot_b_version is not None:
+        row.slot_b_version = body.slot_b_version
     if body.is_trial_boot is not None:
         row.is_trial_boot = body.is_trial_boot
     if body.last_upgrade_state is not None:
@@ -839,6 +880,19 @@ async def supervisor_heartbeat(
         row.desired_appliance_version = None
         row.desired_slot_image_url = None
 
+    # Auto-clear desired_next_boot_slot once the supervisor reports
+    # the requested slot as ``current_slot`` — the operator's intent
+    # was "boot into this slot next", and we got there. ``durable_
+    # default`` is irrelevant here (next-boot is one-shot by design).
+    if row.desired_next_boot_slot is not None and row.current_slot == row.desired_next_boot_slot:
+        row.desired_next_boot_slot = None
+
+    # Auto-clear desired_default_slot once the supervisor reports the
+    # requested slot as ``durable_default`` — grub-set-default landed
+    # and survives subsequent reboots.
+    if row.desired_default_slot is not None and row.durable_default == row.desired_default_slot:
+        row.desired_default_slot = None
+
     # Auto-clear reboot_requested 15 s after the stamp — by that
     # point the heartbeat is itself proof the reboot landed (or that
     # the reboot trigger has been written + the host runner is about
@@ -878,6 +932,8 @@ async def supervisor_heartbeat(
         state=row.state,  # type: ignore[arg-type]
         desired_appliance_version=row.desired_appliance_version,
         desired_slot_image_url=row.desired_slot_image_url,
+        desired_next_boot_slot=row.desired_next_boot_slot,  # type: ignore[arg-type]
+        desired_default_slot=row.desired_default_slot,  # type: ignore[arg-type]
         reboot_requested=row.reboot_requested,
         cert_pem=row.cert_pem,
         ca_chain_pem=ca_chain_pem,
@@ -954,7 +1010,7 @@ class ApplianceRow(BaseModel):
 
     id: uuid.UUID
     hostname: str
-    state: Literal["pending_approval", "approved", "rejected"]
+    state: Literal["pending_approval", "approved", "rejected", "revoked"]
     public_key_fingerprint: str
     supervisor_version: str | None
     capabilities: dict
@@ -973,6 +1029,8 @@ class ApplianceRow(BaseModel):
     installed_appliance_version: str | None
     current_slot: str | None
     durable_default: str | None
+    slot_a_version: str | None
+    slot_b_version: str | None
     is_trial_boot: bool
     last_upgrade_state: str | None
     last_upgrade_state_at: datetime | None
@@ -980,6 +1038,8 @@ class ApplianceRow(BaseModel):
     ntp_sync_state: str | None
     desired_appliance_version: str | None
     desired_slot_image_url: str | None
+    desired_next_boot_slot: str | None
+    desired_default_slot: str | None
     reboot_requested: bool
     reboot_requested_at: datetime | None
     # #170 Wave C2 — role assignment + free-form tags.
@@ -1001,6 +1061,9 @@ class ApplianceRow(BaseModel):
     # ``dhcp-kea``); values carry ``{role, status, since,
     # container_id}``.
     role_health: dict[str, dict[str, Any]]
+    # #170 Wave E follow-up — soft-delete timestamp. Non-null on
+    # ``state=revoked`` rows; cleared by re-authorize.
+    revoked_at: datetime | None = None
     created_at: datetime
 
 
@@ -1038,6 +1101,8 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         installed_appliance_version=row.installed_appliance_version,
         current_slot=row.current_slot,
         durable_default=row.durable_default,
+        slot_a_version=row.slot_a_version,
+        slot_b_version=row.slot_b_version,
         is_trial_boot=row.is_trial_boot,
         last_upgrade_state=row.last_upgrade_state,
         last_upgrade_state_at=row.last_upgrade_state_at,
@@ -1045,6 +1110,8 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         ntp_sync_state=row.ntp_sync_state,
         desired_appliance_version=row.desired_appliance_version,
         desired_slot_image_url=row.desired_slot_image_url,
+        desired_next_boot_slot=row.desired_next_boot_slot,
+        desired_default_slot=row.desired_default_slot,
         reboot_requested=row.reboot_requested,
         reboot_requested_at=row.reboot_requested_at,
         assigned_roles=list(row.assigned_roles or []),
@@ -1056,6 +1123,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         role_switch_state=row.role_switch_state,
         role_switch_reason=row.role_switch_reason,
         role_health=dict(row.role_health or {}),
+        revoked_at=row.revoked_at,
         created_at=row.created_at,
     )
 
@@ -1219,33 +1287,40 @@ class DeleteApplianceRequest(BaseModel):
 
 @router.delete(
     "/appliances/{appliance_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=ApplianceRow,
     dependencies=[Depends(require_permission("admin", "appliance"))],
-    summary="Delete an approved appliance (superadmin + password re-auth)",
+    summary="Soft-delete an appliance (superadmin + password re-auth)",
 )
 async def delete_appliance(
     appliance_id: uuid.UUID,
     body: DeleteApplianceRequest,
     current_user: CurrentUser,
     db: DB,
-) -> None:
-    """Permanently remove an approved appliance from the fleet. The
-    supervisor's next mTLS call will fail (cert chain still valid but
-    no matching DB row); supervisor falls back to bootstrapping +
-    needs a fresh pairing code to re-join.
+) -> ApplianceRow:
+    """Soft-delete an appliance (#170 Wave E follow-up).
 
-    Requires the operator's current password in the request body —
-    a UI mis-click can't drop a fleet row even with the per-row
-    Delete button + checkbox guard, the password check is the final
-    safety valve. ``verify_password`` is constant-time; we leak no
-    timing on the result through the 403."""
+    The row stays — ``state`` flips to ``revoked`` + ``revoked_at``
+    stamped — so heartbeats from that appliance return 403, the
+    supervisor's revocation detector trips, and its DNS/DHCP service
+    containers tear down. An admin can later either
+    ``POST /appliances/{id}/reauthorize`` (flip back to ``approved``
+    + clear ``revoked_at``) or
+    ``POST /appliances/{id}/permanent-delete`` (real DELETE).
+
+    A Celery beat sweep eventually hard-deletes rows whose
+    ``revoked_at`` is older than
+    ``platform_settings.appliance_revoked_retention_days`` (default
+    30, ``0`` disables auto-purge).
+
+    Requires the operator's current password — UI mis-click guard
+    even with the per-row Delete button + checkbox.
+    """
     from app.core.security import verify_password  # noqa: PLC0415
 
     _require_superadmin(current_user)
     if not current_user.hashed_password or not verify_password(
         body.password, current_user.hashed_password
     ):
-        # Audit the failed attempt so a brute-force shows up.
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -1266,17 +1341,148 @@ async def delete_appliance(
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    state_at_delete = row.state
+    row.state = APPLIANCE_STATE_REVOKED
+    row.revoked_at = datetime.now(UTC)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.soft_deleted",
+            resource_type="appliance",
+            resource_id=str(appliance_id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={
+                "state_at_delete": state_at_delete,
+                "revoked_at": row.revoked_at.isoformat(),
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    logger.info(
+        "appliance_soft_deleted",
+        appliance_id=str(appliance_id),
+        hostname=row.hostname,
+        user=current_user.username,
+    )
+    return _row_to_schema(row)
+
+
+@router.post(
+    "/appliances/{appliance_id}/reauthorize",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Re-authorize a revoked appliance (superadmin)",
+)
+async def reauthorize_appliance(
+    appliance_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceRow:
+    """Lift a soft-delete: clear ``revoked_at`` and put the appliance
+    back in ``approved``. The supervisor's three-strike detector will
+    self-clear on the next 200 heartbeat — but bringing service
+    containers BACK up requires the operator to re-fire the role
+    assignment (the supervisor's revoke-teardown ran a ``compose stop``;
+    a fresh role-assignment apply re-runs ``up -d``).
+    """
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state != APPLIANCE_STATE_REVOKED:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Appliance is in state {row.state!r}; only revoked rows can be re-authorized.",
+        )
+    row.state = APPLIANCE_STATE_APPROVED
+    row.revoked_at = None
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.reauthorized",
+            resource_type="appliance",
+            resource_id=str(appliance_id),
+            resource_display=row.hostname,
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    logger.info(
+        "appliance_reauthorized",
+        appliance_id=str(appliance_id),
+        hostname=row.hostname,
+        user=current_user.username,
+    )
+    return _row_to_schema(row)
+
+
+@router.post(
+    "/appliances/{appliance_id}/permanent-delete",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Permanently delete an appliance row (superadmin + password)",
+)
+async def permanent_delete_appliance(
+    appliance_id: uuid.UUID,
+    body: DeleteApplianceRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> None:
+    """Hard DELETE the appliance row. Same password gate as the soft
+    delete + an explicit state check: the row must already be
+    ``revoked`` (operator went through soft-delete first). This is
+    the recovery path for after-the-fact "yes I'm sure" + the action
+    invoked by the retention sweep when ``revoked_at`` is older than
+    the retention window.
+    """
+    from app.core.security import verify_password  # noqa: PLC0415
+
+    _require_superadmin(current_user)
+    if not current_user.hashed_password or not verify_password(
+        body.password, current_user.hashed_password
+    ):
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="appliance.permanent_delete_denied",
+                resource_type="appliance",
+                resource_id=str(appliance_id),
+                result="denied",
+                error_message="bad_password",
+            )
+        )
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Current password incorrect.",
+        )
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state != APPLIANCE_STATE_REVOKED:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Permanent delete is only allowed on revoked appliances; soft-delete first.",
+        )
     hostname = row.hostname
     fingerprint = row.public_key_fingerprint
     cert_serial = row.cert_serial
-    state_at_delete = row.state
     await db.delete(row)
     db.add(
         AuditLog(
             user_id=current_user.id,
             user_display_name=current_user.display_name,
             auth_source=current_user.auth_source,
-            action="appliance.deleted",
+            action="appliance.permanently_deleted",
             resource_type="appliance",
             resource_id=str(appliance_id),
             resource_display=hostname,
@@ -1284,13 +1490,12 @@ async def delete_appliance(
             new_value={
                 "fingerprint": fingerprint,
                 "cert_serial": cert_serial,
-                "state_at_delete": state_at_delete,
             },
         )
     )
     await db.commit()
     logger.info(
-        "appliance_deleted",
+        "appliance_permanently_deleted",
         appliance_id=str(appliance_id),
         hostname=hostname,
         user=current_user.username,
@@ -1646,9 +1851,21 @@ async def schedule_appliance_upgrade(
         # frontend host is reachable from the appliance subnet (which
         # it must be — that's where the supervisor already
         # heartbeats), this lines up.
+        #
+        # ``?t=<hmac>`` token authorises the host-side
+        # ``spatium-upgrade-slot`` runner — it does an unauthenticated
+        # ``urllib.request.urlopen`` because it has no operator
+        # session and no mTLS material. The token is HMAC'd against
+        # the image_id + SECRET_KEY, so a leaked URL can't be replayed
+        # against a different image.
+        from app.api.v1.appliance.slot_images import (  # noqa: PLC0415
+            slot_image_download_token,
+        )
+
+        token = slot_image_download_token(image.id)
         resolved_url = (
             f"{str(request.base_url).rstrip('/')}"
-            f"/api/v1/appliance/slot-images/{image.id}/raw.xz"
+            f"/api/v1/appliance/slot-images/{image.id}/raw.xz?t={token}"
         )
     else:
         assert body.desired_slot_image_url is not None
@@ -1717,6 +1934,156 @@ async def clear_appliance_upgrade(
         )
     )
     await db.commit()
+    return _row_to_schema(row)
+
+
+class ApplianceSlotActionRequest(BaseModel):
+    """Pick which A/B slot the operator wants to act on.
+
+    Used by both ``/set-next-boot`` (one-shot, ``grub-reboot``) and
+    ``/set-default-slot`` (durable, ``grub-set-default``). The
+    supervisor's next heartbeat picks the desired field up and writes
+    the matching trigger file the host runner watches.
+    """
+
+    slot: Literal["slot_a", "slot_b"]
+
+
+def _check_appliance_slot_action_allowed(row: Appliance) -> None:
+    """Shared guards for both ``/set-next-boot`` + ``/set-default-slot``.
+
+    A slot action only makes sense on an approved appliance host: a
+    docker / k8s row has no A/B partition layout, and a pending /
+    revoked / rejected row is offline to the supervisor heartbeat
+    cycle that delivers the intent.
+    """
+    if row.state != APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Cannot change boot slot on appliance in state {row.state!r}.",
+        )
+    if row.deployment_kind not in (None, "appliance"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            (
+                f"Appliance reports deployment_kind={row.deployment_kind!r}; "
+                "A/B slot operations are only available on the SpatiumDDI "
+                "appliance OS."
+            ),
+        )
+
+
+@router.post(
+    "/appliances/{appliance_id}/set-next-boot",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Boot a specific A/B slot on the next reboot (one-shot)",
+)
+async def schedule_appliance_set_next_boot(
+    appliance_id: uuid.UUID,
+    body: ApplianceSlotActionRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceRow:
+    """Stamps ``desired_next_boot_slot`` on the appliance row. The
+    supervisor's heartbeat picks it up + writes the
+    ``slot-set-next-boot-pending`` trigger; the host runner invokes
+    ``spatium-upgrade-slot set-next-boot <slot>`` (``grub-reboot``).
+
+    Semantics: one-shot. The slot is set for exactly the next boot.
+    If the operator doesn't commit (via ``/set-default-slot``) before
+    the boot AFTER that, grub auto-reverts to the previous durable
+    default — that's the safety net behind trial-boot upgrades.
+
+    The actual reboot is NOT triggered by this call. Operator
+    either reboots manually (``/reboot`` endpoint) or waits for the
+    next planned reboot window."""
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    _check_appliance_slot_action_allowed(row)
+    row.desired_next_boot_slot = body.slot
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.set_next_boot_scheduled",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={"desired_next_boot_slot": body.slot},
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_set_next_boot_scheduled",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        slot=body.slot,
+        user=current_user.username,
+    )
+    return _row_to_schema(row)
+
+
+@router.post(
+    "/appliances/{appliance_id}/set-default-slot",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Durably set the default A/B boot slot (commit / revert)",
+)
+async def schedule_appliance_set_default_slot(
+    appliance_id: uuid.UUID,
+    body: ApplianceSlotActionRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceRow:
+    """Stamps ``desired_default_slot`` on the appliance row. The
+    supervisor's heartbeat picks it up + writes the
+    ``slot-set-default-pending`` trigger; the host runner invokes
+    ``spatium-upgrade-slot set-default <slot>``
+    (``grub-set-default``).
+
+    Semantics: durable. The grub default flips and survives subsequent
+    reboots. Two common uses:
+
+    * **Commit a trial boot** — operator booted the trial slot via
+      ``/set-next-boot``, validated it, calls this against the
+      currently-running slot to make it durable. (``firstboot.service``
+      also does this automatically when ``/health/live`` passes; this
+      endpoint exists for the explicit operator-action case.)
+    * **Durable revert** — operator wants to go back to the previous
+      slot for good (not just one boot). Calls this against the
+      previous slot."""
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    _check_appliance_slot_action_allowed(row)
+    row.desired_default_slot = body.slot
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.set_default_slot_scheduled",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={"desired_default_slot": body.slot},
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_set_default_slot_scheduled",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        slot=body.slot,
+        user=current_user.username,
+    )
     return _row_to_schema(row)
 
 

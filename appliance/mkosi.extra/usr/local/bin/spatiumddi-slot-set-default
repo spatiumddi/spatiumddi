@@ -1,0 +1,62 @@
+#!/bin/bash
+# spatiumddi-slot-set-default — host-side runner for the Fleet UI's
+# "Set this slot as default" action.
+#
+# The supervisor writes /var/lib/spatiumddi/release-state/
+# slot-set-default-pending with one line: ``slot_a`` or ``slot_b``.
+# ``spatiumddi-slot-set-default.path`` notices the file and runs this
+# script as root. It:
+#
+#   1. Reads the trigger file
+#   2. Invokes /usr/local/bin/spatium-upgrade-slot set-default <slot>
+#      (which calls ``grub-set-default`` — durable, survives reboots)
+#   3. Renames the trigger to .done or .failed so the .path unit
+#      doesn't re-fire on the next watch
+#
+# Use to commit a trial boot once /health/live has proved the new
+# slot good, or to explicitly revert. Does NOT trigger a reboot —
+# the operator's choice of "apply now (reboot)" vs "apply on next
+# maintenance window" stays separate from the durable commit.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/slot-set-default-pending
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/slot-upgrade.log"
+
+mkdir -p "$LOG_DIR"
+exec >> "$LOG" 2>&1
+echo
+echo "[$(date -Iseconds)] === spatiumddi-slot-set-default fired ==="
+
+if [ ! -f "$TRIGGER" ]; then
+    echo "  no trigger file at $TRIGGER, nothing to do"
+    exit 0
+fi
+
+SLOT=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
+
+case "$SLOT" in
+    slot_a|slot_b) ;;
+    *)
+        echo "  ERROR: unrecognised slot '$SLOT' (expected slot_a / slot_b)"
+        mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+        exit 1
+        ;;
+esac
+
+echo "  target slot: $SLOT"
+echo "in-flight $(date -Iseconds)" > "${TRIGGER}.state"
+
+if /usr/local/bin/spatium-upgrade-slot set-default "$SLOT"; then
+    echo
+    echo "  ✓ durable default committed: $SLOT"
+    echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+else
+    echo
+    echo "  ✗ set-default failed"
+    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    exit 1
+fi

@@ -62,6 +62,18 @@ def load_cert(state_dir: Path) -> str | None:
         return None
 
 
+def clear_cert(state_dir: Path) -> None:
+    """Drop the cached cert + CA chain. Used during revoke-recovery
+    (#170 Wave E follow-up) — the cert was issued against the old
+    appliance_id which no longer exists on the control plane;
+    presenting it for mTLS would just fail. The supervisor falls back
+    to session-token auth on the new register call + receives a fresh
+    cert when an admin approves the re-pair."""
+    tls_dir = _tls_dir(state_dir)
+    (tls_dir / CERT_FILENAME).unlink(missing_ok=True)
+    (tls_dir / CA_CHAIN_FILENAME).unlink(missing_ok=True)
+
+
 def _content_matches(path: Path, body: str) -> bool:
     if not path.exists():
         return False

@@ -27,9 +27,13 @@ import time
 import httpx
 import structlog
 
+from . import approval_state
+from .cert_auth import clear_cert
 from .config import SupervisorConfig
 from .heartbeat import heartbeat_once
 from .identity import (
+    clear_appliance_id,
+    clear_session_token,
     load_appliance_id,
     load_or_generate,
     load_session_token,
@@ -66,11 +70,36 @@ def _maybe_register(cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger) ->
 
     cached_appliance_id = load_appliance_id(cfg.state_dir)
     if cached_appliance_id is not None:
-        log.info(
-            "supervisor.register.cached",
-            appliance_id=str(cached_appliance_id),
-        )
-        return
+        # Issue #170 Wave E follow-up — revoke recovery. If the
+        # supervisor flipped to ``approval-state=revoked`` (control
+        # plane returning 403/404 for our cached identity) and the
+        # operator handed us a fresh pairing code via spatium-pair,
+        # the cached appliance_id is stale by definition. Clear the
+        # soft state (appliance_id / session_token / cert.pem /
+        # approval-state / strikes) so the register call below
+        # actually fires against the new pairing code. The Ed25519
+        # keypair stays — it's stable across re-pairs and the
+        # control plane creates a new appliance row + cert against
+        # it on the next approve.
+        if (
+            approval_state.read_state(cfg.state_dir) == "revoked"
+            and cfg.bootstrap_pairing_code
+        ):
+            log.info(
+                "supervisor.register.revoked_reregister",
+                stale_appliance_id=str(cached_appliance_id),
+            )
+            clear_appliance_id(cfg.state_dir)
+            clear_session_token(cfg.state_dir)
+            clear_cert(cfg.state_dir)
+            approval_state.clear(cfg.state_dir)
+            # Fall through to the register call below.
+        else:
+            log.info(
+                "supervisor.register.cached",
+                appliance_id=str(cached_appliance_id),
+            )
+            return
 
     if not cfg.control_plane_url:
         log.warning("supervisor.register.skipped", reason="no control_plane_url")

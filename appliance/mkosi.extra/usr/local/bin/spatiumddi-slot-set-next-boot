@@ -1,0 +1,62 @@
+#!/bin/bash
+# spatiumddi-slot-set-next-boot — host-side runner for the Fleet
+# UI's "Boot this slot next" action.
+#
+# The supervisor writes /var/lib/spatiumddi/release-state/
+# slot-set-next-boot-pending with one line: ``slot_a`` or ``slot_b``.
+# ``spatiumddi-slot-set-next-boot.path`` notices the file and runs
+# this script as root. It:
+#
+#   1. Reads the trigger file
+#   2. Invokes /usr/local/bin/spatium-upgrade-slot set-next-boot <slot>
+#      (which calls ``grub-reboot`` — one-shot, auto-reverts on the
+#       NEXT reboot if the operator doesn't commit)
+#   3. Renames the trigger to .done or .failed so the .path unit
+#      doesn't re-fire on the next watch
+#
+# Does NOT trigger an actual reboot. The operator either reboots
+# manually (Fleet UI "Reboot host" button → /reboot endpoint) or
+# waits for the next maintenance window.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/slot-set-next-boot-pending
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/slot-upgrade.log"
+
+mkdir -p "$LOG_DIR"
+exec >> "$LOG" 2>&1
+echo
+echo "[$(date -Iseconds)] === spatiumddi-slot-set-next-boot fired ==="
+
+if [ ! -f "$TRIGGER" ]; then
+    echo "  no trigger file at $TRIGGER, nothing to do"
+    exit 0
+fi
+
+SLOT=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
+
+case "$SLOT" in
+    slot_a|slot_b) ;;
+    *)
+        echo "  ERROR: unrecognised slot '$SLOT' (expected slot_a / slot_b)"
+        mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+        exit 1
+        ;;
+esac
+
+echo "  target slot: $SLOT"
+echo "in-flight $(date -Iseconds)" > "${TRIGGER}.state"
+
+if /usr/local/bin/spatium-upgrade-slot set-next-boot "$SLOT"; then
+    echo
+    echo "  ✓ next-boot armed for $SLOT (reboot to switch)"
+    echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+else
+    echo
+    echo "  ✗ set-next-boot failed"
+    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    exit 1
+fi

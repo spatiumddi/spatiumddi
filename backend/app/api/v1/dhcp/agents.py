@@ -348,16 +348,21 @@ async def agent_config_longpoll(
         )
         etag = "sha256:" + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
 
-        # Pending ops fast-path
-        ops_res = await db.execute(
-            select(DHCPConfigOp).where(
-                DHCPConfigOp.server_id == server.id, DHCPConfigOp.status == "pending"
+        # Pending ops fast-path. Issue #182: paused servers don't ship
+        # ops — they accumulate as ``pending`` and dispatch as soon as
+        # the operator resumes.
+        if server.maintenance_mode:
+            pending_ops: list[dict[str, Any]] = []
+        else:
+            ops_res = await db.execute(
+                select(DHCPConfigOp).where(
+                    DHCPConfigOp.server_id == server.id, DHCPConfigOp.status == "pending"
+                )
             )
-        )
-        pending_ops = [
-            {"op_id": str(o.id), "op_type": o.op_type, "payload": o.payload}
-            for o in ops_res.scalars().all()
-        ]
+            pending_ops = [
+                {"op_id": str(o.id), "op_type": o.op_type, "payload": o.payload}
+                for o in ops_res.scalars().all()
+            ]
 
         if etag != if_none_match or pending_ops:
             logger.info(

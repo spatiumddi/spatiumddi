@@ -52,6 +52,20 @@ async def _check_health(server_id: uuid.UUID) -> None:
 
             now = datetime.now(UTC)
 
+            # Issue #182: skip the health probe entirely for paused
+            # servers. Status stays at whatever it was at pause time;
+            # the UI's amber Maintenance chip is the operator-visible
+            # signal while the server is intentionally offline.
+            if server.maintenance_mode:
+                server.last_health_check_at = now
+                await db.commit()
+                logger.info(
+                    "dhcp_health_skipped_maintenance",
+                    server_id=str(server_id),
+                    host=server.host,
+                )
+                return
+
             if is_agentless(server.driver):
                 # Agentless: ask the driver to round-trip against the server.
                 # Any exception from get_driver / health_check is caught and

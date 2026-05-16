@@ -286,6 +286,10 @@ class ServerResponse(BaseModel):
     last_config_etag: str | None
     pending_approval: bool
     is_primary: bool
+    # Per-server maintenance mode (issue #182).
+    maintenance_mode: bool = False
+    maintenance_started_at: datetime | None = None
+    maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -315,6 +319,9 @@ class ServerResponse(BaseModel):
             last_config_etag=s.last_config_etag,
             pending_approval=s.pending_approval,
             is_primary=s.is_primary,
+            maintenance_mode=s.maintenance_mode,
+            maintenance_started_at=s.maintenance_started_at,
+            maintenance_reason=s.maintenance_reason,
             created_at=s.created_at,
             modified_at=s.modified_at,
         )
@@ -1045,6 +1052,105 @@ async def delete_server(
     )
     await db.delete(server)
     await db.commit()
+
+
+# ── Maintenance mode (issue #182) ───────────────────────────────────────────
+
+
+class MaintenancePauseRequest(BaseModel):
+    """Body for ``POST /dns/groups/.../servers/{id}/pause`` — reason
+    is optional but strongly encouraged so the audit trail explains
+    *why* an operator took a server offline."""
+
+    reason: str | None = None
+
+
+@router.post(
+    "/groups/{group_id}/servers/{server_id}/pause",
+    response_model=ServerResponse,
+)
+async def pause_server(
+    group_id: uuid.UUID,
+    server_id: uuid.UUID,
+    body: MaintenancePauseRequest,
+    db: DB,
+    current_user: SuperAdmin,
+) -> ServerResponse:
+    """Mark this DNS server as in operator-set maintenance mode.
+
+    Effects of the flag:
+      * pending DNSRecordOp rows aren't shipped to the agent
+      * heartbeat-stale alerts auto-resolve and won't re-fire
+    The container itself isn't stopped from this endpoint — the
+    appliance supervisor handles that when wired (see #182 design);
+    docker / k8s operators stop the container however they normally
+    would. The flag silences the noise about it.
+    """
+    server = await _require_server(group_id, server_id, db)
+    was_paused = server.maintenance_mode
+    server.maintenance_mode = True
+    if not was_paused:
+        server.maintenance_started_at = datetime.now(UTC)
+    if body.reason is not None:
+        server.maintenance_reason = body.reason.strip() or None
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action=(
+                "dns.server.maintenance_entered"
+                if not was_paused
+                else "dns.server.maintenance_updated"
+            ),
+            resource_type="dns_server",
+            resource_id=str(server.id),
+            resource_display=server.name,
+            new_value={"reason": server.maintenance_reason},
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(server)
+    return ServerResponse.from_model(server)
+
+
+@router.post(
+    "/groups/{group_id}/servers/{server_id}/resume",
+    response_model=ServerResponse,
+)
+async def resume_server(
+    group_id: uuid.UUID,
+    server_id: uuid.UUID,
+    db: DB,
+    current_user: SuperAdmin,
+) -> ServerResponse:
+    """Exit maintenance mode — pending ops resume shipping, alerts
+    fire normally again. The operator is expected to have already
+    started the container if they stopped it themselves; we don't
+    dispatch a start command from here.
+    """
+    server = await _require_server(group_id, server_id, db)
+    if not server.maintenance_mode:
+        return ServerResponse.from_model(server)
+    server.maintenance_mode = False
+    server.maintenance_started_at = None
+    server.maintenance_reason = None
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="dns.server.maintenance_exited",
+            resource_type="dns_server",
+            resource_id=str(server.id),
+            resource_display=server.name,
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(server)
+    return ServerResponse.from_model(server)
 
 
 # ── Windows DNS (Path B) — WinRM helpers ────────────────────────────────────

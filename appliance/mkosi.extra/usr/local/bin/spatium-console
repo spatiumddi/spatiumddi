@@ -966,6 +966,19 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
             slot_line.append("  ", style="dim")
             slot_line.append("(grubenv unreadable)", style="dim")
 
+    # Slot-upgrade status line. Only renders when there's something to
+    # show (in-flight / failed / done waiting for reboot) — quiet
+    # otherwise so a steady-state appliance doesn't carry a permanent
+    # "no upgrade pending" row.
+    upgrade_line: Text | None = None
+    if role == "application":
+        ustatus = upgrade_status()
+        if ustatus is not None:
+            label, ustyle = ustatus
+            upgrade_line = Text()
+            upgrade_line.append("Upgrade ", style="dim")
+            upgrade_line.append(label, style=ustyle)
+
     # Rule — horizontal divider between identity and vitals.
     rule = Rule(style="cyan dim", characters="─")
 
@@ -998,6 +1011,8 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
         body_parts.append(watchdog_line)
     if slot_line is not None:
         body_parts.append(slot_line)
+    if upgrade_line is not None:
+        body_parts.append(upgrade_line)
     body_parts += [rule, vitals]
     body = Group(*body_parts)
     return Panel(body, box=SQUARE, border_style="cyan", padding=(0, 1),
@@ -1095,24 +1110,127 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
                  title_align="left")
 
 
+def upgrade_status() -> tuple[str, str] | None:
+    """Slot-upgrade state derived from
+    ``/var/lib/spatiumddi/release-state/`` (#138 Phase 8b).
+
+    Returns ``(label, rich-style)`` for the header's Upgrade line, or
+    ``None`` when there's nothing relevant to show (no pending trigger,
+    no recent run). The runner writes one of three state values into
+    ``slot-upgrade-pending.state``:
+
+      * ``in-flight`` — dd + grub edit in progress; trigger file still
+        present
+      * ``done`` — last apply succeeded; trigger renamed to
+        ``slot-upgrade-pending.done.<ts>``
+      * ``failed`` — last apply errored; trigger renamed to
+        ``slot-upgrade-pending.failed.<ts>``
+
+    We also surface a count of recent ``.failed.<ts>`` sidecars so
+    the operator can tell a one-off bad-network glitch from a
+    persistent fault.
+    """
+    state_dir = Path("/var/lib/spatiumddi/release-state")
+    if not state_dir.is_dir():
+        return None
+    state_file = state_dir / "slot-upgrade-pending.state"
+    pending_marker = state_dir / "slot-upgrade-pending"
+
+    state_text = ""
+    try:
+        state_text = state_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        # Sidecar missing or unreadable → treat as "no upgrade state".
+        # The dashboard is best-effort observability; a stat() race
+        # against the host runner's rename shouldn't crash the panel.
+        pass
+    parts = state_text.split(None, 1)
+    state_val = parts[0] if parts else ""
+
+    # Count failed sidecars in the last hour so a single transient
+    # failure doesn't look as scary as a stuck loop. The path-unit
+    # cadence is roughly once per heartbeat (60 s) so >5 failures /
+    # hour is a real fault.
+    now = time.time()
+    failed_recent = 0
+    try:
+        for f in state_dir.glob("slot-upgrade-pending.failed.*"):
+            try:
+                if now - f.stat().st_mtime < 3600:
+                    failed_recent += 1
+            except OSError:
+                # Sidecar disappeared between glob() and stat() — the
+                # host runner rotates these on each apply. Skip and
+                # keep counting the rest.
+                pass
+    except OSError:
+        # /var/lib/spatiumddi/release-state isn't readable (fresh
+        # boot before firstboot, or unprivileged execution path).
+        # Fall through with failed_recent=0; the dashboard then
+        # rolls up to whatever state_val we managed to read above.
+        pass
+
+    # In-flight beats everything else — the trigger file's still
+    # present so the runner hasn't completed (or is currently
+    # mid-dd). ``state=in-flight`` confirms it.
+    if pending_marker.exists() or state_val == "in-flight":
+        return ("Upgrading…", "bold yellow")
+    if state_val == "failed" or failed_recent >= 3:
+        # ≥3 failures in the last hour → call it red even if the
+        # current state somehow recovered. Operators want to see the
+        # red chip until they've investigated.
+        label = "Upgrade failed"
+        if failed_recent > 1:
+            label += f" ({failed_recent}× recent)"
+        label += " — see /var/log/spatiumddi/slot-upgrade.log"
+        return (label, "bold red")
+    if state_val == "done":
+        # Show the success chip until the next reboot picks up the
+        # new slot. ``slot_info()`` separately renders "TRIAL" once
+        # the appliance has actually booted into the new slot.
+        return ("Upgrade ready · reboot to activate", "bold green")
+    return None
+
+
 def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple[str, str] | None:
     """#170 — derive a (label, style) tuple for the console's
     'Identity' row, or ``None`` when the role doesn't pair against
     a remote control plane.
 
-    Reads the supervisor's identity dir under
-    ``/var/persist/spatium-supervisor/identity/``. The ``appliance_id``
-    file is created when the supervisor's claim succeeds;
-    ``tls/cert.pem`` (written by the supervisor's poll loop once
-    admin approves) marks the approved state.
+    Reads the supervisor's state dir under
+    ``/var/persist/spatium-supervisor/``:
+
+    * ``approval-state`` — when present and ``revoked``, the control
+      plane has rejected our heartbeats long enough that the
+      supervisor flipped to the revoked state (issue #170 Wave E
+      follow-up). Takes precedence over cert.pem so a stale-cert
+      "Approved ✓" can't mislead the operator after a server-side
+      deletion.
+    * ``identity/appliance_id`` — created when the supervisor's
+      pairing-code claim succeeds.
+    * ``tls/cert.pem`` — created when the admin approves the row.
 
     Returns ``(label, rich-style)`` so the renderer can colour the row.
     """
     if role != "application":
         return None
-    identity_dir = Path("/var/persist/spatium-supervisor/identity")
+    state_dir = Path("/var/persist/spatium-supervisor")
+    approval_state_file = state_dir / "approval-state"
+    identity_dir = state_dir / "identity"
     appliance_id_file = identity_dir / "appliance_id"
-    cert_file = Path("/var/persist/spatium-supervisor/tls/cert.pem")
+    cert_file = state_dir / "tls" / "cert.pem"
+
+    # Revoked is the loudest signal — read it first so an operator
+    # who deleted the row but didn't yet ``rm`` cert.pem doesn't see
+    # a stale green chip. The recovery path is documented in the
+    # label text (re-pair from /appliance/pairing).
+    try:
+        approval_state_text = approval_state_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        approval_state_text = ""
+    if approval_state_text == "revoked":
+        return ("Approval revoked — re-pair from /appliance/pairing", "bold red")
+
     if cert_file.exists() and cert_file.stat().st_size > 0:
         return ("Approved ✓", "bold green")
     if appliance_id_file.exists() and appliance_id_file.stat().st_size > 0:
@@ -1467,7 +1585,65 @@ def do_shutdown(console: Console) -> None:
         subprocess.run(["systemctl", "poweroff"], check=False)
 
 
-def do_monitor(console: Console) -> None:
+def _term_env() -> dict[str, str]:
+    """Build a subprocess env with a usable ``TERM`` for ncurses tools
+    (whiptail in spatium-pair, htop, nmtui).
+
+    The tty1 systemd unit doesn't ``Environment=TERM=...``, so the
+    Python process inherits whatever systemd defaults to — which can
+    be empty. whiptail with no TERM renders a black screen with a
+    cursor, no dialog box, no exit path. Force ``linux`` for tty1
+    (the right type for the Linux VT console) and ``vt220`` for
+    serial consoles so newt picks the right capability set.
+    """
+    env = os.environ.copy()
+    term = env.get("TERM", "").strip()
+    if not term or term in {"dumb", "unknown"}:
+        try:
+            ttyname = os.ttyname(0)
+        except OSError:
+            ttyname = "/dev/tty1"
+        env["TERM"] = "vt220" if "ttyS" in ttyname else "linux"
+    return env
+
+
+def _prepare_tty_for_subprocess(tty: str) -> None:
+    """Flush Rich's altscreen-exit + main-screen-clear sequences to the
+    physical TTY *before* forking an ncurses subprocess.
+
+    Rich's ``Live(screen=True).stop()`` writes ``\\x1b[?1049l`` (exit
+    altscreen) through Python's buffered stdout. The buffer doesn't
+    drain before ``subprocess.run`` forks, so whiptail / htop / nmtui
+    draw onto the alternate screen buffer the user is no longer
+    looking at — operator sees a blank screen with a cursor and can't
+    escape. Writing the reset sequence directly to ``/dev/ttyN``
+    bypasses the buffer entirely and forces the terminal back to the
+    main screen + a clean cursor before the subprocess starts.
+    """
+    try:
+        with open(tty, "w") as tty_out:
+            # \\x1b[?1049l = leave altscreen; \\x1bc = full reset
+            # (clears screen, resets attrs, cursor home).
+            tty_out.write("\x1b[?1049l\x1bc")
+            tty_out.flush()
+    except OSError:
+        # If the TTY isn't writable we're in trouble anyway —
+        # nothing to do here.
+        pass
+    # Also flush Python's own stdout so any residual Rich output
+    # doesn't get interleaved with the subprocess.
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except OSError:
+        # Best-effort flush before handing the TTY to a subprocess.
+        # A broken stdout/stderr here means Rich already failed to
+        # write its altscreen exit sequence, which is a much bigger
+        # problem the subprocess will surface in its own output.
+        pass
+
+
+def do_monitor(console: Console, tty: str) -> None:
     """Launch htop as the unprivileged ``admin`` user.
 
     Running as ``admin`` (not root) means htop's interactive kill /
@@ -1479,16 +1655,37 @@ def do_monitor(console: Console) -> None:
     """
     console.clear()
     console.print("[bold]Launching htop — q or F10 to exit.[/bold]\n")
+    _prepare_tty_for_subprocess(tty)
     try:
-        subprocess.run(["runuser", "-u", "admin", "--", "htop"], check=False)
-    except FileNotFoundError:
-        # htop missing on this image — fall back to top, which is in
-        # procps and effectively always present on Debian.
-        console.print("[yellow]htop not installed; falling back to top.[/yellow]")
-        subprocess.run(["runuser", "-u", "admin", "--", "top"], check=False)
+        with open(tty, "r+b", buffering=0) as tty_io:
+            try:
+                subprocess.run(
+                    ["runuser", "-u", "admin", "--", "htop"],
+                    check=False,
+                    env=_term_env(),
+                    stdin=tty_io,
+                    stdout=tty_io,
+                    stderr=tty_io,
+                )
+            except FileNotFoundError:
+                # htop missing on this image — fall back to top.
+                console.print(
+                    "[yellow]htop not installed; falling back to top.[/yellow]"
+                )
+                subprocess.run(
+                    ["runuser", "-u", "admin", "--", "top"],
+                    check=False,
+                    env=_term_env(),
+                    stdin=tty_io,
+                    stdout=tty_io,
+                    stderr=tty_io,
+                )
+    except OSError as exc:
+        console.print(f"[red]Failed to open {tty}: {exc}[/red]")
+        time.sleep(3)
 
 
-def do_containers(console: Console) -> None:
+def do_containers(console: Console, tty: str) -> None:
     """Stream ``docker stats`` until the operator quits.
 
     docker stats already speaks the cooked-tty / ncurses-like idiom
@@ -1498,10 +1695,22 @@ def do_containers(console: Console) -> None:
     """
     console.clear()
     console.print("[bold]docker stats — Ctrl-C to return to the dashboard.[/bold]\n")
-    subprocess.run(["docker", "stats"], check=False)
+    _prepare_tty_for_subprocess(tty)
+    try:
+        with open(tty, "r+b", buffering=0) as tty_io:
+            subprocess.run(
+                ["docker", "stats"],
+                check=False,
+                stdin=tty_io,
+                stdout=tty_io,
+                stderr=tty_io,
+            )
+    except OSError as exc:
+        console.print(f"[red]Failed to open {tty}: {exc}[/red]")
+        time.sleep(3)
 
 
-def do_network(console: Console) -> None:
+def do_network(console: Console, tty: str) -> None:
     """Hand off to nmtui for network reconfiguration.
 
     Runs as root because every meaningful nmtui action (add / edit /
@@ -1513,8 +1722,20 @@ def do_network(console: Console) -> None:
     model here.
     """
     console.clear()
+    _prepare_tty_for_subprocess(tty)
+    # Same TTY-redirect pattern as do_pair — keep stderr off the
+    # journald pipe so ncurses error / status output reaches the
+    # screen.
     try:
-        subprocess.run(["nmtui"], check=False)
+        with open(tty, "r+b", buffering=0) as tty_io:
+            subprocess.run(
+                ["nmtui"],
+                check=False,
+                env=_term_env(),
+                stdin=tty_io,
+                stdout=tty_io,
+                stderr=tty_io,
+            )
     except FileNotFoundError:
         console.print(
             "[red]nmtui not installed — this appliance image predates the "
@@ -1522,9 +1743,12 @@ def do_network(console: Console) -> None:
             "`systemctl restart systemd-networkd` to reconfigure.[/red]"
         )
         time.sleep(4)
+    except OSError as exc:
+        console.print(f"[red]Failed to open {tty}: {exc}[/red]")
+        time.sleep(3)
 
 
-def do_pair(console: Console) -> None:
+def do_pair(console: Console, tty: str) -> None:
     """Run ``spatium-pair`` to re-enter control-plane URL + pairing code.
 
     Strict appliance-application gate — refuses on full-stack /
@@ -1556,10 +1780,31 @@ def do_pair(console: Console) -> None:
         time.sleep(3)
         return
     console.clear()
+    _prepare_tty_for_subprocess(tty)
+    # CRITICAL: explicitly route stdin / stdout / stderr to the TTY.
+    # The systemd unit sets ``StandardError=journal`` so the Python
+    # process's stderr is a pipe to journald, NOT the terminal.
+    # spatium-pair uses the standard bash whiptail idiom ``3>&1 1>&2
+    # 2>&3`` which swaps stdout ↔ stderr so whiptail's UI (drawn on
+    # whatever ends up as fd 2 post-swap) reaches the terminal. With
+    # stderr → journald inherited, the swap puts whiptail's UI on the
+    # journald pipe instead — operator sees a blank screen. Forcing
+    # all three streams to the TTY here bypasses the journald redirect.
     try:
-        subprocess.run(["spatium-pair"], check=False)
+        with open(tty, "r+b", buffering=0) as tty_io:
+            subprocess.run(
+                ["spatium-pair"],
+                check=False,
+                env=_term_env(),
+                stdin=tty_io,
+                stdout=tty_io,
+                stderr=tty_io,
+            )
     except FileNotFoundError:
         console.print("[red]spatium-pair not installed[/red]")
+        time.sleep(3)
+    except OSError as exc:
+        console.print(f"[red]Failed to open {tty}: {exc}[/red]")
         time.sleep(3)
 
 
@@ -1693,13 +1938,13 @@ def main() -> int:
                             elif action == "shutdown":
                                 do_shutdown(console)
                             elif action == "monitor":
-                                do_monitor(console)
+                                do_monitor(console, args.tty)
                             elif action == "containers":
-                                do_containers(console)
+                                do_containers(console, args.tty)
                             elif action == "network":
-                                do_network(console)
+                                do_network(console, args.tty)
                             elif action == "pair":
-                                do_pair(console)
+                                do_pair(console, args.tty)
                         finally:
                             # Hard-reset the terminal state before
                             # re-entering Live. whiptail (do_pair) +

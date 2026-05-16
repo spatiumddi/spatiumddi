@@ -436,3 +436,14 @@ class PlatformSettings(Base):
     supervisor_registration_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
+
+    # ── Appliance soft-delete retention (#170 Wave E follow-up) ─────
+    # When an operator clicks Delete on a Fleet UI row, the row goes
+    # to ``state=revoked`` + stamps ``revoked_at = now()``. After
+    # ``appliance_revoked_retention_days`` the row is permanently
+    # hard-deleted by a Celery beat sweep. Set to 0 to disable the
+    # automatic hard-delete and require operator action via the
+    # "Permanently delete" button on the per-row drilldown.
+    appliance_revoked_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=30, server_default=sa_text("30")
+    )

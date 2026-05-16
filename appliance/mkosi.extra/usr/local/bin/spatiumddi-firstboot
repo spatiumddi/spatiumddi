@@ -258,6 +258,37 @@ EOF
     esac
 fi
 
+# #138 Phase 8b — reconcile SPATIUMDDI_VERSION + APPLIANCE_VERSION in
+# .env on EVERY boot, not just first install. Without this, a slot
+# upgrade lands new container images on the rootfs (tagged with the
+# new CalVer) but ``${SPATIUMDDI_VERSION}`` in .env still points at
+# the pre-upgrade tag — docker compose looks up the OLD image tag,
+# doesn't find it, and the whole stack fails with ``No such image:
+# ghcr.io/spatiumddi/spatium-supervisor:<old-tag>``. The .env lives
+# on /var (shared across slots) so it persists across upgrades and
+# never gets refreshed by the "first boot" guard above.
+#
+# Authoritative source for the slot's bundled software version is
+# /usr/lib/spatiumddi/docker-overlay.version (image tag set by the
+# bake) for SPATIUMDDI_VERSION, and /etc/spatiumddi/appliance-release
+# (ISO version set by the release pipeline) for APPLIANCE_VERSION.
+# Both files live on the rootfs (per-slot), so a slot swap
+# automatically swings them to the new slot's values. We re-sed the
+# matching lines in .env every boot so the operator can never end
+# up running stale image tags.
+if [ -f "$ENV_FILE" ]; then
+    if [ -f /usr/lib/spatiumddi/docker-overlay.version ]; then
+        CURRENT_SPATIUMDDI_VERSION="$(cat /usr/lib/spatiumddi/docker-overlay.version)"
+        sed -i "s|^SPATIUMDDI_VERSION=.*|SPATIUMDDI_VERSION=${CURRENT_SPATIUMDDI_VERSION}|" "$ENV_FILE"
+    fi
+    if [ -f /etc/spatiumddi/appliance-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/spatiumddi/appliance-release
+        CURRENT_APPLIANCE_VERSION="${APPLIANCE_VERSION:-0.1.0}"
+        sed -i "s|^APPLIANCE_VERSION=.*|APPLIANCE_VERSION=${CURRENT_APPLIANCE_VERSION}|" "$ENV_FILE"
+    fi
+fi
+
 # docker-compose looks for .env in the compose file's directory.
 ln -sfn "$ENV_FILE" "$COMPOSE_DIR/.env"
 

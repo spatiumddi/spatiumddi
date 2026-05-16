@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
@@ -19,6 +19,7 @@ from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.registry import _DRIVERS as _DHCP_DRIVERS
 from app.drivers.dhcp.registry import get_driver
 from app.drivers.dhcp.windows import test_winrm_credentials
+from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPServer
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.pull_leases import pull_leases_from_server
@@ -132,6 +133,10 @@ class ServerResponse(BaseModel):
     # ``status-get`` poll. Null for standalone servers (group size < 2).
     ha_state: str | None = None
     ha_last_heartbeat_at: datetime | None = None
+    # Per-server maintenance mode (issue #182).
+    maintenance_mode: bool = False
+    maintenance_started_at: datetime | None = None
+    maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -170,6 +175,9 @@ class ServerResponse(BaseModel):
             ha_peer_url=s.ha_peer_url or "",
             ha_state=s.ha_state,
             ha_last_heartbeat_at=s.ha_last_heartbeat_at,
+            maintenance_mode=s.maintenance_mode,
+            maintenance_started_at=s.maintenance_started_at,
+            maintenance_reason=s.maintenance_reason,
             created_at=s.created_at,
             modified_at=s.modified_at,
         )
@@ -620,6 +628,304 @@ async def approve_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Serv
     await db.commit()
     await db.refresh(s)
     return ServerResponse.from_model(s)
+
+
+# ── Maintenance mode (issue #182) ────────────────────────────────────
+
+
+class MaintenancePauseRequest(BaseModel):
+    """Body for ``POST /dhcp/servers/{id}/pause`` — reason is optional but
+    strongly encouraged so the audit trail explains *why* an operator
+    took a server offline."""
+
+    reason: str | None = None
+
+
+@router.post("/{server_id}/pause", response_model=ServerResponse)
+async def pause_server(
+    server_id: uuid.UUID,
+    body: MaintenancePauseRequest,
+    db: DB,
+    user: SuperAdmin,
+) -> ServerResponse:
+    """Mark this DHCP server as in operator-set maintenance mode.
+
+    Effects of the flag:
+      * pending DHCPConfigOp rows aren't shipped to the agent
+      * heartbeat-stale alerts auto-resolve and won't re-fire
+      * HA peer accounting treats the server as expected-but-quiet
+    The container itself isn't stopped from this endpoint; appliance
+    deployments use the supervisor to act on the flag (planned), and
+    docker / k8s operators stop the container however they normally
+    would. The point is to silence the noise about it.
+    """
+    s = await db.get(DHCPServer, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    # Idempotent — re-pausing an already-paused server just refreshes
+    # the reason (operator may have figured out *why* mid-window and
+    # wants the audit trail updated). started_at stays anchored on the
+    # original transition so the UI's "Paused 2h ago" doesn't reset.
+    was_paused = s.maintenance_mode
+    s.maintenance_mode = True
+    if not was_paused:
+        s.maintenance_started_at = datetime.now(UTC)
+    if body.reason is not None:
+        s.maintenance_reason = body.reason.strip() or None
+    write_audit(
+        db,
+        user=user,
+        action=(
+            "dhcp.server.maintenance_entered"
+            if not was_paused
+            else "dhcp.server.maintenance_updated"
+        ),
+        resource_type="dhcp_server",
+        resource_id=str(s.id),
+        resource_display=s.name,
+        new_value={"reason": s.maintenance_reason},
+    )
+    await db.commit()
+    await db.refresh(s)
+    return ServerResponse.from_model(s)
+
+
+@router.post("/{server_id}/resume", response_model=ServerResponse)
+async def resume_server(
+    server_id: uuid.UUID,
+    db: DB,
+    user: SuperAdmin,
+) -> ServerResponse:
+    """Exit maintenance mode — pending ops resume shipping, alerts
+    fire normally, HA accounting treats the server as live again.
+
+    Operator is expected to have already started the container if
+    they stopped it themselves; we don't dispatch a start command
+    from here (it'd be too easy to surprise someone whose container
+    is intentionally still down).
+    """
+    s = await db.get(DHCPServer, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    if not s.maintenance_mode:
+        # Idempotent — already running normally. Return current state
+        # without writing an audit row.
+        return ServerResponse.from_model(s)
+    s.maintenance_mode = False
+    s.maintenance_started_at = None
+    s.maintenance_reason = None
+    write_audit(
+        db,
+        user=user,
+        action="dhcp.server.maintenance_exited",
+        resource_type="dhcp_server",
+        resource_id=str(s.id),
+        resource_display=s.name,
+    )
+    await db.commit()
+    await db.refresh(s)
+    return ServerResponse.from_model(s)
+
+
+# ── Server Detail modal endpoints (issue #181) ───────────────────────
+#
+# Mirrors the per-server endpoints on the DNS side (zone-state /
+# pending-ops / recent-events / rendered-config). The DHCP equivalents
+# are simpler: no per-zone state since Kea bundles are applied
+# atomically, no agent-pushed rendered config snapshot (we render from
+# the current bundle on demand). Used by the DHCP ServerDetailModal in
+# the frontend; same shape contract as DNS so the UI tabs feel
+# identical.
+
+
+class DHCPPendingOpEntry(BaseModel):
+    op_id: str
+    op_type: str
+    status: str
+    attempts: int
+    error_msg: str | None
+    created_at: datetime
+    acked_at: datetime | None
+
+    @field_validator("op_id", mode="before")
+    @classmethod
+    def _coerce_op_id(cls, v: object) -> str:
+        return str(v)
+
+
+class DHCPPendingOpsResponse(BaseModel):
+    server_id: uuid.UUID
+    counts: dict[str, int]
+    items: list[DHCPPendingOpEntry]
+
+
+@router.get(
+    "/{server_id}/pending-ops",
+    response_model=DHCPPendingOpsResponse,
+)
+async def get_server_pending_ops(
+    server_id: uuid.UUID, db: DB, _: CurrentUser, limit: int = 50
+) -> DHCPPendingOpsResponse:
+    """Queued / in-flight / recently-applied / failed config ops.
+
+    Drives the ServerDetailModal's "Sync" tab. The counts dict keys
+    on ``status`` (``pending`` / ``in_flight`` / ``applied`` /
+    ``failed``). Items are ordered by ``created_at DESC`` and capped
+    at ``limit``.
+    """
+    server = await db.get(DHCPServer, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    counts_res = await db.execute(
+        select(DHCPConfigOp.status, func.count())
+        .where(DHCPConfigOp.server_id == server_id)
+        .group_by(DHCPConfigOp.status)
+    )
+    counts: dict[str, int] = {row[0]: int(row[1]) for row in counts_res.all()}
+
+    ops_res = await db.execute(
+        select(DHCPConfigOp)
+        .where(DHCPConfigOp.server_id == server_id)
+        .order_by(DHCPConfigOp.created_at.desc())
+        .limit(limit)
+    )
+    items = [
+        DHCPPendingOpEntry(
+            op_id=str(op.id),
+            op_type=op.op_type,
+            status=op.status,
+            attempts=op.attempts,
+            error_msg=op.error_msg,
+            created_at=op.created_at,
+            acked_at=op.acked_at,
+        )
+        for op in ops_res.scalars().all()
+    ]
+    return DHCPPendingOpsResponse(
+        server_id=server.id,
+        counts=counts,
+        items=items,
+    )
+
+
+class DHCPServerEventEntry(BaseModel):
+    id: str
+    timestamp: datetime
+    user_display_name: str
+    action: str
+    resource_type: str
+    resource_display: str
+    result: str
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _coerce_id(cls, v: object) -> str:
+        return str(v)
+
+
+class DHCPServerEventsResponse(BaseModel):
+    server_id: uuid.UUID
+    items: list[DHCPServerEventEntry]
+
+
+@router.get(
+    "/{server_id}/recent-events",
+    response_model=DHCPServerEventsResponse,
+)
+async def get_server_recent_events(
+    server_id: uuid.UUID, db: DB, _: CurrentUser, limit: int = 50
+) -> DHCPServerEventsResponse:
+    """Audit-log rows where ``resource_id`` matches this DHCP server.
+
+    Drives the ServerDetailModal's "Events" tab. Matches the DNS
+    side's contract verbatim.
+    """
+    server = await db.get(DHCPServer, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    rows = (
+        (
+            await db.execute(
+                select(AuditLog)
+                .where(AuditLog.resource_id == str(server_id))
+                .order_by(AuditLog.timestamp.desc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    items = [
+        DHCPServerEventEntry(
+            id=str(r.id),
+            timestamp=r.timestamp,
+            user_display_name=r.user_display_name,
+            action=r.action,
+            resource_type=r.resource_type,
+            resource_display=r.resource_display,
+            result=r.result,
+        )
+        for r in rows
+    ]
+    return DHCPServerEventsResponse(server_id=server.id, items=items)
+
+
+class DHCPRenderedConfigResponse(BaseModel):
+    server_id: uuid.UUID
+    driver: str
+    etag: str
+    rendered_at: datetime
+    # Kea config as JSON text. Empty for read-only drivers (windows_dhcp)
+    # which have no on-disk config we render.
+    config: str
+
+
+@router.get(
+    "/{server_id}/rendered-config",
+    response_model=DHCPRenderedConfigResponse,
+)
+async def get_server_rendered_config(
+    server_id: uuid.UUID, db: DB, _: CurrentUser
+) -> DHCPRenderedConfigResponse:
+    """Render this server's current ConfigBundle through its driver.
+
+    For Kea this returns the ``Dhcp4`` / ``Dhcp6`` JSON the agent
+    would apply on its next reload — useful for operators to preview
+    what's in flight without SSHing into the agent. Read-only drivers
+    (``windows_dhcp``) return an empty ``config`` payload since there's
+    no rendered config to show; the UI tab handles that case.
+    """
+    server = await db.get(DHCPServer, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    if is_read_only(server.driver):
+        return DHCPRenderedConfigResponse(
+            server_id=server.id,
+            driver=server.driver,
+            etag="",
+            rendered_at=datetime.now(UTC),
+            config="",
+        )
+
+    bundle = await build_config_bundle(db, server)
+    try:
+        driver = get_driver(server.driver)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown driver {server.driver!r}",
+        ) from exc
+    rendered = driver.render_config(bundle)
+    return DHCPRenderedConfigResponse(
+        server_id=server.id,
+        driver=server.driver,
+        etag=bundle.etag,
+        rendered_at=bundle.generated_at,
+        config=rendered,
+    )
 
 
 @router.get("/{server_id}/leases", response_model=list[LeaseResponse])

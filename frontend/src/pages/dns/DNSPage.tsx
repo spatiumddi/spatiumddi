@@ -33,6 +33,8 @@ import {
   Workflow,
   KeyRound,
   Copy,
+  Pause,
+  Play,
 } from "lucide-react";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
@@ -40,6 +42,7 @@ import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
 import { DelegationModal } from "./DelegationModal";
 import { ZoneTemplateModal } from "./ZoneTemplateModal";
 import { ServerDetailModal } from "./ServerDetailModal";
+import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { PoolsView } from "./PoolsView";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -3185,6 +3188,28 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
   const [detailServer, setDetailServer] = useState<DNSServer | null>(null);
   const [confirmDeleteServer, setConfirmDeleteServer] =
     useState<DNSServer | null>(null);
+  // Issue #182 — per-row Pause/Resume affordance. The Pause click
+  // opens a small modal that captures an optional reason; Resume
+  // fires immediately. ``pauseInFlightFor`` tracks which row is
+  // mid-mutation so we don't disable every Pause/Resume button at
+  // once when one of them is busy.
+  const [pausePrompt, setPausePrompt] = useState<DNSServer | null>(null);
+  const pauseInFlightFor = useRef<string | null>(null);
+  const pauseMut = useMutation({
+    mutationFn: ({ id, reason }: { id: string; reason: string }) =>
+      dnsApi.pauseServer(group.id, id, reason),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-servers"] }),
+    onSettled: () => {
+      pauseInFlightFor.current = null;
+    },
+  });
+  const resumeMut = useMutation({
+    mutationFn: (id: string) => dnsApi.resumeServer(group.id, id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-servers"] }),
+    onSettled: () => {
+      pauseInFlightFor.current = null;
+    },
+  });
 
   const { data: servers = [], isFetching } = useQuery({
     queryKey: ["dns-servers", group.id],
@@ -3307,6 +3332,18 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   <span className="inline-flex items-center rounded border px-1.5 py-0.5 text-xs">
                     {s.driver}
                   </span>
+                  {s.maintenance_mode && (
+                    <span
+                      className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
+                      title={
+                        s.maintenance_reason
+                          ? `Paused: ${s.maintenance_reason}`
+                          : "In operator-set maintenance mode"
+                      }
+                    >
+                      Maintenance
+                    </span>
+                  )}
                 </div>
                 <p className="text-xs text-muted-foreground">
                   {s.host}:{s.port}
@@ -3327,6 +3364,41 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
               </div>
             </div>
             <div className="flex items-center gap-1">
+              {s.maintenance_mode ? (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    pauseInFlightFor.current = s.id;
+                    resumeMut.mutate(s.id);
+                  }}
+                  disabled={
+                    (pauseMut.isPending || resumeMut.isPending) &&
+                    pauseInFlightFor.current === s.id
+                  }
+                  className="inline-flex items-center gap-1 rounded border border-emerald-600/40 bg-emerald-500/10 px-1.5 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-500/20 disabled:opacity-50 dark:text-emerald-400"
+                  title="Resume — exit maintenance mode"
+                >
+                  <Play className="h-3 w-3" />
+                  {(pauseMut.isPending || resumeMut.isPending) &&
+                  pauseInFlightFor.current === s.id
+                    ? "…"
+                    : "Resume"}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setPausePrompt(s);
+                  }}
+                  className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-1.5 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                  title="Pause — enter maintenance mode"
+                >
+                  <Pause className="h-3 w-3" />
+                  Pause
+                </button>
+              )}
               <button
                 className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
                 onClick={(e) => {
@@ -3363,6 +3435,21 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
         <ServerDetailModal
           server={detailServer}
           onClose={() => setDetailServer(null)}
+        />
+      )}
+      {pausePrompt && (
+        <PauseServerModal
+          serverName={pausePrompt.name}
+          serverKind="DNS"
+          isPending={pauseMut.isPending}
+          onConfirm={(reason) => {
+            pauseInFlightFor.current = pausePrompt.id;
+            pauseMut.mutate(
+              { id: pausePrompt.id, reason },
+              { onSuccess: () => setPausePrompt(null) },
+            );
+          }}
+          onCancel={() => setPausePrompt(null)}
         />
       )}
       {confirmDeleteServer && (

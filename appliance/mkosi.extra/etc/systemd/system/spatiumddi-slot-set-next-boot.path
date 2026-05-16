@@ -1,0 +1,14 @@
+[Unit]
+Description=Watch for SpatiumDDI slot-set-next-boot trigger (Fleet UI)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+# Skip on the live ISO — no installed slot partitions to boot.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# PathChanged fires on close-after-write. The supervisor atomically
+# renames a .new sibling onto the trigger path so this only fires
+# once per operator action.
+PathChanged=/var/lib/spatiumddi/release-state/slot-set-next-boot-pending
+
+[Install]
+WantedBy=multi-user.target

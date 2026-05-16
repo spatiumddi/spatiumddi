@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
+  Ban,
   CheckCircle2,
   HardDrive,
   KeyRound,
@@ -9,6 +10,7 @@ import {
   Network,
   Power,
   RefreshCw,
+  RotateCcw,
   ShieldAlert,
   ShieldCheck,
   ShieldQuestion,
@@ -71,6 +73,17 @@ function stateBadge(state: ApplianceState): {
       label: "rejected",
       className:
         "bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-500/30",
+      Icon: ShieldAlert,
+    };
+  }
+  if (state === "revoked") {
+    // Issue #170 Wave E follow-up — soft-deleted. Visually distinct
+    // from ``rejected`` (which is an admin saying "I don't want this
+    // pairing") via the amber palette; rejected stays rose.
+    return {
+      label: "revoked",
+      className:
+        "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/30",
       Icon: ShieldAlert,
     };
   }
@@ -263,6 +276,45 @@ export function FleetTab() {
       if (drilldown && drilldown.id === row.id) setDrilldown(row);
     },
   });
+  // Issue #170 Wave E follow-up — re-authorize a revoked appliance.
+  // No password gate (low-risk: just flipping back to approved); the
+  // supervisor's three-strike detector self-clears on the next 200.
+  // The operator may still need to re-fire role assignment to bring
+  // services back up since the revoke teardown ran a ``compose stop``.
+  const reauthorize = useMutation({
+    mutationFn: (id: string) => applianceApprovalApi.reauthorize(id),
+    onSuccess: (row) => {
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+      if (drilldown && drilldown.id === row.id) setDrilldown(row);
+    },
+  });
+  const [permanentDeleteTarget, setPermanentDeleteTarget] =
+    useState<ApplianceRow | null>(null);
+  const [permanentDeletePwError, setPermanentDeletePwError] = useState<
+    string | null
+  >(null);
+  const permanentDelete = useMutation({
+    mutationFn: ({ id, password }: { id: string; password: string }) =>
+      applianceApprovalApi.permanentDelete(id, password),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+      setPermanentDeleteTarget(null);
+      setDrilldown(null);
+      setPermanentDeletePwError(null);
+    },
+    onError: (err: unknown) => {
+      const e = err as {
+        response?: { status?: number; data?: { detail?: string } };
+      };
+      if (e?.response?.status === 403) {
+        setPermanentDeletePwError(
+          e.response.data?.detail || "Current password incorrect.",
+        );
+      } else {
+        setPermanentDeletePwError("Permanent delete failed. Try again.");
+      }
+    },
+  });
 
   const rows = useMemo(() => data ?? [], [data]);
   const pending = rows.filter((r) => r.state === "pending_approval");
@@ -321,7 +373,7 @@ export function FleetTab() {
         },
         {
           key: "slot-images",
-          label: "Slot images",
+          label: "Upgrade images",
           summary: "Air-gap .raw.xz upload + browse.",
         },
       ],
@@ -406,9 +458,24 @@ export function FleetTab() {
 
           {view === "slot-images" && (
             <div>
-              <h2 className="mb-1 text-base font-semibold">Slot images</h2>
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <h2 className="text-base font-semibold">Upgrade images</h2>
+                <button
+                  type="button"
+                  onClick={() =>
+                    qc.invalidateQueries({
+                      queryKey: ["appliance", "slot-images"],
+                    })
+                  }
+                  title="Refresh the upgrade images list"
+                  className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-muted"
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  Refresh
+                </button>
+              </div>
               <p className="mb-4 text-xs text-muted-foreground">
-                Air-gap support — upload <code>.raw.xz</code> slot images for
+                Air-gap support — upload <code>.raw.xz</code> upgrade images for
                 offline appliance upgrades. The supervisor downloads through the
                 control plane via an authenticated internal URL once an OS
                 upgrade points at the uploaded row.
@@ -520,6 +587,9 @@ export function FleetTab() {
                           Capabilities
                         </th>
                         <th className="px-3 py-2 text-left font-medium">
+                          Slots
+                        </th>
+                        <th className="px-3 py-2 text-left font-medium">
                           Fingerprint
                         </th>
                         <th className="px-3 py-2 text-left font-medium">
@@ -547,6 +617,10 @@ export function FleetTab() {
                           onReject={() => setRejectTarget(row)}
                           onRekey={() => setRekeyTarget(row)}
                           onDelete={() => setDeleteTarget(row)}
+                          onReauthorize={() => reauthorize.mutate(row.id)}
+                          onPermanentDelete={() =>
+                            setPermanentDeleteTarget(row)
+                          }
                         />
                       ))}
                       {others.map((row) => (
@@ -559,6 +633,10 @@ export function FleetTab() {
                           onReject={() => setRejectTarget(row)}
                           onRekey={() => setRekeyTarget(row)}
                           onDelete={() => setDeleteTarget(row)}
+                          onReauthorize={() => reauthorize.mutate(row.id)}
+                          onPermanentDelete={() =>
+                            setPermanentDeleteTarget(row)
+                          }
                         />
                       ))}
                     </tbody>
@@ -614,14 +692,24 @@ export function FleetTab() {
       {deleteTarget && (
         <ConfirmModal
           open
-          title="Delete appliance?"
+          title="Revoke appliance?"
           message={
             <>
               <p className="text-sm">
-                Permanently remove <strong>{deleteTarget.hostname}</strong> from
-                the fleet. The supervisor's mTLS calls will fail (cert chain
-                still valid but no matching DB row); the supervisor falls back
-                to bootstrapping and needs a fresh pairing code to re-join.
+                Revoke <strong>{deleteTarget.hostname}</strong>. The row flips
+                to{" "}
+                <span className="rounded bg-amber-500/15 px-1 font-medium text-amber-700 dark:text-amber-400">
+                  revoked
+                </span>{" "}
+                — heartbeats start returning 403, the supervisor's three-strike
+                detector tears down its DNS / DHCP service containers within ~3
+                min, and the chip on the appliance console flips to red.
+              </p>
+              <p className="mt-2 text-sm">
+                The row stays for <strong>30 days</strong> by default — long
+                enough for an operator to <em>Re-authorize</em> if they revoked
+                by mistake. The <em>Delete</em> button appears on revoked rows
+                for permanent removal.
               </p>
               <p className="mt-2 text-xs text-muted-foreground">
                 Cert serial:{" "}
@@ -631,10 +719,10 @@ export function FleetTab() {
               </p>
             </>
           }
-          confirmLabel="Delete"
+          confirmLabel="Revoke"
           tone="destructive"
           loading={remove.isPending}
-          requireCheckboxLabel={`I understand this permanently removes ${deleteTarget.hostname} and breaks its mTLS chain to the control plane.`}
+          requireCheckboxLabel={`I understand ${deleteTarget.hostname} will stop heartbeating successfully and its service containers will tear down within ~3 minutes.`}
           requirePassword
           passwordError={deletePwError}
           onConfirm={(password) =>
@@ -643,6 +731,47 @@ export function FleetTab() {
           onClose={() => {
             setDeleteTarget(null);
             setDeletePwError(null);
+          }}
+        />
+      )}
+
+      {permanentDeleteTarget && (
+        <ConfirmModal
+          open
+          title="Delete appliance?"
+          message={
+            <>
+              <p className="text-sm">
+                Hard DELETE the{" "}
+                <strong>{permanentDeleteTarget.hostname}</strong> row from the
+                database. <strong>This cannot be undone.</strong> The
+                supervisor's mTLS calls will fail; the supervisor's cached
+                identity will be orphaned until the operator re-pairs against a
+                fresh pairing code.
+              </p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Cert serial:{" "}
+                <code className="text-foreground">
+                  {permanentDeleteTarget.cert_serial ?? "—"}
+                </code>
+              </p>
+            </>
+          }
+          confirmLabel="Delete"
+          tone="destructive"
+          loading={permanentDelete.isPending}
+          requireCheckboxLabel={`I understand this permanently removes ${permanentDeleteTarget.hostname} and cannot be reversed.`}
+          requirePassword
+          passwordError={permanentDeletePwError}
+          onConfirm={(password) =>
+            permanentDelete.mutate({
+              id: permanentDeleteTarget.id,
+              password: password ?? "",
+            })
+          }
+          onClose={() => {
+            setPermanentDeleteTarget(null);
+            setPermanentDeletePwError(null);
           }}
         />
       )}
@@ -729,6 +858,8 @@ function ApplianceTableRow({
   onReject,
   onRekey,
   onDelete,
+  onReauthorize,
+  onPermanentDelete,
 }: {
   row: ApplianceRow;
   highlight?: boolean;
@@ -738,6 +869,8 @@ function ApplianceTableRow({
   onReject: () => void;
   onRekey: () => void;
   onDelete: () => void;
+  onReauthorize: () => void;
+  onPermanentDelete: () => void;
 }) {
   const badge = stateBadge(row.state);
   const Icon = badge.Icon;
@@ -796,6 +929,9 @@ function ApplianceTableRow({
           )}
         </div>
       </td>
+      <td className="px-3 py-2">
+        <ApplianceSlotsCell row={row} />
+      </td>
       <td className="px-3 py-2 font-mono text-xs">
         {shortFingerprint(row.public_key_fingerprint)}
       </td>
@@ -851,8 +987,30 @@ function ApplianceTableRow({
               <button
                 type="button"
                 onClick={onDelete}
-                className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-muted"
-                title="Permanently remove from the fleet"
+                className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                title="Revoke — flip to revoked state, supervisor tears down service containers. Re-authorize on the same row to recover."
+              >
+                <Ban className="h-3 w-3" />
+                Revoke
+              </button>
+            </>
+          )}
+          {row.state === "revoked" && (
+            <>
+              <button
+                type="button"
+                onClick={onReauthorize}
+                className="inline-flex items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-300"
+                title="Re-authorize — flip back to approved; supervisor resumes on next heartbeat"
+              >
+                <CheckCircle2 className="h-3 w-3" />
+                Re-authorize
+              </button>
+              <button
+                type="button"
+                onClick={onPermanentDelete}
+                className="inline-flex items-center gap-1 rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-xs text-rose-700 hover:bg-rose-500/20 dark:text-rose-300"
+                title="Permanently delete this row — cannot be undone"
               >
                 <Trash2 className="h-3 w-3" />
                 Delete
@@ -1540,6 +1698,231 @@ function slotLabel(slot: string | null): string {
   return "—";
 }
 
+// Normalise a per-slot version string. The supervisor's sidecar uses
+// ``"unstamped"`` / ``"unreadable"`` / ``"unknown"`` for slots whose
+// /etc/spatiumddi/appliance-release can't be read; render those as
+// ``"—"`` since the actual content isn't useful to the operator.
+function slotVersionLabel(version: string | null | undefined): string {
+  if (!version) return "—";
+  if (
+    version === "unstamped" ||
+    version === "unreadable" ||
+    version === "unknown"
+  ) {
+    return "—";
+  }
+  return version;
+}
+
+// Pick the per-slot version off the row by slot name. Keeps the
+// callers small + flat (one ternary instead of mismatched lookups).
+function rowSlotVersion(
+  row: Pick<ApplianceRow, "slot_a_version" | "slot_b_version">,
+  slot: "slot_a" | "slot_b",
+): string {
+  return slotVersionLabel(
+    slot === "slot_a" ? row.slot_a_version : row.slot_b_version,
+  );
+}
+
+// Compact two-line slot column for the appliances list. One line per
+// slot, each carrying the version + a tiny chip for the booted /
+// default role. Hidden entirely on docker / k8s rows where the A/B
+// partition layout doesn't exist.
+function ApplianceSlotsCell({ row }: { row: ApplianceRow }) {
+  if (row.deployment_kind && row.deployment_kind !== "appliance") {
+    return <span className="text-xs text-muted-foreground">—</span>;
+  }
+  if (!row.slot_a_version && !row.slot_b_version) {
+    return <span className="text-xs text-muted-foreground">—</span>;
+  }
+  return (
+    <div className="flex flex-col gap-0.5 text-xs">
+      {(["slot_a", "slot_b"] as const).map((slot) => {
+        const isBooted = row.current_slot === slot;
+        const isDefault = row.durable_default === slot;
+        return (
+          <div key={slot} className="flex items-center gap-1.5">
+            <span className="font-mono text-muted-foreground">
+              {slotLabel(slot)}
+            </span>
+            <span className="font-mono">{rowSlotVersion(row, slot)}</span>
+            {isBooted && (
+              <span className="rounded-full bg-emerald-500/10 px-1.5 py-0 text-[10px] font-medium uppercase text-emerald-700 dark:text-emerald-300">
+                run
+              </span>
+            )}
+            {isDefault && !isBooted && (
+              <span className="rounded-full bg-blue-500/10 px-1.5 py-0 text-[10px] font-medium uppercase text-blue-700 dark:text-blue-300">
+                def
+              </span>
+            )}
+          </div>
+        );
+      })}
+      {row.is_trial_boot && (
+        <span className="rounded-full bg-amber-500/10 px-1.5 py-0 text-[10px] font-medium uppercase text-amber-700 dark:text-amber-300">
+          trial boot
+        </span>
+      )}
+    </div>
+  );
+}
+
+// Per-slot card shown in the Fleet drilldown's OS & lifecycle
+// section — two of these render side-by-side (slot A on the left,
+// slot B on the right) carrying the version installed on the slot
+// + role badges + action buttons. Mirrors the local-appliance OS
+// Image card's ``SlotCardView`` styling so the visual language is
+// the same on both surfaces.
+//
+// Action buttons fire the heartbeat-pickup pipeline:
+//   * "Boot once"     → POST /set-next-boot      (grub-reboot, one-shot)
+//   * "Set as default" → POST /set-default-slot   (grub-set-default,
+//                                                  durable)
+function ApplianceSlotCard({
+  row,
+  slot,
+  onSetNextBoot,
+  onSetDefault,
+  busyNextBoot,
+  busyDefault,
+}: {
+  row: ApplianceRow;
+  slot: "slot_a" | "slot_b";
+  onSetNextBoot: () => void;
+  onSetDefault: () => void;
+  busyNextBoot: boolean;
+  busyDefault: boolean;
+}) {
+  const isBooted = row.current_slot === slot;
+  const isDefault = row.durable_default === slot;
+  const isTrial = isBooted && row.is_trial_boot;
+  const desiredNext = row.desired_next_boot_slot === slot;
+  const desiredDefault = row.desired_default_slot === slot;
+  const otherSlot = slot === "slot_a" ? "slot_b" : "slot_a";
+
+  // Outer card colouring follows the most-relevant role so the pair
+  // has visual rhythm at a glance.
+  const borderClass = isTrial
+    ? "border-amber-500/50 bg-amber-500/5"
+    : isBooted
+      ? "border-emerald-500/40 bg-emerald-500/5"
+      : "border-border bg-muted/40";
+
+  // One-line subtext explaining the slot's role in plain English.
+  let subtext: string;
+  if (isTrial) {
+    subtext = `Trial boot — reverts to slot ${slotLabel(row.durable_default)} on next reboot unless committed.`;
+  } else if (isBooted && isDefault) {
+    subtext = "Active · this is where the appliance boots.";
+  } else if (isDefault && !isBooted) {
+    subtext = "Durable default · next normal reboot lands here.";
+  } else if (isBooted) {
+    subtext = "Active · trial state without durable backing.";
+  } else {
+    subtext = "Inactive · candidate for upgrades or trial boot.";
+  }
+
+  const version = rowSlotVersion(row, slot);
+
+  return (
+    <div
+      className={cn(
+        "flex flex-col rounded-md border p-2.5 text-xs",
+        borderClass,
+      )}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div className="font-mono font-semibold">Slot {slotLabel(slot)}</div>
+        <div className="flex flex-wrap items-center gap-1">
+          {isBooted && (
+            <span className="inline-flex items-center rounded-md bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-emerald-700 dark:text-emerald-300">
+              Booted
+            </span>
+          )}
+          {isDefault && (
+            <span className="inline-flex items-center rounded-md bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-blue-700 dark:text-blue-300">
+              Default
+            </span>
+          )}
+          {isTrial && (
+            <span className="inline-flex items-center rounded-md bg-yellow-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-yellow-700 dark:text-yellow-300">
+              Trial
+            </span>
+          )}
+        </div>
+      </div>
+      <div className="mt-1 font-mono text-[11px] text-muted-foreground">
+        {version}
+      </div>
+      <div className="mt-1 text-[11px] text-muted-foreground">{subtext}</div>
+
+      {/* Pending-intent banner. Auto-clears server-side once the
+          supervisor reports the requested state landed. */}
+      {(desiredNext || desiredDefault) && (
+        <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-700 dark:text-amber-300">
+          {desiredNext && (
+            <div>
+              Boot-once requested · supervisor will arm on next heartbeat.
+            </div>
+          )}
+          {desiredDefault && (
+            <div>
+              Set-as-default requested · supervisor will commit on next
+              heartbeat.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Action buttons. Only render the option that's meaningful:
+          - "Boot once" only when this is NOT the running slot
+            (one-shot grub-reboot into the other slot)
+          - "Set as default" only when this slot isn't already the
+            durable default. Doubles as the trial-commit affordance. */}
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {!isBooted && (
+          <button
+            type="button"
+            onClick={onSetNextBoot}
+            disabled={busyNextBoot || desiredNext}
+            title={`Boot slot ${slotLabel(slot)} on the next reboot (one-shot — auto-reverts to slot ${slotLabel(otherSlot)} after that boot unless committed).`}
+            className="inline-flex items-center gap-1 rounded-md border border-input bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {busyNextBoot ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <RotateCcw className="h-3 w-3" />
+            )}
+            Boot once
+          </button>
+        )}
+        {!isDefault && (
+          <button
+            type="button"
+            onClick={onSetDefault}
+            disabled={busyDefault || desiredDefault}
+            title={
+              isTrial
+                ? `Commit this trial boot as durable (grub-set-default ${slot}).`
+                : `Make slot ${slotLabel(slot)} the durable default boot.`
+            }
+            className="inline-flex items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-700 hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-50 dark:text-emerald-300"
+          >
+            {busyDefault ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <CheckCircle2 className="h-3 w-3" />
+            )}
+            {isTrial ? "Approve trial" : "Set as default"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
   const qc = useQueryClient();
   const [sourceKind, setSourceKind] = useState<"url" | "uploaded">("uploaded");
@@ -1550,7 +1933,6 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
 
   const isApplianceHost =
     row.deployment_kind === "appliance" || row.deployment_kind === null;
-  const trialBoot = row.is_trial_boot;
   const upgradeInFlight = row.desired_appliance_version !== null;
 
   // Uploaded slot images — fetched only when the operator picks the
@@ -1591,6 +1973,16 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
     mutationFn: () => applianceApprovalApi.clearUpgrade(row.id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
+  const setNextBoot = useMutation({
+    mutationFn: (slot: "slot_a" | "slot_b") =>
+      applianceApprovalApi.setNextBootSlot(row.id, slot),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
+  });
+  const setDefault = useMutation({
+    mutationFn: (slot: "slot_a" | "slot_b") =>
+      applianceApprovalApi.setDefaultSlot(row.id, slot),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
+  });
   const reboot = useMutation({
     mutationFn: () => applianceApprovalApi.scheduleReboot(row.id),
     onSuccess: () => {
@@ -1610,23 +2002,6 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
           <span className="rounded-full bg-muted px-1.5 py-0.5 font-mono text-[10px]">
             {row.deployment_kind ?? "unknown"}
           </span>
-        </dd>
-        <dt className="text-muted-foreground">Installed</dt>
-        <dd className="font-mono">{row.installed_appliance_version ?? "—"}</dd>
-        <dt className="text-muted-foreground">Slots</dt>
-        <dd>
-          <span className="font-mono">
-            running={slotLabel(row.current_slot)}
-          </span>
-          {" · "}
-          <span className="font-mono">
-            default={slotLabel(row.durable_default)}
-          </span>
-          {trialBoot && (
-            <span className="ml-2 rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-700 dark:text-amber-300">
-              trial boot
-            </span>
-          )}
         </dd>
         <dt className="text-muted-foreground">Last upgrade</dt>
         <dd>
@@ -1654,6 +2029,34 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
           )}
         </dd>
       </dl>
+
+      {/* Per-slot version + boot-control cards. Two cards side-by-
+          side carry the version installed on each A/B slot plus
+          action buttons that ride the heartbeat-pickup pipeline. */}
+      {isApplianceHost && (
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          {(["slot_a", "slot_b"] as const).map((slot) => (
+            <ApplianceSlotCard
+              key={slot}
+              row={row}
+              slot={slot}
+              onSetNextBoot={() => setNextBoot.mutate(slot)}
+              onSetDefault={() => setDefault.mutate(slot)}
+              busyNextBoot={
+                setNextBoot.isPending && setNextBoot.variables === slot
+              }
+              busyDefault={
+                setDefault.isPending && setDefault.variables === slot
+              }
+            />
+          ))}
+        </div>
+      )}
+      {(setNextBoot.error || setDefault.error) && (
+        <p className="mt-1 text-xs text-rose-700 dark:text-rose-300">
+          {((setNextBoot.error ?? setDefault.error) as Error).message}
+        </p>
+      )}
 
       {!isApplianceHost ? (
         <p className="mt-3 text-xs text-muted-foreground">
@@ -1733,8 +2136,8 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
               </select>
               {uploadedQuery.data && uploadedQuery.data.length === 0 && (
                 <p className="text-[11px] text-muted-foreground">
-                  No slot images uploaded yet. Open the &ldquo;Slot image
-                  uploads&rdquo; section above to upload one.
+                  No upgrade images uploaded yet. Open the &ldquo;Upgrade
+                  images&rdquo; section above to upload one.
                 </p>
               )}
               <input
@@ -1992,7 +2395,7 @@ function SlotImageManager() {
           <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
         </div>
       ) : (imagesQuery.data ?? []).length === 0 ? (
-        <p className="text-muted-foreground">No uploaded slot images yet.</p>
+        <p className="text-muted-foreground">No uploaded upgrade images yet.</p>
       ) : (
         <table className="w-full">
           <thead className="text-[10px] uppercase tracking-wide text-muted-foreground">
@@ -2043,7 +2446,7 @@ function SlotImageManager() {
       {deleteTarget && (
         <ConfirmModal
           open
-          title="Delete slot image?"
+          title="Delete upgrade image?"
           message={
             <>
               <p className="text-sm">

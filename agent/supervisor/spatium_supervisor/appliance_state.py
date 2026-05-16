@@ -30,6 +30,7 @@ circuited by ``detect_deployment_kind()``'s appliance gate.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from datetime import datetime
@@ -234,6 +235,24 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
 
 _TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pending")
 _REBOOT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/reboot-pending")
+# Per-slot installed-version sidecar maintained by ``spatium-upgrade-
+# slot sync-versions`` (called by spatiumddi-firstboot at every boot
+# + at the end of every apply). Shape: ``{"slot_a": "<version>",
+# "slot_b": "<version>"}`` — values may be the literal ``"unstamped"``
+# / ``"unreadable"`` / ``"unknown"`` for slots that aren't readable
+# from the host. We pass values through verbatim; the Fleet UI
+# normalises them in ``slotVersion()``.
+_SLOT_VERSIONS_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-versions.json")
+# Per-slot boot-control trigger files. Each carries a single line:
+# the target slot name (``slot_a`` / ``slot_b``). The host-side
+# ``spatiumddi-slot-set-next-boot.path`` / ``spatiumddi-slot-set-
+# default.path`` units fire on close-after-write rename.
+_SET_NEXT_BOOT_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/slot-set-next-boot-pending"
+)
+_SET_DEFAULT_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/slot-set-default-pending"
+)
 # Issue #153 — SNMP config rollout. The trigger file carries the
 # rendered snmpd.conf body so the host runner doesn't need to re-
 # render. The hash sidecar lets the agent skip re-firing after an
@@ -324,6 +343,111 @@ def maybe_fire_reboot(reboot_requested: bool) -> bool:
         # the operator can debug from /var/log/spatiumddi if needed.
         tmp.write_text(datetime.utcnow().isoformat() + "Z\n", encoding="utf-8")
         tmp.replace(_REBOOT_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def read_slot_versions() -> tuple[str | None, str | None]:
+    """Read per-slot installed versions from the
+    ``slot-versions.json`` sidecar (maintained by ``spatium-upgrade-
+    slot sync-versions``).
+
+    Returns ``(slot_a_version, slot_b_version)`` — either or both may
+    be ``None`` when the sidecar is missing entirely. ``"unstamped"`` /
+    ``"unreadable"`` / ``"unknown"`` sentinel values are passed through
+    verbatim; the Fleet UI's ``slotVersion()`` helper normalises them
+    to ``"—"``.
+
+    Strict appliance-only — non-appliance deploys don't have the host
+    bind mount + the sidecar wouldn't exist anyway. Returns the same
+    ``(None, None)`` so the control plane's "only update when not
+    None" semantics leaves the columns untouched.
+    """
+    if detect_deployment_kind() != "appliance":
+        return None, None
+    if not _SLOT_VERSIONS_FILE.exists():
+        return None, None
+    try:
+        text = _SLOT_VERSIONS_FILE.read_text(encoding="utf-8", errors="replace")
+        data = json.loads(text)
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    slot_a = data.get("slot_a") if isinstance(data.get("slot_a"), str) else None
+    slot_b = data.get("slot_b") if isinstance(data.get("slot_b"), str) else None
+    return slot_a, slot_b
+
+
+def maybe_fire_set_next_boot(
+    desired_slot: str | None,
+    current_slot: str | None,
+) -> bool:
+    """Write the slot-set-next-boot trigger when the control plane
+    asks for a slot that isn't already running.
+
+    ``desired_slot`` mirrors the heartbeat response's
+    ``desired_next_boot_slot`` (``slot_a`` / ``slot_b`` / ``None``).
+    ``current_slot`` is the supervisor's last observed running slot —
+    if the operator's intent already matches reality we don't fire
+    (the heartbeat handler will auto-clear ``desired_*`` on the next
+    tick).
+
+    Strict appliance-only gate (mirrors ``maybe_fire_reboot``). Empty
+    intent or invalid slot literal → skip. Idempotent via trigger-
+    file presence; the host runner renames the trigger to .done /
+    .failed on completion.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if desired_slot not in ("slot_a", "slot_b"):
+        return False
+    if current_slot == desired_slot:
+        return False
+    if _SET_NEXT_BOOT_TRIGGER_FILE.exists():
+        return False
+    try:
+        _SET_NEXT_BOOT_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _SET_NEXT_BOOT_TRIGGER_FILE.with_suffix(".new")
+        # Single-line payload — host runner reads + invokes
+        # ``spatium-upgrade-slot set-next-boot <slot>`` with this
+        # value. Validated as a slot literal above so no shell
+        # metachars reach the runner.
+        tmp.write_text(desired_slot + "\n", encoding="utf-8")
+        tmp.replace(_SET_NEXT_BOOT_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def maybe_fire_set_default(
+    desired_slot: str | None,
+    durable_default: str | None,
+) -> bool:
+    """Write the slot-set-default trigger when the control plane asks
+    for a durable default different from the current grub
+    ``saved_entry``.
+
+    Same shape as ``maybe_fire_set_next_boot`` but for the durable
+    (``grub-set-default``) action: commits a trial boot or durably
+    reverts. If the durable default already matches the intent we
+    skip (the heartbeat handler will auto-clear ``desired_*`` on the
+    next tick).
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if desired_slot not in ("slot_a", "slot_b"):
+        return False
+    if durable_default == desired_slot:
+        return False
+    if _SET_DEFAULT_TRIGGER_FILE.exists():
+        return False
+    try:
+        _SET_DEFAULT_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _SET_DEFAULT_TRIGGER_FILE.with_suffix(".new")
+        tmp.write_text(desired_slot + "\n", encoding="utf-8")
+        tmp.replace(_SET_DEFAULT_TRIGGER_FILE)
         return True
     except OSError:
         return False
@@ -496,6 +620,8 @@ def collect() -> dict[str, object]:
         _last_upgrade_state_from_sidecar() if is_appliance else (None, None)
     )
 
+    slot_a_version, slot_b_version = read_slot_versions()
+
     return {
         "deployment_kind": deployment_kind,
         "installed_appliance_version": (
@@ -503,6 +629,8 @@ def collect() -> dict[str, object]:
         ),
         "current_slot": current_slot,
         "durable_default": durable_default,
+        "slot_a_version": slot_a_version,
+        "slot_b_version": slot_b_version,
         "is_trial_boot": is_trial_boot,
         "last_upgrade_state": last_state,
         "last_upgrade_state_at": last_state_at.isoformat() if last_state_at else None,

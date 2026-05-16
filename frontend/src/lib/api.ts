@@ -3874,6 +3874,12 @@ export interface DNSServer {
   last_config_etag: string | null;
   pending_approval: boolean;
   is_primary: boolean;
+  /** Per-server maintenance mode (issue #182). When true the control
+   * plane skips shipping pending DNSRecordOp rows + suppresses the
+   * heartbeat-stale alert; the UI renders an amber Maintenance chip. */
+  maintenance_mode: boolean;
+  maintenance_started_at: string | null;
+  maintenance_reason: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -4222,6 +4228,17 @@ export const dnsApi = {
       .then((r) => r.data),
   deleteServer: (groupId: string, serverId: string) =>
     api.delete(`/dns/groups/${groupId}/servers/${serverId}`),
+  // Issue #182: per-server maintenance mode.
+  pauseServer: (groupId: string, serverId: string, reason?: string) =>
+    api
+      .post<DNSServer>(`/dns/groups/${groupId}/servers/${serverId}/pause`, {
+        reason: reason ?? null,
+      })
+      .then((r) => r.data),
+  resumeServer: (groupId: string, serverId: string) =>
+    api
+      .post<DNSServer>(`/dns/groups/${groupId}/servers/${serverId}/resume`)
+      .then((r) => r.data),
 
   testWindowsCredentials: (body: {
     host: string;
@@ -5167,6 +5184,12 @@ export interface DHCPServer {
   is_agentless: boolean;
   // Driver only supports reads — UI hides config-push actions.
   is_read_only: boolean;
+  // Per-server maintenance mode (issue #182). When true the control
+  // plane skips shipping pending DHCPConfigOp rows + suppresses the
+  // heartbeat-stale alert; the UI renders an amber Maintenance chip.
+  maintenance_mode: boolean;
+  maintenance_started_at: string | null;
+  maintenance_reason: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -5365,6 +5388,49 @@ export interface PhoneProfileUpdate {
   tags?: Record<string, unknown>;
 }
 
+// ── DHCP ServerDetailModal payloads (issue #181) ────────────────────────────
+// Mirrors the DNS side's per-server detail interfaces. The shapes match
+// the DNS equivalents close enough that the modal's tab components feel
+// identical to a DNS-familiar operator.
+export interface DHCPPendingOpEntry {
+  op_id: string;
+  op_type: string;
+  status: string;
+  attempts: number;
+  error_msg: string | null;
+  created_at: string;
+  acked_at: string | null;
+}
+
+export interface DHCPPendingOpsResponse {
+  server_id: string;
+  counts: Record<string, number>;
+  items: DHCPPendingOpEntry[];
+}
+
+export interface DHCPServerEventEntry {
+  id: string;
+  timestamp: string;
+  user_display_name: string;
+  action: string;
+  resource_type: string;
+  resource_display: string;
+  result: string;
+}
+
+export interface DHCPServerEventsResponse {
+  server_id: string;
+  items: DHCPServerEventEntry[];
+}
+
+export interface DHCPRenderedConfigResponse {
+  server_id: string;
+  driver: string;
+  etag: string;
+  rendered_at: string;
+  config: string;
+}
+
 export const dhcpApi = {
   listGroups: () =>
     api.get<DHCPServerGroup[]>("/dhcp/server-groups").then((r) => r.data),
@@ -5416,9 +5482,41 @@ export const dhcpApi = {
       .then((r) => r.data),
   approveServer: (id: string) =>
     api.post<DHCPServer>(`/dhcp/servers/${id}/approve`).then((r) => r.data),
+  // Issue #182: per-server maintenance mode. ``reason`` is optional but
+  // strongly encouraged so the audit trail captures *why* a server
+  // went offline. ``resumeServer`` takes no body — that path is
+  // single-purpose.
+  pauseServer: (id: string, reason?: string) =>
+    api
+      .post<DHCPServer>(`/dhcp/servers/${id}/pause`, {
+        reason: reason ?? null,
+      })
+      .then((r) => r.data),
+  resumeServer: (id: string) =>
+    api.post<DHCPServer>(`/dhcp/servers/${id}/resume`).then((r) => r.data),
   getLeases: (id: string, params?: { limit?: number }) =>
     api
       .get<DHCPLease[]>(`/dhcp/servers/${id}/leases`, { params })
+      .then((r) => r.data),
+
+  // Per-server detail (powers the DHCP ServerDetailModal — issue #181)
+  getServerPendingOps: (serverId: string, limit = 50) =>
+    api
+      .get<DHCPPendingOpsResponse>(
+        `/dhcp/servers/${serverId}/pending-ops?limit=${limit}`,
+      )
+      .then((r) => r.data),
+  getServerRecentEvents: (serverId: string, limit = 50) =>
+    api
+      .get<DHCPServerEventsResponse>(
+        `/dhcp/servers/${serverId}/recent-events?limit=${limit}`,
+      )
+      .then((r) => r.data),
+  getServerRenderedConfig: (serverId: string) =>
+    api
+      .get<DHCPRenderedConfigResponse>(
+        `/dhcp/servers/${serverId}/rendered-config`,
+      )
       .then((r) => r.data),
 
   listScopesBySubnet: (subnetId: string, params?: { tag?: string[] }) =>
@@ -7137,7 +7235,15 @@ export const appliancePairingApi = {
 // submitted Ed25519 pubkey + the supervisor picks the cert up on its
 // next /supervisor/poll. Reject = delete the row + the supervisor
 // falls back to bootstrapping.
-export type ApplianceState = "pending_approval" | "approved" | "rejected";
+export type ApplianceState =
+  | "pending_approval"
+  | "approved"
+  | "rejected"
+  // Issue #170 Wave E follow-up — soft-deleted. Heartbeats return
+  // 403, the supervisor flips to local revoked + tears down its
+  // service containers. Admin can Re-authorize (back to ``approved``)
+  // or Permanently delete (hard DELETE).
+  | "revoked";
 
 export interface SupervisorCapabilities {
   can_run_dns_bind9?: boolean;
@@ -7179,6 +7285,12 @@ export interface ApplianceRow {
   installed_appliance_version: string | null;
   current_slot: string | null;
   durable_default: string | null;
+  // Per-slot installed version, surfaced from the supervisor's
+  // ``slot-versions.json`` sidecar. Two side-by-side slot cards in
+  // the Fleet drilldown read these; ``slotVersionLabel`` normalises
+  // ``"unstamped"`` / ``"unreadable"`` / ``"unknown"`` to ``"—"``.
+  slot_a_version: string | null;
+  slot_b_version: string | null;
   is_trial_boot: boolean;
   last_upgrade_state: string | null;
   last_upgrade_state_at: string | null;
@@ -7186,6 +7298,13 @@ export interface ApplianceRow {
   ntp_sync_state: string | null;
   desired_appliance_version: string | null;
   desired_slot_image_url: string | null;
+  // Operator's per-slot boot intents. Non-null means the Fleet UI
+  // has asked the appliance to switch boot slots; the supervisor's
+  // next heartbeat picks the field up + writes a host-side trigger.
+  // Auto-clears in the heartbeat handler once the supervisor reports
+  // back that the action landed.
+  desired_next_boot_slot: string | null;
+  desired_default_slot: string | null;
   reboot_requested: boolean;
   reboot_requested_at: string | null;
   // #170 Wave C2 — role assignment + free-form tags.
@@ -7220,6 +7339,9 @@ export interface ApplianceRow {
       container_id: string | null;
     }
   >;
+  // Issue #170 Wave E follow-up — soft-delete timestamp. Non-null on
+  // ``state=revoked`` rows; cleared by re-authorize.
+  revoked_at: string | null;
   created_at: string;
 }
 
@@ -7244,10 +7366,24 @@ export const applianceApprovalApi = {
       .then((r) => r.data),
   reject: (id: string) =>
     api.post<void>(`/appliance/appliances/${id}/reject`).then((r) => r.data),
+  // Issue #170 Wave E follow-up — soft-delete. Row flips to
+  // ``state=revoked`` + ``revoked_at`` stamped; heartbeats return 403,
+  // supervisor tears down its service containers, but the row stays
+  // for an admin to either Re-authorize or Permanently delete.
   remove: (id: string, password: string) =>
     api
-      .delete<void>(`/appliance/appliances/${id}`, {
+      .delete<ApplianceRow>(`/appliance/appliances/${id}`, {
         data: { password },
+      })
+      .then((r) => r.data),
+  reauthorize: (id: string) =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/reauthorize`)
+      .then((r) => r.data),
+  permanentDelete: (id: string, password: string) =>
+    api
+      .post<void>(`/appliance/appliances/${id}/permanent-delete`, {
+        password,
       })
       .then((r) => r.data),
   rekey: (id: string) =>
@@ -7279,6 +7415,21 @@ export const applianceApprovalApi = {
   clearUpgrade: (id: string) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/clear-upgrade`)
+      .then((r) => r.data),
+  // Per-slot boot intents (operator-facing affordances on the two
+  // slot cards in the Fleet drilldown). Both ride the same heartbeat-
+  // pickup pipeline as ``scheduleUpgrade`` — the backend stamps a
+  // desired-state column on the appliance row, the supervisor's next
+  // heartbeat reads it + writes the host-side trigger file.
+  setNextBootSlot: (id: string, slot: "slot_a" | "slot_b") =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/set-next-boot`, { slot })
+      .then((r) => r.data),
+  setDefaultSlot: (id: string, slot: "slot_a" | "slot_b") =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/set-default-slot`, {
+        slot,
+      })
       .then((r) => r.data),
   scheduleReboot: (id: string) =>
     api
