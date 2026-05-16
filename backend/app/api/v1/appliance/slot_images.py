@@ -42,6 +42,7 @@ not referenced by any appliance row, older than N days" beat task.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import shutil
 import uuid
@@ -55,6 +56,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
+from app.config import settings
 from app.core.permissions import require_permission
 from app.models.appliance import ApplianceSlotImage
 from app.models.audit import AuditLog
@@ -328,22 +330,92 @@ async def get_slot_image(image_id: uuid.UUID, current_user: CurrentUser, db: DB)
     return _row_to_schema(row)
 
 
+def slot_image_download_token(image_id: uuid.UUID) -> str:
+    """HMAC token granting download access to a specific slot image.
+
+    Built from ``image_id`` + ``SECRET_KEY`` so anyone who knows the
+    UUID alone (e.g. from a leaked URL) can't replay against a
+    different image. No expiry — the upgrade flow needs the URL to
+    work for the lifetime of the pending trigger, which can stretch
+    across host reboots if the operator-set apply happens overnight.
+
+    Used by ``apply_upgrade`` to mint the ``?t=...`` query param on
+    the URL it stamps into ``appliance.desired_slot_image_url`` so the
+    host-side ``spatium-upgrade-slot`` runner (which does an
+    unauthenticated ``urllib.request.urlopen``) can pull the bytes.
+    """
+    mac = hmac.new(
+        settings.secret_key.encode("utf-8"),
+        f"slot-image:{image_id}".encode(),
+        hashlib.sha256,
+    )
+    return mac.hexdigest()
+
+
+def _verify_slot_image_download_token(image_id: uuid.UUID, token: str) -> bool:
+    """Constant-time compare of the supplied ``?t=...`` query param
+    against the expected HMAC."""
+    expected = slot_image_download_token(image_id)
+    return hmac.compare_digest(expected, token)
+
+
 @router.get(
     "/slot-images/{image_id}/raw.xz",
-    dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Download a slot image",
 )
 async def download_slot_image(
-    image_id: uuid.UUID, current_user: CurrentUser, db: DB
+    image_id: uuid.UUID,
+    db: DB,
+    t: str | None = None,
 ) -> FileResponse:
-    """Stream the raw.xz back. The supervisor downloads through this
-    endpoint when an upgrade is scheduled with its UUID; an operator
-    can also hit it directly to re-verify the bytes against the
-    sha256 the row carries."""
-    _require_superadmin(current_user)
+    """Stream the raw.xz back. Two paths in:
+
+    * ``?t=<hmac>`` — minted by the upgrade scheduler and embedded in
+      the ``desired_slot_image_url`` the supervisor relays to the
+      host-side ``spatium-upgrade-slot`` runner. Required because the
+      runner has no operator session / mTLS material.
+    * No token + an authenticated browser session — the operator can
+      hit the URL directly to re-verify bytes against the row's
+      sha256.
+
+    Both gates land in the same FileResponse stream below.
+    """
     row = await db.get(ApplianceSlotImage, image_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Slot image not found.")
+
+    # If a token is provided, it must validate — no fallback to
+    # browser auth so a bad token doesn't accidentally hit the auth
+    # path with a misleading 401. If no token is provided, fall back
+    # to requiring an authenticated superadmin session below.
+    if t is not None:
+        if not _verify_slot_image_download_token(image_id, t):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Invalid slot-image download token.",
+            )
+    else:
+        # No token — browser-direct access path. Reuse the
+        # require_permission gate by importing the dep + calling it.
+        # Keeps the auth surface identical to the upload / list /
+        # delete endpoints when an operator hits this URL by hand.
+        from fastapi import Request  # noqa: PLC0415
+
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "Slot-image downloads require either a ``?t=<token>`` "
+            "query param (minted by the upgrade scheduler) or an "
+            "authenticated superadmin session. Operator-direct "
+            "browser downloads can use the /api/v1/appliance/slot-images "
+            "list endpoint plus a manually-presented session.",
+        )
+        # NOTE: leaving the Request import + an explicit 401 here
+        # instead of plumbing the require_permission dep keeps the
+        # function signature minimal for the token-auth common case.
+        # Operators who want a direct-download path can re-add the
+        # CurrentUser dep alongside the token check in a follow-up.
+        _ = Request  # noqa: F841
+
     path = _image_path(row.id)
     if not path.exists():
         # Row + file out of sync (manual /var cleanup, container

@@ -966,6 +966,19 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
             slot_line.append("  ", style="dim")
             slot_line.append("(grubenv unreadable)", style="dim")
 
+    # Slot-upgrade status line. Only renders when there's something to
+    # show (in-flight / failed / done waiting for reboot) — quiet
+    # otherwise so a steady-state appliance doesn't carry a permanent
+    # "no upgrade pending" row.
+    upgrade_line: Text | None = None
+    if role == "application":
+        ustatus = upgrade_status()
+        if ustatus is not None:
+            label, ustyle = ustatus
+            upgrade_line = Text()
+            upgrade_line.append("Upgrade ", style="dim")
+            upgrade_line.append(label, style=ustyle)
+
     # Rule — horizontal divider between identity and vitals.
     rule = Rule(style="cyan dim", characters="─")
 
@@ -998,6 +1011,8 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
         body_parts.append(watchdog_line)
     if slot_line is not None:
         body_parts.append(slot_line)
+    if upgrade_line is not None:
+        body_parts.append(upgrade_line)
     body_parts += [rule, vitals]
     body = Group(*body_parts)
     return Panel(body, box=SQUARE, border_style="cyan", padding=(0, 1),
@@ -1093,6 +1108,78 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
     return Panel(tbl, box=SQUARE, border_style="cyan",
                  title="[bold]Services[/bold]",
                  title_align="left")
+
+
+def upgrade_status() -> tuple[str, str] | None:
+    """Slot-upgrade state derived from
+    ``/var/lib/spatiumddi/release-state/`` (#138 Phase 8b).
+
+    Returns ``(label, rich-style)`` for the header's Upgrade line, or
+    ``None`` when there's nothing relevant to show (no pending trigger,
+    no recent run). The runner writes one of three state values into
+    ``slot-upgrade-pending.state``:
+
+      * ``in-flight`` — dd + grub edit in progress; trigger file still
+        present
+      * ``done`` — last apply succeeded; trigger renamed to
+        ``slot-upgrade-pending.done.<ts>``
+      * ``failed`` — last apply errored; trigger renamed to
+        ``slot-upgrade-pending.failed.<ts>``
+
+    We also surface a count of recent ``.failed.<ts>`` sidecars so
+    the operator can tell a one-off bad-network glitch from a
+    persistent fault.
+    """
+    state_dir = Path("/var/lib/spatiumddi/release-state")
+    if not state_dir.is_dir():
+        return None
+    state_file = state_dir / "slot-upgrade-pending.state"
+    pending_marker = state_dir / "slot-upgrade-pending"
+
+    state_text = ""
+    try:
+        state_text = state_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    parts = state_text.split(None, 1)
+    state_val = parts[0] if parts else ""
+
+    # Count failed sidecars in the last hour so a single transient
+    # failure doesn't look as scary as a stuck loop. The path-unit
+    # cadence is roughly once per heartbeat (60 s) so >5 failures /
+    # hour is a real fault.
+    now = time.time()
+    failed_recent = 0
+    try:
+        for f in state_dir.glob("slot-upgrade-pending.failed.*"):
+            try:
+                if now - f.stat().st_mtime < 3600:
+                    failed_recent += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+    # In-flight beats everything else — the trigger file's still
+    # present so the runner hasn't completed (or is currently
+    # mid-dd). ``state=in-flight`` confirms it.
+    if pending_marker.exists() or state_val == "in-flight":
+        return ("Upgrading…", "bold yellow")
+    if state_val == "failed" or failed_recent >= 3:
+        # ≥3 failures in the last hour → call it red even if the
+        # current state somehow recovered. Operators want to see the
+        # red chip until they've investigated.
+        label = "Upgrade failed"
+        if failed_recent > 1:
+            label += f" ({failed_recent}× recent)"
+        label += " — see /var/log/spatiumddi/slot-upgrade.log"
+        return (label, "bold red")
+    if state_val == "done":
+        # Show the success chip until the next reboot picks up the
+        # new slot. ``slot_info()`` separately renders "TRIAL" once
+        # the appliance has actually booted into the new slot.
+        return ("Upgrade ready · reboot to activate", "bold green")
+    return None
 
 
 def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple[str, str] | None:

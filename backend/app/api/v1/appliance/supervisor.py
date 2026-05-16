@@ -1799,9 +1799,21 @@ async def schedule_appliance_upgrade(
         # frontend host is reachable from the appliance subnet (which
         # it must be — that's where the supervisor already
         # heartbeats), this lines up.
+        #
+        # ``?t=<hmac>`` token authorises the host-side
+        # ``spatium-upgrade-slot`` runner — it does an unauthenticated
+        # ``urllib.request.urlopen`` because it has no operator
+        # session and no mTLS material. The token is HMAC'd against
+        # the image_id + SECRET_KEY, so a leaked URL can't be replayed
+        # against a different image.
+        from app.api.v1.appliance.slot_images import (  # noqa: PLC0415
+            slot_image_download_token,
+        )
+
+        token = slot_image_download_token(image.id)
         resolved_url = (
             f"{str(request.base_url).rstrip('/')}"
-            f"/api/v1/appliance/slot-images/{image.id}/raw.xz"
+            f"/api/v1/appliance/slot-images/{image.id}/raw.xz?t={token}"
         )
     else:
         assert body.desired_slot_image_url is not None
