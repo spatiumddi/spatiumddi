@@ -261,8 +261,8 @@ _STATUS_HEALTH_RE = re.compile(r"\(([^)]+)\)")
 
 
 def docker_ps() -> list[dict]:
-    """Return the currently-running pods in the ``spatium`` namespace
-    via ``kubectl get pods -o json``, translated into the docker-ps
+    """Return every pod on the local cluster via
+    ``kubectl get pods -A -o json``, translated into the docker-ps
     dict shape the rest of the console expects.
 
     Function name kept as ``docker_ps`` so the rest of the renderer
@@ -271,10 +271,12 @@ def docker_ps() -> list[dict]:
     binary's embedded kubectl. ~50 ms per call (fork + JSON parse)
     is fine for the dashboard's 2 s refresh cadence.
 
-    Returns [] on any failure (k3s not running, kubeconfig missing,
-    namespace not present yet). The renderer surfaces missing
-    services as "(not running)" rows so the dashboard stays usable
-    even when k3s is fully broken.
+    Returns every namespace's pods (was previously filtered to
+    ``spatium`` + a chart label) so the dashboard surfaces
+    kube-system add-ons (coredns / local-path / helm-install) +
+    anything operators kubectl-applied themselves.
+
+    Returns [] on any failure (k3s not running, kubeconfig missing).
     """
     try:
         proc = subprocess.run(
@@ -283,10 +285,7 @@ def docker_ps() -> list[dict]:
                 "kubectl",
                 "get",
                 "pods",
-                "-n",
-                "spatium",
-                "-l",
-                "app.kubernetes.io/part-of=spatiumddi",
+                "-A",
                 "-o",
                 "json",
             ],
@@ -376,6 +375,7 @@ def docker_ps() -> list[dict]:
         out.append(
             {
                 "Names": meta.get("name") or "",
+                "Namespace": meta.get("namespace") or "",
                 "Image": (first.get("image") or "") if first else "",
                 "Status": status_str,
                 "Labels": labels,
@@ -1093,94 +1093,87 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
 
 
 def render_services(role: str, ps_rows: list[dict]) -> Panel:
-    # ``dict.get(k, default)`` evaluates ``default`` eagerly. The
-    # previous ``ROLE_SERVICES["control"]`` fallback was an orphan
-    # from the pre-#170 5-role world and raised ``KeyError`` on every
-    # render — *before* ``get`` could return a hit on a valid role
-    # — so the dashboard crash-looped on every appliance.
-    expected = list(ROLE_SERVICES.get(role, ROLE_SERVICES["full-stack"]))
-    # Index ps by compose-service name.
-    by_service: dict[str, dict] = {}
-    for r in ps_rows:
-        svc = container_service_name(r)
-        # Pick the most-recently-created replica if multiple exist.
-        if svc not in by_service:
-            by_service[svc] = r
-    # #170 Wave D follow-up — on the Application role the supervisor
-    # spawns role-aligned service containers dynamically after admin
-    # role assignment in the fleet UI. Surface them alongside the
-    # static base set so the dashboard reflects what's actually
-    # running. The supervisor-managed services that aren't present
-    # right now stay off the list — otherwise every Application
-    # appliance would carry permanent ``(not running)`` rows for
-    # roles it was never assigned.
-    #
-    # #170 Wave E watchdog tie-in: also union services the supervisor
-    # *expects* to be running (per role-compose.env) but that aren't
-    # in docker ps. Those render as ``(not running)`` so a crashed /
-    # removed container is visible from the console without
-    # SSH-ing in. ``watchdog_expected_services`` reads the env file
-    # the supervisor maintains; an absent file (idle appliance, no
-    # role assigned yet) returns ``[]``.
-    if role == "application":
-        watchdog_expected = set(watchdog_expected_services())
-        for svc in SUPERVISOR_DYNAMIC_SERVICES:
-            if (svc in by_service or svc in watchdog_expected) and svc not in expected:
-                expected.append(svc)
+    """Render the Pods panel — every pod on the local k3s cluster
+    grouped by namespace, with status + ports + image.
+
+    Function name kept as ``render_services`` so call sites in
+    ``render_frame`` don't need to change. Pre-Phase-7 this was
+    role-scoped (showed only the compose services for the active
+    role). Phase 7 widens the scope: the appliance is a real
+    Kubernetes node and operators want the same view ``kubectl get
+    pods -A -o wide`` gives, condensed for the TTY.
+
+    The ``role`` argument is unused now but kept on the signature
+    so the call site in render_frame stays unchanged.
+    """
+    _ = role  # signature kept for compatibility
 
     tbl = Table.grid(padding=(0, 1), expand=True)
-    tbl.add_column(width=2, no_wrap=True)        # health glyph
-    tbl.add_column(width=14, no_wrap=True)       # service name
-    tbl.add_column(width=11, no_wrap=True)       # state
-    tbl.add_column(width=18, no_wrap=True)       # ports / net mode
-    tbl.add_column(min_width=14, no_wrap=False)  # image / detail
+    tbl.add_column(width=2, no_wrap=True)          # health glyph
+    tbl.add_column(width=12, no_wrap=True)         # namespace
+    tbl.add_column(min_width=20, no_wrap=False)    # pod name
+    tbl.add_column(width=10, no_wrap=True)         # state
+    tbl.add_column(width=18, no_wrap=True)         # ports / net mode
+    tbl.add_column(min_width=14, no_wrap=False)    # image
     tbl.add_column(justify="right", no_wrap=True)  # status text
 
-    for svc in expected:
-        row = by_service.get(svc)
-        if row is None:
-            verdict = "missing"
-            glyph, style = HEALTH_STYLES[verdict]
-            tbl.add_row(
-                Text(glyph, style=style),
-                Text(svc, style="dim"),
-                Text("not running", style="dim"),
-                Text("", style="dim"),
-                Text("", style="dim"),
-                Text("—", style="dim"),
-            )
-            continue
+    # Sort: spatium first (the role pods operators care about most),
+    # kube-system next, then anything else alphabetically. Within a
+    # namespace, alphabetical by name.
+    def _ns_rank(ns: str) -> tuple[int, str]:
+        if ns == "spatium":
+            return (0, ns)
+        if ns == "kube-system":
+            return (1, ns)
+        return (2, ns)
+
+    sorted_rows = sorted(
+        ps_rows,
+        key=lambda r: (_ns_rank(r.get("Namespace") or ""), r.get("Names") or ""),
+    )
+
+    if not sorted_rows:
+        tbl.add_row(
+            Text("·", style="dim"),
+            Text("—", style="dim"),
+            Text("no pods running (k3s not ready?)", style="dim"),
+            Text("", style="dim"),
+            Text("", style="dim"),
+            Text("", style="dim"),
+            Text("", style="dim"),
+        )
+        return Panel(
+            tbl, box=SQUARE, border_style="cyan",
+            title="[bold]Pods[/bold]", title_align="left",
+        )
+
+    for row in sorted_rows:
         status = row.get("Status") or ""
         verdict = health_from_status(status)
-        # One-shot services: a clean exit (code 0) is the desired
-        # end-state, not a failure. Migrate finishes after alembic
-        # upgrade head completes — operators shouldn't see red there.
-        if svc in ONE_SHOT_SERVICES and status.startswith("Exited (0)"):
+        if (row.get("State") or "") == "exited" and status.startswith("Succeeded"):
             verdict = "completed"
         glyph, style = HEALTH_STYLES[verdict]
+
         image = row.get("Image") or ""
-        # Trim ghcr.io/spatiumddi/ + :tag for compact display.
-        short_image = image
-        if "/" in short_image:
-            short_image = short_image.rsplit("/", 1)[1]
+        short_image = image.rsplit("/", 1)[1] if "/" in image else image
+
         ports = container_port_summary(row)
-        # Colour the ports cell so ``host net`` reads visually
-        # different from a published port list — operators learn at a
-        # glance that DHCP is in host mode (the expected/correct
-        # state) vs accidentally bridged.
         ports_style = "bold cyan" if ports == "host net" else "dim"
+
         tbl.add_row(
             Text(glyph, style=style),
-            Text(svc, style="bold"),
+            Text(row.get("Namespace") or "—", style="dim"),
+            Text(row.get("Names") or "", style="bold"),
             Text(verdict, style=style),
             Text(ports or "—", style=ports_style),
             Text(short_image, style="dim"),
             Text(status, style="dim"),
         )
 
-    return Panel(tbl, box=SQUARE, border_style="cyan",
-                 title="[bold]Services[/bold]",
-                 title_align="left")
+    return Panel(
+        tbl, box=SQUARE, border_style="cyan",
+        title="[bold]Pods[/bold]", title_align="left",
+    )
 
 
 def upgrade_status() -> tuple[str, str] | None:
@@ -1453,38 +1446,35 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # Compact sizing — feedback was that the dashboard occupied too
     # many rows. Each panel claims exactly content + 2 border rows;
     # footer is a borderless 1-row strip.
-    services_count = len(ROLE_SERVICES.get(state.role, []))
-    # #170 Wave D + Wave E — render_services unions any supervisor-
-    # spawned service container (dns-bind9 / dns-powerdns / dhcp-kea)
-    # that's either currently in docker ps OR that the supervisor's
-    # watchdog expects to be running (per role-compose.env). Mirror
-    # that here so the Services panel is tall enough to show every
-    # row without truncation, including any missing/expected entries.
-    if state.role == "application":
-        ps_index = {container_service_name(r) for r in state.ps_rows}
-        watchdog_expected = set(watchdog_expected_services())
-        for svc in SUPERVISOR_DYNAMIC_SERVICES:
-            if svc in ps_index or svc in watchdog_expected:
-                services_count += 1
-    # Header layout: 4 base content lines (host+role / IPs / Build /
-    # vitals+disks) + 1 horizontal rule + 2 panel border. ``Slot``,
-    # ``Agent``, and ``Watchdog`` lines each add a row when present.
-    # Pre-#170 fold this carried a separate Agent panel; collapsing
-    # its 2-3 rows into one inline header line saves ~4 visual rows.
-    # Vitals + Disk were merged into one row in the same pass (the
-    # bind-mount dedupe + docker-overlay skip keeps disk entries to 2-3
-    # which fit alongside Up/CPU/RAM/Load on any 80+ col TTY).
+
+    # Phase 7 — Pods panel shows every pod on the local cluster, not
+    # the pre-Phase-7 role-scoped service list. Row count is dynamic:
+    # number of pods, plus 2 for the panel border. Min 3 rows so the
+    # empty-state "no pods running" hint stays visible while k3s comes
+    # up. Capped at terminal-height-aware ceiling in render_frame's
+    # log_height clamp below.
+    pods_count = len(state.ps_rows) if state.ps_rows else 1
+    # Header layout: 3 base content lines (host+role / IPs / Build) +
+    # 1 horizontal rule + 1 vitals + 2 panel border = 7. Conditional
+    # rows below each add one row when present. Must include every
+    # conditional render_header() can emit (agent / watchdog / slot /
+    # upgrade / k3s) or vitals gets clipped off the bottom of the
+    # header panel.
     has_agent_line = state.role == "application"
     has_watchdog_line = (
         state.role == "application" and supervisor_watchdog_status() is not None
     )
+    has_upgrade_line = state.role == "application" and upgrade_status() is not None
+    has_k3s_line = k3s_status() is not None
     HEADER_ROWS = (
         7
         + (1 if slot_info() is not None else 0)
         + (1 if has_agent_line else 0)
         + (1 if has_watchdog_line else 0)
+        + (1 if has_upgrade_line else 0)
+        + (1 if has_k3s_line else 0)
     )
-    SVC_ROWS = services_count + 2   # tight: just borders, no padding
+    SVC_ROWS = pods_count + 2   # tight: just borders, no padding
     FOOTER_ROWS = 1   # single-line borderless strip
 
     layout = Layout()

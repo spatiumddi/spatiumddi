@@ -1,7 +1,13 @@
 {{- /* Issue #183 Phase 2 — BIND9 DNS agent.
-       Deployment + Service. Standard pod (not hostNetwork) — agent
-       connects outbound to the control plane to register; clients
-       reach it via the Service. */}}
+       Deployment with hostNetwork=true — port 53 needs to listen
+       directly on the node IP so non-cluster clients can resolve
+       against the appliance. Klipper-lb is disabled in our k3s
+       config (single-node, no LoadBalancer impl), and NodePort
+       defaults exclude 53, so hostNetwork is the simplest way to
+       expose :53 to the operator's network. Mirrors dhcp-kea's
+       pattern (also hostNetwork for raw broadcast access).
+       Agent still connects outbound to the control plane to
+       register. */}}
 {{- if .Values.dnsBind9.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -24,6 +30,8 @@ spec:
         app.kubernetes.io/name: dns-bind9
         app.kubernetes.io/component: dns-bind9
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}
       containers:

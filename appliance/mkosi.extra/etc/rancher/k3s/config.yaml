@@ -8,16 +8,19 @@
 # Air-gap-friendly defaults — every component k3s needs is baked into
 # the slot rootfs.
 
-# Bind kubeapi to localhost by default. Phase 4 (#183) widens this to
-# the control-plane CIDR via the supervisor's nftables drop-in once
-# the operator approves the cross-network kubeapi surface. Until
-# then, only the local supervisor pod + ``kubectl`` from a root /
-# admin shell can reach the api.
-bind-address: 127.0.0.1
+# kubeapi listens on the node IP — k3s auto-detects from the default
+# route. Binding to 127.0.0.1 here is tempting for defense in depth
+# but breaks k8s ≥ 1.31: the kube-apiserver registers itself as the
+# `kubernetes` Service endpoint, and the endpoint slice validator
+# rejects loopback IPs ("may not be in the loopback range") — coredns
+# / local-path / helm-controller all fail to reach the cluster IP.
+#
+# External reach is gated by nftables: tcp/6443 is only accepted from
+# the pod CIDR (10.42.0.0/16) on the input chain; all other origins
+# fall through to the default-drop policy. Phase 4 widens this to the
+# control-plane CIDR via the supervisor's nftables drop-in once the
+# operator approves the cross-network kubeapi surface.
 https-listen-port: 6443
-# Don't advertise on every NIC — single-node, control plane is local
-# only until Phase 4.
-advertise-address: 127.0.0.1
 
 # Disable bundled components we replace or don't need:
 #   * traefik    — operator-facing TLS still goes through our nginx
@@ -67,11 +70,13 @@ kube-apiserver-arg:
   - audit-log-maxage=7
   - audit-log-maxbackup=4
   - audit-log-maxsize=100
-  # Defence-in-depth — even though kubeapi binds to 127.0.0.1, refuse
-  # impersonation + restrict the default node-restriction admission
-  # plugin so a compromised supervisor pod can only see its own
-  # namespace.
-  - enable-admission-plugins=NodeRestriction,EventRateLimit
+  # Defence-in-depth — NodeRestriction limits the kubelet credential
+  # to its own node + pods running on it (already on by default in
+  # k3s ≥ 1.27, listed here so the policy is explicit at the config
+  # level). EventRateLimit is intentionally NOT enabled — it requires
+  # a separate admission-control-config-file with limits defined or
+  # kube-apiserver crash-loops at boot.
+  - enable-admission-plugins=NodeRestriction
 
 # Kubelet args. image-gc thresholds high so we don't churn the
 # baked image set under disk pressure (images are intentionally

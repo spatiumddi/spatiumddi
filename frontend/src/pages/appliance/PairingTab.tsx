@@ -286,7 +286,7 @@ function CodesTable({
                       )}
                     </button>
                   )}
-                  {row.state !== "revoked" && (
+                  {row.state !== "revoked" && row.state !== "expired" && (
                     <button
                       type="button"
                       onClick={() => onRevoke(row)}

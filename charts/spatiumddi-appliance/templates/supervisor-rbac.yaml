@@ -16,14 +16,14 @@
        Phase 3 default: enabled when ``supervisor.enabled`` is true.
        Phase 1+2 left supervisor.enabled=false, so this whole block
        is dormant until the operator opts in. */}}
+{{- /* The spatium namespace is intentionally NOT a chart resource —
+       pre-created by the bootstrap manifest spatiumddi-firstboot
+       writes into k3s's auto-deploy dir. If helm owns the namespace,
+       a partial install that fails (and gets retried) ends up trying
+       to "import" an existing-but-unowned namespace and hits "invalid
+       ownership metadata" because the bootstrap-pre-created namespace
+       doesn't carry helm's `meta.helm.sh/release-*` annotations. */}}
 {{- if .Values.supervisor.enabled }}
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: spatium
-  labels:
-    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
----
 apiVersion: v1
 kind: ServiceAccount
 metadata:

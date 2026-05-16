@@ -54,6 +54,11 @@ spec:
             - name: run-udev
               mountPath: /run/udev
               readOnly: true
+            - name: state-dir
+              mountPath: /var/lib/spatium-supervisor
+            - name: chart-dir
+              mountPath: /usr/lib/spatiumddi/charts
+              readOnly: true
             # Phase 3 will mount /etc/rancher/k3s/k3s.yaml here so the
             # supervisor can talk to its local kubeapi.
             - name: kubeconfig
@@ -75,6 +80,14 @@ spec:
         - name: run-udev
           hostPath:
             path: {{ .Values.supervisor.hostMounts.runUdev }}
+            type: Directory
+        - name: state-dir
+          hostPath:
+            path: {{ .Values.supervisor.hostMounts.stateDir }}
+            type: DirectoryOrCreate
+        - name: chart-dir
+          hostPath:
+            path: {{ .Values.supervisor.hostMounts.chartDir }}
             type: Directory
         - name: kubeconfig
           hostPath:

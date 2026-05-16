@@ -143,3 +143,13 @@ supervisor:
     releaseState: /var/lib/spatiumddi/release-state
     bootEfi: /boot/efi
     runUdev: /run/udev
+    # Supervisor's persistent state — Ed25519 identity, signed cert,
+    # approval state, cached pairing data. MUST persist across pod
+    # restarts or every restart re-pairs as a fresh appliance and the
+    # control plane's Fleet view fills with phantom rows.
+    stateDir: /var/persist/spatium-supervisor
+    # Slot-baked chart tarball — the supervisor re-PATCHes the
+    # HelmChart CR on role-assignment changes and needs the chart
+    # bytes to base64-encode into spec.chartContent. The path
+    # matches service_lifecycle._BAKED_CHART_TARBALL.
+    chartDir: /usr/lib/spatiumddi/charts

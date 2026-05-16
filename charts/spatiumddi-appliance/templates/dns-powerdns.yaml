@@ -23,6 +23,8 @@ spec:
         app.kubernetes.io/name: dns-powerdns
         app.kubernetes.io/component: dns-powerdns
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}
       containers:

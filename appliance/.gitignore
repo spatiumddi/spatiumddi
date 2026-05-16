@@ -43,3 +43,7 @@ mkosi.extra/usr/share/doc/k3s/.version
 # via ``make appliance-bake-chart`` from the tracked
 # charts/spatiumddi-appliance/ source.
 mkosi.extra/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz
+
+# Issue #183 — version stamp written by appliance/scripts/
+# bake-images.sh (or appliance-stamp-dev). Build-time artefact.
+mkosi.extra/usr/lib/spatiumddi/spatiumddi-version
