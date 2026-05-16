@@ -1147,6 +1147,10 @@ function ApplianceDrilldownModal({
             <ApplianceRoleHealthSection row={row} />
           )}
 
+        {row.state === "approved" && (
+          <ApplianceClusterHealthSection row={row} />
+        )}
+
         {row.state === "approved" && <ApplianceOsUpgradeSection row={row} />}
 
         {row.state === "approved" && (
@@ -1392,6 +1396,114 @@ function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
             })}
           </tbody>
         </table>
+      </div>
+    </div>
+  );
+}
+
+// Issue #183 Phase 4 — k3s cluster-health summary + restart action.
+// Renders only when the appliance has heartbeat-reported cluster
+// state (legacy compose appliances ship an empty cluster_health
+// dict, so this section quietly hides).
+function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
+  const qc = useQueryClient();
+  // Hooks must run unconditionally — declare the mutation up front,
+  // then bail later if cluster_health is empty.
+  const restartBind9 = useMutation({
+    mutationFn: () =>
+      applianceApprovalApi.k8sRolloutRestart(row.id, {
+        kind: "Deployment",
+        namespace: "spatium",
+        name: "dns-bind9",
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
+  });
+
+  const ch = row.cluster_health ?? {};
+  const ready = ch.kubeapi_ready === true;
+  const nodesTotal = ch.nodes_total;
+  const nodesReady = ch.nodes_ready;
+  const podsTotal = ch.pods_total;
+  const podsByPhase = ch.pods_by_phase ?? {};
+
+  // Hide on pre-#183 / legacy compose appliances where the supervisor
+  // never reports cluster_health.
+  if (Object.keys(ch).length === 0) {
+    return null;
+  }
+
+  return (
+    <div>
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        k3s cluster health
+      </h3>
+      <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1.5 text-xs">
+        <dt className="text-muted-foreground">Kubeapi</dt>
+        <dd>
+          <span
+            className={cn(
+              "rounded-full px-1.5 py-0.5 font-mono text-[10px]",
+              ready
+                ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                : "bg-rose-500/10 text-rose-700 dark:text-rose-300",
+            )}
+          >
+            {ready ? "ready" : "unreachable"}
+          </span>
+        </dd>
+        {nodesTotal !== undefined && (
+          <>
+            <dt className="text-muted-foreground">Nodes</dt>
+            <dd className="font-mono">
+              {nodesReady ?? 0} / {nodesTotal} ready
+            </dd>
+          </>
+        )}
+        {podsTotal !== undefined && (
+          <>
+            <dt className="text-muted-foreground">Pods (spatium)</dt>
+            <dd>
+              <span className="font-mono">{podsTotal}</span>
+              {Object.entries(podsByPhase).length > 0 && (
+                <span className="ml-2 font-mono text-[11px] text-muted-foreground">
+                  {Object.entries(podsByPhase)
+                    .map(([phase, count]) => `${phase} ${count}`)
+                    .join(" · ")}
+                </span>
+              )}
+            </dd>
+          </>
+        )}
+      </dl>
+      <p className="mt-2 text-[11px] text-muted-foreground">
+        Direct kubeapi proxy via the supervisor's mTLS channel — actions are
+        sub-second on a healthy appliance.
+      </p>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={() => restartBind9.mutate()}
+          disabled={!ready || restartBind9.isPending}
+          title="kubectl rollout restart deploy/dns-bind9 -n spatium"
+          className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {restartBind9.isPending ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <RefreshCw className="h-3 w-3" />
+          )}
+          Restart bind9
+        </button>
+        {restartBind9.error && (
+          <span className="text-[11px] text-rose-700 dark:text-rose-300">
+            {(restartBind9.error as Error).message}
+          </span>
+        )}
+        {restartBind9.isSuccess && (
+          <span className="text-[11px] text-emerald-700 dark:text-emerald-300">
+            rollout-restart issued
+          </span>
+        )}
       </div>
     </div>
   );

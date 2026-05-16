@@ -7339,6 +7339,16 @@ export interface ApplianceRow {
       container_id: string | null;
     }
   >;
+  // Issue #183 Phase 4 — local k3s cluster health summary, supplied
+  // by the supervisor on every heartbeat. Empty object on legacy
+  // compose appliances or pre-#183 supervisors.
+  cluster_health: {
+    kubeapi_ready?: boolean;
+    nodes_total?: number;
+    nodes_ready?: number;
+    pods_total?: number;
+    pods_by_phase?: Record<string, number>;
+  };
   // Issue #170 Wave E follow-up — soft-delete timestamp. Non-null on
   // ``state=revoked`` rows; cleared by re-authorize.
   revoked_at: string | null;
@@ -7434,6 +7444,25 @@ export const applianceApprovalApi = {
   scheduleReboot: (id: string) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/reboot`)
+      .then((r) => r.data),
+  // Issue #183 Phase 4 — direct kubeapi action via the supervisor's
+  // long-poll proxy. Sub-second on a healthy appliance; surfaces a
+  // 504 / 502 when the proxy times out or kubeapi returns an error.
+  k8sRolloutRestart: (
+    id: string,
+    body: {
+      kind: "Deployment" | "DaemonSet";
+      namespace?: string;
+      name: string;
+    },
+  ) =>
+    api
+      .post<{
+        ok: boolean;
+        status: number;
+        kind: string;
+        name: string;
+      }>(`/appliance/appliances/${id}/k8s/restart`, body)
       .then((r) => r.data),
 };
 

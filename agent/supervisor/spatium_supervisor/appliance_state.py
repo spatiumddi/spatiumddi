@@ -638,6 +638,86 @@ def read_ntp_sync_state() -> str | None:
     return None
 
 
+def read_cluster_health() -> dict[str, object] | None:
+    """Issue #183 Phase 4 — local k3s health summary for the
+    heartbeat's slow drift channel.
+
+    Probes the local kubeapi for:
+      * Node count + how many report ``Ready``
+      * Pod count in the ``spatium`` namespace + per-phase breakdown
+      * Whether the kubeapi itself reports ``/readyz`` ok
+
+    Returns ``None`` when k3s isn't the runtime (no probe attempted)
+    or ``{}`` when probes fail (kubeapi unreachable from a
+    runtime-claimed-as-k3s appliance, which itself is signal).
+
+    Pure read-only — never mutates cluster state. Sub-2s total probe
+    budget so the heartbeat-collect step stays cheap.
+    """
+    if detect_runtime() != "k3s":
+        return None
+
+    # Lazy import — non-appliance / non-k3s deployments don't load
+    # the kubeapi client.
+    from . import k8s_api  # noqa: PLC0415
+
+    summary: dict[str, object] = {"kubeapi_ready": False}
+    if not k8s_api.check_kubeapi_ready(timeout=1.5):
+        return summary
+    summary["kubeapi_ready"] = True
+
+    # Node count via the kubeapi list. Each node carries a
+    # ``conditions`` array; the ``Ready`` condition's ``status`` is
+    # ``True`` when the kubelet says so.
+    try:
+
+        status_code, body = k8s_api._request("GET", "/api/v1/nodes")
+    except (RuntimeError, OSError):
+        return summary
+    if status_code == 200:
+        import json  # noqa: PLC0415
+
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            data = {}
+        nodes = data.get("items") or []
+        ready = 0
+        for n in nodes:
+            for cond in (n.get("status") or {}).get("conditions") or []:
+                if cond.get("type") == "Ready" and cond.get("status") == "True":
+                    ready += 1
+                    break
+        summary["nodes_total"] = len(nodes)
+        summary["nodes_ready"] = ready
+
+    # Pod count in the spatium namespace, grouped by phase.
+    try:
+        status_code, body = k8s_api._request("GET", "/api/v1/namespaces/spatium/pods")
+    except (RuntimeError, OSError):
+        return summary
+    if status_code == 200:
+        import json  # noqa: PLC0415
+
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            data = {}
+        pods = data.get("items") or []
+        phase_counts: dict[str, int] = {}
+        for p in pods:
+            phase = (p.get("status") or {}).get("phase") or "Unknown"
+            phase_counts[phase] = phase_counts.get(phase, 0) + 1
+        summary["pods_total"] = len(pods)
+        summary["pods_by_phase"] = phase_counts
+    elif status_code == 404:
+        # Namespace doesn't exist yet — no role assigned, no pods.
+        summary["pods_total"] = 0
+        summary["pods_by_phase"] = {}
+
+    return summary
+
+
 def collect() -> dict[str, object]:
     """Snapshot the agent's slot + deployment state for the heartbeat.
 
@@ -660,6 +740,7 @@ def collect() -> dict[str, object]:
     )
 
     slot_a_version, slot_b_version = read_slot_versions()
+    cluster_health = read_cluster_health() if is_appliance else None
 
     return {
         "deployment_kind": deployment_kind,
@@ -683,4 +764,10 @@ def collect() -> dict[str, object]:
         # reference / stratum >= 16; ``unknown`` = chronyc unreadable
         # (transient at boot). None on non-appliance deploys.
         "ntp_sync_state": read_ntp_sync_state() if is_appliance else None,
+        # Issue #183 Phase 4 — local k3s health summary. Slow drift
+        # signals that ride the heartbeat (fast actions go through
+        # the proxy). Empty dict on non-k3s appliances; never None
+        # so the backend's "overwrite verbatim" semantics clear stale
+        # health when k3s is disabled.
+        "cluster_health": cluster_health if cluster_health is not None else {},
     }

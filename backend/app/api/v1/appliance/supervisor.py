@@ -302,7 +302,9 @@ async def supervisor_register(
     # force a fresh registration they delete the row in the fleet UI,
     # which causes the supervisor to clear its identity + claim a new
     # pairing code on next boot.
-    existing_stmt = select(Appliance).where(Appliance.public_key_fingerprint == pubkey_fingerprint)
+    existing_stmt = select(Appliance).where(
+        Appliance.public_key_fingerprint == pubkey_fingerprint
+    )
     existing = (await db.execute(existing_stmt)).scalar_one_or_none()
     if existing is not None:
         # Idempotent re-register. Touch last_seen_at so the heartbeat
@@ -388,7 +390,9 @@ async def supervisor_register(
                 resource_type="pairing_code",
                 resource_id=str(code_row.id) if code_row is not None else "unknown",
                 resource_display=(
-                    "supervisor pairing code" if code_row is not None else "unknown pairing code"
+                    "supervisor pairing code"
+                    if code_row is not None
+                    else "unknown pairing code"
                 ),
                 result="forbidden",
                 new_value={
@@ -538,7 +542,9 @@ async def supervisor_poll(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
 
     row = await db.get(Appliance, body.appliance_id)
-    valid = row is not None and verify_session_token(body.session_token, row.session_token_hash)
+    valid = row is not None and verify_session_token(
+        body.session_token, row.session_token_hash
+    )
     if not valid:
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
@@ -631,6 +637,12 @@ class SupervisorHeartbeatRequest(BaseModel):
     # None / omitted = supervisor didn't run the watchdog this tick
     # (typical on docker / k8s deployments or before the first probe).
     role_health: dict[str, dict[str, Any]] | None = None
+    # Issue #183 Phase 4 — local k3s cluster health summary. Shape:
+    # ``{"kubeapi_ready": bool, "nodes_total": int, "nodes_ready":
+    # int, "pods_total": int, "pods_by_phase": {<phase>: count}}``.
+    # Empty dict on legacy compose appliances; None / omitted = the
+    # supervisor didn't run the probe this tick (pre-#183 supervisors).
+    cluster_health: dict[str, Any] | None = None
 
 
 class SupervisorRoleAssignment(BaseModel):
@@ -716,7 +728,9 @@ class SupervisorHeartbeatResponse(BaseModel):
     # uses this to bring up dns-bind9 / dns-powerdns / dhcp-kea
     # service containers via docker compose. Empty roles list = idle
     # (approved but no service running).
-    role_assignment: SupervisorRoleAssignment = Field(default_factory=SupervisorRoleAssignment)
+    role_assignment: SupervisorRoleAssignment = Field(
+        default_factory=SupervisorRoleAssignment
+    )
 
 
 @router.post(
@@ -801,7 +815,9 @@ async def supervisor_heartbeat(
         )
         if not valid:
             await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "Invalid appliance or session."
+            )
 
     assert row is not None
     # Issue #170 Wave E follow-up — reject heartbeats from soft-deleted
@@ -868,6 +884,11 @@ async def supervisor_heartbeat(
         # supervisor's ``since`` timestamp is the canonical "first
         # observed in this status" anchor across heartbeats.
         row.role_health = dict(body.role_health)
+    if body.cluster_health is not None:
+        # Issue #183 Phase 4 — supervisor's local-k3s health summary.
+        # Same overwrite-verbatim shape as role_health. Empty dict
+        # is a meaningful signal (legacy compose; clear stale state).
+        row.cluster_health = dict(body.cluster_health)
 
     # Auto-clear desired_appliance_version once installed matches +
     # the upgrade landed cleanly. Same shape as #138 Phase 8f-4's
@@ -884,13 +905,19 @@ async def supervisor_heartbeat(
     # the requested slot as ``current_slot`` — the operator's intent
     # was "boot into this slot next", and we got there. ``durable_
     # default`` is irrelevant here (next-boot is one-shot by design).
-    if row.desired_next_boot_slot is not None and row.current_slot == row.desired_next_boot_slot:
+    if (
+        row.desired_next_boot_slot is not None
+        and row.current_slot == row.desired_next_boot_slot
+    ):
         row.desired_next_boot_slot = None
 
     # Auto-clear desired_default_slot once the supervisor reports the
     # requested slot as ``durable_default`` — grub-set-default landed
     # and survives subsequent reboots.
-    if row.desired_default_slot is not None and row.durable_default == row.desired_default_slot:
+    if (
+        row.desired_default_slot is not None
+        and row.durable_default == row.desired_default_slot
+    ):
         row.desired_default_slot = None
 
     # Auto-clear reboot_requested 15 s after the stamp — by that
@@ -952,7 +979,9 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
     from app.models.dns import DNSServerGroup
 
     assigned_roles = list(row.assigned_roles or [])
-    dns_role_assigned = "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
+    dns_role_assigned = (
+        "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
+    )
     dhcp_role_assigned = "dhcp" in assigned_roles
 
     dns_engine: str | None = None
@@ -1061,6 +1090,8 @@ class ApplianceRow(BaseModel):
     # ``dhcp-kea``); values carry ``{role, status, since,
     # container_id}``.
     role_health: dict[str, dict[str, Any]]
+    # Issue #183 Phase 4 — local k3s cluster health summary.
+    cluster_health: dict[str, Any]
     # #170 Wave E follow-up — soft-delete timestamp. Non-null on
     # ``state=revoked`` rows; cleared by re-authorize.
     revoked_at: datetime | None = None
@@ -1123,6 +1154,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         role_switch_state=row.role_switch_state,
         role_switch_reason=row.role_switch_reason,
         role_health=dict(row.role_health or {}),
+        cluster_health=dict(row.cluster_health or {}),
         revoked_at=row.revoked_at,
         created_at=row.created_at,
     )
@@ -1137,7 +1169,9 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
 async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     _require_superadmin(current_user)
     rows = (
-        (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc()))).scalars().all()
+        (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc())))
+        .scalars()
+        .all()
     )
     return ApplianceList(appliances=[_row_to_schema(r) for r in rows])
 
@@ -1148,7 +1182,9 @@ async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Fetch a single appliance (superadmin)",
 )
-async def get_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> ApplianceRow:
+async def get_appliance(
+    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> ApplianceRow:
     _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
@@ -1237,7 +1273,9 @@ async def approve_appliance(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Reject a pending appliance (deletes the row, superadmin)",
 )
-async def reject_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def reject_appliance(
+    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> None:
     """Reject = DELETE the row. Supervisor's next poll gets 403 +
     falls back to bootstrapping. Distinct from delete (next endpoint)
     only in the audit verb — operationally identical."""
@@ -1727,10 +1765,14 @@ async def update_appliance_roles(
             new_value={
                 "roles": list(row.assigned_roles or []),
                 "dns_group_id": (
-                    str(row.assigned_dns_group_id) if row.assigned_dns_group_id else None
+                    str(row.assigned_dns_group_id)
+                    if row.assigned_dns_group_id
+                    else None
                 ),
                 "dhcp_group_id": (
-                    str(row.assigned_dhcp_group_id) if row.assigned_dhcp_group_id else None
+                    str(row.assigned_dhcp_group_id)
+                    if row.assigned_dhcp_group_id
+                    else None
                 ),
                 "tags": dict(row.tags or {}),
             },
@@ -1886,7 +1928,9 @@ async def schedule_appliance_upgrade(
             new_value={
                 "desired_appliance_version": body.desired_appliance_version,
                 "desired_slot_image_url": resolved_url,
-                "slot_image_id": (str(body.slot_image_id) if body.slot_image_id else None),
+                "slot_image_id": (
+                    str(body.slot_image_id) if body.slot_image_id else None
+                ),
             },
         )
     )
@@ -2143,3 +2187,261 @@ async def schedule_appliance_reboot(
         user=current_user.username,
     )
     return _row_to_schema(row)
+
+
+# ── Issue #183 Phase 4 — kubeapi proxy + restart-deployment action ──
+
+
+class K8sProxyPollResponse(BaseModel):
+    """Long-poll result. ``request_id`` is empty + ``method`` is empty
+    when the poll timed out without a request — the supervisor handles
+    that as "no work, poll again". Otherwise the supervisor decodes
+    ``body_b64`` and POSTs against its local kubeapi."""
+
+    request_id: str
+    method: str
+    path: str
+    headers: dict[str, str]
+    body_b64: str
+
+
+class K8sProxyReplyRequest(BaseModel):
+    """Supervisor-sent reply after executing the proxied request
+    against the local kubeapi. ``status`` is the kubeapi's HTTP
+    status; ``body_b64`` carries the response body verbatim."""
+
+    request_id: str
+    status: int
+    headers: dict[str, str] = Field(default_factory=dict)
+    body_b64: str = ""
+
+
+async def _require_cert_auth(request: Request, db: DB) -> Appliance:
+    """Shared cert-auth gate for the proxy endpoints. Returns the
+    authenticated appliance row. Raises 403 on failure — no fallback
+    to session-token here since the proxy channel only exists for
+    approved appliances with mTLS certs.
+    """
+    from app.services.appliance.cert_auth import (  # noqa: PLC0415
+        CertAuthFailed,
+        authenticate_cert,
+    )
+
+    try:
+        principal = await authenticate_cert(request, db)
+    except CertAuthFailed as exc:
+        logger.warning("appliance.k8s_proxy.cert_auth_failed", reason=exc.reason)
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Invalid appliance client cert."
+        ) from exc
+    if principal is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Cert headers required for kubeapi proxy.",
+        )
+    if principal.appliance.state != APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"Appliance in state {principal.appliance.state!r}; proxy disabled.",
+        )
+    return principal.appliance
+
+
+@router.post(
+    "/supervisor/k8s-proxy/poll",
+    response_model=K8sProxyPollResponse,
+    summary="Long-poll for the next queued kubeapi request",
+)
+async def k8s_proxy_poll(request: Request, db: DB) -> K8sProxyPollResponse:
+    """Supervisor-only endpoint. The supervisor's ``k8s_proxy.py``
+    background thread holds an outbound long-poll here; when an
+    operator action enqueues a request bound for this appliance, the
+    poll returns immediately. Otherwise the request times out after
+    30 s and the supervisor re-issues.
+
+    Cert auth required — anonymous callers can't intercept queued
+    requests. Cert subject must match an approved appliance row
+    (the proxy queue is keyed by appliance_id, so a misbehaving cert
+    would only see its own queue anyway).
+    """
+    from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
+
+    appliance = await _require_cert_auth(request, db)
+    queued = await _proxy.pop_request(appliance.id, timeout=30.0)
+    if queued is None:
+        # No request within the timeout — return an empty shape so
+        # the supervisor loop just re-polls. 200 (not 204) so the
+        # supervisor doesn't have to special-case "no body".
+        return K8sProxyPollResponse(
+            request_id="", method="", path="", headers={}, body_b64=""
+        )
+    return K8sProxyPollResponse(
+        request_id=queued.request_id,
+        method=queued.method,
+        path=queued.path,
+        headers=queued.headers,
+        body_b64=queued.body_b64,
+    )
+
+
+@router.post(
+    "/supervisor/k8s-proxy/reply/{request_id}",
+    summary="Return a kubeapi response to the awaiting operator action",
+)
+async def k8s_proxy_reply(
+    request_id: str,
+    body: K8sProxyReplyRequest,
+    request: Request,
+    db: DB,
+) -> dict[str, str]:
+    """Supervisor-only endpoint. Once the supervisor has executed the
+    proxied request against the local kubeapi, it POSTs the response
+    here. The backend's in-memory future map matches the request_id
+    + resolves the operator action's pending future.
+
+    Returns 200 either way — late replies (operator already timed
+    out + the future was GC'd) are logged + discarded server-side
+    so the supervisor's loop stays simple.
+    """
+    from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
+
+    appliance = await _require_cert_auth(request, db)
+    if body.request_id != request_id:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "request_id path/body mismatch",
+        )
+    response = _proxy.K8sProxyResponse(
+        request_id=request_id,
+        status=body.status,
+        headers=body.headers,
+        body_b64=body.body_b64,
+    )
+    delivered = _proxy.deliver_response(response)
+    logger.info(
+        "appliance.k8s_proxy.reply",
+        appliance_id=str(appliance.id),
+        request_id=request_id,
+        status=body.status,
+        delivered=delivered,
+    )
+    return {"delivered": "true" if delivered else "stale"}
+
+
+class ApplianceRestartDeploymentRequest(BaseModel):
+    """Operator-driven Deployment / DaemonSet rollout-restart.
+
+    Same effect as ``kubectl rollout restart <kind>/<name> -n
+    <namespace>``. Bumps the pod template's
+    ``kubectl.kubernetes.io/restartedAt`` annotation, which makes the
+    controller spin up new pods and reap the old ones one at a time.
+    """
+
+    kind: Literal["Deployment", "DaemonSet"]
+    namespace: str = Field(default="spatium", min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=253)
+
+
+@router.post(
+    "/appliances/{appliance_id}/k8s/restart",
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Rollout-restart a Deployment/DaemonSet on the appliance's k3s",
+)
+async def k8s_rollout_restart(
+    appliance_id: uuid.UUID,
+    body: ApplianceRestartDeploymentRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> dict[str, object]:
+    """First operator-facing direct-kubeapi action (#183 Phase 4
+    proof-of-concept). Enqueues a kubeapi PATCH against the local
+    cluster via the supervisor proxy + waits up to 30 s for the
+    response.
+
+    Returns ``{"ok": true, "status": <kubeapi-status>}`` on success;
+    surfaces a 504 if the supervisor doesn't reply in time, 502 if
+    the kubeapi itself returned an error.
+    """
+    from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
+
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state != APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Appliance in state {row.state!r}; kubeapi proxy unavailable.",
+        )
+
+    # Strategic-merge patch that bumps the pod template's
+    # ``restartedAt`` annotation. Standard kubectl rollout-restart
+    # shape — same JSON kubectl sends.
+    api_path = (
+        f"/apis/apps/v1/namespaces/{body.namespace}/"
+        f"{body.kind.lower()}s/{body.name}"
+    )
+    patch_body = {
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "kubectl.kubernetes.io/restartedAt": datetime.now(
+                            UTC
+                        ).isoformat()
+                    }
+                }
+            }
+        }
+    }
+    try:
+        status_code, response_body = await _proxy.k8s_call(
+            row.id,
+            "PATCH",
+            api_path,
+            body=patch_body,
+            content_type="application/strategic-merge-patch+json",
+            timeout=20.0,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status.HTTP_504_GATEWAY_TIMEOUT,
+            "Supervisor didn't reply in 20s. Is the appliance heartbeating?",
+        ) from exc
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.k8s_rollout_restart",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success" if 200 <= status_code < 300 else "failed",
+            new_value={
+                "kind": body.kind,
+                "namespace": body.namespace,
+                "name": body.name,
+                "kubeapi_status": status_code,
+            },
+        )
+    )
+    await db.commit()
+
+    if not 200 <= status_code < 300:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"kubeapi returned {status_code}: {response_body[:200]!r}",
+        )
+
+    logger.info(
+        "appliance.k8s_rollout_restart",
+        appliance_id=str(row.id),
+        kind=body.kind,
+        namespace=body.namespace,
+        name=body.name,
+        kubeapi_status=status_code,
+        user=current_user.username,
+    )
+    return {"ok": True, "status": status_code, "kind": body.kind, "name": body.name}

@@ -61,7 +61,9 @@ class ApplianceCertificate(Base):
 
     __tablename__ = "appliance_certificate"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
 
     # Operator-chosen label. Unique so audit log lines + UI cards can
     # refer to "letsencrypt-2026.05" without ambiguity. Distinct from
@@ -98,7 +100,9 @@ class ApplianceCertificate(Base):
     # the most recent activation timestamp so the UI can show "active
     # since X" without consulting the audit log.
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    activated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Identity extracted from the cert at upload time (so listing
     # doesn't need to re-parse every PEM on every request). subject_cn
@@ -123,8 +127,12 @@ class ApplianceCertificate(Base):
     # render "expires in N days" badges and by a future renewal task
     # (Phase 4b.4) to schedule Let's Encrypt rotations. NULL on
     # CSR-pending rows.
-    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_from: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    valid_to: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Operator notes — purely descriptive. UI shows them on the card
     # for context ("Let's Encrypt prod cert — renew script in cron").
@@ -184,11 +192,15 @@ class PairingCode(Base):
 
     __tablename__ = "pairing_code"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
 
     # sha256 hex digest of the cleartext code. UNIQUE so the consume
     # endpoint can look up by hash in O(log n) without collision risk.
-    code_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    code_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
 
     # Last two digits of the cleartext code. Surfaced in the list
     # endpoint for visual correlation ("which row is the code I just
@@ -230,7 +242,9 @@ class PairingCode(Base):
     # revoking a code is permanent ("dead row"), disabling is
     # reversible ("paused"). Revoking a claimed code is a no-op for
     # already-issued certs but still useful audit signal.
-    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     revoked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
@@ -265,7 +279,9 @@ class PairingClaim(Base):
 
     __tablename__ = "pairing_claim"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     pairing_code_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("pairing_code.id", ondelete="CASCADE"),
@@ -350,7 +366,9 @@ class Appliance(Base):
 
     __tablename__ = "appliance"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
 
     hostname: Mapped[str] = mapped_column(String(255), nullable=False)
 
@@ -392,11 +410,15 @@ class Appliance(Base):
     # an admin can Re-authorize (clear ``revoked_at`` + state back
     # to ``approved``). A retention cron hard-deletes after
     # ``platform_settings.appliance_revoked_retention_days``.
-    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Updated by Wave A2+'s supervisor heartbeat path. Stays NULL
     # until the supervisor's first post-register check-in.
-    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_seen_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Wave B1 — supervisor-reported capabilities (can_run_dns_bind9,
@@ -422,16 +444,24 @@ class Appliance(Base):
     # supervisor auto-renews 30 days before expiry (Wave C polish).
     cert_pem: Mapped[str | None] = mapped_column(Text, nullable=True)
     cert_serial: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    cert_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    cert_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cert_issued_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cert_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Approval audit columns (the canonical state is still `state` —
     # these timestamps are for UI relative-time chips).
-    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
-    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     rejected_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
@@ -442,7 +472,9 @@ class Appliance(Base):
     # is now the single producer; the fleet UI reads these columns
     # to drive the Upgrade affordance, slot chips, and reboot button.
     deployment_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    installed_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    installed_appliance_version: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     current_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
     durable_default: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Per-slot installed version — supervisor reads the
@@ -469,7 +501,9 @@ class Appliance(Base):
     # trigger files on the appliance host. Heartbeat handler auto-
     # clears once installed catches up (upgrade) or a fresh heartbeat
     # arrives post-reboot.
-    desired_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    desired_appliance_version: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     desired_slot_image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     reboot_requested: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa.text("false")
@@ -490,7 +524,9 @@ class Appliance(Base):
     #
     # Both auto-clear in the heartbeat handler once the supervisor's
     # reported state matches what was requested.
-    desired_next_boot_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    desired_next_boot_slot: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
     desired_default_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # Role assignment — #170 Wave C2. Operator picks a subset of
@@ -563,6 +599,20 @@ class Appliance(Base):
         server_default="{}",
     )
 
+    # Issue #183 Phase 4 — local k3s cluster health summary, supplied
+    # by the supervisor on every heartbeat. Shape:
+    # ``{"kubeapi_ready": bool, "nodes_total": int, "nodes_ready":
+    # int, "pods_total": int, "pods_by_phase": {"Running": N, ...}}``.
+    # Empty dict on legacy compose appliances (or k3s probe failure)
+    # so the Fleet UI knows the difference between "not running k3s"
+    # vs "k3s here but kubeapi wedged".
+    cluster_health: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -595,7 +645,9 @@ class ApplianceCA(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
 
 
 class ApplianceSlotImage(Base):
@@ -617,7 +669,9 @@ class ApplianceSlotImage(Base):
 
     __tablename__ = "appliance_slot_image"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     size_bytes: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
