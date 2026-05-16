@@ -30,13 +30,28 @@ VERSION_FILE="$APPLIANCE_DIR/mkosi.extra/usr/lib/spatiumddi/spatiumddi-version"
 SPATIUMDDI_VERSION="${SPATIUMDDI_VERSION:-dev}"
 BAKE_SOURCE="${BAKE_SOURCE:-local}"  # local (docker :dev) | ghcr (pull from ghcr.io)
 
-# Image set the slot needs to carry. Names match the chart's
-# values.yaml ``<role>.image.repository`` + the supervisor.
+# SpatiumDDI service images. Tagged with SPATIUMDDI_VERSION so the
+# chart's ``image: ghcr.io/spatiumddi/<name>:${SPATIUMDDI_VERSION}``
+# reference resolves locally without a pull.
 IMAGES=(
     "ghcr.io/spatiumddi/spatium-supervisor"
     "ghcr.io/spatiumddi/dns-bind9"
     "ghcr.io/spatiumddi/dns-powerdns"
     "ghcr.io/spatiumddi/dhcp-kea"
+)
+
+# Issue #183 Phase 8 — 3rd-party observability images. Tagged with
+# the upstream version (NOT SPATIUMDDI_VERSION) since they're
+# distributed-as-binaries upstream. The chart references them with
+# their canonical names (``registry.k8s.io/kube-state-metrics/...:
+# v2.13.0`` etc); we pull + save without retag.
+#
+# Format: ``<full-image>:<tag>``. Keep in lock-step with
+# ``charts/spatiumddi-appliance/values.yaml`` ``observability.*``
+# image refs.
+OBSERVABILITY_IMAGES=(
+    "registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.13.0"
+    "quay.io/prometheus/node-exporter:v1.8.2"
 )
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -112,6 +127,34 @@ for repo in "${IMAGES[@]}"; do
     echo "  ✓ $size"
 done
 
+# Issue #183 Phase 8 — 3rd-party observability images. Pull + save
+# at upstream tags; no retag, no SPATIUMDDI_VERSION involvement.
+# Operator opts in via ``observability.kubeStateMetrics.enabled`` /
+# ``observability.nodeExporter.enabled`` in the chart's values.yaml;
+# the bake always ships them so the toggle works air-gap.
+#
+# Slugged output filenames so two images from the same registry
+# path prefix don't collide. ``kube-state-metrics`` + ``node-exporter``
+# are distinct enough that ``basename`` works.
+for image in "${OBSERVABILITY_IMAGES[@]}"; do
+    short="$(basename "${image%%:*}")"
+    out_tar="$IMAGES_DIR/${short}.tar.zst"
+
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        echo "→ Pulling $image …"
+        docker pull "$image" >/dev/null
+    fi
+
+    echo "→ Baking $image → $out_tar"
+    tmp="${out_tar}.new"
+    docker save "$image" | zstd -T0 -19 -o "$tmp"
+    mv "$tmp" "$out_tar"
+
+    size="$(du -h "$out_tar" | awk '{print $1}')"
+    echo "  ✓ $size"
+done
+
 TOTAL="$(du -hc "$IMAGES_DIR"/*.tar.zst 2>/dev/null | tail -1 | awk '{print $1}')"
-echo "✓ ${#IMAGES[@]} images baked into $IMAGES_DIR ($TOTAL)"
+TOTAL_COUNT=$((${#IMAGES[@]} + ${#OBSERVABILITY_IMAGES[@]}))
+echo "✓ ${TOTAL_COUNT} images baked into $IMAGES_DIR ($TOTAL)"
 echo "  k3s auto-imports these at startup (no firstboot shell-out required)"

@@ -7496,6 +7496,44 @@ export const applianceApprovalApi = {
         cidrs,
       })
       .then((r) => r.data),
+  // Issue #183 Phase 8 — pod listing + log viewer via the kubeapi
+  // proxy. Snapshot-mode (no --follow) since the proxy is request/
+  // response; operators get the recent tail + a refresh button.
+  k8sListPods: (id: string, namespace: string = "spatium") =>
+    api
+      .get<{
+        pods: Array<{
+          name: string;
+          namespace: string;
+          phase: string;
+          ready: boolean;
+          containers: string[];
+          labels: Record<string, string>;
+        }>;
+      }>(`/appliance/appliances/${id}/k8s/pods`, {
+        params: { namespace },
+      })
+      .then((r) => r.data),
+  k8sGetPodLogs: (
+    id: string,
+    pod: string,
+    opts: {
+      namespace?: string;
+      container?: string;
+      tail_lines?: number;
+    } = {},
+  ) =>
+    api
+      .get<string>(`/appliance/appliances/${id}/k8s/logs`, {
+        params: {
+          pod,
+          namespace: opts.namespace ?? "spatium",
+          ...(opts.container ? { container: opts.container } : {}),
+          tail_lines: opts.tail_lines ?? 1000,
+        },
+        responseType: "text",
+      })
+      .then((r) => r.data),
 };
 
 // ── Slot image uploads (#170 follow-up) ────────────────────────────

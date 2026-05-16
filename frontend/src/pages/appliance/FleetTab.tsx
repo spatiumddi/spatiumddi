@@ -4,6 +4,7 @@ import {
   AlertCircle,
   Ban,
   CheckCircle2,
+  FileText,
   HardDrive,
   KeyRound,
   Loader2,
@@ -1420,6 +1421,7 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
   });
   const [revealOpen, setRevealOpen] = useState(false);
   const [cidrEditorOpen, setCidrEditorOpen] = useState(false);
+  const [logsOpen, setLogsOpen] = useState(false);
 
   const ch = row.cluster_health ?? {};
   const ready = ch.kubeapi_ready === true;
@@ -1542,6 +1544,16 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
           <KeyRound className="h-3 w-3" />
           Reveal kubeconfig
         </button>
+        <button
+          type="button"
+          onClick={() => setLogsOpen(true)}
+          disabled={!ready}
+          title="View pod logs (snapshot via the kubeapi proxy)"
+          className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <FileText className="h-3 w-3" />
+          Pod logs
+        </button>
         {restartBind9.error && (
           <span className="text-[11px] text-rose-700 dark:text-rose-300">
             {(restartBind9.error as Error).message}
@@ -1565,7 +1577,163 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
           onClose={() => setCidrEditorOpen(false)}
         />
       )}
+      {logsOpen && (
+        <PodLogsModal appliance={row} onClose={() => setLogsOpen(false)} />
+      )}
     </div>
+  );
+}
+
+// Issue #183 Phase 8 — pod log viewer. Snapshot mode (no follow)
+// because the Phase 4 kubeapi proxy is request/response. Operator
+// picks a pod from the dropdown; backend fetches the last N lines
+// via the proxy and we render in a textarea. Refresh button to
+// re-fetch.
+function PodLogsModal({
+  appliance,
+  onClose,
+}: {
+  appliance: ApplianceRow;
+  onClose: () => void;
+}) {
+  const podsQuery = useQuery({
+    queryKey: ["appliance", "fleet", appliance.id, "k8s-pods"],
+    queryFn: () => applianceApprovalApi.k8sListPods(appliance.id),
+    staleTime: 10_000,
+  });
+  const [selectedPod, setSelectedPod] = useState<string>("");
+  const [selectedContainer, setSelectedContainer] = useState<string>("");
+  const [tailLines, setTailLines] = useState<number>(500);
+
+  // Auto-select the first pod when the list loads; keep the
+  // operator's choice sticky after they change it.
+  useEffect(() => {
+    if (!selectedPod && podsQuery.data?.pods.length) {
+      setSelectedPod(podsQuery.data.pods[0].name);
+    }
+  }, [podsQuery.data, selectedPod]);
+
+  const selectedPodInfo = podsQuery.data?.pods.find(
+    (p) => p.name === selectedPod,
+  );
+  // Reset container picker when the pod changes — first container
+  // is the natural default.
+  useEffect(() => {
+    if (
+      selectedPodInfo &&
+      !selectedPodInfo.containers.includes(selectedContainer)
+    ) {
+      setSelectedContainer(selectedPodInfo.containers[0] ?? "");
+    }
+  }, [selectedPodInfo, selectedContainer]);
+
+  const logsQuery = useQuery({
+    queryKey: [
+      "appliance",
+      "fleet",
+      appliance.id,
+      "k8s-logs",
+      selectedPod,
+      selectedContainer,
+      tailLines,
+    ],
+    queryFn: () =>
+      applianceApprovalApi.k8sGetPodLogs(appliance.id, selectedPod, {
+        container: selectedContainer || undefined,
+        tail_lines: tailLines,
+      }),
+    enabled: !!selectedPod,
+    staleTime: 0,
+  });
+
+  return (
+    <Modal title={`Pod logs · ${appliance.hostname}`} onClose={onClose} wide>
+      <div className="space-y-2 text-sm">
+        <p className="text-xs text-muted-foreground">
+          Snapshot via the kubeapi proxy (Phase 4 channel) — same as{" "}
+          <code>kubectl logs --tail={tailLines}</code>. For continuous
+          follow-mode, ssh to the appliance + run <code>kubectl logs -f</code>{" "}
+          directly.
+        </p>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-[2fr_1fr_1fr] sm:items-end">
+          <label className="text-xs">
+            Pod
+            <select
+              value={selectedPod}
+              onChange={(e) => setSelectedPod(e.target.value)}
+              disabled={podsQuery.isLoading}
+              className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
+            >
+              {podsQuery.isLoading && <option>Loading…</option>}
+              {(podsQuery.data?.pods ?? []).map((p) => (
+                <option key={p.name} value={p.name}>
+                  {p.name} ({p.phase}
+                  {p.ready ? "·ready" : ""})
+                </option>
+              ))}
+              {!podsQuery.isLoading &&
+                (podsQuery.data?.pods?.length ?? 0) === 0 && (
+                  <option value="">(no pods)</option>
+                )}
+            </select>
+          </label>
+          {selectedPodInfo && selectedPodInfo.containers.length > 1 && (
+            <label className="text-xs">
+              Container
+              <select
+                value={selectedContainer}
+                onChange={(e) => setSelectedContainer(e.target.value)}
+                className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
+              >
+                {selectedPodInfo.containers.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <label className="text-xs">
+            Tail lines
+            <select
+              value={tailLines}
+              onChange={(e) => setTailLines(Number(e.target.value))}
+              className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
+            >
+              <option value={100}>100</option>
+              <option value={500}>500</option>
+              <option value={1000}>1000</option>
+              <option value={5000}>5000</option>
+            </select>
+          </label>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => logsQuery.refetch()}
+            disabled={!selectedPod || logsQuery.isFetching}
+            className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {logsQuery.isFetching ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3 w-3" />
+            )}
+            Refresh
+          </button>
+          {logsQuery.error && (
+            <span className="text-[11px] text-rose-700 dark:text-rose-300">
+              {(logsQuery.error as Error).message}
+            </span>
+          )}
+        </div>
+        <pre className="h-[50vh] overflow-auto whitespace-pre rounded-md border bg-muted/30 p-2 font-mono text-[11px] leading-tight">
+          {logsQuery.isFetching && !logsQuery.data
+            ? "Loading…"
+            : logsQuery.data || "(empty)"}
+        </pre>
+      </div>
+    </Modal>
   );
 }
 
