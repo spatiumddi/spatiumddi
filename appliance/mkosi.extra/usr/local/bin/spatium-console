@@ -1075,18 +1075,34 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
         ]
         vitals.append("  ".join(disk_bits))
 
-    body_parts: list = [line1, line2, line3]
+    # Pack the short label-value rows into a two-column grid so the
+    # right half of the panel (~40 chars on an 80-col TTY) stops
+    # rendering as dead space. line1 stays full-width since its
+    # right column is already used by clock+spinner; vitals stays
+    # full-width because it's one long line of bits that flows
+    # naturally. Everything else (IPs/Build/Agent/Watchdog/Slot/
+    # Upgrade/k3s) is short enough to fit in a half-width cell.
+    short_lines: list[Text] = [line2, line3]
     if agent_line is not None:
-        body_parts.append(agent_line)
+        short_lines.append(agent_line)
     if watchdog_line is not None:
-        body_parts.append(watchdog_line)
+        short_lines.append(watchdog_line)
     if slot_line is not None:
-        body_parts.append(slot_line)
+        short_lines.append(slot_line)
     if upgrade_line is not None:
-        body_parts.append(upgrade_line)
+        short_lines.append(upgrade_line)
     if k3s_line is not None:
-        body_parts.append(k3s_line)
-    body_parts += [rule, vitals]
+        short_lines.append(k3s_line)
+
+    paired_grid = Table.grid(expand=True, padding=(0, 2))
+    paired_grid.add_column(ratio=1, no_wrap=False)
+    paired_grid.add_column(ratio=1, no_wrap=False)
+    for i in range(0, len(short_lines), 2):
+        left = short_lines[i]
+        right = short_lines[i + 1] if i + 1 < len(short_lines) else Text("")
+        paired_grid.add_row(left, right)
+
+    body_parts: list = [line1, paired_grid, rule, vitals]
     body = Group(*body_parts)
     return Panel(body, box=SQUARE, border_style="cyan", padding=(0, 1),
                  title="[bold]SpatiumDDI[/bold]", title_align="left")
@@ -1454,26 +1470,28 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # up. Capped at terminal-height-aware ceiling in render_frame's
     # log_height clamp below.
     pods_count = len(state.ps_rows) if state.ps_rows else 1
-    # Header layout: 3 base content lines (host+role / IPs / Build) +
-    # 1 horizontal rule + 1 vitals + 2 panel border = 7. Conditional
-    # rows below each add one row when present. Must include every
-    # conditional render_header() can emit (agent / watchdog / slot /
-    # upgrade / k3s) or vitals gets clipped off the bottom of the
-    # header panel.
+    # Header layout: 1 line1 (host+role | clock) + N rows of the
+    # 2-col paired grid + 1 horizontal rule + 1 vitals + 2 panel
+    # border. The grid packs IPs + Build + every conditional row
+    # (agent / watchdog / slot / upgrade / k3s) 2-per-row, so
+    # what would have been 5-7 separate rows becomes 3-4 paired
+    # rows — saves ~3 vertical rows on a typical appliance.
     has_agent_line = state.role == "application"
     has_watchdog_line = (
         state.role == "application" and supervisor_watchdog_status() is not None
     )
     has_upgrade_line = state.role == "application" and upgrade_status() is not None
     has_k3s_line = k3s_status() is not None
-    HEADER_ROWS = (
-        7
+    short_count = (
+        2  # IPs + Build, always present
         + (1 if slot_info() is not None else 0)
         + (1 if has_agent_line else 0)
         + (1 if has_watchdog_line else 0)
         + (1 if has_upgrade_line else 0)
         + (1 if has_k3s_line else 0)
     )
+    paired_rows = (short_count + 1) // 2  # ceil(short_count / 2)
+    HEADER_ROWS = 1 + paired_rows + 1 + 1 + 2  # line1 + grid + rule + vitals + border
     SVC_ROWS = pods_count + 2   # tight: just borders, no padding
     FOOTER_ROWS = 1   # single-line borderless strip
 
