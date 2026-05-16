@@ -15,8 +15,10 @@ from urllib.parse import urlencode
 
 import httpx
 import structlog
-from authlib.jose import JsonWebKey, jwt
-from authlib.jose.errors import JoseError
+from joserfc import jwt
+from joserfc.errors import JoseError
+from joserfc.jwk import KeySet
+from joserfc.jwt import JWTClaimsRegistry
 
 from app.core.auth.user_sync import ExternalAuthResult
 from app.core.crypto import decrypt_dict
@@ -186,19 +188,18 @@ async def exchange_code(
         raise OIDCServiceError("no id_token in token response")
 
     jwks = await _fetch_jwks(jwks_uri, provider_id)
-    keys = JsonWebKey.import_key_set(jwks)
+    key_set = KeySet.import_key_set(jwks)
     try:
-        claims = jwt.decode(
-            id_token,
-            keys,
-            claims_options={
-                "iss": {"values": [issuer]},
-                "aud": {"values": [cfg.client_id]},
-            },
+        token = jwt.decode(id_token, key_set)
+        registry = JWTClaimsRegistry(
+            iss={"essential": True, "value": issuer},
+            aud={"essential": True, "value": cfg.client_id},
         )
-        claims.validate()
+        registry.validate(token.claims)
     except JoseError as exc:
         raise OIDCServiceError(f"ID token invalid: {exc}") from exc
+
+    claims = token.claims
 
     if claims.get("nonce") != expected_nonce:
         raise OIDCServiceError("nonce mismatch")
