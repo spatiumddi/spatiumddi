@@ -57,7 +57,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.config import settings
-from app.core.permissions import require_permission
+from app.core.permissions import is_effective_superadmin, require_permission
 from app.models.appliance import ApplianceSlotImage
 from app.models.audit import AuditLog
 
@@ -87,7 +87,7 @@ _CHUNK_BYTES = 4 * 1024 * 1024
 
 
 def _require_superadmin(user: CurrentUser) -> None:
-    if not user.is_superadmin:
+    if not is_effective_superadmin(user):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Slot-image management is restricted to superadmins.",

@@ -33,6 +33,7 @@ from pydantic import BaseModel
 
 from app.api.deps import DB, CurrentUser
 from app.config import settings
+from app.core.permissions import is_effective_superadmin
 from app.models.audit import AuditLog
 from app.services.backup import (
     BackupArchiveError,
@@ -52,8 +53,8 @@ logger = structlog.get_logger(__name__)
 _MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 
 
-def _require_superadmin(current_user: object) -> None:
-    if not getattr(current_user, "is_superadmin", False):
+def _require_superadmin(current_user: CurrentUser) -> None:
+    if not is_effective_superadmin(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Backup + restore is restricted to superadmin",
@@ -69,7 +70,7 @@ async def list_backup_sections(current_user: CurrentUser) -> dict[str, Any]:
     the upcoming selective-backup + selective-restore checkboxes —
     operators tick which sections to include / apply.
     """
-    if not getattr(current_user, "is_superadmin", False):
+    if not is_effective_superadmin(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Backup is restricted to superadmin",

@@ -27,6 +27,7 @@ from sqlalchemy import select
 from app.api.deps import DB, CurrentUser
 from app.config import settings
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.permissions import is_effective_superadmin
 from app.models.backup import BackupTarget
 from app.services.factory_reset import (
     FACTORY_SECTIONS,
@@ -45,8 +46,8 @@ router = APIRouter()
 logger = structlog.get_logger(__name__)
 
 
-def _require_superadmin(current_user: object) -> None:
-    if not getattr(current_user, "is_superadmin", False):
+def _require_superadmin(current_user: CurrentUser) -> None:
+    if not is_effective_superadmin(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Factory reset is restricted to superadmin",
