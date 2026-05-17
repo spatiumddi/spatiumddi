@@ -22,6 +22,40 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 2026.05.17-2 — 2026-05-17
+
+Same-day hotfix for the 2026.05.17-1 release pipeline. The
+`build-appliance-iso` job in the release workflow failed at 14 s
+with exit code 3 because `appliance/scripts/bake-images.sh` tried
+to `docker pull` three images that don't exist:
+`ghcr.io/spatiumddi/spatiumddi-worker`,
+`ghcr.io/spatiumddi/spatiumddi-beat`,
+`ghcr.io/spatiumddi/spatiumddi-migrate`. The umbrella chart's
+worker / beat / migrate Deployments + Jobs all share the
+`spatiumddi-api` image with different `command:` overrides
+(confirmed across `docker-compose.yml` and
+`charts/spatiumddi/templates/{api,worker,beat,migrate}.yaml`); no
+separate Dockerfile, no `build-*` job in the release workflow, no
+ghcr tag pushed. They were added to `bake-images.sh` in #183
+Phase 11 wave 1 (commit `a6bc553`) without being verified —
+straight ghost entries.
+
+2026.05.17-1 published the container images + Helm chart to ghcr
+intact (those jobs ran before the bake step failed). docker-compose
++ Kubernetes installs of 2026.05.17-1 already work; this release
+only re-runs the workflow against the fixed bake script so the
+appliance ISO + slot raw.xz land on the GitHub release page. No
+operator action needed on existing installs.
+
+### Fixed
+
+- **Release-workflow `build-appliance-iso` failed on missing
+  spatiumddi-worker / -beat / -migrate images.** Dropped the three
+  nonexistent entries from `appliance/scripts/bake-images.sh`'s
+  `IMAGES` array; the two real control-plane-bundled images
+  (`spatiumddi-api` + `spatiumddi-frontend`) stay. Slot rootfs disk
+  savings ~250 MB.
+
 ## 2026.05.17-1 — 2026-05-17
 
 Big-architecture release — the SpatiumDDI appliance moves end-to-end
