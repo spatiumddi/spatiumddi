@@ -44,6 +44,24 @@ to match. Fixed.
   `du -sh` against the post-#183 tarball directory the bake script
   actually populates.
 
+### Changed
+
+- **Appliance operator-facing docs caught up to k3s.**
+  `appliance/README.md` and `appliance/cloud-init/README.md` still
+  described the pre-#183 first-boot flow (`docker compose pull && up
+  -d`) + referenced the now-gone `mkosi.extra/usr/local/share/
+  spatiumddi/docker-compose.yml` artifact. Rewritten to describe the
+  k3s flow: firstboot renders a variant-specific HelmChart manifest
+  into `/var/lib/rancher/k3s/server/manifests/`; k3s containerd
+  auto-imports the per-image tarballs at `/var/lib/rancher/k3s/
+  agent/images/*.tar.zst` so a fresh boot never reaches out to
+  ghcr.io; helm-controller installs the chart tarball baked at
+  `/usr/lib/spatiumddi/charts/`.
+- **`spatium-console` skipped the loop-mounted `/var/lib/spatiumddi/
+  docker-overlay/` mount in the disk panel** — dead skip rule from
+  the docker-overlay era (the path doesn't exist post-#183). Rule +
+  the two comment blocks that referenced it removed.
+
 ## 2026.05.17-3 — 2026-05-17
 
 Second hotfix on top of -2. The release-workflow's

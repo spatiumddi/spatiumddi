@@ -51,10 +51,19 @@ hdiutil makehybrid -o cidata.iso -hfs -joliet -iso \
 2. The `spatiumddi-firstboot.service` systemd unit starts after
    `cloud-final.service` and:
    - generates `/etc/spatiumddi/.env` (POSTGRES_PASSWORD, SECRET_KEY,
-     CREDENTIAL_ENCRYPTION_KEY, DNS_AGENT_KEY, DHCP_AGENT_KEY) on
-     first run only — preserved across reboots
-   - `docker compose pull` (first run) + `docker compose up -d`
-   - polls `http://127.0.0.1:8000/health/live` until ready (5 min cap)
+     CREDENTIAL_ENCRYPTION_KEY, DNS_AGENT_KEY, DHCP_AGENT_KEY,
+     BOOTSTRAP_PAIRING_CODE on Application installs) on first run
+     only — preserved across reboots via the `/etc` overlay →
+     `/var/persist/etc` path
+   - renders the variant-specific HelmChart manifest into
+     `/var/lib/rancher/k3s/server/manifests/spatium-bootstrap.yaml`;
+     k3s's helm-controller auto-installs the chart tarball baked at
+     `/usr/lib/spatiumddi/charts/`
+   - starts `k3s.service`; containerd auto-imports the per-image
+     tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst` so a
+     fresh boot never reaches out to ghcr.io
+   - polls `http://127.0.0.1:8000/health/live` until the api pod
+     reports ready (5 min cap)
 3. Web UI is reachable at `http://<appliance-ip>/`. Default login
    `admin` / `admin` (forces password change on first login).
 

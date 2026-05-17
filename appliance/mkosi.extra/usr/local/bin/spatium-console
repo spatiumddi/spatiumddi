@@ -594,14 +594,6 @@ def disk_summary() -> list[tuple[str, float, float, float]]:
         "binfmt_misc", "autofs", "nsfs", "hugetlbfs", "fuse.gvfsd-fuse",
     }
     skip_mounts = {"/boot/efi"}
-    # Skip the loop-mounted baked-image overlay — it's an internal
-    # implementation detail (Phase 8 firstboot loop-mounts the
-    # /usr/lib/spatiumddi/docker-overlay.img read-only as a lower
-    # layer for the docker storage driver). The operator-visible
-    # storage signal is /, /var, and ESP; the overlay's capacity
-    # doesn't change once the image is laid down at boot.
-    skip_mount_prefixes = ("/var/lib/spatiumddi/docker-overlay/",)
-    rows: list[tuple[str, float, float, float]] = []
     # Dedupe by device — bind mounts (e.g. /home → /var/home, /root →
     # /var/root per #170 Phase 8a) report the SAME underlying device
     # as the parent, just at a different mountpoint. Listing them all
@@ -616,8 +608,6 @@ def disk_summary() -> list[tuple[str, float, float, float]]:
         if part.fstype in skip_fstypes:
             continue
         if part.mountpoint in skip_mounts:
-            continue
-        if any(part.mountpoint.startswith(p) for p in skip_mount_prefixes):
             continue
         if part.device in seen_devices:
             continue
@@ -1148,9 +1138,9 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
 
     # Vitals line — uptime / cpu / ram / load / disks all on one row.
     # Previously disks were on a separate ``line5`` but with the bind-
-    # mount dedupe + docker-overlay skip there are typically only 2-3
-    # mount entries, easily fitting alongside the vitals on the same
-    # row on any 80+ col TTY. Saves one vertical row on the dashboard.
+    # mount dedupe there are typically only 2-3 mount entries, easily
+    # fitting alongside the vitals on the same row on any 80+ col TTY.
+    # Saves one vertical row on the dashboard.
     vitals = Text()
     vitals.append("Up ", style="dim"); vitals.append(uptime_str(), style="bold")
     vitals.append("   CPU ", style="dim"); vitals.append(f"{cpu:.0f}%", style="bold")
