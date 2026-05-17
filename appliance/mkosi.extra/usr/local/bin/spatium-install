@@ -776,7 +776,15 @@ EOF
 # Pre-bake the role labels so the appliance chart's DaemonSets
 # schedule at first boot without needing a supervisor to write
 # them at heartbeat time.
+#
+# IMPORTANT: k3s ``config.yaml.d/*`` drop-ins REPLACE (not append
+# to) list-valued keys from the main ``config.yaml``, so we must
+# re-list the base ``spatium.io/role=appliance`` label here. Without
+# it, the chart's ``global.nodeSelector: {spatium.io/role: appliance}``
+# default wouldn't match — agent-landing / dns-bind9 / dhcp-kea
+# DaemonSets compute DESIRED=0 and nothing schedules.
 node-label:
+  - spatium.io/role=appliance
   - spatium.io/role-dns-bind9=true
   - spatium.io/role-dhcp=true
 EOF
