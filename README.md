@@ -40,7 +40,7 @@
 
 ---
 
-> ⚠️ **Alpha software.** SpatiumDDI is under active development and has not yet been battle-tested in production. Expect rough edges, breaking schema changes between releases (Phase 1), and features listed in the roadmap that are still in flight. Run it in a lab, file bugs, and please don't put it in front of DHCP clients you care about until Phase 2 is complete. Early adopter feedback is very welcome — open an issue or start a discussion on GitHub.
+> ⚠️ **Beta software.** SpatiumDDI is under active development. Core IPAM / DNS / DHCP / appliance surfaces have stabilised since the `2026.04.16-1` alpha cut, but expect occasional schema changes between releases and roadmap features that are still in flight. Suitable for labs, homelabs, and pilots in front of non-critical client populations; production deploys in front of business-critical DHCP should pin to a tested release and snapshot Postgres before upgrading. Early adopter feedback is very welcome — open an issue or start a discussion on GitHub.
 
 ---
 
@@ -1005,7 +1005,7 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 | Phase 1 | Core IPAM, auth, user management, audit log, Docker Compose | ✅ Done — LDAP/OIDC/SAML + RADIUS/TACACS+, group-based RBAC, bulk-edit, inheritance, mobile-responsive UI, and full IPv6 `/next-address` (EUI-64 + random /128 + sequential) all shipped |
 | Phase 2 | DHCP (Kea), DNS (BIND9), DDNS, zone/subnet tree UI | ✅ Done — DNS, Kea DHCPv4, subnet-level DDNS, agent-side Kea DDNS, block/space DDNS inheritance, per-server zone serial reporting all shipped |
 | Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin, Kea HA | 🔄 DNS features + health dashboard + alerts framework + group-centric Kea HA (self-healing peer-IP drift + supervised daemons) landed; DNS Views end-to-end + HA state-transition actions still pending |
-| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore, ACME | 🔄 SAML + full backup/restore + factory-reset + OS appliance alpha (Debian 13 ISO with `/appliance` management hub: TLS upload + CSR-on-server, GitHub release apply, container start/stop/restart + live logs, host log viewer + self-test + diagnostic bundle, maintenance mode + reboot, web first-boot wizard) all landed. Terraform/Ansible providers + ACME embedded client (Let's Encrypt auto-issue) still pending |
+| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore, ACME | 🔄 SAML + full backup/restore + factory-reset + OS appliance beta (Debian 13 ISO + embedded [k3s](https://k3s.io/) + Helm orchestration, `/appliance` management hub with TLS upload + CSR-on-server, GitHub release apply, kubeapi-driven Pods tab + live SSE logs, host log viewer + self-test + diagnostic bundle, maintenance mode + reboot, web first-boot wizard, atomic A/B slot upgrades) all landed. Terraform/Ansible providers + ACME embedded client (Let's Encrypt auto-issue) still pending |
 | Phase 5 | Multi-tenancy, IP request workflows, advanced reporting | 📋 Planned |
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-release feature list and

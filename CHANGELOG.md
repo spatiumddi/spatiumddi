@@ -22,6 +22,334 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 2026.05.17-1 — 2026-05-17
+
+Big-architecture release — the SpatiumDDI appliance moves end-to-end
+from `docker-compose` to **k3s + Helm orchestration (#183)**. Eleven
+phases shipped on `issue-183`: bake k3s into the slot rootfs as a
+~70 MB static binary, ship per-service helm-controller-driven HelmChart
+CRs as the declarative target, rewrite the supervisor to PATCH node
+labels for role swaps (single `kubectl label node` call replaces the
+old `docker compose down/up` dance), strip docker entirely, AIO + Core
++ Application install variants land in the wizard, frontend on
+hostNetwork serves :443 from first boot with a self-signed cert that
+operators replace through the in-UI cert manager, and every
+`/appliance` management surface (Pods tab, TLS Secret PATCH, Logs &
+Diagnostics self-test) gets rewritten to call kubeapi via the api
+pod's mounted ServiceAccount instead of the now-dead docker socket.
+Role swap latency drops from "tens of seconds + occasional manual
+recovery" to "single API call, ~25-35 s end-to-end with no recovery
+needed." Off-appliance Helm operators benefit too — flipping
+`APPLIANCE_MODE=true` on an umbrella-chart install lights up the same
+`/appliance` management surfaces (sans slot-upgrade UI which stays
+appliance-ISO-specific). The full design + phase breakdown is in
+[`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) under
+the new "Current architecture (post-#183)" section. Follow-ups
+deferred to [#193](https://github.com/spatiumddi/spatiumddi/issues/193)
+(Phase 4 control-plane proxy half, Helm release UI, krew, firstboot
+fail-on-missing-tarball, `appliance_mode` split into `k8s_mode` +
+`appliance_mode`, plus three carry-overs from #170 Wave E).
+
+Also lands two operator-facing bug closures: **OIDC superadmin gates
+(#190)** — eight per-endpoint local `_require_superadmin` helpers
+(diagnostics / pairing / slot_images / supervisor approval / alerts /
+backup × 2 / factory_reset) each open-coded `user.is_superadmin ==
+True`, missing the RBAC wildcard path the canonical `require_superadmin`
+in `deps.py` already handled. OIDC users mapped into a Superadmin-role
+group passed every `require_permission` gate but hit 403 on every
+hand-rolled superadmin surface. New `is_effective_superadmin(user)`
+helper in `app/core/permissions.py` unifies both paths; all eight
+hand-rolled helpers + the canonical dependency now delegate to it. And
+**backend error detail in the UI (#186)** — 40 render sites across 20
+files were rendering `(error as Error).message` (which shows axios's
+generic `"Request failed with status code 409"`) instead of pulling
+the real `response.data.detail` (which carries the operator-readable
+message like `"No DNS_AGENT_KEY configured on the control plane..."`).
+The `formatApiError(err)` helper that already existed in `lib/api.ts`
+from #31 was simply unused at every cast-to-Error site; this release
+sweeps all 40 + the two `String((mutation.error as Error).message ??
+mutation.error)` variants in PairingTab to use it.
+
+**OIDC auth library migration (#187).** `authlib.jose` is deprecated
+and slated for removal in authlib v2.0. The OIDC token-validation
+layer in `app/core/auth/oidc.py` migrates to `joserfc` — the library
+authlib itself recommends as the replacement. Wire-level behaviour
+unchanged (RS256 / `exp` / `iss` / `aud` / `nonce` / tampered-signature
+validation all keep the same semantics); the migration is purely
+internal. 15 new unit tests at `tests/test_oidc.py` exercise the full
+`exchange_code()` flow against real RSA-signed JWTs (not mocked
+internals) covering every claim validation path + the
+`OIDCServiceError` raise behaviour. Zero `DeprecationWarning` on
+import after the swap.
+
+**prune_pairing_codes AttributeError (#189).** The Celery task that
+sweeps stale pairing codes referenced `PairingCode.used_at` — a column
+that was dropped during #170 Wave A3 (claim accounting moved to a
+separate `PairingClaim` child table). Result: every 30-minute beat
+tick raised `AttributeError`, the task failed silently in the worker
+log, the table never pruned. Replaced the broken column references
+with a correlated subquery against `PairingClaim` — claimed codes
+prune via `HAVING MAX(claimed_at) < cutoff` (correctly handles
+persistent codes with one old + one recent claim), expired codes prune
+via `NOT EXISTS` against PairingClaim so a claimed-but-expired code
+isn't double-counted. 16 integration tests against live Postgres
+cover the three buckets + boundary conditions + persistent multi-claim
+semantics + idempotency.
+
+**Frontend nginx upstream + resolver (#176).** The frontend nginx
+config previously hardcoded the api host as `api:8000` which worked
+for docker-compose but broke on Kubernetes (where the api service is
+on `<release>-api.<namespace>.svc.cluster.local` and the cluster
+resolver isn't in nginx's default config). The frontend Dockerfile
+now ships a templated `default.conf.template` that gets filled in at
+container start from `API_UPSTREAM_HOST` + `API_UPSTREAM_PORT` env
+vars, plus an `API_DNS_RESOLVER` setting that nginx uses to resolve
+upstream hostnames at first request (so pod restarts on the api side
+don't strand the frontend on a stale IP). Defaults preserve the
+docker-compose shape; the umbrella chart sets the K8s shape; the
+appliance bootstrap sets the in-cluster shape with the FQDN form for
+the hostNetwork frontend pod's edge case (nginx's resolver doesn't
+honour /etc/resolv.conf's search list).
+
+**Proxmox VNet → IPAM subnet matching by CIDR (#177).** The Proxmox
+integration's VNet-to-subnet mapping previously matched by name (the
+operator-supplied label on the Proxmox SDN VNet). Names drift —
+operators rename VNets in Proxmox without telling SpatiumDDI, then
+wonder why the integration's "matched subnet" column flips to "no
+match" on the next poll. The matcher now keys on **CIDR overlap** —
+the IPAM subnet whose CIDR best-matches the VNet's CIDR (longest-
+prefix wins on partial overlaps) gets the link, regardless of names.
+Existing matched-by-name links migrate to matched-by-CIDR
+automatically on the next poll if the CIDR also matches; orphans
+surface in the integration's "unmatched" list for operator review.
+
+**Appliance polish (#181 + #182, landed pre-#183).** The DHCP server
+detail surface gains a tabbed modal mirroring the DNS side (Overview /
+Sync / Events / Logs / Config — Stats deferred to [#195](https://
+github.com/spatiumddi/spatiumddi/issues/195)). Three new endpoints
+under `/api/v1/dhcp/servers/{id}` (`pending-ops` / `recent-events` /
+`rendered-config`); the existing Kea log pipeline drives the Logs
+tab. Per-server **maintenance mode** (#182) lets operators pause a
+single DNS or DHCP server without removing it from its group —
+ConfigBundle long-poll responses get a `paused=true` marker so the
+agent stops applying changes, the control plane masks heartbeat
+"offline" alerts during the window, and the operator's "reason" + a
+"pausing since X ago" chip render across the UI. The fix replaces the
+old two-bad-choices situation: delete the row (loses peer + pending
+state) vs stop the container (control plane keeps pushing config, red
+alerts fire, fleet view shows a degraded server). Maintenance mode is
+the deliberate "I'm working on this — don't worry about it" toggle.
+
+Plus a wave of housekeeping closures: **#188 Appliance joins wrong
+group on whitespace** marked moot by #170's removal of the installer's
+group prompt (groups are now Fleet-UI assigned after admin approval)
+and the parallel drop of pairing-code `server_group_id` pre-assignment
+in Wave A3 (migration `b5a8d2e9c473`); **#181's missing Stats tab**
+carved out as #195 with the open product decision documented (lease-
+rate timeseries + active-lease KPI as the recommended core).
+
+### Added
+
+- **Appliance k3s + Helm orchestration (#183).** Eleven-phase
+  architecture pivot. Highlights:
+  - **k3s static binary baked into the slot rootfs** at
+    `/usr/local/bin/k3s` (~70 MB), pinned via the Makefile's
+    `K3S_VERSION` env. `kubectl` / `crictl` / `ctr` symlink to it.
+  - **Airgap-image preload** — k3s's own images (CoreDNS /
+    local-path / pause / metrics-server) + every SpatiumDDI
+    container image (api / frontend / worker / beat / migrate /
+    dns-bind9 / dns-powerdns / dhcp-kea / supervisor + postgres:16-
+    alpine + redis:7-alpine + nginx:1.27-alpine for AIO/Core
+    variants) ship as zst-compressed tarballs under
+    `/usr/lib/spatiumddi/images/`. firstboot imports them via
+    `ctr -n k8s.io images import`. A fresh boot never reaches out
+    to ghcr.io.
+  - **Two HelmChart CRs** drive the cluster state — `spatium-
+    bootstrap` (variant-aware: Application = supervisor + agent-
+    landing; AIO + Core = umbrella with control plane pods) and
+    `spatiumddi-appliance` (role DaemonSets for dns-bind9 /
+    dns-powerdns / dhcp-kea, Application variant only). Both chart
+    tarballs baked at `/usr/lib/spatiumddi/charts/`.
+  - **Three install variants** in the wizard — Application /
+    All-in-One / Core-only. Application = supervisor pairs against
+    a remote control plane (current shape pre-#183). AIO = control
+    plane + role pods on the same single-node k3s. Core = control
+    plane only; remote Applications pair against it. Pairing
+    prompts gate on `APPLIANCE_ROLE=application`.
+  - **Node-label-based role scheduling** (Phase 10, also lands here).
+    The supervisor's role-swap path is now a single
+    `kubectl label node <name> spatium.io/role-<role>=true|-` API
+    call. Per-role DaemonSets carry a matching `nodeSelector`; the
+    k8s scheduler picks up the label and schedules / terminates the
+    role pod within ~1-2 s. The HelmChart CR for the appliance
+    release is installed once at first boot and never re-PATCHed for
+    role swaps — kine (the SQLite-backed k3s datastore) stays small.
+    `reconcile_node_labels()` runs on every heartbeat to catch
+    out-of-band `kubectl label` drift.
+  - **TLS from first boot.** `spatiumddi-firstboot` generates a
+    self-signed RSA cert with the host's globally-scoped IPs in the
+    SAN list, writes a Secret manifest at
+    `/var/lib/rancher/k3s/server/manifests/spatium-appliance-tls.yaml`,
+    and the umbrella chart's frontend mounts it via a ConfigMap-
+    templated nginx config (`:80 → 301 https`, `:443 TLS` against
+    `/etc/nginx/tls/tls.crt` + `tls.key`). Operators browse to
+    `https://<appliance-ip>/` immediately; replace the cert through
+    `/appliance → Web UI Certificate` (the cert manager now PATCHes
+    the Secret in place + bumps a checksum annotation on the
+    frontend Deployment to trigger a rollout — replaces the
+    pre-#183 SIGHUP-the-frontend-via-docker-sock path).
+  - **k3s-aware `/appliance` management surfaces.** New
+    `app/services/appliance/k8s.py` stdlib HTTPS kubeapi client
+    (mirrors the supervisor's pattern); new
+    `charts/spatiumddi/templates/api-rbac.yaml` adds a per-namespace
+    ServiceAccount + Role + RoleBinding (`pods` get/list/watch +
+    `pods/log` + the specific `spatium-appliance-tls` Secret
+    patch + the frontend Deployment annotation patch). Pods tab now
+    lists pods via kubeapi instead of docker; "Restart pod" deletes
+    the pod (the owning Deployment / DaemonSet recreates it on the
+    next reconcile); SSE live logs wrap kubeapi's `?follow=true`
+    pod-log endpoint.
+  - **Talos-style console dashboard expansion.** Pods panel lists
+    all spatium pods with header + state coloring + Age + ports
+    column. F3 opens a pod-log viewer. New `Watchdog` header line
+    surfacing the external watchdog state. Live-log noise filter
+    drops Python tracebacks + systemd restart spam.
+  - **Atomic A/B slot upgrades** stay unchanged from #138 — the
+    raw.xz slot image now also carries the baked k3s binary + images
+    + chart tarballs, so a slot upgrade is **also** a container
+    upgrade. Same `/health/live` auto-commit / auto-revert flow.
+
+- **DHCP server detail modal (#181).** Tabbed modal mirroring the
+  DNS-side server detail. Five tabs ship — Overview / Sync / Events /
+  Logs / Config. Three new endpoints under
+  `/api/v1/dhcp/servers/{id}` (`pending-ops` / `recent-events` /
+  `rendered-config`). The Logs tab reuses the existing Kea log
+  pipeline. Stats tab deferred to #195 (lease-rate timeseries +
+  active-lease KPI need a product decision before building).
+
+- **Per-server maintenance mode (#182, DNS + DHCP).** New `paused`
+  flag on `dns_server` + `dhcp_server`. ConfigBundle responses to a
+  paused server's long-poll carry `paused=true` + an operator-set
+  `reason` string; agents stop applying config changes while paused
+  (no zone reloads, no Kea reloads — they just heartbeat). Control
+  plane masks "offline" / "heartbeat stale" alerts during the
+  window. UI: pause button on the server detail modal opens a
+  `PauseServerModal` for the reason + a confirmation; resumed by
+  clicking the chip. The original problem this closes: pre-fix,
+  operators taking a server offline for maintenance had to pick
+  between deleting the row (loses peer + pending state) and
+  stopping the container (control plane spams 'down' alerts).
+  Maintenance mode is the deliberate "I'm working on this, don't
+  worry" toggle.
+
+- **Templated frontend nginx upstream + resolver (#176).** The
+  frontend Dockerfile ships a `default.conf.template` filled in at
+  container start from `API_UPSTREAM_HOST` / `API_UPSTREAM_PORT` /
+  `API_DNS_RESOLVER` env vars. Defaults preserve docker-compose's
+  `api:8000` shape; the umbrella chart sets the K8s service FQDN
+  + the cluster's DNS resolver; the appliance bootstrap sets the
+  FQDN form for the hostNetwork frontend pod (nginx's resolver
+  doesn't honour `/etc/resolv.conf` search list).
+
+- **Effective-superadmin helper (#190).** New
+  `is_effective_superadmin(user)` in `app/core/permissions.py`
+  unifies the legacy `User.is_superadmin == True` flag with the
+  group → role wildcard `{action: "*", resource_type: "*"}`
+  permission path. Six new unit tests cover both paths + the
+  inactive-superadmin admission carve-out.
+
+### Changed
+
+- **Appliance: docker-compose → k3s (#183).** The supervisor no
+  longer runs `docker compose up/down` against service containers;
+  role swaps are `kubectl label node` calls + k8s scheduler does
+  the rest. No docker binary on the appliance rootfs (Phase 7).
+  The pre-#183 path is gone in every shipped artifact; existing
+  installs upgrade by applying a fresh slot image.
+- **`/appliance → Containers` tab renamed to `Pods`** to match the
+  underlying k8s primitive. UI strings (Docker socket →
+  ServiceAccount; container → pod) follow.
+- **Eight per-endpoint local `_require_superadmin` helpers**
+  (diagnostics / appliance pairing / slot_images / supervisor /
+  alerts / backup / backup-targets / factory_reset) now delegate to
+  the new `is_effective_superadmin` helper. Error messages + audit-
+  log shapes unchanged.
+- **40 frontend `(error as Error).message` render sites** (across
+  20 files) replaced with `formatApiError(error)` so the backend's
+  `response.data.detail` reaches the operator. The
+  `formatApiError` helper itself is unchanged (it shipped in #31);
+  the change is making every error-surface actually use it.
+- **OIDC token validation migrates from `authlib.jose` to `joserfc`**
+  (#187). Wire behaviour unchanged; the migration is purely internal
+  (`authlib.jose` is deprecated upstream).
+- **Proxmox VNet → IPAM subnet matching is now CIDR-based, not
+  name-based** (#177). Names drift; CIDRs don't. Existing name-
+  matched links migrate to CIDR-matched on the next poll when the
+  CIDR also matches.
+- **`require_superadmin` dependency in `app/api/deps.py`** drops
+  its inline duplication and delegates to
+  `is_effective_superadmin` instead.
+
+### Fixed
+
+- **`prune_pairing_codes` `AttributeError` on every beat tick (#189).**
+  Task referenced `PairingCode.used_at` which was dropped in #170
+  Wave A3; replaced with a `PairingClaim` correlated subquery using
+  `HAVING MAX(claimed_at)` for the claimed bucket and `NOT EXISTS`
+  for the expired bucket. 16 integration tests against live
+  Postgres cover the three buckets + edge cases (persistent multi-
+  claim, claimed-but-expired protection, idempotency).
+- **OIDC users mapped to Superadmin-role group hit 403 on
+  Diagnostics + 7 other surfaces (#190).** Eight hand-rolled
+  `_require_superadmin` helpers only checked the legacy
+  `User.is_superadmin` column; users with the RBAC wildcard
+  permission through a group → role pass `require_permission` gates
+  but failed those helpers. Fixed by delegating to
+  `is_effective_superadmin` which accepts both paths.
+- **UI showed "409" / "422" instead of the backend's actual error
+  message (#186).** 40 render sites across 20 files were using
+  `(error as Error).message` (axios's generic "Request failed with
+  status code N") instead of pulling `response.data.detail` via the
+  existing `formatApiError` helper. Pairing-code generation, slot-
+  image upload, agent-key reveal, fleet operations, IPAM mutations
+  all benefit.
+- **DNS record changes didn't propagate to non-primary group
+  members.** Pre-fix, `enqueue_record_op` queued one op against
+  `is_primary=True` and the agent's pending-op shipper gated on the
+  same flag — but under #170 every group member renders its zone as
+  `type master` (independent authoritative copy), so secondaries
+  stayed frozen at whatever bundle they received on initial
+  register. Now fans out one `DNSRecordOp` row per enabled agent-
+  based server in the group regardless of `is_primary`.
+
+### Migrations
+
+The k3s migration itself doesn't add any Postgres alembic migrations
+(the change is at the orchestration layer, not the schema). Existing
+installs upgrade by applying a fresh slot image — the next boot picks
+up the baked k3s binary + chart tarballs and the helm-controller
+reconciles the bootstrap manifest into a running cluster.
+
+Application appliances that were paired pre-#183 keep working — the
+supervisor's identity / cert / approval state lives on
+`/var/persist/spatium-supervisor/` which survives the slot swap. The
+DNS / DHCP service containers' agent JWTs are similarly preserved.
+
+### Deprecated
+
+- **`/api/v1/appliance/slot-images/*` endpoints** stay functional
+  but a rename to `upgrade-images` is queued in [#199](https://
+  github.com/spatiumddi/spatiumddi/issues/199) along with a
+  GitHub-Releases-driven picker. No removal in this release.
+
+### Security
+
+- **`authlib.jose` deprecation closed before authlib v2.0** (#187).
+  Removes the `AuthlibDeprecationWarning` on import + future-proofs
+  the OIDC token validation path against the upcoming authlib v2.0
+  drop of the `jose` module. Same wire-level semantics; new unit
+  test coverage at `tests/test_oidc.py`.
+
 ## 2026.05.14-1 — 2026-05-14
 
 Big-feature release closing out two appliance arcs back-to-back.

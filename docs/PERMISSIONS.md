@@ -80,6 +80,30 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 1. **Superadmin short-circuits everything.** If `User.is_superadmin=True`
    the check always passes (no audit denial written).
 2. **Inactive users are denied** regardless of permissions.
+
+### "Effective superadmin" — legacy flag + RBAC wildcard
+
+Two paths grant superadmin-level access (#190):
+
+- **Legacy column** — `User.is_superadmin=True` set directly on the
+  row (seeded `admin`, anyone explicitly flagged in the user-admin
+  form).
+- **RBAC wildcard** — the user is a member of a group whose role
+  carries a `{action: "*", resource_type: "*"}` permission (the
+  built-in `Superadmin` role or any clone of it).
+
+Both pass `require_permission` gates identically. For endpoints with
+`Depends(require_superadmin)` (or an inline `is_effective_superadmin`
+check), both also admit — without this unification, users provisioned
+via LDAP / OIDC / SAML and mapped into a Superadmin-role group passed
+every `require_permission` check but 403'd on hand-rolled superadmin
+helpers (the canonical pre-#190 bug).
+
+Carve-out: the legacy-flag path keeps admitting **inactive**
+superadmins so a disabled bootstrap admin can still reach diagnostic
+surfaces during incident triage. The wildcard-permission path still
+requires `is_active=True` because `user_has_permission` short-circuits
+on inactive.
 3. **Match algorithm** for a given check (`action`, `resource_type`, `resource_id`):
    - Walk every role in every group the user is a member of.
    - A permission entry matches when:
