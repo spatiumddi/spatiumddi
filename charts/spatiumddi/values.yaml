@@ -72,6 +72,18 @@ frontend:
   # Off-appliance K8s deployments leave this false + run an Ingress
   # in front instead.
   hostNetwork: false
+  # Phase 11 wave 3 (#183) — TLS termination at the frontend nginx.
+  # When enabled, the frontend pod mounts a ConfigMap with a
+  # TLS-aware nginx template (templates/frontend-tls-config.yaml)
+  # at /etc/nginx/templates/default.conf.template + a Secret with
+  # the cert/key at /etc/nginx/tls/. Port 80 → 443 redirect; 443
+  # serves the SpatiumDDI UI. ``secretName`` is the
+  # kubernetes.io/tls Secret firstboot creates with the self-
+  # signed cert (operator-uploaded cert later replaces the Secret
+  # contents via the Cert Manager UI).
+  tls:
+    enabled: false
+    secretName: spatium-appliance-tls
   # Issue #176: the frontend nginx proxies ``/api/`` to the api Service
   # using a runtime-substituted upstream. The Docker image defaults to
   # ``api:8000`` (the Compose service name) which doesn't resolve on

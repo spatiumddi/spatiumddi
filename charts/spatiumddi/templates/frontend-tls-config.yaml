@@ -1,0 +1,105 @@
+{{- if .Values.frontend.tls.enabled }}
+{{- /* Phase 11 wave 3 (#183) — TLS-aware nginx config for the appliance.
+
+       Mounted into the frontend pod at
+       /etc/nginx/templates/default.conf.template via a subpath
+       mount in the Deployment so it replaces the image's default
+       (port 80 only) template. The image's standard entrypoint
+       (20-envsubst-on-templates.sh) substitutes ${API_UPSTREAM_*}
+       + ${NGINX_LOCAL_RESOLVERS} from env, same as the default.
+
+       Two server blocks:
+
+       * ``:80``  — 301 → https. Operators bookmarking the bare
+                    IP land on TLS without thinking.
+       * ``:443`` — real TLS-terminated frontend. Cert + key
+                    paths line up with the Secret mount at
+                    /etc/nginx/tls/ (subPath=tls.crt + tls.key,
+                    the standard kubernetes.io/tls Secret keys). */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-frontend-tls-conf
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "frontend") .) | nindent 4 }}
+data:
+  default.conf.template: |
+    # Plain HTTP — redirect to HTTPS. Single permanent (301) so
+    # browsers cache it; operators hitting :80 once never have to
+    # think about it again.
+    server {
+        listen 80 default_server;
+        listen [::]:80 default_server;
+        server_name _;
+        return 301 https://$host$request_uri;
+    }
+
+    # HTTPS — same routing the image's default template has,
+    # wrapped in TLS termination using the cert mounted by the
+    # secret volume at /etc/nginx/tls/.
+    server {
+        listen 443 ssl default_server;
+        listen [::]:443 ssl default_server;
+        http2 on;
+        server_name _;
+        root /usr/share/nginx/html;
+        index index.html;
+
+        ssl_certificate     /etc/nginx/tls/tls.crt;
+        ssl_certificate_key /etc/nginx/tls/tls.key;
+        # Match nginx defaults; downstream HTTPS terminators
+        # (cert manager) can override via operator-mounted config.
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_prefer_server_ciphers off;
+
+        resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
+
+        # Large request bodies for the backup endpoint — keep the
+        # same shape the default template uses.
+        location /api/v1/backup/ {
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass               $api_upstream;
+            proxy_set_header         Host $http_host;
+            proxy_set_header         X-Real-IP $remote_addr;
+            proxy_set_header         X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header         X-Forwarded-Proto $scheme;
+            proxy_http_version       1.1;
+            proxy_set_header         Connection "";
+            client_max_body_size     2g;
+            proxy_request_buffering  off;
+            proxy_read_timeout       1800s;
+            proxy_send_timeout       1800s;
+        }
+
+        location /api/ {
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass         $api_upstream;
+            proxy_set_header   Host $http_host;
+            proxy_set_header   X-Real-IP $remote_addr;
+            proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_http_version 1.1;
+            proxy_set_header   Connection "";
+            proxy_read_timeout 60s;
+        }
+
+        location ~ ^/(health|metrics) {
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass $api_upstream;
+            proxy_set_header Host $http_host;
+        }
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+
+        location ~* \.(js|css|woff2?|png|svg|ico)$ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+
+        gzip on;
+        gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+    }
+{{- end }}

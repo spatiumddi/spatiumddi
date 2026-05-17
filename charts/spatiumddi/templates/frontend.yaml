@@ -55,6 +55,27 @@ spec:
               {{- if .Values.frontend.hostNetwork }}
               hostPort: 80
               {{- end }}
+            {{- if .Values.frontend.tls.enabled }}
+            - name: https
+              containerPort: 443
+              {{- if .Values.frontend.hostNetwork }}
+              hostPort: 443
+              {{- end }}
+            {{- end }}
+          {{- if .Values.frontend.tls.enabled }}
+          volumeMounts:
+            # Replace the image's default 80-only template with the
+            # appliance TLS template (Phase 11 wave 3 — issue #183).
+            # subPath ensures only ``default.conf.template`` gets
+            # swapped, not the whole /etc/nginx/templates dir.
+            - name: tls-config
+              mountPath: /etc/nginx/templates/default.conf.template
+              subPath: default.conf.template
+              readOnly: true
+            - name: tls-cert
+              mountPath: /etc/nginx/tls
+              readOnly: true
+          {{- end }}
           env:
             # Issue #176: tell the frontend nginx where the api Service
             # is. The image defaults to ``api:8000`` (Docker Compose's
@@ -89,6 +110,20 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.frontend.resources | nindent 12 }}
+      {{- if .Values.frontend.tls.enabled }}
+      volumes:
+        - name: tls-config
+          configMap:
+            name: {{ include "spatiumddi.fullname" . }}-frontend-tls-conf
+        - name: tls-cert
+          secret:
+            secretName: {{ .Values.frontend.tls.secretName }}
+            # ``optional: true`` so a missing Secret doesn't block
+            # pod startup — firstboot creates it just before the
+            # chart's first reconcile, but a chart upgrade that
+            # races could otherwise wedge.
+            optional: true
+      {{- end }}
       {{- with .Values.frontend.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
