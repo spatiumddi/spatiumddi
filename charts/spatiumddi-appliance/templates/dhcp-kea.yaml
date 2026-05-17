@@ -25,6 +25,11 @@ spec:
     spec:
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+        # Phase 10 (#183) — per-role scheduling label. The supervisor
+        # labels the node with ``spatium.io/role-dhcp=true`` when DHCP
+        # is in the desired role set, and clears the label on
+        # role removal — pod sits Pending until then.
+        spatium.io/role-dhcp: "true"
       # ``hostNetwork: true`` lets Kea see DHCP-discover broadcasts on
       # the host NIC. Required: relayed deployments would use a
       # different mode (Phase 5).
@@ -46,7 +51,12 @@ spec:
                 - NET_BIND_SERVICE
                 - NET_RAW
           env:
-            - name: CONTROL_PLANE_URL
+            # Kea entrypoint env contract (agent/dhcp/images/kea/
+            # entrypoint.sh): SPATIUM_API_URL + SPATIUM_AGENT_KEY +
+            # AGENT_GROUP. The chart values are named after the
+            # SpatiumDDI control plane (controlPlaneUrl / agentKey /
+            # serverGroupName); translate at the env boundary.
+            - name: SPATIUM_API_URL
               value: {{ .Values.dhcpKea.controlPlaneUrl | quote }}
             - name: SPATIUM_AGENT_KEY
               value: {{ .Values.dhcpKea.agentKey | quote }}
@@ -64,7 +74,11 @@ spec:
               command:
                 - sh
                 - -c
-                - "ss -lun | grep -q ':67 '"
+                # ``ss`` isn't in the kea image; read /proc/net/udp
+                # directly. UDP port 67 = hex 0043. Kea's kea-dhcp4
+                # process binds it on hostNetwork; matching ":0043"
+                # confirms the daemon is up + listening.
+                - "grep -q ':0043 ' /proc/net/udp"
             initialDelaySeconds: 10
             periodSeconds: 30
           volumeMounts:

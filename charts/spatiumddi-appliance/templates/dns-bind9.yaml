@@ -34,6 +34,12 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+        # Phase 10 (#183) — per-role scheduling label. Pod stays
+        # Pending until the supervisor's role-apply path labels the
+        # node with ``spatium.io/role-dns-bind9=true``. Keeps the
+        # ``enabled`` values toggle alongside so an operator who
+        # wants to globally suppress the Deployment still can.
+        spatium.io/role-dns-bind9: "true"
       containers:
         - name: dns-bind9
           image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dnsBind9.image.repository) }}

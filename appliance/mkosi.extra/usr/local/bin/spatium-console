@@ -321,24 +321,40 @@ def docker_ps() -> list[dict]:
         # synthesise one from the pod's container readiness +
         # waiting-reason. Mirrors what the watchdog does in
         # ``_derive_pod_status``.
+        # Surface the raw k8s state alongside the docker-shape
+        # ``Status`` string the older renderer code expects. The
+        # console's Pods panel reads ``K8sState`` directly so it can
+        # show "CrashLoopBackOff" / "Pending" / "Running" / etc. as
+        # operators see in ``kubectl get pods`` — same vocabulary,
+        # no translation layer.
         container_statuses = status.get("containerStatuses") or []
+        waiting_reason = ""
+        for cs in container_statuses:
+            waiting = (cs.get("state") or {}).get("waiting") or {}
+            r = waiting.get("reason") or ""
+            if r:
+                waiting_reason = r
+                break
+        # Default k8s state = phase (Running / Pending / Succeeded /
+        # Failed / Unknown). Promote the most-specific waiting reason
+        # if one is present — "CrashLoopBackOff" is more informative
+        # than "Running" for a pod that just failed.
+        if waiting_reason:
+            k8s_state = waiting_reason
+        else:
+            k8s_state = phase
+        # Legacy ``Status`` + ``State`` fields for code paths that
+        # still read them (verdict colouring, etc.).
         if phase == "Running" and container_statuses:
             all_ready = all(cs.get("ready") for cs in container_statuses)
             if all_ready:
                 status_str = "Running (healthy)"
                 state_str = "running"
             else:
-                # Find any waiting-reason for the unhealthy marker.
-                reason = ""
-                for cs in container_statuses:
-                    if cs.get("ready"):
-                        continue
-                    waiting = (cs.get("state") or {}).get("waiting") or {}
-                    reason = (waiting.get("reason") or "").lower()
-                    if reason:
-                        break
-                if reason in ("crashloopbackoff", "errimagepull", "imagepullbackoff"):
-                    status_str = f"Running (unhealthy: {reason})"
+                if waiting_reason.lower() in (
+                    "crashloopbackoff", "errimagepull", "imagepullbackoff"
+                ):
+                    status_str = f"Running (unhealthy: {waiting_reason.lower()})"
                 else:
                     status_str = "Running (health: starting)"
                 state_str = "running"
@@ -380,6 +396,7 @@ def docker_ps() -> list[dict]:
                 "Status": status_str,
                 "Labels": labels,
                 "State": state_str,
+                "K8sState": k8s_state,
                 "Ports": ports_out,
                 "NetworkMode": "host" if spec.get("hostNetwork") else "default",
                 "CreationTimestamp": meta.get("creationTimestamp") or "",
@@ -1205,7 +1222,7 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
     tbl.add_column(width=12, no_wrap=True)         # namespace
     tbl.add_column(min_width=20, no_wrap=False)    # pod name
     tbl.add_column(width=5, no_wrap=True, justify="right")  # age
-    tbl.add_column(width=10, no_wrap=True)         # state (verdict)
+    tbl.add_column(width=18, no_wrap=True)         # k8s state (CrashLoopBackOff fits)
     tbl.add_column(width=15, no_wrap=True)         # ports / net mode
     tbl.add_column(min_width=14, no_wrap=False)    # image
 
@@ -1254,12 +1271,31 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
 
         age = _format_pod_age(row.get("CreationTimestamp") or "")
 
+        # Show the raw k8s state (Running / Pending / Succeeded /
+        # CrashLoopBackOff / ImagePullBackOff / …) — same vocabulary
+        # as ``kubectl get pods``. Colour mirrors the glyph verdict
+        # so the eye still tracks healthy → unhealthy without
+        # needing to translate the string.
+        k8s_state = row.get("K8sState") or "Unknown"
+        state_style = (
+            "green" if k8s_state == "Running"
+            else "blue" if k8s_state == "Succeeded"
+            else "yellow" if k8s_state in (
+                "Pending", "ContainerCreating", "PodInitializing"
+            )
+            else "red" if k8s_state in (
+                "Failed", "CrashLoopBackOff", "ImagePullBackOff",
+                "ErrImagePull", "CreateContainerError",
+            )
+            else "dim"
+        )
+
         tbl.add_row(
             Text(glyph, style=style),
             Text(row.get("Namespace") or "—", style="dim"),
             Text(row.get("Names") or "", style="bold"),
             Text(age, style="dim"),
-            Text(verdict, style=style),
+            Text(k8s_state, style=state_style),
             Text(ports or "—", style=ports_style),
             Text(short_image, style="dim"),
         )

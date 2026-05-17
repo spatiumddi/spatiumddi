@@ -42,6 +42,16 @@ spec:
           # down once the controller pattern lands.
           securityContext:
             privileged: true
+          env:
+            # Phase 10 (#183) — k8s_api.patch_node_labels needs the
+            # node name. Downward API surfaces the kubelet-known
+            # node name without having to guess from hostname (which
+            # may not match the registered node identity, especially
+            # on multi-NIC setups).
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           volumeMounts:
             - name: etc-spatiumddi-host
               mountPath: /etc/spatiumddi-host

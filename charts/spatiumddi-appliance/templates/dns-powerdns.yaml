@@ -27,6 +27,8 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+        # Phase 10 (#183) — per-role scheduling label.
+        spatium.io/role-dns-powerdns: "true"
       containers:
         - name: dns-powerdns
           image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dnsPowerdns.image.repository) }}

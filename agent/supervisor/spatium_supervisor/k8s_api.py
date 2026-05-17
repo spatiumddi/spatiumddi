@@ -398,6 +398,48 @@ def delete_helmchart(
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+def patch_node_labels(
+    node_name: str,
+    set_labels: dict[str, str | None],
+) -> tuple[bool, str | None]:
+    """Add or remove labels on a node via a JSON-merge-patch.
+
+    ``set_labels`` keys map to label names; values map to label
+    values (string) or ``None`` to remove the label. Single round
+    trip — kubeapi applies the diff atomically.
+
+    Idempotent: setting a label to its current value or removing a
+    label that doesn't exist is a no-op server-side.
+
+    Phase 10 (#183) entry point for the supervisor's role-apply
+    path. The chart templates' per-role nodeSelector
+    (``spatium.io/role-dns-bind9: "true"`` etc.) gates pod
+    scheduling on the matching label being on the node. The
+    supervisor calls this when a role joins/leaves the desired
+    set.
+    """
+    if not set_labels:
+        return True, None
+    # JSON merge-patch on a Node resource: ``{"metadata":
+    # {"labels": {"key": "value"}}}`` sets a label;
+    # ``{"key": null}`` removes it.
+    labels: dict[str, str | None] = dict(set_labels)
+    payload = json.dumps({"metadata": {"labels": labels}}).encode("utf-8")
+    path = f"/api/v1/nodes/{quote(node_name)}"
+    try:
+        status, resp = _request(
+            "PATCH",
+            path,
+            body=payload,
+            content_type="application/merge-patch+json",
+        )
+    except RuntimeError as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        return True, None
+    return False, f"kubeapi status {status}: {resp[:200]!r}"
+
+
 __all__ = [
     "KubeConfig",
     "PodStatus",
@@ -405,5 +447,6 @@ __all__ = [
     "check_kubeapi_ready",
     "delete_helmchart",
     "get_config",
+    "patch_node_labels",
     "list_pods",
 ]

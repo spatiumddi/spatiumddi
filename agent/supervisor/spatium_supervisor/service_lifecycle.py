@@ -91,6 +91,20 @@ _PROFILE_TO_HELM_KEY = {
     "dhcp": "dhcpKea",
 }
 
+# Phase 10 (#183) — every role the chart templates have a per-role
+# nodeSelector for. The supervisor labels the node with
+# ``spatium.io/role-<key>=true`` for each role in the desired set
+# and clears the label for each role leaving. Pod scheduling gates
+# on the label being present, so role swap = label flip.
+#
+# Keep in lock-step with the per-template ``nodeSelector`` blocks in
+# charts/spatiumddi-appliance/templates/*.yaml.
+_ROLE_LABEL_KEYS = {
+    "dns-bind9": "spatium.io/role-dns-bind9",
+    "dns-powerdns": "spatium.io/role-dns-powerdns",
+    "dhcp": "spatium.io/role-dhcp",
+}
+
 # Env keys to lift from the rendered role-compose env file into chart
 # values. The compose path interpolates them at ``docker compose up``;
 # the k3s path threads them into the chart's values.yaml structure.
@@ -275,6 +289,42 @@ def apply_role_assignment(
         # UI banner; kubeapi errors are similarly short.
         return LifecycleResult(state="failed", reason=err or "kubeapi apply failed")
 
+    # Phase 10 (#183) — alongside the values PATCH, label the node
+    # with ``spatium.io/role-<role>=true`` for each desired role,
+    # and clear the label for each role not in the desired set.
+    # The chart's per-role nodeSelector gates scheduling on this,
+    # so a role swap (BIND9 → PowerDNS) becomes "label flip" instead
+    # of a chart upgrade race. Best-effort: a label-patch failure
+    # doesn't block the apply (the values PATCH already landed and
+    # the helm-install will sit Pending until the next reconcile
+    # writes the labels).
+    desired_role_set = {p for p in profiles if p in _ROLE_LABEL_KEYS}
+    label_diff: dict[str, str | None] = {}
+    for role, label in _ROLE_LABEL_KEYS.items():
+        label_diff[label] = "true" if role in desired_role_set else None
+    node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
+    if not node_name:
+        try:
+            import socket as _socket
+            node_name = _socket.gethostname()
+        except OSError:
+            node_name = ""
+    if node_name:
+        label_ok, label_err = k8s_api.patch_node_labels(node_name, label_diff)
+        if not label_ok:
+            log.warning(
+                "supervisor.k3s_lifecycle.label_patch_failed",
+                node=node_name,
+                error=label_err,
+            )
+        else:
+            log.info(
+                "supervisor.k3s_lifecycle.labels_applied",
+                node=node_name,
+                set=[k for k, v in label_diff.items() if v is not None],
+                cleared=[k for k, v in label_diff.items() if v is None],
+            )
+
     desired_services = tuple(sorted(p for p in profiles if p in _PROFILE_TO_HELM_KEY))
     log.info(
         "supervisor.k3s_lifecycle.applied",
@@ -312,6 +362,21 @@ def tear_down_supervised_services() -> LifecycleResult:
     )
     if not ok:
         return LifecycleResult(state="failed", reason=err or "kubeapi delete failed")
+
+    # Phase 10 (#183) — clear every per-role label so pods that
+    # somehow survived the chart delete don't keep running on the
+    # node. helm-controller's uninstall should remove the
+    # Deployments first, but this is belt-and-braces.
+    node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
+    if not node_name:
+        try:
+            import socket as _socket
+            node_name = _socket.gethostname()
+        except OSError:
+            node_name = ""
+    if node_name:
+        label_diff: dict[str, str | None] = {label: None for label in _ROLE_LABEL_KEYS.values()}
+        k8s_api.patch_node_labels(node_name, label_diff)
     log.warning("supervisor.k3s_lifecycle.torn_down")
     # Report every supervised service as ``stopped`` — we deleted
     # the chart that owned every one of them. The Fleet drilldown's

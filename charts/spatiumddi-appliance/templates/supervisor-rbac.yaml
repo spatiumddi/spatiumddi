@@ -108,7 +108,12 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get", "list", "watch"]
+    # Phase 10 (#183) — supervisor PATCHes node labels for per-role
+    # scheduling (``spatium.io/role-dns-bind9=true`` etc.). ``patch``
+    # + ``update`` cover both the merge-patch form used by
+    # k8s_api.patch_node_labels and a fallback strategic-merge if we
+    # ever switch.
+    verbs: ["get", "list", "watch", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
