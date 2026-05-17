@@ -32,6 +32,7 @@ import {
   type DHCPClientClass,
   type DHCPOptionTemplate,
   type DHCPLease,
+  formatApiError,
 } from "@/lib/api";
 import { useSessionState } from "@/lib/useSessionState";
 import { copyToClipboard } from "@/lib/clipboard";
@@ -2365,7 +2366,7 @@ export function DHCPPage() {
     deleteGroupMut.error &&
     (((deleteGroupMut.error as { response?: { data?: { detail?: string } } })
       ?.response?.data?.detail as string | undefined) ??
-      (deleteGroupMut.error as Error).message);
+      formatApiError(deleteGroupMut.error));
   const deleteServerMut = useMutation({
     mutationFn: (id: string) => dhcpApi.deleteServer(id),
     onSuccess: (_, id) => {

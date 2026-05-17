@@ -18,13 +18,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 
 from app.api.deps import DB, CurrentUser
+from app.core.permissions import is_effective_superadmin
+from app.models.auth import User
 from app.models.diagnostics import InternalError
 
 router = APIRouter()
 
 
-def _require_superadmin(user_obj: object) -> None:
-    if not getattr(user_obj, "is_superadmin", False):
+def _require_superadmin(user_obj: User) -> None:
+    if not is_effective_superadmin(user_obj):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Diagnostics surface is restricted to superadmin",

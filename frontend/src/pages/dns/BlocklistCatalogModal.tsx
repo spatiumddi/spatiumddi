@@ -13,6 +13,7 @@ import {
   dnsBlocklistApi,
   type BlocklistCatalogSource,
   type DNSBlockList,
+  formatApiError,
 } from "@/lib/api";
 
 /**
@@ -131,7 +132,7 @@ export function BlocklistCatalogModal({ onClose }: { onClose: () => void }) {
 
         {subscribeMut.isError && (
           <p className="text-xs text-destructive">
-            {(subscribeMut.error as Error).message}
+            {formatApiError(subscribeMut.error)}
           </p>
         )}
 

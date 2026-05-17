@@ -15,6 +15,7 @@ import {
 import {
   applianceDiagnosticsApi,
   type ApplianceSelfTestReport,
+  formatApiError,
 } from "@/lib/api";
 
 /**
@@ -91,7 +92,7 @@ function SelfTestCard() {
       {run.isError && (
         <div className="mt-3 flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
           <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <span>{(run.error as Error).message}</span>
+          <span>{formatApiError(run.error)}</span>
         </div>
       )}
 
@@ -213,7 +214,7 @@ function LogViewerCard() {
         {tail.isLoading
           ? "Loading…"
           : tail.isError
-            ? `(error: ${(tail.error as Error).message})`
+            ? `(error: ${formatApiError(tail.error)})`
             : tail.data?.tail || "(empty)"}
       </pre>
     </section>

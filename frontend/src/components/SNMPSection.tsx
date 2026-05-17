@@ -9,6 +9,7 @@ import {
   type SnmpAuthProtocol,
   type SnmpPrivProtocol,
   type SnmpVersion,
+  formatApiError,
 } from "@/lib/api";
 import { Toggle } from "@/components/ui/toggle";
 import { cn } from "@/lib/utils";
@@ -191,7 +192,7 @@ function CommunityField({
         )}
         {revealMutation.isError && (
           <span className="text-xs text-destructive">
-            {(revealMutation.error as Error).message}
+            {formatApiError(revealMutation.error)}
           </span>
         )}
 

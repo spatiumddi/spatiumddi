@@ -13,6 +13,7 @@ import {
 import {
   agentBootstrapKeysApi,
   type AgentBootstrapKeysReveal,
+  formatApiError,
 } from "@/lib/api";
 
 /**
@@ -103,7 +104,7 @@ export function AgentBootstrapKeysSection() {
           {reveal.isError && (
             <div className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
               <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span>{(reveal.error as Error).message}</span>
+              <span>{formatApiError(reveal.error)}</span>
             </div>
           )}
           <button

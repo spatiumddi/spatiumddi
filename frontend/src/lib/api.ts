@@ -127,17 +127,22 @@ export const api = createClient();
 
 /**
  * Normalise whatever shape an API error arrives in into a single string
- * suitable for React children.
+ * suitable for React children (issue #31) and operator-readable toasts
+ * / inline form errors (issue #186).
  *
  * FastAPI returns three common shapes:
  *   - 4xx HTTPException:   `{"detail": "some message"}`
  *   - 422 validation:      `{"detail": [{"type", "loc", "msg", "input", "ctx"}, ...]}`
  *   - Unhandled 500:       `{"detail": "Internal Server Error"}` or no body
  *
- * Passing the raw `detail` into `setError(...)` was crashing React with
- * error #31 ("Objects are not valid as a React child") when a 422 hit a
- * code path that assumed it was always a string. Use this helper instead
- * of a naive `err.response?.data?.detail ?? "Error"`.
+ * Use this **everywhere** an error gets rendered — including
+ * ``{(mutation.error as Error).message}``-style sites. Axios's default
+ * ``.message`` is just ``"Request failed with status code N"`` which
+ * hides the backend's actual detail; this helper pulls the right field
+ * for each shape. Original use case was issue #31 (avoid React error
+ * "Objects are not valid as a React child" when the 422 path returned
+ * an array); issue #186 extended adoption across every error-render
+ * site in the app.
  */
 export function formatApiError(err: unknown, fallback = "Error"): string {
   const anyErr = err as {

@@ -25,6 +25,7 @@ import {
   type DNSImportZoneConflict,
   type PowerDNSConnectionInfo,
   type WindowsDNSServerOption,
+  formatApiError,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -205,7 +206,7 @@ function BindTab() {
     onError: (err: unknown) => {
       const detail =
         (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? (err as Error).message;
+          ?.detail ?? formatApiError(err);
       setState((s) => ({ ...s, phase: "select", error: detail }));
     },
   });
@@ -226,7 +227,7 @@ function BindTab() {
     onError: (err: unknown) => {
       const detail =
         (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? (err as Error).message;
+          ?.detail ?? formatApiError(err);
       setState((s) => ({ ...s, phase: "ready", error: detail }));
     },
   });
@@ -371,7 +372,7 @@ function WindowsDNSTab() {
     onError: (err: unknown) => {
       const detail =
         (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? (err as Error).message;
+          ?.detail ?? formatApiError(err);
       setState((s) => ({ ...s, phase: "select", error: detail }));
     },
   });
@@ -392,7 +393,7 @@ function WindowsDNSTab() {
     onError: (err: unknown) => {
       const detail =
         (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? (err as Error).message;
+          ?.detail ?? formatApiError(err);
       setState((s) => ({ ...s, phase: "ready", error: detail }));
     },
   });
@@ -657,7 +658,7 @@ function PowerDNSTab() {
     onError: (err: unknown) => {
       const detail =
         (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? (err as Error).message;
+          ?.detail ?? formatApiError(err);
       setState((s) => ({ ...s, testInfo: null, error: detail }));
     },
   });
@@ -693,7 +694,7 @@ function PowerDNSTab() {
     onError: (err: unknown) => {
       const detail =
         (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? (err as Error).message;
+          ?.detail ?? formatApiError(err);
       setState((s) => ({ ...s, phase: "select", error: detail }));
     },
   });
@@ -714,7 +715,7 @@ function PowerDNSTab() {
     onError: (err: unknown) => {
       const detail =
         (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? (err as Error).message;
+          ?.detail ?? formatApiError(err);
       setState((s) => ({ ...s, phase: "ready", error: detail }));
     },
   });

@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, select
 
 from app.api.deps import DB, CurrentUser
+from app.core.permissions import is_effective_superadmin
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.audit import AuditLog
 from app.services import alerts as alert_service
@@ -251,8 +252,8 @@ class EvaluateResponse(BaseModel):
 # ── Rules ──────────────────────────────────────────────────────────────────
 
 
-def _require_superadmin(current_user: object) -> None:
-    if not getattr(current_user, "is_superadmin", False):
+def _require_superadmin(current_user: CurrentUser) -> None:
+    if not is_effective_superadmin(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Superadmin required to manage alert rules",

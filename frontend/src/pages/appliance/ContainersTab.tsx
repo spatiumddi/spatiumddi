@@ -17,6 +17,7 @@ import {
   streamApplianceContainerLogs,
   type ApplianceContainer,
   type ContainerAction,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 
@@ -84,7 +85,7 @@ export function ContainersTab() {
 
       {error && (
         <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
-          {(error as Error).message}
+          {formatApiError(error)}
         </div>
       )}
 

@@ -19,6 +19,7 @@ import {
   applianceSystemApi,
   type ApplianceSlot,
   type ApplianceSlotStatus,
+  formatApiError,
 } from "@/lib/api";
 
 /**
@@ -224,7 +225,7 @@ export function SlotUpgradeCard() {
 
       {error && (
         <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
-          Failed to load slot status: {(error as Error).message}
+          Failed to load slot status: {formatApiError(error)}
         </div>
       )}
 
@@ -337,8 +338,8 @@ export function SlotUpgradeCard() {
             {releasesError && (
               <p className="text-[11px] text-destructive">
                 Couldn’t load the GitHub releases list (
-                {(releasesError as Error).message}). Switch to custom URL to
-                apply manually.
+                {formatApiError(releasesError)}). Switch to custom URL to apply
+                manually.
               </p>
             )}
           </>
@@ -512,9 +513,7 @@ export function SlotUpgradeCard() {
               reboot that lands back on the current slot.
             </p>
             {apply.isError && (
-              <p className="text-destructive">
-                {(apply.error as Error).message}
-              </p>
+              <p className="text-destructive">{formatApiError(apply.error)}</p>
             )}
           </div>
         }
@@ -553,7 +552,7 @@ export function SlotUpgradeCard() {
             </p>
             {rollback.isError && (
               <p className="text-destructive">
-                {(rollback.error as Error).message}
+                {formatApiError(rollback.error)}
               </p>
             )}
           </div>
@@ -588,9 +587,7 @@ export function SlotUpgradeCard() {
                 : "No slot change pending — this just reboots the current slot."}
             </p>
             {reboot.isError && (
-              <p className="text-destructive">
-                {(reboot.error as Error).message}
-              </p>
+              <p className="text-destructive">{formatApiError(reboot.error)}</p>
             )}
           </div>
         }

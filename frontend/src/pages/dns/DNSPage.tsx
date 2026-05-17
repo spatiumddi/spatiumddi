@@ -7394,7 +7394,7 @@ export function DNSPage() {
     deleteGroup.error &&
     (((deleteGroup.error as { response?: { data?: { detail?: string } } })
       ?.response?.data?.detail as string | undefined) ??
-      (deleteGroup.error as Error).message);
+      formatApiError(deleteGroup.error));
 
   function toggleGroup(id: string) {
     setExpandedGroups((prev) => {

@@ -56,7 +56,7 @@ from sqlalchemy import func as sa_func
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
-from app.core.permissions import require_permission
+from app.core.permissions import is_effective_superadmin, require_permission
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
@@ -1164,7 +1164,7 @@ class ApplianceList(BaseModel):
 
 
 def _require_superadmin(user: CurrentUser) -> None:
-    if not user.is_superadmin:
+    if not is_effective_superadmin(user):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Appliance approval is restricted to superadmins.",

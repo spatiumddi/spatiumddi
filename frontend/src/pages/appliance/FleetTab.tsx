@@ -30,6 +30,7 @@ import {
   type ApplianceState,
   type SlotImage,
   type SupervisorCapabilities,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -549,7 +550,7 @@ export function FleetTab() {
 
               {error ? (
                 <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-700 dark:text-rose-300">
-                  Failed to load appliances: {(error as Error).message}
+                  Failed to load appliances: {formatApiError(error)}
                 </div>
               ) : isLoading ? (
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -1556,7 +1557,7 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
         </button>
         {restartBind9.error && (
           <span className="text-[11px] text-rose-700 dark:text-rose-300">
-            {(restartBind9.error as Error).message}
+            {formatApiError(restartBind9.error)}
           </span>
         )}
         {restartBind9.isSuccess && (
@@ -1723,7 +1724,7 @@ function PodLogsModal({
           </button>
           {logsQuery.error && (
             <span className="text-[11px] text-rose-700 dark:text-rose-300">
-              {(logsQuery.error as Error).message}
+              {formatApiError(logsQuery.error)}
             </span>
           )}
         </div>
@@ -1822,7 +1823,7 @@ function KubeapiCidrEditorModal({
         />
         {save.error && (
           <p className="text-xs text-rose-700 dark:text-rose-300">
-            {(save.error as Error).message}
+            {formatApiError(save.error)}
           </p>
         )}
         <div className="flex items-center justify-end gap-2">
@@ -1928,7 +1929,7 @@ function RevealKubeconfigModal({
             </div>
             {reveal.error && (
               <p className="text-xs text-rose-700 dark:text-rose-300">
-                {(reveal.error as Error).message}
+                {formatApiError(reveal.error)}
               </p>
             )}
           </>
@@ -2258,7 +2259,7 @@ function ApplianceRoleAssignmentSection({
         )}
         {save.error && (
           <span className="text-xs text-rose-700 dark:text-rose-300">
-            {(save.error as Error).message}
+            {formatApiError(save.error)}
           </span>
         )}
       </div>
@@ -2772,7 +2773,7 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
             </button>
             {scheduleUpgrade.error && (
               <span className="text-xs text-rose-700 dark:text-rose-300">
-                {(scheduleUpgrade.error as Error).message}
+                {formatApiError(scheduleUpgrade.error)}
               </span>
             )}
           </div>
@@ -2804,7 +2805,7 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
           </button>
           {reboot.error && (
             <span className="text-xs text-rose-700 dark:text-rose-300">
-              {(reboot.error as Error).message}
+              {formatApiError(reboot.error)}
             </span>
           )}
         </div>
@@ -2972,7 +2973,7 @@ function SlotImageManager() {
           )}
           {upload.error && (
             <span className="text-rose-700 dark:text-rose-300">
-              {(upload.error as Error).message}
+              {formatApiError(upload.error)}
             </span>
           )}
         </div>

@@ -87,6 +87,34 @@ def _resource_id_matches(granted: str | None, requested: str | None) -> bool:
     return str(granted) == str(requested)
 
 
+def is_effective_superadmin(user: User) -> bool:
+    """Whether the user is a superadmin for gate-style checks.
+
+    Two paths qualify:
+
+    * **Legacy column** — ``User.is_superadmin=True`` set directly on the
+      row (seeded ``admin`` account, anyone explicitly flagged in
+      ``users/router.py``'s admin form).
+    * **RBAC wildcard** — the user belongs to a group whose role carries
+      a ``{action: "*", resource_type: "*"}`` permission (the built-in
+      ``Superadmin`` role + any custom clone of it).
+
+    Without the RBAC path, users provisioned via LDAP / OIDC / SAML and
+    mapped into a Superadmin-role group pass every ``require_permission``
+    gate but get 403 on the per-endpoint local ``_require_superadmin``
+    helpers — closes that split-brain (issue #190).
+
+    This is intentionally separate from :func:`user_has_permission`:
+    inactive users are admitted here when the legacy flag is set so a
+    disabled superadmin can still reach the diagnostic surfaces an
+    operator might need during incident triage. Per-permission checks
+    still gate on ``user.is_active``.
+    """
+    if getattr(user, "is_superadmin", False):
+        return True
+    return user_has_permission(user, "*", "*")
+
+
 def user_has_permission(
     user: User,
     action: str,

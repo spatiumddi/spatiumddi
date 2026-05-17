@@ -54,7 +54,7 @@ from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
 from app.core.crypto import decrypt_str, encrypt_str
-from app.core.permissions import require_permission
+from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.security import verify_password
 from app.models.appliance import PairingClaim, PairingCode
 from app.models.audit import AuditLog
@@ -177,7 +177,7 @@ class PairingCodeRevealResponse(BaseModel):
 
 
 def _require_superadmin(user: CurrentUser) -> None:
-    if not user.is_superadmin:
+    if not is_effective_superadmin(user):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Pairing-code management is restricted to superadmins.",

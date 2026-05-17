@@ -160,29 +160,34 @@ async def get_current_user(
 
 
 def require_superadmin(current_user: Annotated[User, Depends(get_current_user)]) -> User:
-    """Admit users who are either
-    (a) the legacy ``User.is_superadmin=True`` (seeded ``admin`` / anyone
-        explicitly flagged), OR
-    (b) granted a Wave-C RBAC wildcard permission (`action=*`,
-        `resource_type=*`) via a group → role, i.e. the built-in ``Superadmin``
-        role or a custom clone of it.
+    """FastAPI dependency: 403 unless the user is an *effective* superadmin.
 
-    Without (b), users provisioned via LDAP / OIDC / SAML and mapped to the
-    ``Superadmins`` internal group could pass RBAC-gated checks but still get
-    403 on ``SuperAdmin``-gated endpoints (users / groups / roles / auth
-    providers / settings) — a split-brain between the legacy flag and the
-    RBAC model. This unifies them.
+    Delegates to :func:`app.core.permissions.is_effective_superadmin`, which
+    admits both:
+
+    * the legacy ``User.is_superadmin=True`` (seeded ``admin`` / anyone
+      explicitly flagged), and
+    * group → role grants of the ``{action: "*", resource_type: "*"}``
+      wildcard permission (built-in ``Superadmin`` role or any clone of it).
+
+    Without the wildcard path, users provisioned via LDAP / OIDC / SAML and
+    mapped to a Superadmin-role group pass every ``require_permission`` gate
+    but get 403 on ``SuperAdmin``-only endpoints — a split-brain between the
+    legacy flag and the RBAC model. The helper unifies them; this dependency
+    is just the gate-style wrapper for routes that pre-Depend.
+
+    Endpoints that already have a hand-rolled ``_require_superadmin`` helper
+    should call ``is_effective_superadmin(user)`` directly from inside the
+    handler — same check, same behaviour.
     """
-    if current_user.is_superadmin:
-        return current_user
     # Lazy import: `app.core.permissions` imports ``CurrentUser`` / ``get_db``
     # from this module at top-level, so an eager import here triggers a
     # circular-import crash at uvicorn startup. Local import side-steps it
     # because by the time this function is called the module graph is fully
     # initialised.
-    from app.core.permissions import user_has_permission
+    from app.core.permissions import is_effective_superadmin
 
-    if user_has_permission(current_user, "*", "*"):
+    if is_effective_superadmin(current_user):
         return current_user
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superadmin required")
 

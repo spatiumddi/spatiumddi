@@ -9,7 +9,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import user_has_permission
+from app.core.permissions import is_effective_superadmin, user_has_permission
 from app.core.security import create_access_token, hash_password
 from app.models.auth import Group, Role, User
 
@@ -74,6 +74,55 @@ def test_superadmin_short_circuits() -> None:
     # No roles at all
     assert user_has_permission(u, "write", "subnet") is True
     assert user_has_permission(u, "delete", "any_made_up_type") is True
+
+
+# ── is_effective_superadmin (issue #190) ──────────────────────────────────────
+
+
+def test_effective_superadmin_legacy_flag() -> None:
+    """User with the legacy ``is_superadmin`` column set is admitted."""
+    u = _user(superadmin=True)
+    assert is_effective_superadmin(u) is True
+
+
+def test_effective_superadmin_via_wildcard_permission() -> None:
+    """OIDC / LDAP user mapped into a group with the built-in Superadmin
+    role gets the same admission as a legacy ``is_superadmin=True``.
+
+    This is the bug #190 closes: pre-fix, per-endpoint local
+    ``_require_superadmin`` helpers ignored this path entirely.
+    """
+    u = _user(superadmin=False)
+    u.groups = [_group([_role([{"action": "*", "resource_type": "*"}])])]
+    assert is_effective_superadmin(u) is True
+
+
+def test_effective_superadmin_denied_without_either_path() -> None:
+    """No legacy flag, no wildcard permission → denied."""
+    u = _user(superadmin=False)
+    u.groups = [_group([_role([{"action": "read", "resource_type": "*"}])])]
+    assert is_effective_superadmin(u) is False
+
+
+def test_effective_superadmin_denied_with_no_groups() -> None:
+    u = _user(superadmin=False)
+    assert is_effective_superadmin(u) is False
+
+
+def test_effective_superadmin_legacy_flag_overrides_inactive() -> None:
+    """A disabled legacy superadmin can still pass the gate — matches the
+    docstring on :func:`is_effective_superadmin` ("disabled superadmin can
+    still reach diagnostic surfaces during incident triage"). The
+    wildcard-permission path still gates on ``is_active``.
+    """
+    u = _user(superadmin=True, is_active=False)
+    assert is_effective_superadmin(u) is True
+
+
+def test_effective_superadmin_wildcard_path_respects_inactive() -> None:
+    u = _user(superadmin=False, is_active=False)
+    u.groups = [_group([_role([{"action": "*", "resource_type": "*"}])])]
+    assert is_effective_superadmin(u) is False
 
 
 def test_inactive_user_denied_even_with_wildcard() -> None:
