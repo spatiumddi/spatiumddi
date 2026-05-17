@@ -20,10 +20,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-CHART_SRC="$REPO_ROOT/charts/spatiumddi-appliance"
+
+# Issue #183 Phase 11 — the bake script is now parametrized so the
+# same plumbing handles both:
+#   * the per-role chart (charts/spatiumddi-appliance, default) —
+#     installed by every appliance variant for supervisor / role
+#     pods / agent-landing
+#   * the control-plane chart (charts/spatiumddi, the umbrella) —
+#     installed by the AIO + Core variants on top of the appliance
+#     chart, deploys api / frontend / postgres / redis / worker /
+#     beat / migrate-job
+#
+# Override CHART_NAME=spatiumddi to bake the umbrella chart;
+# defaults to spatiumddi-appliance.
+CHART_NAME="${CHART_NAME:-spatiumddi-appliance}"
+CHART_SRC="$REPO_ROOT/charts/$CHART_NAME"
 APPLIANCE_DIR="$REPO_ROOT/appliance"
 BAKED_DIR="$APPLIANCE_DIR/mkosi.extra/usr/lib/spatiumddi/charts"
-BAKED_TARBALL="$BAKED_DIR/spatiumddi-appliance.tgz"
+BAKED_TARBALL="$BAKED_DIR/$CHART_NAME.tgz"
 
 if [ ! -d "$CHART_SRC" ]; then
     echo "ERROR: chart source missing at $CHART_SRC" >&2
@@ -52,7 +66,7 @@ helm package "$CHART_SRC" --destination "$TMP_OUT" 1>&2
 
 # helm-package output filename pattern: <name>-<version>.tgz.
 # Resolve via glob; the chart directory yields exactly one tgz.
-PACKAGED_TGZ="$(ls "$TMP_OUT"/spatiumddi-appliance-*.tgz | head -1)"
+PACKAGED_TGZ="$(ls "$TMP_OUT"/"$CHART_NAME"-*.tgz | head -1)"
 if [ ! -f "$PACKAGED_TGZ" ]; then
     echo "ERROR: helm package didn't produce a tgz in $TMP_OUT" >&2
     exit 3

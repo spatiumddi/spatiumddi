@@ -39,10 +39,12 @@ mkosi.extra/usr/share/doc/k3s/NOTICE
 mkosi.extra/usr/share/doc/k3s/k3s-images.txt
 mkosi.extra/usr/share/doc/k3s/.version
 
-# Issue #183 Phase 3 — baked Helm chart tarball. Reproducible
-# via ``make appliance-bake-chart`` from the tracked
-# charts/spatiumddi-appliance/ source.
+# Issue #183 Phase 3 — baked Helm chart tarballs. Reproducible
+# via ``make appliance-bake-chart`` (appliance chart) +
+# ``make appliance-bake-control-chart`` (umbrella chart, Phase 11)
+# from the tracked charts/ sources.
 mkosi.extra/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz
+mkosi.extra/usr/lib/spatiumddi/charts/spatiumddi.tgz
 
 # Issue #183 — version stamp written by appliance/scripts/
 # bake-images.sh (or appliance-stamp-dev). Build-time artefact.
