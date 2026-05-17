@@ -382,6 +382,7 @@ def docker_ps() -> list[dict]:
                 "State": state_str,
                 "Ports": ports_out,
                 "NetworkMode": "host" if spec.get("hostNetwork") else "default",
+                "CreationTimestamp": meta.get("creationTimestamp") or "",
             }
         )
 
@@ -397,7 +398,7 @@ def container_port_summary(row: dict) -> str:
 
     Output shapes:
 
-    * ``host net`` — container in ``NetworkMode=host`` (DHCP-kea
+    * ``Host Network`` — container in ``NetworkMode=host`` (DHCP-kea
       runs here for broadcast-relay reachability).
     * ``53/tcp 53/udp`` — bridge-mode container with published
       ports; dedupes IPv4/IPv6 entries that the engine API returns
@@ -406,7 +407,7 @@ def container_port_summary(row: dict) -> str:
       supervisor itself, internal-only containers).
     """
     if row.get("NetworkMode") == "host":
-        return "host net"
+        return "Host Network"
     pairs: set[tuple[int, str]] = set()
     for p in row.get("Ports") or []:
         pub = p.get("PublicPort")
@@ -450,6 +451,40 @@ def container_service_name(row: dict) -> str:
     if len(parts) >= 3 and len(parts[-1]) == 5 and len(parts[-2]) >= 5:
         return "-".join(parts[:-2])
     return name
+
+
+def _format_pod_age(creation_iso: str) -> str:
+    """Format a pod's age relative to now in kubectl-shape units.
+
+    Mirrors ``kubectl get pod`` AGE column — biggest meaningful unit:
+    ``45s`` / ``12m`` / ``3h`` / ``5d`` / ``2y``. Empty string on
+    parse failure so the column just renders blank rather than
+    breaking the row layout.
+    """
+    if not creation_iso:
+        return ""
+    try:
+        # kubectl serializes as RFC3339 with trailing Z; Python's
+        # fromisoformat handles +00:00 but not Z, so swap.
+        ts = datetime.fromisoformat(creation_iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return ""
+    delta = datetime.now(ts.tzinfo) - ts
+    secs = int(delta.total_seconds())
+    if secs < 0:
+        return "0s"
+    if secs < 60:
+        return f"{secs}s"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m"
+    hours = mins // 60
+    if hours < 48:
+        return f"{hours}h"
+    days = hours // 24
+    if days < 365:
+        return f"{days}d"
+    return f"{days // 365}y"
 
 
 def health_from_status(status: str) -> str:
@@ -1125,13 +1160,13 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
     _ = role  # signature kept for compatibility
 
     tbl = Table.grid(padding=(0, 1), expand=True)
-    tbl.add_column(width=2, no_wrap=True)          # health glyph
+    tbl.add_column(width=1, no_wrap=True)          # health glyph
     tbl.add_column(width=12, no_wrap=True)         # namespace
     tbl.add_column(min_width=20, no_wrap=False)    # pod name
-    tbl.add_column(width=10, no_wrap=True)         # state
-    tbl.add_column(width=18, no_wrap=True)         # ports / net mode
+    tbl.add_column(width=5, no_wrap=True, justify="right")  # age
+    tbl.add_column(width=10, no_wrap=True)         # state (verdict)
+    tbl.add_column(width=15, no_wrap=True)         # ports / net mode
     tbl.add_column(min_width=14, no_wrap=False)    # image
-    tbl.add_column(justify="right", no_wrap=True)  # status text
 
     # Sort: spatium first (the role pods operators care about most),
     # kube-system next, then anything else alphabetically. Within a
@@ -1174,16 +1209,18 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         short_image = image.rsplit("/", 1)[1] if "/" in image else image
 
         ports = container_port_summary(row)
-        ports_style = "bold cyan" if ports == "host net" else "dim"
+        ports_style = "bold cyan" if ports == "Host Network" else "dim"
+
+        age = _format_pod_age(row.get("CreationTimestamp") or "")
 
         tbl.add_row(
             Text(glyph, style=style),
             Text(row.get("Namespace") or "—", style="dim"),
             Text(row.get("Names") or "", style="bold"),
+            Text(age, style="dim"),
             Text(verdict, style=style),
             Text(ports or "—", style=ports_style),
             Text(short_image, style="dim"),
-            Text(status, style="dim"),
         )
 
     return Panel(

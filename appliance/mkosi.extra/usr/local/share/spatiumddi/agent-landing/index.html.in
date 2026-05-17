@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SpatiumDDI __ROLE_LABEL__ agent</title>
+<title>SpatiumDDI Appliance</title>
 <style>
   :root { color-scheme: dark light; }
   * { box-sizing: border-box; }
@@ -83,24 +83,23 @@
 </head>
 <body>
 <main class="card">
-  <h1><span class="dot"></span>SpatiumDDI __ROLE_LABEL__ agent</h1>
+  <h1><span class="dot"></span>SpatiumDDI Appliance</h1>
   <p class="subtitle">
-    This appliance is a distributed agent — it registers against a
-    remote control plane. There's no web UI here; this is just a
-    confirmation page that the box is up and which control plane it
-    points at.
+    This appliance pairs with a remote control plane for role
+    assignment (DNS, DHCP, …). There's no web UI here; this page
+    just confirms the box is up and reachable. Role assignment +
+    live config live in the Fleet UI on the control plane.
   </p>
   <dl>
-    <dt>Role</dt>          <dd>__ROLE__</dd>
     <dt>Hostname</dt>      <dd>__HOSTNAME__</dd>
     <dt>Control plane</dt> <dd><a href="__CONTROL_PLANE_URL__">__CONTROL_PLANE_URL__</a></dd>
     <dt>Version</dt>       <dd>__APPLIANCE_VERSION__</dd>
   </dl>
   <p class="note">
-    To check live agent state — heartbeat status, last config push,
-    cached JWT validity — SSH in as the OS admin user you created at
-    install and run <code>kubectl -n spatium logs -l app.kubernetes.io/component=__ROLE_SHORT__</code>.
-    For the full SpatiumDDI UI, browse to the control plane URL above.
+    To check live state — running pods, role assignment, heartbeat
+    status — SSH in as the OS admin user you created at install and
+    run <code>kubectl get pods -A</code>. For the full SpatiumDDI
+    UI, browse to the control plane URL above.
   </p>
 </main>
 </body>

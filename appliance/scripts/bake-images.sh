@@ -52,6 +52,10 @@ IMAGES=(
 OBSERVABILITY_IMAGES=(
     "registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.13.0"
     "quay.io/prometheus/node-exporter:v1.8.2"
+    # Agent landing page — always-on nginx serving the rendered
+    # /var/lib/spatiumddi/agent-landing/index.html on :80. Pinned to
+    # 1.27-alpine matching values.yaml's ``agentLanding.image.tag``.
+    "nginx:1.27-alpine"
 )
 
 if ! command -v docker >/dev/null 2>&1; then

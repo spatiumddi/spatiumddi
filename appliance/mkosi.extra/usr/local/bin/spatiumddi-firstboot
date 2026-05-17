@@ -243,6 +243,46 @@ else
     echo "WARN: $CHART_TGZ missing — supervisor pod won't auto-deploy. Is the chart baked?"
 fi
 
+# ── Render agent landing page ───────────────────────────────────────────────
+# Static "this is a SpatiumDDI appliance" page served on :80 by the
+# agent-landing nginx pod (chart template:
+# templates/agent-landing.yaml). Template lives at
+# /usr/local/share/spatiumddi/agent-landing/index.html.in; firstboot
+# substitutes hostname + control-plane URL + version, writes the
+# result to /var/lib/spatiumddi/agent-landing/index.html where the
+# pod mounts it via hostPath.
+#
+# Reset umask before the write — the .env-secrets path above set 077
+# which would leave the file 0600 (root-readable only) + nginx
+# would 403 it.
+umask 022
+LANDING_TEMPLATE=/usr/local/share/spatiumddi/agent-landing/index.html.in
+LANDING_DIR=/var/lib/spatiumddi/agent-landing
+if [ -r "$LANDING_TEMPLATE" ]; then
+    mkdir -p "$LANDING_DIR"
+    chmod 0755 "$LANDING_DIR"
+    # Pull CONTROL_PLANE_URL / APPLIANCE_HOSTNAME / SPATIUMDDI_VERSION
+    # out of /etc/spatiumddi/.env (the same file firstboot just
+    # wrote or refreshed above). grep|cut so we don't have to
+    # ``source`` a file that might carry shell-special chars.
+    _env_get() {
+        grep "^${1}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-
+    }
+    HN=$(_env_get APPLIANCE_HOSTNAME)
+    HN="${HN:-$(hostname 2>/dev/null || echo unknown)}"
+    CPU=$(_env_get CONTROL_PLANE_URL)
+    CPU="${CPU:-(not set)}"
+    VER=$(_env_get SPATIUMDDI_VERSION)
+    VER="${VER:-(unknown)}"
+    sed \
+        -e "s|__HOSTNAME__|${HN}|g" \
+        -e "s|__CONTROL_PLANE_URL__|${CPU}|g" \
+        -e "s|__APPLIANCE_VERSION__|${VER}|g" \
+        "$LANDING_TEMPLATE" > "$LANDING_DIR/index.html"
+    chmod 0644 "$LANDING_DIR/index.html"
+    echo "Rendered $LANDING_DIR/index.html"
+fi
+
 # ── Phase 8 — refresh per-slot version sidecar ──────────────────────────────
 # Best-effort: a failure here doesn't block — the api just falls back
 # to "unknown" for the slot the operator hasn't booted into recently.

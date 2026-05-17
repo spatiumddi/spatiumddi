@@ -153,3 +153,17 @@ supervisor:
     # bytes to base64-encode into spec.chartContent. The path
     # matches service_lifecycle._BAKED_CHART_TARBALL.
     chartDir: /usr/lib/spatiumddi/charts
+
+# Always-on landing page served on :80 — "this is a SpatiumDDI
+# appliance" + hostname / control-plane URL / version. firstboot
+# renders the HTML from the template at
+# /usr/local/share/spatiumddi/agent-landing/index.html.in into
+# /var/lib/spatiumddi/agent-landing/ on the host; nginx hostPath-
+# mounts that dir read-only.
+agentLanding:
+  enabled: true
+  image:
+    repository: nginx
+    tag: 1.27-alpine
+  hostMounts:
+    htmlDir: /var/lib/spatiumddi/agent-landing
