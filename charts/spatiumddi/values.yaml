@@ -68,6 +68,26 @@ api:
   # ``settings.appliance_mode`` gate.
   serviceAccount:
     enabled: false
+  # Appliance host bind mounts. The api writes the setup-complete
+  # flag, slot-upgrade trigger files, rollback triggers, and the
+  # maintenance flag into ``/var/lib/spatiumddi-host/release-state/``
+  # — host-side ``spatiumddi-*.path`` systemd units watch that
+  # directory + dispatch the matching ``.service``. Also reads the
+  # host's slot-upgrade log + host env from
+  # ``/var/log/spatiumddi-host`` + ``/etc/spatiumddi-host`` for the
+  # ``/appliance`` UI surfaces. Leave off for non-appliance K8s
+  # installs; the host paths don't exist there and the ``/appliance``
+  # endpoints already 404 via the ``settings.appliance_mode`` gate.
+  applianceHostMounts:
+    enabled: false
+    # Host paths (created by spatiumddi-firstboot). The ``-host`` suffix
+    # appears only inside the container as the bind-mount target —
+    # backend code reads ``/var/lib/spatiumddi-host/release-state/...``
+    # which actually lives at ``/var/lib/spatiumddi/release-state/...``
+    # on the appliance's filesystem.
+    releaseStateDir: /var/lib/spatiumddi/release-state
+    hostLogDir: /var/log/spatiumddi
+    hostEtcDir: /etc/spatiumddi
 
 # ── Frontend (nginx + Vite build) ────────────────────────────────────────────
 frontend:

@@ -76,6 +76,38 @@ spec:
             failureThreshold: 3
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
+          {{- if .Values.api.applianceHostMounts.enabled }}
+          volumeMounts:
+            # Setup-complete flag, slot-upgrade triggers,
+            # maintenance flag — api WRITES here.
+            - name: spatiumddi-host-release-state
+              mountPath: /var/lib/spatiumddi-host/release-state
+            # Slot-upgrade log — api READS for the live tail in the
+            # OS Versions card.
+            - name: spatiumddi-host-log
+              mountPath: /var/log/spatiumddi-host
+              readOnly: true
+            # Host env (deployment_kind, role-config) — api READS for
+            # the Fleet UI's slot/version detection.
+            - name: spatiumddi-host-etc
+              mountPath: /etc/spatiumddi-host
+              readOnly: true
+          {{- end }}
+      {{- if .Values.api.applianceHostMounts.enabled }}
+      volumes:
+        - name: spatiumddi-host-release-state
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.releaseStateDir }}
+            type: DirectoryOrCreate
+        - name: spatiumddi-host-log
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.hostLogDir }}
+            type: DirectoryOrCreate
+        - name: spatiumddi-host-etc
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.hostEtcDir }}
+            type: DirectoryOrCreate
+      {{- end }}
       {{- with .Values.api.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
