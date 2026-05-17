@@ -1,0 +1,18 @@
+[Unit]
+Description=Watch for SpatiumDDI firewall drop-in trigger (issue #183 Phase 9)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/183
+# Skip on the live ISO — nothing writes the trigger from the
+# installer environment.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# PathChanged fires on close-after-write. The supervisor pod
+# (Application appliance) writes this file atomically via its
+# /var/lib/spatiumddi-host/release-state hostPath mount whenever a
+# role-assignment change requires the firewall drop-in to be
+# re-rendered. ``.new → mv`` rename pattern means each apply
+# fires the unit exactly once.
+PathChanged=/var/lib/spatiumddi/release-state/firewall-pending
+
+[Install]
+WantedBy=multi-user.target

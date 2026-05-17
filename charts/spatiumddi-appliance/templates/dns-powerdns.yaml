@@ -1,0 +1,108 @@
+{{- /* Issue #183 Phase 2 — PowerDNS DNS agent (alternative to BIND9).
+       Phase 10 wave 2 — ``.enabled`` is now release-ownership scope
+       (bootstrap=false, appliance=true), NOT role-scope. Scheduling
+       is gated by the ``spatium.io/role-dns-powerdns=true`` node
+       label. BIND9 vs PowerDNS mutual exclusion is enforced
+       supervisor-side: it sets at most one of ``role-dns-bind9`` /
+       ``role-dns-powerdns`` labels on any heartbeat. */}}
+{{- if .Values.dnsPowerdns.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dns-powerdns
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dns-powerdns
+spec:
+  # DaemonSet for symmetry with dns-bind9 + dhcp-kea — DESIRED=0
+  # when the node lacks ``spatium.io/role-dns-powerdns=true``, so
+  # ``kubectl get pods`` stays silent on unscheduled roles.
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dns-powerdns
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        app.kubernetes.io/name: dns-powerdns
+        app.kubernetes.io/component: dns-powerdns
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+        # Phase 10 (#183) — per-role scheduling label.
+        spatium.io/role-dns-powerdns: "true"
+      containers:
+        - name: dns-powerdns
+          image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dnsPowerdns.image.repository) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - name: CONTROL_PLANE_URL
+              value: {{ .Values.dnsPowerdns.controlPlaneUrl | quote }}
+            - name: DNS_AGENT_KEY
+              value: {{ .Values.dnsPowerdns.agentKey | quote }}
+            - name: AGENT_GROUP
+              value: {{ .Values.dnsPowerdns.serverGroupName | quote }}
+            {{- with .Values.global.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: dns-udp
+              containerPort: 53
+              protocol: UDP
+            - name: dns-tcp
+              containerPort: 53
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/powerdns
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: dns-powerdns-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-powerdns
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dns-powerdns
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: dns-powerdns
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dns-powerdns-data
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: {{ .Values.dnsPowerdns.persistence.data.size }}
+{{- end }}

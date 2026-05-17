@@ -1,0 +1,128 @@
+#!/bin/bash
+# spatiumddi-helm-stuck-recover — recover wedged k3s HelmChart releases
+# (issue #183 Phase 9).
+#
+# Live boot-test caught a failure mode where a HelmChart CR ended
+# up in a state that helm-controller couldn't auto-recover from:
+#
+#   $ helm ls --all          → spatium-bootstrap  failed,1
+#   $ helm uninstall ...     → "Error: release: not found"
+#   $ helm install ...       → "Error: namespaces 'spatium' exists"
+#
+# Root cause was the chart owning the spatium namespace; we fixed
+# that in 8c3a0a1 by dropping the Namespace template + having the
+# bootstrap manifest pre-create the namespace separately. So this
+# specific failure shouldn't recur. But other "release record
+# missing while resources still exist" wedges can still happen
+# (transient kine corruption, partial commit during a power loss,
+# a chart with a render error that gets fixed in a slot upgrade,
+# etc.). This timer-driven runner catches them generically.
+#
+# Action:
+#   1. List every HelmChart CR with status.conditions[Failed].status=True
+#   2. For each, if the failure has been latched for > 10 min
+#      (or there's no JobCompleted condition we can check the age
+#      of), wipe the stuck state:
+#        - Delete the helm-install Job in kube-system (helm-controller
+#          watches Job completion; deleting it triggers a fresh attempt)
+#        - Delete any sh.helm.release.v1.<name>.v* secrets in the
+#          target namespace (clears helm's release tracking so a
+#          fresh install can begin)
+#   3. Log every action loudly so an operator at `journalctl -u
+#      spatiumddi-helm-stuck-recover` can see what we did
+#
+# CONSERVATIVE: never delete the HelmChart CR itself (that would
+# uninstall everything) or any resources outside the helm release
+# secrets + the install Job. helm-controller is the source of truth
+# for what gets installed; we just unblock its retry loop.
+
+set -euo pipefail
+
+log() { printf '[helm-stuck-recover] %s\n' "$*"; }
+
+STUCK_THRESHOLD_SECONDS=600   # 10 min
+
+# /usr/local/bin/k3s carries kubectl + has access to the local
+# server via /etc/rancher/k3s/k3s.yaml.
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+KUBECTL="/usr/local/bin/k3s kubectl"
+
+# Bail silently if k3s isn't up yet (boot race) — the timer will
+# retry on the next tick.
+if ! $KUBECTL --request-timeout=5s get --raw=/readyz >/dev/null 2>&1; then
+    log "k3s api not ready — skipping this tick"
+    exit 0
+fi
+
+now_epoch=$(date +%s)
+
+# List HelmChart CRs as JSON. Empty result = nothing to do.
+charts_json=$($KUBECTL --request-timeout=10s get helmchart -A -o json 2>/dev/null || echo '{"items":[]}')
+
+# Walk each item, pull (namespace, name, conditions). We use python3
+# because jq isn't guaranteed (it's in the slot image but the runner
+# stays dep-free in case a future slot trims it).
+python3 - <<PY
+import json, sys, subprocess, time
+
+data = json.loads('''$charts_json''')
+now = int(time.time())
+
+def kubectl(*args):
+    return subprocess.run(
+        ["/usr/local/bin/k3s", "kubectl", *args],
+        env={"KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"},
+        capture_output=True, text=True, check=False,
+    )
+
+def parse_k8s_ts(s: str) -> int:
+    # ``2026-05-17T01:23:45Z`` → epoch
+    try:
+        from datetime import datetime, timezone
+        return int(datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
+    except Exception:
+        return 0
+
+for item in data.get("items", []):
+    meta = item.get("metadata", {})
+    ns = meta.get("namespace", "")
+    name = meta.get("name", "")
+    status = item.get("status", {})
+    conditions = status.get("conditions", [])
+    failed = next((c for c in conditions if c.get("type") == "Failed" and c.get("status") == "True"), None)
+    if not failed:
+        continue
+
+    # When did it transition to Failed=True? Field is
+    # ``lastTransitionTime`` on the condition.
+    transition = failed.get("lastTransitionTime") or meta.get("creationTimestamp", "")
+    transition_epoch = parse_k8s_ts(transition)
+    age = now - transition_epoch if transition_epoch else 99999
+    if age < ${STUCK_THRESHOLD_SECONDS}:
+        print(f"[helm-stuck-recover] HelmChart {ns}/{name} Failed for {age}s — under threshold, leaving alone")
+        continue
+
+    target_ns = item.get("spec", {}).get("targetNamespace") or ns
+    print(f"[helm-stuck-recover] CLEARING wedged HelmChart {ns}/{name} (Failed for {age}s, target ns={target_ns})")
+
+    # 1. Delete the helm-install Job — helm-controller watches Job
+    #    completion; deleting it triggers a fresh attempt.
+    job_name = f"helm-install-{name}"
+    r = kubectl("-n", ns, "delete", "job", job_name, "--ignore-not-found", "--wait=false")
+    print(f"[helm-stuck-recover]   delete job {ns}/{job_name}: rc={r.returncode}")
+
+    # 2. Delete stuck helm release secrets in the target namespace.
+    #    Filter by owner=helm + name=<release> via grep on the kubectl
+    #    output rather than --field-selector (which doesn't support
+    #    secret name prefix filters).
+    r = kubectl("-n", target_ns, "get", "secrets", "-l", "owner=helm",
+                "-o", "jsonpath={.items[*].metadata.name}")
+    secrets = [s for s in r.stdout.split() if s.startswith(f"sh.helm.release.v1.{name}.")]
+    for sec in secrets:
+        rr = kubectl("-n", target_ns, "delete", "secret", sec, "--ignore-not-found")
+        print(f"[helm-stuck-recover]   delete secret {target_ns}/{sec}: rc={rr.returncode}")
+    if not secrets:
+        print(f"[helm-stuck-recover]   no orphan release secrets in {target_ns}")
+
+    print(f"[helm-stuck-recover] {ns}/{name} unblocked — helm-controller will retry on next reconcile loop")
+PY

@@ -1,0 +1,10 @@
+[Unit]
+Description=Clear wedged k3s HelmChart releases so helm-controller retries (#183 Phase 9)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/183
+After=k3s.service
+Requires=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-helm-stuck-recover
+# No Install — only invoked by the .timer.

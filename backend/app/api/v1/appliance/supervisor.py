@@ -38,6 +38,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -153,9 +154,15 @@ class SupervisorRegisterRequest(BaseModel):
     @field_validator("pairing_code")
     @classmethod
     def _digits_only(cls, v: str) -> str:
-        if not v.isdigit():
+        # Operator-facing presentation can carry dashes / spaces
+        # (frontend chunks the code as ``1234-5678`` for
+        # readability); strip every non-digit before validating so
+        # ``1234-5678`` / ``1234 5678`` / ``12345678`` all
+        # resolve to the same canonical hash.
+        cleaned = "".join(ch for ch in v if ch.isdigit())
+        if len(cleaned) != 8:
             raise ValueError("Pairing code must be 8 decimal digits.")
-        return v
+        return cleaned
 
 
 class SupervisorRegisterResponse(BaseModel):
@@ -631,6 +638,25 @@ class SupervisorHeartbeatRequest(BaseModel):
     # None / omitted = supervisor didn't run the watchdog this tick
     # (typical on docker / k8s deployments or before the first probe).
     role_health: dict[str, dict[str, Any]] | None = None
+    # Issue #183 Phase 4 — local k3s cluster health summary. Shape:
+    # ``{"kubeapi_ready": bool, "nodes_total": int, "nodes_ready":
+    # int, "pods_total": int, "pods_by_phase": {<phase>: count}}``.
+    # Empty dict on legacy compose appliances; None / omitted = the
+    # supervisor didn't run the probe this tick (pre-#183 supervisors).
+    cluster_health: dict[str, Any] | None = None
+    # Issue #183 Phase 5 — operator-facing k3s metadata.
+    # ``k3s_version`` is the upstream release tag the slot was baked
+    # against (e.g. ``v1.35.4+k3s1``). ``kubeconfig`` is the raw
+    # admin kubeconfig YAML straight off the appliance — the backend
+    # rewrites ``server:`` for operator reachability + Fernet-encrypts
+    # before persisting. Both ``None`` = supervisor didn't ship them
+    # this tick (legacy compose / pre-Phase-5 / k3s not yet started).
+    k3s_version: str | None = None
+    kubeconfig: str | None = None
+    # Issue #183 Phase 6 — k3s server-cert ``Not After`` timestamp
+    # (ISO-8601 UTC). None when not k3s; the heartbeat handler
+    # leaves the column untouched in that case.
+    k3s_api_cert_expires_at: datetime | None = None
 
 
 class SupervisorRoleAssignment(BaseModel):
@@ -670,6 +696,12 @@ class SupervisorRoleAssignment(BaseModel):
     # role-driven mgmt + per-role blocks. NULL / empty → role-driven
     # rules only.
     firewall_extra: str | None = None
+    # Issue #183 Phase 6 — operator-allowed CIDRs for direct kubeapi
+    # access on tcp/6443. Empty = proxy-only (kubeapi stays on
+    # 127.0.0.1, only the supervisor's outbound proxy channel can
+    # drive it). The supervisor's firewall renderer emits one
+    # ``ip saddr { ... } tcp dport 6443 accept`` rule per heartbeat.
+    kubeapi_expose_cidrs: list[str] = Field(default_factory=list)
 
 
 class SupervisorHeartbeatResponse(BaseModel):
@@ -868,6 +900,48 @@ async def supervisor_heartbeat(
         # supervisor's ``since`` timestamp is the canonical "first
         # observed in this status" anchor across heartbeats.
         row.role_health = dict(body.role_health)
+    if body.cluster_health is not None:
+        # Issue #183 Phase 4 — supervisor's local-k3s health summary.
+        # Same overwrite-verbatim shape as role_health. Empty dict
+        # is a meaningful signal (legacy compose; clear stale state).
+        row.cluster_health = dict(body.cluster_health)
+
+    # Issue #183 Phase 5 — k3s version + kubeconfig persist. Both
+    # follow "only update when not None" so legacy compose / pre-
+    # Phase-5 supervisors don't blank the columns out.
+    if body.k3s_version is not None:
+        row.k3s_version = body.k3s_version
+    if body.k3s_api_cert_expires_at is not None:
+        # Issue #183 Phase 6 — k3s serving-cert expiry. Drives the
+        # ``k3s_api_cert_expiring`` alert rule. Overwrite-verbatim so
+        # k3s cert rotation (1-year default) propagates on the next
+        # tick.
+        row.k3s_api_cert_expires_at = body.k3s_api_cert_expires_at
+    if body.kubeconfig is not None:
+        from app.core.crypto import encrypt_str  # noqa: PLC0415
+
+        # Rewrite ``server: https://127.0.0.1:6443`` → the appliance's
+        # last-seen IP so the operator's downloaded kubeconfig
+        # actually works against the appliance over the wire. Falls
+        # back to localhost when last_seen_ip is unknown (operator
+        # can edit themselves). Same IP we surface in the row chip.
+        rewritten = body.kubeconfig
+        if row.last_seen_ip:
+            # k3s.yaml's server line is structured + greppable; the
+            # supervisor doesn't run a port-7443 listener so 6443 is
+            # always the right target port.
+            new_server = f"server: https://{row.last_seen_ip}:6443"
+            rewritten = re.sub(
+                r"server:\s*https://127\.0\.0\.1:6443",
+                new_server,
+                rewritten,
+            )
+            rewritten = re.sub(
+                r"server:\s*https://0\.0\.0\.0:6443",
+                new_server,
+                rewritten,
+            )
+        row.kubeconfig_encrypted = encrypt_str(rewritten)
 
     # Auto-clear desired_appliance_version once installed matches +
     # the upgrade landed cleanly. Same shape as #138 Phase 8f-4's
@@ -998,6 +1072,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
         dhcp_network_mode=dhcp_network_mode,
         dhcp_agent_key=dhcp_agent_key,
         firewall_extra=row.firewall_extra,
+        kubeapi_expose_cidrs=list(row.kubeapi_expose_cidrs or []),
     )
 
 
@@ -1061,6 +1136,23 @@ class ApplianceRow(BaseModel):
     # ``dhcp-kea``); values carry ``{role, status, since,
     # container_id}``.
     role_health: dict[str, dict[str, Any]]
+    # Issue #183 Phase 4 — local k3s cluster health summary.
+    cluster_health: dict[str, Any]
+    # Issue #183 Phase 5 — installed k3s version (plain text, public).
+    # NULL on legacy compose appliances / pre-#183 supervisors.
+    k3s_version: str | None
+    # Issue #183 Phase 5 — boolean indicating whether the supervisor
+    # has shipped a kubeconfig the operator can reveal. The cipher-
+    # text itself never leaves the server outside the reveal endpoint;
+    # the row schema only exposes a "have I got one" bit.
+    kubeconfig_set: bool
+    # Issue #183 Phase 6 — k3s server-cert ``Not After`` timestamp.
+    # NULL on legacy compose appliances; drives the
+    # ``k3s_api_cert_expiring`` alert rule.
+    k3s_api_cert_expires_at: datetime | None
+    # Issue #183 Phase 6 — operator-controlled CIDR allowlist for
+    # direct kubeapi access on tcp/6443. Empty = proxy-only.
+    kubeapi_expose_cidrs: list[str]
     # #170 Wave E follow-up — soft-delete timestamp. Non-null on
     # ``state=revoked`` rows; cleared by re-authorize.
     revoked_at: datetime | None = None
@@ -1123,6 +1215,11 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         role_switch_state=row.role_switch_state,
         role_switch_reason=row.role_switch_reason,
         role_health=dict(row.role_health or {}),
+        cluster_health=dict(row.cluster_health or {}),
+        k3s_version=row.k3s_version,
+        kubeconfig_set=row.kubeconfig_encrypted is not None,
+        k3s_api_cert_expires_at=row.k3s_api_cert_expires_at,
+        kubeapi_expose_cidrs=list(row.kubeapi_expose_cidrs or []),
         revoked_at=row.revoked_at,
         created_at=row.created_at,
     )
@@ -2143,3 +2240,648 @@ async def schedule_appliance_reboot(
         user=current_user.username,
     )
     return _row_to_schema(row)
+
+
+# ── Issue #183 Phase 4 — kubeapi proxy + restart-deployment action ──
+
+
+class K8sProxyPollResponse(BaseModel):
+    """Long-poll result. ``request_id`` is empty + ``method`` is empty
+    when the poll timed out without a request — the supervisor handles
+    that as "no work, poll again". Otherwise the supervisor decodes
+    ``body_b64`` and POSTs against its local kubeapi."""
+
+    request_id: str
+    method: str
+    path: str
+    headers: dict[str, str]
+    body_b64: str
+
+
+class K8sProxyReplyRequest(BaseModel):
+    """Supervisor-sent reply after executing the proxied request
+    against the local kubeapi. ``status`` is the kubeapi's HTTP
+    status; ``body_b64`` carries the response body verbatim."""
+
+    request_id: str
+    status: int
+    headers: dict[str, str] = Field(default_factory=dict)
+    body_b64: str = ""
+
+
+async def _require_cert_auth(request: Request, db: DB) -> Appliance:
+    """Shared cert-auth gate for the proxy endpoints. Returns the
+    authenticated appliance row. Raises 403 on failure — no fallback
+    to session-token here since the proxy channel only exists for
+    approved appliances with mTLS certs.
+    """
+    from app.services.appliance.cert_auth import (  # noqa: PLC0415
+        CertAuthFailed,
+        authenticate_cert,
+    )
+
+    try:
+        principal = await authenticate_cert(request, db)
+    except CertAuthFailed as exc:
+        logger.warning("appliance.k8s_proxy.cert_auth_failed", reason=exc.reason)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance client cert.") from exc
+    if principal is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Cert headers required for kubeapi proxy.",
+        )
+    if principal.appliance.state != APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"Appliance in state {principal.appliance.state!r}; proxy disabled.",
+        )
+    return principal.appliance
+
+
+@router.post(
+    "/supervisor/k8s-proxy/poll",
+    response_model=K8sProxyPollResponse,
+    summary="Long-poll for the next queued kubeapi request",
+)
+async def k8s_proxy_poll(request: Request, db: DB) -> K8sProxyPollResponse:
+    """Supervisor-only endpoint. The supervisor's ``k8s_proxy.py``
+    background thread holds an outbound long-poll here; when an
+    operator action enqueues a request bound for this appliance, the
+    poll returns immediately. Otherwise the request times out after
+    30 s and the supervisor re-issues.
+
+    Cert auth required — anonymous callers can't intercept queued
+    requests. Cert subject must match an approved appliance row
+    (the proxy queue is keyed by appliance_id, so a misbehaving cert
+    would only see its own queue anyway).
+    """
+    from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
+
+    appliance = await _require_cert_auth(request, db)
+    queued = await _proxy.pop_request(appliance.id, timeout=30.0)
+    if queued is None:
+        # No request within the timeout — return an empty shape so
+        # the supervisor loop just re-polls. 200 (not 204) so the
+        # supervisor doesn't have to special-case "no body".
+        return K8sProxyPollResponse(request_id="", method="", path="", headers={}, body_b64="")
+    return K8sProxyPollResponse(
+        request_id=queued.request_id,
+        method=queued.method,
+        path=queued.path,
+        headers=queued.headers,
+        body_b64=queued.body_b64,
+    )
+
+
+@router.post(
+    "/supervisor/k8s-proxy/reply/{request_id}",
+    summary="Return a kubeapi response to the awaiting operator action",
+)
+async def k8s_proxy_reply(
+    request_id: str,
+    body: K8sProxyReplyRequest,
+    request: Request,
+    db: DB,
+) -> dict[str, str]:
+    """Supervisor-only endpoint. Once the supervisor has executed the
+    proxied request against the local kubeapi, it POSTs the response
+    here. The backend's in-memory future map matches the request_id
+    + resolves the operator action's pending future.
+
+    Returns 200 either way — late replies (operator already timed
+    out + the future was GC'd) are logged + discarded server-side
+    so the supervisor's loop stays simple.
+    """
+    from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
+
+    appliance = await _require_cert_auth(request, db)
+    if body.request_id != request_id:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "request_id path/body mismatch",
+        )
+    response = _proxy.K8sProxyResponse(
+        request_id=request_id,
+        status=body.status,
+        headers=body.headers,
+        body_b64=body.body_b64,
+    )
+    delivered = _proxy.deliver_response(response)
+    logger.info(
+        "appliance.k8s_proxy.reply",
+        appliance_id=str(appliance.id),
+        request_id=request_id,
+        status=body.status,
+        delivered=delivered,
+    )
+    return {"delivered": "true" if delivered else "stale"}
+
+
+class ApplianceRestartDeploymentRequest(BaseModel):
+    """Operator-driven Deployment / DaemonSet rollout-restart.
+
+    Same effect as ``kubectl rollout restart <kind>/<name> -n
+    <namespace>``. Bumps the pod template's
+    ``kubectl.kubernetes.io/restartedAt`` annotation, which makes the
+    controller spin up new pods and reap the old ones one at a time.
+    """
+
+    kind: Literal["Deployment", "DaemonSet"]
+    namespace: str = Field(default="spatium", min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=253)
+
+
+@router.post(
+    "/appliances/{appliance_id}/k8s/restart",
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Rollout-restart a Deployment/DaemonSet on the appliance's k3s",
+)
+async def k8s_rollout_restart(
+    appliance_id: uuid.UUID,
+    body: ApplianceRestartDeploymentRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> dict[str, object]:
+    """First operator-facing direct-kubeapi action (#183 Phase 4
+    proof-of-concept). Enqueues a kubeapi PATCH against the local
+    cluster via the supervisor proxy + waits up to 30 s for the
+    response.
+
+    Returns ``{"ok": true, "status": <kubeapi-status>}`` on success;
+    surfaces a 504 if the supervisor doesn't reply in time, 502 if
+    the kubeapi itself returned an error.
+    """
+    from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
+
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state != APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Appliance in state {row.state!r}; kubeapi proxy unavailable.",
+        )
+
+    # Strategic-merge patch that bumps the pod template's
+    # ``restartedAt`` annotation. Standard kubectl rollout-restart
+    # shape — same JSON kubectl sends.
+    api_path = f"/apis/apps/v1/namespaces/{body.namespace}/" f"{body.kind.lower()}s/{body.name}"
+    patch_body = {
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "kubectl.kubernetes.io/restartedAt": datetime.now(UTC).isoformat()
+                    }
+                }
+            }
+        }
+    }
+    try:
+        status_code, response_body = await _proxy.k8s_call(
+            row.id,
+            "PATCH",
+            api_path,
+            body=patch_body,
+            content_type="application/strategic-merge-patch+json",
+            timeout=20.0,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status.HTTP_504_GATEWAY_TIMEOUT,
+            "Supervisor didn't reply in 20s. Is the appliance heartbeating?",
+        ) from exc
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.k8s_rollout_restart",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success" if 200 <= status_code < 300 else "failed",
+            new_value={
+                "kind": body.kind,
+                "namespace": body.namespace,
+                "name": body.name,
+                "kubeapi_status": status_code,
+            },
+        )
+    )
+    await db.commit()
+
+    if not 200 <= status_code < 300:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"kubeapi returned {status_code}: {response_body[:200]!r}",
+        )
+
+    logger.info(
+        "appliance.k8s_rollout_restart",
+        appliance_id=str(row.id),
+        kind=body.kind,
+        namespace=body.namespace,
+        name=body.name,
+        kubeapi_status=status_code,
+        user=current_user.username,
+    )
+    return {"ok": True, "status": status_code, "kind": body.kind, "name": body.name}
+
+
+# ── Issue #183 Phase 5 — kubeconfig reveal ──
+
+
+class RevealKubeconfigRequest(BaseModel):
+    """Operator's local-auth password — re-verified before we hand
+    back the cleartext kubeconfig. Same gate the SNMP-community and
+    agent-bootstrap-key reveals use."""
+
+    password: str
+
+
+class RevealKubeconfigResponse(BaseModel):
+    """Payload of a successful reveal. ``hostname`` is the operator-
+    visible name we surface in the suggested download filename
+    (``<hostname>.kubeconfig``)."""
+
+    configured: bool
+    kubeconfig: str | None
+    hostname: str
+
+
+@router.post(
+    "/appliances/{appliance_id}/k8s/kubeconfig/reveal",
+    response_model=RevealKubeconfigResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Reveal an appliance's k3s admin kubeconfig (superadmin + password)",
+)
+async def reveal_appliance_kubeconfig(
+    appliance_id: uuid.UUID,
+    body: RevealKubeconfigRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> RevealKubeconfigResponse:
+    """Return the appliance's stored kubeconfig after password
+    re-verification. Same shape as ``POST /admin/agent-keys/reveal``
+    and ``POST /settings/snmp/reveal-community``:
+
+    * Superadmin gate
+    * Local-auth gate (external-auth users have no password to
+      re-confirm)
+    * Password re-verification
+    * Every denial path emits an audit row + a 100 ms friction sleep
+
+    The kubeconfig's ``server:`` field has already been rewritten to
+    the appliance's last-seen IP on the way in (see the heartbeat
+    handler). Operators on the appliance's network can use the
+    downloaded file directly; operators on a different network may
+    need to edit the server line to a reachable address.
+    """
+    from app.core.crypto import decrypt_str  # noqa: PLC0415
+    from app.core.security import verify_password  # noqa: PLC0415
+
+    def _audit_denied(reason: str, *, row: Appliance | None = None) -> None:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="appliance_kubeconfig_reveal_denied",
+                resource_type="appliance",
+                resource_id=str(appliance_id),
+                resource_display=row.hostname if row else str(appliance_id),
+                result="forbidden",
+                new_value={"reason": reason},
+            )
+        )
+
+    if not current_user.is_superadmin:
+        _audit_denied("non_superadmin")
+        await db.commit()
+        await asyncio.sleep(0.1)
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only superadmins can reveal an appliance kubeconfig.",
+        )
+    if current_user.auth_source != "local":
+        _audit_denied("external_auth")
+        await db.commit()
+        await asyncio.sleep(0.1)
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Kubeconfig reveal requires a local-auth superadmin "
+            f"(your account authenticates via {current_user.auth_source}). "
+            "Log in as a local admin to reveal the kubeconfig.",
+        )
+    if not current_user.hashed_password or not verify_password(
+        body.password, current_user.hashed_password
+    ):
+        _audit_denied("password_mismatch")
+        await db.commit()
+        await asyncio.sleep(0.1)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password is incorrect.")
+
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        _audit_denied("appliance_not_found")
+        await db.commit()
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.kubeconfig_encrypted is None:
+        # Clean "nothing to reveal" — supervisor hasn't shipped a
+        # kubeconfig yet (legacy compose / pre-Phase-5 / k3s not
+        # started). Surface as a friendly state, not an error.
+        return RevealKubeconfigResponse(configured=False, kubeconfig=None, hostname=row.hostname)
+
+    try:
+        plaintext = decrypt_str(row.kubeconfig_encrypted)
+    except Exception:  # noqa: BLE001
+        _audit_denied("decrypt_failed", row=row)
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Stored kubeconfig could not be decrypted (key mismatch?). "
+            "The supervisor will re-ship it on the next heartbeat.",
+        ) from None
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance_kubeconfig_revealed",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_kubeconfig_revealed",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        user=current_user.username,
+    )
+    return RevealKubeconfigResponse(configured=True, kubeconfig=plaintext, hostname=row.hostname)
+
+
+# ── Issue #183 Phase 6 — kubeapi-expose CIDR editor ──
+
+
+class ApplianceKubeapiCidrsRequest(BaseModel):
+    """Operator-supplied list of CIDRs allowed to reach this
+    appliance's kubeapi on tcp/6443. Validated as a list of strings;
+    empty list = proxy-only (the default, recommended posture)."""
+
+    cidrs: list[str] = Field(default_factory=list, max_length=32)
+
+
+def _validate_cidr(value: str) -> str:
+    """Light CIDR validation — operator may type ``10.0.0.0/8`` or
+    a bare host ``192.168.1.50`` (which nftables accepts inline).
+    Strips whitespace, refuses anything that doesn't parse as an
+    ip_network or ip_address. Returns the normalised string the
+    nft renderer will emit verbatim."""
+    import ipaddress  # noqa: PLC0415
+
+    text = value.strip()
+    if not text:
+        raise ValueError("empty CIDR")
+    try:
+        return str(ipaddress.ip_network(text, strict=False))
+    except ValueError:
+        # Bare host — nft accepts a single-IP rule the same way.
+        try:
+            return str(ipaddress.ip_address(text))
+        except ValueError as exc:
+            raise ValueError(f"{text!r} isn't a valid CIDR or IP address") from exc
+
+
+@router.put(
+    "/appliances/{appliance_id}/kubeapi-cidrs",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Set the kubeapi-direct-access CIDR allowlist on an appliance",
+)
+async def update_appliance_kubeapi_cidrs(
+    appliance_id: uuid.UUID,
+    body: ApplianceKubeapiCidrsRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceRow:
+    """Update the operator-controlled CIDR allowlist for direct
+    kubeapi access. The supervisor's firewall renderer reads this
+    list on every heartbeat + emits ``ip saddr { ... } tcp dport
+    6443 accept`` rules.
+
+    Empty list = proxy-only (the recommended default): kubeapi stays
+    on 127.0.0.1 and the only path into it is the supervisor's
+    outbound proxy channel (Phase 4). Non-empty list = direct
+    access for operators who want sub-millisecond local-network
+    ops; the supervisor's mTLS proxy still works alongside.
+    """
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+
+    normalised: list[str] = []
+    for value in body.cidrs:
+        try:
+            normalised.append(_validate_cidr(value))
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                str(exc),
+            ) from exc
+
+    row.kubeapi_expose_cidrs = normalised
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.kubeapi_cidrs_updated",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={"kubeapi_expose_cidrs": normalised},
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance.kubeapi_cidrs_updated",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        cidr_count=len(normalised),
+        user=current_user.username,
+    )
+    return _row_to_schema(row)
+
+
+# ── Issue #183 Phase 8 — pod list + log viewer (via Phase 4 proxy) ──
+
+
+class K8sPodSummary(BaseModel):
+    """Trimmed shape of a kubeapi Pod for the operator's log-picker
+    dropdown. We don't surface the full PodSpec — operators only
+    need to pick (pod, container) for the log fetch."""
+
+    name: str
+    namespace: str
+    phase: str
+    ready: bool
+    containers: list[str]
+    labels: dict[str, str]
+
+
+class K8sPodListResponse(BaseModel):
+    pods: list[K8sPodSummary]
+
+
+@router.get(
+    "/appliances/{appliance_id}/k8s/pods",
+    response_model=K8sPodListResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="List pods on the appliance's local k3s (via the supervisor proxy)",
+)
+async def k8s_list_pods(
+    appliance_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    namespace: str = "spatium",
+) -> K8sPodListResponse:
+    """List pods in the named namespace via the kubeapi proxy.
+
+    Default namespace ``spatium`` covers every chart-deployed pod.
+    Operators who want kube-system / default visibility pass the
+    namespace explicitly — same kubeapi surface as ``kubectl get
+    pods``.
+    """
+    from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
+
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state != APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Appliance in state {row.state!r}; kubeapi proxy unavailable.",
+        )
+
+    path = f"/api/v1/namespaces/{namespace}/pods"
+    try:
+        status_code, body = await _proxy.k8s_call(row.id, "GET", path, timeout=15.0)
+    except TimeoutError as exc:
+        raise HTTPException(
+            status.HTTP_504_GATEWAY_TIMEOUT,
+            "Supervisor didn't reply in 15s. Is the appliance heartbeating?",
+        ) from exc
+    if not 200 <= status_code < 300:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"kubeapi returned {status_code}: {body[:200]!r}",
+        )
+
+    try:
+        import json  # noqa: PLC0415
+
+        data = json.loads(body)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"kubeapi returned non-JSON body: {exc}",
+        ) from exc
+
+    pods: list[K8sPodSummary] = []
+    for item in data.get("items") or []:
+        meta = item.get("metadata") or {}
+        spec = item.get("spec") or {}
+        st = item.get("status") or {}
+        container_statuses = st.get("containerStatuses") or []
+        ready = bool(container_statuses) and all(cs.get("ready") for cs in container_statuses)
+        pods.append(
+            K8sPodSummary(
+                name=meta.get("name") or "",
+                namespace=meta.get("namespace") or namespace,
+                phase=st.get("phase") or "Unknown",
+                ready=ready,
+                containers=[
+                    c.get("name") or "" for c in (spec.get("containers") or []) if c.get("name")
+                ],
+                labels=dict(meta.get("labels") or {}),
+            )
+        )
+    return K8sPodListResponse(pods=pods)
+
+
+@router.get(
+    "/appliances/{appliance_id}/k8s/logs",
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Fetch recent pod logs from the appliance's local k3s",
+)
+async def k8s_get_pod_logs(
+    appliance_id: uuid.UUID,
+    pod: str,
+    current_user: CurrentUser,
+    db: DB,
+    namespace: str = "spatium",
+    container: str | None = None,
+    tail_lines: int = 1000,
+):
+    """Return the last ``tail_lines`` lines of the named pod's log
+    via the kubeapi proxy.
+
+    Snapshot-mode rather than ``--follow``: the Phase 4 proxy is
+    request/response. For true ``kubectl logs -f``-style streaming
+    the operator can ssh to the appliance + run the kubectl directly
+    (kubeconfig revealed via the Fleet UI). A future Phase 8b
+    follow-up extends the proxy with a streaming-response channel.
+
+    Returns ``text/plain`` so the Fleet UI's textarea can render it
+    verbatim. Up to 1 MiB per call — k3s tail-line cap by default.
+    """
+    from fastapi.responses import PlainTextResponse  # noqa: PLC0415
+
+    from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
+
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state != APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Appliance in state {row.state!r}; kubeapi proxy unavailable.",
+        )
+
+    # Reject obvious path-injection on operator-supplied strings —
+    # the proxy concatenates them into the kubeapi URL.
+    if "/" in pod or "/" in namespace or (container and "/" in container):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid identifier")
+    tail = max(1, min(10_000, tail_lines))
+
+    path = f"/api/v1/namespaces/{namespace}/pods/{pod}/log?tailLines={tail}"
+    if container:
+        path += f"&container={container}"
+
+    try:
+        status_code, body = await _proxy.k8s_call(
+            row.id, "GET", path, accept="text/plain", timeout=20.0
+        )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status.HTTP_504_GATEWAY_TIMEOUT,
+            "Supervisor didn't reply in 20s.",
+        ) from exc
+    if not 200 <= status_code < 300:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"kubeapi returned {status_code}: {body[:200]!r}",
+        )
+    return PlainTextResponse(body.decode("utf-8", errors="replace"))

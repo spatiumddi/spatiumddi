@@ -85,6 +85,12 @@ RULE_TYPE_AUDIT_CHAIN_BROKEN = "audit_chain_broken"
 # meaning "alert me when fewer than 10 phones are reachable").
 RULE_TYPE_VOICE_LEASE_COUNT_BELOW = "voice_lease_count_below"
 
+# Issue #183 Phase 6 — k3s server cert expiry. Subject = appliance.
+# Same threshold-escalation shape as ``circuit_term_expiring`` /
+# ``domain_expiring``: warning at threshold_days, escalating to
+# critical as expiry approaches. Default threshold 30 d.
+RULE_TYPE_K3S_API_CERT_EXPIRING = "k3s_api_cert_expiring"
+
 RULE_TYPES = frozenset(
     {
         RULE_TYPE_SUBNET_UTILIZATION,
@@ -104,6 +110,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_COMPLIANCE_CHANGE,
         RULE_TYPE_AUDIT_CHAIN_BROKEN,
         RULE_TYPE_VOICE_LEASE_COUNT_BELOW,
+        RULE_TYPE_K3S_API_CERT_EXPIRING,
     }
 )
 
@@ -714,6 +721,70 @@ async def _matching_circuit_term_expiring_subjects(
             f"{threshold_days} d)"
         )
         matches.append((str(c.id), c.name, message, sev))
+    return matches
+
+
+# ── Appliance k3s cert evaluator (#183 Phase 6) ────────────────────
+
+
+async def _matching_k3s_api_cert_expiring_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for the
+    ``k3s_api_cert_expiring`` rule type. Mirrors the
+    ``circuit_term_expiring`` shape — severity escalates per
+    ``threshold/4`` (warning) / ``threshold/12`` (critical) so one
+    rule covers the 30 / 7-day expiry chain.
+
+    Only matches appliances where the supervisor has reported
+    ``k3s_api_cert_expires_at`` (k3s is the runtime). Soft-deleted
+    rows are excluded — a revoked appliance's cert expiring is
+    operator-actionable but not via this alert.
+    """
+    from app.models.appliance import Appliance  # noqa: PLC0415
+
+    threshold_days = rule.threshold_days or _DEFAULT_EXPIRING_THRESHOLD_DAYS
+    cutoff = now + timedelta(days=threshold_days)
+
+    rows = (
+        (
+            await db.execute(
+                select(Appliance)
+                .where(Appliance.revoked_at.is_(None))
+                .where(Appliance.k3s_api_cert_expires_at.is_not(None))
+                .where(Appliance.k3s_api_cert_expires_at <= cutoff)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    matches: list[tuple[str, str, str, str]] = []
+    for a in rows:
+        if a.k3s_api_cert_expires_at is None:
+            continue
+        delta = a.k3s_api_cert_expires_at - now
+        days_to_expiry = delta.days
+        sev = _escalate_severity_for_expiring(
+            rule.severity,
+            threshold_days=threshold_days,
+            days_to_expiry=days_to_expiry,
+        )
+        if days_to_expiry <= 0:
+            descriptor = "has expired"
+        elif days_to_expiry == 1:
+            descriptor = "expires tomorrow"
+        else:
+            descriptor = f"expires in {days_to_expiry} day(s)"
+        message = (
+            f"k3s API server cert on {a.hostname} {descriptor} "
+            f"({a.k3s_api_cert_expires_at.isoformat()}, threshold "
+            f"{threshold_days} d). k3s rotates this automatically; "
+            f"a restart of k3s.service should pick up a refreshed cert."
+        )
+        matches.append((str(a.id), a.hostname, message, sev))
     return matches
 
 
@@ -1450,6 +1521,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 expiring = await _matching_circuit_term_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
                 subject_type = "circuit"
+            elif rule.rule_type == RULE_TYPE_K3S_API_CERT_EXPIRING:
+                expiring = await _matching_k3s_api_cert_expiring_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
+                subject_type = "appliance"
             elif rule.rule_type == RULE_TYPE_SERVICE_TERM_EXPIRING:
                 expiring = await _matching_service_term_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]

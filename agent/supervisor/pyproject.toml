@@ -15,6 +15,12 @@ dependencies = [
   "structlog>=24.1",
   "cryptography>=42",
   "pydantic>=2.6",
+  # Issue #183 Phase 3 — supervisor talks to k3s via the kubeapi
+  # using a minimal stdlib http client (k8s_api.py). PyYAML is the
+  # one external lib we need for the chart values rendering +
+  # kubeconfig fallback parse. No kubernetes client lib — too large
+  # for the supervisor image + we only need ~3 verbs.
+  "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]

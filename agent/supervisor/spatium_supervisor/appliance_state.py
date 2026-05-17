@@ -53,6 +53,18 @@ _UDEV_DATA = Path("/run/udev/data")
 _UUID_RE = re.compile(r"root=UUID=([0-9a-fA-F-]+)")
 
 
+def detect_runtime() -> str:
+    """Issue #183 Phase 7 — the appliance is k3s-only.
+
+    Pre-Phase-7 this function branched on systemctl-is-active-k3s to
+    pick between the docker-compose and k3s lifecycle paths. Phase 7
+    retires the compose path entirely; the function survives as a
+    pure constant for any caller that still reads the runtime tag
+    (heartbeat telemetry, console rendering, etc.).
+    """
+    return "k3s"
+
+
 def detect_deployment_kind() -> str:
     """Best-effort introspection of where the agent is running.
 
@@ -599,6 +611,197 @@ def read_ntp_sync_state() -> str | None:
     return None
 
 
+_HOST_K3S_KUBECONFIG = Path("/etc/spatiumddi-host/rancher/k3s/k3s.yaml")
+# Fallback when the bind mount is the supervisor compose's
+# ``/etc/rancher/k3s`` path-through instead of the
+# ``/etc/spatiumddi-host`` mount. Both layouts exist in the wild.
+_DIRECT_K3S_KUBECONFIG = Path("/etc/rancher/k3s/k3s.yaml")
+_K3S_VERSION_SIDECAR = Path("/usr/share/doc/k3s/.version")
+
+
+def read_k3s_version() -> str | None:
+    """Issue #183 Phase 5 — installed k3s version stamped by the
+    build-time ``fetch-k3s.sh`` script. Single value per slot; the
+    Fleet UI shows it next to the appliance row.
+
+    Returns ``None`` when the sidecar is missing — pre-#183 slots or
+    non-appliance deploys.
+    """
+    if not _K3S_VERSION_SIDECAR.exists():
+        return None
+    try:
+        text = _K3S_VERSION_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def read_kubeconfig() -> str | None:
+    """Issue #183 Phase 5 — operator kubeconfig payload.
+
+    Reads ``k3s.yaml`` straight off the slot's /etc overlay (the
+    admin kubeconfig k3s writes on first start). Returns the raw
+    YAML text — the backend rewrites the ``server:`` field for
+    operator reachability (using the appliance's last-seen IP) and
+    Fernet-encrypts before persisting.
+
+    Returns ``None`` when:
+      * The supervisor isn't on a k3s appliance (``detect_runtime()
+        != "k3s"``)
+      * The kubeconfig file doesn't exist yet (k3s.service hasn't
+        started, or first-boot is still warming up)
+
+    Shipping the cleartext kubeconfig over the heartbeat is safe —
+    the heartbeat channel is already mTLS-encrypted end-to-end with
+    the supervisor's cert. At-rest encryption is the backend's job.
+    """
+    if detect_runtime() != "k3s":
+        return None
+    for path in (_HOST_K3S_KUBECONFIG, _DIRECT_K3S_KUBECONFIG):
+        if path.exists():
+            try:
+                return path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+    return None
+
+
+# Issue #183 Phase 6 — k3s server cert expiry probe. The k3s
+# default serving cert lives at one of two paths depending on
+# whether the supervisor's host bind mount picked up /var/lib/
+# rancher (the standard layout) or /var/lib/spatiumddi-host/
+# rancher (the bind-mount-everything fallback). Probe both.
+_K3S_SERVING_CERT_CANDIDATES = (
+    Path("/var/lib/spatiumddi-host/rancher/k3s/server/tls/serving-kube-apiserver.crt"),
+    Path("/var/lib/rancher/k3s/server/tls/serving-kube-apiserver.crt"),
+)
+
+
+def read_k3s_api_cert_expiry() -> str | None:
+    """Issue #183 Phase 6 — k3s server-cert ``Not After`` timestamp.
+
+    k3s rotates this cert automatically (1-year default). Surfacing
+    the expiry on the heartbeat lets the Fleet UI render an
+    "expires in N days" chip + drives the
+    ``k3s_api_cert_expiring`` alert rule at 30 / 7 day thresholds.
+
+    Returns the ISO-8601 UTC timestamp string the backend stores in
+    ``Appliance.k3s_api_cert_expires_at``. ``None`` when the cert
+    isn't readable (not k3s, no bind mount, file missing, parse
+    error). The backend's "only update when not None" semantics
+    leave the column untouched in those cases.
+    """
+    if detect_runtime() != "k3s":
+        return None
+    for path in _K3S_SERVING_CERT_CANDIDATES:
+        if not path.exists():
+            continue
+        try:
+            pem = path.read_bytes()
+        except OSError:
+            continue
+        try:
+            # cryptography is already a supervisor dep (cert_auth
+            # signs heartbeat bodies with the supervisor's Ed25519
+            # key). Lazy-import so non-cert-bearing imports stay
+            # fast.
+            from cryptography import x509  # noqa: PLC0415
+
+            cert = x509.load_pem_x509_certificate(pem)
+        except (ValueError, ImportError):
+            return None
+        # cert.not_valid_after_utc lands in cryptography 42+; the
+        # older naïve-datetime accessor is deprecated but still
+        # works as a fallback for forks that pin an older version.
+        not_after = getattr(cert, "not_valid_after_utc", None) or getattr(
+            cert, "not_valid_after", None
+        )
+        if not_after is None:
+            return None
+        if not_after.tzinfo is None:
+            from datetime import timezone  # noqa: PLC0415
+
+            not_after = not_after.replace(tzinfo=timezone.utc)
+        return not_after.isoformat()
+    return None
+
+
+def read_cluster_health() -> dict[str, object] | None:
+    """Issue #183 Phase 4 — local k3s health summary for the
+    heartbeat's slow drift channel.
+
+    Probes the local kubeapi for:
+      * Node count + how many report ``Ready``
+      * Pod count in the ``spatium`` namespace + per-phase breakdown
+      * Whether the kubeapi itself reports ``/readyz`` ok
+
+    Returns ``None`` when k3s isn't the runtime (no probe attempted)
+    or ``{}`` when probes fail (kubeapi unreachable from a
+    runtime-claimed-as-k3s appliance, which itself is signal).
+
+    Pure read-only — never mutates cluster state. Sub-2s total probe
+    budget so the heartbeat-collect step stays cheap.
+    """
+    if detect_runtime() != "k3s":
+        return None
+
+    # Lazy import — non-appliance / non-k3s deployments don't load
+    # the kubeapi client.
+    from . import k8s_api  # noqa: PLC0415
+
+    summary: dict[str, object] = {"kubeapi_ready": False}
+    if not k8s_api.check_kubeapi_ready(timeout=1.5):
+        return summary
+    summary["kubeapi_ready"] = True
+
+    # Node count via the kubeapi list. Each node carries a
+    # ``conditions`` array; the ``Ready`` condition's ``status`` is
+    # ``True`` when the kubelet says so.
+    try:
+
+        status_code, body = k8s_api._request("GET", "/api/v1/nodes")
+    except (RuntimeError, OSError):
+        return summary
+    if status_code == 200:
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            data = {}
+        nodes = data.get("items") or []
+        ready = 0
+        for n in nodes:
+            for cond in (n.get("status") or {}).get("conditions") or []:
+                if cond.get("type") == "Ready" and cond.get("status") == "True":
+                    ready += 1
+                    break
+        summary["nodes_total"] = len(nodes)
+        summary["nodes_ready"] = ready
+
+    # Pod count in the spatium namespace, grouped by phase.
+    try:
+        status_code, body = k8s_api._request("GET", "/api/v1/namespaces/spatium/pods")
+    except (RuntimeError, OSError):
+        return summary
+    if status_code == 200:
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            data = {}
+        pods = data.get("items") or []
+        phase_counts: dict[str, int] = {}
+        for p in pods:
+            phase = (p.get("status") or {}).get("phase") or "Unknown"
+            phase_counts[phase] = phase_counts.get(phase, 0) + 1
+        summary["pods_total"] = len(pods)
+        summary["pods_by_phase"] = phase_counts
+    elif status_code == 404:
+        # Namespace doesn't exist yet — no role assigned, no pods.
+        summary["pods_total"] = 0
+        summary["pods_by_phase"] = {}
+
+    return summary
+
+
 def collect() -> dict[str, object]:
     """Snapshot the agent's slot + deployment state for the heartbeat.
 
@@ -621,6 +824,10 @@ def collect() -> dict[str, object]:
     )
 
     slot_a_version, slot_b_version = read_slot_versions()
+    cluster_health = read_cluster_health() if is_appliance else None
+    k3s_version = read_k3s_version() if is_appliance else None
+    kubeconfig = read_kubeconfig() if is_appliance else None
+    k3s_api_cert_expires_at = read_k3s_api_cert_expiry() if is_appliance else None
 
     return {
         "deployment_kind": deployment_kind,
@@ -644,4 +851,22 @@ def collect() -> dict[str, object]:
         # reference / stratum >= 16; ``unknown`` = chronyc unreadable
         # (transient at boot). None on non-appliance deploys.
         "ntp_sync_state": read_ntp_sync_state() if is_appliance else None,
+        # Issue #183 Phase 4 — local k3s health summary. Slow drift
+        # signals that ride the heartbeat (fast actions go through
+        # the proxy). Empty dict on non-k3s appliances; never None
+        # so the backend's "overwrite verbatim" semantics clear stale
+        # health when k3s is disabled.
+        "cluster_health": cluster_health if cluster_health is not None else {},
+        # Issue #183 Phase 5 — operator-facing k3s metadata. The
+        # backend rewrites the kubeconfig's ``server:`` field for
+        # operator reachability + Fernet-encrypts before persisting.
+        # ``None`` when k3s isn't the runtime (backend then leaves
+        # the column untouched).
+        "k3s_version": k3s_version,
+        "kubeconfig": kubeconfig,
+        # Issue #183 Phase 6 — k3s server-cert ``Not After``
+        # timestamp (ISO-8601 UTC) so the backend can drive expiry
+        # alerts. None when not k3s; the backend leaves the column
+        # untouched on null.
+        "k3s_api_cert_expires_at": k3s_api_cert_expires_at,
     }

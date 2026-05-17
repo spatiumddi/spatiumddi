@@ -1,0 +1,106 @@
+{{- /* Issue #183 Phase 2 scaffold — spatium-supervisor.
+       Deferred: Phase 3 ports the supervisor onto k3s + wires the
+       CRD reconciler. This template ships the eventual pod spec
+       (privileged DaemonSet, hostPath mounts identical to today's
+       docker-compose volume mounts) so the chart structure is
+       stable + Phase 3 only flips supervisor.enabled to true.
+       Phase 2 keeps it ``enabled: false`` by default. */}}
+{{- if .Values.supervisor.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: spatium-supervisor
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supervisor
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spatium-supervisor
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        app.kubernetes.io/name: spatium-supervisor
+        app.kubernetes.io/component: supervisor
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+      # Issue #183 Phase 3 — in-cluster auth via the SA the matching
+      # supervisor-rbac template provisions. The auto-mounted SA
+      # token + ca.crt give the supervisor's k8s_api module enough
+      # to PATCH HelmChart CRs in kube-system + read pods in the
+      # spatium namespace, no external kubeconfig needed.
+      serviceAccountName: spatium-supervisor
+      hostPID: true
+      containers:
+        - name: spatium-supervisor
+          image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.supervisor.image.repository) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          # Privileged because the supervisor writes host-side
+          # trigger files + reads /run/udev. Phase 3 narrows this
+          # down once the controller pattern lands.
+          securityContext:
+            privileged: true
+          env:
+            # Phase 10 (#183) — k8s_api.patch_node_labels needs the
+            # node name. Downward API surfaces the kubelet-known
+            # node name without having to guess from hostname (which
+            # may not match the registered node identity, especially
+            # on multi-NIC setups).
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: etc-spatiumddi-host
+              mountPath: /etc/spatiumddi-host
+              readOnly: true
+            - name: release-state
+              mountPath: /var/lib/spatiumddi-host/release-state
+            - name: boot-efi
+              mountPath: /boot/efi-host
+              readOnly: true
+            - name: run-udev
+              mountPath: /run/udev
+              readOnly: true
+            - name: state-dir
+              mountPath: /var/lib/spatium-supervisor
+            - name: chart-dir
+              mountPath: /usr/lib/spatiumddi/charts
+              readOnly: true
+            # Phase 3 will mount /etc/rancher/k3s/k3s.yaml here so the
+            # supervisor can talk to its local kubeapi.
+            - name: kubeconfig
+              mountPath: /etc/rancher/k3s
+              readOnly: true
+      volumes:
+        - name: etc-spatiumddi-host
+          hostPath:
+            path: {{ .Values.supervisor.hostMounts.etcSpatiumddiHost }}
+            type: Directory
+        - name: release-state
+          hostPath:
+            path: {{ .Values.supervisor.hostMounts.releaseState }}
+            type: DirectoryOrCreate
+        - name: boot-efi
+          hostPath:
+            path: {{ .Values.supervisor.hostMounts.bootEfi }}
+            type: Directory
+        - name: run-udev
+          hostPath:
+            path: {{ .Values.supervisor.hostMounts.runUdev }}
+            type: Directory
+        - name: state-dir
+          hostPath:
+            path: {{ .Values.supervisor.hostMounts.stateDir }}
+            type: DirectoryOrCreate
+        - name: chart-dir
+          hostPath:
+            path: {{ .Values.supervisor.hostMounts.chartDir }}
+            type: Directory
+        - name: kubeconfig
+          hostPath:
+            path: /etc/rancher/k3s
+            type: Directory
+{{- end }}

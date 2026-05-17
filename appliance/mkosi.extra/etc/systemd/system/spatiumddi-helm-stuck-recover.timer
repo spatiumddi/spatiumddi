@@ -1,0 +1,18 @@
+[Unit]
+Description=Periodically scan for wedged k3s HelmChart releases (issue #183 Phase 9)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/183
+# Don't fire on the live ISO — k3s isn't running there.
+ConditionKernelCommandLine=!boot=live
+
+[Timer]
+# Wait 5 min after boot so k3s + helm-install have time to do their
+# first-install dance on a fresh appliance without us interfering.
+OnBootSec=5min
+# Then every 5 min in steady state. The runner short-circuits on
+# anything that isn't a >10 min stuck failed release, so the
+# steady-state cost is one kubectl call per tick.
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

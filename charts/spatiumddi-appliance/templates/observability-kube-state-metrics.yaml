@@ -1,0 +1,160 @@
+{{- /* Issue #183 Phase 8 — kube-state-metrics.
+
+       Exposes cluster-state metrics at port 8080 (/metrics) in
+       Prometheus format. Standard k8s observability primitive — the
+       future control-plane Prometheus federation scrapes this.
+
+       Default-off (operator opt-in via values.yaml or the Fleet UI).
+       Air-gap-friendly: image is preloaded into containerd at slot
+       bake time; ``imagePullPolicy: Never``.
+
+       Scoped to the ``spatium`` namespace via the role binding so
+       a misconfigured KSM doesn't surface the kube-system control
+       plane's pod inventory (which the operator hasn't asked to
+       monitor). Bumping scope later is a one-line edit. */}}
+{{- if .Values.observability.kubeStateMetrics.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-state-metrics
+  namespace: spatium
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kube-state-metrics
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spatium-kube-state-metrics
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources:
+      - configmaps
+      - secrets
+      - nodes
+      - pods
+      - services
+      - resourcequotas
+      - replicationcontrollers
+      - limitranges
+      - persistentvolumeclaims
+      - persistentvolumes
+      - namespaces
+      - endpoints
+    verbs: ["list", "watch"]
+  - apiGroups: ["apps"]
+    resources:
+      - statefulsets
+      - daemonsets
+      - deployments
+      - replicasets
+    verbs: ["list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs", "jobs"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies", "ingresses"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "volumeattachments"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spatium-kube-state-metrics
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: spatium-kube-state-metrics
+subjects:
+  - kind: ServiceAccount
+    name: kube-state-metrics
+    namespace: spatium
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kube-state-metrics
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kube-state-metrics
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        app.kubernetes.io/name: kube-state-metrics
+        app.kubernetes.io/component: kube-state-metrics
+    spec:
+      serviceAccountName: kube-state-metrics
+      nodeSelector:
+        {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+      containers:
+        - name: kube-state-metrics
+          image: "{{ .Values.observability.kubeStateMetrics.image.repository }}:{{ .Values.observability.kubeStateMetrics.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - name: http-metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: telemetry
+              containerPort: 8081
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.observability.kubeStateMetrics.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-state-metrics
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kube-state-metrics
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kube-state-metrics
+  ports:
+    - name: http-metrics
+      port: 8080
+      protocol: TCP
+    - name: telemetry
+      port: 8081
+      protocol: TCP
+{{- end }}

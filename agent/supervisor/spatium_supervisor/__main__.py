@@ -31,6 +31,7 @@ from . import approval_state
 from .cert_auth import clear_cert
 from .config import SupervisorConfig
 from .heartbeat import heartbeat_once
+from .k8s_proxy import start_proxy_thread
 from .identity import (
     clear_appliance_id,
     clear_session_token,
@@ -168,6 +169,19 @@ def main() -> int:
     )
 
     _maybe_register(cfg, log)
+
+    # Issue #183 Phase 4 — k3s proxy thread. Daemon thread that
+    # long-polls the control plane for queued kubeapi requests +
+    # forwards them to the local k3s apiserver. Self-resilient
+    # (no cert / no registration / no k3s → sleep + retry); safe
+    # to spawn even on legacy compose deployments. The proxy is
+    # net-new for #183; pre-#183 control planes don't enqueue
+    # anything so the loop just sees empty polls.
+    if cfg.k8s_proxy_enabled:
+        identity_for_proxy, _ = load_or_generate(cfg.state_dir)
+        start_proxy_thread(cfg, identity_for_proxy)
+    else:
+        log.info("supervisor.k8s_proxy.disabled_by_config")
 
     stop = False
 

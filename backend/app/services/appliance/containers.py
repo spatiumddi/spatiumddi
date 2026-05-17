@@ -1,12 +1,19 @@
-"""Docker container listing + control + log tailing (Phase 4d).
+"""Pod listing + control + log tailing for the appliance Fleet UI.
 
-Talks to the docker socket via the docker SDK; gated on
-``settings.appliance_mode`` + the socket actually being reachable
-(group_add for the docker gid is required on the appliance compose;
-see docker-compose.yml).
+Phase 11 wave 4 (#183) rewrite. Pre-Phase-11 this talked to the
+docker socket via the docker SDK; appliance mode is now k3s-only
+(see Phase 7 docker-strip), so we go through kubeapi instead via
+the api pod's mounted ServiceAccount token.
 
-The endpoints in ``app/api/v1/appliance/containers.py`` wrap these
-helpers + add permission gates + audit-log rows.
+The endpoints in ``app/api/v1/appliance/containers.py`` wrap
+these helpers + add permission gates + audit-log rows. The public
+exception name + dataclass shape are unchanged so callers don't
+have to follow the rewrite.
+
+Gated on ``settings.appliance_mode`` + the ServiceAccount actually
+being mounted (``services/appliance/k8s.get_config()``). On docker-
+compose / non-k8s deployments the gate fails fast + the endpoints
+log + 503 — same shape the docker path used.
 """
 
 from __future__ import annotations
@@ -14,199 +21,241 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from typing import Any
 
 import anyio
 import structlog
 
 from app.config import settings
+from app.services.appliance import k8s
 
 logger = structlog.get_logger(__name__)
 
-_DOCKER_SOCK = Path("/var/run/docker.sock")
-# Spatium containers carry this label-prefix on the compose ``name``
-# (e.g. ``spatiumddi-api-1``, ``spatiumddi-frontend``). The listing
-# endpoint filters to these so operators don't see unrelated stuff
-# (other compose projects, system containers) on the same host.
-_SPATIUM_NAME_PREFIX = "spatiumddi-"
-
 
 class DockerUnavailableError(RuntimeError):
-    """Raised when the docker socket can't be reached or the SDK is
-    missing. The router translates these into 503 Service Unavailable."""
+    """Raised when kubeapi can't be reached or the ServiceAccount
+    isn't mounted.
+
+    Name kept for backwards compat with the router which translates
+    this to 503 Service Unavailable. The error message body
+    distinguishes the real cause for the operator's log.
+    """
 
 
 @dataclass
 class ContainerSummary:
+    """Pod summary in a docker-shape (name/image/state/status/
+    health/short_id/started_at/is_spatium) for the existing
+    ``/appliance/containers`` API surface.
+
+    ``short_id`` is the pod's metadata.uid truncated to 12 chars
+    (matches docker short_id length). ``health`` reflects the
+    pod-level readiness summary (healthy / unhealthy / starting)
+    derived from container statuses + waiting reasons — same
+    vocabulary the docker container model used.
+    """
+
     name: str
     image: str
-    state: str  # running / restarting / exited / paused / created
-    status: str  # human-readable e.g. "Up 5 minutes (healthy)"
+    state: str  # running / pending / succeeded / failed / unknown
+    status: str  # human-readable e.g. "Running (5m, healthy)"
     health: str | None  # healthy / unhealthy / starting / None
     short_id: str
     started_at: datetime | None
     is_spatium: bool
 
 
-def _client():
-    """Lazy docker SDK import + connect.
+def _parse_pod_to_summary(pod: dict[str, Any]) -> ContainerSummary:
+    """Flatten a kubeapi Pod object to ContainerSummary."""
+    meta = pod.get("metadata") or {}
+    spec = pod.get("spec") or {}
+    status_obj = pod.get("status") or {}
+    name = meta.get("name") or ""
+    labels = meta.get("labels") or {}
+    # "Spatium" pod detection — both chart conventions count:
+    #   * umbrella (charts/spatiumddi/): ``app.kubernetes.io/name=
+    #     spatiumddi``
+    #   * appliance (charts/spatiumddi-appliance/):
+    #     ``app.kubernetes.io/part-of=spatiumddi`` (plus the same
+    #     ``name`` on some templates)
+    is_spatium = (
+        labels.get("app.kubernetes.io/part-of") == "spatiumddi"
+        or labels.get("app.kubernetes.io/name") == "spatiumddi"
+    )
 
-    Defer the import so non-appliance deploys don't pay the (small)
-    import cost. Raises DockerUnavailableError on any failure.
-    """
-    if not _DOCKER_SOCK.exists():
-        raise DockerUnavailableError("docker socket not mounted into the api container")
-    try:
-        import docker  # noqa: PLC0415
-        from docker.errors import DockerException  # noqa: PLC0415
-    except ImportError as exc:
-        raise DockerUnavailableError(f"docker SDK not installed: {exc}") from exc
-    try:
-        return docker.from_env()
-    except DockerException as exc:
-        raise DockerUnavailableError(f"docker client init failed: {exc}") from exc
+    containers = spec.get("containers") or []
+    first_image = containers[0].get("image", "") if containers else ""
+
+    phase = status_obj.get("phase") or "Unknown"
+    # Health derived from container readiness + waiting reasons.
+    container_statuses = status_obj.get("containerStatuses") or []
+    health: str | None = None
+    waiting_reason = ""
+    if phase == "Running" and container_statuses:
+        all_ready = all(cs.get("ready") for cs in container_statuses)
+        if all_ready:
+            health = "healthy"
+        else:
+            for cs in container_statuses:
+                waiting = (cs.get("state") or {}).get("waiting") or {}
+                r = waiting.get("reason") or ""
+                if r:
+                    waiting_reason = r
+                    break
+            if waiting_reason.lower() in (
+                "crashloopbackoff",
+                "errimagepull",
+                "imagepullbackoff",
+            ):
+                health = "unhealthy"
+            else:
+                health = "starting"
+    elif phase == "Pending":
+        health = "starting"
+    elif phase in ("Failed", "Unknown"):
+        health = "unhealthy"
+
+    # State mirrors the docker vocabulary roughly:
+    #   Running   → running
+    #   Pending   → starting (no docker analog; closest is "created")
+    #   Succeeded → exited
+    #   Failed    → exited
+    #   Unknown   → unknown
+    state = {
+        "Running": "running",
+        "Pending": "starting",
+        "Succeeded": "exited",
+        "Failed": "exited",
+    }.get(phase, "unknown")
+
+    # Human-readable status combining phase + age + health hint.
+    # Same shape ``docker ps`` produces:  "Up 5 minutes (healthy)".
+    start_time = status_obj.get("startTime")
+    started_at: datetime | None = None
+    if start_time:
+        try:
+            started_at = datetime.fromisoformat(start_time.rstrip("Z") + "+00:00")
+        except ValueError:
+            started_at = None
+    if waiting_reason:
+        status_str = f"{phase} ({waiting_reason})"
+    elif health:
+        status_str = f"{phase} ({health})"
+    else:
+        status_str = phase
+
+    return ContainerSummary(
+        name=name,
+        image=first_image,
+        state=state,
+        status=status_str,
+        health=health,
+        short_id=(meta.get("uid") or "")[:12],
+        started_at=started_at,
+        is_spatium=is_spatium,
+    )
 
 
 def list_containers() -> list[ContainerSummary]:
     if not settings.appliance_mode:
         return []
-    client = _client()
-    out: list[ContainerSummary] = []
-    for c in client.containers.list(all=True):
-        attrs = c.attrs or {}
-        state_obj = attrs.get("State", {}) or {}
-        health_obj = state_obj.get("Health") or {}
-        started_raw = state_obj.get("StartedAt")
-        started_at: datetime | None
-        try:
-            # docker emits ISO 8601 in UTC; py3.11+ fromisoformat handles
-            # the trailing Z directly in 3.12 but we strip just in case.
-            started_at = (
-                datetime.fromisoformat(started_raw.rstrip("Z") + "+00:00")
-                if started_raw and started_raw != "0001-01-01T00:00:00Z"
-                else None
-            )
-        except (ValueError, AttributeError):
-            started_at = None
-        name = c.name or ""
-        out.append(
-            ContainerSummary(
-                name=name,
-                image=(c.image.tags[0] if c.image and c.image.tags else c.attrs.get("Image", "")),
-                state=state_obj.get("Status", "unknown"),
-                status=c.status,
-                health=health_obj.get("Status") if health_obj else None,
-                short_id=c.short_id,
-                started_at=started_at,
-                is_spatium=name.startswith(_SPATIUM_NAME_PREFIX),
-            )
-        )
-    # Spatium containers first, then alphabetical within each group.
+    try:
+        pods = k8s.list_pods()
+    except k8s.KubeapiUnavailableError as exc:
+        raise DockerUnavailableError(str(exc)) from exc
+    out = [_parse_pod_to_summary(p) for p in pods]
+    # Spatium pods first, then alphabetical within each group.
     out.sort(key=lambda c: (not c.is_spatium, c.name))
     return out
 
 
 def container_action(name: str, action: str) -> None:
-    """Apply ``start`` / ``stop`` / ``restart`` to the named container."""
-    valid = {"start", "stop", "restart"}
-    if action not in valid:
-        raise ValueError(f"unknown container action: {action!r}")
-    client = _client()
-    try:
-        from docker.errors import APIError, NotFound  # noqa: PLC0415
-    except ImportError as exc:
-        raise DockerUnavailableError(str(exc)) from exc
-    try:
-        container = client.containers.get(name)
-    except NotFound as exc:
-        raise DockerUnavailableError(f"no container named {name!r}") from exc
-    except APIError as exc:
-        raise DockerUnavailableError(str(exc)) from exc
-    getattr(container, action)()
-    logger.info("appliance_container_action", name=name, action=action)
+    """Apply ``start`` / ``stop`` / ``restart`` to the named pod.
+
+    K8s vocabulary:
+      * ``restart`` → delete the pod; the owning Deployment /
+        DaemonSet recreates it on the next reconcile.
+      * ``start`` / ``stop`` → not directly supported on a single
+        pod (you'd scale the owning Deployment). For the appliance
+        Fleet UI's purposes ``restart`` is the only meaningful
+        action; ``start`` / ``stop`` raise ValueError (was a
+        wishlist UX in the docker era).
+    """
+    if action == "restart":
+        ok, err = k8s.delete_pod(name)
+        if not ok:
+            raise DockerUnavailableError(err or f"failed to delete pod {name}")
+        logger.info("appliance_pod_restart", name=name)
+        return
+    if action in ("start", "stop"):
+        raise ValueError(
+            f"pod action {action!r} requires scaling the owning Deployment; "
+            "use kubectl scale for now (UI exposure pending)"
+        )
+    raise ValueError(f"unknown pod action: {action!r}")
 
 
 def get_container_logs(name: str, tail: int = 200, since_seconds: int | None = None) -> str:
     """Return the last ``tail`` log lines (or lines since N seconds ago).
 
-    Combined stdout+stderr, decoded to UTF-8 with replacement for
-    binary fragments. Truncated at ``tail`` lines on the server side
-    so the response is bounded.
+    Decoded UTF-8 with replacement for binary fragments. Truncated at
+    ``tail`` lines server-side so response is bounded.
     """
-    client = _client()
     try:
-        container = client.containers.get(name)
-    except Exception as exc:  # noqa: BLE001
+        body = k8s.get_pod_logs(name, tail=tail, since_seconds=since_seconds)
+    except k8s.KubeapiUnavailableError as exc:
         raise DockerUnavailableError(str(exc)) from exc
-    kwargs: dict[str, object] = {
-        "stdout": True,
-        "stderr": True,
-        "tail": tail,
-        "timestamps": True,
-    }
-    if since_seconds is not None:
-        from datetime import timedelta
-
-        kwargs["since"] = datetime.now(UTC) - timedelta(seconds=since_seconds)
-    raw = container.logs(**kwargs)
-    if isinstance(raw, bytes):
-        return raw.decode("utf-8", errors="replace")
-    return str(raw)
+    return body
 
 
 async def stream_container_logs(name: str, tail: int = 100) -> AsyncGenerator[str, None]:
-    """Yield log lines from the named container as they arrive.
+    """Yield log lines from the named pod as they arrive.
 
-    Wraps the docker SDK's blocking iterator with anyio.to_thread so
-    the FastAPI event loop isn't blocked. Each yielded chunk is a
-    UTF-8 string; the router formats them as SSE ``data:`` frames.
+    Wraps ``k8s.stream_pod_logs`` (a sync generator) with
+    ``anyio.to_thread.run_sync`` so the FastAPI event loop isn't
+    blocked. Each yielded chunk is a UTF-8 string with the
+    trailing newline stripped; the router formats them as SSE
+    ``data:`` frames.
 
     Cancellation: when the SSE client disconnects, FastAPI cancels
-    this generator; anyio.to_thread.run_sync runs to its next
-    cancellation checkpoint and we exit cleanly.
+    this generator; the underlying http.client connection in the
+    worker thread is closed via the generator's GeneratorExit
+    propagation through the iter wrapper below.
     """
-    client = _client()
     try:
-        container = client.containers.get(name)
-    except Exception as exc:  # noqa: BLE001
+        gen = k8s.stream_pod_logs(name, tail=tail)
+    except k8s.KubeapiUnavailableError as exc:
         raise DockerUnavailableError(str(exc)) from exc
 
-    log_stream = container.logs(
-        stdout=True,
-        stderr=True,
-        stream=True,
-        follow=True,
-        tail=tail,
-        timestamps=True,
-    )
-
-    # ``log_stream`` is a sync byte-iterator. Pulling each chunk inside
-    # a worker thread keeps the event loop responsive — important
-    # because SSE clients might stay connected for hours and the
-    # event loop has other things to do.
-    iterator = iter(log_stream)
-
-    def _next() -> bytes | None:
+    def _next() -> str | None:
         try:
-            return next(iterator)
+            return next(gen)
         except StopIteration:
             return None
 
     try:
         while True:
-            chunk = await anyio.to_thread.run_sync(_next)
-            if chunk is None:
+            line = await anyio.to_thread.run_sync(_next)
+            if line is None:
                 break
-            if isinstance(chunk, bytes):
-                yield chunk.decode("utf-8", errors="replace")
-            else:
-                yield str(chunk)
+            yield line
     finally:
-        # Best-effort close of the underlying urllib3 response so
-        # docker SDK doesn't leave a dangling socket on disconnect.
-        close = getattr(log_stream, "close", None)
+        close = getattr(gen, "close", None)
         if callable(close):
             try:
                 close()
             except Exception:  # noqa: BLE001
                 pass
+
+
+__all__ = [
+    "ContainerSummary",
+    "DockerUnavailableError",
+    "container_action",
+    "get_container_logs",
+    "list_containers",
+    "stream_container_logs",
+]
+
+
+_ = UTC  # silence "imported but unused" — kept for stable import line

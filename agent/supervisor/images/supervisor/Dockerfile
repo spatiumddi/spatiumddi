@@ -16,22 +16,19 @@ COPY agent/supervisor/README.md /src/README.md
 RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packages .
 
 FROM alpine:3.22 AS runtime
-# ``docker-cli`` (Wave C) lets the supervisor talk to the host's
-# docker daemon via the bind-mounted ``/var/run/docker.sock``. It's
-# baked in now so the Wave-A image is the same shape it'll be in
-# Wave C — no surprise rebuilds when role-assignment lands.
-# ``docker-cli-compose`` is a SEPARATE Alpine package (the
-# docker-cli package ships only the CLI binary, NOT the compose
-# plugin). The supervisor's service_lifecycle.py shells out to
-# ``docker compose -f ... up -d`` to start role-aligned service
-# containers, so without the plugin every role-assignment apply
-# bombs with ``docker: unknown command: docker compose``.
-# ``nftables`` likewise — the supervisor renders nft drop-ins under
-# ``/etc/nftables.d/`` and exec()s ``nft -f`` to apply.
+# Issue #183 Phase 7 — k3s-only appliance. ``docker-cli`` +
+# ``docker-cli-compose`` are gone; the supervisor's k3s lifecycle
+# module talks to the local kubeapi via stdlib http.client (no
+# ``kubernetes`` Python client needed — see k8s_api.py). The
+# supervisor pod uses in-cluster ServiceAccount auth, so it doesn't
+# need a kubeconfig file either.
+#
+# ``nftables`` stays — the supervisor renders nft drop-ins under
+# ``/etc/nftables.d/`` and exec()s ``nft -f`` to apply (firewall
+# allowlist for the kubeapi-direct CIDRs, role-driven ports).
 RUN apk add --no-cache \
       tini su-exec \
       python3 py3-pip \
-      docker-cli docker-cli-compose \
       nftables libcap \
       ca-certificates tzdata \
  && addgroup -S spatium \
