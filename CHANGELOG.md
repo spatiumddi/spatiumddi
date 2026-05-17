@@ -22,6 +22,53 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 2026.05.17-5 — 2026-05-17
+
+Fourth hotfix on the 2026.05.17 chain. The previous four cuts all
+produced a green release artifact and uploaded an appliance ISO, but
+once the ISO was booted on a fresh VM (192.168.0.199) it became
+clear the slot rootfs was missing two artifacts that #194's k3s
+migration introduced: the k3s static binary at `/usr/local/bin/k3s`
+and the helm charts at `/usr/lib/spatiumddi/charts/{spatiumddi.tgz,
+spatiumddi-appliance.tgz}`. `k3s.service` crash-looped at restart
+counter 43, firstboot wedged forever at "Waiting for k3s /readyz",
+no api pod ever came up, no web UI ever served. The local `make
+appliance-baked-iso` chain runs `appliance-fetch-k3s` +
+`appliance-bake-chart` + `appliance-bake-control-chart` before mkosi
+— the release workflow's `build-appliance-iso` job inlines its own
+steps and never picked them up after #194 added them. Bundled with a
+separate `NameError` regression in `spatium-console` that crash-
+looped the F-key console dashboard at first frame (restart counter
+18 on 192.168.0.199).
+
+### Fixed
+
+- **Release workflow missing k3s + chart bake steps.** Added three
+  steps to `.github/workflows/release.yml`'s
+  `build-appliance-iso` job ahead of the mkosi build:
+  apt-install `helm` from the Helm stable repo (Debian's archive
+  doesn't carry a current helm), run `appliance/scripts/fetch-k3s
+  .sh` to download the pinned k3s static binary + airgap images
+  tarball + LICENSE into `mkosi.extra/`, run `appliance/scripts/
+  bake-chart.sh` (appliance chart) and `CHART_NAME=spatiumddi
+  appliance/scripts/bake-chart.sh` (umbrella control chart) to
+  package both helm charts into `mkosi.extra/usr/lib/spatiumddi/
+  charts/`. Mirrors `make appliance-fetch-k3s appliance-bake-chart
+  appliance-bake-control-chart` from the local
+  `appliance-baked-iso` chain. Without this the slot rootfs has no
+  k3s and no charts; the booted appliance is completely non-
+  functional. Caught when 192.168.0.199 came up from the
+  2026.05.17-4 ISO with k3s.service crash-looping and firstboot
+  warning "/usr/lib/spatiumddi/charts/spatiumddi.tgz missing —
+  control plane won't auto-deploy".
+- **`spatium-console` `NameError: name 'rows' is not defined`** at
+  `disk_summary` L619. #194 dropped the docker-overlay skip-prefix
+  block and accidentally also dropped the `rows: list[tuple[str,
+  float, float, float]] = []` initialization line. The function
+  appended to an undefined name on its first iteration → the
+  service crash-looped at restart counter 18 within seconds of
+  boot. Restored the initialization.
+
 ## 2026.05.17-4 — 2026-05-17
 
 Third hotfix in the chain. With #201 + #203 the bake script + sudo

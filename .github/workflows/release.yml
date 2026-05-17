@@ -336,8 +336,43 @@ jobs:
           } > appliance/mkosi.extra/etc/spatiumddi/appliance-release
           echo "→ Stamped appliance-release:"
           cat appliance/mkosi.extra/etc/spatiumddi/appliance-release
-      - name: Install zstd
-        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Install zstd + helm
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y zstd
+          # helm comes from its own apt repo (Debian/Ubuntu don't carry
+          # current helm). bake-chart.sh shells out to ``helm package``
+          # so it must be on PATH before the chart-bake steps.
+          curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+          sudo apt-get update
+          sudo apt-get install -y helm
+          helm version
+      - name: Fetch k3s binary + airgap tarball
+        run: |
+          set -euo pipefail
+          # Issue #183 — without this step the slot rootfs ships zero
+          # k3s, ``/usr/local/bin/k3s`` is missing on every appliance,
+          # ``k3s.service`` crash-loops, firstboot wedges forever at
+          # "Waiting for k3s /readyz". Mirrors what
+          # ``make appliance-fetch-k3s`` does locally.
+          chmod +x appliance/scripts/fetch-k3s.sh
+          appliance/scripts/fetch-k3s.sh
+          ls -lh appliance/mkosi.extra/usr/local/bin/k3s
+          ls -lh appliance/mkosi.extra/var/lib/rancher/k3s/agent/images/k3s-airgap-images-*.tar.zst
+      - name: Bake helm charts (appliance + control)
+        run: |
+          set -euo pipefail
+          # Issue #183 — without these steps the slot rootfs ships an
+          # empty /usr/lib/spatiumddi/charts/ directory; firstboot's
+          # WARN "missing — control plane won't auto-deploy" fires and
+          # the appliance never installs anything via the HelmChart CR.
+          # Mirrors ``make appliance-bake-chart appliance-bake-control-chart``.
+          chmod +x appliance/scripts/bake-chart.sh
+          appliance/scripts/bake-chart.sh
+          CHART_NAME=spatiumddi appliance/scripts/bake-chart.sh
+          ls -lh appliance/mkosi.extra/usr/lib/spatiumddi/charts/*.tgz
       - name: Bake container images into rootfs overlay
         env:
           SPATIUMDDI_VERSION: ${{ needs.meta.outputs.version }}
