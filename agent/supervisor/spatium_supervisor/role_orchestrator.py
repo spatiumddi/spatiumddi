@@ -36,10 +36,57 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any
 
+import structlog
+
+log = structlog.get_logger(__name__)
+
 # Roles the supervisor knows how to start a service container for.
 # ``observer`` + ``custom`` are reserved (no compose profile yet);
 # the supervisor recognises them on heartbeat but does nothing.
 _SERVICE_ROLES = {"dns-bind9", "dns-powerdns", "dhcp"}
+
+
+# Issue #237 — values from the heartbeat response land in a docker-
+# compose env file the supervisor writes to disk + hands off to
+# ``docker compose --env-file``. A value containing a newline injects
+# an additional ``KEY=VALUE`` line into the file. Validate every value
+# against a strict allow-list pattern; reject anything that doesn't
+# match.
+#
+# Patterns are intentionally tight:
+#   * Agent keys (long hex bootstrap PSK): 32–128 lowercase hex digits.
+#   * Server group names / engine names: alphanumeric + hyphen / dot /
+#     underscore, 1–128 chars. The control plane validates these on
+#     create but defense-in-depth here keeps a compromised control
+#     plane from injecting env lines through the supervisor.
+_AGENT_KEY_RE = re.compile(r"^[a-f0-9]{32,128}$")
+_GROUP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _safe_env_value(name: str, value: Any, pattern: re.Pattern[str]) -> str | None:
+    """Return ``value`` cast to ``str`` if it matches ``pattern``,
+    else log + return ``None`` so the caller can omit the line.
+
+    Defends against control-plane payloads carrying ``\n`` or other
+    metacharacters that would inject extra env-file lines (#237).
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        log.warning(
+            "supervisor.role_orchestrator.invalid_env_value_type",
+            name=name,
+            type=type(value).__name__,
+        )
+        return None
+    if not pattern.match(value):
+        log.warning(
+            "supervisor.role_orchestrator.rejected_env_value",
+            name=name,
+            value_len=len(value),
+        )
+        return None
+    return value
 
 
 @dataclass(frozen=True)
@@ -82,26 +129,48 @@ def compute_target_env(role_assignment: dict[str, Any] | None) -> TargetEnv:
 
     # DNS group config — only populated when a DNS role is assigned.
     dns_group_name = role_assignment.get("dns_group_name")
-    dns_engine = role_assignment.get("dns_engine")
+    # Issue #237 — every value from the heartbeat is validated against
+    # a strict allow-list pattern before it lands in the env-file
+    # line. A newline / null byte / quote in any value would otherwise
+    # inject extra env-file entries.
+    dns_engine_raw = role_assignment.get("dns_engine")
+    dns_group = _safe_env_value("dns_group_name", dns_group_name, _GROUP_NAME_RE)
+    dns_engine = _safe_env_value("dns_engine", dns_engine_raw, _GROUP_NAME_RE)
     # #170 Wave D follow-up — control-plane-provided bootstrap PSK so
     # the bind9 / powerdns service container can register against
     # /api/v1/dns/agents/register without operator-side .env edits.
     # ``None`` when the control plane hasn't configured the key.
-    dns_agent_key = role_assignment.get("dns_agent_key")
+    dns_agent_key = _safe_env_value(
+        "dns_agent_key", role_assignment.get("dns_agent_key"), _AGENT_KEY_RE
+    )
     if any(r in roles for r in ("dns-bind9", "dns-powerdns")):
-        if dns_group_name:
-            env_lines.append(f"AGENT_GROUP={dns_group_name}")
+        if dns_group:
+            env_lines.append(f"AGENT_GROUP={dns_group}")
         if dns_engine:
             env_lines.append(f"DNS_ENGINE={dns_engine}")
         if dns_agent_key:
             env_lines.append(f"DNS_AGENT_KEY={dns_agent_key}")
 
     # DHCP group config.
-    dhcp_group_name = role_assignment.get("dhcp_group_name")
-    dhcp_network_mode = role_assignment.get("dhcp_network_mode") or "host"
-    dhcp_agent_key = role_assignment.get("dhcp_agent_key")
+    dhcp_group = _safe_env_value(
+        "dhcp_group_name", role_assignment.get("dhcp_group_name"), _GROUP_NAME_RE
+    )
+    dhcp_network_mode_raw = role_assignment.get("dhcp_network_mode") or "host"
+    # ``dhcp_network_mode`` is one of two known literals; validate
+    # against an exact-match set rather than a regex.
+    if dhcp_network_mode_raw in {"host", "bridged"}:
+        dhcp_network_mode: str | None = dhcp_network_mode_raw
+    else:
+        log.warning(
+            "supervisor.role_orchestrator.invalid_dhcp_network_mode",
+            value=dhcp_network_mode_raw,
+        )
+        dhcp_network_mode = "host"
+    dhcp_agent_key = _safe_env_value(
+        "dhcp_agent_key", role_assignment.get("dhcp_agent_key"), _AGENT_KEY_RE
+    )
     if "dhcp" in roles:
-        if dhcp_group_name:
+        if dhcp_group:
             # AGENT_GROUP is overloaded — DNS + DHCP can't be in the
             # same group anyway (different drivers), so when both
             # roles are assigned we still write one AGENT_GROUP and
@@ -109,7 +178,7 @@ def compute_target_env(role_assignment: dict[str, Any] | None) -> TargetEnv:
             # role-specific env vars (Wave C3 reshape; for now we
             # emit a second AGENT_GROUP line — the later wins under
             # docker-compose's env-file parser).
-            env_lines.append(f"DHCP_AGENT_GROUP={dhcp_group_name}")
+            env_lines.append(f"DHCP_AGENT_GROUP={dhcp_group}")
         env_lines.append(f"DHCP_NETWORK_MODE={dhcp_network_mode}")
         if dhcp_agent_key:
             env_lines.append(f"DHCP_AGENT_KEY={dhcp_agent_key}")

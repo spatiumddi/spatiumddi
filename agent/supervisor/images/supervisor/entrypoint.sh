@@ -31,20 +31,57 @@ if [ -d /etc/nftables.d ]; then
     chmod 0775 /etc/nftables.d || true
 fi
 
-# Source the host's /etc/spatiumddi/.env (mounted at
-# /etc/spatiumddi-host/.env in the pod via hostPath) so the
-# supervisor's SupervisorConfig.from_env() picks up the operator's
-# install-time choices. Best-effort — a fresh appliance before
-# spatium-install completion has no file here yet.
+# Read the host's /etc/spatiumddi/.env (mounted at
+# /etc/spatiumddi-host/.env in the pod via hostPath) and export only
+# strict ``KEY=VALUE`` lines into the supervisor's environment.
+# Best-effort — a fresh appliance before spatium-install completion
+# has no file here yet.
+#
+# Issue #238 — the pre-fix ``set -a; . "$HOST_ENV"; set +a`` shell-
+# sourced the file verbatim, executing every command-substitution
+# / arithmetic-expansion inside it. A foothold that could write a
+# single line like ``EVIL=$(rm -rf /var/lib/spatium-supervisor)`` to
+# the operator-managed host file got immediate code execution
+# inside the supervisor pod. The new loop reads the file with
+# ``read -r`` (no backslash interpretation), validates each KEY
+# matches the POSIX env-var-name pattern, strips at most one layer
+# of surrounding quotes from the value, and ``export``s the pair
+# without shell-interpretation of the value.
 HOST_ENV=/etc/spatiumddi-host/.env
 if [ -r "$HOST_ENV" ]; then
-    # ``set -a; . file; set +a`` auto-exports each variable so they
-    # land in the supervisor process's environment. Comments + blanks
-    # are tolerated by the standard ``.`` shell builtin.
-    set -a
-    # shellcheck disable=SC1090
-    . "$HOST_ENV"
-    set +a
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Skip blanks + comments.
+        case "$line" in
+            ''|'#'*) continue ;;
+        esac
+        # Tolerate a leading ``export `` prefix the way the dot-source
+        # would. Strip it before splitting.
+        case "$line" in
+            'export '*) line=${line#export } ;;
+        esac
+        # Must contain a ``=``. Skip otherwise.
+        case "$line" in
+            *=*) ;;
+            *) continue ;;
+        esac
+        key=${line%%=*}
+        val=${line#*=}
+        # Validate KEY shape — POSIX env-var name pattern. We use
+        # ``case`` rather than a regex tool so the entrypoint stays
+        # busybox-compatible.
+        case "$key" in
+            [A-Za-z_]) ;;                      # single-char name
+            [A-Za-z_]*[!A-Za-z0-9_]*) continue ;;  # has bad char anywhere
+            [A-Za-z_]*) ;;                     # multi-char, all good
+            *) continue ;;
+        esac
+        # Strip one layer of surrounding ``"..."`` or ``'...'``.
+        case "$val" in
+            \"*\") val=${val#\"}; val=${val%\"} ;;
+            \'*\') val=${val#\'}; val=${val%\'} ;;
+        esac
+        export "$key=$val"
+    done < "$HOST_ENV"
 fi
 
 # Drop privileges to the unprivileged spatium user. ``su-exec spatium``

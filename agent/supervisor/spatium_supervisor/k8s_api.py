@@ -176,18 +176,37 @@ def _parse_host_kubeconfig(path: Path) -> KubeConfig:
         port = 6443
 
     # Host kubeconfig path doesn't ship a CA path we can use directly;
-    # the CA bytes are inline (base64-encoded). For Phase 3's minimal
-    # client we accept that introspection-via-host-kubeconfig is
-    # best-effort + write a CA-bundle temp file once at process start.
+    # the CA bytes are inline (base64-encoded). Write a CA-bundle file
+    # once at process start under the supervisor's own state dir —
+    # NOT /tmp, which would be a predictable filename on a world-
+    # writable dir (issue #235: symlink-race vector since the
+    # supervisor runs privileged). ``O_NOFOLLOW`` defends against a
+    # symlink even within state_dir on the off chance another
+    # writer can drop one there.
     ca_path: str | None = None
     ca_b64 = cluster.get("certificate-authority-data")
     if ca_b64:
         import base64  # noqa: PLC0415
 
-        tmp = Path("/tmp/.spatium-k3s-ca.crt")
+        state_dir = Path(
+            os.environ.get("STATE_DIR", "/var/lib/spatium-supervisor")
+        )
         try:
-            tmp.write_bytes(base64.b64decode(ca_b64))
-            ca_path = str(tmp)
+            state_dir.mkdir(parents=True, exist_ok=True)
+            target = state_dir / ".k3s-ca.crt"
+            # Open with O_NOFOLLOW so a pre-existing symlink at the
+            # target path isn't followed. O_CREAT + O_TRUNC make the
+            # write idempotent across process restarts.
+            fd = os.open(
+                str(target),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                0o600,
+            )
+            try:
+                os.write(fd, base64.b64decode(ca_b64))
+            finally:
+                os.close(fd)
+            ca_path = str(target)
         except OSError as exc:
             log.warning("supervisor.k8s_api.ca_write_failed", error=str(exc))
 
@@ -219,17 +238,32 @@ def get_config() -> KubeConfig | None:
 
 
 def _ssl_context(ca_path: str | None) -> ssl.SSLContext:
-    """Build an SSLContext that verifies the kubeapi server cert."""
+    """Build an SSLContext that verifies the kubeapi server cert.
+
+    Issue #233 — refuses to connect when no CA path is resolvable.
+    The pre-#233 fallback silently dropped to ``verify_mode=CERT_NONE``
+    with only a log.warning; the supervisor runs privileged and even
+    a loopback channel is MITM-able by a tampered cni / sidecar.
+    Operators on dev boxes pointed at a self-signed kubeapi can
+    explicitly opt out by setting ``SPATIUM_INSECURE_SKIP_TLS_VERIFY=1``
+    in the supervisor env.
+    """
     ctx = ssl.create_default_context()
     if ca_path:
         ctx.load_verify_locations(cafile=ca_path)
-    else:
-        # No CA path — in-cluster path always has one, so this is the
-        # host-kubeconfig fallback without a CA. Permit but warn.
-        log.warning("supervisor.k8s_api.ssl_unverified")
+        return ctx
+    if os.environ.get("SPATIUM_INSECURE_SKIP_TLS_VERIFY") == "1":
+        log.warning("supervisor.k8s_api.ssl_unverified_opt_in")
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    return ctx
+        return ctx
+    raise RuntimeError(
+        "k8s_api: refusing to build TLS context — no CA path resolved "
+        "and SPATIUM_INSECURE_SKIP_TLS_VERIFY is not set. Inspect the "
+        "host kubeconfig at /etc/rancher/k3s/k3s.yaml for a missing "
+        "``certificate-authority-data:`` field, or set the env var "
+        "explicitly for a dev / self-signed setup."
+    )
 
 
 def _request(
