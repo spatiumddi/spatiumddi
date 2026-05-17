@@ -1922,6 +1922,8 @@ def do_containers(console: Console, tty: str) -> None:
                         "get",
                         "pods",
                         "-A",
+                        "-o",
+                        "wide",
                         "-w",
                     ],
                     env=env,
