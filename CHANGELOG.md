@@ -22,6 +22,36 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 2026.05.17-6 — 2026-05-17
+
+Fifth hotfix on the 2026.05.17 chain. 2026.05.17-5 tried to
+``apt-get install helm`` from ``baltocdn.com``'s Helm-stable repo
+but the Azure-hosted GitHub Actions runner's network policy doesn't
+resolve baltocdn.com (``curl: (6) Could not resolve host:
+baltocdn.com``), so the bake step never landed. Swapped to the
+upstream ``azure/setup-helm@v4`` action which downloads the helm
+static binary directly from ``get.helm.sh`` — same channel
+get-helm-3 ships from, reachable from Azure runners (GitHub
+Releases CDN). Took the opportunity to bump every helm-action pin
+in the repo (release.yml's chart-publish job + agent-e2e.yml were
+both on the long-stale v3.14.0) to the current latest v3.20.2 so
+all three CI surfaces stay aligned.
+
+### Fixed
+
+- **Release workflow's helm install couldn't reach baltocdn.com.**
+  Replaced the apt-repo recipe in ``build-appliance-iso`` with
+  ``azure/setup-helm@v4`` pinned to ``v3.20.2`` — same channel
+  ``get-helm-3`` ships from, reachable from Azure runners.
+
+### Changed
+
+- **All ``azure/setup-helm`` pins bumped to v3.20.2.**
+  ``release.yml``'s Publish-Helm-chart job and ``agent-e2e.yml``'s
+  kind-cluster job were both on v3.14.0; aligned with the new
+  ``build-appliance-iso`` job's pin so the three CI surfaces
+  don't drift.
+
 ## 2026.05.17-5 — 2026-05-17
 
 Fourth hotfix on the 2026.05.17 chain. The previous four cuts all
