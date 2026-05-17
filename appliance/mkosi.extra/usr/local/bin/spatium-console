@@ -1226,6 +1226,22 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
     tbl.add_column(width=15, no_wrap=True)         # ports / net mode
     tbl.add_column(min_width=14, no_wrap=False)    # image
 
+    # Header row — column labels. dim style so the data rows below
+    # stay the visual focus. ``rich.Table.grid`` doesn't have a
+    # show_header flag the way Table does, so emit a regular row
+    # with bold-dim styling — same shape as the bottom-row F-key
+    # footer.
+    header_style = "bold dim"
+    tbl.add_row(
+        Text("", style=header_style),
+        Text("NAMESPACE", style=header_style),
+        Text("NAME", style=header_style),
+        Text("AGE", style=header_style),
+        Text("STATE", style=header_style),
+        Text("PORTS", style=header_style),
+        Text("IMAGE", style=header_style),
+    )
+
     # Sort: spatium first (the role pods operators care about most),
     # kube-system next, then anything else alphabetically. Within a
     # namespace, alphabetical by name.
@@ -1606,7 +1622,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     )
     paired_rows = (short_count + 1) // 2  # ceil(short_count / 2)
     HEADER_ROWS = 1 + paired_rows + 1 + 1 + 2  # line1 + grid + rule + vitals + border
-    SVC_ROWS = pods_count + 2   # tight: just borders, no padding
+    SVC_ROWS = pods_count + 3   # 1 header row + 2 panel border
     FOOTER_ROWS = 1   # single-line borderless strip
 
     layout = Layout()
