@@ -11,7 +11,9 @@ Three independent retention buckets:
 
 * **Claimed** rows prune after 30 days. Useful for "who paired which
   agent and when" forensics during onboarding, but past a month the
-  audit log carries the same signal.
+  audit log carries the same signal. A code is considered claimed if
+  at least one ``PairingClaim`` row references it, with the earliest
+  claim older than the retention window.
 * **Revoked** rows prune after 7 days. Operator-driven cancellation
   is a transient state; once it's a week old it's just noise.
 * **Expired without claim** rows prune after 24 h past their grace
@@ -30,11 +32,11 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import delete
+from sqlalchemy import delete, exists, func, select
 
 from app.celery_app import celery_app
 from app.db import task_session
-from app.models.appliance import PairingCode
+from app.models.appliance import PairingClaim, PairingCode
 
 logger = structlog.get_logger(__name__)
 
@@ -53,24 +55,42 @@ async def _sweep() -> dict[str, int]:
         revoked_cutoff = now - timedelta(days=REVOKED_RETENTION_DAYS)
         expired_cutoff = now - _GRACE_AFTER_EXPIRY - timedelta(hours=EXPIRED_RETENTION_HOURS)
 
+        # Claimed codes: has at least one PairingClaim row whose
+        # claimed_at is older than the retention window. Using a
+        # correlated EXISTS + MIN(claimed_at) subquery avoids loading
+        # claim rows into Python.
+        claimed_subq = (
+            select(PairingClaim.pairing_code_id)
+            .group_by(PairingClaim.pairing_code_id)
+            .having(func.max(PairingClaim.claimed_at) < claimed_cutoff)
+            .scalar_subquery()
+        )
         claimed_del = await db.execute(
             delete(PairingCode).where(
-                PairingCode.used_at.isnot(None),
-                PairingCode.used_at < claimed_cutoff,
+                PairingCode.revoked_at.is_(None),
+                PairingCode.id.in_(claimed_subq),
             )
         )
+
+        # Revoked codes: revoked_at set and old enough.
         revoked_del = await db.execute(
             delete(PairingCode).where(
-                PairingCode.used_at.is_(None),
                 PairingCode.revoked_at.isnot(None),
                 PairingCode.revoked_at < revoked_cutoff,
             )
         )
+
+        # Expired-without-claim: past the grace window, not revoked,
+        # and no PairingClaim rows exist for this code.
+        no_claims_subq = (
+            ~exists().where(PairingClaim.pairing_code_id == PairingCode.id)
+        )
         expired_del = await db.execute(
             delete(PairingCode).where(
-                PairingCode.used_at.is_(None),
                 PairingCode.revoked_at.is_(None),
+                PairingCode.expires_at.isnot(None),
                 PairingCode.expires_at < expired_cutoff,
+                no_claims_subq,
             )
         )
         await db.commit()
