@@ -10,7 +10,7 @@
 #   ingress               Frontend ingress
 #   postgresql            In-chart Postgres StatefulSet using postgres:16-alpine
 #                         (matches docker-compose.yml). BYO via externalDatabase.
-#   redis                 In-chart Redis StatefulSet using redis:7-alpine.
+#   redis                 In-chart Redis StatefulSet using redis:8.6-alpine.
 #                         BYO via externalRedis.
 #   dnsAgents             Optional BIND9 agent StatefulSets (one per DNSServer row)
 #   dhcpAgents            Optional Kea agent StatefulSets (one per DHCPServer row)
@@ -251,14 +251,14 @@ externalDatabase:
 
 # ── Redis ────────────────────────────────────────────────────────────────────
 # In-chart single-node Redis StatefulSet using the official
-# ``redis:7-alpine`` image (matches docker-compose.yml). For HA
+# ``redis:8.6-alpine`` image (matches docker-compose.yml). For HA
 # production set ``redis.enabled=false`` and point ``externalRedis`` at
 # a Redis Sentinel cluster (see k8s/ha/redis-sentinel.yaml).
 redis:
   enabled: true
   image:
     repository: redis
-    tag: "7-alpine"
+    tag: "8.6-alpine"
     pullPolicy: IfNotPresent
   # Cap and eviction policy match docker-compose.yml's redis-server
   # CLI flags. Bump if your install needs a larger cache.
