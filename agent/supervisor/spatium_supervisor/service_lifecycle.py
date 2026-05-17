@@ -179,6 +179,25 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
             "imageTag": image_tag,
             "imagePullPolicy": "Never",
         },
+        # The agent-landing nginx Deployment is owned by the
+        # firstboot-deployed ``spatium-bootstrap`` release, which sets
+        # agentLanding.enabled=true (chart default). The
+        # role-driven ``spatiumddi-appliance`` release uses the same
+        # chart; if we left agentLanding default-on here too, helm
+        # would refuse the install with "Deployment agent-landing ...
+        # cannot be imported into the current release: meta.helm.sh/
+        # release-name must equal spatiumddi-appliance: current value
+        # is spatium-bootstrap". Explicitly disabling here keeps the
+        # always-on landing page in the bootstrap release only.
+        "agentLanding": {
+            "enabled": False,
+        },
+        # Same shape — the supervisor itself is owned by spatium-
+        # bootstrap; the spatiumddi-appliance release should never
+        # try to re-create it.
+        "supervisor": {
+            "enabled": False,
+        },
         "dnsBind9": {
             "enabled": "dnsBind9" in desired_helm_keys,
             "controlPlaneUrl": control_plane_url,

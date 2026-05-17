@@ -72,15 +72,15 @@ _ROLE_ENV_FILENAME = "role-compose.env"
 
 # #170 Wave C3 — nftables drop-in path. Lives under /etc/nftables.d
 # (bind-mounted rw on the supervisor compose entry). The host's
-# master /etc/nftables.conf includes everything in that dir under
-# the inet filter table's input chain. Strict appliance-only —
-# skipped on dev / docker / k8s deployments via the same
-# detect_deployment_kind() gate the trigger-file writers use.
-_NFT_DROPIN_PATH = Path("/etc/nftables.d/spatium-role.nft")
-# Per-profile "last applied" sidecar so we don't re-run ``nft -f``
-# every heartbeat when nothing has changed. Lives in the same dir
-# as the drop-in so a host-side audit / backup picks it up too.
-_NFT_LAST_PROFILE_PATH = Path("/etc/nftables.d/spatium-role.profile")
+# Phase 9 trigger-file path used by spatium-firewall-reload.path on
+# the host. Mounted into the supervisor pod via the
+# /var/lib/spatiumddi-host/release-state hostPath bind (same dir
+# used by snmp / chrony / slot-upgrade triggers). Writing to this
+# path = "host runner please re-render".
+_NFT_TRIGGER_PATH = Path("/var/lib/spatiumddi-host/release-state/firewall-pending")
+_NFT_APPLIED_HASH_PATH = Path(
+    "/var/lib/spatiumddi-host/release-state/firewall-applied-hash"
+)
 
 
 # Issue #183 Phase 7 — capability reporting is now trivially true on
@@ -229,247 +229,83 @@ def _watchdog_check_due() -> bool:
     return time.monotonic() - _last_watchdog_at >= _WATCHDOG_INTERVAL_S
 
 
-# Periodic firewall live-ruleset verification. Read the actual
-# kernel-active rules from nft and confirm the supervisor-managed
-# service ports per the assigned role profile are present. If any
-# expected rule is missing (someone flushed the ruleset, the host
-# nftables.conf got out from under us, the drop-in include failed
-# silently, etc.) clear the in-memory "body matched" short-circuit
-# so the next ``_maybe_apply_firewall`` rewrite + nft reload
-# restores the canonical state.
-_FIREWALL_LIVE_CHECK_INTERVAL_S = 300.0  # 5 minutes
-_last_firewall_live_check_at: float = 0.0
-
-
-def _firewall_live_check_due() -> bool:
-    """Return True if the periodic live-ruleset check is due. The
-    cadence is in monotonic time so the supervisor's own restart
-    doesn't accidentally skip an interval. First call after startup
-    always returns True (forces an early verification once the
-    supervisor settles)."""
-    return (
-        time.monotonic() - _last_firewall_live_check_at
-        >= _FIREWALL_LIVE_CHECK_INTERVAL_S
-    )
-
-
-def _firewall_live_missing_ports(profile: FirewallProfile) -> tuple[set[int], set[int]]:
-    """Return the (missing_tcp, missing_udp) port sets — expected
-    rules per the rendered ``profile`` that aren't visible in the
-    kernel's live ruleset. Empty pair = firewall is in the expected
-    shape. Both pairs populated = either nft is unreachable (treat
-    as missing — force re-apply) or the drop-in include path is
-    broken.
-
-    Reads via ``nft -j list chain inet filter input`` (JSON, the
-    machine-readable output mode added in nftables 0.9.x); JSON is
-    cheaper to parse than the human format + immune to translation
-    drift across distro versions.
-    """
-    if not profile.expected_tcp_ports and not profile.expected_udp_ports:
-        return set(), set()
-    try:
-        result = subprocess.run(
-            ["nft", "-j", "list", "chain", "inet", "filter", "input"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        # nft missing entirely → treat as "all rules missing" so the
-        # caller force re-applies (which itself will fail with a
-        # clearer error if the host genuinely lacks nft).
-        return set(profile.expected_tcp_ports), set(profile.expected_udp_ports)
-    if result.returncode != 0:
-        return set(profile.expected_tcp_ports), set(profile.expected_udp_ports)
-    try:
-        import json
-
-        data = json.loads(result.stdout)
-    except (json.JSONDecodeError, ValueError):
-        return set(profile.expected_tcp_ports), set(profile.expected_udp_ports)
-    # The nft JSON shape is {"nftables": [<rule objects>]}. Each
-    # rule object has an "expr" array of expression atoms. For our
-    # role-driven accept rules the relevant atoms are a payload
-    # match (tcp/udp dport == <port>) followed by a verdict (accept).
-    tcp_present: set[int] = set()
-    udp_present: set[int] = set()
-    for entry in data.get("nftables") or []:
-        rule = entry.get("rule")
-        if not rule:
-            continue
-        # Walk the expression atoms looking for payload match against
-        # tcp.dport or udp.dport that matches a literal integer.
-        for atom in rule.get("expr") or []:
-            match = atom.get("match")
-            if not match:
-                continue
-            left = match.get("left") or {}
-            right = match.get("right")
-            payload = left.get("payload") or {}
-            proto = payload.get("protocol")
-            field = payload.get("field")
-            if field != "dport":
-                continue
-            # ``right`` is either an int (single port) or an object
-            # like ``{"set": [80, 443]}`` for a port set. Normalise.
-            ports: list[int] = []
-            if isinstance(right, int):
-                ports.append(right)
-            elif isinstance(right, dict) and "set" in right:
-                for item in right["set"]:
-                    if isinstance(item, int):
-                        ports.append(item)
-            if proto == "tcp":
-                tcp_present.update(ports)
-            elif proto == "udp":
-                udp_present.update(ports)
-    missing_tcp = set(profile.expected_tcp_ports) - tcp_present
-    missing_udp = set(profile.expected_udp_ports) - udp_present
-    return missing_tcp, missing_udp
+# Phase 9 rewrite — the pre-Phase-9 drift detector (live nft -j
+# parse + missing-port diff) ran from inside the supervisor pod
+# where nft can't actually read the host's ruleset, so it was
+# always force-re-applying. The new trigger-file shape inverts the
+# responsibility: the host runner is the source of truth (writes
+# the applied-hash sidecar), the supervisor compares the rendered
+# body's hash to the sidecar each tick. Operator's manual nft
+# edits → host runner doesn't write a new sidecar → mismatch on
+# next supervisor tick → trigger fires → canonical state restored.
+# The drift-port-list helpers from the in-pod era are gone.
 
 
 def _maybe_apply_firewall(
     role_assignment: dict[str, Any] | None,
     log: structlog.stdlib.BoundLogger,
 ) -> None:
-    """Render + atomically swap the supervisor's nftables drop-in.
+    """Render the firewall drop-in + write a trigger file the host
+    runner picks up.
 
-    Strict appliance-only gate (mirrors the trigger-file writers in
-    ``appliance_state.py``): on docker / k8s / unknown deployments
-    the /etc/nftables.d bind mount may not exist + nft itself may
-    not be installed, so we no-op silently.
+    Phase 9 rewrite (#183): the pre-Phase-9 path tried to write
+    /etc/nftables.d/spatium-role.nft directly and call ``nft -f
+    /etc/nftables.conf`` from inside the supervisor pod. Neither
+    worked — the pod's /etc is its own mount namespace (writes don't
+    reach the host) and /etc/nftables.conf doesn't exist in the
+    pod fs. Every heartbeat logged ``firewall.reload_failed``.
 
-    Three short-circuit signals:
+    New shape: render the body + write
+    /var/lib/spatiumddi-host/release-state/firewall-pending as
+    ``<sha256>\\n<body>``. The host-side spatium-firewall-reload.path
+    unit watches that path, fires the matching .service, and the
+    runner (``/usr/local/bin/spatium-firewall-reload``) does the
+    actual nft validate + apply. Same trigger-file shape as
+    spatium-snmp-reload / spatium-chrony-reload.
 
-    1. ``detect_deployment_kind() != "appliance"`` → log + bail.
-    2. Last-applied profile sidecar matches the freshly-rendered
-       profile body → no-op (most heartbeats land here).
-    3. ``nft -c -f <tmp>`` dry-run fails → log loud + leave the
-       live drop-in untouched. The operator's invalid extra
-       fragment can't put the firewall into a half-rendered state.
-
-    Atomic-rename on success so a crash mid-write doesn't truncate
-    the live file. ``nft -f`` after the rename reloads the master
-    /etc/nftables.conf and picks up the new drop-in.
+    Short-circuits on unchanged body — the host runner writes the
+    applied-hash sidecar after a successful apply; we read that
+    on every tick and skip the write when the rendered body's hash
+    matches the last-applied hash. Operator's manual nft edits
+    out-of-band → hash mismatches on next render → trigger fires →
+    canonical state restored.
     """
     if appliance_state.detect_deployment_kind() != "appliance":
         return
 
-    global _last_firewall_live_check_at
-
     profile: FirewallProfile = render_drop_in(role_assignment)
     body = profile.body
+    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
-    # Short-circuit on unchanged body. We compare the live drop-in
-    # file directly rather than caching in-memory because a host-
-    # side intervention (operator manually edited the file) should
-    # cause us to re-apply on the next heartbeat, restoring the
-    # canonical state.
+    # Read the applied-hash sidecar the host runner writes. Matching
+    # = already applied; we leave the trigger file alone so the
+    # .path unit doesn't fire pointlessly. Missing or mismatching =
+    # re-write the trigger.
     try:
-        current_body = _NFT_DROPIN_PATH.read_text(encoding="utf-8")
+        applied_hash = _NFT_APPLIED_HASH_PATH.read_text(encoding="utf-8").strip()
     except OSError:
-        current_body = ""
-    body_matches = current_body == body
+        applied_hash = ""
 
-    # Periodic live-ruleset drift check (#170 Wave D follow-up). The
-    # drop-in file content matching the desired body only proves the
-    # FILE is right — not that the kernel-active nftables ruleset
-    # actually includes those rules. ``nft -f /etc/nftables.conf``
-    # could have failed silently after an out-of-band edit, the host
-    # could have ``nft flush ruleset``'d during a manual debugging
-    # session, or the master conf's ``include`` directive could
-    # have stopped matching the drop-in path. Every
-    # ``_FIREWALL_LIVE_CHECK_INTERVAL_S`` (5 min) we read the live
-    # ruleset and confirm the expected per-role service ports are
-    # present; if any are missing, force a re-apply by bypassing the
-    # body-matches short-circuit.
-    force_apply = False
-    if body_matches and _firewall_live_check_due():
-        missing_tcp, missing_udp = _firewall_live_missing_ports(profile)
-        _last_firewall_live_check_at = time.monotonic()
-        if missing_tcp or missing_udp:
-            log.warning(
-                "supervisor.firewall.drift_detected",
-                profile=profile.name,
-                missing_tcp=sorted(missing_tcp),
-                missing_udp=sorted(missing_udp),
-            )
-            force_apply = True
-
-    if body_matches and not force_apply:
+    if applied_hash == body_hash:
         return
 
     try:
-        _NFT_DROPIN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _NFT_DROPIN_PATH.with_suffix(".new")
-        tmp.write_text(body, encoding="utf-8")
-        # Dry-run validate before swap. The drop-in is included from
-        # inside ``table inet filter { chain input { ... } }`` in the
-        # host's ``/etc/nftables.conf``, so the body itself is a chain
-        # fragment — not a complete nft script. Running ``nft -c -f``
-        # against the fragment alone fails with "syntax error,
-        # unexpected tcp" because nft expects a top-level table
-        # declaration. Wrap the fragment in the same chain context
-        # the live config uses, write the wrapped form to a *second*
-        # temp file, validate that, then swap the *unwrapped* form
-        # into the live drop-in path.
-        wrapped_tmp = _NFT_DROPIN_PATH.with_suffix(".check.new")
-        wrapped_body = (
-            "table inet filter {\n"
-            "    chain input {\n"
-            + "\n".join("        " + line for line in body.splitlines())
-            + "\n    }\n"
-            + "}\n"
-        )
-        wrapped_tmp.write_text(wrapped_body, encoding="utf-8")
-        result = subprocess.run(
-            ["nft", "-c", "-f", str(wrapped_tmp)],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        try:
-            wrapped_tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        if result.returncode != 0:
-            log.warning(
-                "supervisor.firewall.dry_run_failed",
-                profile=profile.name,
-                stderr=result.stderr.strip()[:300],
-            )
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return
-        tmp.replace(_NFT_DROPIN_PATH)
-        # Reload nftables so the master conf picks up the new
-        # drop-in. ``nft -f /etc/nftables.conf`` is the documented
-        # reload path; it's idempotent + atomic on the kernel side
-        # (the netlink commit either lands fully or not at all).
-        reload_result = subprocess.run(
-            ["nft", "-f", "/etc/nftables.conf"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if reload_result.returncode != 0:
-            log.warning(
-                "supervisor.firewall.reload_failed",
-                profile=profile.name,
-                stderr=reload_result.stderr.strip()[:300],
-            )
-            return
-        _NFT_LAST_PROFILE_PATH.write_text(profile.name + "\n", encoding="utf-8")
+        _NFT_TRIGGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _NFT_TRIGGER_PATH.with_suffix(".new")
+        tmp.write_text(f"{body_hash}\n{body}", encoding="utf-8")
+        # Atomic rename — the .path unit watches PathChanged which
+        # fires on close-after-write of the final path, so the
+        # rename ensures the runner sees a complete trigger file
+        # rather than a half-written one.
+        tmp.replace(_NFT_TRIGGER_PATH)
         log.info(
-            "supervisor.firewall.applied",
+            "supervisor.firewall.trigger_written",
             profile=profile.name,
+            body_hash=body_hash[:12],
             roles=role_assignment.get("roles") if role_assignment else [],
         )
-    except (OSError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
-        log.warning("supervisor.firewall.apply_failed", error=str(exc))
+    except OSError as exc:
+        log.warning("supervisor.firewall.trigger_write_failed", error=str(exc))
 
 
 def heartbeat_once(

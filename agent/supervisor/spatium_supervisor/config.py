@@ -42,17 +42,17 @@ class SupervisorConfig:
             k8s_proxy_enabled=os.environ.get("K8S_PROXY_ENABLED", "").lower() in (
                 "1", "true", "yes", "on",
             ),
-            # Phase 9 (#183) — in-pod nftables rendering is architecturally
-            # broken: the supervisor runs in a k3s pod and writes drop-ins
-            # to /etc/nftables.d/ inside the pod, then calls `nft -f
-            # /etc/nftables.conf` which doesn't exist in the pod fs. Every
-            # heartbeat logs `firewall.reload_failed`. Meanwhile the host's
-            # /etc/nftables.conf already opens SSH / 53 / 67 / 80 / 443 and
-            # the role pods all use hostNetwork=true, so they listen
-            # directly on those ports without any per-role drop-in. The
-            # supervisor's drop-in is duplicative noise. Default off; flip
-            # to opt in only if you're actively developing the operator
-            # CIDR-allowlist surface (Phase 6 kubeapi_expose_cidrs).
-            in_pod_firewall_enabled=os.environ.get("IN_POD_FIREWALL_ENABLED", "").lower()
-            in ("1", "true", "yes", "on"),
+            # Phase 9 (#183) firewall management. The original in-pod
+            # path tried to nft-write inside the pod (broken — pod fs
+            # has no /etc/nftables.conf to reload) so this was gated
+            # off. Phase 9 rewrote it to write a trigger file via the
+            # /var/lib/spatiumddi-host/release-state hostPath mount;
+            # the host-side spatium-firewall-reload.path watches that
+            # file and fires the runner which does the actual nft
+            # validate + apply. The trigger-file shape is benign on
+            # docker / k8s deployments (the .path unit isn't there)
+            # so default on; flip to off only as a panic-disable.
+            in_pod_firewall_enabled=os.environ.get(
+                "IN_POD_FIREWALL_ENABLED", "true"
+            ).lower() in ("1", "true", "yes", "on"),
         )
