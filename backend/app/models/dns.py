@@ -185,7 +185,13 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=53)
     # api_port: used for rndc (BIND9)
     api_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Issue #210 — Fernet-encrypted at rest, matching the rest of the
+    # codebase's encrypted-column convention (LargeBinary + encrypt_str
+    # / decrypt_str). Pre-#210 this was a ``Text`` column written with
+    # plaintext and a ``# TODO: encrypt`` marker. The migration scrubs
+    # any pre-existing plaintext into NULL (no consumer existed yet,
+    # so no operator-visible loss; column was effectively decorative).
+    api_key_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     # roles: authoritative | recursive | forwarder (JSON array of strings)
     roles: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     # User-controlled "pause" — when False, this server is skipped by the

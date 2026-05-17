@@ -914,8 +914,11 @@ async def create_server(
     data = body.model_dump(exclude={"api_key", "windows_credentials"})
     data["group_id"] = group_id
     if body.api_key:
-        # TODO: encrypt before storing
-        data["api_key_encrypted"] = body.api_key
+        # Issue #210 — Fernet-encrypted at rest, matching the unifi /
+        # tailscale / fingerbank surfaces (encrypt_str → LargeBinary).
+        # Pre-#210 the value landed in a Text column with a stale
+        # ``# TODO: encrypt`` marker.
+        data["api_key_encrypted"] = encrypt_str(body.api_key)
 
     # Auto-mark this server as primary if the group has no primary yet.
     # Prevents the footgun where a freshly-created group has zero primaries
@@ -969,7 +972,11 @@ async def update_server(
     server = await _require_server(group_id, server_id, db)
     changes = body.model_dump(exclude_none=True, exclude={"api_key", "windows_credentials"})
     if body.api_key is not None:
-        changes["api_key_encrypted"] = body.api_key  # TODO: encrypt
+        # Issue #210 — Fernet-encrypted at rest; matches the create
+        # path above. ``body.api_key == ""`` clears the column.
+        changes["api_key_encrypted"] = (
+            encrypt_str(body.api_key) if body.api_key else None
+        )
     # When the user flips is_enabled, reflect it in status immediately so
     # the UI pill updates without waiting for the next 60s health-sweep
     # tick. The sweep then re-asserts on schedule.
