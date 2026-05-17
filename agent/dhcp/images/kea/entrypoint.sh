@@ -20,15 +20,7 @@
 set -eu
 
 : "${SPATIUM_API_URL:?SPATIUM_API_URL is required}"
-# Either ``SPATIUM_AGENT_KEY`` (long hex PSK) or ``BOOTSTRAP_PAIRING_CODE``
-# (8-digit short-lived code from #169) must be present — the Python
-# resolver picks whichever is non-empty. Pre-check at the entrypoint
-# so a misconfigured container fails with a clear message instead of
-# crash-looping inside the supervisor.
-if [ -z "${SPATIUM_AGENT_KEY:-}" ] && [ -z "${BOOTSTRAP_PAIRING_CODE:-}" ]; then
-    echo "entrypoint: one of SPATIUM_AGENT_KEY or BOOTSTRAP_PAIRING_CODE must be set" >&2
-    exit 1
-fi
+: "${SPATIUM_AGENT_KEY:?SPATIUM_AGENT_KEY is required (issue #246: pairing-code exchange was removed in #170 Wave A3 — paste the long hex key directly; Application appliances receive it via the supervisor's role-compose.env automatically)}"
 
 # Ensure state + runtime dirs are writable by the agent user.
 mkdir -p /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /var/log/kea

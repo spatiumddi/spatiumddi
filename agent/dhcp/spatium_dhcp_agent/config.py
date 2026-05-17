@@ -28,12 +28,12 @@ class AgentConfig:
     """
 
     control_plane_url: str
-    # Either ``agent_key`` (long hex PSK from SPATIUM_AGENT_KEY) OR
-    # ``bootstrap_pairing_code`` (short-lived code via #169) must be
-    # set. The resolved key is computed at bootstrap time — see
-    # ``pairing.resolve_bootstrap_key``.
+    # Long-PSK bootstrap key. Issue #246 — pairing-code exchange via the
+    # removed ``POST /api/v1/appliance/pair`` endpoint is no longer
+    # supported here; standalone agents paste ``SPATIUM_AGENT_KEY``
+    # directly and Application appliances receive it via the
+    # supervisor's ``role-compose.env``.
     agent_key: str
-    bootstrap_pairing_code: str
     server_name: str
     state_dir: Path
     kea_config_path: Path
@@ -52,20 +52,19 @@ class AgentConfig:
         if not cp:
             raise RuntimeError("SPATIUM_API_URL is required")
         key = os.environ.get("SPATIUM_AGENT_KEY", "")
-        pairing_code = os.environ.get("BOOTSTRAP_PAIRING_CODE", "")
-        # One-of validation. A cached resolved key on disk would also
-        # suffice but we can't see it from here; the resolver raises
-        # a clearer error if every source is exhausted.
-        if not key and not pairing_code:
+        if not key:
             raise RuntimeError(
-                "One of SPATIUM_AGENT_KEY or BOOTSTRAP_PAIRING_CODE must be set."
+                "SPATIUM_AGENT_KEY is required. Issue #246 removed the "
+                "pairing-code → PSK exchange (the underlying control-plane "
+                "endpoint was retired in #170 Wave A3); paste the long hex "
+                "key directly. Application appliances receive it via the "
+                "supervisor's role-compose.env automatically."
             )
         roles_raw = os.environ.get("AGENT_ROLES", "primary")
         roles = [r.strip() for r in roles_raw.split(",") if r.strip()]
         return cls(
             control_plane_url=cp,
             agent_key=key,
-            bootstrap_pairing_code=pairing_code,
             server_name=(
                 os.environ.get("SPATIUM_SERVER_NAME")
                 or os.environ.get("AGENT_HOSTNAME")
