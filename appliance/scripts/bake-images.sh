@@ -42,12 +42,17 @@ IMAGES=(
     # install variants. Application-role appliances don't run these
     # pods, but baking them keeps the slot consistent across all
     # three variants (no "I built a Core but my image set was for
-    # Application" gotcha) — disk cost ~1 GB extra on the slot.
+    # Application" gotcha) — disk cost ~250 MB extra on the slot.
+    #
+    # NOTE — only ``spatiumddi-api`` + ``spatiumddi-frontend`` are
+    # separately-built images. The umbrella chart's worker / beat /
+    # migrate Deployments + Jobs all run the SAME spatiumddi-api
+    # image with different ``command:`` overrides (verified across
+    # docker-compose.yml + charts/spatiumddi/templates/{api,worker,
+    # beat,migrate}.yaml). Don't add ``spatiumddi-worker`` /
+    # ``-beat`` / ``-migrate`` here — they don't exist in ghcr.
     "ghcr.io/spatiumddi/spatiumddi-api"
     "ghcr.io/spatiumddi/spatiumddi-frontend"
-    "ghcr.io/spatiumddi/spatiumddi-worker"
-    "ghcr.io/spatiumddi/spatiumddi-beat"
-    "ghcr.io/spatiumddi/spatiumddi-migrate"
 )
 
 # Issue #183 Phase 8 — 3rd-party observability images. Tagged with
