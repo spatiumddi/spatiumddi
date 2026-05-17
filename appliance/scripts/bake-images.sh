@@ -38,6 +38,16 @@ IMAGES=(
     "ghcr.io/spatiumddi/dns-bind9"
     "ghcr.io/spatiumddi/dns-powerdns"
     "ghcr.io/spatiumddi/dhcp-kea"
+    # Phase 11 (#183) — control-plane images for the AIO + Core
+    # install variants. Application-role appliances don't run these
+    # pods, but baking them keeps the slot consistent across all
+    # three variants (no "I built a Core but my image set was for
+    # Application" gotcha) — disk cost ~1 GB extra on the slot.
+    "ghcr.io/spatiumddi/spatiumddi-api"
+    "ghcr.io/spatiumddi/spatiumddi-frontend"
+    "ghcr.io/spatiumddi/spatiumddi-worker"
+    "ghcr.io/spatiumddi/spatiumddi-beat"
+    "ghcr.io/spatiumddi/spatiumddi-migrate"
 )
 
 # Issue #183 Phase 8 — 3rd-party observability images. Tagged with
@@ -56,6 +66,11 @@ OBSERVABILITY_IMAGES=(
     # /var/lib/spatiumddi/agent-landing/index.html on :80. Pinned to
     # 1.27-alpine matching values.yaml's ``agentLanding.image.tag``.
     "nginx:1.27-alpine"
+    # Phase 11 (#183) — datastores for the AIO + Core control plane.
+    # Tags follow the umbrella chart's ``postgresql.image.tag`` and
+    # ``redis.image.tag`` defaults.
+    "postgres:16-alpine"
+    "redis:7-alpine"
 )
 
 if ! command -v docker >/dev/null 2>&1; then

@@ -24,6 +24,16 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if .Values.frontend.hostNetwork }}
+      # Appliance use (#183 Phase 11): expose :80 on the node IP
+      # directly. The umbrella chart is otherwise pure ClusterIP,
+      # but the appliance disables klipper-lb + the default
+      # NodePort range excludes :80. hostNetwork is the simplest
+      # way to land on http://<appliance>/ for the operator. Pair
+      # with replicas=1 so the single host port doesn't conflict.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
       containers:
         - name: frontend
           image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-frontend") .) }}
@@ -31,6 +41,9 @@ spec:
           ports:
             - name: http
               containerPort: 80
+              {{- if .Values.frontend.hostNetwork }}
+              hostPort: 80
+              {{- end }}
           env:
             # Issue #176: tell the frontend nginx where the api Service
             # is. The image defaults to ``api:8000`` (Docker Compose's

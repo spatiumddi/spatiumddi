@@ -329,6 +329,17 @@ spec:
     image:
       tag: "${SPATIUMDDI_VERSION}"
       pullPolicy: IfNotPresent
+    # Appliance overrides — collapse the frontend to a single
+    # replica with hostNetwork on the node IP so http://<ip>/
+    # serves the SpatiumDDI UI. klipper-lb is disabled in our
+    # k3s config + NodePort defaults exclude :80, so hostNetwork
+    # is the cleanest path. dnsPolicy: ClusterFirstWithHostNet
+    # is set by the chart template so service DNS still resolves
+    # (pod talks to api via the in-cluster ClusterIP through
+    # kube-proxy iptables).
+    frontend:
+      replicas: 1
+      hostNetwork: true
     # DNS / DHCP agents from the umbrella chart are NOT used on the
     # appliance — the appliance chart (templates/dns-bind9.yaml etc.)
     # owns the role pods with hostNetwork + per-role node labels.

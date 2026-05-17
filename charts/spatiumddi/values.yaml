@@ -63,6 +63,15 @@ frontend:
   service:
     type: ClusterIP
     port: 80
+  # Appliance use (#183 Phase 11) — flip to true to make the frontend
+  # pod bind on the node's :80 directly via hostNetwork + hostPort.
+  # Pair with ``replicas: 1`` (the single :80 host port is exclusive).
+  # ``dnsPolicy: ClusterFirstWithHostNet`` gets added automatically so
+  # cluster DNS still resolves; the pod talks to api via the existing
+  # in-cluster ClusterIP Service through kube-proxy iptables.
+  # Off-appliance K8s deployments leave this false + run an Ingress
+  # in front instead.
+  hostNetwork: false
   # Issue #176: the frontend nginx proxies ``/api/`` to the api Service
   # using a runtime-substituted upstream. The Docker image defaults to
   # ``api:8000`` (the Compose service name) which doesn't resolve on
