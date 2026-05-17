@@ -35,20 +35,19 @@ mkdir -p "$BUILDROOT/etc/systemd/system/multi-user.target.wants"
 # Install + Live mode services are kept WantedBy=multi-user.target
 # but gate themselves with ConditionKernelCommandLine=spatium-mode=…
 # so only one runs per boot, depending on the GRUB menu choice.
-for unit in docker.service chrony.service ssh.service \
+for unit in chrony.service ssh.service \
             NetworkManager.service \
-            spatium-docker-overlay.service \
             spatiumddi-firstboot.service \
-            spatiumddi-update.path \
             spatiumddi-reboot.path \
             spatiumddi-slot-upgrade.path \
             spatiumddi-slot-rollback.path \
             spatiumddi-slot-set-next-boot.path \
             spatiumddi-slot-set-default.path \
             spatiumddi-reboot-agent.path \
+            k3s.service \
             spatiumddi-snmp-reload.path \
             spatiumddi-chrony-reload.path \
-            spatiumddi-supervisor-watchdog.timer \
+            spatium-firewall-reload.path \
             spatium-install.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
@@ -157,12 +156,11 @@ d /var/persist/etc-work  0755 root root - -
 EOF
 
 # #170 Wave A1 — supervisor identity dir. Bind-mounted into the
-# spatium-supervisor container at /var/lib/spatium-supervisor. Lives
-# on /var/persist so the Ed25519 keypair + control-plane-signed cert
-# (Wave A2) survive slot swaps verbatim. Mode 0755 root:root because
-# docker would auto-create it as root:root anyway; the supervisor
-# entrypoint chowns the dir contents to the in-container ``spatium``
-# uid on first start.
+# spatium-supervisor pod at /var/lib/spatium-supervisor. Lives on
+# /var/persist so the Ed25519 keypair + control-plane-signed cert
+# survive slot swaps verbatim. Mode 0755 root:root; the pod
+# entrypoint chowns the dir contents to the in-pod ``spatium`` uid
+# on first start.
 cat > "$BUILDROOT/usr/lib/tmpfiles.d/spatium-supervisor.conf" <<'EOF'
 # #170 Wave A1 — supervisor identity directory. Survives slot swaps.
 d /var/persist/spatium-supervisor 0755 root root - -
@@ -202,7 +200,6 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-stack-status"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-install"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-banner"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-bootstrap"
-chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-update"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-slot-upgrade"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-console"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etc-reconcile"
@@ -211,8 +208,6 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firstboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-install.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-bootstrap.service"
-chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-update.path"
-chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-update.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-rollback.path"
@@ -233,6 +228,9 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-snmp-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-chrony-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.service"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-firewall-reload"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-firewall-reload.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-firewall-reload.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console.service"
@@ -241,6 +239,57 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/etc.mount"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-reconcile.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/home.mount"
 chmod 0644 "$BUILDROOT/etc/systemd/system/root.mount"
+
+# Issue #183 Phase 1 — k3s baked binary + systemd unit + config.
+# Phase 7 made the appliance k3s-only — no docker on the rootfs.
+# k3s.service is enabled in the unit-enable loop above so it comes
+# up at first boot; the auto-deploy manifests directory the
+# firstboot script writes to brings the supervisor pod online.
+if [ -f "$BUILDROOT/usr/local/bin/k3s" ]; then
+    chmod 0755 "$BUILDROOT/usr/local/bin/k3s"
+fi
+chmod 0644 "$BUILDROOT/etc/systemd/system/k3s.service"
+chmod 0644 "$BUILDROOT/etc/rancher/k3s/config.yaml"
+chmod 0644 "$BUILDROOT/etc/profile.d/k3s.sh"
+# kubectl / crictl / ctr are symlinks to /usr/local/bin/k3s created
+# by fetch-k3s.sh — chmod the underlying binary is enough since
+# symlinks inherit on execve.
+
+# kubectl bash completion — generated from the baked k3s binary at
+# image-build time so the operator gets tab-completion without
+# needing network access on first boot. bash-completion (the
+# loader) is in the Packages= list above; k3s's embedded kubectl
+# emits the completion script via `kubectl completion bash`.
+install -d -m 0755 "$BUILDROOT/etc/bash_completion.d"
+if [ -x "$BUILDROOT/usr/local/bin/k3s" ]; then
+    "$BUILDROOT/usr/local/bin/k3s" kubectl completion bash \
+        > "$BUILDROOT/etc/bash_completion.d/kubectl" 2>/dev/null || true
+    chmod 0644 "$BUILDROOT/etc/bash_completion.d/kubectl" 2>/dev/null || true
+fi
+# /etc/profile.d drop-in: source bash-completion + the kubectl
+# script + define a `k` alias bound to kubectl's completion.
+cat > "$BUILDROOT/etc/profile.d/kubectl-alias.sh" <<'PROF'
+# Auto-generated by mkosi.postinst — kubectl tab-complete + `k` alias.
+[ -f /usr/share/bash-completion/bash_completion ] && \
+    . /usr/share/bash-completion/bash_completion
+[ -f /etc/bash_completion.d/kubectl ] && . /etc/bash_completion.d/kubectl
+alias k=kubectl
+complete -F __start_kubectl k 2>/dev/null || true
+PROF
+chmod 0644 "$BUILDROOT/etc/profile.d/kubectl-alias.sh"
+# Air-gap images tarball + LICENSE/manifest land via mkosi.extra/
+# copy; ensure their containing dirs exist with sane modes.
+install -d -m 0755 "$BUILDROOT/var/lib/rancher/k3s/agent/images"
+install -d -m 0755 "$BUILDROOT/usr/share/doc/k3s"
+# Issue #183 Phase 3 — baked chart tarball. Source-tracked in
+# charts/spatiumddi-appliance/ and packaged at build time via
+# appliance/scripts/bake-chart.sh. The supervisor's
+# service_lifecycle_k3s module reads this exact path + base64-
+# encodes for the HelmChart CR ``spec.chartContent``.
+install -d -m 0755 "$BUILDROOT/usr/lib/spatiumddi/charts"
+if [ -f "$BUILDROOT/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz" ]; then
+    chmod 0644 "$BUILDROOT/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz"
+fi
 
 # State directories owned by the spatiumddi-firstboot service.
 install -d -m 0755 "$BUILDROOT/etc/spatiumddi"
@@ -257,59 +306,17 @@ install -d -m 0755 "$BUILDROOT/etc/nftables.d"
 install -d -m 2755 "$BUILDROOT/var/log/journal"
 chgrp systemd-journal "$BUILDROOT/var/log/journal" 2>/dev/null || true
 
-# ── Docker client CLI ─────────────────────────────────────────────────────────
-# Debian trixie's docker.io package (26.1.5+dfsg1-9+b12) ships ONLY
-# the daemon — dockerd, docker-proxy, docker-init. It does NOT ship
-# /usr/bin/docker, the CLI client most operators expect. Download
-# the upstream static binary and drop it in /usr/local/bin/docker so
-# `docker ps`, `docker logs`, `docker exec` etc. work for
-# troubleshooting. /usr/local/ takes priority over /usr/ in $PATH so
-# no conflict if Debian ever ships the CLI again.
-# Docker CLI version — docker.com's static binaries only go back so
-# far. 27.x CLIs are backward-compatible with the Debian-shipped
-# 26.x daemon (Docker keeps the API stable for at least one major).
-DOCKER_VERSION=27.5.1
-if [ ! -x "$BUILDROOT/usr/local/bin/docker" ]; then
-    echo "Downloading docker CLI ${DOCKER_VERSION}..."
-    tmpd=$(mktemp -d)
-    # The mkosi sandbox exposes neither host curl nor host tar on
-    # PATH or at /usr/bin/. But python3 IS available (mkosi is
-    # python-based) — fetch + extract entirely in stdlib so we
-    # don't depend on host tooling.
-    if python3 - "$tmpd/docker" <<EOF
-import sys, urllib.request, tarfile, shutil, pathlib
-url = "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz"
-out_file = pathlib.Path(sys.argv[1])
-out_file.parent.mkdir(parents=True, exist_ok=True)
-tarball = out_file.parent / "docker.tgz"
-print(f"  fetching {url}")
-with urllib.request.urlopen(url, timeout=60) as r, open(tarball, "wb") as f:
-    shutil.copyfileobj(r, f)
-size = tarball.stat().st_size
-print(f"  extracting docker/docker from {size}-byte tarball")
-# Use extractfile() + manual write so we don't trip Python 3.13's
-# new tar-filter machinery (it rejects extract() of files with
-# non-portable metadata, but extractfile() returns a plain stream).
-with tarfile.open(tarball) as t, \
-     t.extractfile("docker/docker") as src, \
-     open(out_file, "wb") as dst:
-    shutil.copyfileobj(src, dst)
-EOF
-    then
-        install -m 0755 "$tmpd/docker" "$BUILDROOT/usr/local/bin/docker"
-        echo "  installed: $(ls -lh "$BUILDROOT/usr/local/bin/docker" | awk '{print $5}')"
-    else
-        echo "WARN: docker CLI download failed — operators will only have docker-compose"
-    fi
-    rm -rf "$tmpd"
-fi
+# Issue #183 Phase 7 — docker CLI fetch removed. The appliance is
+# k3s-only; operators get ``kubectl`` (symlink to /usr/local/bin/k3s)
+# for service inspection. The docker.com static-binary download
+# stanza that used to live here is gone with the rest of docker.
 
 # Make /etc/resolv.conf the systemd-resolved-managed one.
 # resolved publishes upstream-DNS info (picked up from networkd's
 # DHCP) at /run/systemd/resolve/resolv.conf. Without this symlink,
 # /etc/resolv.conf is whatever rsync brought from the live system
-# (often a dangling stub pointing at ::1) and docker pull fails on
-# every fresh install with "lookup registry-1.docker.io on [::1]:53".
+# (often a dangling stub pointing at ::1) and outbound DNS dies on
+# every fresh install.
 ln -sfn /run/systemd/resolve/resolv.conf "$BUILDROOT/etc/resolv.conf"
 
 # Enable resolved alongside the rest of the service set. (Manually

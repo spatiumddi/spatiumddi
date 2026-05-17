@@ -55,8 +55,8 @@
 - [Architecture](#architecture)
 - [Getting Started](#getting-started) — three ways to run SpatiumDDI:
   - [Try the demo in GitHub Codespaces](#try-the-demo-in-github-codespaces) — one-click full stack with seeded data, browser-only, free 60 h/month
+  - [Quick start with the OS appliance ISO](#quick-start-with-the-os-appliance-iso-recommended) — easiest deploy: Debian 13 + embedded k3s + atomic A/B upgrades, six-question installer
   - [Quick start with Docker Compose](#quick-start-with-docker-compose) — `docker compose up` on any Docker host, full control
-  - [Quick start with the OS appliance ISO](#quick-start-with-the-os-appliance-iso) — boot a Debian 13 VM/baremetal image, five-question installer, atomic A/B upgrades
   - Plus: [demo seed](#seeding-demo-data) · [in-place upgrade flow](#upgrading) · [built-in DNS/DHCP containers](#running-the-built-in-bind9--powerdns--kea-containers) · [API docs](#api--interactive-docs)
 - [Deployment Options](#deployment-options)
 - [Documentation](#documentation)
@@ -656,7 +656,183 @@ The demo Codespace runs in **DEMO_MODE** — abusable surfaces are server-side l
 
 Cold start is ~5–8 minutes (image build) on a 4-core machine; the Codespace's free-tier hours come from your own GitHub account, and trashing the data only affects your own copy. To start fresh, delete the Codespace and click the badge again.
 
+### Quick start with the OS appliance ISO (recommended)
+
+The fastest way to a working SpatiumDDI install. Boot a single
+ISO, answer six wizard prompts, and you're on **HTTPS with the
+full stack running** in 2-5 minutes. No Docker setup, no
+Kubernetes setup, no Python virtualenv. The ISO is a
+self-contained Debian 13 image with [k3s](https://k3s.io/)
+embedded — a single-binary Kubernetes distribution — so the same
+SpatiumDDI containers that ship as a Helm chart deploy on the
+appliance via [HelmChart CRDs](https://docs.k3s.io/helm).
+Operators get a real Kubernetes node without managing one.
+
+#### What you get out of the box
+
+- Single-node [k3s](https://k3s.io/) cluster (~70 MB static
+  binary, no daemons to chase).
+- SpatiumDDI control plane (API, frontend, worker, beat,
+  PostgreSQL, Redis, migrate Job) running as Pods.
+- HTTPS on `:443` from first boot — a self-signed cert with the
+  host's globally-scoped IPs in the SAN list. Replace with
+  your own pasted PEM / CSR-on-server / Let's Encrypt cert
+  whenever you're ready.
+- A **dedicated `/appliance` management hub** that handles
+  everything you'd otherwise need SSH for: pod inspection +
+  live log streaming, TLS cert manager, atomic A/B OS slot
+  upgrades, firmware-pending banner, fleet management for
+  remote agents, NTP / SNMP host config, journalctl viewer,
+  self-test runner, one-click diagnostic bundle, maintenance
+  mode, host reboot / shutdown.
+- A Talos-style **console dashboard** on the appliance's
+  physical / serial console showing live vitals, pod health,
+  and a journalctl tail — useful when the web UI is down.
+- **Atomic A/B slot OS upgrades**: every appliance has two
+  identical root partitions; an upgrade dd's the new image
+  into the inactive one, reboots, and auto-reverts on
+  `/health/live` failure. Worst case is one wasted reboot.
+
+#### Get the ISO
+
+- **Pre-built:** grab `spatiumddi-appliance-<version>.iso` from the
+  [latest release](https://github.com/spatiumddi/spatiumddi/releases).
+- **Build from source:** `make appliance-dev-iso` produces an
+  ISO in `appliance/build/`. See
+  [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md)
+  for prerequisites.
+
+#### Install
+
+1. Attach the ISO as a CD-ROM in your hypervisor (Proxmox /
+   VMware / Hyper-V / QEMU), or `dd` it to a USB stick for
+   bare metal. Hard floor: **32 GiB disk, 2 GiB RAM, amd64**
+   (arm64 ISO is planned).
+2. Boot. The installer wizard asks for:
+   - **Variant** — *All-in-One* (control plane + DNS + DHCP
+     on this box), *Core-only* (control plane only; agents
+     pair against it from other boxes), or *Application*
+     (DNS / DHCP agent box; pairs against a remote control
+     plane).
+   - **Target disk**, **hostname**, **admin password**,
+     **network** (DHCP or static), **timezone**.
+   - For *Application*, also **control plane URL** and a
+     **bootstrap method** — see "Joining DNS / DHCP agents"
+     below.
+3. The installer partitions, installs GRUB, and reboots.
+   First boot generates secrets, bakes a self-signed cert,
+   and starts k3s + the helm-controller. The helm-controller
+   reconciles the baked HelmChart CR; in 30-90 s every
+   spatium pod is in Running state.
+
+#### Access
+
+Browse to `https://<appliance-ip>/`. Accept the self-signed
+cert warning (you'll replace it through **Appliance → Web UI
+Certificate** as soon as you're logged in). Sign in with
+`admin / admin` — you'll be forced to set a real password on
+first login.
+
+The default port is `:443` (HTTPS); `:80` redirects to it. If
+you replace the cert with Let's Encrypt or a corp-CA cert, the
+nginx pod reloads automatically — no operator action needed
+beyond pasting the new cert in the UI.
+
+#### Joining DNS / DHCP agents
+
+For distributed deployments (control plane on one box, DNS
+and DHCP on others), install the **Application** variant on
+each agent box. Each agent needs a bootstrap secret to
+register with the control plane. Two ways to provide it:
+
+**Pairing code (recommended).** Easy to type, even over an
+IPMI / serial console.
+
+1. On the control plane, open **Appliance → Pairing** and
+   click **New pairing code**. Pick the agent kind (DNS /
+   DHCP / DNS + DHCP for combined boxes), an optional server
+   group, and an expiry (15 min default).
+2. The UI shows an 8-digit code with a live countdown.
+3. On the agent appliance's installer, pick "Pairing code"
+   at the **Bootstrap method** prompt and type the 8 digits.
+   The agent redeems the code for the real key on first
+   boot and registers itself.
+
+**Bootstrap key (advanced).** For re-installs, air-gapped
+sites with a saved key, or when a pairing code expired
+before you got to the installer. Reveal the 64-char hex key
+on the control plane via **Settings → Security → Agent
+bootstrap keys** and paste it.
+
+The agent appliance's console dashboard shows a **Pairing**
+row — green ✓ when registered, yellow while in progress,
+red with a regenerate-the-code hint on failure.
+
+Once paired, the agent shows up on **Appliance → Fleet**.
+The operator approves the row (signs the agent's cert),
+then picks roles (`dns-bind9` / `dns-powerdns` / `dhcp` —
+DNS engines are mutually exclusive). The supervisor on the
+agent labels the k3s node (`spatium.io/role-<role>=true`)
+and the matching DaemonSet schedules the role pod. Total
+time from click to running pod: typically 25-35 s.
+
+#### Managing the appliance
+
+The **Appliance** section in the sidebar groups every host
+concern:
+
+- **OS Versions** — atomic A/B slot upgrades for this
+  appliance and every registered remote agent. Pick a
+  release, optionally bulk-select agents, click Apply.
+  Failed upgrades auto-revert on the next reboot; rollback
+  is a single click.
+- **Pairing** — generate single-use codes to onboard agents.
+- **Releases** — GitHub releases list with one-click upgrades.
+- **Web UI Certificate** — replace the self-signed cert with
+  a pasted PEM + key, an in-server CSR, or a Let's Encrypt
+  cert. Modifies the k8s Secret + bumps the frontend pod's
+  rollout annotation; nginx reloads with the new cert in ~15 s.
+- **NTP** — chrony config that propagates to every
+  registered agent appliance.
+- **SNMP** — read-only monitoring access (v2c with community
+  + CIDR allowlist, or v3 USM).
+- **Pods** — live pod list across the spatium namespace via
+  the api's mounted ServiceAccount; per-pod restart (delete
+  → controller recreate) and SSE live log streaming.
+- **Logs & Diagnostics** — journal viewer, self-test runner
+  (DNS resolution + kubeapi reachability + pod health + role
+  presence), one-click diagnostic bundle (secrets redacted).
+- **Maintenance** — drain traffic, reboot, shutdown.
+
+The **console dashboard** on the appliance's physical or
+serial console shows live vitals, pod health, and a
+journalctl tail. F-keys give you local-login (F1), htop
+(F2), `kubectl get pods -A` (F3 — pod log viewer), `nmtui`
+for networking (F4), and confirmed reboot / shutdown
+(F5 / F6).
+
+Stuck without a working web UI? SSH in as the OS admin user
+you created during install. `kubectl` is on PATH (with bash
+completion + a `k` alias); `kubectl get pods -A` is the
+fastest "what's broken" diagnostic. `journalctl -u
+spatiumddi-firstboot` shows the first-boot setup log; `kubectl
+-n spatium logs <pod>` for any pod's stdout/stderr.
+
+> The appliance is beta — see issue
+> [#134](https://github.com/spatiumddi/spatiumddi/issues/134)
+> + [#183](https://github.com/spatiumddi/spatiumddi/issues/183)
+> for the roadmap and
+> [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md)
+> for the full design, build pipeline, k3s architecture, and
+> known limitations.
+
 ### Quick start with Docker Compose
+
+If you'd rather run on existing Docker infrastructure, the
+same SpatiumDDI containers ship as a docker-compose stack.
+Useful for dev work, small single-host production where you
+want full control of the OS, or environments where Kubernetes
+overhead is unwanted.
 
 ```bash
 git clone https://github.com/spatiumddi/spatiumddi.git
@@ -749,111 +925,6 @@ Record changes propagate to BIND9 via RFC 2136 — typically sub-second, no daem
 
 **Production**: point the agent at your real control plane, expose `53/udp` + `53/tcp`, and run one container per DNS server you want in the cluster. All servers in a group share the same TSIG key for dynamic updates.
 
-### Quick start with the OS appliance ISO
-
-Prefer to skip Docker setup entirely? SpatiumDDI ships a self-contained
-OS appliance image — Debian 13 with the full stack pre-installed. Boot
-it, answer the installer's questions, and you're on HTTPS with
-everything running. No prior Docker or Linux experience needed.
-
-#### Get the ISO
-
-- **Pre-built:** grab `spatiumddi-appliance-<version>.iso` (~440 MB
-  hybrid USB/CD) from the
-  [latest release](https://github.com/spatiumddi/spatiumddi/releases).
-- **Build from source:** `make appliance-dev-iso` produces an ISO in
-  `appliance/build/`. See
-  [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) for
-  prerequisites.
-
-#### Install
-
-1. Attach the ISO as a CD-ROM in your hypervisor (Proxmox / VMware /
-   Hyper-V / QEMU), or `dd` it to a USB stick for bare metal.
-2. Boot. The installer asks for **role** (control plane all-in-one,
-   control-only, or one of the agent roles), **target disk**,
-   **hostname**, **admin password**, **network** (DHCP or static), and
-   **timezone**.
-3. For agent roles, the wizard also asks for a **control plane URL**
-   and a **bootstrap method** — see the next section.
-4. The installer partitions, copies the system, installs GRUB, and
-   reboots. First boot finishes in 2-5 minutes.
-
-#### Access
-
-Browse to `https://<appliance-ip>/`. Accept the self-signed cert
-warning, then sign in with `admin / admin` — you'll be forced to set
-a real password on first login.
-
-#### Joining DNS / DHCP agents
-
-For distributed deployments where DNS and DHCP live on separate boxes,
-the installer offers role-split appliances (`dns-agent-bind9`,
-`dns-agent-powerdns`, `dhcp-agent`). Each agent needs a bootstrap
-secret to register with the control plane. Two ways to provide it:
-
-**Pairing code (recommended).** Easy to type, even over an IPMI /
-serial console.
-
-1. On the control plane, open **Appliance → Pairing** and click
-   **New pairing code**. Pick the agent kind (DNS / DHCP / DNS + DHCP
-   for combined boxes), an optional server group, and an expiry (15
-   min default).
-2. The UI shows an 8-digit code with a live countdown.
-3. On the agent appliance, pick "Pairing code" at the installer's
-   **Bootstrap method** prompt and type the 8 digits. The agent
-   redeems the code for the real key on first boot and registers
-   itself.
-
-**Bootstrap key (advanced).** For re-installs, air-gapped sites with a
-saved key, or when a pairing code expired before you got to the
-installer. Reveal the 64-char hex key on the control plane via
-**Settings → Security → Agent bootstrap keys** and paste it.
-
-The console dashboard's **Pairing** row shows whether the agent has
-paired successfully — green ✓ when registered, yellow while in
-progress, red with a regenerate-the-code hint on failure.
-
-#### Managing the appliance
-
-The **Appliance** section in the sidebar groups everything you'd
-otherwise need SSH for:
-
-- **OS Versions** — atomic A/B slot upgrades for this appliance and
-  every registered remote agent. Pick a release, optionally bulk-
-  select agents, click Apply. Failed upgrades auto-revert on the
-  next reboot; rollback is a single click.
-- **Pairing** — generate single-use codes to onboard agents (see
-  above).
-- **Releases** — GitHub releases list with one-click container-stack
-  upgrades.
-- **Web UI Certificate** — replace the self-signed cert with a
-  pasted PEM + key, an in-server CSR, or a Let's Encrypt cert.
-- **NTP** — chrony config that propagates to every registered
-  agent appliance.
-- **SNMP** — read-only monitoring access (v2c with community + CIDR
-  allowlist, or v3 USM).
-- **Containers** — start / stop / restart, live SSE log streaming.
-- **Logs & Diagnostics** — journal viewer, self-test runner,
-  one-click diagnostic bundle (secrets redacted).
-- **Maintenance** — drain traffic, reboot, shutdown.
-
-The **console dashboard** on the appliance's physical or serial
-console shows live vitals, container health, and a journalctl tail.
-F-keys give you local-login (F1), htop (F2), `docker stats` (F3),
-`nmtui` for networking (F4), and confirmed reboot / shutdown
-(F5 / F6).
-
-Stuck without a working web UI? SSH in as the OS admin user you
-created during install and check `journalctl -u spatiumddi-firstboot`
-or
-`docker compose -f /usr/local/share/spatiumddi/docker-compose.yml ps`.
-
-> The appliance is beta — see issue
-> [#134](https://github.com/spatiumddi/spatiumddi/issues/134) for the
-> roadmap and [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md)
-> for the full design, build pipeline, and known limitations.
-
 ### API & interactive docs
 
 The FastAPI backend auto-generates OpenAPI / Swagger:
@@ -901,7 +972,7 @@ EOF
 | **Docker Compose** | Dev, small single-host production | ✅ Supported |
 | **Kubernetes + Helm** | Multi-node production, scalable | ✅ Umbrella chart (`charts/spatiumddi`, published OCI to `ghcr.io/spatiumddi/charts/spatiumddi`) |
 | **Bare metal / VM (Ansible)** | On-prem without containers | 📋 Planned |
-| **OS Appliance (ISO / qcow2)** | Air-gapped, zero-dependency, dedicated `/appliance` management hub | 🔄 Alpha — Debian 13 + full stack, hybrid USB/CD, web first-boot wizard, in-UI TLS / releases / containers / logs / diagnostics / maintenance + reboot. Build with `make appliance && make appliance-iso`. See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) + [issue #134](https://github.com/spatiumddi/spatiumddi/issues/134) |
+| **OS Appliance (ISO / qcow2)** | Easiest deploy, air-gapped, dedicated `/appliance` management hub | 🔄 Beta — Debian 13 + embedded [k3s](https://k3s.io/) + full stack as HelmChart CRs, hybrid USB/CD, installer wizard, atomic A/B slot upgrades, in-UI TLS / releases / pods / logs / diagnostics / maintenance. Build with `make appliance-iso`. See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) + issues [#134](https://github.com/spatiumddi/spatiumddi/issues/134) / [#183](https://github.com/spatiumddi/spatiumddi/issues/183) |
 
 ---
 

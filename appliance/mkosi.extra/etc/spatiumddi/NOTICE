@@ -36,10 +36,10 @@ Bootloader
                                           support is Phase 4 work)
 
 Container runtime
-   Docker (docker.io)                     Apache 2.0
-   docker-compose (Python v1)             Apache 2.0
-   runc                                   Apache 2.0
-   containerd                             Apache 2.0
+   k3s                                    Apache 2.0  (statically
+                                          links containerd / runc /
+                                          flannel / kine / helm-
+                                          controller — all Apache 2.0)
 
 DNS server (in container)
    BIND 9                                 MPL 2.0

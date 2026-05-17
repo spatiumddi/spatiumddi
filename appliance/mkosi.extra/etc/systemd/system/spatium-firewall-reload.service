@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply pending SpatiumDDI firewall drop-in (issue #183 Phase 9)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/183
+# The runner writes /etc/nftables.d/spatium-role.nft and reloads the
+# master config. Both paths need the /etc overlay (Phase 8a) mounted
+# so writes land on the /var-backed upper layer and persist across
+# A/B slot swaps. The trigger file itself lives under
+# /var/lib/spatiumddi which isn't available until local-fs.target.
+After=etc.mount local-fs.target
+Requires=etc.mount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatium-firewall-reload
+# No Install — only invoked by the matching .path unit.

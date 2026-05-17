@@ -1,89 +1,59 @@
-"""Docker-compose lifecycle for the supervisor (#170 Wave D follow-up).
+"""Supervisor service-lifecycle module (#183 Phase 7 — k3s-only).
 
-Pairs with ``role_orchestrator.py``: that module computes the
-target ``COMPOSE_PROFILES`` + env file from the control plane's
-role assignment; this one actually runs ``docker compose`` against
-that env file so the service containers come up / go down.
+Owns the supervisor's orchestration plane: applies role assignments
+from the control-plane heartbeat to the local k3s by PATCHing
+``HelmChart`` Custom Resources into the kubeapi. k3s's bundled
+helm-controller picks the CRs up + runs ``helm upgrade --install``
+for us on the next reconcile cycle.
 
-The appliance compose file at
-``/etc/spatiumddi/docker-compose.yml`` (managed by the appliance
-ISO; not the supervisor's to write) carries every service the
-supervisor can ever start. ``COMPOSE_PROFILES`` decides which subset
-runs — the supervisor flips it via the env file every heartbeat.
+Before Phase 7 there was a parallel docker-compose path in this
+module + ``docker_api.py``. Phase 7 retires docker entirely; both
+are deleted, and the k3s path graduates to the only path.
 
-Failure semantics:
+Design notes:
 
-* Stop / start failures don't crash the supervisor — they bubble up
-  as a ``LifecycleResult`` with ``ok=False`` and a short reason
-  string. The supervisor reports the reason in the next heartbeat's
-  ``role_switch_state`` field so the Fleet UI can render a red chip.
-* No automatic revert in this commit. The operator sees the failure
-  in the UI + can either fix the underlying issue (image missing,
-  port conflict — see Phase E2 pre-flight) and let the next
-  heartbeat retry, or reassign the role.
+* The supervisor doesn't run ``helm`` itself. We construct a
+  ``HelmChart`` CR carrying ``spec.chartContent`` (base64-encoded
+  tarball) + ``spec.valuesContent`` (rendered YAML) and PATCH it.
+
+* The chart tarball is **baked into the slot** at
+  ``/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz`` by the
+  build-time ``appliance/scripts/bake-chart.sh`` script. Air-gap
+  friendly: no chart registry, no internet calls, no ``helm pull``
+  at runtime.
+
+* Values are derived from the heartbeat-response ``role_assignment``
+  shape (rendered by ``role_orchestrator``).
+  ``COMPOSE_PROFILES`` keys translate to per-role
+  ``<role>.enabled: true`` flags + the agent keys / group names /
+  control-plane URL.
+
+Failures are surfaced as ``state="failed"`` with a single-line
+``reason`` so the Fleet drilldown's red banner stays readable.
 """
 
 from __future__ import annotations
 
-import shutil
-import subprocess
+import base64
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-from . import docker_api
+import structlog
 
-# Default compose file on the appliance — the ISO drops it under
-# /usr/local/share/spatiumddi/. (Earlier comments wrongly said
-# /etc/spatiumddi/; the actual install path is /usr/local/share/.)
-# Operators on docker / k8s deployments don't run this lifecycle
-# path; ``apply_role_assignment`` short-circuits when the compose
-# file is missing.
-_DEFAULT_COMPOSE_FILE = Path("/usr/local/share/spatiumddi/docker-compose.yml")
-
-# #170 Wave D follow-up — the appliance host's main env file (the
-# one ``spatiumddi-firstboot`` populates from install-wizard input)
-# is bind-mounted into the supervisor at ``/etc/spatiumddi-host/.env``
-# (see appliance compose: ``/etc/spatiumddi:/etc/spatiumddi-host:ro``).
-# Passing it as an additional ``--env-file`` ahead of the role env
-# file gives ``docker compose`` access to operator-set knobs like
-# ``DOCKER_GID`` / ``DNS_AGENT_KEY`` / ``HTTP_PORT`` without the
-# supervisor having to re-emit each one into the role env. Later
-# ``--env-file`` arguments override earlier matching keys, so the
-# role env file's role-scoped vars (``COMPOSE_PROFILES``, etc.) still
-# win on collision.
-_HOST_ENV_FILE = Path("/etc/spatiumddi-host/.env")
-
-# Every service the supervisor can start. Names match the
-# ``services:`` keys in the appliance compose. The active subset
-# = intersection of this list + the operator's role assignment
-# (after profile→service mapping below).
-SUPERVISED_SERVICES = ("dns-bind9", "dns-powerdns", "dhcp-kea")
-
-# Compose profile → compose service name. ``COMPOSE_PROFILES`` (and
-# the ``profiles`` list ``apply_role_assignment`` receives from
-# ``compute_target_env``) carries profile values, which match
-# service names for DNS but NOT for DHCP — its profile is ``dhcp``
-# while its service is ``dhcp-kea``. Without the mapping the
-# desired-set intersection drops DHCP silently and ``up -d`` never
-# brings the kea container up. Mirrors ``watchdog._PROFILE_TO_SERVICE``;
-# keep them in sync.
-_PROFILE_TO_SERVICE: dict[str, str] = {
-    "dns-bind9": "dns-bind9",
-    "dns-powerdns": "dns-powerdns",
-    "dhcp": "dhcp-kea",
-}
+from . import k8s_api
 
 
 @dataclass(frozen=True)
 class LifecycleResult:
-    """Outcome of one ``apply_role_assignment`` pass.
+    """Outcome of one ``apply_role_assignment`` or
+    ``tear_down_supervised_services`` pass.
 
     ``state`` mirrors what the supervisor reports in the next
     heartbeat under ``role_switch_state``: ``idle`` / ``ready`` /
-    ``failed``. ``reason`` carries the failure detail (compose
-    stderr first line is usually enough) so the operator can
-    triage without SSH-ing in.
+    ``failed``. ``reason`` carries the failure detail (kubeapi
+    error first line is usually enough) so the operator can triage
+    without SSH-ing in.
     """
 
     state: str  # ready | failed | idle
@@ -92,240 +62,338 @@ class LifecycleResult:
     stopped: tuple[str, ...] = ()
 
 
-def _compose_available(compose_file: Path) -> tuple[bool, str | None]:
-    """Return ``(available, reason)``. False on dev (no compose file)
-    or on a host that doesn't have docker installed — the supervisor
-    short-circuits cleanly in either case."""
-    if not compose_file.exists():
-        return False, f"compose file missing: {compose_file}"
-    if shutil.which("docker") is None:
-        return False, "docker binary not on PATH"
-    return True, None
+# Service names the appliance can run. Match the chart's component
+# names (``app.kubernetes.io/component`` labels). The watchdog uses
+# this set to enumerate "which pods should I expect".
+SUPERVISED_SERVICES: tuple[str, ...] = ("dns-bind9", "dns-powerdns", "dhcp-kea")
+
+log = structlog.get_logger(__name__)
+
+# Baked-chart path the build-time script writes (#183 Phase 3).
+# Sibling to /usr/lib/spatiumddi/images/*.tar.zst — same lifecycle
+# (slot-baked at build, mounted via mkosi.extra/ copy).
+_BAKED_CHART_TARBALL = Path("/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz")
+
+# HelmChart CR name + namespaces. Single chart per appliance — one
+# install drives every assigned role via per-role enabled flags.
+# The CR itself lives in kube-system (where helm-controller watches);
+# the deployed pods live in the dedicated "spatium" namespace.
+_HELMCHART_NAME = "spatiumddi-appliance"
+_CHART_NAMESPACE = "kube-system"
+_TARGET_NAMESPACE = "spatium"
+
+# Profile → Helm chart key mapping. ``compose_profiles`` from the
+# rendered env file uses compose-style names; the chart's values.yaml
+# uses camelCase per-role blocks.
+_PROFILE_TO_HELM_KEY = {
+    "dns-bind9": "dnsBind9",
+    "dns-powerdns": "dnsPowerdns",
+    "dhcp": "dhcpKea",
+}
+
+# Phase 10 (#183) — every role the chart templates have a per-role
+# nodeSelector for. The supervisor labels the node with
+# ``spatium.io/role-<key>=true`` for each role in the desired set
+# and clears the label for each role leaving. Pod scheduling gates
+# on the label being present, so role swap = label flip.
+#
+# Keep in lock-step with the per-template ``nodeSelector`` blocks in
+# charts/spatiumddi-appliance/templates/*.yaml.
+_ROLE_LABEL_KEYS = {
+    "dns-bind9": "spatium.io/role-dns-bind9",
+    "dns-powerdns": "spatium.io/role-dns-powerdns",
+    "dhcp": "spatium.io/role-dhcp",
+}
+
+@dataclass(frozen=True)
+class K3sEnvironment:
+    """Result of probing whether k3s is the live runtime."""
+
+    available: bool
+    reason: str | None = None
 
 
-def _running_supervised_services(compose_file: Path) -> list[str]:
-    """Return the subset of :data:`SUPERVISED_SERVICES` currently in
-    running state. Best-effort — a docker daemon failure returns an
-    empty list (caller starts everything in the desired set;
-    redundant ``up -d`` on an already-running service is a no-op).
+def k3s_available() -> K3sEnvironment:
+    """Return whether the k3s path is ready to use.
 
-    Reads /var/run/docker.sock directly via ``docker_api`` instead of
-    shelling out to ``docker compose ps`` — same data, ~30× faster
-    (no compose CLI fork/exec + JSON re-serialisation). The compose
-    project name is stamped onto every container via the
-    ``com.docker.compose.project`` label by ``docker compose up``;
-    filter on that + the ``com.docker.compose.service`` label to
-    pick out the supervised services without ambiguity.
-    """
-    # The compose project name defaults to the compose file's parent
-    # directory name lowercased — for our appliance install that's
-    # ``spatiumddi`` (the file lives in /usr/local/share/spatiumddi/).
-    # Keying on the project label means an operator who manually
-    # ``docker run``s an arbitrary container named ``dns-bind9-test``
-    # won't false-positive into the running set.
-    expected_project = compose_file.parent.name
-    running: list[str] = []
-    for c in docker_api.list_running_containers():
-        labels = c.get("Labels") or {}
-        if labels.get("com.docker.compose.project") != expected_project:
+    Checks (all must pass):
+      * Chart tarball baked into the slot
+      * Kubeapi reachable (``/readyz`` returns ok)
+
+    Returns an ``unavailable`` with a human reason when any fails
+    so heartbeat-level logging can show *why* the supervisor stayed
+    on docker compose this tick."""
+    if not _BAKED_CHART_TARBALL.exists():
+        return K3sEnvironment(available=False, reason="chart tarball not baked")
+    if not k8s_api.check_kubeapi_ready():
+        return K3sEnvironment(available=False, reason="kubeapi /readyz not ok")
+    return K3sEnvironment(available=True)
+
+
+def _parse_env_file(env_file: Path) -> dict[str, str]:
+    """Read the rendered role-compose env file into a dict. Same
+    format render_env_file produces: ``KEY=value`` lines, comments
+    prefixed with ``#``, blanks ignored."""
+    out: dict[str, str] = {}
+    if not env_file.exists():
+        return out
+    try:
+        text = env_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.warning("supervisor.k3s_lifecycle.env_read_failed", error=str(exc))
+        return out
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
             continue
-        service = labels.get("com.docker.compose.service")
-        # State is "running" for actively-running containers; docker
-        # API uses "State" (top-level) for the engine-level state,
-        # which only returns running by default when ``all=0``.
-        if service in SUPERVISED_SERVICES:
-            running.append(service)
-    return running
+        key, _, value = line.partition("=")
+        out[key.strip()] = value.strip().strip('"').strip("'")
+    return out
+
+
+def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, object]:
+    """Construct the Helm values dict from the active profile set +
+    rendered env. Mirrors the per-role values.yaml structure in
+    ``charts/spatiumddi-appliance/``.
+
+    Air-gap defaults are inherited from the chart's values.yaml;
+    here we only override what changes per-appliance (per-role
+    enabled flags + agent keys + group names + control-plane URL).
+    """
+    control_plane_url = env_vars.get("CONTROL_PLANE_URL") or os.environ.get(
+        "CONTROL_PLANE_URL", ""
+    )
+    image_tag = env_vars.get("SPATIUMDDI_VERSION") or os.environ.get(
+        "SPATIUMDDI_VERSION", "dev"
+    )
+
+    # Phase 10 wave 2 — ``enabled`` flags here are RELEASE-ownership
+    # scope (which helm release owns which Deployment), NOT
+    # role-scheduling scope. Scheduling is gated by node labels
+    # exclusively (``spatium.io/role-<role>=true``); the supervisor
+    # toggles those on every heartbeat via reconcile_node_labels.
+    #
+    # The role release ALWAYS sets every role's enabled=true (so the
+    # chart renders + helm tracks the Deployment + PVCs). The
+    # bootstrap release sets them all false (so spatium-bootstrap
+    # doesn't fight us for ownership). Result: role swap = pure
+    # label flip, no chart upgrade, no chartContent re-upload to
+    # kine — Phase 9 kine-footprint follow-up closes.
+    values: dict[str, object] = {
+        "global": {
+            "imageTag": image_tag,
+            "imagePullPolicy": "Never",
+        },
+        "agentLanding": {
+            "enabled": False,
+        },
+        "supervisor": {
+            "enabled": False,
+        },
+        "dnsBind9": {
+            "enabled": True,
+            "controlPlaneUrl": control_plane_url,
+            "agentKey": env_vars.get("DNS_AGENT_KEY", ""),
+            "serverGroupName": env_vars.get("AGENT_GROUP", ""),
+        },
+        "dnsPowerdns": {
+            "enabled": True,
+            "controlPlaneUrl": control_plane_url,
+            "agentKey": env_vars.get("DNS_AGENT_KEY", ""),
+            "serverGroupName": env_vars.get("AGENT_GROUP", ""),
+        },
+        "dhcpKea": {
+            "enabled": True,
+            "controlPlaneUrl": control_plane_url,
+            "agentKey": env_vars.get("DHCP_AGENT_KEY", ""),
+            "serverGroupName": env_vars.get("DHCP_AGENT_GROUP", "")
+            or env_vars.get("AGENT_GROUP", ""),
+            "networkMode": env_vars.get("DHCP_NETWORK_MODE", "host"),
+        },
+    }
+    return values
+
+
+def _read_chart_tarball() -> bytes:
+    """Load the baked chart tarball off the slot rootfs. Raises
+    ``FileNotFoundError`` if the bake didn't run — caller surfaces
+    this as a ``failed`` LifecycleResult."""
+    return _BAKED_CHART_TARBALL.read_bytes()
 
 
 def apply_role_assignment(
     profiles: list[str],
     env_file: Path,
-    *,
-    compose_file: Path = _DEFAULT_COMPOSE_FILE,
 ) -> LifecycleResult:
-    """Bring the appliance's service containers in line with the
-    ``profiles`` list.
+    """k3s analog of ``service_lifecycle.apply_role_assignment``.
 
-    Algorithm:
+    Reads the rendered env file for control-plane URL + per-role
+    agent keys, builds the chart values block, base64-encodes the
+    baked chart tarball, and PATCHes a HelmChart CR into the
+    appliance's local kubeapi. k3s's helm-controller reconciles
+    the CR into a Helm release on its next loop (typically <5s).
 
-    1. If compose isn't available (dev / docker / k8s deploys), return
-       ``idle`` immediately — the supervisor reports that to the
-       control plane so the Fleet UI shows the appliance as paired
-       but not running anything yet.
-    2. Resolve the desired service set = intersection of profiles +
-       :data:`SUPERVISED_SERVICES`.
-    3. ``docker compose stop`` any supervised service currently
-       running that's not in the desired set. Removes service
-       containers cleanly; their state volume survives (named
-       volume).
-    4. ``docker compose --env-file=<env_file> up -d <desired>`` to
-       start the desired set. Idempotent — already-running services
-       are no-ops.
-    5. Returns ``ready`` on success, ``failed`` (with the first
-       stderr line) on any compose error.
+    Returns ``ready`` on PATCH success, ``idle`` when k3s isn't
+    available (no chart baked / kubeapi unreachable — caller's
+    fallback to the compose path), ``failed`` on a kubeapi or
+    serialisation error.
     """
-    available, reason = _compose_available(compose_file)
-    if not available:
-        return LifecycleResult(state="idle", reason=reason)
+    env = k3s_available()
+    if not env.available:
+        # ``idle`` instead of ``failed`` mirrors the compose path's
+        # "compose not available" shape: the supervisor isn't broken,
+        # this just isn't the runtime here. Caller (heartbeat) reads
+        # ``state="idle"`` as "skip + report we did nothing".
+        return LifecycleResult(state="idle", reason=env.reason)
 
-    # Map each profile to its compose service name, drop anything
-    # outside SUPERVISED_SERVICES (observer / custom roles have no
-    # service container). Without this mapping ``up -d <profile>``
-    # silently no-ops for DHCP because the compose service is
-    # ``dhcp-kea`` while the profile is just ``dhcp``.
-    desired: list[str] = []
-    for p in profiles:
-        svc = _PROFILE_TO_SERVICE.get(p)
-        if svc is not None and svc in SUPERVISED_SERVICES:
-            desired.append(svc)
-    running = _running_supervised_services(compose_file)
-    to_stop = [s for s in running if s not in desired]
-    to_start = desired  # ``up -d`` is idempotent — pass the full target set
+    env_vars = _parse_env_file(env_file)
+    values = _build_values(profiles, env_vars)
 
-    stopped: list[str] = []
-    started: list[str] = []
-
-    if to_stop:
-        try:
-            result = subprocess.run(
-                [
-                    "docker",
-                    "compose",
-                    "-f",
-                    str(compose_file),
-                    "stop",
-                    *to_stop,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            return LifecycleResult(state="failed", reason=f"stop: {exc}")
-        if result.returncode != 0:
-            first = result.stderr.strip().splitlines()[:1]
-            return LifecycleResult(
-                state="failed",
-                reason=f"stop failed: {(first[0] if first else 'no stderr')}",
-            )
-        stopped = list(to_stop)
-
-    if to_start:
-        try:
-            cmd = ["docker", "compose", "-f", str(compose_file)]
-            if _HOST_ENV_FILE.exists():
-                cmd += ["--env-file", str(_HOST_ENV_FILE)]
-            cmd += ["--env-file", str(env_file), "up", "-d", *to_start]
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            return LifecycleResult(state="failed", reason=f"up: {exc}")
-        if result.returncode != 0:
-            first = result.stderr.strip().splitlines()[:1]
-            return LifecycleResult(
-                state="failed",
-                reason=f"up failed: {(first[0] if first else 'no stderr')}",
-            )
-        started = list(to_start)
-
-    if not desired and not stopped and not started:
-        return LifecycleResult(state="idle")
-    return LifecycleResult(
-        state="ready",
-        started=tuple(started),
-        stopped=tuple(stopped),
-    )
-
-
-def tear_down_supervised_services(
-    *,
-    compose_file: Path = _DEFAULT_COMPOSE_FILE,
-) -> LifecycleResult:
-    """Stop AND remove every running supervised service container
-    (#170 Wave E follow-up — revoke teardown).
-
-    ``apply_role_assignment([], env_path)`` alone only runs
-    ``docker compose stop``, which leaves the containers in their
-    state with the original restart policy intact. On a subsequent
-    host reboot, dockerd brings them back up — exactly the bug an
-    operator hit after revoking + rebooting a paired appliance.
-
-    This function does ``stop`` followed by ``rm -fsv`` so the
-    container records are removed from dockerd's state entirely.
-    The compose service definition stays in the compose file (the
-    operator hasn't deleted the role assignment, just the appliance
-    row on the control plane) — but no container exists to auto-
-    restart. A subsequent re-authorize on the control plane → 200
-    heartbeat → ``apply_role_assignment(profiles, env_path)`` will
-    bring fresh containers back up cleanly.
-
-    Idempotent: returns ``idle`` when nothing is running. Safe to
-    call on every heartbeat in revoked state.
-    """
-    available, reason = _compose_available(compose_file)
-    if not available:
-        return LifecycleResult(state="idle", reason=reason)
-
-    running = _running_supervised_services(compose_file)
-    if not running:
-        return LifecycleResult(state="idle")
-
-    # ``docker compose rm -fsv`` does stop + remove + volume cleanup
-    # in one shot; ``-s`` stops first, ``-f`` skips the y/n prompt,
-    # ``-v`` removes anonymous volumes. The container's state
-    # volumes are named volumes (not anonymous) so ``-v`` is a
-    # no-op for the supervised services — the BIND9 / PowerDNS /
-    # Kea persistent state survives. Verified by inspecting the
-    # compose file's volume definitions.
     try:
-        result = subprocess.run(
-            [
-                "docker",
-                "compose",
-                "-f",
-                str(compose_file),
-                "rm",
-                "-fsv",
-                *running,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        return LifecycleResult(state="failed", reason=f"rm: {exc}")
-    if result.returncode != 0:
-        first = result.stderr.strip().splitlines()[:1]
-        return LifecycleResult(
-            state="failed",
-            reason=f"rm failed: {(first[0] if first else 'no stderr')}",
-        )
-    return LifecycleResult(state="ready", stopped=tuple(running))
+        chart_bytes = _read_chart_tarball()
+    except OSError as exc:
+        return LifecycleResult(state="failed", reason=f"chart read: {exc}")
+    chart_b64 = base64.b64encode(chart_bytes).decode("ascii")
+
+    ok, err = k8s_api.apply_helmchart(
+        _HELMCHART_NAME,
+        chart_content_b64=chart_b64,
+        values=values,
+        target_namespace=_TARGET_NAMESPACE,
+        chart_namespace=_CHART_NAMESPACE,
+    )
+    if not ok:
+        # Compose stderr first-line is usually enough for the Fleet
+        # UI banner; kubeapi errors are similarly short.
+        return LifecycleResult(state="failed", reason=err or "kubeapi apply failed")
+
+    # Phase 10 (#183) — alongside the values PATCH, label the node
+    # with ``spatium.io/role-<role>=true`` for each desired role,
+    # and clear the label for each role not in the desired set.
+    # The chart's per-role nodeSelector gates scheduling on this,
+    # so a role swap (BIND9 → PowerDNS) becomes "label flip" instead
+    # of a chart upgrade race. Best-effort: a label-patch failure
+    # doesn't block the apply (the values PATCH already landed and
+    # the helm-install will sit Pending until the next reconcile
+    # writes the labels).
+    desired_role_set = {p for p in profiles if p in _ROLE_LABEL_KEYS}
+    label_diff: dict[str, str | None] = {}
+    for role, label in _ROLE_LABEL_KEYS.items():
+        label_diff[label] = "true" if role in desired_role_set else None
+    node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
+    if not node_name:
+        try:
+            import socket as _socket
+            node_name = _socket.gethostname()
+        except OSError:
+            node_name = ""
+    if node_name:
+        label_ok, label_err = k8s_api.patch_node_labels(node_name, label_diff)
+        if not label_ok:
+            log.warning(
+                "supervisor.k3s_lifecycle.label_patch_failed",
+                node=node_name,
+                error=label_err,
+            )
+        else:
+            log.info(
+                "supervisor.k3s_lifecycle.labels_applied",
+                node=node_name,
+                set=[k for k, v in label_diff.items() if v is not None],
+                cleared=[k for k, v in label_diff.items() if v is None],
+            )
+
+    desired_services = tuple(sorted(p for p in profiles if p in _PROFILE_TO_HELM_KEY))
+    log.info(
+        "supervisor.k3s_lifecycle.applied",
+        profiles=list(profiles),
+        services=list(desired_services),
+        control_plane_url=(
+            values["dnsBind9"]["controlPlaneUrl"]  # type: ignore[index]
+            if isinstance(values.get("dnsBind9"), dict)
+            else None
+        ),
+    )
+    # ``started`` reports the FULL desired set; reconciliation
+    # idempotency means re-applying with the same set is cheap
+    # (helm-controller short-circuits when the release hash hasn't
+    # moved). Watchdog confirms each pod is healthy independently.
+    return LifecycleResult(state="ready", started=desired_services)
 
 
-def lifecycle_state_for_assignment(role_assignment: dict[str, Any] | None) -> str:
-    """Helper for the heartbeat-skip case: when the supervisor has
-    a role assignment but compose isn't available, we still need to
-    report a sensible ``role_switch_state``. ``idle`` works for both
-    "nothing assigned" and "can't run anything here" — the Fleet UI
-    renders the deployment_kind chip alongside, so the operator can
-    tell them apart."""
-    role_assignment = role_assignment or {}
-    roles = list(role_assignment.get("roles") or [])
-    if not any(r in SUPERVISED_SERVICES for r in roles):
-        return "idle"
-    return "idle"
+def reconcile_node_labels(profiles: list[str]) -> tuple[bool, str | None]:
+    """Reconcile the node's per-role labels against ``profiles``.
+
+    Idempotent — setting a label to its current value is a kubeapi
+    no-op. Cheap enough (single PATCH, <10 ms locally) to run on
+    every heartbeat tick alongside the apply_role_assignment
+    skip-check. Catches drift from an out-of-band ``kubectl label``
+    or a manual unlabeling without waiting for the values-hash to
+    change.
+
+    Returns ``(ok, error_or_None)`` — caller logs but doesn't act
+    on failure (next heartbeat re-attempts).
+    """
+    desired_role_set = {p for p in profiles if p in _ROLE_LABEL_KEYS}
+    label_diff: dict[str, str | None] = {}
+    for role, label in _ROLE_LABEL_KEYS.items():
+        label_diff[label] = "true" if role in desired_role_set else None
+    node_name = (
+        os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
+    )
+    if not node_name:
+        try:
+            import socket as _socket
+            node_name = _socket.gethostname()
+        except OSError:
+            return False, "node_name unknown"
+    return k8s_api.patch_node_labels(node_name, label_diff)
+
+
+def tear_down_supervised_services() -> LifecycleResult:
+    """k3s analog of ``service_lifecycle.tear_down_supervised_services``.
+
+    Deletes the HelmChart CR. helm-controller catches the delete +
+    runs ``helm uninstall`` against the spatium namespace. Idempotent
+    — deleting a non-existent CR is a no-op.
+
+    Called by heartbeat on revocation (control plane removed our
+    approval) so the appliance stops running its assigned services.
+    """
+    env = k3s_available()
+    if not env.available:
+        return LifecycleResult(state="idle", reason=env.reason)
+
+    ok, err = k8s_api.delete_helmchart(
+        _HELMCHART_NAME, chart_namespace=_CHART_NAMESPACE
+    )
+    if not ok:
+        return LifecycleResult(state="failed", reason=err or "kubeapi delete failed")
+
+    # Phase 10 (#183) — clear every per-role label so pods that
+    # somehow survived the chart delete don't keep running on the
+    # node. helm-controller's uninstall should remove the
+    # Deployments first, but this is belt-and-braces.
+    node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
+    if not node_name:
+        try:
+            import socket as _socket
+            node_name = _socket.gethostname()
+        except OSError:
+            node_name = ""
+    if node_name:
+        label_diff: dict[str, str | None] = {label: None for label in _ROLE_LABEL_KEYS.values()}
+        k8s_api.patch_node_labels(node_name, label_diff)
+    log.warning("supervisor.k3s_lifecycle.torn_down")
+    # Report every supervised service as ``stopped`` — we deleted
+    # the chart that owned every one of them. The Fleet drilldown's
+    # role-switch banner reads the same shape regardless of runtime.
+    return LifecycleResult(state="ready", stopped=tuple(SUPERVISED_SERVICES))
 
 
 __all__ = [
-    "LifecycleResult",
-    "SUPERVISED_SERVICES",
     "apply_role_assignment",
-    "lifecycle_state_for_assignment",
+    "k3s_available",
+    "reconcile_node_labels",
     "tear_down_supervised_services",
 ]

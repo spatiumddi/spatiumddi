@@ -1,35 +1,30 @@
 [Unit]
-Description=SpatiumDDI appliance first-boot orchestrator + stack supervisor
+Description=SpatiumDDI appliance first-boot orchestrator
 # Skip on the live ISO. live-boot puts `boot=live` in the kernel
 # cmdline; the installed system doesn't carry that token. This
 # matters because firstboot fallocate's a 2 GiB swapfile at
-# /var/lib/spatiumddi/swapfile and pulls multi-GiB Docker images
-# — fine on a real disk, fatal on the live ISO's ~1 GiB tmpfs
-# overlay (fills it in one second, every subsequent write — incl.
-# the spatium-install wizard's log + trace fds — fails with ENOSPC
-# and the wizard exits silently).
+# /var/lib/spatiumddi/swapfile — fine on a real disk, fatal on
+# the live ISO's ~1 GiB tmpfs overlay.
 ConditionKernelCommandLine=!boot=live
-# docker.service is the only hard dependency. We previously also
-# pinned `network-online.target` and `cloud-final.service`, but in
-# live-ISO mode that chain creates an ordering cycle with live-config
-# and systemd deletes our unit to break it (visible as
-# "Ordering cycle found, skipping spatiumddi-firstboot.service"
-# during boot). docker.service already pulls in network.target via
-# its own deps, and the orchestrator's `docker compose pull` step
-# tolerates network coming up a bit late.
-After=docker.service
-Requires=docker.service
+# Issue #183 Phase 7 — no docker dependency. firstboot writes the
+# bootstrap HelmChart manifest into /var/lib/rancher/k3s/server/
+# manifests/; k3s's helm-controller picks it up whenever it gets
+# there (the manifests dir is continuously watched). We DO NOT
+# order k3s.service After=firstboot — that would deadlock the
+# readyz wait at the end of firstboot.
+After=network-online.target spatium-etc-reconcile.service
+Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=10min
 ExecStart=/usr/local/bin/spatiumddi-firstboot
-ExecStop=/bin/sh -c 'cd /usr/local/share/spatiumddi && /usr/bin/docker-compose down --remove-orphans'
+# No ExecStop — the appliance is k3s-only; shutdown is k3s's job
+# (it cleanly evicts pods on systemctl stop k3s.service).
 # Log routing: the firstboot script self-redirects to
-# /var/log/spatiumddi/firstboot.log via `exec >>`. We don't double-capture
-# here so the file isn't written twice. `journalctl -u spatiumddi-firstboot`
-# still shows systemd's start/stop transitions.
+# /var/log/spatiumddi/firstboot.log via `exec >>`. journalctl -u
+# spatiumddi-firstboot still shows systemd's start/stop transitions.
 
 [Install]
 WantedBy=multi-user.target

@@ -3,19 +3,21 @@ SpatiumDDI Appliance — useful commands
 ──────────────────────────────────────────────────────────────────────
 
   spatiumddi-stack-status
-        Quick rollup: docker compose state + appliance version pin
-        + web-UI reachable
+        Quick rollup: k3s + appliance version pin + web-UI
+        reachable + pod inventory
 
   sudo systemctl status spatiumddi-firstboot
         First-boot orchestrator state (generates secrets,
-        pulls ghcr.io images, brings docker-compose stack up,
-        waits for /health/live)
+        renders the bootstrap HelmChart manifest, waits for
+        k3s /readyz)
 
   sudo tail -f /var/log/spatiumddi/firstboot.log
         Live tail of the orchestrator's output
 
-  sudo docker-compose -f /usr/local/share/spatiumddi/docker-compose.yml ps
-  sudo docker-compose -f /usr/local/share/spatiumddi/docker-compose.yml logs -f
+  kubectl get pods -A
+  kubectl logs -n spatium -l app.kubernetes.io/component=supervisor -f
+        Standard k3s inspection — KUBECONFIG is pre-exported
+        via /etc/profile.d/k3s.sh for admin + root login shells.
 
   sudo spatium-pair
         Re-enter the control-plane URL + pairing code on an

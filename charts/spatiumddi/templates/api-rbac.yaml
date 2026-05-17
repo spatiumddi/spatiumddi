@@ -1,0 +1,73 @@
+{{- if .Values.api.serviceAccount.enabled }}
+{{- /* Phase 11 wave 4 (#183) — api ServiceAccount + minimum-needed
+       Role for the appliance management surfaces.
+
+       Two things the api needs from kubeapi:
+
+       * **Pod listing + logs** (formerly /appliance/containers).
+         Reads ``pods`` + ``pods/log`` in the chart's target
+         namespace (default ``spatium``).
+
+       * **TLS Secret patch** (formerly cert deploy to a docker
+         volume + SIGHUP). Reads + patches the
+         ``spatium-appliance-tls`` Secret in the same namespace.
+
+       Permissions:
+         - pods, pods/log → get, list, watch  (listing + log tail)
+         - secrets        → get, patch, update (TLS Secret in-place
+                            update; ``create`` is intentionally
+                            absent — the firstboot-applied Secret
+                            manifest is the only creation path)
+         - deployments    → get, patch         (annotation bump on
+                            frontend Deployment to trigger rollover
+                            after a Secret change)
+
+       Scope is namespace-only — no cluster-scoped permissions,
+       no permission to write pods / deployments other than
+       annotation patches. */}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "api") .) | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "api") .) | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["spatium-appliance-tls"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "api") .) | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "spatiumddi.fullname" . }}-api
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "spatiumddi.fullname" . }}-api
+{{- end }}

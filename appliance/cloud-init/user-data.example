@@ -19,7 +19,7 @@ timezone: UTC
 # user with your SSH key here.
 users:
   - name: admin
-    groups: [wheel, docker]
+    groups: [wheel]
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     lock_passwd: true
@@ -62,10 +62,10 @@ users:
 #                   against it from the fleet UI.
 
 # ── First-boot behaviour ──────────────────────────────────────────────────────
-# Nothing else required. The spatiumddi-firstboot OpenRC service runs
-# automatically after cloud-final, generates secrets, brings the docker
-# compose stack up, and waits for the control plane to answer
-# /health/live. Watch progress with:
+# Nothing else required. The spatiumddi-firstboot systemd service runs
+# automatically after cloud-final, generates secrets, renders the
+# bootstrap HelmChart manifest into k3s's auto-deploy directory, and
+# waits for k3s /readyz. Watch progress with:
 #
 #   tail -f /var/log/spatiumddi/firstboot.log
 #

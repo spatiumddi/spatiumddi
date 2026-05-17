@@ -26,6 +26,16 @@ spec:
       {{- end }}
     spec:
       terminationGracePeriodSeconds: 30
+      {{- if .Values.api.serviceAccount.enabled }}
+      # Phase 11 wave 4 (#183) — the api uses kubeapi for two things
+      # on the appliance: (1) Updating the spatium-appliance-tls
+      # Secret when an operator uploads a cert through the Cert
+      # Manager UI; (2) Listing pods + tailing pod logs for the
+      # /appliance/containers (now /pods) management surface.
+      # Auto-mount the ServiceAccount token at
+      # /var/run/secrets/kubernetes.io/serviceaccount/.
+      serviceAccountName: {{ include "spatiumddi.fullname" . }}-api
+      {{- end }}
       {{- with .Values.image.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

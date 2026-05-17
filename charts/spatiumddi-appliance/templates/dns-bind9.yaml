@@ -1,0 +1,142 @@
+{{- /* Issue #183 Phase 2 — BIND9 DNS agent.
+       Deployment with hostNetwork=true — port 53 needs to listen
+       directly on the node IP so non-cluster clients can resolve
+       against the appliance.
+
+       Phase 10 wave 2 — the ``.enabled`` flag is now release-
+       ownership scoped, not role-scoped: the spatium-bootstrap
+       release sets ``dnsBind9.enabled=false`` (owned elsewhere),
+       the spatiumddi-appliance release sets ``dnsBind9.enabled=true``
+       (this release owns it). Pod scheduling is gated by the node
+       label ``spatium.io/role-dns-bind9=true`` independently of
+       ``.enabled`` — role swap = label flip, no chart upgrade
+       (closes the kine footprint Phase 9 follow-up). */}}
+{{- if .Values.dnsBind9.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dns-bind9
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dns-bind9
+spec:
+  # DaemonSet so ``DESIRED`` is computed from matching nodes — no
+  # Pending pod when the per-role label isn't on the node. Same
+  # shape as dhcp-kea. Use OnDelete update strategy so a chart
+  # upgrade doesn't roll-replace mid-flight (single-instance
+  # stateful workload + hostNetwork:53; operator can `kubectl
+  # delete pod` to trigger the upgrade explicitly).
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dns-bind9
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        app.kubernetes.io/name: dns-bind9
+        app.kubernetes.io/component: dns-bind9
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+        # Phase 10 (#183) — per-role scheduling label. Pod stays
+        # Pending until the supervisor's role-apply path labels the
+        # node with ``spatium.io/role-dns-bind9=true``. Keeps the
+        # ``enabled`` values toggle alongside so an operator who
+        # wants to globally suppress the Deployment still can.
+        spatium.io/role-dns-bind9: "true"
+      containers:
+        - name: dns-bind9
+          image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dnsBind9.image.repository) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - name: CONTROL_PLANE_URL
+              value: {{ .Values.dnsBind9.controlPlaneUrl | quote }}
+            - name: DNS_AGENT_KEY
+              value: {{ .Values.dnsBind9.agentKey | quote }}
+            - name: AGENT_GROUP
+              value: {{ .Values.dnsBind9.serverGroupName | quote }}
+            {{- with .Values.global.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: dns-udp
+              containerPort: 53
+              protocol: UDP
+            - name: dns-tcp
+              containerPort: 53
+              protocol: TCP
+          # ``dig version.bind CH TXT`` against the local listener
+          # is the standard BIND9 readiness probe. Same shape kind-
+          # AXFR uses in our existing e2e workflow.
+          readinessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /var/named/data
+            - name: keys
+              mountPath: /var/named/keys
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: dns-bind9-data
+        - name: keys
+          persistentVolumeClaim:
+            claimName: dns-bind9-keys
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-bind9
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dns-bind9
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: dns-bind9
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dns-bind9-data
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: {{ .Values.dnsBind9.persistence.data.size }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dns-bind9-keys
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: {{ .Values.dnsBind9.persistence.keys.size }}
+{{- end }}

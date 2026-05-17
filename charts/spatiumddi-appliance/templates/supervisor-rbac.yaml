@@ -1,0 +1,132 @@
+{{- /* Issue #183 Phase 3 — ServiceAccount + RBAC for the supervisor.
+
+       The supervisor pod uses in-cluster service-account auth (token
+       + ca.crt auto-mounted at /var/run/secrets/kubernetes.io/
+       serviceaccount/) so it doesn't need a kubeconfig. The chart
+       grants exactly the permissions the supervisor's lifecycle
+       module needs:
+
+       * Read/write HelmChart CRs in kube-system (k3s helm-controller
+         picks them up and runs the actual ``helm upgrade``).
+       * Read pods + services in the ``spatium`` target namespace for
+         the watchdog's health probe.
+       * Read/list nodes for cluster-level introspection (capabilities
+         reporting).
+
+       Phase 3 default: enabled when ``supervisor.enabled`` is true.
+       Phase 1+2 left supervisor.enabled=false, so this whole block
+       is dormant until the operator opts in. */}}
+{{- /* The spatium namespace is intentionally NOT a chart resource —
+       pre-created by the bootstrap manifest spatiumddi-firstboot
+       writes into k3s's auto-deploy dir. If helm owns the namespace,
+       a partial install that fails (and gets retried) ends up trying
+       to "import" an existing-but-unowned namespace and hits "invalid
+       ownership metadata" because the bootstrap-pre-created namespace
+       doesn't carry helm's `meta.helm.sh/release-*` annotations. */}}
+{{- if .Values.supervisor.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spatium-supervisor
+  namespace: spatium
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+---
+{{- /* HelmChart CRs live in kube-system (k3s convention). The
+       supervisor needs full CRUD on the single chart object the
+       lifecycle module manages. Scope to kube-system via Role so the
+       supervisor can't accidentally edit OTHER charts the operator
+       might have dropped into kube-system out-of-band. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spatium-supervisor-helm
+  namespace: kube-system
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["helm.cattle.io"]
+    resources: ["helmcharts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spatium-supervisor-helm
+  namespace: kube-system
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spatium-supervisor-helm
+subjects:
+  - kind: ServiceAccount
+    name: spatium-supervisor
+    namespace: spatium
+---
+{{- /* Watchdog reads pods + services in the spatium namespace to
+       derive role_health. Read-only — the lifecycle module mutates
+       through HelmChart CRs, not direct pod patches. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spatium-supervisor-namespace
+  namespace: spatium
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "events", "configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spatium-supervisor-namespace
+  namespace: spatium
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spatium-supervisor-namespace
+subjects:
+  - kind: ServiceAccount
+    name: spatium-supervisor
+    namespace: spatium
+---
+{{- /* ClusterRole for node-level introspection (capabilities
+       reporting). Single verb, single resource — narrowest grant
+       that gets ``kubectl get nodes`` to work. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spatium-supervisor-nodes
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    # Phase 10 (#183) — supervisor PATCHes node labels for per-role
+    # scheduling (``spatium.io/role-dns-bind9=true`` etc.). ``patch``
+    # + ``update`` cover both the merge-patch form used by
+    # k8s_api.patch_node_labels and a fallback strategic-merge if we
+    # ever switch.
+    verbs: ["get", "list", "watch", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spatium-supervisor-nodes
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: spatium-supervisor-nodes
+subjects:
+  - kind: ServiceAccount
+    name: spatium-supervisor
+    namespace: spatium
+{{- end }}

@@ -21,18 +21,21 @@ import {
 import { Modal } from "@/components/ui/modal";
 
 /**
- * Phase 4d — Container management tab.
+ * Phase 4d (rewritten as Phase 11 wave 4) — Pod management tab.
  *
- * Lists containers visible to the api via the mounted docker socket,
- * with spatium-prefixed ones pinned first. Per-card start/stop/restart
- * buttons hit /containers/{name}/{action}. The "Logs" button opens a
- * modal that streams the container's stdout/stderr as SSE — token-auth
- * via fetch+reader (EventSource can't set Authorization headers).
+ * Lists pods in the spatium namespace via the api's mounted
+ * ServiceAccount → in-cluster kubeapi, with SpatiumDDI-owned pods
+ * (``app.kubernetes.io/part-of=spatiumddi``) pinned first. The
+ * "Restart" button hits /containers/{name}/restart which deletes
+ * the pod via kubeapi; the owning Deployment / DaemonSet then
+ * recreates it on the next reconcile (~1–5 s). "Logs" opens a
+ * modal that streams the pod's stdout/stderr via SSE backed by
+ * kubeapi's ``follow=true`` pod-log endpoint.
  *
- * Only the spatium-named containers get start/stop/restart buttons by
- * default; for others the surface is read-only because restarting a
- * random container the operator brought up themselves could nuke their
- * own work without warning.
+ * Only spatium-owned pods get the restart button by default;
+ * cluster-system pods (coredns / local-path-provisioner) are
+ * read-only because restarting them on a single-node appliance
+ * is an operator footgun.
  */
 export function ContainersTab() {
   const qc = useQueryClient();
@@ -57,12 +60,13 @@ export function ContainersTab() {
         <div>
           <h2 className="flex items-center gap-2 text-base font-semibold">
             <ContainerIcon className="h-4 w-4 text-muted-foreground" />
-            Containers
+            Pods
           </h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            All Docker containers visible to the api's socket mount. SpatiumDDI
-            stack containers are pinned to the top. Logs stream live; start /
-            stop / restart actions are gated on the appliance admin permission.
+            All pods in the spatium namespace, listed via the api pod's
+            in-cluster ServiceAccount. SpatiumDDI-owned pods are pinned to the
+            top. Logs stream live (kubeapi ``follow=true``); Restart deletes the
+            pod so the owning Deployment / DaemonSet recreates it.
           </p>
         </div>
         <button
@@ -90,7 +94,8 @@ export function ContainersTab() {
         </div>
       ) : !data || data.length === 0 ? (
         <div className="rounded-lg border border-dashed bg-muted/30 px-6 py-12 text-center text-sm text-muted-foreground">
-          No containers visible. Docker socket may not be mounted into the api.
+          No pods visible. The api's ServiceAccount may not be wired up — check
+          the chart's ``api.serviceAccount.enabled`` value.
         </div>
       ) : (
         <div className="space-y-2">

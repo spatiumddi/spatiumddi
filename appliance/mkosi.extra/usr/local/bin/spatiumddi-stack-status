@@ -1,21 +1,24 @@
 #!/bin/sh
 # Quick at-a-glance status for the SpatiumDDI appliance stack.
 # Intended to be the operator's first command after SSH'ing in.
-# Runs as the unprivileged admin user; reads only world-readable
-# state. /etc/spatiumddi/.env is mode 0600 (it has secrets) so we
-# never touch it from this script.
+#
+# Issue #183 Phase 7 — the appliance is k3s-only; this used to
+# call ``docker-compose ps``. Now it queries the local k3s via
+# ``kubectl get pods``. Runs as the unprivileged admin user;
+# /etc/profile.d/k3s.sh exports KUBECONFIG=/etc/rancher/k3s/
+# k3s.yaml so kubectl works without flags.
+
 set -eu
 
-COMPOSE_DIR=/usr/local/share/spatiumddi
 RELEASE_FILE=/etc/spatiumddi/release
-
-cd "$COMPOSE_DIR"
 
 echo "── SpatiumDDI appliance ──────────────────────────────────────"
 if [ -r "$RELEASE_FILE" ]; then
     awk '/^SPATIUMDDI_VERSION=/{ sub(/^SPATIUMDDI_VERSION=/, "Release pin: "); print }' "$RELEASE_FILE"
+elif [ -r /usr/lib/spatiumddi/spatiumddi-version ]; then
+    echo "Release pin: $(cat /usr/lib/spatiumddi/spatiumddi-version)  (slot bake)"
 else
-    echo "Release pin: latest  (no /etc/spatiumddi/release override)"
+    echo "Release pin: unknown"
 fi
 
 if [ -r /var/lib/spatiumddi/firstboot.done ]; then
@@ -28,15 +31,23 @@ IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
 echo "Web UI:      http://${IP:-<appliance-ip>}/"
 echo
 
-# docker-compose ps needs the .env to resolve image tags. We don't
-# have permission to read it as the admin user (it's 0600 root:root
-# because of POSTGRES_PASSWORD + SECRET_KEY + Fernet key). Two
-# options: pass --env-file with a workaround, or require sudo. We
-# go with sudo here — it's the operationally normal pattern and
-# the user is in the sudo group.
-if [ "$(id -u)" -eq 0 ]; then
-    docker-compose ps
+if [ -x /usr/local/bin/kubectl ] && [ -r /etc/rancher/k3s/k3s.yaml ]; then
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    echo "── k3s ───────────────────────────────────────────────────────"
+    if kubectl get --raw=/readyz 2>/dev/null | grep -q '^ok'; then
+        echo "kubeapi:     ready"
+    else
+        echo "kubeapi:     UNREACHABLE — see 'systemctl status k3s'"
+    fi
+    echo "Nodes:"
+    kubectl get nodes -o wide 2>/dev/null | sed 's/^/  /' || \
+        echo "  (no nodes returned)"
+    echo
+    echo "Pods:"
+    kubectl get pods -A -o wide 2>/dev/null | sed 's/^/  /' || \
+        echo "  (no pods returned)"
 else
-    sudo docker-compose ps 2>/dev/null || \
-        echo "  (run 'sudo docker-compose -f $COMPOSE_DIR/docker-compose.yml ps' for container state)"
+    echo "── k3s ───────────────────────────────────────────────────────"
+    echo "kubectl / kubeconfig missing — k3s may still be initialising."
+    echo "Check 'systemctl status k3s' + 'journalctl -u k3s'."
 fi

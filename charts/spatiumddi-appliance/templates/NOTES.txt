@@ -1,0 +1,25 @@
+{{- /* Operator-facing post-install message from `helm install`. */}}
+SpatiumDDI appliance role chart installed.
+
+Enabled roles (see ``values.yaml`` to flip):
+{{- if .Values.dnsBind9.enabled }}
+  ✓ dns-bind9       (Deployment + Service)
+{{- end }}
+{{- if .Values.dnsPowerdns.enabled }}
+  ✓ dns-powerdns    (Deployment + Service)
+{{- end }}
+{{- if .Values.dhcpKea.enabled }}
+  ✓ dhcp-kea        (DaemonSet, hostNetwork)
+{{- end }}
+{{- if .Values.supervisor.enabled }}
+  ✓ supervisor      (DaemonSet, privileged)
+{{- end }}
+
+Inspect:
+  kubectl get pods,svc -l app.kubernetes.io/part-of=spatiumddi
+
+Logs:
+  kubectl logs -l app.kubernetes.io/component=dns-bind9 -f
+
+Issue #183 Phase 2 — chart scaffold only. Phase 3 wires the
+supervisor as the chart's reconciler driver.
