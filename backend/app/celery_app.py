@@ -8,7 +8,6 @@ celery_app = Celery(
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
     include=[
-        "app.tasks.ipam",
         "app.tasks.ipam_dns_sync",
         "app.tasks.dns",
         "app.tasks.dns_pull",
@@ -59,7 +58,6 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
     task_routes={
-        "app.tasks.ipam.*": {"queue": "ipam"},
         "app.tasks.ipam_dns_sync.*": {"queue": "ipam"},
         "app.tasks.dns.*": {"queue": "dns"},
         "app.tasks.dns_pull.*": {"queue": "dns"},
