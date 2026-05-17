@@ -594,6 +594,7 @@ def disk_summary() -> list[tuple[str, float, float, float]]:
         "binfmt_misc", "autofs", "nsfs", "hugetlbfs", "fuse.gvfsd-fuse",
     }
     skip_mounts = {"/boot/efi"}
+    rows: list[tuple[str, float, float, float]] = []
     # Dedupe by device — bind mounts (e.g. /home → /var/home, /root →
     # /var/root per #170 Phase 8a) report the SAME underlying device
     # as the parent, just at a different mountpoint. Listing them all
