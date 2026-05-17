@@ -722,6 +722,47 @@ def appliance_version_string(env: dict[str, str]) -> str:
 # ── live log tailing ──────────────────────────────────────────────────
 
 
+# journalctl --output short-iso format:
+#   ``2026-05-17T01:24:10+00:00 hostname unit[pid]: REST``
+# Extract YYYY-MM-DD HH:MM:SS + unit (without pid suffix) + REST.
+# Hostname is dropped — the operator already knows which appliance
+# they're on, and "k3s1" repeated on every line is wasted width.
+# Timezone is dropped too — appliance config locks to UTC.
+_JOURNAL_ISO_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})[+\-]\d{2}:\d{2}\s+\S+\s+(\S+?)(?:\[\d+\])?:\s+(.*)$"
+)
+
+# klog header (k3s, kubelet, kube-proxy, …) carries its own
+# timestamp + duplicate pid:
+#   ``I0517 01:24:10.644155       692 file:line] msg``
+# Strip it down to just ``file:line] msg`` since journalctl
+# already gave us HH:MM:SS + the unit name.
+_KLOG_HEADER_RE = re.compile(
+    r"^[IWEF]\d{4}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+(.*)$"
+)
+
+
+def _compact_journal_line(line: str) -> str:
+    """Trim the journal date+host+pid prefix + klog's redundant
+    duplicate timestamp/pid header.
+
+    Lines that don't match the short-iso format are returned as-is
+    so a journalctl format change doesn't blank the log pane.
+    """
+    m = _JOURNAL_ISO_RE.match(line)
+    if not m:
+        return line
+    date, ts, unit, rest = m.group(1), m.group(2), m.group(3), m.group(4)
+    # Trim unit suffix down to the short name (drop ``.service``
+    # / ``.path`` so ``k3s.service`` reads as ``k3s``).
+    unit = unit.rsplit(".", 1)[0]
+    # Strip klog header from the message body if present.
+    km = _KLOG_HEADER_RE.match(rest)
+    if km:
+        rest = km.group(1)
+    return f"{date} {ts}  {unit}  {rest}"
+
+
 class JournalTail(threading.Thread):
     """Tail journalctl into a deque so the renderer can read recent
     lines without blocking on subprocess I/O each refresh."""
@@ -806,7 +847,7 @@ class JournalTail(threading.Thread):
                     break
                 line = line.rstrip("\n")
                 if line and not self._is_noise(line):
-                    self.lines.append(line)
+                    self.lines.append(_compact_journal_line(line))
             # Subprocess exited (rotate / journald restart). Restart in
             # 2 s unless we're stopping.
             self._proc = None
