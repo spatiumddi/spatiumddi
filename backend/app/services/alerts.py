@@ -150,9 +150,7 @@ _COMPLIANCE_CHANGE_SCAN_LIMIT = 1000
 # Resource types in audit_log we know how to map back to a Subnet for
 # classification lookup. Anything outside this set is skipped with a
 # logged debug. The map values name a mapper function below.
-_COMPLIANCE_RESOURCE_TYPES: frozenset[str] = frozenset(
-    {"subnet", "ip_address", "dhcp_scope"}
-)
+_COMPLIANCE_RESOURCE_TYPES: frozenset[str] = frozenset({"subnet", "ip_address", "dhcp_scope"})
 
 # Resource-kind → SQLAlchemy model for the orphan sweep. Mirrors the
 # router's ``_KIND_MODEL`` map. ``overlay_network`` lit up alongside
@@ -221,9 +219,7 @@ async def _matching_subnet_subjects(
 ) -> list[tuple[str, str, str]]:
     """Return [(subject_id, display, message), ...] for a subnet_utilization rule."""
     threshold = rule.threshold_percent if rule.threshold_percent is not None else 90
-    res = await db.execute(
-        select(Subnet).where(Subnet.utilization_percent >= threshold)
-    )
+    res = await db.execute(select(Subnet).where(Subnet.utilization_percent >= threshold))
     subnets = list(res.scalars().all())
     matches: list[tuple[str, str, str]] = []
     for s in subnets:
@@ -254,9 +250,7 @@ async def _matching_voice_lease_count_below_subjects(
     threshold = int(rule.threshold_percent) if rule.threshold_percent is not None else 1
     # Voice-tagged subnets only — `subnet_role='voice'` is the gate.
     voice_subnets = list(
-        (await db.execute(select(Subnet).where(Subnet.subnet_role == "voice")))
-        .scalars()
-        .all()
+        (await db.execute(select(Subnet).where(Subnet.subnet_role == "voice"))).scalars().all()
     )
     if not voice_subnets:
         return []
@@ -344,9 +338,7 @@ async def _matching_rpki_roa_expiring_subjects(
     operators create N rules with different severities + filters
     when they want graduated alerting.
     """
-    res = await db.execute(
-        select(ASNRpkiRoa).where(ASNRpkiRoa.state == "expiring_soon")
-    )
+    res = await db.execute(select(ASNRpkiRoa).where(ASNRpkiRoa.state == "expiring_soon"))
     matches: list[tuple[str, str, str]] = []
     now = datetime.now(UTC)
     for roa in res.scalars().all():
@@ -523,17 +515,13 @@ async def _matching_domain_drift_subjects(
     operator-set ``expected_nameservers`` doesn't match the
     last-observed ``actual_nameservers``."""
     rows = (
-        (await db.execute(select(Domain).where(Domain.nameserver_drift.is_(True))))
-        .scalars()
-        .all()
+        (await db.execute(select(Domain).where(Domain.nameserver_drift.is_(True)))).scalars().all()
     )
     matches: list[tuple[str, str, str]] = []
     for d in rows:
         expected = sorted(d.expected_nameservers or [])
         actual = sorted(d.actual_nameservers or [])
-        message = (
-            f"Domain {d.name} NS drift — " f"expected={expected!r}, actual={actual!r}"
-        )
+        message = f"Domain {d.name} NS drift — " f"expected={expected!r}, actual={actual!r}"
         matches.append((str(d.id), d.name, message))
     return matches
 
@@ -599,9 +587,7 @@ async def _evaluate_domain_transition_rule(
     # rule-create has no "from" to record. Look up the most recent
     # event row per subject — open or resolved.
     last_event_res = await db.execute(
-        select(AlertEvent)
-        .where(AlertEvent.rule_id == rule.id)
-        .order_by(AlertEvent.fired_at.desc())
+        select(AlertEvent).where(AlertEvent.rule_id == rule.id).order_by(AlertEvent.fired_at.desc())
     )
     last_event_by_subject: dict[str, AlertEvent] = {}
     for ev in last_event_res.scalars().all():
@@ -619,9 +605,7 @@ async def _evaluate_domain_transition_rule(
             continue
 
         prior_event = last_event_by_subject.get(subject_id)
-        if prior_event is not None and isinstance(
-            prior_event.last_observed_value, dict
-        ):
+        if prior_event is not None and isinstance(prior_event.last_observed_value, dict):
             prior_value = prior_event.last_observed_value.get("to")
         else:
             prior_value = None
@@ -652,10 +636,7 @@ async def _evaluate_domain_transition_rule(
             continue
 
         # Real transition. Open a fresh event + deliver.
-        message = (
-            f"Domain {d.name} {rule_label} changed: "
-            f"{prior_value!r} → {current_value!r}"
-        )
+        message = f"Domain {d.name} {rule_label} changed: " f"{prior_value!r} → {current_value!r}"
         event = AlertEvent(
             rule_id=rule.id,
             subject_type="domain",
@@ -860,20 +841,14 @@ async def _evaluate_circuit_status_changed_rule(
     # ``last_status_change_at``. Without that, every evaluation pass
     # would re-fire on the same transition.
     last_event_res = await db.execute(
-        select(AlertEvent)
-        .where(AlertEvent.rule_id == rule.id)
-        .order_by(AlertEvent.fired_at.desc())
+        select(AlertEvent).where(AlertEvent.rule_id == rule.id).order_by(AlertEvent.fired_at.desc())
     )
     last_event_by_subject: dict[str, AlertEvent] = {}
     for ev in last_event_res.scalars().all():
         if ev.subject_id not in last_event_by_subject:
             last_event_by_subject[ev.subject_id] = ev
 
-    rows = (
-        (await db.execute(select(Circuit).where(Circuit.deleted_at.is_(None))))
-        .scalars()
-        .all()
-    )
+    rows = (await db.execute(select(Circuit).where(Circuit.deleted_at.is_(None)))).scalars().all()
     for c in rows:
         subject_id = str(c.id)
         if c.last_status_change_at is None:
@@ -889,9 +864,7 @@ async def _evaluate_circuit_status_changed_rule(
         # If the most recent event already latched this exact
         # ``last_status_change_at``, we've already fired for it.
         prior_event = last_event_by_subject.get(subject_id)
-        if prior_event is not None and isinstance(
-            prior_event.last_observed_value, dict
-        ):
+        if prior_event is not None and isinstance(prior_event.last_observed_value, dict):
             latched = prior_event.last_observed_value.get("changed_at")
             if latched == c.last_status_change_at.isoformat():
                 continue
@@ -1194,9 +1167,7 @@ async def _evaluate_compliance_change_rule(
     # also the dedup index.
     existing_event_subjects = {
         ev.subject_id
-        for ev in (
-            await db.execute(select(AlertEvent).where(AlertEvent.rule_id == rule.id))
-        )
+        for ev in (await db.execute(select(AlertEvent).where(AlertEvent.rule_id == rule.id)))
         .scalars()
         .all()
     }
@@ -1579,9 +1550,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # Audit-log-driven; opens one event per matching audit
                 # row with its own auto-resolve window. Watermark stored
                 # on the rule itself.
-                op_, res_, dsy, dwh, dsm = await _evaluate_compliance_change_rule(
-                    db, rule, now
-                )
+                op_, res_, dsy, dwh, dsm = await _evaluate_compliance_change_rule(db, rule, now)
                 opened += op_
                 resolved += res_
                 delivered_syslog += dsy
@@ -1624,9 +1593,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # 60s tick.
                 continue
             else:
-                logger.warning(
-                    "alert_unknown_rule_type", rule=str(rule.id), type=rule.rule_type
-                )
+                logger.warning("alert_unknown_rule_type", rule=str(rule.id), type=rule.rule_type)
                 continue
 
             # Index current open events by subject_id for this rule.

@@ -70,9 +70,7 @@ class K8sProxyResponse:
 
 # Per-appliance queues. defaultdict so the first enqueue for a new
 # appliance auto-creates the queue without an init step.
-_request_queues: dict[uuid.UUID, asyncio.Queue[K8sProxyRequest]] = defaultdict(
-    asyncio.Queue
-)
+_request_queues: dict[uuid.UUID, asyncio.Queue[K8sProxyRequest]] = defaultdict(asyncio.Queue)
 
 # Per-request response futures. Keyed by request_id so reply
 # dispatching is O(1). Memory cost is bounded by the operator's
@@ -112,9 +110,7 @@ async def enqueue_request(
         body_b64=body_b64,
     )
 
-    future: asyncio.Future[K8sProxyResponse] = (
-        asyncio.get_running_loop().create_future()
-    )
+    future: asyncio.Future[K8sProxyResponse] = asyncio.get_running_loop().create_future()
     _response_futures[request_id] = future
 
     await _request_queues[appliance_id].put(request)
@@ -144,9 +140,7 @@ async def enqueue_request(
         _response_futures.pop(request_id, None)
 
 
-async def pop_request(
-    appliance_id: uuid.UUID, *, timeout: float = 30.0
-) -> K8sProxyRequest | None:
+async def pop_request(appliance_id: uuid.UUID, *, timeout: float = 30.0) -> K8sProxyRequest | None:
     """Long-poll for the next request bound for ``appliance_id``.
 
     Returns the dequeued request, or ``None`` if no request arrives

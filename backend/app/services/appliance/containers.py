@@ -31,14 +31,6 @@ from app.services.appliance import k8s
 
 logger = structlog.get_logger(__name__)
 
-# Pods carrying any of these labels show up as "spatium" rows (first
-# in the listing, dot/marker styling client-side). The umbrella
-# chart stamps every spatium pod with ``app.kubernetes.io/part-of=
-# spatiumddi`` and the appliance chart stamps the same plus
-# ``app.kubernetes.io/component=<role>``. Keep the surface low-
-# touch: any matching label = spatium-owned.
-_SPATIUM_PART_OF = "spatiumddi"
-
 
 class DockerUnavailableError(RuntimeError):
     """Raised when kubeapi can't be reached or the ServiceAccount
@@ -142,9 +134,7 @@ def _parse_pod_to_summary(pod: dict[str, Any]) -> ContainerSummary:
     started_at: datetime | None = None
     if start_time:
         try:
-            started_at = datetime.fromisoformat(
-                start_time.rstrip("Z") + "+00:00"
-            )
+            started_at = datetime.fromisoformat(start_time.rstrip("Z") + "+00:00")
         except ValueError:
             started_at = None
     if waiting_reason:
@@ -205,9 +195,7 @@ def container_action(name: str, action: str) -> None:
     raise ValueError(f"unknown pod action: {action!r}")
 
 
-def get_container_logs(
-    name: str, tail: int = 200, since_seconds: int | None = None
-) -> str:
+def get_container_logs(name: str, tail: int = 200, since_seconds: int | None = None) -> str:
     """Return the last ``tail`` log lines (or lines since N seconds ago).
 
     Decoded UTF-8 with replacement for binary fragments. Truncated at

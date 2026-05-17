@@ -31,12 +31,11 @@ from __future__ import annotations
 
 import http.client
 import json
-import socket
 import ssl
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, overload
 from urllib.parse import quote
 
 import structlog
@@ -121,6 +120,30 @@ def _ssl_context(ca_path: str) -> ssl.SSLContext:
     return ctx
 
 
+@overload
+def _request(
+    method: str,
+    path: str,
+    *,
+    body: bytes | None = ...,
+    content_type: str | None = ...,
+    timeout: float = ...,
+    stream: Literal[False] = False,
+) -> tuple[int, bytes]: ...
+
+
+@overload
+def _request(
+    method: str,
+    path: str,
+    *,
+    body: bytes | None = ...,
+    content_type: str | None = ...,
+    timeout: float = ...,
+    stream: Literal[True],
+) -> tuple[int, http.client.HTTPResponse]: ...
+
+
 def _request(
     method: str,
     path: str,
@@ -157,7 +180,7 @@ def _request(
             # Caller owns the conn — return both so they can close.
             return resp.status, resp
         return resp.status, resp.read()
-    except (OSError, socket.timeout, ssl.SSLError) as exc:
+    except (OSError, TimeoutError, ssl.SSLError) as exc:
         raise KubeapiUnavailableError(f"kubeapi {method} {path}: {exc}") from exc
     finally:
         if not stream:
@@ -303,7 +326,9 @@ def delete_pod(name: str, namespace: str | None = None) -> tuple[bool, str | Non
     return False, f"kubeapi status {status}: {body[:200]!r}"
 
 
-def patch_secret(name: str, data: dict[str, str], namespace: str | None = None) -> tuple[bool, str | None]:
+def patch_secret(
+    name: str, data: dict[str, str], namespace: str | None = None
+) -> tuple[bool, str | None]:
     """Strategic-merge-patch a Secret's ``data`` block in place.
 
     ``data`` keys are filenames inside the Secret (e.g. ``tls.crt``);

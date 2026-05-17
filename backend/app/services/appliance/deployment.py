@@ -127,10 +127,7 @@ def reload_frontend_nginx() -> bool:
     # post-patch body, so re-GET via the same _request helper.
     from urllib.parse import quote  # noqa: PLC0415
 
-    path = (
-        f"/api/v1/namespaces/{quote(cfg.namespace)}"
-        f"/secrets/{quote(_TLS_SECRET_NAME)}"
-    )
+    path = f"/api/v1/namespaces/{quote(cfg.namespace)}" f"/secrets/{quote(_TLS_SECRET_NAME)}"
     try:
         status, body = k8s._request("GET", path)
     except k8s.KubeapiUnavailableError as exc:
@@ -149,13 +146,9 @@ def reload_frontend_nginx() -> bool:
         logger.warning("appliance_nginx_reload_secret_bad_json", error=str(exc))
         return False
     data = secret.get("data") or {}
-    checksum_src = (
-        (data.get(_TLS_CRT_KEY) or "") + (data.get(_TLS_KEY_KEY) or "")
-    ).encode("utf-8")
+    checksum_src = ((data.get(_TLS_CRT_KEY) or "") + (data.get(_TLS_KEY_KEY) or "")).encode("utf-8")
     checksum = hashlib.sha256(checksum_src).hexdigest()
-    ok, err = k8s.patch_deployment_annotation(
-        deployment_name, _ROLLOUT_ANNOTATION, checksum
-    )
+    ok, err = k8s.patch_deployment_annotation(deployment_name, _ROLLOUT_ANNOTATION, checksum)
     if not ok:
         logger.warning(
             "appliance_nginx_reload_deployment_patch_failed",

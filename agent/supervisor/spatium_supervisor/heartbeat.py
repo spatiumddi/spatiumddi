@@ -55,6 +55,8 @@ from .role_orchestrator import (
 )
 from . import watchdog
 
+log = structlog.get_logger(__name__)
+
 # Issue #183 Phase 7 — k3s-only lifecycle. The pre-Phase-7 dispatcher
 # (compose vs k3s on ``detect_runtime()``) is gone with the rest of
 # docker; this is the only path now.
@@ -113,8 +115,15 @@ def _detect_storage_type() -> str:
             value = sidecar.read_text(encoding="utf-8").strip()
             if value in ("ssd", "hdd", "unknown"):
                 return value
-        except OSError:
-            pass
+        except OSError as exc:
+            # Sidecar present but unreadable (permissions / mid-write).
+            # Fall through to in-pod detection below; log so a recurring
+            # bind-mount permission regression doesn't stay hidden.
+            log.debug(
+                "supervisor.storage_type.sidecar_read_failed",
+                path=str(sidecar),
+                error=str(exc),
+            )
     try:
         with open("/proc/mounts", "r", encoding="utf-8") as fh:
             for line in fh:

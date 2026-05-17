@@ -105,21 +105,6 @@ _ROLE_LABEL_KEYS = {
     "dhcp": "spatium.io/role-dhcp",
 }
 
-# Env keys to lift from the rendered role-compose env file into chart
-# values. The compose path interpolates them at ``docker compose up``;
-# the k3s path threads them into the chart's values.yaml structure.
-_ENV_PASSTHROUGH_KEYS = {
-    "AGENT_GROUP",
-    "DNS_ENGINE",
-    "DNS_AGENT_KEY",
-    "DHCP_AGENT_GROUP",
-    "DHCP_NETWORK_MODE",
-    "DHCP_AGENT_KEY",
-    "CONTROL_PLANE_URL",
-    "SPATIUMDDI_VERSION",
-}
-
-
 @dataclass(frozen=True)
 class K3sEnvironment:
     """Result of probing whether k3s is the live runtime."""

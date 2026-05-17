@@ -763,8 +763,6 @@ def read_cluster_health() -> dict[str, object] | None:
     except (RuntimeError, OSError):
         return summary
     if status_code == 200:
-        import json  # noqa: PLC0415
-
         try:
             data = json.loads(body)
         except (json.JSONDecodeError, ValueError):
@@ -785,8 +783,6 @@ def read_cluster_health() -> dict[str, object] | None:
     except (RuntimeError, OSError):
         return summary
     if status_code == 200:
-        import json  # noqa: PLC0415
-
         try:
             data = json.loads(body)
         except (json.JSONDecodeError, ValueError):
