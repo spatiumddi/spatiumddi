@@ -22,6 +22,43 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 2026.05.17-3 — 2026-05-17
+
+Second hotfix on top of -2. The release-workflow's
+`build-appliance-iso` job failed again — different bug. The
+workflow's `Bake container images into rootfs overlay` step runs
+`sudo appliance/scripts/bake-images.sh` (sudo is required for the
+later loop-mount of the docker-overlay.img), but `sudo` strips the
+environment by default — so `SPATIUMDDI_VERSION=2026.05.17-2` and
+`BAKE_SOURCE=ghcr` (set on the job's `env:` block) never reached
+the script. The script fell back to its `SPATIUMDDI_VERSION=dev` +
+`BAKE_SOURCE=local` defaults, then errored at
+`ERROR: no local image found for ghcr.io/spatiumddi/spatium-supervisor`
+because there's no `:dev`-tagged image on a GitHub-hosted runner.
+
+Fix is one line: `sudo -E` instead of bare `sudo` so the env passes
+through. Plus a preemptive `DOCKER_CONFIG=$HOME/.docker` to point
+root's docker CLI at the runner-user's `~/.docker/config.json`
+where the workflow's `docker/login-action` step stamped the GHCR
+credentials — our `ghcr.io/spatiumddi/*` container images are
+private, so without this redirect the `docker pull` calls inside
+the script would 401 anonymously even after the env-var fix.
+
+Same story as -2: container images + Helm chart are already published
+from the -1 / -2 cuts; this release only re-runs the workflow against
+the env-passthrough fix so the appliance ISO + slot raw.xz finally
+land on a GitHub release page. No operator action needed on existing
+docker-compose or Kubernetes installs.
+
+### Fixed
+
+- **Release-workflow `Bake container images` step lost
+  `SPATIUMDDI_VERSION` + `BAKE_SOURCE` through `sudo`.** Changed
+  `sudo appliance/scripts/bake-images.sh` to `sudo
+  DOCKER_CONFIG="$HOME/.docker" -E appliance/scripts/bake-images.sh`
+  so the env passes through and root inherits the runner-user's
+  GHCR auth.
+
 ## 2026.05.17-2 — 2026-05-17
 
 Same-day hotfix for the 2026.05.17-1 release pipeline. The
