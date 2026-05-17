@@ -85,12 +85,12 @@ const TABS: TabSpec[] = [
   },
   {
     key: "containers",
-    label: "Containers",
-    phase: "4d",
+    label: "Pods",
+    phase: "11",
     icon: ContainerIcon,
     selfOnly: true,
     summary:
-      "Container list driven off the docker socket, with start / stop / restart and live log streaming over websocket. Drives the spatium stack — the appliance compose mounts /var/run/docker.sock read-write for this surface.",
+      "Pod list driven off the in-cluster kubeapi via the api pod's ServiceAccount, with restart (delete pod → controller recreate) and live log streaming over SSE. Replaces the pre-Phase-11 docker-socket surface; the appliance is k3s-only.",
   },
   {
     key: "logs",
@@ -184,7 +184,7 @@ export function AppliancePage() {
           {!isApplianceHost && (
             <span
               className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground"
-              title="This control plane is running on Docker or Kubernetes. Host-level tabs (TLS, Containers, Logs, Network, Maintenance) are hidden — the OS Versions tab still drives slot upgrades on any registered appliance agents."
+              title="This control plane is running on Docker or Kubernetes. Host-level tabs (TLS, Pods, Logs, Network, Maintenance) are hidden — the OS Versions tab still drives slot upgrades on any registered appliance agents."
             >
               docker/k8s
             </span>

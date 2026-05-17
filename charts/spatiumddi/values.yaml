@@ -56,6 +56,18 @@ api:
   tolerations: []
   affinity: {}
   podAnnotations: {}
+  # Phase 11 wave 4 (#183) — api ServiceAccount + Role for kubeapi
+  # access. Needed for:
+  #   * /appliance/containers (post-rename: pods) — list + tail
+  #     logs from in-cluster pods instead of docker.
+  #   * Operator cert upload — PATCH the spatium-appliance-tls
+  #     Secret in-place instead of writing to a docker volume +
+  #     SIGHUP via the docker socket.
+  # Off-appliance docker-compose installs leave this off; the
+  # /appliance/* endpoints no-op there anyway via the
+  # ``settings.appliance_mode`` gate.
+  serviceAccount:
+    enabled: false
 
 # ── Frontend (nginx + Vite build) ────────────────────────────────────────────
 frontend:

@@ -410,10 +410,23 @@ spec:
     # Phase 11 wave 3 — flip the api into appliance-mode so the
     # cert upload / activate endpoints write to the Kubernetes
     # Secret instead of the docker-compose volume + SIGHUP path.
+    # Phase 11 wave 4 — enable the api ServiceAccount + Role so
+    # the kubeapi-driven surfaces (pod listing for the Fleet UI's
+    # Pods tab, TLS Secret patching for the Cert Manager UI) can
+    # authenticate against the in-cluster kubeapi.
+    # Appliance is single-node — collapse api/worker to 1 replica
+    # each + disable HPA (no horizontal scaling on a single host).
     api:
+      replicas: 1
+      autoscaling:
+        enabled: false
       env:
         - name: APPLIANCE_MODE
           value: "true"
+      serviceAccount:
+        enabled: true
+    worker:
+      replicas: 1
     # DNS / DHCP agents from the umbrella chart are NOT used on the
     # appliance — the appliance chart (templates/dns-bind9.yaml etc.)
     # owns the role pods with hostNetwork + per-role node labels.

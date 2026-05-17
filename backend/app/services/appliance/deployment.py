@@ -1,182 +1,182 @@
-"""Cert deployer — writes the active cert to disk + reloads nginx.
+"""Cert deployer — pushes the active cert to the frontend nginx.
 
-Phase 4b.2 (issue #134). Called by:
+Phase 11 wave 4 (#183) rewrite. Pre-Phase-11 this wrote the cert to
+a docker-compose volume and SIGHUPed the frontend container via the
+docker socket. The appliance is k3s-only now, so we go through
+kubeapi instead:
 
-* ``ensure_self_signed_cert`` on appliance api startup — populates the
-  cert volume on first boot before the frontend container reads it.
-* ``activate_certificate`` / ``import_signed_cert`` endpoints — pushes
-  the freshly-activated cert into the volume + signals nginx to swap
-  its TLS context.
+* PATCH the ``spatium-appliance-tls`` Secret in the spatium
+  namespace with the new tls.crt / tls.key.
+* Bump a ``checksum/secret`` annotation on the frontend Deployment's
+  pod template so the Deployment controller rolls a new pod —
+  the new pod re-reads the Secret on schedule. Plain-secret-update
+  alone doesn't trigger a rollout; the annotation is the standard
+  k8s pattern for "this Deployment depends on this Secret".
+
+Called by:
+
+* ``ensure_self_signed_cert`` on appliance api startup — populates
+  the Secret on first boot (no-op now that firstboot writes the
+  Secret manifest via k3s's auto-deploy directory before the
+  chart applies; kept here as a safety net).
+* ``activate_certificate`` / ``import_signed_cert`` endpoints —
+  pushes the freshly-activated cert into the Secret + bumps the
+  Deployment annotation.
 
 Designed to be fully no-op on non-appliance deploys: if
-``settings.appliance_mode`` is false we never touch the filesystem
-or docker. On appliance deploys but during dev iteration (cert dir
-not yet mounted, docker socket missing, frontend container not
-running) the operations log + skip — they don't propagate failures
-to the API caller, because by the time the deployer runs the DB has
-already been committed (the cert IS active, the deployment is just
-the materialisation).
+``settings.appliance_mode`` is false we never reach kubeapi.
+
+The exception-leaks-as-warnings semantic is preserved — by the
+time the deployer runs the DB has already been committed (the
+cert IS active, the deployment is just the materialisation), so
+a failed PATCH gets logged + retried on the next API restart's
+``ensure_self_signed_cert`` pass.
 """
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
+import hashlib
 
 import structlog
 
 from app.config import settings
+from app.services.appliance import k8s
 
 logger = structlog.get_logger(__name__)
 
-# File names inside ``appliance_cert_dir``. The frontend nginx config
-# (mkosi.extra/usr/local/share/spatiumddi/nginx-appliance.conf) loads
-# these exact paths.
-_CERT_FILENAME = "active.pem"
-_KEY_FILENAME = "active.key"
-# Path the cert deployer treats as "is the docker socket reachable
-# from this container". The deployer no-ops gracefully if it's not.
-_DOCKER_SOCK = Path("/var/run/docker.sock")
+# Secret name + filenames inside the Secret. ``kubernetes.io/tls``
+# secrets always use these two keys; the umbrella chart's frontend
+# template mounts the secret at /etc/nginx/tls/ and the
+# TLS-aware nginx config (frontend-tls-config.yaml) reads
+# /etc/nginx/tls/tls.crt + /etc/nginx/tls/tls.key.
+_TLS_SECRET_NAME = "spatium-appliance-tls"
+_TLS_CRT_KEY = "tls.crt"
+_TLS_KEY_KEY = "tls.key"
+# The Deployment name + annotation key for the rollout trigger.
+# Tracks the umbrella chart's release-fullname convention
+# (``<release>-frontend``); since the appliance release is named
+# ``spatium-control`` (see appliance/mkosi.extra/usr/local/bin/
+# spatiumddi-firstboot), the resolved name is
+# ``spatium-control-spatiumddi-frontend``. Kept configurable via
+# ``settings.appliance_frontend_deployment`` so a future rename
+# doesn't require a code change.
+_DEFAULT_FRONTEND_DEPLOYMENT = "spatium-control-spatiumddi-frontend"
+_ROLLOUT_ANNOTATION = "spatiumddi.io/tls-secret-checksum"
 
 
 def deploy_active_cert(cert_pem: str, key_pem: str, *, name: str = "") -> bool:
-    """Write the cert + key to ``appliance_cert_dir``.
+    """PATCH the appliance TLS Secret with the active cert + key.
 
-    Atomicity: writes to a ``.new`` sibling then ``os.replace``s on
-    top of the live file. nginx reads happen via inotify-less
-    SIGHUP — we never observe a half-written file from the frontend
-    container's perspective because ``rename`` on the same filesystem
-    is atomic, and SIGHUP runs after our rename completes.
+    Idempotent: re-applying the same cert+key produces the same
+    base64'd Secret data + the same checksum annotation, which
+    kubeapi treats as a no-op (no rollout triggered).
 
-    Returns True if the files were written; False if appliance_mode
-    is off or the cert dir doesn't exist (logged either way).
+    Returns True if the PATCH succeeded; False otherwise (and a
+    structured log line at warning level explains why).
     """
     if not settings.appliance_mode:
         return False
-
-    cert_dir = Path(settings.appliance_cert_dir)
-    try:
-        cert_dir.mkdir(parents=True, exist_ok=True)
-    except (PermissionError, OSError) as exc:
+    ok, err = k8s.patch_secret(
+        _TLS_SECRET_NAME,
+        {_TLS_CRT_KEY: cert_pem, _TLS_KEY_KEY: key_pem},
+    )
+    if not ok:
         logger.warning(
-            "appliance_cert_deploy_dir_failed",
-            cert_dir=str(cert_dir),
-            error=str(exc),
-        )
-        return False
-
-    cert_path = cert_dir / _CERT_FILENAME
-    key_path = cert_dir / _KEY_FILENAME
-    cert_tmp = cert_dir / (_CERT_FILENAME + ".new")
-    key_tmp = cert_dir / (_KEY_FILENAME + ".new")
-
-    try:
-        cert_tmp.write_text(cert_pem, encoding="utf-8")
-        key_tmp.write_text(key_pem, encoding="utf-8")
-        # Cert is public — 0644 so nginx (running as nginx user) can
-        # read it. Key MUST be 0600 even though nginx-the-process
-        # opens it before dropping privileges; this stops casual cat
-        # of the key from a sidecar / wrong-uid context.
-        os.chmod(cert_tmp, 0o644)
-        os.chmod(key_tmp, 0o600)
-        os.replace(cert_tmp, cert_path)
-        os.replace(key_tmp, key_path)
-    except (PermissionError, OSError) as exc:
-        logger.error(
-            "appliance_cert_deploy_write_failed",
-            cert_dir=str(cert_dir),
+            "appliance_cert_secret_patch_failed",
+            secret=_TLS_SECRET_NAME,
             name=name,
-            error=str(exc),
+            error=err,
         )
         return False
-
     logger.info(
-        "appliance_cert_deployed",
-        cert_dir=str(cert_dir),
+        "appliance_cert_secret_patched",
+        secret=_TLS_SECRET_NAME,
         name=name,
     )
     return True
 
 
 def reload_frontend_nginx() -> bool:
-    """Send SIGHUP to the frontend container so nginx reloads.
+    """Trigger a frontend Deployment rollout so pods re-read the Secret.
 
-    Uses the docker SDK over the host's docker socket. SIGHUP makes
-    nginx re-read its config + cert files without dropping in-flight
-    connections (graceful reload). No-op + logged warning if any of:
-        - settings.appliance_mode is false
-        - docker socket isn't mounted into this container
-        - docker SDK isn't installed (e.g. dev image without the dep)
-        - frontend container can't be found
+    Bumps the ``spatiumddi.io/tls-secret-checksum`` annotation on the
+    Deployment's pod template to the sha256 of the freshly-PATCHed
+    Secret data. The Deployment controller treats the annotation
+    change as a template change + rolls the pod. Single-replica
+    appliance frontend uses the Recreate strategy (chart template
+    handles this when hostNetwork=true) so the old pod terminates
+    BEFORE the new one binds :443 — ~5 s of downtime.
 
-    Returns True on success, False otherwise.
+    Returns True on successful PATCH. False otherwise.
     """
     if not settings.appliance_mode:
         return False
-    if not _DOCKER_SOCK.exists():
-        logger.warning(
-            "appliance_nginx_reload_no_docker_sock",
-            socket=str(_DOCKER_SOCK),
-        )
-        return False
+    # Read the active Secret back so we hash exactly what's on the
+    # wire — covers the case where another caller updated the
+    # Secret between deploy_active_cert's PATCH and this call.
+    import json  # noqa: PLC0415
 
+    cfg = k8s.get_config()
+    if cfg is None:
+        logger.warning("appliance_nginx_reload_no_kubeapi")
+        return False
+    deployment_name = getattr(
+        settings, "appliance_frontend_deployment", _DEFAULT_FRONTEND_DEPLOYMENT
+    )
+    # Pull the Secret to hash. patch_secret didn't return the
+    # post-patch body, so re-GET via the same _request helper.
+    from urllib.parse import quote  # noqa: PLC0415
+
+    path = (
+        f"/api/v1/namespaces/{quote(cfg.namespace)}"
+        f"/secrets/{quote(_TLS_SECRET_NAME)}"
+    )
     try:
-        import docker  # noqa: PLC0415 — optional in dev
-        from docker.errors import (  # noqa: PLC0415
-            APIError,
-            DockerException,
-            NotFound,
-        )
-    except ImportError as exc:
-        logger.warning("appliance_nginx_reload_docker_sdk_missing", error=str(exc))
+        status, body = k8s._request("GET", path)
+    except k8s.KubeapiUnavailableError as exc:
+        logger.warning("appliance_nginx_reload_secret_read_failed", error=str(exc))
         return False
-
-    try:
-        client = docker.from_env()
-    except DockerException as exc:
-        logger.warning("appliance_nginx_reload_client_failed", error=str(exc))
-        return False
-
-    container_name = settings.appliance_frontend_container
-    try:
-        container = client.containers.get(container_name)
-    except NotFound:
+    if status != 200:
         logger.warning(
-            "appliance_nginx_reload_container_not_found",
-            container=container_name,
+            "appliance_nginx_reload_secret_read_status",
+            status=status,
+            body=body[:200] if isinstance(body, bytes) else None,
         )
         return False
-    except APIError as exc:
-        logger.warning(
-            "appliance_nginx_reload_lookup_failed",
-            container=container_name,
-            error=str(exc),
-        )
-        return False
-
     try:
-        # SIGHUP triggers nginx master process to re-read config + certs
-        # while leaving existing workers handling in-flight requests.
-        # Equivalent to ``nginx -s reload`` from inside the container.
-        container.kill(signal="HUP")
-    except APIError as exc:
+        secret = json.loads(body)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("appliance_nginx_reload_secret_bad_json", error=str(exc))
+        return False
+    data = secret.get("data") or {}
+    checksum_src = (
+        (data.get(_TLS_CRT_KEY) or "") + (data.get(_TLS_KEY_KEY) or "")
+    ).encode("utf-8")
+    checksum = hashlib.sha256(checksum_src).hexdigest()
+    ok, err = k8s.patch_deployment_annotation(
+        deployment_name, _ROLLOUT_ANNOTATION, checksum
+    )
+    if not ok:
         logger.warning(
-            "appliance_nginx_reload_signal_failed",
-            container=container_name,
-            error=str(exc),
+            "appliance_nginx_reload_deployment_patch_failed",
+            deployment=deployment_name,
+            error=err,
         )
         return False
-
-    logger.info("appliance_nginx_reloaded", container=container_name)
+    logger.info(
+        "appliance_nginx_reloaded",
+        deployment=deployment_name,
+        checksum=checksum[:12],
+    )
     return True
 
 
 def deploy_and_reload(cert_pem: str, key_pem: str, *, name: str = "") -> bool:
-    """Convenience — deploy cert files, then signal nginx to reload.
+    """Convenience — PATCH the Secret, then trigger Deployment rollout.
 
     Returns True only when both steps succeeded. Failed deploys skip
-    the reload (no point signalling nginx when the cert on disk
-    didn't change).
+    the reload (no point bumping the rollout annotation when the
+    Secret didn't update).
     """
     if not deploy_active_cert(cert_pem, key_pem, name=name):
         return False
