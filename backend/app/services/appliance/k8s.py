@@ -129,7 +129,8 @@ def _request(
     content_type: str | None = ...,
     timeout: float = ...,
     stream: Literal[False] = False,
-) -> tuple[int, bytes]: ...
+) -> tuple[int, bytes]:
+    pass
 
 
 @overload
@@ -141,7 +142,8 @@ def _request(
     content_type: str | None = ...,
     timeout: float = ...,
     stream: Literal[True],
-) -> tuple[int, http.client.HTTPResponse]: ...
+) -> tuple[int, http.client.HTTPResponse]:
+    pass
 
 
 def _request(

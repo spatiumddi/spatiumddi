@@ -2107,7 +2107,7 @@ def do_containers(console: Console, tty: str) -> None:
                     # signal to stop tailing this pod; we deliberately
                     # swallow it so the picker loop resumes instead of
                     # the whole F3 panel exiting.
-                    pass
+                    continue
                 # Loop back to picker.
     except OSError as exc:
         console.print(f"[red]Failed to open {tty}: {exc}[/red]")
