@@ -7,6 +7,7 @@ import {
   type IPBlock,
   type IPSpace,
   type SubnetPlanRead,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { newNodeId } from "@/lib/uuid";
@@ -331,7 +332,7 @@ function NewPlanModal({ onClose }: { onClose: () => void }) {
         </div>
         {createMut.isError && (
           <p className="text-xs text-destructive">
-            {(createMut.error as Error).message}
+            {formatApiError(createMut.error)}
           </p>
         )}
         <div className="flex justify-end gap-2 pt-2">

@@ -8,7 +8,7 @@ import {
   Server,
 } from "lucide-react";
 
-import { applianceSystemApi } from "@/lib/api";
+import { applianceSystemApi, formatApiError } from "@/lib/api";
 
 /**
  * Phase 4f — Network & Host info (read-mostly MVP).
@@ -60,7 +60,7 @@ export function NetworkTab() {
 
       {error && (
         <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
-          {(error as Error).message}
+          {formatApiError(error)}
         </div>
       )}
 

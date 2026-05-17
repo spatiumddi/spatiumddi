@@ -4,6 +4,7 @@ import {
   dhcpApi,
   type DHCPServer,
   type WindowsDHCPCredentials,
+  formatApiError,
 } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 
@@ -151,7 +152,7 @@ export function CreateServerModal({
           try {
             mut.mutate();
           } catch (err) {
-            setError((err as Error).message);
+            setError(formatApiError(err));
           }
         }}
         className="space-y-3"

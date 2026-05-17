@@ -7,6 +7,7 @@ import {
   type IPBlock,
   type PlanAllocationResponse,
   type PlanRequestItem,
+  formatApiError,
 } from "@/lib/api";
 
 interface RowDraft {
@@ -169,7 +170,7 @@ export function PlanAllocationModal({
         )}
         {planMut.isError && (
           <p className="text-xs text-destructive">
-            {(planMut.error as Error).message}
+            {formatApiError(planMut.error)}
           </p>
         )}
 

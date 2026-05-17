@@ -11,7 +11,11 @@ import {
   RefreshCw,
 } from "lucide-react";
 
-import { applianceReleasesApi, type ApplianceRelease } from "@/lib/api";
+import {
+  applianceReleasesApi,
+  type ApplianceRelease,
+  formatApiError,
+} from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 
 // Number of most-recent releases rendered as full cards. Anything older
@@ -91,7 +95,7 @@ export function ReleasesTab({
 
       {error && (
         <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
-          Failed to load releases: {(error as Error).message}
+          Failed to load releases: {formatApiError(error)}
         </div>
       )}
 
@@ -156,7 +160,7 @@ export function ReleasesTab({
           onClose={() => !apply.isPending && setConfirmTarget(null)}
           onConfirm={() => apply.mutate(confirmTarget.tag)}
           submitting={apply.isPending}
-          error={apply.isError ? (apply.error as Error).message : null}
+          error={apply.isError ? formatApiError(apply.error) : null}
         />
       )}
     </div>

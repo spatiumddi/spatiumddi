@@ -19,6 +19,7 @@ import {
   authApi,
   type PairingCodeCreated,
   type PairingCodeRow,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -514,7 +515,7 @@ function GenerateCodeModal({
 
           {mutation.error && (
             <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
-              {String((mutation.error as Error).message ?? mutation.error)}
+              {formatApiError(mutation.error)}
             </div>
           )}
 
@@ -702,7 +703,7 @@ function RevealModal({
           </label>
           {mutation.error && (
             <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
-              {String((mutation.error as Error).message ?? mutation.error)}
+              {formatApiError(mutation.error)}
             </div>
           )}
           <div className="flex justify-end gap-2">

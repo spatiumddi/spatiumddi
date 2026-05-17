@@ -73,6 +73,7 @@ import {
   type MacHistoryEntry,
   type NATMapping,
   type NetworkContextEntry,
+  formatApiError,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
@@ -5344,7 +5345,7 @@ function DnsSyncModal({
           )}
           {error && (
             <p className="text-sm text-destructive">
-              Failed to load preview. {(error as Error).message}
+              Failed to load preview. {formatApiError(error)}
             </p>
           )}
           {data && (

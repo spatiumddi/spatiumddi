@@ -16,6 +16,7 @@ import {
   diagnosticsApi,
   type InternalErrorDetail,
   type InternalErrorListItem,
+  formatApiError,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
 
@@ -195,7 +196,7 @@ export function DiagnosticsErrorsPage() {
           <div className="p-6 text-sm text-destructive">
             Failed to load errors.
             {(listQ.error as Error)?.message
-              ? ` ${(listQ.error as Error).message}`
+              ? ` ${formatApiError(listQ.error)}`
               : ""}
           </div>
         ) : errors.length === 0 ? (

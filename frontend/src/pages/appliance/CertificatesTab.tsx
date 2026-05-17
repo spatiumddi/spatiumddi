@@ -18,6 +18,7 @@ import {
   type ApplianceCertificate,
   type CSRKeyType,
   type CertificateSource,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -113,7 +114,7 @@ export function CertificatesTab() {
 
       {error && (
         <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
-          Failed to load certificates: {(error as Error).message}
+          Failed to load certificates: {formatApiError(error)}
         </div>
       )}
 
