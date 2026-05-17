@@ -7,16 +7,18 @@
        ``role-dns-powerdns`` labels on any heartbeat. */}}
 {{- if .Values.dnsPowerdns.enabled }}
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: dns-powerdns
   labels:
     {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
     app.kubernetes.io/component: dns-powerdns
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate
+  # DaemonSet for symmetry with dns-bind9 + dhcp-kea — DESIRED=0
+  # when the node lacks ``spatium.io/role-dns-powerdns=true``, so
+  # ``kubectl get pods`` stays silent on unscheduled roles.
+  updateStrategy:
+    type: OnDelete
   selector:
     matchLabels:
       app.kubernetes.io/name: dns-powerdns

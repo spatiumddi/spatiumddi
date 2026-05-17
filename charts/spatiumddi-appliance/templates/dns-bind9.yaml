@@ -13,16 +13,21 @@
        (closes the kine footprint Phase 9 follow-up). */}}
 {{- if .Values.dnsBind9.enabled }}
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: dns-bind9
   labels:
     {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
     app.kubernetes.io/component: dns-bind9
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate          # PVCs + hostPath data: no rolling
+  # DaemonSet so ``DESIRED`` is computed from matching nodes — no
+  # Pending pod when the per-role label isn't on the node. Same
+  # shape as dhcp-kea. Use OnDelete update strategy so a chart
+  # upgrade doesn't roll-replace mid-flight (single-instance
+  # stateful workload + hostNetwork:53; operator can `kubectl
+  # delete pod` to trigger the upgrade explicitly).
+  updateStrategy:
+    type: OnDelete
   selector:
     matchLabels:
       app.kubernetes.io/name: dns-bind9
