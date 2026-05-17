@@ -3,22 +3,15 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "LICENSE"
-      - "NOTICE"
-      - ".gitignore"
-      - ".github/ISSUE_TEMPLATE/**"
-      - ".github/PULL_REQUEST_TEMPLATE.md"
   pull_request:
     branches: [main]
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "LICENSE"
-      - "NOTICE"
-      - ".gitignore"
+  # ``paths-ignore`` is deliberately absent. Skipped workflow runs
+  # don't post the required check-runs the ``protect-main`` ruleset
+  # waits for, so docs-only PRs (CHANGELOG bumps, README polish,
+  # release-prep PRs) sit BLOCKED forever even though every code
+  # check would be a no-op. Cheaper to spend ~7 min of free runner
+  # time on a docs PR than to maintain the bypass-actor dance on
+  # every release.
 
 concurrency:
   group: ci-${{ github.ref }}
