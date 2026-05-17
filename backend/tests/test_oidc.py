@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import inspect
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -276,20 +276,31 @@ class TestExchangeCodeTokenValidation:
 
 
 # ---------------------------------------------------------------------------
-# Config validation
+# Config validation (OIDCConfig is a dataclass; validation runs in from_provider)
 # ---------------------------------------------------------------------------
 class TestOIDCConfigValidation:
+    def _make_provider(self, config_dict: dict) -> MagicMock:
+        """Return a minimal mock AuthProvider backed by config_dict."""
+        provider = MagicMock()
+        provider.config = config_dict
+        provider.secrets_encrypted = None
+        return provider
+
     def test_missing_discovery_url(self):
-        from app.core.auth.oidc import OIDCConfig
-        import pydantic
-        with pytest.raises((ValueError, pydantic.ValidationError)):
-            OIDCConfig(client_id="x", client_secret="y")
+        from app.core.auth.oidc import OIDCConfig, OIDCServiceError
+
+        provider = self._make_provider({"client_id": "x", "scopes": ["openid"]})
+        with pytest.raises(OIDCServiceError, match="discovery_url"):
+            OIDCConfig.from_provider(provider)
 
     def test_missing_client_id(self):
-        from app.core.auth.oidc import OIDCConfig
-        import pydantic
-        with pytest.raises((ValueError, pydantic.ValidationError)):
-            OIDCConfig(discovery_url="https://idp/openid-configuration", client_secret="y")
+        from app.core.auth.oidc import OIDCConfig, OIDCServiceError
+
+        provider = self._make_provider(
+            {"discovery_url": "https://idp/openid-configuration", "scopes": ["openid"]}
+        )
+        with pytest.raises(OIDCServiceError, match="client_id"):
+            OIDCConfig.from_provider(provider)
 
 
 # ---------------------------------------------------------------------------
@@ -297,13 +308,13 @@ class TestOIDCConfigValidation:
 # ---------------------------------------------------------------------------
 class TestInvalidateCaches:
     def test_invalidate_removes_cached_entries(self):
-        from app.core.auth.oidc import _discovery_cache, _jwks_cache, invalidate_caches
+        from app.core.auth.oidc import _DISCOVERY_CACHE, _JWKS_CACHE, invalidate_caches
 
-        _discovery_cache["p1"] = ("doc", time.time() + 300)
-        _jwks_cache["p1"] = ({"keys": []}, time.time() + 300)
+        _DISCOVERY_CACHE["p1"] = ("doc", time.time() + 300)
+        _JWKS_CACHE["p1"] = ({"keys": []}, time.time() + 300)
         invalidate_caches("p1")
-        assert "p1" not in _discovery_cache
-        assert "p1" not in _jwks_cache
+        assert "p1" not in _DISCOVERY_CACHE
+        assert "p1" not in _JWKS_CACHE
 
     def test_invalidate_unknown_provider_is_noop(self):
         from app.core.auth.oidc import invalidate_caches
