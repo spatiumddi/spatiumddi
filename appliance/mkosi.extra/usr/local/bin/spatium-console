@@ -1242,20 +1242,12 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         Text("IMAGE", style=header_style),
     )
 
-    # Sort: spatium first (the role pods operators care about most),
-    # kube-system next, then anything else alphabetically. Within a
-    # namespace, alphabetical by name.
-    def _ns_rank(ns: str) -> tuple[int, str]:
-        if ns == "spatium":
-            return (0, ns)
-        if ns == "kube-system":
-            return (1, ns)
-        return (2, ns)
-
-    sorted_rows = sorted(
-        ps_rows,
-        key=lambda r: (_ns_rank(r.get("Namespace") or ""), r.get("Names") or ""),
-    )
+    # Pure alphabetical by pod name. Operator feedback —
+    # namespace-grouping made the spatium pods land at the top
+    # consistently but obscured the natural "where is foo-pod"
+    # scan; the namespace column itself still makes the grouping
+    # obvious at a glance.
+    sorted_rows = sorted(ps_rows, key=lambda r: r.get("Names") or "")
 
     if not sorted_rows:
         tbl.add_row(
@@ -1671,7 +1663,9 @@ class DashboardState:
         self.ram_total_gib: float = 0.0
         self.ram_percent: float = 0.0
         self.load_avg: tuple[float, float, float] = (0.0, 0.0, 0.0)
-        self.clock_str: str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.clock_str: str = datetime.now().astimezone().strftime(
+            "%Y-%m-%d %H:%M:%S %Z"
+        )
         self.disks: list[tuple[str, float, float, float]] = []
 
     def refresh(self, force: bool = False) -> None:
@@ -1686,7 +1680,13 @@ class DashboardState:
             self.ram_total_gib = vm.total / 2**30
             self.ram_percent = vm.percent
             self.load_avg = os.getloadavg()
-            self.clock_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # ``%Z`` resolves the IANA-zone abbreviation (``EDT`` /
+            # ``UTC`` / etc.) from the system localtime. astimezone()
+            # picks up the active TZ each tick so ``timedatectl
+            # set-timezone`` reflects without a console restart.
+            self.clock_str = datetime.now().astimezone().strftime(
+                "%Y-%m-%d %H:%M:%S %Z"
+            )
             self.disks = disk_summary()
 
         # Data tier (2 s) — docker ps + env re-read.

@@ -3,7 +3,15 @@
        ``hostNetwork: true`` + ``CAP_NET_BIND_SERVICE`` for udp/67.
        Same shape as today's docker-compose ``network_mode: host``
        entry. Single node on the appliance, so DaemonSet
-       degenerates to one pod. */}}
+       degenerates to one pod.
+
+       Phase 10 wave 2 — ``.enabled`` is release-ownership scope
+       (bootstrap=false, appliance=true), NOT role-scope. The
+       supervisor's spatiumddi-appliance HelmChart sets
+       ``dhcpKea.enabled=true``; the bootstrap release sets it
+       false. Pod scheduling is gated by the
+       ``spatium.io/role-dhcp=true`` node label — pod sits in
+       Pending until the supervisor labels the node. */}}
 {{- if .Values.dhcpKea.enabled }}
 apiVersion: apps/v1
 kind: DaemonSet

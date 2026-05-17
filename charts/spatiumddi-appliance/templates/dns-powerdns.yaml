@@ -1,6 +1,10 @@
 {{- /* Issue #183 Phase 2 — PowerDNS DNS agent (alternative to BIND9).
-       Mutually exclusive with dnsBind9.enabled at the supervisor-CRD
-       level (server-side validation). */}}
+       Phase 10 wave 2 — ``.enabled`` is now release-ownership scope
+       (bootstrap=false, appliance=true), NOT role-scope. Scheduling
+       is gated by the ``spatium.io/role-dns-powerdns=true`` node
+       label. BIND9 vs PowerDNS mutual exclusion is enforced
+       supervisor-side: it sets at most one of ``role-dns-bind9`` /
+       ``role-dns-powerdns`` labels on any heartbeat. */}}
 {{- if .Values.dnsPowerdns.enabled }}
 apiVersion: apps/v1
 kind: Deployment

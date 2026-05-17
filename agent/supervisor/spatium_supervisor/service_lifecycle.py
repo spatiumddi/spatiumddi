@@ -182,50 +182,43 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
         "SPATIUMDDI_VERSION", "dev"
     )
 
-    desired_helm_keys: set[str] = set()
-    for profile in profiles:
-        key = _PROFILE_TO_HELM_KEY.get(profile)
-        if key is not None:
-            desired_helm_keys.add(key)
-
+    # Phase 10 wave 2 — ``enabled`` flags here are RELEASE-ownership
+    # scope (which helm release owns which Deployment), NOT
+    # role-scheduling scope. Scheduling is gated by node labels
+    # exclusively (``spatium.io/role-<role>=true``); the supervisor
+    # toggles those on every heartbeat via reconcile_node_labels.
+    #
+    # The role release ALWAYS sets every role's enabled=true (so the
+    # chart renders + helm tracks the Deployment + PVCs). The
+    # bootstrap release sets them all false (so spatium-bootstrap
+    # doesn't fight us for ownership). Result: role swap = pure
+    # label flip, no chart upgrade, no chartContent re-upload to
+    # kine — Phase 9 kine-footprint follow-up closes.
     values: dict[str, object] = {
         "global": {
             "imageTag": image_tag,
             "imagePullPolicy": "Never",
         },
-        # The agent-landing nginx Deployment is owned by the
-        # firstboot-deployed ``spatium-bootstrap`` release, which sets
-        # agentLanding.enabled=true (chart default). The
-        # role-driven ``spatiumddi-appliance`` release uses the same
-        # chart; if we left agentLanding default-on here too, helm
-        # would refuse the install with "Deployment agent-landing ...
-        # cannot be imported into the current release: meta.helm.sh/
-        # release-name must equal spatiumddi-appliance: current value
-        # is spatium-bootstrap". Explicitly disabling here keeps the
-        # always-on landing page in the bootstrap release only.
         "agentLanding": {
             "enabled": False,
         },
-        # Same shape — the supervisor itself is owned by spatium-
-        # bootstrap; the spatiumddi-appliance release should never
-        # try to re-create it.
         "supervisor": {
             "enabled": False,
         },
         "dnsBind9": {
-            "enabled": "dnsBind9" in desired_helm_keys,
+            "enabled": True,
             "controlPlaneUrl": control_plane_url,
             "agentKey": env_vars.get("DNS_AGENT_KEY", ""),
             "serverGroupName": env_vars.get("AGENT_GROUP", ""),
         },
         "dnsPowerdns": {
-            "enabled": "dnsPowerdns" in desired_helm_keys,
+            "enabled": True,
             "controlPlaneUrl": control_plane_url,
             "agentKey": env_vars.get("DNS_AGENT_KEY", ""),
             "serverGroupName": env_vars.get("AGENT_GROUP", ""),
         },
         "dhcpKea": {
-            "enabled": "dhcpKea" in desired_helm_keys,
+            "enabled": True,
             "controlPlaneUrl": control_plane_url,
             "agentKey": env_vars.get("DHCP_AGENT_KEY", ""),
             "serverGroupName": env_vars.get("DHCP_AGENT_GROUP", "")
@@ -343,6 +336,35 @@ def apply_role_assignment(
     return LifecycleResult(state="ready", started=desired_services)
 
 
+def reconcile_node_labels(profiles: list[str]) -> tuple[bool, str | None]:
+    """Reconcile the node's per-role labels against ``profiles``.
+
+    Idempotent — setting a label to its current value is a kubeapi
+    no-op. Cheap enough (single PATCH, <10 ms locally) to run on
+    every heartbeat tick alongside the apply_role_assignment
+    skip-check. Catches drift from an out-of-band ``kubectl label``
+    or a manual unlabeling without waiting for the values-hash to
+    change.
+
+    Returns ``(ok, error_or_None)`` — caller logs but doesn't act
+    on failure (next heartbeat re-attempts).
+    """
+    desired_role_set = {p for p in profiles if p in _ROLE_LABEL_KEYS}
+    label_diff: dict[str, str | None] = {}
+    for role, label in _ROLE_LABEL_KEYS.items():
+        label_diff[label] = "true" if role in desired_role_set else None
+    node_name = (
+        os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
+    )
+    if not node_name:
+        try:
+            import socket as _socket
+            node_name = _socket.gethostname()
+        except OSError:
+            return False, "node_name unknown"
+    return k8s_api.patch_node_labels(node_name, label_diff)
+
+
 def tear_down_supervised_services() -> LifecycleResult:
     """k3s analog of ``service_lifecycle.tear_down_supervised_services``.
 
@@ -387,5 +409,6 @@ def tear_down_supervised_services() -> LifecycleResult:
 __all__ = [
     "apply_role_assignment",
     "k3s_available",
+    "reconcile_node_labels",
     "tear_down_supervised_services",
 ]

@@ -29,7 +29,15 @@ class SupervisorConfig:
             control_plane_url=os.environ.get("CONTROL_PLANE_URL", "").rstrip("/"),
             hostname=os.environ.get("APPLIANCE_HOSTNAME") or socket.gethostname(),
             state_dir=Path(os.environ.get("STATE_DIR", "/var/lib/spatium-supervisor")),
-            bootstrap_pairing_code=os.environ.get("BOOTSTRAP_PAIRING_CODE", ""),
+            # Strip non-digit characters so a dash-separated code
+            # (``1234-5678`` — how the frontend formats 8-digit codes
+            # for readability) hashes to the same canonical form as
+            # the bare ``12345678``. Backend validator does the same
+            # strip; this is belt-and-braces so the env contract is
+            # operator-friendly too.
+            bootstrap_pairing_code="".join(
+                ch for ch in os.environ.get("BOOTSTRAP_PAIRING_CODE", "") if ch.isdigit()
+            ),
             heartbeat_interval_seconds=int(
                 os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "60")
             ),

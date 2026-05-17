@@ -154,9 +154,15 @@ class SupervisorRegisterRequest(BaseModel):
     @field_validator("pairing_code")
     @classmethod
     def _digits_only(cls, v: str) -> str:
-        if not v.isdigit():
+        # Operator-facing presentation can carry dashes / spaces
+        # (frontend chunks the code as ``1234-5678`` for
+        # readability); strip every non-digit before validating so
+        # ``1234-5678`` / ``1234 5678`` / ``12345678`` all
+        # resolve to the same canonical hash.
+        cleaned = "".join(ch for ch in v if ch.isdigit())
+        if len(cleaned) != 8:
             raise ValueError("Pairing code must be 8 decimal digits.")
-        return v
+        return cleaned
 
 
 class SupervisorRegisterResponse(BaseModel):

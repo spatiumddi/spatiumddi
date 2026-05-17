@@ -236,6 +236,16 @@ spec:
       imagePullPolicy: Never
     supervisor:
       enabled: true
+    # Phase 10 wave 2 — bootstrap release owns supervisor +
+    # agent-landing only; role pods live in the supervisor-driven
+    # spatiumddi-appliance release. Explicit ``enabled: false`` so
+    # the two releases don't fight over the same Deployments.
+    dnsBind9:
+      enabled: false
+    dnsPowerdns:
+      enabled: false
+    dhcpKea:
+      enabled: false
 EOF
     mv "$tmp" "$BOOTSTRAP_MANIFEST"
     chmod 0600 "$BOOTSTRAP_MANIFEST"

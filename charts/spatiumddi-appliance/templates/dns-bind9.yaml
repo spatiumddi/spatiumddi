@@ -1,13 +1,16 @@
 {{- /* Issue #183 Phase 2 — BIND9 DNS agent.
        Deployment with hostNetwork=true — port 53 needs to listen
        directly on the node IP so non-cluster clients can resolve
-       against the appliance. Klipper-lb is disabled in our k3s
-       config (single-node, no LoadBalancer impl), and NodePort
-       defaults exclude 53, so hostNetwork is the simplest way to
-       expose :53 to the operator's network. Mirrors dhcp-kea's
-       pattern (also hostNetwork for raw broadcast access).
-       Agent still connects outbound to the control plane to
-       register. */}}
+       against the appliance.
+
+       Phase 10 wave 2 — the ``.enabled`` flag is now release-
+       ownership scoped, not role-scoped: the spatium-bootstrap
+       release sets ``dnsBind9.enabled=false`` (owned elsewhere),
+       the spatiumddi-appliance release sets ``dnsBind9.enabled=true``
+       (this release owns it). Pod scheduling is gated by the node
+       label ``spatium.io/role-dns-bind9=true`` independently of
+       ``.enabled`` — role swap = label flip, no chart upgrade
+       (closes the kine footprint Phase 9 follow-up). */}}
 {{- if .Values.dnsBind9.enabled }}
 apiVersion: apps/v1
 kind: Deployment

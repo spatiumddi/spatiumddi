@@ -39,6 +39,19 @@ import { cn } from "@/lib/utils";
  * a refresh), 15s when nothing is pending.
  */
 
+/**
+ * Format an 8-digit pairing code as ``1234-5678`` for display. The
+ * dash is cosmetic — the backend's pairing-code validator, the
+ * installer wizard, and the supervisor entrypoint all strip
+ * non-digits before validating, so an operator can type the dash
+ * or leave it out and either resolves to the same hash.
+ */
+function formatPairingCode(code: string): string {
+  const digits = code.replace(/\D/g, "");
+  if (digits.length !== 8) return code;
+  return `${digits.slice(0, 4)}-${digits.slice(4)}`;
+}
+
 const inputCls =
   "rounded-md border bg-background px-3 py-1.5 text-sm disabled:opacity-60";
 
@@ -539,8 +552,14 @@ function GeneratedView({
 }) {
   const [copied, setCopied] = useState(false);
   const copyRef = useRef<number | null>(null);
+  const formatted = formatPairingCode(code.code);
   const onCopy = async () => {
-    await navigator.clipboard.writeText(code.code);
+    // Copy the formatted form (1234-5678) so paste into the
+    // installer / Settings field carries the same characters the
+    // operator sees on screen. The backend + installer + supervisor
+    // all strip non-digits before validating, so the dashes are
+    // cosmetic only.
+    await navigator.clipboard.writeText(formatted);
     setCopied(true);
     if (copyRef.current !== null) window.clearTimeout(copyRef.current);
     copyRef.current = window.setTimeout(() => setCopied(false), 1500);
@@ -563,7 +582,7 @@ function GeneratedView({
       </p>
       <div className="flex items-center gap-2">
         <code className="flex-1 rounded-md border bg-muted px-4 py-3 text-center font-mono text-2xl tracking-widest">
-          {code.code}
+          {formatted}
         </code>
         <button
           type="button"
@@ -620,9 +639,10 @@ function RevealModal({
     onSuccess: (body) => setRevealed(body.code),
   });
 
+  const formattedRevealed = revealed ? formatPairingCode(revealed) : null;
   const onCopy = async () => {
-    if (!revealed) return;
-    await navigator.clipboard.writeText(revealed);
+    if (!formattedRevealed) return;
+    await navigator.clipboard.writeText(formattedRevealed);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1500);
   };
@@ -633,7 +653,7 @@ function RevealModal({
         <div className="flex flex-col gap-3">
           <div className="flex items-center gap-2">
             <code className="flex-1 rounded-md border bg-muted px-4 py-3 text-center font-mono text-2xl tracking-widest">
-              {revealed}
+              {formattedRevealed}
             </code>
             <button
               type="button"

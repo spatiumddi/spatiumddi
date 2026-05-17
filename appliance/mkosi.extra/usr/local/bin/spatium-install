@@ -226,16 +226,20 @@ ask_application_config() {
             --inputbox "Enter the 8-digit pairing code from the control plane.\n\nMint one at https://<control-plane>/appliance → Pairing → 'New pairing code'. Single-use ephemeral codes expire after 15 min by default; persistent codes (multi-claim) stay valid until disabled or revoked.\n\nAfter the supervisor claims the code, the appliance sits in pending — ask the control plane admin to click Approve in the fleet UI to issue the identity cert and assign a role." \
             18 78 "$BOOTSTRAP_PAIRING_CODE" 3>&1 1>&2 2>&3) \
             || return 1
-        code_val=$(echo "$code_val" | tr -d '[:space:]')
+        # The frontend displays codes as ``1234-5678`` for
+        # readability; an operator typing in dashes or spaces from
+        # what they see on screen should validate cleanly. Strip
+        # every non-digit before checking the length.
+        code_val=$(echo "$code_val" | tr -cd '0-9')
         if [ -z "$code_val" ]; then
             whiptail --msgbox "Pairing code is required for an Application install." 8 60 || true
             continue
         fi
-        # Validate: exactly 8 decimal digits. Catch typos before
-        # firstboot tries to redeem the code and fails with a
-        # generic 403 (which we'd then surface on the console).
+        # Validate: exactly 8 decimal digits after stripping. Catch
+        # typos before firstboot tries to redeem the code and fails
+        # with a generic 403 (which we'd then surface on the console).
         if ! [[ "$code_val" =~ ^[0-9]{8}$ ]]; then
-            whiptail --msgbox "Pairing code must be exactly 8 decimal digits.\n\nGot: $code_val" 10 60 || true
+            whiptail --msgbox "Pairing code must be 8 decimal digits (dashes / spaces accepted as separators).\n\nGot after strip: $code_val" 10 60 || true
             continue
         fi
         break

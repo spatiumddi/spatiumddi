@@ -60,6 +60,7 @@ from . import watchdog
 # docker; this is the only path now.
 from .service_lifecycle import (
     apply_role_assignment,
+    reconcile_node_labels,
     tear_down_supervised_services,
 )
 
@@ -603,6 +604,24 @@ def heartbeat_once(
         return
 
     if not env_write_failed and appliance_state.detect_deployment_kind() == "appliance":
+        # Phase 10 wave 2 — reconcile node labels every heartbeat
+        # regardless of the env-hash skip below. patch_node_labels is
+        # idempotent (same-value = no-op), so the cost is one PATCH
+        # per minute; the win is catching drift from out-of-band
+        # ``kubectl label node`` runs or manual unlabeling without
+        # waiting for the operator to flip a role.
+        try:
+            label_ok, label_err = reconcile_node_labels(target.profiles)
+            if not label_ok:
+                log.warning(
+                    "supervisor.heartbeat.labels_reconcile_failed",
+                    error=label_err,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "supervisor.heartbeat.labels_reconcile_crashed", error=str(exc)
+            )
+
         env_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
         last_hash = _read_last_apply_hash(cfg.state_dir)
         if env_hash == last_hash:
