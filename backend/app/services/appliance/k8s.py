@@ -255,10 +255,16 @@ def stream_pod_logs(
         cfg.host, cfg.port, timeout=None, context=_ssl_context(cfg.ca_path)
     )
     try:
+        # ``Accept: text/plain`` fails kubeapi's media-type check with
+        # 406 — the api server only allows application/json,
+        # application/yaml, application/vnd.kubernetes.protobuf,
+        # application/cbor, or ``*/*``. Pod logs are returned as raw
+        # text regardless. Use ``*/*`` so we don't accidentally
+        # constrain the negotiation.
         headers = {
             "Host": cfg.host,
             "Authorization": f"Bearer {cfg.token}",
-            "Accept": "text/plain",
+            "Accept": "*/*",
         }
         conn.request("GET", path, headers=headers)
         resp = conn.getresponse()

@@ -80,7 +80,16 @@ def _parse_pod_to_summary(pod: dict[str, Any]) -> ContainerSummary:
     status_obj = pod.get("status") or {}
     name = meta.get("name") or ""
     labels = meta.get("labels") or {}
-    part_of = labels.get("app.kubernetes.io/part-of") or ""
+    # "Spatium" pod detection — both chart conventions count:
+    #   * umbrella (charts/spatiumddi/): ``app.kubernetes.io/name=
+    #     spatiumddi``
+    #   * appliance (charts/spatiumddi-appliance/):
+    #     ``app.kubernetes.io/part-of=spatiumddi`` (plus the same
+    #     ``name`` on some templates)
+    is_spatium = (
+        labels.get("app.kubernetes.io/part-of") == "spatiumddi"
+        or labels.get("app.kubernetes.io/name") == "spatiumddi"
+    )
 
     containers = spec.get("containers") or []
     first_image = containers[0].get("image", "") if containers else ""
@@ -153,7 +162,7 @@ def _parse_pod_to_summary(pod: dict[str, Any]) -> ContainerSummary:
         health=health,
         short_id=(meta.get("uid") or "")[:12],
         started_at=started_at,
-        is_spatium=(part_of == _SPATIUM_PART_OF),
+        is_spatium=is_spatium,
     )
 
 
