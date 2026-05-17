@@ -4,6 +4,7 @@ import {
   AlertCircle,
   Ban,
   CheckCircle2,
+  FileText,
   HardDrive,
   KeyRound,
   Loader2,
@@ -1048,7 +1049,7 @@ function ApplianceDrilldownModal({
 
   return (
     <Modal title={`Appliance · ${row.hostname}`} onClose={onClose} wide>
-      <div className="space-y-4 text-sm">
+      <div className="divide-y divide-border text-sm [&>*]:pt-4 [&>*:first-child]:pt-0 [&>*]:pb-4 [&>*:last-child]:pb-0">
         <div className="flex flex-wrap items-center gap-2">
           <span
             className={cn(
@@ -1147,6 +1148,10 @@ function ApplianceDrilldownModal({
             <ApplianceRoleHealthSection row={row} />
           )}
 
+        {row.state === "approved" && (
+          <ApplianceClusterHealthSection row={row} />
+        )}
+
         {row.state === "approved" && <ApplianceOsUpgradeSection row={row} />}
 
         {row.state === "approved" && (
@@ -1173,7 +1178,7 @@ function ApplianceDrilldownModal({
           </div>
         )}
 
-        <div className="flex flex-wrap justify-end gap-2 border-t pt-3">
+        <div className="flex flex-wrap justify-end gap-2">
           {row.state === "pending_approval" ? (
             <>
               <button
@@ -1394,6 +1399,577 @@ function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
         </table>
       </div>
     </div>
+  );
+}
+
+// Issue #183 Phase 4 — k3s cluster-health summary + restart action.
+// Renders only when the appliance has heartbeat-reported cluster
+// state (legacy compose appliances ship an empty cluster_health
+// dict, so this section quietly hides).
+function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
+  const qc = useQueryClient();
+  // Hooks must run unconditionally — declare the mutation up front,
+  // then bail later if cluster_health is empty.
+  const restartBind9 = useMutation({
+    mutationFn: () =>
+      applianceApprovalApi.k8sRolloutRestart(row.id, {
+        kind: "Deployment",
+        namespace: "spatium",
+        name: "dns-bind9",
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
+  });
+  const [revealOpen, setRevealOpen] = useState(false);
+  const [cidrEditorOpen, setCidrEditorOpen] = useState(false);
+  const [logsOpen, setLogsOpen] = useState(false);
+
+  const ch = row.cluster_health ?? {};
+  const ready = ch.kubeapi_ready === true;
+  const nodesTotal = ch.nodes_total;
+  const nodesReady = ch.nodes_ready;
+  const podsTotal = ch.pods_total;
+  const podsByPhase = ch.pods_by_phase ?? {};
+
+  // Hide on pre-#183 / legacy compose appliances where the supervisor
+  // never reports cluster_health.
+  if (Object.keys(ch).length === 0) {
+    return null;
+  }
+
+  return (
+    <div>
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        k3s cluster health
+      </h3>
+      <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1.5 text-xs">
+        <dt className="text-muted-foreground">Kubeapi</dt>
+        <dd>
+          <span
+            className={cn(
+              "rounded-full px-1.5 py-0.5 font-mono text-[10px]",
+              ready
+                ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                : "bg-rose-500/10 text-rose-700 dark:text-rose-300",
+            )}
+          >
+            {ready ? "ready" : "unreachable"}
+          </span>
+          {row.k3s_version && (
+            <span className="ml-2 font-mono text-[11px] text-muted-foreground">
+              {row.k3s_version}
+            </span>
+          )}
+        </dd>
+        {nodesTotal !== undefined && (
+          <>
+            <dt className="text-muted-foreground">Nodes</dt>
+            <dd className="font-mono">
+              {nodesReady ?? 0} / {nodesTotal} ready
+            </dd>
+          </>
+        )}
+        {podsTotal !== undefined && (
+          <>
+            <dt className="text-muted-foreground">Pods (spatium)</dt>
+            <dd>
+              <span className="font-mono">{podsTotal}</span>
+              {Object.entries(podsByPhase).length > 0 && (
+                <span className="ml-2 font-mono text-[11px] text-muted-foreground">
+                  {Object.entries(podsByPhase)
+                    .map(([phase, count]) => `${phase} ${count}`)
+                    .join(" · ")}
+                </span>
+              )}
+            </dd>
+          </>
+        )}
+        {row.k3s_api_cert_expires_at && (
+          <>
+            <dt className="text-muted-foreground">API cert</dt>
+            <dd>
+              <CertExpiryChip iso={row.k3s_api_cert_expires_at} />
+            </dd>
+          </>
+        )}
+        <dt className="text-muted-foreground">Direct access</dt>
+        <dd>
+          {row.kubeapi_expose_cidrs.length === 0 ? (
+            <span className="text-[11px] text-muted-foreground">
+              proxy-only
+            </span>
+          ) : (
+            <span className="font-mono text-[11px]">
+              {row.kubeapi_expose_cidrs.join(", ")}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => setCidrEditorOpen(true)}
+            className="ml-2 text-[11px] text-primary underline decoration-dotted underline-offset-2 hover:text-foreground"
+          >
+            Edit
+          </button>
+        </dd>
+      </dl>
+      <p className="mt-2 text-[11px] text-muted-foreground">
+        Direct kubeapi proxy via the supervisor's mTLS channel — actions are
+        sub-second on a healthy appliance.
+      </p>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={() => restartBind9.mutate()}
+          disabled={!ready || restartBind9.isPending}
+          title="kubectl rollout restart deploy/dns-bind9 -n spatium"
+          className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {restartBind9.isPending ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <RefreshCw className="h-3 w-3" />
+          )}
+          Restart bind9
+        </button>
+        <button
+          type="button"
+          onClick={() => setRevealOpen(true)}
+          disabled={!row.kubeconfig_set}
+          title={
+            row.kubeconfig_set
+              ? "Reveal + download the admin kubeconfig (password-gated)"
+              : "Supervisor hasn't shipped a kubeconfig yet"
+          }
+          className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <KeyRound className="h-3 w-3" />
+          Reveal kubeconfig
+        </button>
+        <button
+          type="button"
+          onClick={() => setLogsOpen(true)}
+          disabled={!ready}
+          title="View pod logs (snapshot via the kubeapi proxy)"
+          className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <FileText className="h-3 w-3" />
+          Pod logs
+        </button>
+        {restartBind9.error && (
+          <span className="text-[11px] text-rose-700 dark:text-rose-300">
+            {(restartBind9.error as Error).message}
+          </span>
+        )}
+        {restartBind9.isSuccess && (
+          <span className="text-[11px] text-emerald-700 dark:text-emerald-300">
+            rollout-restart issued
+          </span>
+        )}
+      </div>
+      {revealOpen && (
+        <RevealKubeconfigModal
+          appliance={row}
+          onClose={() => setRevealOpen(false)}
+        />
+      )}
+      {cidrEditorOpen && (
+        <KubeapiCidrEditorModal
+          appliance={row}
+          onClose={() => setCidrEditorOpen(false)}
+        />
+      )}
+      {logsOpen && (
+        <PodLogsModal appliance={row} onClose={() => setLogsOpen(false)} />
+      )}
+    </div>
+  );
+}
+
+// Issue #183 Phase 8 — pod log viewer. Snapshot mode (no follow)
+// because the Phase 4 kubeapi proxy is request/response. Operator
+// picks a pod from the dropdown; backend fetches the last N lines
+// via the proxy and we render in a textarea. Refresh button to
+// re-fetch.
+function PodLogsModal({
+  appliance,
+  onClose,
+}: {
+  appliance: ApplianceRow;
+  onClose: () => void;
+}) {
+  const podsQuery = useQuery({
+    queryKey: ["appliance", "fleet", appliance.id, "k8s-pods"],
+    queryFn: () => applianceApprovalApi.k8sListPods(appliance.id),
+    staleTime: 10_000,
+  });
+  const [selectedPod, setSelectedPod] = useState<string>("");
+  const [selectedContainer, setSelectedContainer] = useState<string>("");
+  const [tailLines, setTailLines] = useState<number>(500);
+
+  // Auto-select the first pod when the list loads; keep the
+  // operator's choice sticky after they change it.
+  useEffect(() => {
+    if (!selectedPod && podsQuery.data?.pods.length) {
+      setSelectedPod(podsQuery.data.pods[0].name);
+    }
+  }, [podsQuery.data, selectedPod]);
+
+  const selectedPodInfo = podsQuery.data?.pods.find(
+    (p) => p.name === selectedPod,
+  );
+  // Reset container picker when the pod changes — first container
+  // is the natural default.
+  useEffect(() => {
+    if (
+      selectedPodInfo &&
+      !selectedPodInfo.containers.includes(selectedContainer)
+    ) {
+      setSelectedContainer(selectedPodInfo.containers[0] ?? "");
+    }
+  }, [selectedPodInfo, selectedContainer]);
+
+  const logsQuery = useQuery({
+    queryKey: [
+      "appliance",
+      "fleet",
+      appliance.id,
+      "k8s-logs",
+      selectedPod,
+      selectedContainer,
+      tailLines,
+    ],
+    queryFn: () =>
+      applianceApprovalApi.k8sGetPodLogs(appliance.id, selectedPod, {
+        container: selectedContainer || undefined,
+        tail_lines: tailLines,
+      }),
+    enabled: !!selectedPod,
+    staleTime: 0,
+  });
+
+  return (
+    <Modal title={`Pod logs · ${appliance.hostname}`} onClose={onClose} wide>
+      <div className="space-y-2 text-sm">
+        <p className="text-xs text-muted-foreground">
+          Snapshot via the kubeapi proxy (Phase 4 channel) — same as{" "}
+          <code>kubectl logs --tail={tailLines}</code>. For continuous
+          follow-mode, ssh to the appliance + run <code>kubectl logs -f</code>{" "}
+          directly.
+        </p>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-[2fr_1fr_1fr] sm:items-end">
+          <label className="text-xs">
+            Pod
+            <select
+              value={selectedPod}
+              onChange={(e) => setSelectedPod(e.target.value)}
+              disabled={podsQuery.isLoading}
+              className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
+            >
+              {podsQuery.isLoading && <option>Loading…</option>}
+              {(podsQuery.data?.pods ?? []).map((p) => (
+                <option key={p.name} value={p.name}>
+                  {p.name} ({p.phase}
+                  {p.ready ? "·ready" : ""})
+                </option>
+              ))}
+              {!podsQuery.isLoading &&
+                (podsQuery.data?.pods?.length ?? 0) === 0 && (
+                  <option value="">(no pods)</option>
+                )}
+            </select>
+          </label>
+          {selectedPodInfo && selectedPodInfo.containers.length > 1 && (
+            <label className="text-xs">
+              Container
+              <select
+                value={selectedContainer}
+                onChange={(e) => setSelectedContainer(e.target.value)}
+                className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
+              >
+                {selectedPodInfo.containers.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <label className="text-xs">
+            Tail lines
+            <select
+              value={tailLines}
+              onChange={(e) => setTailLines(Number(e.target.value))}
+              className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
+            >
+              <option value={100}>100</option>
+              <option value={500}>500</option>
+              <option value={1000}>1000</option>
+              <option value={5000}>5000</option>
+            </select>
+          </label>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => logsQuery.refetch()}
+            disabled={!selectedPod || logsQuery.isFetching}
+            className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {logsQuery.isFetching ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3 w-3" />
+            )}
+            Refresh
+          </button>
+          {logsQuery.error && (
+            <span className="text-[11px] text-rose-700 dark:text-rose-300">
+              {(logsQuery.error as Error).message}
+            </span>
+          )}
+        </div>
+        <pre className="h-[50vh] overflow-auto whitespace-pre rounded-md border bg-muted/30 p-2 font-mono text-[11px] leading-tight">
+          {logsQuery.isFetching && !logsQuery.data
+            ? "Loading…"
+            : logsQuery.data || "(empty)"}
+        </pre>
+      </div>
+    </Modal>
+  );
+}
+
+// Issue #183 Phase 6 — cert-expiry chip. Colour scales with
+// days-remaining: emerald > 30 d, amber 7-30 d, rose < 7 d, red on
+// already-expired. k3s rotates the cert automatically on
+// k3s.service restart so the red state is rarely reachable in
+// practice.
+function CertExpiryChip({ iso }: { iso: string }) {
+  const expiresAt = new Date(iso);
+  const now = new Date();
+  const days = Math.floor(
+    (expiresAt.getTime() - now.getTime()) / (1000 * 60 * 60 * 24),
+  );
+  let cls: string;
+  let label: string;
+  if (days < 0) {
+    cls = "bg-rose-500/10 text-rose-700 dark:text-rose-300";
+    label = `expired ${-days}d ago`;
+  } else if (days < 7) {
+    cls = "bg-rose-500/10 text-rose-700 dark:text-rose-300";
+    label = `expires in ${days}d`;
+  } else if (days < 30) {
+    cls = "bg-amber-500/10 text-amber-700 dark:text-amber-300";
+    label = `expires in ${days}d`;
+  } else {
+    cls = "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
+    label = `${days}d remaining`;
+  }
+  return (
+    <span
+      className={cn("rounded-full px-1.5 py-0.5 font-mono text-[10px]", cls)}
+      title={`k3s API server cert expires ${expiresAt.toLocaleString()}`}
+    >
+      {label}
+    </span>
+  );
+}
+
+// Issue #183 Phase 6 — CIDR allowlist editor. Empty list = proxy-
+// only (the recommended posture). Operators with sub-millisecond
+// local-network kubectl needs add their CIDRs; the supervisor's
+// firewall renderer picks them up on the next heartbeat + emits one
+// ``ip saddr {…} tcp dport 6443 accept`` rule.
+function KubeapiCidrEditorModal({
+  appliance,
+  onClose,
+}: {
+  appliance: ApplianceRow;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [text, setText] = useState(appliance.kubeapi_expose_cidrs.join("\n"));
+  const save = useMutation({
+    mutationFn: () => {
+      const cidrs = text
+        .split("\n")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      return applianceApprovalApi.updateKubeapiCidrs(appliance.id, cidrs);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+      onClose();
+    },
+  });
+  return (
+    <Modal
+      title={`Direct kubeapi access · ${appliance.hostname}`}
+      onClose={onClose}
+    >
+      <div className="space-y-3 text-sm">
+        <p className="text-xs text-muted-foreground">
+          One CIDR or IP per line. Each entry opens this appliance's tcp/6443
+          kubeapi port to that source range — bypassing the supervisor's mTLS
+          proxy for sub-millisecond local-network <code>kubectl</code>. Leave
+          empty for proxy-only (the recommended posture; kubeapi stays on
+          127.0.0.1 and only the supervisor's outbound channel can drive it).
+        </p>
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          rows={6}
+          placeholder="10.0.0.0/8&#10;192.168.1.50"
+          className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
+        />
+        {save.error && (
+          <p className="text-xs text-rose-700 dark:text-rose-300">
+            {(save.error as Error).message}
+          </p>
+        )}
+        <div className="flex items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={() => save.mutate()}
+            disabled={save.isPending}
+            className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {save.isPending ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <CheckCircle2 className="h-3.5 w-3.5" />
+            )}
+            Save
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// Issue #183 Phase 5 — password-gated reveal + download for the
+// appliance's admin kubeconfig. Mirrors Settings → Security ↘ Reveal
+// SNMP community / agent bootstrap keys.
+function RevealKubeconfigModal({
+  appliance,
+  onClose,
+}: {
+  appliance: ApplianceRow;
+  onClose: () => void;
+}) {
+  const [password, setPassword] = useState("");
+  const [shown, setShown] = useState<string | null>(null);
+  const reveal = useMutation({
+    mutationFn: () =>
+      applianceApprovalApi.revealKubeconfig(appliance.id, password),
+    onSuccess: (data) => {
+      setShown(data.kubeconfig ?? "");
+    },
+  });
+  function download() {
+    if (!shown) return;
+    const blob = new Blob([shown], { type: "application/yaml" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${appliance.hostname}.kubeconfig`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  return (
+    <Modal
+      title={`Reveal kubeconfig · ${appliance.hostname}`}
+      onClose={onClose}
+    >
+      <div className="space-y-3 text-sm">
+        <p className="text-xs text-muted-foreground">
+          Re-confirm your password to reveal the admin kubeconfig the supervisor
+          shipped for this appliance. The reveal is audit-logged and
+          local-auth-only. The downloaded file works against the appliance from
+          its current network; for cross-network use, edit the{" "}
+          <code>server:</code> line to a reachable address.
+        </p>
+        {!shown && (
+          <>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Your password"
+              className="w-full rounded-md border bg-background px-2 py-1 text-sm"
+              autoFocus
+            />
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => reveal.mutate()}
+                disabled={!password.trim() || reveal.isPending}
+                className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {reveal.isPending ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <KeyRound className="h-3.5 w-3.5" />
+                )}
+                Reveal
+              </button>
+            </div>
+            {reveal.error && (
+              <p className="text-xs text-rose-700 dark:text-rose-300">
+                {(reveal.error as Error).message}
+              </p>
+            )}
+          </>
+        )}
+        {shown !== null && (
+          <>
+            {shown ? (
+              <>
+                <textarea
+                  readOnly
+                  value={shown}
+                  rows={14}
+                  className="w-full rounded-md border bg-muted/30 px-2 py-1 font-mono text-[11px]"
+                />
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => navigator.clipboard.writeText(shown)}
+                    className="rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted"
+                  >
+                    Copy
+                  </button>
+                  <button
+                    type="button"
+                    onClick={download}
+                    className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs hover:bg-primary/20"
+                  >
+                    Download {appliance.hostname}.kubeconfig
+                  </button>
+                </div>
+              </>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                Supervisor hasn't shipped a kubeconfig yet — wait for the next
+                heartbeat after k3s.service is up.
+              </p>
+            )}
+          </>
+        )}
+      </div>
+    </Modal>
   );
 }
 
@@ -1763,6 +2339,18 @@ function ApplianceSlotsCell({ row }: { row: ApplianceRow }) {
       {row.is_trial_boot && (
         <span className="rounded-full bg-amber-500/10 px-1.5 py-0 text-[10px] font-medium uppercase text-amber-700 dark:text-amber-300">
           trial boot
+        </span>
+      )}
+      {row.k3s_version && (
+        <span
+          className="rounded-full bg-sky-500/10 px-1.5 py-0 font-mono text-[10px] text-sky-700 dark:text-sky-300"
+          title={
+            row.cluster_health?.kubeapi_ready
+              ? `k3s ready · ${row.cluster_health?.nodes_ready ?? 0}/${row.cluster_health?.nodes_total ?? 0} nodes`
+              : "k3s baked, kubeapi unreachable"
+          }
+        >
+          k3s {row.k3s_version}
         </span>
       )}
     </div>

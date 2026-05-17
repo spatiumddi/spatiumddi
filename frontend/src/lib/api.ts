@@ -7339,6 +7339,29 @@ export interface ApplianceRow {
       container_id: string | null;
     }
   >;
+  // Issue #183 Phase 4 — local k3s cluster health summary, supplied
+  // by the supervisor on every heartbeat. Empty object on legacy
+  // compose appliances or pre-#183 supervisors.
+  cluster_health: {
+    kubeapi_ready?: boolean;
+    nodes_total?: number;
+    nodes_ready?: number;
+    pods_total?: number;
+    pods_by_phase?: Record<string, number>;
+  };
+  // Issue #183 Phase 5 — installed k3s version (e.g. ``v1.35.4+k3s1``).
+  // Null on legacy compose / pre-#183 supervisors.
+  k3s_version: string | null;
+  // Issue #183 Phase 5 — boolean "supervisor has shipped a kubeconfig".
+  // The ciphertext itself only crosses the wire on the reveal endpoint.
+  kubeconfig_set: boolean;
+  // Issue #183 Phase 6 — k3s server-cert ``Not After`` timestamp
+  // (ISO-8601 UTC). Drives the cluster-health "expires in N days"
+  // chip + the ``k3s_api_cert_expiring`` alert rule.
+  k3s_api_cert_expires_at: string | null;
+  // Issue #183 Phase 6 — operator-controlled CIDR allowlist for
+  // direct kubeapi access on tcp/6443. Empty = proxy-only.
+  kubeapi_expose_cidrs: string[];
   // Issue #170 Wave E follow-up — soft-delete timestamp. Non-null on
   // ``state=revoked`` rows; cleared by re-authorize.
   revoked_at: string | null;
@@ -7434,6 +7457,82 @@ export const applianceApprovalApi = {
   scheduleReboot: (id: string) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/reboot`)
+      .then((r) => r.data),
+  // Issue #183 Phase 4 — direct kubeapi action via the supervisor's
+  // long-poll proxy. Sub-second on a healthy appliance; surfaces a
+  // 504 / 502 when the proxy times out or kubeapi returns an error.
+  k8sRolloutRestart: (
+    id: string,
+    body: {
+      kind: "Deployment" | "DaemonSet";
+      namespace?: string;
+      name: string;
+    },
+  ) =>
+    api
+      .post<{
+        ok: boolean;
+        status: number;
+        kind: string;
+        name: string;
+      }>(`/appliance/appliances/${id}/k8s/restart`, body)
+      .then((r) => r.data),
+  // Issue #183 Phase 5 — reveal the stored kubeconfig after a
+  // password re-confirmation. Same shape as the SNMP-community and
+  // agent-bootstrap-key reveal endpoints.
+  revealKubeconfig: (id: string, password: string) =>
+    api
+      .post<{
+        configured: boolean;
+        kubeconfig: string | null;
+        hostname: string;
+      }>(`/appliance/appliances/${id}/k8s/kubeconfig/reveal`, { password })
+      .then((r) => r.data),
+  // Issue #183 Phase 6 — operator-controlled CIDR allowlist for
+  // direct kubeapi access. Empty = proxy-only (default).
+  updateKubeapiCidrs: (id: string, cidrs: string[]) =>
+    api
+      .put<ApplianceRow>(`/appliance/appliances/${id}/kubeapi-cidrs`, {
+        cidrs,
+      })
+      .then((r) => r.data),
+  // Issue #183 Phase 8 — pod listing + log viewer via the kubeapi
+  // proxy. Snapshot-mode (no --follow) since the proxy is request/
+  // response; operators get the recent tail + a refresh button.
+  k8sListPods: (id: string, namespace: string = "spatium") =>
+    api
+      .get<{
+        pods: Array<{
+          name: string;
+          namespace: string;
+          phase: string;
+          ready: boolean;
+          containers: string[];
+          labels: Record<string, string>;
+        }>;
+      }>(`/appliance/appliances/${id}/k8s/pods`, {
+        params: { namespace },
+      })
+      .then((r) => r.data),
+  k8sGetPodLogs: (
+    id: string,
+    pod: string,
+    opts: {
+      namespace?: string;
+      container?: string;
+      tail_lines?: number;
+    } = {},
+  ) =>
+    api
+      .get<string>(`/appliance/appliances/${id}/k8s/logs`, {
+        params: {
+          pod,
+          namespace: opts.namespace ?? "spatium",
+          ...(opts.container ? { container: opts.container } : {}),
+          tail_lines: opts.tail_lines ?? 1000,
+        },
+        responseType: "text",
+      })
       .then((r) => r.data),
 };
 

@@ -1,0 +1,169 @@
+# Issue #183 Phase 2 — appliance role values.
+#
+# Each top-level ``<role>.enabled: false`` is the operator-assigned
+# default. The supervisor's CRD reconciler (Phase 3) flips the right
+# subset to ``true`` based on the SpatiumApplianceRole spec.
+#
+# All container images come from the slot's containerd content store
+# (preloaded at firstboot from /usr/lib/spatiumddi/images/*.tar.zst).
+# imagePullPolicy is ``Never`` everywhere — air-gap means no registry
+# lookup at runtime, ever.
+
+# Global settings shared by every role.
+global:
+  # Image tags follow the slot's SPATIUMDDI_VERSION stamp. The
+  # supervisor rewrites this value when applying the chart so the
+  # tags line up with whatever's preloaded in containerd.
+  imageTag: dev
+  # ImagePullPolicy. Always ``Never`` on the appliance — bytes are
+  # baked, the kubelet must NOT phone home to ghcr.io.
+  imagePullPolicy: Never
+  # Node selector — every role pins to the appliance-labelled node
+  # so a future ops engineer who joins external workers to the
+  # cluster can't accidentally schedule our service pods there.
+  nodeSelector:
+    spatium.io/role: appliance
+  # Operator-pasted env applied to every service container. Lives on
+  # the appliance row's ``firewall_extra`` analogue (free-form
+  # operator override).
+  extraEnv: []
+
+# DNS — bind9 backend. Exactly one of dnsBind9 / dnsPowerdns runs
+# per appliance; the supervisor enforces mutual-exclusion at the
+# CRD reconciler level so flipping both ``enabled: true`` is a
+# server-side validation error.
+dnsBind9:
+  enabled: false
+  image:
+    repository: ghcr.io/spatiumddi/dns-bind9
+  # Pass-through to the agent via env. The supervisor fills these in
+  # when assigning the DNS role.
+  controlPlaneUrl: ""
+  agentKey: ""
+  serverGroupName: ""
+  # hostPath bind mounts for persistent state. local-path-provisioner
+  # binds these to /var/lib/rancher/k3s/storage/<pvc>/ on the host.
+  persistence:
+    data:
+      size: 1Gi
+    keys:
+      size: 256Mi
+
+# DNS — PowerDNS backend. Same shape as dnsBind9.
+dnsPowerdns:
+  enabled: false
+  image:
+    repository: ghcr.io/spatiumddi/dns-powerdns
+  controlPlaneUrl: ""
+  agentKey: ""
+  serverGroupName: ""
+  persistence:
+    data:
+      size: 1Gi
+
+# DHCP — Kea backend. DaemonSet (single node) with ``hostNetwork:
+# true`` + ``CAP_NET_BIND_SERVICE`` so Kea sees DHCP-discover
+# broadcasts on the appliance's host NIC. Same shape as today's
+# ``network_mode: host`` docker-compose entry.
+dhcpKea:
+  enabled: false
+  image:
+    repository: ghcr.io/spatiumddi/dhcp-kea
+  controlPlaneUrl: ""
+  agentKey: ""
+  serverGroupName: ""
+  # ``host`` = listen on the host's NIC (the default + only mode
+  # that lets DHCP broadcasts reach Kea). ``bridged`` would require
+  # a relay-agent on every subnet — defer to Phase 5.
+  networkMode: host
+  persistence:
+    leases:
+      size: 512Mi
+
+# Observer — placeholder for future metrics / log shipper role. No
+# service container in Phase 2; this just lets the supervisor pre-
+# populate the values.yaml shape without leaving a TBD section.
+observer:
+  enabled: false
+
+# Issue #183 Phase 8 — cluster observability add-ons. Both default
+# OFF (operator opt-in via the Fleet UI's "Observability" toggle
+# once Phase 8 wires it). When enabled they expose Prometheus-shape
+# metrics at the standard endpoints; future Phase 8 work adds a
+# control-plane Prometheus scraper that federates across appliances.
+observability:
+  # kube-state-metrics exposes cluster-state metrics (pod count,
+  # deployment status, restart counts, …) at /metrics. ~30 MB RSS.
+  # Standard k8s observability primitive.
+  kubeStateMetrics:
+    enabled: false
+    image:
+      repository: registry.k8s.io/kube-state-metrics/kube-state-metrics
+      tag: v2.13.0
+    # Resource cap — appliance VMs are typically 2-4 GB; KSM has a
+    # bounded memory profile but a runaway pod shouldn't dent the
+    # service pods' headroom.
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        memory: 128Mi
+
+  # node-exporter exposes host-level metrics (CPU, memory, disk,
+  # network) at /metrics. DaemonSet with hostNetwork so the metrics
+  # reflect the host (not the pod's network namespace). ~10 MB RSS.
+  nodeExporter:
+    enabled: false
+    image:
+      repository: quay.io/prometheus/node-exporter
+      tag: v1.8.2
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+      limits:
+        memory: 64Mi
+
+# Supervisor — privileged DaemonSet that reconciles the operator's
+# CRD assignment + ships heartbeats to the control plane.
+#
+# Phase 1: the supervisor still runs via docker-compose on the host
+# (legacy compose path). Phase 3 ports it onto k3s; this block
+# scaffolds the eventual values shape so the chart structure is
+# stable from the start.
+supervisor:
+  enabled: false
+  image:
+    repository: ghcr.io/spatiumddi/spatium-supervisor
+  # Host mounts the supervisor needs — same set as today's compose
+  # entry (release-state writes the trigger files, etc).
+  hostMounts:
+    etcSpatiumddiHost: /etc/spatiumddi
+    releaseState: /var/lib/spatiumddi/release-state
+    bootEfi: /boot/efi
+    runUdev: /run/udev
+    # Supervisor's persistent state — Ed25519 identity, signed cert,
+    # approval state, cached pairing data. MUST persist across pod
+    # restarts or every restart re-pairs as a fresh appliance and the
+    # control plane's Fleet view fills with phantom rows.
+    stateDir: /var/persist/spatium-supervisor
+    # Slot-baked chart tarball — the supervisor re-PATCHes the
+    # HelmChart CR on role-assignment changes and needs the chart
+    # bytes to base64-encode into spec.chartContent. The path
+    # matches service_lifecycle._BAKED_CHART_TARBALL.
+    chartDir: /usr/lib/spatiumddi/charts
+
+# Always-on landing page served on :80 — "this is a SpatiumDDI
+# appliance" + hostname / control-plane URL / version. firstboot
+# renders the HTML from the template at
+# /usr/local/share/spatiumddi/agent-landing/index.html.in into
+# /var/lib/spatiumddi/agent-landing/ on the host; nginx hostPath-
+# mounts that dir read-only.
+agentLanding:
+  enabled: true
+  image:
+    repository: nginx
+    tag: 1.27-alpine
+  hostMounts:
+    htmlDir: /var/lib/spatiumddi/agent-landing

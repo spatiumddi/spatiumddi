@@ -50,9 +50,10 @@ log "operator-triggered reboot accepted (agent stamp: ${TRIGGER_PAYLOAD:-unknown
 log "scheduling reboot in ${GRACE_SECONDS}s"
 
 # systemd-shutdown sends SIGTERM (then SIGKILL) to running services;
-# container shutdown happens via docker.service's stop sequence, so
-# in-flight queries get a chance to drain. The grace window above is
-# in addition to that.
+# pod shutdown happens via k3s.service's stop sequence (kubelet
+# evicts pods cleanly with their terminationGracePeriodSeconds), so
+# in-flight queries get a chance to drain. The grace window above
+# is in addition to that.
 sleep "$GRACE_SECONDS"
 
 log "issuing systemctl reboot"

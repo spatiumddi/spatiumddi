@@ -20,13 +20,11 @@
 from __future__ import annotations
 
 import argparse
-import http.client
 import json
 import os
 import re
 import select
 import signal
-import socket
 import subprocess
 import sys
 import termios
@@ -51,7 +49,6 @@ from rich.text import Text
 
 
 ENV_FILE = Path("/etc/spatiumddi/.env")
-COMPOSE_FILE = Path("/usr/local/share/spatiumddi/docker-compose.yml")
 FIRSTBOOT_LOG = Path("/var/log/spatiumddi/firstboot.log")
 FIRSTBOOT_STAMP = Path("/var/lib/spatiumddi/firstboot.done")
 APPLIANCE_RELEASE = Path("/etc/spatiumddi/appliance-release")
@@ -191,13 +188,14 @@ def watchdog_expected_services() -> list[str]:
     return []
 
 # journalctl units the live-log pane tails. Same set on every role —
-# operators want to see firstboot / release manager output regardless
-# of which containers ran. docker.service catches everything else
-# (every container's stdout/stderr is shipped to docker → journald).
+# operators want to see firstboot / k3s / reboot output regardless of
+# which pods ran. k3s.service captures cluster-level events; per-pod
+# logs come from ``kubectl logs`` (via the journal too once
+# ``log-level=info`` is set, but that's noisier than the per-unit
+# tail this surface aims for).
 JOURNAL_UNITS = [
-    "docker.service",
+    "k3s.service",
     "spatiumddi-firstboot.service",
-    "spatiumddi-update.service",
     "spatiumddi-reboot.service",
     "spatium-console.service",
 ]
@@ -247,99 +245,167 @@ def role_label(role: str) -> str:
     return ROLE_LABELS.get(role, role)
 
 
-# ── docker / system state ─────────────────────────────────────────────
+# ── k3s pod state ─────────────────────────────────────────────────────
+#
+# Issue #183 Phase 7/8 — the appliance is k3s-only; this used to talk
+# to /var/run/docker.sock + parse ``docker ps`` output. Now we query
+# the local kubeapi via ``kubectl get pods -o json`` and translate
+# the pod shape into the dict shape the downstream renderer already
+# expects (``Names`` / ``Image`` / ``Status`` / ``Labels`` / ``State`` /
+# ``Ports`` / ``NetworkMode``). Keeping the same shape means the
+# Services-row renderer + service-name parser + watchdog status reader
+# all keep working unchanged.
 
 
 _STATUS_HEALTH_RE = re.compile(r"\(([^)]+)\)")
 
 
-class _UnixHTTPConnection(http.client.HTTPConnection):
-    """``http.client.HTTPConnection`` over a unix socket — the
-    docker engine API speaks HTTP/1.1 over /var/run/docker.sock.
-    Replaces the ``subprocess.run(["docker", "ps", ...])`` pattern
-    with a direct API call (~30× faster on a 1-CPU appliance VM,
-    no Go binary startup + arg parsing + JSON formatting overhead).
-    The previous shell-out cadence on a 1-CPU VM created a feedback
-    loop with dockerd's OpenTelemetry middleware — see ``docker_ps``
-    for the full story."""
-
-    def __init__(self, socket_path: str, timeout: float = 5.0) -> None:
-        super().__init__("localhost", timeout=timeout)
-        self._socket_path = socket_path
-
-    def connect(self) -> None:
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(self._socket_path)
-
-
 def docker_ps() -> list[dict]:
-    """Return the currently-running containers via the docker engine
-    API. One HTTP GET to /var/run/docker.sock — much cheaper than the
-    old ``docker ps --format`` subprocess.
+    """Return every pod on the local cluster via
+    ``kubectl get pods -A -o json``, translated into the docker-ps
+    dict shape the rest of the console expects.
 
-    Returns [] on any failure (daemon down, EACCES on socket, etc.).
-    The renderer surfaces missing containers as "(not running)" rows
-    so the dashboard stays usable even when docker is fully broken.
+    Function name kept as ``docker_ps`` so the rest of the renderer
+    code doesn't have to change. Pre-Phase-7 this hit
+    /var/run/docker.sock directly; now it shells to the local k3s
+    binary's embedded kubectl. ~50 ms per call (fork + JSON parse)
+    is fine for the dashboard's 2 s refresh cadence.
 
-    The previous subprocess form's 3 s timeout fired mid-response on
-    a slow 1-CPU VM, dockerd logged "superfluous
-    response.WriteHeader call from go.opentelemetry.io/contrib/..."
-    on every kill, and the journal-tail rendered those errors in the
-    live-log pane creating an infinite feedback loop. Direct API
-    talk side-steps the whole problem: no fork, no exec, no Go
-    binary startup, no JSON re-serialisation through the CLI.
+    Returns every namespace's pods (was previously filtered to
+    ``spatium`` + a chart label) so the dashboard surfaces
+    kube-system add-ons (coredns / local-path / helm-install) +
+    anything operators kubectl-applied themselves.
+
+    Returns [] on any failure (k3s not running, kubeconfig missing).
     """
     try:
-        conn = _UnixHTTPConnection("/var/run/docker.sock", timeout=10.0)
-        try:
-            conn.request("GET", "/v1.45/containers/json", headers={"Host": "localhost"})
-            resp = conn.getresponse()
-            body = resp.read()
-            if resp.status != 200:
-                return []
-            data = json.loads(body)
-        finally:
-            conn.close()
-    except (OSError, ValueError, json.JSONDecodeError):
+        proc = subprocess.run(
+            [
+                "/usr/local/bin/k3s",
+                "kubectl",
+                "get",
+                "pods",
+                "-A",
+                "-o",
+                "json",
+            ],
+            env={
+                **os.environ,
+                "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml",
+            },
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
-    # Translate the engine-API shape into the same dict shape
-    # ``docker ps --format '{{json .}}'`` used to emit so the
-    # downstream renderer keeps working unchanged. The renderer
-    # cares about: Names, Image, Status, Labels (for compose
-    # project/service stamps via ``container_service_name``), State.
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return []
     out: list[dict] = []
-    for c in data:
-        # Names from the API come as ``["/some-name"]`` with a leading
-        # slash; the CLI's --format strips it. Match that.
-        raw_names = c.get("Names") or []
-        name = (raw_names[0].lstrip("/") if raw_names else "")
-        # Engine-API ``Labels`` is a flat ``{key: value}`` dict; the
-        # CLI's --format collapses it to a comma-separated string of
-        # ``key=value`` pairs. ``container_service_name`` already
-        # handles both shapes (dict via .get, fallback string parse),
-        # so passing the dict through is fine — keeping the original
-        # dict is cheaper than re-flattening.
-        hostcfg = c.get("HostConfig") or {}
-        out.append({
-            "Names": name,
-            "Image": c.get("Image", ""),
-            "Status": c.get("Status", ""),
-            "Labels": c.get("Labels") or {},
-            "State": c.get("State", ""),
-            # Engine API ``Ports`` is a list of {IP, PrivatePort,
-            # PublicPort, Type} dicts. The renderer's
-            # ``container_port_summary`` collapses them into a short
-            # human string for the Services row.
-            "Ports": c.get("Ports") or [],
-            # ``HostConfig.NetworkMode`` is "default" / "host" /
-            # "bridge" / "<network-name>" / "container:<id>". The
-            # supervisor's DHCP role specifically runs in ``host``
-            # mode for broadcast-relay reachability; surface that
-            # signal in the Services row so operators can spot a
-            # mis-deployed bridged DHCP at a glance.
-            "NetworkMode": hostcfg.get("NetworkMode") or "",
-        })
+    for pod in data.get("items") or []:
+        meta = pod.get("metadata") or {}
+        spec = pod.get("spec") or {}
+        status = pod.get("status") or {}
+        phase = status.get("phase") or "Unknown"
+        containers = spec.get("containers") or []
+        first = containers[0] if containers else {}
+        labels = meta.get("labels") or {}
+
+        # Derive a docker-ps-style ``Status`` string. The renderer's
+        # ``health_from_status`` reads the trailing ``(healthy)`` /
+        # ``(unhealthy)`` / ``(health: starting)`` marker, so we
+        # synthesise one from the pod's container readiness +
+        # waiting-reason. Mirrors what the watchdog does in
+        # ``_derive_pod_status``.
+        # Surface the raw k8s state alongside the docker-shape
+        # ``Status`` string the older renderer code expects. The
+        # console's Pods panel reads ``K8sState`` directly so it can
+        # show "CrashLoopBackOff" / "Pending" / "Running" / etc. as
+        # operators see in ``kubectl get pods`` — same vocabulary,
+        # no translation layer.
+        container_statuses = status.get("containerStatuses") or []
+        waiting_reason = ""
+        for cs in container_statuses:
+            waiting = (cs.get("state") or {}).get("waiting") or {}
+            r = waiting.get("reason") or ""
+            if r:
+                waiting_reason = r
+                break
+        # Default k8s state = phase (Running / Pending / Succeeded /
+        # Failed / Unknown). Promote the most-specific waiting reason
+        # if one is present — "CrashLoopBackOff" is more informative
+        # than "Running" for a pod that just failed.
+        if waiting_reason:
+            k8s_state = waiting_reason
+        else:
+            k8s_state = phase
+        # Legacy ``Status`` + ``State`` fields for code paths that
+        # still read them (verdict colouring, etc.).
+        if phase == "Running" and container_statuses:
+            all_ready = all(cs.get("ready") for cs in container_statuses)
+            if all_ready:
+                status_str = "Running (healthy)"
+                state_str = "running"
+            else:
+                if waiting_reason.lower() in (
+                    "crashloopbackoff", "errimagepull", "imagepullbackoff"
+                ):
+                    status_str = f"Running (unhealthy: {waiting_reason.lower()})"
+                else:
+                    status_str = "Running (health: starting)"
+                state_str = "running"
+        elif phase == "Pending":
+            status_str = "Pending (health: starting)"
+            state_str = "starting"
+        elif phase in ("Failed", "Succeeded"):
+            status_str = f"{phase} (unhealthy)"
+            state_str = "exited"
+        else:
+            status_str = phase
+            state_str = phase.lower()
+
+        # Translate container ports → docker-ps ``Ports`` shape.
+        # Pre-Phase-7 ``PublicPort`` was the host-side mapping; k3s
+        # uses host ports only for ``hostNetwork: true`` pods, which
+        # we mark as NetworkMode=host so the renderer collapses the
+        # whole row to ``host net`` regardless of the ports list.
+        ports_out: list[dict] = []
+        for c in containers:
+            for p in c.get("ports") or []:
+                cport = p.get("containerPort")
+                proto = p.get("protocol") or "TCP"
+                if cport is None:
+                    continue
+                ports_out.append(
+                    {
+                        "PrivatePort": cport,
+                        "PublicPort": cport if spec.get("hostNetwork") else None,
+                        "Type": proto.lower(),
+                    }
+                )
+
+        out.append(
+            {
+                "Names": meta.get("name") or "",
+                "Namespace": meta.get("namespace") or "",
+                "Image": (first.get("image") or "") if first else "",
+                "Status": status_str,
+                "Labels": labels,
+                "State": state_str,
+                "K8sState": k8s_state,
+                "Ports": ports_out,
+                "NetworkMode": "host" if spec.get("hostNetwork") else "default",
+                "CreationTimestamp": meta.get("creationTimestamp") or "",
+            }
+        )
+
+    # Plus the supervisor pod from the kube-system / spatium
+    # namespace — query it separately since its labels match the
+    # selector above only on the same chart.
     return out
 
 
@@ -349,7 +415,7 @@ def container_port_summary(row: dict) -> str:
 
     Output shapes:
 
-    * ``host net`` — container in ``NetworkMode=host`` (DHCP-kea
+    * ``Host Network`` — container in ``NetworkMode=host`` (DHCP-kea
       runs here for broadcast-relay reachability).
     * ``53/tcp 53/udp`` — bridge-mode container with published
       ports; dedupes IPv4/IPv6 entries that the engine API returns
@@ -358,7 +424,7 @@ def container_port_summary(row: dict) -> str:
       supervisor itself, internal-only containers).
     """
     if row.get("NetworkMode") == "host":
-        return "host net"
+        return "Host Network"
     pairs: set[tuple[int, str]] = set()
     for p in row.get("Ports") or []:
         pub = p.get("PublicPort")
@@ -376,22 +442,66 @@ def container_port_summary(row: dict) -> str:
 
 
 def container_service_name(row: dict) -> str:
-    """Pull the docker-compose service name out of a ps row.
+    """Pull the logical service name (``dns-bind9`` / ``dhcp-kea`` /
+    ``spatium-supervisor``) out of a ps row.
 
-    Compose names containers `<project>-<service>-<replica>`; project
-    is `spatiumddi` on the appliance compose. Falls back to the bare
-    Names field if the prefix doesn't match.
+    Phase 7: rows now come from k3s pods. The chart labels every pod
+    with ``app.kubernetes.io/component=<name>``, so we read that
+    first. Falls back to the bare ``Names`` field (or pod name) when
+    the label isn't present — covers pre-Phase-7-compatible callers
+    + any operator-deployed pods that bypassed the chart.
     """
-    names = (row.get("Names") or "").split(",")[0].strip().lstrip("/")
-    if names.startswith("spatiumddi-"):
-        rest = names[len("spatiumddi-"):]
-        # strip trailing -1 / -2 replica numbers
-        if "-" in rest:
-            last = rest.rsplit("-", 1)[1]
-            if last.isdigit():
-                return rest.rsplit("-", 1)[0]
-        return rest
-    return names
+    labels = row.get("Labels") or {}
+    if isinstance(labels, dict):
+        component = labels.get("app.kubernetes.io/component")
+        if component:
+            return component
+    # Fallback: parse from the pod name. k3s pods are
+    # ``<deployment>-<replicaset>-<hash>`` so strip the trailing
+    # two hash segments and we're left with the workload name.
+    name = (row.get("Names") or "").strip().lstrip("/")
+    if not name:
+        return ""
+    parts = name.split("-")
+    # Last two parts of a Deployment-managed pod are
+    # ``<rs-hash>-<pod-hash>``; strip them.
+    if len(parts) >= 3 and len(parts[-1]) == 5 and len(parts[-2]) >= 5:
+        return "-".join(parts[:-2])
+    return name
+
+
+def _format_pod_age(creation_iso: str) -> str:
+    """Format a pod's age relative to now in kubectl-shape units.
+
+    Mirrors ``kubectl get pod`` AGE column — biggest meaningful unit:
+    ``45s`` / ``12m`` / ``3h`` / ``5d`` / ``2y``. Empty string on
+    parse failure so the column just renders blank rather than
+    breaking the row layout.
+    """
+    if not creation_iso:
+        return ""
+    try:
+        # kubectl serializes as RFC3339 with trailing Z; Python's
+        # fromisoformat handles +00:00 but not Z, so swap.
+        ts = datetime.fromisoformat(creation_iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return ""
+    delta = datetime.now(ts.tzinfo) - ts
+    secs = int(delta.total_seconds())
+    if secs < 0:
+        return "0s"
+    if secs < 60:
+        return f"{secs}s"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m"
+    hours = mins // 60
+    if hours < 48:
+        return f"{hours}h"
+    days = hours // 24
+    if days < 365:
+        return f"{days}d"
+    return f"{days // 365}y"
 
 
 def health_from_status(status: str) -> str:
@@ -629,6 +739,47 @@ def appliance_version_string(env: dict[str, str]) -> str:
 # ── live log tailing ──────────────────────────────────────────────────
 
 
+# journalctl --output short-iso format:
+#   ``2026-05-17T01:24:10+00:00 hostname unit[pid]: REST``
+# Extract YYYY-MM-DD HH:MM:SS + unit (without pid suffix) + REST.
+# Hostname is dropped — the operator already knows which appliance
+# they're on, and "k3s1" repeated on every line is wasted width.
+# Timezone is dropped too — appliance config locks to UTC.
+_JOURNAL_ISO_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})[+\-]\d{2}:\d{2}\s+\S+\s+(\S+?)(?:\[\d+\])?:\s+(.*)$"
+)
+
+# klog header (k3s, kubelet, kube-proxy, …) carries its own
+# timestamp + duplicate pid:
+#   ``I0517 01:24:10.644155       692 file:line] msg``
+# Strip it down to just ``file:line] msg`` since journalctl
+# already gave us HH:MM:SS + the unit name.
+_KLOG_HEADER_RE = re.compile(
+    r"^[IWEF]\d{4}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+(.*)$"
+)
+
+
+def _compact_journal_line(line: str) -> str:
+    """Trim the journal date+host+pid prefix + klog's redundant
+    duplicate timestamp/pid header.
+
+    Lines that don't match the short-iso format are returned as-is
+    so a journalctl format change doesn't blank the log pane.
+    """
+    m = _JOURNAL_ISO_RE.match(line)
+    if not m:
+        return line
+    date, ts, unit, rest = m.group(1), m.group(2), m.group(3), m.group(4)
+    # Trim unit suffix down to the short name (drop ``.service``
+    # / ``.path`` so ``k3s.service`` reads as ``k3s``).
+    unit = unit.rsplit(".", 1)[0]
+    # Strip klog header from the message body if present.
+    km = _KLOG_HEADER_RE.match(rest)
+    if km:
+        rest = km.group(1)
+    return f"{date} {ts}  {unit}  {rest}"
+
+
 class JournalTail(threading.Thread):
     """Tail journalctl into a deque so the renderer can read recent
     lines without blocking on subprocess I/O each refresh."""
@@ -713,7 +864,7 @@ class JournalTail(threading.Thread):
                     break
                 line = line.rstrip("\n")
                 if line and not self._is_noise(line):
-                    self.lines.append(line)
+                    self.lines.append(_compact_journal_line(line))
             # Subprocess exited (rotate / journald restart). Restart in
             # 2 s unless we're stopping.
             self._proc = None
@@ -979,6 +1130,19 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
             upgrade_line.append("Upgrade ", style="dim")
             upgrade_line.append(label, style=ustyle)
 
+    # Issue #183 Phase 1 — k3s row. Quiet on pre-#183 slots (no k3s
+    # binary baked); always-on once the slot ships k3s so operators
+    # can see the cluster's version + readiness at a glance. The
+    # "disabled" state is the Phase 1 default — k3s ships in the
+    # slot but isn't auto-enabled until Phase 3 wires the supervisor.
+    k3s_line: Text | None = None
+    k3s_state = k3s_status()
+    if k3s_state is not None:
+        label, kstyle = k3s_state
+        k3s_line = Text()
+        k3s_line.append("k3s   ", style="dim")
+        k3s_line.append(label, style=kstyle)
+
     # Rule — horizontal divider between identity and vitals.
     rule = Rule(style="cyan dim", characters="─")
 
@@ -1004,110 +1168,150 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
         ]
         vitals.append("  ".join(disk_bits))
 
-    body_parts: list = [line1, line2, line3]
+    # Pack the short label-value rows into a two-column grid so the
+    # right half of the panel (~40 chars on an 80-col TTY) stops
+    # rendering as dead space. line1 stays full-width since its
+    # right column is already used by clock+spinner; vitals stays
+    # full-width because it's one long line of bits that flows
+    # naturally. Everything else (IPs/Build/Agent/Watchdog/Slot/
+    # Upgrade/k3s) is short enough to fit in a half-width cell.
+    short_lines: list[Text] = [line2, line3]
     if agent_line is not None:
-        body_parts.append(agent_line)
+        short_lines.append(agent_line)
     if watchdog_line is not None:
-        body_parts.append(watchdog_line)
+        short_lines.append(watchdog_line)
     if slot_line is not None:
-        body_parts.append(slot_line)
+        short_lines.append(slot_line)
     if upgrade_line is not None:
-        body_parts.append(upgrade_line)
-    body_parts += [rule, vitals]
+        short_lines.append(upgrade_line)
+    if k3s_line is not None:
+        short_lines.append(k3s_line)
+
+    paired_grid = Table.grid(expand=True, padding=(0, 2))
+    paired_grid.add_column(ratio=1, no_wrap=False)
+    paired_grid.add_column(ratio=1, no_wrap=False)
+    for i in range(0, len(short_lines), 2):
+        left = short_lines[i]
+        right = short_lines[i + 1] if i + 1 < len(short_lines) else Text("")
+        paired_grid.add_row(left, right)
+
+    body_parts: list = [line1, paired_grid, rule, vitals]
     body = Group(*body_parts)
     return Panel(body, box=SQUARE, border_style="cyan", padding=(0, 1),
                  title="[bold]SpatiumDDI[/bold]", title_align="left")
 
 
 def render_services(role: str, ps_rows: list[dict]) -> Panel:
-    # ``dict.get(k, default)`` evaluates ``default`` eagerly. The
-    # previous ``ROLE_SERVICES["control"]`` fallback was an orphan
-    # from the pre-#170 5-role world and raised ``KeyError`` on every
-    # render — *before* ``get`` could return a hit on a valid role
-    # — so the dashboard crash-looped on every appliance.
-    expected = list(ROLE_SERVICES.get(role, ROLE_SERVICES["full-stack"]))
-    # Index ps by compose-service name.
-    by_service: dict[str, dict] = {}
-    for r in ps_rows:
-        svc = container_service_name(r)
-        # Pick the most-recently-created replica if multiple exist.
-        if svc not in by_service:
-            by_service[svc] = r
-    # #170 Wave D follow-up — on the Application role the supervisor
-    # spawns role-aligned service containers dynamically after admin
-    # role assignment in the fleet UI. Surface them alongside the
-    # static base set so the dashboard reflects what's actually
-    # running. The supervisor-managed services that aren't present
-    # right now stay off the list — otherwise every Application
-    # appliance would carry permanent ``(not running)`` rows for
-    # roles it was never assigned.
-    #
-    # #170 Wave E watchdog tie-in: also union services the supervisor
-    # *expects* to be running (per role-compose.env) but that aren't
-    # in docker ps. Those render as ``(not running)`` so a crashed /
-    # removed container is visible from the console without
-    # SSH-ing in. ``watchdog_expected_services`` reads the env file
-    # the supervisor maintains; an absent file (idle appliance, no
-    # role assigned yet) returns ``[]``.
-    if role == "application":
-        watchdog_expected = set(watchdog_expected_services())
-        for svc in SUPERVISOR_DYNAMIC_SERVICES:
-            if (svc in by_service or svc in watchdog_expected) and svc not in expected:
-                expected.append(svc)
+    """Render the Pods panel — every pod on the local k3s cluster
+    grouped by namespace, with status + ports + image.
+
+    Function name kept as ``render_services`` so call sites in
+    ``render_frame`` don't need to change. Pre-Phase-7 this was
+    role-scoped (showed only the compose services for the active
+    role). Phase 7 widens the scope: the appliance is a real
+    Kubernetes node and operators want the same view ``kubectl get
+    pods -A -o wide`` gives, condensed for the TTY.
+
+    The ``role`` argument is unused now but kept on the signature
+    so the call site in render_frame stays unchanged.
+    """
+    _ = role  # signature kept for compatibility
 
     tbl = Table.grid(padding=(0, 1), expand=True)
-    tbl.add_column(width=2, no_wrap=True)        # health glyph
-    tbl.add_column(width=14, no_wrap=True)       # service name
-    tbl.add_column(width=11, no_wrap=True)       # state
-    tbl.add_column(width=18, no_wrap=True)       # ports / net mode
-    tbl.add_column(min_width=14, no_wrap=False)  # image / detail
-    tbl.add_column(justify="right", no_wrap=True)  # status text
+    tbl.add_column(width=1, no_wrap=True)          # health glyph
+    tbl.add_column(width=12, no_wrap=True)         # namespace
+    tbl.add_column(min_width=20, no_wrap=False)    # pod name
+    tbl.add_column(width=5, no_wrap=True, justify="right")  # age
+    tbl.add_column(width=18, no_wrap=True)         # k8s state (CrashLoopBackOff fits)
+    tbl.add_column(width=15, no_wrap=True)         # ports / net mode
+    tbl.add_column(min_width=14, no_wrap=False)    # image
 
-    for svc in expected:
-        row = by_service.get(svc)
-        if row is None:
-            verdict = "missing"
-            glyph, style = HEALTH_STYLES[verdict]
-            tbl.add_row(
-                Text(glyph, style=style),
-                Text(svc, style="dim"),
-                Text("not running", style="dim"),
-                Text("", style="dim"),
-                Text("", style="dim"),
-                Text("—", style="dim"),
-            )
-            continue
-        status = row.get("Status") or ""
-        verdict = health_from_status(status)
-        # One-shot services: a clean exit (code 0) is the desired
-        # end-state, not a failure. Migrate finishes after alembic
-        # upgrade head completes — operators shouldn't see red there.
-        if svc in ONE_SHOT_SERVICES and status.startswith("Exited (0)"):
-            verdict = "completed"
-        glyph, style = HEALTH_STYLES[verdict]
-        image = row.get("Image") or ""
-        # Trim ghcr.io/spatiumddi/ + :tag for compact display.
-        short_image = image
-        if "/" in short_image:
-            short_image = short_image.rsplit("/", 1)[1]
-        ports = container_port_summary(row)
-        # Colour the ports cell so ``host net`` reads visually
-        # different from a published port list — operators learn at a
-        # glance that DHCP is in host mode (the expected/correct
-        # state) vs accidentally bridged.
-        ports_style = "bold cyan" if ports == "host net" else "dim"
+    # Header row — column labels. dim style so the data rows below
+    # stay the visual focus. ``rich.Table.grid`` doesn't have a
+    # show_header flag the way Table does, so emit a regular row
+    # with bold-dim styling — same shape as the bottom-row F-key
+    # footer.
+    header_style = "bold dim"
+    tbl.add_row(
+        Text("", style=header_style),
+        Text("NAMESPACE", style=header_style),
+        Text("NAME", style=header_style),
+        Text("AGE", style=header_style),
+        Text("STATE", style=header_style),
+        Text("PORTS", style=header_style),
+        Text("IMAGE", style=header_style),
+    )
+
+    # Pure alphabetical by pod name. Operator feedback —
+    # namespace-grouping made the spatium pods land at the top
+    # consistently but obscured the natural "where is foo-pod"
+    # scan; the namespace column itself still makes the grouping
+    # obvious at a glance.
+    sorted_rows = sorted(ps_rows, key=lambda r: r.get("Names") or "")
+
+    if not sorted_rows:
         tbl.add_row(
-            Text(glyph, style=style),
-            Text(svc, style="bold"),
-            Text(verdict, style=style),
-            Text(ports or "—", style=ports_style),
-            Text(short_image, style="dim"),
-            Text(status, style="dim"),
+            Text("·", style="dim"),
+            Text("—", style="dim"),
+            Text("no pods running (k3s not ready?)", style="dim"),
+            Text("", style="dim"),
+            Text("", style="dim"),
+            Text("", style="dim"),
+            Text("", style="dim"),
+        )
+        return Panel(
+            tbl, box=SQUARE, border_style="cyan",
+            title="[bold]Pods[/bold]", title_align="left",
         )
 
-    return Panel(tbl, box=SQUARE, border_style="cyan",
-                 title="[bold]Services[/bold]",
-                 title_align="left")
+    for row in sorted_rows:
+        status = row.get("Status") or ""
+        verdict = health_from_status(status)
+        if (row.get("State") or "") == "exited" and status.startswith("Succeeded"):
+            verdict = "completed"
+        glyph, style = HEALTH_STYLES[verdict]
+
+        image = row.get("Image") or ""
+        short_image = image.rsplit("/", 1)[1] if "/" in image else image
+
+        ports = container_port_summary(row)
+        ports_style = "bold cyan" if ports == "Host Network" else "dim"
+
+        age = _format_pod_age(row.get("CreationTimestamp") or "")
+
+        # Show the raw k8s state (Running / Pending / Succeeded /
+        # CrashLoopBackOff / ImagePullBackOff / …) — same vocabulary
+        # as ``kubectl get pods``. Colour mirrors the glyph verdict
+        # so the eye still tracks healthy → unhealthy without
+        # needing to translate the string.
+        k8s_state = row.get("K8sState") or "Unknown"
+        state_style = (
+            "green" if k8s_state == "Running"
+            else "blue" if k8s_state == "Succeeded"
+            else "yellow" if k8s_state in (
+                "Pending", "ContainerCreating", "PodInitializing"
+            )
+            else "red" if k8s_state in (
+                "Failed", "CrashLoopBackOff", "ImagePullBackOff",
+                "ErrImagePull", "CreateContainerError",
+            )
+            else "dim"
+        )
+
+        tbl.add_row(
+            Text(glyph, style=style),
+            Text(row.get("Namespace") or "—", style="dim"),
+            Text(row.get("Names") or "", style="bold"),
+            Text(age, style="dim"),
+            Text(k8s_state, style=state_style),
+            Text(ports or "—", style=ports_style),
+            Text(short_image, style="dim"),
+        )
+
+    return Panel(
+        tbl, box=SQUARE, border_style="cyan",
+        title="[bold]Pods[/bold]", title_align="left",
+    )
 
 
 def upgrade_status() -> tuple[str, str] | None:
@@ -1192,6 +1396,91 @@ def upgrade_status() -> tuple[str, str] | None:
     return None
 
 
+def k3s_status() -> tuple[str, str] | None:
+    """Issue #183 Phase 1 — derive a (label, style) tuple for the
+    console's 'k3s' row, or ``None`` when k3s isn't baked into this
+    slot at all (pre-#183 fielded appliances).
+
+    Three observable states:
+
+    * **disabled** — k3s binary baked + unit installed but
+      ``k3s.service`` not enabled. The default Phase 1 shape: ships
+      in the slot, operator opts in for validation. Yellow chip.
+    * **initializing** — unit active but kubeapi not yet responsive.
+      Boot transient (~30s on a fresh appliance, ~3s on a re-bind).
+      Yellow chip.
+    * **ready** — kubeapi reports the node Ready. Green chip with
+      version + node-condition summary.
+    * **failed** — unit reports failed/dead. Red chip with the last
+      exit reason if we can extract it.
+    """
+    if not Path("/usr/local/bin/k3s").exists():
+        return None  # Not a #183-aware slot; quiet.
+
+    # Resolve version from the baked sidecar (cheaper + race-free vs
+    # shelling to ``k3s --version`` which has to fork the static
+    # binary). Falls back to a runtime ``k3s --version`` only when
+    # the sidecar is missing.
+    version = "unknown"
+    sidecar = Path("/usr/share/doc/k3s/.version")
+    if sidecar.exists():
+        try:
+            version = sidecar.read_text(encoding="utf-8").strip() or "unknown"
+        except OSError:
+            # Sidecar unreadable — fall through to the runtime probe.
+            pass
+
+    # Unit state via systemctl is-active. systemctl returns 0 on
+    # active, 3 on inactive/failed/disabled — we check the textual
+    # output rather than relying on exit code so we can distinguish
+    # ``inactive`` (operator hasn't enabled yet, expected Phase 1)
+    # from ``failed`` (operator enabled but k3s crashed).
+    try:
+        proc = subprocess.run(
+            ["systemctl", "is-active", "k3s.service"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        unit_state = proc.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        unit_state = "unknown"
+
+    if unit_state in ("inactive", "unknown"):
+        return (f"{version} · disabled (systemctl enable --now k3s)", "yellow")
+    if unit_state == "failed":
+        return (f"{version} · failed — journalctl -u k3s", "bold red")
+    if unit_state == "activating":
+        return (f"{version} · starting…", "yellow")
+
+    # unit is active — probe the kubeapi via the local kubeconfig.
+    # Use a tight timeout so a wedged apiserver doesn't stall the
+    # render loop (whole function runs every 1 s).
+    if not Path("/etc/rancher/k3s/k3s.yaml").exists():
+        return (f"{version} · active · no kubeconfig yet", "yellow")
+    try:
+        proc = subprocess.run(
+            [
+                "/usr/local/bin/k3s",
+                "kubectl",
+                "get",
+                "--raw=/readyz",
+            ],
+            env={
+                **os.environ,
+                "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml",
+            },
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return (f"{version} · active · api not responding", "yellow")
+    if proc.returncode == 0 and proc.stdout.strip() == "ok":
+        return (f"{version} · ready", "bold green")
+    return (f"{version} · active · api {proc.returncode}", "yellow")
+
+
 def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple[str, str] | None:
     """#170 — derive a (label, style) tuple for the console's
     'Identity' row, or ``None`` when the role doesn't pair against
@@ -1271,7 +1560,7 @@ def render_footer(message: str = "") -> Text:
     keys = [
         ("F1", "Login"),
         ("F2", "Monitor"),
-        ("F3", "Containers"),
+        ("F3", "Pods"),
         ("F4", "Network"),
         ("F5", "Reboot"),
         ("F6", "Shutdown"),
@@ -1295,38 +1584,37 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # Compact sizing — feedback was that the dashboard occupied too
     # many rows. Each panel claims exactly content + 2 border rows;
     # footer is a borderless 1-row strip.
-    services_count = len(ROLE_SERVICES.get(state.role, []))
-    # #170 Wave D + Wave E — render_services unions any supervisor-
-    # spawned service container (dns-bind9 / dns-powerdns / dhcp-kea)
-    # that's either currently in docker ps OR that the supervisor's
-    # watchdog expects to be running (per role-compose.env). Mirror
-    # that here so the Services panel is tall enough to show every
-    # row without truncation, including any missing/expected entries.
-    if state.role == "application":
-        ps_index = {container_service_name(r) for r in state.ps_rows}
-        watchdog_expected = set(watchdog_expected_services())
-        for svc in SUPERVISOR_DYNAMIC_SERVICES:
-            if svc in ps_index or svc in watchdog_expected:
-                services_count += 1
-    # Header layout: 4 base content lines (host+role / IPs / Build /
-    # vitals+disks) + 1 horizontal rule + 2 panel border. ``Slot``,
-    # ``Agent``, and ``Watchdog`` lines each add a row when present.
-    # Pre-#170 fold this carried a separate Agent panel; collapsing
-    # its 2-3 rows into one inline header line saves ~4 visual rows.
-    # Vitals + Disk were merged into one row in the same pass (the
-    # bind-mount dedupe + docker-overlay skip keeps disk entries to 2-3
-    # which fit alongside Up/CPU/RAM/Load on any 80+ col TTY).
+
+    # Phase 7 — Pods panel shows every pod on the local cluster, not
+    # the pre-Phase-7 role-scoped service list. Row count is dynamic:
+    # number of pods, plus 2 for the panel border. Min 3 rows so the
+    # empty-state "no pods running" hint stays visible while k3s comes
+    # up. Capped at terminal-height-aware ceiling in render_frame's
+    # log_height clamp below.
+    pods_count = len(state.ps_rows) if state.ps_rows else 1
+    # Header layout: 1 line1 (host+role | clock) + N rows of the
+    # 2-col paired grid + 1 horizontal rule + 1 vitals + 2 panel
+    # border. The grid packs IPs + Build + every conditional row
+    # (agent / watchdog / slot / upgrade / k3s) 2-per-row, so
+    # what would have been 5-7 separate rows becomes 3-4 paired
+    # rows — saves ~3 vertical rows on a typical appliance.
     has_agent_line = state.role == "application"
     has_watchdog_line = (
         state.role == "application" and supervisor_watchdog_status() is not None
     )
-    HEADER_ROWS = (
-        7
+    has_upgrade_line = state.role == "application" and upgrade_status() is not None
+    has_k3s_line = k3s_status() is not None
+    short_count = (
+        2  # IPs + Build, always present
         + (1 if slot_info() is not None else 0)
         + (1 if has_agent_line else 0)
         + (1 if has_watchdog_line else 0)
+        + (1 if has_upgrade_line else 0)
+        + (1 if has_k3s_line else 0)
     )
-    SVC_ROWS = services_count + 2   # tight: just borders, no padding
+    paired_rows = (short_count + 1) // 2  # ceil(short_count / 2)
+    HEADER_ROWS = 1 + paired_rows + 1 + 1 + 2  # line1 + grid + rule + vitals + border
+    SVC_ROWS = pods_count + 3   # 1 header row + 2 panel border
     FOOTER_ROWS = 1   # single-line borderless strip
 
     layout = Layout()
@@ -1375,7 +1663,9 @@ class DashboardState:
         self.ram_total_gib: float = 0.0
         self.ram_percent: float = 0.0
         self.load_avg: tuple[float, float, float] = (0.0, 0.0, 0.0)
-        self.clock_str: str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.clock_str: str = datetime.now().astimezone().strftime(
+            "%Y-%m-%d %H:%M:%S %Z"
+        )
         self.disks: list[tuple[str, float, float, float]] = []
 
     def refresh(self, force: bool = False) -> None:
@@ -1390,7 +1680,13 @@ class DashboardState:
             self.ram_total_gib = vm.total / 2**30
             self.ram_percent = vm.percent
             self.load_avg = os.getloadavg()
-            self.clock_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # ``%Z`` resolves the IANA-zone abbreviation (``EDT`` /
+            # ``UTC`` / etc.) from the system localtime. astimezone()
+            # picks up the active TZ each tick so ``timedatectl
+            # set-timezone`` reflects without a console restart.
+            self.clock_str = datetime.now().astimezone().strftime(
+                "%Y-%m-%d %H:%M:%S %Z"
+            )
             self.disks = disk_summary()
 
         # Data tier (2 s) — docker ps + env re-read.
@@ -1686,25 +1982,133 @@ def do_monitor(console: Console, tty: str) -> None:
 
 
 def do_containers(console: Console, tty: str) -> None:
-    """Stream ``docker stats`` until the operator quits.
+    """Pod picker → per-pod log streamer.
 
-    docker stats already speaks the cooked-tty / ncurses-like idiom
-    (auto-refreshing table, Ctrl-C to exit) so we just hand the tty
-    over to it. No filtering on container name: every container the
-    daemon knows about is interesting on a single-box appliance.
+    Issue #183 Phase 9 — list every pod with a numbered shortcut,
+    prompt the operator to pick one, then ``kubectl logs -f`` until
+    Ctrl-C. Loop back to the picker; q exits to the dashboard.
+
+    Previously F3 streamed ``kubectl top pod`` (metrics-server-
+    dependent) or fell through to a watch on all pods. Watch is
+    useful for "did anything change" but operators triaging a real
+    incident actually need logs. The new design: pick a pod, see
+    its logs, ctrl-C, pick another.
     """
-    console.clear()
-    console.print("[bold]docker stats — Ctrl-C to return to the dashboard.[/bold]\n")
     _prepare_tty_for_subprocess(tty)
+    env = {**os.environ, "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"}
+
     try:
         with open(tty, "r+b", buffering=0) as tty_io:
-            subprocess.run(
-                ["docker", "stats"],
-                check=False,
-                stdin=tty_io,
-                stdout=tty_io,
-                stderr=tty_io,
-            )
+            while True:
+                console.clear()
+                console.print("[bold]F3 — Pods (logs viewer)[/bold]")
+                console.print(
+                    "[dim]Pick a number to tail logs (Ctrl-C exits "
+                    "logs view), or q to return to dashboard.[/dim]\n"
+                )
+
+                # Re-fetch the pod list on each iteration so a pod
+                # that crashed or got rescheduled between picks shows
+                # its new state.
+                proc = subprocess.run(
+                    [
+                        "/usr/local/bin/k3s", "kubectl",
+                        "get", "pods", "-A", "-o", "wide",
+                        "--no-headers",
+                    ],
+                    env=env, capture_output=True, text=True, timeout=5,
+                )
+                if proc.returncode != 0:
+                    console.print(
+                        f"[red]kubectl get pods failed: "
+                        f"{proc.stderr.strip()[:200]}[/red]"
+                    )
+                    time.sleep(3)
+                    return
+
+                # Each line: NAMESPACE NAME READY STATUS RESTARTS AGE IP NODE …
+                pods: list[tuple[str, str, str]] = []  # (ns, name, status)
+                for line in proc.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        pods.append((parts[0], parts[1], parts[3]))
+
+                if not pods:
+                    console.print("[dim]No pods found.[/dim]")
+                    time.sleep(2)
+                    return
+
+                # Two-column numbered list. Same sort as the dashboard
+                # Pods panel (spatium first, then kube-system, then
+                # alphabetical).
+                def _ns_rank(ns: str) -> tuple[int, str]:
+                    if ns == "spatium":
+                        return (0, ns)
+                    if ns == "kube-system":
+                        return (1, ns)
+                    return (2, ns)
+
+                pods.sort(key=lambda p: (_ns_rank(p[0]), p[1]))
+
+                for i, (ns, name, status) in enumerate(pods, 1):
+                    status_color = (
+                        "green" if status == "Running"
+                        else "yellow" if status in ("Pending", "ContainerCreating")
+                        else "red" if status in ("Error", "CrashLoopBackOff")
+                        else "dim"
+                    )
+                    console.print(
+                        f"  [bold cyan]{i:>2}[/bold cyan]  "
+                        f"[dim]{ns:<14}[/dim] {name}  "
+                        f"[{status_color}]{status}[/{status_color}]"
+                    )
+
+                console.print("")
+                try:
+                    answer = input("Pick (number/q): ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    return
+                if not answer or answer == "q":
+                    return
+
+                try:
+                    pick = int(answer)
+                except ValueError:
+                    console.print("[red]Not a number.[/red]")
+                    time.sleep(1)
+                    continue
+
+                if not (1 <= pick <= len(pods)):
+                    console.print(
+                        f"[red]Out of range (1-{len(pods)}).[/red]"
+                    )
+                    time.sleep(1)
+                    continue
+
+                ns, name, _ = pods[pick - 1]
+                console.clear()
+                console.print(
+                    f"[bold]kubectl logs -f -n {ns} {name}[/bold]  "
+                    f"[dim](Ctrl-C to return to picker)[/dim]\n"
+                )
+                try:
+                    subprocess.run(
+                        [
+                            "/usr/local/bin/k3s", "kubectl",
+                            "logs", "-f", "--tail=200",
+                            "-n", ns, name,
+                        ],
+                        env=env,
+                        stdin=tty_io, stdout=tty_io, stderr=tty_io,
+                        check=False,
+                    )
+                except KeyboardInterrupt:
+                    # Ctrl-C inside ``kubectl logs -f`` is the operator's
+                    # signal to stop tailing this pod; we deliberately
+                    # swallow it so the picker loop resumes instead of
+                    # the whole F3 panel exiting.
+                    continue
+                # Loop back to picker.
     except OSError as exc:
         console.print(f"[red]Failed to open {tty}: {exc}[/red]")
         time.sleep(3)

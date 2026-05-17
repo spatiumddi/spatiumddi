@@ -1,0 +1,90 @@
+# Issue #183 Phase 1 — k3s server config for the SpatiumDDI appliance.
+#
+# Operator-editable file. k3s.service reads it on every (re)start;
+# changes require ``systemctl restart k3s``. Lives in the /etc
+# overlay's upper (/var/persist/etc/rancher/k3s/) so edits survive
+# slot swaps + the image-baseline /etc.image refresh.
+#
+# Air-gap-friendly defaults — every component k3s needs is baked into
+# the slot rootfs.
+
+# kubeapi listens on the node IP — k3s auto-detects from the default
+# route. Binding to 127.0.0.1 here is tempting for defense in depth
+# but breaks k8s ≥ 1.31: the kube-apiserver registers itself as the
+# `kubernetes` Service endpoint, and the endpoint slice validator
+# rejects loopback IPs ("may not be in the loopback range") — coredns
+# / local-path / helm-controller all fail to reach the cluster IP.
+#
+# External reach is gated by nftables: tcp/6443 is only accepted from
+# the pod CIDR (10.42.0.0/16) on the input chain; all other origins
+# fall through to the default-drop policy. Phase 4 widens this to the
+# control-plane CIDR via the supervisor's nftables drop-in once the
+# operator approves the cross-network kubeapi surface.
+https-listen-port: 6443
+
+# Disable bundled components we replace or don't need:
+#   * traefik    — operator-facing TLS still goes through our nginx
+#                  reverse proxy (existing Appliance → Web UI Cert
+#                  flow). No second ingress controller.
+#   * servicelb  — single-node, no LoadBalancer service IPs to hand
+#                  out; klipper-lb would just add a noisy DaemonSet.
+#   * metrics-server — defer until Phase 8; we don't surface metrics
+#                  yet, and the pod adds ~80 MiB RSS.
+disable:
+  - traefik
+  - servicelb
+  - metrics-server
+
+# Skip the cloud controller — bare-metal single node, no cloud
+# provider integrations to reconcile.
+disable-cloud-controller: true
+
+# Don't render NetworkPolicy in kube-proxy — single node, no need
+# for inter-pod policies that the CNI plugin would have to enforce.
+disable-network-policy: true
+
+# Flannel backend ``host-gw`` writes Linux routes directly instead
+# of using VXLAN encapsulation. Works without inter-node tunnelling
+# (we're single-node) + plays well with the appliance's nftables
+# config since there's no overlay traffic to allow through.
+flannel-backend: host-gw
+
+# Kubeconfig file mode — by default 0600 (root only). 0644 lets the
+# admin user read it via /etc/profile.d/k3s.sh's KUBECONFIG export
+# without a sudo prompt. The file lives in the /etc overlay upper
+# so the operator's permissions changes persist; this just sets the
+# initial bit.
+write-kubeconfig-mode: "0644"
+
+# Operator-visible node label so the supervisor (Phase 3) + future
+# Helm charts can target schedule pods to "spatiumddi appliances"
+# vs any random k3s node a future ops engineer might cluster in.
+node-label:
+  - spatium.io/role=appliance
+
+# Audit log path — fed by the kube-apiserver --audit-log-path flag.
+# Lives on /var so it survives slot swaps; bound to 100 MiB / 7-day
+# rotation by k3s defaults.
+kube-apiserver-arg:
+  - audit-log-path=/var/log/spatiumddi/k3s-audit.log
+  - audit-log-maxage=7
+  - audit-log-maxbackup=4
+  - audit-log-maxsize=100
+  # Defence-in-depth — NodeRestriction limits the kubelet credential
+  # to its own node + pods running on it (already on by default in
+  # k3s ≥ 1.27, listed here so the policy is explicit at the config
+  # level). EventRateLimit is intentionally NOT enabled — it requires
+  # a separate admission-control-config-file with limits defined or
+  # kube-apiserver crash-loops at boot.
+  - enable-admission-plugins=NodeRestriction
+
+# Kubelet args. image-gc thresholds high so we don't churn the
+# baked image set under disk pressure (images are intentionally
+# preloaded; if the operator's running low on /var space the gc
+# pressure shows up elsewhere first).
+kubelet-arg:
+  - image-gc-high-threshold=95
+  - image-gc-low-threshold=85
+  # Surface log path with a known location so spatium-console + the
+  # control-plane log streamer can tail it.
+  - log-flush-frequency=5s

@@ -1,8 +1,16 @@
-# SpatiumDDI OS Appliance — Phase 1 (Debian 13 amd64 qcow2 MVP)
+# SpatiumDDI OS Appliance
 
-Self-contained bootable image: Debian 13 (trixie) amd64 + Docker +
-SpatiumDDI's `ghcr.io` container set, wired together so the operator
-gets a working web UI on first boot.
+Self-contained bootable image: Debian 13 (trixie) amd64 + k3s +
+SpatiumDDI's container set baked in as containerd-format `.tar.zst`
+archives, wired together so the operator gets a working web UI on
+first boot.
+
+**Issue #183 Phase 7 (2026-05-16):** the appliance is **k3s-only**.
+The pre-Phase-7 docker + docker-compose stack is gone; pods are
+managed by k3s's bundled helm-controller via the `spatiumddi-
+appliance` Helm chart. The supervisor runs as a privileged DaemonSet
+pod; service roles (DNS / DHCP) come up via per-role chart values
+the supervisor PATCHes onto the chart on heartbeat.
 
 > **Why Debian, not Alpine?** mkosi ≥ 23 dropped Alpine as a supported
 > distribution. Phase 1's job is the proving ground for cloud-init,
@@ -24,21 +32,33 @@ gets a working web UI on first boot.
 
 - Debian 13 (trixie) amd64, `linux-image-cloud-amd64` kernel
 - systemd + cloud-init (NoCloud datasource)
-- `docker.io` + `docker-compose-v2`
-- All-in-one stack at `/usr/local/share/spatiumddi/docker-compose.yml`:
-  control plane (api + worker + beat + migrate + frontend) + Postgres
-  + Redis + BIND9 + Kea
+- **k3s** (pinned via `K3S_VERSION` in the top-level Makefile; baked
+  as a single static binary at `/usr/local/bin/k3s` with `kubectl`,
+  `crictl`, `ctr` as symlinks)
+- `kubectl` pre-`KUBECONFIG`'d for admin + root login shells
+- **Helm chart** at `/usr/lib/spatiumddi/charts/spatiumddi-appliance
+  .tgz` — applied by k3s's helm-controller on first boot via the
+  bootstrap manifest the firstboot orchestrator writes into
+  `/var/lib/rancher/k3s/server/manifests/`
+- **Preloaded containerd image set** in
+  `/var/lib/rancher/k3s/agent/images/*.tar.zst` (k3s auto-imports
+  on first start, no docker-load shell-out needed)
 - First-boot orchestrator (`/usr/local/bin/spatiumddi-firstboot`)
-  that generates secrets, pulls images, brings the stack up, and waits
-  for `/health/live`
+  that generates secrets, renders the bootstrap HelmChart manifest,
+  and waits for kubeapi `/readyz`
 
 ## Build prerequisites
 
-- **Docker** with privileged-container support — that's the only host
-  tool. mkosi + qemu-utils + apt keyring + grub variants live inside
-  the published builder image
-  (`ghcr.io/spatiumddi/appliance-builder:latest`)
-- ~2 GiB free disk in the build directory
+- **Docker** with privileged-container support on the **build host
+  only** — the appliance itself ships zero docker. mkosi + qemu-
+  utils + apt keyring + grub variants live inside the published
+  builder image (`ghcr.io/spatiumddi/appliance-builder:latest`).
+  The bake step uses host docker to `docker save` SpatiumDDI's
+  service images into containerd-readable `.tar.zst` archives.
+- **helm** + **zstd** on the build host — `make appliance-bake-
+  chart` packages the Helm chart; `appliance/scripts/bake-images
+  .sh` compresses image archives.
+- ~2 GiB free disk in the build directory.
 
 The build runs `docker run --privileged` because mkosi needs loop
 devices, kernel namespaces, and bind-mounts to bootstrap the rootfs.

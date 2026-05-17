@@ -4,9 +4,97 @@
 
 SpatiumDDI can be shipped as a **self-contained OS appliance image** — a bootable image where the OS, all services, and the SpatiumDDI application are pre-installed and pre-configured. This allows deployment without any prior OS or container runtime setup: download, boot, configure via web UI, done.
 
+The appliance is **Debian 13 + embedded [k3s](https://k3s.io/)** (a single-binary Kubernetes distribution). SpatiumDDI's container set deploys as k3s HelmChart custom resources — the same umbrella + appliance Helm charts that ship for standalone Kubernetes installs. Operators get a real Kubernetes node without having to install or manage one; release upgrades reconcile through helm-controller, role swaps are single `kubectl label node` calls, and atomic A/B slot upgrades carry both OS and container versions in one unit so they can't drift.
+
 ---
 
-## Post-#170 architecture (2026-05-14)
+## Current architecture (post-#183, 2026-05-17)
+
+The appliance runs **k3s** as its container orchestrator. Pre-#183 it ran `docker-compose` driven from `spatiumddi-firstboot`; that path is gone in every shipped artifact. The historical post-#170 architecture section below documents the docker-compose era for context — it's preserved because most field installs predate #183. For new installs and the current release, start here.
+
+### One-paragraph summary
+
+`spatiumddi-firstboot` writes a HelmChart CR into k3s's auto-deploy directory (`/var/lib/rancher/k3s/server/manifests/`). The k3s-bundled helm-controller picks it up + runs `helm install` from a chart tarball baked into the appliance rootfs (`/usr/lib/spatiumddi/charts/`). Three install variants pick which chart + values get rendered:
+
+- **Application** — supervisor + agent-landing nginx. Pairs against a remote control plane via 8-digit pairing code; roles (`dns-bind9` / `dns-powerdns` / `dhcp`) are assigned post-approval from the control plane's `/appliance → Fleet` tab.
+- **All-in-One (AIO)** — control plane (api / frontend / worker / beat / migrate / Postgres / Redis) + role pods, all on the same single-node k3s. The umbrella chart deploys the control plane; node labels are baked into k3s's config at install time so DNS + DHCP DaemonSets schedule immediately. No supervisor, no pairing-code dance.
+- **Core-only** — control plane only. Remote Application appliances pair against this box.
+
+```
+[appliance: single-node k3s]
+   ├─ /usr/local/bin/k3s (static binary, pinned via K3S_VERSION)
+   ├─ /var/lib/rancher/k3s/agent/images/*.tar.zst   ← air-gap-preloaded
+   ├─ /usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz   ← appliance chart
+   ├─ /usr/lib/spatiumddi/charts/spatiumddi.tgz             ← umbrella chart (AIO + Core)
+   └─ /var/lib/rancher/k3s/server/manifests/spatium-bootstrap.yaml
+        ↓ (firstboot writes on every boot, content depends on variant)
+   helm-controller reconciles → installs `spatium-bootstrap` release
+        ↓
+   spatium-supervisor pod (DaemonSet, privileged, hostNetwork: false)   ← Application only
+        ↓ (registers + heartbeats to control plane)
+        ↓ (on role assignment: labels node → DaemonSet schedules)
+   role pods: dns-bind9 / dns-powerdns / dhcp-kea (hostNetwork: true)
+   always-on: agent-landing nginx on :80                                 ← Application only
+   control plane pods (api / frontend / db / redis / worker / beat /     ← AIO + Core
+                       migrate, frontend on hostNetwork :80 + :443)
+```
+
+### What's bundled in the slot rootfs
+
+mkosi bakes everything the appliance needs to come up fully air-gapped:
+
+- **k3s static binary** (~70 MB) at `/usr/local/bin/k3s`; `kubectl` / `crictl` / `ctr` symlink to it.
+- **k3s airgap images** (CoreDNS / local-path / pause / metrics-server) as zst-compressed tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst`. k3s auto-imports them into containerd at boot.
+- **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:7-alpine for AIO / Core variants.
+- **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Application installs; the umbrella chart drives AIO + Core. Built at release time + signed.
+- **bash-completion + `k` alias** for kubectl — operator SSHing in for triage drops straight into a usable shell.
+
+A fresh appliance boot never reaches out to ghcr.io or any external registry. The first time it does is when an operator explicitly applies a new release through `/appliance → OS Versions` or `/appliance → Releases`.
+
+### Two HelmChart CRs
+
+- **`spatium-bootstrap`** — written by `spatiumddi-firstboot` into k3s's auto-deploy directory on every boot. Content depends on install variant (Application / AIO / Core). Owns the always-on resources (supervisor + agent-landing on Application; control plane pods on AIO + Core).
+- **`spatiumddi-appliance`** — written by the supervisor on its first successful heartbeat (Application variant only). Deploys the three role DaemonSets (dns-bind9 / dns-powerdns / dhcp-kea). After #183 Phase 10, this release is installed once and never re-PATCHed for role changes — role swaps happen through node labels (`spatium.io/role-<role>=true`); the DaemonSet's matching-nodes semantics mean an unassigned role produces zero pods rather than a Pending one.
+
+### Why k3s
+
+The pre-#183 docker-compose path fought us on three things every operator-facing release ran into:
+
+1. **Role swaps were brittle.** `docker compose down` of one service + `up -d` of another, with a manual `--env-file` dance, no consistent rollback if a step failed midway. Real recovery was always "delete `/var/lib/spatiumddi/.compose-state`, reboot."
+2. **No declarative target.** Compose had no notion of "this appliance should always have N pods of kind X running"; the supervisor's drift checker reimplemented this by parsing `docker compose ps` JSON every 5 min.
+3. **A/B slot upgrades had to migrate compose state** across slot rootfs swaps. `/var/lib/docker/` was on `/var` (persistent), but the compose file lived on rootfs, so a new slot could carry a different compose schema while old containers still ran against the old.
+
+k3s solves all three: HelmChart CRs as the declarative target, helm-controller as the reconciler, kine (SQLite) as the state store (survives slot swap because `/var/lib/rancher/` is on `/var`). The supervisor becomes a thin controller that PATCHes node labels per role-assignment change — the role pod schedules or terminates as a consequence of the label, not as a consequence of a `docker compose` invocation.
+
+The trade-off: k3s adds ~70 MB to the slot rootfs and a steady ~150 MB RAM footprint for the k3s server process itself. On the 16 GiB disk floor + 2 GiB RAM floor the appliance targets, both are well under budget.
+
+### Appliance management surfaces (k3s-aware)
+
+The `/appliance` section in the SpatiumDDI UI talks to k3s directly via the api pod's mounted ServiceAccount:
+
+- **Pods tab** (`/appliance/containers` API surface, renamed Containers → Pods in the UI). Lists every pod in the spatium namespace via kubeapi `GET /api/v1/namespaces/spatium/pods`. Restart = `DELETE` the pod (owning Deployment / DaemonSet recreates it). Logs = SSE wrapping kubeapi's `?follow=true` pod-log endpoint.
+- **TLS cert manager**. Patches the `spatium-appliance-tls` Secret in place via `kubectl patch secret`. Bumps a checksum annotation on the frontend Deployment to trigger a rollout (k8s doesn't auto-roll on Secret changes — the annotation acts as the trigger).
+- **Logs & Diagnostics → Self-test**. Five-check battery: external DNS resolution, kubeapi reachability via the ServiceAccount, every spatium pod's health (Running + healthy / Succeeded Jobs OK), informational DHCP + DNS role presence (OK when not assigned).
+- **Diagnostic bundle**. Per-pod log tails (last 500 lines via kubeapi) + host logs + system info + redacted env, zipped for support tickets.
+- **OS Versions**. Atomic A/B slot upgrades — same machinery as pre-#183 (Phase 8); the slot raw.xz carries a complete rootfs with k3s + baked images + chart tarballs. A slot upgrade is also an effective container upgrade because images are baked.
+
+The api pod's ServiceAccount is namespace-scoped with minimal RBAC: pods + pods/log read, the specific `spatium-appliance-tls` Secret patch, and the frontend Deployment annotation patch. Nothing cluster-wide, nothing destructive.
+
+### From-zero operator flow
+
+1. Boot the ISO → installer wizard asks for **variant** + target disk + hostname + admin + network + timezone (+ pairing code / control-plane URL on Application).
+2. Installer partitions (BIOS Boot + ESP + root_A + root_B + var), writes fstab + grub menuentries, runs postinst hardening, reboots.
+3. First-boot: `spatiumddi-firstboot` generates `/etc/spatiumddi/.env` with secrets, bakes the self-signed cert, writes the HelmChart bootstrap manifest, starts k3s.
+4. k3s comes up + imports baked images + helm-controller installs the bootstrap release. 30-90 s for control plane pods to reach Ready; another 15-30 s for migrate Job to complete schema migrations.
+5. Operator browses to `https://<appliance-ip>/`, accepts the self-signed cert, signs in `admin / admin`, sets a real password.
+6. (Application variant only) Operator approves the appliance from the control plane's `/appliance → Fleet` tab, picks roles. DaemonSet schedules role pods within ~30 s.
+
+For a step-by-step user-facing version, see the README's
+["Quick start with the OS appliance ISO" section](../../README.md#quick-start-with-the-os-appliance-iso-recommended).
+
+---
+
+## Post-#170 architecture (2026-05-14, superseded by #183)
 
 The architecture below was reshaped end-to-end by [issue #170](https://github.com/spatiumddi/spatiumddi/issues/170). Three threads converged:
 
@@ -332,7 +420,16 @@ trigger: tag push (CalVer)
 
 ## 4. Appliance First-Boot Setup
 
-### Phase 1 (current): headless via cloud-init NoCloud
+> **#183 update.** Sections 4 + 4.1 below describe the pre-#183
+> docker-compose flow. Post-#183 the first-boot path runs k3s +
+> writes a HelmChart manifest into k3s's auto-deploy directory
+> — see [Current architecture](#current-architecture-post-183-2026-05-17)
+> above for the authoritative flow. The user-facing wizard +
+> cloud-init datasource shapes still apply; only what
+> `spatiumddi-firstboot` runs after collecting answers has
+> changed.
+
+### Phase 1 (pre-#183, replaced): headless via cloud-init NoCloud
 
 Phase 1 ships with `cloud-init` enabled and the NoCloud datasource
 active. Operators drop a CIDATA ISO with `user-data` + `meta-data`,
@@ -348,7 +445,11 @@ The `spatiumddi-firstboot.service` systemd unit runs after
    reboots. ``BOOTSTRAP_PAIRING_CODE`` carries the operator-supplied
    8-digit code from the installer through to the agent containers
    on Phase 6 role-split agent appliances (see §10).
-2. `docker-compose pull` (first run) + `docker-compose up -d`.
+2. **(Pre-#183)** `docker-compose pull` (first run) + `docker-compose up -d`.
+   **(Post-#183)** Writes the variant-specific bootstrap HelmChart
+   manifest into `/var/lib/rancher/k3s/server/manifests/`; k3s's
+   helm-controller picks it up + runs `helm install` against the
+   baked chart tarball.
 3. Polls `http://127.0.0.1:8000/health/live` for up to 5 min.
 
 Default web-UI login is `admin / admin` with `force_password_change=True`.
@@ -391,19 +492,29 @@ After completion, the appliance reboots into normal operation.
 
 ## 5. Appliance Update Mechanism
 
-Two update paths land in 2026.05.12-1, addressing different
-operator workflows:
+Two update paths exist, addressing different operator workflows.
+Both are post-#183 k3s-native; the pre-#183 docker-compose flows
+they replace are documented in the historical sections above for
+reference.
 
-### 5a. Container-stack release recycle (Phase 4c)
+### 5a. Container-stack release recycle (Phase 4c, k3s-rewritten in #183)
 
 For incremental SpatiumDDI releases that don't change the host
 OS. The `/appliance` Releases card lists recent GitHub releases;
-operator clicks Apply, the api container writes a trigger file
-the host-side `spatiumddi-release-update.path` unit watches, the
-runner runs `docker-compose pull && docker-compose up -d` and
-records progress in `/var/log/spatiumddi/release-update.log`.
-The api container can recreate itself cleanly because the host
-process owns the docker-compose command. No host reboot needed.
+operator clicks Apply, the api pod writes a trigger file the
+host-side `spatiumddi-release-update.path` unit watches, the
+runner PATCHes each HelmChart CR's `spec.set.image.tag` with the
+new CalVer tag. helm-controller picks up the change and runs
+`helm upgrade` against the chart in `/usr/lib/spatiumddi/charts/`
+— which pulls images from the local containerd image store (already
+loaded from `/usr/lib/spatiumddi/images/*.tar.zst` at firstboot).
+Pod rollouts happen with the chart's existing strategies
+(RollingUpdate for non-hostNetwork pods; Recreate for frontend
+when hostNetwork is on). No host reboot needed. Pre-#183 this
+path ran `docker-compose pull && docker-compose up -d`; the new
+shape is functionally equivalent but declarative — the HelmChart
+CR is the source of truth for "what version should this appliance
+be running."
 
 ### 5b. Phase 8 atomic A/B image upgrades (slot upgrade)
 

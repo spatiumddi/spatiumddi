@@ -104,6 +104,15 @@ def render_drop_in(role_assignment: dict[str, Any] | None) -> FirewallProfile:
     role_assignment = role_assignment or {}
     roles = [r for r in (role_assignment.get("roles") or []) if isinstance(r, str)]
     firewall_extra = role_assignment.get("firewall_extra") or ""
+    # Issue #183 Phase 6 — operator-controlled CIDR allowlist for
+    # direct kubeapi access on tcp/6443. Empty / missing = proxy-
+    # only (kubeapi stays on 127.0.0.1; only the supervisor's
+    # outbound proxy channel can drive it).
+    kubeapi_cidrs = [
+        c
+        for c in (role_assignment.get("kubeapi_expose_cidrs") or [])
+        if isinstance(c, str) and c.strip()
+    ]
 
     profile = _profile_name(roles)
     lines: list[str] = []
@@ -138,6 +147,27 @@ def render_drop_in(role_assignment: dict[str, Any] | None) -> FirewallProfile:
         lines.append(f'udp dport {port} accept comment "role:{profile}"')
     for port in sorted(tcp_ports):
         lines.append(f'tcp dport {port} accept comment "role:{profile}"')
+
+    # Issue #183 Phase 6 — kubeapi direct-access allowlist. One
+    # ``ip saddr { ... } tcp dport 6443 accept`` rule when non-
+    # empty; complements the Phase 4 outbound proxy (which works
+    # regardless of these CIDRs). The supervisor's drift checker
+    # tracks ``tcp/6443`` in ``expected_tcp_ports`` only when the
+    # allowlist is non-empty — proxy-only mode keeps it OUT of the
+    # expected set so the drift watcher doesn't false-positive a
+    # missing rule.
+    if kubeapi_cidrs:
+        lines.append("")
+        lines.append("# ── kubeapi (operator-allowed CIDRs, #183 Phase 6) ──────")
+        # nft accepts a comma-separated saddr set inline; quote-strip
+        # each entry on the way in (operator-supplied) so a stray
+        # whitespace doesn't break the parse.
+        cidrs_inline = ", ".join(c.strip() for c in kubeapi_cidrs)
+        lines.append(
+            f"ip saddr {{ {cidrs_inline} }} tcp dport 6443 accept "
+            f'comment "kubeapi-direct"'
+        )
+        tcp_ports.add(6443)
 
     if firewall_extra.strip():
         lines.append("")

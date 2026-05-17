@@ -1,0 +1,71 @@
+{{- /* Issue #183 Phase 9 — agent landing page.
+
+       Always-on nginx serving the rendered
+       /var/lib/spatiumddi/agent-landing/index.html on :80 of the
+       node IP. Pre-Phase-7 this was a docker-compose service named
+       ``agent-landing``; restored here as a chart Deployment after
+       Phase 7's docker-strip removed it.
+
+       hostNetwork + hostPath: same shape as dns-bind9 / dns-powerdns
+       / dhcp-kea — the page needs to bind on the appliance's
+       outward-facing IP, not a cluster IP, so an operator browsing
+       to http://<appliance>/ sees something. We're a single-node
+       k3s; no LoadBalancer to fall back on (klipper-lb is disabled),
+       so hostNetwork is the simplest path.
+
+       Image: stock ``nginx:1.27-alpine``, preloaded into containerd
+       at bake time alongside the SpatiumDDI service images. */}}
+{{- if .Values.agentLanding.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-landing
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent-landing
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agent-landing
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        app.kubernetes.io/name: agent-landing
+        app.kubernetes.io/component: agent-landing
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+      containers:
+        - name: nginx
+          image: "{{ .Values.agentLanding.image.repository }}:{{ .Values.agentLanding.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html
+              readOnly: true
+      volumes:
+        - name: html
+          hostPath:
+            path: {{ .Values.agentLanding.hostMounts.htmlDir }}
+            type: DirectoryOrCreate
+{{- end }}

@@ -1,0 +1,30 @@
+apiVersion: v2
+name: spatiumddi-appliance
+description: |
+  SpatiumDDI appliance — per-role service workloads deployed onto the
+  appliance's local k3s cluster. Issued and reconciled by the
+  spatium-supervisor based on the operator's role-assignment on the
+  control plane (issue #183 Phase 2).
+type: application
+version: 0.1.0
+appVersion: "0.0.0-dev"
+kubeVersion: ">=1.27.0-0"
+home: https://spatiumddi.github.io/spatiumddi/
+sources:
+  - https://github.com/spatiumddi/spatiumddi
+icon: https://spatiumddi.github.io/spatiumddi/assets/logo-icon.svg
+keywords:
+  - ipam
+  - dns
+  - dhcp
+  - ddi
+  - networking
+  - appliance
+  - k3s
+maintainers:
+  - name: SpatiumDDI Contributors
+# No subchart dependencies — each role lives in its own template
+# under templates/<role>.yaml, gated on a top-level feature flag in
+# values.yaml. The supervisor's CRD reconciler (Phase 3) renders
+# values.yaml from the SpatiumApplianceRole spec + applies via the
+# k3s-builtin HelmChart CRD.

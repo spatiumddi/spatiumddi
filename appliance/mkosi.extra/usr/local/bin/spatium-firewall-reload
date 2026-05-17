@@ -1,0 +1,108 @@
+#!/bin/bash
+# spatium-firewall-reload — host-side nftables drop-in apply runner
+# (issue #183 Phase 9).
+#
+# The supervisor pod writes
+# /var/lib/spatiumddi/release-state/firewall-pending whenever the
+# rendered drop-in body (for the active role assignment + operator
+# CIDR allowlist) changes vs. what's been applied here. The path
+# unit (spatium-firewall-reload.path) catches the rename and runs
+# this script.
+#
+# File format (plain text, no JSON to keep the runner dependency-
+# free):
+#   line 1:    sha256 hex of the body
+#   line 2+:   rendered drop-in body
+#
+# Apply flow:
+#   1. Read trigger, split hash + body
+#   2. Stage body to a tmp file under /etc/nftables.d/
+#   3. ``nft -c -f /etc/nftables.conf`` after the tmp → live swap
+#      target is in place — dry-run validates the WHOLE merged
+#      config including any other operator drop-ins. Abort on fail
+#      so a malformed body can't break the firewall.
+#   4. Atomic rename to /etc/nftables.d/spatium-role.nft
+#   5. ``nft -f /etc/nftables.conf`` to commit
+#   6. Write sidecar files so the supervisor knows we applied
+#      (firewall-applied-hash) and what state we're in
+#      (firewall-applied-status)
+#
+# Persistence across A/B slot swaps (Phase 8a, issue #138):
+#
+#   /etc/nftables.d/spatium-role.nft → /var/persist/etc/nftables.d/...
+#       (the /etc overlay's upper, on /var)
+#   /var/lib/spatiumddi/release-state/firewall-*
+#       (on /var directly)
+#
+# So a slot upgrade or rollback preserves the rendered drop-in + the
+# applied hash. The supervisor compares its rendered hash to the
+# applied hash sidecar on every heartbeat tick; matching = skip
+# trigger; mismatch = re-write.
+
+set -eu
+
+TRIGGER_FILE=/var/lib/spatiumddi/release-state/firewall-pending
+APPLIED_HASH=/var/lib/spatiumddi/release-state/firewall-applied-hash
+APPLIED_STATUS=/var/lib/spatiumddi/release-state/firewall-applied-status
+DROP_IN=/etc/nftables.d/spatium-role.nft
+NFT_MAIN=/etc/nftables.conf
+STAGING=/etc/nftables.d/.spatium-role.nft.new
+
+log() { printf '[spatium-firewall-reload] %s\n' "$*"; }
+
+write_status() {
+    mkdir -p "$(dirname "$APPLIED_STATUS")"
+    printf '%s\n' "$1" > "$APPLIED_STATUS"
+}
+
+if [ ! -r "$TRIGGER_FILE" ]; then
+    log "no trigger file at $TRIGGER_FILE — nothing to do"
+    exit 0
+fi
+
+HASH=$(sed -n '1p' "$TRIGGER_FILE")
+if [ -z "$HASH" ]; then
+    log "trigger missing hash (line 1) — refusing to apply"
+    write_status "error:missing-hash"
+    exit 1
+fi
+
+# Body is everything after line 1. tail -n +2 streams it without
+# reading the whole file into a shell variable.
+mkdir -p "$(dirname "$DROP_IN")"
+tail -n +2 "$TRIGGER_FILE" > "$STAGING"
+
+# Atomic rename — load `nft -c -f` will see the live drop-in path
+# resolved via the include glob in /etc/nftables.conf. If the dry-
+# run fails we revert to whatever was there before by deleting the
+# tmp file (the live path is untouched until the mv).
+if ! nft -c -f "$NFT_MAIN" 2>/tmp/nft-check.err; then
+    log "dry-run via $NFT_MAIN failed BEFORE swap — refusing:"
+    cat /tmp/nft-check.err | sed 's/^/[spatium-firewall-reload]  /'
+    rm -f "$STAGING"
+    write_status "error:dry-run-pre"
+    exit 1
+fi
+
+mv "$STAGING" "$DROP_IN"
+
+if ! nft -c -f "$NFT_MAIN" 2>/tmp/nft-check.err; then
+    log "dry-run via $NFT_MAIN failed AFTER swap — drop-in body is invalid:"
+    cat /tmp/nft-check.err | sed 's/^/[spatium-firewall-reload]  /'
+    # Remove the bad drop-in so the master config still loads.
+    rm -f "$DROP_IN"
+    write_status "error:dry-run-post"
+    exit 1
+fi
+
+if ! nft -f "$NFT_MAIN" 2>/tmp/nft-apply.err; then
+    log "nft -f $NFT_MAIN failed — runtime apply error:"
+    cat /tmp/nft-apply.err | sed 's/^/[spatium-firewall-reload]  /'
+    write_status "error:apply"
+    exit 1
+fi
+
+mkdir -p "$(dirname "$APPLIED_HASH")"
+printf '%s\n' "$HASH" > "$APPLIED_HASH"
+write_status "ok"
+log "applied drop-in (hash=$HASH)"
