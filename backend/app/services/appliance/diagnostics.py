@@ -1,17 +1,29 @@
-"""Logs, self-test, and diagnostic bundle (Phase 4e).
+"""Logs, self-test, and diagnostic bundle for the Fleet UI.
+
+Phase 11 wave 4 (#183) rewrite. Appliance mode is now k3s-only
+post-Phase-7; the docker-era checks (docker SDK + /var/log/
+spatiumddi-host bind mount + sync localhost-loopback HTTP check)
+have been replaced with kubeapi-driven equivalents that match the
+new chart topology.
 
 Three operator-facing surfaces:
 
-* **Log viewer** — tails host-side log files (firstboot.log, update.log,
-  self-test.log) plus a curated set of container logs via the docker
-  SDK. Read-only.
+* **Log viewer** — tails host-side log files when the api pod has
+  ``/var/log/spatiumddi-host`` bind-mounted (full-stack appliance
+  with k3s manifest-side host mount). Returns no sources when the
+  bind mount is absent — that's the expected state on docker /
+  K8s control planes and on agent-only appliances. Read-only.
 * **Self-test** — runs a battery of checks ("DNS resolves",
-  "all spatium containers healthy", "/api/v1/version answers",
-  "DHCP daemon running") and returns a structured report.
-* **Diagnostic bundle** — zips the above + sanitised env + recent
-  container logs into a single downloadable file for support.
-  Secrets (POSTGRES_PASSWORD, SECRET_KEY, …) are redacted before
-  bundling.
+  "kubeapi reachable via ServiceAccount", "all spatium pods
+  healthy", "optional roles present"). Self-test runs inside the
+  api worker; the api uses a single uvicorn worker so any check
+  that loops back to the api's own listen port via
+  ``127.0.0.1:8000`` would deadlock the event loop — none of the
+  checks do that any more.
+* **Diagnostic bundle** — zips logs + per-pod log tails + system
+  info + redacted env into a single download. Container logs
+  come from kubeapi via the ServiceAccount; the pre-Phase-11
+  docker-socket path is gone.
 """
 
 from __future__ import annotations
@@ -29,6 +41,7 @@ from typing import Any
 import structlog
 
 from app.config import settings
+from app.services.appliance import k8s
 from app.services.appliance.containers import (
     DockerUnavailableError,
     get_container_logs,
@@ -37,15 +50,15 @@ from app.services.appliance.containers import (
 
 logger = structlog.get_logger(__name__)
 
-# Host log dir bind-mounted by the appliance compose (RO). Falls back
+# Host log dir bind-mounted by the appliance manifest (RO). Falls back
 # to the container's own /var/log/spatiumddi on dev / when bind isn't
-# present (the api writes its own logs to /var/log/spatiumddi inside
-# the container even outside appliance mode).
+# present. On the k3s appliance this is mounted by the umbrella chart
+# (api.hostPaths) only when the appliance role is assigned; agent-only
+# and off-appliance installs leave it empty and the UI shows "no log
+# files yet".
 _HOST_LOG_DIR = Path("/var/log/spatiumddi-host")
 _FALLBACK_LOG_DIR = Path("/var/log/spatiumddi")
-# Sanitised /etc/spatiumddi/.env mount point — not currently exposed
-# (would require an additional bind mount); included as a placeholder
-# so the diagnostic bundle can mention it.
+# Sanitised /etc/spatiumddi/.env mount point — same gating as above.
 _HOST_ENV_FILE = Path("/etc/spatiumddi-host/.env")
 # Tail size for each log file in the bundle and for the UI's "show me
 # what happened recently" panel. 500 lines is enough for support
@@ -131,10 +144,10 @@ def run_self_test() -> SelfTestReport:
     """
     checks: list[CheckResult] = []
     checks.append(_check_dns_resolves())
-    checks.append(_check_containers_healthy())
-    checks.append(_check_api_reachable())
-    checks.append(_check_dhcp_running())
-    checks.append(_check_dns_container_running())
+    checks.append(_check_kubeapi_reachable())
+    checks.append(_check_pods_healthy())
+    checks.append(_check_role_present("dhcp", "DHCP role"))
+    checks.append(_check_role_present("dns", "DNS role"))
     return SelfTestReport(
         run_at=datetime.now(tz=UTC),
         overall_ok=all(c.ok for c in checks),
@@ -160,104 +173,140 @@ def _check_dns_resolves() -> CheckResult:
         )
 
 
-def _check_containers_healthy() -> CheckResult:
-    """Every spatium-prefixed container reports state=running."""
+def _check_kubeapi_reachable() -> CheckResult:
+    """Verify the api pod can talk to kubeapi via its ServiceAccount.
+
+    Replaces the pre-Phase-11 ``127.0.0.1:8000/health/live`` self-
+    loopback check. The api runs ``--workers 1`` and self-test is
+    synchronous, so a loopback HTTP call from inside the same
+    worker deadlocked at the event loop. The kubeapi check is a
+    different connection entirely and exercises something more
+    useful — the path the Pods tab + Cert Manager use.
+    """
+    if not settings.appliance_mode:
+        return CheckResult(
+            name="Kubeapi reachable",
+            ok=True,
+            detail="not appliance mode — check skipped",
+        )
+    cfg = k8s.get_config()
+    if cfg is None:
+        return CheckResult(
+            name="Kubeapi reachable",
+            ok=False,
+            detail=(
+                "ServiceAccount not mounted at "
+                "/var/run/secrets/kubernetes.io/serviceaccount/ — "
+                "chart may need api.serviceAccount.enabled=true"
+            ),
+        )
+    try:
+        pods = k8s.list_pods()
+    except k8s.KubeapiUnavailableError as exc:
+        return CheckResult(
+            name="Kubeapi reachable",
+            ok=False,
+            detail=str(exc),
+        )
+    return CheckResult(
+        name="Kubeapi reachable",
+        ok=True,
+        detail=f"{len(pods)} pods visible in namespace {cfg.namespace}",
+    )
+
+
+def _check_pods_healthy() -> CheckResult:
+    """Every spatium-labelled pod reports a healthy phase.
+
+    "Healthy" means Running with all containers ready OR Succeeded
+    (Jobs that finished cleanly). Pending pods are flagged only if
+    they're stuck in a known-bad waiting reason (CrashLoopBackOff,
+    ImagePullBackOff, ErrImagePull).
+    """
     try:
         rows = list_containers()
     except DockerUnavailableError as exc:
         return CheckResult(
-            name="Container health",
+            name="Pod health",
             ok=False,
-            detail=f"docker unreachable: {exc}",
+            detail=f"kubeapi unreachable: {exc}",
+        )
+    if not rows:
+        if not settings.appliance_mode:
+            return CheckResult(
+                name="Pod health",
+                ok=True,
+                detail="not appliance mode — check skipped",
+            )
+        return CheckResult(
+            name="Pod health",
+            ok=False,
+            detail="no pods visible — kubeapi or RBAC issue",
         )
     spatium = [c for c in rows if c.is_spatium]
     if not spatium:
         return CheckResult(
-            name="Container health",
+            name="Pod health",
             ok=False,
-            detail="no spatiumddi-* containers found",
+            detail="no spatium-labelled pods found",
         )
-    bad = [c for c in spatium if c.state != "running"]
-    unhealthy = [c for c in spatium if c.health and c.health == "unhealthy"]
+    # Running with healthy + Succeeded (Job that completed) are both fine.
+    bad: list[str] = []
+    for c in spatium:
+        if c.state == "running" and c.health in (None, "healthy", "starting"):
+            continue
+        if c.state == "exited" and c.health is None:
+            # Succeeded Jobs come through as state="exited" with no
+            # health vocabulary attached — that's a normal end-of-life
+            # for a one-shot pod (migrate, helm-install).
+            continue
+        bad.append(f"{c.name} ({c.status})")
     if bad:
-        names = ", ".join(c.name for c in bad)
         return CheckResult(
-            name="Container health",
+            name="Pod health",
             ok=False,
-            detail=f"not running: {names}",
-        )
-    if unhealthy:
-        names = ", ".join(c.name for c in unhealthy)
-        return CheckResult(
-            name="Container health",
-            ok=False,
-            detail=f"unhealthy: {names}",
+            detail=", ".join(bad),
         )
     return CheckResult(
-        name="Container health",
+        name="Pod health",
         ok=True,
-        detail=f"{len(spatium)} spatium containers running",
+        detail=f"{len(spatium)} spatium pods healthy",
     )
 
 
-def _check_api_reachable() -> CheckResult:
-    """The api can reach its own /health/live over localhost."""
-    import urllib.error  # noqa: PLC0415
-    import urllib.request  # noqa: PLC0415
+def _check_role_present(name_substring: str, label: str) -> CheckResult:
+    """Informational check for an optional role's pods.
 
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:8000/health/live", timeout=3) as resp:
-            ok = resp.status == 200
-            return CheckResult(
-                name="Internal API health",
-                ok=ok,
-                detail=f"HTTP {resp.status}",
-            )
-    except (TimeoutError, urllib.error.URLError, OSError) as exc:
-        return CheckResult(
-            name="Internal API health",
-            ok=False,
-            detail=str(exc),
-        )
-
-
-def _check_dhcp_running() -> CheckResult:
+    Returns OK when no matching pods exist (operator hasn't assigned
+    the role to this appliance) and OK when present + running. Only
+    flags failure when a matching pod exists but is unhealthy.
+    """
     try:
         rows = list_containers()
     except DockerUnavailableError as exc:
-        return CheckResult(name="DHCP daemon", ok=False, detail=f"docker unreachable: {exc}")
-    dhcp = [c for c in rows if "dhcp" in c.name.lower() and c.is_spatium]
-    if not dhcp:
+        return CheckResult(name=label, ok=False, detail=f"kubeapi unreachable: {exc}")
+    matched = [c for c in rows if name_substring in c.name.lower() and c.is_spatium]
+    if not matched:
         return CheckResult(
-            name="DHCP daemon",
-            ok=False,
-            detail="no dhcp container — DHCP profile not enabled?",
+            name=label,
+            ok=True,
+            detail="role not assigned to this appliance",
         )
-    running = [c for c in dhcp if c.state == "running"]
-    return CheckResult(
-        name="DHCP daemon",
-        ok=bool(running),
-        detail=", ".join(f"{c.name} ({c.state})" for c in dhcp),
-    )
-
-
-def _check_dns_container_running() -> CheckResult:
-    try:
-        rows = list_containers()
-    except DockerUnavailableError as exc:
-        return CheckResult(name="DNS daemon", ok=False, detail=f"docker unreachable: {exc}")
-    dns = [c for c in rows if "dns" in c.name.lower() and c.is_spatium]
-    if not dns:
+    bad = [
+        c
+        for c in matched
+        if not (c.state == "running" and c.health in (None, "healthy", "starting"))
+    ]
+    if bad:
         return CheckResult(
-            name="DNS daemon",
+            name=label,
             ok=False,
-            detail="no dns container — DNS profile not enabled?",
+            detail=", ".join(f"{c.name} ({c.status})" for c in bad),
         )
-    running = [c for c in dns if c.state == "running"]
     return CheckResult(
-        name="DNS daemon",
-        ok=bool(running),
-        detail=", ".join(f"{c.name} ({c.state})" for c in dns),
+        name=label,
+        ok=True,
+        detail=", ".join(f"{c.name} ({c.state})" for c in matched),
     )
 
 
@@ -280,7 +329,7 @@ def _redact_env(text: str) -> str:
 
 
 def generate_diagnostic_bundle() -> bytes:
-    """Build a zip with logs, container info, system info, redacted env.
+    """Build a zip with logs, pod info, system info, redacted env.
 
     Returns the zip bytes (in-memory; spatium installs are small
     enough this is fine — ~1-5 MB typical). Caller wraps it in a
@@ -307,7 +356,9 @@ def generate_diagnostic_bundle() -> bytes:
             _format_self_test_report(report),
         )
 
-        # Every host log file we can see
+        # Every host log file we can see (will be empty when no bind
+        # mount is present — that's the expected state on docker / K8s
+        # control planes and on agent-only appliances).
         for name in list_log_sources():
             try:
                 content = (_log_dir() / name).read_text(encoding="utf-8", errors="replace")
@@ -315,7 +366,7 @@ def generate_diagnostic_bundle() -> bytes:
             except OSError:
                 pass
 
-        # Last 500 lines for each spatium container's combined stdout/stderr
+        # Last 500 lines for each spatium pod's stdout/stderr via kubeapi.
         try:
             for c in list_containers():
                 if not c.is_spatium:
@@ -324,13 +375,13 @@ def generate_diagnostic_bundle() -> bytes:
                     logs = get_container_logs(c.name, tail=500)
                 except DockerUnavailableError as exc:
                     logs = f"[unable to fetch logs: {exc}]"
-                zf.writestr(f"containers/{c.name}.log", logs)
+                zf.writestr(f"pods/{c.name}.log", logs)
         except DockerUnavailableError as exc:
-            zf.writestr("containers/_error.txt", f"docker unreachable: {exc}")
+            zf.writestr("pods/_error.txt", f"kubeapi unreachable: {exc}")
 
         # Sanitised /etc/spatiumddi/.env if accessible. Not currently
-        # bind-mounted into the api container; the placeholder warns
-        # support reviewers if the env was unavailable.
+        # bind-mounted into the api pod by default; the placeholder
+        # warns support reviewers if the env was unavailable.
         if _HOST_ENV_FILE.is_file():
             try:
                 raw = _HOST_ENV_FILE.read_text(encoding="utf-8")
@@ -341,12 +392,12 @@ def generate_diagnostic_bundle() -> bytes:
             zf.writestr(
                 "config/env.unavailable",
                 "/etc/spatiumddi/.env is not bind-mounted into the api "
-                "container by default — operator can copy it manually "
-                "after running `sed -E 's/(PASSWORD|SECRET|KEY|TOKEN)=.*/\\1=[REDACTED]/i' /etc/spatiumddi/.env`.",
+                "pod by default — operator can copy it manually after "
+                "running `sed -E 's/(PASSWORD|SECRET|KEY|TOKEN)=.*/\\1=[REDACTED]/i' /etc/spatiumddi/.env`.",
             )
 
         # System info — uname, uptime, meminfo. /proc is in the api
-        # container's namespace which is fine: the host's kernel is
+        # pod's namespace which is fine: the host's kernel is
         # shared, so /proc/version reports the host kernel.
         for proc in ("/proc/version", "/proc/uptime", "/proc/meminfo", "/proc/cpuinfo"):
             try:

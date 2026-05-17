@@ -99,7 +99,7 @@ const TABS: TabSpec[] = [
     icon: ScrollText,
     selfOnly: true,
     summary:
-      'System log viewer wired to journalctl, the "Run self-test" health-check button (DNS resolution + DHCP issuance + web reachability), and the "Download diagnostic bundle" one-click zip with secrets redacted.',
+      'Host-log viewer (when bind-mounted), the "Run self-test" health-check button (DNS resolution + kubeapi reachability + pod health + role presence), and the "Download diagnostic bundle" one-click zip with secrets redacted.',
   },
   {
     key: "maintenance",
