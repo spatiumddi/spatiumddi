@@ -65,17 +65,19 @@ IMAGES=(
 # ``charts/spatiumddi-appliance/values.yaml`` ``observability.*``
 # image refs.
 OBSERVABILITY_IMAGES=(
-    "registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.13.0"
-    "quay.io/prometheus/node-exporter:v1.8.2"
+    "registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.18.0"
+    "quay.io/prometheus/node-exporter:v1.11.1"
     # Agent landing page — always-on nginx serving the rendered
     # /var/lib/spatiumddi/agent-landing/index.html on :80. Pinned to
-    # 1.27-alpine matching values.yaml's ``agentLanding.image.tag``.
-    "nginx:1.27-alpine"
+    # 1.30.1-alpine matching values.yaml's ``agentLanding.image.tag``.
+    "nginx:1.30.1-alpine"
     # Phase 11 (#183) — datastores for the AIO + Core control plane.
     # Tags follow the umbrella chart's ``postgresql.image.tag`` and
-    # ``redis.image.tag`` defaults.
+    # ``redis.image.tag`` defaults. Postgres stays on 16-alpine
+    # pending a dedicated PR with pg_upgrade migration tooling —
+    # PG18 refuses to start against a PG16 data directory.
     "postgres:16-alpine"
-    "redis:7-alpine"
+    "redis:8.6-alpine"
 )
 
 if ! command -v docker >/dev/null 2>&1; then

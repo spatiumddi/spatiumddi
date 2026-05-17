@@ -45,7 +45,7 @@ mkosi bakes everything the appliance needs to come up fully air-gapped:
 
 - **k3s static binary** (~70 MB) at `/usr/local/bin/k3s`; `kubectl` / `crictl` / `ctr` symlink to it.
 - **k3s airgap images** (CoreDNS / local-path / pause / metrics-server) as zst-compressed tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst`. k3s auto-imports them into containerd at boot.
-- **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:7-alpine for AIO / Core variants.
+- **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.6-alpine for AIO / Core variants.
 - **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Application installs; the umbrella chart drives AIO + Core. Built at release time + signed.
 - **bash-completion + `k` alias** for kubectl — operator SSHing in for triage drops straight into a usable shell.
 
