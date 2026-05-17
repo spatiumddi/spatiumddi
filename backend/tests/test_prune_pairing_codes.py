@@ -233,9 +233,7 @@ async def test_unrevoked_code_not_touched_by_revoked_bucket(db_session: AsyncSes
 async def test_expired_unclaimed_code_past_grace_is_pruned(db_session: AsyncSession) -> None:
     """An expired, unclaimed code well past the grace + retention window is pruned."""
     old_expiry = (
-        datetime.now(UTC)
-        - _GRACE_AFTER_EXPIRY
-        - timedelta(hours=EXPIRED_RETENTION_HOURS + 1)
+        datetime.now(UTC) - _GRACE_AFTER_EXPIRY - timedelta(hours=EXPIRED_RETENTION_HOURS + 1)
     )
     pc = _code(expires_at=old_expiry)
     db_session.add(pc)
@@ -273,9 +271,7 @@ async def test_expired_but_claimed_code_protected_by_exists_guard(
     bucket instead. With a recent claim it survives both buckets entirely.
     """
     old_expiry = (
-        datetime.now(UTC)
-        - _GRACE_AFTER_EXPIRY
-        - timedelta(hours=EXPIRED_RETENTION_HOURS + 1)
+        datetime.now(UTC) - _GRACE_AFTER_EXPIRY - timedelta(hours=EXPIRED_RETENTION_HOURS + 1)
     )
     pc = _code(expires_at=old_expiry)
     db_session.add(pc)
@@ -287,8 +283,8 @@ async def test_expired_but_claimed_code_protected_by_exists_guard(
 
     result = await _sweep()
 
-    assert result["expired_removed"] == 0   # blocked by EXISTS guard
-    assert result["claimed_removed"] == 0   # claim is too recent
+    assert result["expired_removed"] == 0  # blocked by EXISTS guard
+    assert result["claimed_removed"] == 0  # claim is too recent
     assert await _count(db_session) == 1
 
 
@@ -350,9 +346,7 @@ async def test_three_buckets_each_remove_one(db_session: AsyncSession) -> None:
 
     # 3. Old expired, unclaimed code
     old_expiry = (
-        datetime.now(UTC)
-        - _GRACE_AFTER_EXPIRY
-        - timedelta(hours=EXPIRED_RETENTION_HOURS + 1)
+        datetime.now(UTC) - _GRACE_AFTER_EXPIRY - timedelta(hours=EXPIRED_RETENTION_HOURS + 1)
     )
     pc_expired = _code(expires_at=old_expiry)
     db_session.add(pc_expired)

@@ -82,9 +82,7 @@ async def _sweep() -> dict[str, int]:
 
         # Expired-without-claim: past the grace window, not revoked,
         # and no PairingClaim rows exist for this code.
-        no_claims_subq = (
-            ~exists().where(PairingClaim.pairing_code_id == PairingCode.id)
-        )
+        no_claims_subq = ~exists().where(PairingClaim.pairing_code_id == PairingCode.id)
         expired_del = await db.execute(
             delete(PairingCode).where(
                 PairingCode.revoked_at.is_(None),
