@@ -3,12 +3,7 @@
 set -eu
 
 : "${CONTROL_PLANE_URL:?CONTROL_PLANE_URL is required}"
-# See bind9/entrypoint.sh for the rationale — accept either the long
-# PSK or a #169 pairing code; Python resolver picks one.
-if [ -z "${DNS_AGENT_KEY:-}" ] && [ -z "${BOOTSTRAP_PAIRING_CODE:-}" ]; then
-    echo "entrypoint: one of DNS_AGENT_KEY or BOOTSTRAP_PAIRING_CODE must be set" >&2
-    exit 1
-fi
+: "${DNS_AGENT_KEY:?DNS_AGENT_KEY is required (issue #246: pairing-code exchange was removed in #170 Wave A3 — paste the long hex key directly; Application appliances receive it via the supervisor's role-compose.env automatically)}"
 
 # Ensure state + LMDB dirs are writable by the agent user.
 mkdir -p /var/lib/spatium-dns-agent /var/lib/powerdns

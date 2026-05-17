@@ -22,6 +22,44 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Fixed
+
+- **`dns-agent-stale-sweep` beat task never fired (#217).**
+  `celery_app.py:51` set ``celery_app.conf.beat_schedule =
+  {"dns-agent-stale-sweep": ...}``, then the very next call
+  ``celery_app.conf.update(beat_schedule={...})`` silently
+  overwrote the whole schedule. The stale-sweep task is defined
+  but never enqueued — DNS agents whose heartbeat goes stale stay
+  ``status='active'`` in the UI forever. Moved the entry into the
+  ``conf.update(beat_schedule=...)`` dict alongside the other 30+
+  beat entries.
+- **Operator Copilot daily digest never sent (#218).**
+  ``app.tasks.ai_digest`` is referenced in ``task_routes`` (line
+  102) and the ``ai-daily-digest`` ``crontab(hour=8, minute=0)``
+  entry (line 350) but was missing from the worker's
+  ``include=[...]`` list. The 08:00 UTC cron fires every day and
+  the worker rejects it as ``Received unregistered task of type
+  'app.tasks.ai_digest.send_daily_digest'``. Added to the
+  include list.
+- **DNS + DHCP agents infinite-retried against removed `/pair`
+  endpoint (#246).** The pairing-code → PSK exchange was
+  retired under #170 Wave A3 (`POST /api/v1/appliance/pair`
+  was removed; pairing now flows through
+  `POST /api/v1/appliance/supervisor/register` instead). The
+  agent's ``pairing.py`` module still POSTed to ``/pair`` on
+  bootstrap when ``BOOTSTRAP_PAIRING_CODE`` was set — got a 404
+  + retried forever. Deleted ``pairing.py`` from both
+  ``agent/dns/spatium_dns_agent/`` and
+  ``agent/dhcp/spatium_dhcp_agent/``, plus their tests; updated
+  ``bootstrap.py`` + ``config.py`` to use the long
+  ``DNS_AGENT_KEY`` / ``SPATIUM_AGENT_KEY`` directly; tightened
+  the three container entrypoint pre-checks back to require the
+  PSK. Application appliances are unaffected — the supervisor
+  injects the per-role keys via ``role-compose.env`` (#170
+  Wave C2). Operators on standalone docker-compose / K8s installs
+  who had been pasting a pairing code instead of the long key
+  must switch to the long key.
+
 ### Changed
 
 - **Bumped four bundled images.** kube-state-metrics

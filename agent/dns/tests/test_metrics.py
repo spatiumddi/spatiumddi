@@ -48,7 +48,6 @@ def _poller(tmp_path: Path) -> MetricsPoller:
     cfg = AgentConfig(
         control_plane_url="http://api.invalid",
         dns_agent_key="unused",
-        bootstrap_pairing_code="",
         server_name="dns-test",
         driver="bind9",
         roles=["authoritative"],

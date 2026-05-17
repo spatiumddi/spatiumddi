@@ -62,7 +62,6 @@ def _poller(tmp_path) -> MetricsPoller:
     cfg = AgentConfig(
         control_plane_url="http://api.invalid",
         agent_key="unused",
-        bootstrap_pairing_code="",
         server_name="dhcp-test",
         state_dir=tmp_path,
         kea_config_path=tmp_path / "kea.conf",

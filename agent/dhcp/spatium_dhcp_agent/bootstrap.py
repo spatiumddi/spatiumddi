@@ -1,10 +1,15 @@
 """Bootstrap / registration loop for the DHCP agent.
 
 Tries the cached JWT first; on 401 (or missing) falls back to PSK
-registration against ``POST /api/v1/dhcp/agents/register``. The PSK
-itself is resolved through ``pairing.resolve_bootstrap_key`` so
-operators can supply either ``SPATIUM_AGENT_KEY`` (long hex string)
-or ``BOOTSTRAP_PAIRING_CODE`` (8-digit short-lived code via #169).
+registration against ``POST /api/v1/dhcp/agents/register`` using
+``cfg.agent_key``.
+
+Issue #246 — the pairing-code → PSK exchange via
+``POST /api/v1/appliance/pair`` that this module used to do was
+removed under #170 Wave A3. Standalone docker-compose / K8s DHCP
+agents now require ``SPATIUM_AGENT_KEY`` directly; Application
+appliances receive the key via the supervisor's ``role-compose.env``
+(#170 Wave C2).
 """
 
 from __future__ import annotations
@@ -19,7 +24,6 @@ import structlog
 from . import __version__
 from .cache import load_or_create_agent_id, load_token, save_token
 from .config import AgentConfig
-from .pairing import resolve_bootstrap_key
 
 log = structlog.get_logger(__name__)
 
@@ -39,15 +43,13 @@ def _client(cfg: AgentConfig) -> httpx.Client:
 
 
 def register(cfg: AgentConfig) -> tuple[str, str, dict]:
-    """Perform PSK bootstrap. Returns (agent_id, token, response_body)."""
+    """Perform PSK bootstrap. Returns (agent_id, token, response_body).
+
+    Requires ``SPATIUM_AGENT_KEY`` set in the environment (validated in
+    ``AgentConfig.from_env``).
+    """
     agent_id = load_or_create_agent_id(cfg.state_dir)
-    bootstrap_key = resolve_bootstrap_key(
-        explicit_key=cfg.agent_key,
-        pairing_code=cfg.bootstrap_pairing_code,
-        state_dir=cfg.state_dir,
-        hostname=cfg.server_name,
-        client_factory=lambda: _client(cfg),
-    )
+    bootstrap_key = cfg.agent_key
     body = {
         "hostname": cfg.server_name,
         "driver": "kea",

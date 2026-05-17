@@ -44,16 +44,10 @@ celery_app = Celery(
         "app.tasks.asn_whois_refresh",
         "app.tasks.rpki_roa_refresh",
         "app.tasks.domain_whois_refresh",
+        "app.tasks.ai_digest",
         "app.tasks.audit_chain_verify",
     ],
 )
-
-celery_app.conf.beat_schedule = {
-    "dns-agent-stale-sweep": {
-        "task": "app.tasks.dns.agent_stale_sweep",
-        "schedule": 60.0,
-    },
-}
 
 celery_app.conf.update(
     task_serializer="json",
@@ -103,6 +97,17 @@ celery_app.conf.update(
         "app.tasks.audit_chain_verify.*": {"queue": "default"},
     },
     beat_schedule={
+        # Every 60 s, mark DNS agents as ``unreachable`` if their
+        # heartbeat hasn't been seen within the staleness window
+        # (issue #217 — this entry used to live in a separate
+        # ``celery_app.conf.beat_schedule = {...}`` assignment that
+        # was silently clobbered by this ``conf.update(beat_schedule
+        # =...)`` call, so the sweep never fired and stale agents
+        # stayed ``status='active'`` forever).
+        "dns-agent-stale-sweep": {
+            "task": "app.tasks.dns.agent_stale_sweep",
+            "schedule": schedule(run_every=60.0),
+        },
         # Every 60s, fan-out health checks to every registered DNS server.
         "dns-health-sweep": {
             "task": "app.tasks.dns.check_all_dns_servers_health",
