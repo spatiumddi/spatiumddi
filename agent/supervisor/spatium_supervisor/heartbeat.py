@@ -95,13 +95,27 @@ _CAPABILITY_FLAGS = ("can_run_dns_bind9", "can_run_dns_powerdns", "can_run_dhcp"
 
 
 def _detect_storage_type() -> str:
-    """Return ``"ssd"`` / ``"hdd"`` / ``"unknown"`` based on the root
-    block device's ``rotational`` flag. The supervisor reads /sys/
-    via the host bind mount; rotational=0 → ssd, =1 → hdd."""
+    """Return ``"ssd"`` / ``"hdd"`` / ``"unknown"`` for the host's
+    root block device.
+
+    Phase 10 follow-up: the supervisor runs inside a k3s pod so its
+    own /proc/mounts shows ``overlay`` mounted at / — the
+    ``/dev/<name>`` parse below always falls through to "unknown".
+    Fix: firstboot writes a sidecar at /var/lib/spatiumddi-host/
+    release-state/host-storage-type (mounted into the pod via the
+    existing release-state hostPath) with the host-detected value.
+    Read that first; fall back to in-pod detection for non-
+    appliance deployments where the sidecar isn't present.
+    """
+    sidecar = Path("/var/lib/spatiumddi-host/release-state/host-storage-type")
+    if sidecar.exists():
+        try:
+            value = sidecar.read_text(encoding="utf-8").strip()
+            if value in ("ssd", "hdd", "unknown"):
+                return value
+        except OSError:
+            pass
     try:
-        # /proc/mounts identifies what's mounted on / — first whitespace
-        # field is the source device. Strip ``/dev/`` + any trailing
-        # digits (sda3 → sda, nvme0n1p3 → nvme0n1).
         with open("/proc/mounts", "r", encoding="utf-8") as fh:
             for line in fh:
                 parts = line.split()
@@ -109,11 +123,8 @@ def _detect_storage_type() -> str:
                     dev = parts[0]
                     if dev.startswith("/dev/"):
                         name = dev[5:]
-                        # Strip trailing partition digits, but preserve
-                        # nvme's pN suffix by stripping until a non-digit.
                         while name and name[-1].isdigit():
                             name = name[:-1]
-                        # nvme0n1p3 → nvme0n1p → nvme0n1 (one more strip)
                         if name.endswith("p"):
                             name = name[:-1]
                         rot_path = f"/sys/block/{name}/queue/rotational"

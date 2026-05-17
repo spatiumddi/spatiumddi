@@ -1049,7 +1049,7 @@ function ApplianceDrilldownModal({
 
   return (
     <Modal title={`Appliance · ${row.hostname}`} onClose={onClose} wide>
-      <div className="space-y-4 text-sm">
+      <div className="divide-y divide-border text-sm [&>*]:pt-4 [&>*:first-child]:pt-0 [&>*]:pb-4 [&>*:last-child]:pb-0">
         <div className="flex flex-wrap items-center gap-2">
           <span
             className={cn(
@@ -1178,7 +1178,7 @@ function ApplianceDrilldownModal({
           </div>
         )}
 
-        <div className="flex flex-wrap justify-end gap-2 border-t pt-3">
+        <div className="flex flex-wrap justify-end gap-2">
           {row.state === "pending_approval" ? (
             <>
               <button

@@ -82,6 +82,42 @@ mkdir -p /var/lib/spatiumddi/release-state /var/log/spatiumddi
 chmod 1777 /var/lib/spatiumddi/release-state
 chmod 0755 /var/log/spatiumddi
 
+# Detect the host's root block device's rotational flag so the
+# supervisor pod (which can't see the host's /proc/mounts properly —
+# its container view shows ``overlay`` mounted at /) can surface
+# "ssd" / "hdd" in the Fleet UI's capabilities block. Write to a
+# sidecar in release-state; the supervisor reads it on every
+# heartbeat. ``unknown`` written on detection failure.
+{
+    detected="unknown"
+    while read -r src mount _; do
+        [ "$mount" = "/" ] || continue
+        case "$src" in
+            /dev/*)
+                name="${src#/dev/}"
+                # Strip trailing partition digits, but preserve nvme's
+                # pN suffix by stripping until a non-digit then one
+                # more strip if it ends with 'p'.
+                while [ -n "$name" ] && [ -z "${name##*[0-9]}" ]; do
+                    name="${name%?}"
+                done
+                case "$name" in *p) name="${name%p}";; esac
+                if [ -r "/sys/block/$name/queue/rotational" ]; then
+                    rot=$(cat "/sys/block/$name/queue/rotational")
+                    if [ "$rot" = "1" ]; then
+                        detected="hdd"
+                    else
+                        detected="ssd"
+                    fi
+                fi
+                ;;
+        esac
+        break
+    done < /proc/mounts
+    printf '%s\n' "$detected" > /var/lib/spatiumddi/release-state/host-storage-type
+    chmod 0644 /var/lib/spatiumddi/release-state/host-storage-type
+}
+
 # k3s's auto-deploy manifests dir. k3s creates this on first start,
 # but firstboot races k3s.service so we may get here first. Pre-
 # create with permissive perms so the supervisor / helm-controller
