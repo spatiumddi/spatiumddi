@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlencode
 
 import httpx
 import structlog
 from joserfc import jwt
+from joserfc._keys import KeySetSerialization
 from joserfc.errors import JoseError
 from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
@@ -108,15 +109,15 @@ async def _fetch_discovery(cfg: OIDCConfig, provider_id: str) -> dict[str, Any]:
     return doc
 
 
-async def _fetch_jwks(jwks_uri: str, provider_id: str) -> dict[str, Any]:
+async def _fetch_jwks(jwks_uri: str, provider_id: str) -> KeySetSerialization:
     cached = _JWKS_CACHE.get(provider_id) if provider_id else None
     if cached and cached[1] > time.time():
-        return cached[0]
+        return cast(KeySetSerialization, cached[0])
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(jwks_uri)
             r.raise_for_status()
-            jwks = r.json()
+            jwks = cast(KeySetSerialization, r.json())
     except httpx.HTTPError as exc:
         raise OIDCServiceError(f"JWKS fetch failed: {exc}") from exc
     if provider_id:
