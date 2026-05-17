@@ -40,6 +40,11 @@ MAX_BATCH = 50
 BATCH_INTERVAL = 10.0
 MAX_BUFFER_SIZE = 5_000
 
+# Issue #257 — retention window on ``_ShipperState.last_seen_macs``.
+# The dedupe window in ``_on_packet`` is 60 s; anything older than
+# 5× that is dead weight that can be safely evicted on each flush.
+_LAST_SEEN_RETENTION = 300.0
+
 # DHCP message-type values (option 53). 1 = DISCOVER, 3 = REQUEST.
 # We intentionally ignore OFFER / ACK / NAK / RELEASE because those
 # come from the server side and don't carry the client's parameter
@@ -288,6 +293,31 @@ class DhcpFingerprintShipper:
             self._state.buffer = self._state.buffer[MAX_BATCH:]
         return batch
 
+    def _prune_last_seen(self, now: float) -> None:
+        """Drop entries from ``last_seen_macs`` whose age exceeds
+        ``LAST_SEEN_RETENTION``.
+
+        Issue #257 — ``last_seen_macs`` is a dedupe ledger keyed on
+        MAC address with a 60 s dedupe window (see ``_on_packet``).
+        Pre-#257 the dict accumulated one entry per unique MAC for
+        the lifetime of the agent and never pruned; on a busy DHCP
+        server with thousands of clients this is a steady memory
+        leak. We retain 5× the dedupe window's worth of entries so a
+        client renewing every 60 s still gets deduped, but anything
+        idle for >5 min is dead weight.
+        """
+        cutoff = now - _LAST_SEEN_RETENTION
+        with self._lock:
+            stale = [
+                mac
+                for mac, ts in self._state.last_seen_macs.items()
+                if ts < cutoff
+            ]
+            for mac in stale:
+                del self._state.last_seen_macs[mac]
+        if stale:
+            log.debug("dhcp_fingerprint_pruned_last_seen", count=len(stale))
+
     def _should_flush(self) -> bool:
         with self._lock:
             buf_len = len(self._state.buffer)
@@ -298,6 +328,10 @@ class DhcpFingerprintShipper:
         return (time.monotonic() - self._last_flush) >= BATCH_INTERVAL
 
     def _flush(self) -> None:
+        # Piggyback the dedupe-ledger prune on every flush — same
+        # cadence as the wire-side batching, single lock acquisition
+        # we already take for ``_drain``.
+        self._prune_last_seen(time.monotonic())
         batch = self._drain()
         if not batch:
             return
