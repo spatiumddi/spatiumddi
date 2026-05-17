@@ -4,6 +4,7 @@ These tests exercise the full exchange_code() path using real RSA-signed JWTs
 and httpx.MockTransport so that no internal functions are patched.
 All HTTP I/O (discovery, JWKS, token endpoint, userinfo) runs through the mock.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -131,6 +132,7 @@ class TestExchangeCodeHappyPath:
     @pytest.fixture(autouse=True)
     def _clear_cache(self):
         from app.core.auth.oidc import invalidate_caches
+
         invalidate_caches("test-provider")
         yield
         invalidate_caches("test-provider")
@@ -138,6 +140,7 @@ class TestExchangeCodeHappyPath:
     @pytest.fixture
     def cfg(self):
         from app.core.auth.oidc import OIDCConfig
+
         return OIDCConfig(
             discovery_url=f"{ISSUER}/.well-known/openid-configuration",
             client_id=CLIENT_ID,
@@ -190,6 +193,7 @@ class TestExchangeCodeTokenValidation:
     @pytest.fixture(autouse=True)
     def _clear_cache(self):
         from app.core.auth.oidc import invalidate_caches
+
         invalidate_caches("val-provider")
         yield
         invalidate_caches("val-provider")
@@ -197,6 +201,7 @@ class TestExchangeCodeTokenValidation:
     @pytest.fixture
     def cfg(self):
         from app.core.auth.oidc import OIDCConfig
+
         return OIDCConfig(
             discovery_url=f"{ISSUER}/.well-known/openid-configuration",
             client_id=CLIENT_ID,
@@ -251,7 +256,9 @@ class TestExchangeCodeTokenValidation:
         token = _mint()
         # Flip last char to corrupt signature
         tampered = token[:-4] + ("AAAA" if token[-4:] != "AAAA" else "BBBB")
-        with patch("app.core.auth.oidc.httpx.AsyncClient", _patched_client(_make_transport(tampered))):
+        with patch(
+            "app.core.auth.oidc.httpx.AsyncClient", _patched_client(_make_transport(tampered))
+        ):
             with pytest.raises(OIDCServiceError, match="ID token invalid"):
                 await exchange_code(cfg, "val-provider", "tampered", "https://app/cb", NONCE)
 
@@ -318,4 +325,5 @@ class TestInvalidateCaches:
 
     def test_invalidate_unknown_provider_is_noop(self):
         from app.core.auth.oidc import invalidate_caches
+
         invalidate_caches("nonexistent-provider-xyz")  # must not raise
