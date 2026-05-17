@@ -22,6 +22,46 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 2026.05.17-4 — 2026-05-17
+
+Third hotfix in the chain. With #201 + #203 the bake script + sudo
+env-passthrough were fixed and the bake itself succeeded on the
+2026.05.17-3 release-workflow run: 11 images, 382 MB written into
+the rootfs overlay. But the workflow's post-bake verification then
+errored at `ls: cannot access 'appliance/mkosi.extra/usr/lib/spatiumddi/docker-overlay.img':
+No such file or directory`. The path is from the pre-#183 era when
+`bake-images.sh` ran a docker-in-docker sandbox to populate
+`/var/lib/docker` and rsynced it into a per-slot overlay image; the
+post-#183 path writes per-image `.tar.zst` tarballs to
+`var/lib/rancher/k3s/agent/images/` for k3s's containerd to auto-
+import at startup. The bake step's verification was never updated
+to match. Fixed.
+
+### Fixed
+
+- **`build-appliance-iso` post-bake verification looked for a
+  pre-#183 docker-overlay.img.** Replaced with an `ls -lh` +
+  `du -sh` against the post-#183 tarball directory the bake script
+  actually populates.
+
+### Changed
+
+- **Appliance operator-facing docs caught up to k3s.**
+  `appliance/README.md` and `appliance/cloud-init/README.md` still
+  described the pre-#183 first-boot flow (`docker compose pull && up
+  -d`) + referenced the now-gone `mkosi.extra/usr/local/share/
+  spatiumddi/docker-compose.yml` artifact. Rewritten to describe the
+  k3s flow: firstboot renders a variant-specific HelmChart manifest
+  into `/var/lib/rancher/k3s/server/manifests/`; k3s containerd
+  auto-imports the per-image tarballs at `/var/lib/rancher/k3s/
+  agent/images/*.tar.zst` so a fresh boot never reaches out to
+  ghcr.io; helm-controller installs the chart tarball baked at
+  `/usr/lib/spatiumddi/charts/`.
+- **`spatium-console` skipped the loop-mounted `/var/lib/spatiumddi/
+  docker-overlay/` mount in the disk panel** — dead skip rule from
+  the docker-overlay era (the path doesn't exist post-#183). Rule +
+  the two comment blocks that referenced it removed.
+
 ## 2026.05.17-3 — 2026-05-17
 
 Second hotfix on top of -2. The release-workflow's

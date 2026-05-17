@@ -118,8 +118,10 @@ At runtime, **live-boot** (baked into the appliance's initrd by
 `mkosi.conf` Packages=) detects the boot medium, loop-mounts
 `/live/filesystem.squashfs` from the ISO, and overlays it with a
 tmpfs so writes work in RAM. The `spatiumddi-firstboot` service
-then runs the same way as on the qcow2 (docker compose up, wait for
-`/health/live`).
+then runs the same way as on the qcow2: writes the variant-specific
+HelmChart manifest into `/var/lib/rancher/k3s/server/manifests/`,
+starts k3s, and polls `/health/live` until the api pod reports
+ready.
 
 Verify the boot records with `xorriso -indev <iso> -report_el_torito plain`.
 
@@ -175,7 +177,7 @@ appliance/
 │       │   ├── spatiumddi-firstboot        # boot-time orchestrator
 │       │   └── spatiumddi-stack-status     # operator status command
 │       └── share/spatiumddi/
-│           └── docker-compose.yml          # all-in-one stack
+│           └── (k3s manifest templates rendered by firstboot)
 ├── builder/
 │   ├── Dockerfile           # the appliance-builder image (mkosi + qemu-img + xorriso + ...)
 │   └── .dockerignore
@@ -189,13 +191,23 @@ appliance/
 
 ## Customising the stack
 
-Compose file: `mkosi.extra/usr/local/share/spatiumddi/docker-compose.yml`.
-Track tag-for-tag with the top-level `docker-compose.yml`; appliance
-deltas should stay surgical (no profile clutter, no docker-volume
-opt-ins, no host-socket mounts).
+The appliance is k3s-driven post-#183. `spatiumddi-firstboot` renders
+one of three variant-specific HelmChart manifests (Application /
+All-in-One / Core-only) into `/var/lib/rancher/k3s/server/manifests/`
+on every boot and k3s's helm-controller installs the chart tarball
+baked at `/usr/lib/spatiumddi/charts/`. Chart values are filled in
+from `/etc/spatiumddi/.env` (secrets + agent keys + control-plane
+URL + appliance role).
 
-To pin a release tag instead of `:latest`, drop a
-`/etc/spatiumddi/release` file via cloud-init `write_files` — see
+To customise an existing install:
+- Operator-pasted overrides live in `/etc/spatiumddi/` (preserved
+  across slot swaps via the `/etc` overlay → `/var/persist/etc`).
+- Per-role firewall extras land in `appliance.firewall_extra` on the
+  control plane — rendered by the supervisor into
+  `/etc/nftables.d/spatium-role.nft`.
+
+To pin a release tag, drop a `/etc/spatiumddi/release` file via
+cloud-init `write_files` — see
 [cloud-init/README.md](cloud-init/README.md).
 
 ## What this MVP does NOT do (yet)
@@ -209,10 +221,8 @@ Tracked in [#134](https://github.com/spatiumddi/spatiumddi/issues/134):
 
 Other gaps Phase 1 surfaces but doesn't close:
 - No SBOM / GPG signing on the produced qcow2
-- No `make appliance` CI workflow yet (the builder-image publish
-  workflow ships, but there's no nightly/per-tag artifact build)
 - Stack health waits on `/health/live` only — does not verify DNS /
   DHCP agents finished registration
-- No host-level Prometheus exporters baked in
-- Debian's `docker-compose` (Python v1) — switch to upstream Docker
-  CE + `docker compose` plugin in Phase 1.x
+- No host-level Prometheus exporters baked in (the `observability`
+  Helm chart values flag enables kube-state-metrics + node-exporter
+  on-demand; both images are baked into the slot)
