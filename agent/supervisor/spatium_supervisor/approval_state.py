@@ -50,11 +50,14 @@ from typing import Literal
 ApprovalState = Literal["pending", "approved", "revoked"]
 
 # Number of consecutive 403/404 heartbeats before we flip to
-# ``revoked``. Three is a good balance: long enough that a short
-# control-plane restart (~30-60 s) doesn't trip a false revocation,
-# short enough that a real deletion is reflected within ~3 min so an
-# operator at the console isn't confused for long.
-REVOCATION_STRIKE_LIMIT = 3
+# ``revoked``. Two strikes × 60s heartbeat = ~2 min from operator
+# click to services going dark — short enough to feel responsive,
+# long enough that a single missed heartbeat (transient network
+# blip) doesn't trip a false revocation. Phase 9 (#183) dropped
+# this from 3 to 2 after live-testing the revocation flow felt
+# slow; a real control-plane restart takes seconds, not minutes,
+# so the previous "30-60 s outage tolerance" was overkill.
+REVOCATION_STRIKE_LIMIT = 2
 
 _STATE_FILE = "approval-state"
 _STRIKES_FILE = "revocation-strikes"

@@ -177,8 +177,11 @@ def main() -> int:
     # to spawn even on legacy compose deployments. The proxy is
     # net-new for #183; pre-#183 control planes don't enqueue
     # anything so the loop just sees empty polls.
-    identity_for_proxy, _ = load_or_generate(cfg.state_dir)
-    start_proxy_thread(cfg, identity_for_proxy)
+    if cfg.k8s_proxy_enabled:
+        identity_for_proxy, _ = load_or_generate(cfg.state_dir)
+        start_proxy_thread(cfg, identity_for_proxy)
+    else:
+        log.info("supervisor.k8s_proxy.disabled_by_config")
 
     stop = False
 

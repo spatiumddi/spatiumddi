@@ -1852,90 +1852,132 @@ def do_monitor(console: Console, tty: str) -> None:
 
 
 def do_containers(console: Console, tty: str) -> None:
-    """Stream ``kubectl top pod`` + ``kubectl get pods`` until the
-    operator quits.
+    """Pod picker → per-pod log streamer.
 
-    Issue #183 Phase 7 — the appliance is k3s-only; this used to
-    hand off to ``docker stats``. ``kubectl top pod -A`` is the
-    closest equivalent (per-pod CPU + memory live), but it depends
-    on metrics-server which we deliberately leave disabled by
-    default (see ``charts/spatiumddi-appliance/templates/`` —
-    metrics-server lands as an optional Phase 8 observability add-
-    on). Fall through to ``kubectl get pods -A -w`` when metrics-
-    server isn't installed; the operator at least sees pod
-    transitions live.
+    Issue #183 Phase 9 — list every pod with a numbered shortcut,
+    prompt the operator to pick one, then ``kubectl logs -f`` until
+    Ctrl-C. Loop back to the picker; q exits to the dashboard.
+
+    Previously F3 streamed ``kubectl top pod`` (metrics-server-
+    dependent) or fell through to a watch on all pods. Watch is
+    useful for "did anything change" but operators triaging a real
+    incident actually need logs. The new design: pick a pod, see
+    its logs, ctrl-C, pick another.
     """
-    console.clear()
-    console.print(
-        "[bold]kubectl — Ctrl-C to return to the dashboard.[/bold]\n"
-    )
     _prepare_tty_for_subprocess(tty)
     env = {**os.environ, "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"}
+
     try:
         with open(tty, "r+b", buffering=0) as tty_io:
-            # Try kubectl top first; fall back to get -w if metrics-
-            # server isn't installed (rc != 0 on first invocation).
-            top = subprocess.run(
-                [
-                    "/usr/local/bin/k3s",
-                    "kubectl",
-                    "top",
-                    "pod",
-                    "-A",
-                    "--no-headers",
-                ],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=3,
-            )
-            if top.returncode == 0:
-                # Operator wants live updates — loop with sleep.
+            while True:
+                console.clear()
+                console.print("[bold]F3 — Pods (logs viewer)[/bold]")
                 console.print(
-                    "[dim]kubectl top pod -A (refreshes every 3 s)[/dim]\n"
+                    "[dim]Pick a number to tail logs (Ctrl-C exits "
+                    "logs view), or q to return to dashboard.[/dim]\n"
                 )
-                while True:
-                    subprocess.run(
-                        [
-                            "/usr/local/bin/k3s",
-                            "kubectl",
-                            "top",
-                            "pod",
-                            "-A",
-                        ],
-                        env=env,
-                        stdin=tty_io,
-                        stdout=tty_io,
-                        stderr=tty_io,
-                        check=False,
+
+                # Re-fetch the pod list on each iteration so a pod
+                # that crashed or got rescheduled between picks shows
+                # its new state.
+                proc = subprocess.run(
+                    [
+                        "/usr/local/bin/k3s", "kubectl",
+                        "get", "pods", "-A", "-o", "wide",
+                        "--no-headers",
+                    ],
+                    env=env, capture_output=True, text=True, timeout=5,
+                )
+                if proc.returncode != 0:
+                    console.print(
+                        f"[red]kubectl get pods failed: "
+                        f"{proc.stderr.strip()[:200]}[/red]"
                     )
                     time.sleep(3)
-            else:
+                    return
+
+                # Each line: NAMESPACE NAME READY STATUS RESTARTS AGE IP NODE …
+                pods: list[tuple[str, str, str]] = []  # (ns, name, status)
+                for line in proc.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        pods.append((parts[0], parts[1], parts[3]))
+
+                if not pods:
+                    console.print("[dim]No pods found.[/dim]")
+                    time.sleep(2)
+                    return
+
+                # Two-column numbered list. Same sort as the dashboard
+                # Pods panel (spatium first, then kube-system, then
+                # alphabetical).
+                def _ns_rank(ns: str) -> tuple[int, str]:
+                    if ns == "spatium":
+                        return (0, ns)
+                    if ns == "kube-system":
+                        return (1, ns)
+                    return (2, ns)
+
+                pods.sort(key=lambda p: (_ns_rank(p[0]), p[1]))
+
+                for i, (ns, name, status) in enumerate(pods, 1):
+                    status_color = (
+                        "green" if status == "Running"
+                        else "yellow" if status in ("Pending", "ContainerCreating")
+                        else "red" if status in ("Error", "CrashLoopBackOff")
+                        else "dim"
+                    )
+                    console.print(
+                        f"  [bold cyan]{i:>2}[/bold cyan]  "
+                        f"[dim]{ns:<14}[/dim] {name}  "
+                        f"[{status_color}]{status}[/{status_color}]"
+                    )
+
+                console.print("")
+                try:
+                    answer = input("Pick (number/q): ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    return
+                if not answer or answer == "q":
+                    return
+
+                try:
+                    pick = int(answer)
+                except ValueError:
+                    console.print("[red]Not a number.[/red]")
+                    time.sleep(1)
+                    continue
+
+                if not (1 <= pick <= len(pods)):
+                    console.print(
+                        f"[red]Out of range (1-{len(pods)}).[/red]"
+                    )
+                    time.sleep(1)
+                    continue
+
+                ns, name, _ = pods[pick - 1]
+                console.clear()
                 console.print(
-                    "[dim]metrics-server not installed — falling back "
-                    "to kubectl get pods -A -w[/dim]\n"
+                    f"[bold]kubectl logs -f -n {ns} {name}[/bold]  "
+                    f"[dim](Ctrl-C to return to picker)[/dim]\n"
                 )
-                subprocess.run(
-                    [
-                        "/usr/local/bin/k3s",
-                        "kubectl",
-                        "get",
-                        "pods",
-                        "-A",
-                        "-o",
-                        "wide",
-                        "-w",
-                    ],
-                    env=env,
-                    stdin=tty_io,
-                    stdout=tty_io,
-                    stderr=tty_io,
-                    check=False,
-                )
-    except (KeyboardInterrupt, OSError) as exc:
-        if isinstance(exc, OSError):
-            console.print(f"[red]Failed to open {tty}: {exc}[/red]")
-            time.sleep(3)
+                try:
+                    subprocess.run(
+                        [
+                            "/usr/local/bin/k3s", "kubectl",
+                            "logs", "-f", "--tail=200",
+                            "-n", ns, name,
+                        ],
+                        env=env,
+                        stdin=tty_io, stdout=tty_io, stderr=tty_io,
+                        check=False,
+                    )
+                except KeyboardInterrupt:
+                    pass
+                # Loop back to picker.
+    except OSError as exc:
+        console.print(f"[red]Failed to open {tty}: {exc}[/red]")
+        time.sleep(3)
 
 
 def do_network(console: Console, tty: str) -> None:

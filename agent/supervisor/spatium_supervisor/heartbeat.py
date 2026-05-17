@@ -688,12 +688,18 @@ def heartbeat_once(
     # operator can inspect what the supervisor would do next.
     role_assignment = body_out.get("role_assignment") or {}
 
-    # #170 Wave C3 — render + apply the nftables drop-in *before*
-    # the compose env so the firewall lands before the matching
-    # service container would start (when C3's compose subprocess
-    # lands). Even today, no-op on docker / k8s deployments via the
-    # appliance gate inside _maybe_apply_firewall.
-    _maybe_apply_firewall(role_assignment, log)
+    # #170 Wave C3 — render + apply the nftables drop-in. Phase 9
+    # (#183) gates this behind cfg.in_pod_firewall_enabled (default
+    # off): the supervisor runs in a k3s pod where the host's
+    # /etc/nftables.conf isn't visible, so `nft -f` fails on every
+    # heartbeat. The host's static /etc/nftables.conf already opens
+    # SSH/53/67/80/443 and the role pods use hostNetwork=true, so
+    # the in-pod drop-in is duplicative — kept here only for the
+    # operator-CIDR-allowlist (Phase 6 kubeapi_expose_cidrs) case,
+    # which needs a host-side trigger-file path before it works
+    # in-pod (Phase 9 follow-up).
+    if cfg.in_pod_firewall_enabled:
+        _maybe_apply_firewall(role_assignment, log)
 
     target = compute_target_env(role_assignment)
     # #170 Wave D follow-up — the role env file carries ONLY role-
