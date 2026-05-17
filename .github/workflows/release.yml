@@ -246,7 +246,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
         with:
-          version: v3.14.0
+          version: v3.20.2
       - name: Log in to GHCR
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" \
@@ -336,19 +336,20 @@ jobs:
           } > appliance/mkosi.extra/etc/spatiumddi/appliance-release
           echo "→ Stamped appliance-release:"
           cat appliance/mkosi.extra/etc/spatiumddi/appliance-release
-      - name: Install zstd + helm
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y zstd
-          # helm comes from its own apt repo (Debian/Ubuntu don't carry
-          # current helm). bake-chart.sh shells out to ``helm package``
-          # so it must be on PATH before the chart-bake steps.
-          curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
-          sudo apt-get update
-          sudo apt-get install -y helm
-          helm version
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Install helm
+        # Use the upstream-published azure/setup-helm action — it
+        # downloads the helm static binary from get.helm.sh (which
+        # resolves via the GitHub Releases CDN; reachable from the
+        # Azure runner). The Helm-stable apt repo at baltocdn.com is
+        # NOT reachable from GitHub Actions runners ("Could not resolve
+        # host: baltocdn.com" — Azure runner network policy).
+        # bake-chart.sh shells out to ``helm package`` so helm must be
+        # on PATH before the chart-bake step.
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.20.2
       - name: Fetch k3s binary + airgap tarball
         run: |
           set -euo pipefail

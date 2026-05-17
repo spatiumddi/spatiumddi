@@ -67,7 +67,7 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
-          version: v3.14.0
+          version: v3.20.2
 
       - name: Create kind cluster
         uses: helm/kind-action@v1
