@@ -64,10 +64,9 @@ export function ContainersTab() {
           </h2>
           <p className="mt-1 text-xs text-muted-foreground">
             All pods in the spatium namespace, listed via the api pod's
-            in-cluster ServiceAccount. SpatiumDDI-owned pods are pinned to
-            the top. Logs stream live (kubeapi ``follow=true``); Restart
-            deletes the pod so the owning Deployment / DaemonSet
-            recreates it.
+            in-cluster ServiceAccount. SpatiumDDI-owned pods are pinned to the
+            top. Logs stream live (kubeapi ``follow=true``); Restart deletes the
+            pod so the owning Deployment / DaemonSet recreates it.
           </p>
         </div>
         <button
@@ -95,8 +94,8 @@ export function ContainersTab() {
         </div>
       ) : !data || data.length === 0 ? (
         <div className="rounded-lg border border-dashed bg-muted/30 px-6 py-12 text-center text-sm text-muted-foreground">
-          No pods visible. The api's ServiceAccount may not be wired up —
-          check the chart's ``api.serviceAccount.enabled`` value.
+          No pods visible. The api's ServiceAccount may not be wired up — check
+          the chart's ``api.serviceAccount.enabled`` value.
         </div>
       ) : (
         <div className="space-y-2">

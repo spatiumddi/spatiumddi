@@ -71,10 +71,10 @@ function SelfTestCard() {
             Self-test
           </h3>
           <p className="mt-0.5 text-[11px] text-muted-foreground">
-            Runs five checks: external DNS resolution, kubeapi reachability
-            via the api pod's ServiceAccount, every spatium pod's health
-            (Running + healthy, Succeeded Jobs OK), and informational role
-            presence (DHCP / DNS — OK when not assigned to this appliance).
+            Runs five checks: external DNS resolution, kubeapi reachability via
+            the api pod's ServiceAccount, every spatium pod's health (Running +
+            healthy, Succeeded Jobs OK), and informational role presence (DHCP /
+            DNS — OK when not assigned to this appliance).
           </p>
         </div>
         <button
@@ -232,10 +232,10 @@ function DiagnosticBundleCard() {
             Diagnostic bundle
           </h3>
           <p className="mt-0.5 text-[11px] text-muted-foreground">
-            One-click zip of host logs, per-pod log tails (last 500 lines
-            each via kubeapi), system info, and a redacted env dump. Useful
-            for support tickets. Secrets (passwords, tokens, keys) are
-            stripped before bundling.
+            One-click zip of host logs, per-pod log tails (last 500 lines each
+            via kubeapi), system info, and a redacted env dump. Useful for
+            support tickets. Secrets (passwords, tokens, keys) are stripped
+            before bundling.
           </p>
         </div>
         <a
