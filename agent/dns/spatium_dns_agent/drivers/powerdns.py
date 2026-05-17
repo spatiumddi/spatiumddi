@@ -290,6 +290,29 @@ class PowerDNSDriver(DriverBase):
                 ),
             )
 
+        # Issue #247 — blocklists. The BIND9 driver renders these as
+        # RPZ zones + a `response-policy` directive in named.conf;
+        # PowerDNS auth doesn't have an equivalent inline RPZ surface
+        # (recursor has Lua hooks but the appliance ships pdns auth
+        # only). For now, log a clear warning so operators on
+        # PowerDNS see why their blocklist UI doesn't actually
+        # block — pre-#247 the entries were silently dropped from
+        # render() and pdns answered normally.
+        blocklists = bundle.get("blocklists") or []
+        if blocklists:
+            log.warning(
+                "powerdns_blocklists_unsupported",
+                blocklist_count=len(blocklists),
+                hint=(
+                    "PowerDNS authoritative server does not support "
+                    "RPZ-style blocklists; the appliance ships pdns "
+                    "auth only (no recursor + Lua hooks). Use the "
+                    "BIND9 driver if blocklist enforcement matters, "
+                    "or move blocking upstream to a recursor / "
+                    "dnsdist tier. See issue #247 for the roadmap."
+                ),
+            )
+
         (new_dir / "zones.json").write_text(json.dumps(zones_payload, indent=2))
 
     def validate(self) -> None:
