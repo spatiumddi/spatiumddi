@@ -39,7 +39,15 @@ class SupervisorConfig:
                 ch for ch in os.environ.get("BOOTSTRAP_PAIRING_CODE", "") if ch.isdigit()
             ),
             heartbeat_interval_seconds=int(
-                os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "60")
+                # 30s default cadence — operator feedback that 60s
+                # felt sluggish on role-swap, since
+                # ``reconcile_node_labels`` only fires per
+                # heartbeat. 30s halves time-to-react and is still
+                # well within control-plane budget on fleets up to
+                # ~hundreds of appliances. Service-container
+                # self-healing (the watchdog at 5 min) is a
+                # separate cadence and doesn't change.
+                os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "30")
             ),
             # Phase 4 (#183) control-plane → kubeapi proxy. The
             # supervisor's loop long-polls a control-plane endpoint that
