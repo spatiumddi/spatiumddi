@@ -8,6 +8,17 @@ metadata:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
 spec:
   replicas: {{ .Values.frontend.replicas }}
+  {{- if .Values.frontend.hostNetwork }}
+  # hostPort:80 is exclusive on a single node — a RollingUpdate
+  # would create the new pod before terminating the old, and it
+  # would sit Pending forever ("didn't have free ports for the
+  # requested pod ports"). Recreate ensures the old pod
+  # terminates first, freeing :80 for the new one. ~5 s of
+  # downtime on a chart upgrade is acceptable for an
+  # appliance-scale single-instance frontend.
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 6 }}
@@ -48,8 +59,16 @@ spec:
             # Issue #176: tell the frontend nginx where the api Service
             # is. The image defaults to ``api:8000`` (Docker Compose's
             # service-discovery name), which doesn't resolve on K8s.
+            # nginx's ``resolver`` directive resolves names against the
+            # configured nameservers but does NOT apply the search list
+            # from /etc/resolv.conf. A bare ``<release>-api`` works in
+            # cluster-network pods (kubelet's own resolv.conf handling
+            # picks up the search domain at process start) but FAILS in
+            # hostNetwork pods (the appliance frontend toggle) — nginx
+            # logs ``Host not found`` on every /api/ request. Use the
+            # FQDN so resolution works in both cases.
             - name: API_UPSTREAM_HOST
-              value: {{ .Values.frontend.apiUpstream.host | default (printf "%s-api" (include "spatiumddi.fullname" .)) | quote }}
+              value: {{ .Values.frontend.apiUpstream.host | default (printf "%s-api.%s.svc.cluster.local" (include "spatiumddi.fullname" .) .Release.Namespace) | quote }}
             - name: API_UPSTREAM_PORT
               value: {{ .Values.frontend.apiUpstream.port | default .Values.api.service.port | quote }}
             {{- with .Values.frontend.nginxLocalResolvers }}
