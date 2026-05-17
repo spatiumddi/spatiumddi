@@ -42,7 +42,7 @@ services:
 
   # ── Redis ───────────────────────────────────────────────────────────────────
   redis:
-    image: redis:7-alpine
+    image: redis:8.6-alpine
     restart: unless-stopped
     networks:
       - spatiumddi

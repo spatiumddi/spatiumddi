@@ -22,6 +22,33 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Changed
+
+- **Bumped four bundled images.** kube-state-metrics
+  ``v2.13.0`` → ``v2.18.0``, prometheus node-exporter ``v1.8.2``
+  → ``v1.11.1``, nginx ``1.27-alpine`` → ``1.30.1-alpine``
+  (agent-landing + frontend runtime), redis ``7-alpine`` →
+  ``8.6-alpine``. All four are in-place safe — three are
+  stateless (metrics scrapers + nginx web server, no on-disk
+  state to migrate), and Redis 8 reads RDB / AOF files written
+  by Redis 5+ so the existing ``redis_data`` volume mounts
+  cleanly on first start. Updated in lockstep across
+  ``appliance/scripts/bake-images.sh``,
+  ``charts/spatiumddi/values.yaml``,
+  ``charts/spatiumddi-appliance/values.yaml``,
+  ``docker-compose.yml``, ``docker-compose.dev.yml``,
+  ``frontend/Dockerfile``, ``k8s/ha/redis-sentinel.yaml``,
+  ``.github/workflows/ci.yml`` (test redis container), and the
+  matching doc comments in ``charts/spatiumddi/Chart.yaml`` +
+  ``charts/spatiumddi-appliance/templates/agent-landing.yaml`` +
+  ``docs/deployment/APPLIANCE.md``. Postgres stays on
+  ``16-alpine`` pending a dedicated PR — PG18 refuses to start
+  against a PG16 data directory, so we need an upfront
+  ``pg_upgrade`` migration sidecar before we bump (and the
+  ``postgresql-client-16`` pin in ``backend/Dockerfile`` needs
+  to move in lockstep with the server major to keep
+  ``pg_dump`` / ``pg_restore`` matched).
+
 ## 2026.05.17-6 — 2026-05-17
 
 Fifth hotfix on the 2026.05.17 chain. 2026.05.17-5 tried to
