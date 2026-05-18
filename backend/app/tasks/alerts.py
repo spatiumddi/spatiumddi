@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 
 import structlog
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.celery_app import celery_app
 from app.db import task_session
@@ -20,8 +21,18 @@ from app.services import alerts as alert_service
 logger = structlog.get_logger(__name__)
 
 
-@celery_app.task(name="app.tasks.alerts.evaluate_alerts")
-def evaluate_alerts() -> dict[str, int]:
+@celery_app.task(
+    name="app.tasks.alerts.evaluate_alerts",
+    bind=True,
+    # Issue #222 — autoretry on transient DB / network classes so a
+    # missed tick doesn't have to wait for the next 60 s beat firing.
+    autoretry_for=(SQLAlchemyError, ConnectionError, OSError),
+    retry_backoff=True,
+    retry_backoff_max=30,
+    retry_jitter=True,
+    max_retries=3,
+)
+def evaluate_alerts(self: object) -> dict[str, int]:  # type: ignore[type-arg]
     return asyncio.run(_run())
 
 
