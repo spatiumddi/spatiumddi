@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from ipaddress import ip_network
 from typing import Any
 
@@ -1227,7 +1227,7 @@ async def test_audit_target(target_id: str, current_user: CurrentUser, db: DB) -
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
     payload: dict[str, Any] = {
         "id": "test-" + str(row.id),
         "timestamp": now.isoformat() + "Z",

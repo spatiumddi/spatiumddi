@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -214,7 +214,7 @@ async def update_session(
     if body.name is not None:
         s.name = body.name
     if body.archived is True and s.archived_at is None:
-        s.archived_at = datetime.utcnow()
+        s.archived_at = datetime.now(UTC)
     if body.archived is False:
         s.archived_at = None
     await db.commit()

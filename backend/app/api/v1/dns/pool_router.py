@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -444,7 +444,11 @@ async def check_pool_now(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> PoolRe
     pool = await db.get(DNSPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
-    pool.next_check_at = datetime.utcnow()
+    # Issue #213 — DB column is ``DateTime(timezone=True)``; using a
+    # naive ``utcnow()`` here writes an implicit-UTC value that asyncpg
+    # was tolerating but Postgres treats as ambiguous. Use a tz-aware
+    # value to match the column type.
+    pool.next_check_at = datetime.now(UTC)
     db.add(
         AuditLog(
             user_id=user.id,

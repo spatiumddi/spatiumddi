@@ -303,22 +303,63 @@ def _fetch_cert_sync(host: str, port: int, timeout: float) -> dict[str, Any]:
         raise ssl.SSLError("Server returned no certificate")
     assert der is not None  # narrow Buffer | None → Buffer for mypy
 
-    # Re-parse the DER without verification to extract human-readable
-    # fields. ``ssl.DER_cert_to_PEM_cert`` + a re-import via a
-    # verify-disabled context gives us the parsed dict.
-    raw_pem = ssl.DER_cert_to_PEM_cert(der)
-    parse_ctx = ssl.create_default_context()
-    parse_ctx.check_hostname = False
-    parse_ctx.verify_mode = ssl.CERT_NONE
-    parse_ctx.load_verify_locations(cadata=raw_pem)
-    # Use ``_test_decode_cert`` to get the parsed dict — undocumented
-    # but stable across Python 3.10+.
-    import tempfile
+    # Issue #212 — switched from ``ssl._ssl._test_decode_cert`` (an
+    # undocumented private stdlib that may go away on any Python
+    # release) to the supported ``cryptography.x509`` parse. The
+    # ``parsed`` dict below preserves the exact shape downstream
+    # callers expect from ``_test_decode_cert`` (subject/issuer as
+    # tuples of single-attr tuples, OpenSSL-format dates,
+    # subjectAltName as ``[(kind, value), ...]``) so neither
+    # ``_format_dn`` nor ``_parse_x509_date`` need to change.
+    from cryptography import x509  # noqa: PLC0415
 
-    with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=True) as fh:
-        fh.write(raw_pem)
-        fh.flush()
-        parsed = ssl._ssl._test_decode_cert(fh.name)  # type: ignore[attr-defined]
+    raw_pem = ssl.DER_cert_to_PEM_cert(der)
+    cert = x509.load_der_x509_certificate(bytes(der))
+
+    def _name_to_tuples(name: x509.Name) -> tuple:
+        return tuple(
+            ((getattr(attr.oid, "_name", None) or attr.oid.dotted_string, attr.value),)
+            for attr in name
+        )
+
+    def _format_date(dt: datetime) -> str:
+        # OpenSSL's "%b %d %H:%M:%S %Y GMT" format that
+        # ``_parse_x509_date`` expects, locale-independent.
+        return dt.strftime("%b %d %H:%M:%S %Y GMT")
+
+    san_pairs: list[tuple[str, str]] = []
+    try:
+        san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        for entry in san_ext.value:
+            if isinstance(entry, x509.DNSName):
+                san_pairs.append(("DNS", entry.value))
+            elif isinstance(entry, x509.IPAddress):
+                san_pairs.append(("IP Address", str(entry.value)))
+            elif isinstance(entry, x509.RFC822Name):
+                san_pairs.append(("email", entry.value))
+            elif isinstance(entry, x509.UniformResourceIdentifier):
+                san_pairs.append(("URI", entry.value))
+    except x509.ExtensionNotFound:
+        pass
+
+    # Match stdlib's serial format: colon-separated uppercase hex.
+    serial_hex = format(cert.serial_number, "X")
+    if len(serial_hex) % 2:
+        serial_hex = "0" + serial_hex
+    serial_colon = ":".join(serial_hex[i : i + 2] for i in range(0, len(serial_hex), 2))
+
+    parsed: dict[str, Any] = {
+        "subject": _name_to_tuples(cert.subject),
+        "issuer": _name_to_tuples(cert.issuer),
+        "notBefore": _format_date(cert.not_valid_before_utc),
+        "notAfter": _format_date(cert.not_valid_after_utc),
+        "subjectAltName": san_pairs,
+        "serialNumber": serial_colon,
+        # X.509 wire version is 0-indexed in cryptography's enum
+        # (Version.v1 = 0, Version.v3 = 2); stdlib reports the
+        # 1-indexed number (1 / 3), so add 1.
+        "version": cert.version.value + 1,
+    }
 
     return {
         "tls_version": tls_version,

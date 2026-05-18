@@ -22,7 +22,7 @@ Three groups of routes:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
@@ -547,7 +547,7 @@ async def export_pdf(
     if framework:
         slug = framework.lower().replace(" ", "-").replace("/", "-")
         fname += f"-{slug}"
-    fname += f"-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.pdf"
+    fname += f"-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
