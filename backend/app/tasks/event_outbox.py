@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 
 import structlog
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -22,8 +23,19 @@ from app.services.event_delivery import process_due_outbox
 logger = structlog.get_logger(__name__)
 
 
-@celery_app.task(name="app.tasks.event_outbox.process_event_outbox")
-def process_event_outbox() -> dict[str, object]:
+@celery_app.task(
+    name="app.tasks.event_outbox.process_event_outbox",
+    bind=True,
+    # Issue #221 — autoretry on DB connection drops so a transient
+    # outage doesn't cost a beat tick. Backoff caps at 30 s so a
+    # retry storm never overlaps the next 10 s beat firing.
+    autoretry_for=(SQLAlchemyError, ConnectionError, OSError),
+    retry_backoff=True,
+    retry_backoff_max=30,
+    retry_jitter=True,
+    max_retries=3,
+)
+def process_event_outbox(self: object) -> dict[str, object]:  # type: ignore[type-arg]
     """Tick the event outbox worker.
 
     Uses a fresh ``NullPool`` engine per tick. Celery's prefork worker
@@ -45,6 +57,9 @@ def process_event_outbox() -> dict[str, object]:
 
     try:
         return dict(asyncio.run(_run()))
+    except (SQLAlchemyError, ConnectionError, OSError):
+        # Let Celery autoretry these — re-raise unchanged.
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.exception("event_outbox_tick_failed", error=str(exc))
         return {"claimed": 0, "delivered": 0, "failed": 0, "dead": 0, "error": str(exc)}

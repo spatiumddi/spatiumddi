@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 import structlog
 from celery import shared_task
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.db import task_session
 from app.models.alerts import AlertEvent, AlertRule
@@ -126,8 +127,19 @@ async def _async_verify_and_alert() -> dict:
         return {"ok": False, "rows_checked": result.rows_checked, "broken": len(result.breaks)}
 
 
-@shared_task(name="app.tasks.audit_chain_verify.verify_audit_chain")
-def verify_audit_chain() -> dict:
+@shared_task(
+    name="app.tasks.audit_chain_verify.verify_audit_chain",
+    bind=True,
+    # Issue #222 — autoretry on transient DB / network classes so a
+    # nightly verifier hit by a DB blip doesn't have to wait a full
+    # 24 h for the next beat firing.
+    autoretry_for=(SQLAlchemyError, ConnectionError, OSError),
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    max_retries=3,
+)
+def verify_audit_chain(self: object) -> dict:  # type: ignore[type-arg]
     """Celery entry point. Runs nightly via beat; idempotent on its
     own — re-runs are cheap and self-resolving when the break clears."""
     return asyncio.run(_async_verify_and_alert())

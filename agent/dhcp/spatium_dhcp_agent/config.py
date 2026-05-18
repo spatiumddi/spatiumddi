@@ -46,6 +46,19 @@ class AgentConfig:
     heartbeat_interval: float = 30.0
     longpoll_timeout: float = 30.0
 
+    def httpx_verify(self) -> bool | str:
+        """Resolve the ``verify=`` argument for ``httpx.Client`` calls.
+
+        Issue #266 — was previously duplicated across 9 modules. Single
+        source of truth: ``insecure_skip_tls_verify`` (dev-only override)
+        wins over a custom CA bundle; the default is full verification.
+        """
+        if self.insecure_skip_tls_verify:
+            return False
+        if self.tls_ca_path:
+            return self.tls_ca_path
+        return True
+
     @classmethod
     def from_env(cls) -> "AgentConfig":
         cp = os.environ.get("SPATIUM_API_URL", "").rstrip("/")

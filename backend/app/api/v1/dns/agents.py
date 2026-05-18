@@ -313,7 +313,7 @@ async def agent_config_longpoll(
         response.headers["X-Spatium-Pending-Approval"] = "1"
         return {"pending_approval": True, "etag": None}
 
-    deadline = asyncio.get_event_loop().time() + LONGPOLL_TIMEOUT_SECONDS
+    deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     while True:
         bundle = await build_config_bundle(db, server)
         etag = bundle["etag"]
@@ -324,7 +324,7 @@ async def agent_config_longpoll(
             await db.commit()
             response.headers["ETag"] = etag
             return bundle
-        if asyncio.get_event_loop().time() >= deadline:
+        if asyncio.get_running_loop().time() >= deadline:
             response.status_code = 304
             response.headers["ETag"] = etag
             return Response(status_code=304, headers={"ETag": etag})

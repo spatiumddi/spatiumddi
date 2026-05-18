@@ -25,6 +25,7 @@ the first ship.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -106,9 +107,6 @@ def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
     entries so the existing reconciler creates / patches it through
     the same code path.
     """
-    import hashlib
-    import time
-
     zname = (catalog.get("zone_name") or "").rstrip(".") + "."
     if not zname or zname == ".":
         return {"name": "invalid.", "kind": "Native", "rrsets": []}

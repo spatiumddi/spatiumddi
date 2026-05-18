@@ -86,10 +86,14 @@ class ServiceHealth:
     container_id: str | None
 
 
-# Process-local history of (status, monotonic-first-seen). Survives
-# heartbeat ticks within one supervisor process; resets on restart
-# (acceptable — first watchdog tick after restart re-observes).
-_status_history: dict[str, tuple[str, float]] = {}
+# Process-local history of (status, monotonic-first-seen,
+# wall-first-seen). Wall timestamp is persisted alongside the
+# monotonic anchor so a backward host-clock adjustment between two
+# probes can't reconstruct a ``since`` that lands in the past
+# relative to itself (issue #244). Survives heartbeat ticks within
+# one supervisor process; resets on restart (acceptable — first
+# watchdog tick after restart re-observes).
+_status_history: dict[str, tuple[str, float, float]] = {}
 
 
 def read_assigned_profiles(env_file: Path) -> list[str]:
@@ -172,10 +176,10 @@ def _check_health_k3s(
         for svc, role in desired_services.items():
             prev = _status_history.get(svc)
             if prev is None or prev[0] != "missing":
-                _status_history[svc] = ("missing", now_mono)
+                _status_history[svc] = ("missing", now_mono, now_wall)
                 since_wall = now_wall
             else:
-                since_wall = now_wall - (now_mono - prev[1])
+                since_wall = prev[2]
             out[svc] = {
                 "role": role,
                 "status": "missing",
@@ -209,10 +213,10 @@ def _check_health_k3s(
 
         prev = _status_history.get(svc)
         if prev is None or prev[0] != status:
-            _status_history[svc] = (status, now_mono)
+            _status_history[svc] = (status, now_mono, now_wall)
             since_wall = now_wall
         else:
-            since_wall = now_wall - (now_mono - prev[1])
+            since_wall = prev[2]
 
         out[svc] = {
             "role": role,

@@ -26,7 +26,7 @@ from typing import Any
 import httpx
 import structlog
 
-from .cache import load_config, save_config, save_rendered_kea
+from .cache import load_config, save_config, save_rendered_kea, save_token
 from .config import AgentConfig
 from .kea_ctrl import KeaCtrlError, config_reload
 from .render_kea import render as render_kea
@@ -99,15 +99,10 @@ class SyncLoop:
         self._stop.set()
 
     def _client(self) -> httpx.Client:
-        verify: bool | str = True
-        if self.cfg.insecure_skip_tls_verify:
-            verify = False
-        elif self.cfg.tls_ca_path:
-            verify = self.cfg.tls_ca_path
         # server holds for ~longpoll_timeout seconds, give client a bit more
         return httpx.Client(
             base_url=self.cfg.control_plane_url,
-            verify=verify,
+            verify=self.cfg.httpx_verify(),
             timeout=self.cfg.longpoll_timeout + 15.0,
         )
 
@@ -245,8 +240,6 @@ class SyncLoop:
                 status=resp.status_code,
                 reason="token_invalid" if resp.status_code == 401 else "server_missing",
             )
-            from .cache import save_token
-
             save_token(self.cfg.state_dir, "")
             self._stop.set()
             return
