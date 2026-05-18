@@ -328,8 +328,8 @@ async def wait_for_op_applied(
     which writes ``state=applied`` on the row. Polling is simple,
     correct, and usually converges in <5 seconds on a healthy pair.
     """
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
         async with AsyncSessionLocal() as fresh_db:
             row = await fresh_db.get(DNSRecordOp, op_id)
             if row is None:
@@ -356,10 +356,10 @@ async def wait_for_ops_applied(
     """
     if not op_ids:
         return {}
-    deadline = asyncio.get_event_loop().time() + timeout
+    deadline = asyncio.get_running_loop().time() + timeout
     remaining = set(op_ids)
     result: dict[uuid.UUID, str] = {}
-    while remaining and asyncio.get_event_loop().time() < deadline:
+    while remaining and asyncio.get_running_loop().time() < deadline:
         async with AsyncSessionLocal() as fresh_db:
             rows = (
                 (

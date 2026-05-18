@@ -309,7 +309,7 @@ async def agent_config_longpoll(
         response.headers["X-Spatium-Pending-Approval"] = "1"
         return {"pending_approval": True, "etag": None}
 
-    deadline = asyncio.get_event_loop().time() + LONGPOLL_TIMEOUT_SECONDS
+    deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     while True:
         bundle = await build_config_bundle(db, server)
         # Issue #153 — fold the rendered snmpd.conf hash into the ETag
@@ -471,7 +471,7 @@ async def agent_config_longpoll(
                 # spatiumddi-chrony-reload.path applies + reloads.
                 "ntp_settings": ntp_block,
             }
-        if asyncio.get_event_loop().time() >= deadline:
+        if asyncio.get_running_loop().time() >= deadline:
             return Response(status_code=304, headers={"ETag": etag})
         await asyncio.sleep(LONGPOLL_POLL_INTERVAL)
 

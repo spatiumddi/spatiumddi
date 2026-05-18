@@ -1,4 +1,15 @@
+import sys
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Sentinel default for ``secret_key``. Production deployments MUST
+# override this via the ``SECRET_KEY`` env var (or ``.env``) — the
+# model validator below emits a loud stderr warning whenever the
+# sentinel is in use, and hard-fails the boot when
+# ``STRICT_SECRET_KEY=true`` is set (recommended for any non-dev
+# deployment).
+_SECRET_KEY_DEV_SENTINEL = "change-me-to-a-random-32-char-string"
 
 
 class Settings(BaseSettings):
@@ -13,7 +24,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
 
     # Security
-    secret_key: str = "change-me-to-a-random-32-char-string"
+    secret_key: str = _SECRET_KEY_DEV_SENTINEL
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
     credential_encryption_key: str = ""
@@ -65,6 +76,14 @@ class Settings(BaseSettings):
     # so forks can point their update check at their own repo.
     github_repo: str = "spatiumddi/spatiumddi"
 
+    # When ``True`` (recommended for any non-dev deployment), the boot
+    # fails fast if ``SECRET_KEY`` is still set to the .env.example
+    # sentinel. Default ``False`` so a fresh ``cp .env.example .env``
+    # first-time setup boots and the operator can log in to fix it,
+    # but every boot with the sentinel still emits a loud stderr
+    # warning regardless of this flag. See #216.
+    strict_secret_key: bool = False
+
     # Demo mode — locks down abusable mutation surfaces (nmap, AI
     # provider creates, webhook targets, integration targets,
     # outbound mail/audit/backup, factory reset, password change)
@@ -107,6 +126,28 @@ class Settings(BaseSettings):
     # SIGHUP to when a new cert is activated, so nginx reloads its
     # TLS context. Matches the compose service name on the appliance.
     appliance_frontend_container: str = "spatiumddi-frontend"
+
+    @model_validator(mode="after")
+    def _check_secret_key_default(self) -> "Settings":
+        # The sentinel JWT-signing key in ``.env.example`` MUST NOT
+        # reach a production deploy. Emit a loud warning every boot;
+        # hard-fail when ``STRICT_SECRET_KEY=true`` is set.
+        if self.secret_key == _SECRET_KEY_DEV_SENTINEL:
+            if self.strict_secret_key:
+                raise ValueError(
+                    "SECRET_KEY is still set to the .env.example default and "
+                    "STRICT_SECRET_KEY=true. Generate a real key with "
+                    "`openssl rand -hex 32` and set SECRET_KEY in .env."
+                )
+            print(
+                "WARNING: SECRET_KEY is still the .env.example sentinel. "
+                "Set SECRET_KEY=<openssl rand -hex 32> in .env. "
+                "Enable STRICT_SECRET_KEY=true in non-dev deployments to "
+                "make this a hard error.",
+                file=sys.stderr,
+                flush=True,
+            )
+        return self
 
 
 settings = Settings()

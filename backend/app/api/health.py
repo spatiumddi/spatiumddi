@@ -1,9 +1,10 @@
 """Health probe endpoints consumed by Docker/Kubernetes."""
 
 import asyncio
+from collections.abc import Awaitable
 from datetime import UTC, datetime
 from time import monotonic
-from typing import Any
+from typing import Any, cast
 
 import structlog
 from fastapi import APIRouter
@@ -49,7 +50,7 @@ async def readiness() -> JSONResponse:
         from app.config import settings
 
         r = aioredis.from_url(settings.redis_url, socket_connect_timeout=2)
-        await r.ping()
+        await cast(Awaitable[bool], r.ping())
         await r.aclose()
         checks["redis"] = "ok"
     except Exception as exc:
@@ -107,7 +108,7 @@ async def platform_health() -> JSONResponse:
         from app.config import settings
 
         r = aioredis.from_url(settings.redis_url, socket_connect_timeout=2)
-        await r.ping()
+        await cast(Awaitable[bool], r.ping())
         await r.aclose()
         components.append(
             {
