@@ -34,7 +34,6 @@ the supervisor.
 from __future__ import annotations
 
 import hashlib
-import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -43,7 +42,7 @@ from typing import Any
 import httpx
 import structlog
 
-from . import appliance_state, approval_state
+from . import appliance_state, approval_state, watchdog
 from .cert_auth import build_auth_headers, load_cert, save_cert
 from .config import SupervisorConfig
 from .firewall_renderer import FirewallProfile, render_drop_in
@@ -53,10 +52,6 @@ from .role_orchestrator import (
     probe_port_conflicts,
     render_env_file,
 )
-from . import watchdog
-
-log = structlog.get_logger(__name__)
-
 # Issue #183 Phase 7 — k3s-only lifecycle. The pre-Phase-7 dispatcher
 # (compose vs k3s on ``detect_runtime()``) is gone with the rest of
 # docker; this is the only path now.
@@ -65,6 +60,8 @@ from .service_lifecycle import (
     reconcile_node_labels,
     tear_down_supervised_services,
 )
+
+log = structlog.get_logger(__name__)
 
 # #170 Wave C2 — role-driven compose env file. Written under the
 # supervisor's state-dir so it survives slot swaps; the operator's

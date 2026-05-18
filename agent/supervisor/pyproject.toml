@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.4", "mypy>=1.10"]
+dev = ["pytest>=8", "ruff>=0.4", "mypy>=1.10", "types-PyYAML>=6.0"]
 
 [project.scripts]
 spatium-supervisor = "spatium_supervisor.__main__:main"
