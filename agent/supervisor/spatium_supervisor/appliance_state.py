@@ -33,8 +33,12 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
+
+import structlog
+
+log = structlog.get_logger(__name__)
 
 # Bind-mount targets the appliance docker-compose exposes. Same paths
 # the api container uses (just different mount source on the agent
@@ -304,6 +308,22 @@ def maybe_fire_fleet_upgrade(
         return False
     if not desired_version or not desired_url:
         return False
+    # Issue #242 — only accept ``https://`` (preferred) or ``file://``
+    # (sneakernet / air-gap). Reject ``http://`` so a misconfigured
+    # control plane can't downgrade the OS-image fetch to cleartext
+    # over the WAN; reject unknown / unscheme'd URLs entirely so a
+    # tampered payload can't slip past as a relative path the host
+    # runner would resolve.
+    desired_url_str = str(desired_url).strip()
+    if not desired_url_str:
+        return False
+    allowed_schemes = ("https://", "file://")
+    if not any(desired_url_str.lower().startswith(s) for s in allowed_schemes):
+        log.warning(
+            "supervisor.appliance_state.rejected_upgrade_url_scheme",
+            url_prefix=desired_url_str.split("://", 1)[0][:32],
+        )
+        return False
     installed = read_installed_version()
     if installed and installed == desired_version:
         return False
@@ -353,7 +373,10 @@ def maybe_fire_reboot(reboot_requested: bool) -> bool:
         # One-line marker — the host runner doesn't actually need any
         # payload, just the path-changed event. Stamp + UTC time so
         # the operator can debug from /var/log/spatiumddi if needed.
-        tmp.write_text(datetime.utcnow().isoformat() + "Z\n", encoding="utf-8")
+        tmp.write_text(
+            datetime.now(UTC).isoformat().replace("+00:00", "Z") + "\n",
+            encoding="utf-8",
+        )
         tmp.replace(_REBOOT_TRIGGER_FILE)
         return True
     except OSError:

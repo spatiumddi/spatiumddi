@@ -196,7 +196,9 @@ def _check_health_k3s(
 
     missing_services: list[str] = []
     for svc, role in desired_services.items():
-        pod = by_service.get(svc)
+        # Explicit Optional annotation so mypy can narrow correctly
+        # in the if-branch below (issue #241).
+        pod: k8s_api.PodStatus | None = by_service.get(svc)
         if pod is None:
             status = "missing"
             container_id = None
