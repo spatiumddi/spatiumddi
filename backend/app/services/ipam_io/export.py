@@ -14,7 +14,7 @@ import ipaddress
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from fastapi import HTTPException, status
@@ -352,7 +352,7 @@ async def export_subtree(
     safe_name = str(scope_name).replace("/", "_").replace(" ", "_")
     # UTC timestamp in the filename so multiple exports on the same day
     # don't overwrite each other and file managers sort them in order.
-    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     base = f"ipam-{safe_name}-{ts}"
     if format == "csv":
         return _to_csv(bundle), "text/csv", f"{base}.csv"

@@ -31,7 +31,7 @@ import json
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -412,7 +412,7 @@ async def gather_dynamic_context(db: AsyncSession, user: User) -> dict[str, Any]
     )
     devices = await _count(select(func.count()).select_from(NetworkDevice))
 
-    cutoff = datetime.utcnow() - _RECENT_ACTIVITY_WINDOW
+    cutoff = datetime.now(UTC) - _RECENT_ACTIVITY_WINDOW
     recent_audits = (
         (
             await db.execute(
@@ -532,7 +532,7 @@ async def build_system_prompt(
     Total payload is well under 500 tokens for a typical deployment;
     quiet installs come in under 200.
     """
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
     ctx = await gather_dynamic_context(db, user)
     topology_line = _format_topology_line(ctx["topology"])
     activity_block = _format_recent_activity(ctx["recent_activity"])

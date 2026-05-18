@@ -29,8 +29,18 @@ class DriverBase(ABC):
         """Rename rendered.new → rendered, signal the daemon to reload."""
 
     @abstractmethod
-    def apply_record_op(self, op: dict[str, Any]) -> None:
-        """Apply a RecordOp via loopback nsupdate via RFC 2136."""
+    def apply_record_op(self, op: dict[str, Any]) -> dict[str, Any] | None:
+        """Apply a RecordOp via loopback nsupdate via RFC 2136.
+
+        Returns an optional dict carrying driver-specific result
+        details — e.g. the PowerDNS driver returns DNSSEC state
+        flags that ``sync.py`` propagates back to the control plane
+        in the pending-op ACK. BIND9's driver returns ``None``
+        (no extra signal to surface). Issue #251 — pre-fix the ABC
+        declared ``-> None`` while powerdns.py already returned a
+        dict; sync.py relied on the dict shape so the contract was
+        already widened in practice.
+        """
 
     @abstractmethod
     def start_daemon(self) -> None:

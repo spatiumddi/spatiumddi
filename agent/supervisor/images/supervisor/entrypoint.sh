@@ -27,8 +27,14 @@ mkdir -p /var/lib/spatium-supervisor
 chown -R spatium:spatium /var/lib/spatium-supervisor || true
 
 if [ -d /etc/nftables.d ]; then
+    # Issue #239 — only the supervisor (spatium user) writes here.
+    # 0750 keeps the group's read+traverse capability for operators
+    # who run ``ls /etc/nftables.d/`` under the spatium group from
+    # the host, but strips group-write. Pre-#239 used 0775 which let
+    # anyone in the spatium group drop arbitrary ``.nft`` files into
+    # the host firewall config dir.
     chown spatium:spatium /etc/nftables.d || true
-    chmod 0775 /etc/nftables.d || true
+    chmod 0750 /etc/nftables.d || true
 fi
 
 # Read the host's /etc/spatiumddi/.env (mounted at

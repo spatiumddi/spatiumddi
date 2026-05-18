@@ -217,12 +217,21 @@ class PowerDNSDriver(DriverBase):
         if query_log_enabled and log_level < 6:
             log_level = 6
 
+        # Issue #250 — operator-overridable ALIAS resolver. Defaults
+        # to 1.1.1.1 + 8.8.8.8 for labs (matches pre-#250 behaviour),
+        # but air-gapped or split-horizon deployments can set
+        # ``options.alias_resolver`` to a private resolver list (or
+        # to an empty string to suppress the ALIAS feature entirely).
+        alias_resolver = opts.get("alias_resolver")
+        if alias_resolver is None:
+            alias_resolver = "1.1.1.1,8.8.8.8"
         conf_path = new_dir / "pdns.conf"
         conf_path.write_text(
             self._render_conf(
                 api_key=api_key,
                 log_level=log_level,
                 query_log_enabled=query_log_enabled,
+                alias_resolver=str(alias_resolver),
             )
         )
 
@@ -789,16 +798,49 @@ class PowerDNSDriver(DriverBase):
         we generate one ourselves so the first config sync has
         something to use — pdns will read the same file when the
         entrypoint copies it into place at startup.
+
+        Issue #249 — atomic write via ``.new`` sibling + ``replace``
+        so a crash between ``write_text`` and ``chmod`` doesn't
+        leave a world-readable key on disk (or a 0-byte partial
+        file if the crash lands mid-write).
+
+        Issue #253 — refuse to overwrite an existing file we can't
+        read. If the entrypoint wrote the key as root with mode 600
+        before chown'ing to spatium, the agent's previous logic
+        treated the unreadable file as "missing" and silently wrote
+        its own value while ``pdns_server`` was already running
+        with the original. New behaviour: if the path exists but
+        is unreadable, raise rather than overwrite — the operator
+        sees a clear error in the agent log + can fix permissions
+        rather than chase a mismatched-key 401 storm.
         """
         path = self._api_key_path()
         if path.exists():
-            return path.read_text().strip()
+            try:
+                return path.read_text().strip()
+            except PermissionError as exc:
+                raise RuntimeError(
+                    f"PowerDNS API key file at {path} exists but is "
+                    "unreadable by the agent. Fix ownership/perms "
+                    "(should be spatium:spatium 0600) instead of "
+                    "letting the agent overwrite — pdns may already "
+                    "be running with the original value."
+                ) from exc
         key = secrets.token_urlsafe(32)
-        path.write_text(key + "\n")
+        tmp = path.with_suffix(path.suffix + ".new")
+        # Open with O_NOFOLLOW + mode 0600 so the file lands with
+        # the right permissions on creation (no race window between
+        # write + chmod where the file is world-readable).
+        fd = os.open(
+            str(tmp),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o600,
+        )
         try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+            os.write(fd, (key + "\n").encode())
+        finally:
+            os.close(fd)
+        tmp.replace(path)
         return key
 
     def _render_conf(
@@ -807,6 +849,7 @@ class PowerDNSDriver(DriverBase):
         api_key: str,
         log_level: int,
         query_log_enabled: bool = False,
+        alias_resolver: str = "1.1.1.1,8.8.8.8",
     ) -> str:
         # Mirrors backend/app/drivers/dns/powerdns.py::render_pdns_conf.
         # Agent and control plane render the same shape; the agent
@@ -846,11 +889,17 @@ class PowerDNSDriver(DriverBase):
                 # ALIAS-record resolution requires both ``expand-alias=yes``
                 # and a ``resolver=`` upstream. PowerDNS Authoritative
                 # synthesises A/AAAA at query time by recursing through
-                # the configured resolver. Default to a public resolver
-                # so labs work out of the box; operators with split-
-                # horizon needs override via custom config injection.
-                "expand-alias=yes",
-                "resolver=1.1.1.1,8.8.8.8",
+                # the configured resolver. The resolver list is
+                # operator-controlled via ``options.alias_resolver``
+                # (#250) so air-gapped + split-horizon deployments can
+                # point at a private resolver instead of leaking
+                # internal-zone lookups to public DNS. Empty string
+                # disables ALIAS entirely.
+                *(
+                    ["expand-alias=yes", f"resolver={alias_resolver}"]
+                    if alias_resolver.strip()
+                    else ["expand-alias=no"]
+                ),
                 # LUA records (PowerDNS-only computed responses —
                 # ``pickrandom`` / ``ifportup`` / ``createReverse`` etc.)
                 # are GLOBALLY enabled here rather than per-zone via

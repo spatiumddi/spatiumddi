@@ -238,17 +238,29 @@ class Bind9Driver(DriverBase):
 
         (new_dir / "named.conf").write_text(conf)
 
-        # TSIG key — written to tsig/ddns.key (stable path)
+        # TSIG key — written to tsig/ddns.key (stable path).
+        # Issue #249 — atomic write so a crash between write_text +
+        # chmod doesn't leave a world-readable secret on disk.
         if tsig_keys:
             tsig_dir = self.state_dir / "tsig"
             tsig_dir.mkdir(parents=True, exist_ok=True)
             k = tsig_keys[0]
             tsig_file = tsig_dir / "ddns.key"
-            tsig_file.write_text(
+            tsig_tmp = tsig_file.with_suffix(".key.new")
+            payload = (
                 f'key "{k["name"]}" {{ algorithm {k.get("algorithm", "hmac-sha256")}; '
                 f'secret "{k["secret"]}"; }};\n'
             )
-            os.chmod(tsig_file, 0o600)
+            fd = os.open(
+                str(tsig_tmp),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                0o600,
+            )
+            try:
+                os.write(fd, payload.encode())
+            finally:
+                os.close(fd)
+            tsig_tmp.replace(tsig_file)
 
     def _write_catalog_zone_file(self, path: Path, catalog: dict[str, Any]) -> None:
         """Render a BIND9 catalog zone file per RFC 9432.

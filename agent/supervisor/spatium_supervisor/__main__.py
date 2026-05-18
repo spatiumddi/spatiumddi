@@ -46,10 +46,34 @@ from .register import RegisterDisabled, RegisterFatal, register
 from .state import ensure_layout
 
 
-def _build_http_client(skip_tls_verify: bool) -> httpx.Client:
+def _build_http_client(
+    skip_tls_verify: bool,
+    *,
+    log: structlog.stdlib.BoundLogger | None = None,
+) -> httpx.Client:
     """Wave A2's client doesn't yet use mTLS (cert lands in B1). Honour
     SPATIUM_INSECURE_SKIP_TLS_VERIFY=1 so dev appliances pointed at a
-    self-signed control plane still register."""
+    self-signed control plane still register.
+
+    Issue #234 — when the opt-out is set, log a prominent WARNING on
+    every build (de-duped via a function attribute so spam stays
+    bounded). The pre-#234 behaviour was a silent ``verify=False``
+    with no log surface, so a misset env on a production appliance
+    disabled TLS verification across every heartbeat with no
+    operator-visible indicator.
+    """
+    if skip_tls_verify and not getattr(_build_http_client, "_warned", False):
+        _build_http_client._warned = True  # type: ignore[attr-defined]
+        (log or structlog.get_logger(__name__)).warning(
+            "supervisor.tls_verify_disabled",
+            reason="SPATIUM_INSECURE_SKIP_TLS_VERIFY=1",
+            hint=(
+                "Control-plane TLS verification is DISABLED for the "
+                "lifetime of this supervisor process. Intended only for "
+                "dev appliances pointed at a self-signed control plane; "
+                "set the env to 0 / unset on production deployments."
+            ),
+        )
     return httpx.Client(verify=not skip_tls_verify)
 
 
@@ -115,7 +139,7 @@ def _maybe_register(cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger) ->
         "yes",
     )
     try:
-        with _build_http_client(skip_tls_verify=skip_tls) as client:
+        with _build_http_client(skip_tls_verify=skip_tls, log=log) as client:
             result = register(
                 control_plane_url=cfg.control_plane_url,
                 pairing_code=cfg.bootstrap_pairing_code,
@@ -225,7 +249,7 @@ def main() -> int:
             session_token = load_session_token(cfg.state_dir)
             identity, _ = load_or_generate(cfg.state_dir)
             try:
-                with _build_http_client(skip_tls_verify=skip_tls) as client:
+                with _build_http_client(skip_tls_verify=skip_tls, log=log) as client:
                     heartbeat_once(
                         cfg=cfg,
                         appliance_id=appliance_id,
