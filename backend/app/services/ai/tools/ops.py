@@ -340,6 +340,9 @@ def _fetch_cert_sync(host: str, port: int, timeout: float) -> dict[str, Any]:
             elif isinstance(entry, x509.UniformResourceIdentifier):
                 san_pairs.append(("URI", entry.value))
     except x509.ExtensionNotFound:
+        # Certs without a SubjectAlternativeName extension are valid
+        # (rare on modern web certs but common on internal / legacy
+        # CAs). The empty ``san_pairs`` list is the correct signal.
         pass
 
     # Match stdlib's serial format: colon-separated uppercase hex.

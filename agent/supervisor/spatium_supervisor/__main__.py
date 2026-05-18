@@ -46,9 +46,6 @@ from .register import RegisterDisabled, RegisterFatal, register
 from .state import ensure_layout
 
 
-_TLS_VERIFY_SKIP_WARNED = False
-
-
 def _build_http_client(
     skip_tls_verify: bool,
     *,
@@ -59,15 +56,14 @@ def _build_http_client(
     self-signed control plane still register.
 
     Issue #234 — when the opt-out is set, log a prominent WARNING on
-    every build (de-duped to once per process to avoid spam). The
-    pre-#234 behaviour was a silent ``verify=False`` with no log
-    surface, so a misset env on a production appliance disabled TLS
-    verification across every heartbeat with no operator-visible
-    indicator.
+    every build (de-duped via a function attribute so spam stays
+    bounded). The pre-#234 behaviour was a silent ``verify=False``
+    with no log surface, so a misset env on a production appliance
+    disabled TLS verification across every heartbeat with no
+    operator-visible indicator.
     """
-    global _TLS_VERIFY_SKIP_WARNED
-    if skip_tls_verify and not _TLS_VERIFY_SKIP_WARNED:
-        _TLS_VERIFY_SKIP_WARNED = True
+    if skip_tls_verify and not getattr(_build_http_client, "_warned", False):
+        _build_http_client._warned = True  # type: ignore[attr-defined]
         (log or structlog.get_logger(__name__)).warning(
             "supervisor.tls_verify_disabled",
             reason="SPATIUM_INSECURE_SKIP_TLS_VERIFY=1",
