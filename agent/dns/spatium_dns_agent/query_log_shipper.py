@@ -26,6 +26,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from typing import TextIO
 
 import httpx
 import structlog
@@ -64,7 +65,7 @@ class QueryLogShipper:
         self._stop = threading.Event()
         self._buffer: list[str] = []
         self._last_flush = time.monotonic()
-        self._fh = None  # type: ignore[var-annotated]
+        self._fh: TextIO | None = None
         self._inode: int | None = None
 
     def stop(self) -> None:
