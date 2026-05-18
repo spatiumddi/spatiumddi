@@ -811,12 +811,18 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
    ``/etc/spatiumddi/role-config``. ``spatiumddi-firstboot`` copies
    it to ``/etc/spatiumddi/.env`` so docker-compose surfaces it in
    the agent container's environment.
-6. On first contact, the agent POSTs
-   ``/api/v1/appliance/pair {code, hostname}``; the control plane
-   atomically marks the code claimed + returns the real bootstrap
-   key. The agent caches the resolved key to
-   ``/var/lib/spatium-<dns|dhcp>-agent/bootstrap.key`` (mode 0600)
-   so subsequent re-registrations don't need a fresh code.
+6. On first contact, the **supervisor** (not the service container)
+   POSTs ``/api/v1/appliance/supervisor/register {code, hostname,
+   pubkey, …}``; the control plane atomically marks the code claimed +
+   issues the supervisor a session token. The per-role
+   ``dns_agent_key`` / ``dhcp_agent_key`` arrive on the next
+   heartbeat response and the supervisor writes them into
+   ``role-compose.env`` so the service containers interpolate
+   ``${DNS_AGENT_KEY}`` / ``${DHCP_AGENT_KEY}`` on first boot. (The
+   short-lived ``POST /api/v1/appliance/pair`` endpoint that
+   standalone agents originally POSTed to was retired under #170
+   Wave A3 — the supervisor-mediated path is the only pairing-code
+   path now. See #246 for the dead-endpoint cleanup.)
 7. The console dashboard's **Pairing** row (on agent-role
    appliances) shows ``Paired ✓`` (green), ``Pairing in progress…``
    /  ``Registering…`` (yellow), or ``Pair failed — regenerate

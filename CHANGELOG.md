@@ -20,10 +20,63 @@ the formatter handles the rest.
 
 ---
 
-## Unreleased
+## 2026.05.18-1 — 2026-05-18
+
+Bug-check housekeeping cut. After the 2026.05.17 hotfix chain
+closed the immediate appliance-boot regressions, a parallel
+sub-agent audit pass (`mzac-bug-check`) read every module across
+api / worker / supervisor / dns-agent / dhcp-agent and flagged
+57 issues by severity (3 critical / 11 high / 25 medium / 18
+low). All 57 land in this release across four sequential PRs
+(#267 #268 #269 #270). Two of the criticals — the silently-
+overwritten beat schedule and the missing Operator Copilot
+include — had been live since the relevant features shipped;
+the third was a 404-loop against the retired `/pair` endpoint.
+The high tier closes five privileged-code supervisor security
+holes (TLS verify drop to NONE, predictable `/tmp` cert write,
+unvalidated CIDRs, host-env injection vectors, untrusted
+heartbeat string interpolation), encrypts the previously-
+plaintext `dns_server.api_key`, and adds retry policies where
+"safe to retry" had decayed into "no autoretry configured."
+Medium tier drops 10 dead `@radix-ui` deps, migrates 8
+`datetime.utcnow()` sites + the deprecated `ssl._ssl._test
+_decode_cert` call, atomicises TSIG / PowerDNS API-key writes,
+and tightens 5 more supervisor hygiene items. Low tier is
+cosmetic / preventative — including a `STRICT_SECRET_KEY`
+boot-gate, `autoretry_for` on 4 more beat tasks, a DHCPv6 stats
+map that finally lights up the metrics row for v6 scopes, and
+the `PeerResolveWatcher` closure-over-empty-list footgun
+removed. Also rolls up the in-flight appliance shake-out (#209
+— full-stack setup-wizard 500 + agent-landing Pending) and the
+deps bump (#207 — kube-state-metrics, node-exporter, nginx,
+redis).
 
 ### Fixed
 
+- **Full-stack appliance setup wizard returned 500 + agent-
+  landing stuck Pending (#209).** Three independent regressions
+  from #183's k3s migration, caught on the 2026.05.17-6 ISO
+  boot of 192.168.0.199. (1) k3s `config.yaml.d/spatium-roles
+  .yaml` drop-in REPLACES (not appends) the base config's
+  `node-label` list, so the umbrella `spatium.io/role=
+  appliance` label disappeared on every fresh full-stack
+  install — appliance chart's `global.nodeSelector` then
+  matched nothing. Drop-in now re-lists the base label. (2)
+  `agent-landing` was deployed on full-stack / frontend-core
+  variants too, where it would have port-conflicted on :80
+  with the real control-plane frontend once (1) was fixed.
+  `_render_appliance_helmchart` grows a fourth
+  `agent_landing_enabled` arg, false for non-Application
+  variants. (3) The api pod had no host bind mounts to write
+  `/var/lib/spatiumddi-host/.setup-complete` through, so
+  `mark_setup_complete` raised `PermissionError`. Added
+  `api.applianceHostMounts` values block (releaseStateDir rw,
+  hostLogDir ro, hostEtcDir ro) gated by the umbrella chart;
+  firstboot flips it on for appliance installs only. Existing
+  2026.05.17-6 appliances pick all three up via slot upgrade;
+  operators who need agent-landing / DNS / DHCP pods to
+  schedule TODAY can `sudo kubectl label node $(hostname)
+  spatium.io/role=appliance --overwrite`.
 - **`dns-agent-stale-sweep` beat task never fired (#217).**
   `celery_app.py:51` set ``celery_app.conf.beat_schedule =
   {"dns-agent-stale-sweep": ...}``, then the very next call
@@ -59,6 +112,134 @@ the formatter handles the rest.
   Wave C2). Operators on standalone docker-compose / K8s installs
   who had been pasting a pairing code instead of the long key
   must switch to the long key.
+- **11 high-severity audit findings (#268).** Five supervisor
+  security holes closed: `k8s_api` + `k8s_proxy`
+  `_ssl_context(ca_path=None)` no longer drops to `CERT_NONE`
+  silently — it raises unless the dev-only
+  `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` opt-out is set (#233);
+  `/tmp/.spatium-k3s-ca.crt` predictable-path write moved
+  under `$STATE_DIR` with `os.open(..., O_NOFOLLOW |
+  O_CREAT | O_TRUNC, 0o600)` (#235); `kubeapi_expose_cidrs`
+  validated through `ipaddress.ip_network(strict=False)` and
+  canonicalised before nft render — bad entries logged +
+  dropped (#236); `dns_agent_key` / `dhcp_agent_key` /
+  `dns_group_name` / `dhcp_group_name` from heartbeat run
+  through `_safe_env_value()` with strict regex (`^[a-f0-9]
+  {32,128}$` / alphanum+`._-`) so newline / quote / control-
+  char injection no longer reaches the rendered env file
+  (#237); supervisor entrypoint replaces `set -a; .
+  "$HOST_ENV"; set +a` with a busybox-portable `read -r` loop
+  that validates each KEY against the POSIX env-var-name
+  pattern + strips one layer of surrounding quotes — no
+  shell interpretation of operator-managed `.env` (#238).
+  Plus `app.tasks.ipam` dead-stub module + its `include` /
+  route entries deleted (#220), `refresh_blocklist_feed`
+  declares `autoretry_for=(httpx.HTTPError, socket.gaierror)`
+  + exp backoff + jitter + `max_retries=3` so transient feed
+  failures retry instead of staying offline until the next
+  beat (#219), DNS agent `HeartbeatClient.send_once` 401/404
+  mirrors `sync.py`'s recovery path (clear cached token + set
+  `_stop` → re-bootstrap from PSK) so a token-expired agent
+  doesn't 401-loop until container restart (#248), PowerDNS
+  driver surfaces `log.warning("powerdns_blocklists_
+  unsupported", ...)` when `bundle["blocklists"]` is non-
+  empty (pdns auth can't do RPZ; the warning makes the
+  silent-no-op visible) (#247), DHCP agent
+  `_ShipperState.last_seen_macs` dedupe ledger pruned on
+  every flush against `_LAST_SEEN_RETENTION = 300.0` so the
+  60 s dedupe window doesn't leak forever (#257), and
+  `dns_server.api_key_encrypted` retyped `Text → LargeBinary`
+  with both writers calling `encrypt_str()` + new Alembic
+  migration `97190c1b0325` flipping the column type +
+  scrubbing any pre-existing plaintext to NULL (the column
+  was decorative — zero readers existed pre-#210 — so the
+  data was never load-bearing) (#210).
+- **25 medium-severity audit findings (#269).** Frontend
+  drops 10 unused `@radix-ui/*` packages + `class-variance-
+  authority` from `package.json` (#223-#232) — all were
+  declared but never imported anywhere in `src/`; codebase
+  uses hand-rolled shadcn-style primitives in
+  `src/components/ui/` instead. `npm uninstall` dropped 19
+  transitive packages. Api migrates 7
+  `datetime.utcnow()` sites to `datetime.now(UTC)` — worst
+  case was `app/api/v1/dns/pool_router.py:447` writing a
+  naive datetime into a `DateTime(timezone=True)` column
+  (#213); replaces the undocumented `ssl._ssl._test_decode
+  _cert` call with supported `cryptography.x509.load_der
+  _x509_certificate` (output shape preserved so callers
+  don't change) (#212). Supervisor hygiene: dev-only TLS-
+  verify-disabled now logs `supervisor.tls_verify_disabled`
+  WARNING once per process (#234), `/etc/nftables.d`
+  permission tightened from `0775` to `0750` (#239),
+  `appliance_state.write_reboot_trigger` migrated to
+  `datetime.now(UTC)` (#240), watchdog gains explicit `pod:
+  k8s_api.PodStatus | None` annotation (#241),
+  `maybe_fire_slot_upgrade` validates `desired_url` against
+  `https://` / `file://` schemes before writing the trigger
+  file (was accepting unschemed + plain `http://`) (#242).
+  DNS-agent: atomic-writes PowerDNS API key + BIND9 TSIG key
+  via `os.open(...O_NOFOLLOW|O_CREAT, 0o600)` + `.new`
+  rename (#249); ALIAS resolver now overridable via
+  `options.alias_resolver` (defaults to `1.1.1.1,8.8.8.8`,
+  empty string disables ALIAS) (#250); `DriverBase.apply
+  _record_op` ABC widened `-> None` → `-> dict[str, Any] |
+  None` to match PowerDNS driver's DNSSEC-state return
+  (#251); query log shipper `_fh` annotated `TextIO | None`
+  explicitly (drops `# type: ignore`) (#252);
+  `_load_or_generate_api_key` refuses to overwrite an
+  existing-but-unreadable key file (pre-fix silently re-
+  generated, causing 401 mismatch with the running pdns)
+  (#253). DHCP-agent: `sync._apply_bundle` + `peer_resolve
+  ._peer_hosts` use explicit bundle-shape narrowing instead
+  of inline-ternary fallthrough that envelope-defaulted on
+  any non-dict (#258 #260); `log_shipper._fh` annotated
+  `TextIO | None` (#259).
+- **18 low-severity audit findings (#270).** Api:
+  `health.py` casts `r.ping()` via
+  `cast(Awaitable[bool], ...)` so the redis-py union return
+  type narrows cleanly (#211); 8 call-sites switch from
+  deprecated `asyncio.get_event_loop().time()` to
+  `asyncio.get_running_loop().time()` (#214);
+  `backend/pyproject.toml` adds `types-croniter` +
+  `types-paramiko` to dev extras (#215); new
+  `STRICT_SECRET_KEY=true` toggle that hard-fails the boot
+  when `SECRET_KEY` is still the `.env.example` sentinel,
+  with a loud stderr warning every boot regardless — opt-in
+  to keep first-time `cp .env.example .env` setups bootable
+  (#216). Worker: `bind=True` + `autoretry_for=(SQLAlchemy
+  Error, ConnectionError, OSError)` + exponential backoff
+  added to `event_outbox`, `conformity`, `alerts`, and
+  `audit_chain_verify` — were re-raising on transient
+  DB/network failures with no retry policy (#221 #222).
+  Supervisor: drop unused `import subprocess` (Phase 7
+  remnant) + fix E402 on `from .service_lifecycle import
+  ...` ordering (#243); persist wall-clock timestamp
+  alongside the monotonic anchor in watchdog's
+  `_status_history` so a backward host-clock adjustment
+  doesn't make `since` land in the past relative to itself
+  (#244); `types-PyYAML` in supervisor dev extras (#245).
+  DNS-agent: hoist `import hashlib` / `import time` from
+  `_render_catalog_zone_payload` / `_write_catalog_zone
+  _file` to module top (#254); drop `f` prefix on two
+  placeholder-less strings (#255); fix stale `# bind9 (only
+  supported backend)` comment now that PowerDNS shipped in
+  #127 (#256). DHCP-agent: remove duplicate
+  `_sniffer.stop()` call (run() owns sniffer cleanup)
+  (#261); drop dead `getattr(self, "pending_acks", None)`
+  defensive check (#262); hoist `from .cache import
+  save_token` from the 401/404 rebootstrap branch (#263);
+  add the long-deferred DHCPv6 stat map — multiple v6
+  message types fold into v4-shaped columns by closest
+  role-equivalent semantics (SOLICIT≈DISCOVER, ADVERTISE≈
+  OFFER, REPLY≈ACK, RENEW+REBIND fold into `request`) so
+  operators running v6 finally see per-bucket metrics
+  (#264); `PeerResolveWatcher` accepts a deferred
+  `apply_fn` and exposes `set_apply_fn()` so the supervisor
+  can construct the watcher first and arm it once SyncLoop
+  exists — drops the `syncer_holder[0]` closure-over-empty-
+  list footgun (#265); hoist `verify=` resolution into
+  `AgentConfig.httpx_verify()` — was duplicated verbatim
+  across 8 modules (#266).
 
 ### Changed
 
