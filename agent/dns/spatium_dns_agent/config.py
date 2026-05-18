@@ -17,7 +17,7 @@ class AgentConfig:
     # supervisor's ``role-compose.env``.
     dns_agent_key: str
     server_name: str
-    driver: str  # bind9 (only supported backend)
+    driver: str  # bind9 | powerdns (see supervisor.py for the registry)
     roles: list[str]
     group_name: str | None
     tls_ca_path: str | None

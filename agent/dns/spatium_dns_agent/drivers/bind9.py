@@ -8,10 +8,12 @@ TSIG key carried in the config bundle.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -277,9 +279,6 @@ class Bind9Driver(DriverBase):
         renders on bundle change, so each render really is a different
         membership state and consumers will always pull.
         """
-        import hashlib
-        import time
-
         path.parent.mkdir(parents=True, exist_ok=True)
         cname = (catalog.get("zone_name") or "").strip()
         if not cname:
@@ -323,7 +322,7 @@ class Bind9Driver(DriverBase):
             f"$TTL {ttl}",
             f"@ IN SOA ns1.{name} admin.{name} ( {serial} 3600 600 86400 300 )",
             f"@ IN NS ns1.{name}",
-            f"ns1 IN A 127.0.0.1",
+            "ns1 IN A 127.0.0.1",
         ]
         for rec in zone.get("records", []) or []:
             rec_ttl = rec.get("ttl") or ttl
@@ -364,7 +363,7 @@ class Bind9Driver(DriverBase):
         zname = bl["rpz_zone_name"]
         lines = [
             "$TTL 60",
-            f"@ IN SOA localhost. root.localhost. ( 1 3600 600 86400 60 )",
+            "@ IN SOA localhost. root.localhost. ( 1 3600 600 86400 60 )",
             "@ IN NS localhost.",
         ]
         for e in bl.get("entries") or []:
