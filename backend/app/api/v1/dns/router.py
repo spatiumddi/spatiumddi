@@ -974,9 +974,7 @@ async def update_server(
     if body.api_key is not None:
         # Issue #210 — Fernet-encrypted at rest; matches the create
         # path above. ``body.api_key == ""`` clears the column.
-        changes["api_key_encrypted"] = (
-            encrypt_str(body.api_key) if body.api_key else None
-        )
+        changes["api_key_encrypted"] = encrypt_str(body.api_key) if body.api_key else None
     # When the user flips is_enabled, reflect it in status immediately so
     # the UI pill updates without waiting for the next 60s health-sweep
     # tick. The sweep then re-asserts on schedule.
