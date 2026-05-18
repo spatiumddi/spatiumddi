@@ -35,6 +35,7 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import os
 import socket
 import ssl
 import threading
@@ -224,9 +225,23 @@ def _call_local_kubeapi(
             return 502, json.dumps(
                 {"error": f"supervisor: ca load failed: {exc}"}
             ).encode("utf-8")
-    else:
+    elif os.environ.get("SPATIUM_INSECURE_SKIP_TLS_VERIFY") == "1":
+        # Documented dev-only opt-out (issue #233). Mirrors the
+        # k8s_api._ssl_context branch.
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+    else:
+        # No CA path AND no opt-out → refuse to proxy. Same rationale
+        # as #233 — the proxy carries operator-queued kubeapi requests
+        # whose responses the UI treats as truth; an unverified channel
+        # lets a MITM inject responses.
+        return 502, json.dumps(
+            {
+                "error": "supervisor: kubeapi CA path not resolved and "
+                "SPATIUM_INSECURE_SKIP_TLS_VERIFY is not set; refusing "
+                "to proxy over an unverified channel (issue #233)."
+            }
+        ).encode("utf-8")
 
     conn = http.client.HTTPSConnection(cfg.host, cfg.port, timeout=15.0, context=ctx)
     try:

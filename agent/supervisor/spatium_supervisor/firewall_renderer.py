@@ -34,8 +34,48 @@ write, sharing the same atomic-rename + validation shape.
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass
 from typing import Any
+
+import structlog
+
+log = structlog.get_logger(__name__)
+
+
+def _validated_cidrs(raw: list[Any]) -> list[str]:
+    """Filter ``raw`` down to syntactically valid CIDR strings.
+
+    Issue #236 — the control plane's ``kubeapi_expose_cidrs`` list was
+    previously inlined verbatim into the nft rule. An invalid (or
+    malicious) entry like ``1.2.3.4 }, drop; tcp dport 22 accept; #``
+    would inject extra nft rules into the host firewall. Reject
+    anything that doesn't round-trip through ``ipaddress.ip_network``
+    in strict=False mode; log the bad entry + drop it from the
+    rendered allowlist.
+    """
+    out: list[str] = []
+    for c in raw:
+        if not isinstance(c, str):
+            log.warning("supervisor.firewall_renderer.invalid_cidr_type", value=c)
+            continue
+        s = c.strip()
+        if not s:
+            continue
+        try:
+            net = ipaddress.ip_network(s, strict=False)
+        except (ValueError, TypeError) as exc:
+            log.warning(
+                "supervisor.firewall_renderer.invalid_cidr",
+                value=s,
+                error=str(exc),
+            )
+            continue
+        # Always re-render through ipaddress.ip_network's str() so the
+        # output is canonical (e.g. "192.168.1.0/24" not the raw
+        # input). nft accepts this form verbatim.
+        out.append(str(net))
+    return out
 
 
 @dataclass(frozen=True)
@@ -108,11 +148,13 @@ def render_drop_in(role_assignment: dict[str, Any] | None) -> FirewallProfile:
     # direct kubeapi access on tcp/6443. Empty / missing = proxy-
     # only (kubeapi stays on 127.0.0.1; only the supervisor's
     # outbound proxy channel can drive it).
-    kubeapi_cidrs = [
-        c
-        for c in (role_assignment.get("kubeapi_expose_cidrs") or [])
-        if isinstance(c, str) and c.strip()
-    ]
+    #
+    # Issue #236 — each entry MUST validate via ipaddress.ip_network
+    # before it lands in the nft saddr set. The pre-#236 path
+    # ``c.strip()``-cleaned but never type-checked, so an injected
+    # ``1.2.3.4 }, drop; ... #`` would slip arbitrary nft into the
+    # filter table when ``nft -f`` reloaded the drop-in.
+    kubeapi_cidrs = _validated_cidrs(role_assignment.get("kubeapi_expose_cidrs") or [])
 
     profile = _profile_name(roles)
     lines: list[str] = []
@@ -159,10 +201,9 @@ def render_drop_in(role_assignment: dict[str, Any] | None) -> FirewallProfile:
     if kubeapi_cidrs:
         lines.append("")
         lines.append("# ── kubeapi (operator-allowed CIDRs, #183 Phase 6) ──────")
-        # nft accepts a comma-separated saddr set inline; quote-strip
-        # each entry on the way in (operator-supplied) so a stray
-        # whitespace doesn't break the parse.
-        cidrs_inline = ", ".join(c.strip() for c in kubeapi_cidrs)
+        # ``_validated_cidrs`` above already canonicalised each entry
+        # via ``ipaddress.ip_network``; safe to inline.
+        cidrs_inline = ", ".join(kubeapi_cidrs)
         lines.append(
             f"ip saddr {{ {cidrs_inline} }} tcp dport 6443 accept "
             f'comment "kubeapi-direct"'

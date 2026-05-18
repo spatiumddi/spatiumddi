@@ -50,7 +50,25 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                     resp = await client.get(bl.feed_url)
                     resp.raise_for_status()
                     text = resp.text
+            except (httpx.HTTPError, socket.gaierror) as e:
+                # Transient — write the per-row error state then re-raise
+                # so Celery's ``autoretry_for`` (configured on the task
+                # below) backs off + retries. Issue #219 — pre-fix the
+                # broad ``except`` swallowed every exception and the
+                # task's ``max_retries=3`` was decorative.
+                bl.last_sync_status = "error"
+                bl.last_sync_error = f"Fetch failed: {e}"
+                bl.last_synced_at = datetime.now(UTC)
+                await db.commit()
+                logger.warning(
+                    "blocklist_feed_fetch_failed",
+                    list_id=list_id,
+                    error=str(e),
+                )
+                raise
             except Exception as e:  # noqa: BLE001
+                # Permanent (parse error, unexpected shape) — same DB
+                # shape but don't bubble; retrying won't help.
                 bl.last_sync_status = "error"
                 bl.last_sync_error = f"Fetch failed: {e}"
                 bl.last_synced_at = datetime.now(UTC)
@@ -111,12 +129,27 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
         await engine.dispose()
 
 
-@celery_app.task(name="app.tasks.dns.refresh_blocklist_feed", bind=True, max_retries=3)
+@celery_app.task(
+    name="app.tasks.dns.refresh_blocklist_feed",
+    bind=True,
+    autoretry_for=(httpx.HTTPError, socket.gaierror),
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    max_retries=3,
+)
 def refresh_blocklist_feed(self: object, list_id: str) -> dict[str, int | str]:  # type: ignore[type-arg]
     """Fetch feed_url, parse as hosts/domain/adblock list, sync entries with source=feed.
 
     Idempotent — safe to retry. Only manages entries with source="feed"; manual
     entries added by users are never touched.
+
+    Issue #219 — ``autoretry_for=(httpx.HTTPError, socket.gaierror)`` +
+    exponential backoff so transient feed-fetch failures retry up to 3
+    times instead of giving up on the first hiccup. The async core
+    re-raises those two classes after persisting the per-row error
+    state to the DB; other exceptions stay swallowed (no retry —
+    parse-shape failures don't get fixed by retrying).
     """
     logger.info("refresh_blocklist_feed_started", list_id=list_id)
     return asyncio.run(_refresh_blocklist_feed_async(list_id))

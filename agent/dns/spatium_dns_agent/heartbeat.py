@@ -67,6 +67,23 @@ class HeartbeatClient:
                     self.token_ref[0] = rotated
                     save_token(self.cfg.state_dir, rotated)
                     log.info("dns_agent_token_rotated")
+            elif resp.status_code in (401, 404):
+                # Issue #248 — mirror sync.py's 401/404 recovery path.
+                # 401 = token expired / invalid; 404 = the server row
+                # was deleted on the control plane. Both recover by
+                # the same path: drop cached token + stop the thread.
+                # The supervisor's dead-thread watch exits the
+                # container; the next start re-bootstraps from PSK.
+                # Pre-#248 the heartbeat just spam-warned until sync
+                # noticed the same 401 (could be a full heartbeat
+                # interval later).
+                log.warning(
+                    "heartbeat_will_rebootstrap",
+                    status=resp.status_code,
+                    reason="token_invalid" if resp.status_code == 401 else "server_missing",
+                )
+                save_token(self.cfg.state_dir, "")
+                self._stop.set()
             else:
                 log.warning("heartbeat_failed", status=resp.status_code)
         except httpx.HTTPError as e:
