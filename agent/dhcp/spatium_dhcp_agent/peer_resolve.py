@@ -49,15 +49,27 @@ class PeerResolveWatcher:
 
     def __init__(
         self,
-        apply_fn: Callable[..., None],
+        apply_fn: Callable[..., None] | None = None,
         *,
         check_interval: float = CHECK_INTERVAL,
     ):
+        # ``apply_fn`` may be deferred so the supervisor can construct
+        # the watcher before the SyncLoop (which the apply_fn closes
+        # over) exists — see ``set_apply_fn`` (issue #265).
         self._apply_fn = apply_fn
         self._check_interval = check_interval
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._bundle: dict[str, Any] | None = None
+
+    def set_apply_fn(self, apply_fn: Callable[..., None]) -> None:
+        """Arm the watcher with the SyncLoop's bundle-apply callback.
+
+        Called by the supervisor after the SyncLoop is constructed so
+        the watcher's apply path can never fire against a partially-
+        wired chain (issue #265).
+        """
+        self._apply_fn = apply_fn
         # Maps hostname → last resolved IP. We only reload when the
         # resolution changes, not on every tick.
         self._resolved: dict[str, str] = {}
@@ -124,6 +136,12 @@ class PeerResolveWatcher:
             return
         for host, old_ip, new_ip in changed:
             log.info("ha_peer_ip_changed", host=host, old=old_ip, new=new_ip)
+        if self._apply_fn is None:
+            # Supervisor hasn't armed the watcher yet — log and bail.
+            # Caller will pick the change up on the next tick once the
+            # SyncLoop wires in via ``set_apply_fn``.
+            log.warning("ha_peer_reresolve_no_apply_fn", changes=len(changed))
+            return
         try:
             self._apply_fn(bundle, reload_kea=True)
             log.info("ha_peer_reresolve_reloaded", changes=len(changed))

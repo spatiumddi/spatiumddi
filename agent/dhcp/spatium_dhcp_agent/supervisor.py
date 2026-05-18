@@ -36,18 +36,19 @@ def run(cfg: AgentConfig) -> int:
 
     heartbeat = HeartbeatClient(cfg, token_ref)
     ha_poller = HAStatusPoller(cfg, token_ref)
-    # Placeholder watcher — we need the syncer to exist before we can
-    # give the watcher its apply callback. Construct both and wire.
-    syncer_holder: list[SyncLoop] = []
-    peer_watcher = PeerResolveWatcher(
-        apply_fn=lambda bundle, reload_kea=True: syncer_holder[0]._apply_bundle(
-            bundle, reload_kea=reload_kea
-        )
-    )
+    # Construct the watcher first (SyncLoop needs the reference in its
+    # ``__init__``), then arm it once the SyncLoop exists. Issue #265 —
+    # the old ``syncer_holder[0]`` closure could fire against an empty
+    # list if anything in SyncLoop ever invoked the apply path during
+    # construction; the explicit ``set_apply_fn`` setter rules that
+    # footgun out at compile time.
+    peer_watcher = PeerResolveWatcher()
     syncer = SyncLoop(
         cfg, token_ref, heartbeat, ha_poller=ha_poller, peer_watcher=peer_watcher
     )
-    syncer_holder.append(syncer)
+    peer_watcher.set_apply_fn(
+        lambda bundle, reload_kea=True: syncer._apply_bundle(bundle, reload_kea=reload_kea)
+    )
     leases = LeaseWatcher(cfg, token_ref, heartbeat)
     metrics = MetricsPoller(cfg, token_ref)
     log_shipper = LogShipper(cfg, token_ref)

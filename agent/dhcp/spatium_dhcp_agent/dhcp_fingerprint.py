@@ -221,12 +221,10 @@ class DhcpFingerprintShipper:
         self._last_flush = time.monotonic()
 
     def stop(self) -> None:
+        # ``run()`` owns the sniffer lifecycle and stops the scapy
+        # AsyncSniffer in its shutdown block. Calling ``_sniffer.stop()``
+        # from here too is harmless (idempotent) but dead — issue #261.
         self._stop.set()
-        if self._sniffer is not None:
-            try:
-                self._sniffer.stop()
-            except Exception:  # noqa: BLE001 — scapy can raise oddly on stop
-                pass
 
     def _on_packet(self, packet: Any) -> None:
         try:
@@ -280,12 +278,11 @@ class DhcpFingerprintShipper:
         return True
 
     def _cp_client(self) -> httpx.Client:
-        verify: bool | str = True
-        if self.cfg.insecure_skip_tls_verify:
-            verify = False
-        elif self.cfg.tls_ca_path:
-            verify = self.cfg.tls_ca_path
-        return httpx.Client(base_url=self.cfg.control_plane_url, verify=verify, timeout=15.0)
+        return httpx.Client(
+            base_url=self.cfg.control_plane_url,
+            verify=self.cfg.httpx_verify(),
+            timeout=15.0,
+        )
 
     def _drain(self) -> list[FingerprintObservation]:
         with self._lock:

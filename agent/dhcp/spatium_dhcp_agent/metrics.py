@@ -9,18 +9,25 @@ the bucket and seed the next snapshot fresh — better to drop one
 bucket than emit a spurious negative-turned-positive spike when the
 new counters climb back up.
 
-Kea statistic names we care about (v4-only for MVP — DHCPv6 stats
-have the same shape under ``pkt6-*`` names and can be added with a
-one-line map once v6 scopes are in wide use):
+Kea statistic names we care about. The eight column names on
+``dhcp_metric_sample`` were v4-shaped originally and now do double
+duty for v6 by mapping each v6 message to the v4 column with the
+closest role-equivalent semantics (SOLICIT≈DISCOVER, ADVERTISE≈
+OFFER, REPLY≈ACK, INFORMATION-REQUEST≈INFORM, RENEW+REBIND fold
+into ``request``). Issue #264 — both stacks share one row per
+server so operators running v6 finally get per-bucket numbers
+without a schema migration.
 
-    pkt4-discover-received    → discover
-    pkt4-offer-sent           → offer
-    pkt4-request-received     → request
-    pkt4-ack-sent             → ack
-    pkt4-nak-sent             → nak
-    pkt4-decline-received     → decline
-    pkt4-release-received     → release
-    pkt4-inform-received      → inform
+    pkt4-discover-received                pkt6-solicit-received        → discover
+    pkt4-offer-sent                       pkt6-advertise-sent          → offer
+    pkt4-request-received                 pkt6-request-received
+                                          pkt6-renew-received
+                                          pkt6-rebind-received         → request
+    pkt4-ack-sent                         pkt6-reply-sent              → ack
+    pkt4-nak-sent                                                      → nak
+    pkt4-decline-received                 pkt6-decline-received        → decline
+    pkt4-release-received                 pkt6-release-received        → release
+    pkt4-inform-received                  pkt6-information-request-received → inform
 """
 
 from __future__ import annotations
@@ -39,6 +46,9 @@ from .kea_ctrl import KeaCtrlError, send_command
 log = structlog.get_logger(__name__)
 
 # Map Kea's statistic names to the column names on dhcp_metric_sample.
+# Multiple v6 message types fold into a single v4-shaped column when
+# their roles align — see the module docstring for the mapping
+# rationale (issue #264).
 _STAT_MAP = {
     "pkt4-discover-received": "discover",
     "pkt4-offer-sent": "offer",
@@ -48,7 +58,21 @@ _STAT_MAP = {
     "pkt4-decline-received": "decline",
     "pkt4-release-received": "release",
     "pkt4-inform-received": "inform",
+    "pkt6-solicit-received": "discover",
+    "pkt6-advertise-sent": "offer",
+    "pkt6-request-received": "request",
+    "pkt6-renew-received": "request",
+    "pkt6-rebind-received": "request",
+    "pkt6-reply-sent": "ack",
+    "pkt6-decline-received": "decline",
+    "pkt6-release-received": "release",
+    "pkt6-information-request-received": "inform",
 }
+
+# Column names — the unique set of values from ``_STAT_MAP``, used by
+# ``_compute_delta`` so a multi-stat → single-column mapping doesn't
+# re-diff the same column twice.
+_METRIC_COLUMNS = sorted(set(_STAT_MAP.values()))
 
 
 def _extract_counter(series: Any) -> int | None:
@@ -73,13 +97,19 @@ def _extract_counter(series: Any) -> int | None:
 
 
 def _parse_snapshot(resp: dict[str, Any]) -> dict[str, int]:
-    """``statistic-get-all`` → flat ``{column: current_counter}`` dict."""
+    """``statistic-get-all`` → flat ``{column: current_counter}`` dict.
+
+    Multiple stat names can map to the same column (e.g. ``pkt6-
+    renew-received`` + ``pkt6-rebind-received`` both feed ``request``);
+    in that case we sum the counters so the column carries the
+    full per-role activity.
+    """
     args = resp.get("arguments") or {}
     out: dict[str, int] = {}
     for stat_name, col in _STAT_MAP.items():
         v = _extract_counter(args.get(stat_name))
         if v is not None:
-            out[col] = v
+            out[col] = out.get(col, 0) + v
     return out
 
 
@@ -96,12 +126,11 @@ class MetricsPoller:
         self._stop.set()
 
     def _client(self) -> httpx.Client:
-        verify: bool | str = True
-        if self.cfg.insecure_skip_tls_verify:
-            verify = False
-        elif self.cfg.tls_ca_path:
-            verify = self.cfg.tls_ca_path
-        return httpx.Client(base_url=self.cfg.control_plane_url, verify=verify, timeout=15.0)
+        return httpx.Client(
+            base_url=self.cfg.control_plane_url,
+            verify=self.cfg.httpx_verify(),
+            timeout=15.0,
+        )
 
     def _poll_kea(self) -> dict[str, int] | None:
         try:
@@ -123,7 +152,7 @@ class MetricsPoller:
             return None  # first bucket — no baseline
         delta: dict[str, int] = {}
         reset = False
-        for col in _STAT_MAP.values():
+        for col in _METRIC_COLUMNS:
             d = current.get(col, 0) - prev.get(col, 0)
             if d < 0:
                 reset = True

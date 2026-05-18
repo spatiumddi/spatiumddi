@@ -30,20 +30,17 @@ class HeartbeatClient:
         self._stop.set()
 
     def _client(self) -> httpx.Client:
-        verify: bool | str = True
-        if self.cfg.insecure_skip_tls_verify:
-            verify = False
-        elif self.cfg.tls_ca_path:
-            verify = self.cfg.tls_ca_path
-        return httpx.Client(base_url=self.cfg.control_plane_url, verify=verify, timeout=15.0)
+        return httpx.Client(
+            base_url=self.cfg.control_plane_url,
+            verify=self.cfg.httpx_verify(),
+            timeout=15.0,
+        )
 
     def send_once(self) -> None:
         # Drain queued op acks (queued by SyncLoop when bundle includes pending_ops).
-        acks = getattr(self, "pending_acks", None)
         ops_ack: list[dict] = []
-        if acks is not None:
-            while acks:
-                ops_ack.append(acks.pop(0))
+        while self.pending_acks:
+            ops_ack.append(self.pending_acks.pop(0))
         body: dict[str, Any] = {
             "agent_version": __version__,
             "pid": os.getpid(),

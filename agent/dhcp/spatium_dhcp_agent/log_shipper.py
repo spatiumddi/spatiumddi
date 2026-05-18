@@ -52,12 +52,11 @@ class LogShipper:
         self._stop.set()
 
     def _cp_client(self) -> httpx.Client:
-        verify: bool | str = True
-        if self.cfg.insecure_skip_tls_verify:
-            verify = False
-        elif self.cfg.tls_ca_path:
-            verify = self.cfg.tls_ca_path
-        return httpx.Client(base_url=self.cfg.control_plane_url, verify=verify, timeout=15.0)
+        return httpx.Client(
+            base_url=self.cfg.control_plane_url,
+            verify=self.cfg.httpx_verify(),
+            timeout=15.0,
+        )
 
     def _open(self) -> bool:
         try:
