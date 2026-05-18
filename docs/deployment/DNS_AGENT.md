@@ -100,27 +100,28 @@ The **agent is the same Python codebase** (`spatium_dns_agent`) in both images; 
 
 **Pre-shared bootstrap key (`DNS_AGENT_KEY`) for first-contact registration, then per-server JWT (`agent_token`) issued by the control plane, rotated on each heartbeat.** The existing `/api/v1/dns/agents/register` + `/agents/{id}/heartbeat` endpoints are extended — the current shared-key model is kept as the *bootstrap* step and a token is issued on success.
 
-#### Alternative: short pairing code (#169)
+#### Pairing-code path retired for standalone agents (#246)
 
-Since 2026.05.13, operators can paste an 8-digit pairing code on
-first boot instead of the 64-char hex key. The agent's resolver
-swaps the code for the real key on first contact via
-``POST /api/v1/appliance/pair``, then continues with the standard
-PSK → JWT bootstrap flow. Resolution priority is:
+The 8-digit pairing-code → PSK exchange originally landed in #169
+shipped against a control-plane endpoint (``POST /api/v1/appliance
+/pair``) that was retired under #170 Wave A3. Pairing-code flow now
+lives entirely inside the **Application appliance** supervisor —
+the supervisor exchanges the code via ``POST /api/v1/appliance
+/supervisor/register``, gets the per-role agent keys back as part
+of the heartbeat-response ``SupervisorRoleAssignment`` block, and
+writes them into ``role-compose.env`` so the DNS / DHCP service
+containers pick them up on first boot with zero operator action.
 
-1. ``DNS_AGENT_KEY`` env var if set (operator-pasted long form
-   wins; lets a re-bootstrap with the explicit key work).
-2. Cached resolved key at ``<state_dir>/bootstrap.key`` (mode 0600)
-   from a previous successful pair — survives ``rm agent_token.jwt``
-   without burning a fresh code.
-3. ``BOOTSTRAP_PAIRING_CODE`` env var → exchanged via ``/pair``,
-   cached for the next run.
+For **standalone** docker-compose / K8s DNS agents, paste the long
+``DNS_AGENT_KEY`` PSK directly into the agent's env. The agent's
+``pairing.py`` module was deleted in 2026.05.18-1 (#246) because the
+``/pair`` endpoint no longer exists — agents that had been bootstrapped
+with ``BOOTSTRAP_PAIRING_CODE=<digits>`` were 404-looping forever
+against the gone endpoint. The container entrypoint now requires
+``DNS_AGENT_KEY`` non-empty.
 
-A 403 from ``/pair`` (invalid / expired / already used) is fatal —
-``PairingError`` exits the agent so the supervisor surfaces a clear
-error rather than backoff-looping against a dead code. See
-``docs/deployment/APPLIANCE.md §10`` for the end-to-end operator
-workflow.
+See ``docs/deployment/APPLIANCE.md §10`` for the Application-
+appliance pairing-code workflow.
 
 ### Flow
 
