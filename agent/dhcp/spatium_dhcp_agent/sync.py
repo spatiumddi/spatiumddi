@@ -125,7 +125,27 @@ class SyncLoop:
         inner dict. Fall back to the envelope if ``bundle`` isn't
         there so cached v0 responses (pre-envelope) still render.
         """
-        inner = bundle.get("bundle") if isinstance(bundle.get("bundle"), dict) else bundle
+        # Issue #258 — explicit narrowing. Pre-#258 the inline
+        # ternary fell through to ``bundle`` for ANY non-dict value
+        # of ``bundle["bundle"]`` (list, str, None, …) and the
+        # downstream ``render_kea`` would render against the
+        # envelope shape, producing a blank ``subnet4: []`` config.
+        # Now we narrow explicitly: only the dict shape becomes
+        # ``inner``; anything else (including a v0 cached response
+        # with no envelope wrapper) falls back to the outer bundle
+        # only when it is itself a dict.
+        inner_candidate = bundle.get("bundle")
+        if isinstance(inner_candidate, dict):
+            inner = inner_candidate
+        elif isinstance(bundle, dict):
+            inner = bundle
+        else:
+            log.warning(
+                "dhcp_sync_unexpected_bundle_shape",
+                outer_type=type(bundle).__name__,
+                inner_type=type(inner_candidate).__name__,
+            )
+            return
         rendered = render_kea(
             inner,
             control_socket=str(self.cfg.kea_control_socket),

@@ -133,11 +133,18 @@ class PeerResolveWatcher:
     @staticmethod
     def _peer_hosts(bundle: dict[str, Any]) -> list[str]:
         """Extract peer hostnames from the bundle's failover block."""
-        inner = (
-            bundle.get("bundle")
-            if isinstance(bundle.get("bundle"), dict)
-            else bundle
-        )
+        # Issue #260 — explicit narrowing matches sync._apply_bundle.
+        # The inline-ternary form crashed on ``inner.get(...)`` when
+        # ``bundle["bundle"]`` was a non-dict and the fallback was a
+        # non-dict outer. New shape: only proceed if we land on a
+        # dict; bail with an empty peer list otherwise.
+        inner_candidate = bundle.get("bundle")
+        if isinstance(inner_candidate, dict):
+            inner = inner_candidate
+        elif isinstance(bundle, dict):
+            inner = bundle
+        else:
+            return []
         failover = inner.get("failover") or {}
         peers = failover.get("peers") or []
         hosts: list[str] = []
