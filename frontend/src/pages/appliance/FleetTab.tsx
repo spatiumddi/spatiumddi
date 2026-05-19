@@ -182,6 +182,23 @@ const SERVICE_CHIP_STYLES: Record<
   neutral: "bg-muted text-muted-foreground border-border",
 };
 
+// #272 Phase 1 — Fleet UI two-table split. Control-plane variants run
+// the umbrella chart (api / frontend / worker / beat / postgres /
+// redis); service-agent variants run the DNS / DHCP service
+// containers. Future ``control-cluster-member`` (Phase 7+) joins the
+// control-plane side. NULL is treated as service-agent because the
+// only supervisors that pre-date the column are #170 Wave-A4-era
+// application appliances — the deferred .133 heartbeat bug also
+// surfaces as NULL on application rows, so this is the safe default.
+const CONTROL_PLANE_VARIANTS = new Set([
+  "full-stack",
+  "frontend-core",
+  "control-cluster-member",
+]);
+function isControlPlaneRow(row: ApplianceRow): boolean {
+  return CONTROL_PLANE_VARIANTS.has(row.appliance_variant ?? "");
+}
+
 export function FleetTab() {
   const qc = useQueryClient();
   const { data: me } = useQuery({
@@ -319,8 +336,20 @@ export function FleetTab() {
   });
 
   const rows = useMemo(() => data ?? [], [data]);
-  const pending = rows.filter((r) => r.state === "pending_approval");
-  const others = rows.filter((r) => r.state !== "pending_approval");
+  // #272 Phase 1 — split rows by Fleet section (Control plane vs
+  // Service agents) first, then by state (pending sticks at the top
+  // of its section). Single-node installs see only one populated
+  // section; multi-node HA (Phase 7+) populates both.
+  const controlPlaneRows = rows.filter(isControlPlaneRow);
+  const serviceAgentRows = rows.filter((r) => !isControlPlaneRow(r));
+  const splitByState = (
+    bucket: ApplianceRow[],
+  ): { pending: ApplianceRow[]; others: ApplianceRow[] } => ({
+    pending: bucket.filter((r) => r.state === "pending_approval"),
+    others: bucket.filter((r) => r.state !== "pending_approval"),
+  });
+  const controlPlane = splitByState(controlPlaneRows);
+  const serviceAgents = splitByState(serviceAgentRows);
 
   if (!isSuperadmin) {
     return (
@@ -366,7 +395,10 @@ export function FleetTab() {
           key: "appliances",
           label: "Appliances",
           summary: "Approve / manage paired supervisors.",
-          badge: pending.length > 0 ? pending.length : undefined,
+          badge:
+            controlPlane.pending.length + serviceAgents.pending.length > 0
+              ? controlPlane.pending.length + serviceAgents.pending.length
+              : undefined,
         },
         {
           key: "pairing",
@@ -518,16 +550,20 @@ export function FleetTab() {
             <>
               <div className="mb-4 flex items-start justify-between gap-4">
                 <div className="min-w-0 flex-1">
-                  <h2 className="text-base font-semibold">
-                    Application appliances
-                  </h2>
+                  <h2 className="text-base font-semibold">Appliances</h2>
                   <p className="mt-1 text-xs text-muted-foreground">
                     Supervisors that claimed a pairing code sit here until a
                     superadmin clicks Approve. Approval signs an X.509 cert
                     against the submitted Ed25519 pubkey using the control
                     plane&apos;s internal CA (lazy-bootstrapped on the first
                     approve). The supervisor picks the cert up on its next poll
-                    and switches from session-token auth to mTLS.
+                    and switches from session-token auth to mTLS. Rows split
+                    by installer variant: <strong>Control plane</strong>{" "}
+                    hosts the SpatiumDDI control-plane workloads (api /
+                    frontend / worker / postgres / redis);{" "}
+                    <strong>Service agents</strong> are Application
+                    appliances running DNS / DHCP service containers paired
+                    to a remote control plane.
                   </p>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
@@ -572,77 +608,49 @@ export function FleetTab() {
                   the code.
                 </div>
               ) : (
-                <div className="overflow-hidden rounded-md border bg-card">
-                  <table className="w-full text-sm">
-                    <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
-                      <tr>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Hostname
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          State
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Services
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Capabilities
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Slots
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Fingerprint
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Paired
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Last seen
-                        </th>
-                        <th className="px-3 py-2 text-right font-medium">
-                          Actions
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y">
-                      {pending.map((row) => (
-                        <ApplianceTableRow
-                          key={row.id}
-                          row={row}
-                          highlight
-                          busy={
-                            approve.isPending && approve.variables === row.id
-                          }
-                          onOpen={() => setDrilldown(row)}
-                          onApprove={() => approve.mutate(row.id)}
-                          onReject={() => setRejectTarget(row)}
-                          onRekey={() => setRekeyTarget(row)}
-                          onDelete={() => setDeleteTarget(row)}
-                          onReauthorize={() => reauthorize.mutate(row.id)}
-                          onPermanentDelete={() =>
-                            setPermanentDeleteTarget(row)
-                          }
-                        />
-                      ))}
-                      {others.map((row) => (
-                        <ApplianceTableRow
-                          key={row.id}
-                          row={row}
-                          busy={rekey.isPending && rekey.variables === row.id}
-                          onOpen={() => setDrilldown(row)}
-                          onApprove={() => approve.mutate(row.id)}
-                          onReject={() => setRejectTarget(row)}
-                          onRekey={() => setRekeyTarget(row)}
-                          onDelete={() => setDeleteTarget(row)}
-                          onReauthorize={() => reauthorize.mutate(row.id)}
-                          onPermanentDelete={() =>
-                            setPermanentDeleteTarget(row)
-                          }
-                        />
-                      ))}
-                    </tbody>
-                  </table>
+                <div className="space-y-6">
+                  <ApplianceTableSection
+                    title="Control plane"
+                    subtitle="Boxes hosting the SpatiumDDI control plane — full-stack, frontend-core, and future control-cluster-member variants."
+                    pendingRows={controlPlane.pending}
+                    otherRows={controlPlane.others}
+                    emptyMessage="No control-plane appliances registered yet."
+                    busyId={
+                      approve.isPending
+                        ? approve.variables
+                        : rekey.isPending
+                          ? rekey.variables
+                          : null
+                    }
+                    onOpen={(row) => setDrilldown(row)}
+                    onApprove={(row) => approve.mutate(row.id)}
+                    onReject={(row) => setRejectTarget(row)}
+                    onRekey={(row) => setRekeyTarget(row)}
+                    onDelete={(row) => setDeleteTarget(row)}
+                    onReauthorize={(row) => reauthorize.mutate(row.id)}
+                    onPermanentDelete={(row) => setPermanentDeleteTarget(row)}
+                  />
+                  <ApplianceTableSection
+                    title="Service agents"
+                    subtitle="Application appliances running DNS / DHCP service containers paired to a remote control plane."
+                    pendingRows={serviceAgents.pending}
+                    otherRows={serviceAgents.others}
+                    emptyMessage="No service-agent appliances registered yet."
+                    busyId={
+                      approve.isPending
+                        ? approve.variables
+                        : rekey.isPending
+                          ? rekey.variables
+                          : null
+                    }
+                    onOpen={(row) => setDrilldown(row)}
+                    onApprove={(row) => approve.mutate(row.id)}
+                    onReject={(row) => setRejectTarget(row)}
+                    onRekey={(row) => setRekeyTarget(row)}
+                    onDelete={(row) => setDeleteTarget(row)}
+                    onReauthorize={(row) => reauthorize.mutate(row.id)}
+                    onPermanentDelete={(row) => setPermanentDeleteTarget(row)}
+                  />
                 </div>
               )}
             </>
@@ -848,6 +856,113 @@ function ServiceChipList({ row }: { row: ApplianceRow }) {
         </span>
       ))}
     </div>
+  );
+}
+
+// #272 Phase 1 — Fleet UI two-table split. One section per bucket
+// (Control plane / Service agents). Pending rows pin to the top of
+// their section, others below. Empty section renders a dashed
+// placeholder so the heading still anchors the bucket visually.
+function ApplianceTableSection({
+  title,
+  subtitle,
+  pendingRows,
+  otherRows,
+  emptyMessage,
+  busyId,
+  onOpen,
+  onApprove,
+  onReject,
+  onRekey,
+  onDelete,
+  onReauthorize,
+  onPermanentDelete,
+}: {
+  title: string;
+  subtitle: string;
+  pendingRows: ApplianceRow[];
+  otherRows: ApplianceRow[];
+  emptyMessage: string;
+  busyId: string | null | undefined;
+  onOpen: (row: ApplianceRow) => void;
+  onApprove: (row: ApplianceRow) => void;
+  onReject: (row: ApplianceRow) => void;
+  onRekey: (row: ApplianceRow) => void;
+  onDelete: (row: ApplianceRow) => void;
+  onReauthorize: (row: ApplianceRow) => void;
+  onPermanentDelete: (row: ApplianceRow) => void;
+}) {
+  const total = pendingRows.length + otherRows.length;
+  return (
+    <section>
+      <div className="mb-2 flex items-baseline justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">{title}</h3>
+          <p className="text-xs text-muted-foreground">{subtitle}</p>
+        </div>
+        <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+          {total}
+        </span>
+      </div>
+      {total === 0 ? (
+        <div className="rounded-md border border-dashed bg-card p-4 text-center text-xs text-muted-foreground">
+          {emptyMessage}
+        </div>
+      ) : (
+        <div className="overflow-hidden rounded-md border bg-card">
+          <table className="w-full text-sm">
+            <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
+              <tr>
+                <th className="px-3 py-2 text-left font-medium">Hostname</th>
+                <th className="px-3 py-2 text-left font-medium">State</th>
+                <th className="px-3 py-2 text-left font-medium">Services</th>
+                <th className="px-3 py-2 text-left font-medium">
+                  Capabilities
+                </th>
+                <th className="px-3 py-2 text-left font-medium">Slots</th>
+                <th className="px-3 py-2 text-left font-medium">
+                  Fingerprint
+                </th>
+                <th className="px-3 py-2 text-left font-medium">Paired</th>
+                <th className="px-3 py-2 text-left font-medium">Last seen</th>
+                <th className="px-3 py-2 text-right font-medium">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {pendingRows.map((row) => (
+                <ApplianceTableRow
+                  key={row.id}
+                  row={row}
+                  highlight
+                  busy={busyId === row.id}
+                  onOpen={() => onOpen(row)}
+                  onApprove={() => onApprove(row)}
+                  onReject={() => onReject(row)}
+                  onRekey={() => onRekey(row)}
+                  onDelete={() => onDelete(row)}
+                  onReauthorize={() => onReauthorize(row)}
+                  onPermanentDelete={() => onPermanentDelete(row)}
+                />
+              ))}
+              {otherRows.map((row) => (
+                <ApplianceTableRow
+                  key={row.id}
+                  row={row}
+                  busy={busyId === row.id}
+                  onOpen={() => onOpen(row)}
+                  onApprove={() => onApprove(row)}
+                  onReject={() => onReject(row)}
+                  onRekey={() => onRekey(row)}
+                  onDelete={() => onDelete(row)}
+                  onReauthorize={() => onReauthorize(row)}
+                  onPermanentDelete={() => onPermanentDelete(row)}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }
 
