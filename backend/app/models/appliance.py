@@ -226,6 +226,18 @@ class PairingCode(Base):
     # shown once on create and gone forever, matching #169 semantics).
     code_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
+    # #272 Phase 1 — self-bootstrap codes auto-approve on register.
+    # The endpoint that mints the code (``/self-register-bootstrap``,
+    # gated to the local supervisor on full-stack / frontend-core)
+    # flips this to True; ``/supervisor/register`` reads it and runs
+    # the cert-signing + state-flip path inline so the operator
+    # doesn't have to manually approve their own local supervisor.
+    # Stays False for every operator-typed pairing code minted via
+    # the Fleet → Pairing tab (those keep the manual-approve flow).
+    auto_approve: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.text("false")
+    )
+
     # Operator-driven cancellation. Independent of enabled —
     # revoking a code is permanent ("dead row"), disabling is
     # reversible ("paused"). Revoking a claimed code is a no-op for

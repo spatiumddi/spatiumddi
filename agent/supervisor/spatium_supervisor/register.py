@@ -64,6 +64,7 @@ def register(
     hostname: str,
     supervisor_version: str,
     client: httpx.Client,
+    appliance_variant: str | None = None,
     max_attempts: int = 60,
     backoff_seconds: float = 2.0,
 ) -> RegisterResult:
@@ -72,12 +73,17 @@ def register(
     than exponential — the supervisor's whole job until registered is
     to retry registration, so polling cadence > retry-pause cadence.
     """
-    payload = {
+    payload: dict[str, object] = {
         "pairing_code": pairing_code,
         "hostname": hostname,
         "public_key_der_b64": base64.b64encode(identity.public_key_der).decode("ascii"),
         "supervisor_version": supervisor_version,
     }
+    if appliance_variant is not None:
+        # #272 Phase 1 — control plane stamps Appliance.appliance_variant
+        # + auto-assigns the variant's fixed role set at register time
+        # instead of waiting for the first heartbeat.
+        payload["appliance_variant"] = appliance_variant
     url = control_plane_url.rstrip("/") + "/api/v1/appliance/supervisor/register"
 
     last_error: str | None = None

@@ -887,7 +887,31 @@ function ApplianceTableRow({
       onClick={onOpen}
     >
       <td className="px-3 py-2">
-        <div className="font-medium">{row.hostname}</div>
+        <div className="flex items-center gap-2">
+          <span className="font-medium">{row.hostname}</span>
+          {/* #272 Phase 1 — installer-role chip. full-stack lives on
+              the Control plane side of the upcoming two-table split;
+              frontend-core too; application is a Service agent. */}
+          {row.appliance_variant && (
+            <span
+              className={cn(
+                "inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium",
+                row.appliance_variant === "application"
+                  ? "border-violet-500/40 bg-violet-500/10 text-violet-600 dark:text-violet-300"
+                  : "border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-300",
+              )}
+              title={
+                row.appliance_variant === "full-stack"
+                  ? "Full-stack — control plane + DNS + DHCP on this box"
+                  : row.appliance_variant === "frontend-core"
+                    ? "Frontend / core — control plane only"
+                    : "Application — DNS / DHCP agent only (pairs remote)"
+              }
+            >
+              {row.appliance_variant}
+            </span>
+          )}
+        </div>
         {row.supervisor_version && (
           <div className="text-xs text-muted-foreground">
             supervisor {row.supervisor_version}

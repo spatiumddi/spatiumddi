@@ -191,6 +191,13 @@ class SupervisorRegisterRequest(BaseModel):
             "to filter role assignment options."
         ),
     )
+    # #272 Phase 1 — installer-role variant from
+    # /etc/spatiumddi-host/role-config:ROLE. Lets the control plane
+    # stamp ``appliance_variant`` + auto-assign the variant's fixed
+    # role set on the resulting Appliance row at register time
+    # instead of waiting for the first heartbeat. None for pre-#272
+    # supervisors.
+    appliance_variant: Literal["full-stack", "frontend-core", "application"] | None = None
 
     @field_validator("pairing_code")
     @classmethod
@@ -419,6 +426,12 @@ async def self_register_bootstrap(
             expires_at=expires_at,
             persistent=False,
             enabled=True,
+            # The supervisor that consumes this code on
+            # /supervisor/register gets auto-approved (cert signed +
+            # state=approved). The operator doesn't have to manually
+            # approve their own local supervisor on full-stack /
+            # frontend-core — they'd have no other choice anyway.
+            auto_approve=True,
             note=f"Self-bootstrap pairing code for {body.appliance_variant}",
         )
     )
@@ -647,6 +660,15 @@ async def supervisor_register(
     # claim accounting lives in pairing_claim now (A3).
     appliance_id = uuid.uuid4()
     session_cleartext, session_hash = generate_session_token()
+    # #272 Phase 1 — stamp variant + auto-assign fixed roles at
+    # register time. Variant comes from /etc/spatiumddi-host/role-
+    # config:ROLE on the supervisor side; control plane uses it to
+    # populate ``Appliance.assigned_roles`` so the Fleet UI's
+    # Services chips render correctly without waiting for the
+    # operator to open the role-picker.
+    initial_assigned_roles: list[str] = []
+    if body.appliance_variant is not None:
+        initial_assigned_roles = list(_REGISTER_VARIANT_FIXED_ROLES.get(body.appliance_variant, []))
     appliance_row = Appliance(
         id=appliance_id,
         hostname=body.hostname,
@@ -659,8 +681,39 @@ async def supervisor_register(
         paired_from_ip=client_ip,
         paired_via_code_id=code_row.id,
         state=APPLIANCE_STATE_PENDING_APPROVAL,
+        appliance_variant=body.appliance_variant,
+        assigned_roles=initial_assigned_roles,
     )
     db.add(appliance_row)
+    # #272 Phase 1 — auto-approve when the consumed pairing code was
+    # minted by /self-register-bootstrap (i.e. the operator's own
+    # local supervisor on full-stack / frontend-core). The operator
+    # has no other choice but to approve themselves; doing it inline
+    # here saves a click + makes the Fleet row green from the first
+    # render. Operator-typed pairing codes from the Fleet → Pairing
+    # tab keep ``auto_approve=False`` so manual approval stays the
+    # norm for any remote pairing.
+    if code_row.auto_approve:
+        await _approve_appliance_inline(db, appliance_row, approved_by_user_id=None)
+        db.add(
+            AuditLog(
+                user_id=None,
+                user_display_name=body.hostname,
+                auth_source="self_bootstrap",
+                source_ip=client_ip,
+                action="appliance.auto_approved",
+                resource_type="appliance",
+                resource_id=str(appliance_id),
+                resource_display=body.hostname,
+                result="success",
+                new_value={
+                    "hostname": body.hostname,
+                    "fingerprint": pubkey_fingerprint,
+                    "appliance_variant": body.appliance_variant,
+                    "cert_serial": appliance_row.cert_serial,
+                },
+            )
+        )
     db.add(
         PairingClaim(
             pairing_code_id=code_row.id,
@@ -722,7 +775,9 @@ async def supervisor_register(
 
     return SupervisorRegisterResponse(
         appliance_id=appliance_id,
-        state=APPLIANCE_STATE_PENDING_APPROVAL,
+        # The auto-approve branch above flipped row.state to
+        # ``approved``; otherwise stays at ``pending_approval``.
+        state=appliance_row.state,  # type: ignore[arg-type]
         public_key_fingerprint=pubkey_fingerprint,
         session_token=session_cleartext,
     )
@@ -1482,6 +1537,53 @@ async def get_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: 
     return _row_to_schema(row)
 
 
+async def _approve_appliance_inline(
+    db: DB,
+    row: Appliance,
+    approved_by_user_id: uuid.UUID | None,
+) -> None:
+    """Sign + persist a supervisor cert on the row, transition to
+    ``approved``. Shared by the operator-driven
+    /appliances/{id}/approve endpoint and the auto-approve path
+    that /supervisor/register hits for self-bootstrap codes (#272
+    Phase 1).
+
+    Caller commits. Idempotent on already-approved rows.
+    """
+    if row.state == APPLIANCE_STATE_APPROVED:
+        return
+    ca = await ensure_ca(db)
+    cert_pem, serial_hex, issued_at, expires_at = sign_supervisor_cert(
+        ca=ca,
+        appliance_id=row.id,
+        public_key_der=row.public_key_der,
+        public_key_fingerprint=row.public_key_fingerprint,
+        hostname=row.hostname,
+    )
+    row.cert_pem = cert_pem
+    row.cert_serial = serial_hex
+    row.cert_issued_at = issued_at
+    row.cert_expires_at = expires_at
+    row.state = APPLIANCE_STATE_APPROVED
+    row.approved_at = issued_at
+    row.approved_by_user_id = approved_by_user_id
+
+
+# #272 Phase 1 — per-variant fixed role set the api stamps on
+# ``Appliance.assigned_roles`` when a supervisor registers with
+# its variant. Keeps the Fleet UI's Services column accurate for
+# full-stack / frontend-core boxes (the operator never opens the
+# role-picker because the variant's roles are install-fixed).
+# Application variant contributes nothing here — operator picks.
+# Keep in lock-step with ``service_lifecycle._VARIANT_FIXED_ROLES``
+# on the supervisor side.
+_REGISTER_VARIANT_FIXED_ROLES: dict[str, list[str]] = {
+    "full-stack": ["dns-bind9", "dhcp"],
+    "frontend-core": [],
+    "application": [],
+}
+
+
 @router.post(
     "/appliances/{appliance_id}/approve",
     response_model=ApplianceRow,
@@ -1503,24 +1605,9 @@ async def approve_appliance(
     if row.state == APPLIANCE_STATE_APPROVED:
         return _row_to_schema(row)  # idempotent
 
-    # Lazy CA bootstrap — first approve on a fresh control plane
-    # generates the singleton.
-    ca = await ensure_ca(db)
-
-    cert_pem, serial_hex, issued_at, expires_at = sign_supervisor_cert(
-        ca=ca,
-        appliance_id=row.id,
-        public_key_der=row.public_key_der,
-        public_key_fingerprint=row.public_key_fingerprint,
-        hostname=row.hostname,
-    )
-    row.cert_pem = cert_pem
-    row.cert_serial = serial_hex
-    row.cert_issued_at = issued_at
-    row.cert_expires_at = expires_at
-    row.state = APPLIANCE_STATE_APPROVED
-    row.approved_at = issued_at
-    row.approved_by_user_id = current_user.id
+    await _approve_appliance_inline(db, row, current_user.id)
+    serial_hex = row.cert_serial or ""
+    expires_at = row.cert_expires_at
     # Session token cleared — supervisor now uses mTLS. Keep the
     # current value on disk so an in-flight /poll succeeds before the
     # supervisor learns to switch; B3's UI will clarify the transition.
@@ -1542,7 +1629,7 @@ async def approve_appliance(
                 "hostname": row.hostname,
                 "fingerprint": row.public_key_fingerprint,
                 "cert_serial": serial_hex,
-                "cert_expires_at": expires_at.isoformat(),
+                "cert_expires_at": expires_at.isoformat() if expires_at else None,
             },
         )
     )

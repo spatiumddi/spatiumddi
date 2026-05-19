@@ -76,7 +76,12 @@ def _build_http_client(
                 "set the env to 0 / unset on production deployments."
             ),
         )
-    return httpx.Client(verify=not skip_tls_verify)
+    # #272 Phase 1 — follow_redirects=True so an operator-typed
+    # http:// CONTROL_PLANE_URL doesn't 301-loop against the nginx
+    # http→https redirect on the appliance frontend. POST redirects
+    # are followed verbatim (httpx preserves the method on 301/302
+    # by default for non-safe methods unless explicitly disabled).
+    return httpx.Client(verify=not skip_tls_verify, follow_redirects=True)
 
 
 def _self_bootstrap_or_skip(
@@ -245,6 +250,11 @@ def _maybe_register(
                 hostname=cfg.hostname,
                 supervisor_version=_supervisor_version(),
                 client=client,
+                # #272 Phase 1 — let the control plane stamp the variant
+                # + auto-assign fixed roles at register time instead of
+                # waiting for the first heartbeat. None on docker / k8s
+                # supervisors (no role-config bind mount).
+                appliance_variant=appliance_state.detect_appliance_variant(),
             )
     except RegisterDisabled as exc:
         log.warning("supervisor.register.disabled", reason=str(exc))
