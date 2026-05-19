@@ -100,6 +100,17 @@ spec:
             - name: NGINX_LOCAL_RESOLVERS
               value: {{ . | quote }}
             {{- end }}
+            # nginx >=1.30's upstream 15-local-resolvers.envsh script
+            # is gated on this var being set — without it the script
+            # returns early and ``NGINX_LOCAL_RESOLVERS`` is never
+            # exported, so envsubst leaves the literal ``${NGINX_
+            # LOCAL_RESOLVERS}`` in the rendered config and nginx
+            # fails to start. Our image's COPY-replaced version of
+            # the script (frontend/15-local-resolvers.envsh) doesn't
+            # need the var, but setting it here is defensive — a
+            # build that somehow loses the COPY still works.
+            - name: NGINX_ENTRYPOINT_LOCAL_RESOLVERS
+              value: "1"
           livenessProbe:
             httpGet: { path: /, port: http }
             initialDelaySeconds: 5
