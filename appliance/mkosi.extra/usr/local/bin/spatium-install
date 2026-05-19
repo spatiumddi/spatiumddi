@@ -700,6 +700,24 @@ EOF
         #   /var/persist/etc-work  workdir   (overlay scratch space)
         mkdir -p "$MOUNT/var/persist/etc" "$MOUNT/var/persist/etc-work"
 
+        # #272 Phase 1 audit — SSH host keys must live on the overlay
+        # UPPER (persistent across slot swaps), not the LOWER (frozen
+        # per-slot image-baseline). Without this, every fresh slot
+        # image carries its own mkosi-built ssh_host_*_key set baked
+        # into /etc.image; on slot upgrade the lower changes → the
+        # host key flips → ssh clients hit a "host key changed" MITM
+        # warning. Pull the keys out of /etc.image and seed them into
+        # the upper before the overlay mounts; sshd then sees the
+        # operator's stable keys from /var/persist/etc/ssh/ on every
+        # subsequent boot regardless of which slot's running.
+        mkdir -p "$MOUNT/var/persist/etc/ssh"
+        for k in "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key \
+                 "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key.pub; do
+            [ -f "$k" ] || continue
+            cp -a "$k" "$MOUNT/var/persist/etc/ssh/" >> "$INSTALL_LOG" 2>&1
+            rm -f "$k"
+        done
+
         # Mount overlay over /target/etc for the REMAINDER of the
         # install. Every chroot useradd / chpasswd / file write that
         # would normally land in /etc instead lands in the upper layer

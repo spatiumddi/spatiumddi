@@ -194,6 +194,31 @@ def cmd_apply(args) -> int:
     print(f"Writing image into INACTIVE slot {inactive['partlabel']} ({target_dev})")
     print(f"(Active slot stays untouched: {active['partlabel']} {active['device']})")
 
+    # #272 Phase 1 audit — migrate SSH host keys into the overlay UPPER
+    # so the slot swap doesn't change them. Pre-#272 installs baked the
+    # ssh_host_*_key set into /etc.image (overlay LOWER); every slot
+    # build mints its own keys, so a slot upgrade silently changed the
+    # host key and ssh clients hit a "host key changed" warning. The
+    # install-time fix in spatium-install seeds /var/persist/etc/ssh/
+    # for new installs; this block handles the migration for existing
+    # installs on their next upgrade — copy the current keys into the
+    # upper if they're not already there. Once in /var/persist/etc/ssh/
+    # the overlay always sees them (upper wins) regardless of which
+    # slot's lower is active. Best-effort: a stuck mount or RO /var
+    # doesn't block the upgrade.
+    persist_ssh = Path("/var/persist/etc/ssh")
+    try:
+        persist_ssh.mkdir(parents=True, exist_ok=True)
+        for keytype in ("rsa", "ecdsa", "ed25519"):
+            for suffix in ("", ".pub"):
+                src = Path(f"/etc/ssh/ssh_host_{keytype}_key{suffix}")
+                dst = persist_ssh / src.name
+                if src.is_file() and not dst.exists():
+                    shutil.copy2(src, dst)
+                    print(f"  migrated SSH host key → {dst}")
+    except OSError as exc:
+        print(f"  WARN: SSH host-key migration skipped ({exc})", file=sys.stderr)
+
     workdir = Path("/var/lib/spatiumddi/slot-staging")
     workdir.mkdir(parents=True, exist_ok=True)
     staged = workdir / "slot.raw.xz"
@@ -266,6 +291,21 @@ def cmd_apply(args) -> int:
         _patch_grub_cfg_slot_label(inactive["partlabel"], new_version)
     sync_slot_versions()
 
+    # #272 Phase 1 audit — bake the operator's CURRENT hostname into
+    # the new slot's /etc.image/hostname. ``build-slot-image.sh``
+    # deliberately empties /etc/hostname in the lower because the /etc
+    # overlay is supposed to surface the operator's hostname from the
+    # upper. In practice systemd reads /etc/hostname VERY early on
+    # boot (before etc.mount fires) — empty lower → fallback to
+    # ``localhost`` → k3s registers a brand-new node named ``localhost``
+    # → operator's old node goes NotReady + PVCs stuck on the old node
+    # → frontend stops responding. Stamping the hostname into the
+    # lower closes the window: the same operator hostname lands in the
+    # early-boot kernel hostname AND in the overlay's eventual merged
+    # view. Best-effort — apply already succeeded; a mount failure
+    # here just leaves the operator with the original (broken) flow.
+    _stamp_lower_hostname(target_dev)
+
     print()
     print("✓ Image written to inactive slot.")
     print()
@@ -278,6 +318,45 @@ def cmd_apply(args) -> int:
     print(f"  spatium-upgrade-slot set-next-boot")
     print("  reboot")
     return 0
+
+
+def _stamp_lower_hostname(target_dev: str) -> None:
+    """Write the operator's current hostname into the new slot's lower
+    /etc.image/hostname. See the caller (cmd_apply) for the architecture
+    background.
+
+    Best-effort throughout: a missing/empty current hostname or a mount
+    failure just skips the stamping — the operator's slot is still
+    bootable, just with the empty-hostname-→-localhost race surfaced.
+    """
+    try:
+        current = Path("/etc/hostname").read_text().strip()
+    except OSError:
+        return
+    if not current:
+        return
+    mountpoint = Path("/tmp/spatium-slot-mnt")
+    try:
+        mountpoint.mkdir(parents=True, exist_ok=True)
+        rc = subprocess.run(
+            ["mount", "-o", "rw", target_dev, str(mountpoint)],
+            check=False,
+        ).returncode
+        if rc != 0:
+            print(f"  WARN: couldn't mount {target_dev} to stamp hostname")
+            return
+        try:
+            etc_image_hostname = mountpoint / "usr/lib/etc.image/hostname"
+            if etc_image_hostname.parent.is_dir():
+                etc_image_hostname.write_text(current + "\n")
+                print(f"  stamped hostname '{current}' into new slot's /etc.image")
+            etc_hostname = mountpoint / "etc/hostname"
+            if etc_hostname.parent.is_dir():
+                etc_hostname.write_text(current + "\n")
+        finally:
+            subprocess.run(["umount", str(mountpoint)], check=False)
+    except OSError as exc:
+        print(f"  WARN: hostname stamp skipped ({exc})", file=sys.stderr)
 
 
 def _blkid_uuid(device: str) -> str | None:
