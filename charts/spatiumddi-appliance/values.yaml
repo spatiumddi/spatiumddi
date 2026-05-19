@@ -167,3 +167,48 @@ agentLanding:
     tag: 1.30.1-alpine
   hostMounts:
     htmlDir: /var/lib/spatiumddi/agent-landing
+
+# ─────────────────────────────────────────────────────────────────────
+# Multi-node HA scaffolding — #272 Phase 1 lands the value stubs;
+# the actual subchart vendoring + activation work lands in Phase 2
+# (CNPG) and Phase 5 (MetalLB). Single-node appliance installs leave
+# both ``enabled: false`` and behave identically to pre-#272.
+# ─────────────────────────────────────────────────────────────────────
+
+# MetalLB — L2 / BGP load-balancer for the control-plane HTTPS VIP
+# and (Phase 10) DNS / DHCP service VIPs. Apache 2.0. Vendored from
+# the upstream chart at v0.15.3 in Phase 5.
+metallb:
+  enabled: false
+  # ``ipPool.addresses`` is the L2 IP range MetalLB hands out to
+  # Services. Operator picks a free slice of the appliance subnet
+  # via the Fleet UI; the value plumbing lands with Phase 5.
+  ipPool:
+    addresses: []
+  # ``bgp`` mode plumbed through the chart for the anycast-DNS
+  # follow-up; specifies neighbor peers + community advertisements.
+  # Spec-only in Phase 5; no behavior change in this PR.
+  bgp:
+    enabled: false
+    peers: []
+
+# CloudNativePG operator — declarative postgres HA. Apache 2.0.
+# Phase 2 vendors the upstream chart + adds a ``Cluster`` CR for
+# the SpatiumDDI schema, then renders a one-shot migration job
+# that pg_dumps the existing single-node ``postgres`` StatefulSet
+# and pg_restores into the CNPG cluster.
+cnpg:
+  enabled: false
+  # Replica topology for the SpatiumDDI ``Cluster`` CR. 3 replicas
+  # (primary + sync + async) is the etcd-quorum-friendly default;
+  # 5 / 7 work for larger clusters. Even counts refused at the
+  # promote endpoint (Phase 7).
+  cluster:
+    instances: 3
+    # Per-replica storage class. Single-node + small dev clusters
+    # default to local-path; multi-node needs longhorn / rook /
+    # external NFS — operator picks at install time. Empty here
+    # forces the operator to make an explicit choice in Phase 2.
+    storage:
+      storageClass: ""
+      size: 20Gi

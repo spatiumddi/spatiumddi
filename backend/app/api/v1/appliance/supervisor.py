@@ -600,6 +600,11 @@ class SupervisorHeartbeatRequest(BaseModel):
     session_token: str | None = None
     capabilities: SupervisorCapabilities | None = None
     deployment_kind: Literal["appliance", "docker", "k8s", "unknown"] | None = None
+    # #272 Phase 1 — installer-role variant read by the supervisor from
+    # ``/etc/spatiumddi-host/role-config:ROLE``. None on pre-#272
+    # supervisors; the persistence handler leaves the column
+    # untouched in that case (no nulling of an existing variant).
+    appliance_variant: Literal["full-stack", "frontend-core", "application"] | None = None
     installed_appliance_version: str | None = None
     current_slot: Literal["slot_a", "slot_b"] | None = None
     durable_default: Literal["slot_a", "slot_b"] | None = None
@@ -859,6 +864,11 @@ async def supervisor_heartbeat(
     # doesn't currently know about.
     if body.deployment_kind is not None:
         row.deployment_kind = body.deployment_kind
+    if body.appliance_variant is not None:
+        # #272 Phase 1 — supervisor reads /etc/spatiumddi-host/role-
+        # config:ROLE and reports here. Leave the existing value alone
+        # if the supervisor didn't ship the field this tick (pre-#272).
+        row.appliance_variant = body.appliance_variant
     if body.installed_appliance_version is not None:
         row.installed_appliance_version = body.installed_appliance_version
     if body.current_slot is not None:
@@ -1101,6 +1111,9 @@ class ApplianceRow(BaseModel):
     cert_expires_at: datetime | None
     # #170 Wave C1 — slot telemetry surfaced from the appliance row.
     deployment_kind: str | None
+    # #272 Phase 1 — installer-role variant. NULL on pre-#272
+    # supervisors that haven't slot-upgraded yet.
+    appliance_variant: str | None
     installed_appliance_version: str | None
     current_slot: str | None
     durable_default: str | None
@@ -1190,6 +1203,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         cert_issued_at=row.cert_issued_at,
         cert_expires_at=row.cert_expires_at,
         deployment_kind=row.deployment_kind,
+        appliance_variant=row.appliance_variant,
         installed_appliance_version=row.installed_appliance_version,
         current_slot=row.current_slot,
         durable_default=row.durable_default,

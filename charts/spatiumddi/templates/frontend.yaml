@@ -124,10 +124,7 @@ spec:
             # races could otherwise wedge.
             optional: true
       {{- end }}
-      {{- with .Values.frontend.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.frontend.nodeSelector) .) | nindent 6 }}
       {{- with .Values.frontend.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}

@@ -24,6 +24,20 @@ image:
   pullPolicy: IfNotPresent
   pullSecrets: []
 
+# Chart-wide settings the appliance + multi-node HA work consume.
+# Plain K8s / docker-compose installs leave these at defaults.
+global:
+  # #272 Phase 1 — every control-plane workload (api / frontend /
+  # worker / beat / postgres / redis) merges this map into its
+  # nodeSelector block on top of any per-component override. The
+  # appliance chart's firstboot flips it to
+  # ``{spatium.io/role-control-plane: "true"}`` so control-plane
+  # pods only schedule on nodes carrying the per-role label.
+  # Leaving it empty (the default) lets plain K8s clusters schedule
+  # control-plane workloads anywhere; multi-node HA (#272 later
+  # phases) configures the gate from the umbrella valuesContent.
+  controlPlaneNodeSelector: {}
+
 # Cluster-wide app name override. Leave empty to use `.Release.Name`.
 fullnameOverride: ""
 nameOverride: ""

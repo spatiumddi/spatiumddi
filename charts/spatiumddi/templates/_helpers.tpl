@@ -73,6 +73,30 @@ Control-plane image — pass `imageName` (e.g. "spatiumddi-api") via merge:
 {{- end -}}
 
 {{/*
+Control-plane nodeSelector block. Issue #272 Phase 1 — emits a
+``nodeSelector:`` stanza when either ``.Values.global.controlPlane
+NodeSelector`` or the component-level override is non-empty, so the
+six umbrella control-plane workloads (api / frontend / worker / beat
+/ postgres / redis) share one selector path.
+
+Pass the per-component override via merge:
+  {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.api.nodeSelector) .) | nindent 6 }}
+
+The helper returns nothing on empty merged map, so plain K8s
+installs that haven't opted into the per-role label still let the
+scheduler pick.
+*/}}
+{{- define "spatiumddi.controlPlaneNodeSelector" -}}
+{{- $globalSel := default (dict) (.Values.global).controlPlaneNodeSelector -}}
+{{- $componentSel := default (dict) .componentNodeSelector -}}
+{{- $merged := merge (dict) $componentSel $globalSel -}}
+{{- if $merged }}
+nodeSelector:
+  {{- toYaml $merged | nindent 2 }}
+{{- end }}
+{{- end -}}
+
+{{/*
 Name of the chart-owned secret carrying SECRET_KEY.
 */}}
 {{- define "spatiumddi.appSecretName" -}}

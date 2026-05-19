@@ -114,10 +114,7 @@ spec:
             failureThreshold: 6
           resources:
             {{- toYaml .Values.postgresql.resources | nindent 12 }}
-      {{- with .Values.postgresql.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.postgresql.nodeSelector) .) | nindent 6 }}
       {{- with .Values.postgresql.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}

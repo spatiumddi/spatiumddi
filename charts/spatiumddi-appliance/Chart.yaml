@@ -23,8 +23,16 @@ keywords:
   - k3s
 maintainers:
   - name: SpatiumDDI Contributors
-# No subchart dependencies — each role lives in its own template
-# under templates/<role>.yaml, gated on a top-level feature flag in
-# values.yaml. The supervisor's CRD reconciler (Phase 3) renders
-# values.yaml from the SpatiumApplianceRole spec + applies via the
-# k3s-builtin HelmChart CRD.
+# Subchart dependencies — populated in #272 Phase 2 (CloudNativePG)
+# and Phase 5 (MetalLB). Phase 1 lands the values-level scaffolding
+# only (see ``metallb`` and ``cnpg`` blocks in values.yaml,
+# ``enabled: false`` defaults) so single-node installs aren't
+# affected. The chart-level ``dependencies:`` block stays empty
+# until those phases vendor the upstream tarballs + values
+# overrides into ``charts/spatiumddi-appliance/charts/``.
+#
+# Upstream sources tracked for the eventual vendor commits:
+#   * MetalLB (Apache 2.0) v0.15.3 —
+#     https://github.com/metallb/metallb/tree/main/charts/metallb
+#   * CloudNativePG (Apache 2.0) latest stable —
+#     https://github.com/cloudnative-pg/charts

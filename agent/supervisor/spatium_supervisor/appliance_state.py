@@ -119,6 +119,40 @@ def read_installed_version() -> str | None:
     return None
 
 
+# #272 Phase 1 — installer-role variants the installer wizard offers.
+# The supervisor reports its variant on every heartbeat so the
+# control plane's Fleet UI can split rows into Control plane
+# (full-stack / frontend-core) vs Service agents (application), and
+# the variant-aware label reconciler can apply the correct per-role
+# labels on the node (full-stack ⇒ dns-bind9 + dhcp + control-plane,
+# frontend-core ⇒ control-plane, application ⇒ operator-assigned).
+_KNOWN_VARIANTS = frozenset({"full-stack", "frontend-core", "application"})
+
+
+def detect_appliance_variant() -> str | None:
+    """Parse ``ROLE=`` out of ``/etc/spatiumddi-host/role-config``.
+
+    The installer wizard's role choice is baked into role-config at
+    install time (``spatium-install`` writes ``ROLE=<variant>``);
+    firstboot leaves the value untouched across slot swaps. Returns
+    ``None`` when the file isn't mounted (docker / k8s) or the
+    parsed value isn't one we recognise — the heartbeat handler
+    treats ``None`` as "supervisor didn't ship the field" and
+    leaves the persisted column alone.
+    """
+    if not _HOST_ROLE_CONFIG.exists():
+        return None
+    try:
+        text = _HOST_ROLE_CONFIG.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("ROLE="):
+            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            return value if value in _KNOWN_VARIANTS else None
+    return None
+
+
 def _current_slot_from_cmdline() -> str | None:
     """Match /proc/cmdline's ``root=UUID=`` against udev's PARTLABEL.
 
@@ -854,6 +888,12 @@ def collect() -> dict[str, object]:
 
     return {
         "deployment_kind": deployment_kind,
+        # #272 Phase 1 — installer-role variant the supervisor is
+        # running on. Only meaningful on appliance deploys; None on
+        # docker / k8s.
+        "appliance_variant": (
+            detect_appliance_variant() if is_appliance else None
+        ),
         "installed_appliance_version": (
             read_installed_version() if is_appliance else None
         ),

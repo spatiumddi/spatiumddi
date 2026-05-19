@@ -58,10 +58,7 @@ spec:
             failureThreshold: 3
           resources:
             {{- toYaml .Values.beat.resources | nindent 12 }}
-      {{- with .Values.beat.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.beat.nodeSelector) .) | nindent 6 }}
       {{- with .Values.beat.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}

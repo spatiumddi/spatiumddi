@@ -7287,6 +7287,11 @@ export interface ApplianceRow {
   // run the supervisor heartbeat path, so these stay null on those
   // rows.
   deployment_kind: string | null;
+  // #272 Phase 1 — installer-role variant ("full-stack" /
+  // "frontend-core" / "application"). Drives the Fleet UI's two-
+  // table split (Control plane vs Service agents). NULL on
+  // pre-#272 supervisors that haven't slot-upgraded yet.
+  appliance_variant: string | null;
   installed_appliance_version: string | null;
   current_slot: string | null;
   durable_default: string | null;
