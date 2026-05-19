@@ -55,6 +55,18 @@ mkdir -p "$BAKED_DIR"
 echo "→ Linting chart at $CHART_SRC …"
 helm lint "$CHART_SRC" 1>&2
 
+# #272 Phase 1 — refresh subchart tarballs under $CHART_SRC/charts/
+# before packaging. ``helm package`` does NOT fetch dependencies on
+# its own, so missing tarballs would silently produce a chart that
+# can't render any of the disabled subcharts (MetalLB, CNPG) when
+# the operator later flips ``<sub>.enabled=true``. ``helm dep
+# update`` requires network on the build machine; the runtime
+# appliance still air-gap-renders the chart from the baked bytes.
+if grep -qE '^dependencies:' "$CHART_SRC/Chart.yaml"; then
+    echo "→ Refreshing subchart tarballs at $CHART_SRC/charts/ …"
+    helm dependency update "$CHART_SRC" 1>&2
+fi
+
 echo "→ Packaging chart → $BAKED_TARBALL …"
 # ``helm package`` writes the tarball with a versioned filename
 # (e.g. spatiumddi-appliance-0.1.0.tgz). Use --destination + a tmpdir

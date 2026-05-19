@@ -23,16 +23,26 @@ keywords:
   - k3s
 maintainers:
   - name: SpatiumDDI Contributors
-# Subchart dependencies — populated in #272 Phase 2 (CloudNativePG)
-# and Phase 5 (MetalLB). Phase 1 lands the values-level scaffolding
-# only (see ``metallb`` and ``cnpg`` blocks in values.yaml,
-# ``enabled: false`` defaults) so single-node installs aren't
-# affected. The chart-level ``dependencies:`` block stays empty
-# until those phases vendor the upstream tarballs + values
-# overrides into ``charts/spatiumddi-appliance/charts/``.
+# Subchart dependencies — #272 Phase 1 bundles MetalLB + CNPG as
+# helm dependencies. Both are gated behind ``<sub>.enabled: false``
+# in values.yaml so single-node installs leave them dormant and
+# behave identically to pre-#272. The supervisor's role-assignment
+# flow flips the right subset to ``true`` when promoting an
+# appliance into a multi-node control-plane cluster (Phase 7).
 #
-# Upstream sources tracked for the eventual vendor commits:
-#   * MetalLB (Apache 2.0) v0.15.3 —
-#     https://github.com/metallb/metallb/tree/main/charts/metallb
-#   * CloudNativePG (Apache 2.0) latest stable —
-#     https://github.com/cloudnative-pg/charts
+# The repo-level ``.gitignore`` keeps the vendored tarballs out of
+# git; ``appliance/scripts/bake-chart.sh`` and the release workflow
+# both ``helm dependency update`` before packaging so the published
+# .tgz carries the subcharts inline (air-gap render at runtime).
+# Refresh locally with:
+#   helm dependency update charts/spatiumddi-appliance
+dependencies:
+  - name: metallb
+    version: 0.15.3
+    repository: https://metallb.github.io/metallb
+    condition: metallb.enabled
+  - name: cloudnative-pg
+    alias: cnpg
+    version: 0.28.2
+    repository: https://cloudnative-pg.github.io/charts
+    condition: cnpg.enabled

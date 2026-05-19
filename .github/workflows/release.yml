@@ -254,9 +254,12 @@ jobs:
                 -u "${{ github.actor }}" \
                 --password-stdin
       - name: Pull chart dependencies
-        # Bitnami subcharts (postgresql, redis) are referenced by OCI
-        # URL in Chart.yaml — resolve them before packaging.
-        run: helm dependency update charts/spatiumddi
+        # Umbrella chart has no subcharts; the appliance chart (#272
+        # Phase 1) bundles MetalLB + CNPG. Both lines are no-ops when
+        # the target chart has no ``dependencies:`` block.
+        run: |
+          helm dependency update charts/spatiumddi
+          helm dependency update charts/spatiumddi-appliance
       - id: pkg
         name: Package + push chart
         run: |
