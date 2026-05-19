@@ -1,53 +1,20 @@
-{{- if .Values.postgresql.enabled }}
+{{- if and .Values.postgresql.enabled (eq (.Values.postgresql.kind | default "standalone") "standalone") }}
 {{- $cmp := "postgresql" -}}
 {{- $secretName := printf "%s-postgresql" (include "spatiumddi.fullname" .) -}}
 # ─────────────────────────────────────────────────────────────────────────────
 # In-chart Postgres — single-node StatefulSet using the official
 # ``postgres:16-alpine`` image. Sized for a small lab / single-VM
-# deployment. Real production HA installs should set
+# deployment. Real production HA installs should flip
+# ``postgresql.kind=cnpg`` (#272 Phase 2 — CloudNativePG ``Cluster``
+# CR at templates/cnpg-cluster.yaml) or set
 # ``postgresql.enabled=false`` and point ``externalDatabase`` at a
-# CloudNativePG / Patroni cluster (see k8s/ha/).
+# self-managed Postgres / Patroni cluster.
+#
+# The credentials Secret (``<fullname>-postgresql``,
+# ``kubernetes.io/basic-auth`` shape with ``username`` + ``password``
+# keys) is rendered by templates/postgres-secret.yaml — shared with
+# the cnpg kind so a kind switch reuses the same credentials.
 # ─────────────────────────────────────────────────────────────────────────────
-
-# Password Secret — generated once on first install and preserved
-# across upgrades via the ``lookup`` function. If the operator passes
-# ``postgresql.auth.password`` or ``postgresql.auth.existingSecret``,
-# we don't render this Secret at all.
-{{- if and (not .Values.postgresql.auth.existingSecret) (not .Values.postgresql.auth.password) }}
-{{- $existing := (lookup "v1" "Secret" .Release.Namespace $secretName) }}
-{{- $password := "" }}
-{{- if $existing }}
-{{- $password = index $existing.data "password" | b64dec }}
-{{- else }}
-{{- $password = randAlphaNum 32 }}
-{{- end }}
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ $secretName }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
-  annotations:
-    "helm.sh/resource-policy": keep
-type: Opaque
-data:
-  password: {{ $password | b64enc | quote }}
----
-{{- end }}
-{{- if .Values.postgresql.auth.password }}
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ $secretName }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
-type: Opaque
-data:
-  password: {{ .Values.postgresql.auth.password | b64enc | quote }}
----
-{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:

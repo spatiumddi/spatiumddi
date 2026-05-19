@@ -222,13 +222,26 @@ ingress:
     #     - spatiumddi.example.com
 
 # ── Postgres ─────────────────────────────────────────────────────────────────
-# In-chart single-node Postgres StatefulSet using the official
-# ``postgres:16-alpine`` image (matches docker-compose.yml). Sized for
-# small lab / single-VM deployments. For HA production set
-# ``postgresql.enabled=false`` and point ``externalDatabase`` at a
-# CloudNativePG / Patroni cluster (see k8s/ha/).
+# Two in-chart shapes, picked via ``postgresql.kind``:
+#
+# * ``standalone`` (default) — single-node StatefulSet using the
+#   official ``postgres:16-alpine`` image (matches docker-compose.yml).
+#   Sized for small lab / single-VM deployments. No HA, no failover.
+# * ``cnpg`` (#272 Phase 2) — CloudNativePG ``Cluster`` CR.
+#   Operator-managed primary + sync replicas + async replicas, with
+#   automatic failover. Requires the CloudNativePG operator already
+#   installed in the cluster (bundled in
+#   ``charts/spatiumddi-appliance/`` for appliance installs; for
+#   plain k8s installs apply the operator separately via:
+#   ``kubectl apply --server-side -f
+#    https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.29/releases/cnpg-1.29.1.yaml``
+#   ).
+#
+# For an externally-managed database, set ``postgresql.enabled=false``
+# and fill in the ``externalDatabase`` block below.
 postgresql:
   enabled: true
+  kind: standalone
   image:
     repository: postgres
     tag: "16-alpine"
@@ -252,6 +265,34 @@ postgresql:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  # CNPG-specific topology (only used when ``kind: cnpg``).
+  cnpg:
+    # Replica count. 3 is the smallest etcd-quorum-friendly default
+    # (primary + sync replica + async replica). 5 / 7 for larger
+    # clusters. CNPG enforces odd counts implicitly via its leader-
+    # election layer.
+    instances: 3
+    # Postgres image used by CNPG-managed pods. Must be a CNPG-built
+    # image (regular ``postgres:16`` images are missing the WAL-G /
+    # barman wrappers CNPG relies on for backups + failover).
+    imageName: "ghcr.io/cloudnative-pg/postgresql:16"
+    # Server-side parameters. Tune for your workload; defaults match
+    # the prototype at ``k8s/ha/postgres-cluster.yaml``.
+    parameters:
+      max_connections: "200"
+      shared_buffers: "256MB"
+      work_mem: "16MB"
+    # PodMonitor for Prometheus Operator. Default false because most
+    # installs don't have Prometheus Operator + ServiceMonitor CRDs.
+    monitoring:
+      enablePodMonitor: false
+    # Continuous WAL archiving to an object store. Defer beyond #272
+    # Phase 2 — the existing pg_dump-based backup workflow already
+    # covers the disaster-recovery story for v1. See CNPG docs for
+    # ``barmanObjectStore`` shape.
+    backup:
+      enabled: false
+      retentionPolicy: "30d"
 
 # Used when postgresql.enabled=false.
 externalDatabase:

@@ -115,7 +115,14 @@ keyRef — never inlined.
 */}}
 {{- define "spatiumddi.postgresHost" -}}
 {{- if .Values.postgresql.enabled -}}
+{{- if eq (.Values.postgresql.kind | default "standalone") "cnpg" -}}
+{{/* CNPG auto-creates ``<cluster>-rw`` for the primary read/write
+     service. The cluster object's name is the chart's fullname
+     (see templates/cnpg-cluster.yaml). */}}
+{{- printf "%s-postgresql-rw" (include "spatiumddi.fullname" .) -}}
+{{- else -}}
 {{- printf "%s-postgresql" (include "spatiumddi.fullname" .) -}}
+{{- end -}}
 {{- else -}}
 {{- required "externalDatabase.host is required when postgresql.enabled=false" .Values.externalDatabase.host -}}
 {{- end -}}
