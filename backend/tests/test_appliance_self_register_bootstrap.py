@@ -63,18 +63,20 @@ def stub_host_role(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
-async def test_404s_while_flag_disabled(
+async def test_works_without_module_gate_enabled(
     db_session: AsyncSession, client: AsyncClient, stub_host_role
 ) -> None:
-    # Module gate is off (PlatformSettings absent / supervisor_
-    # registration_enabled=False). Endpoint returns 404 — same shape
-    # as if it didn't exist — without touching host role-config.
+    # The self-bootstrap endpoint deliberately does NOT honour the
+    # ``supervisor_registration_enabled`` gate — the local supervisor
+    # MUST be able to register or the appliance is unusable. The
+    # gate applies to the public /supervisor/register endpoint only.
+    # No PlatformSettings row → gate is off → endpoint still works.
     stub_host_role("full-stack")
     resp = await client.post(
         "/api/v1/appliance/self-register-bootstrap",
         json={"appliance_variant": "full-stack"},
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200, resp.text
 
 
 @pytest.mark.asyncio
@@ -93,7 +95,8 @@ async def test_happy_path_mints_code(
     body = resp.json()
     assert len(body["code"]) == 8
     assert body["code"].isdigit()
-    assert body["control_plane_url"] == "https://localhost"
+    assert body["control_plane_url"].startswith("http://")
+    assert "spatium-control-spatiumddi-api" in body["control_plane_url"]
     assert body["expires_in_seconds"] == 600
 
     # A pairing_code row landed with a 10-min expiry.

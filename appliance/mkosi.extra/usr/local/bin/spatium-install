@@ -173,8 +173,8 @@ ask_role() {
     while true; do
         pick=$(whiptail --backtitle "$BACKTITLE" --title "Appliance role" \
             --cancel-button "Back" \
-            --radiolist "What role does this appliance play?\n\nFull stack runs everything on one box (good for labs / small sites). Frontend / core runs just the control plane — pair Application appliances against it from the fleet UI for distributed deployments.\n\nApplication is the generic agent role: the supervisor pairs with a remote control plane, sits in pending approval, and is assigned its role(s) (DNS-BIND9 / DNS-PowerDNS / DHCP / multi-role) by an admin in the fleet UI. No DNS or DHCP pre-pick at install time." \
-            22 82 3 \
+            --radiolist "What role does this appliance play?\n\n  full-stack  \n    All-in-one. Control plane + DNS (BIND9) + DHCP (Kea) run\n    locally. Pick this for a homelab, a single-site deploy, or\n    the first node of a multi-node control-plane cluster.\n\n  frontend-core  \n    Control plane only — no DNS / DHCP on this box. Pair\n    Application appliances against this control plane via the\n    Fleet UI to run those workloads remotely. Also used to add\n    members to an existing control-plane cluster.\n\n  application  \n    DNS / DHCP agent only. The supervisor pairs with a remote\n    control plane via an 8-digit pairing code; an admin assigns\n    the role(s) (BIND9 / PowerDNS / DHCP / multi-role) in the\n    Fleet UI after approval. No pre-pick at install time." \
+            28 82 3 \
             "full-stack"    "Full stack — control plane + BIND9 + Kea (AIO)" "$([ "$ROLE" = "full-stack"    ] && echo ON || echo OFF)" \
             "frontend-core" "Frontend / core — control plane only"          "$([ "$ROLE" = "frontend-core" ] && echo ON || echo OFF)" \
             "application"   "Application — supervisor only (pairs remote)"  "$([ "$ROLE" = "application"   ] && echo ON || echo OFF)" \
@@ -757,9 +757,16 @@ ROLE=$ROLE
 CONTROL_PLANE_URL=$CONTROL_PLANE_URL
 BOOTSTRAP_PAIRING_CODE=$BOOTSTRAP_PAIRING_CODE
 EOF
-        # The pairing code is sensitive even before firstboot
-        # transcribes it into .env — restrict role-config to root.
-        chmod 0600 "$MOUNT/etc/spatiumddi/role-config"
+        # Mode 0644 — readable by the host's non-root user (`app`,
+        # uid 1000) so the api pod can introspect ``ROLE=`` via its
+        # ``/etc/spatiumddi-host/role-config`` bind mount (#272 Phase
+        # 1's self-bootstrap endpoint gates on that match). Pairing
+        # codes are single-use + 15 min TTL, so a non-root shell on
+        # the host already has access via ``sudo`` and the looser
+        # mode isn't a meaningful exfiltration vector. firstboot
+        # transcribes the value into ``/etc/spatiumddi/.env`` (also
+        # mode 0644) on first boot anyway.
+        chmod 0644 "$MOUNT/etc/spatiumddi/role-config"
 
         # Phase 11 (#183) — pre-bake the per-role node labels at
         # install time so the appliance chart's DaemonSets +

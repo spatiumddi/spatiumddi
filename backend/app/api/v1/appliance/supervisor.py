@@ -367,13 +367,16 @@ async def self_register_bootstrap(
     the appliance-local control-plane URL (``https://localhost``).
     The supervisor stamps these into its env and proceeds through
     the normal ``/supervisor/register`` flow.
-    """
-    # Module gate first — exits before any DB work if the operator
-    # has turned supervisor registration off entirely.
-    if not await _module_enabled(db):
-        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Not Found")
 
+    Note: this endpoint deliberately does NOT honour the
+    ``supervisor_registration_enabled`` module gate (which guards
+    the public ``/supervisor/register`` endpoint). The local
+    supervisor MUST be able to register or the appliance is
+    unusable; the operator-controlled module gate gets re-applied
+    once they reach the Fleet UI to control remote pairing.
+    Strong gates remain via host role-config + variant + single-
+    shot Appliance-count check below.
+    """
     # Variant gate.
     if body.appliance_variant not in _SELF_BOOTSTRAP_VARIANTS:
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
@@ -419,6 +422,21 @@ async def self_register_bootstrap(
             note=f"Self-bootstrap pairing code for {body.appliance_variant}",
         )
     )
+    # Atomically flip the supervisor_registration_enabled gate on so
+    # the supervisor's follow-up ``/supervisor/register`` call doesn't
+    # 404 against the same module gate that the public-endpoint
+    # default-off protects against. The operator can turn it off
+    # again in Settings once they're done pairing — single-shot
+    # on the self-bootstrap side (no further auto-enables) and the
+    # module gate works as before for any subsequent operator-driven
+    # remote pairings.
+    settings_row = (
+        await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    if settings_row is None:
+        db.add(PlatformSettings(id=1, supervisor_registration_enabled=True))
+    elif not settings_row.supervisor_registration_enabled:
+        settings_row.supervisor_registration_enabled = True
     db.add(
         AuditLog(
             user_id=None,
@@ -445,9 +463,14 @@ async def self_register_bootstrap(
         expires_at=expires_at.isoformat(),
     )
 
+    # Return the in-cluster Service URL — ``https://localhost`` from
+    # inside a Kubernetes pod is the pod's own loopback, not the api.
+    # The supervisor will use this URL for every subsequent
+    # /supervisor/register + /supervisor/heartbeat call. http:// is
+    # fine inside the cluster — nothing exits the spatium namespace.
     return SelfRegisterBootstrapResponse(
         code=code,
-        control_plane_url="https://localhost",
+        control_plane_url="http://spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000",
         expires_in_seconds=int(_SELF_BOOTSTRAP_CODE_TTL.total_seconds()),
     )
 
