@@ -56,6 +56,36 @@ dev:
 
 build: build-supervisor
 	$(COMPOSE) build
+	# #272 Phase 1 — retag compose-built images under the canonical
+	# ``ghcr.io/spatiumddi/<name>:dev`` form so
+	# ``appliance/scripts/bake-images.sh``'s resolve_source_tag picks
+	# the freshly-built image. Pre-#272 the bake's first-candidate
+	# was ``ghcr.io/...:dev``, which on most dev hosts was a
+	# stale months-old image left over from a previous CI pull;
+	# ``spatiumddi-<name>:dev`` (the compose-style tag) was only
+	# tried second and ignored. Result: ``make appliance-baked-iso``
+	# baked stale api / frontend images that didn't include the
+	# operator's local edits (caught during #272 Phase 1 ISO test —
+	# the migrate Job ran against a 4-day-old api image and stopped
+	# at the wrong alembic head). Retag every compose service that
+	# the bake script looks for; the supervisor image is dual-tagged
+	# by ``build-supervisor`` already.
+	@# Compose tags ``<project>-<service>:dev`` (project=spatiumddi).
+	@# bake-images.sh's IMAGES list uses the canonical
+	@# ``ghcr.io/spatiumddi/<short>`` form where <short> matches the
+	@# upstream image name — which is NOT always the compose service
+	@# name. Map explicitly:
+	@for pair in \
+	    "api:spatiumddi-api" \
+	    "frontend:spatiumddi-frontend" \
+	    "dns-bind9:dns-bind9" \
+	    "dns-powerdns:dns-powerdns" \
+	    "dhcp-kea:dhcp-kea"; do \
+	  compose="$${pair%%:*}"; target="$${pair##*:}"; \
+	  if docker image inspect "spatiumddi-$$compose:dev" >/dev/null 2>&1; then \
+	    docker tag "spatiumddi-$$compose:dev" "ghcr.io/spatiumddi/$$target:dev"; \
+	  fi; \
+	done
 
 # Build the standalone spatium-supervisor image (#170). The image
 # isn't in docker-compose.yml — it ships out of band as part of the
