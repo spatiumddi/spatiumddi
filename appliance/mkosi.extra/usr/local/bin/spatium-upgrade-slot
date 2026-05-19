@@ -306,6 +306,21 @@ def cmd_apply(args) -> int:
     # here just leaves the operator with the original (broken) flow.
     _stamp_lower_hostname(target_dev)
 
+    # #272 Phase 1 audit — refresh the persistent /var partition's
+    # k3s airgap-image cache from the new slot's rootfs. Each baked
+    # slot ships its own ``/var/lib/rancher/k3s/agent/images/*.tar.zst``
+    # (the chart-aligned image tags for THIS slot's APPLIANCE_VERSION).
+    # The slot's tarballs sit on the slot's rootfs; once the slot
+    # boots, the persistent ``/var`` mount shadows them, so k3s scans
+    # the OLD (pre-upgrade) tarballs from the persistent /var and
+    # imports stale image tags. Any pod with ``imagePullPolicy:
+    # Never`` (every pod on the appliance) then fails ErrImageNeverPull
+    # because the chart now requests ``:<new-version>`` tags that the
+    # imported tarballs don't carry. Mount the new slot, copy its
+    # bake set across, unmount — k3s on next reboot scans /var, finds
+    # the new tarballs, imports them, the chart's tags resolve.
+    _refresh_baked_images(target_dev)
+
     print()
     print("✓ Image written to inactive slot.")
     print()
@@ -318,6 +333,43 @@ def cmd_apply(args) -> int:
     print(f"  spatium-upgrade-slot set-next-boot")
     print("  reboot")
     return 0
+
+
+def _refresh_baked_images(target_dev: str) -> None:
+    """Copy the new slot's baked image tarballs to the persistent /var
+    partition's k3s airgap-images dir. See cmd_apply for the
+    architecture background.
+
+    Best-effort: a mount failure just leaves the persistent /var with
+    its previous tarballs and the operator gets ErrImageNeverPull on
+    boot — same failure mode as before this fix, no regression.
+    """
+    mountpoint = Path("/tmp/spatium-slot-mnt")
+    dest = Path("/var/lib/rancher/k3s/agent/images")
+    try:
+        mountpoint.mkdir(parents=True, exist_ok=True)
+        rc = subprocess.run(
+            ["mount", "-o", "ro", target_dev, str(mountpoint)],
+            check=False,
+        ).returncode
+        if rc != 0:
+            print(f"  WARN: couldn't mount {target_dev} to refresh baked images")
+            return
+        try:
+            src = mountpoint / "var/lib/rancher/k3s/agent/images"
+            if not src.is_dir():
+                print(f"  WARN: no baked-image dir at {src}")
+                return
+            dest.mkdir(parents=True, exist_ok=True)
+            copied = 0
+            for tarball in src.glob("*.tar.zst"):
+                shutil.copy2(tarball, dest / tarball.name)
+                copied += 1
+            print(f"  refreshed {copied} baked tarballs → {dest}")
+        finally:
+            subprocess.run(["umount", str(mountpoint)], check=False)
+    except OSError as exc:
+        print(f"  WARN: baked-image refresh skipped ({exc})", file=sys.stderr)
 
 
 def _stamp_lower_hostname(target_dev: str) -> None:
