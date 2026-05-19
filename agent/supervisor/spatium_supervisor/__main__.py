@@ -186,24 +186,37 @@ def _maybe_register(
 
     cached_appliance_id = load_appliance_id(cfg.state_dir)
     if cached_appliance_id is not None:
-        # Issue #170 Wave E follow-up — revoke recovery. If the
-        # supervisor flipped to ``approval-state=revoked`` (control
-        # plane returning 403/404 for our cached identity) and the
-        # operator handed us a fresh pairing code via spatium-pair,
-        # the cached appliance_id is stale by definition. Clear the
-        # soft state (appliance_id / session_token / cert.pem /
-        # approval-state / strikes) so the register call below
-        # actually fires against the new pairing code. The Ed25519
-        # keypair stays — it's stable across re-pairs and the
-        # control plane creates a new appliance row + cert against
-        # it on the next approve.
-        if (
-            approval_state.read_state(cfg.state_dir) == "revoked"
-            and cfg.bootstrap_pairing_code
+        # Issue #170 Wave E follow-up + #272 Phase 1 audit — revoke
+        # recovery. If the supervisor flipped to
+        # ``approval-state=revoked`` (control plane returning 403/404
+        # for our cached identity) we need to clear the stale soft
+        # state (appliance_id / session_token / cert.pem / approval-
+        # state / strikes) so the register call below mints a fresh
+        # identity. The Ed25519 keypair stays — it's stable across
+        # re-pairs and the control plane creates a new appliance row
+        # + cert against it on the next approve.
+        #
+        # Re-pair sources, in order of precedence:
+        #   1. ``cfg.bootstrap_pairing_code`` — operator handed us a
+        #      fresh code via spatium-pair (#170 Wave E flow).
+        #   2. Self-bootstrap variant (full-stack / frontend-core) —
+        #      #272 Phase 1; the supervisor mints its own pairing
+        #      code against the in-cluster api on the recovery path.
+        #
+        # Without case 2 the supervisor would stay locked in revoked
+        # after the operator deleted its row from the Fleet UI on a
+        # control-plane appliance (no pairing code env present, no
+        # human-mediated recovery path) — verified live on .199.
+        variant = appliance_state.detect_appliance_variant()
+        can_self_bootstrap = variant in ("full-stack", "frontend-core")
+        if approval_state.read_state(cfg.state_dir) == "revoked" and (
+            cfg.bootstrap_pairing_code or can_self_bootstrap
         ):
             log.info(
                 "supervisor.register.revoked_reregister",
                 stale_appliance_id=str(cached_appliance_id),
+                via_self_bootstrap=can_self_bootstrap
+                and not cfg.bootstrap_pairing_code,
             )
             clear_appliance_id(cfg.state_dir)
             clear_session_token(cfg.state_dir)

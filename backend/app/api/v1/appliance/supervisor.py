@@ -197,7 +197,9 @@ class SupervisorRegisterRequest(BaseModel):
     # role set on the resulting Appliance row at register time
     # instead of waiting for the first heartbeat. None for pre-#272
     # supervisors.
-    appliance_variant: Literal["full-stack", "frontend-core", "application"] | None = None
+    appliance_variant: Literal["full-stack", "frontend-core", "application"] | None = (
+        None
+    )
 
     @field_validator("pairing_code")
     @classmethod
@@ -357,11 +359,13 @@ async def self_register_bootstrap(
        caller has host access AND the host's installer-baked role
        matches the claim. On non-appliance deploys the file isn't
        mounted and the endpoint refuses outright.
-    3. No ``Appliance`` rows may exist. The endpoint is single-shot
-       per install; a factory-reset or fresh install can re-fire.
-       Multi-node HA (#272 Phase 7) provisions additional
-       supervisors through the operator-typed pairing-code flow,
-       not this endpoint.
+    3. No LIVE ``Appliance`` row may exist (``last_seen_at IS NOT
+       NULL``). Orphan rows (``last_seen_at IS NULL``) from a
+       botched earlier attempt get cleared on each call so the
+       endpoint is safe to re-fire when the supervisor lost its
+       local state. Multi-node HA (#272 Phase 7) provisions
+       additional supervisors through the operator-typed pairing-
+       code flow, not this endpoint.
     4. Module gate (``supervisor_registration_enabled``) — same
        gate the normal pair-and-register endpoint honours.
 
@@ -403,18 +407,56 @@ async def self_register_bootstrap(
             detail="Self-bootstrap unavailable on this host",
         )
 
-    # Single-shot gate — refuse if any Appliance rows already exist.
-    # The first supervisor that successfully registers locks the
-    # endpoint out; promotion of additional control-plane members
-    # (#272 Phase 7) uses operator-typed codes through the normal
-    # pairing flow.
-    existing = await db.scalar(select(sa_func.count(Appliance.id)))
-    if existing and existing > 0:
+    # Single-shot gate — refuse if any LIVE Appliance row exists.
+    # "Live" = at least one successful heartbeat (last_seen_at IS NOT
+    # NULL). Orphan rows from a botched earlier self-bootstrap (the
+    # supervisor minted a row, never finished register, then lost its
+    # local state — verified live on .199 after a Fleet-UI delete +
+    # service restart) leave a phantom row with last_seen_at=NULL
+    # that would otherwise lock this endpoint forever. Promotion of
+    # additional control-plane members (#272 Phase 7) uses operator-
+    # typed codes through the normal pairing flow, so this gate
+    # treats any heartbeating row as "real" and refuses.
+    live_count = await db.scalar(
+        select(sa_func.count(Appliance.id)).where(Appliance.last_seen_at.is_not(None))
+    )
+    if live_count and live_count > 0:
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            detail="Appliances already registered; self-bootstrap is single-shot",
+            detail="Live appliances already registered; self-bootstrap is single-shot",
         )
+
+    # Clear orphan rows (last_seen_at IS NULL) before minting. These
+    # are leftovers from prior self-bootstrap attempts that didn't
+    # complete — leaving them would just confuse the Fleet UI with a
+    # ghost row that never resurrects. Audit-logged so the operator
+    # can trace what got removed if anything seemed odd.
+    orphan_rows = (
+        (await db.execute(select(Appliance).where(Appliance.last_seen_at.is_(None))))
+        .scalars()
+        .all()
+    )
+    for orphan in orphan_rows:
+        db.add(
+            AuditLog(
+                user_id=None,
+                user_display_name="anonymous supervisor",
+                auth_source="anonymous",
+                source_ip=_client_ip(request),
+                action="appliance.self_bootstrap_orphan_cleared",
+                resource_type="appliance",
+                resource_id=str(orphan.id),
+                resource_display=orphan.hostname or str(orphan.id),
+                result="ok",
+                old_value={
+                    "hostname": orphan.hostname,
+                    "state": orphan.state,
+                    "appliance_variant": orphan.appliance_variant,
+                },
+            )
+        )
+        await db.delete(orphan)
 
     # Mint the code.
     code = _gen_self_bootstrap_code()
@@ -537,7 +579,9 @@ async def supervisor_register(
     # force a fresh registration they delete the row in the fleet UI,
     # which causes the supervisor to clear its identity + claim a new
     # pairing code on next boot.
-    existing_stmt = select(Appliance).where(Appliance.public_key_fingerprint == pubkey_fingerprint)
+    existing_stmt = select(Appliance).where(
+        Appliance.public_key_fingerprint == pubkey_fingerprint
+    )
     existing = (await db.execute(existing_stmt)).scalar_one_or_none()
     if existing is not None:
         # Idempotent re-register. Touch last_seen_at so the heartbeat
@@ -623,7 +667,9 @@ async def supervisor_register(
                 resource_type="pairing_code",
                 resource_id=str(code_row.id) if code_row is not None else "unknown",
                 resource_display=(
-                    "supervisor pairing code" if code_row is not None else "unknown pairing code"
+                    "supervisor pairing code"
+                    if code_row is not None
+                    else "unknown pairing code"
                 ),
                 result="forbidden",
                 new_value={
@@ -668,7 +714,9 @@ async def supervisor_register(
     # operator to open the role-picker.
     initial_assigned_roles: list[str] = []
     if body.appliance_variant is not None:
-        initial_assigned_roles = list(_REGISTER_VARIANT_FIXED_ROLES.get(body.appliance_variant, []))
+        initial_assigned_roles = list(
+            _REGISTER_VARIANT_FIXED_ROLES.get(body.appliance_variant, [])
+        )
     appliance_row = Appliance(
         id=appliance_id,
         hostname=body.hostname,
@@ -815,7 +863,9 @@ async def supervisor_poll(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
 
     row = await db.get(Appliance, body.appliance_id)
-    valid = row is not None and verify_session_token(body.session_token, row.session_token_hash)
+    valid = row is not None and verify_session_token(
+        body.session_token, row.session_token_hash
+    )
     if not valid:
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
@@ -874,7 +924,9 @@ class SupervisorHeartbeatRequest(BaseModel):
     # ``/etc/spatiumddi-host/role-config:ROLE``. None on pre-#272
     # supervisors; the persistence handler leaves the column
     # untouched in that case (no nulling of an existing variant).
-    appliance_variant: Literal["full-stack", "frontend-core", "application"] | None = None
+    appliance_variant: Literal["full-stack", "frontend-core", "application"] | None = (
+        None
+    )
     installed_appliance_version: str | None = None
     current_slot: Literal["slot_a", "slot_b"] | None = None
     durable_default: Literal["slot_a", "slot_b"] | None = None
@@ -1023,7 +1075,9 @@ class SupervisorHeartbeatResponse(BaseModel):
     # uses this to bring up dns-bind9 / dns-powerdns / dhcp-kea
     # service containers via docker compose. Empty roles list = idle
     # (approved but no service running).
-    role_assignment: SupervisorRoleAssignment = Field(default_factory=SupervisorRoleAssignment)
+    role_assignment: SupervisorRoleAssignment = Field(
+        default_factory=SupervisorRoleAssignment
+    )
 
 
 @router.post(
@@ -1108,7 +1162,9 @@ async def supervisor_heartbeat(
         )
         if not valid:
             await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "Invalid appliance or session."
+            )
 
     assert row is not None
     # Issue #170 Wave E follow-up — reject heartbeats from soft-deleted
@@ -1238,13 +1294,19 @@ async def supervisor_heartbeat(
     # the requested slot as ``current_slot`` — the operator's intent
     # was "boot into this slot next", and we got there. ``durable_
     # default`` is irrelevant here (next-boot is one-shot by design).
-    if row.desired_next_boot_slot is not None and row.current_slot == row.desired_next_boot_slot:
+    if (
+        row.desired_next_boot_slot is not None
+        and row.current_slot == row.desired_next_boot_slot
+    ):
         row.desired_next_boot_slot = None
 
     # Auto-clear desired_default_slot once the supervisor reports the
     # requested slot as ``durable_default`` — grub-set-default landed
     # and survives subsequent reboots.
-    if row.desired_default_slot is not None and row.durable_default == row.desired_default_slot:
+    if (
+        row.desired_default_slot is not None
+        and row.durable_default == row.desired_default_slot
+    ):
         row.desired_default_slot = None
 
     # Auto-clear reboot_requested 15 s after the stamp — by that
@@ -1306,7 +1368,9 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
     from app.models.dns import DNSServerGroup
 
     assigned_roles = list(row.assigned_roles or [])
-    dns_role_assigned = "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
+    dns_role_assigned = (
+        "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
+    )
     dhcp_role_assigned = "dhcp" in assigned_roles
 
     dns_engine: str | None = None
@@ -1518,7 +1582,9 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
 async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     _require_superadmin(current_user)
     rows = (
-        (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc()))).scalars().all()
+        (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc())))
+        .scalars()
+        .all()
     )
     return ApplianceList(appliances=[_row_to_schema(r) for r in rows])
 
@@ -1529,7 +1595,9 @@ async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Fetch a single appliance (superadmin)",
 )
-async def get_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> ApplianceRow:
+async def get_appliance(
+    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> ApplianceRow:
     _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
@@ -1650,7 +1718,9 @@ async def approve_appliance(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Reject a pending appliance (deletes the row, superadmin)",
 )
-async def reject_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def reject_appliance(
+    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> None:
     """Reject = DELETE the row. Supervisor's next poll gets 403 +
     falls back to bootstrapping. Distinct from delete (next endpoint)
     only in the audit verb — operationally identical."""
@@ -2140,10 +2210,14 @@ async def update_appliance_roles(
             new_value={
                 "roles": list(row.assigned_roles or []),
                 "dns_group_id": (
-                    str(row.assigned_dns_group_id) if row.assigned_dns_group_id else None
+                    str(row.assigned_dns_group_id)
+                    if row.assigned_dns_group_id
+                    else None
                 ),
                 "dhcp_group_id": (
-                    str(row.assigned_dhcp_group_id) if row.assigned_dhcp_group_id else None
+                    str(row.assigned_dhcp_group_id)
+                    if row.assigned_dhcp_group_id
+                    else None
                 ),
                 "tags": dict(row.tags or {}),
             },
@@ -2299,7 +2373,9 @@ async def schedule_appliance_upgrade(
             new_value={
                 "desired_appliance_version": body.desired_appliance_version,
                 "desired_slot_image_url": resolved_url,
-                "slot_image_id": (str(body.slot_image_id) if body.slot_image_id else None),
+                "slot_image_id": (
+                    str(body.slot_image_id) if body.slot_image_id else None
+                ),
             },
         )
     )
@@ -2600,7 +2676,9 @@ async def _require_cert_auth(request: Request, db: DB) -> Appliance:
         principal = await authenticate_cert(request, db)
     except CertAuthFailed as exc:
         logger.warning("appliance.k8s_proxy.cert_auth_failed", reason=exc.reason)
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance client cert.") from exc
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Invalid appliance client cert."
+        ) from exc
     if principal is None:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -2639,7 +2717,9 @@ async def k8s_proxy_poll(request: Request, db: DB) -> K8sProxyPollResponse:
         # No request within the timeout — return an empty shape so
         # the supervisor loop just re-polls. 200 (not 204) so the
         # supervisor doesn't have to special-case "no body".
-        return K8sProxyPollResponse(request_id="", method="", path="", headers={}, body_b64="")
+        return K8sProxyPollResponse(
+            request_id="", method="", path="", headers={}, body_b64=""
+        )
     return K8sProxyPollResponse(
         request_id=queued.request_id,
         method=queued.method,
@@ -2742,13 +2822,18 @@ async def k8s_rollout_restart(
     # Strategic-merge patch that bumps the pod template's
     # ``restartedAt`` annotation. Standard kubectl rollout-restart
     # shape — same JSON kubectl sends.
-    api_path = f"/apis/apps/v1/namespaces/{body.namespace}/" f"{body.kind.lower()}s/{body.name}"
+    api_path = (
+        f"/apis/apps/v1/namespaces/{body.namespace}/"
+        f"{body.kind.lower()}s/{body.name}"
+    )
     patch_body = {
         "spec": {
             "template": {
                 "metadata": {
                     "annotations": {
-                        "kubectl.kubernetes.io/restartedAt": datetime.now(UTC).isoformat()
+                        "kubectl.kubernetes.io/restartedAt": datetime.now(
+                            UTC
+                        ).isoformat()
                     }
                 }
             }
@@ -2909,7 +2994,9 @@ async def reveal_appliance_kubeconfig(
         # Clean "nothing to reveal" — supervisor hasn't shipped a
         # kubeconfig yet (legacy compose / pre-Phase-5 / k3s not
         # started). Surface as a friendly state, not an error.
-        return RevealKubeconfigResponse(configured=False, kubeconfig=None, hostname=row.hostname)
+        return RevealKubeconfigResponse(
+            configured=False, kubeconfig=None, hostname=row.hostname
+        )
 
     try:
         plaintext = decrypt_str(row.kubeconfig_encrypted)
@@ -2941,7 +3028,9 @@ async def reveal_appliance_kubeconfig(
         hostname=row.hostname,
         user=current_user.username,
     )
-    return RevealKubeconfigResponse(configured=True, kubeconfig=plaintext, hostname=row.hostname)
+    return RevealKubeconfigResponse(
+        configured=True, kubeconfig=plaintext, hostname=row.hostname
+    )
 
 
 # ── Issue #183 Phase 6 — kubeapi-expose CIDR editor ──
@@ -3120,7 +3209,9 @@ async def k8s_list_pods(
         spec = item.get("spec") or {}
         st = item.get("status") or {}
         container_statuses = st.get("containerStatuses") or []
-        ready = bool(container_statuses) and all(cs.get("ready") for cs in container_statuses)
+        ready = bool(container_statuses) and all(
+            cs.get("ready") for cs in container_statuses
+        )
         pods.append(
             K8sPodSummary(
                 name=meta.get("name") or "",
@@ -3128,7 +3219,9 @@ async def k8s_list_pods(
                 phase=st.get("phase") or "Unknown",
                 ready=ready,
                 containers=[
-                    c.get("name") or "" for c in (spec.get("containers") or []) if c.get("name")
+                    c.get("name") or ""
+                    for c in (spec.get("containers") or [])
+                    if c.get("name")
                 ],
                 labels=dict(meta.get("labels") or {}),
             )

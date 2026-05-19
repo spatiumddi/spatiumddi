@@ -6,7 +6,8 @@ didn't capture a pairing code (the control plane is local). Gates:
 
 * Variant must be ``full-stack`` / ``frontend-core``.
 * The api's host bind-mounted ``role-config:ROLE`` must match.
-* No ``Appliance`` rows may exist.
+* No LIVE ``Appliance`` row may exist (``last_seen_at IS NOT NULL``);
+  orphan rows from a botched earlier attempt get cleared.
 * Module gate (``supervisor_registration_enabled``).
 """
 
@@ -112,7 +113,9 @@ async def test_happy_path_mints_code(
     audits = (
         (
             await db_session.execute(
-                select(AuditLog).where(AuditLog.action == "appliance.self_bootstrap_minted")
+                select(AuditLog).where(
+                    AuditLog.action == "appliance.self_bootstrap_minted"
+                )
             )
         )
         .scalars()
@@ -182,7 +185,9 @@ async def test_application_variant_refused(
     # The endpoint refuses to short-circuit that.
     await _enable_supervisor_registration(db_session)
     await db_session.commit()
-    stub_host_role("application")  # contrived — application normally has CONTROL_PLANE_URL filled
+    stub_host_role(
+        "application"
+    )  # contrived — application normally has CONTROL_PLANE_URL filled
 
     resp = await client.post(
         "/api/v1/appliance/self-register-bootstrap",
@@ -193,18 +198,20 @@ async def test_application_variant_refused(
 
 
 @pytest.mark.asyncio
-async def test_single_shot_after_first_appliance(
+async def test_single_shot_after_live_appliance(
     db_session: AsyncSession, client: AsyncClient, stub_host_role
 ) -> None:
-    # Pre-existing Appliance row simulates a control plane that's
-    # already registered a supervisor — the endpoint refuses 409.
+    # Pre-existing LIVE Appliance row (last_seen_at IS NOT NULL)
+    # simulates a control plane that's already registered a
+    # heartbeating supervisor — the endpoint refuses 409.
     await _enable_supervisor_registration(db_session)
     db_session.add(
         Appliance(
             hostname="test",
             public_key_der=b"\x00" * 32,
             public_key_fingerprint="a" * 64,
-            state="pending_approval",
+            state="approved",
+            last_seen_at=datetime.now(UTC),
         )
     )
     await db_session.commit()
@@ -215,3 +222,51 @@ async def test_single_shot_after_first_appliance(
         json={"appliance_variant": "full-stack"},
     )
     assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_orphan_appliance_cleared_on_self_bootstrap(
+    db_session: AsyncSession, client: AsyncClient, stub_host_role
+) -> None:
+    # Phase 1 audit follow-up — a pre-existing row with
+    # ``last_seen_at IS NULL`` is an orphan from a botched earlier
+    # self-bootstrap. The endpoint clears it + mints a fresh code
+    # so the supervisor can recover without operator intervention.
+    await _enable_supervisor_registration(db_session)
+    orphan = Appliance(
+        hostname="test1",
+        public_key_der=b"\x00" * 32,
+        public_key_fingerprint="a" * 64,
+        state="approved",
+        last_seen_at=None,
+    )
+    db_session.add(orphan)
+    await db_session.commit()
+    orphan_id = orphan.id
+    stub_host_role("full-stack")
+
+    resp = await client.post(
+        "/api/v1/appliance/self-register-bootstrap",
+        json={"appliance_variant": "full-stack"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["code"]) == 8
+    assert body["control_plane_url"].startswith("http")
+
+    # Orphan row deleted; audit row records the clearance.
+    remaining = (await db_session.execute(select(Appliance))).scalars().all()
+    assert orphan_id not in {a.id for a in remaining}
+    audit_actions = {
+        a.action
+        for a in (
+            (
+                await db_session.execute(
+                    select(AuditLog).where(AuditLog.resource_id == str(orphan_id))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    }
+    assert "appliance.self_bootstrap_orphan_cleared" in audit_actions
