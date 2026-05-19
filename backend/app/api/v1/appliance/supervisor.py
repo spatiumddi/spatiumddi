@@ -39,8 +39,10 @@ import base64
 import hashlib
 import hmac
 import re
+import secrets
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 
 import structlog
@@ -92,6 +94,45 @@ def _hash_code(code: str) -> str:
 
 def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
+
+
+# #272 Phase 1 — self-bootstrap path for full-stack / frontend-core
+# appliances. The local supervisor calls
+# ``POST /api/v1/appliance/self-register-bootstrap`` with its
+# variant; the api gates on the host-mounted ``role-config`` (the
+# api itself has a bind mount of ``/etc/spatiumddi-host/role-
+# config`` per #209) so we can prove the caller is the local
+# supervisor by matching the variant claim against the file the
+# installer wrote.
+_HOST_ROLE_CONFIG = Path("/etc/spatiumddi-host/role-config")
+_SELF_BOOTSTRAP_VARIANTS = frozenset({"full-stack", "frontend-core"})
+_SELF_BOOTSTRAP_CODE_TTL = timedelta(minutes=10)
+
+
+def _read_host_role() -> str | None:
+    """Parse ``ROLE=`` out of ``/etc/spatiumddi-host/role-config``.
+
+    Mirror of the supervisor's ``detect_appliance_variant`` — read by
+    the api via its #209 host bind mount. Returns None when the file
+    isn't mounted (docker / k8s) or the parsed value isn't one the
+    self-bootstrap gate recognises.
+    """
+    try:
+        text = _HOST_ROLE_CONFIG.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("ROLE="):
+            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            return value if value in _SELF_BOOTSTRAP_VARIANTS else None
+    return None
+
+
+def _gen_self_bootstrap_code() -> str:
+    """8-digit numeric pairing code, same shape the installer wizard
+    produces. ``secrets.choice`` for cryptographically-uniform
+    digits (no modulo bias from int conversion)."""
+    return "".join(secrets.choice("0123456789") for _ in range(_CODE_LENGTH))
 
 
 # ── Schemas ────────────────────────────────────────────────────────
@@ -258,6 +299,157 @@ async def _module_enabled(db: DB) -> bool:
     if row is None:
         return False
     return bool(row.supervisor_registration_enabled)
+
+
+# ── Self-bootstrap (full-stack / frontend-core) ────────────────────
+
+
+class SelfRegisterBootstrapRequest(BaseModel):
+    """Body for ``POST /appliance/self-register-bootstrap`` — the
+    local supervisor's first call on full-stack / frontend-core
+    variants, where the installer wizard didn't capture a pairing
+    code (the control plane IS local).
+
+    The supervisor claims its variant; the api validates against
+    the host-mounted ``role-config:ROLE`` before minting a code.
+    """
+
+    appliance_variant: Literal["full-stack", "frontend-core"]
+
+
+class SelfRegisterBootstrapResponse(BaseModel):
+    code: str = Field(min_length=_CODE_LENGTH, max_length=_CODE_LENGTH)
+    control_plane_url: str
+    expires_in_seconds: int
+
+
+@router.post(
+    "/self-register-bootstrap",
+    response_model=SelfRegisterBootstrapResponse,
+    summary=(
+        "Mint a pairing code for the local supervisor on full-stack / "
+        "frontend-core appliances (single-shot)"
+    ),
+)
+async def self_register_bootstrap(
+    body: SelfRegisterBootstrapRequest,
+    request: Request,
+    db: DB,
+) -> SelfRegisterBootstrapResponse:
+    """Mint a one-shot pairing code so the local supervisor can
+    register against its own control plane.
+
+    Gates (all required, in order):
+
+    1. Variant must be ``full-stack`` or ``frontend-core``.
+       ``application`` uses the operator-typed pairing code from
+       the installer wizard; this endpoint refuses to short-
+       circuit that flow.
+    2. The api's host bind mount ``/etc/spatiumddi-host/role-
+       config:ROLE`` must equal the requested variant. Proves the
+       caller has host access AND the host's installer-baked role
+       matches the claim. On non-appliance deploys the file isn't
+       mounted and the endpoint refuses outright.
+    3. No ``Appliance`` rows may exist. The endpoint is single-shot
+       per install; a factory-reset or fresh install can re-fire.
+       Multi-node HA (#272 Phase 7) provisions additional
+       supervisors through the operator-typed pairing-code flow,
+       not this endpoint.
+    4. Module gate (``supervisor_registration_enabled``) — same
+       gate the normal pair-and-register endpoint honours.
+
+    Failures collapse into 403 with a constant friction delay so
+    the gate decision doesn't leak via response-time delta. Hits
+    one of: variant mismatch / appliances already registered /
+    module disabled / role-config missing.
+
+    On success the response carries the cleartext pairing code +
+    the appliance-local control-plane URL (``https://localhost``).
+    The supervisor stamps these into its env and proceeds through
+    the normal ``/supervisor/register`` flow.
+    """
+    # Module gate first — exits before any DB work if the operator
+    # has turned supervisor registration off entirely.
+    if not await _module_enabled(db):
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+    # Variant gate.
+    if body.appliance_variant not in _SELF_BOOTSTRAP_VARIANTS:
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="Self-bootstrap is only available for full-stack / frontend-core variants",
+        )
+
+    # Host role-config gate — read /etc/spatiumddi-host/role-config
+    # and verify ROLE matches what the caller claims. On non-appliance
+    # deploys the file doesn't exist and we refuse.
+    host_role = _read_host_role()
+    if host_role is None or host_role != body.appliance_variant:
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="Self-bootstrap unavailable on this host",
+        )
+
+    # Single-shot gate — refuse if any Appliance rows already exist.
+    # The first supervisor that successfully registers locks the
+    # endpoint out; promotion of additional control-plane members
+    # (#272 Phase 7) uses operator-typed codes through the normal
+    # pairing flow.
+    existing = await db.scalar(select(sa_func.count(Appliance.id)))
+    if existing and existing > 0:
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="Appliances already registered; self-bootstrap is single-shot",
+        )
+
+    # Mint the code.
+    code = _gen_self_bootstrap_code()
+    expires_at = datetime.now(UTC) + _SELF_BOOTSTRAP_CODE_TTL
+    db.add(
+        PairingCode(
+            code_hash=_hash_code(code),
+            code_last_two=code[-2:],
+            expires_at=expires_at,
+            persistent=False,
+            enabled=True,
+            note=f"Self-bootstrap pairing code for {body.appliance_variant}",
+        )
+    )
+    db.add(
+        AuditLog(
+            user_id=None,
+            user_display_name="anonymous supervisor",
+            auth_source="anonymous",
+            source_ip=_client_ip(request),
+            action="appliance.self_bootstrap_minted",
+            resource_type="pairing_code",
+            resource_id=code[-2:],
+            resource_display=f"self-bootstrap code (…{code[-2:]})",
+            result="ok",
+            new_value={
+                "appliance_variant": body.appliance_variant,
+                "expires_at": expires_at.isoformat(),
+            },
+        )
+    )
+    await db.commit()
+
+    logger.info(
+        "appliance.self_bootstrap.minted",
+        variant=body.appliance_variant,
+        code_last_two=code[-2:],
+        expires_at=expires_at.isoformat(),
+    )
+
+    return SelfRegisterBootstrapResponse(
+        code=code,
+        control_plane_url="https://localhost",
+        expires_in_seconds=int(_SELF_BOOTSTRAP_CODE_TTL.total_seconds()),
+    )
 
 
 # ── Endpoint ───────────────────────────────────────────────────────
