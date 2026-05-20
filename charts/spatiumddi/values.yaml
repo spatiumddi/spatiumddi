@@ -109,6 +109,22 @@ frontend:
   service:
     type: ClusterIP
     port: 80
+  # #272 Phase 5 — control-plane VIP. When set (multi-node HA), the
+  # frontend Service becomes type=LoadBalancer requesting this exact IP
+  # from MetalLB's ``spatium-control-plane`` pool, so the operator's
+  # browser + every agent heartbeat hit one stable address regardless
+  # of which control-plane node is up. The frontend nginx proxies /api,
+  # so this single VIP fronts both the UI and the API. The supervisor
+  # threads this in (matching ``metallb.controlPlaneVIP`` on the
+  # appliance chart) on promote, and the VIP seeds the host cert SANs.
+  # When set, hostNetwork is forced off (the pod floats; the VIP routes)
+  # and the address-pool/loadBalancerIPs MetalLB annotations are added.
+  # Empty on single-node installs → behaves exactly as before.
+  controlPlaneVIP: ""
+  # MetalLB pool name the VIP is drawn from. Matches the IPAddressPool
+  # rendered by the appliance chart (charts/spatiumddi-appliance/
+  # templates/metallb-pool.yaml). Only used when controlPlaneVIP is set.
+  controlPlaneVIPPool: spatium-control-plane
   # Appliance use (#183 Phase 11) — flip to true to make the frontend
   # pod bind on the node's :80 directly via hostNetwork + hostPort.
   # Pair with ``replicas: 1`` (the single :80 host port is exclusive).

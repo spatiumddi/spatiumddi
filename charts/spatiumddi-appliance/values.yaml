@@ -186,20 +186,82 @@ agentLanding:
 
 # MetalLB — L2 / BGP load-balancer for the control-plane HTTPS VIP
 # and (Phase 10) DNS / DHCP service VIPs. Apache 2.0. Vendored from
-# the upstream chart at v0.15.3 in Phase 5.
+# the official upstream chart (https://metallb.github.io/metallb) at
+# v0.15.3 — NOT bitnami. The controller + speaker container images
+# are baked into the appliance slot at build time
+# (appliance/scripts/bake-images.sh ``METALLB_IMAGES``) so air-gapped
+# installs need zero outbound pulls. KEEP the pinned image refs below
+# in lock-step with that bake list.
 metallb:
   enabled: false
+
+  # ── L2 (native) mode ──────────────────────────────────────────────
+  # We run MetalLB in *native* L2 mode, not FRR mode. The upstream
+  # chart defaults ``speaker.frr.enabled=true`` (pulls the large
+  # quay.io/frrouting/frr image + runs an FRR sidecar). L2 ARP/NDP
+  # announcement needs none of that, and BGP is spec-only in Phase 5,
+  # so we disable FRR — that also keeps the air-gap bake to just the
+  # controller + speaker images.
+  speaker:
+    frr:
+      enabled: false
+    image:
+      repository: quay.io/metallb/speaker
+      tag: v0.15.3
+    # Speaker is a DaemonSet that answers ARP for the VIP; it must run
+    # on the control-plane nodes that host the fronted Services. The
+    # appliance control-plane cluster is all-control-plane nodes, so
+    # gate it on the per-role label (CLAUDE.md non-negotiable #16).
+    # MetalLB ships control-plane-taint tolerations by default.
+    nodeSelector:
+      spatium.io/role-control-plane: "true"
+  controller:
+    image:
+      repository: quay.io/metallb/controller
+      tag: v0.15.3
+    nodeSelector:
+      spatium.io/role-control-plane: "true"
+
+  # ── L2 IP pool ────────────────────────────────────────────────────
   # ``ipPool.addresses`` is the L2 IP range MetalLB hands out to
-  # Services. Operator picks a free slice of the appliance subnet
-  # via the Fleet UI; the value plumbing lands with Phase 5.
+  # LoadBalancer Services. Operator picks a free slice of the appliance
+  # subnet via the Fleet → Control plane UI; the supervisor writes it
+  # into the chart values on promote (Phase 7). Each entry is a CIDR
+  # (``192.0.2.240/28``) or a range (``192.0.2.240-192.0.2.250``).
+  # Empty → no IPAddressPool/L2Advertisement is rendered even when
+  # ``enabled: true`` (so the controller/speaker can come up first and
+  # the pool lands once the operator picks a range).
   ipPool:
     addresses: []
+    # Keep VIPs out of unrelated LoadBalancer Services: only Services
+    # that explicitly request an IP (via the loadBalancerIPs annotation)
+    # draw from this pool. The control-plane VIP Service does exactly
+    # that. Flip to true only if you want generic LB auto-assignment.
+    autoAssign: false
+
+  # ── Control-plane VIP ─────────────────────────────────────────────
+  # The single floating IP that fronts the frontend (which proxies the
+  # API) so the operator's browser + every agent heartbeat hit one
+  # stable address regardless of which control-plane node is up. MUST
+  # fall inside ``ipPool.addresses``. Consumed by the umbrella chart's
+  # frontend Service (type=LoadBalancer) — the supervisor threads this
+  # value into the umbrella valuesContent on promote, and it seeds the
+  # host's auto-issued cert SAN list. Empty on single-node installs.
+  controlPlaneVIP: ""
+
   # ``bgp`` mode plumbed through the chart for the anycast-DNS
   # follow-up; specifies neighbor peers + community advertisements.
-  # Spec-only in Phase 5; no behavior change in this PR.
+  # Spec-only in Phase 5 — rendering a BGPPeer/BGPAdvertisement needs
+  # FRR mode (re-enable speaker.frr.enabled + bake the frr image).
+  # No behavior change while ``enabled: false``.
   bgp:
     enabled: false
+    # Each peer: {myASN, peerASN, peerAddress, peerPort?, holdTime?}.
     peers: []
+    # Each advertisement: {ipAddressPools: [...], communities: [...],
+    # aggregationLength?}. Rendered as metallb.io/v1beta1 BGPAdvertisement
+    # when bgp.enabled (FRR mode required).
+    advertisements: []
 
 # CloudNativePG operator — declarative postgres HA. Apache 2.0.
 # Phase 2 vendors the upstream chart + adds a ``Cluster`` CR for

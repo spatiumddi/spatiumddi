@@ -1,0 +1,44 @@
+{{- /* #272 Phase 5 — MetalLB L2 IP pool + advertisement.
+
+       Rendered only when MetalLB is enabled AND the operator has
+       picked an address range (``metallb.ipPool.addresses``). The
+       controller/speaker (the metallb subchart) can come up with an
+       empty pool; the IPAddressPool lands once the operator chooses a
+       free slice of the appliance subnet via the Fleet → Control plane
+       UI (the supervisor writes it into the chart values on promote).
+
+       These CRs are metallb.io/v1beta1 and MUST live in the namespace
+       the MetalLB controller watches — the release namespace, same as
+       the subchart's controller Deployment.
+
+       L2 (native) mode: the speaker answers ARP/NDP for VIPs assigned
+       from this pool, so a single floating IP follows whichever
+       control-plane node is up. BGP advertisement is a separate,
+       spec-only template (metallb-bgp.yaml). */}}
+{{- if and .Values.metallb.enabled .Values.metallb.ipPool.addresses }}
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: spatium-control-plane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+spec:
+  addresses:
+    {{- toYaml .Values.metallb.ipPool.addresses | nindent 4 }}
+  # Hand out the control-plane VIP only when a Service explicitly
+  # requests it (loadBalancerIPs annotation) — don't auto-assign these
+  # IPs to unrelated LoadBalancer Services that happen to omit a pool.
+  autoAssign: {{ .Values.metallb.ipPool.autoAssign | default false }}
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: spatium-control-plane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+spec:
+  ipAddressPools:
+    - spatium-control-plane
+{{- end }}

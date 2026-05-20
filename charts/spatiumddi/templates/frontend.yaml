@@ -35,13 +35,18 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.frontend.hostNetwork }}
+      {{- if and .Values.frontend.hostNetwork (not .Values.frontend.controlPlaneVIP) }}
       # Appliance use (#183 Phase 11): expose :80 on the node IP
       # directly. The umbrella chart is otherwise pure ClusterIP,
       # but the appliance disables klipper-lb + the default
       # NodePort range excludes :80. hostNetwork is the simplest
       # way to land on http://<appliance>/ for the operator. Pair
       # with replicas=1 so the single host port doesn't conflict.
+      #
+      # #272 Phase 5 — a control-plane VIP supersedes hostNetwork:
+      # the pod must float across control-plane nodes for the VIP to
+      # mean anything, so when ``controlPlaneVIP`` is set we drop
+      # hostNetwork (and the LoadBalancer Service below carries :80/:443).
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
@@ -52,13 +57,13 @@ spec:
           ports:
             - name: http
               containerPort: 80
-              {{- if .Values.frontend.hostNetwork }}
+              {{- if and .Values.frontend.hostNetwork (not .Values.frontend.controlPlaneVIP) }}
               hostPort: 80
               {{- end }}
             {{- if .Values.frontend.tls.enabled }}
             - name: https
               containerPort: 443
-              {{- if .Values.frontend.hostNetwork }}
+              {{- if and .Values.frontend.hostNetwork (not .Values.frontend.controlPlaneVIP) }}
               hostPort: 443
               {{- end }}
             {{- end }}
@@ -152,11 +157,30 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+  {{- if .Values.frontend.controlPlaneVIP }}
+  annotations:
+    # #272 Phase 5 — pin the control-plane VIP from MetalLB's pool.
+    metallb.universe.tf/address-pool: {{ .Values.frontend.controlPlaneVIPPool | quote }}
+    metallb.universe.tf/loadBalancerIPs: {{ .Values.frontend.controlPlaneVIP | quote }}
+  {{- end }}
 spec:
+  {{- if .Values.frontend.controlPlaneVIP }}
+  # A control-plane VIP forces a LoadBalancer Service regardless of the
+  # configured service.type, so MetalLB assigns the floating IP.
+  type: LoadBalancer
+  {{- else }}
   type: {{ .Values.frontend.service.type }}
+  {{- end }}
   selector:
     {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
   ports:
     - name: http
       port: {{ .Values.frontend.service.port }}
       targetPort: http
+    {{- if and .Values.frontend.controlPlaneVIP .Values.frontend.tls.enabled }}
+    # Expose :443 on the VIP too — without hostNetwork, the LoadBalancer
+    # Service is the only path to the frontend's TLS listener.
+    - name: https
+      port: 443
+      targetPort: https
+    {{- end }}

@@ -80,6 +80,24 @@ OBSERVABILITY_IMAGES=(
     "redis:8.6-alpine"
 )
 
+# #272 Phase 5 — MetalLB (control-plane HTTPS VIP + Phase 10 DNS/DHCP
+# VIPs). Official upstream images (NOT bitnami), tagged with the chart
+# appVersion. Baked so multi-node HA promotion works in air-gapped
+# environments with zero outbound pulls — same as every other image.
+#
+# L2 (native) mode only: ``metallb.speaker.frr.enabled=false`` in
+# charts/spatiumddi-appliance/values.yaml, so the large
+# quay.io/frrouting/frr image is intentionally NOT baked. If/when BGP
+# mode lands (Phase 10), add ``quay.io/frrouting/frr:<tag>`` here and
+# flip frr.enabled.
+#
+# KEEP these refs in lock-step with the metallb.controller.image /
+# metallb.speaker.image pins in the appliance chart's values.yaml.
+METALLB_IMAGES=(
+    "quay.io/metallb/controller:v0.15.3"
+    "quay.io/metallb/speaker:v0.15.3"
+)
+
 if ! command -v docker >/dev/null 2>&1; then
     echo "ERROR: docker CLI required on the build host (used to save + retag images)." >&2
     echo "       The APPLIANCE itself ships zero docker; this is build-host tooling only." >&2
@@ -188,7 +206,7 @@ done
 # Slugged output filenames so two images from the same registry
 # path prefix don't collide. ``kube-state-metrics`` + ``node-exporter``
 # are distinct enough that ``basename`` works.
-for image in "${OBSERVABILITY_IMAGES[@]}"; do
+for image in "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}"; do
     short="$(basename "${image%%:*}")"
     out_tar="$IMAGES_DIR/${short}.tar.zst"
 
@@ -207,6 +225,6 @@ for image in "${OBSERVABILITY_IMAGES[@]}"; do
 done
 
 TOTAL="$(du -hc "$IMAGES_DIR"/*.tar.zst 2>/dev/null | tail -1 | awk '{print $1}')"
-TOTAL_COUNT=$((${#IMAGES[@]} + ${#OBSERVABILITY_IMAGES[@]}))
+TOTAL_COUNT=$((${#IMAGES[@]} + ${#OBSERVABILITY_IMAGES[@]} + ${#METALLB_IMAGES[@]}))
 echo "✓ ${TOTAL_COUNT} images baked into $IMAGES_DIR ($TOTAL)"
 echo "  k3s auto-imports these at startup (no firstboot shell-out required)"
