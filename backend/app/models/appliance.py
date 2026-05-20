@@ -324,6 +324,23 @@ APPLIANCE_STATES = (
     APPLIANCE_STATE_REVOKED,
 )
 
+# #272 Phase 7 — k3s control-plane cluster membership.
+CLUSTER_ROLE_PRIMARY = "primary"  # etcd seed (cluster-init); runs the control plane
+CLUSTER_ROLE_MEMBER = "member"  # server node that joined the seed
+CLUSTER_ROLES = (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+
+CLUSTER_JOIN_STATE_JOINING = "joining"  # promote in progress
+CLUSTER_JOIN_STATE_READY = "ready"  # promote complete — node is a member
+CLUSTER_JOIN_STATE_LEAVING = "leaving"  # demote in progress
+CLUSTER_JOIN_STATE_LEFT = "left"  # demote complete — node left the cluster
+CLUSTER_JOIN_STATE_FAILED = "failed"
+
+# Sentinel desired_cluster_role values handed to the supervisor:
+# "member" → join the seed; "none" → leave the cluster + revert to a
+# plain application appliance.
+DESIRED_CLUSTER_ROLE_MEMBER = "member"
+DESIRED_CLUSTER_ROLE_NONE = "none"
+
 
 class Appliance(Base):
     """One row per supervisor that's claimed a pairing code (#170).
@@ -634,6 +651,40 @@ class Appliance(Base):
         default=list,
         server_default=sa.text("'[]'::jsonb"),
     )
+
+    # ── #272 Phase 7 — control-plane cluster membership ──────────────
+    # ``cluster_role`` is the appliance's settled role in the k3s
+    # control-plane cluster:
+    #   * ``primary``   — the etcd seed (booted ``cluster-init: true``);
+    #                     also where the SpatiumDDI control plane runs.
+    #   * ``member``    — a server node that joined the seed via
+    #                     ``--server <url> --token <token>``.
+    #   * NULL          — not a control-plane cluster member (a plain
+    #                     ``application`` data-plane appliance, or a
+    #                     single-node install that hasn't been promoted).
+    # The promote/demote endpoints stamp ``desired_cluster_role`` +
+    # the join coordinates below; the supervisor's host-side runner
+    # (Phase 7b) reconfigures k3s and reports ``cluster_join_state``.
+    cluster_role: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    desired_cluster_role: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Join coordinates handed to a node being promoted to ``member``:
+    # the seed's kubeapi URL (``https://<seed-ip>:6443``) + the cluster
+    # join token. Token is Fernet-encrypted at rest (it grants full
+    # server join). Both NULL except while a promote is in flight; the
+    # heartbeat handler clears them once the node reports ``ready``.
+    desired_k3s_server_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    desired_k3s_join_token_encrypted: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )
+    # The seed's own join token, reported by the PRIMARY's supervisor on
+    # heartbeat (read from ``/var/lib/rancher/k3s/server/token``), Fernet-
+    # encrypted at rest. The promote endpoint reads this off the primary
+    # row to populate ``desired_k3s_join_token_encrypted`` on each joiner.
+    k3s_join_token_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    # Supervisor-reported progress of the in-flight join/leave:
+    # ``joining`` | ``ready`` | ``leaving`` | ``failed`` | NULL (idle).
+    cluster_join_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    cluster_join_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

@@ -22,6 +22,19 @@
 # operator approves the cross-network kubeapi surface.
 https-listen-port: 6443
 
+# #272 Phase 7 — embedded etcd from first boot. ``cluster-init: true``
+# makes even a single node a legitimate one-member etcd cluster that
+# additional server nodes can later join (``k3s server --server
+# https://<seed>:6443 --token <token>``). Without it k3s uses the
+# SQLite/kine datastore, which CANNOT be promoted to multi-node HA —
+# joiners would be refused. Baked on for every fresh install so the
+# control-plane promotion flow just works.
+#
+# NOTE: flipping SQLite→etcd is NOT an in-place migration; this only
+# applies to fresh installs. Pre-#272 appliances must re-install (the
+# partition layout changed in #276 anyway — see the release banner).
+cluster-init: true
+
 # Disable bundled components we replace or don't need:
 #   * traefik    — operator-facing TLS still goes through our nginx
 #                  reverse proxy (existing Appliance → Web UI Cert

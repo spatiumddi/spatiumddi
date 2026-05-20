@@ -55,7 +55,7 @@ from cryptography.hazmat.primitives.serialization import (
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func as sa_func
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import is_effective_superadmin, require_permission
@@ -63,6 +63,14 @@ from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
     APPLIANCE_STATE_REVOKED,
+    CLUSTER_JOIN_STATE_JOINING,
+    CLUSTER_JOIN_STATE_LEAVING,
+    CLUSTER_JOIN_STATE_LEFT,
+    CLUSTER_JOIN_STATE_READY,
+    CLUSTER_ROLE_MEMBER,
+    CLUSTER_ROLE_PRIMARY,
+    DESIRED_CLUSTER_ROLE_MEMBER,
+    DESIRED_CLUSTER_ROLE_NONE,
     Appliance,
     PairingClaim,
     PairingCode,
@@ -197,9 +205,7 @@ class SupervisorRegisterRequest(BaseModel):
     # role set on the resulting Appliance row at register time
     # instead of waiting for the first heartbeat. None for pre-#272
     # supervisors.
-    appliance_variant: Literal["full-stack", "frontend-core", "application"] | None = (
-        None
-    )
+    appliance_variant: Literal["full-stack", "frontend-core", "application"] | None = None
 
     @field_validator("pairing_code")
     @classmethod
@@ -579,9 +585,7 @@ async def supervisor_register(
     # force a fresh registration they delete the row in the fleet UI,
     # which causes the supervisor to clear its identity + claim a new
     # pairing code on next boot.
-    existing_stmt = select(Appliance).where(
-        Appliance.public_key_fingerprint == pubkey_fingerprint
-    )
+    existing_stmt = select(Appliance).where(Appliance.public_key_fingerprint == pubkey_fingerprint)
     existing = (await db.execute(existing_stmt)).scalar_one_or_none()
     if existing is not None:
         # Idempotent re-register. Touch last_seen_at so the heartbeat
@@ -667,9 +671,7 @@ async def supervisor_register(
                 resource_type="pairing_code",
                 resource_id=str(code_row.id) if code_row is not None else "unknown",
                 resource_display=(
-                    "supervisor pairing code"
-                    if code_row is not None
-                    else "unknown pairing code"
+                    "supervisor pairing code" if code_row is not None else "unknown pairing code"
                 ),
                 result="forbidden",
                 new_value={
@@ -714,9 +716,7 @@ async def supervisor_register(
     # operator to open the role-picker.
     initial_assigned_roles: list[str] = []
     if body.appliance_variant is not None:
-        initial_assigned_roles = list(
-            _REGISTER_VARIANT_FIXED_ROLES.get(body.appliance_variant, [])
-        )
+        initial_assigned_roles = list(_REGISTER_VARIANT_FIXED_ROLES.get(body.appliance_variant, []))
     appliance_row = Appliance(
         id=appliance_id,
         hostname=body.hostname,
@@ -863,9 +863,7 @@ async def supervisor_poll(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
 
     row = await db.get(Appliance, body.appliance_id)
-    valid = row is not None and verify_session_token(
-        body.session_token, row.session_token_hash
-    )
+    valid = row is not None and verify_session_token(body.session_token, row.session_token_hash)
     if not valid:
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
@@ -924,9 +922,7 @@ class SupervisorHeartbeatRequest(BaseModel):
     # ``/etc/spatiumddi-host/role-config:ROLE``. None on pre-#272
     # supervisors; the persistence handler leaves the column
     # untouched in that case (no nulling of an existing variant).
-    appliance_variant: Literal["full-stack", "frontend-core", "application"] | None = (
-        None
-    )
+    appliance_variant: Literal["full-stack", "frontend-core", "application"] | None = None
     installed_appliance_version: str | None = None
     current_slot: Literal["slot_a", "slot_b"] | None = None
     durable_default: Literal["slot_a", "slot_b"] | None = None
@@ -984,6 +980,17 @@ class SupervisorHeartbeatRequest(BaseModel):
     # (ISO-8601 UTC). None when not k3s; the heartbeat handler
     # leaves the column untouched in that case.
     k3s_api_cert_expires_at: datetime | None = None
+    # #272 Phase 7 — control-plane cluster membership.
+    # ``k3s_join_token`` is the seed's node-token (read by the PRIMARY's
+    # supervisor from /var/lib/rancher/k3s/server/token); the backend
+    # Fernet-encrypts it and the promote endpoint hands it to joiners.
+    # Only the primary reports it; None elsewhere (leaves the column
+    # untouched). ``cluster_join_state`` / ``cluster_join_reason`` are
+    # the joiner/leaver's progress report (joining / ready / leaving /
+    # left / failed) that drives the desired-state auto-clear.
+    k3s_join_token: str | None = None
+    cluster_join_state: str | None = None
+    cluster_join_reason: str | None = None
 
 
 class SupervisorRoleAssignment(BaseModel):
@@ -1075,9 +1082,17 @@ class SupervisorHeartbeatResponse(BaseModel):
     # uses this to bring up dns-bind9 / dns-powerdns / dhcp-kea
     # service containers via docker compose. Empty roles list = idle
     # (approved but no service running).
-    role_assignment: SupervisorRoleAssignment = Field(
-        default_factory=SupervisorRoleAssignment
-    )
+    role_assignment: SupervisorRoleAssignment = Field(default_factory=SupervisorRoleAssignment)
+    # #272 Phase 7 — control-plane promote/demote desired state.
+    # ``desired_cluster_role`` = "member" → join the seed via
+    # ``desired_k3s_server_url`` + ``desired_k3s_join_token``; "none" →
+    # leave the cluster + revert to a plain application appliance.
+    # NULL = no change. The token is the plaintext node-token (the
+    # heartbeat channel is mTLS); the supervisor's host-side runner
+    # (Phase 7b) reconfigures k3s + reports back via cluster_join_state.
+    desired_cluster_role: Literal["member", "none"] | None = None
+    desired_k3s_server_url: str | None = None
+    desired_k3s_join_token: str | None = None
 
 
 @router.post(
@@ -1162,9 +1177,7 @@ async def supervisor_heartbeat(
         )
         if not valid:
             await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN, "Invalid appliance or session."
-            )
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
 
     assert row is not None
     # Issue #170 Wave E follow-up — reject heartbeats from soft-deleted
@@ -1279,6 +1292,38 @@ async def supervisor_heartbeat(
             )
         row.kubeconfig_encrypted = encrypt_str(rewritten)
 
+    # #272 Phase 7 — persist control-plane cluster telemetry.
+    if body.k3s_join_token is not None:
+        from app.core.crypto import encrypt_str  # noqa: PLC0415
+
+        # Only the primary reports a token; store it Fernet-encrypted so
+        # the promote endpoint can hand it to joiners.
+        row.k3s_join_token_encrypted = encrypt_str(body.k3s_join_token)
+    if body.cluster_join_state is not None:
+        row.cluster_join_state = body.cluster_join_state
+        row.cluster_join_reason = body.cluster_join_reason
+
+    # Auto-clear the promote desired-state once the join landed: the
+    # supervisor reports ``ready`` → the node IS a member now, so settle
+    # cluster_role and drop the (sensitive) join coordinates.
+    if (
+        row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+        and row.cluster_join_state == CLUSTER_JOIN_STATE_READY
+    ):
+        row.cluster_role = CLUSTER_ROLE_MEMBER
+        row.desired_cluster_role = None
+        row.desired_k3s_server_url = None
+        row.desired_k3s_join_token_encrypted = None
+    # Auto-clear the demote desired-state once the leave landed: the
+    # supervisor reports ``left`` → the node is back to a plain
+    # application appliance.
+    if (
+        row.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
+        and row.cluster_join_state == CLUSTER_JOIN_STATE_LEFT
+    ):
+        row.cluster_role = None
+        row.desired_cluster_role = None
+
     # Auto-clear desired_appliance_version once installed matches +
     # the upgrade landed cleanly. Same shape as #138 Phase 8f-4's
     # legacy dns_server / dhcp_server auto-clear.
@@ -1294,19 +1339,13 @@ async def supervisor_heartbeat(
     # the requested slot as ``current_slot`` — the operator's intent
     # was "boot into this slot next", and we got there. ``durable_
     # default`` is irrelevant here (next-boot is one-shot by design).
-    if (
-        row.desired_next_boot_slot is not None
-        and row.current_slot == row.desired_next_boot_slot
-    ):
+    if row.desired_next_boot_slot is not None and row.current_slot == row.desired_next_boot_slot:
         row.desired_next_boot_slot = None
 
     # Auto-clear desired_default_slot once the supervisor reports the
     # requested slot as ``durable_default`` — grub-set-default landed
     # and survives subsequent reboots.
-    if (
-        row.desired_default_slot is not None
-        and row.durable_default == row.desired_default_slot
-    ):
+    if row.desired_default_slot is not None and row.durable_default == row.desired_default_slot:
         row.desired_default_slot = None
 
     # Auto-clear reboot_requested 15 s after the stamp — by that
@@ -1343,6 +1382,21 @@ async def supervisor_heartbeat(
         ca = await ensure_ca(db)
         ca_chain_pem = ca.cert_pem
 
+    # #272 Phase 7 — decrypt the join token for the joiner (mTLS channel).
+    desired_join_token: str | None = None
+    if (
+        row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+        and row.desired_k3s_join_token_encrypted is not None
+    ):
+        from app.core.crypto import decrypt_str  # noqa: PLC0415
+
+        try:
+            desired_join_token = decrypt_str(row.desired_k3s_join_token_encrypted)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "supervisor_heartbeat_join_token_decrypt_failed", appliance_id=str(row.id)
+            )
+
     return SupervisorHeartbeatResponse(
         appliance_id=row.id,
         state=row.state,  # type: ignore[arg-type]
@@ -1355,6 +1409,9 @@ async def supervisor_heartbeat(
         ca_chain_pem=ca_chain_pem,
         cert_expires_at=row.cert_expires_at,
         role_assignment=role_assignment,
+        desired_cluster_role=row.desired_cluster_role,  # type: ignore[arg-type]
+        desired_k3s_server_url=row.desired_k3s_server_url,
+        desired_k3s_join_token=desired_join_token,
     )
 
 
@@ -1368,9 +1425,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
     from app.models.dns import DNSServerGroup
 
     assigned_roles = list(row.assigned_roles or [])
-    dns_role_assigned = (
-        "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
-    )
+    dns_role_assigned = "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
     dhcp_role_assigned = "dhcp" in assigned_roles
 
     dns_engine: str | None = None
@@ -1582,9 +1637,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
 async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     _require_superadmin(current_user)
     rows = (
-        (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc())))
-        .scalars()
-        .all()
+        (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc()))).scalars().all()
     )
     return ApplianceList(appliances=[_row_to_schema(r) for r in rows])
 
@@ -1595,9 +1648,7 @@ async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Fetch a single appliance (superadmin)",
 )
-async def get_appliance(
-    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
-) -> ApplianceRow:
+async def get_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> ApplianceRow:
     _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
@@ -1718,9 +1769,7 @@ async def approve_appliance(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Reject a pending appliance (deletes the row, superadmin)",
 )
-async def reject_appliance(
-    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
-) -> None:
+async def reject_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
     """Reject = DELETE the row. Supervisor's next poll gets 403 +
     falls back to bootstrapping. Distinct from delete (next endpoint)
     only in the audit verb — operationally identical."""
@@ -2210,14 +2259,10 @@ async def update_appliance_roles(
             new_value={
                 "roles": list(row.assigned_roles or []),
                 "dns_group_id": (
-                    str(row.assigned_dns_group_id)
-                    if row.assigned_dns_group_id
-                    else None
+                    str(row.assigned_dns_group_id) if row.assigned_dns_group_id else None
                 ),
                 "dhcp_group_id": (
-                    str(row.assigned_dhcp_group_id)
-                    if row.assigned_dhcp_group_id
-                    else None
+                    str(row.assigned_dhcp_group_id) if row.assigned_dhcp_group_id else None
                 ),
                 "tags": dict(row.tags or {}),
             },
@@ -2232,6 +2277,269 @@ async def update_appliance_roles(
         user=current_user.username,
     )
     return _row_to_schema(row)
+
+
+# ── Admin: control-plane promotion (#272 Phase 7) ────────────────
+
+
+class ControlPlaneMembersRequest(BaseModel):
+    """Batch promote/demote payload — a list of appliance IDs.
+
+    k3s embedded-etcd HA wants odd server counts (1 / 3 / 5 / 7), so
+    promotion is done in batches that land on an odd total instead of
+    one-at-a-time (which would pause at a fragile even count). The
+    endpoint validates the RESULTING committed-or-in-flight member
+    count is odd and refuses otherwise (operator sees it inline).
+    """
+
+    appliance_ids: list[uuid.UUID] = Field(..., min_length=1)
+
+
+async def _effective_cp_members(db: DB) -> list[Appliance]:
+    """Every appliance that is, or is becoming, a control-plane member.
+
+    Counts settled members (``cluster_role`` in primary/member) PLUS
+    in-flight joiners (``desired_cluster_role='member'``) and excludes
+    in-flight leavers (``desired_cluster_role='none'``) — so two
+    overlapping promote calls can't both think the cluster is still at
+    1 and each add 2 (→ silently landing at 5).
+    """
+    rows = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    or_(
+                        Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                        Appliance.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER,
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [r for r in rows if r.desired_cluster_role != DESIRED_CLUSTER_ROLE_NONE]
+
+
+async def _resolve_primary(db: DB, members: list[Appliance]) -> Appliance | None:
+    """Return the etcd seed (``cluster_role='primary'``), designating
+    one on the first promote.
+
+    On a fresh single-node install no row carries ``cluster_role`` yet.
+    The seed is the lone approved control-plane appliance (full-stack /
+    frontend-core); designate it primary so subsequent joiners point at
+    it. Ambiguous (0 or >1 candidates) → caller raises 409.
+    """
+    for m in members:
+        if m.cluster_role == CLUSTER_ROLE_PRIMARY:
+            return m
+    candidates = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    Appliance.appliance_variant.in_(("full-stack", "frontend-core")),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(candidates) == 1:
+        candidates[0].cluster_role = CLUSTER_ROLE_PRIMARY
+        return candidates[0]
+    return None
+
+
+@router.post(
+    "/fleet/control-plane/promote",
+    response_model=ApplianceList,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Promote application appliances into the control-plane cluster (superadmin)",
+)
+async def promote_control_plane(
+    body: ControlPlaneMembersRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceList:
+    """Batch-promote the given appliances to k3s control-plane members.
+
+    Stamps each with the seed's join coordinates (server URL + token);
+    the supervisor's host-side runner reconfigures k3s + reports back
+    via ``cluster_join_state``. Refuses a batch that wouldn't land on an
+    odd total member count (etcd quorum hygiene).
+    """
+    _require_superadmin(current_user)
+
+    members = await _effective_cp_members(db)
+    primary = await _resolve_primary(db, members)
+    if primary is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "No single control-plane seed found to join. Exactly one approved "
+            "full-stack / frontend-core appliance is required as the etcd seed.",
+        )
+    if primary.k3s_join_token_encrypted is None or not primary.last_seen_ip:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The control-plane seed hasn't reported its k3s join token / IP yet — "
+            "wait for its next heartbeat and retry.",
+        )
+
+    # Count the seed even when it was just designated (cluster_role was
+    # NULL on a fresh single-node install, so it isn't in ``members``).
+    current_count = len({m.id for m in members} | {primary.id})
+    targets: list[Appliance] = []
+    seen: set[uuid.UUID] = set()
+    for aid in body.appliance_ids:
+        if aid in seen:
+            continue
+        seen.add(aid)
+        row = await db.get(Appliance, aid)
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Appliance {aid} not found.")
+        if row.id == primary.id:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Appliance {row.hostname!r} is the control-plane seed; it's already a member.",
+            )
+        if row.state != APPLIANCE_STATE_APPROVED:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Appliance {row.hostname!r} is in state {row.state!r}; approve it first.",
+            )
+        if row.cluster_role is not None or row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Appliance {row.hostname!r} is already a control-plane member (or joining).",
+            )
+        if row.deployment_kind != "appliance":
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Appliance {row.hostname!r} (deployment_kind={row.deployment_kind!r}) can't join "
+                "a k3s control-plane cluster — only OS-appliance nodes can.",
+            )
+        targets.append(row)
+
+    new_total = current_count + len(targets)
+    if new_total % 2 == 0:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Promoting {len(targets)} appliance(s) would leave the control-plane cluster at "
+            f"{new_total} members. etcd HA wants an ODD count (1 / 3 / 5 / 7) — promote "
+            f"{'one fewer' if len(targets) > 1 else 'one more'} so the total is odd.",
+        )
+
+    server_url = f"https://{primary.last_seen_ip}:6443"
+    for row in targets:
+        row.desired_cluster_role = DESIRED_CLUSTER_ROLE_MEMBER
+        row.desired_k3s_server_url = server_url
+        row.desired_k3s_join_token_encrypted = primary.k3s_join_token_encrypted
+        row.cluster_join_state = CLUSTER_JOIN_STATE_JOINING
+        row.cluster_join_reason = None
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="appliance.control_plane_promoted",
+                resource_type="appliance",
+                resource_id=str(row.id),
+                resource_display=row.hostname,
+                result="success",
+                new_value={"server_url": server_url, "new_total_members": new_total},
+            )
+        )
+    await db.commit()
+    logger.info(
+        "control_plane_promote",
+        primary=str(primary.id),
+        promoted=[str(r.id) for r in targets],
+        new_total=new_total,
+        user=current_user.username,
+    )
+    return ApplianceList(appliances=[_row_to_schema(r) for r in targets])
+
+
+@router.post(
+    "/fleet/control-plane/demote",
+    response_model=ApplianceList,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Demote control-plane members back to application appliances (superadmin)",
+)
+async def demote_control_plane(
+    body: ControlPlaneMembersRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceList:
+    """Batch-demote the given control-plane members back to application
+    appliances. Refuses a batch that would leave the cluster at an even
+    count, and refuses demoting the seed (use a dedicated seed-migration
+    flow for that — out of scope for Phase 7)."""
+    _require_superadmin(current_user)
+
+    members = await _effective_cp_members(db)
+    current_count = len(members)
+
+    targets: list[Appliance] = []
+    seen: set[uuid.UUID] = set()
+    for aid in body.appliance_ids:
+        if aid in seen:
+            continue
+        seen.add(aid)
+        row = await db.get(Appliance, aid)
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Appliance {aid} not found.")
+        if row.cluster_role == CLUSTER_ROLE_PRIMARY:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Appliance {row.hostname!r} is the etcd seed and can't be demoted here.",
+            )
+        if row.cluster_role != CLUSTER_ROLE_MEMBER:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Appliance {row.hostname!r} isn't a control-plane member.",
+            )
+        targets.append(row)
+
+    remaining = current_count - len(targets)
+    if remaining % 2 == 0:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Demoting {len(targets)} appliance(s) would leave the control-plane cluster at "
+            f"{remaining} members. etcd HA wants an ODD count (1 / 3 / 5 / 7) — demote "
+            f"{'one fewer' if len(targets) > 1 else 'one more'} so the remainder is odd.",
+        )
+
+    for row in targets:
+        row.desired_cluster_role = DESIRED_CLUSTER_ROLE_NONE
+        row.cluster_join_state = CLUSTER_JOIN_STATE_LEAVING
+        row.cluster_join_reason = None
+        # The join coordinates aren't needed for a leave; clear any stale ones.
+        row.desired_k3s_server_url = None
+        row.desired_k3s_join_token_encrypted = None
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="appliance.control_plane_demoted",
+                resource_type="appliance",
+                resource_id=str(row.id),
+                resource_display=row.hostname,
+                result="success",
+                new_value={"remaining_members": remaining},
+            )
+        )
+    await db.commit()
+    logger.info(
+        "control_plane_demote",
+        demoted=[str(r.id) for r in targets],
+        remaining=remaining,
+        user=current_user.username,
+    )
+    return ApplianceList(appliances=[_row_to_schema(r) for r in targets])
 
 
 # ── Admin: OS upgrade + reboot (#170 Wave D1) ────────────────────
@@ -2373,9 +2681,7 @@ async def schedule_appliance_upgrade(
             new_value={
                 "desired_appliance_version": body.desired_appliance_version,
                 "desired_slot_image_url": resolved_url,
-                "slot_image_id": (
-                    str(body.slot_image_id) if body.slot_image_id else None
-                ),
+                "slot_image_id": (str(body.slot_image_id) if body.slot_image_id else None),
             },
         )
     )
@@ -2676,9 +2982,7 @@ async def _require_cert_auth(request: Request, db: DB) -> Appliance:
         principal = await authenticate_cert(request, db)
     except CertAuthFailed as exc:
         logger.warning("appliance.k8s_proxy.cert_auth_failed", reason=exc.reason)
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN, "Invalid appliance client cert."
-        ) from exc
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance client cert.") from exc
     if principal is None:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -2717,9 +3021,7 @@ async def k8s_proxy_poll(request: Request, db: DB) -> K8sProxyPollResponse:
         # No request within the timeout — return an empty shape so
         # the supervisor loop just re-polls. 200 (not 204) so the
         # supervisor doesn't have to special-case "no body".
-        return K8sProxyPollResponse(
-            request_id="", method="", path="", headers={}, body_b64=""
-        )
+        return K8sProxyPollResponse(request_id="", method="", path="", headers={}, body_b64="")
     return K8sProxyPollResponse(
         request_id=queued.request_id,
         method=queued.method,
@@ -2822,18 +3124,13 @@ async def k8s_rollout_restart(
     # Strategic-merge patch that bumps the pod template's
     # ``restartedAt`` annotation. Standard kubectl rollout-restart
     # shape — same JSON kubectl sends.
-    api_path = (
-        f"/apis/apps/v1/namespaces/{body.namespace}/"
-        f"{body.kind.lower()}s/{body.name}"
-    )
+    api_path = f"/apis/apps/v1/namespaces/{body.namespace}/" f"{body.kind.lower()}s/{body.name}"
     patch_body = {
         "spec": {
             "template": {
                 "metadata": {
                     "annotations": {
-                        "kubectl.kubernetes.io/restartedAt": datetime.now(
-                            UTC
-                        ).isoformat()
+                        "kubectl.kubernetes.io/restartedAt": datetime.now(UTC).isoformat()
                     }
                 }
             }
@@ -2994,9 +3291,7 @@ async def reveal_appliance_kubeconfig(
         # Clean "nothing to reveal" — supervisor hasn't shipped a
         # kubeconfig yet (legacy compose / pre-Phase-5 / k3s not
         # started). Surface as a friendly state, not an error.
-        return RevealKubeconfigResponse(
-            configured=False, kubeconfig=None, hostname=row.hostname
-        )
+        return RevealKubeconfigResponse(configured=False, kubeconfig=None, hostname=row.hostname)
 
     try:
         plaintext = decrypt_str(row.kubeconfig_encrypted)
@@ -3028,9 +3323,7 @@ async def reveal_appliance_kubeconfig(
         hostname=row.hostname,
         user=current_user.username,
     )
-    return RevealKubeconfigResponse(
-        configured=True, kubeconfig=plaintext, hostname=row.hostname
-    )
+    return RevealKubeconfigResponse(configured=True, kubeconfig=plaintext, hostname=row.hostname)
 
 
 # ── Issue #183 Phase 6 — kubeapi-expose CIDR editor ──
@@ -3209,9 +3502,7 @@ async def k8s_list_pods(
         spec = item.get("spec") or {}
         st = item.get("status") or {}
         container_statuses = st.get("containerStatuses") or []
-        ready = bool(container_statuses) and all(
-            cs.get("ready") for cs in container_statuses
-        )
+        ready = bool(container_statuses) and all(cs.get("ready") for cs in container_statuses)
         pods.append(
             K8sPodSummary(
                 name=meta.get("name") or "",
@@ -3219,9 +3510,7 @@ async def k8s_list_pods(
                 phase=st.get("phase") or "Unknown",
                 ready=ready,
                 containers=[
-                    c.get("name") or ""
-                    for c in (spec.get("containers") or [])
-                    if c.get("name")
+                    c.get("name") or "" for c in (spec.get("containers") or []) if c.get("name")
                 ],
                 labels=dict(meta.get("labels") or {}),
             )
