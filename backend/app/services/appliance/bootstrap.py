@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.crypto import decrypt_str, encrypt_str
@@ -65,6 +66,19 @@ async def ensure_self_signed_cert() -> None:
     if not settings.appliance_mode:
         return
 
+    hostname = settings.appliance_hostname or socket.gethostname()
+    # Prefer host IPs detected by firstboot — those are the IPs a
+    # browser will actually connect to. Fall back to in-container
+    # detection only when running outside the appliance (no
+    # APPLIANCE_HOST_IPS env) or when the host had no globally-scoped
+    # addresses at firstboot time (rare; firstboot writes an empty list
+    # which we treat as "ask the local socket").
+    ips = _parse_host_ips(settings.appliance_host_ips) or _detect_local_ips()
+    # #272 Phase 6 — extra SANs the cert must also cover (the
+    # control-plane VIP etc), threaded in from the chart on promote.
+    extra_sans = _parse_extra_sans(settings.appliance_extra_cert_sans)
+    desired_sans = _desired_sans(hostname, ips, extra_sans)
+
     async with AsyncSessionLocal() as db:
         active_row = (
             await db.execute(
@@ -73,9 +87,26 @@ async def ensure_self_signed_cert() -> None:
         ).scalar_one_or_none()
 
         if active_row is not None and active_row.cert_pem:
-            # Path A — replay the active cert to disk in case the
-            # volume was reset. Decrypts the key inside this function
-            # only; the plaintext never leaves the deployer's scope.
+            covered = _sans_cover(active_row.sans_json, desired_sans)
+            # #272 Phase 6 — regenerate ONLY a self-signed cert that no
+            # longer covers every desired SAN (e.g. a control-plane VIP
+            # was added on promote). Operator-uploaded / CSR-signed certs
+            # are left untouched — the operator owns those SANs; we just
+            # warn that the VIP isn't covered.
+            if active_row.source == CERT_SOURCE_SELF_SIGNED and not covered:
+                logger.info(
+                    "appliance_self_signed_cert_regenerating",
+                    cert_id=str(active_row.id),
+                    old_sans=active_row.sans_json,
+                    new_sans=desired_sans,
+                )
+                active_row.is_active = False
+                await _generate_activate_deploy(db, hostname, ips, extra_sans)
+                return
+
+            # Path A — replay the active cert to disk in case the volume
+            # was reset. Decrypts the key inside this function only; the
+            # plaintext never leaves the deployer's scope.
             try:
                 key_pem = decrypt_str(active_row.key_encrypted)
             except Exception as exc:  # noqa: BLE001
@@ -85,6 +116,13 @@ async def ensure_self_signed_cert() -> None:
                     error=str(exc),
                 )
                 return
+            if not covered:
+                logger.warning(
+                    "appliance_active_cert_missing_sans",
+                    cert_id=str(active_row.id),
+                    source=active_row.source,
+                    missing=[s for s in desired_sans if not _sans_cover(active_row.sans_json, [s])],
+                )
             deploy_and_reload(active_row.cert_pem, key_pem, name=active_row.name)
             logger.info(
                 "appliance_active_cert_redeployed",
@@ -94,48 +132,53 @@ async def ensure_self_signed_cert() -> None:
             )
             return
 
-        # Path B — generate a self-signed default.
-        hostname = settings.appliance_hostname or socket.gethostname()
-        # Prefer host IPs detected by firstboot — those are the IPs a
-        # browser will actually connect to. Fall back to in-container
-        # detection only when running outside the appliance (no
-        # APPLIANCE_HOST_IPS env) or when the host had no globally-
-        # scoped addresses at firstboot time (rare; firstboot writes
-        # an empty list which we treat as "ask the local socket").
-        ips = _parse_host_ips(settings.appliance_host_ips) or _detect_local_ips()
-        cert_pem, key_pem, info = _generate_self_signed_cert(hostname, ips)
+        # Path B — no active row: generate a self-signed default.
+        await _generate_activate_deploy(db, hostname, ips, extra_sans)
 
-        row = ApplianceCertificate(
-            name=_unique_name("self-signed-default"),
-            source=CERT_SOURCE_SELF_SIGNED,
-            cert_pem=cert_pem,
-            key_encrypted=encrypt_str(key_pem),
-            is_active=True,
-            activated_at=_dt.datetime.now(_dt.UTC),
-            subject_cn=info["subject_cn"],
-            sans_json=info["sans"],
-            issuer_cn=info["issuer_cn"],
-            fingerprint_sha256=info["fingerprint_sha256"],
-            valid_from=info["valid_from"],
-            valid_to=info["valid_to"],
-            notes=(
-                "Auto-generated on first boot. Replace with an uploaded "
-                "cert, a CSR-signed cert, or a Let's Encrypt cert via the "
-                "Appliance → Web UI Certificate tab."
-            ),
-        )
-        db.add(row)
-        await db.commit()
-        await db.refresh(row)
-        logger.info(
-            "appliance_self_signed_cert_generated",
-            cert_id=str(row.id),
-            hostname=hostname,
-            sans=info["sans"],
-            fingerprint=info["fingerprint_sha256"][:23] + "…",
-        )
 
-        deploy_and_reload(cert_pem, key_pem, name=row.name)
+async def _generate_activate_deploy(
+    db: AsyncSession, hostname: str, ips: list[str], extra_sans: list[str]
+) -> None:
+    """Generate a self-signed cert, persist it as the active row, deploy.
+
+    Shared by Path B (no active cert) and the Phase 6 regenerate branch
+    (a self-signed cert that no longer covers every desired SAN). The
+    caller is responsible for deactivating any prior active row before
+    calling this — there is only ever one ``is_active=True`` row.
+    """
+    cert_pem, key_pem, info = _generate_self_signed_cert(hostname, ips, extra_sans)
+
+    row = ApplianceCertificate(
+        name=_unique_name("self-signed-default"),
+        source=CERT_SOURCE_SELF_SIGNED,
+        cert_pem=cert_pem,
+        key_encrypted=encrypt_str(key_pem),
+        is_active=True,
+        activated_at=_dt.datetime.now(_dt.UTC),
+        subject_cn=info["subject_cn"],
+        sans_json=info["sans"],
+        issuer_cn=info["issuer_cn"],
+        fingerprint_sha256=info["fingerprint_sha256"],
+        valid_from=info["valid_from"],
+        valid_to=info["valid_to"],
+        notes=(
+            "Auto-generated on first boot. Replace with an uploaded "
+            "cert, a CSR-signed cert, or a Let's Encrypt cert via the "
+            "Appliance → Web UI Certificate tab."
+        ),
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    logger.info(
+        "appliance_self_signed_cert_generated",
+        cert_id=str(row.id),
+        hostname=hostname,
+        sans=info["sans"],
+        fingerprint=info["fingerprint_sha256"][:23] + "…",
+    )
+
+    deploy_and_reload(cert_pem, key_pem, name=row.name)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -212,13 +255,61 @@ def _detect_local_ips() -> list[str]:
     return ips
 
 
-def _generate_self_signed_cert(hostname: str, ips: list[str]) -> tuple[str, str, dict[str, object]]:
+def _parse_extra_sans(env: str) -> list[str]:
+    """Parse the comma-separated APPLIANCE_EXTRA_CERT_SANS env.
+
+    Accepts both IPs (the common case — a control-plane VIP) and DNS
+    names. Drops empties, loopback / link-local / unspecified IPs, and
+    de-dupes while preserving order. DNS names pass through verbatim.
+    """
+    out: list[str] = []
+    for raw in env.split(","):
+        s = raw.strip()
+        if not s:
+            continue
+        try:
+            ip = ipaddress.ip_address(s)
+            if ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+                continue
+        except ValueError:
+            pass  # not an IP → treat as a DNS name
+        if s not in out:
+            out.append(s)
+    return out
+
+
+def _desired_sans(hostname: str, ips: list[str], extra_sans: list[str]) -> list[str]:
+    """Ordered, de-duped SAN list the active cert ought to cover."""
+    out: list[str] = []
+    for s in [hostname, *ips, *extra_sans]:
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def _sans_cover(existing: object, desired: list[str]) -> bool:
+    """True if every ``desired`` SAN is present in ``existing``.
+
+    ``existing`` is the persisted ``sans_json`` (a list of strings, or
+    None for legacy rows). A None / non-list existing set covers nothing,
+    forcing a regenerate when desired SANs are present.
+    """
+    have = set(existing) if isinstance(existing, list) else set()
+    return all(s in have for s in desired)
+
+
+def _generate_self_signed_cert(
+    hostname: str, ips: list[str], extra_sans: list[str] | None = None
+) -> tuple[str, str, dict[str, object]]:
     """Generate a fresh RSA-2048 self-signed cert + key.
 
     Subject + Issuer are both ``CN=<hostname>`` so OpenSSL renders
     "self-signed" consistently. SANs include every detected IP plus
-    the hostname (browsers only check SANs since 2017, ignore CN).
+    the hostname plus any ``extra_sans`` (e.g. the control-plane VIP) —
+    browsers only check SANs since 2017, ignore CN. Each extra SAN is
+    emitted as an IPAddress SAN when it parses as an IP, else a DNSName.
     """
+    extra_sans = extra_sans or []
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
 
@@ -228,6 +319,11 @@ def _generate_self_signed_cert(hostname: str, ips: list[str]) -> tuple[str, str,
             san_entries.append(x509.IPAddress(ipaddress.ip_address(ip)))
         except ValueError:
             pass
+    for entry in extra_sans:
+        try:
+            san_entries.append(x509.IPAddress(ipaddress.ip_address(entry)))
+        except ValueError:
+            san_entries.append(x509.DNSName(entry))
 
     now = _dt.datetime.now(_dt.UTC)
     not_after = now + _dt.timedelta(days=_SELF_SIGNED_DAYS)
@@ -255,7 +351,7 @@ def _generate_self_signed_cert(hostname: str, ips: list[str]) -> tuple[str, str,
     info: dict[str, object] = {
         "subject_cn": hostname,
         "issuer_cn": hostname,
-        "sans": [hostname, *ips],
+        "sans": _desired_sans(hostname, ips, extra_sans),
         "fingerprint_sha256": _format_fingerprint(cert.fingerprint(hashes.SHA256())),
         "valid_from": now,
         "valid_to": not_after,

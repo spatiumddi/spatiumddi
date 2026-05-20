@@ -51,6 +51,15 @@ spec:
               containerPort: 8000
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
+            {{- if .Values.frontend.controlPlaneVIP }}
+            # #272 Phase 6 — the self-signed cert bootstrap adds the
+            # control-plane VIP to the cert SANs (and regenerates an
+            # existing self-signed cert that doesn't cover it), so a cert
+            # served on the VIP validates. Threaded from the same value
+            # the frontend Service uses for the LoadBalancer VIP.
+            - name: APPLIANCE_EXTRA_CERT_SANS
+              value: {{ .Values.frontend.controlPlaneVIP | quote }}
+            {{- end }}
             {{- with .Values.api.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

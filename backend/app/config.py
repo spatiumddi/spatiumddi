@@ -122,6 +122,15 @@ class Settings(BaseSettings):
     # container's own socket-level view only knows the docker bridge IP).
     # Empty on non-appliance deploys.
     appliance_host_ips: str = ""
+    # #272 Phase 6 — extra SAN entries the self-signed cert MUST cover
+    # beyond the host's own IPs: the control-plane VIP (and any other
+    # floating address the operator's browser / agents hit). The
+    # umbrella chart threads ``frontend.controlPlaneVIP`` in here on
+    # promote; when set, the self-signed bootstrap regenerates an
+    # existing self-signed cert that doesn't already cover these, so a
+    # cert served on the VIP validates. Comma-separated IPs or DNS
+    # names. Empty on single-node / non-appliance deploys.
+    appliance_extra_cert_sans: str = ""
 
     # Where the cert deployer (Phase 4b.2) writes the currently-active
     # TLS cert + key. Mounted as a shared volume between the api
