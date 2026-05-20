@@ -6,9 +6,10 @@ The supervisor reads its installer-role variant from
 (a) report ``appliance_variant`` in the heartbeat payload so the
 Fleet UI can split rows into Control plane vs Service agents, and
 (b) merge the variant's fixed role set into the per-tick label
-reconciliation so full-stack always asserts dns-bind9 + dhcp +
-control-plane, frontend-core always asserts control-plane, and
-application contributes nothing fixed (operator-assigned only).
+reconciliation. After #272 Phase 7b only ``control-plane`` is forced
+(on full-stack + frontend-core); DNS/DHCP are operator-toggleable on
+every variant (full-stack just defaults them on at register time), and
+application contributes nothing fixed.
 """
 
 from __future__ import annotations
@@ -84,13 +85,14 @@ def test_variant_fixed_roles_subset_of_label_keys() -> None:
     assert every_role.issubset(service_lifecycle._ROLE_LABEL_KEYS.keys())
 
 
-def test_full_stack_carries_control_plane_label_role() -> None:
-    # Explicit assertion of the design intent — full-stack runs every
-    # role locally, so the supervisor reconciler asserts all three
-    # per-role labels on the node. Catches accidental removal of any
-    # one of them in a future refactor.
+def test_full_stack_forces_only_control_plane() -> None:
+    # #272 Phase 7b (item 5): full-stack only FORCES the control-plane
+    # label now. DNS/DHCP run by default (register-time default
+    # assignment) but are operator-shed-able — so they must NOT be in
+    # the forced set, or the reconciler would re-add the labels every
+    # tick and make shedding impossible after a promote.
     assert service_lifecycle._VARIANT_FIXED_ROLES["full-stack"] == frozenset(
-        {"dns-bind9", "dhcp", "control-plane"}
+        {"control-plane"}
     )
 
 
@@ -104,3 +106,14 @@ def test_application_has_no_fixed_roles() -> None:
     # Application appliances inherit roles only from the operator's
     # heartbeat-response role assignment — nothing fixed.
     assert service_lifecycle._VARIANT_FIXED_ROLES["application"] == frozenset()
+
+
+def test_dns_dhcp_are_never_force_asserted() -> None:
+    # #272 Phase 7b (items 4/5): DNS/DHCP must be operator-toggleable on
+    # every variant, so neither role may appear in ANY variant's forced
+    # set — otherwise the reconciler re-adds the label every tick and
+    # the operator can't shed (full-stack) or the role picker is moot.
+    for variant, forced in service_lifecycle._VARIANT_FIXED_ROLES.items():
+        assert "dns-bind9" not in forced, variant
+        assert "dns-powerdns" not in forced, variant
+        assert "dhcp" not in forced, variant

@@ -130,8 +130,22 @@ _ROLE_LABEL_KEYS = {
 # application:   no fixed roles. Operator picks via the Fleet UI's
 #                role-assignment block; supervisor reconciles to
 #                match.
+# #272 Phase 7b (items 4/5) — only ``control-plane`` is *forced* per
+# variant now. DNS/DHCP are operator-toggleable on every variant:
+#   * full-stack still RUNS dns-bind9 + dhcp out of the box, but those
+#     come from the register-time DEFAULT assignment
+#     (``_REGISTER_VARIANT_FIXED_ROLES`` on the control plane), NOT a
+#     forced union here — so an operator who promotes a full-stack into
+#     a control-plane-of-N can SHED the data-plane workloads by
+#     removing the roles (item 5). Forcing them here would re-add the
+#     labels every tick and make shedding impossible.
+#   * frontend-core / a promoted control-plane node can ADD dns-bind9 /
+#     dhcp via the role picker (capability-gated) — nothing forbids it
+#     (item 4).
+# control-plane stays fixed on the two control-plane variants so the
+# umbrella workloads never lose their node.
 _VARIANT_FIXED_ROLES: dict[str, frozenset[str]] = {
-    "full-stack": frozenset({"dns-bind9", "dhcp", "control-plane"}),
+    "full-stack": frozenset({"control-plane"}),
     "frontend-core": frozenset({"control-plane"}),
     "application": frozenset(),
 }
@@ -367,10 +381,10 @@ def reconcile_node_labels(profiles: list[str]) -> tuple[bool, str | None]:
       * Operator-assigned ``profiles`` from the heartbeat-response's
         role-assignment block (passed through here every tick).
       * The fixed per-variant set from ``_VARIANT_FIXED_ROLES``
-        (#272 Phase 1) — full-stack always asserts dns-bind9 + dhcp
-        + control-plane regardless of operator state; frontend-core
-        always asserts control-plane; application contributes
-        nothing fixed (operator chooses).
+        (#272 Phase 7b) — full-stack + frontend-core always assert
+        ``control-plane``; DNS/DHCP are operator-toggleable on every
+        variant (full-stack just defaults them on at register time).
+        application contributes nothing fixed (operator chooses).
 
     Returns ``(ok, error_or_None)`` — caller logs but doesn't act
     on failure (next heartbeat re-attempts).

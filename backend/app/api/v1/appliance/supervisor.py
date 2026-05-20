@@ -1688,14 +1688,18 @@ async def _approve_appliance_inline(
     row.approved_by_user_id = approved_by_user_id
 
 
-# #272 Phase 1 — per-variant fixed role set the api stamps on
-# ``Appliance.assigned_roles`` when a supervisor registers with
-# its variant. Keeps the Fleet UI's Services column accurate for
-# full-stack / frontend-core boxes (the operator never opens the
-# role-picker because the variant's roles are install-fixed).
-# Application variant contributes nothing here — operator picks.
-# Keep in lock-step with ``service_lifecycle._VARIANT_FIXED_ROLES``
-# on the supervisor side.
+# #272 Phase 1 — per-variant DEFAULT role set the api stamps on
+# ``Appliance.assigned_roles`` when a supervisor registers with its
+# variant, so a fresh full-stack runs DNS + DHCP out of the box
+# without the operator opening the role picker.
+#
+# #272 Phase 7b (item 5): these are DEFAULTS, not forced roles. The
+# supervisor's ``_VARIANT_FIXED_ROLES`` only force-asserts the
+# ``control-plane`` label now — so an operator who promotes a
+# full-stack into a control-plane-of-N can REMOVE dns-bind9 / dhcp
+# here and the supervisor will actually shed them (it no longer
+# re-adds the labels every reconcile). Hence this table and
+# ``_VARIANT_FIXED_ROLES`` intentionally DIVERGE: defaults vs forced.
 _REGISTER_VARIANT_FIXED_ROLES: dict[str, list[str]] = {
     "full-stack": ["dns-bind9", "dhcp"],
     "frontend-core": [],
