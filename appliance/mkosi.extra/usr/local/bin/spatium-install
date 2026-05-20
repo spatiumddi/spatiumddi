@@ -806,13 +806,23 @@ EOF
         # pairing fields.
         cat > "$STATE_MNT/spatium-config.yaml" <<EOF
 # SpatiumDDI appliance machine config (issue #276).
-# Authoritative source for hostname / role / pairing — rendered into
-# /etc by spatium-etc-render on every boot. Survives OS slot swaps +
-# a /var factory reset.
+# Authoritative source for hostname / role / pairing / network —
+# rendered into /etc by spatium-etc-render on every boot. Survives
+# OS slot swaps + a /var factory reset.
 hostname: "$HOSTNAME"
 role: "$ROLE"
 control_plane_url: "$CONTROL_PLANE_URL"
 bootstrap_pairing_code: "$BOOTSTRAP_PAIRING_CODE"
+# Network — flat keys (no nested map) so the render service's sed
+# parser stays dependency-free. mode=dhcp leaves NetworkManager on
+# its auto-DHCP default; mode=static makes the render service write
+# a keyfile connection profile.
+network_mode: "$NET_MODE"
+network_interface: "$NET_INTERFACE"
+network_ip: "$NET_IP"
+network_prefix: "$NET_PREFIX"
+network_gateway: "$NET_GATEWAY"
+network_dns: "$NET_DNS"
 EOF
         chmod 0644 "$STATE_MNT/spatium-config.yaml"
 
@@ -950,44 +960,14 @@ EOF
             echo "UTC" > "$MOUNT/etc/timezone"
         fi
 
-        # Static-IP override. The appliance runs NetworkManager (since
-        # the 2026.05.12 switch from systemd-networkd) — operator-set
-        # static config is a keyfile-format connection profile dropped
-        # under /etc/NetworkManager/system-connections/. NM auto-DHCPs
-        # every other ethernet interface by default, so we don't need
-        # an explicit "wired-default" file.
-        if [ "$NET_MODE" = "static" ]; then
-            install -d -m 0755 "$MOUNT/etc/NetworkManager/system-connections"
-            net_dns_csv=$(echo "$NET_DNS" | tr -s ' ' ';')
-            # NM keyfile UUIDs aren't load-bearing for our flow but
-            # must be present + unique. uuidgen is in util-linux on
-            # Debian; spatium-install runs in the live image where
-            # uuidgen is available.
-            net_uuid=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
-            cat > "$MOUNT/etc/NetworkManager/system-connections/10-spatium-static.nmconnection" <<EOF
-[connection]
-id=spatium-static
-uuid=$net_uuid
-type=ethernet
-interface-name=$NET_INTERFACE
-autoconnect=true
-
-[ethernet]
-
-[ipv4]
-method=manual
-address1=$NET_IP/$NET_PREFIX,$NET_GATEWAY
-dns=$net_dns_csv;
-
-[ipv6]
-method=auto
-EOF
-            # NM refuses to load system-connection keyfiles that
-            # aren't mode 600 (security check — they may carry wifi
-            # passphrases or VPN secrets). Same constraint applies to
-            # ethernet profiles for consistency.
-            chmod 0600 "$MOUNT/etc/NetworkManager/system-connections/10-spatium-static.nmconnection"
-        fi
+        # Static-IP config — issue #276. The NetworkManager keyfile is
+        # NOT written here anymore; spatium-etc-render materializes it
+        # from STATE's spatium-config.yaml (network_* keys, seeded
+        # above) on every boot, before NetworkManager starts. That
+        # makes the static config survive a /var factory reset (STATE
+        # outlives /var) and keeps a single source of truth. NM
+        # auto-DHCPs every ethernet interface by default, so dhcp mode
+        # needs no keyfile at all.
 
         echo "XXX"; echo "75"; echo "Creating admin user..."; echo "XXX"
         # Bind /proc /sys /dev for chroot operations.

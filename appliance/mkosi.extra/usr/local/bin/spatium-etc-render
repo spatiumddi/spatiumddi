@@ -101,4 +101,104 @@ else
     echo "no role in $CONFIG — leaving existing /etc/spatiumddi/role-config"
 fi
 
+# ── Network (NetworkManager keyfile) ─────────────────────────────────
+# Runs Before=NetworkManager.service so the profile is in place before
+# NM reads its connections. dhcp mode = no keyfile (NM auto-DHCPs every
+# ethernet interface by default); static mode writes a keyfile-format
+# connection. Remove a stale keyfile when the mode flips back to dhcp.
+NET_MODE_VAL="$(get_cfg network_mode)"
+NM_KEYFILE=/etc/NetworkManager/system-connections/10-spatium-static.nmconnection
+if [ "$NET_MODE_VAL" = "static" ]; then
+    NET_IFACE_VAL="$(get_cfg network_interface)"
+    NET_IP_VAL="$(get_cfg network_ip)"
+    NET_PREFIX_VAL="$(get_cfg network_prefix)"
+    NET_GATEWAY_VAL="$(get_cfg network_gateway)"
+    NET_DNS_VAL="$(get_cfg network_dns)"
+    if [ -n "$NET_IP_VAL" ] && [ -n "$NET_IFACE_VAL" ]; then
+        # NM wants DNS servers semicolon-separated + trailing ';'.
+        net_dns_csv="$(echo "$NET_DNS_VAL" | tr -s ' ' ';')"
+        # Stable UUID derived from the interface so re-renders don't
+        # churn NM's connection list. uuidgen if present, else a
+        # deterministic fallback (NM only needs it present + unique).
+        net_uuid="$(uuidgen 2>/dev/null || echo "5a71c0de-0000-4000-8000-$(printf '%012d' "$(echo "$NET_IFACE_VAL" | cksum | cut -d' ' -f1)")")"
+        # Preserve the existing UUID across re-renders if a keyfile is
+        # already present (avoids NM treating it as a new connection).
+        if [ -f "$NM_KEYFILE" ]; then
+            existing_uuid="$(sed -n 's/^uuid=//p' "$NM_KEYFILE" | head -1)"
+            [ -n "$existing_uuid" ] && net_uuid="$existing_uuid"
+        fi
+        install -d -m 0755 /etc/NetworkManager/system-connections
+        cat > "$NM_KEYFILE" <<EOF
+[connection]
+id=spatium-static
+uuid=$net_uuid
+type=ethernet
+interface-name=$NET_IFACE_VAL
+autoconnect=true
+
+[ethernet]
+
+[ipv4]
+method=manual
+address1=$NET_IP_VAL/$NET_PREFIX_VAL,$NET_GATEWAY_VAL
+dns=$net_dns_csv;
+
+[ipv6]
+method=auto
+EOF
+        # NM refuses keyfiles that aren't mode 600.
+        chmod 0600 "$NM_KEYFILE"
+        echo "network → static $NET_IP_VAL/$NET_PREFIX_VAL on $NET_IFACE_VAL"
+    else
+        echo "WARN: network_mode=static but ip/interface missing — skipping keyfile"
+    fi
+elif [ "$NET_MODE_VAL" = "dhcp" ]; then
+    # Flip back to DHCP — drop any static keyfile a prior render wrote.
+    if [ -f "$NM_KEYFILE" ]; then
+        rm -f "$NM_KEYFILE"
+        echo "network → dhcp (removed stale static keyfile)"
+    fi
+fi
+
+# ── Supervisor identity on STATE ─────────────────────────────────────
+# The spatium-supervisor pod's persistent identity (Ed25519 keypair,
+# signed cert, approval state) lives at /var/persist/spatium-supervisor
+# — the path its hostPath mount + the host-side console / pair / watchdog
+# tools all reference. Point that path at STATE so the identity survives
+# a /var factory reset (not just slot swaps). The symlink itself lives
+# on /var and is re-created here every boot, so even after a /var wipe
+# the next boot relinks to the (surviving) STATE copy → the box stays
+# paired + approved.
+if [ -d "$STATE_DIR" ]; then
+    mkdir -p "$STATE_DIR/spatium-supervisor"
+    mkdir -p /var/persist
+    if [ ! -L /var/persist/spatium-supervisor ]; then
+        # Migrate any pre-#276 real directory's contents into STATE
+        # before replacing it with the symlink (no-op on fresh installs).
+        if [ -d /var/persist/spatium-supervisor ]; then
+            cp -a /var/persist/spatium-supervisor/. "$STATE_DIR/spatium-supervisor/" 2>/dev/null || true
+            rm -rf /var/persist/spatium-supervisor
+        fi
+        ln -s "$STATE_DIR/spatium-supervisor" /var/persist/spatium-supervisor
+        echo "supervisor identity → STATE (symlinked /var/persist/spatium-supervisor)"
+    fi
+fi
+
+# ── machine-id ───────────────────────────────────────────────────────
+# Persist /etc/machine-id into STATE so it survives a /var factory
+# reset (journald continuity, any machine-id-keyed state). Restore
+# from STATE only when it diverges — normally they match, so this is
+# a no-op after the first boot. systemd already committed the
+# image-baseline machine-id in PID1; rewriting it here is safe for
+# our purposes (no per-boot machine-id consumers run before sysinit).
+if [ -s "$STATE_DIR/machine-id" ]; then
+    if ! cmp -s "$STATE_DIR/machine-id" /etc/machine-id; then
+        cp "$STATE_DIR/machine-id" /etc/machine-id
+        echo "machine-id restored from STATE"
+    fi
+elif [ -s /etc/machine-id ]; then
+    cp /etc/machine-id "$STATE_DIR/machine-id"
+    echo "machine-id persisted to STATE"
+fi
+
 echo "=== spatium-etc-render done ==="

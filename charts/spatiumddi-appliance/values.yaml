@@ -147,6 +147,15 @@ supervisor:
     # approval state, cached pairing data. MUST persist across pod
     # restarts or every restart re-pairs as a fresh appliance and the
     # control plane's Fleet view fills with phantom rows.
+    #
+    # Path stays /var/persist/spatium-supervisor for compatibility with
+    # the host-side consumers (spatium-console, spatium-pair, the
+    # external watchdog). Issue #276 makes this a symlink INTO the
+    # STATE partition (spatium-etc-render points it at
+    # /var/lib/spatium-state/spatium-supervisor), so the supervisor's
+    # identity + signed cert survive a /var factory reset, not just
+    # slot swaps — the symlink target lives on STATE which /var-reset
+    # doesn't touch.
     stateDir: /var/persist/spatium-supervisor
     # Slot-baked chart tarball — the supervisor re-PATCHes the
     # HelmChart CR on role-assignment changes and needs the chart
