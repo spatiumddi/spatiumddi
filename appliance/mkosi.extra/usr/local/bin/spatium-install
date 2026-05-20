@@ -298,7 +298,61 @@ pick_disk() {
         fi
         log "Operator picked $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB) — below 24 GiB minimum; re-prompting"
         whiptail --backtitle "$BACKTITLE" --title "Disk too small" --msgbox \
-            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 24 GiB:\n  ESP        512 MiB\n  root_A       8 GiB\n  root_B       8 GiB\n  var       remainder (≥7 GiB usable)\n\nThe slots are sized to carry the full container image set (issue #170 Wave A4) so the appliance works air-gapped without ghcr.io.\n\nPick a different disk, or Cancel out to attach a larger one." 18 76
+            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 24 GiB:\n  ESP        512 MiB\n  STATE      256 MiB\n  root_A       8 GiB\n  root_B       8 GiB\n  var       remainder (≥7 GiB usable)\n\nThe slots are sized to carry the full container image set (issue #170 Wave A4) so the appliance works air-gapped without ghcr.io.\n\nPick a different disk, or Cancel out to attach a larger one." 19 76
+    done
+}
+
+# Issue #276 — partition-layout confirmation. Shows the exact GPT
+# layout that ``do_install`` will create on $TARGET_DISK and forces
+# the operator to tick a confirmation checkbox before proceeding.
+# Back (or an un-ticked box) returns to disk selection so a misclick
+# costs nothing.
+confirm_partition_layout() {
+    log "Step: confirm_partition_layout"
+    local DISK_BYTES disk_gib var_gib
+    DISK_BYTES=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
+    disk_gib=$((DISK_BYTES / 1024 / 1024 / 1024))
+    # var = total − (1 MiB BBP + 512 MiB ESP + 256 MiB STATE + 2× 8 GiB
+    # slots). Round the fixed overhead up to ~17 GiB and subtract 1 for
+    # GPT/rounding slack so the figure shown is a safe lower bound.
+    var_gib=$(( disk_gib - 17 - 1 ))
+    [ "$var_gib" -lt 1 ] && var_gib=1
+
+    local layout
+    layout="Layout to be created on $TARGET_DISK ($disk_gib GiB):\n\n"
+    layout+="  p1  BIOS boot   1 MiB    legacy boot chain-load\n"
+    layout+="  p2  ESP       512 MiB    /boot/efi (FAT32)\n"
+    layout+="  p3  STATE     256 MiB    /var/lib/spatium-state\n"
+    layout+="                           machine config + SSH host keys +\n"
+    layout+="                           supervisor identity (survives OS\n"
+    layout+="                           slot swaps + a /var factory reset)\n"
+    layout+="  p4  root_A      8 GiB    active OS slot (this install)\n"
+    layout+="  p5  root_B      8 GiB    standby OS slot (next upgrade)\n"
+    layout+="  p6  var       ~$var_gib GiB    /var — database, k3s, logs\n\n"
+    layout+="ALL EXISTING DATA on $TARGET_DISK will be ERASED.\n"
+    layout+="There is no undo.\n\n"
+    layout+="Tick the box and choose OK to proceed, or Back to pick\n"
+    layout+="a different disk."
+
+    while true; do
+        local choice
+        choice=$(whiptail --backtitle "$BACKTITLE" --title "Confirm Partition Layout" \
+            --cancel-button "Back" \
+            --checklist "$layout" 24 76 1 \
+            "erase" "I understand all data on $TARGET_DISK will be erased" OFF \
+            3>&1 1>&2 2>&3) \
+            || return 1
+        # whiptail returns the ticked tags quoted, e.g. "erase".
+        case "$choice" in
+            *erase*)
+                log "Operator confirmed partition layout for $TARGET_DISK"
+                return 0
+                ;;
+            *)
+                whiptail --backtitle "$BACKTITLE" --title "Confirmation required" \
+                    --msgbox "You must tick the confirmation box to continue.\n\nChoose Back on the next screen if you'd rather pick a different disk." 10 64 || true
+                ;;
+        esac
     done
 }
 
@@ -479,15 +533,20 @@ do_install() {
     # and the EXIT trap drops the operator to a shell with the log.
     set -e
 
-    # Phase 8a-1 GPT layout — Atomic A/B image upgrade support (issue #138).
-    # Replaces the previous single-root layout with an A/B + /var
-    # split:
+    # GPT layout — Atomic A/B image upgrade (issue #138 Phase 8a-1) +
+    # Talos-style STATE partition (issue #276):
     #
     #   p1  BIOS Boot     1 MiB     ef02   legacy chain-load (grub i386-pc)
     #   p2  ESP          512 MiB    ef00   FAT32, /boot/efi
-    #   p3  root_A         8 GiB    8304   active slot (this install lands here)
-    #   p4  root_B         8 GiB    8304   inactive slot (staging next image)
-    #   p5  var          rest       8300   /var, persisted across slot swaps
+    #   p3  state        256 MiB    8300   /var/lib/spatium-state — machine
+    #                                      config, SSH host keys, supervisor
+    #                                      identity. Survives slot swaps AND
+    #                                      a /var factory reset; replaces
+    #                                      the per-slot /etc.image drift
+    #                                      that #272 Phase 1 bandaided.
+    #   p4  root_A         8 GiB    8304   active slot (this install lands here)
+    #   p5  root_B         8 GiB    8304   inactive slot (staging next image)
+    #   p6  var          rest       8310   /var, persisted across slot swaps
     #
     # Slot sizing — #170 Phase A4 bakes every container image into the
     # rootfs (~800 MB-1.2 GB compressed depending on third-party
@@ -498,23 +557,23 @@ do_install() {
     # Previous 4 GiB slots predated baking and are too tight once
     # the full container set lives on-rootfs.
     #
-    # Hard floor: 24 GiB target disk (= 1 MiB BBP + 512 MiB ESP + 2× 8
-    # GiB slots + at least 7 GiB usable /var). Below that, postgres +
-    # k3s state (containerd content store, local-path PV dirs) +
-    # audit log outgrow /var quickly. Bumped from the pre-A4 16 GiB
-    # floor.
-    local BBP ESP ROOT_A ROOT_B VAR
+    # Hard floor: 24 GiB target disk (= 1 MiB BBP + 512 MiB ESP + 256
+    # MiB STATE + 2× 8 GiB slots + at least 7 GiB usable /var). Below
+    # that, postgres + k3s state (containerd content store, local-path
+    # PV dirs) + audit log outgrow /var quickly.
+    local BBP ESP STATE ROOT_A ROOT_B VAR
     BBP=$(partition_node 1)
     ESP=$(partition_node 2)
-    ROOT_A=$(partition_node 3)
-    ROOT_B=$(partition_node 4)
-    VAR=$(partition_node 5)
+    STATE=$(partition_node 3)
+    ROOT_A=$(partition_node 4)
+    ROOT_B=$(partition_node 5)
+    VAR=$(partition_node 6)
 
     # Disk-size validation lives in ``pick_disk`` now (fires right
     # after the operator picks rather than at the end of the wizard
     # after they've typed hostname / admin / network / timezone).
 
-    log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP ROOT_A=$ROOT_A ROOT_B=$ROOT_B VAR=$VAR"
+    log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP STATE=$STATE ROOT_A=$ROOT_A ROOT_B=$ROOT_B VAR=$VAR"
 
     {
         echo "XXX"; echo "3"; echo "Releasing existing partitions on $TARGET_DISK..."; echo "XXX"
@@ -569,9 +628,10 @@ do_install() {
         #                                      partition discoverable.)
         sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
                -n2:0:+512M  -t2:ef00 -c2:ESP \
-               -n3:0:+8G    -t3:8304 -c3:root_A \
-               -n4:0:+8G    -t4:8304 -c4:root_B \
-               -n5:0:0      -t5:8310 -c5:var \
+               -n3:0:+256M  -t3:8300 -c3:state \
+               -n4:0:+8G    -t4:8304 -c4:root_A \
+               -n5:0:+8G    -t5:8304 -c5:root_B \
+               -n6:0:0      -t6:8310 -c6:var \
                "$TARGET_DISK"               >> "$INSTALL_LOG" 2>&1
         partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true
         udevadm settle                      >> "$INSTALL_LOG" 2>&1 || true
@@ -579,6 +639,11 @@ do_install() {
 
         echo "XXX"; echo "10"; echo "Formatting partitions..."; echo "XXX"
         mkfs.fat -F32 -n ESP "$ESP"         >> "$INSTALL_LOG" 2>&1
+        # STATE partition — issue #276. Small ext4 holding machine
+        # config + SSH host keys + supervisor identity. Mounted at
+        # /var/lib/spatium-state. Label ``state`` so fstab can
+        # ``LABEL=state`` it without chasing UUIDs across re-installs.
+        mkfs.ext4 -F -L state "$STATE"      >> "$INSTALL_LOG" 2>&1
         # Label the slots distinctly so the boot loader / sysupdate
         # can pick them by label rather than position. root_a is the
         # active slot for this install; root_b is empty until 8b's
@@ -597,6 +662,13 @@ do_install() {
         mount "$VAR" "$MOUNT/var"
         mkdir -p "$MOUNT/boot/efi"
         mount "$ESP" "$MOUNT/boot/efi"
+        # Issue #276 — mount the STATE partition under the eventual
+        # runtime path so the install-time render seeds it directly.
+        # The unmount step at the end of do_install drops it before
+        # /var (LIFO ordering); on next boot fstab re-mounts it via
+        # LABEL=state.
+        mkdir -p "$MOUNT/var/lib/spatium-state"
+        mount "$STATE" "$MOUNT/var/lib/spatium-state"
 
         echo "XXX"; echo "20"; echo "Copying root filesystem (3-5 min)..."; echo "XXX"
         rsync -aAXH \
@@ -672,10 +744,19 @@ do_install() {
         # /home + /root    — systemd .mount unit files (image-shipped
         #                    at /etc/systemd/system/home.mount +
         #                    root.mount). Not in fstab.
+        # /var/lib/spatium-state — LABEL=state (issue #276). Holds
+        # machine config + SSH host keys + supervisor identity.
+        # ``nofail`` so a missing/corrupt STATE partition degrades
+        # to a normal boot instead of dropping to emergency.target
+        # (the render service tolerates an absent STATE and falls
+        # back to image-baseline values). Mounted under /var so it
+        # orders after the /var mount — the render service's
+        # After=local-fs.target dependency covers ordering.
         cat > "$MOUNT/etc/fstab" <<'EOF'
-LABEL=var  /var       ext4   defaults                              0 2
-LABEL=ESP  /boot/efi  vfat   fmask=0133,dmask=0022,shortname=winnt 0 2
-tmpfs      /tmp       tmpfs  nosuid,nodev,noexec,mode=1777         0 0
+LABEL=var    /var                    ext4   defaults                              0 2
+LABEL=state  /var/lib/spatium-state  ext4   defaults,nofail                       0 2
+LABEL=ESP    /boot/efi               vfat   fmask=0133,dmask=0022,shortname=winnt 0 2
+tmpfs        /tmp                     tmpfs  nosuid,nodev,noexec,mode=1777         0 0
 EOF
         echo "$HOSTNAME" > "$MOUNT/etc/hostname"
 
@@ -1224,13 +1305,16 @@ EOF
         done
         umount "$MOUNT/boot/efi"
         # Phase 8a unmount order matters:
-        #   1. /home, /root    — bind mounts onto /var subdirs
-        #   2. /etc (overlay)  — upper is on /var, must release first
-        #   3. /var partition  — must be after /etc overlay + binds
-        #   4. root_A          — last
+        #   1. /home, /root            — bind mounts onto /var subdirs
+        #   2. /etc (overlay)          — upper is on /var, release first
+        #   3. /var/lib/spatium-state  — STATE partition, mounted under
+        #                                /var so release before /var (#276)
+        #   4. /var partition          — after /etc overlay + binds + STATE
+        #   5. root_A                  — last
         umount "$MOUNT/home"
         umount "$MOUNT/root"
         umount "$MOUNT/etc"
+        umount "$MOUNT/var/lib/spatium-state"
         umount "$MOUNT/var"
         umount "$MOUNT"
         sync
@@ -1341,10 +1425,13 @@ main() {
                 if ask_role; then step="pick_disk"; else step="welcome"; fi
                 ;;
             pick_disk)
-                if pick_disk; then step="ask_hostname"; else step="ask_role"; fi
+                if pick_disk; then step="confirm_partition_layout"; else step="ask_role"; fi
+                ;;
+            confirm_partition_layout)
+                if confirm_partition_layout; then step="ask_hostname"; else step="pick_disk"; fi
                 ;;
             ask_hostname)
-                if ask_hostname; then step="ask_user_password"; else step="pick_disk"; fi
+                if ask_hostname; then step="ask_user_password"; else step="confirm_partition_layout"; fi
                 ;;
             ask_user_password)
                 if ask_user_password; then step="ask_network"; else step="ask_hostname"; fi

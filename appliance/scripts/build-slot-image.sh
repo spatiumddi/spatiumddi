@@ -122,11 +122,18 @@ echo "→ Copying rootfs into slot image…"
 # /var/persist/etc/ stays invisible. Same content spatium-install
 # writes for slot_a at install time, so both slots agree.
 echo "→ Writing image-baseline /etc/fstab into slot…"
+# Must match spatium-install's fstab (incl. the #276 STATE entry) so a
+# slot swap keeps every operator mount. ``nofail`` on STATE so an
+# appliance imaged before the #276 partition layout (no STATE
+# partition) still boots after a slot upgrade — it just runs without
+# the render service's STATE source.
 cat > "$WORK/slot-mnt/etc/fstab" <<'FSTAB'
-LABEL=var  /var       ext4   defaults                              0 2
-LABEL=ESP  /boot/efi  vfat   fmask=0133,dmask=0022,shortname=winnt 0 2
-tmpfs      /tmp       tmpfs  nosuid,nodev,noexec,mode=1777         0 0
+LABEL=var    /var                    ext4   defaults                              0 2
+LABEL=state  /var/lib/spatium-state  ext4   defaults,nofail                       0 2
+LABEL=ESP    /boot/efi               vfat   fmask=0133,dmask=0022,shortname=winnt 0 2
+tmpfs        /tmp                     tmpfs  nosuid,nodev,noexec,mode=1777         0 0
 FSTAB
+mkdir -p "$WORK/slot-mnt/var/lib/spatium-state"
 
 # /etc/hostname is image-baseline only — empty file, so before the
 # overlay mounts the kernel hostname is "(none)". Once etc.mount
