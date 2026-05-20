@@ -52,6 +52,7 @@ from .role_orchestrator import (
     probe_port_conflicts,
     render_env_file,
 )
+
 # Issue #183 Phase 7 — k3s-only lifecycle. The pre-Phase-7 dispatcher
 # (compose vs k3s on ``detect_runtime()``) is gone with the rest of
 # docker; this is the only path now.
@@ -78,9 +79,7 @@ _ROLE_ENV_FILENAME = "role-compose.env"
 # used by snmp / chrony / slot-upgrade triggers). Writing to this
 # path = "host runner please re-render".
 _NFT_TRIGGER_PATH = Path("/var/lib/spatiumddi-host/release-state/firewall-pending")
-_NFT_APPLIED_HASH_PATH = Path(
-    "/var/lib/spatiumddi-host/release-state/firewall-applied-hash"
-)
+_NFT_APPLIED_HASH_PATH = Path("/var/lib/spatiumddi-host/release-state/firewall-applied-hash")
 
 
 # Issue #183 Phase 7 — capability reporting is now trivially true on
@@ -518,7 +517,8 @@ def heartbeat_once(
     # next heartbeat once it sees current_slot / durable_default match.
     if desired_next_boot_slot:
         if appliance_state.maybe_fire_set_next_boot(
-            desired_next_boot_slot, state.get("current_slot")  # type: ignore[arg-type]
+            desired_next_boot_slot,
+            state.get("current_slot"),  # type: ignore[arg-type]
         ):
             log.info(
                 "supervisor.heartbeat.set_next_boot_trigger_fired",
@@ -526,7 +526,8 @@ def heartbeat_once(
             )
     if desired_default_slot:
         if appliance_state.maybe_fire_set_default(
-            desired_default_slot, state.get("durable_default")  # type: ignore[arg-type]
+            desired_default_slot,
+            state.get("durable_default"),  # type: ignore[arg-type]
         ):
             log.info(
                 "supervisor.heartbeat.set_default_trigger_fired",
@@ -535,6 +536,25 @@ def heartbeat_once(
     if reboot_requested:
         if appliance_state.maybe_fire_reboot(True):
             log.info("supervisor.heartbeat.reboot_trigger_fired")
+
+    # #272 Phase 7b — control-plane promote/demote. The host-side runner
+    # (spatium-cluster-join) reconfigures k3s + reports back via the
+    # .state sidecar that collect() ships on the next heartbeat; the
+    # backend then settles cluster_role + clears the desired-state.
+    desired_cluster_role = body_out.get("desired_cluster_role")
+    if desired_cluster_role == "member":
+        if appliance_state.maybe_fire_cluster_join(
+            desired_cluster_role,
+            body_out.get("desired_k3s_server_url"),  # type: ignore[arg-type]
+            body_out.get("desired_k3s_join_token"),  # type: ignore[arg-type]
+        ):
+            log.info(
+                "supervisor.heartbeat.cluster_join_trigger_fired",
+                server_url=body_out.get("desired_k3s_server_url"),
+            )
+    elif desired_cluster_role == "none":
+        if appliance_state.maybe_fire_cluster_leave(desired_cluster_role):
+            log.info("supervisor.heartbeat.cluster_leave_trigger_fired")
 
     # #170 Wave C2 — render the role-driven compose env. C3 will
     # consume this via ``docker compose --env-file`` to actually
@@ -635,9 +655,7 @@ def heartbeat_once(
                     error=label_err,
                 )
         except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "supervisor.heartbeat.labels_reconcile_crashed", error=str(exc)
-            )
+            log.warning("supervisor.heartbeat.labels_reconcile_crashed", error=str(exc))
 
         env_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
         last_hash = _read_last_apply_hash(cfg.state_dir)
