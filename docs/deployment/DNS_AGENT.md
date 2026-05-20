@@ -13,7 +13,7 @@
 
 ## Post-#170 architecture (2026-05-14)
 
-The Application appliance role + `spatium-supervisor` from
+The Appliance role (was "Application" pre-#272) + `spatium-supervisor` from
 [#170](https://github.com/spatiumddi/spatiumddi/issues/170)
 reshape this document's scope. Read this first; the historical
 sections below describe the pre-#170 agent surface (still
@@ -105,7 +105,7 @@ The **agent is the same Python codebase** (`spatium_dns_agent`) in both images; 
 The 8-digit pairing-code → PSK exchange originally landed in #169
 shipped against a control-plane endpoint (``POST /api/v1/appliance
 /pair``) that was retired under #170 Wave A3. Pairing-code flow now
-lives entirely inside the **Application appliance** supervisor —
+lives entirely inside the **Appliance** supervisor —
 the supervisor exchanges the code via ``POST /api/v1/appliance
 /supervisor/register``, gets the per-role agent keys back as part
 of the heartbeat-response ``SupervisorRoleAssignment`` block, and

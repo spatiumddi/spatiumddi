@@ -709,14 +709,15 @@ Operators get a real Kubernetes node without managing one.
    bare metal. Hard floor: **32 GiB disk, 2 GiB RAM, amd64**
    (arm64 ISO is planned).
 2. Boot. The installer wizard asks for:
-   - **Variant** — *All-in-One* (control plane + DNS + DHCP
-     on this box), *Core-only* (control plane only; agents
-     pair against it from other boxes), or *Application*
-     (DNS / DHCP agent box; pairs against a remote control
-     plane).
+   - **Role** — *Control plane* (the required first install:
+     control plane on this box + the k3s etcd seed; DNS / DHCP
+     are off at install and enabled later per node from the
+     Fleet UI) or *Appliance* (DNS / DHCP agent box; pairs
+     against a remote control plane and can later be promoted
+     to join the control-plane cluster).
    - **Target disk**, **hostname**, **admin password**,
      **network** (DHCP or static), **timezone**.
-   - For *Application*, also **control plane URL** and a
+   - For *Appliance*, also **control plane URL** and a
      **bootstrap method** — see "Joining DNS / DHCP agents"
      below.
 3. The installer partitions, installs GRUB, and reboots.
@@ -741,7 +742,7 @@ beyond pasting the new cert in the UI.
 #### Joining DNS / DHCP agents
 
 For distributed deployments (control plane on one box, DNS
-and DHCP on others), install the **Application** variant on
+and DHCP on others), install the **Appliance** role on
 each agent box. Each agent needs a bootstrap secret to
 register with the control plane. Two ways to provide it:
 

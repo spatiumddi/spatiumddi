@@ -28,17 +28,17 @@ The historical AIO / Core-only / Application narrative below documents the pre-#
    ├─ /usr/local/bin/k3s (static binary, pinned via K3S_VERSION)
    ├─ /var/lib/rancher/k3s/agent/images/*.tar.zst   ← air-gap-preloaded
    ├─ /usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz   ← appliance chart
-   ├─ /usr/lib/spatiumddi/charts/spatiumddi.tgz             ← umbrella chart (AIO + Core)
+   ├─ /usr/lib/spatiumddi/charts/spatiumddi.tgz             ← umbrella chart (Control plane)
    └─ /var/lib/rancher/k3s/server/manifests/spatium-bootstrap.yaml
         ↓ (firstboot writes on every boot, content depends on variant)
    helm-controller reconciles → installs `spatium-bootstrap` release
         ↓
-   spatium-supervisor pod (DaemonSet, privileged, hostNetwork: false)   ← Application only
+   spatium-supervisor pod (DaemonSet, privileged, hostNetwork: false)   ← all roles
         ↓ (registers + heartbeats to control plane)
         ↓ (on role assignment: labels node → DaemonSet schedules)
    role pods: dns-bind9 / dns-powerdns / dhcp-kea (hostNetwork: true)
-   always-on: agent-landing nginx on :80                                 ← Application only
-   control plane pods (api / frontend / db / redis / worker / beat /     ← AIO + Core
+   always-on: agent-landing nginx on :80                                 ← Appliance only
+   control plane pods (api / frontend / db / redis / worker / beat /     ← Control plane
                        migrate, frontend on hostNetwork :80 + :443)
 ```
 
@@ -48,16 +48,16 @@ mkosi bakes everything the appliance needs to come up fully air-gapped:
 
 - **k3s static binary** (~70 MB) at `/usr/local/bin/k3s`; `kubectl` / `crictl` / `ctr` symlink to it.
 - **k3s airgap images** (CoreDNS / local-path / pause / metrics-server) as zst-compressed tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst`. k3s auto-imports them into containerd at boot.
-- **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.6-alpine for AIO / Core variants.
-- **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Application installs; the umbrella chart drives AIO + Core. Built at release time + signed.
+- **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.6-alpine for the Control plane role.
+- **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Appliance installs (and the supervisor on the Control plane); the umbrella chart drives the Control plane. Built at release time + signed.
 - **bash-completion + `k` alias** for kubectl — operator SSHing in for triage drops straight into a usable shell.
 
 A fresh appliance boot never reaches out to ghcr.io or any external registry. The first time it does is when an operator explicitly applies a new release through `/appliance → OS Versions` or `/appliance → Releases`.
 
 ### Two HelmChart CRs
 
-- **`spatium-bootstrap`** — written by `spatiumddi-firstboot` into k3s's auto-deploy directory on every boot. Content depends on install variant (Application / AIO / Core). Owns the always-on resources (supervisor + agent-landing on Application; control plane pods on AIO + Core).
-- **`spatiumddi-appliance`** — written by the supervisor on its first successful heartbeat (Application variant only). Deploys the three role DaemonSets (dns-bind9 / dns-powerdns / dhcp-kea). After #183 Phase 10, this release is installed once and never re-PATCHed for role changes — role swaps happen through node labels (`spatium.io/role-<role>=true`); the DaemonSet's matching-nodes semantics mean an unassigned role produces zero pods rather than a Pending one.
+- **`spatium-bootstrap`** — written by `spatiumddi-firstboot` into k3s's auto-deploy directory on every boot. Content depends on install role (Control plane / Appliance). Owns the always-on resources (supervisor on every role; agent-landing on Appliance; control plane pods on Control plane).
+- **`spatiumddi-appliance`** — written by the supervisor on its first successful heartbeat (every role runs a supervisor). Deploys the three role DaemonSets (dns-bind9 / dns-powerdns / dhcp-kea). After #183 Phase 10, this release is installed once and never re-PATCHed for role changes — role swaps happen through node labels (`spatium.io/role-<role>=true`); the DaemonSet's matching-nodes semantics mean an unassigned role produces zero pods rather than a Pending one.
 
 ### Why k3s
 
@@ -85,12 +85,12 @@ The api pod's ServiceAccount is namespace-scoped with minimal RBAC: pods + pods/
 
 ### From-zero operator flow
 
-1. Boot the ISO → installer wizard asks for **variant** + target disk + hostname + admin + network + timezone (+ pairing code / control-plane URL on Application).
+1. Boot the ISO → installer wizard asks for **role** + target disk + hostname + admin + network + timezone (+ pairing code / control-plane URL on Appliance).
 2. Installer partitions (BIOS Boot + ESP + root_A + root_B + var), writes fstab + grub menuentries, runs postinst hardening, reboots.
 3. First-boot: `spatiumddi-firstboot` generates `/etc/spatiumddi/.env` with secrets, bakes the self-signed cert, writes the HelmChart bootstrap manifest, starts k3s.
 4. k3s comes up + imports baked images + helm-controller installs the bootstrap release. 30-90 s for control plane pods to reach Ready; another 15-30 s for migrate Job to complete schema migrations.
 5. Operator browses to `https://<appliance-ip>/`, accepts the self-signed cert, signs in `admin / admin`, sets a real password.
-6. (Application variant only) Operator approves the appliance from the control plane's `/appliance → Fleet` tab, picks roles. DaemonSet schedules role pods within ~30 s.
+6. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
 
 For a step-by-step user-facing version, see the README's
 ["Quick start with the OS appliance ISO" section](../../README.md#quick-start-with-the-os-appliance-iso-recommended).
