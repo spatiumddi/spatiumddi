@@ -63,7 +63,7 @@ async def _seed(db: AsyncSession) -> Appliance:
     return await _appliance(
         db,
         "seed",
-        appliance_variant="full-stack",
+        appliance_variant="control-plane",
         cluster_role=CLUSTER_ROLE_PRIMARY,
         last_seen_ip="10.0.0.1",
         k3s_join_token_encrypted=encrypt_str("K10::servertoken"),
@@ -80,8 +80,8 @@ def _hdr(token: str) -> dict[str, str]:
 async def test_promote_to_three_ok(db_session: AsyncSession, client: AsyncClient) -> None:
     token = await _admin(db_session)
     await _seed(db_session)
-    a = await _appliance(db_session, "app1", appliance_variant="application")
-    b = await _appliance(db_session, "app2", appliance_variant="application")
+    a = await _appliance(db_session, "app1", appliance_variant="appliance")
+    b = await _appliance(db_session, "app2", appliance_variant="appliance")
     await db_session.commit()
 
     resp = await client.post(
@@ -103,7 +103,7 @@ async def test_promote_to_three_ok(db_session: AsyncSession, client: AsyncClient
 async def test_promote_even_target_refused(db_session: AsyncSession, client: AsyncClient) -> None:
     token = await _admin(db_session)
     await _seed(db_session)
-    a = await _appliance(db_session, "app1", appliance_variant="application")
+    a = await _appliance(db_session, "app1", appliance_variant="appliance")
     await db_session.commit()
 
     # 1 seed + 1 promote = 2 → even → refused.
@@ -122,12 +122,12 @@ async def test_promote_requires_seed_token(db_session: AsyncSession, client: Asy
     await _appliance(
         db_session,
         "seed",
-        appliance_variant="full-stack",
+        appliance_variant="control-plane",
         cluster_role=CLUSTER_ROLE_PRIMARY,
         last_seen_ip="10.0.0.1",
     )
-    a = await _appliance(db_session, "app1", appliance_variant="application")
-    b = await _appliance(db_session, "app2", appliance_variant="application")
+    a = await _appliance(db_session, "app1", appliance_variant="appliance")
+    b = await _appliance(db_session, "app2", appliance_variant="appliance")
     await db_session.commit()
 
     resp = await client.post(
@@ -141,16 +141,16 @@ async def test_promote_requires_seed_token(db_session: AsyncSession, client: Asy
 
 async def test_promote_designates_lone_seed(db_session: AsyncSession, client: AsyncClient) -> None:
     token = await _admin(db_session)
-    # Single full-stack with no cluster_role yet → designated primary.
+    # Single control-plane node with no cluster_role yet → designated.
     seed = await _appliance(
         db_session,
         "seed",
-        appliance_variant="full-stack",
+        appliance_variant="control-plane",
         last_seen_ip="10.0.0.9",
         k3s_join_token_encrypted=encrypt_str("K10::tok"),
     )
-    a = await _appliance(db_session, "app1", appliance_variant="application")
-    b = await _appliance(db_session, "app2", appliance_variant="application")
+    a = await _appliance(db_session, "app1", appliance_variant="appliance")
+    b = await _appliance(db_session, "app2", appliance_variant="appliance")
     await db_session.commit()
 
     resp = await client.post(
@@ -166,7 +166,7 @@ async def test_promote_designates_lone_seed(db_session: AsyncSession, client: As
 async def test_promote_non_superadmin_403(db_session: AsyncSession, client: AsyncClient) -> None:
     token = await _admin(db_session, superadmin=False, username="regular")
     await _seed(db_session)
-    a = await _appliance(db_session, "app1", appliance_variant="application")
+    a = await _appliance(db_session, "app1", appliance_variant="appliance")
     await db_session.commit()
     resp = await client.post(
         "/api/v1/appliance/fleet/control-plane/promote",

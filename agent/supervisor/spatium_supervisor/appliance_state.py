@@ -117,14 +117,23 @@ def read_installed_version() -> str | None:
     return None
 
 
-# #272 Phase 1 — installer-role variants the installer wizard offers.
-# The supervisor reports its variant on every heartbeat so the
-# control plane's Fleet UI can split rows into Control plane
-# (full-stack / frontend-core) vs Service agents (application), and
-# the variant-aware label reconciler can apply the correct per-role
-# labels on the node (full-stack ⇒ dns-bind9 + dhcp + control-plane,
-# frontend-core ⇒ control-plane, application ⇒ operator-assigned).
-_KNOWN_VARIANTS = frozenset({"full-stack", "frontend-core", "application"})
+# #272 — two installer-role variants: ``control-plane`` (the brain +
+# k3s etcd seed) and ``appliance`` (a data-plane node that pairs with
+# a remote control plane). The supervisor reports its variant on every
+# heartbeat so the Fleet UI can split rows into Control plane vs
+# Service agents, and the label reconciler can apply the correct
+# per-role labels (control-plane ⇒ control-plane label;
+# appliance ⇒ operator-assigned).
+_KNOWN_VARIANTS = frozenset({"control-plane", "appliance"})
+# Pre-#272 installs wrote one of three variant strings; normalise them
+# to the two canonical values so a not-yet-reinstalled box reports a
+# clean variant (full-stack / frontend-core were both control planes;
+# application was the data-plane node).
+_LEGACY_VARIANT_ALIASES = {
+    "full-stack": "control-plane",
+    "frontend-core": "control-plane",
+    "application": "appliance",
+}
 
 
 def detect_appliance_variant() -> str | None:
@@ -132,11 +141,12 @@ def detect_appliance_variant() -> str | None:
 
     The installer wizard's role choice is baked into role-config at
     install time (``spatium-install`` writes ``ROLE=<variant>``);
-    firstboot leaves the value untouched across slot swaps. Returns
-    ``None`` when the file isn't mounted (docker / k8s) or the
-    parsed value isn't one we recognise — the heartbeat handler
-    treats ``None`` as "supervisor didn't ship the field" and
-    leaves the persisted column alone.
+    firstboot leaves the value untouched across slot swaps. Legacy
+    pre-#272 strings are normalised to the two canonical variants.
+    Returns ``None`` when the file isn't mounted (docker / k8s) or the
+    parsed value isn't one we recognise — the heartbeat handler treats
+    ``None`` as "supervisor didn't ship the field" and leaves the
+    persisted column alone.
     """
     if not _HOST_ROLE_CONFIG.exists():
         return None
@@ -147,6 +157,7 @@ def detect_appliance_variant() -> str | None:
     for line in text.splitlines():
         if line.startswith("ROLE="):
             value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            value = _LEGACY_VARIANT_ALIASES.get(value, value)
             return value if value in _KNOWN_VARIANTS else None
     return None
 

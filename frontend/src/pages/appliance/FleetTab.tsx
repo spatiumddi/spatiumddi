@@ -184,13 +184,15 @@ const SERVICE_CHIP_STYLES: Record<
 
 // #272 Phase 1 — Fleet UI two-table split. Control-plane variants run
 // the umbrella chart (api / frontend / worker / beat / postgres /
-// redis); service-agent variants run the DNS / DHCP service
-// containers. Future ``control-cluster-member`` (Phase 7+) joins the
-// control-plane side. NULL is treated as service-agent because the
-// only supervisors that pre-date the column are #170 Wave-A4-era
-// application appliances — the deferred .133 heartbeat bug also
-// surfaces as NULL on application rows, so this is the safe default.
+// redis); the ``appliance`` variant runs the DNS / DHCP service
+// containers. NULL is treated as service-agent. The legacy full-stack
+// / frontend-core / control-cluster-member strings are kept here so a
+// not-yet-reinstalled box still classifies onto the control-plane side.
+// (Surfacing a *promoted* appliance on the control-plane side via
+// cluster_role is Phase 7c UI work.)
 const CONTROL_PLANE_VARIANTS = new Set([
+  "control-plane",
+  // legacy (pre-#272) aliases:
   "full-stack",
   "frontend-core",
   "control-cluster-member",
@@ -436,7 +438,7 @@ export function FleetTab() {
         <div className="border-b px-4 py-3">
           <h1 className="text-sm font-semibold">Appliance fleet</h1>
           <p className="text-xs text-muted-foreground">
-            Lifecycle for Application appliances.
+            Lifecycle for Appliance nodes.
           </p>
         </div>
         <nav className="p-2">
@@ -561,7 +563,7 @@ export function FleetTab() {
                     by installer variant: <strong>Control plane</strong>{" "}
                     hosts the SpatiumDDI control-plane workloads (api /
                     frontend / worker / postgres / redis);{" "}
-                    <strong>Service agents</strong> are Application
+                    <strong>Service agents</strong> are Appliance
                     appliances running DNS / DHCP service containers paired
                     to a remote control plane.
                   </p>
@@ -603,7 +605,7 @@ export function FleetTab() {
                   >
                     Pairing codes
                   </button>{" "}
-                  section to mint one, then install an Application appliance
+                  section to mint one, then install an Appliance node
                   against it — the row appears here once the supervisor claims
                   the code.
                 </div>
@@ -611,7 +613,7 @@ export function FleetTab() {
                 <div className="space-y-6">
                   <ApplianceTableSection
                     title="Control plane"
-                    subtitle="Boxes hosting the SpatiumDDI control plane — full-stack, frontend-core, and future control-cluster-member variants."
+                    subtitle="Boxes hosting the SpatiumDDI control plane — the control-plane node plus any promoted appliances."
                     pendingRows={controlPlane.pending}
                     otherRows={controlPlane.others}
                     emptyMessage="No control-plane appliances registered yet."
@@ -632,7 +634,7 @@ export function FleetTab() {
                   />
                   <ApplianceTableSection
                     title="Service agents"
-                    subtitle="Application appliances running DNS / DHCP service containers paired to a remote control plane."
+                    subtitle="Appliance nodes running DNS / DHCP service containers paired to a remote control plane."
                     pendingRows={serviceAgents.pending}
                     otherRows={serviceAgents.others}
                     emptyMessage="No service-agent appliances registered yet."
@@ -1004,23 +1006,21 @@ function ApplianceTableRow({
       <td className="px-3 py-2">
         <div className="flex items-center gap-2">
           <span className="font-medium">{row.hostname}</span>
-          {/* #272 Phase 1 — installer-role chip. full-stack lives on
-              the Control plane side of the upcoming two-table split;
-              frontend-core too; application is a Service agent. */}
+          {/* #272 — installer-role chip. Two variants: control-plane
+              (Control plane table) + appliance (Service agents).
+              Legacy strings still render with a sensible label. */}
           {row.appliance_variant && (
             <span
               className={cn(
                 "inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium",
-                row.appliance_variant === "application"
-                  ? "border-violet-500/40 bg-violet-500/10 text-violet-600 dark:text-violet-300"
-                  : "border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-300",
+                isControlPlaneRow(row)
+                  ? "border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-300"
+                  : "border-violet-500/40 bg-violet-500/10 text-violet-600 dark:text-violet-300",
               )}
               title={
-                row.appliance_variant === "full-stack"
-                  ? "Full-stack — control plane + DNS + DHCP on this box"
-                  : row.appliance_variant === "frontend-core"
-                    ? "Frontend / core — control plane only"
-                    : "Application — DNS / DHCP agent only (pairs remote)"
+                isControlPlaneRow(row)
+                  ? "Control plane — api + db + frontend (enable DNS/DHCP via the role toggle)"
+                  : "Appliance — DNS / DHCP agent (pairs with a control plane)"
               }
             >
               {row.appliance_variant}

@@ -54,10 +54,14 @@ FIRSTBOOT_STAMP = Path("/var/lib/spatiumddi/firstboot.done")
 APPLIANCE_RELEASE = Path("/etc/spatiumddi/appliance-release")
 
 
+# #272 — two variants: control-plane + appliance (legacy strings kept
+# as aliases for a not-yet-reinstalled box).
 ROLE_LABELS = {
-    "full-stack": "Full stack — control plane + BIND9 + Kea (AIO)",
-    "frontend-core": "Frontend / core — control plane only",
-    "application": "Application — supervisor (pairs remote)",
+    "control-plane": "Control plane — api + db + frontend (DNS/DHCP via Fleet toggle)",
+    "appliance": "Appliance — supervisor (pairs with a control plane)",
+    "full-stack": "Control plane (legacy full-stack)",
+    "frontend-core": "Control plane (legacy frontend-core)",
+    "application": "Appliance (legacy application)",
 }
 
 # Container service names we render per role. Names match the
@@ -65,22 +69,25 @@ ROLE_LABELS = {
 # already decides which subset actually runs, but we render the full
 # expected set so a missing-from-`docker ps` service shows up as
 # `(not running)` instead of being silently absent.
+# control-plane base = the umbrella control workloads. DNS/DHCP are
+# NOT in the base set (#272 — they're enabled per node via the Fleet
+# role toggle); render_services unions whichever supervisor-managed
+# dns/dhcp container is actually running so they appear when enabled
+# without a permanent ``(not running)`` row beforehand.
+# appliance base = supervisor + agent-landing; service containers
+# appear via the same dynamic union after approval + role assignment.
 ROLE_SERVICES = {
+    "control-plane": [
+        "postgres", "redis", "migrate", "api", "worker", "beat", "frontend",
+    ],
+    "appliance": ["spatium-supervisor", "agent-landing"],
+    # legacy aliases:
     "full-stack": [
-        "postgres", "redis", "migrate", "api", "worker", "beat",
-        "frontend", "dns-bind9", "dhcp-kea",
+        "postgres", "redis", "migrate", "api", "worker", "beat", "frontend",
     ],
     "frontend-core": [
         "postgres", "redis", "migrate", "api", "worker", "beat", "frontend",
     ],
-    # Application = supervisor + the agent-landing static page. The
-    # service container (dns-bind9 / dns-powerdns / dhcp-kea) starts
-    # only after admin approval + role assignment in the fleet UI
-    # (#170 Wave C); render_services unions any role-supervised
-    # container currently in ``docker ps`` so the operator sees them
-    # when they're running, without cluttering the dashboard with
-    # ``(not running)`` rows for roles the supervisor hasn't been
-    # given.
     "application": ["spatium-supervisor", "agent-landing"],
 }
 
@@ -237,8 +244,8 @@ def read_env(path: Path = ENV_FILE) -> dict[str, str]:
 
 
 def role_from_env(env: dict[str, str]) -> str:
-    raw = (env.get("APPLIANCE_ROLE") or "full-stack").strip()
-    return raw if raw in ROLE_LABELS else "full-stack"
+    raw = (env.get("APPLIANCE_ROLE") or "control-plane").strip()
+    return raw if raw in ROLE_LABELS else "control-plane"
 
 
 def role_label(role: str) -> str:
@@ -1045,13 +1052,13 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     line3.append("Build ", style="dim")
     line3.append(build)
 
-    # Line 3a — Control plane + Identity (only on application
-    # appliances; #170 Wave D). Inlining these into the header lets
-    # us drop the separate Agent panel, saving ~4 rows of vertical
-    # space the operator would otherwise spend looking at one panel
-    # title + two values.
+    # Line 3a — Control plane + Identity (only on appliance nodes that
+    # pair with a remote control plane; #170 Wave D). Inlining these
+    # into the header lets us drop the separate Agent panel, saving ~4
+    # rows of vertical space the operator would otherwise spend looking
+    # at one panel title + two values.
     agent_line: Text | None = None
-    if role == "application":
+    if role in ("appliance", "application"):
         cp_url = env.get("CONTROL_PLANE_URL") or "(not configured)"
         pairing = pairing_status(env, role, state.ps_rows)
         agent_line = Text()
@@ -1069,7 +1076,7 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # mtime delta here gives the physical-console operator the same
     # signal the host watchdog acts on.
     watchdog_line: Text | None = None
-    if role == "application":
+    if role in ("appliance", "application"):
         wd_status = supervisor_watchdog_status()
         if wd_status is not None:
             label, wstyle = wd_status
@@ -1113,7 +1120,7 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # otherwise so a steady-state appliance doesn't carry a permanent
     # "no upgrade pending" row.
     upgrade_line: Text | None = None
-    if role == "application":
+    if role in ("appliance", "application"):
         ustatus = upgrade_status()
         if ustatus is not None:
             label, ustyle = ustatus
@@ -1492,7 +1499,7 @@ def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple
 
     Returns ``(label, rich-style)`` so the renderer can colour the row.
     """
-    if role != "application":
+    if role not in ("appliance", "application"):
         return None
     state_dir = Path("/var/persist/spatium-supervisor")
     approval_state_file = state_dir / "approval-state"
@@ -1589,11 +1596,11 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # (agent / watchdog / slot / upgrade / k3s) 2-per-row, so
     # what would have been 5-7 separate rows becomes 3-4 paired
     # rows — saves ~3 vertical rows on a typical appliance.
-    has_agent_line = state.role == "application"
+    has_agent_line = state.role in ("appliance", "application")
     has_watchdog_line = (
-        state.role == "application" and supervisor_watchdog_status() is not None
+        state.role in ("appliance", "application") and supervisor_watchdog_status() is not None
     )
-    has_upgrade_line = state.role == "application" and upgrade_status() is not None
+    has_upgrade_line = state.role in ("appliance", "application") and upgrade_status() is not None
     has_k3s_line = k3s_status() is not None
     short_count = (
         2  # IPs + Build, always present
@@ -2248,7 +2255,7 @@ def main() -> int:
             return 75  # EX_TEMPFAIL — paired with RestartPreventExitStatus=75
 
     env = read_env() if not args.dev else {
-        "APPLIANCE_ROLE": "full-stack",
+        "APPLIANCE_ROLE": "control-plane",
         "APPLIANCE_HOSTNAME": "ddi-dev-01",
         "APPLIANCE_VERSION": "0.1.0-dev",
         "SPATIUMDDI_VERSION": "dev",

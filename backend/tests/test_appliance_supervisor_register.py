@@ -506,9 +506,11 @@ async def test_register_with_auto_approve_code_signs_cert_inline(
     assert appliance.cert_expires_at is not None
     assert appliance.approved_at is not None
     assert appliance.approved_by_user_id is None  # auto-approved (no admin)
-    # Variant stamped + full-stack's fixed role set populated.
+    # Variant stamped. #272 — DNS/DHCP are no longer auto-assigned at
+    # register; the operator enables them per node via the Fleet role
+    # toggle, so a fresh control-plane node starts with no roles.
     assert appliance.appliance_variant == "full-stack"
-    assert set(appliance.assigned_roles) == {"dns-bind9", "dhcp"}
+    assert appliance.assigned_roles == []
 
 
 @pytest.mark.asyncio

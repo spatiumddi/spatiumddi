@@ -92,7 +92,7 @@ def _self_bootstrap_or_skip(
     """Mint a local pairing code via the in-cluster api Service and
     return a config carrying it.
 
-    Only fires on full-stack / frontend-core appliances where the
+    Only fires on the control-plane appliance where the
     installer wizard didn't capture a pairing code (the control plane
     IS local). The api gates the endpoint on (1) the host bind-mounted
     ``role-config:ROLE`` matching this claim and (2) no existing
@@ -158,15 +158,13 @@ def _self_bootstrap_or_skip(
     )
 
 
-def _maybe_register(
-    cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger
-) -> SupervisorConfig:
+def _maybe_register(cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger) -> SupervisorConfig:
     """Run identity generation + register-if-needed in one shot. Logs
     its own status; never raises into the caller (the main loop
     falls back to idle on any failure).
 
     Returns the (possibly mutated) ``cfg`` — when the
-    self-bootstrap path fires on full-stack / frontend-core,
+    self-bootstrap path fires on the control-plane node,
     ``control_plane_url`` and ``bootstrap_pairing_code`` are
     refreshed in the returned config so the caller's heartbeat
     loop can use the new control-plane URL going forward.
@@ -199,7 +197,7 @@ def _maybe_register(
         # Re-pair sources, in order of precedence:
         #   1. ``cfg.bootstrap_pairing_code`` — operator handed us a
         #      fresh code via spatium-pair (#170 Wave E flow).
-        #   2. Self-bootstrap variant (full-stack / frontend-core) —
+        #   2. Self-bootstrap variant (control-plane) —
         #      #272 Phase 1; the supervisor mints its own pairing
         #      code against the in-cluster api on the recovery path.
         #
@@ -208,15 +206,14 @@ def _maybe_register(
         # control-plane appliance (no pairing code env present, no
         # human-mediated recovery path) — verified live on .199.
         variant = appliance_state.detect_appliance_variant()
-        can_self_bootstrap = variant in ("full-stack", "frontend-core")
+        can_self_bootstrap = variant == "control-plane"
         if approval_state.read_state(cfg.state_dir) == "revoked" and (
             cfg.bootstrap_pairing_code or can_self_bootstrap
         ):
             log.info(
                 "supervisor.register.revoked_reregister",
                 stale_appliance_id=str(cached_appliance_id),
-                via_self_bootstrap=can_self_bootstrap
-                and not cfg.bootstrap_pairing_code,
+                via_self_bootstrap=can_self_bootstrap and not cfg.bootstrap_pairing_code,
             )
             clear_appliance_id(cfg.state_dir)
             clear_session_token(cfg.state_dir)
@@ -230,7 +227,7 @@ def _maybe_register(
             )
             return cfg
 
-    # #272 Phase 1 — self-bootstrap on full-stack / frontend-core.
+    # #272 — self-bootstrap on the control-plane node.
     # The installer wizard doesn't capture a pairing code for these
     # variants (the control plane is local), so on first boot both
     # control_plane_url and bootstrap_pairing_code are empty. Try
@@ -239,7 +236,7 @@ def _maybe_register(
     # code through the standard register flow below.
     if not cfg.control_plane_url and not cfg.bootstrap_pairing_code:
         variant = appliance_state.detect_appliance_variant()
-        if variant in ("full-stack", "frontend-core"):
+        if variant == "control-plane":
             cfg = _self_bootstrap_or_skip(cfg, variant, log)
 
     if not cfg.control_plane_url:
@@ -369,7 +366,7 @@ def main() -> int:
         appliance_id = load_appliance_id(cfg.state_dir)
         # #272 Phase 1 — retry the register path each loop iteration
         # while we haven't successfully registered. Catches the
-        # full-stack / frontend-core self-bootstrap case where the
+        # control-plane self-bootstrap case where the
         # in-cluster api Service wasn't reachable on the supervisor's
         # first attempt at startup (api pod still coming up). Cheap
         # for the steady-state — cached_appliance_id short-circuits
@@ -397,11 +394,7 @@ def main() -> int:
         else:
             log.info(
                 "supervisor.heartbeat.skipped",
-                reason=(
-                    "no_appliance_id"
-                    if appliance_id is None
-                    else "no_control_plane_url"
-                ),
+                reason=("no_appliance_id" if appliance_id is None else "no_control_plane_url"),
             )
         for _ in range(cfg.heartbeat_interval_seconds):
             if stop:

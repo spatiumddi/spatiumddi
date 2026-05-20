@@ -105,50 +105,35 @@ _ROLE_LABEL_KEYS = {
     "dns-bind9": "spatium.io/role-dns-bind9",
     "dns-powerdns": "spatium.io/role-dns-powerdns",
     "dhcp": "spatium.io/role-dhcp",
-    # #272 Phase 1 — gate the umbrella chart's frontend / api /
-    # worker / beat / postgres / redis workloads onto control-plane
-    # variants only (full-stack + frontend-core; never application).
-    # Multi-node HA (#272 later phases) selects between control-plane
-    # members via this label.
+    # #272 — gate the umbrella chart's frontend / api / worker / beat /
+    # postgres / redis workloads onto the control-plane variant (never
+    # an appliance). Multi-node HA selects between control-plane members
+    # via this label.
     "control-plane": "spatium.io/role-control-plane",
 }
 
-# #272 Phase 1 — per-variant fixed role set. The supervisor reads
-# its variant from ``/etc/spatiumddi-host/role-config:ROLE`` and
-# always asserts these labels on the node, on top of whatever
-# operator-assigned roles arrive via the heartbeat response. This
-# makes the supervisor the single source of truth for node labels
-# regardless of variant — install-time drop-ins remain a bootstrap
-# (so pods can schedule before the supervisor pod itself is up)
-# but the supervisor reconciles every tick.
+# #272 — per-variant FORCED role set. The supervisor reads its variant
+# from ``/etc/spatiumddi-host/role-config:ROLE`` and always asserts
+# these labels on the node, on top of whatever operator-assigned roles
+# arrive via the heartbeat response. The supervisor is the single
+# source of truth for node labels; install-time drop-ins are only a
+# boot bootstrap (so pods can schedule before the supervisor is up).
 #
-# full-stack:    dns-bind9 + dhcp run locally + control-plane
-#                workloads run locally. All three labels fixed.
-# frontend-core: only control-plane workloads run locally. No DNS /
-#                DHCP roles assignable (those go on application
-#                appliances joined to the cluster).
-# application:   no fixed roles. Operator picks via the Fleet UI's
-#                role-assignment block; supervisor reconciles to
-#                match.
-# #272 Phase 7b (items 4/5) — only ``control-plane`` is *forced* per
-# variant now. DNS/DHCP are operator-toggleable on every variant:
-#   * full-stack still RUNS dns-bind9 + dhcp out of the box, but those
-#     come from the register-time DEFAULT assignment
-#     (``_REGISTER_VARIANT_FIXED_ROLES`` on the control plane), NOT a
-#     forced union here — so an operator who promotes a full-stack into
-#     a control-plane-of-N can SHED the data-plane workloads by
-#     removing the roles (item 5). Forcing them here would re-add the
-#     labels every tick and make shedding impossible.
-#   * frontend-core / a promoted control-plane node can ADD dns-bind9 /
-#     dhcp via the role picker (capability-gated) — nothing forbids it
-#     (item 4).
-# control-plane stays fixed on the two control-plane variants so the
-# umbrella workloads never lose their node.
+# Two variants, and only ``control-plane`` is forced:
+#   * control-plane — forces the control-plane label so the umbrella
+#     workloads (api / frontend / db / redis / worker / beat) never
+#     lose their node. DNS/DHCP are NOT forced here AND NOT auto-
+#     assigned at register — the operator enables them per node via
+#     the Fleet role toggle (so the data plane is always a deliberate
+#     fleet decision, and a promoted control-plane node can shed them).
+#   * appliance — nothing forced. Operator-assigned roles only.
+# Forcing DNS/DHCP here would re-add the labels every tick and make the
+# Fleet toggle a no-op, so they must stay out of every forced set.
 _VARIANT_FIXED_ROLES: dict[str, frozenset[str]] = {
-    "full-stack": frozenset({"control-plane"}),
-    "frontend-core": frozenset({"control-plane"}),
-    "application": frozenset(),
+    "control-plane": frozenset({"control-plane"}),
+    "appliance": frozenset(),
 }
+
 
 @dataclass(frozen=True)
 class K3sEnvironment:
@@ -205,12 +190,8 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
     here we only override what changes per-appliance (per-role
     enabled flags + agent keys + group names + control-plane URL).
     """
-    control_plane_url = env_vars.get("CONTROL_PLANE_URL") or os.environ.get(
-        "CONTROL_PLANE_URL", ""
-    )
-    image_tag = env_vars.get("SPATIUMDDI_VERSION") or os.environ.get(
-        "SPATIUMDDI_VERSION", "dev"
-    )
+    control_plane_url = env_vars.get("CONTROL_PLANE_URL") or os.environ.get("CONTROL_PLANE_URL", "")
+    image_tag = env_vars.get("SPATIUMDDI_VERSION") or os.environ.get("SPATIUMDDI_VERSION", "dev")
 
     # Phase 10 wave 2 — ``enabled`` flags here are RELEASE-ownership
     # scope (which helm release owns which Deployment), NOT
@@ -329,6 +310,7 @@ def apply_role_assignment(
     if not node_name:
         try:
             import socket as _socket
+
             node_name = _socket.gethostname()
         except OSError:
             node_name = ""
@@ -399,12 +381,11 @@ def reconcile_node_labels(profiles: list[str]) -> tuple[bool, str | None]:
     label_diff: dict[str, str | None] = {}
     for role, label in _ROLE_LABEL_KEYS.items():
         label_diff[label] = "true" if role in desired_role_set else None
-    node_name = (
-        os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
-    )
+    node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
     if not node_name:
         try:
             import socket as _socket
+
             node_name = _socket.gethostname()
         except OSError:
             return False, "node_name unknown"
@@ -425,9 +406,7 @@ def tear_down_supervised_services() -> LifecycleResult:
     if not env.available:
         return LifecycleResult(state="idle", reason=env.reason)
 
-    ok, err = k8s_api.delete_helmchart(
-        _HELMCHART_NAME, chart_namespace=_CHART_NAMESPACE
-    )
+    ok, err = k8s_api.delete_helmchart(_HELMCHART_NAME, chart_namespace=_CHART_NAMESPACE)
     if not ok:
         return LifecycleResult(state="failed", reason=err or "kubeapi delete failed")
 
@@ -439,6 +418,7 @@ def tear_down_supervised_services() -> LifecycleResult:
     if not node_name:
         try:
             import socket as _socket
+
             node_name = _socket.gethostname()
         except OSError:
             node_name = ""

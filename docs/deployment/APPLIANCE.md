@@ -14,11 +14,14 @@ The appliance runs **k3s** as its container orchestrator. Pre-#183 it ran `docke
 
 ### One-paragraph summary
 
-`spatiumddi-firstboot` writes a HelmChart CR into k3s's auto-deploy directory (`/var/lib/rancher/k3s/server/manifests/`). The k3s-bundled helm-controller picks it up + runs `helm install` from a chart tarball baked into the appliance rootfs (`/usr/lib/spatiumddi/charts/`). Three install variants pick which chart + values get rendered:
+`spatiumddi-firstboot` writes a HelmChart CR into k3s's auto-deploy directory (`/var/lib/rancher/k3s/server/manifests/`). The k3s-bundled helm-controller picks it up + runs `helm install` from a chart tarball baked into the appliance rootfs (`/usr/lib/spatiumddi/charts/`).
 
-- **Application** — supervisor + agent-landing nginx. Pairs against a remote control plane via 8-digit pairing code; roles (`dns-bind9` / `dns-powerdns` / `dhcp`) are assigned post-approval from the control plane's `/appliance → Fleet` tab.
-- **All-in-One (AIO)** — control plane (api / frontend / worker / beat / migrate / Postgres / Redis) + role pods, all on the same single-node k3s. The umbrella chart deploys the control plane; node labels are baked into k3s's config at install time so DNS + DHCP DaemonSets schedule immediately. No supervisor, no pairing-code dance.
-- **Core-only** — control plane only. Remote Application appliances pair against this box.
+**#272 — two install roles** (the installer wizard collapsed from the earlier three; the old `full-stack` / `frontend-core` distinction is now a runtime DNS/DHCP role toggle, not an install choice — and legacy variant strings are still accepted from a not-yet-reinstalled box):
+
+- **Control plane** (the default; the required FIRST install) — control plane (api / frontend / worker / beat / migrate / Postgres / Redis) + the supervisor, all on a single-node k3s that is also the etcd seed. **DNS + DHCP are OFF at install** — the operator enables them per node from the `/appliance → Fleet` role toggle (so the data plane is always a deliberate fleet decision). The umbrella chart deploys the control plane; the supervisor owns the per-role node labels. More control-plane nodes are made by **promoting** Appliances in the Fleet UI (#272 Phase 7), not installed as this role.
+- **Appliance** — supervisor + agent-landing nginx. Pairs against a remote control plane via 8-digit pairing code; roles (`dns-bind9` / `dns-powerdns` / `dhcp`) are assigned post-approval from the control plane's `/appliance → Fleet` tab. Can later be promoted to join the control-plane cluster.
+
+The historical AIO / Core-only / Application narrative below documents the pre-#272 three-role world; the firstboot dispatch still handles those strings as aliases.
 
 ```
 [appliance: single-node k3s]

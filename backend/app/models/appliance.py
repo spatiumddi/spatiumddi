@@ -471,14 +471,16 @@ class Appliance(Base):
     # is now the single producer; the fleet UI reads these columns
     # to drive the Upgrade affordance, slot chips, and reboot button.
     deployment_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    # #272 Phase 1 — installer role baked into ``/etc/spatiumddi/
-    # role-config:ROLE``. One of ``full-stack`` / ``frontend-core`` /
-    # ``application`` (matches the installer wizard's three choices).
-    # The supervisor reads the file on startup + reports the value
-    # here so the Fleet UI's two-table split (Control plane vs
-    # Service agents) can categorise each appliance, and the
-    # variant-aware label reconciler can apply the correct per-role
-    # labels on the node. NULL on the pre-#272 supervisor heartbeat
+    # #272 — installer role baked into ``/etc/spatiumddi/
+    # role-config:ROLE``. One of ``control-plane`` / ``appliance``
+    # (matches the installer wizard's two choices; legacy
+    # ``full-stack`` / ``frontend-core`` / ``application`` strings from
+    # pre-#272 installs are still accepted as aliases). The supervisor
+    # reads the file on startup + reports the value here so the Fleet
+    # UI's two-table split (Control plane vs Service agents) can
+    # categorise each appliance, and the variant-aware label reconciler
+    # can apply the correct per-role labels on the node. NULL on the
+    # pre-#272 supervisor heartbeat
     # shape — the handler leaves the column untouched when the field
     # is missing so a stale supervisor doesn't null out its variant.
     appliance_variant: Mapped[str | None] = mapped_column(String(32), nullable=True)

@@ -106,29 +106,35 @@ NET_PREFIX="24"
 NET_GATEWAY=""
 NET_DNS="1.1.1.1 1.0.0.1"
 TIMEZONE="UTC"
-# No default ROLE — every install must actively pick one. Hitting OK
-# without selecting an option on the role picker would otherwise
-# default to "full-stack" silently, and that's the wrong shape for any
-# Frontend-core or Application install. ask_role() loops until the
-# operator makes a selection.
-ROLE=""
-# Installer roles (#170):
-#   full-stack    — Full SpatiumDDI stack: api + worker + beat + db
-#                   + redis + frontend + bundled BIND9 + Kea (AIO).
-#   frontend-core — Control plane only, no bundled service workers.
-#   application   — Supervisor only. Pairs with a remote control
-#                   plane via a pairing code and sits in
-#                   pending_approval until an admin clicks Approve
-#                   in the fleet UI. The control plane assigns the
-#                   role(s) + group(s) after approval — operators
-#                   no longer pick DNS / DHCP / engine at install
-#                   time. Replaces the three per-service agent roles.
+# Default ROLE = control-plane — the required first install + the
+# single-box all-in-one default (#272: two roles, control-plane first).
+# ask_role() pre-selects it so a first-timer who just hits OK gets a
+# working control plane rather than an Appliance with nothing to join.
+ROLE="control-plane"
+# Installer roles (#272 — collapsed from the old three to two; the
+# old full-stack / frontend-core distinction is now a runtime DNS/DHCP
+# role toggle, not an install choice):
+#   control-plane — Runs the SpatiumDDI control plane (api + worker +
+#                   beat + db + redis + frontend) and is the k3s etcd
+#                   seed. DNS (BIND9) + DHCP (Kea) are OFF at install —
+#                   the operator enables them per node via the Fleet
+#                   role toggle (so the data plane is a deliberate
+#                   fleet decision, not a silent install default). The
+#                   required FIRST install; extra control-plane nodes
+#                   are made by promoting Appliances in the Fleet UI,
+#                   not installed as this role.
+#   appliance     — Supervisor only. Pairs with a remote control plane
+#                   via an 8-digit pairing code and sits in
+#                   pending_approval until an admin clicks Approve in
+#                   the Fleet UI. The control plane assigns the role(s)
+#                   + group(s) after approval (DNS / DHCP). Can later
+#                   be promoted to join the control-plane cluster.
 # Every role still creates an OS admin account so the operator can
 # SSH in and manage the appliance, irrespective of which web UI runs.
 CONTROL_PLANE_URL=""
 # Pairing code claimed by the supervisor on first boot. 8 decimal
 # digits — single-use ephemeral or persistent depending on what the
-# control-plane admin minted. Only meaningful when ROLE=application.
+# control-plane admin minted. Only meaningful when ROLE=appliance.
 BOOTSTRAP_PAIRING_CODE=""
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -139,7 +145,7 @@ welcome() {
         --msgbox "Welcome to the SpatiumDDI Appliance Installer.\n\n\
 This installer will ERASE a target disk and install SpatiumDDI to it.\n\n\
 You'll be asked for:\n\
-  - Role (Full stack / Frontend-core / Application)\n\
+  - Role (Control plane / Appliance)\n\
   - Target disk\n\
   - Hostname\n\
   - Admin OS user + password (for SSH access)\n\
@@ -151,36 +157,40 @@ Press OK to begin, or Cancel to drop to a shell." 18 70 \
 
 ask_role() {
     log "Step: ask_role"
-    # whiptail --radiolist returns the selected tag on stdout. There is
-    # no default — every install must actively pick one of the three
-    # roles. Three roles (#170 Wave B2):
-    #   full-stack    — control plane + bundled BIND9 + Kea
-    #                   (single-box AIO).
-    #   frontend-core — control plane only. Pairs with remote
-    #                   Application appliances via the fleet UI.
-    #   application   — supervisor only. Submits an Ed25519 pubkey
-    #                   against a pairing code, sits in pending until
-    #                   an admin clicks Approve; the control plane
-    #                   then assigns role(s) + group(s) and the
-    #                   supervisor pulls the matching service
-    #                   containers on its next poll.
+    # whiptail --radiolist returns the selected tag on stdout. Two roles
+    # (#272 — control-plane listed first + pre-selected):
+    #   control-plane — control plane (api + db + redis + frontend) +
+    #                   k3s etcd seed; DNS (BIND9) + DHCP (Kea) OFF at
+    #                   install (enable per node via the Fleet toggle).
+    #                   The required FIRST install. More control-plane
+    #                   nodes are made by PROMOTING Appliances in Fleet.
+    #   appliance     — supervisor only. Submits an Ed25519 pubkey
+    #                   against a pairing code, sits in pending until an
+    #                   admin clicks Approve; the control plane then
+    #                   assigns role(s) + group(s) and the supervisor
+    #                   pulls the matching service containers. Can later
+    #                   be promoted into the control-plane cluster.
     #
     # The per-row ON/OFF flag reflects the current $ROLE so backing in
-    # from a later step preserves the previous selection. On the first
-    # pass $ROLE is empty so every row is OFF — whiptail returns ""
-    # and we re-prompt with a "pick one" msgbox until they choose.
+    # from a later step preserves the selection. $ROLE defaults to
+    # control-plane (see top of file) so the first row is pre-selected
+    # — hitting OK installs a control plane, the correct first install.
+    local cp_flag=OFF app_flag=OFF
+    case "$ROLE" in
+        appliance) app_flag=ON ;;
+        *) cp_flag=ON ;;  # control-plane (or empty) → default
+    esac
     local pick
     while true; do
         pick=$(whiptail --backtitle "$BACKTITLE" --title "Appliance role" \
             --cancel-button "Back" \
-            --radiolist "What role does this appliance play?\n\n  full-stack  \n    All-in-one. Control plane + DNS (BIND9) + DHCP (Kea) run\n    locally. Pick this for a homelab, a single-site deploy, or\n    the first node of a multi-node control-plane cluster.\n\n  frontend-core  \n    Control plane only — no DNS / DHCP on this box. Pair\n    Application appliances against this control plane via the\n    Fleet UI to run those workloads remotely. Also used to add\n    members to an existing control-plane cluster.\n\n  application  \n    DNS / DHCP agent only. The supervisor pairs with a remote\n    control plane via an 8-digit pairing code; an admin assigns\n    the role(s) (BIND9 / PowerDNS / DHCP / multi-role) in the\n    Fleet UI after approval. No pre-pick at install time." \
-            28 82 3 \
-            "full-stack"    "Full stack — control plane + BIND9 + Kea (AIO)" "$([ "$ROLE" = "full-stack"    ] && echo ON || echo OFF)" \
-            "frontend-core" "Frontend / core — control plane only"          "$([ "$ROLE" = "frontend-core" ] && echo ON || echo OFF)" \
-            "application"   "Application — supervisor only (pairs remote)"  "$([ "$ROLE" = "application"   ] && echo ON || echo OFF)" \
+            --radiolist "What role does this appliance play?\n\n  Control plane  \n    Runs the SpatiumDDI control plane (api + db + redis +\n    frontend) and is the k3s etcd seed. DNS (BIND9) + DHCP (Kea)\n    are OFF at install — enable them per node from the Fleet UI.\n    Pick this for the FIRST node (a homelab, a single-site\n    deploy, or the seed of an HA cluster). Add more control-plane\n    nodes by promoting Appliances later.\n\n  Appliance  \n    DNS / DHCP agent. The supervisor pairs with a remote control\n    plane via an 8-digit pairing code; an admin assigns the\n    role(s) (BIND9 / PowerDNS / DHCP / multi-role) in the Fleet UI\n    after approval. Can later be promoted to join the cluster." \
+            26 82 2 \
+            "control-plane" "Control plane — api + db + frontend (the first node)" "$cp_flag" \
+            "appliance"     "Appliance — DNS / DHCP agent (pairs with a control plane)" "$app_flag" \
             3>&1 1>&2 2>&3) || return 1
         if [ -z "$pick" ]; then
-            whiptail --msgbox "Please pick a role to continue. There is no default — each role produces a meaningfully different appliance." 10 64 || true
+            whiptail --msgbox "Please pick a role to continue." 9 60 || true
             continue
         fi
         ROLE="$pick"
@@ -190,10 +200,11 @@ ask_role() {
 }
 
 ask_application_config() {
-    # Only fires for the Application role. The full-stack and
-    # frontend-core roles ARE control planes — they don't need to be
-    # told where one is.
-    if [ "$ROLE" != "application" ]; then
+    # Only fires for the Appliance role. The control-plane role IS a
+    # control plane — it doesn't need to be told where one is.
+    # (Function/step name kept historical to avoid churning the wizard
+    # state machine; it gates on the appliance role now.)
+    if [ "$ROLE" != "appliance" ]; then
         return 0
     fi
     log "Step: ask_application_config"
@@ -485,14 +496,13 @@ confirm() {
     log "Step: confirm"
     local role_label
     case "$ROLE" in
-        full-stack)    role_label="Full stack — control plane + BIND9 + Kea (AIO)" ;;
-        frontend-core) role_label="Frontend / core — control plane only" ;;
-        application)   role_label="Application — supervisor only (pairs remote)" ;;
+        control-plane) role_label="Control plane — api + db + DNS + DHCP (first node)" ;;
+        appliance)     role_label="Appliance — DNS / DHCP agent (pairs with a control plane)" ;;
         *)             role_label="$ROLE" ;;
     esac
     local s
     s="Role:        $role_label\n"
-    if [ "$ROLE" = "application" ]; then
+    if [ "$ROLE" = "appliance" ]; then
         s+="Control URL: $CONTROL_PLANE_URL\n"
         # Mask the code in the confirmation screen — the IPMI / serial
         # console operator already typed it; no need to flash all 8
@@ -910,36 +920,27 @@ EOF
         # default wouldn't match — DaemonSets compute DESIRED=0 and
         # nothing schedules.
         mkdir -p "$MOUNT/etc/rancher/k3s/config.yaml.d"
-        if [ "$ROLE" = "full-stack" ]; then
-            # full-stack runs every role locally: dns-bind9 + dhcp
-            # service pods + the umbrella control-plane workloads
-            # (api / frontend / worker / beat / postgres / redis).
+        if [ "$ROLE" = "control-plane" ]; then
+            # control-plane runs ONLY the umbrella control-plane
+            # workloads (api / frontend / worker / beat / postgres /
+            # redis) at install time. DNS / DHCP are NOT enabled by
+            # default (#272) — the operator turns them on per node via
+            # the Fleet role toggle, so DNS/DHCP are a deliberate fleet
+            # decision rather than a silent install-time default. Baked
+            # unconditionally so the umbrella pods can schedule before
+            # the supervisor pod itself is healthy.
             cat > "$MOUNT/etc/rancher/k3s/config.yaml.d/spatium-roles.yaml" <<EOF
-# Auto-generated by spatium-install for ROLE=full-stack.
-# #272 Phase 1 — supervisor reconciles these on every heartbeat;
-# install-time bake here is the boot-up bootstrap so pods can
-# schedule before the supervisor pod itself is healthy.
-node-label:
-  - spatium.io/role=appliance
-  - spatium.io/role-dns-bind9=true
-  - spatium.io/role-dhcp=true
-  - spatium.io/role-control-plane=true
-EOF
-            chmod 0644 "$MOUNT/etc/rancher/k3s/config.yaml.d/spatium-roles.yaml"
-        elif [ "$ROLE" = "frontend-core" ]; then
-            # frontend-core runs only the umbrella control-plane
-            # workloads. No DNS / DHCP pods scheduled here; those
-            # ride on application appliances joined to the cluster.
-            cat > "$MOUNT/etc/rancher/k3s/config.yaml.d/spatium-roles.yaml" <<EOF
-# Auto-generated by spatium-install for ROLE=frontend-core.
-# #272 Phase 1 — supervisor reconciles these on every heartbeat.
+# Auto-generated by spatium-install for ROLE=control-plane.
+# #272 — supervisor reconciles these on every heartbeat; install-time
+# bake is the boot-up bootstrap so pods schedule before the supervisor
+# is healthy. DNS/DHCP are enabled later via the Fleet role toggle.
 node-label:
   - spatium.io/role=appliance
   - spatium.io/role-control-plane=true
 EOF
             chmod 0644 "$MOUNT/etc/rancher/k3s/config.yaml.d/spatium-roles.yaml"
         fi
-        # ROLE=application leaves the drop-in absent; the supervisor
+        # ROLE=appliance leaves the drop-in absent; the supervisor
         # applies role-* labels dynamically via the heartbeat-driven
         # role-assignment flow.
         cat > "$MOUNT/etc/hosts" <<EOF
@@ -1404,8 +1405,8 @@ main() {
     # Cancel on Welcome is the only exit-installer path; every other
     # screen's Cancel button is renamed "Back" and walks the wizard
     # back one step. ask_application_config is conditional on
-    # ROLE=application — it returns 0 immediately for the other roles
-    # so Back from confirm walks through it transparently to
+    # ROLE=appliance — it returns 0 immediately for the control-plane
+    # role so Back from confirm walks through it transparently to
     # ask_timezone.
     local step="welcome"
     while [ -n "$step" ]; do

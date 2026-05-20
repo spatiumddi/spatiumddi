@@ -104,16 +104,19 @@ def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
-# #272 Phase 1 — self-bootstrap path for full-stack / frontend-core
-# appliances. The local supervisor calls
+# #272 Phase 1 — self-bootstrap path for the control-plane appliance.
+# The local supervisor calls
 # ``POST /api/v1/appliance/self-register-bootstrap`` with its
 # variant; the api gates on the host-mounted ``role-config`` (the
 # api itself has a bind mount of ``/etc/spatiumddi-host/role-
 # config`` per #209) so we can prove the caller is the local
 # supervisor by matching the variant claim against the file the
-# installer wrote.
+# installer wrote. Only the control-plane node self-bootstraps (it IS
+# the control plane); an ``appliance`` pairs against a remote one.
+# Legacy ``full-stack`` / ``frontend-core`` accepted as aliases for a
+# not-yet-reinstalled box.
 _HOST_ROLE_CONFIG = Path("/etc/spatiumddi-host/role-config")
-_SELF_BOOTSTRAP_VARIANTS = frozenset({"full-stack", "frontend-core"})
+_SELF_BOOTSTRAP_VARIANTS = frozenset({"control-plane", "full-stack", "frontend-core"})
 _SELF_BOOTSTRAP_CODE_TTL = timedelta(minutes=10)
 
 
@@ -205,7 +208,17 @@ class SupervisorRegisterRequest(BaseModel):
     # role set on the resulting Appliance row at register time
     # instead of waiting for the first heartbeat. None for pre-#272
     # supervisors.
-    appliance_variant: Literal["full-stack", "frontend-core", "application"] | None = None
+    appliance_variant: (
+        Literal[
+            "control-plane",
+            "appliance",
+            # legacy (pre-#272) — accepted from not-yet-reinstalled boxes
+            "full-stack",
+            "frontend-core",
+            "application",
+        ]
+        | None
+    ) = None
 
     @field_validator("pairing_code")
     @classmethod
@@ -329,7 +342,7 @@ class SelfRegisterBootstrapRequest(BaseModel):
     the host-mounted ``role-config:ROLE`` before minting a code.
     """
 
-    appliance_variant: Literal["full-stack", "frontend-core"]
+    appliance_variant: Literal["control-plane", "full-stack", "frontend-core"]
 
 
 class SelfRegisterBootstrapResponse(BaseModel):
@@ -922,7 +935,17 @@ class SupervisorHeartbeatRequest(BaseModel):
     # ``/etc/spatiumddi-host/role-config:ROLE``. None on pre-#272
     # supervisors; the persistence handler leaves the column
     # untouched in that case (no nulling of an existing variant).
-    appliance_variant: Literal["full-stack", "frontend-core", "application"] | None = None
+    appliance_variant: (
+        Literal[
+            "control-plane",
+            "appliance",
+            # legacy (pre-#272) — accepted from not-yet-reinstalled boxes
+            "full-stack",
+            "frontend-core",
+            "application",
+        ]
+        | None
+    ) = None
     installed_appliance_version: str | None = None
     current_slot: Literal["slot_a", "slot_b"] | None = None
     durable_default: Literal["slot_a", "slot_b"] | None = None
@@ -1688,20 +1711,20 @@ async def _approve_appliance_inline(
     row.approved_by_user_id = approved_by_user_id
 
 
-# #272 Phase 1 — per-variant DEFAULT role set the api stamps on
-# ``Appliance.assigned_roles`` when a supervisor registers with its
-# variant, so a fresh full-stack runs DNS + DHCP out of the box
-# without the operator opening the role picker.
+# #272 — per-variant DEFAULT role set the api stamps on
+# ``Appliance.assigned_roles`` when a supervisor registers.
 #
-# #272 Phase 7b (item 5): these are DEFAULTS, not forced roles. The
-# supervisor's ``_VARIANT_FIXED_ROLES`` only force-asserts the
-# ``control-plane`` label now — so an operator who promotes a
-# full-stack into a control-plane-of-N can REMOVE dns-bind9 / dhcp
-# here and the supervisor will actually shed them (it no longer
-# re-adds the labels every reconcile). Hence this table and
-# ``_VARIANT_FIXED_ROLES`` intentionally DIVERGE: defaults vs forced.
+# DNS/DHCP are NOT auto-assigned to the control-plane node: the
+# operator turns them on per node via the Fleet role toggle, so the
+# data plane is always a deliberate fleet decision and a fresh control
+# plane ships pure-control. Every variant therefore defaults to an
+# empty role set. Kept as a table (rather than dropped) for the
+# auto-assign mechanism + so a future variant can default differently.
+# Legacy variant strings map to the same empty default.
 _REGISTER_VARIANT_FIXED_ROLES: dict[str, list[str]] = {
-    "full-stack": ["dns-bind9", "dhcp"],
+    "control-plane": [],
+    "appliance": [],
+    "full-stack": [],
     "frontend-core": [],
     "application": [],
 }
@@ -2343,7 +2366,9 @@ async def _resolve_primary(db: DB, members: list[Appliance]) -> Appliance | None
             await db.execute(
                 select(Appliance).where(
                     Appliance.state == APPLIANCE_STATE_APPROVED,
-                    Appliance.appliance_variant.in_(("full-stack", "frontend-core")),
+                    Appliance.appliance_variant.in_(
+                        ("control-plane", "full-stack", "frontend-core")
+                    ),
                 )
             )
         )
