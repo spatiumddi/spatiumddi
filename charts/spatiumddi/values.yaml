@@ -186,6 +186,11 @@ beat:
   tolerations: []
   affinity: {}
   podAnnotations: {}
+  # Beat is a singleton (see beat.yaml DECISION block). On a hard node
+  # loss it must reschedule onto a surviving control-plane node quickly;
+  # the chart emits unreachable/not-ready NoExecute tolerations with this
+  # tolerationSeconds so the gap is ~30s instead of the ~300s default.
+  fastRescheduleSeconds: 30
 
 # ── Migrate (Alembic upgrade head) ───────────────────────────────────────────
 # Regular Job (named per Helm revision so each install/upgrade creates

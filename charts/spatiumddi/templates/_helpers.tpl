@@ -360,14 +360,22 @@ the api image (postgresql-client-16, see backend/Dockerfile).
 {{- end -}}
 
 {{/*
-Init container that blocks until alembic migrations have been applied
-(detected by presence of a row in the ``alembic_version`` table). Used
-by api / worker / beat so they don't roll out before the schema is in
-place. Uses ``psql`` from the api image.
+Init container that blocks until the DB schema reaches the alembic
+head(s) baked into THIS image. Used by api / worker / beat.
 
-The DATABASE_URL on commonEnv uses the asyncpg driver scheme; psql
-needs the plain ``postgresql://`` scheme, so we build connection
-arguments from the discrete pieces instead of the URL.
+Why "reach head" and not just "any alembic row exists" (#272 Phase 4 /
+Phase 8 — rolling-upgrade ordering): during a chart upgrade the new
+api/worker/beat Pods carry a newer image whose alembic head has moved.
+If we only waited for *some* alembic_version row, a new Pod could start
+against the OLD schema and hit UndefinedColumnError on the first request
+touching a new column. By comparing this image's ``alembic heads``
+against the live DB's ``alembic current`` we guarantee the migrate Job
+(same new image) has finished applying the new migration before any new
+app Pod accepts traffic.
+
+Uses ``alembic`` from the api image (same binary + DATABASE_URL the
+migrate Job uses), so no psql / secret plumbing is needed here — the
+URL comes from commonEnv.
 */}}
 {{- define "spatiumddi.waitForMigrateInit" -}}
 - name: wait-for-migrate
@@ -377,26 +385,20 @@ arguments from the discrete pieces instead of the URL.
     - sh
     - -c
     - |
-      export PGPASSWORD="$POSTGRES_PASSWORD"
-      until psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
-            -tAc "SELECT version_num FROM alembic_version LIMIT 1" 2>/dev/null \
-          | grep -qE '[a-f0-9]'; do
-        echo "waiting for alembic migrations to land..."
+      # Head(s) compiled into this image's migration tree. ``$1`` drops
+      # the trailing "(head)" annotation; sort makes the comparison
+      # order-independent across branched heads.
+      HEADS=$(alembic heads 2>/dev/null | awk '{print $1}' | sort | tr '\n' ',')
+      echo "this image's alembic head(s): ${HEADS:-<none>}"
+      while :; do
+        CUR=$(alembic current 2>/dev/null | awk '{print $1}' | sort | tr '\n' ',')
+        if [ -n "$CUR" ] && [ "$CUR" = "$HEADS" ]; then
+          echo "alembic at head ($CUR)"
+          break
+        fi
+        echo "waiting for alembic to reach head; current=${CUR:-<unreachable/empty>}"
         sleep 3
       done
-      echo "alembic schema present"
   env:
-    - name: POSTGRES_PASSWORD
-      valueFrom:
-        secretKeyRef:
-          name: {{ include "spatiumddi.postgresSecretName" . }}
-          key: {{ include "spatiumddi.postgresSecretPasswordKey" . }}
-    - name: PGHOST
-      value: {{ include "spatiumddi.postgresHost" . | quote }}
-    - name: PGPORT
-      value: {{ include "spatiumddi.postgresPort" . | quote }}
-    - name: PGUSER
-      value: {{ include "spatiumddi.postgresUser" . | quote }}
-    - name: PGDATABASE
-      value: {{ include "spatiumddi.postgresDatabase" . | quote }}
+    {{- include "spatiumddi.commonEnv" . | nindent 4 }}
 {{- end -}}

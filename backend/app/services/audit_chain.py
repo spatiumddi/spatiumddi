@@ -100,25 +100,54 @@ def compute_audit_hashes(session: Session) -> None:
     if not new_rows:
         return
 
-    # Materialise the Python + server defaults BEFORE we hash. ``id``
-    # uses Python ``default=uuid.uuid4`` and ``timestamp`` uses
-    # ``server_default=now()`` — both fire during SQLAlchemy's flush
-    # phase, AFTER this ``before_flush`` event. Without this step the
-    # hash sees ``id=None`` + ``timestamp=None`` while the DB later
-    # stores real values, and the verifier reports row_hash_mismatch
-    # on every row. Setting the attributes here forces SQLAlchemy to
-    # carry the explicit values through to the INSERT, overriding
-    # both defaults with the same values we just hashed over.
+    # Materialise the Python + server defaults BEFORE we hash. Defaults
+    # (``id`` via ``default=uuid.uuid4``, ``timestamp`` via
+    # ``server_default=now()``, plus scalar defaults like
+    # ``auth_source`` / ``result``) fire during SQLAlchemy's flush phase,
+    # AFTER this ``before_flush`` event. Without this step the hash sees
+    # the not-yet-defaulted values while the DB later stores the real
+    # ones, and the verifier reports row_hash_mismatch on every row.
+    # Setting the attributes here forces SQLAlchemy to carry the explicit
+    # values through to the INSERT, overriding the defaults with the same
+    # values we just hashed over.
     now = datetime.now(UTC)
     for row in new_rows:
         if row.id is None:
             row.id = uuid.uuid4()
         if row.timestamp is None:
             row.timestamp = now
+        # Also materialise any Python-side *scalar* column defaults that
+        # are still unset. Columns like ``auth_source`` (default "local")
+        # and ``result`` (default "success") are None at before_flush time
+        # but the ORM fills them during flush — so the hash MUST see the
+        # same value the DB will store, or ``verify_chain`` reports a false
+        # ``row_hash_mismatch`` for every row that didn't pass those fields
+        # explicitly (e.g. system-generated audit rows). This was the
+        # residual half of #73: the original fix only materialised ``id`` +
+        # ``timestamp`` and missed the scalar string defaults. Driving it
+        # off column metadata (not a hand-list) keeps it correct if a
+        # future defaulted column is added. Callable defaults (uuid4) are
+        # is_scalar=False and handled above; server_default columns
+        # (timestamp) carry ``col.default = None`` and are handled above.
+        for col in row.__table__.columns:
+            default = col.default
+            if (
+                default is not None
+                and getattr(default, "is_scalar", False)
+                and getattr(row, col.key, None) is None
+            ):
+                setattr(row, col.key, default.arg)
 
-    # Stable order: timestamp first (now guaranteed set above), id as
-    # tie-breaker.
-    new_rows.sort(key=lambda r: (r.timestamp, str(r.id)))
+    # DO NOT re-sort. ``verify_chain`` walks rows by ``seq`` (the DB
+    # sequence assigned at INSERT) and checks each row's ``prev_hash``
+    # against the previous-by-seq row, so the chain MUST be built in the
+    # same order the rows will be inserted. ``session.new`` iterates in
+    # insertion (add) order in SQLAlchemy 2.x, and same-mapper inserts
+    # preserve that order — so add-order == insert-order == seq-order.
+    # The previous ``sort(key=(timestamp, id))`` broke this whenever
+    # several audit rows landed in one flush with the same timestamp:
+    # the uuid tie-break reordered the chain away from seq order and
+    # verify_chain reported a false ``prev_hash_mismatch``.
 
     # Transaction-scoped advisory lock; auto-released at COMMIT/ROLLBACK.
     session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _AUDIT_CHAIN_LOCK_KEY})
