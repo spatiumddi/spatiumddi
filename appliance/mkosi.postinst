@@ -237,8 +237,18 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console@.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/etc.mount"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-reconcile.service"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etc-render"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-render.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/home.mount"
 chmod 0644 "$BUILDROOT/etc/systemd/system/root.mount"
+
+# Issue #276 — spatium-etc-render runs in the sysinit phase (it must
+# set hostname + SSH host keys before sshd / k3s). The multi-user
+# enable loop above lands units in multi-user.target.wants, which is
+# too late, so enable it directly into sysinit.target.wants here.
+mkdir -p "$BUILDROOT/etc/systemd/system/sysinit.target.wants"
+ln -sfn /etc/systemd/system/spatium-etc-render.service \
+    "$BUILDROOT/etc/systemd/system/sysinit.target.wants/spatium-etc-render.service"
 
 # Issue #183 Phase 1 — k3s baked binary + systemd unit + config.
 # Phase 7 made the appliance k3s-only — no docker on the rootfs.

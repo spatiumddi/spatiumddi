@@ -781,23 +781,40 @@ EOF
         #   /var/persist/etc-work  workdir   (overlay scratch space)
         mkdir -p "$MOUNT/var/persist/etc" "$MOUNT/var/persist/etc-work"
 
-        # #272 Phase 1 audit — SSH host keys must live on the overlay
-        # UPPER (persistent across slot swaps), not the LOWER (frozen
-        # per-slot image-baseline). Without this, every fresh slot
-        # image carries its own mkosi-built ssh_host_*_key set baked
-        # into /etc.image; on slot upgrade the lower changes → the
-        # host key flips → ssh clients hit a "host key changed" MITM
-        # warning. Pull the keys out of /etc.image and seed them into
-        # the upper before the overlay mounts; sshd then sees the
-        # operator's stable keys from /var/persist/etc/ssh/ on every
-        # subsequent boot regardless of which slot's running.
-        mkdir -p "$MOUNT/var/persist/etc/ssh"
+        # Issue #276 — SSH host keys + machine config are seeded into
+        # the STATE partition, which spatium-etc-render copies into
+        # /etc on every boot BEFORE sshd / k3s start. STATE survives
+        # both an OS slot swap AND a /var factory reset, so the host
+        # key + hostname stay stable forever. Strip the keys out of
+        # /etc.image (the overlay LOWER) so a future slot image's
+        # mkosi-built keys can never shadow the operator's. (Supersedes
+        # the #272 Phase 1 bandaid that parked keys in
+        # /var/persist/etc/ssh — STATE is the authoritative home now.)
+        STATE_MNT="$MOUNT/var/lib/spatium-state"
+        mkdir -p "$STATE_MNT/ssh"
         for k in "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key \
                  "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key.pub; do
             [ -f "$k" ] || continue
-            cp -a "$k" "$MOUNT/var/persist/etc/ssh/" >> "$INSTALL_LOG" 2>&1
+            cp -a "$k" "$STATE_MNT/ssh/" >> "$INSTALL_LOG" 2>&1
             rm -f "$k"
         done
+
+        # spatium-config.yaml — the operator-authoritative machine
+        # config the render service reads. Flat ``key: value`` shape
+        # (see spatium-etc-render's get_cfg parser). Network config is
+        # a follow-up; v1 carries hostname + role + control-plane
+        # pairing fields.
+        cat > "$STATE_MNT/spatium-config.yaml" <<EOF
+# SpatiumDDI appliance machine config (issue #276).
+# Authoritative source for hostname / role / pairing — rendered into
+# /etc by spatium-etc-render on every boot. Survives OS slot swaps +
+# a /var factory reset.
+hostname: "$HOSTNAME"
+role: "$ROLE"
+control_plane_url: "$CONTROL_PLANE_URL"
+bootstrap_pairing_code: "$BOOTSTRAP_PAIRING_CODE"
+EOF
+        chmod 0644 "$STATE_MNT/spatium-config.yaml"
 
         # Mount overlay over /target/etc for the REMAINDER of the
         # install. Every chroot useradd / chpasswd / file write that
