@@ -79,6 +79,29 @@ dhcpKea:
   persistence:
     leases:
       size: 512Mi
+  # #272 Phase 5 — DHCP relay-VIP (default off). When set, an ADDITIONAL
+  # LoadBalancer Service (``dhcp-kea-relay``) requests this IP from the
+  # MetalLB pool so a DHCP relay's ``forward-to`` target can outlive a
+  # single Kea node. Kea KEEPS hostNetwork:67 — this VIP does NOT replace
+  # client-facing broadcast reach (operators still run a relay per VLAN);
+  # it only stabilises the relay→server unicast forward. Must fall inside
+  # the MetalLB pool. Requires ``metallb.enabled: true``.
+  relayVIP: ""
+
+# #272 Phase 5 — DNS resolver VIP (default off, full wiring is Phase 10).
+# When ``useMetalLBVIP: true`` the bind9 + powerdns Pods DROP
+# hostNetwork:53 and sit behind a single L2 LoadBalancer Service at
+# ``vip``, so clients use one resolver IP that follows whichever node is
+# up. Net-loss on single-node (an extra hop for no gain) — single-node
+# installs leave this false and keep hostNetwork. ``vip`` must fall
+# inside the MetalLB pool and differ from ``metallb.controlPlaneVIP``
+# (the pool needs ≥2 free addresses). Requires ``metallb.enabled: true``.
+# An appliance runs one DNS driver at a time, so the single ``vip`` is
+# requested by whichever of bind9 / powerdns is enabled.
+dns:
+  useMetalLBVIP: false
+  vip: ""
+  vipPool: spatium-control-plane
 
 # Observer — placeholder for future metrics / log shipper role. No
 # service container in Phase 2; this just lets the supervisor pre-

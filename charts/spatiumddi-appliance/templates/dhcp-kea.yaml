@@ -109,4 +109,31 @@ spec:
   resources:
     requests:
       storage: {{ .Values.dhcpKea.persistence.leases.size }}
+{{- if .Values.dhcpKea.relayVIP }}
+---
+# #272 Phase 5 — DHCP relay-VIP. An ADDITIONAL LoadBalancer Service so a
+# DHCP relay's ``forward-to`` target is a stable floating IP that
+# outlives any single Kea node. Kea still runs hostNetwork:67 (the
+# DaemonSet above) for direct-attached VLAN broadcast reach — this VIP
+# only fronts the relay→server unicast forward, NOT client-facing :67.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dhcp-kea-relay
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dhcp-kea
+  annotations:
+    metallb.universe.tf/address-pool: {{ .Values.dns.vipPool | quote }}
+    metallb.universe.tf/loadBalancerIPs: {{ .Values.dhcpKea.relayVIP | quote }}
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: dhcp-kea
+  ports:
+    - name: dhcp-server
+      port: 67
+      targetPort: 67
+      protocol: UDP
+{{- end }}
 {{- end }}
