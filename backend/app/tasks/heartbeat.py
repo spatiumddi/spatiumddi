@@ -12,11 +12,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-import redis
 import structlog
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.core.redis_client import make_sync_redis
 
 logger = structlog.get_logger(__name__)
 
@@ -30,7 +30,7 @@ BEAT_HEARTBEAT_TTL_SECONDS = 300
     ignore_result=True,
 )
 def beat_tick(self) -> str:  # noqa: ARG001 — bind=True boilerplate
-    r = redis.from_url(settings.redis_url)
+    r = make_sync_redis(settings.redis_url)
     try:
         r.set(
             BEAT_HEARTBEAT_KEY,

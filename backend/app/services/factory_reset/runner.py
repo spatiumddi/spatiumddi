@@ -154,11 +154,10 @@ async def _acquire_lock_or_raise() -> Any:
     :class:`FactoryResetMutexError` when the flag is already held.
     Returns the redis client so the caller can release it.
     """
-    import redis.asyncio as aioredis  # noqa: PLC0415
-
     from app.config import settings  # noqa: PLC0415
+    from app.core.redis_client import make_async_redis  # noqa: PLC0415
 
-    client = aioredis.from_url(settings.redis_url, socket_connect_timeout=2)
+    client = make_async_redis(settings.redis_url, socket_connect_timeout=2)
     acquired = await client.set(RESET_LOCK_KEY, "1", nx=True, ex=RESET_LOCK_TTL_SECONDS)
     if not acquired:
         await client.aclose()

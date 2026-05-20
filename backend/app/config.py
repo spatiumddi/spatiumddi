@@ -22,6 +22,14 @@ class Settings(BaseSettings):
 
     # Redis
     redis_url: str = "redis://redis:6379/0"
+    # Redis Sentinel (#272 Phase 3). When ``redis_url`` /
+    # ``celery_broker_url`` carry a ``sentinel://`` scheme, the
+    # connection helpers query Sentinel for the current master named
+    # ``redis_sentinel_master``. ``redis_sentinel_password`` is the
+    # password Sentinel itself requires (often the same as the data
+    # password); empty falls back to the password embedded in the URL.
+    redis_sentinel_master: str = "mymaster"
+    redis_sentinel_password: str = ""
 
     # Security
     secret_key: str = _SECRET_KEY_DEV_SENTINEL

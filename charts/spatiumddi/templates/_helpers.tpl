@@ -182,6 +182,32 @@ externalRedis.
 {{- if .Values.redis.enabled -}}6379{{- else -}}{{ .Values.externalRedis.port }}{{- end -}}
 {{- end -}}
 
+{{/*
+True when the chart-owned Redis runs in Sentinel mode (#272 Phase 3).
+Drives the sentinel:// URL branch in commonEnv + the master-name env.
+*/}}
+{{- define "spatiumddi.redisIsSentinel" -}}
+{{- if and .Values.redis.enabled (eq (.Values.redis.kind | default "standalone") "sentinel") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Comma-separated sentinel host:port list for the redis-py-style
+sentinel:// URL. Points at the per-pod headless DNS so the client can
+reach every sentinel even mid-failover; the sentinel Service fronts
+the same set for kombu.
+*/}}
+{{- define "spatiumddi.redisSentinelHosts" -}}
+{{- $fullname := include "spatiumddi.fullname" . -}}
+{{- $sts := printf "%s-redis" $fullname -}}
+{{- $headless := printf "%s-redis-headless" $fullname -}}
+{{- $n := int .Values.redis.sentinel.replicas -}}
+{{- $hosts := list -}}
+{{- range $i := until $n -}}
+{{- $hosts = append $hosts (printf "%s-%d.%s.%s.svc.cluster.local:26379" $sts $i $headless $.Release.Namespace) -}}
+{{- end -}}
+{{- join "," $hosts -}}
+{{- end -}}
+
 {{- define "spatiumddi.redisAuthEnabled" -}}
 {{- if .Values.redis.enabled -}}
 {{- if .Values.redis.auth.enabled -}}true{{- end -}}
@@ -225,7 +251,41 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
       key: secret-key
 - name: DATABASE_URL
   value: "postgresql+asyncpg://{{ include "spatiumddi.postgresUser" . }}:$(POSTGRES_PASSWORD)@{{ include "spatiumddi.postgresHost" . }}:{{ include "spatiumddi.postgresPort" . }}/{{ include "spatiumddi.postgresDatabase" . }}"
-{{- if eq (include "spatiumddi.redisAuthEnabled" .) "true" }}
+{{- if eq (include "spatiumddi.redisIsSentinel" .) "true" }}
+{{- $sentinelHosts := include "spatiumddi.redisSentinelHosts" . }}
+{{- $sentinelSvc := printf "%s-redis-sentinel" (include "spatiumddi.fullname" .) }}
+{{- /* #272 Phase 3 — Redis Sentinel. The app's redis-py helper parses
+       the comma-separated host list in REDIS_URL; Celery/kombu reaches
+       the sentinels through the Service VIP + the master_name set in
+       celery_app.py's broker_transport_options. */}}
+- name: REDIS_SENTINEL_MASTER
+  value: {{ .Values.redis.sentinel.masterName | quote }}
+{{- if .Values.redis.auth.enabled }}
+- name: REDIS_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.redisSecretName" . }}
+      key: {{ include "spatiumddi.redisSecretPasswordKey" . }}
+- name: REDIS_SENTINEL_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.redisSecretName" . }}
+      key: {{ include "spatiumddi.redisSecretPasswordKey" . }}
+- name: REDIS_URL
+  value: "sentinel://:$(REDIS_PASSWORD)@{{ $sentinelHosts }}/0"
+- name: CELERY_BROKER_URL
+  value: "sentinel://:$(REDIS_PASSWORD)@{{ $sentinelSvc }}:26379/1"
+- name: CELERY_RESULT_BACKEND
+  value: "sentinel://:$(REDIS_PASSWORD)@{{ $sentinelSvc }}:26379/2"
+{{- else }}
+- name: REDIS_URL
+  value: "sentinel://{{ $sentinelHosts }}/0"
+- name: CELERY_BROKER_URL
+  value: "sentinel://{{ $sentinelSvc }}:26379/1"
+- name: CELERY_RESULT_BACKEND
+  value: "sentinel://{{ $sentinelSvc }}:26379/2"
+{{- end }}
+{{- else if eq (include "spatiumddi.redisAuthEnabled" .) "true" }}
 - name: REDIS_PASSWORD
   valueFrom:
     secretKeyRef:

@@ -305,12 +305,23 @@ externalDatabase:
   existingSecretPasswordKey: "password"
 
 # ── Redis ────────────────────────────────────────────────────────────────────
-# In-chart single-node Redis StatefulSet using the official
-# ``redis:8.6-alpine`` image (matches docker-compose.yml). For HA
-# production set ``redis.enabled=false`` and point ``externalRedis`` at
-# a Redis Sentinel cluster (see k8s/ha/redis-sentinel.yaml).
+# Two in-chart shapes, picked via ``redis.kind``:
+#
+# * ``standalone`` (default) — single-node StatefulSet using the
+#   official ``redis:8.6-alpine`` image (matches docker-compose.yml).
+#   No HA, no failover.
+# * ``sentinel`` (#272 Phase 3) — a 3-replica StatefulSet where each
+#   pod runs a redis-server + a redis-sentinel sidecar. The sentinels
+#   elect a master + fail over automatically. The api / worker / beat
+#   pick up a ``sentinel://`` URL (see spatiumddi.commonEnv) and
+#   resolve the live master through the sentinels — no static master
+#   Service needed. ``master_name`` is fixed to ``mymaster``.
+#
+# For an externally-managed Redis, set ``redis.enabled=false`` and
+# fill in ``externalRedis``.
 redis:
   enabled: true
+  kind: standalone
   image:
     repository: redis
     tag: "8.6-alpine"
@@ -332,6 +343,19 @@ redis:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  # Sentinel topology (only used when ``kind: sentinel``).
+  sentinel:
+    # Replica count — 3 is the smallest quorum (1 master + 2 replicas,
+    # 3 sentinels). The sentinel quorum to declare a master down is
+    # floor(replicas/2)+1 = 2 at 3 replicas.
+    replicas: 3
+    # The Sentinel-monitored master name. Must match the app's
+    # ``redis_sentinel_master`` setting (default ``mymaster``); the
+    # chart wires the env var to this value.
+    masterName: mymaster
+    # down-after / failover tuning (ms).
+    downAfterMs: 5000
+    failoverTimeoutMs: 60000
 
 # Used when redis.enabled=false.
 externalRedis:
