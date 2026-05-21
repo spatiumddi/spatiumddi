@@ -432,7 +432,39 @@ spec:
       enabled: false  # spatium:metallb-enabled
       ipPool:
         addresses: []  # spatium:metallb-pool
+      # The metallb subchart ships its CRDs as a (templated) sub-subchart.
+      # On the appliance metallb always starts DISABLED, so the subchart +
+      # its CRDs aren't rendered at first install; enabling it later is a
+      # helm UPGRADE, and helm won't establish those CRDs before applying
+      # the IPAddressPool / L2Advertisement CRs in the same release → the
+      # upgrade fails "no matches for kind IPAddressPool". So we DON'T let
+      # helm own the CRDs at all — they're pre-loaded unconditionally as a
+      # k3s auto-deploy manifest at firstboot (place_metallb_crds below).
+      crds:
+        enabled: false
 EOF
+}
+
+# #272 — pre-load the MetalLB CRDs as a k3s auto-deploy manifest so they
+# exist cluster-wide BEFORE the operator ever enables MetalLB. MetalLB
+# always starts disabled on the appliance and is turned on via a helm
+# UPGRADE of the spatium-bootstrap release; helm can't establish the
+# metallb subchart's CRDs before applying the IPAddressPool /
+# L2Advertisement CRs in that same release ("no matches for kind
+# IPAddressPool"). So we keep the CRDs out of helm entirely
+# (metallb.crds.enabled=false in the valuesContent above) and lay them
+# down here — k3s applies everything in its manifests dir at boot, well
+# before the operator could enable MetalLB. The baked file is vendored
+# from the metallb 0.16.0 chart (its {{ .Release.Namespace }} already
+# substituted to ``spatium``).
+place_metallb_crds() {
+    local src=/usr/local/share/spatiumddi/metallb-crds.yaml
+    if [ -r "$src" ]; then
+        install -m 0644 "$src" "$K3S_MANIFESTS_DIR/spatium-metallb-crds.yaml"
+        echo "Placed MetalLB CRDs at $K3S_MANIFESTS_DIR/spatium-metallb-crds.yaml"
+    else
+        echo "WARN: $src missing — MetalLB CRDs not pre-loaded; enabling MetalLB later will fail."
+    fi
 }
 
 # Renders the control-plane HelmChart CR for the control-plane
@@ -604,6 +636,10 @@ case "$APPLIANCE_ROLE_VAL" in
         fi
         ;;
     control-plane|full-stack|frontend-core)
+        # #272 — lay down the MetalLB CRDs unconditionally (the seed is a
+        # control-plane node; CRDs are cluster-scoped so doing it here
+        # covers any node later promoted into the cluster).
+        place_metallb_crds
         # Both variants need the control-plane chart (api/frontend/db
         # /redis/worker/beat/migrate). full-stack ADDITIONALLY needs
         # the appliance chart with role pods enabled (supervisor
