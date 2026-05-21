@@ -332,6 +332,15 @@ _NTP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-status")
 # k3s server dir.
 _CLUSTER_JOIN_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/cluster-join-pending")
 _CLUSTER_LEAVE_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/cluster-leave-pending")
+# Guardrail confirmation markers (#272). The host-side spatium-cluster-join
+# runner does DESTRUCTIVE k3s surgery (full cluster-identity wipe + rejoin),
+# fired by a systemd .path unit watching these trigger files. To stop a
+# stray / accidental / hand-touched file from triggering a wipe, the
+# supervisor stamps a magic first line and the runner refuses to act on any
+# trigger whose first line isn't an exact match. Must stay byte-identical to
+# the constants in spatium-cluster-join.
+_CLUSTER_JOIN_CONFIRM = "SPATIUMDDI-CLUSTER-JOIN-CONFIRM-V1"
+_CLUSTER_LEAVE_CONFIRM = "SPATIUMDDI-CLUSTER-LEAVE-CONFIRM-V1"
 _CLUSTER_JOIN_STATE_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/cluster-join.state")
 _K3S_JOIN_TOKEN_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/k3s-join-token")
 
@@ -620,8 +629,10 @@ def maybe_fire_cluster_join(
     Strict appliance-only gate (mirrors ``maybe_fire_reboot``).
     Idempotent via trigger-file presence — once written, we don't
     stack writes until the host runner consumes it (renaming to
-    ``.done`` / ``.failed``). The trigger payload is two lines:
-    ``server_url`` then ``join_token``.
+    ``.done`` / ``.failed``). The trigger payload is three lines: the
+    ``_CLUSTER_JOIN_CONFIRM`` guardrail marker, then ``server_url``,
+    then ``join_token``. The runner refuses any trigger whose first
+    line isn't the marker, so a stray file can't fire a wipe.
     """
     if detect_deployment_kind() != "appliance":
         return False
@@ -634,7 +645,9 @@ def maybe_fire_cluster_join(
     try:
         _CLUSTER_JOIN_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _CLUSTER_JOIN_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(f"{server_url}\n{join_token}\n", encoding="utf-8")
+        tmp.write_text(
+            f"{_CLUSTER_JOIN_CONFIRM}\n{server_url}\n{join_token}\n", encoding="utf-8"
+        )
         tmp.replace(_CLUSTER_JOIN_TRIGGER_FILE)
         return True
     except OSError:
@@ -645,9 +658,10 @@ def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
     """Write the cluster-leave trigger when the control plane asks this
     node to leave the cluster (``desired_cluster_role == "none"``).
 
-    No payload — the host runner knows how to reset k3s back to a
-    single-node seed. Strict appliance-only + idempotent via trigger-
-    file presence.
+    Payload is two lines: the ``_CLUSTER_LEAVE_CONFIRM`` guardrail
+    marker then a timestamp. The runner refuses any trigger whose first
+    line isn't the marker. Strict appliance-only + idempotent via
+    trigger-file presence.
     """
     if detect_deployment_kind() != "appliance":
         return False
@@ -658,10 +672,8 @@ def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
     try:
         _CLUSTER_LEAVE_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _CLUSTER_LEAVE_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(
-            datetime.now(UTC).isoformat().replace("+00:00", "Z") + "\n",
-            encoding="utf-8",
-        )
+        ts = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        tmp.write_text(f"{_CLUSTER_LEAVE_CONFIRM}\n{ts}\n", encoding="utf-8")
         tmp.replace(_CLUSTER_LEAVE_TRIGGER_FILE)
         return True
     except OSError:
