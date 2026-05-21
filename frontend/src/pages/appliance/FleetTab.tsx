@@ -260,9 +260,21 @@ function ClusterMembershipModal({
   const [promoteSel, setPromoteSel] = useState<Set<string>>(new Set());
   const [demoteSel, setDemoteSel] = useState<Set<string>>(new Set());
 
+  // Current control-plane members for the odd-count math. A node is a
+  // member if it's a control-plane node by INSTALL VARIANT (the seed —
+  // isControlPlaneRow) OR an actually-joined cluster member. The seed
+  // has cluster_role=null until the first promote *designates* it, so
+  // counting cluster_role alone undercounts by 1 and the modal showed
+  // "Current members: 0" / blocked an odd 1→3 promote. Matches the
+  // backend's _resolve_primary (which counts the lone seed as 1).
   const members = rows.filter(
-    (r) => r.cluster_role === "primary" || r.cluster_role === "member",
+    (r) =>
+      r.state !== "revoked" &&
+      (isControlPlaneRow(r) ||
+        r.cluster_role === "primary" ||
+        r.cluster_role === "member"),
   );
+  // Only actually-joined members are demotable (never the seed).
   const demotable = members.filter((r) => r.cluster_role === "member");
   const memberCount = members.length;
   // Eligible to promote: approved OS-appliance nodes that aren't already
