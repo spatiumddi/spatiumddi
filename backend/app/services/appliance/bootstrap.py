@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import ipaddress
-import socket
 import uuid
 
 import structlog
@@ -66,14 +65,22 @@ async def ensure_self_signed_cert() -> None:
     if not settings.appliance_mode:
         return
 
-    hostname = settings.appliance_hostname or socket.gethostname()
-    # Prefer host IPs detected by firstboot — those are the IPs a
-    # browser will actually connect to. Fall back to in-container
-    # detection only when running outside the appliance (no
-    # APPLIANCE_HOST_IPS env) or when the host had no globally-scoped
-    # addresses at firstboot time (rare; firstboot writes an empty list
-    # which we treat as "ask the local socket").
-    ips = _parse_host_ips(settings.appliance_host_ips) or _detect_local_ips()
+    # #272 HA — the cert identity MUST be stable across api replicas.
+    # In a multi-node control plane the api Deployment runs N pods (one
+    # per control-plane node), all sharing one cluster-wide
+    # spatium-appliance-tls Secret + one appliance_certificate row. If
+    # we derived the CN/SANs from the running POD (socket.gethostname()
+    # = the pod name, or the pod's own IP), every replica would see "the
+    # active cert doesn't cover MY name/IP" and regenerate — three pods
+    # → three certs, each overwriting the Secret (exactly the churn an
+    # operator reported). So use ONLY the host-stable identity that
+    # firstboot threads into the Deployment env (identical for every
+    # replica): APPLIANCE_HOSTNAME + APPLIANCE_HOST_IPS + the
+    # control-plane VIP. No per-pod fallbacks. The result: the first
+    # node's cert is generated once and every replica just re-deploys
+    # it; the operator adds more SANs (other node IPs) via a CSR.
+    hostname = settings.appliance_hostname or "spatiumddi-appliance"
+    ips = _parse_host_ips(settings.appliance_host_ips)
     # #272 Phase 6 — extra SANs the cert must also cover (the
     # control-plane VIP etc), threaded in from the chart on promote.
     extra_sans = _parse_extra_sans(settings.appliance_extra_cert_sans)
@@ -224,35 +231,6 @@ def _parse_host_ips(env: str) -> list[str]:
         if s not in out:
             out.append(s)
     return out
-
-
-def _detect_local_ips() -> list[str]:
-    """Return every non-loopback, non-link-local IP bound to this host.
-
-    Uses ``socket.getaddrinfo`` against the hostname for portability
-    (no ``ip``-binary required, no /sys/class/net spelunking that
-    breaks in containers without ``--net=host``). Falls back to an
-    empty list on any failure — a self-signed cert with only the
-    hostname SAN is still useful.
-    """
-    ips: list[str] = []
-    try:
-        hostname = socket.gethostname()
-        for family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None):
-            if family not in (socket.AF_INET, socket.AF_INET6):
-                continue
-            ip_str = str(sockaddr[0])
-            try:
-                ip = ipaddress.ip_address(ip_str)
-            except ValueError:
-                continue
-            if ip.is_loopback or ip.is_link_local or ip.is_unspecified:
-                continue
-            if ip_str not in ips:
-                ips.append(ip_str)
-    except (socket.gaierror, OSError):
-        return []
-    return ips
 
 
 def _parse_extra_sans(env: str) -> list[str]:

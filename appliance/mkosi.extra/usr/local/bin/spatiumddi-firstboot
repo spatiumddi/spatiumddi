@@ -497,6 +497,22 @@ spec:
           value: "${DNS_AGENT_KEY_VAL}"
         - name: DHCP_AGENT_KEY
           value: "${DHCP_AGENT_KEY_VAL}"
+        # #272 HA — stable identity for the self-signed Web UI cert.
+        # The api Deployment runs N replicas (one per control-plane
+        # node), all sharing one cluster TLS Secret. WITHOUT these the
+        # cert bootstrap falls back to the POD name/IP, so every replica
+        # regenerates a cert for its own ephemeral identity and clobbers
+        # the Secret — the operator-reported "3 certificates" churn.
+        # These env values are identical for every replica (the host's
+        # hostname + globally-scoped IPs, computed once at firstboot),
+        # so the first node's cert is generated once and every replica
+        # just re-deploys it. Operators add other node IPs as SANs via a
+        # CSR. (The control-plane VIP, when one is set on promote, is
+        # threaded separately as APPLIANCE_EXTRA_CERT_SANS.)
+        - name: APPLIANCE_HOSTNAME
+          value: "${APPLIANCE_HOSTNAME_VAL}"
+        - name: APPLIANCE_HOST_IPS
+          value: "${APPLIANCE_HOST_IPS_VAL}"
       serviceAccount:
         enabled: true
       # Appliance bind mounts. /var/lib/spatiumddi-host/release-state
@@ -524,6 +540,18 @@ spec:
       kind: cnpg
       cnpg:
         instances: 1  # spatium:cp-size
+    # #272 Phase 3 — Redis runs under Sentinel on every appliance so the
+    # cache/queue layer is HA like postgres: each replica pairs a
+    # redis-server with a redis-sentinel that elects a master + fails
+    # over automatically, and the app/worker/beat resolve the live
+    # master through a sentinel:// URL. replicas tracks the control-plane
+    # size via the same ``# spatium:cp-size`` marker — 1 on a single
+    # node (degenerate but functional), 3/5/7 with real quorum + failover
+    # after promote (the seed supervisor patches it alongside CNPG).
+    redis:
+      kind: sentinel
+      sentinel:
+        replicas: 1  # spatium:cp-size
     # DNS / DHCP agents from the umbrella chart are NOT used on the
     # appliance — the appliance chart (templates/dns-bind9.yaml etc.)
     # owns the role pods with hostNetwork + per-role node labels.
