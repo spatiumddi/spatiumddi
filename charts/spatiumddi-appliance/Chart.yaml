@@ -38,7 +38,7 @@ maintainers:
 #   helm dependency update charts/spatiumddi-appliance
 dependencies:
   - name: metallb
-    version: 0.15.3
+    version: 0.16.0
     repository: https://metallb.github.io/metallb
     condition: metallb.enabled
   - name: cloudnative-pg

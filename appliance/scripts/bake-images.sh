@@ -85,17 +85,18 @@ OBSERVABILITY_IMAGES=(
 # appVersion. Baked so multi-node HA promotion works in air-gapped
 # environments with zero outbound pulls — same as every other image.
 #
-# L2 (native) mode only: ``metallb.speaker.frr.enabled=false`` in
-# charts/spatiumddi-appliance/values.yaml, so the large
-# quay.io/frrouting/frr image is intentionally NOT baked. If/when BGP
-# mode lands (Phase 10), add ``quay.io/frrouting/frr:<tag>`` here and
-# flip frr.enabled.
+# L2 (native) mode only: ``metallb.speaker.frr.enabled=false`` AND
+# ``metallb.frrk8s.enabled=false`` in charts/spatiumddi-appliance/
+# values.yaml (0.16.0 made frr-k8s the default BGP backend), so the
+# quay.io/metallb/frr-k8s + quay.io/frrouting/frr images are
+# intentionally NOT baked. If/when BGP mode lands (Phase 10), enable
+# frrk8s + add those two images here.
 #
 # KEEP these refs in lock-step with the metallb.controller.image /
 # metallb.speaker.image pins in the appliance chart's values.yaml.
 METALLB_IMAGES=(
-    "quay.io/metallb/controller:v0.15.3"
-    "quay.io/metallb/speaker:v0.15.3"
+    "quay.io/metallb/controller:v0.16.0"
+    "quay.io/metallb/speaker:v0.16.0"
 )
 
 if ! command -v docker >/dev/null 2>&1; then
