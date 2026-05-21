@@ -239,6 +239,19 @@ Common env block for api / worker / beat. Only $(POSTGRES_PASSWORD) and
 $(REDIS_PASSWORD) reference secrets; everything else is inline.
 */}}
 {{- define "spatiumddi.commonEnv" -}}
+{{/* Issue #274 — running version, surfaced by the api as
+     ``settings.version`` and rendered in the sidebar's lower-
+     left "v…" chip. Mirrors the docker-compose ``VERSION:
+     ${SPATIUMDDI_VERSION:-dev}`` wiring on the helm path.
+     Precedence: operator-pinned ``image.tag`` wins (e.g. for a
+     manual rollback) → chart-packaged ``.Chart.AppVersion`` (the
+     CalVer tag the release workflow stamps via
+     ``helm package --app-version``) → falls through to the
+     api's own ``"dev"`` fallback in ``app/config.py``. Same
+     resolution chain as the existing ``spatiumddi.image``
+     helper so the env value tracks the running image tag. */}}
+- name: VERSION
+  value: {{ .Values.image.tag | default .Chart.AppVersion | quote }}
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
