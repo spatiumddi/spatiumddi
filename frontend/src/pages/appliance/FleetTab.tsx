@@ -1994,6 +1994,10 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
 
   const ch = row.cluster_health ?? {};
   const ready = ch.kubeapi_ready === true;
+  // "Restart bind9" only makes sense on a node actually running the
+  // dns-bind9 role — on a control-plane seed (DNS off) the Deployment
+  // doesn't exist, so the button would just error. Gate it on the role.
+  const hasBind9 = (row.assigned_roles ?? []).includes("dns-bind9");
   const nodesTotal = ch.nodes_total;
   const nodesReady = ch.nodes_ready;
   const podsTotal = ch.pods_total;
@@ -2085,20 +2089,22 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
         sub-second on a healthy appliance.
       </p>
       <div className="mt-2 flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          onClick={() => restartBind9.mutate()}
-          disabled={!ready || restartBind9.isPending}
-          title="kubectl rollout restart deploy/dns-bind9 -n spatium"
-          className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {restartBind9.isPending ? (
-            <Loader2 className="h-3 w-3 animate-spin" />
-          ) : (
-            <RefreshCw className="h-3 w-3" />
-          )}
-          Restart bind9
-        </button>
+        {hasBind9 && (
+          <button
+            type="button"
+            onClick={() => restartBind9.mutate()}
+            disabled={!ready || restartBind9.isPending}
+            title="kubectl rollout restart deploy/dns-bind9 -n spatium"
+            className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {restartBind9.isPending ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3 w-3" />
+            )}
+            Restart bind9
+          </button>
+        )}
         <button
           type="button"
           onClick={() => setRevealOpen(true)}
