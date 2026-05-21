@@ -156,6 +156,21 @@ backup_and_wipe_identity() {
     fi
     [ -f "$K3S_NODE_PASSWORD" ] && mv "$K3S_NODE_PASSWORD" "$bak/node-password"
     [ -f "$K3S_LOCAL_KUBECONFIG" ] && mv "$K3S_LOCAL_KUBECONFIG" "$bak/k3s.yaml"
+    # #277 — clear stale pod-network state so the (re)joining node gets
+    # pod IPs from its NEW cluster-assigned podCIDR, not the old
+    # single-node 10.42.0.0/24. /run/flannel/subnet.env is on tmpfs but
+    # SURVIVES the join (a join is a k3s restart, not a reboot), so it
+    # still holds the old subnet; if a pod (e.g. the supervisor
+    # DaemonSet) is scheduled in the window before flannel rewrites it
+    # post-join, the pod gets a stale-subnet IP that COLLIDES with the
+    # seed's pods → that pod can't route → its supervisor heartbeat
+    # fails → the node never reports "ready" → stuck "joining" (observed
+    # live on a 1→3 promote). Removing it makes early pod-sandbox
+    # creation block until flannel writes the new subnet, so every pod
+    # lands on the correct CIDR. Host-local IPAM allocations cleared too.
+    # Regenerated network state — not backed up.
+    rm -f /run/flannel/subnet.env 2>/dev/null || true
+    rm -rf /var/lib/cni/networks 2>/dev/null || true
     log "wiped cluster identity → $bak (k3s binary + airgap images kept)"
     printf '%s\n' "$bak"
 }
