@@ -378,6 +378,17 @@ def reconcile_node_labels(profiles: list[str]) -> tuple[bool, str | None]:
     variant = appliance_state.detect_appliance_variant()
     if variant is not None:
         desired_role_set |= set(_VARIANT_FIXED_ROLES.get(variant, frozenset()))
+    # #277 — a promoted `appliance`-variant node (one that JOINED the
+    # control-plane cluster as a k3s server) must also carry the
+    # control-plane label so the control-plane workloads (api / frontend
+    # / worker + the CNPG postgres primary & replicas) can schedule onto
+    # it. The seed (control-plane variant) already gets this via
+    # _VARIANT_FIXED_ROLES; this covers members promoted from an
+    # `appliance` install. Key off the host runner's join-state sidecar:
+    # "ready" == joined and Ready as a cluster member.
+    join_state, _ = appliance_state.read_cluster_join_state()
+    if join_state == "ready":
+        desired_role_set.add("control-plane")
     label_diff: dict[str, str | None] = {}
     for role, label in _ROLE_LABEL_KEYS.items():
         label_diff[label] = "true" if role in desired_role_set else None

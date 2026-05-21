@@ -71,12 +71,15 @@ OBSERVABILITY_IMAGES=(
     # /var/lib/spatiumddi/agent-landing/index.html on :80. Pinned to
     # 1.30.1-alpine matching values.yaml's ``agentLanding.image.tag``.
     "nginx:1.30.1-alpine"
-    # Phase 11 (#183) — datastores for the AIO + Core control plane.
-    # Tags follow the umbrella chart's ``postgresql.image.tag`` and
-    # ``redis.image.tag`` defaults. Postgres stays on 16-alpine
-    # pending a dedicated PR with pg_upgrade migration tooling —
-    # PG18 refuses to start against a PG16 data directory.
-    "postgres:16-alpine"
+    # Phase 11 (#183) — Redis datastore for the control plane.
+    # Tag follows the umbrella chart's ``redis.image.tag`` default.
+    # NOTE: the standalone ``postgres:16-alpine`` image is intentionally
+    # NOT baked anymore (#277). The appliance now runs PostgreSQL under
+    # CloudNativePG on every install (single instance → 3/5/7 on
+    # promote); the CNPG runtime image (ghcr.io/cloudnative-pg/postgresql)
+    # + operator are baked in CNPG_IMAGES below. The chart's standalone
+    # StatefulSet path stays for non-appliance docker/k8s users, but the
+    # appliance never renders it, so its image is dead weight in the ISO.
     "redis:8.6-alpine"
 )
 
@@ -97,6 +100,20 @@ OBSERVABILITY_IMAGES=(
 METALLB_IMAGES=(
     "quay.io/metallb/controller:v0.16.0"
     "quay.io/metallb/speaker:v0.16.0"
+)
+
+# CloudNativePG (#272 / #277) — PostgreSQL is CNPG on every appliance
+# (single-node = 1 instance, scales to 3/5/7 on control-plane promote).
+# The operator runs from the spatiumddi-appliance chart's cnpg subchart;
+# the runtime image is what each Cluster instance pod runs. Both MUST be
+# baked or a fresh airgap install can't bring postgres up.
+#   * operator tag = cloudnative-pg chart 0.28.2 appVersion (1.29.1).
+#   * runtime tag  = charts/spatiumddi values.yaml postgresql.cnpg.imageName.
+# KEEP in lock-step with charts/spatiumddi-appliance/charts/cloudnative-pg-*.tgz
+# (appVersion) and charts/spatiumddi/values.yaml (cnpg.imageName).
+CNPG_IMAGES=(
+    "ghcr.io/cloudnative-pg/cloudnative-pg:1.29.1"
+    "ghcr.io/cloudnative-pg/postgresql:16"
 )
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -207,7 +224,7 @@ done
 # Slugged output filenames so two images from the same registry
 # path prefix don't collide. ``kube-state-metrics`` + ``node-exporter``
 # are distinct enough that ``basename`` works.
-for image in "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}"; do
+for image in "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}" "${CNPG_IMAGES[@]}"; do
     short="$(basename "${image%%:*}")"
     out_tar="$IMAGES_DIR/${short}.tar.zst"
 
@@ -226,6 +243,6 @@ for image in "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}"; do
 done
 
 TOTAL="$(du -hc "$IMAGES_DIR"/*.tar.zst 2>/dev/null | tail -1 | awk '{print $1}')"
-TOTAL_COUNT=$((${#IMAGES[@]} + ${#OBSERVABILITY_IMAGES[@]} + ${#METALLB_IMAGES[@]}))
+TOTAL_COUNT=$((${#IMAGES[@]} + ${#OBSERVABILITY_IMAGES[@]} + ${#METALLB_IMAGES[@]} + ${#CNPG_IMAGES[@]}))
 echo "✓ ${TOTAL_COUNT} images baked into $IMAGES_DIR ($TOTAL)"
 echo "  k3s auto-imports these at startup (no firstboot shell-out required)"
