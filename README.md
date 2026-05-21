@@ -600,7 +600,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Docker Compose
   - Kubernetes — Helm umbrella chart, OCI-published
   - Bare metal
-  - OS appliance ISO — beta (Debian 13 + full stack pre-installed, dedicated `/appliance` management hub with TLS, releases, containers, logs, host config; see [Getting Started](#quick-start-with-the-os-appliance-iso) + [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md))
+  - OS appliance ISO — beta (Debian 13 + k3s + full stack pre-installed, dedicated `/appliance` management hub with TLS, releases, containers, logs, host config; **multi-node control-plane HA** — promote appliances to a 3/5/7-node cluster with CloudNativePG + Redis Sentinel + a MetalLB VIP; see [Getting Started](#quick-start-with-the-os-appliance-iso) + [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md))
 
 ---
 
@@ -692,6 +692,10 @@ Operators get a real Kubernetes node without managing one.
   identical root partitions; an upgrade dd's the new image
   into the inactive one, reboots, and auto-reverts on
   `/health/live` failure. Worst case is one wasted reboot.
+- **Scale to a 3/5/7-node HA control plane** by promoting more
+  appliances from the Fleet UI — embedded-etcd quorum, replicated
+  PostgreSQL (CloudNativePG) + Redis Sentinel, and a MetalLB
+  control-plane VIP, all configured from the web UI (see below).
 
 #### Get the ISO
 
@@ -777,11 +781,62 @@ agent labels the k3s node (`spatium.io/role-<role>=true`)
 and the matching DaemonSet schedules the role pod. Total
 time from click to running pod: typically 25-35 s.
 
+#### Control-plane high availability (multi-node)
+
+A single appliance is a one-node control plane. To survive a
+node loss, **promote** more appliances into the control-plane
+cluster from **Appliance → Fleet → Manage control plane
+cluster…**. Pick the boxes to add and confirm — embedded-etcd
+HA wants an **odd** member count, so you grow 1 → 3 → 5 → 7
+(the API refuses a batch that would land on an even total).
+
+Promotion is hands-off. The supervisor on each promoted node
+does a full k3s cluster-identity reset and rejoins the seed's
+embedded-etcd cluster; within ~60 s the data layer scales
+itself to the new member count:
+
+- **PostgreSQL** ([CloudNativePG](https://cloudnative-pg.io/))
+  grows from one instance to a primary + streaming replicas
+  with automatic failover.
+- **Redis** runs in Sentinel mode — each member pairs a
+  redis-server with a sentinel that elects a master and fails
+  over; the app resolves the live master via a `sentinel://` URL.
+- **api / frontend / worker** spread to one replica per node.
+
+**One Web UI, one address.** Set a [MetalLB](https://metallb.io/)
+L2 address pool + a floating **control-plane VIP** in **Fleet →
+Control plane**; the frontend Service moves onto the VIP so the
+UI (and every agent heartbeat) hits one stable address
+regardless of which node is up. The self-signed Web UI cert
+auto-grows its SAN list to cover every member's hostname + IP
+and the VIP, so it validates on any node — unless you've
+uploaded your own cert, which is never touched.
+
+Roll back by **demoting** members the same way (the etcd seed
+can't be demoted, and demoting to an even count is refused). A
+control-plane node can't be revoked until it's been demoted —
+revoking a live etcd member would break quorum. Control-plane
+workloads are pinned to control-plane nodes by a per-role node
+label, so promoting a DNS-only appliance never accidentally
+schedules Postgres onto it.
+
+> Multi-node HA shipped in
+> [#272](https://github.com/spatiumddi/spatiumddi/issues/272);
+> the live shake-out validated a 1 → 3 promote end-to-end. See
+> [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md)
+> for the architecture + the
+> [HA topologies in `docs/deployment/TOPOLOGIES.md`](docs/deployment/TOPOLOGIES.md).
+
 #### Managing the appliance
 
 The **Appliance** section in the sidebar groups every host
 concern:
 
+- **Fleet** — every registered appliance in two tables
+  (control-plane nodes + service agents): approve pairings,
+  assign DNS/DHCP roles, watch per-service health, and
+  promote/demote control-plane cluster members + set the
+  MetalLB control-plane VIP (see HA above).
 - **OS Versions** — atomic A/B slot upgrades for this
   appliance and every registered remote agent. Pick a
   release, optionally bulk-select agents, click Apply.

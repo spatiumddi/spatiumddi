@@ -2,8 +2,11 @@
 
 > SpatiumDDI is designed to scale from a single homelab VM all the way to a
 > distributed multi-region deployment with the control plane in the cloud
-> and DNS/DHCP agents running on-prem. This guide walks through five
-> reference topologies and shows which knobs each one flexes.
+> and DNS/DHCP agents running on-prem. This guide walks through seven
+> reference topologies and shows which knobs each one flexes — including
+> the self-contained **multi-node appliance HA** path (Topology 7), where
+> you promote OS appliances into a 3/5/7-node control-plane cluster from
+> the web UI with no Patroni / Helm / kubectl to operate.
 
 For the per-platform install steps, see:
 
@@ -23,8 +26,9 @@ For the per-platform install steps, see:
 | **Async work** (`worker`) | Celery worker process | N copies, sharded by queue (`ipam`, `dns`, `dhcp`, `default`) |
 | **Scheduler** (`beat`) | Celery beat | Exactly **one** instance — not horizontally scalable. Run two with leader-election (`celery-beat-leader`) only if you need HA |
 | **Frontend** (`frontend`) | nginx + static Vite build | Stateless — horizontally scalable, often co-located with the API behind the same LB |
-| **PostgreSQL** | Stateful, primary write source | Patroni (bare-metal/VM) or CloudNativePG (K8s) for HA. Read replicas optional — SpatiumDDI doesn't currently route reads to replicas |
-| **Redis** | Cache + Celery broker + factory-reset lock | Sentinel for HA; single-node fine until you need >1 worker host |
+| **PostgreSQL** | Stateful, primary write source | Patroni (bare-metal/VM), CloudNativePG (K8s + the OS appliance) for HA. On the appliance, CNPG instances scale automatically with the promoted control-plane member count (#272). Read replicas optional — SpatiumDDI doesn't currently route reads to replicas |
+| **Redis** | Cache + Celery broker + factory-reset lock | Sentinel for HA; single-node fine until you need >1 worker host. On the appliance, Sentinel replicas scale with the member count |
+| **Appliance control plane** (k3s) | Single-binary k3s on each OS-appliance node | Promote Appliances in the Fleet UI → embedded-etcd quorum (3/5/7) + a MetalLB control-plane VIP. Self-contained — no external DCS / load balancer to run (Topology 7) |
 | **DNS agents** (BIND9 + sidecar) | Per DNS server | One agent per DNS server. 2-node HA via primary/secondary or split-horizon view |
 | **DHCP agents** (Kea + sidecar) | Per DHCP server | One agent per DHCP server. Group-centric Kea HA across 2+ peers |
 | **Backup destinations** | External (S3/SCP/Azure/SMB/FTP/GCS/WebDAV) | Out-of-band — operator's responsibility. SpatiumDDI just writes archives there |
@@ -97,6 +101,16 @@ The agent registers with the control plane on first boot, exchanges
 its PSK for a rotating JWT, then long-polls forever. See
 [`DNS_AGENT.md`](DNS_AGENT.md) for the protocol.
 
+> **OS-appliance agents take a different path.** The compose +
+> `SPATIUM_AGENT_KEY` recipe above is the raw-Docker route. If your
+> agents are SpatiumDDI OS appliances, install the **Appliance** role
+> and onboard them with an **8-digit pairing code** from `/appliance →
+> Pairing` — no hex key to copy. The agent's supervisor registers, the
+> operator approves it on `/appliance → Fleet`, and roles are assigned
+> from the UI. See the README's
+> ["Joining DNS / DHCP agents"](../../README.md#joining-dns--dhcp-agents)
+> section + [`APPLIANCE.md`](APPLIANCE.md).
+
 ---
 
 ## Topology 3 — DNS + DHCP HA pairs
@@ -134,6 +148,12 @@ API hosts behind a load balancer; PostgreSQL via Patroni (3 nodes is
 the standard quorum); Redis via Sentinel. Beat stays single-instance
 (see the table at the top — it's not horizontally scalable without
 leader-election).
+
+> **Running the OS appliance? See [Topology 7](#topology-7--appliance-multi-node-control-plane-ha-272)
+> instead** — it gives you this same HA shape self-contained (bundled
+> CNPG + Redis Sentinel + embedded etcd + a MetalLB VIP), scaled by
+> promoting appliances in the Fleet UI with no Patroni / LB / kubectl to
+> run. Topology 4 is for hand-rolled bare-metal / Docker control planes.
 
 <p align="center">
   <img src="../assets/topologies/topology-4-ha-control-plane.svg" alt="Topology 4 — HA control plane with Patroni + Redis Sentinel" width="900"/>
@@ -246,6 +266,86 @@ targets, and the upgrade-flow recipe.
 
 ---
 
+## Topology 7 — Appliance multi-node control-plane HA (#272)
+
+The self-contained version of Topology 4, built **without touching
+Patroni, Helm values, or kubectl**. Every SpatiumDDI OS appliance is a
+single-node [k3s](https://k3s.io/) cluster; you scale the control plane
+to 3 / 5 / 7 nodes by **promoting** appliances from the web UI
+(`/appliance → Fleet → Manage control plane cluster…`). This is the
+recommended HA path for operators who installed from the ISO.
+
+```
+        ┌── appliance-1 (etcd seed) ──┐  ┌── appliance-2 ──┐  ┌── appliance-3 ──┐
+        │  k3s server + etcd          │  │  k3s + etcd     │  │  k3s + etcd     │
+        │  CNPG primary               │  │  CNPG replica   │  │  CNPG replica   │
+        │  redis + sentinel           │  │  redis+sentinel │  │  redis+sentinel │
+        │  api / frontend / worker    │  │  api/fe/worker  │  │  api/fe/worker  │
+        └─────────────────────────────┘  └─────────────────┘  └─────────────────┘
+                         └──────────── MetalLB L2 control-plane VIP ────────────┘
+                                      (operators + agents hit this one IP)
+```
+
+*(SVG diagram pending — the shape is 3 appliance VMs, embedded-etcd
+quorum, one MetalLB VIP fronting the frontend, CNPG primary + 2 replicas,
+Redis Sentinel 3-node.)*
+
+**How it differs from Topology 4 / 6:**
+
+- **No external Patroni / CloudNativePG to operate.** The appliance
+  bundles the CNPG operator; promoting a node scales the `Cluster` CR's
+  instance count automatically (primary + streaming replicas + failover).
+- **Embedded etcd, not an external DCS.** k3s runs etcd in-process on
+  each server node. **Odd member counts only** (1 → 3 → 5 → 7); the API
+  refuses a batch that would land on an even total. Promotion does a full
+  k3s cluster-identity reset + rejoin of the seed's etcd (handled by the
+  supervisor's host-side `spatium-cluster-join` runner — backed up +
+  guardrailed).
+- **One floating VIP, set in the UI.** A bundled MetalLB (L2) hands the
+  frontend Service a control-plane VIP you pick in `Fleet → Control
+  plane`. Point DNS/DHCP agents + operator browsers at the VIP, not a
+  single node IP. The self-signed Web UI cert auto-grows its SANs to
+  cover every member + the VIP (an uploaded cert is never touched).
+- **Singletons handled by the chart** — 1-replica `Recreate` beat with
+  fast reschedule tolerations + a migrate Job gating app pods on the
+  alembic head. No `celery-beat-leader` to run.
+- **Control-plane workloads stay on control-plane nodes** via a per-role
+  node label, so promoting a DNS-only appliance never schedules Postgres
+  onto it.
+
+**Bring-up:**
+
+1. Install the first appliance (ISO, **Control plane** role) — that's
+   the etcd seed + a working one-node control plane.
+2. Install two more appliances and pair them (Appliance role, or a
+   second/third Control-plane install).
+3. `/appliance → Fleet → Manage control plane cluster…` → select the two
+   → promote. Within ~60 s: etcd quorum across 3, CNPG at 3 instances,
+   Redis Sentinel 3-node, api/worker/frontend at 3 replicas.
+4. `Fleet → Control plane` → set a MetalLB pool + a control-plane VIP.
+   The frontend moves onto the VIP; the cert auto-covers it.
+
+**Failure behaviour:** lose one of three nodes → etcd keeps quorum (2/3),
+CNPG fails over to a replica, the MetalLB VIP re-homes to a surviving
+node, the UI stays up on the same address. Bring the node back, or
+replace it — operator-driven dead-node replacement is the Phase 9
+follow-up tracked on [#272](https://github.com/spatiumddi/spatiumddi/issues/272).
+
+**Demote / teardown:** demoting members in the Fleet UI reverses the
+scale (the etcd seed can't be demoted; demoting to an even count is
+refused). A control-plane node can't be **revoked** while it's a live
+cluster member — demote it first.
+
+**When to use Topology 4 / 6 instead:** you already run a managed Postgres
+(RDS / Cloud SQL) or an existing Kubernetes platform, or you want
+read-scale / cross-region shapes the appliance doesn't bundle. Topology 7
+is the "I want HA without becoming a Postgres + Kubernetes operator"
+answer. Full design + the live shake-out log live in
+[issue #272](https://github.com/spatiumddi/spatiumddi/issues/272);
+the appliance internals are in [`APPLIANCE.md`](APPLIANCE.md#control-plane-high-availability-272).
+
+---
+
 ## PowerDNS-primary + BIND-secondary hybrid (driver crossover)
 
 SpatiumDDI ships two authoritative DNS drivers: BIND9 (default) and PowerDNS. Each `DNSServerGroup` is single-driver — but **multiple groups, each on a different driver, can serve overlapping namespaces** via plain AXFR or RFC 9432 catalog zones. Two operator-relevant shapes:
@@ -303,16 +403,20 @@ Replacing a BIND9 group with a PowerDNS group on the same zones is a four-step r
 | A single homelab box, 3 people max using it | Topology 1 |
 | One DC, network-edge appliances expected | Topology 2 |
 | One DC, downtime-sensitive DNS or DHCP | Topology 3 |
-| Multi-DC or cloud-first ops team | Topology 4 |
+| Hand-rolled bare-metal / Docker HA control plane | Topology 4 |
 | Branch offices feeding back to a HQ control plane | Topology 5 |
 | Anything K8s-native | Topology 6 |
+| **HA control plane from the OS appliance, no Patroni/kubectl** | **Topology 7** |
 | Need ALIAS / LUA / one-toggle DNSSEC | Add a PowerDNS group to any of the above |
 
 You can move between topologies without re-installing. Going from
 Topology 1 → 2 → 3 → 4 is purely additive: new VMs join the existing
 control plane via the agent-key bootstrap. The database doesn't
 move; you just point more agents at the same API URL and add their
-`agent_key` rows in **Settings → Agents**.
+`agent_key` rows in **Settings → Agents**. On the OS appliance, the
+1 → 3 → 5 control-plane scale (Topology 7) is likewise additive — you
+**promote** more appliances from the Fleet UI, no reinstall and no
+database move.
 
 ---
 
@@ -345,7 +449,12 @@ stateless. A few shape notes:
 ## What's NOT supported (yet)
 
 - **Active-active control plane across regions.** The schema isn't
-  partitioned for it. One Patroni cluster per install today.
+  partitioned for it. One Patroni / CNPG / appliance-etcd cluster per
+  install today.
+- **Operator-driven dead-node replacement on the appliance.** Promote /
+  demote ship today (Topology 7); evicting a permanently-dead etcd member
+  and minting a pairing code for its replacement is the Phase 9 follow-up
+  on [#272](https://github.com/spatiumddi/spatiumddi/issues/272).
 - **Multi-tenant control plane.** Coming as Phase 5 per the
   CLAUDE.md roadmap. Today, "tenants" = separate installs.
 - **Read replicas as query routes.** All reads currently go to the

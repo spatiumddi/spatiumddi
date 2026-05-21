@@ -97,6 +97,94 @@ For a step-by-step user-facing version, see the README's
 
 ---
 
+## Control-plane high availability (#272)
+
+A fresh install is a one-node control plane. Multi-node HA is built
+**by promoting Appliances**, not by a separate installer role — the
+operator scales the existing cluster from `/appliance → Fleet →
+Manage control plane cluster…`. Full design lives in
+[issue #272](https://github.com/spatiumddi/spatiumddi/issues/272);
+the reference topologies are in
+[`TOPOLOGIES.md`](TOPOLOGIES.md).
+
+### Topology + locked decisions
+
+- **k3s embedded etcd, 3 / 5 / 7 server nodes.** Every node boots
+  `cluster-init: true` (a one-member etcd). **Promotion does a full
+  cluster-identity reset + rejoin** — wiping only the etcd `db` is not
+  enough, the server CA / TLS / node password / flannel subnet all have
+  to go too, then the node rejoins the seed via
+  `https://<seed-node-ip>:6443` with the Fernet'd join token. The
+  host-side runner is `spatium-cluster-join` (etcd backup + rollback +
+  a confirmation-marker guardrail so a stray trigger file can't fire a
+  destructive wipe). **Even counts (2 / 4) are refused at the API** for
+  etcd quorum hygiene.
+- **PostgreSQL HA = CloudNativePG.** The operator-managed `Cluster` CR
+  is the permanent appliance default (`postgresql.kind=cnpg`); instances
+  scale with the committed member count (1 → 3/5/7, primary + streaming
+  replicas + automatic failover).
+- **Redis HA = Sentinel.** Each member pairs a redis-server + a sentinel
+  sidecar; app / worker / beat resolve the master via a `sentinel://`
+  URL. `sentinel.replicas` scales with the member count.
+- **MetalLB, v0.16.0, L2 mode** (air-gap baked: controller + speaker
+  only, `frrk8s.enabled=false`). Provides the control-plane VIP; BGP
+  templates render spec-only for the anycast-DNS follow-up.
+- **One TLS cert, cluster-wide**, in the `spatium-appliance-tls` Secret,
+  mounted by every frontend replica. The self-signed default uses stable
+  host identity (never the pod) and **auto-grows its SANs to cover every
+  member's hostname + node IP + the VIP** — an operator-uploaded / CSR
+  cert is never auto-replaced.
+
+### How a promote settles (per-tick, hands-off)
+
+The seed supervisor (control-plane variant) reconciles cluster-global
+state on its heartbeat:
+
+- **`# spatium:cp-size` marker.** firstboot tags the
+  CNPG `instances`, the Redis `sentinel.replicas`, and the
+  api/frontend/worker `replicas` lines in the `spatium-control`
+  HelmChart `valuesContent`. `k8s_api.scale_control_plane_helmchart()`
+  regex-rewrites them to the committed member count; helm-controller
+  upgrades the release.
+- **MetalLB / VIP (Phase 7c).** The operator's pool + VIP live on the
+  `platform_settings` singleton (`metallb_enabled` /
+  `metallb_pool_addresses` / `control_plane_vip`); the seed supervisor
+  patches `metallb.*` on `spatium-bootstrap` + `frontend.controlPlaneVIP`
+  on `spatium-control` via the same marked-line rewriter
+  (`apply_metallb_config`). The VIP also auto-threads into the api's
+  `APPLIANCE_EXTRA_CERT_SANS` so the served cert validates on it.
+- **Cert SAN reconcile (Phase 7c).** A periodic loop in the api lifespan
+  (`reconcile_cluster_cert_sans`, advisory-locked across the api
+  replicas, appliance-mode only) grows the self-signed cert as members
+  join, updates the Secret + rolls the frontend pods. Coverage only ever
+  grows, so a demote never churns the cert.
+- **Per-role node-label gating** keeps control-plane workloads on
+  control-plane nodes (`spatium.io/role-control-plane=true`), so
+  promoting a DNS-only appliance never schedules Postgres onto it
+  (CLAUDE.md non-negotiable #16).
+
+### Fleet UI
+
+`/appliance → Fleet` is two tables — **Control plane** (the 1–N k3s
+servers, including promoted Appliances) + **Service agents** (DNS/DHCP
+appliances). "Manage control plane cluster…" drives the batch
+promote/demote (odd-target enforced inline). The **Control plane** view
+also carries the Web UI cert status and the **MetalLB control-plane VIP**
+picker (enable + L2 pool + VIP, VIP-must-fall-in-pool validated). The
+etcd seed can't be demoted, and a node can't be **revoked** while it's a
+live cluster member — it must be demoted first (revoking a live etcd
+member would break quorum).
+
+### Storage note
+
+CNPG + Redis PVs use k3s local-path (`/var/lib/rancher/k3s/storage`,
+node-local on the dedicated `/var` partition so they survive A/B slot
+swaps). Replicas are per-node anyway, so node-pinned PVs are acceptable;
+a shared-storage class (Longhorn / Rook-Ceph / NFS) for true PV mobility
+is an open question on #272.
+
+---
+
 ## Post-#170 architecture (2026-05-14, superseded by #183)
 
 The architecture below was reshaped end-to-end by [issue #170](https://github.com/spatiumddi/spatiumddi/issues/170). Three threads converged:
