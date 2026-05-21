@@ -598,11 +598,13 @@ export function FleetTab() {
   // section; multi-node HA (Phase 7+) populates both.
   const controlPlaneRows = rows.filter(isControlPlaneRow);
   const serviceAgentRows = rows.filter((r) => !isControlPlaneRow(r));
+  const byHostname = (a: ApplianceRow, b: ApplianceRow) =>
+    (a.hostname ?? "").localeCompare(b.hostname ?? "", undefined, { numeric: true });
   const splitByState = (
     bucket: ApplianceRow[],
   ): { pending: ApplianceRow[]; others: ApplianceRow[] } => ({
-    pending: bucket.filter((r) => r.state === "pending_approval"),
-    others: bucket.filter((r) => r.state !== "pending_approval"),
+    pending: bucket.filter((r) => r.state === "pending_approval").sort(byHostname),
+    others: bucket.filter((r) => r.state !== "pending_approval").sort(byHostname),
   });
   const controlPlane = splitByState(controlPlaneRows);
   const serviceAgents = splitByState(serviceAgentRows);
