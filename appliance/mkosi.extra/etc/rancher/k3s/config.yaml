@@ -17,9 +17,11 @@
 #
 # External reach is gated by nftables: tcp/6443 is only accepted from
 # the pod CIDR (10.42.0.0/16) on the input chain; all other origins
-# fall through to the default-drop policy. Phase 4 widens this to the
-# control-plane CIDR via the supervisor's nftables drop-in once the
-# operator approves the cross-network kubeapi surface.
+# fall through to the default-drop policy. #272 Phase 7b widens this on
+# control-plane nodes: when the control plane promotes peers, it hands
+# each member the peer node IPs and the supervisor renders an nftables
+# drop-in opening the k3s server ports (6443 apiserver, 2379/2380 etcd,
+# 10250 kubelet) to those peers — see firewall_renderer._K3S_PEER_PORTS_TCP.
 https-listen-port: 6443
 
 # #272 Phase 7 — embedded etcd from first boot. ``cluster-init: true``

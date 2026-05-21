@@ -985,6 +985,49 @@ def read_cluster_health() -> dict[str, object] | None:
     return summary
 
 
+def read_node_ip() -> str | None:
+    """Return this node's k3s-registered InternalIP (#272 Phase 7b).
+
+    The control-plane promote endpoint needs the SEED's real, routable
+    node IP to build the ``--server https://<ip>:6443`` join URL handed
+    to joiners. ``last_seen_ip`` can't be used: the supervisor heartbeats
+    from inside the cluster, so the control plane sees its POD IP
+    (10.42.x.x), which a joiner can't reach. The node's InternalIP is the
+    address k3s itself uses for the apiserver + etcd, so it's the correct
+    join target.
+
+    Looks the local node up by NODE_NAME (downward-API ``spec.nodeName``,
+    set in the supervisor DaemonSet) and returns the first ``InternalIP``
+    address. ``None`` when not k3s, NODE_NAME is unset, or the probe
+    fails — the backend's "only update when not None" semantics then
+    leave the column untouched.
+    """
+    if detect_runtime() != "k3s":
+        return None
+    node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME")
+    if not node_name:
+        return None
+
+    from urllib.parse import quote  # noqa: PLC0415
+
+    from . import k8s_api  # noqa: PLC0415
+
+    try:
+        status_code, body = k8s_api._request("GET", f"/api/v1/nodes/{quote(node_name)}")
+    except (RuntimeError, OSError):
+        return None
+    if status_code != 200:
+        return None
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    for addr in (data.get("status") or {}).get("addresses") or []:
+        if addr.get("type") == "InternalIP" and addr.get("address"):
+            return str(addr["address"])
+    return None
+
+
 def collect() -> dict[str, object]:
     """Snapshot the agent's slot + deployment state for the heartbeat.
 
@@ -1009,6 +1052,7 @@ def collect() -> dict[str, object]:
     k3s_version = read_k3s_version() if is_appliance else None
     kubeconfig = read_kubeconfig() if is_appliance else None
     k3s_api_cert_expires_at = read_k3s_api_cert_expiry() if is_appliance else None
+    node_ip = read_node_ip() if is_appliance else None
 
     return {
         "deployment_kind": deployment_kind,
@@ -1058,4 +1102,9 @@ def collect() -> dict[str, object]:
         "k3s_join_token": read_k3s_join_token() if is_appliance else None,
         "cluster_join_state": (read_cluster_join_state()[0] if is_appliance else None),
         "cluster_join_reason": (read_cluster_join_state()[1] if is_appliance else None),
+        # #272 Phase 7b — the node's real routable InternalIP. The
+        # promote endpoint builds the k3s join URL from the seed's
+        # node_ip; ``last_seen_ip`` is the supervisor POD IP (10.42.x.x),
+        # which joiners can't reach. None on non-appliance / non-k3s.
+        "node_ip": node_ip,
     }

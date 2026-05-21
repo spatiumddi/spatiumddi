@@ -65,7 +65,8 @@ async def _seed(db: AsyncSession) -> Appliance:
         "seed",
         appliance_variant="control-plane",
         cluster_role=CLUSTER_ROLE_PRIMARY,
-        last_seen_ip="10.0.0.1",
+        last_seen_ip="10.42.0.6",  # supervisor POD IP — must NOT be used
+        node_ip="10.0.0.1",  # real routable node IP — the join target
         k3s_join_token_encrypted=encrypt_str("K10::servertoken"),
     )
 
@@ -139,6 +140,33 @@ async def test_promote_requires_seed_token(db_session: AsyncSession, client: Asy
     assert "join token" in resp.text
 
 
+async def test_promote_requires_seed_node_ip(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session)
+    # Seed reported a token but only a pod IP (no node_ip) — the join URL
+    # can't be built from a pod IP, so promote must refuse.
+    await _appliance(
+        db_session,
+        "seed",
+        appliance_variant="control-plane",
+        cluster_role=CLUSTER_ROLE_PRIMARY,
+        last_seen_ip="10.42.0.6",
+        k3s_join_token_encrypted=encrypt_str("K10::servertoken"),
+    )
+    a = await _appliance(db_session, "app1", appliance_variant="appliance")
+    b = await _appliance(db_session, "app2", appliance_variant="appliance")
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/appliance/fleet/control-plane/promote",
+        json={"appliance_ids": [str(a.id), str(b.id)]},
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 409
+    assert "node IP" in resp.text
+
+
 async def test_promote_designates_lone_seed(db_session: AsyncSession, client: AsyncClient) -> None:
     token = await _admin(db_session)
     # Single control-plane node with no cluster_role yet → designated.
@@ -146,7 +174,8 @@ async def test_promote_designates_lone_seed(db_session: AsyncSession, client: As
         db_session,
         "seed",
         appliance_variant="control-plane",
-        last_seen_ip="10.0.0.9",
+        last_seen_ip="10.42.0.7",
+        node_ip="10.0.0.9",
         k3s_join_token_encrypted=encrypt_str("K10::tok"),
     )
     a = await _appliance(db_session, "app1", appliance_variant="appliance")

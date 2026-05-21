@@ -1014,6 +1014,12 @@ class SupervisorHeartbeatRequest(BaseModel):
     k3s_join_token: str | None = None
     cluster_join_state: str | None = None
     cluster_join_reason: str | None = None
+    # #272 Phase 7b — the node's real routable k3s InternalIP. Distinct
+    # from ``last_seen_ip`` (the supervisor POD's source IP, 10.42.x.x,
+    # since it heartbeats from inside the cluster). The promote endpoint
+    # builds the join URL from the seed's ``node_ip``. None on
+    # non-appliance / non-k3s; the handler leaves the column untouched.
+    node_ip: str | None = None
 
 
 class SupervisorRoleAssignment(BaseModel):
@@ -1116,6 +1122,15 @@ class SupervisorHeartbeatResponse(BaseModel):
     desired_cluster_role: Literal["member", "none"] | None = None
     desired_k3s_server_url: str | None = None
     desired_k3s_join_token: str | None = None
+    # #272 Phase 7b — the node IPs (as ``/32`` CIDRs) of every OTHER
+    # control-plane peer this node must reach (and be reachable from) on
+    # the k3s server ports (6443 apiserver, 2379/2380 etcd, 10250
+    # kubelet). The base appliance firewall only opens :6443 from the pod
+    # CIDR, so cross-node server traffic (the join handshake + etcd
+    # quorum) is dropped without this. The supervisor renders an
+    # nftables drop-in opening those ports from these peers. Empty on a
+    # single-node / non-control-plane appliance.
+    cluster_peer_cidrs: list[str] = Field(default_factory=list)
 
 
 @router.post(
@@ -1293,16 +1308,19 @@ async def supervisor_heartbeat(
         from app.core.crypto import encrypt_str  # noqa: PLC0415
 
         # Rewrite ``server: https://127.0.0.1:6443`` → the appliance's
-        # last-seen IP so the operator's downloaded kubeconfig
-        # actually works against the appliance over the wire. Falls
-        # back to localhost when last_seen_ip is unknown (operator
-        # can edit themselves). Same IP we surface in the row chip.
+        # real node IP so the operator's downloaded kubeconfig actually
+        # works against the appliance over the wire. Prefer the
+        # k3s-registered ``node_ip`` over ``last_seen_ip`` — the latter
+        # is the supervisor POD's source IP (10.42.x.x), which the
+        # operator can't reach. Falls back to localhost when neither is
+        # known (operator can edit themselves).
         rewritten = body.kubeconfig
-        if row.last_seen_ip:
+        kubeconfig_host = body.node_ip or row.node_ip or row.last_seen_ip
+        if kubeconfig_host:
             # k3s.yaml's server line is structured + greppable; the
             # supervisor doesn't run a port-7443 listener so 6443 is
             # always the right target port.
-            new_server = f"server: https://{row.last_seen_ip}:6443"
+            new_server = f"server: https://{kubeconfig_host}:6443"
             rewritten = re.sub(
                 r"server:\s*https://127\.0\.0\.1:6443",
                 new_server,
@@ -1325,6 +1343,12 @@ async def supervisor_heartbeat(
     if body.cluster_join_state is not None:
         row.cluster_join_state = body.cluster_join_state
         row.cluster_join_reason = body.cluster_join_reason
+    # The node's real routable InternalIP — used by the promote endpoint
+    # for the join URL + the cross-node firewall peer set. Only update
+    # when the supervisor sourced it (k3s appliances); None leaves the
+    # column untouched.
+    if body.node_ip is not None:
+        row.node_ip = body.node_ip
 
     # Auto-clear the promote desired-state once the join landed: the
     # supervisor reports ``ready`` → the node IS a member now, so settle
@@ -1420,6 +1444,10 @@ async def supervisor_heartbeat(
                 "supervisor_heartbeat_join_token_decrypt_failed", appliance_id=str(row.id)
             )
 
+    # #272 Phase 7b — the cross-node firewall peer set this node must
+    # open its k3s server ports to (empty unless row is a CP node).
+    cluster_peer_cidrs = await _cluster_peer_cidrs(db, row)
+
     return SupervisorHeartbeatResponse(
         appliance_id=row.id,
         state=row.state,  # type: ignore[arg-type]
@@ -1435,6 +1463,7 @@ async def supervisor_heartbeat(
         desired_cluster_role=row.desired_cluster_role,  # type: ignore[arg-type]
         desired_k3s_server_url=row.desired_k3s_server_url,
         desired_k3s_join_token=desired_join_token,
+        cluster_peer_cidrs=cluster_peer_cidrs,
     )
 
 
@@ -1934,9 +1963,7 @@ async def delete_appliance(
                     Appliance.state != APPLIANCE_STATE_REVOKED,
                     or_(
                         Appliance.appliance_variant.in_(tuple(_SELF_BOOTSTRAP_VARIANTS)),
-                        Appliance.cluster_role.in_(
-                            (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
-                        ),
+                        Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
                     ),
                 )
             )
@@ -2398,6 +2425,27 @@ async def _effective_cp_members(db: DB) -> list[Appliance]:
     return [r for r in rows if r.desired_cluster_role != DESIRED_CLUSTER_ROLE_NONE]
 
 
+async def _cluster_peer_cidrs(db: DB, row: Appliance) -> list[str]:
+    """``/32`` CIDRs of every OTHER control-plane peer ``row`` must open
+    its k3s server ports to (#272 Phase 7b).
+
+    Only meaningful when ``row`` is itself a control-plane node — a
+    settled member/primary, or a node mid-promotion
+    (``desired_cluster_role='member'``). In-flight joiners need the peer
+    set too: the seed must open :6443 to the joiner BEFORE it connects,
+    and the joiner must open etcd ports back. Returns an empty list for
+    plain application appliances + single-node installs (no peers).
+    """
+    is_cp = (
+        row.cluster_role in (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+        or row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+    )
+    if not is_cp:
+        return []
+    members = await _effective_cp_members(db)
+    return sorted(f"{m.node_ip}/32" for m in members if m.id != row.id and m.node_ip)
+
+
 async def _resolve_primary(db: DB, members: list[Appliance]) -> Appliance | None:
     """Return the etcd seed (``cluster_role='primary'``), designating
     one on the first promote.
@@ -2458,11 +2506,12 @@ async def promote_control_plane(
             "No single control-plane seed found to join. Exactly one approved "
             "full-stack / frontend-core appliance is required as the etcd seed.",
         )
-    if primary.k3s_join_token_encrypted is None or not primary.last_seen_ip:
+    if primary.k3s_join_token_encrypted is None or not primary.node_ip:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            "The control-plane seed hasn't reported its k3s join token / IP yet — "
-            "wait for its next heartbeat and retry.",
+            "The control-plane seed hasn't reported its k3s join token / node IP yet — "
+            "wait for its next heartbeat and retry. (The join URL needs the seed's real "
+            "node IP, not the supervisor pod IP.)",
         )
 
     # Count the seed even when it was just designated (cluster_role was
@@ -2520,7 +2569,11 @@ async def promote_control_plane(
             f"{'one fewer' if len(targets) > 1 else 'one more'} so the total is odd.",
         )
 
-    server_url = f"https://{primary.last_seen_ip}:6443"
+    # Build the join URL from the seed's REAL node IP, never
+    # ``last_seen_ip`` (the supervisor pod IP, 10.42.x.x — unreachable
+    # by joiners). ``node_ip`` is the k3s-registered InternalIP the
+    # supervisor reports on heartbeat.
+    server_url = f"https://{primary.node_ip}:6443"
     for row in targets:
         row.desired_cluster_role = DESIRED_CLUSTER_ROLE_MEMBER
         row.desired_k3s_server_url = server_url

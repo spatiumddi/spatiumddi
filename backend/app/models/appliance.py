@@ -687,6 +687,15 @@ class Appliance(Base):
     # ``joining`` | ``ready`` | ``leaving`` | ``failed`` | NULL (idle).
     cluster_join_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
     cluster_join_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The node's k3s-registered InternalIP, reported by the supervisor on
+    # heartbeat (``kubectl get node <self> -o …InternalIP``). This is the
+    # appliance's REAL routable host IP — distinct from ``last_seen_ip``,
+    # which is the supervisor POD's source IP (10.42.x.x) since it
+    # heartbeats from inside the cluster. The promote endpoint builds the
+    # join URL (``https://<node_ip>:6443``) from the seed's ``node_ip``; a
+    # pod/service IP there is unreachable by joiners. Also the source for
+    # the cross-node firewall peer set + the operator kubeconfig rewrite.
+    node_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

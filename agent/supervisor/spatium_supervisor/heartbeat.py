@@ -261,6 +261,7 @@ def _watchdog_check_due() -> bool:
 def _maybe_apply_firewall(
     role_assignment: dict[str, Any] | None,
     log: structlog.stdlib.BoundLogger,
+    cluster_peer_cidrs: list[Any] | None = None,
 ) -> None:
     """Render the firewall drop-in + write a trigger file the host
     runner picks up.
@@ -290,7 +291,7 @@ def _maybe_apply_firewall(
     if appliance_state.detect_deployment_kind() != "appliance":
         return
 
-    profile: FirewallProfile = render_drop_in(role_assignment)
+    profile: FirewallProfile = render_drop_in(role_assignment, cluster_peer_cidrs)
     body = profile.body
     body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -572,8 +573,17 @@ def heartbeat_once(
     # operator-CIDR-allowlist (Phase 6 kubeapi_expose_cidrs) case,
     # which needs a host-side trigger-file path before it works
     # in-pod (Phase 9 follow-up).
-    if cfg.in_pod_firewall_enabled:
-        _maybe_apply_firewall(role_assignment, log)
+    # #272 Phase 7b — control-plane peer firewall openings. The base
+    # appliance /etc/nftables.conf only accepts :6443 from the pod CIDR,
+    # so a multi-node join + etcd quorum is dropped without opening the
+    # k3s server ports to the peer node IPs. Unlike the role-driven
+    # rules (which the host static config already covers, hence the
+    # default-off in_pod_firewall_enabled gate), the peer openings are
+    # ESSENTIAL — apply them whenever the control plane hands us a peer
+    # set, regardless of that gate.
+    cluster_peer_cidrs = body_out.get("cluster_peer_cidrs") or []
+    if cfg.in_pod_firewall_enabled or cluster_peer_cidrs:
+        _maybe_apply_firewall(role_assignment, log, cluster_peer_cidrs)
 
     target = compute_target_env(role_assignment)
     # #170 Wave D follow-up — the role env file carries ONLY role-
