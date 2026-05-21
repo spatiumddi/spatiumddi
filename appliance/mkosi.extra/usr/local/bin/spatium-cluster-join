@@ -64,6 +64,28 @@ mkdir -p "$LOG_DIR" "$RELEASE_STATE"
 
 log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" | tee -a "$LOG"; }
 
+# Clean the k3s runtime before a (re)start. k3s's `systemctl stop`
+# notoriously leaves orphaned containerd-shim processes behind (this is
+# exactly why upstream ships k3s-killall.sh — which the appliance does
+# NOT bake). Across repeated join/rollback cycles those shims pile up by
+# the hundred, pollute the service cgroup, and ``systemctl start k3s``
+# starts failing. On top of that, rapid restart cycling trips systemd's
+# StartLimitBurst (5/10s) so ``systemctl start`` returns failure in <1s
+# without even launching k3s. Both manifested as the #272 Phase 7b join
+# loop. So before every start: reap orphaned shims + reset the start
+# counter. Best-effort — never fail the join on cleanup.
+clean_k3s_runtime() {
+    systemctl reset-failed k3s 2>/dev/null || true
+    # Reap data-plane leftovers a prior stop didn't (shims + their
+    # containerd). Safe because k3s is stopped at every call site.
+    pkill -9 -f 'containerd-shim' 2>/dev/null || true
+    pkill -9 -f 'k3s/data' 2>/dev/null || true
+    # Unmount stale kubelet pod + k3s mounts so the next start sees a
+    # clean tree (longest paths first).
+    awk '$2 ~ "/var/lib/kubelet/pods|/run/k3s|/var/lib/rancher/k3s" {print $2}' /proc/mounts \
+        | sort -r | while read -r m; do umount "$m" 2>/dev/null || true; done
+}
+
 # State sidecar the supervisor reads (state<TAB>reason). Keep the
 # vocabulary in lock-step with the supervisor's appliance_state.py:
 #   joining | ready | leaving | left | failed
@@ -168,6 +190,7 @@ EOF
     chmod 0600 "$JOIN_DROPIN"
 
     log "restarting k3s to join $server_url"
+    clean_k3s_runtime
     if systemctl start k3s && wait_ready; then
         log "JOIN ok — node is Ready as a control-plane member"
         write_state ready "$server_url"
@@ -191,6 +214,7 @@ EOF
         mv -f "$MANIFESTS_ASIDE"/*.yaml "$K3S_MANIFESTS/" || true
         log "restored local bootstrap manifests"
     fi
+    clean_k3s_runtime
     systemctl start k3s || true
     write_state failed "join failed; rolled back to single-node"
     mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
@@ -218,6 +242,7 @@ do_leave() {
     fi
 
     log "restarting k3s as a fresh single-node seed"
+    clean_k3s_runtime
     if systemctl start k3s && wait_ready; then
         log "LEAVE ok — node is a standalone single-node cluster again"
         write_state left ""
