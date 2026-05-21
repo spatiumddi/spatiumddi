@@ -188,6 +188,115 @@ async def _generate_activate_deploy(
     deploy_and_reload(cert_pem, key_pem, name=row.name)
 
 
+# #272 Phase 7c — advisory-lock key so only one api replica regenerates
+# the shared self-signed cert at a time. The api Deployment runs N pods
+# (one per control-plane node), all running the periodic reconcile loop
+# below against one shared spatium-appliance-tls Secret + one active
+# appliance_certificate row. A Postgres transaction-level advisory lock
+# serialises them; losers no-op. Arbitrary stable bigint.
+_CERT_RECONCILE_LOCK_KEY = 0x5350433727  # "SPC7c"-ish
+
+
+async def reconcile_cluster_cert_sans() -> dict[str, object]:
+    """Grow the self-signed Web UI cert's SANs to cover every settled
+    control-plane member (hostname + node IP) plus the control-plane VIP
+    (#272 Phase 7c).
+
+    Only ever touches a **self-signed** active cert — an operator-uploaded
+    or CSR-signed cert is left alone (the operator owns those SANs). SAN
+    coverage only GROWS: a demoted node's SAN stays in the cert (harmless),
+    so a demote never rolls the frontend. Idempotent + coverage-gated, so
+    it's a cheap no-op once converged; on growth it regenerates the cert,
+    updates the ``spatium-appliance-tls`` Secret, and rolls the frontend
+    pods (via ``_generate_activate_deploy`` → ``deploy_and_reload``).
+
+    Runs from a periodic api-side loop (main.lifespan); a per-transaction
+    advisory lock keeps the api replicas from regenerating concurrently.
+    """
+    if not settings.appliance_mode:
+        return {"status": "disabled"}
+
+    from sqlalchemy import text  # noqa: PLC0415
+
+    from app.models.appliance import (  # noqa: PLC0415
+        APPLIANCE_STATE_APPROVED,
+        CLUSTER_ROLE_MEMBER,
+        CLUSTER_ROLE_PRIMARY,
+        Appliance,
+    )
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as db:
+        # One regenerator at a time across the api replicas. The lock is
+        # held until this transaction commits/rolls back; losers bail.
+        got = (
+            await db.execute(
+                text("select pg_try_advisory_xact_lock(:k)"),
+                {"k": _CERT_RECONCILE_LOCK_KEY},
+            )
+        ).scalar()
+        if not got:
+            return {"status": "locked"}
+
+        active_row = (
+            await db.execute(
+                select(ApplianceCertificate).where(ApplianceCertificate.is_active.is_(True))
+            )
+        ).scalar_one_or_none()
+        if active_row is None or not active_row.cert_pem:
+            # No active cert yet — startup bootstrap owns the first issue.
+            return {"status": "no-active-cert"}
+        if active_row.source != CERT_SOURCE_SELF_SIGNED:
+            # Operator owns this cert + its SANs — never auto-replace it.
+            return {"status": "operator-cert"}
+
+        # Stable seed identity, same inputs ensure_self_signed_cert uses.
+        hostname = settings.appliance_hostname or "spatiumddi-appliance"
+        ips = _parse_host_ips(settings.appliance_host_ips)
+        extra_sans = _parse_extra_sans(settings.appliance_extra_cert_sans)
+
+        # Union in every settled control-plane member: node IP as an IP
+        # SAN, hostname as a DNS SAN.
+        members = (
+            (
+                await db.execute(
+                    select(Appliance).where(
+                        Appliance.state == APPLIANCE_STATE_APPROVED,
+                        Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for m in members:
+            if m.node_ip and m.node_ip not in ips:
+                ips.append(m.node_ip)
+            if m.hostname and m.hostname not in extra_sans:
+                extra_sans.append(m.hostname)
+
+        # Control-plane VIP (platform_settings singleton) as an IP SAN.
+        ps = (
+            await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+        ).scalar_one_or_none()
+        if ps and ps.control_plane_vip and ps.control_plane_vip not in extra_sans:
+            extra_sans.append(ps.control_plane_vip)
+
+        desired = _desired_sans(hostname, ips, extra_sans)
+        if _sans_cover(active_row.sans_json, desired):
+            return {"status": "covered", "sans": desired}
+
+        logger.info(
+            "appliance_cluster_cert_regenerating",
+            old_sans=active_row.sans_json,
+            new_sans=desired,
+            members=[m.hostname for m in members],
+        )
+        active_row.is_active = False
+        await _generate_activate_deploy(db, hostname, ips, extra_sans)
+        return {"status": "regenerated", "sans": desired}
+
+
 # ── Helpers ─────────────────────────────────────────────────────────
 
 
