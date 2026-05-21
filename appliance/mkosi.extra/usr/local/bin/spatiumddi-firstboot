@@ -419,6 +419,19 @@ spec:
     # control-plane node enables it.
     cnpg:
       enabled: ${cnpg_enabled}
+    # #272 Phase 7c — MetalLB L2 pool for the control-plane VIP. Off /
+    # empty on a fresh install; the seed supervisor patches these marked
+    # lines from platform_settings when the operator sets a pool + VIP in
+    # Fleet → Control plane. ``ipPool.addresses`` renders as a flow-style
+    # YAML list (e.g. ["192.0.2.240/28"]); the supervisor writes JSON,
+    # which is valid flow YAML. When enabled, the controller/speaker come
+    # up + the IPAddressPool / L2Advertisement land (templates/
+    # metallb-pool.yaml). The VIP itself is set on the umbrella chart's
+    # frontend Service (see spatium-control above).
+    metallb:
+      enabled: false  # spatium:metallb-enabled
+      ipPool:
+        addresses: []  # spatium:metallb-pool
 EOF
 }
 
@@ -468,6 +481,15 @@ spec:
     frontend:
       replicas: 1  # spatium:cp-size
       hostNetwork: true
+      # #272 Phase 7c — control-plane VIP. Empty on a fresh install
+      # (hostNetwork frontend, no VIP); the seed supervisor patches this
+      # marked line from platform_settings when the operator sets a VIP
+      # in Fleet → Control plane. A non-empty value supersedes
+      # hostNetwork (the chart drops it + flips the Service to a
+      # LoadBalancer) and threads the VIP into the api's
+      # APPLIANCE_EXTRA_CERT_SANS so the served cert validates on it.
+      controlPlaneVIP: ""  # spatium:metallb-vip
+      controlPlaneVIPPool: spatium-control-plane
       tls:
         enabled: true
         secretName: spatium-appliance-tls

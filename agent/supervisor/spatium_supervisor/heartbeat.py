@@ -578,6 +578,31 @@ def heartbeat_once(
         elif err:
             log.warning("supervisor.heartbeat.control_plane_scale_failed", error=err, size=cp_size)
 
+        # #272 Phase 7c — apply the cluster-wide MetalLB pool + control-
+        # plane VIP. Same seed-only gate as the cp-size scale above (the
+        # spatium-bootstrap + spatium-control HelmCharts live on the
+        # seed; on members the GET 404s → no-op). Idempotent — patches
+        # only when the rendered values differ, so it stays quiet once
+        # converged and reconverges one tick after the operator changes
+        # the config in the Fleet UI.
+        ml_enabled = bool(body_out.get("desired_metallb_enabled"))
+        ml_pool = body_out.get("desired_metallb_pool_addresses") or []
+        ml_vip = body_out.get("desired_control_plane_vip") or ""
+        ml_changed, ml_err = k8s_api.apply_metallb_config(
+            enabled=ml_enabled,
+            pool_addresses=list(ml_pool),
+            control_plane_vip=str(ml_vip),
+        )
+        if ml_changed:
+            log.info(
+                "supervisor.heartbeat.metallb_applied",
+                enabled=ml_enabled,
+                pool=list(ml_pool),
+                vip=ml_vip,
+            )
+        elif ml_err:
+            log.warning("supervisor.heartbeat.metallb_apply_failed", error=ml_err)
+
     # #170 Wave C2 — render the role-driven compose env. C3 will
     # consume this via ``docker compose --env-file`` to actually
     # bring services up/down; for now we just write the file so the

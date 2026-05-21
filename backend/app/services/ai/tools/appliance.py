@@ -215,6 +215,48 @@ async def find_appliance_fleet(
     }
 
 
+# ── find_control_plane_vip ─────────────────────────────────────────
+
+
+class FindControlPlaneVipArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="find_control_plane_vip",
+    description=(
+        "Read the cluster-wide MetalLB control-plane VIP config "
+        "(superadmin only, #272 Phase 7c). Returns whether MetalLB is "
+        "enabled, the L2 address pool, and the floating VIP that fronts "
+        "the Web UI across control-plane nodes. Read-only — changing the "
+        "VIP is a high-blast-radius operation (it can sever Web UI / "
+        "agent reachability) and is done in Fleet → Control plane, not "
+        "via the Copilot."
+    ),
+    args_model=FindControlPlaneVipArgs,
+    category="admin",
+    default_enabled=True,
+    module="appliance.fleet",
+)
+async def find_control_plane_vip(
+    db: AsyncSession, user: User, args: FindControlPlaneVipArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+    from app.models.settings import PlatformSettings
+
+    row = (
+        await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    if row is None:
+        return {"enabled": False, "pool_addresses": [], "control_plane_vip": ""}
+    return {
+        "enabled": bool(row.metallb_enabled),
+        "pool_addresses": list(row.metallb_pool_addresses or []),
+        "control_plane_vip": row.control_plane_vip or "",
+    }
+
+
 # ── propose_approve_appliance ──────────────────────────────────────
 
 

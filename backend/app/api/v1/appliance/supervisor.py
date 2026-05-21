@@ -38,6 +38,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import re
 import secrets
 import uuid
@@ -53,7 +54,7 @@ from cryptography.hazmat.primitives.serialization import (
     load_der_public_key,
 )
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func as sa_func
 from sqlalchemy import or_, select
 
@@ -1138,6 +1139,15 @@ class SupervisorHeartbeatResponse(BaseModel):
     # Deployments scale with the cluster (1 instance single-node →
     # 3/5/7 with streaming replicas + failover after promote).
     control_plane_size: int = 1
+    # #272 Phase 7c — cluster-wide MetalLB / control-plane-VIP desired
+    # state (from platform_settings). Returned to every supervisor but
+    # acted on only by the seed (control-plane variant): it patches
+    # ``metallb.*`` on spatium-bootstrap + ``frontend.controlPlaneVIP``
+    # on spatium-control. Disabled / empty = no VIP (hostNetwork
+    # frontend), the single-node default.
+    desired_metallb_enabled: bool = False
+    desired_metallb_pool_addresses: list[str] = Field(default_factory=list)
+    desired_control_plane_vip: str = ""
 
 
 @router.post(
@@ -1460,6 +1470,18 @@ async def supervisor_heartbeat(
     # workload replicas to this.
     control_plane_size = await _committed_cp_count(db)
 
+    # #272 Phase 7c — cluster-wide MetalLB / VIP desired state. Read
+    # from the platform_settings singleton; the seed supervisor applies
+    # it to the HelmCharts. Best-effort — a missing settings row (never
+    # the case in practice; seeded at startup) renders the disabled
+    # default so the heartbeat still succeeds.
+    cfg_row = (
+        await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    metallb_enabled = bool(cfg_row.metallb_enabled) if cfg_row else False
+    metallb_pool = list(cfg_row.metallb_pool_addresses or []) if cfg_row else []
+    metallb_vip = (cfg_row.control_plane_vip or "") if cfg_row else ""
+
     return SupervisorHeartbeatResponse(
         appliance_id=row.id,
         state=row.state,  # type: ignore[arg-type]
@@ -1477,6 +1499,9 @@ async def supervisor_heartbeat(
         desired_k3s_join_token=desired_join_token,
         cluster_peer_cidrs=cluster_peer_cidrs,
         control_plane_size=control_plane_size,
+        desired_metallb_enabled=metallb_enabled,
+        desired_metallb_pool_addresses=metallb_pool,
+        desired_control_plane_vip=metallb_vip,
     )
 
 
@@ -2720,6 +2745,204 @@ async def demote_control_plane(
         user=current_user.username,
     )
     return ApplianceList(appliances=[_row_to_schema(r) for r in targets])
+
+
+# ── Admin: MetalLB control-plane VIP (#272 Phase 7c) ─────────────
+
+
+def _parse_pool_entry(raw: str) -> tuple[int, int, int]:
+    """Normalise one MetalLB pool entry to ``(version, first_int, last_int)``.
+
+    Accepts a CIDR (``192.0.2.0/28``), a hyphen range
+    (``192.0.2.10-192.0.2.20``), or a single host (``192.0.2.5``).
+    Raises ``ValueError`` on anything malformed (so the field
+    validator can surface a 422 with the offending entry).
+    """
+    s = raw.strip()
+    if "-" in s and "/" not in s:
+        lo_s, _, hi_s = s.partition("-")
+        lo = ipaddress.ip_address(lo_s.strip())
+        hi = ipaddress.ip_address(hi_s.strip())
+        if lo.version != hi.version:
+            raise ValueError(f"range {raw!r} mixes IPv4 and IPv6")
+        if int(lo) > int(hi):
+            raise ValueError(f"range {raw!r} is reversed (start > end)")
+        return (lo.version, int(lo), int(hi))
+    if "/" in s:
+        net = ipaddress.ip_network(s, strict=False)
+        return (net.version, int(net.network_address), int(net.broadcast_address))
+    host = ipaddress.ip_address(s)
+    return (host.version, int(host), int(host))
+
+
+def _vip_in_pool(vip: str, pool: list[str]) -> bool:
+    """True when ``vip`` falls inside any entry of ``pool``."""
+    addr = ipaddress.ip_address(vip.strip())
+    for entry in pool:
+        try:
+            version, lo, hi = _parse_pool_entry(entry)
+        except ValueError:
+            continue
+        if version == addr.version and lo <= int(addr) <= hi:
+            return True
+    return False
+
+
+class MetalLBConfigResponse(BaseModel):
+    """Cluster-wide MetalLB / control-plane-VIP config (Fleet UI)."""
+
+    enabled: bool = False
+    pool_addresses: list[str] = Field(default_factory=list)
+    control_plane_vip: str = ""
+
+
+class MetalLBConfigUpdate(BaseModel):
+    """PUT body for the MetalLB / control-plane-VIP config.
+
+    All-or-nothing replace (not a partial merge) — the Fleet card
+    always submits the full state. Validators canonicalise pool
+    entries + enforce the VIP-in-pool / enabled-needs-pool invariants
+    so a half-configured state can never reach the chart.
+    """
+
+    enabled: bool = False
+    pool_addresses: list[str] = Field(default_factory=list)
+    control_plane_vip: str = ""
+
+    @field_validator("pool_addresses")
+    @classmethod
+    def _valid_pool(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in v:
+            s = raw.strip()
+            if not s:
+                continue
+            try:
+                _parse_pool_entry(s)
+            except ValueError as exc:
+                raise ValueError(f"invalid pool entry {raw!r}: {exc}") from exc
+            out.append(s)
+        return out
+
+    @field_validator("control_plane_vip")
+    @classmethod
+    def _valid_vip(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            return ""
+        try:
+            ipaddress.ip_address(s)
+        except ValueError as exc:
+            raise ValueError(f"control_plane_vip must be a single IP: {exc}") from exc
+        return s
+
+    @model_validator(mode="after")
+    def _cross_field(self) -> MetalLBConfigUpdate:
+        if self.enabled:
+            if not self.pool_addresses:
+                raise ValueError("an address pool is required when MetalLB is enabled")
+            if not self.control_plane_vip:
+                raise ValueError("a control-plane VIP is required when MetalLB is enabled")
+        if self.control_plane_vip and self.pool_addresses:
+            if not _vip_in_pool(self.control_plane_vip, self.pool_addresses):
+                raise ValueError(
+                    f"control-plane VIP {self.control_plane_vip} is not inside the " "address pool"
+                )
+        return self
+
+
+async def _get_or_create_settings(db: DB) -> PlatformSettings:
+    row = (
+        await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    if row is None:
+        row = PlatformSettings(id=1)
+        db.add(row)
+        await db.flush()
+    return row
+
+
+@router.get(
+    "/fleet/control-plane/metallb",
+    response_model=MetalLBConfigResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Read the cluster MetalLB / control-plane-VIP config (superadmin)",
+)
+async def get_metallb_config(
+    current_user: CurrentUser,
+    db: DB,
+) -> MetalLBConfigResponse:
+    _require_superadmin(current_user)
+    row = await _get_or_create_settings(db)
+    return MetalLBConfigResponse(
+        enabled=row.metallb_enabled,
+        pool_addresses=list(row.metallb_pool_addresses or []),
+        control_plane_vip=row.control_plane_vip or "",
+    )
+
+
+@router.put(
+    "/fleet/control-plane/metallb",
+    response_model=MetalLBConfigResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Set the cluster MetalLB / control-plane-VIP config (superadmin)",
+)
+async def put_metallb_config(
+    body: MetalLBConfigUpdate,
+    current_user: CurrentUser,
+    db: DB,
+) -> MetalLBConfigResponse:
+    """Persist the cluster-wide MetalLB pool + control-plane VIP.
+
+    Validated all-or-nothing (VIP must fall inside the pool; enabling
+    requires both). The seed supervisor picks the new values up on its
+    next heartbeat (``desired_metallb_*`` in the response) and patches
+    the spatium-bootstrap + spatium-control HelmCharts; helm-controller
+    then renders the IPAddressPool / L2Advertisement + flips the
+    frontend Service to a LoadBalancer on the VIP. Idempotent.
+    """
+    _require_superadmin(current_user)
+    row = await _get_or_create_settings(db)
+    old = {
+        "enabled": row.metallb_enabled,
+        "pool_addresses": list(row.metallb_pool_addresses or []),
+        "control_plane_vip": row.control_plane_vip or "",
+    }
+    row.metallb_enabled = body.enabled
+    row.metallb_pool_addresses = body.pool_addresses
+    row.control_plane_vip = body.control_plane_vip
+    new = {
+        "enabled": body.enabled,
+        "pool_addresses": body.pool_addresses,
+        "control_plane_vip": body.control_plane_vip,
+    }
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.metallb_config_updated",
+            resource_type="platform_settings",
+            resource_id="1",
+            resource_display="MetalLB control-plane VIP",
+            result="success",
+            old_value=old,
+            new_value=new,
+        )
+    )
+    await db.commit()
+    logger.info(
+        "metallb_config_updated",
+        enabled=body.enabled,
+        pool=body.pool_addresses,
+        vip=body.control_plane_vip,
+        user=current_user.username,
+    )
+    return MetalLBConfigResponse(
+        enabled=row.metallb_enabled,
+        pool_addresses=list(row.metallb_pool_addresses or []),
+        control_plane_vip=row.control_plane_vip or "",
+    )
 
 
 # ── Admin: OS upgrade + reboot (#170 Wave D1) ────────────────────

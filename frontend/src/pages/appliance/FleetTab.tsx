@@ -30,6 +30,7 @@ import {
   type ApplianceCertificate,
   type ApplianceRow,
   type ApplianceState,
+  type MetalLBConfig,
   type SlotImage,
   type SupervisorCapabilities,
   formatApiError,
@@ -484,7 +485,11 @@ function ControlPlaneTlsCard({ onManage }: { onManage: () => void }) {
       (new Date(active.valid_to).getTime() - Date.now()) / 86_400_000,
     );
     const tone =
-      days < 0 ? "text-rose-600" : days < 14 ? "text-amber-600" : "text-muted-foreground";
+      days < 0
+        ? "text-rose-600"
+        : days < 14
+          ? "text-amber-600"
+          : "text-muted-foreground";
     expiry = {
       text:
         days < 0
@@ -526,7 +531,10 @@ function ControlPlaneTlsCard({ onManage }: { onManage: () => void }) {
         ) : active ? (
           <div className="flex flex-col gap-0.5">
             <span>
-              Active: <span className="font-mono text-foreground">{active.subject_cn}</span>
+              Active:{" "}
+              <span className="font-mono text-foreground">
+                {active.subject_cn}
+              </span>
             </span>
             {expiry && <span className={expiry.tone}>{expiry.text}</span>}
             {active.sans.length > 0 && (
@@ -545,9 +553,152 @@ function ControlPlaneTlsCard({ onManage }: { onManage: () => void }) {
       </div>
       <p className="mt-2 text-xs text-muted-foreground">
         Served on every control-plane frontend replica via the{" "}
-        <span className="font-mono">spatium-appliance-tls</span> Secret — uploading
-        or activating a cert rolls all replicas automatically.
+        <span className="font-mono">spatium-appliance-tls</span> Secret —
+        uploading or activating a cert rolls all replicas automatically.
       </p>
+    </div>
+  );
+}
+
+// #272 Phase 7c — cluster-wide MetalLB pool + control-plane VIP picker.
+// Lives on Fleet → Control plane next to the TLS card. The operator
+// sets an L2 address pool + a floating VIP; the seed supervisor picks
+// the saved config up on its next heartbeat (~60 s) and patches the
+// HelmCharts so the frontend Service floats on the VIP across nodes.
+function MetalLBConfigCard() {
+  const qc = useQueryClient();
+  const { data, isLoading } = useQuery({
+    queryKey: ["appliance", "metallb"],
+    queryFn: applianceApprovalApi.getMetalLBConfig,
+    staleTime: 30_000,
+  });
+
+  const [enabled, setEnabled] = useState(false);
+  const [poolText, setPoolText] = useState("");
+  const [vip, setVip] = useState("");
+  const [dirty, setDirty] = useState(false);
+
+  // Seed the form from the server once it loads (and re-seed after a
+  // save) — but never clobber in-progress operator edits.
+  useEffect(() => {
+    if (data && !dirty) {
+      setEnabled(data.enabled);
+      setPoolText((data.pool_addresses ?? []).join("\n"));
+      setVip(data.control_plane_vip ?? "");
+    }
+  }, [data, dirty]);
+
+  const save = useMutation({
+    mutationFn: (body: MetalLBConfig) =>
+      applianceApprovalApi.setMetalLBConfig(body),
+    onSuccess: (saved) => {
+      qc.setQueryData(["appliance", "metallb"], saved);
+      setDirty(false);
+    },
+  });
+
+  const poolAddresses = poolText
+    .split(/[\n,]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const onSave = () => {
+    save.mutate({
+      enabled,
+      pool_addresses: poolAddresses,
+      control_plane_vip: vip.trim(),
+    });
+  };
+
+  return (
+    <div className="rounded-lg border bg-card p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <span
+            className={cn(
+              "inline-block h-2 w-2 rounded-full",
+              data?.enabled ? "bg-emerald-500" : "bg-zinc-400",
+            )}
+          />
+          <h3 className="text-sm font-semibold">Control-plane VIP (MetalLB)</h3>
+          {data?.enabled && data.control_plane_vip && (
+            <span className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
+              {data.control_plane_vip}
+            </span>
+          )}
+        </div>
+      </div>
+      <p className="mt-2 text-xs text-muted-foreground">
+        A single floating IP that fronts the Web UI so it stays reachable on one
+        address regardless of which control-plane node is up. The VIP must fall
+        inside the address pool. Applied across the cluster by the seed within
+        ~60&nbsp;s; the served certificate auto-adds the VIP to its SANs.
+      </p>
+
+      {isLoading ? (
+        <p className="mt-3 text-sm text-muted-foreground">Loading…</p>
+      ) : (
+        <div className="mt-3 flex flex-col gap-3">
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(e) => {
+                setEnabled(e.target.checked);
+                setDirty(true);
+              }}
+            />
+            Enable MetalLB + control-plane VIP
+          </label>
+          <div className="flex flex-col gap-1">
+            <span className="text-xs font-medium text-muted-foreground">
+              Address pool — one CIDR or range per line
+            </span>
+            <textarea
+              value={poolText}
+              onChange={(e) => {
+                setPoolText(e.target.value);
+                setDirty(true);
+              }}
+              rows={2}
+              placeholder={"192.168.0.240/29\n192.168.0.240-192.168.0.247"}
+              className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
+            />
+          </div>
+          <div className="flex flex-col gap-1">
+            <span className="text-xs font-medium text-muted-foreground">
+              Control-plane VIP
+            </span>
+            <input
+              value={vip}
+              onChange={(e) => {
+                setVip(e.target.value);
+                setDirty(true);
+              }}
+              placeholder="192.168.0.240"
+              className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
+            />
+          </div>
+          {save.isError && (
+            <p className="text-xs text-rose-600">
+              {formatApiError(save.error)}
+            </p>
+          )}
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onSave}
+              disabled={!dirty || save.isPending}
+              className="rounded-md border bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:opacity-50"
+            >
+              {save.isPending ? "Saving…" : "Save"}
+            </button>
+            {save.isSuccess && !dirty && (
+              <span className="text-xs text-emerald-600">✓ Saved</span>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -707,12 +858,18 @@ export function FleetTab({
   const controlPlaneRows = rows.filter(isControlPlaneRow);
   const serviceAgentRows = rows.filter((r) => !isControlPlaneRow(r));
   const byHostname = (a: ApplianceRow, b: ApplianceRow) =>
-    (a.hostname ?? "").localeCompare(b.hostname ?? "", undefined, { numeric: true });
+    (a.hostname ?? "").localeCompare(b.hostname ?? "", undefined, {
+      numeric: true,
+    });
   const splitByState = (
     bucket: ApplianceRow[],
   ): { pending: ApplianceRow[]; others: ApplianceRow[] } => ({
-    pending: bucket.filter((r) => r.state === "pending_approval").sort(byHostname),
-    others: bucket.filter((r) => r.state !== "pending_approval").sort(byHostname),
+    pending: bucket
+      .filter((r) => r.state === "pending_approval")
+      .sort(byHostname),
+    others: bucket
+      .filter((r) => r.state !== "pending_approval")
+      .sort(byHostname),
   });
   const controlPlane = splitByState(controlPlaneRows);
   const serviceAgents = splitByState(serviceAgentRows);
@@ -1020,8 +1177,11 @@ export function FleetTab({
                     onPermanentDelete={(row) => setPermanentDeleteTarget(row)}
                   />
                   {isApplianceHost && (
-                    <ControlPlaneTlsCard onManage={() => onNavigateTab?.("tls")} />
+                    <ControlPlaneTlsCard
+                      onManage={() => onNavigateTab?.("tls")}
+                    />
                   )}
+                  {isApplianceHost && <MetalLBConfigCard />}
                   <ApplianceTableSection
                     soleControlPlaneId={soleControlPlaneId}
                     title="Service agents"

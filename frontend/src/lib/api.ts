@@ -7113,6 +7113,13 @@ export interface FleetAgentRow {
   reboot_requested_at: string | null;
 }
 
+// #272 Phase 7c — cluster-wide MetalLB / control-plane-VIP config.
+export interface MetalLBConfig {
+  enabled: boolean;
+  pool_addresses: string[];
+  control_plane_vip: string;
+}
+
 export const applianceFleetApi = {
   list: () =>
     api
@@ -7445,14 +7452,30 @@ export const applianceApprovalApi = {
     api
       .post<{
         appliances: ApplianceRow[];
-      }>("/appliance/fleet/control-plane/promote", { appliance_ids: applianceIds })
+      }>("/appliance/fleet/control-plane/promote", {
+        appliance_ids: applianceIds,
+      })
       .then((r) => r.data.appliances),
   demoteControlPlane: (applianceIds: string[]) =>
     api
       .post<{
         appliances: ApplianceRow[];
-      }>("/appliance/fleet/control-plane/demote", { appliance_ids: applianceIds })
+      }>("/appliance/fleet/control-plane/demote", {
+        appliance_ids: applianceIds,
+      })
       .then((r) => r.data.appliances),
+  // #272 Phase 7c — cluster-wide MetalLB pool + control-plane VIP. The
+  // seed supervisor picks the saved config up on heartbeat and patches
+  // the HelmCharts; the VIP must fall inside the pool (the API 422s
+  // otherwise, message surfaced inline).
+  getMetalLBConfig: () =>
+    api
+      .get<MetalLBConfig>("/appliance/fleet/control-plane/metallb")
+      .then((r) => r.data),
+  setMetalLBConfig: (body: MetalLBConfig) =>
+    api
+      .put<MetalLBConfig>("/appliance/fleet/control-plane/metallb", body)
+      .then((r) => r.data),
   // #170 Wave D1 — OS slot upgrade + reboot affordances on the
   // Fleet drilldown. Appliance-only deployments; the API surfaces a
   // 409 with a useful message on docker / k8s rows.

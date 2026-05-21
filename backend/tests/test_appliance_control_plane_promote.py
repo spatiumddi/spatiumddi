@@ -258,3 +258,106 @@ async def test_demote_refuses_primary(db_session: AsyncSession, client: AsyncCli
     )
     assert resp.status_code == 422
     assert "seed" in resp.text
+
+
+# ── MetalLB control-plane VIP config (Phase 7c) ──────────────────────
+
+_METALLB_URL = "/api/v1/appliance/fleet/control-plane/metallb"
+
+
+async def test_metallb_get_default(db_session: AsyncSession, client: AsyncClient) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.get(_METALLB_URL, headers=_hdr(token))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body == {"enabled": False, "pool_addresses": [], "control_plane_vip": ""}
+
+
+async def test_metallb_put_and_get(db_session: AsyncSession, client: AsyncClient) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": True,
+            "pool_addresses": ["192.168.0.240/29"],
+            "control_plane_vip": "192.168.0.241",
+        },
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["control_plane_vip"] == "192.168.0.241"
+    # Round-trips through the GET.
+    got = await client.get(_METALLB_URL, headers=_hdr(token))
+    assert got.json() == {
+        "enabled": True,
+        "pool_addresses": ["192.168.0.240/29"],
+        "control_plane_vip": "192.168.0.241",
+    }
+
+
+async def test_metallb_vip_outside_pool_refused(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": True,
+            "pool_addresses": ["192.168.0.240/29"],
+            "control_plane_vip": "10.0.0.5",
+        },
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 422
+    assert "not inside" in resp.text
+
+
+async def test_metallb_enabled_requires_pool(db_session: AsyncSession, client: AsyncClient) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={"enabled": True, "pool_addresses": [], "control_plane_vip": ""},
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 422
+    assert "pool is required" in resp.text
+
+
+async def test_metallb_invalid_pool_entry(db_session: AsyncSession, client: AsyncClient) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={"enabled": False, "pool_addresses": ["not-an-ip"], "control_plane_vip": ""},
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 422
+    assert "invalid pool entry" in resp.text
+
+
+async def test_metallb_range_pool_ok(db_session: AsyncSession, client: AsyncClient) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": True,
+            "pool_addresses": ["192.168.0.240-192.168.0.247"],
+            "control_plane_vip": "192.168.0.245",
+        },
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def test_metallb_non_superadmin_refused(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session, superadmin=False, username="plainuser")
+    await db_session.commit()
+    resp = await client.get(_METALLB_URL, headers=_hdr(token))
+    assert resp.status_code == 403
