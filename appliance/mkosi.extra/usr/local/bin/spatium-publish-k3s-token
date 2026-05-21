@@ -27,7 +27,15 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     if [ -r "$TOKEN_FILE" ]; then
         tmp="$SIDECAR.new"
         if tr -d '\r\n' < "$TOKEN_FILE" > "$tmp" 2>/dev/null; then
-            chmod 0600 "$tmp"
+            # 0644 so the supervisor's unprivileged process user (uid 100
+            # spatium, su-exec'd from root by the entrypoint) can read it
+            # through the release-state bind mount. A 0600-root sidecar is
+            # invisible to that user → read_k3s_join_token() returns None →
+            # the seed never reports its token → promote 409s. Same 0644
+            # precedent as firstboot's /etc/spatiumddi/.env (also secrets
+            # the unprivileged supervisor must read). Single-tenant box;
+            # the host filesystem is the trust boundary, not this mode.
+            chmod 0644 "$tmp"
             mv -f "$tmp" "$SIDECAR"
         fi
         exit 0

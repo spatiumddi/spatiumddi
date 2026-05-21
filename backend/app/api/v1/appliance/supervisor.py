@@ -1912,6 +1912,43 @@ async def delete_appliance(
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+
+    # #272 — refuse revoking the only control-plane node. It runs THIS
+    # control plane (api / db / frontend) AND is the etcd seed; revoking
+    # it makes its heartbeats 403, trips the supervisor's revocation
+    # detector, and tears the control plane down — bricking the cluster.
+    # A control-plane node must be demoted (or another promoted) first.
+    def _is_control_plane(a: Appliance) -> bool:
+        return a.appliance_variant in _SELF_BOOTSTRAP_VARIANTS or a.cluster_role in (
+            CLUSTER_ROLE_PRIMARY,
+            CLUSTER_ROLE_MEMBER,
+        )
+
+    if _is_control_plane(row):
+        other_cp = (
+            await db.execute(
+                select(sa_func.count())
+                .select_from(Appliance)
+                .where(
+                    Appliance.id != row.id,
+                    Appliance.state != APPLIANCE_STATE_REVOKED,
+                    or_(
+                        Appliance.appliance_variant.in_(tuple(_SELF_BOOTSTRAP_VARIANTS)),
+                        Appliance.cluster_role.in_(
+                            (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+                        ),
+                    ),
+                )
+            )
+        ).scalar() or 0
+        if other_cp == 0:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Refusing to revoke the only control-plane node — it runs the "
+                "control plane and is the etcd seed. Promote another node first, "
+                "or factory-reset / reinstall this box to decommission it.",
+            )
+
     state_at_delete = row.state
     row.state = APPLIANCE_STATE_REVOKED
     row.revoked_at = datetime.now(UTC)
@@ -2454,6 +2491,17 @@ async def promote_control_plane(
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 f"Appliance {row.hostname!r} is already a control-plane member (or joining).",
+            )
+        # A control-plane-variant node is already a control plane — you
+        # can't promote a control plane to a control plane. (The seed is
+        # caught by the primary check above; this catches any other
+        # control-plane-variant box, designated or not.)
+        if row.appliance_variant in _SELF_BOOTSTRAP_VARIANTS:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Appliance {row.hostname!r} is a control-plane node "
+                f"(variant {row.appliance_variant!r}) — it's already a control plane, "
+                "not promotable. Only Appliance-role nodes join as members.",
             )
         if row.deployment_kind != "appliance":
             raise HTTPException(

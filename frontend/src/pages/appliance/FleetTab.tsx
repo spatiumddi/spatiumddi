@@ -266,11 +266,16 @@ function ClusterMembershipModal({
   const demotable = members.filter((r) => r.cluster_role === "member");
   const memberCount = members.length;
   // Eligible to promote: approved OS-appliance nodes that aren't already
-  // a member or mid-join.
+  // a control-plane node (the seed / a promoted member) and aren't
+  // mid-join. ``isControlPlaneRow`` keys off the install variant, so a
+  // control-plane node is excluded even before it's formally designated
+  // primary (cluster_role is null until the first promote) — you can't
+  // promote a control plane to a control plane.
   const eligible = rows.filter(
     (r) =>
       r.state === "approved" &&
       r.deployment_kind === "appliance" &&
+      !isControlPlaneRow(r) &&
       !r.cluster_role &&
       r.desired_cluster_role !== "member",
   );

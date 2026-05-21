@@ -56,6 +56,16 @@ dev:
 
 build: build-supervisor
 	$(COMPOSE) build
+	# #272 — explicitly build the frontend. No compose service has a
+	# ``build:`` in the prod compose, and the frontend is the one image
+	# nothing else rebuilds routinely (api/dns/dhcp get rebuilt during
+	# dev iteration; the frontend dev loop runs ``npm run dev`` and its
+	# built image goes stale). Without this the appliance bake embeds a
+	# STALE spatiumddi-frontend:dev — caught on the #272 phase7 ISO,
+	# where the control-plane node showed up under Service agents
+	# because the baked UI predated the two-role / promote-UI changes.
+	# Mirrors build-supervisor; the retag loop below maps it to ghcr:dev.
+	docker build -t spatiumddi-frontend:dev $(FRONTEND_DIR)
 	# #272 Phase 1 — retag compose-built images under the canonical
 	# ``ghcr.io/spatiumddi/<name>:dev`` form so
 	# ``appliance/scripts/bake-images.sh``'s resolve_source_tag picks
