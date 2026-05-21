@@ -275,20 +275,9 @@ to 3 / 5 / 7 nodes by **promoting** appliances from the web UI
 (`/appliance → Fleet → Manage control plane cluster…`). This is the
 recommended HA path for operators who installed from the ISO.
 
-```
-        ┌── appliance-1 (etcd seed) ──┐  ┌── appliance-2 ──┐  ┌── appliance-3 ──┐
-        │  k3s server + etcd          │  │  k3s + etcd     │  │  k3s + etcd     │
-        │  CNPG primary               │  │  CNPG replica   │  │  CNPG replica   │
-        │  redis + sentinel           │  │  redis+sentinel │  │  redis+sentinel │
-        │  api / frontend / worker    │  │  api/fe/worker  │  │  api/fe/worker  │
-        └─────────────────────────────┘  └─────────────────┘  └─────────────────┘
-                         └──────────── MetalLB L2 control-plane VIP ────────────┘
-                                      (operators + agents hit this one IP)
-```
-
-*(SVG diagram pending — the shape is 3 appliance VMs, embedded-etcd
-quorum, one MetalLB VIP fronting the frontend, CNPG primary + 2 replicas,
-Redis Sentinel 3-node.)*
+<p align="center">
+  <img src="../assets/topologies/topology-7-appliance-ha.svg" alt="Topology 7 — Appliance multi-node control-plane HA" width="900"/>
+</p>
 
 **How it differs from Topology 4 / 6:**
 
