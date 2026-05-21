@@ -87,6 +87,11 @@ dhcpKea:
   # it only stabilises the relay→server unicast forward. Must fall inside
   # the MetalLB pool. Requires ``metallb.enabled: true``.
   relayVIP: ""
+  # MetalLB pool the relay VIP draws from. Empty → falls back to the
+  # shared control-plane pool (``dns.vipPool``) so a single-pool install
+  # needs no extra config; set this only when DHCP must draw from a
+  # different pool than DNS.
+  relayVIPPool: ""
 
 # #272 Phase 5 — DNS resolver VIP (default off, full wiring is Phase 10).
 # When ``useMetalLBVIP: true`` the bind9 + powerdns Pods DROP

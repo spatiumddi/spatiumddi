@@ -87,8 +87,14 @@ spec:
             - |
               set -eu
               PW="${REDIS_PASSWORD:-}"
-              sed "s/__PASSWORD__/${PW}/g" /tmpl/redis.conf.tmpl > /data/redis.conf
-              sed "s/__PASSWORD__/${PW}/g" /tmpl/sentinel.conf.tmpl > /data/sentinel.conf
+              # Escape sed-replacement metacharacters (\ & and the /
+              # delimiter) so a password containing them renders a valid
+              # auth line instead of a broken one. The auto-generated
+              # chart secret is alnum, but a non-appliance operator may
+              # BYO a password with special chars.
+              ESC=$(printf '%s' "$PW" | sed -e 's/[\\/&]/\\&/g')
+              sed "s/__PASSWORD__/${ESC}/g" /tmpl/redis.conf.tmpl > /data/redis.conf
+              sed "s/__PASSWORD__/${ESC}/g" /tmpl/sentinel.conf.tmpl > /data/sentinel.conf
               if [ "${HOSTNAME}" != "{{ $sts }}-0" ]; then
                 echo "replicaof {{ $masterFqdn }} 6379" >> /data/redis.conf
               fi

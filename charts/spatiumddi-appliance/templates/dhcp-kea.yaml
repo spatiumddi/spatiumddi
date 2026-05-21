@@ -124,7 +124,10 @@ metadata:
     {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
     app.kubernetes.io/component: dhcp-kea
   annotations:
-    metallb.universe.tf/address-pool: {{ .Values.dns.vipPool | quote }}
+    # Prefer a dedicated DHCP relay pool; fall back to the shared
+    # control-plane pool (dns.vipPool) so a single-pool install still
+    # works without setting both. Decouples DHCP VIP config from DNS.
+    metallb.universe.tf/address-pool: {{ .Values.dhcpKea.relayVIPPool | default .Values.dns.vipPool | quote }}
     metallb.universe.tf/loadBalancerIPs: {{ .Values.dhcpKea.relayVIP | quote }}
 spec:
   type: LoadBalancer

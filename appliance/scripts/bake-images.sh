@@ -242,23 +242,28 @@ for image in "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}" "${CNPG_IMAGES[
     echo "  ✓ $size"
 done
 
-TOTAL="$(du -hc "$IMAGES_DIR"/*.tar.zst 2>/dev/null | tail -1 | awk '{print $1}')"
 # Prune stale image archives that this bake no longer produces (#277).
 # bake-images.sh appends but never cleaned, so an image dropped from the
 # lists above (e.g. the standalone ``postgres:16-alpine`` once the
 # appliance went CNPG-only) left its ~100 MB ``.tar.zst`` behind to be
 # baked into the ISO forever as dead weight. Compute the expected
-# basenames from every list + the externally-fetched k3s airgap bundle
-# (produced by ``appliance-fetch-k3s``, NOT this script — never prune
-# it), then remove any other ``*.tar.zst``.
+# basenames from every list, then remove any other ``*.tar.zst`` — but
+# NEVER the externally-fetched k3s airgap bundle (produced by
+# ``appliance-fetch-k3s``, not this script). That bundle is arch-tagged
+# (``k3s-airgap-images-<arch>.tar.zst``), so match it by glob rather than
+# a hardcoded ``-amd64`` — hardcoding would prune the arm64 bundle on a
+# multi-arch build and break the ISO.
 expected=()
 for repo in "${IMAGES[@]}" "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}" "${CNPG_IMAGES[@]}"; do
     expected+=("$(basename "${repo%%:*}").tar.zst")
 done
-expected+=("k3s-airgap-images-amd64.tar.zst")  # fetched separately — keep
 for f in "$IMAGES_DIR"/*.tar.zst; do
     [ -e "$f" ] || continue
     base="$(basename "$f")"
+    # Keep the k3s airgap bundle for any arch (amd64 / arm64).
+    case "$base" in
+        k3s-airgap-images-*.tar.zst) continue ;;
+    esac
     keep=false
     for e in "${expected[@]}"; do
         [ "$base" = "$e" ] && { keep=true; break; }
@@ -269,6 +274,8 @@ for f in "$IMAGES_DIR"/*.tar.zst; do
     fi
 done
 
+# Total AFTER the prune so the reported size matches what's actually baked.
+TOTAL="$(du -hc "$IMAGES_DIR"/*.tar.zst 2>/dev/null | tail -1 | awk '{print $1}')"
 TOTAL_COUNT=$((${#IMAGES[@]} + ${#OBSERVABILITY_IMAGES[@]} + ${#METALLB_IMAGES[@]} + ${#CNPG_IMAGES[@]}))
 echo "✓ ${TOTAL_COUNT} images baked into $IMAGES_DIR ($TOTAL)"
 echo "  k3s auto-imports these at startup (no firstboot shell-out required)"
