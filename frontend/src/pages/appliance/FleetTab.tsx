@@ -23,9 +23,11 @@ import {
 import {
   applianceApprovalApi,
   applianceSlotImagesApi,
+  applianceTlsApi,
   authApi,
   dhcpApi,
   dnsApi,
+  type ApplianceCertificate,
   type ApplianceRow,
   type ApplianceState,
   type SlotImage,
@@ -454,7 +456,113 @@ function ClusterMembershipModal({
   );
 }
 
-export function FleetTab() {
+// #272 Phase 6 — surface the Web UI TLS certificate on the Fleet →
+// Control plane tab. The cert is a control-plane concern (served on the
+// frontend / control-plane VIP, stored in the spatium-appliance-tls k8s
+// Secret that rolls every frontend replica). The full upload / CSR /
+// activate flow lives on the "Web UI Certificate" tab; this card shows
+// the active cert's status where operators manage the cluster, with a
+// jump to that tab. Read-only — no mutation here.
+const _CERT_SOURCE_LABEL: Record<ApplianceCertificate["source"], string> = {
+  uploaded: "Uploaded",
+  csr: "CSR-signed",
+  letsencrypt: "Let's Encrypt",
+  "self-signed": "Self-signed",
+};
+
+function ControlPlaneTlsCard({ onManage }: { onManage: () => void }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ["appliance", "tls"],
+    queryFn: applianceTlsApi.list,
+    staleTime: 30_000,
+  });
+  const active = data?.find((c) => c.is_active) ?? null;
+
+  let expiry: { text: string; tone: string } | null = null;
+  if (active?.valid_to) {
+    const days = Math.floor(
+      (new Date(active.valid_to).getTime() - Date.now()) / 86_400_000,
+    );
+    const tone =
+      days < 0 ? "text-rose-600" : days < 14 ? "text-amber-600" : "text-muted-foreground";
+    expiry = {
+      text:
+        days < 0
+          ? `expired ${-days}d ago`
+          : `expires in ${days}d (${new Date(active.valid_to).toLocaleDateString()})`,
+      tone,
+    };
+  }
+
+  return (
+    <div className="rounded-lg border bg-card p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <span
+            className={cn(
+              "inline-block h-2 w-2 rounded-full",
+              active ? "bg-emerald-500" : "bg-zinc-400",
+            )}
+          />
+          <h3 className="text-sm font-semibold">Web UI TLS certificate</h3>
+          {active && (
+            <span className="rounded-md bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+              {_CERT_SOURCE_LABEL[active.source] ?? active.source}
+            </span>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={onManage}
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+          title="Open the Web UI Certificate tab to upload, generate a CSR, or activate a cert"
+        >
+          Manage…
+        </button>
+      </div>
+      <div className="mt-2 text-sm text-muted-foreground">
+        {isLoading ? (
+          <span>Loading…</span>
+        ) : active ? (
+          <div className="flex flex-col gap-0.5">
+            <span>
+              Active: <span className="font-mono text-foreground">{active.subject_cn}</span>
+            </span>
+            {expiry && <span className={expiry.tone}>{expiry.text}</span>}
+            {active.sans.length > 0 && (
+              <span className="break-all text-xs">
+                SANs: {active.sans.join(", ")}
+              </span>
+            )}
+          </div>
+        ) : (
+          <span>
+            No active certificate — the appliance is serving a self-signed cert
+            generated at first boot. Upload your own or generate a CSR from the
+            Web UI Certificate tab.
+          </span>
+        )}
+      </div>
+      <p className="mt-2 text-xs text-muted-foreground">
+        Served on every control-plane frontend replica via the{" "}
+        <span className="font-mono">spatium-appliance-tls</span> Secret — uploading
+        or activating a cert rolls all replicas automatically.
+      </p>
+    </div>
+  );
+}
+
+export function FleetTab({
+  onNavigateTab,
+  isApplianceHost = false,
+}: {
+  // #272 Phase 6 — lets the cert card jump to the "Web UI Certificate"
+  // tab. Optional so the component still renders standalone.
+  onNavigateTab?: (tab: string) => void;
+  // Only appliance hosts have a local Web UI cert to manage; docker/k8s
+  // control planes hide the cert tab, so we hide the card there too.
+  isApplianceHost?: boolean;
+}) {
   const qc = useQueryClient();
   const { data: me } = useQuery({
     queryKey: ["me"],
@@ -911,6 +1019,9 @@ export function FleetTab() {
                     onReauthorize={(row) => reauthorize.mutate(row.id)}
                     onPermanentDelete={(row) => setPermanentDeleteTarget(row)}
                   />
+                  {isApplianceHost && (
+                    <ControlPlaneTlsCard onManage={() => onNavigateTab?.("tls")} />
+                  )}
                   <ApplianceTableSection
                     soleControlPlaneId={soleControlPlaneId}
                     title="Service agents"
