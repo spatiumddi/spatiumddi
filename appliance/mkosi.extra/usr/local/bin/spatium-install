@@ -106,11 +106,14 @@ NET_PREFIX="24"
 NET_GATEWAY=""
 NET_DNS="1.1.1.1 1.0.0.1"
 TIMEZONE="UTC"
-# Default ROLE = control-plane — the required first install + the
-# single-box all-in-one default (#272: two roles, control-plane first).
-# ask_role() pre-selects it so a first-timer who just hits OK gets a
-# working control plane rather than an Appliance with nothing to join.
-ROLE="control-plane"
+# Default ROLE = appliance (the role screen frames it as "Additional
+# node"). #272 UX fix: operators don't read the body text, and a
+# misclick / blind Enter on "control plane" silently spins up a SECOND
+# standalone control plane (its own DB + cluster) instead of joining the
+# existing one. Defaulting to the additive, non-destructive role — plus
+# a confirm guard on the control-plane choice in ask_role() — makes that
+# accident hard. The very first install actively picks "First node".
+ROLE="appliance"
 # Installer roles (#272 — collapsed from the old three to two; the
 # old full-stack / frontend-core distinction is now a runtime DNS/DHCP
 # role toggle, not an install choice):
@@ -157,44 +160,62 @@ Press OK to begin, or Cancel to drop to a shell." 18 70 \
 
 ask_role() {
     log "Step: ask_role"
-    # whiptail --radiolist returns the selected tag on stdout. Two roles
-    # (#272 — control-plane listed first + pre-selected):
-    #   control-plane — control plane (api + db + redis + frontend) +
-    #                   k3s etcd seed; DNS (BIND9) + DHCP (Kea) OFF at
-    #                   install (enable per node via the Fleet toggle).
-    #                   The required FIRST install. More control-plane
-    #                   nodes are made by PROMOTING Appliances in Fleet.
-    #   appliance     — supervisor only. Submits an Ed25519 pubkey
-    #                   against a pairing code, sits in pending until an
-    #                   admin clicks Approve; the control plane then
-    #                   assigns role(s) + group(s) and the supervisor
-    #                   pulls the matching service containers. Can later
-    #                   be promoted into the control-plane cluster.
+    # #272 UX — reframe the install role around the decision operators
+    # actually make ("is this my FIRST SpatiumDDI node, or am I adding
+    # one to an existing install?") instead of the jargon control-plane
+    # vs appliance, which most people don't read past. The radio TAGS
+    # are operator-facing (``add-node`` / ``first-node``) and map back to
+    # the internal ROLE values (``appliance`` / ``control-plane``) that
+    # firstboot + the supervisor consume — so downstream is unchanged.
     #
-    # The per-row ON/OFF flag reflects the current $ROLE so backing in
-    # from a later step preserves the selection. $ROLE defaults to
-    # control-plane (see top of file) so the first row is pre-selected
-    # — hitting OK installs a control plane, the correct first install.
-    local cp_flag=OFF app_flag=OFF
+    # ``add-node`` (appliance) is listed first + default: it's the common
+    # case once a control plane exists, and it's the non-destructive
+    # choice. ``first-node`` (control-plane) creates a NEW, standalone
+    # SpatiumDDI (its own DB + cluster), so a wrong pick there is the
+    # real footgun — it's guarded by an explicit confirm below. The
+    # per-row ON flag reflects $ROLE so backing in preserves the pick.
+    local first_flag=OFF add_flag=OFF
     case "$ROLE" in
-        appliance) app_flag=ON ;;
-        *) cp_flag=ON ;;  # control-plane (or empty) → default
+        control-plane) first_flag=ON ;;
+        *) add_flag=ON ;;  # appliance (or unset) → default
     esac
     local pick
     while true; do
-        pick=$(whiptail --backtitle "$BACKTITLE" --title "Appliance role" \
+        pick=$(whiptail --backtitle "$BACKTITLE" --title "What is this node?" \
             --cancel-button "Back" \
-            --radiolist "What role does this appliance play?\n\n  Control plane  \n    Runs the SpatiumDDI control plane (api + db + redis +\n    frontend) and is the k3s etcd seed. DNS (BIND9) + DHCP (Kea)\n    are OFF at install — enable them per node from the Fleet UI.\n    Pick this for the FIRST node (a homelab, a single-site\n    deploy, or the seed of an HA cluster). Add more control-plane\n    nodes by promoting Appliances later.\n\n  Appliance  \n    DNS / DHCP agent. The supervisor pairs with a remote control\n    plane via an 8-digit pairing code; an admin assigns the\n    role(s) (BIND9 / PowerDNS / DHCP / multi-role) in the Fleet UI\n    after approval. Can later be promoted to join the cluster." \
-            26 82 2 \
-            "control-plane" "Control plane — api + db + frontend (the first node)" "$cp_flag" \
-            "appliance"     "Appliance — DNS / DHCP agent (pairs with a control plane)" "$app_flag" \
+            --radiolist "Is this your FIRST SpatiumDDI node, or are you adding one to an existing install?\n\n  Additional node  (default)\n    Pairs with an EXISTING SpatiumDDI over an 8-digit code; an\n    admin then approves it and assigns DNS / DHCP roles in the\n    Fleet UI. Can be PROMOTED into the control-plane cluster later\n    — this is how you add control-plane nodes for HA (NOT by\n    installing 'First node' again).\n\n  First node\n    Creates a NEW SpatiumDDI: the control plane (api + database +\n    web UI) + k3s seed. DNS + DHCP stay OFF — enable them per node\n    from the Fleet UI. Pick this for a homelab, a single box, or\n    the seed of a brand-new HA cluster." \
+            27 84 2 \
+            "add-node"   "Additional node — add to an EXISTING SpatiumDDI (DNS/DHCP, promotable)" "$add_flag" \
+            "first-node" "First node — create a NEW SpatiumDDI (control plane: api+db+UI)" "$first_flag" \
             3>&1 1>&2 2>&3) || return 1
         if [ -z "$pick" ]; then
-            whiptail --msgbox "Please pick a role to continue." 9 60 || true
+            whiptail --msgbox "Please pick an option to continue." 9 60 || true
             continue
         fi
-        ROLE="$pick"
-        break
+        case "$pick" in
+            add-node)
+                ROLE="appliance"
+                break
+                ;;
+            first-node)
+                # Confirm guard — the accidental-footgun direction. A new
+                # control plane is a separate database + cluster; adding
+                # to an existing SpatiumDDI must use "Additional node"
+                # then promote. --defaultno so a blind Enter says No.
+                if whiptail --backtitle "$BACKTITLE" \
+                    --title "Create a NEW control plane?" \
+                    --defaultno --yes-button "Yes, new" --no-button "Go back" \
+                    --yesno "This creates a NEW, standalone SpatiumDDI — its own database and cluster.\n\nIf you are ADDING a node to an existing SpatiumDDI (for HA, or as a DNS / DHCP agent), choose \"Additional node\" instead, then promote it from the Fleet UI.\n\nCreate a new control plane on this box?" \
+                    16 76; then
+                    ROLE="control-plane"
+                    break
+                fi
+                # No → re-show the radio with the safe default pre-selected.
+                first_flag=OFF
+                add_flag=ON
+                continue
+                ;;
+        esac
     done
     log "Selected role: $ROLE"
 }
