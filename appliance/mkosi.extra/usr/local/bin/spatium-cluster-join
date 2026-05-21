@@ -1,0 +1,241 @@
+#!/bin/bash
+# spatium-cluster-join — host-side k3s control-plane join/leave runner
+# (#272 Phase 7b).
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │ ⚠️  UNVALIDATED ON A MULTI-NODE CLUSTER. This script performs    │
+# │ DESTRUCTIVE k3s/etcd surgery (it abandons the node's local       │
+# │ single-node etcd to join the seed's cluster). It is written      │
+# │ defensively — the etcd data dir is BACKED UP (moved aside, never │
+# │ rm'd) and a failed join ROLLS BACK to the prior single-node      │
+# │ state — but it has NOT been shaken out on real VMs yet. Validate │
+# │ a 1→3 promote + a demote on three throwaway VMs before trusting  │
+# │ it in the field. See #272 Phase 7b.                              │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# Flow (mirrors the slot-upgrade / reboot-agent host-runner pattern):
+#   1. Operator promotes/demotes the node from the control plane's
+#      Fleet UI → backend stamps desired_cluster_role on the row.
+#   2. The supervisor's heartbeat picks it up + writes a trigger file
+#      via its release-state bind mount:
+#        join  → /var/lib/spatiumddi/release-state/cluster-join-pending
+#                (2 lines: server_url, join_token)
+#        leave → /var/lib/spatiumddi/release-state/cluster-leave-pending
+#   3. The matching systemd .path unit notices the file + runs this
+#      script as root (`spatium-cluster-join join|leave`).
+#   4. This script reconfigures k3s, writes the cluster-join.state
+#      sidecar (state<TAB>reason) the supervisor reads back + reports,
+#      and renames the trigger to .done / .failed so the .path unit
+#      doesn't re-fire.
+#
+# k3s HA model: the seed booted `cluster-init: true` (a 1-member etcd
+# cluster). A joining server runs `k3s server --server https://<seed>:
+# 6443 --token <token>` with `cluster-init` OFF and a CLEAN etcd data
+# dir. So a join = stop k3s → back up + clear the local etcd → flip
+# cluster-init off + write server/token → start k3s. A leave reverses
+# it (flip cluster-init back on, clear etcd, re-init single-node).
+
+set -uo pipefail
+
+MODE="${1:-}"
+
+RELEASE_STATE=/var/lib/spatiumddi/release-state
+JOIN_TRIGGER="$RELEASE_STATE/cluster-join-pending"
+LEAVE_TRIGGER="$RELEASE_STATE/cluster-leave-pending"
+STATE="$RELEASE_STATE/cluster-join.state"
+
+K3S_CONFIG=/etc/rancher/k3s/config.yaml
+K3S_DROPIN_DIR=/etc/rancher/k3s/config.yaml.d
+JOIN_DROPIN="$K3S_DROPIN_DIR/spatium-cluster.yaml"
+ETCD_DIR=/var/lib/rancher/k3s/server/db
+# k3s auto-deploy manifests. Once this node joins the SEED's shared
+# etcd, the seed owns the cluster's HelmChart releases — so we move
+# this node's own spatium-*.yaml bootstrap manifests aside on join (or
+# helm-controller would re-apply them into the shared cluster and
+# collide on the same release names) and restore them on leave.
+K3S_MANIFESTS=/var/lib/rancher/k3s/server/manifests
+MANIFESTS_ASIDE=/var/lib/spatiumddi/release-state/manifests-joined-aside
+
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/cluster-join.log"
+READY_TIMEOUT=180  # seconds to wait for the node to report Ready
+
+mkdir -p "$LOG_DIR" "$RELEASE_STATE"
+
+log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" | tee -a "$LOG"; }
+
+# State sidecar the supervisor reads (state<TAB>reason). Keep the
+# vocabulary in lock-step with the supervisor's appliance_state.py:
+#   joining | ready | leaving | left | failed
+write_state() { printf '%s\t%s\n' "$1" "${2:-}" > "$STATE"; }
+
+require_appliance() {
+    # Strict appliance + k3s gate — these host paths only exist on a
+    # real installed appliance, never the live ISO or docker/k8s.
+    if [ ! -f /etc/spatiumddi/role-config ]; then
+        log "not a SpatiumDDI appliance (no role-config) — refusing"
+        exit 0
+    fi
+    if ! command -v k3s >/dev/null 2>&1; then
+        log "k3s not installed — refusing"
+        exit 0
+    fi
+}
+
+# Move the etcd data dir aside (recoverable) rather than deleting it.
+# Returns the backup path on stdout so the caller can roll back.
+backup_etcd() {
+    local suffix="$1" backup
+    backup="${ETCD_DIR}.${suffix}.$(date +%s)"
+    if [ -d "$ETCD_DIR" ]; then
+        mv "$ETCD_DIR" "$backup"
+        log "backed up etcd data: $ETCD_DIR → $backup"
+        printf '%s\n' "$backup"
+    fi
+}
+
+wait_ready() {
+    # Poll the local kubeapi until this node reports Ready (or timeout).
+    local deadline=$(( $(date +%s) + READY_TIMEOUT )) node
+    node="$(hostname)"
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if k3s kubectl get node "$node" \
+                -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' \
+                2>/dev/null | grep -q True; then
+            return 0
+        fi
+        sleep 5
+    done
+    return 1
+}
+
+do_join() {
+    if [ ! -f "$JOIN_TRIGGER" ]; then
+        log "join invoked without a trigger file — nothing to do"
+        exit 0
+    fi
+    local server_url join_token
+    server_url="$(sed -n '1p' "$JOIN_TRIGGER" | tr -d '\r\n')"
+    join_token="$(sed -n '2p' "$JOIN_TRIGGER" | tr -d '\r\n')"
+
+    # Validate before we touch anything destructive.
+    if ! printf '%s' "$server_url" | grep -qE '^https://[A-Za-z0-9.:_-]+:6443$'; then
+        log "invalid server_url ($server_url) — refusing join"
+        write_state failed "invalid server_url"
+        mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
+        exit 1
+    fi
+    if [ -z "$join_token" ]; then
+        log "empty join token — refusing join"
+        write_state failed "empty join token"
+        mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
+        exit 1
+    fi
+
+    log "JOIN: server=$server_url (joining the control-plane cluster)"
+    write_state joining "$server_url"
+
+    systemctl stop k3s || true
+
+    # Snapshot the pieces we change so a failed join can roll back to
+    # the prior single-node-seed state.
+    local etcd_backup config_backup
+    config_backup="${K3S_CONFIG}.pre-join.$(date +%s)"
+    cp -a "$K3S_CONFIG" "$config_backup" 2>/dev/null || true
+    etcd_backup="$(backup_etcd pre-join)"
+
+    # A joiner must NOT cluster-init (it has no etcd of its own now) and
+    # must point at the seed. We edit the BASE config deterministically
+    # rather than betting on config.yaml.d scalar-merge for the
+    # load-bearing cluster-init flag, and add server/token via a drop-in.
+    sed -i 's/^cluster-init:.*/cluster-init: false/' "$K3S_CONFIG"
+    # Move this node's own bootstrap manifests aside so it doesn't
+    # re-apply its releases into the seed's shared cluster.
+    if ls "$K3S_MANIFESTS"/spatium-*.yaml >/dev/null 2>&1; then
+        mkdir -p "$MANIFESTS_ASIDE"
+        mv -f "$K3S_MANIFESTS"/spatium-*.yaml "$MANIFESTS_ASIDE/" || true
+        log "moved local bootstrap manifests aside → $MANIFESTS_ASIDE"
+    fi
+    mkdir -p "$K3S_DROPIN_DIR"
+    cat > "$JOIN_DROPIN" <<EOF
+# Auto-written by spatium-cluster-join (#272 Phase 7b). Joins this node
+# to the control-plane cluster as an additional k3s server. Removed +
+# cluster-init restored on demote.
+server: $server_url
+token: $join_token
+EOF
+    chmod 0600 "$JOIN_DROPIN"
+
+    log "restarting k3s to join $server_url"
+    if systemctl start k3s && wait_ready; then
+        log "JOIN ok — node is Ready as a control-plane member"
+        write_state ready "$server_url"
+        mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.done.$(date +%s)" || true
+        # Keep the etcd backup one boot for safety; a later sweep can
+        # prune ${ETCD_DIR}.pre-join.* once the operator is satisfied.
+        exit 0
+    fi
+
+    # ── Rollback — restore the single-node seed so we don't brick it ──
+    log "JOIN failed — rolling back to single-node seed"
+    systemctl stop k3s || true
+    rm -f "$JOIN_DROPIN"
+    [ -f "$config_backup" ] && mv -f "$config_backup" "$K3S_CONFIG"
+    if [ -n "${etcd_backup:-}" ] && [ -d "$etcd_backup" ]; then
+        rm -rf "$ETCD_DIR"
+        mv "$etcd_backup" "$ETCD_DIR"
+        log "restored etcd from $etcd_backup"
+    fi
+    if [ -d "$MANIFESTS_ASIDE" ] && ls "$MANIFESTS_ASIDE"/*.yaml >/dev/null 2>&1; then
+        mv -f "$MANIFESTS_ASIDE"/*.yaml "$K3S_MANIFESTS/" || true
+        log "restored local bootstrap manifests"
+    fi
+    systemctl start k3s || true
+    write_state failed "join failed; rolled back to single-node"
+    mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
+    exit 1
+}
+
+do_leave() {
+    if [ ! -f "$LEAVE_TRIGGER" ]; then
+        log "leave invoked without a trigger file — nothing to do"
+        exit 0
+    fi
+    log "LEAVE: resetting to a single-node seed"
+    write_state leaving ""
+
+    systemctl stop k3s || true
+    rm -f "$JOIN_DROPIN"
+    # Restore cluster-init so the node re-initialises its own etcd.
+    sed -i 's/^cluster-init:.*/cluster-init: true/' "$K3S_CONFIG"
+    backup_etcd pre-leave >/dev/null
+    # Restore this node's own bootstrap manifests so the standalone
+    # node redeploys its supervisor / control plane.
+    if [ -d "$MANIFESTS_ASIDE" ] && ls "$MANIFESTS_ASIDE"/*.yaml >/dev/null 2>&1; then
+        mv -f "$MANIFESTS_ASIDE"/*.yaml "$K3S_MANIFESTS/" || true
+        log "restored local bootstrap manifests"
+    fi
+
+    log "restarting k3s as a fresh single-node seed"
+    if systemctl start k3s && wait_ready; then
+        log "LEAVE ok — node is a standalone single-node cluster again"
+        write_state left ""
+        mv -f "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.done.$(date +%s)" || true
+        exit 0
+    fi
+    log "LEAVE failed — k3s did not come Ready; manual recovery needed"
+    write_state failed "leave failed; k3s not Ready"
+    mv -f "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.failed.$(date +%s)" || true
+    exit 1
+}
+
+require_appliance
+case "$MODE" in
+    join)  do_join ;;
+    leave) do_leave ;;
+    *)
+        log "usage: spatium-cluster-join join|leave (got: '${MODE}')"
+        exit 2
+        ;;
+esac

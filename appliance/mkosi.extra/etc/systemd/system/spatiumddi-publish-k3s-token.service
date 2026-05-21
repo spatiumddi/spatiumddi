@@ -1,0 +1,13 @@
+[Unit]
+Description=Publish the k3s join token to the supervisor release-state sidecar (#272 Phase 7b)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/272
+ConditionKernelCommandLine=!boot=live
+After=k3s.service
+Wants=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatium-publish-k3s-token
+
+[Install]
+WantedBy=multi-user.target

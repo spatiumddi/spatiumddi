@@ -1,0 +1,9 @@
+[Unit]
+Description=Join this node to the SpatiumDDI control-plane cluster (#272 Phase 7b)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/272
+# k3s reconfigure; the runner stops/starts k3s itself.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatium-cluster-join join
+# No Install section — only invoked by the matching .path unit.

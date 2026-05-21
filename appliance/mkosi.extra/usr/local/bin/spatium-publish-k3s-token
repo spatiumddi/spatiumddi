@@ -1,0 +1,39 @@
+#!/bin/bash
+# spatium-publish-k3s-token — copy the local k3s cluster join token to
+# the release-state sidecar the supervisor reads (#272 Phase 7b).
+#
+# The supervisor pod can't read /var/lib/rancher/k3s/server/token (not
+# bind-mounted, and we don't want to mount the k3s server dir into a
+# pod). Instead this host-side oneshot copies the token into
+# /var/lib/spatiumddi/release-state/k3s-join-token, which IS in the
+# supervisor's release-state bind mount. The supervisor reports it on
+# heartbeat; the control plane's promote endpoint reads the primary's
+# token to hand to joiners.
+#
+# Runs After=k3s.service on every boot. The token is created by k3s
+# during server init, which can lag the service start, so we poll for
+# it briefly. Every k3s server in the cluster shares the same join
+# token, so publishing on each node is correct + harmless.
+set -uo pipefail
+
+TOKEN_FILE=/var/lib/rancher/k3s/server/token
+SIDECAR=/var/lib/spatiumddi/release-state/k3s-join-token
+DEADLINE=$(( $(date +%s) + 60 ))
+
+# Appliance only — the sidecar dir is the supervisor's bind-mount source.
+[ -d /var/lib/spatiumddi/release-state ] || exit 0
+
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+    if [ -r "$TOKEN_FILE" ]; then
+        tmp="$SIDECAR.new"
+        if tr -d '\r\n' < "$TOKEN_FILE" > "$tmp" 2>/dev/null; then
+            chmod 0600 "$tmp"
+            mv -f "$tmp" "$SIDECAR"
+        fi
+        exit 0
+    fi
+    sleep 3
+done
+# No token after the window — not a server node yet, or k3s wedged.
+# Leave any prior sidecar intact; the supervisor reports None.
+exit 0

@@ -1,0 +1,7 @@
+[Unit]
+Description=Leave the SpatiumDDI control-plane cluster, reset to single-node (#272 Phase 7b)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/272
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatium-cluster-join leave
