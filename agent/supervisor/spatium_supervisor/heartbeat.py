@@ -557,6 +557,27 @@ def heartbeat_once(
         if appliance_state.maybe_fire_cluster_leave(desired_cluster_role):
             log.info("supervisor.heartbeat.cluster_leave_trigger_fired")
 
+    # #277 — scale the CNPG postgres cluster + control-plane workload
+    # replicas to the committed member count. Only the SEED acts (the
+    # spatium-control HelmChart lives there; on members the GET 404s and
+    # this is a no-op). The seed is the lone control-plane-variant node;
+    # promoted members are `appliance` variant. Idempotent — patches
+    # only when the rendered cp-size differs, so it converges one tick
+    # after a promote/demote settles and stays quiet otherwise.
+    cp_size = body_out.get("control_plane_size")
+    if (
+        isinstance(cp_size, int)
+        and cp_size >= 1
+        and appliance_state.detect_appliance_variant() == "control-plane"
+    ):
+        from . import k8s_api  # noqa: PLC0415
+
+        changed, err = k8s_api.scale_control_plane_helmchart(cp_size)
+        if changed:
+            log.info("supervisor.heartbeat.control_plane_scaled", size=cp_size)
+        elif err:
+            log.warning("supervisor.heartbeat.control_plane_scale_failed", error=err, size=cp_size)
+
     # #170 Wave C2 — render the role-driven compose env. C3 will
     # consume this via ``docker compose --env-file`` to actually
     # bring services up/down; for now we just write the file so the

@@ -24,6 +24,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 from dataclasses import dataclass, field
@@ -432,6 +433,71 @@ def delete_helmchart(
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+# #277 — matches the ``replicas: N  # spatium:cp-size`` /
+# ``instances: N  # spatium:cp-size`` lines firstboot renders into the
+# spatium-control HelmChart's valuesContent. The seed supervisor rewrites
+# N to the committed control-plane member count so the CNPG cluster +
+# api/frontend/worker Deployments scale with the cluster.
+_CP_SIZE_RE = re.compile(r"((?:replicas|instances):[ \t]*)\d+([ \t]*#[ \t]*spatium:cp-size)")
+
+
+def scale_control_plane_helmchart(
+    target_size: int,
+    *,
+    name: str = "spatium-control",
+    chart_namespace: str = "kube-system",
+) -> tuple[bool, str | None]:
+    """Patch the ``spatium-control`` HelmChart CR so every
+    ``# spatium:cp-size``-marked line (CNPG ``instances`` + api/frontend
+    /worker ``replicas``) equals ``target_size`` (#277).
+
+    Returns ``(changed, error)``. ``(False, None)`` means the values
+    already matched (idempotent no-op) OR the CR doesn't exist here (this
+    node isn't the seed). The seed supervisor calls this when the
+    committed control-plane member count changes; k3s's helm-controller
+    then upgrades the release (CNPG scales the postgres cluster, the
+    Deployments scale their replicas).
+    """
+    if target_size < 1:
+        return False, "target_size < 1"
+    path = (
+        f"/apis/helm.cattle.io/v1/namespaces/{quote(chart_namespace)}"
+        f"/helmcharts/{quote(name)}"
+    )
+    try:
+        status, resp = _request("GET", path)
+    except RuntimeError as exc:
+        return False, str(exc)
+    if status == 404:
+        return False, None  # no control chart on this node — not the seed
+    if status != 200:
+        return False, f"kubeapi GET status {status}"
+    try:
+        obj = json.loads(resp)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return False, f"bad helmchart json: {exc}"
+    values = (obj.get("spec") or {}).get("valuesContent") or ""
+    if not values:
+        return False, "no valuesContent"
+    new_values, n = _CP_SIZE_RE.subn(
+        lambda m: f"{m.group(1)}{target_size}{m.group(2)}", values
+    )
+    if n == 0:
+        return False, "no cp-size markers found"
+    if new_values == values:
+        return False, None  # already at target
+    patch = json.dumps({"spec": {"valuesContent": new_values}}).encode("utf-8")
+    try:
+        status, resp = _request(
+            "PATCH", path, body=patch, content_type="application/merge-patch+json"
+        )
+    except RuntimeError as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        return True, None
+    return False, f"kubeapi PATCH status {status}: {resp[:200]!r}"
+
+
 def patch_node_labels(
     node_name: str,
     set_labels: dict[str, str | None],
@@ -483,4 +549,5 @@ __all__ = [
     "get_config",
     "patch_node_labels",
     "list_pods",
+    "scale_control_plane_helmchart",
 ]

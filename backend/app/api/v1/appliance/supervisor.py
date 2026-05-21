@@ -1131,6 +1131,13 @@ class SupervisorHeartbeatResponse(BaseModel):
     # nftables drop-in opening those ports from these peers. Empty on a
     # single-node / non-control-plane appliance.
     cluster_peer_cidrs: list[str] = Field(default_factory=list)
+    # #277 — the committed control-plane size (count of settled
+    # primary + member nodes, floored at 1). The seed's supervisor
+    # patches the spatium-control HelmChart's ``# spatium:cp-size`` lines
+    # to this so the CNPG postgres cluster + api/frontend/worker
+    # Deployments scale with the cluster (1 instance single-node →
+    # 3/5/7 with streaming replicas + failover after promote).
+    control_plane_size: int = 1
 
 
 @router.post(
@@ -1448,6 +1455,11 @@ async def supervisor_heartbeat(
     # open its k3s server ports to (empty unless row is a CP node).
     cluster_peer_cidrs = await _cluster_peer_cidrs(db, row)
 
+    # #277 — committed control-plane size (settled primary + members,
+    # floored at 1). The seed supervisor scales CNPG instances +
+    # workload replicas to this.
+    control_plane_size = await _committed_cp_count(db)
+
     return SupervisorHeartbeatResponse(
         appliance_id=row.id,
         state=row.state,  # type: ignore[arg-type]
@@ -1464,6 +1476,7 @@ async def supervisor_heartbeat(
         desired_k3s_server_url=row.desired_k3s_server_url,
         desired_k3s_join_token=desired_join_token,
         cluster_peer_cidrs=cluster_peer_cidrs,
+        control_plane_size=control_plane_size,
     )
 
 
@@ -2423,6 +2436,31 @@ async def _effective_cp_members(db: DB) -> list[Appliance]:
         .all()
     )
     return [r for r in rows if r.desired_cluster_role != DESIRED_CLUSTER_ROLE_NONE]
+
+
+async def _committed_cp_count(db: DB) -> int:
+    """Count of SETTLED control-plane nodes (``cluster_role`` in
+    primary/member), floored at 1 (#277).
+
+    Used to scale the CNPG postgres cluster + control-plane workload
+    replicas. Counts only settled members — NOT in-flight joiners
+    (``desired_cluster_role='member'`` but ``cluster_role`` still NULL)
+    — so CNPG doesn't try to provision a replica for a node that hasn't
+    finished joining + getting labeled yet. Floored at 1 so a fresh
+    single-node install (seed's cluster_role still NULL pre-promote)
+    renders instances=1, not 0.
+    """
+    n = (
+        await db.execute(
+            select(sa_func.count())
+            .select_from(Appliance)
+            .where(
+                Appliance.state == APPLIANCE_STATE_APPROVED,
+                Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+            )
+        )
+    ).scalar() or 0
+    return max(1, int(n))
 
 
 async def _cluster_peer_cidrs(db: DB, row: Appliance) -> list[str]:
