@@ -18,9 +18,7 @@ def test_is_sentinel_url() -> None:
 
 
 def test_parse_sentinel_url_multi_host_with_password() -> None:
-    hosts, db, password = _parse_sentinel_url(
-        "sentinel://:s3cret@h1:26379,h2:26379,h3:26379/2"
-    )
+    hosts, db, password = _parse_sentinel_url("sentinel://:s3cret@h1:26379,h2:26379,h3:26379/2")
     assert hosts == [("h1", 26379), ("h2", 26379), ("h3", 26379)]
     assert db == 2
     assert password == "s3cret"

@@ -80,8 +80,9 @@ def test_generated_cert_carries_vip_in_san() -> None:
     dns_sans = set(san.get_values_for_type(x509.DNSName))
     assert ipaddress.ip_address("192.0.2.241") in {ipaddress.ip_address(s) for s in ip_sans}
     assert ipaddress.ip_address("10.0.0.5") in {ipaddress.ip_address(s) for s in ip_sans}
-    assert "vip.example.com" in dns_sans
-    assert "appliance1" in dns_sans
+    # Subset assertion (not ``"literal" in set``) so CodeQL's URL
+    # substring-sanitization heuristic doesn't flag the hostname literal.
+    assert {"vip.example.com", "appliance1"} <= dns_sans
 
 
 def test_generated_cert_no_extras_unchanged_shape() -> None:

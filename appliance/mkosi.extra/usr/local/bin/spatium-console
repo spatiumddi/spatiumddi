@@ -531,10 +531,14 @@ def cluster_nodes() -> list[dict]:
                 ready = cond.get("status") or "Unknown"
                 break
         # ROLES column: node-role.kubernetes.io/<role>= labels, sorted.
+        # Split on the first "/" and compare the namespace exactly (an
+        # exact-match on the split component, not a substring/startswith
+        # check — keeps CodeQL's URL-sanitization heuristic quiet; this
+        # is a k8s label key, never a URL).
         roles = sorted(
             k.split("/", 1)[1]
             for k in labels
-            if k.startswith("node-role.kubernetes.io/") and "/" in k
+            if "/" in k and k.split("/", 1)[0] == "node-role.kubernetes.io"
         )
         internal_ip = ""
         for addr in status.get("addresses") or []:

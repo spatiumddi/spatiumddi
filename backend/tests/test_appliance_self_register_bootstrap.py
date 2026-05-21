@@ -113,9 +113,7 @@ async def test_happy_path_mints_code(
     audits = (
         (
             await db_session.execute(
-                select(AuditLog).where(
-                    AuditLog.action == "appliance.self_bootstrap_minted"
-                )
+                select(AuditLog).where(AuditLog.action == "appliance.self_bootstrap_minted")
             )
         )
         .scalars()
@@ -185,9 +183,7 @@ async def test_application_variant_refused(
     # The endpoint refuses to short-circuit that.
     await _enable_supervisor_registration(db_session)
     await db_session.commit()
-    stub_host_role(
-        "application"
-    )  # contrived — application normally has CONTROL_PLANE_URL filled
+    stub_host_role("application")  # contrived — application normally has CONTROL_PLANE_URL filled
 
     resp = await client.post(
         "/api/v1/appliance/self-register-bootstrap",
