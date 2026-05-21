@@ -1,19 +1,69 @@
 SpatiumDDI
 Copyright 2024 SpatiumDDI Contributors
 
-This product bundles or integrates with the following open source components:
+This product bundles, ships, or integrates with the following open source
+components. Grouped by role; license + project URL for each.
 
+── Operating system & boot (OS appliance image) ──────────────────────────
 - Linux Kernel — GPL v2 — https://kernel.org
+- Debian — DFSG (mixed) — https://debian.org
+- Alpine Linux — MIT + GPL v2 (kernel) — https://alpinelinux.org
+- GRUB 2 — GPL v3 — https://www.gnu.org/software/grub
+- systemd — LGPL v2.1 — https://systemd.io
+- NetworkManager — GPL v2+ — https://networkmanager.dev
+- chrony (NTP) — GPL v2 — https://chrony-project.org
+- Net-SNMP (snmpd) — BSD-style (multiple) — https://net-snmp.org
+- nftables — GPL v2 — https://netfilter.org
+
+── Kubernetes control plane / orchestration (multi-node HA appliance) ─────
+- k3s — Apache 2.0 — https://k3s.io
+- etcd — Apache 2.0 — https://etcd.io
+- containerd — Apache 2.0 — https://containerd.io
+- Flannel (CNI) — Apache 2.0 — https://github.com/flannel-io/flannel
+- Helm — Apache 2.0 — https://helm.sh
+- MetalLB (L2 load balancer / control-plane VIP) — Apache 2.0 — https://metallb.io
+- CloudNativePG (PostgreSQL operator) — Apache 2.0 — https://cloudnative-pg.io
+
+── Data services ──────────────────────────────────────────────────────────
+- PostgreSQL — PostgreSQL License — https://postgresql.org
+- Redis — BSD 3-Clause (pre-7.4) / RSALv2+SSPL (7.4+) — https://redis.io
+- Prometheus (+ client libs) — Apache 2.0 — https://prometheus.io
+- node-exporter / kube-state-metrics — Apache 2.0 — https://prometheus.io
+
+── DNS / DHCP service engines ─────────────────────────────────────────────
+- ISC Kea DHCP — MPL 2.0 — https://kea.isc.org
+- ISC BIND 9 — MPL 2.0 — https://isc.org/bind
+- PowerDNS Authoritative Server — GPL v2 — https://powerdns.com
+
+── Backend (Python) ───────────────────────────────────────────────────────
 - Python — PSF License — https://python.org
 - FastAPI — MIT — https://fastapi.tiangolo.com
+- Starlette — BSD 3-Clause — https://www.starlette.io
+- Uvicorn — BSD 3-Clause — https://www.uvicorn.org
 - SQLAlchemy — MIT — https://sqlalchemy.org
-- PostgreSQL — PostgreSQL License — https://postgresql.org
-- Redis — BSD 3-Clause — https://redis.io
-- Celery — BSD — https://celeryproject.org
-- React — MIT — https://react.dev
-- ISC Kea DHCP — MPL 2.0 — https://kea.isc.org
-- ISC BIND9 — MPL 2.0 — https://isc.org/bind
-- Alpine Linux — MIT + GPL v2 (kernel) — https://alpinelinux.org
-- Debian — DFSG — https://debian.org
+- Alembic — MIT — https://alembic.sqlalchemy.org
+- Pydantic — MIT — https://pydantic.dev
+- Celery — BSD 3-Clause — https://celeryq.dev
+- structlog — MIT / Apache 2.0 — https://www.structlog.org
+- cryptography — Apache 2.0 / BSD 3-Clause — https://cryptography.io
+- httpx — BSD 3-Clause — https://www.python-httpx.org
+- Authlib (OIDC/OAuth) — BSD 3-Clause — https://authlib.org
+- ldap3 (LDAP) — LGPL v3 — https://github.com/cannatag/ldap3
+- python3-saml (SAML) — MIT — https://github.com/SAML-Toolkits/python3-saml
+- reportlab (PDF export) — BSD 3-Clause — https://www.reportlab.com
+- Scapy (passive DHCP fingerprinting) — GPL v2 — https://scapy.net
+- nmap (network scanning) — NPSL (Nmap Public Source License) — https://nmap.org
 
-Full license texts are available in the LICENSES/ directory.
+── Frontend (TypeScript / React) ──────────────────────────────────────────
+- React — MIT — https://react.dev
+- Vite — MIT — https://vitejs.dev
+- TypeScript — Apache 2.0 — https://www.typescriptlang.org
+- Tailwind CSS — MIT — https://tailwindcss.com
+- TanStack Query (React Query) — MIT — https://tanstack.com/query
+- shadcn/ui (component patterns) — MIT — https://ui.shadcn.com
+- Recharts — MIT — https://recharts.org
+- nginx (frontend static serving + agent landing) — BSD 2-Clause — https://nginx.org
+
+This list covers the major bundled / shipped components; it is not an
+exhaustive enumeration of every transitive dependency. Full license texts
+for the primary components are available in the LICENSES/ directory.
