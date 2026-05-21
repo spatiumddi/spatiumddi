@@ -584,6 +584,20 @@ export function FleetTab() {
   });
   const controlPlane = splitByState(controlPlaneRows);
   const serviceAgents = splitByState(serviceAgentRows);
+  // #272 — the only control-plane node (across non-revoked rows) can't
+  // be revoked: doing so would brick the control plane. Hide its Revoke
+  // action. Count nodes that are control-plane by variant OR an actual
+  // cluster member. null when 0 or >1 (then Revoke is allowed — there's
+  // a surviving control plane / it's not a CP node).
+  const liveControlPlane = rows.filter(
+    (r) =>
+      r.state !== "revoked" &&
+      (isControlPlaneRow(r) ||
+        r.cluster_role === "primary" ||
+        r.cluster_role === "member"),
+  );
+  const soleControlPlaneId =
+    liveControlPlane.length === 1 ? liveControlPlane[0].id : null;
 
   if (!isSuperadmin) {
     return (
@@ -852,6 +866,7 @@ export function FleetTab() {
                     </button>
                   </div>
                   <ApplianceTableSection
+                    soleControlPlaneId={soleControlPlaneId}
                     title="Control plane"
                     subtitle="Boxes hosting the SpatiumDDI control plane — the control-plane node plus any promoted appliances."
                     pendingRows={controlPlane.pending}
@@ -873,6 +888,7 @@ export function FleetTab() {
                     onPermanentDelete={(row) => setPermanentDeleteTarget(row)}
                   />
                   <ApplianceTableSection
+                    soleControlPlaneId={soleControlPlaneId}
                     title="Service agents"
                     subtitle="Appliance nodes running DNS / DHCP service containers paired to a remote control plane."
                     pendingRows={serviceAgents.pending}
@@ -1126,6 +1142,7 @@ function ApplianceTableSection({
   onDelete,
   onReauthorize,
   onPermanentDelete,
+  soleControlPlaneId,
 }: {
   title: string;
   subtitle: string;
@@ -1133,6 +1150,9 @@ function ApplianceTableSection({
   otherRows: ApplianceRow[];
   emptyMessage: string;
   busyId: string | null | undefined;
+  // #272 — id of the only control-plane node (if exactly one), so its
+  // Revoke action is hidden. null when 0 or >1 control-plane nodes.
+  soleControlPlaneId: string | null;
   onOpen: (row: ApplianceRow) => void;
   onApprove: (row: ApplianceRow) => void;
   onReject: (row: ApplianceRow) => void;
@@ -1189,6 +1209,7 @@ function ApplianceTableSection({
                   onDelete={() => onDelete(row)}
                   onReauthorize={() => onReauthorize(row)}
                   onPermanentDelete={() => onPermanentDelete(row)}
+                  canRevoke={row.id !== soleControlPlaneId}
                 />
               ))}
               {otherRows.map((row) => (
@@ -1203,6 +1224,7 @@ function ApplianceTableSection({
                   onDelete={() => onDelete(row)}
                   onReauthorize={() => onReauthorize(row)}
                   onPermanentDelete={() => onPermanentDelete(row)}
+                  canRevoke={row.id !== soleControlPlaneId}
                 />
               ))}
             </tbody>
@@ -1224,6 +1246,7 @@ function ApplianceTableRow({
   onDelete,
   onReauthorize,
   onPermanentDelete,
+  canRevoke = true,
 }: {
   row: ApplianceRow;
   highlight?: boolean;
@@ -1235,6 +1258,10 @@ function ApplianceTableRow({
   onDelete: () => void;
   onReauthorize: () => void;
   onPermanentDelete: () => void;
+  // #272 — false for the sole control-plane node: revoking it would
+  // brick the control plane, so we hide the action (the backend also
+  // refuses it). True for everything else.
+  canRevoke?: boolean;
 }) {
   const badge = stateBadge(row.state);
   const Icon = badge.Icon;
@@ -1371,15 +1398,17 @@ function ApplianceTableRow({
                 <KeyRound className="h-3 w-3" />
                 Re-key
               </button>
-              <button
-                type="button"
-                onClick={onDelete}
-                className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
-                title="Revoke — flip to revoked state, supervisor tears down service containers. Re-authorize on the same row to recover."
-              >
-                <Ban className="h-3 w-3" />
-                Revoke
-              </button>
+              {canRevoke && (
+                <button
+                  type="button"
+                  onClick={onDelete}
+                  className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                  title="Revoke — flip to revoked state, supervisor tears down service containers. Re-authorize on the same row to recover."
+                >
+                  <Ban className="h-3 w-3" />
+                  Revoke
+                </button>
+              )}
             </>
           )}
           {row.state === "revoked" && (
