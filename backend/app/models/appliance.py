@@ -697,6 +697,18 @@ class Appliance(Base):
     # the cross-node firewall peer set + the operator kubeconfig rewrite.
     node_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # #272 Phase 9 — dead-node replacement. Set True by the
+    # ``/control-plane/{id}/replace`` endpoint on a member that has gone
+    # away ungracefully (its own supervisor can't run a leave — it's
+    # dead). The SEED supervisor reads the eviction list off its
+    # heartbeat response and deletes the k8s Node (k3s removes the etcd
+    # member with it), then reports the hostname back so the backend
+    # clears this flag + settles the row to ``left``. Distinct from a
+    # graceful demote, which the leaving node drives itself.
+    evict_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.text("false")
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

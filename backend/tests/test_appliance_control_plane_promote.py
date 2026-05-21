@@ -140,9 +140,7 @@ async def test_promote_requires_seed_token(db_session: AsyncSession, client: Asy
     assert "join token" in resp.text
 
 
-async def test_promote_requires_seed_node_ip(
-    db_session: AsyncSession, client: AsyncClient
-) -> None:
+async def test_promote_requires_seed_node_ip(db_session: AsyncSession, client: AsyncClient) -> None:
     token = await _admin(db_session)
     # Seed reported a token but only a pod IP (no node_ip) — the join URL
     # can't be built from a pod IP, so promote must refuse.
@@ -258,6 +256,63 @@ async def test_demote_refuses_primary(db_session: AsyncSession, client: AsyncCli
     )
     assert resp.status_code == 422
     assert "seed" in resp.text
+
+
+# ── dead-node replacement (Phase 9) ──────────────────────────────────
+
+
+async def test_replace_member_evicts_and_mints_code(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session)
+    await _seed(db_session)
+    m1 = await _appliance(db_session, "m1", cluster_role=CLUSTER_ROLE_MEMBER, node_ip="10.0.0.2")
+    await _appliance(db_session, "m2", cluster_role=CLUSTER_ROLE_MEMBER, node_ip="10.0.0.3")
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/appliance/fleet/control-plane/{m1.id}/replace",
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["pairing_code"] and len(body["pairing_code"]) == 8
+    assert body["evicted"]["hostname"] == "m1"
+
+    await db_session.refresh(m1)
+    assert m1.cluster_role is None
+    assert m1.evict_requested is True
+    assert m1.cluster_join_state == "evicting"
+
+
+async def test_replace_refuses_primary(db_session: AsyncSession, client: AsyncClient) -> None:
+    token = await _admin(db_session)
+    seed = await _seed(db_session)
+    await _appliance(db_session, "m1", cluster_role=CLUSTER_ROLE_MEMBER)
+    await _appliance(db_session, "m2", cluster_role=CLUSTER_ROLE_MEMBER)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/appliance/fleet/control-plane/{seed.id}/replace",
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 422
+    assert "seed" in resp.text
+
+
+async def test_replace_refuses_non_member(db_session: AsyncSession, client: AsyncClient) -> None:
+    token = await _admin(db_session)
+    await _seed(db_session)
+    # An approved appliance that never joined the control plane.
+    plain = await _appliance(db_session, "agent1", appliance_variant="appliance")
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/appliance/fleet/control-plane/{plain.id}/replace",
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 409
+    assert "member" in resp.text
 
 
 # ── MetalLB control-plane VIP config (Phase 7c) ──────────────────────

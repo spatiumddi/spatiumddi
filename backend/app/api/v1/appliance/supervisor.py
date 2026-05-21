@@ -1021,6 +1021,12 @@ class SupervisorHeartbeatRequest(BaseModel):
     # builds the join URL from the seed's ``node_ip``. None on
     # non-appliance / non-k3s; the handler leaves the column untouched.
     node_ip: str | None = None
+    # #272 Phase 9 — dead-node replacement. The SEED supervisor reports
+    # the hostnames of k8s Nodes it successfully evicted (deleting the
+    # Node makes k3s drop the etcd member). The handler clears
+    # ``evict_requested`` + settles those rows to ``left``. Empty on
+    # every non-seed heartbeat + when there's nothing to evict.
+    evicted_node_names: list[str] = Field(default_factory=list)
 
 
 class SupervisorRoleAssignment(BaseModel):
@@ -1148,6 +1154,13 @@ class SupervisorHeartbeatResponse(BaseModel):
     desired_metallb_enabled: bool = False
     desired_metallb_pool_addresses: list[str] = Field(default_factory=list)
     desired_control_plane_vip: str = ""
+    # #272 Phase 9 — dead-node replacement. Hostnames of k8s Nodes the
+    # SEED should evict (delete the Node → k3s removes the etcd member).
+    # Populated from rows flagged ``evict_requested``; only the
+    # control-plane-variant seed acts on it. The supervisor reports the
+    # ones it deleted back via ``evicted_node_names`` so the backend
+    # clears the flag. Empty in the steady state.
+    evict_node_names: list[str] = Field(default_factory=list)
 
 
 @router.post(
@@ -1367,6 +1380,27 @@ async def supervisor_heartbeat(
     if body.node_ip is not None:
         row.node_ip = body.node_ip
 
+    # #272 Phase 9 — the seed reports k8s Nodes it evicted (dead-node
+    # replacement). Clear the flag + settle those rows to ``left`` so
+    # they stop appearing in the seed's evict list on the next tick.
+    if body.evicted_node_names:
+        evicted = (
+            (
+                await db.execute(
+                    select(Appliance).where(
+                        Appliance.hostname.in_(body.evicted_node_names),
+                        Appliance.evict_requested.is_(True),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for ev in evicted:
+            ev.evict_requested = False
+            ev.cluster_join_state = CLUSTER_JOIN_STATE_LEFT
+            logger.info("control_plane_node_evicted", hostname=ev.hostname, by=str(row.id))
+
     # Auto-clear the promote desired-state once the join landed: the
     # supervisor reports ``ready`` → the node IS a member now, so settle
     # cluster_role and drop the (sensitive) join coordinates.
@@ -1482,6 +1516,20 @@ async def supervisor_heartbeat(
     metallb_pool = list(cfg_row.metallb_pool_addresses or []) if cfg_row else []
     metallb_vip = (cfg_row.control_plane_vip or "") if cfg_row else ""
 
+    # #272 Phase 9 — dead k8s Nodes the seed should evict. Returned to
+    # every CP supervisor but only the control-plane-variant seed acts.
+    evict_names = [
+        h
+        for (h,) in (
+            await db.execute(
+                select(Appliance.hostname).where(
+                    Appliance.evict_requested.is_(True),
+                    Appliance.hostname.isnot(None),
+                )
+            )
+        ).all()
+    ]
+
     return SupervisorHeartbeatResponse(
         appliance_id=row.id,
         state=row.state,  # type: ignore[arg-type]
@@ -1502,6 +1550,7 @@ async def supervisor_heartbeat(
         desired_metallb_enabled=metallb_enabled,
         desired_metallb_pool_addresses=metallb_pool,
         desired_control_plane_vip=metallb_vip,
+        evict_node_names=evict_names,
     )
 
 
@@ -2745,6 +2794,122 @@ async def demote_control_plane(
         user=current_user.username,
     )
     return ApplianceList(appliances=[_row_to_schema(r) for r in targets])
+
+
+# ── Admin: dead-node replacement (#272 Phase 9) ──────────────────
+
+
+class ControlPlaneReplaceResponse(BaseModel):
+    """Result of replacing a dead control-plane member.
+
+    The dead row is flagged for eviction (the seed deletes its k8s Node
+    on the next heartbeat, which makes k3s drop the etcd member) and a
+    fresh single-use pairing code is minted so a replacement appliance
+    can pair → be approved → be promoted into the freed slot.
+    """
+
+    evicted: ApplianceRow
+    pairing_code: str
+    pairing_expires_at: datetime
+
+
+@router.post(
+    "/fleet/control-plane/{appliance_id}/replace",
+    response_model=ControlPlaneReplaceResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Replace a dead control-plane member — evict + mint a pairing code (superadmin)",
+)
+async def replace_control_plane_member(
+    appliance_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+) -> ControlPlaneReplaceResponse:
+    """Recover a control-plane node that died ungracefully.
+
+    Unlike demote (which the leaving node's own supervisor drives), a
+    dead node can't wipe itself — so the SEED evicts it: this endpoint
+    flags the row ``evict_requested`` + drops it from the cluster
+    accounting, the seed supervisor deletes the k8s Node on its next
+    heartbeat (k3s removes the etcd member with it), and a single-use
+    pairing code is minted for the replacement box. Refuses the etcd
+    seed (migrating the seed is a separate flow) and any row that isn't
+    a settled control-plane member.
+    """
+    _require_superadmin(current_user)
+
+    from app.api.v1.appliance.pairing import _generate_code, _hash_code  # noqa: PLC0415
+    from app.models.appliance import PairingCode  # noqa: PLC0415
+
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Appliance {appliance_id} not found.")
+    if row.cluster_role == CLUSTER_ROLE_PRIMARY:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Appliance {row.hostname!r} is the etcd seed — replacing the seed is a "
+            "separate migration flow, out of scope here.",
+        )
+    if row.cluster_role != CLUSTER_ROLE_MEMBER:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Appliance {row.hostname!r} isn't a settled control-plane member — nothing "
+            "to evict. (Demote in-flight joiners; this is for replacing a dead member.)",
+        )
+
+    # Drop the dead member from the cluster accounting + flag it for the
+    # seed to evict. Keep the hostname (the seed deletes the Node by
+    # name); clear the join coordinates + role.
+    row.cluster_role = None
+    row.desired_cluster_role = None
+    row.desired_k3s_server_url = None
+    row.desired_k3s_join_token_encrypted = None
+    row.cluster_join_state = "evicting"
+    row.cluster_join_reason = None
+    row.evict_requested = True
+
+    # Mint a single-use 60-min pairing code for the replacement box.
+    code = _generate_code()
+    expires_at = datetime.now(UTC) + timedelta(minutes=60)
+    pc_id = uuid.uuid4()
+    db.add(
+        PairingCode(
+            id=pc_id,
+            code_hash=_hash_code(code),
+            code_last_two=code[-2:],
+            persistent=False,
+            enabled=True,
+            expires_at=expires_at,
+            code_encrypted=None,
+            note=f"replacement for {row.hostname}",
+            created_by_user_id=current_user.id,
+        )
+    )
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.control_plane_replaced",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={"pairing_code_id": str(pc_id), "pairing_expires_at": expires_at.isoformat()},
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    logger.info(
+        "control_plane_replace",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        user=current_user.username,
+    )
+    return ControlPlaneReplaceResponse(
+        evicted=_row_to_schema(row),
+        pairing_code=code,
+        pairing_expires_at=expires_at,
+    )
 
 
 # ── Admin: MetalLB control-plane VIP (#272 Phase 7c) ─────────────

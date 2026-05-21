@@ -37,6 +37,16 @@ https-listen-port: 6443
 # partition layout changed in #276 anyway — see the release banner).
 cluster-init: true
 
+# #272 Phase 9 — automatic etcd snapshots for disaster recovery +
+# dead-node replacement. k3s snapshots the embedded etcd on this cron
+# and keeps the last N. Snapshots land under
+# /var/lib/rancher/k3s/server/db/snapshots (and as ETCDSnapshotFile CRs
+# on recent k3s, which the Fleet UI can list). Restore is a manual
+# ``k3s server --cluster-reset --cluster-reset-restore-path=…`` — a
+# guided restore flow is a Phase 9 follow-up.
+etcd-snapshot-schedule-cron: "0 */6 * * *"
+etcd-snapshot-retention: 8
+
 # Disable bundled components we replace or don't need:
 #   * traefik    — operator-facing TLS still goes through our nginx
 #                  reverse proxy (existing Appliance → Web UI Cert

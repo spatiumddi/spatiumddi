@@ -238,6 +238,11 @@ _WATCHDOG_INTERVAL_S = 300.0  # 5 minutes
 _last_watchdog_at: float = 0.0
 _cached_role_health: dict[str, Any] = {}
 
+# #272 Phase 9 — k8s Node names this seed has successfully evicted but
+# the backend hasn't yet confirmed cleared. Reported on each heartbeat
+# request; pruned once the backend drops the name from its evict list.
+_evicted_pending: set[str] = set()
+
 
 def _watchdog_check_due() -> bool:
     """First call always returns True (forces a probe within the
@@ -351,6 +356,10 @@ def heartbeat_once(
         # if the conflict went away. The probe is cheap (``ss``) so
         # running it every heartbeat is fine.
         "port_conflicts": probe_port_conflicts(),
+        # #272 Phase 9 — report the k8s Nodes this seed evicted on prior
+        # ticks so the backend clears their ``evict_requested`` flag +
+        # settles them to ``left``. Empty on non-seed / nothing-evicted.
+        "evicted_node_names": sorted(_evicted_pending),
     }
     # #170 Wave D follow-up — surface the outcome of the previous
     # heartbeat's compose-lifecycle apply. Empty / None on the first
@@ -602,6 +611,24 @@ def heartbeat_once(
             )
         elif ml_err:
             log.warning("supervisor.heartbeat.metallb_apply_failed", error=ml_err)
+
+        # #272 Phase 9 — dead-node replacement. The seed deletes each k8s
+        # Node the backend flagged for eviction (deleting the Node makes
+        # k3s drop the etcd member); newly-deleted names are stashed in
+        # ``_evicted_pending`` and reported on the next heartbeat so the
+        # backend clears the flag. Prune the stash to whatever the
+        # backend still lists as pending (everything else is confirmed).
+        evict_names = body_out.get("evict_node_names") or []
+        for name in evict_names:
+            if name in _evicted_pending:
+                continue
+            ok, evict_err = k8s_api.delete_node(str(name))
+            if ok:
+                _evicted_pending.add(str(name))
+                log.info("supervisor.heartbeat.node_evicted", node=name)
+            else:
+                log.warning("supervisor.heartbeat.node_evict_failed", node=name, error=evict_err)
+        _evicted_pending.intersection_update({str(n) for n in evict_names})
 
     # #170 Wave C2 — render the role-driven compose env. C3 will
     # consume this via ``docker compose --env-file`` to actually

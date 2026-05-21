@@ -425,6 +425,22 @@ def delete_helmchart(name: str, chart_namespace: str = "kube-system") -> tuple[b
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+def delete_node(name: str) -> tuple[bool, str | None]:
+    """Delete a k8s Node. On k3s, deleting a server Node object makes
+    the cluster drop its etcd member — so this is how a dead
+    control-plane member is evicted (#272 Phase 9 dead-node
+    replacement). Only the seed runs it (it holds the admin kubeconfig).
+    Idempotent — a 404 (already gone) counts as success."""
+    path = f"/api/v1/nodes/{quote(name)}"
+    try:
+        status, resp = _request("DELETE", path)
+    except RuntimeError as exc:
+        return False, str(exc)
+    if status in (200, 202, 404):
+        return True, None
+    return False, f"kubeapi status {status}: {resp[:200]!r}"
+
+
 # #277 — matches the ``replicas: N  # spatium:cp-size`` /
 # ``instances: N  # spatium:cp-size`` lines firstboot renders into the
 # spatium-control HelmChart's valuesContent. The seed supervisor rewrites
@@ -643,6 +659,7 @@ __all__ = [
     "apply_metallb_config",
     "check_kubeapi_ready",
     "delete_helmchart",
+    "delete_node",
     "get_config",
     "patch_marked_helmchart_values",
     "patch_node_labels",
