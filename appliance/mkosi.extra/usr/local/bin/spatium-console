@@ -1318,10 +1318,13 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # Saves one vertical row on the dashboard.
     vitals = Text()
     vitals.append("Up ", style="dim"); vitals.append(uptime_str(), style="bold")
-    vitals.append("   CPU ", style="dim"); vitals.append(f"{cpu:.0f}%", style="bold")
+    # Pad the per-second-volatile percentages to a fixed 3-digit width
+    # (0–100) so the fields after them — RAM / Load / Disk — don't reflow
+    # left/right every tick as CPU/RAM jiggle between 1 and 3 digits.
+    vitals.append("   CPU ", style="dim"); vitals.append(f"{cpu:3.0f}%", style="bold")
     vitals.append("   RAM ", style="dim")
     vitals.append(
-        f"{state.ram_used_gib:.1f}/{state.ram_total_gib:.1f} GiB ({state.ram_percent:.0f}%)",
+        f"{state.ram_used_gib:.1f}/{state.ram_total_gib:.1f} GiB ({state.ram_percent:3.0f}%)",
         style="bold",
     )
     vitals.append("   Load ", style="dim"); vitals.append(load, style="bold")
