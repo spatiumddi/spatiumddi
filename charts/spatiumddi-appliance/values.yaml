@@ -301,6 +301,18 @@ metallb:
 # and pg_restores into the CNPG cluster.
 cnpg:
   enabled: false
+  # #277 — the cloudnative-pg subchart is aliased to ``cnpg`` (so its
+  # values + the enable gate live under a short key). But Helm sets the
+  # subchart's ``.Chart.Name`` to the ALIAS, so its ``app.kubernetes.io
+  # /name`` label renders ``cnpg`` — and the operator self-discovers its
+  # own Deployment with a HARDCODED filter ``app.kubernetes.io/name=
+  # cloudnative-pg`` (to own the CA cert it generates). Mismatch →
+  # "no operator deployment found" → "unable to setup PKI infrastructure"
+  # → CrashLoopBackOff. ``nameOverride`` forces the label (and the
+  # chart's fullname-derived service / configmap / RBAC names, all
+  # rendered consistently) back to ``cloudnative-pg`` so self-discovery
+  # works. Do NOT remove without also de-aliasing the dependency.
+  nameOverride: cloudnative-pg
   # Replica topology for the SpatiumDDI ``Cluster`` CR. 3 replicas
   # (primary + sync + async) is the etcd-quorum-friendly default;
   # 5 / 7 work for larger clusters. Even counts refused at the
