@@ -23,11 +23,9 @@ import {
 import {
   applianceApprovalApi,
   applianceSlotImagesApi,
-  applianceTlsApi,
   authApi,
   dhcpApi,
   dnsApi,
-  type ApplianceCertificate,
   type ApplianceRow,
   type ApplianceState,
   type MetalLBConfig,
@@ -457,111 +455,8 @@ function ClusterMembershipModal({
   );
 }
 
-// #272 Phase 6 — surface the Web UI TLS certificate on the Fleet →
-// Control plane tab. The cert is a control-plane concern (served on the
-// frontend / control-plane VIP, stored in the spatium-appliance-tls k8s
-// Secret that rolls every frontend replica). The full upload / CSR /
-// activate flow lives on the "Web UI Certificate" tab; this card shows
-// the active cert's status where operators manage the cluster, with a
-// jump to that tab. Read-only — no mutation here.
-const _CERT_SOURCE_LABEL: Record<ApplianceCertificate["source"], string> = {
-  uploaded: "Uploaded",
-  csr: "CSR-signed",
-  letsencrypt: "Let's Encrypt",
-  "self-signed": "Self-signed",
-};
-
-function ControlPlaneTlsCard({ onManage }: { onManage: () => void }) {
-  const { data, isLoading } = useQuery({
-    queryKey: ["appliance", "tls"],
-    queryFn: applianceTlsApi.list,
-    staleTime: 30_000,
-  });
-  const active = data?.find((c) => c.is_active) ?? null;
-
-  let expiry: { text: string; tone: string } | null = null;
-  if (active?.valid_to) {
-    const days = Math.floor(
-      (new Date(active.valid_to).getTime() - Date.now()) / 86_400_000,
-    );
-    const tone =
-      days < 0
-        ? "text-rose-600"
-        : days < 14
-          ? "text-amber-600"
-          : "text-muted-foreground";
-    expiry = {
-      text:
-        days < 0
-          ? `expired ${-days}d ago`
-          : `expires in ${days}d (${new Date(active.valid_to).toLocaleDateString()})`,
-      tone,
-    };
-  }
-
-  return (
-    <div className="rounded-lg border bg-card p-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <span
-            className={cn(
-              "inline-block h-2 w-2 rounded-full",
-              active ? "bg-emerald-500" : "bg-zinc-400",
-            )}
-          />
-          <h3 className="text-sm font-semibold">Web UI TLS certificate</h3>
-          {active && (
-            <span className="rounded-md bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
-              {_CERT_SOURCE_LABEL[active.source] ?? active.source}
-            </span>
-          )}
-        </div>
-        <button
-          type="button"
-          onClick={onManage}
-          className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
-          title="Open the Web UI Certificate tab to upload, generate a CSR, or activate a cert"
-        >
-          Manage…
-        </button>
-      </div>
-      <div className="mt-2 text-sm text-muted-foreground">
-        {isLoading ? (
-          <span>Loading…</span>
-        ) : active ? (
-          <div className="flex flex-col gap-0.5">
-            <span>
-              Active:{" "}
-              <span className="font-mono text-foreground">
-                {active.subject_cn}
-              </span>
-            </span>
-            {expiry && <span className={expiry.tone}>{expiry.text}</span>}
-            {active.sans.length > 0 && (
-              <span className="break-all text-xs">
-                SANs: {active.sans.join(", ")}
-              </span>
-            )}
-          </div>
-        ) : (
-          <span>
-            No active certificate — the appliance is serving a self-signed cert
-            generated at first boot. Upload your own or generate a CSR from the
-            Web UI Certificate tab.
-          </span>
-        )}
-      </div>
-      <p className="mt-2 text-xs text-muted-foreground">
-        Served on every control-plane frontend replica via the{" "}
-        <span className="font-mono">spatium-appliance-tls</span> Secret —
-        uploading or activating a cert rolls all replicas automatically.
-      </p>
-    </div>
-  );
-}
-
 // #272 Phase 7c — cluster-wide MetalLB pool + control-plane VIP picker.
-// Lives on Fleet → Control plane next to the TLS card. The operator
+// Lives on Fleet → Control plane. The operator
 // sets an L2 address pool + a floating VIP; the seed supervisor picks
 // the saved config up on its next heartbeat (~60 s) and patches the
 // HelmCharts so the frontend Service floats on the VIP across nodes.
@@ -873,20 +768,6 @@ export function FleetTab({
   });
   const controlPlane = splitByState(controlPlaneRows);
   const serviceAgents = splitByState(serviceAgentRows);
-  // #272 — the only control-plane node (across non-revoked rows) can't
-  // be revoked: doing so would brick the control plane. Hide its Revoke
-  // action. Count nodes that are control-plane by variant OR an actual
-  // cluster member. null when 0 or >1 (then Revoke is allowed — there's
-  // a surviving control plane / it's not a CP node).
-  const liveControlPlane = rows.filter(
-    (r) =>
-      r.state !== "revoked" &&
-      (isControlPlaneRow(r) ||
-        r.cluster_role === "primary" ||
-        r.cluster_role === "member"),
-  );
-  const soleControlPlaneId =
-    liveControlPlane.length === 1 ? liveControlPlane[0].id : null;
 
   if (!isSuperadmin) {
     return (
@@ -1012,7 +893,16 @@ export function FleetTab({
 
       {/* ── Main pane ── */}
       <main className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-5xl p-6">
+        {/* The appliances list is a wide multi-column table — let it use
+            the full pane width (like the IPAM table) instead of the
+            max-w-5xl cap the narrower config forms (pairing / slot-images
+            / NTP / SNMP) read better at. */}
+        <div
+          className={cn(
+            "mx-auto p-6",
+            view === "appliances" ? "max-w-none" : "max-w-5xl",
+          )}
+        >
           {view === "pairing" && (
             <div>
               <h2 className="mb-1 text-base font-semibold">Pairing codes</h2>
@@ -1102,7 +992,25 @@ export function FleetTab({
                     paired to a remote control plane.
                   </p>
                 </div>
-                <div className="flex shrink-0 items-center gap-2">
+                <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowCluster(true)}
+                    className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted"
+                    title="Promote appliances into the control-plane cluster, or demote members"
+                  >
+                    Manage control plane cluster…
+                  </button>
+                  {isApplianceHost && (
+                    <button
+                      type="button"
+                      onClick={() => onNavigateTab?.("tls")}
+                      className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted"
+                      title="Upload a Web UI certificate, generate a CSR, or activate a cert"
+                    >
+                      Manage certificates…
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => refetch()}
@@ -1144,18 +1052,7 @@ export function FleetTab({
                 </div>
               ) : (
                 <div className="space-y-6">
-                  <div className="flex justify-end">
-                    <button
-                      type="button"
-                      onClick={() => setShowCluster(true)}
-                      className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
-                      title="Promote appliances into the control-plane cluster, or demote members"
-                    >
-                      Manage control plane cluster…
-                    </button>
-                  </div>
                   <ApplianceTableSection
-                    soleControlPlaneId={soleControlPlaneId}
                     title="Control plane"
                     subtitle="Boxes hosting the SpatiumDDI control plane — the control-plane node plus any promoted appliances."
                     pendingRows={controlPlane.pending}
@@ -1176,14 +1073,8 @@ export function FleetTab({
                     onReauthorize={(row) => reauthorize.mutate(row.id)}
                     onPermanentDelete={(row) => setPermanentDeleteTarget(row)}
                   />
-                  {isApplianceHost && (
-                    <ControlPlaneTlsCard
-                      onManage={() => onNavigateTab?.("tls")}
-                    />
-                  )}
                   {isApplianceHost && <MetalLBConfigCard />}
                   <ApplianceTableSection
-                    soleControlPlaneId={soleControlPlaneId}
                     title="Service agents"
                     subtitle="Appliance nodes running DNS / DHCP service containers paired to a remote control plane."
                     pendingRows={serviceAgents.pending}
@@ -1437,7 +1328,6 @@ function ApplianceTableSection({
   onDelete,
   onReauthorize,
   onPermanentDelete,
-  soleControlPlaneId,
 }: {
   title: string;
   subtitle: string;
@@ -1445,9 +1335,6 @@ function ApplianceTableSection({
   otherRows: ApplianceRow[];
   emptyMessage: string;
   busyId: string | null | undefined;
-  // #272 — id of the only control-plane node (if exactly one), so its
-  // Revoke action is hidden. null when 0 or >1 control-plane nodes.
-  soleControlPlaneId: string | null;
   onOpen: (row: ApplianceRow) => void;
   onApprove: (row: ApplianceRow) => void;
   onReject: (row: ApplianceRow) => void;
@@ -1477,17 +1364,17 @@ function ApplianceTableSection({
           <table className="w-full text-sm">
             <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
               <tr>
-                <th className="px-3 py-2 text-left font-medium">Hostname</th>
-                <th className="px-3 py-2 text-left font-medium">State</th>
-                <th className="px-3 py-2 text-left font-medium">Services</th>
-                <th className="px-3 py-2 text-left font-medium">
+                <th className="px-4 py-3 text-left font-medium">Hostname</th>
+                <th className="px-4 py-3 text-left font-medium">State</th>
+                <th className="px-4 py-3 text-left font-medium">Services</th>
+                <th className="px-4 py-3 text-left font-medium">
                   Capabilities
                 </th>
-                <th className="px-3 py-2 text-left font-medium">Slots</th>
-                <th className="px-3 py-2 text-left font-medium">Fingerprint</th>
-                <th className="px-3 py-2 text-left font-medium">Paired</th>
-                <th className="px-3 py-2 text-left font-medium">Last seen</th>
-                <th className="px-3 py-2 text-right font-medium">Actions</th>
+                <th className="px-4 py-3 text-left font-medium">Slots</th>
+                <th className="px-4 py-3 text-left font-medium">Fingerprint</th>
+                <th className="px-4 py-3 text-left font-medium">Paired</th>
+                <th className="px-4 py-3 text-left font-medium">Last seen</th>
+                <th className="px-4 py-3 text-right font-medium">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y">
@@ -1504,7 +1391,7 @@ function ApplianceTableSection({
                   onDelete={() => onDelete(row)}
                   onReauthorize={() => onReauthorize(row)}
                   onPermanentDelete={() => onPermanentDelete(row)}
-                  canRevoke={row.id !== soleControlPlaneId}
+                  canRevoke={!isControlPlaneRow(row)}
                 />
               ))}
               {otherRows.map((row) => (
@@ -1519,7 +1406,7 @@ function ApplianceTableSection({
                   onDelete={() => onDelete(row)}
                   onReauthorize={() => onReauthorize(row)}
                   onPermanentDelete={() => onPermanentDelete(row)}
-                  canRevoke={row.id !== soleControlPlaneId}
+                  canRevoke={!isControlPlaneRow(row)}
                 />
               ))}
             </tbody>
@@ -1570,7 +1457,7 @@ function ApplianceTableRow({
       )}
       onClick={onOpen}
     >
-      <td className="px-3 py-2">
+      <td className="px-4 py-3">
         <div className="flex items-center gap-2">
           <span className="font-medium">{row.hostname}</span>
           {/* #272 — installer-role chip. Two variants: control-plane
@@ -1579,7 +1466,7 @@ function ApplianceTableRow({
           {row.appliance_variant && (
             <span
               className={cn(
-                "inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium",
+                "inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium",
                 isControlPlaneRow(row)
                   ? "border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-300"
                   : "border-violet-500/40 bg-violet-500/10 text-violet-600 dark:text-violet-300",
@@ -1601,7 +1488,7 @@ function ApplianceTableRow({
           </div>
         )}
       </td>
-      <td className="px-3 py-2">
+      <td className="px-4 py-3">
         <span
           className={cn(
             "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs",
@@ -1611,10 +1498,10 @@ function ApplianceTableRow({
           <Icon className="h-3 w-3" /> {badge.label}
         </span>
       </td>
-      <td className="px-3 py-2">
+      <td className="px-4 py-3">
         <ServiceChipList row={row} />
       </td>
-      <td className="px-3 py-2">
+      <td className="px-4 py-3">
         <div className="flex flex-wrap gap-1">
           {caps.length === 0 ? (
             <span className="text-xs text-muted-foreground">—</span>
@@ -1622,7 +1509,7 @@ function ApplianceTableRow({
             caps.map((c) => (
               <span
                 key={c.key}
-                className="rounded-full bg-muted px-1.5 py-0.5 font-mono text-[10px]"
+                className="rounded-full bg-muted px-2 py-0.5 font-mono text-xs"
               >
                 {c.label}
               </span>
@@ -1630,7 +1517,7 @@ function ApplianceTableRow({
           )}
           {row.capabilities.has_baked_images && (
             <span
-              className="rounded-full bg-sky-500/10 px-1.5 py-0.5 font-mono text-[10px] text-sky-700 dark:text-sky-300"
+              className="rounded-full bg-sky-500/10 px-2 py-0.5 font-mono text-xs text-sky-700 dark:text-sky-300"
               title="Supervisor reports baked container images on the rootfs — air-gap-ready."
             >
               baked
@@ -1638,22 +1525,22 @@ function ApplianceTableRow({
           )}
         </div>
       </td>
-      <td className="px-3 py-2">
+      <td className="px-4 py-3">
         <ApplianceSlotsCell row={row} />
       </td>
-      <td className="px-3 py-2 font-mono text-xs">
+      <td className="px-4 py-3 font-mono text-xs">
         {shortFingerprint(row.public_key_fingerprint)}
       </td>
-      <td className="px-3 py-2 text-xs text-muted-foreground">
+      <td className="px-4 py-3 text-xs text-muted-foreground">
         {relativeTime(row.paired_at)}
         {row.paired_from_ip && (
           <div className="font-mono">{row.paired_from_ip}</div>
         )}
       </td>
-      <td className="px-3 py-2 text-xs text-muted-foreground">
+      <td className="px-4 py-3 text-xs text-muted-foreground">
         {relativeTime(row.last_seen_at)}
       </td>
-      <td className="px-3 py-2 text-right" onClick={(e) => e.stopPropagation()}>
+      <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
         <div className="inline-flex items-center gap-1">
           {row.state === "pending_approval" && (
             <>
@@ -1693,17 +1580,25 @@ function ApplianceTableRow({
                 <KeyRound className="h-3 w-3" />
                 Re-key
               </button>
-              {canRevoke && (
-                <button
-                  type="button"
-                  onClick={onDelete}
-                  className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
-                  title="Revoke — flip to revoked state, supervisor tears down service containers. Re-authorize on the same row to recover."
-                >
-                  <Ban className="h-3 w-3" />
-                  Revoke
-                </button>
-              )}
+              {/* #272 — a control-plane cluster member can't be revoked
+                  until it's demoted (demote via "Manage control plane
+                  cluster…"). Revoking a live etcd member would break
+                  quorum. Show the button disabled with a hint rather than
+                  hiding it, so the path forward is obvious. */}
+              <button
+                type="button"
+                onClick={canRevoke ? onDelete : undefined}
+                disabled={!canRevoke}
+                className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-40 dark:text-amber-400"
+                title={
+                  canRevoke
+                    ? "Revoke — flip to revoked state, supervisor tears down service containers. Re-authorize on the same row to recover."
+                    : "Demote this node from the control-plane cluster first (Manage control plane cluster…) before revoking."
+                }
+              >
+                <Ban className="h-3 w-3" />
+                Revoke
+              </button>
             </>
           )}
           {row.state === "revoked" && (
