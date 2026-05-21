@@ -198,7 +198,17 @@ const CONTROL_PLANE_VARIANTS = new Set([
   "control-cluster-member",
 ]);
 function isControlPlaneRow(row: ApplianceRow): boolean {
-  return CONTROL_PLANE_VARIANTS.has(row.appliance_variant ?? "");
+  // A row belongs on the control-plane side if it installed as a
+  // control-plane variant OR it has actually joined the k3s control
+  // plane (an `appliance`-variant box promoted to a cluster member —
+  // #272 Phase 7). Without the cluster_role check a promoted member
+  // keeps rendering under "Service agents" even though it's now an
+  // etcd/control-plane node.
+  return (
+    CONTROL_PLANE_VARIANTS.has(row.appliance_variant ?? "") ||
+    row.cluster_role === "primary" ||
+    row.cluster_role === "member"
+  );
 }
 
 // #272 Phase 7c — settled / in-flight control-plane cluster membership.
