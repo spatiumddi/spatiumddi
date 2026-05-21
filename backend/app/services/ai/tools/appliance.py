@@ -91,6 +91,11 @@ def _row_to_dict(row: Appliance) -> dict[str, Any]:
         "last_seen_ip": row.last_seen_ip,
         "cert_serial": row.cert_serial,
         "cert_expires_at": (row.cert_expires_at.isoformat() if row.cert_expires_at else None),
+        # #272 control-plane cluster membership (Phase 7+).
+        "cluster_role": row.cluster_role,
+        "desired_cluster_role": row.desired_cluster_role,
+        "cluster_join_state": row.cluster_join_state,
+        "node_ip": row.node_ip,
     }
 
 
@@ -254,6 +259,158 @@ async def find_control_plane_vip(
         "enabled": bool(row.metallb_enabled),
         "pool_addresses": list(row.metallb_pool_addresses or []),
         "control_plane_vip": row.control_plane_vip or "",
+    }
+
+
+# ── find_k8s_pods ──────────────────────────────────────────────────
+
+
+class FindK8sPodsArgs(BaseModel):
+    namespace: str | None = Field(
+        default="spatium",
+        description=(
+            "Namespace to list pods in (default 'spatium', where the "
+            "control-plane workloads live). Pass an empty string for the "
+            "api pod's own namespace; there is no all-namespaces mode."
+        ),
+    )
+    only_unhealthy: bool = Field(
+        default=False,
+        description="Return only pods that aren't Running + fully Ready.",
+    )
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+@register_tool(
+    name="find_k8s_pods",
+    description=(
+        "List Kubernetes pods on the appliance control plane (superadmin "
+        "only, #272). Returns per-pod namespace / name / phase / node / "
+        "ready / restarts — the same view as `kubectl get pods`. Use to "
+        "answer 'is anything crash-looping?' or 'which node is the "
+        "primary postgres on?'. Appliance control plane only; read-only."
+    ),
+    args_model=FindK8sPodsArgs,
+    category="admin",
+    default_enabled=True,
+    module="appliance.cluster",
+)
+async def find_k8s_pods(db: AsyncSession, user: User, args: FindK8sPodsArgs) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+    import asyncio  # noqa: PLC0415
+
+    from app.config import settings  # noqa: PLC0415
+    from app.services.appliance import k8s  # noqa: PLC0415
+
+    if not settings.appliance_mode:
+        return {
+            "error": (
+                "Kubernetes introspection is only available on the "
+                "SpatiumDDI OS appliance control plane."
+            )
+        }
+    try:
+        items = await asyncio.to_thread(k8s.list_pods, args.namespace or None)
+    except k8s.KubeapiUnavailableError as exc:
+        return {"error": f"kubeapi unreachable: {exc}"}
+
+    pods: list[dict[str, Any]] = []
+    for it in items:
+        meta = it.get("metadata") or {}
+        spec = it.get("spec") or {}
+        st = it.get("status") or {}
+        cs = st.get("containerStatuses") or []
+        ready_n = sum(1 for c in cs if c.get("ready"))
+        restarts = sum(int(c.get("restartCount") or 0) for c in cs)
+        all_ready = bool(cs) and ready_n == len(cs)
+        phase = st.get("phase")
+        if args.only_unhealthy and phase in ("Running", "Succeeded") and all_ready:
+            continue
+        pods.append(
+            {
+                "namespace": meta.get("namespace"),
+                "name": meta.get("name"),
+                "phase": phase,
+                "node": spec.get("nodeName"),
+                "ready": f"{ready_n}/{len(cs)}" if cs else "0/0",
+                "restarts": restarts,
+            }
+        )
+    pods = pods[: args.limit]
+    return {"pods": pods, "count": len(pods)}
+
+
+# ── find_cluster_health ────────────────────────────────────────────
+
+
+class FindClusterHealthArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="find_cluster_health",
+    description=(
+        "Roll up the appliance control-plane cluster health (superadmin "
+        "only, #272). Returns the settled control-plane member count, an "
+        "etcd-quorum assessment (odd count + all members reporting "
+        "ready), and a per-node summary (hostname / node IP / cluster "
+        "role / join state / last-seen). Use to answer 'is the control "
+        "plane healthy?' or 'did node X finish joining?'. Read-only."
+    ),
+    args_model=FindClusterHealthArgs,
+    category="admin",
+    default_enabled=True,
+    module="appliance.cluster",
+)
+async def find_cluster_health(
+    db: AsyncSession, user: User, args: FindClusterHealthArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+    from app.models.appliance import (  # noqa: PLC0415
+        APPLIANCE_STATE_APPROVED,
+        CLUSTER_ROLE_MEMBER,
+        CLUSTER_ROLE_PRIMARY,
+    )
+
+    rows = list(
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    nodes = [
+        {
+            "hostname": r.hostname,
+            "node_ip": r.node_ip,
+            "cluster_role": r.cluster_role,
+            "cluster_join_state": r.cluster_join_state,
+            "last_seen_at": (r.last_seen_at.isoformat() if r.last_seen_at else None),
+        }
+        for r in sorted(rows, key=lambda r: (r.cluster_role != CLUSTER_ROLE_PRIMARY, r.hostname))
+    ]
+    member_count = len(rows)
+    all_ready = all(r.cluster_join_state in (None, "ready") for r in rows)
+    has_primary = any(r.cluster_role == CLUSTER_ROLE_PRIMARY for r in rows)
+    odd = member_count % 2 == 1
+    quorum_ok = member_count >= 1 and odd and all_ready and has_primary
+    return {
+        "member_count": member_count,
+        "etcd_quorum_ok": quorum_ok,
+        "quorum_notes": {
+            "odd_member_count": odd,
+            "all_members_ready": all_ready,
+            "has_primary_seed": has_primary,
+            "tolerates_node_loss": max(0, (member_count - 1) // 2),
+        },
+        "nodes": nodes,
     }
 
 
