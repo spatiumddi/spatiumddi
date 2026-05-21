@@ -7120,6 +7120,13 @@ export interface MetalLBConfig {
   control_plane_vip: string;
 }
 
+// #272 Phase 9 — dead-node replacement result.
+export interface ControlPlaneReplaceResult {
+  evicted: ApplianceRow;
+  pairing_code: string;
+  pairing_expires_at: string;
+}
+
 export const applianceFleetApi = {
   list: () =>
     api
@@ -7464,6 +7471,15 @@ export const applianceApprovalApi = {
         appliance_ids: applianceIds,
       })
       .then((r) => r.data.appliances),
+  // #272 Phase 9 — replace a DEAD control-plane member: the seed evicts
+  // its k8s Node (k3s drops the etcd member), and a single-use pairing
+  // code is minted for the replacement box. Returns the code (shown once).
+  replaceControlPlaneMember: (applianceId: string) =>
+    api
+      .post<ControlPlaneReplaceResult>(
+        `/appliance/fleet/control-plane/${applianceId}/replace`,
+      )
+      .then((r) => r.data),
   // #272 Phase 7c — cluster-wide MetalLB pool + control-plane VIP. The
   // seed supervisor picks the saved config up on heartbeat and patches
   // the HelmCharts; the VIP must fall inside the pool (the API 422s

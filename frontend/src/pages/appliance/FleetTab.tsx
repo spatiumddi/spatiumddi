@@ -28,7 +28,7 @@ import {
   dnsApi,
   type ApplianceRow,
   type ApplianceState,
-  type MetalLBConfig,
+  type ControlPlaneReplaceResult,
   type SlotImage,
   type SupervisorCapabilities,
   formatApiError,
@@ -455,149 +455,6 @@ function ClusterMembershipModal({
   );
 }
 
-// #272 Phase 7c — cluster-wide MetalLB pool + control-plane VIP picker.
-// Lives on Fleet → Control plane. The operator
-// sets an L2 address pool + a floating VIP; the seed supervisor picks
-// the saved config up on its next heartbeat (~60 s) and patches the
-// HelmCharts so the frontend Service floats on the VIP across nodes.
-function MetalLBConfigCard() {
-  const qc = useQueryClient();
-  const { data, isLoading } = useQuery({
-    queryKey: ["appliance", "metallb"],
-    queryFn: applianceApprovalApi.getMetalLBConfig,
-    staleTime: 30_000,
-  });
-
-  const [enabled, setEnabled] = useState(false);
-  const [poolText, setPoolText] = useState("");
-  const [vip, setVip] = useState("");
-  const [dirty, setDirty] = useState(false);
-
-  // Seed the form from the server once it loads (and re-seed after a
-  // save) — but never clobber in-progress operator edits.
-  useEffect(() => {
-    if (data && !dirty) {
-      setEnabled(data.enabled);
-      setPoolText((data.pool_addresses ?? []).join("\n"));
-      setVip(data.control_plane_vip ?? "");
-    }
-  }, [data, dirty]);
-
-  const save = useMutation({
-    mutationFn: (body: MetalLBConfig) =>
-      applianceApprovalApi.setMetalLBConfig(body),
-    onSuccess: (saved) => {
-      qc.setQueryData(["appliance", "metallb"], saved);
-      setDirty(false);
-    },
-  });
-
-  const poolAddresses = poolText
-    .split(/[\n,]/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  const onSave = () => {
-    save.mutate({
-      enabled,
-      pool_addresses: poolAddresses,
-      control_plane_vip: vip.trim(),
-    });
-  };
-
-  return (
-    <div className="rounded-lg border bg-card p-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <span
-            className={cn(
-              "inline-block h-2 w-2 rounded-full",
-              data?.enabled ? "bg-emerald-500" : "bg-zinc-400",
-            )}
-          />
-          <h3 className="text-sm font-semibold">Control-plane VIP (MetalLB)</h3>
-          {data?.enabled && data.control_plane_vip && (
-            <span className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
-              {data.control_plane_vip}
-            </span>
-          )}
-        </div>
-      </div>
-      <p className="mt-2 text-xs text-muted-foreground">
-        A single floating IP that fronts the Web UI so it stays reachable on one
-        address regardless of which control-plane node is up. The VIP must fall
-        inside the address pool. Applied across the cluster by the seed within
-        ~60&nbsp;s; the served certificate auto-adds the VIP to its SANs.
-      </p>
-
-      {isLoading ? (
-        <p className="mt-3 text-sm text-muted-foreground">Loading…</p>
-      ) : (
-        <div className="mt-3 flex flex-col gap-3">
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={enabled}
-              onChange={(e) => {
-                setEnabled(e.target.checked);
-                setDirty(true);
-              }}
-            />
-            Enable MetalLB + control-plane VIP
-          </label>
-          <div className="flex flex-col gap-1">
-            <span className="text-xs font-medium text-muted-foreground">
-              Address pool — one CIDR or range per line
-            </span>
-            <textarea
-              value={poolText}
-              onChange={(e) => {
-                setPoolText(e.target.value);
-                setDirty(true);
-              }}
-              rows={2}
-              placeholder={"192.168.0.240/29\n192.168.0.240-192.168.0.247"}
-              className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
-            />
-          </div>
-          <div className="flex flex-col gap-1">
-            <span className="text-xs font-medium text-muted-foreground">
-              Control-plane VIP
-            </span>
-            <input
-              value={vip}
-              onChange={(e) => {
-                setVip(e.target.value);
-                setDirty(true);
-              }}
-              placeholder="192.168.0.240"
-              className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
-            />
-          </div>
-          {save.isError && (
-            <p className="text-xs text-rose-600">
-              {formatApiError(save.error)}
-            </p>
-          )}
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={onSave}
-              disabled={!dirty || save.isPending}
-              className="rounded-md border bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:opacity-50"
-            >
-              {save.isPending ? "Saving…" : "Save"}
-            </button>
-            {save.isSuccess && !dirty && (
-              <span className="text-xs text-emerald-600">✓ Saved</span>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
 export function FleetTab({
   onNavigateTab,
   isApplianceHost = false,
@@ -644,6 +501,12 @@ export function FleetTab({
   const [rejectTarget, setRejectTarget] = useState<ApplianceRow | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ApplianceRow | null>(null);
   const [rekeyTarget, setRekeyTarget] = useState<ApplianceRow | null>(null);
+  // #272 Phase 9 — dead-node replacement. ``replaceTarget`` is the
+  // member to evict (confirm modal); ``replaceResult`` holds the minted
+  // pairing code shown once the eviction is stamped.
+  const [replaceTarget, setReplaceTarget] = useState<ApplianceRow | null>(null);
+  const [replaceResult, setReplaceResult] =
+    useState<ControlPlaneReplaceResult | null>(null);
 
   const approve = useMutation({
     mutationFn: (id: string) => applianceApprovalApi.approve(id),
@@ -661,6 +524,15 @@ export function FleetTab({
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
       setRejectTarget(null);
+    },
+  });
+  const replace = useMutation({
+    mutationFn: (id: string) =>
+      applianceApprovalApi.replaceControlPlaneMember(id),
+    onSuccess: (result) => {
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+      setReplaceTarget(null);
+      setReplaceResult(result);
     },
   });
   // #170 follow-up — password re-auth required for delete (the
@@ -1072,8 +944,8 @@ export function FleetTab({
                     onDelete={(row) => setDeleteTarget(row)}
                     onReauthorize={(row) => reauthorize.mutate(row.id)}
                     onPermanentDelete={(row) => setPermanentDeleteTarget(row)}
+                    onReplace={(row) => setReplaceTarget(row)}
                   />
-                  {isApplianceHost && <MetalLBConfigCard />}
                   <ApplianceTableSection
                     title="Service agents"
                     subtitle="Appliance nodes running DNS / DHCP service containers paired to a remote control plane."
@@ -1268,6 +1140,76 @@ export function FleetTab({
           onClose={() => setRekeyTarget(null)}
         />
       )}
+
+      {/* #272 Phase 9 — confirm dead-node eviction. */}
+      {replaceTarget && (
+        <ConfirmModal
+          open
+          title="Replace dead control-plane member?"
+          message={
+            <>
+              <p className="text-sm">
+                Evict <strong>{replaceTarget.hostname}</strong> from the
+                control-plane cluster. The seed deletes its k8s Node (k3s drops
+                the etcd member with it) and the cluster drops to{" "}
+                {"the remaining members"}. A single-use pairing code is minted
+                so a fresh appliance can take its place — pair it, approve it,
+                and promote it back into the cluster.
+              </p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Use this only when the node is gone for good. For a node that's
+                still alive, demote it gracefully via "Manage control plane
+                cluster…" instead.
+              </p>
+              {replace.isError && (
+                <p className="mt-2 text-xs text-rose-600">
+                  {formatApiError(replace.error)}
+                </p>
+              )}
+            </>
+          }
+          confirmLabel="Evict + mint replacement code"
+          loading={replace.isPending}
+          onConfirm={() => replace.mutate(replaceTarget.id)}
+          onClose={() => setReplaceTarget(null)}
+        />
+      )}
+
+      {/* #272 Phase 9 — show the minted replacement pairing code once. */}
+      {replaceResult && (
+        <Modal
+          title="Replacement pairing code"
+          onClose={() => setReplaceResult(null)}
+        >
+          <div className="space-y-3 text-sm">
+            <p>
+              <strong>{replaceResult.evicted.hostname}</strong> has been
+              evicted. Install a fresh appliance (Appliance role) and pair it
+              with this single-use code, then approve + promote it to restore
+              the cluster:
+            </p>
+            <div className="flex items-center gap-2">
+              <code className="rounded-md bg-muted px-3 py-2 font-mono text-lg tracking-widest">
+                {replaceResult.pairing_code}
+              </code>
+              <button
+                type="button"
+                onClick={() =>
+                  navigator.clipboard?.writeText(replaceResult.pairing_code)
+                }
+                className="rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                Copy
+              </button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Expires{" "}
+              {new Date(replaceResult.pairing_expires_at).toLocaleString()}.
+              Shown once — regenerate from the Pairing tab if you lose it.
+            </p>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
@@ -1328,6 +1270,7 @@ function ApplianceTableSection({
   onDelete,
   onReauthorize,
   onPermanentDelete,
+  onReplace,
 }: {
   title: string;
   subtitle: string;
@@ -1342,6 +1285,9 @@ function ApplianceTableSection({
   onDelete: (row: ApplianceRow) => void;
   onReauthorize: (row: ApplianceRow) => void;
   onPermanentDelete: (row: ApplianceRow) => void;
+  // #272 Phase 9 — only the Control plane section passes this (members
+  // can be replaced when dead). Undefined elsewhere → no Replace action.
+  onReplace?: (row: ApplianceRow) => void;
 }) {
   const total = pendingRows.length + otherRows.length;
   return (
@@ -1392,6 +1338,7 @@ function ApplianceTableSection({
                   onReauthorize={() => onReauthorize(row)}
                   onPermanentDelete={() => onPermanentDelete(row)}
                   canRevoke={!isControlPlaneRow(row)}
+                  onReplace={onReplace ? () => onReplace(row) : undefined}
                 />
               ))}
               {otherRows.map((row) => (
@@ -1407,6 +1354,7 @@ function ApplianceTableSection({
                   onReauthorize={() => onReauthorize(row)}
                   onPermanentDelete={() => onPermanentDelete(row)}
                   canRevoke={!isControlPlaneRow(row)}
+                  onReplace={onReplace ? () => onReplace(row) : undefined}
                 />
               ))}
             </tbody>
@@ -1428,6 +1376,7 @@ function ApplianceTableRow({
   onDelete,
   onReauthorize,
   onPermanentDelete,
+  onReplace,
   canRevoke = true,
 }: {
   row: ApplianceRow;
@@ -1440,6 +1389,7 @@ function ApplianceTableRow({
   onDelete: () => void;
   onReauthorize: () => void;
   onPermanentDelete: () => void;
+  onReplace?: (() => void) | undefined;
   // #272 — false for the sole control-plane node: revoking it would
   // brick the control plane, so we hide the action (the backend also
   // refuses it). True for everything else.
@@ -1580,6 +1530,20 @@ function ApplianceTableRow({
                 <KeyRound className="h-3 w-3" />
                 Re-key
               </button>
+              {/* #272 Phase 9 — replace a DEAD control-plane member:
+                  evict its etcd member + mint a replacement pairing code.
+                  Only offered for settled members (cluster_role=member). */}
+              {onReplace && row.cluster_role === "member" && (
+                <button
+                  type="button"
+                  onClick={onReplace}
+                  className="inline-flex items-center gap-1 rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-xs text-rose-700 hover:bg-rose-500/20 dark:text-rose-300"
+                  title="Replace a DEAD member — evict its etcd member + mint a pairing code for a replacement box. Use only when the node is gone for good."
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  Replace…
+                </button>
+              )}
               {/* #272 — a control-plane cluster member can't be revoked
                   until it's demoted (demote via "Manage control plane
                   cluster…"). Revoking a live etcd member would break

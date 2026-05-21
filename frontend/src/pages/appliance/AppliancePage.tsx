@@ -61,14 +61,14 @@ interface TabSpec {
   selfOnly?: boolean;
 }
 
-// ── IMPORTANT: keep this array sorted alphabetically by ``label`` ────
-// Tabs render in the order they appear here. Operators expect a
-// stable alphabetised list across releases (otherwise a new tab
-// landing somewhere in the middle visually shuffles every adjacent
-// label). When adding a new tab, slot it in by alphabetical position
-// rather than appending at the bottom. The list intentionally
-// includes selfOnly tabs in the same sort order — hiding them on
-// docker / k8s control planes happens at render time, not here.
+// ── Tab order: Fleet pinned first, the rest alphabetical by label ────
+// The render-time sort in ``visibleTabs`` (below) does the ordering, so
+// the source order here doesn't matter — Fleet is pinned to the front
+// and every other tab sorts by its ``label`` (case-insensitive). This
+// is robust to label renames (e.g. "Containers" → "Pods" no longer
+// strands the tab in the wrong slot) + new tabs slotting in
+// automatically. selfOnly tabs are hidden on docker / k8s control
+// planes at filter time, also below.
 const TABS: TabSpec[] = [
   {
     // Issue #170 Wave D1 — Fleet tab (renamed from Approvals).
@@ -150,7 +150,15 @@ export function AppliancePage() {
   // OS Versions so operators with appliance *agents* (registered
   // against this docker/k8s control plane) can manage them.
   const isApplianceHost = !!info?.appliance_mode;
-  const visibleTabs = TABS.filter((t) => !t.selfOnly || isApplianceHost);
+  // Fleet pinned first; every other visible tab sorted alphabetically
+  // by label (case-insensitive). See the comment on TABS above.
+  const visibleTabs = TABS.filter((t) => !t.selfOnly || isApplianceHost).sort(
+    (a, b) => {
+      if (a.key === "fleet") return -1;
+      if (b.key === "fleet") return 1;
+      return a.label.localeCompare(b.label, undefined, { sensitivity: "base" });
+    },
+  );
 
   // Default tab — first self-only tab on appliance hosts (TLS),
   // first universal tab (Releases) otherwise. Keeps the session-stored
