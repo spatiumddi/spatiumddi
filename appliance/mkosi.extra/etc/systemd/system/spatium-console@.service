@@ -25,7 +25,7 @@ ExecStartPre=-/usr/bin/systemctl stop serial-getty@%i.service
 # Serial consoles already drive arbitrary character grids (the
 # software terminal on the host picks the size), so setfont is a
 # no-op here — left in for symmetry with the tty1 unit.
-ExecStartPre=-/usr/bin/setfont -C /dev/%I Lat15-VGA16
+ExecStartPre=-/usr/bin/setfont -C /dev/%I Lat15-Terminus12x6
 ExecStart=/usr/local/bin/spatium-console --tty /dev/%I
 StandardInput=tty
 StandardOutput=tty

@@ -252,6 +252,38 @@ def role_label(role: str) -> str:
     return ROLE_LABELS.get(role, role)
 
 
+_CLUSTER_JOIN_STATE_FILE = Path("/var/lib/spatiumddi/release-state/cluster-join.state")
+
+
+def cluster_join_state() -> str | None:
+    """Read the host cluster-join runner's ``.state`` sidecar
+    (``state<TAB>reason``). Returns the state — joining / ready /
+    leaving / left / failed — or None when the node has never
+    joined/left a control-plane cluster (#272)."""
+    try:
+        raw = _CLUSTER_JOIN_STATE_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return raw.split("\t", 1)[0] or None if raw else None
+
+
+def effective_role_label(role: str) -> str:
+    """Role label that reflects k3s cluster membership. An ``appliance``
+    that has been PROMOTED + JOINED the control-plane cluster (#272)
+    shows as a control-plane member, not the install-time
+    "Appliance — supervisor" — its install role-config still says
+    appliance, but operationally it's now a control-plane/etcd node."""
+    if role in ("appliance", "application"):
+        st = cluster_join_state()
+        if st == "ready":
+            return "Control-plane member (promoted appliance)"
+        if st == "joining":
+            return "Appliance — joining control-plane cluster…"
+        if st == "leaving":
+            return "Appliance — leaving control-plane cluster…"
+    return role_label(role)
+
+
 # ── k3s pod state ─────────────────────────────────────────────────────
 #
 # Issue #183 Phase 7/8 — the appliance is k3s-only; this used to talk
@@ -399,6 +431,7 @@ def cluster_pods() -> list[dict]:
             {
                 "Names": meta.get("name") or "",
                 "Namespace": meta.get("namespace") or "",
+                "Node": spec.get("nodeName") or "",
                 "Image": (first.get("image") or "") if first else "",
                 "Status": status_str,
                 "Labels": labels,
@@ -483,8 +516,9 @@ def container_port_summary(row: dict) -> str:
 
     Output shapes:
 
-    * ``Host Network`` — container in ``NetworkMode=host`` (DHCP-kea
-      runs here for broadcast-relay reachability).
+    * ``host`` — container in ``NetworkMode=host`` (DHCP-kea runs
+      here for broadcast-relay reachability). Compact label so the
+      Ports column stays narrow on the multi-node console.
     * ``53/tcp 53/udp`` — bridge-mode container with published
       ports; dedupes IPv4/IPv6 entries that the engine API returns
       twice for the same port.
@@ -492,7 +526,7 @@ def container_port_summary(row: dict) -> str:
       supervisor itself, internal-only containers).
     """
     if row.get("NetworkMode") == "host":
-        return "Host Network"
+        return "host"
     pairs: set[tuple[int, str]] = set()
     for p in row.get("Ports") or []:
         pub = p.get("PublicPort")
@@ -1082,7 +1116,7 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     left1.append("Host ", style="dim")
     left1.append(hostname, style="bold")
     left1.append("   Role ", style="dim")
-    left1.append(role_label(role), style="bold cyan")
+    left1.append(effective_role_label(role), style="bold cyan")
     right1 = Text()
     right1.append(clock, style="bold")
     right1.append("  ")
@@ -1260,9 +1294,30 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
                  title="[bold]SpatiumDDI[/bold]", title_align="left")
 
 
+# Strip the long SpatiumDDI helm-release prefixes from pod names for the
+# Pods panel — ``spatium-control-spatiumddi-api-xxx`` reads as
+# ``api-xxx`` and ``spatium-bootstrap-cloudnative-pg-xxx`` as
+# ``cloudnative-pg-xxx``. ``spatium-supervisor-xxx`` is left alone (short
+# + clear already), as are non-SpatiumDDI pods (coredns, helm-install-*,
+# local-path-*).
+_POD_NAME_PREFIXES = (
+    "spatium-control-spatiumddi-",
+    "spatium-bootstrap-",
+)
+
+
+def _short_pod_name(name: str) -> str:
+    for p in _POD_NAME_PREFIXES:
+        if name.startswith(p):
+            return name[len(p):]
+    return name
+
+
 def render_services(role: str, ps_rows: list[dict]) -> Panel:
     """Render the Pods panel — every pod on the local k3s cluster
-    grouped by namespace, with status + ports + image.
+    with status + node + ports (the image column was dropped — on an
+    appliance every image is baked + known, so per-pod image was noise;
+    ``kubectl describe`` still has it).
 
     Function name kept as ``render_services`` so call sites in
     ``render_frame`` don't need to change. Pre-Phase-7 this was
@@ -1278,12 +1333,12 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
 
     tbl = Table.grid(padding=(0, 1), expand=True)
     tbl.add_column(width=1, no_wrap=True)          # health glyph
-    tbl.add_column(width=12, no_wrap=True)         # namespace
-    tbl.add_column(min_width=20, no_wrap=False)    # pod name
-    tbl.add_column(width=5, no_wrap=True, justify="right")  # age
-    tbl.add_column(width=18, no_wrap=True)         # k8s state (CrashLoopBackOff fits)
-    tbl.add_column(width=15, no_wrap=True)         # ports / net mode
-    tbl.add_column(min_width=14, no_wrap=False)    # image
+    tbl.add_column(width=11, no_wrap=True)         # namespace
+    tbl.add_column(min_width=18, no_wrap=False)    # pod name (prefix-stripped)
+    tbl.add_column(width=8, no_wrap=True)          # node (#272 multi-node)
+    tbl.add_column(width=4, no_wrap=True, justify="right")  # age
+    tbl.add_column(width=16, no_wrap=True)         # k8s state (CrashLoopBackOff = 16)
+    tbl.add_column(width=9, no_wrap=True)          # ports / net mode (compact)
 
     # Header row — column labels. dim style so the data rows below
     # stay the visual focus. ``rich.Table.grid`` doesn't have a
@@ -1295,10 +1350,10 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         Text("", style=header_style),
         Text("NAMESPACE", style=header_style),
         Text("NAME", style=header_style),
+        Text("NODE", style=header_style),
         Text("AGE", style=header_style),
         Text("STATE", style=header_style),
         Text("PORTS", style=header_style),
-        Text("IMAGE", style=header_style),
     )
 
     # Pure alphabetical by pod name. Operator feedback —
@@ -1330,11 +1385,8 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
             verdict = "completed"
         glyph, style = HEALTH_STYLES[verdict]
 
-        image = row.get("Image") or ""
-        short_image = image.rsplit("/", 1)[1] if "/" in image else image
-
         ports = container_port_summary(row)
-        ports_style = "bold cyan" if ports == "Host Network" else "dim"
+        ports_style = "bold cyan" if ports == "host" else "dim"
 
         age = _format_pod_age(row.get("CreationTimestamp") or "")
 
@@ -1360,11 +1412,11 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         tbl.add_row(
             Text(glyph, style=style),
             Text(row.get("Namespace") or "—", style="dim"),
-            Text(row.get("Names") or "", style="bold"),
+            Text(_short_pod_name(row.get("Names") or ""), style="bold"),
+            Text(row.get("Node") or "—", style="dim"),
             Text(age, style="dim"),
             Text(k8s_state, style=state_style),
             Text(ports or "—", style=ports_style),
-            Text(short_image, style="dim"),
         )
 
     return Panel(
