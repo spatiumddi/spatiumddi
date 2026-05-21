@@ -1,7 +1,10 @@
 #!/bin/sh
 # spatium-live-banner — replaces the auto-login getty on tty1 in
-# live mode. Shows the appliance status and a one-line install hint.
-# Loops on read so it persists; Ctrl-C drops to a root shell.
+# rescue / diagnostics mode (spatium-mode=live). This is NOT a running
+# SpatiumDDI — k3s + firstboot are gated ``!boot=live``, so nothing
+# serves the Web UI here. It's a recovery environment for repairing an
+# unbootable install or capturing diagnostics. Loops on read so it
+# persists; Ctrl-C drops to a root shell.
 set -eu
 
 clear
@@ -13,26 +16,35 @@ cat <<'BANNER'
  |____/| .__/ \__,_|\__|_|\__,_|_| |_| |_|_|   |____/|___|
        |_|
 
- SpatiumDDI Appliance - live mode (running from CD/USB, no install).
+ SpatiumDDI Appliance - RESCUE / DIAGNOSTICS shell (from CD/USB).
+ This does NOT run SpatiumDDI: no k3s, no control plane, no Web UI.
+ Use it to recover an install or capture diagnostics, then reboot.
 
 BANNER
 
 IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
 if [ -n "$IP" ]; then
-    echo "   Web UI:   http://$IP/"
+    echo "   SSH in:   ssh root@$IP"
 else
-    echo "   Web UI:   (waiting for network - check 'ip a')"
+    echo "   SSH in:   (waiting for network - check 'ip a')"
 fi
-echo "   Default:  admin / admin   (forces password change on first login)"
+# spatium-live-bootstrap generated a one-time root password for this
+# session and wrote it here (world-readable, never reaches a disk).
+PWFILE=/var/log/spatium-live-ssh-password
+if [ -r "$PWFILE" ]; then
+    echo "   Password: $(cat "$PWFILE")   (random, this session only)"
+fi
 echo
-echo "   First-boot orchestrator status:"
-echo "     systemctl status spatiumddi-firstboot"
-echo "     tail -f /var/log/spatiumddi/firstboot.log"
+echo "   Recover an installed system (it's on the disk, not here):"
+echo "     lsblk -o NAME,PARTLABEL,FSTYPE,SIZE   # find root_A / root_B / var"
+echo "     mkdir -p /mnt/r && mount /dev/disk/by-partlabel/root_A /mnt/r"
+echo "     mount /dev/disk/by-partlabel/var /mnt/r/var   # firstboot/k3s logs"
+echo "     less /mnt/r/var/log/spatiumddi/firstboot.log"
 echo
 echo "================================================================="
 echo
-echo "   To install to disk:    sudo spatium-install"
-echo "   To get a shell:        press Enter, then Ctrl-D when done"
+echo "   Re-install to disk:    sudo spatium-install"
+echo "   Get a shell:           press Enter, then Ctrl-D when done"
 echo
 while true; do
     printf "Press Enter to refresh, or type 'install' / 'shell' / 'reboot': "
