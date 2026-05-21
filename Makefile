@@ -66,6 +66,23 @@ build: build-supervisor
 	# because the baked UI predated the two-role / promote-UI changes.
 	# Mirrors build-supervisor; the retag loop below maps it to ghcr:dev.
 	docker build -t spatiumddi-frontend:dev $(FRONTEND_DIR)
+	# #272 — explicitly build api / dns / dhcp too. The PROD compose
+	# (``$(COMPOSE)`` = docker-compose.yml) has NO ``build:`` sections —
+	# every service pins a pre-built ``image:`` — so ``docker compose
+	# build`` above rebuilds NOTHING for these. Only the dev compose
+	# carries ``build:`` (with the api on ``target: dev``), so unless an
+	# operator happened to run a dev-compose build recently, the baked
+	# ISO embeds a stale ``spatiumddi-api:dev``. That bit the #272 Phase
+	# 7b join-fix ISO: the api image predated migration d5f1a37c20e9, so
+	# the migrate Job stopped at the prior alembic head, the ``node_ip``
+	# column never existed, and every supervisor heartbeat silently
+	# dropped the field → promote fell back to the pod IP again. Build
+	# the api at its ``runtime`` (prod) stage, NOT ``dev`` (which adds
+	# pytest + a 1M-line test tree we don't want in the appliance).
+	docker build -t spatiumddi-api:dev --target runtime $(BACKEND_DIR)
+	docker build -t spatiumddi-dns-bind9:dev -f agent/dns/images/bind9/Dockerfile .
+	docker build -t spatiumddi-dns-powerdns:dev -f agent/dns/images/powerdns/Dockerfile .
+	docker build -t spatiumddi-dhcp-kea:dev -f agent/dhcp/images/kea/Dockerfile .
 	# #272 Phase 1 — retag compose-built images under the canonical
 	# ``ghcr.io/spatiumddi/<name>:dev`` form so
 	# ``appliance/scripts/bake-images.sh``'s resolve_source_tag picks
