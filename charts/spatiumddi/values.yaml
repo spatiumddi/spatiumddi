@@ -117,8 +117,11 @@ frontend:
   # so this single VIP fronts both the UI and the API. The supervisor
   # threads this in (matching ``metallb.controlPlaneVIP`` on the
   # appliance chart) on promote, and the VIP seeds the host cert SANs.
-  # When set, hostNetwork is forced off (the pod floats; the VIP routes)
-  # and the address-pool/loadBalancerIPs MetalLB annotations are added.
+  # When set, a MetalLB LoadBalancer VIP is added (address-pool /
+  # loadBalancerIPs annotations, externalTrafficPolicy: Local). The
+  # frontend KEEPS hostNetwork, so each node's IP stays a direct backup
+  # path while the VIP is the primary floating address — both front the
+  # same per-node frontend pods + the same cert (#272).
   # Empty on single-node installs → behaves exactly as before.
   controlPlaneVIP: ""
   # MetalLB pool name the VIP is drawn from. Matches the IPAddressPool
