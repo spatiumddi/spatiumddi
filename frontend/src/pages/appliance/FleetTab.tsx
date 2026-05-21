@@ -201,6 +201,232 @@ function isControlPlaneRow(row: ApplianceRow): boolean {
   return CONTROL_PLANE_VARIANTS.has(row.appliance_variant ?? "");
 }
 
+// #272 Phase 7c — settled / in-flight control-plane cluster membership.
+const _CLUSTER_CHIP_BASE =
+  "inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium";
+function ClusterStatusChip({ row }: { row: ApplianceRow }) {
+  const js = row.cluster_join_state;
+  // An in-flight join/leave takes precedence over the settled role.
+  if (js && js !== "ready" && js !== "left") {
+    const tone =
+      js === "failed"
+        ? "border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-300"
+        : "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-300";
+    const label =
+      js === "joining" ? "joining…" : js === "leaving" ? "leaving…" : js;
+    return (
+      <span
+        className={cn(_CLUSTER_CHIP_BASE, tone)}
+        title={row.cluster_join_reason ?? ""}
+      >
+        cluster: {label}
+      </span>
+    );
+  }
+  if (row.cluster_role === "primary" || row.cluster_role === "member") {
+    return (
+      <span
+        className={cn(
+          _CLUSTER_CHIP_BASE,
+          "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300",
+        )}
+        title={
+          row.cluster_role === "primary"
+            ? "etcd seed — runs the control plane + the cluster's etcd"
+            : "control-plane cluster member (joined the seed)"
+        }
+      >
+        {row.cluster_role === "primary" ? "etcd seed" : "cluster member"}
+      </span>
+    );
+  }
+  return null;
+}
+
+// #272 Phase 7c — batch promote/demote control-plane members. etcd HA
+// wants an ODD server count (1 / 3 / 5 / 7), so this is multi-select:
+// a single 1→2 promote is refused by the API guard, you promote two at
+// once to reach 3. The API enforces the odd-target rule; we both
+// pre-empt it (disable when the resulting count is even) and surface
+// its 422 message inline.
+function ClusterMembershipModal({
+  rows,
+  onClose,
+}: {
+  rows: ApplianceRow[];
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [promoteSel, setPromoteSel] = useState<Set<string>>(new Set());
+  const [demoteSel, setDemoteSel] = useState<Set<string>>(new Set());
+
+  const members = rows.filter(
+    (r) => r.cluster_role === "primary" || r.cluster_role === "member",
+  );
+  const demotable = members.filter((r) => r.cluster_role === "member");
+  const memberCount = members.length;
+  // Eligible to promote: approved OS-appliance nodes that aren't already
+  // a member or mid-join.
+  const eligible = rows.filter(
+    (r) =>
+      r.state === "approved" &&
+      r.deployment_kind === "appliance" &&
+      !r.cluster_role &&
+      r.desired_cluster_role !== "member",
+  );
+
+  const refresh = () =>
+    qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+  const promote = useMutation({
+    mutationFn: () => applianceApprovalApi.promoteControlPlane([...promoteSel]),
+    onSuccess: () => {
+      refresh();
+      setPromoteSel(new Set());
+    },
+  });
+  const demote = useMutation({
+    mutationFn: () => applianceApprovalApi.demoteControlPlane([...demoteSel]),
+    onSuccess: () => {
+      refresh();
+      setDemoteSel(new Set());
+    },
+  });
+
+  const toggle = (
+    set: Set<string>,
+    id: string,
+    setter: (s: Set<string>) => void,
+  ) => {
+    const next = new Set(set);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setter(next);
+  };
+
+  const resultingPromote = memberCount + promoteSel.size;
+  const resultingDemote = memberCount - demoteSel.size;
+  const promoteEven = promoteSel.size > 0 && resultingPromote % 2 === 0;
+  const demoteEven = demoteSel.size > 0 && resultingDemote % 2 === 0;
+
+  return (
+    <Modal title="Manage control plane cluster" onClose={onClose} wide>
+      <div className="space-y-5 text-sm">
+        <p className="text-muted-foreground">
+          The control-plane cluster runs on embedded etcd, which wants an{" "}
+          <strong>odd</strong> server count (1 / 3 / 5 / 7) for quorum. Promote
+          or demote in batches so the total lands on an odd number — the server
+          refuses an even result. Current members:{" "}
+          <strong>{memberCount}</strong>.
+        </p>
+
+        {/* ── Promote ──────────────────────────────────────────── */}
+        <section className="space-y-2">
+          <h4 className="font-medium">Promote appliances → control plane</h4>
+          {eligible.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No eligible appliance nodes (need an approved, paired Appliance
+              that isn’t already a member).
+            </p>
+          ) : (
+            <div className="space-y-1">
+              {eligible.map((r) => (
+                <label key={r.id} className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={promoteSel.has(r.id)}
+                    onChange={() => toggle(promoteSel, r.id, setPromoteSel)}
+                  />
+                  <span>{r.hostname}</span>
+                  {r.last_seen_ip && (
+                    <span className="text-xs text-muted-foreground">
+                      {r.last_seen_ip}
+                    </span>
+                  )}
+                </label>
+              ))}
+            </div>
+          )}
+          {promoteSel.size > 0 && (
+            <p
+              className={cn(
+                "text-xs",
+                promoteEven ? "text-rose-500" : "text-muted-foreground",
+              )}
+            >
+              Resulting members: {resultingPromote}
+              {promoteEven &&
+                " — even; select one more (or fewer) to make it odd"}
+            </p>
+          )}
+          {promote.error && (
+            <p className="text-xs text-rose-500">
+              {formatApiError(promote.error)}
+            </p>
+          )}
+          <button
+            type="button"
+            className="rounded-md border px-3 py-1.5 text-sm disabled:opacity-50"
+            disabled={promoteSel.size === 0 || promoteEven || promote.isPending}
+            onClick={() => promote.mutate()}
+          >
+            {promote.isPending
+              ? "Promoting…"
+              : `Promote ${promoteSel.size || ""} to control plane`}
+          </button>
+        </section>
+
+        {/* ── Demote ───────────────────────────────────────────── */}
+        <section className="space-y-2 border-t pt-4">
+          <h4 className="font-medium">Demote members → appliance</h4>
+          {demotable.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No demotable members (the etcd seed can’t be demoted here).
+            </p>
+          ) : (
+            <div className="space-y-1">
+              {demotable.map((r) => (
+                <label key={r.id} className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={demoteSel.has(r.id)}
+                    onChange={() => toggle(demoteSel, r.id, setDemoteSel)}
+                  />
+                  <span>{r.hostname}</span>
+                </label>
+              ))}
+            </div>
+          )}
+          {demoteSel.size > 0 && (
+            <p
+              className={cn(
+                "text-xs",
+                demoteEven ? "text-rose-500" : "text-muted-foreground",
+              )}
+            >
+              Remaining members: {resultingDemote}
+              {demoteEven &&
+                " — even; select one more (or fewer) to make it odd"}
+            </p>
+          )}
+          {demote.error && (
+            <p className="text-xs text-rose-500">
+              {formatApiError(demote.error)}
+            </p>
+          )}
+          <button
+            type="button"
+            className="rounded-md border px-3 py-1.5 text-sm disabled:opacity-50"
+            disabled={demoteSel.size === 0 || demoteEven || demote.isPending}
+            onClick={() => demote.mutate()}
+          >
+            {demote.isPending ? "Demoting…" : `Demote ${demoteSel.size || ""}`}
+          </button>
+        </section>
+      </div>
+    </Modal>
+  );
+}
+
 export function FleetTab() {
   const qc = useQueryClient();
   const { data: me } = useQuery({
@@ -233,6 +459,7 @@ export function FleetTab() {
   >("appliance.fleet.section", "appliances");
 
   const [drilldown, setDrilldown] = useState<ApplianceRow | null>(null);
+  const [showCluster, setShowCluster] = useState(false);
   const [rejectTarget, setRejectTarget] = useState<ApplianceRow | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ApplianceRow | null>(null);
   const [rekeyTarget, setRekeyTarget] = useState<ApplianceRow | null>(null);
@@ -559,13 +786,12 @@ export function FleetTab() {
                     against the submitted Ed25519 pubkey using the control
                     plane&apos;s internal CA (lazy-bootstrapped on the first
                     approve). The supervisor picks the cert up on its next poll
-                    and switches from session-token auth to mTLS. Rows split
-                    by installer variant: <strong>Control plane</strong>{" "}
-                    hosts the SpatiumDDI control-plane workloads (api /
-                    frontend / worker / postgres / redis);{" "}
-                    <strong>Service agents</strong> are Appliance
-                    appliances running DNS / DHCP service containers paired
-                    to a remote control plane.
+                    and switches from session-token auth to mTLS. Rows split by
+                    installer variant: <strong>Control plane</strong> hosts the
+                    SpatiumDDI control-plane workloads (api / frontend / worker
+                    / postgres / redis); <strong>Service agents</strong> are
+                    Appliance appliances running DNS / DHCP service containers
+                    paired to a remote control plane.
                   </p>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
@@ -605,12 +831,21 @@ export function FleetTab() {
                   >
                     Pairing codes
                   </button>{" "}
-                  section to mint one, then install an Appliance node
-                  against it — the row appears here once the supervisor claims
-                  the code.
+                  section to mint one, then install an Appliance node against it
+                  — the row appears here once the supervisor claims the code.
                 </div>
               ) : (
                 <div className="space-y-6">
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      onClick={() => setShowCluster(true)}
+                      className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+                      title="Promote appliances into the control-plane cluster, or demote members"
+                    >
+                      Manage control plane cluster…
+                    </button>
+                  </div>
                   <ApplianceTableSection
                     title="Control plane"
                     subtitle="Boxes hosting the SpatiumDDI control plane — the control-plane node plus any promoted appliances."
@@ -659,6 +894,13 @@ export function FleetTab() {
           )}
         </div>
       </main>
+
+      {showCluster && (
+        <ClusterMembershipModal
+          rows={rows}
+          onClose={() => setShowCluster(false)}
+        />
+      )}
 
       {drilldown && (
         <ApplianceDrilldownModal
@@ -922,9 +1164,7 @@ function ApplianceTableSection({
                   Capabilities
                 </th>
                 <th className="px-3 py-2 text-left font-medium">Slots</th>
-                <th className="px-3 py-2 text-left font-medium">
-                  Fingerprint
-                </th>
+                <th className="px-3 py-2 text-left font-medium">Fingerprint</th>
                 <th className="px-3 py-2 text-left font-medium">Paired</th>
                 <th className="px-3 py-2 text-left font-medium">Last seen</th>
                 <th className="px-3 py-2 text-right font-medium">Actions</th>
@@ -1026,6 +1266,7 @@ function ApplianceTableRow({
               {row.appliance_variant}
             </span>
           )}
+          <ClusterStatusChip row={row} />
         </div>
         {row.supervisor_version && (
           <div className="text-xs text-muted-foreground">

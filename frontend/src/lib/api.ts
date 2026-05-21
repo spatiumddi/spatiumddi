@@ -7373,6 +7373,14 @@ export interface ApplianceRow {
   // Issue #183 Phase 6 — operator-controlled CIDR allowlist for
   // direct kubeapi access on tcp/6443. Empty = proxy-only.
   kubeapi_expose_cidrs: string[];
+  // #272 Phase 7 — control-plane cluster membership. cluster_role is
+  // the settled role (primary / member / null); the desired_/join_state
+  // pair reflect an in-flight promote/demote (joining / ready / leaving
+  // / left / failed) so the UI can render a status chip.
+  cluster_role: string | null;
+  desired_cluster_role: string | null;
+  cluster_join_state: string | null;
+  cluster_join_reason: string | null;
   // Issue #170 Wave E follow-up — soft-delete timestamp. Non-null on
   // ``state=revoked`` rows; cleared by re-authorize.
   revoked_at: string | null;
@@ -7428,6 +7436,23 @@ export const applianceApprovalApi = {
     api
       .put<ApplianceRow>(`/appliance/appliances/${id}/roles`, body)
       .then((r) => r.data),
+  // #272 Phase 7 — batch promote/demote control-plane cluster members.
+  // Promote turns approved Appliance nodes into k3s control-plane
+  // (etcd) members; demote reverses it. Batch (a list of ids) because
+  // etcd HA wants an ODD total — the API 422s if the resulting count
+  // would be even, and the message is surfaced inline.
+  promoteControlPlane: (applianceIds: string[]) =>
+    api
+      .post<{
+        appliances: ApplianceRow[];
+      }>("/appliance/fleet/control-plane/promote", { appliance_ids: applianceIds })
+      .then((r) => r.data.appliances),
+  demoteControlPlane: (applianceIds: string[]) =>
+    api
+      .post<{
+        appliances: ApplianceRow[];
+      }>("/appliance/fleet/control-plane/demote", { appliance_ids: applianceIds })
+      .then((r) => r.data.appliances),
   // #170 Wave D1 — OS slot upgrade + reboot affordances on the
   // Fleet drilldown. Appliance-only deployments; the API surfaces a
   // 409 with a useful message on docker / k8s rows.

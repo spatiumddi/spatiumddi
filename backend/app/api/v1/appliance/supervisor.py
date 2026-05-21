@@ -1578,6 +1578,14 @@ class ApplianceRow(BaseModel):
     # Issue #183 Phase 6 — operator-controlled CIDR allowlist for
     # direct kubeapi access on tcp/6443. Empty = proxy-only.
     kubeapi_expose_cidrs: list[str]
+    # #272 Phase 7 — control-plane cluster membership. ``cluster_role``
+    # is the settled role (primary / member / null); ``desired_*`` +
+    # ``cluster_join_state`` reflect an in-flight promote/demote so the
+    # Fleet UI can show a "joining…" / "leaving…" / "failed" chip.
+    cluster_role: str | None = None
+    desired_cluster_role: str | None = None
+    cluster_join_state: str | None = None
+    cluster_join_reason: str | None = None
     # #170 Wave E follow-up — soft-delete timestamp. Non-null on
     # ``state=revoked`` rows; cleared by re-authorize.
     revoked_at: datetime | None = None
@@ -1646,6 +1654,10 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         kubeconfig_set=row.kubeconfig_encrypted is not None,
         k3s_api_cert_expires_at=row.k3s_api_cert_expires_at,
         kubeapi_expose_cidrs=list(row.kubeapi_expose_cidrs or []),
+        cluster_role=row.cluster_role,
+        desired_cluster_role=row.desired_cluster_role,
+        cluster_join_state=row.cluster_join_state,
+        cluster_join_reason=row.cluster_join_reason,
         revoked_at=row.revoked_at,
         created_at=row.created_at,
     )
