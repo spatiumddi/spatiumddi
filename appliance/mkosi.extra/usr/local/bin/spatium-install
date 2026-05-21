@@ -185,8 +185,8 @@ ask_role() {
             --cancel-button "Back" \
             --radiolist "Is this your FIRST SpatiumDDI node, or are you adding one to an existing install?\n\n  Additional node  (default)\n    Pairs with an EXISTING SpatiumDDI over an 8-digit code; an\n    admin then approves it and assigns DNS / DHCP roles in the\n    Fleet UI. Can be PROMOTED into the control-plane cluster later\n    — this is how you add control-plane nodes for HA (NOT by\n    installing 'First node' again).\n\n  First node\n    Creates a NEW SpatiumDDI: the control plane (api + database +\n    web UI) + k3s seed. DNS + DHCP stay OFF — enable them per node\n    from the Fleet UI. Pick this for a homelab, a single box, or\n    the seed of a brand-new HA cluster." \
             27 84 2 \
-            "add-node"   "Additional node — add to an EXISTING SpatiumDDI (DNS/DHCP, promotable)" "$add_flag" \
-            "first-node" "First node — create a NEW SpatiumDDI (control plane: api+db+UI)" "$first_flag" \
+            "add-node"   "Additional node — DNS/DHCP agent (promotable)" "$add_flag" \
+            "first-node" "First node — new control plane (api+db+UI)" "$first_flag" \
             3>&1 1>&2 2>&3) || return 1
         if [ -z "$pick" ]; then
             whiptail --msgbox "Please pick an option to continue." 9 60 || true
