@@ -298,6 +298,26 @@ def effective_role_label(role: str) -> str:
 
 _STATUS_HEALTH_RE = re.compile(r"\(([^)]+)\)")
 
+# Map a pod's owner-reference kind to a short workload type for the Pods
+# panel. A Deployment's pods are owned by a ReplicaSet (which the
+# Deployment owns), so ReplicaSet → "Deploy". CNPG postgres instance
+# pods are owned by a cloudnative-pg ``Cluster`` CR. Owner-less pods
+# (rare — bare/static) show "Static".
+_WORKLOAD_TYPE = {
+    "ReplicaSet": "Deploy",
+    "DaemonSet": "Daemon",
+    "StatefulSet": "Stateful",
+    "Job": "Job",
+    "Cluster": "CNPG",
+}
+
+
+def _pod_workload_type(owner_refs: list) -> str:
+    if not owner_refs:
+        return "Static"
+    kind = owner_refs[0].get("kind") or ""
+    return _WORKLOAD_TYPE.get(kind, kind or "—")
+
 
 def cluster_pods() -> list[dict]:
     """Return every pod on the local cluster via
@@ -427,6 +447,26 @@ def cluster_pods() -> list[dict]:
                     }
                 )
 
+        # #272 — readiness / restarts / last-restart / pod IP for the
+        # Pods panel. All straight from pod status (no metrics-server).
+        ready_n = sum(1 for cs in container_statuses if cs.get("ready"))
+        ready_total = len(container_statuses) or len(containers)
+        restarts = sum(int(cs.get("restartCount") or 0) for cs in container_statuses)
+        # Last (re)start: when a container has restarted, its running
+        # state's startedAt is when the current instance came up. Pick
+        # the most recent across containers; blank when nothing restarted.
+        restarted_at = ""
+        if restarts > 0:
+            starts = [
+                (cs.get("state") or {}).get("running", {}).get("startedAt")
+                for cs in container_statuses
+                if int(cs.get("restartCount") or 0) > 0
+                and (cs.get("state") or {}).get("running")
+            ]
+            starts = [s for s in starts if s]
+            if starts:
+                restarted_at = max(starts)
+
         out.append(
             {
                 "Names": meta.get("name") or "",
@@ -440,6 +480,11 @@ def cluster_pods() -> list[dict]:
                 "Ports": ports_out,
                 "NetworkMode": "host" if spec.get("hostNetwork") else "default",
                 "CreationTimestamp": meta.get("creationTimestamp") or "",
+                "Ready": f"{ready_n}/{ready_total}",
+                "Restarts": restarts,
+                "RestartedAt": restarted_at,
+                "PodIP": status.get("podIP") or "",
+                "Type": _pod_workload_type(meta.get("ownerReferences") or []),
             }
         )
 
@@ -1334,11 +1379,16 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
     tbl = Table.grid(padding=(0, 1), expand=True)
     tbl.add_column(width=1, no_wrap=True)          # health glyph
     tbl.add_column(width=11, no_wrap=True)         # namespace
-    tbl.add_column(min_width=18, no_wrap=False)    # pod name (prefix-stripped)
+    tbl.add_column(min_width=16, no_wrap=False)    # pod name (prefix-stripped)
+    tbl.add_column(width=8, no_wrap=True)          # workload type (Deploy/Daemon/…)
     tbl.add_column(width=8, no_wrap=True)          # node (#272 multi-node)
+    tbl.add_column(width=5, no_wrap=True)          # ready (n/m)
+    tbl.add_column(width=4, no_wrap=True, justify="right")  # restarts
+    tbl.add_column(width=7, no_wrap=True, justify="right")  # restart age
     tbl.add_column(width=4, no_wrap=True, justify="right")  # age
     tbl.add_column(width=16, no_wrap=True)         # k8s state (CrashLoopBackOff = 16)
-    tbl.add_column(width=9, no_wrap=True)          # ports / net mode (compact)
+    tbl.add_column(width=14, no_wrap=True)         # pod IP
+    tbl.add_column(width=8, no_wrap=True)          # ports / net mode (compact)
 
     # Header row — column labels. dim style so the data rows below
     # stay the visual focus. ``rich.Table.grid`` doesn't have a
@@ -1350,9 +1400,14 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         Text("", style=header_style),
         Text("NAMESPACE", style=header_style),
         Text("NAME", style=header_style),
+        Text("TYPE", style=header_style),
         Text("NODE", style=header_style),
+        Text("READY", style=header_style),
+        Text("RST", style=header_style),
+        Text("RST-AGE", style=header_style),
         Text("AGE", style=header_style),
         Text("STATE", style=header_style),
+        Text("IP", style=header_style),
         Text("PORTS", style=header_style),
     )
 
@@ -1368,10 +1423,7 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
             Text("·", style="dim"),
             Text("—", style="dim"),
             Text("no pods running (k3s not ready?)", style="dim"),
-            Text("", style="dim"),
-            Text("", style="dim"),
-            Text("", style="dim"),
-            Text("", style="dim"),
+            *[Text("", style="dim") for _ in range(9)],
         )
         return Panel(
             tbl, box=SQUARE, border_style="cyan",
@@ -1389,6 +1441,24 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         ports_style = "bold cyan" if ports == "host" else "dim"
 
         age = _format_pod_age(row.get("CreationTimestamp") or "")
+
+        # READY (n/m) — amber when not all containers are ready (a
+        # Running-but-0/1 pod is failing its probes).
+        ready = row.get("Ready") or "0/0"
+        try:
+            rn, rm = (int(x) for x in ready.split("/", 1))
+        except ValueError:
+            rn, rm = 0, 0
+        ready_style = "dim" if (rm and rn >= rm) else "yellow"
+
+        # RESTARTS — dim at 0, amber 1-5, red beyond (a flapping pod).
+        restarts = int(row.get("Restarts") or 0)
+        rst_text = str(restarts) if restarts else "·"
+        rst_style = "dim" if restarts == 0 else "yellow" if restarts <= 5 else "bold red"
+        # How long ago it last restarted (blank → "·").
+        rage = _format_pod_age(row.get("RestartedAt") or "") if row.get("RestartedAt") else "·"
+
+        pod_ip = row.get("PodIP") or "—"
 
         # Show the raw k8s state (Running / Pending / Succeeded /
         # CrashLoopBackOff / ImagePullBackOff / …) — same vocabulary
@@ -1413,9 +1483,14 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
             Text(glyph, style=style),
             Text(row.get("Namespace") or "—", style="dim"),
             Text(_short_pod_name(row.get("Names") or ""), style="bold"),
+            Text(row.get("Type") or "—", style="dim"),
             Text(row.get("Node") or "—", style="dim"),
+            Text(ready, style=ready_style),
+            Text(rst_text, style=rst_style),
+            Text(rage, style="dim"),
             Text(age, style="dim"),
             Text(k8s_state, style=state_style),
+            Text(pod_ip, style="dim"),
             Text(ports or "—", style=ports_style),
         )
 
