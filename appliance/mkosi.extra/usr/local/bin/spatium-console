@@ -542,6 +542,30 @@ def cluster_nodes() -> list[dict]:
                 internal_ip = addr.get("address") or ""
                 break
         node_info = status.get("nodeInfo") or {}
+        # Health beyond Ready: cordoned (unschedulable) or any pressure
+        # / network condition True. "ok" when clean.
+        node_spec = node.get("spec") or {}
+        warns: list[str] = []
+        if node_spec.get("unschedulable"):
+            warns.append("Cordoned")
+        for cond in status.get("conditions") or []:
+            t = cond.get("type") or ""
+            if t in ("MemoryPressure", "DiskPressure", "PIDPressure") and cond.get("status") == "True":
+                warns.append(t.replace("Pressure", "Press"))
+            elif t == "NetworkUnavailable" and cond.get("status") == "True":
+                warns.append("NetDown")
+        conditions = ",".join(warns) if warns else "ok"
+        # Allocatable capacity (live usage% would need metrics-server,
+        # which the appliance disables). cpu cores + memory → e.g. "4c/7.8Gi".
+        alloc = status.get("allocatable") or {}
+        mem_raw = str(alloc.get("memory") or "")
+        gib = ""
+        if mem_raw.endswith("Ki"):
+            try:
+                gib = f"{int(mem_raw[:-2]) / 1048576:.1f}Gi"
+            except ValueError:
+                gib = ""
+        capacity = f"{alloc.get('cpu') or '?'}c/{gib or '?'}"
         out.append(
             {
                 "name": meta.get("name") or "",
@@ -549,6 +573,9 @@ def cluster_nodes() -> list[dict]:
                 "roles": ",".join(roles) if roles else "<none>",
                 "version": node_info.get("kubeletVersion") or "",
                 "internal_ip": internal_ip,
+                "created": meta.get("creationTimestamp") or "",
+                "conditions": conditions,
+                "capacity": capacity,
             }
         )
     out.sort(key=lambda n: n["name"])
@@ -1500,19 +1527,31 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
     )
 
 
-def render_nodes(nodes: list[dict]) -> Panel:
-    """Render the cluster Nodes panel (#272) — name / Ready / roles /
-    internal IP / version, one row per k3s node.
+def render_nodes(nodes: list[dict], pods: list[dict] | None = None) -> Panel:
+    """Render the cluster Nodes panel (#272) — one row per k3s node:
+    Ready / roles / pod count / health / capacity / age / IP / version.
 
     Only shown when the cluster has >1 node (a single-node box doesn't
-    need it — render_frame gates on len). Compact one-line-per-node
-    table so it adds minimal vertical space above the Pods panel.
+    need it — render_frame gates on len). ``pods`` (the same list the
+    Pods panel uses) drives the per-node POD count, so an empty / under-
+    scheduled control-plane node is obvious at a glance.
     """
+    # Pod count per node from the already-fetched pod list (no extra API).
+    pod_counts: dict[str, int] = {}
+    for p in pods or []:
+        nm = p.get("Node") or ""
+        if nm:
+            pod_counts[nm] = pod_counts.get(nm, 0) + 1
+
     tbl = Table.grid(padding=(0, 1), expand=True)
     tbl.add_column(width=1, no_wrap=True)            # ready glyph
     tbl.add_column(min_width=10, no_wrap=True)       # node name
     tbl.add_column(width=8, no_wrap=True)            # Ready/NotReady
-    tbl.add_column(width=20, no_wrap=True)           # roles
+    tbl.add_column(width=18, no_wrap=True)           # roles
+    tbl.add_column(width=4, no_wrap=True, justify="right")  # pod count
+    tbl.add_column(width=13, no_wrap=True)           # conditions / health
+    tbl.add_column(width=10, no_wrap=True)           # capacity (cpu/mem)
+    tbl.add_column(width=5, no_wrap=True, justify="right")  # age
     tbl.add_column(width=15, no_wrap=True)           # internal IP
     tbl.add_column(min_width=12, no_wrap=False)      # version
 
@@ -1522,6 +1561,10 @@ def render_nodes(nodes: list[dict]) -> Panel:
         Text("NODE", style=header_style),
         Text("READY", style=header_style),
         Text("ROLES", style=header_style),
+        Text("PODS", style=header_style),
+        Text("COND", style=header_style),
+        Text("CPU/MEM", style=header_style),
+        Text("AGE", style=header_style),
         Text("INTERNAL-IP", style=header_style),
         Text("VERSION", style=header_style),
     )
@@ -1534,11 +1577,17 @@ def render_nodes(nodes: list[dict]) -> Panel:
             glyph, gstyle, rtxt, rstyle = "●", "red", "NotReady", "red"
         else:
             glyph, gstyle, rtxt, rstyle = "●", "yellow", "Unknown", "yellow"
+        cond = n.get("conditions") or "ok"
+        cond_style = "dim" if cond == "ok" else "bold yellow"
         tbl.add_row(
             Text(glyph, style=gstyle),
             Text(n.get("name") or "", style="bold"),
             Text(rtxt, style=rstyle),
             Text(n.get("roles") or "<none>", style="dim"),
+            Text(str(pod_counts.get(n.get("name") or "", 0)), style="dim"),
+            Text(cond, style=cond_style),
+            Text(n.get("capacity") or "—", style="dim"),
+            Text(_format_pod_age(n.get("created") or ""), style="dim"),
             Text(n.get("internal_ip") or "—", style="dim"),
             Text(n.get("version") or "", style="dim"),
         )
@@ -1871,7 +1920,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
             Layout(name="services", size=SVC_ROWS),
             Layout(name="log", ratio=1),
         )
-        layout["body"]["nodes"].update(render_nodes(state.nodes))
+        layout["body"]["nodes"].update(render_nodes(state.nodes, state.ps_rows))
         fixed = HEADER_ROWS + NODES_ROWS + SVC_ROWS + FOOTER_ROWS
     else:
         layout["body"].split_column(
