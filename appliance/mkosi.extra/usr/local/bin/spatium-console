@@ -267,12 +267,12 @@ def role_label(role: str) -> str:
 _STATUS_HEALTH_RE = re.compile(r"\(([^)]+)\)")
 
 
-def docker_ps() -> list[dict]:
+def cluster_pods() -> list[dict]:
     """Return every pod on the local cluster via
     ``kubectl get pods -A -o json``, translated into the docker-ps
     dict shape the rest of the console expects.
 
-    Function name kept as ``docker_ps`` so the rest of the renderer
+    Pre-Phase-7 (was ``docker_ps``) this hit /var/run/docker.sock; the
     code doesn't have to change. Pre-Phase-7 this hit
     /var/run/docker.sock directly; now it shells to the local k3s
     binary's embedded kubectl. ~50 ms per call (fork + JSON parse)
@@ -413,6 +413,67 @@ def docker_ps() -> list[dict]:
     # Plus the supervisor pod from the kube-system / spatium
     # namespace — query it separately since its labels match the
     # selector above only on the same chart.
+    return out
+
+
+def cluster_nodes() -> list[dict]:
+    """Return the k3s cluster's nodes via ``kubectl get nodes -o json``,
+    one dict per node: ``{name, ready, roles, version, internal_ip}``.
+
+    Surfaced on the console only when the cluster has >1 node (#272) —
+    a single-node box doesn't need a nodes table. ``ready`` is the
+    Ready condition's status ("True"/"False"/"Unknown"); ``roles`` is the
+    kubectl-shape ROLES column (e.g. "control-plane,etcd"). Returns []
+    on any failure so the dashboard degrades to pods-only.
+    """
+    try:
+        proc = subprocess.run(
+            ["/usr/local/bin/k3s", "kubectl", "get", "nodes", "-o", "json"],
+            env={**os.environ, "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"},
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    out: list[dict] = []
+    for node in data.get("items") or []:
+        meta = node.get("metadata") or {}
+        status = node.get("status") or {}
+        labels = meta.get("labels") or {}
+        ready = "Unknown"
+        for cond in status.get("conditions") or []:
+            if cond.get("type") == "Ready":
+                ready = cond.get("status") or "Unknown"
+                break
+        # ROLES column: node-role.kubernetes.io/<role>= labels, sorted.
+        roles = sorted(
+            k.split("/", 1)[1]
+            for k in labels
+            if k.startswith("node-role.kubernetes.io/") and "/" in k
+        )
+        internal_ip = ""
+        for addr in status.get("addresses") or []:
+            if addr.get("type") == "InternalIP":
+                internal_ip = addr.get("address") or ""
+                break
+        node_info = status.get("nodeInfo") or {}
+        out.append(
+            {
+                "name": meta.get("name") or "",
+                "ready": ready,
+                "roles": ",".join(roles) if roles else "<none>",
+                "version": node_info.get("kubeletVersion") or "",
+                "internal_ip": internal_ip,
+            }
+        )
+    out.sort(key=lambda n: n["name"])
     return out
 
 
@@ -1312,6 +1373,55 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
     )
 
 
+def render_nodes(nodes: list[dict]) -> Panel:
+    """Render the cluster Nodes panel (#272) — name / Ready / roles /
+    internal IP / version, one row per k3s node.
+
+    Only shown when the cluster has >1 node (a single-node box doesn't
+    need it — render_frame gates on len). Compact one-line-per-node
+    table so it adds minimal vertical space above the Pods panel.
+    """
+    tbl = Table.grid(padding=(0, 1), expand=True)
+    tbl.add_column(width=1, no_wrap=True)            # ready glyph
+    tbl.add_column(min_width=10, no_wrap=True)       # node name
+    tbl.add_column(width=8, no_wrap=True)            # Ready/NotReady
+    tbl.add_column(width=20, no_wrap=True)           # roles
+    tbl.add_column(width=15, no_wrap=True)           # internal IP
+    tbl.add_column(min_width=12, no_wrap=False)      # version
+
+    header_style = "bold dim"
+    tbl.add_row(
+        Text("", style=header_style),
+        Text("NODE", style=header_style),
+        Text("READY", style=header_style),
+        Text("ROLES", style=header_style),
+        Text("INTERNAL-IP", style=header_style),
+        Text("VERSION", style=header_style),
+    )
+    ready_total = sum(1 for n in nodes if n.get("ready") == "True")
+    for n in nodes:
+        ready = n.get("ready") or "Unknown"
+        if ready == "True":
+            glyph, gstyle, rtxt, rstyle = "●", "green", "Ready", "green"
+        elif ready == "False":
+            glyph, gstyle, rtxt, rstyle = "●", "red", "NotReady", "red"
+        else:
+            glyph, gstyle, rtxt, rstyle = "●", "yellow", "Unknown", "yellow"
+        tbl.add_row(
+            Text(glyph, style=gstyle),
+            Text(n.get("name") or "", style="bold"),
+            Text(rtxt, style=rstyle),
+            Text(n.get("roles") or "<none>", style="dim"),
+            Text(n.get("internal_ip") or "—", style="dim"),
+            Text(n.get("version") or "", style="dim"),
+        )
+    title = f"[bold]Cluster[/bold] · {ready_total}/{len(nodes)} Ready"
+    return Panel(
+        tbl, box=SQUARE, border_style="magenta",
+        title=title, title_align="left",
+    )
+
+
 def upgrade_status() -> tuple[str, str] | None:
     """Slot-upgrade state derived from
     ``/var/lib/spatiumddi/release-state/`` (#138 Phase 8b).
@@ -1621,13 +1731,28 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
         Layout(name="body", ratio=1),
         Layout(name="footer", size=FOOTER_ROWS),
     )
-    layout["body"].split_column(
-        Layout(name="services", size=SVC_ROWS),
-        Layout(name="log", ratio=1),
-    )
+    # #272 — on a multi-node control-plane cluster, show a Nodes panel
+    # (name / Ready / roles / IP / version) above Pods so operators see
+    # cluster membership + health at the TTY. Single-node boxes skip it
+    # (nothing to compare) and keep the original two-panel layout.
+    show_nodes = len(state.nodes) > 1
     layout["header"].update(render_header(state, mono_t))
+    if show_nodes:
+        NODES_ROWS = len(state.nodes) + 3  # 1 header row + 2 panel border
+        layout["body"].split_column(
+            Layout(name="nodes", size=NODES_ROWS),
+            Layout(name="services", size=SVC_ROWS),
+            Layout(name="log", ratio=1),
+        )
+        layout["body"]["nodes"].update(render_nodes(state.nodes))
+        fixed = HEADER_ROWS + NODES_ROWS + SVC_ROWS + FOOTER_ROWS
+    else:
+        layout["body"].split_column(
+            Layout(name="services", size=SVC_ROWS),
+            Layout(name="log", ratio=1),
+        )
+        fixed = HEADER_ROWS + SVC_ROWS + FOOTER_ROWS
     layout["body"]["services"].update(render_services(state.role, state.ps_rows))
-    fixed = HEADER_ROWS + SVC_ROWS + FOOTER_ROWS
     log_height = max(state.term_size[1] - fixed, 4)
     layout["body"]["log"].update(render_log(state.tail, log_height))
     layout["footer"].update(render_footer(state.status_message))
@@ -1644,6 +1769,7 @@ class DashboardState:
         self.tail = tail
         self.tty_path = tty_path
         self.ps_rows: list[dict] = []
+        self.nodes: list[dict] = []
         self.status_message = ""
         self.status_expires = 0.0
         self.pending_action: str | None = None
@@ -1690,7 +1816,8 @@ class DashboardState:
         # Data tier (2 s) — docker ps + env re-read.
         if force or (now - self._last_data_refresh) >= DATA_REFRESH_EVERY:
             self._last_data_refresh = now
-            self.ps_rows = docker_ps()
+            self.ps_rows = cluster_pods()
+            self.nodes = cluster_nodes()
             try:
                 self.env = read_env()
             except Exception:
@@ -2234,7 +2361,7 @@ def main() -> int:
     # spatium-console@ttyS0 instance inherits the same fate.
     # Without this guard the dashboard goes Live(...) → first frame
     # render → EIO on stdout.flush() → exit 1 → systemd Restart=always
-    # respawns in 2 s, repeat forever. Each spawn calls docker_ps()
+    # respawns in 2 s, repeat forever. Each spawn calls cluster_pods()
     # once before failing, which generates a broken-pipe entry on
     # docker.sock — and at 2 s intervals that's ~30 noise lines/min
     # in the docker daemon journal for the no-op crash loop. Bailing
