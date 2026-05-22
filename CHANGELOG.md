@@ -20,6 +20,44 @@ the formatter handles the rest.
 
 ---
 
+## 2026.05.22-2 — 2026-05-22
+
+Same-day shake-out cut. Testing the 2026.05.22-1 control-plane HA
+release on real 3-node hardware surfaced two appliance bugs that only
+appear once DNS/DHCP run across multiple control-plane nodes — both
+fixed here. No partition-layout change this time, so the
+no-in-place-upgrade caveat from 2026.05.22-1 does not re-apply. Note
+that an automated multi-node rolling OS upgrade is still pending
+(tracked in #296); upgrading a multi-node cluster today is a
+per-node / reinstall operation.
+
+### Fixed
+
+- **Multi-node DNS/DHCP agents couldn't come up (#292).** Enabling the
+  DNS/DHCP roles across a 3/5/7-node control plane left the agent
+  DaemonSets broken three ways: (1) they pointed at the external
+  node-IP URL whose self-signed cert they couldn't verify →
+  registration failed; now they use the in-cluster API Service over
+  plain HTTP (no intra-cluster TLS to verify), same repoint as the
+  supervisor heartbeat; (2) a shared RWO local-path PVC pinned its PV
+  to one node, so the other nodes' pods sat Pending forever — switched
+  to per-node hostPath; (3) `dns-bind9`/`dns-powerdns` used
+  `updateStrategy: OnDelete`, which stranded a pod on its stale
+  empty-URL spec — switched to RollingUpdate. The fix also persists the
+  agents' last-known-good **config-bundle cache** on per-node hostPath
+  (`/var/lib/spatium-{dns,dhcp}-agent`) — it was never mounted, so a pod
+  restart during a control-plane outage lost it; now the node keeps
+  serving from cache when the control plane is unreachable
+  (non-negotiable #5). Chart-only — no agent/image change.
+- **Dead "Apply" button on the appliance Releases tab (#294).** It
+  triggered a pre-#183 docker-compose updater
+  (`spatiumddi-update.path` → `docker-compose pull && up -d`) that
+  doesn't exist on the k3s appliance, so it silently did nothing. The
+  Releases tab is now read-only; appliance OS upgrades are pointed at
+  the Fleet tab's A/B slot-image flow, and docker/k8s control planes
+  keep the copy-paste manual-upgrade modal. Removed the dead
+  `POST /releases/apply` + `/log` endpoints and the trigger machinery.
+
 ## 2026.05.22-1 — 2026-05-22
 
 > ⚠️ **RELEASE NOTE — NO IN-PLACE UPGRADE.** This release changes the appliance partition layout (6-partition GPT + Talos-style `state` partition, #276) to support control-plane HA; A/B slot upgrades **cannot** cross that boundary. Existing appliances **must full-reinstall from the new ISO**. (No production installs exist yet — this affects field-test boxes only.)
