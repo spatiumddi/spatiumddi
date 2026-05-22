@@ -12,11 +12,15 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import sys
 from functools import lru_cache
 
+import structlog
 from cryptography.fernet import Fernet, InvalidToken
 
 from app.config import settings
+
+logger = structlog.get_logger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -25,11 +29,27 @@ def _fernet() -> Fernet:
     if raw:
         try:
             return Fernet(raw.encode())
-        except (ValueError, Exception):
-            # Explicit key is malformed — fall through to derived key so the
-            # service still runs. Admins should set a valid Fernet key generated
-            # via `Fernet.generate_key()`.
-            pass
+        except Exception as exc:  # noqa: BLE001 — Fernet raises bare ValueError/binascii
+            # Explicit key is malformed. Falling through to the derived key
+            # would encrypt with a DIFFERENT key than the operator intended,
+            # silently orphaning every secret written with the (broken) key.
+            # Make it loud — and a hard error under STRICT_SECRET_KEY so a
+            # production boot can't quietly mis-key its secrets.
+            msg = (
+                "CREDENTIAL_ENCRYPTION_KEY is set but not a valid Fernet key "
+                f"({exc!r}). Generate one with `Fernet.generate_key()`."
+            )
+            if settings.strict_secret_key:
+                raise ValueError(msg) from exc
+            logger.error("credential_encryption_key_invalid", error=str(exc))
+            print(f"WARNING: {msg} Falling back to a SECRET_KEY-derived key.", file=sys.stderr)
+    else:
+        # No explicit key — secrets are encrypted with a key DERIVED from
+        # SECRET_KEY. That couples the two: rotating SECRET_KEY without
+        # re-encrypting rows makes every stored LDAP/OIDC/SAML secret +
+        # backup-target credential unreadable. Note it once at startup.
+        if "pytest" not in sys.modules:
+            logger.info("credential_encryption_key_derived_from_secret_key")
     digest = hashlib.sha256(settings.secret_key.encode()).digest()
     return Fernet(base64.urlsafe_b64encode(digest))
 

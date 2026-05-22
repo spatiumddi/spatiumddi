@@ -37,6 +37,13 @@ function createClient(): AxiosInstance {
   //   2. If refresh fails, we must reject every queued request too
   //      — not just the current one. Otherwise any concurrent
   //      requests that were already queued hang forever.
+  // NOTE: isRefreshing + refreshQueue are closure-local to this
+  // createClient() call. That's correct here because createClient() is
+  // invoked exactly once and the single instance is exported as `api`
+  // below — so there is one shared refresh lock + queue process-wide. If
+  // this module were ever evaluated twice (e.g. a test that re-imports a
+  // fresh copy), each copy would get its own lock and two concurrent 401s
+  // could trigger two parallel refreshes. Keep createClient() a singleton.
   let isRefreshing = false;
   let refreshQueue: Array<{
     resolve: (token: string) => void;

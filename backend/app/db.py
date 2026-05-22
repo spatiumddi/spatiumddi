@@ -83,10 +83,16 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 async def task_session() -> AsyncGenerator[AsyncSession, None]:
     """Per-Celery-task DB session — fresh engine, fresh loop binding."""
 
+    # A task needs exactly one connection; bound the pool to 1 (no
+    # overflow) so a burst of N concurrent scheduled tasks opens N
+    # connections, not N×(pool_size+max_overflow). The engine is disposed
+    # in the finally below, releasing that connection at task end (#15).
     task_engine = create_async_engine(
         settings.database_url,
         future=True,
         json_serializer=_json_serializer,
+        pool_size=1,
+        max_overflow=0,
     )
     factory = async_sessionmaker(task_engine, class_=AsyncSession, expire_on_commit=False)
     try:
@@ -208,6 +214,14 @@ def _filter_soft_deleted(execute_state: Any) -> None:
     for model in _get_soft_delete_models():
         if not _statement_references(statement, model):
             continue
+        # NOTE: no late-binding-closure bug here. ``model`` (the outer
+        # loop var) is NOT captured by the lambda — it's passed to
+        # ``with_loader_criteria`` as the entity to scope to, and
+        # SQLAlchemy invokes the lambda with THAT entity as ``cls`` at
+        # query-build time. So each criterion correctly targets its own
+        # model. Do NOT "fix" this by referencing ``model`` inside the
+        # lambda — that WOULD introduce the classic late-binding bug
+        # (every criterion would see the last loop value).
         statement = statement.options(
             with_loader_criteria(
                 model,

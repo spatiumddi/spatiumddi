@@ -294,6 +294,11 @@ class ProxmoxClient:
         verify: Any
         if not self._verify_tls:
             verify = False
+            # Operator opted out of TLS verification for this endpoint.
+            # Surface it on every connect so the insecure posture is
+            # visible in the centralized logs (#5); the who/when of
+            # enabling it lives in the integration-target audit row.
+            logger.warning("proxmox_tls_verification_disabled", endpoint=self._base)
         elif self._ca_bundle_pem:
             verify = ssl.create_default_context(cadata=self._ca_bundle_pem)
         else:

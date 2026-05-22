@@ -168,6 +168,11 @@ class FtpDestination(BackupDestination):
             if not verify:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
+                # Operator opted out of TLS verification for this backup
+                # target. Surface it whenever we connect so the insecure
+                # posture is visible in the centralized logs (#5); the
+                # who/when of enabling it lives in the target's audit row.
+                logger.warning("ftp_tls_verification_disabled", host=config.get("host"), mode=mode)
 
         try:
             if mode == "ftps_implicit":

@@ -251,6 +251,13 @@ class UnifiClient:
         if self._cfg.auth_kind == "api_key" and self._cfg.api_key:
             headers["X-API-Key"] = self._cfg.api_key
 
+        if verify is False:
+            # Operator opted out of TLS verification for this controller.
+            # Surface it on every connect so the insecure posture is
+            # visible in the centralized logs (#5); the who/when of
+            # enabling it lives in the integration-target audit row.
+            logger.warning("unifi_tls_verification_disabled", endpoint=base)
+
         self._client = httpx.AsyncClient(
             base_url=base,
             headers=headers,

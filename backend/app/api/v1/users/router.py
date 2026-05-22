@@ -1,5 +1,6 @@
 """User management endpoints (superadmin only)."""
 
+import re
 import uuid
 from datetime import UTC, datetime
 
@@ -80,6 +81,23 @@ class UserResponse(BaseModel):
         return data
 
 
+# Pragmatic email shape check for local-user create/edit (#14). Not full
+# RFC 5322 — just enough to reject the malformed values that confuse
+# outbound mail (password reset, alerts): one ``@``, a non-empty local
+# part, and a dotted domain with no whitespace. External-auth-synced
+# users bypass this surface (they're provisioned by user_sync, not this
+# API), so a sloppy LDAP attr can still land — but operator-entered
+# locals are validated here.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _validate_email(v: str) -> str:
+    v = v.strip()
+    if not _EMAIL_RE.match(v):
+        raise ValueError("Invalid email address")
+    return v
+
+
 class CreateUserRequest(BaseModel):
     username: str
     email: str
@@ -103,6 +121,11 @@ class CreateUserRequest(BaseModel):
             raise ValueError("Username cannot be empty")
         return v
 
+    @field_validator("email")
+    @classmethod
+    def email_valid(cls, v: str) -> str:
+        return _validate_email(v)
+
 
 class UpdateUserRequest(BaseModel):
     display_name: str | None = None
@@ -110,6 +133,11 @@ class UpdateUserRequest(BaseModel):
     is_active: bool | None = None
     is_superadmin: bool | None = None
     force_password_change: bool | None = None
+
+    @field_validator("email")
+    @classmethod
+    def email_valid(cls, v: str | None) -> str | None:
+        return None if v is None else _validate_email(v)
 
 
 class ResetPasswordRequest(BaseModel):
