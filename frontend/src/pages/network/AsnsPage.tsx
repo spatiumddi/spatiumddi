@@ -330,6 +330,15 @@ export function AsnsPage() {
   const { data, isFetching } = useQuery({
     queryKey: ["asns", queryParams],
     queryFn: () => asnsApi.list(queryParams),
+    // #278 follow-up — a freshly-created ASN's RDAP/RPKI data lands a few
+    // seconds later via the one-shot worker task. ``whois_last_checked_at``
+    // is null until that first lookup records an attempt (it's stamped for
+    // private rows too), so poll while any row is still un-checked and stop
+    // once they've all reported — no manual Refresh needed.
+    refetchInterval: (query) => {
+      const rows = query.state.data?.items ?? [];
+      return rows.some((a) => a.whois_last_checked_at == null) ? 3000 : false;
+    },
   });
   const asns = data?.items ?? [];
   const total = data?.total ?? 0;
