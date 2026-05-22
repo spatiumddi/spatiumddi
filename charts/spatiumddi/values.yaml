@@ -287,7 +287,24 @@ postgresql:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 1000m, memory: 1Gi }
   nodeSelector: {}
-  tolerations: []
+  # #272 — fast failover on a hard node loss. k8s auto-injects a 300 s
+  # NoExecute tolerationSeconds (DefaultTolerationSeconds), so a CNPG
+  # primary on a powered-off node sits ~5 min before eviction → CNPG
+  # can't promote a replica → the -rw service has no endpoint → all
+  # writes (including login) stall. Override with 20 s so a dead primary
+  # node fails over in ~node-grace(40 s)+20 s ≈ 1 min. CNPG threads
+  # these into the instance pods via the Cluster CR's affinity block.
+  # Not lower than ~15 s: too-tight turns a transient blip (NIC hiccup,
+  # GC pause on a 1-CPU appliance) into a needless failover + re-sync.
+  tolerations:
+    - key: node.kubernetes.io/unreachable
+      operator: Exists
+      effect: NoExecute
+      tolerationSeconds: 20
+    - key: node.kubernetes.io/not-ready
+      operator: Exists
+      effect: NoExecute
+      tolerationSeconds: 20
   affinity: {}
   # CNPG-specific topology (only used when ``kind: cnpg``).
   cnpg:
@@ -365,7 +382,19 @@ redis:
     requests: { cpu: 50m, memory: 64Mi }
     limits:   { cpu: 500m, memory: 512Mi }
   nodeSelector: {}
-  tolerations: []
+  # #272 — fast failover on a hard node loss (same rationale as
+  # postgresql.tolerations above). Sentinel elects a new master in
+  # seconds on its own, but the redis pod on a dead node otherwise sits
+  # ~5 min before eviction; 20 s keeps the StatefulSet membership fresh.
+  tolerations:
+    - key: node.kubernetes.io/unreachable
+      operator: Exists
+      effect: NoExecute
+      tolerationSeconds: 20
+    - key: node.kubernetes.io/not-ready
+      operator: Exists
+      effect: NoExecute
+      tolerationSeconds: 20
   affinity: {}
   # Sentinel topology (only used when ``kind: sentinel``).
   sentinel:
