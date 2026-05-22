@@ -22,12 +22,21 @@ metadata:
 spec:
   # DaemonSet so ``DESIRED`` is computed from matching nodes — no
   # Pending pod when the per-role label isn't on the node. Same
-  # shape as dhcp-kea. Use OnDelete update strategy so a chart
-  # upgrade doesn't roll-replace mid-flight (single-instance
-  # stateful workload + hostNetwork:53; operator can `kubectl
-  # delete pod` to trigger the upgrade explicitly).
+  # shape as dhcp-kea.
+  #
+  # #292 — RollingUpdate, NOT OnDelete. OnDelete strands a pod on its
+  # creation-time spec: the supervisor first renders this DaemonSet
+  # before CONTROL_PLANE_URL is known (empty), the pod crashloops, and
+  # OnDelete never recreates it when the URL is later populated — it
+  # crashloops forever until manually deleted. RollingUpdate auto-rolls
+  # on any template/env change. maxUnavailable:1 means one node at a
+  # time: the old hostNetwork:53 pod terminates (releasing the port)
+  # before the new one binds, and the cluster's other DNS nodes keep
+  # serving during the brief per-node gap.
   updateStrategy:
-    type: OnDelete
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: dns-bind9
@@ -59,8 +68,17 @@ spec:
           image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dnsBind9.image.repository) }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           env:
+            # #292 — co-located DaemonSet agents reach the control plane
+            # via the in-cluster API Service over plain HTTP. The external
+            # operator-facing URL (dnsBind9.controlPlaneUrl) carries the
+            # appliance's self-signed cert, which the agent can't verify
+            # → registration fails with CERTIFICATE_VERIFY_FAILED. Intra-
+            # cluster traffic needs no TLS, so point at the api Service
+            # directly (same repoint as the #272 supervisor heartbeat).
+            # ``inClusterApiUrl`` overrides the default if a deployment
+            # uses a non-standard control-release name/namespace.
             - name: CONTROL_PLANE_URL
-              value: {{ .Values.dnsBind9.controlPlaneUrl | quote }}
+              value: {{ .Values.dnsBind9.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
             - name: DNS_AGENT_KEY
               value: {{ .Values.dnsBind9.agentKey | quote }}
             - name: AGENT_GROUP
@@ -89,17 +107,30 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 30
           volumeMounts:
-            - name: data
-              mountPath: /var/named/data
-            - name: keys
-              mountPath: /var/named/keys
+            # #292 — the agent's state dir (AGENT_STATE_DIR) is the ONLY
+            # thing that needs persisting. named runs with
+            # ``-c /var/lib/spatium-dns-agent/rendered/named.conf`` and
+            # every path it references (rendered zones, tsig + rndc keys,
+            # the cached ConfigBundle under config/) lives here. The old
+            # /var/named/{data,keys} PVC mounts were never written to —
+            # confirmed empty on a live install — so they're dropped.
+            # MUST be persistent: on a pod restart during a control-plane
+            # outage this cache is the only thing that lets named keep
+            # serving from last-known-good config (non-negotiable #5).
+            - name: agent-state
+              mountPath: /var/lib/spatium-dns-agent
+      # #292 — per-node hostPath, NOT a shared RWO PVC and NOT emptyDir:
+      #   * A single local-path PVC pins its PV to one node, so the other
+      #     DaemonSet pods can't bind it → Pending forever.
+      #   * emptyDir is wiped on pod restart → loses the #5 cache.
+      # hostPath gives each node its own durable dir on the persistent
+      # /var partition (survives restart + reboot + slot upgrade).
+      # Containers run as root, so kubelet-created dirs are writable.
       volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: dns-bind9-data
-        - name: keys
-          persistentVolumeClaim:
-            claimName: dns-bind9-keys
+        - name: agent-state
+          hostPath:
+            path: /var/lib/spatiumddi/agents/dns-bind9/state
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
@@ -129,30 +160,4 @@ spec:
     - name: dns-tcp
       port: 53
       protocol: TCP
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: dns-bind9-data
-  labels:
-    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
-spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: local-path
-  resources:
-    requests:
-      storage: {{ .Values.dnsBind9.persistence.data.size }}
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: dns-bind9-keys
-  labels:
-    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
-spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: local-path
-  resources:
-    requests:
-      storage: {{ .Values.dnsBind9.persistence.keys.size }}
 {{- end }}

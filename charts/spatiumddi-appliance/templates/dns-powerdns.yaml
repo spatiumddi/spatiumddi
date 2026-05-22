@@ -17,8 +17,13 @@ spec:
   # DaemonSet for symmetry with dns-bind9 + dhcp-kea — DESIRED=0
   # when the node lacks ``spatium.io/role-dns-powerdns=true``, so
   # ``kubectl get pods`` stays silent on unscheduled roles.
+  # #292 — RollingUpdate (not OnDelete): OnDelete strands a pod on its
+  # creation-time spec when CONTROL_PLANE_URL is populated after first
+  # render. See dns-bind9.yaml for the full rationale.
   updateStrategy:
-    type: OnDelete
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: dns-powerdns
@@ -44,8 +49,10 @@ spec:
           image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dnsPowerdns.image.repository) }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           env:
+            # #292 — in-cluster API Service over HTTP; see dns-bind9.yaml
+            # (the external URL's self-signed cert fails agent registration).
             - name: CONTROL_PLANE_URL
-              value: {{ .Values.dnsPowerdns.controlPlaneUrl | quote }}
+              value: {{ .Values.dnsPowerdns.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
             - name: DNS_AGENT_KEY
               value: {{ .Values.dnsPowerdns.agentKey | quote }}
             - name: AGENT_GROUP
@@ -71,12 +78,23 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 30
           volumeMounts:
+            # #292 — persistent agent config-bundle cache (#5); see
+            # dns-bind9.yaml.
+            - name: agent-state
+              mountPath: /var/lib/spatium-dns-agent
             - name: data
               mountPath: /var/lib/powerdns
+      # #292 — per-node hostPath (not shared PVC, not emptyDir); see
+      # dns-bind9.yaml for the rationale.
       volumes:
+        - name: agent-state
+          hostPath:
+            path: /var/lib/spatiumddi/agents/dns-powerdns/state
+            type: DirectoryOrCreate
         - name: data
-          persistentVolumeClaim:
-            claimName: dns-powerdns-data
+          hostPath:
+            path: /var/lib/spatiumddi/agents/dns-powerdns/data
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
@@ -106,17 +124,4 @@ spec:
     - name: dns-tcp
       port: 53
       protocol: TCP
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: dns-powerdns-data
-  labels:
-    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
-spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: local-path
-  resources:
-    requests:
-      storage: {{ .Values.dnsPowerdns.persistence.data.size }}
 {{- end }}
