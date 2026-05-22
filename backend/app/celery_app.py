@@ -403,6 +403,22 @@ celery_app.conf.update(
 )
 
 
+# ── Redis Sentinel broker/backend (#272 Phase 3) ────────────────────────
+#
+# When the broker / result-backend URLs carry the ``sentinel://``
+# scheme (umbrella chart with ``redis.kind=sentinel``), Celery's
+# kombu transport needs the master name in transport options to know
+# which Sentinel-monitored master to resolve. The Sentinel auth
+# password (when the data nodes require auth) rides in
+# ``sentinel_kwargs``. Plain ``redis://`` URLs need none of this.
+if settings.celery_broker_url.startswith(("sentinel://", "redis+sentinel://")):
+    _sentinel_opts: dict = {"master_name": settings.redis_sentinel_master}
+    if settings.redis_sentinel_password:
+        _sentinel_opts["sentinel_kwargs"] = {"password": settings.redis_sentinel_password}
+    celery_app.conf.broker_transport_options = _sentinel_opts
+    celery_app.conf.result_backend_transport_options = dict(_sentinel_opts)
+
+
 # ── Diagnostics — Celery task_failure capture (issue #123) ──────────────
 #
 # Mirror of the FastAPI exception handler in ``app.main``. Every

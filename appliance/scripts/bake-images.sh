@@ -71,13 +71,49 @@ OBSERVABILITY_IMAGES=(
     # /var/lib/spatiumddi/agent-landing/index.html on :80. Pinned to
     # 1.30.1-alpine matching values.yaml's ``agentLanding.image.tag``.
     "nginx:1.30.1-alpine"
-    # Phase 11 (#183) — datastores for the AIO + Core control plane.
-    # Tags follow the umbrella chart's ``postgresql.image.tag`` and
-    # ``redis.image.tag`` defaults. Postgres stays on 16-alpine
-    # pending a dedicated PR with pg_upgrade migration tooling —
-    # PG18 refuses to start against a PG16 data directory.
-    "postgres:16-alpine"
+    # Phase 11 (#183) — Redis datastore for the control plane.
+    # Tag follows the umbrella chart's ``redis.image.tag`` default.
+    # NOTE: the standalone ``postgres:16-alpine`` image is intentionally
+    # NOT baked anymore (#277). The appliance now runs PostgreSQL under
+    # CloudNativePG on every install (single instance → 3/5/7 on
+    # promote); the CNPG runtime image (ghcr.io/cloudnative-pg/postgresql)
+    # + operator are baked in CNPG_IMAGES below. The chart's standalone
+    # StatefulSet path stays for non-appliance docker/k8s users, but the
+    # appliance never renders it, so its image is dead weight in the ISO.
     "redis:8.6-alpine"
+)
+
+# #272 Phase 5 — MetalLB (control-plane HTTPS VIP + Phase 10 DNS/DHCP
+# VIPs). Official upstream images (NOT bitnami), tagged with the chart
+# appVersion. Baked so multi-node HA promotion works in air-gapped
+# environments with zero outbound pulls — same as every other image.
+#
+# L2 (native) mode only: ``metallb.speaker.frr.enabled=false`` AND
+# ``metallb.frrk8s.enabled=false`` in charts/spatiumddi-appliance/
+# values.yaml (0.16.0 made frr-k8s the default BGP backend), so the
+# quay.io/metallb/frr-k8s + quay.io/frrouting/frr images are
+# intentionally NOT baked. If/when BGP mode lands (Phase 10), enable
+# frrk8s + add those two images here.
+#
+# KEEP these refs in lock-step with the metallb.controller.image /
+# metallb.speaker.image pins in the appliance chart's values.yaml.
+METALLB_IMAGES=(
+    "quay.io/metallb/controller:v0.16.0"
+    "quay.io/metallb/speaker:v0.16.0"
+)
+
+# CloudNativePG (#272 / #277) — PostgreSQL is CNPG on every appliance
+# (single-node = 1 instance, scales to 3/5/7 on control-plane promote).
+# The operator runs from the spatiumddi-appliance chart's cnpg subchart;
+# the runtime image is what each Cluster instance pod runs. Both MUST be
+# baked or a fresh airgap install can't bring postgres up.
+#   * operator tag = cloudnative-pg chart 0.28.2 appVersion (1.29.1).
+#   * runtime tag  = charts/spatiumddi values.yaml postgresql.cnpg.imageName.
+# KEEP in lock-step with charts/spatiumddi-appliance/charts/cloudnative-pg-*.tgz
+# (appVersion) and charts/spatiumddi/values.yaml (cnpg.imageName).
+CNPG_IMAGES=(
+    "ghcr.io/cloudnative-pg/cloudnative-pg:1.29.1"
+    "ghcr.io/cloudnative-pg/postgresql:16"
 )
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -188,7 +224,7 @@ done
 # Slugged output filenames so two images from the same registry
 # path prefix don't collide. ``kube-state-metrics`` + ``node-exporter``
 # are distinct enough that ``basename`` works.
-for image in "${OBSERVABILITY_IMAGES[@]}"; do
+for image in "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}" "${CNPG_IMAGES[@]}"; do
     short="$(basename "${image%%:*}")"
     out_tar="$IMAGES_DIR/${short}.tar.zst"
 
@@ -206,7 +242,40 @@ for image in "${OBSERVABILITY_IMAGES[@]}"; do
     echo "  ✓ $size"
 done
 
+# Prune stale image archives that this bake no longer produces (#277).
+# bake-images.sh appends but never cleaned, so an image dropped from the
+# lists above (e.g. the standalone ``postgres:16-alpine`` once the
+# appliance went CNPG-only) left its ~100 MB ``.tar.zst`` behind to be
+# baked into the ISO forever as dead weight. Compute the expected
+# basenames from every list, then remove any other ``*.tar.zst`` — but
+# NEVER the externally-fetched k3s airgap bundle (produced by
+# ``appliance-fetch-k3s``, not this script). That bundle is arch-tagged
+# (``k3s-airgap-images-<arch>.tar.zst``), so match it by glob rather than
+# a hardcoded ``-amd64`` — hardcoding would prune the arm64 bundle on a
+# multi-arch build and break the ISO.
+expected=()
+for repo in "${IMAGES[@]}" "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}" "${CNPG_IMAGES[@]}"; do
+    expected+=("$(basename "${repo%%:*}").tar.zst")
+done
+for f in "$IMAGES_DIR"/*.tar.zst; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+    # Keep the k3s airgap bundle for any arch (amd64 / arm64).
+    case "$base" in
+        k3s-airgap-images-*.tar.zst) continue ;;
+    esac
+    keep=false
+    for e in "${expected[@]}"; do
+        [ "$base" = "$e" ] && { keep=true; break; }
+    done
+    if [ "$keep" = false ]; then
+        echo "→ Pruning stale baked image (no longer in the bake list): $base"
+        rm -f "$f"
+    fi
+done
+
+# Total AFTER the prune so the reported size matches what's actually baked.
 TOTAL="$(du -hc "$IMAGES_DIR"/*.tar.zst 2>/dev/null | tail -1 | awk '{print $1}')"
-TOTAL_COUNT=$((${#IMAGES[@]} + ${#OBSERVABILITY_IMAGES[@]}))
+TOTAL_COUNT=$((${#IMAGES[@]} + ${#OBSERVABILITY_IMAGES[@]} + ${#METALLB_IMAGES[@]} + ${#CNPG_IMAGES[@]}))
 echo "✓ ${TOTAL_COUNT} images baked into $IMAGES_DIR ($TOTAL)"
 echo "  k3s auto-imports these at startup (no firstboot shell-out required)"

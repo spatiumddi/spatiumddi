@@ -45,11 +45,10 @@ async def readiness() -> JSONResponse:
 
     # Redis check
     try:
-        import redis.asyncio as aioredis
-
         from app.config import settings
+        from app.core.redis_client import make_async_redis
 
-        r = aioredis.from_url(settings.redis_url, socket_connect_timeout=2)
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         await cast(Awaitable[bool], r.ping())
         await r.aclose()
         checks["redis"] = "ok"
@@ -103,11 +102,10 @@ async def platform_health() -> JSONResponse:
     # Redis
     t0 = monotonic()
     try:
-        import redis.asyncio as aioredis
-
         from app.config import settings
+        from app.core.redis_client import make_async_redis
 
-        r = aioredis.from_url(settings.redis_url, socket_connect_timeout=2)
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         await cast(Awaitable[bool], r.ping())
         await r.aclose()
         components.append(

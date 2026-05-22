@@ -447,3 +447,27 @@ class PlatformSettings(Base):
     appliance_revoked_retention_days: Mapped[int] = mapped_column(
         Integer, nullable=False, default=30, server_default=sa_text("30")
     )
+
+    # ── Control-plane MetalLB VIP (issue #272 Phase 7c) ─────────────
+    # Cluster-wide singleton. ``metallb_pool_addresses`` is the L2 IP
+    # range the appliance's bundled MetalLB hands out (CIDR ``a.b.c.0/28``
+    # or range ``a.b.c.10-a.b.c.20`` per entry); ``control_plane_vip`` is
+    # the single floating IP that fronts the frontend Service so the Web
+    # UI + every agent heartbeat hit one stable address regardless of
+    # which control-plane node is up. The VIP MUST fall inside the pool.
+    # Applied to the cluster by the seed supervisor on heartbeat (same
+    # desired-state path as ``control_plane_size``): it patches
+    # ``metallb.enabled`` + ``metallb.ipPool.addresses`` on the
+    # spatium-bootstrap HelmChart and ``frontend.controlPlaneVIP`` on the
+    # spatium-control HelmChart (the latter also seeds the auto-issued
+    # cert's SAN list via APPLIANCE_EXTRA_CERT_SANS). Disabled / empty =
+    # single-node hostNetwork frontend, no VIP.
+    metallb_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    metallb_pool_addresses: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    control_plane_vip: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=sa_text("''")
+    )

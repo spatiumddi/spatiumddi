@@ -48,9 +48,7 @@ log = structlog.get_logger(__name__)
 _HOST_ROLE_CONFIG = Path("/etc/spatiumddi-host/role-config")
 _HOST_RELEASE = Path("/etc/spatiumddi-host/appliance-release")
 _HOST_GRUBENV = Path("/boot/efi-host/grub/grubenv")
-_HOST_SLOT_STATE = Path(
-    "/var/lib/spatiumddi-host/release-state/slot-upgrade-pending.state"
-)
+_HOST_SLOT_STATE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pending.state")
 _PROC_CMDLINE = Path("/proc/cmdline")
 _UDEV_DATA = Path("/run/udev/data")
 
@@ -116,6 +114,51 @@ def read_installed_version() -> str | None:
     for line in text.splitlines():
         if line.startswith("APPLIANCE_VERSION="):
             return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
+# #272 — two installer-role variants: ``control-plane`` (the brain +
+# k3s etcd seed) and ``appliance`` (a data-plane node that pairs with
+# a remote control plane). The supervisor reports its variant on every
+# heartbeat so the Fleet UI can split rows into Control plane vs
+# Service agents, and the label reconciler can apply the correct
+# per-role labels (control-plane ⇒ control-plane label;
+# appliance ⇒ operator-assigned).
+_KNOWN_VARIANTS = frozenset({"control-plane", "appliance"})
+# Pre-#272 installs wrote one of three variant strings; normalise them
+# to the two canonical values so a not-yet-reinstalled box reports a
+# clean variant (full-stack / frontend-core were both control planes;
+# application was the data-plane node).
+_LEGACY_VARIANT_ALIASES = {
+    "full-stack": "control-plane",
+    "frontend-core": "control-plane",
+    "application": "appliance",
+}
+
+
+def detect_appliance_variant() -> str | None:
+    """Parse ``ROLE=`` out of ``/etc/spatiumddi-host/role-config``.
+
+    The installer wizard's role choice is baked into role-config at
+    install time (``spatium-install`` writes ``ROLE=<variant>``);
+    firstboot leaves the value untouched across slot swaps. Legacy
+    pre-#272 strings are normalised to the two canonical variants.
+    Returns ``None`` when the file isn't mounted (docker / k8s) or the
+    parsed value isn't one we recognise — the heartbeat handler treats
+    ``None`` as "supervisor didn't ship the field" and leaves the
+    persisted column alone.
+    """
+    if not _HOST_ROLE_CONFIG.exists():
+        return None
+    try:
+        text = _HOST_ROLE_CONFIG.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("ROLE="):
+            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            value = _LEGACY_VARIANT_ALIASES.get(value, value)
+            return value if value in _KNOWN_VARIANTS else None
     return None
 
 
@@ -266,9 +309,7 @@ _SLOT_VERSIONS_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-versions
 _SET_NEXT_BOOT_TRIGGER_FILE = Path(
     "/var/lib/spatiumddi-host/release-state/slot-set-next-boot-pending"
 )
-_SET_DEFAULT_TRIGGER_FILE = Path(
-    "/var/lib/spatiumddi-host/release-state/slot-set-default-pending"
-)
+_SET_DEFAULT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-set-default-pending")
 # Issue #153 — SNMP config rollout. The trigger file carries the
 # rendered snmpd.conf body so the host runner doesn't need to re-
 # render. The hash sidecar lets the agent skip re-firing after an
@@ -280,6 +321,28 @@ _SNMP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/snmp-status"
 _NTP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/ntp-config-pending")
 _NTP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-config-hash")
 _NTP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-status")
+
+# #272 Phase 7b — control-plane cluster join/leave. The join trigger
+# carries the seed's kubeapi URL + join token; the host-side runner
+# (spatium-cluster-join) reconfigures k3s to join the seed as a server
+# node and writes the .state sidecar (state\treason) the supervisor
+# reads back. The leave trigger has no payload. The token sidecar is
+# written by the PRIMARY's host runner from /var/lib/rancher/k3s/
+# server/token so the supervisor can report it without mounting the
+# k3s server dir.
+_CLUSTER_JOIN_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/cluster-join-pending")
+_CLUSTER_LEAVE_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/cluster-leave-pending")
+# Guardrail confirmation markers (#272). The host-side spatium-cluster-join
+# runner does DESTRUCTIVE k3s surgery (full cluster-identity wipe + rejoin),
+# fired by a systemd .path unit watching these trigger files. To stop a
+# stray / accidental / hand-touched file from triggering a wipe, the
+# supervisor stamps a magic first line and the runner refuses to act on any
+# trigger whose first line isn't an exact match. Must stay byte-identical to
+# the constants in spatium-cluster-join.
+_CLUSTER_JOIN_CONFIRM = "SPATIUMDDI-CLUSTER-JOIN-CONFIRM-V1"
+_CLUSTER_LEAVE_CONFIRM = "SPATIUMDDI-CLUSTER-LEAVE-CONFIRM-V1"
+_CLUSTER_JOIN_STATE_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/cluster-join.state")
+_K3S_JOIN_TOKEN_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/k3s-join-token")
 
 
 def maybe_fire_fleet_upgrade(
@@ -536,17 +599,127 @@ def maybe_fire_snmp_reload(bundle_block: object) -> bool:
         # runner) so the agent and host agree on exactly which body
         # was applied — useful when the runner writes the sidecar
         # the agent reads on next bundle to short-circuit re-firing.
-        payload = (
-            ("enabled\n" if enabled else "disabled\n")
-            + (config_hash + "\n")
-            + snmpd_conf
-        )
+        payload = ("enabled\n" if enabled else "disabled\n") + (config_hash + "\n") + snmpd_conf
         tmp = _SNMP_TRIGGER_FILE.with_suffix(".new")
         tmp.write_text(payload, encoding="utf-8")
         tmp.replace(_SNMP_TRIGGER_FILE)
         return True
     except OSError:
         return False
+
+
+# ── #272 Phase 7b — control-plane cluster join/leave ────────────────
+
+
+def maybe_fire_cluster_join(
+    desired_cluster_role: str | None,
+    server_url: str | None,
+    join_token: str | None,
+) -> bool:
+    """Write the cluster-join trigger when the control plane asks this
+    node to join the k3s control-plane cluster as a server.
+
+    ``desired_cluster_role`` mirrors the heartbeat response field —
+    only ``"member"`` fires a join. ``server_url`` + ``join_token`` are
+    the seed's coordinates. The host-side runner reconfigures k3s +
+    writes the ``.state`` sidecar; the supervisor reports that state on
+    subsequent heartbeats so the backend can settle ``cluster_role`` +
+    drop the desired-state.
+
+    Strict appliance-only gate (mirrors ``maybe_fire_reboot``).
+    Idempotent via trigger-file presence — once written, we don't
+    stack writes until the host runner consumes it (renaming to
+    ``.done`` / ``.failed``). The trigger payload is three lines: the
+    ``_CLUSTER_JOIN_CONFIRM`` guardrail marker, then ``server_url``,
+    then ``join_token``. The runner refuses any trigger whose first
+    line isn't the marker, so a stray file can't fire a wipe.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if desired_cluster_role != "member":
+        return False
+    if not server_url or not join_token:
+        return False
+    if _CLUSTER_JOIN_TRIGGER_FILE.exists():
+        return False
+    try:
+        _CLUSTER_JOIN_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CLUSTER_JOIN_TRIGGER_FILE.with_suffix(".new")
+        tmp.write_text(
+            f"{_CLUSTER_JOIN_CONFIRM}\n{server_url}\n{join_token}\n", encoding="utf-8"
+        )
+        tmp.replace(_CLUSTER_JOIN_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
+    """Write the cluster-leave trigger when the control plane asks this
+    node to leave the cluster (``desired_cluster_role == "none"``).
+
+    Payload is two lines: the ``_CLUSTER_LEAVE_CONFIRM`` guardrail
+    marker then a timestamp. The runner refuses any trigger whose first
+    line isn't the marker. Strict appliance-only + idempotent via
+    trigger-file presence.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if desired_cluster_role != "none":
+        return False
+    if _CLUSTER_LEAVE_TRIGGER_FILE.exists():
+        return False
+    try:
+        _CLUSTER_LEAVE_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CLUSTER_LEAVE_TRIGGER_FILE.with_suffix(".new")
+        ts = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        tmp.write_text(f"{_CLUSTER_LEAVE_CONFIRM}\n{ts}\n", encoding="utf-8")
+        tmp.replace(_CLUSTER_LEAVE_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def read_cluster_join_state() -> tuple[str | None, str | None]:
+    """Return ``(cluster_join_state, cluster_join_reason)`` from the
+    ``.state`` sidecar the host runner writes (``state\\treason``).
+
+    Appliance-only; ``(None, None)`` when the sidecar is missing so the
+    backend's "only update when not None" semantics leave the columns
+    alone on nodes that have never joined/left.
+    """
+    if detect_deployment_kind() != "appliance":
+        return None, None
+    if not _CLUSTER_JOIN_STATE_SIDECAR.exists():
+        return None, None
+    try:
+        raw = _CLUSTER_JOIN_STATE_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None, None
+    if not raw:
+        return None, None
+    state, _, reason = raw.partition("\t")
+    return (state or None), (reason or None)
+
+
+def read_k3s_join_token() -> str | None:
+    """Return the seed's k3s node-token from the sidecar the PRIMARY's
+    host runner copies out of ``/var/lib/rancher/k3s/server/token``.
+
+    Only the seed has this sidecar; ``None`` everywhere else (the
+    backend leaves the column untouched). Reading a sidecar rather than
+    the k3s server dir keeps the supervisor pod from needing that
+    sensitive path mounted.
+    """
+    if detect_deployment_kind() != "appliance":
+        return None
+    if not _K3S_JOIN_TOKEN_SIDECAR.exists():
+        return None
+    try:
+        tok = _K3S_JOIN_TOKEN_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return tok or None
 
 
 def read_snmpd_running() -> bool | None:
@@ -781,7 +954,6 @@ def read_cluster_health() -> dict[str, object] | None:
     # ``conditions`` array; the ``Ready`` condition's ``status`` is
     # ``True`` when the kubelet says so.
     try:
-
         status_code, body = k8s_api._request("GET", "/api/v1/nodes")
     except (RuntimeError, OSError):
         return summary
@@ -825,6 +997,49 @@ def read_cluster_health() -> dict[str, object] | None:
     return summary
 
 
+def read_node_ip() -> str | None:
+    """Return this node's k3s-registered InternalIP (#272 Phase 7b).
+
+    The control-plane promote endpoint needs the SEED's real, routable
+    node IP to build the ``--server https://<ip>:6443`` join URL handed
+    to joiners. ``last_seen_ip`` can't be used: the supervisor heartbeats
+    from inside the cluster, so the control plane sees its POD IP
+    (10.42.x.x), which a joiner can't reach. The node's InternalIP is the
+    address k3s itself uses for the apiserver + etcd, so it's the correct
+    join target.
+
+    Looks the local node up by NODE_NAME (downward-API ``spec.nodeName``,
+    set in the supervisor DaemonSet) and returns the first ``InternalIP``
+    address. ``None`` when not k3s, NODE_NAME is unset, or the probe
+    fails — the backend's "only update when not None" semantics then
+    leave the column untouched.
+    """
+    if detect_runtime() != "k3s":
+        return None
+    node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME")
+    if not node_name:
+        return None
+
+    from urllib.parse import quote  # noqa: PLC0415
+
+    from . import k8s_api  # noqa: PLC0415
+
+    try:
+        status_code, body = k8s_api._request("GET", f"/api/v1/nodes/{quote(node_name)}")
+    except (RuntimeError, OSError):
+        return None
+    if status_code != 200:
+        return None
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    for addr in (data.get("status") or {}).get("addresses") or []:
+        if addr.get("type") == "InternalIP" and addr.get("address"):
+            return str(addr["address"])
+    return None
+
+
 def collect() -> dict[str, object]:
     """Snapshot the agent's slot + deployment state for the heartbeat.
 
@@ -842,21 +1057,22 @@ def collect() -> dict[str, object]:
     if current_slot and durable_default:
         is_trial_boot = current_slot != durable_default
 
-    last_state, last_state_at = (
-        _last_upgrade_state_from_sidecar() if is_appliance else (None, None)
-    )
+    last_state, last_state_at = _last_upgrade_state_from_sidecar() if is_appliance else (None, None)
 
     slot_a_version, slot_b_version = read_slot_versions()
     cluster_health = read_cluster_health() if is_appliance else None
     k3s_version = read_k3s_version() if is_appliance else None
     kubeconfig = read_kubeconfig() if is_appliance else None
     k3s_api_cert_expires_at = read_k3s_api_cert_expiry() if is_appliance else None
+    node_ip = read_node_ip() if is_appliance else None
 
     return {
         "deployment_kind": deployment_kind,
-        "installed_appliance_version": (
-            read_installed_version() if is_appliance else None
-        ),
+        # #272 Phase 1 — installer-role variant the supervisor is
+        # running on. Only meaningful on appliance deploys; None on
+        # docker / k8s.
+        "appliance_variant": (detect_appliance_variant() if is_appliance else None),
+        "installed_appliance_version": (read_installed_version() if is_appliance else None),
         "current_slot": current_slot,
         "durable_default": durable_default,
         "slot_a_version": slot_a_version,
@@ -892,4 +1108,15 @@ def collect() -> dict[str, object]:
         # alerts. None when not k3s; the backend leaves the column
         # untouched on null.
         "k3s_api_cert_expires_at": k3s_api_cert_expires_at,
+        # #272 Phase 7b — control-plane cluster join/leave telemetry.
+        # ``k3s_join_token`` only present on the seed; join state from
+        # the host runner's .state sidecar. All None on non-appliance.
+        "k3s_join_token": read_k3s_join_token() if is_appliance else None,
+        "cluster_join_state": (read_cluster_join_state()[0] if is_appliance else None),
+        "cluster_join_reason": (read_cluster_join_state()[1] if is_appliance else None),
+        # #272 Phase 7b — the node's real routable InternalIP. The
+        # promote endpoint builds the k3s join URL from the seed's
+        # node_ip; ``last_seen_ip`` is the supervisor POD IP (10.42.x.x),
+        # which joiners can't reach. None on non-appliance / non-k3s.
+        "node_ip": node_ip,
     }

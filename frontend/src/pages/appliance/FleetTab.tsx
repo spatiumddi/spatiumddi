@@ -28,6 +28,7 @@ import {
   dnsApi,
   type ApplianceRow,
   type ApplianceState,
+  type ControlPlaneReplaceResult,
   type SlotImage,
   type SupervisorCapabilities,
   formatApiError,
@@ -182,7 +183,304 @@ const SERVICE_CHIP_STYLES: Record<
   neutral: "bg-muted text-muted-foreground border-border",
 };
 
-export function FleetTab() {
+// #272 Phase 1 — Fleet UI two-table split. Control-plane variants run
+// the umbrella chart (api / frontend / worker / beat / postgres /
+// redis); the ``appliance`` variant runs the DNS / DHCP service
+// containers. NULL is treated as service-agent. The legacy full-stack
+// / frontend-core / control-cluster-member strings are kept here so a
+// not-yet-reinstalled box still classifies onto the control-plane side.
+// (Surfacing a *promoted* appliance on the control-plane side via
+// cluster_role is Phase 7c UI work.)
+const CONTROL_PLANE_VARIANTS = new Set([
+  "control-plane",
+  // legacy (pre-#272) aliases:
+  "full-stack",
+  "frontend-core",
+  "control-cluster-member",
+]);
+function isControlPlaneRow(row: ApplianceRow): boolean {
+  // A row belongs on the control-plane side if it installed as a
+  // control-plane variant OR it has actually joined the k3s control
+  // plane (an `appliance`-variant box promoted to a cluster member —
+  // #272 Phase 7). Without the cluster_role check a promoted member
+  // keeps rendering under "Service agents" even though it's now an
+  // etcd/control-plane node.
+  return (
+    CONTROL_PLANE_VARIANTS.has(row.appliance_variant ?? "") ||
+    row.cluster_role === "primary" ||
+    row.cluster_role === "member"
+  );
+}
+
+// #272 Phase 7c — settled / in-flight control-plane cluster membership.
+const _CLUSTER_CHIP_BASE =
+  "inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium";
+function ClusterStatusChip({ row }: { row: ApplianceRow }) {
+  const js = row.cluster_join_state;
+  // An in-flight join/leave takes precedence over the settled role.
+  if (js && js !== "ready" && js !== "left") {
+    const tone =
+      js === "failed"
+        ? "border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-300"
+        : "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-300";
+    const label =
+      js === "joining" ? "joining…" : js === "leaving" ? "leaving…" : js;
+    return (
+      <span
+        className={cn(_CLUSTER_CHIP_BASE, tone)}
+        title={row.cluster_join_reason ?? ""}
+      >
+        cluster: {label}
+      </span>
+    );
+  }
+  if (row.cluster_role === "primary" || row.cluster_role === "member") {
+    return (
+      <span
+        className={cn(
+          _CLUSTER_CHIP_BASE,
+          "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300",
+        )}
+        title={
+          row.cluster_role === "primary"
+            ? "etcd seed — runs the control plane + the cluster's etcd"
+            : "control-plane cluster member (joined the seed)"
+        }
+      >
+        {row.cluster_role === "primary" ? "etcd seed" : "cluster member"}
+      </span>
+    );
+  }
+  return null;
+}
+
+// #272 Phase 7c — batch promote/demote control-plane members. etcd HA
+// wants an ODD server count (1 / 3 / 5 / 7), so this is multi-select:
+// a single 1→2 promote is refused by the API guard, you promote two at
+// once to reach 3. The API enforces the odd-target rule; we both
+// pre-empt it (disable when the resulting count is even) and surface
+// its 422 message inline.
+function ClusterMembershipModal({
+  rows,
+  onClose,
+}: {
+  rows: ApplianceRow[];
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [promoteSel, setPromoteSel] = useState<Set<string>>(new Set());
+  const [demoteSel, setDemoteSel] = useState<Set<string>>(new Set());
+
+  // Current control-plane members for the odd-count math. A node is a
+  // member if it's a control-plane node by INSTALL VARIANT (the seed —
+  // isControlPlaneRow) OR an actually-joined cluster member. The seed
+  // has cluster_role=null until the first promote *designates* it, so
+  // counting cluster_role alone undercounts by 1 and the modal showed
+  // "Current members: 0" / blocked an odd 1→3 promote. Matches the
+  // backend's _resolve_primary (which counts the lone seed as 1).
+  const members = rows.filter(
+    (r) =>
+      r.state !== "revoked" &&
+      (isControlPlaneRow(r) ||
+        r.cluster_role === "primary" ||
+        r.cluster_role === "member"),
+  );
+  // Alphabetical by hostname (natural sort so ddi2 < ddi10), not the
+  // API's IP order — operators scan the promote/demote lists by name.
+  const byHostname = (a: ApplianceRow, b: ApplianceRow) =>
+    (a.hostname ?? "").localeCompare(b.hostname ?? "", undefined, {
+      numeric: true,
+      sensitivity: "base",
+    });
+  // Only actually-joined members are demotable (never the seed).
+  const demotable = members
+    .filter((r) => r.cluster_role === "member")
+    .sort(byHostname);
+  const memberCount = members.length;
+  // Eligible to promote: approved OS-appliance nodes that aren't already
+  // a control-plane node (the seed / a promoted member) and aren't
+  // mid-join. ``isControlPlaneRow`` keys off the install variant, so a
+  // control-plane node is excluded even before it's formally designated
+  // primary (cluster_role is null until the first promote) — you can't
+  // promote a control plane to a control plane.
+  const eligible = rows
+    .filter(
+      (r) =>
+        r.state === "approved" &&
+        r.deployment_kind === "appliance" &&
+        !isControlPlaneRow(r) &&
+        !r.cluster_role &&
+        r.desired_cluster_role !== "member",
+    )
+    .sort(byHostname);
+
+  const refresh = () =>
+    qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+  const promote = useMutation({
+    mutationFn: () => applianceApprovalApi.promoteControlPlane([...promoteSel]),
+    onSuccess: () => {
+      refresh();
+      setPromoteSel(new Set());
+    },
+  });
+  const demote = useMutation({
+    mutationFn: () => applianceApprovalApi.demoteControlPlane([...demoteSel]),
+    onSuccess: () => {
+      refresh();
+      setDemoteSel(new Set());
+    },
+  });
+
+  const toggle = (
+    set: Set<string>,
+    id: string,
+    setter: (s: Set<string>) => void,
+  ) => {
+    const next = new Set(set);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setter(next);
+  };
+
+  const resultingPromote = memberCount + promoteSel.size;
+  const resultingDemote = memberCount - demoteSel.size;
+  const promoteEven = promoteSel.size > 0 && resultingPromote % 2 === 0;
+  const demoteEven = demoteSel.size > 0 && resultingDemote % 2 === 0;
+
+  return (
+    <Modal title="Manage control plane cluster" onClose={onClose} wide>
+      <div className="space-y-5 text-sm">
+        <p className="text-muted-foreground">
+          The control-plane cluster runs on embedded etcd, which wants an{" "}
+          <strong>odd</strong> server count (1 / 3 / 5 / 7) for quorum. Promote
+          or demote in batches so the total lands on an odd number — the server
+          refuses an even result. Current members:{" "}
+          <strong>{memberCount}</strong>.
+        </p>
+
+        {/* ── Promote ──────────────────────────────────────────── */}
+        <section className="space-y-2">
+          <h4 className="font-medium">Promote appliances → control plane</h4>
+          {eligible.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No eligible appliance nodes (need an approved, paired Appliance
+              that isn’t already a member).
+            </p>
+          ) : (
+            <div className="space-y-1">
+              {eligible.map((r) => (
+                <label key={r.id} className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={promoteSel.has(r.id)}
+                    onChange={() => toggle(promoteSel, r.id, setPromoteSel)}
+                  />
+                  <span>{r.hostname}</span>
+                  {r.last_seen_ip && (
+                    <span className="text-xs text-muted-foreground">
+                      {r.last_seen_ip}
+                    </span>
+                  )}
+                </label>
+              ))}
+            </div>
+          )}
+          {promoteSel.size > 0 && (
+            <p
+              className={cn(
+                "text-xs",
+                promoteEven ? "text-rose-500" : "text-muted-foreground",
+              )}
+            >
+              Resulting members: {resultingPromote}
+              {promoteEven &&
+                " — even; select one more (or fewer) to make it odd"}
+            </p>
+          )}
+          {promote.error && (
+            <p className="text-xs text-rose-500">
+              {formatApiError(promote.error)}
+            </p>
+          )}
+          <button
+            type="button"
+            className="rounded-md border px-3 py-1.5 text-sm disabled:opacity-50"
+            disabled={promoteSel.size === 0 || promoteEven || promote.isPending}
+            onClick={() => promote.mutate()}
+          >
+            {promote.isPending
+              ? "Promoting…"
+              : `Promote ${promoteSel.size || ""} to control plane`}
+          </button>
+        </section>
+
+        {/* ── Demote ───────────────────────────────────────────── */}
+        <section className="space-y-2 border-t pt-4">
+          <h4 className="font-medium">Demote members → appliance</h4>
+          {demotable.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No demotable members (the etcd seed can’t be demoted here).
+            </p>
+          ) : (
+            <div className="space-y-1">
+              {demotable.map((r) => (
+                <label key={r.id} className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={demoteSel.has(r.id)}
+                    onChange={() => toggle(demoteSel, r.id, setDemoteSel)}
+                  />
+                  <span>{r.hostname}</span>
+                </label>
+              ))}
+            </div>
+          )}
+          {demoteSel.size > 0 && (
+            <p
+              className={cn(
+                "text-xs",
+                demoteEven ? "text-rose-500" : "text-muted-foreground",
+              )}
+            >
+              Remaining members: {resultingDemote}
+              {demoteEven &&
+                " — even; select one more (or fewer) to make it odd"}
+            </p>
+          )}
+          {demote.error && (
+            <p className="text-xs text-rose-500">
+              {formatApiError(demote.error)}
+            </p>
+          )}
+          <button
+            type="button"
+            className="rounded-md border px-3 py-1.5 text-sm disabled:opacity-50"
+            disabled={demoteSel.size === 0 || demoteEven || demote.isPending}
+            onClick={() => demote.mutate()}
+          >
+            {demote.isPending ? "Demoting…" : `Demote ${demoteSel.size || ""}`}
+          </button>
+        </section>
+      </div>
+    </Modal>
+  );
+}
+
+// #272 — localStorage key for the dismissable "set up a VIP" advisory
+// shown on the Control plane section once a multi-node cluster exists.
+const VIP_ADVISORY_DISMISS_KEY = "spatium.fleet.vipAdvisoryDismissed";
+
+export function FleetTab({
+  onNavigateTab,
+  isApplianceHost = false,
+}: {
+  // #272 Phase 6 — lets the cert card jump to the "Web UI Certificate"
+  // tab. Optional so the component still renders standalone.
+  onNavigateTab?: (tab: string) => void;
+  // Only appliance hosts have a local Web UI cert to manage; docker/k8s
+  // control planes hide the cert tab, so we hide the card there too.
+  isApplianceHost?: boolean;
+}) {
   const qc = useQueryClient();
   const { data: me } = useQuery({
     queryKey: ["me"],
@@ -202,6 +500,17 @@ export function FleetTab() {
     enabled: isSuperadmin,
   });
 
+  // #272 — the no-VIP advisory. Only meaningful on an appliance-hosted
+  // control plane (MetalLB is a baked-in appliance subsystem; docker/k8s
+  // control planes manage their own ingress/LB). We read the current
+  // MetalLB config to decide whether a VIP is set.
+  const { data: metallb } = useQuery({
+    queryKey: ["appliance", "metallb"],
+    queryFn: applianceApprovalApi.getMetalLBConfig,
+    enabled: isSuperadmin && isApplianceHost,
+    staleTime: 30_000,
+  });
+
   // #170 follow-up — left-sidebar nav mirroring SettingsPage's
   // shape. Sections: the appliance fleet table, pairing-code
   // management, air-gap slot-image uploads, plus NTP + SNMP
@@ -214,9 +523,23 @@ export function FleetTab() {
   >("appliance.fleet.section", "appliances");
 
   const [drilldown, setDrilldown] = useState<ApplianceRow | null>(null);
+  const [showCluster, setShowCluster] = useState(false);
   const [rejectTarget, setRejectTarget] = useState<ApplianceRow | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ApplianceRow | null>(null);
   const [rekeyTarget, setRekeyTarget] = useState<ApplianceRow | null>(null);
+  // #272 Phase 9 — dead-node replacement. ``replaceTarget`` is the
+  // member to evict (confirm modal); ``replaceResult`` holds the minted
+  // pairing code shown once the eviction is stamped.
+  const [replaceTarget, setReplaceTarget] = useState<ApplianceRow | null>(null);
+  const [replaceResult, setReplaceResult] =
+    useState<ControlPlaneReplaceResult | null>(null);
+  // #272 — no-VIP advisory dismissal. Persisted in localStorage (not
+  // session) so it stays dismissed across browser restarts; the
+  // checkbox gate makes dismissal deliberate rather than a stray click.
+  const [vipAdvisoryDismissed, setVipAdvisoryDismissed] = useState<boolean>(
+    () => localStorage.getItem(VIP_ADVISORY_DISMISS_KEY) === "1",
+  );
+  const [vipDismissAck, setVipDismissAck] = useState(false);
 
   const approve = useMutation({
     mutationFn: (id: string) => applianceApprovalApi.approve(id),
@@ -234,6 +557,15 @@ export function FleetTab() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
       setRejectTarget(null);
+    },
+  });
+  const replace = useMutation({
+    mutationFn: (id: string) =>
+      applianceApprovalApi.replaceControlPlaneMember(id),
+    onSuccess: (result) => {
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+      setReplaceTarget(null);
+      setReplaceResult(result);
     },
   });
   // #170 follow-up — password re-auth required for delete (the
@@ -319,8 +651,44 @@ export function FleetTab() {
   });
 
   const rows = useMemo(() => data ?? [], [data]);
-  const pending = rows.filter((r) => r.state === "pending_approval");
-  const others = rows.filter((r) => r.state !== "pending_approval");
+  // #272 Phase 1 — split rows by Fleet section (Control plane vs
+  // Service agents) first, then by state (pending sticks at the top
+  // of its section). Single-node installs see only one populated
+  // section; multi-node HA (Phase 7+) populates both.
+  const controlPlaneRows = rows.filter(isControlPlaneRow);
+  const serviceAgentRows = rows.filter((r) => !isControlPlaneRow(r));
+  const byHostname = (a: ApplianceRow, b: ApplianceRow) =>
+    (a.hostname ?? "").localeCompare(b.hostname ?? "", undefined, {
+      numeric: true,
+    });
+  const splitByState = (
+    bucket: ApplianceRow[],
+  ): { pending: ApplianceRow[]; others: ApplianceRow[] } => ({
+    pending: bucket
+      .filter((r) => r.state === "pending_approval")
+      .sort(byHostname),
+    others: bucket
+      .filter((r) => r.state !== "pending_approval")
+      .sort(byHostname),
+  });
+  const controlPlane = splitByState(controlPlaneRows);
+  const serviceAgents = splitByState(serviceAgentRows);
+
+  // #272 — show the "set up a VIP" advisory once a multi-node control
+  // plane exists but no MetalLB VIP is configured. A cluster with >1
+  // approved control-plane node and no floating VIP is a latent SPOF:
+  // every off-cluster agent + operator browser is pinned to whichever
+  // node IP they happened to type, so losing that node strands them
+  // even though the cluster itself is healthy.
+  const approvedControlPlaneCount = controlPlaneRows.filter(
+    (r) => r.state !== "pending_approval",
+  ).length;
+  const vipConfigured = !!(metallb?.enabled && metallb.control_plane_vip);
+  const showVipAdvisory =
+    isApplianceHost &&
+    approvedControlPlaneCount > 1 &&
+    !vipConfigured &&
+    !vipAdvisoryDismissed;
 
   if (!isSuperadmin) {
     return (
@@ -366,7 +734,10 @@ export function FleetTab() {
           key: "appliances",
           label: "Appliances",
           summary: "Approve / manage paired supervisors.",
-          badge: pending.length > 0 ? pending.length : undefined,
+          badge:
+            controlPlane.pending.length + serviceAgents.pending.length > 0
+              ? controlPlane.pending.length + serviceAgents.pending.length
+              : undefined,
         },
         {
           key: "pairing",
@@ -404,7 +775,7 @@ export function FleetTab() {
         <div className="border-b px-4 py-3">
           <h1 className="text-sm font-semibold">Appliance fleet</h1>
           <p className="text-xs text-muted-foreground">
-            Lifecycle for Application appliances.
+            Lifecycle for Appliance nodes.
           </p>
         </div>
         <nav className="p-2">
@@ -443,7 +814,16 @@ export function FleetTab() {
 
       {/* ── Main pane ── */}
       <main className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-5xl p-6">
+        {/* The appliances list is a wide multi-column table — let it use
+            the full pane width (like the IPAM table) instead of the
+            max-w-5xl cap the narrower config forms (pairing / slot-images
+            / NTP / SNMP) read better at. */}
+        <div
+          className={cn(
+            "mx-auto p-6",
+            view === "appliances" ? "max-w-none" : "max-w-5xl",
+          )}
+        >
           {view === "pairing" && (
             <div>
               <h2 className="mb-1 text-base font-semibold">Pairing codes</h2>
@@ -518,19 +898,40 @@ export function FleetTab() {
             <>
               <div className="mb-4 flex items-start justify-between gap-4">
                 <div className="min-w-0 flex-1">
-                  <h2 className="text-base font-semibold">
-                    Application appliances
-                  </h2>
+                  <h2 className="text-base font-semibold">Appliances</h2>
                   <p className="mt-1 text-xs text-muted-foreground">
                     Supervisors that claimed a pairing code sit here until a
                     superadmin clicks Approve. Approval signs an X.509 cert
                     against the submitted Ed25519 pubkey using the control
                     plane&apos;s internal CA (lazy-bootstrapped on the first
                     approve). The supervisor picks the cert up on its next poll
-                    and switches from session-token auth to mTLS.
+                    and switches from session-token auth to mTLS. Rows split by
+                    installer variant: <strong>Control plane</strong> hosts the
+                    SpatiumDDI control-plane workloads (api / frontend / worker
+                    / postgres / redis); <strong>Service agents</strong> are
+                    Appliance appliances running DNS / DHCP service containers
+                    paired to a remote control plane.
                   </p>
                 </div>
-                <div className="flex shrink-0 items-center gap-2">
+                <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowCluster(true)}
+                    className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted"
+                    title="Promote appliances into the control-plane cluster, or demote members"
+                  >
+                    Manage control plane cluster…
+                  </button>
+                  {isApplianceHost && (
+                    <button
+                      type="button"
+                      onClick={() => onNavigateTab?.("tls")}
+                      className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted"
+                      title="Upload a Web UI certificate, generate a CSR, or activate a cert"
+                    >
+                      Manage certificates…
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => refetch()}
@@ -547,6 +948,60 @@ export function FleetTab() {
                   </button>
                 </div>
               </div>
+
+              {showVipAdvisory && (
+                <div className="mb-4 rounded-md border border-amber-500/50 bg-amber-500/10 p-4">
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-700 dark:text-amber-400" />
+                    <div className="min-w-0 flex-1">
+                      <p className="font-semibold text-amber-700 dark:text-amber-400">
+                        Set up a control-plane VIP
+                      </p>
+                      <p className="mt-1 text-sm text-muted-foreground">
+                        This control plane has{" "}
+                        <strong>{approvedControlPlaneCount} nodes</strong> but
+                        no MetalLB virtual IP (VIP) is configured. Without a
+                        VIP, operator browsers and every off-cluster DNS / DHCP
+                        agent are pinned to a single node&apos;s address — if
+                        that node goes down they lose the control plane even
+                        though the cluster is still healthy on the surviving
+                        nodes. Set a floating VIP so there&apos;s one stable
+                        address that re-homes automatically on node loss.
+                      </p>
+                      <div className="mt-3 flex flex-wrap items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={() => onNavigateTab?.("network")}
+                          className="inline-flex items-center gap-1.5 rounded-md bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-700"
+                        >
+                          <Network className="h-3.5 w-3.5" />
+                          Set up a VIP
+                        </button>
+                        <label className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            checked={vipDismissAck}
+                            onChange={(e) => setVipDismissAck(e.target.checked)}
+                            className="h-3.5 w-3.5 rounded border-input"
+                          />
+                          I understand the risk and want to dismiss this
+                        </label>
+                        <button
+                          type="button"
+                          disabled={!vipDismissAck}
+                          onClick={() => {
+                            localStorage.setItem(VIP_ADVISORY_DISMISS_KEY, "1");
+                            setVipAdvisoryDismissed(true);
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {error ? (
                 <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-700 dark:text-rose-300">
@@ -567,88 +1022,67 @@ export function FleetTab() {
                   >
                     Pairing codes
                   </button>{" "}
-                  section to mint one, then install an Application appliance
-                  against it — the row appears here once the supervisor claims
-                  the code.
+                  section to mint one, then install an Appliance node against it
+                  — the row appears here once the supervisor claims the code.
                 </div>
               ) : (
-                <div className="overflow-hidden rounded-md border bg-card">
-                  <table className="w-full text-sm">
-                    <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
-                      <tr>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Hostname
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          State
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Services
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Capabilities
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Slots
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Fingerprint
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Paired
-                        </th>
-                        <th className="px-3 py-2 text-left font-medium">
-                          Last seen
-                        </th>
-                        <th className="px-3 py-2 text-right font-medium">
-                          Actions
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y">
-                      {pending.map((row) => (
-                        <ApplianceTableRow
-                          key={row.id}
-                          row={row}
-                          highlight
-                          busy={
-                            approve.isPending && approve.variables === row.id
-                          }
-                          onOpen={() => setDrilldown(row)}
-                          onApprove={() => approve.mutate(row.id)}
-                          onReject={() => setRejectTarget(row)}
-                          onRekey={() => setRekeyTarget(row)}
-                          onDelete={() => setDeleteTarget(row)}
-                          onReauthorize={() => reauthorize.mutate(row.id)}
-                          onPermanentDelete={() =>
-                            setPermanentDeleteTarget(row)
-                          }
-                        />
-                      ))}
-                      {others.map((row) => (
-                        <ApplianceTableRow
-                          key={row.id}
-                          row={row}
-                          busy={rekey.isPending && rekey.variables === row.id}
-                          onOpen={() => setDrilldown(row)}
-                          onApprove={() => approve.mutate(row.id)}
-                          onReject={() => setRejectTarget(row)}
-                          onRekey={() => setRekeyTarget(row)}
-                          onDelete={() => setDeleteTarget(row)}
-                          onReauthorize={() => reauthorize.mutate(row.id)}
-                          onPermanentDelete={() =>
-                            setPermanentDeleteTarget(row)
-                          }
-                        />
-                      ))}
-                    </tbody>
-                  </table>
+                <div className="space-y-6">
+                  <ApplianceTableSection
+                    title="Control plane"
+                    subtitle="Boxes hosting the SpatiumDDI control plane — the control-plane node plus any promoted appliances."
+                    pendingRows={controlPlane.pending}
+                    otherRows={controlPlane.others}
+                    emptyMessage="No control-plane appliances registered yet."
+                    busyId={
+                      approve.isPending
+                        ? approve.variables
+                        : rekey.isPending
+                          ? rekey.variables
+                          : null
+                    }
+                    onOpen={(row) => setDrilldown(row)}
+                    onApprove={(row) => approve.mutate(row.id)}
+                    onReject={(row) => setRejectTarget(row)}
+                    onRekey={(row) => setRekeyTarget(row)}
+                    onDelete={(row) => setDeleteTarget(row)}
+                    onReauthorize={(row) => reauthorize.mutate(row.id)}
+                    onPermanentDelete={(row) => setPermanentDeleteTarget(row)}
+                    onReplace={(row) => setReplaceTarget(row)}
+                  />
+                  <ApplianceTableSection
+                    title="Service agents"
+                    subtitle="Appliance nodes running DNS / DHCP service containers paired to a remote control plane."
+                    pendingRows={serviceAgents.pending}
+                    otherRows={serviceAgents.others}
+                    emptyMessage="No service-agent appliances registered yet."
+                    busyId={
+                      approve.isPending
+                        ? approve.variables
+                        : rekey.isPending
+                          ? rekey.variables
+                          : null
+                    }
+                    onOpen={(row) => setDrilldown(row)}
+                    onApprove={(row) => approve.mutate(row.id)}
+                    onReject={(row) => setRejectTarget(row)}
+                    onRekey={(row) => setRekeyTarget(row)}
+                    onDelete={(row) => setDeleteTarget(row)}
+                    onReauthorize={(row) => reauthorize.mutate(row.id)}
+                    onPermanentDelete={(row) => setPermanentDeleteTarget(row)}
+                  />
                 </div>
               )}
             </>
           )}
         </div>
       </main>
+
+      {showCluster && (
+        <ClusterMembershipModal
+          rows={rows}
+          onClose={() => setShowCluster(false)}
+        />
+      )}
 
       {drilldown && (
         <ApplianceDrilldownModal
@@ -809,6 +1243,76 @@ export function FleetTab() {
           onClose={() => setRekeyTarget(null)}
         />
       )}
+
+      {/* #272 Phase 9 — confirm dead-node eviction. */}
+      {replaceTarget && (
+        <ConfirmModal
+          open
+          title="Replace dead control-plane member?"
+          message={
+            <>
+              <p className="text-sm">
+                Evict <strong>{replaceTarget.hostname}</strong> from the
+                control-plane cluster. The seed deletes its k8s Node (k3s drops
+                the etcd member with it) and the cluster drops to{" "}
+                {"the remaining members"}. A single-use pairing code is minted
+                so a fresh appliance can take its place — pair it, approve it,
+                and promote it back into the cluster.
+              </p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Use this only when the node is gone for good. For a node that's
+                still alive, demote it gracefully via "Manage control plane
+                cluster…" instead.
+              </p>
+              {replace.isError && (
+                <p className="mt-2 text-xs text-rose-600">
+                  {formatApiError(replace.error)}
+                </p>
+              )}
+            </>
+          }
+          confirmLabel="Evict + mint replacement code"
+          loading={replace.isPending}
+          onConfirm={() => replace.mutate(replaceTarget.id)}
+          onClose={() => setReplaceTarget(null)}
+        />
+      )}
+
+      {/* #272 Phase 9 — show the minted replacement pairing code once. */}
+      {replaceResult && (
+        <Modal
+          title="Replacement pairing code"
+          onClose={() => setReplaceResult(null)}
+        >
+          <div className="space-y-3 text-sm">
+            <p>
+              <strong>{replaceResult.evicted.hostname}</strong> has been
+              evicted. Install a fresh appliance (Appliance role) and pair it
+              with this single-use code, then approve + promote it to restore
+              the cluster:
+            </p>
+            <div className="flex items-center gap-2">
+              <code className="rounded-md bg-muted px-3 py-2 font-mono text-lg tracking-widest">
+                {replaceResult.pairing_code}
+              </code>
+              <button
+                type="button"
+                onClick={() =>
+                  navigator.clipboard?.writeText(replaceResult.pairing_code)
+                }
+                className="rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                Copy
+              </button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Expires{" "}
+              {new Date(replaceResult.pairing_expires_at).toLocaleString()}.
+              Shown once — regenerate from the Pairing tab if you lose it.
+            </p>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
@@ -851,6 +1355,119 @@ function ServiceChipList({ row }: { row: ApplianceRow }) {
   );
 }
 
+// #272 Phase 1 — Fleet UI two-table split. One section per bucket
+// (Control plane / Service agents). Pending rows pin to the top of
+// their section, others below. Empty section renders a dashed
+// placeholder so the heading still anchors the bucket visually.
+function ApplianceTableSection({
+  title,
+  subtitle,
+  pendingRows,
+  otherRows,
+  emptyMessage,
+  busyId,
+  onOpen,
+  onApprove,
+  onReject,
+  onRekey,
+  onDelete,
+  onReauthorize,
+  onPermanentDelete,
+  onReplace,
+}: {
+  title: string;
+  subtitle: string;
+  pendingRows: ApplianceRow[];
+  otherRows: ApplianceRow[];
+  emptyMessage: string;
+  busyId: string | null | undefined;
+  onOpen: (row: ApplianceRow) => void;
+  onApprove: (row: ApplianceRow) => void;
+  onReject: (row: ApplianceRow) => void;
+  onRekey: (row: ApplianceRow) => void;
+  onDelete: (row: ApplianceRow) => void;
+  onReauthorize: (row: ApplianceRow) => void;
+  onPermanentDelete: (row: ApplianceRow) => void;
+  // #272 Phase 9 — only the Control plane section passes this (members
+  // can be replaced when dead). Undefined elsewhere → no Replace action.
+  onReplace?: (row: ApplianceRow) => void;
+}) {
+  const total = pendingRows.length + otherRows.length;
+  return (
+    <section>
+      <div className="mb-2 flex items-baseline justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">{title}</h3>
+          <p className="text-xs text-muted-foreground">{subtitle}</p>
+        </div>
+        <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+          {total}
+        </span>
+      </div>
+      {total === 0 ? (
+        <div className="rounded-md border border-dashed bg-card p-4 text-center text-xs text-muted-foreground">
+          {emptyMessage}
+        </div>
+      ) : (
+        <div className="overflow-hidden rounded-md border bg-card">
+          <table className="w-full text-sm">
+            <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
+              <tr>
+                <th className="px-4 py-3 text-left font-medium">Hostname</th>
+                <th className="px-4 py-3 text-left font-medium">State</th>
+                <th className="px-4 py-3 text-left font-medium">Services</th>
+                <th className="px-4 py-3 text-left font-medium">
+                  Capabilities
+                </th>
+                <th className="px-4 py-3 text-left font-medium">Slots</th>
+                <th className="px-4 py-3 text-left font-medium">Fingerprint</th>
+                <th className="px-4 py-3 text-left font-medium">Paired</th>
+                <th className="px-4 py-3 text-left font-medium">Last seen</th>
+                <th className="px-4 py-3 text-right font-medium">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {pendingRows.map((row) => (
+                <ApplianceTableRow
+                  key={row.id}
+                  row={row}
+                  highlight
+                  busy={busyId === row.id}
+                  onOpen={() => onOpen(row)}
+                  onApprove={() => onApprove(row)}
+                  onReject={() => onReject(row)}
+                  onRekey={() => onRekey(row)}
+                  onDelete={() => onDelete(row)}
+                  onReauthorize={() => onReauthorize(row)}
+                  onPermanentDelete={() => onPermanentDelete(row)}
+                  canRevoke={!isControlPlaneRow(row)}
+                  onReplace={onReplace ? () => onReplace(row) : undefined}
+                />
+              ))}
+              {otherRows.map((row) => (
+                <ApplianceTableRow
+                  key={row.id}
+                  row={row}
+                  busy={busyId === row.id}
+                  onOpen={() => onOpen(row)}
+                  onApprove={() => onApprove(row)}
+                  onReject={() => onReject(row)}
+                  onRekey={() => onRekey(row)}
+                  onDelete={() => onDelete(row)}
+                  onReauthorize={() => onReauthorize(row)}
+                  onPermanentDelete={() => onPermanentDelete(row)}
+                  canRevoke={!isControlPlaneRow(row)}
+                  onReplace={onReplace ? () => onReplace(row) : undefined}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function ApplianceTableRow({
   row,
   highlight,
@@ -862,6 +1479,8 @@ function ApplianceTableRow({
   onDelete,
   onReauthorize,
   onPermanentDelete,
+  onReplace,
+  canRevoke = true,
 }: {
   row: ApplianceRow;
   highlight?: boolean;
@@ -873,6 +1492,11 @@ function ApplianceTableRow({
   onDelete: () => void;
   onReauthorize: () => void;
   onPermanentDelete: () => void;
+  onReplace?: (() => void) | undefined;
+  // #272 — false for the sole control-plane node: revoking it would
+  // brick the control plane, so we hide the action (the backend also
+  // refuses it). True for everything else.
+  canRevoke?: boolean;
 }) {
   const badge = stateBadge(row.state);
   const Icon = badge.Icon;
@@ -886,15 +1510,38 @@ function ApplianceTableRow({
       )}
       onClick={onOpen}
     >
-      <td className="px-3 py-2">
-        <div className="font-medium">{row.hostname}</div>
+      <td className="px-4 py-3">
+        <div className="flex items-center gap-2">
+          <span className="font-medium">{row.hostname}</span>
+          {/* #272 — installer-role chip. Two variants: control-plane
+              (Control plane table) + appliance (Service agents).
+              Legacy strings still render with a sensible label. */}
+          {row.appliance_variant && (
+            <span
+              className={cn(
+                "inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium",
+                isControlPlaneRow(row)
+                  ? "border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-300"
+                  : "border-violet-500/40 bg-violet-500/10 text-violet-600 dark:text-violet-300",
+              )}
+              title={
+                isControlPlaneRow(row)
+                  ? "Control plane — api + db + frontend (enable DNS/DHCP via the role toggle)"
+                  : "Appliance — DNS / DHCP agent (pairs with a control plane)"
+              }
+            >
+              {row.appliance_variant}
+            </span>
+          )}
+          <ClusterStatusChip row={row} />
+        </div>
         {row.supervisor_version && (
           <div className="text-xs text-muted-foreground">
             supervisor {row.supervisor_version}
           </div>
         )}
       </td>
-      <td className="px-3 py-2">
+      <td className="px-4 py-3">
         <span
           className={cn(
             "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs",
@@ -904,10 +1551,10 @@ function ApplianceTableRow({
           <Icon className="h-3 w-3" /> {badge.label}
         </span>
       </td>
-      <td className="px-3 py-2">
+      <td className="px-4 py-3">
         <ServiceChipList row={row} />
       </td>
-      <td className="px-3 py-2">
+      <td className="px-4 py-3">
         <div className="flex flex-wrap gap-1">
           {caps.length === 0 ? (
             <span className="text-xs text-muted-foreground">—</span>
@@ -915,7 +1562,7 @@ function ApplianceTableRow({
             caps.map((c) => (
               <span
                 key={c.key}
-                className="rounded-full bg-muted px-1.5 py-0.5 font-mono text-[10px]"
+                className="rounded-full bg-muted px-2 py-0.5 font-mono text-xs"
               >
                 {c.label}
               </span>
@@ -923,7 +1570,7 @@ function ApplianceTableRow({
           )}
           {row.capabilities.has_baked_images && (
             <span
-              className="rounded-full bg-sky-500/10 px-1.5 py-0.5 font-mono text-[10px] text-sky-700 dark:text-sky-300"
+              className="rounded-full bg-sky-500/10 px-2 py-0.5 font-mono text-xs text-sky-700 dark:text-sky-300"
               title="Supervisor reports baked container images on the rootfs — air-gap-ready."
             >
               baked
@@ -931,22 +1578,22 @@ function ApplianceTableRow({
           )}
         </div>
       </td>
-      <td className="px-3 py-2">
+      <td className="px-4 py-3">
         <ApplianceSlotsCell row={row} />
       </td>
-      <td className="px-3 py-2 font-mono text-xs">
+      <td className="px-4 py-3 font-mono text-xs">
         {shortFingerprint(row.public_key_fingerprint)}
       </td>
-      <td className="px-3 py-2 text-xs text-muted-foreground">
+      <td className="px-4 py-3 text-xs text-muted-foreground">
         {relativeTime(row.paired_at)}
         {row.paired_from_ip && (
           <div className="font-mono">{row.paired_from_ip}</div>
         )}
       </td>
-      <td className="px-3 py-2 text-xs text-muted-foreground">
+      <td className="px-4 py-3 text-xs text-muted-foreground">
         {relativeTime(row.last_seen_at)}
       </td>
-      <td className="px-3 py-2 text-right" onClick={(e) => e.stopPropagation()}>
+      <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
         <div className="inline-flex items-center gap-1">
           {row.state === "pending_approval" && (
             <>
@@ -986,11 +1633,35 @@ function ApplianceTableRow({
                 <KeyRound className="h-3 w-3" />
                 Re-key
               </button>
+              {/* #272 Phase 9 — replace a DEAD control-plane member:
+                  evict its etcd member + mint a replacement pairing code.
+                  Only offered for settled members (cluster_role=member). */}
+              {onReplace && row.cluster_role === "member" && (
+                <button
+                  type="button"
+                  onClick={onReplace}
+                  className="inline-flex items-center gap-1 rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-xs text-rose-700 hover:bg-rose-500/20 dark:text-rose-300"
+                  title="Replace a DEAD member — evict its etcd member + mint a pairing code for a replacement box. Use only when the node is gone for good."
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  Replace…
+                </button>
+              )}
+              {/* #272 — a control-plane cluster member can't be revoked
+                  until it's demoted (demote via "Manage control plane
+                  cluster…"). Revoking a live etcd member would break
+                  quorum. Show the button disabled with a hint rather than
+                  hiding it, so the path forward is obvious. */}
               <button
                 type="button"
-                onClick={onDelete}
-                className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
-                title="Revoke — flip to revoked state, supervisor tears down service containers. Re-authorize on the same row to recover."
+                onClick={canRevoke ? onDelete : undefined}
+                disabled={!canRevoke}
+                className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-40 dark:text-amber-400"
+                title={
+                  canRevoke
+                    ? "Revoke — flip to revoked state, supervisor tears down service containers. Re-authorize on the same row to recover."
+                    : "Demote this node from the control-plane cluster first (Manage control plane cluster…) before revoking."
+                }
               >
                 <Ban className="h-3 w-3" />
                 Revoke
@@ -1426,6 +2097,10 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
 
   const ch = row.cluster_health ?? {};
   const ready = ch.kubeapi_ready === true;
+  // "Restart bind9" only makes sense on a node actually running the
+  // dns-bind9 role — on a control-plane seed (DNS off) the Deployment
+  // doesn't exist, so the button would just error. Gate it on the role.
+  const hasBind9 = (row.assigned_roles ?? []).includes("dns-bind9");
   const nodesTotal = ch.nodes_total;
   const nodesReady = ch.nodes_ready;
   const podsTotal = ch.pods_total;
@@ -1517,20 +2192,22 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
         sub-second on a healthy appliance.
       </p>
       <div className="mt-2 flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          onClick={() => restartBind9.mutate()}
-          disabled={!ready || restartBind9.isPending}
-          title="kubectl rollout restart deploy/dns-bind9 -n spatium"
-          className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {restartBind9.isPending ? (
-            <Loader2 className="h-3 w-3 animate-spin" />
-          ) : (
-            <RefreshCw className="h-3 w-3" />
-          )}
-          Restart bind9
-        </button>
+        {hasBind9 && (
+          <button
+            type="button"
+            onClick={() => restartBind9.mutate()}
+            disabled={!ready || restartBind9.isPending}
+            title="kubectl rollout restart deploy/dns-bind9 -n spatium"
+            className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {restartBind9.isPending ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3 w-3" />
+            )}
+            Restart bind9
+          </button>
+        )}
         <button
           type="button"
           onClick={() => setRevealOpen(true)}

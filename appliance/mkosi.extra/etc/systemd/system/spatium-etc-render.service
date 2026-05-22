@@ -1,0 +1,29 @@
+[Unit]
+Description=Render /etc from STATE partition (issue #276)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/276
+DefaultDependencies=no
+# Run after the /etc overlay + the STATE partition are mounted (both
+# part of local-fs.target), and after the account-reconcile step so
+# we operate on a fully merged /etc. Run BEFORE anything that reads
+# the values we materialize:
+#   * systemd-hostnamed — would otherwise serve the wrong hostname
+#   * ssh/sshd          — reads host keys at startup
+#   * NetworkManager    — reads connection profiles at startup
+#   * k3s               — caches the node name (= hostname) at startup
+#   * spatiumddi-firstboot — transcribes ROLE from role-config
+After=etc.mount local-fs.target spatium-etc-reconcile.service
+Before=sysinit.target systemd-hostnamed.service ssh.service sshd.service NetworkManager.service k3s.service spatiumddi-firstboot.service
+# Only meaningful once the /etc overlay actually mounted (matches the
+# reconcile unit's guard). STATE absence is handled inside the script
+# (degrades to image-baseline), so no ConditionPathExists on STATE.
+ConditionPathIsMountPoint=/etc
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatium-etc-render
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=sysinit.target

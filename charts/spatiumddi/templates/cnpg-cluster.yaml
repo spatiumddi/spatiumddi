@@ -1,0 +1,114 @@
+{{- if and .Values.postgresql.enabled (eq (.Values.postgresql.kind | default "standalone") "cnpg") }}
+{{- $cmp := "postgresql" -}}
+{{- $fullname := include "spatiumddi.fullname" . -}}
+{{- $clusterName := printf "%s-postgresql" $fullname -}}
+{{- $secretName := printf "%s-postgresql" $fullname -}}
+# ─────────────────────────────────────────────────────────────────────────────
+# Postgres HA via CloudNativePG (#272 Phase 2).
+#
+# Renders a ``Cluster`` CR (postgresql.cnpg.io/v1) which the operator
+# (installed separately — see values.yaml's ``postgresql.kind: cnpg``
+# block) reconciles into a primary + N-1 replicas, automatic failover,
+# rolling restart on parameter changes, and per-instance PVCs.
+#
+# Services CNPG creates automatically (do NOT define them here):
+#   <cluster>-rw   read/write — always points at the current primary
+#   <cluster>-r    read-only — round-robins primary + sync replicas
+#   <cluster>-ro   read-only — replicas only (excludes primary)
+#
+# The api / worker / beat / migrate Deployments point at
+# ``<cluster>-rw`` via the ``spatiumddi.postgresHost`` helper — no
+# template changes elsewhere.
+#
+# The bootstrap Secret (``spatiumddi-postgresql``) is shared with the
+# standalone shape so a kind=standalone → kind=cnpg switch reuses the
+# same credentials. Generated in this file the same way the
+# standalone template does, with the lookup() rollback-safe pattern.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Credentials Secret is rendered by templates/postgres-secret.yaml —
+# same shape (``kubernetes.io/basic-auth`` with username + password
+# keys) regardless of kind. CNPG accepts that secret directly via the
+# ``bootstrap.initdb.secret.name`` reference below.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ $clusterName }}
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    # #272 — NEVER let a Helm operation delete the Postgres cluster (and
+    # therefore its operator-managed PVCs + the database itself). The
+    # k3s helm-controller can drop a release into a ``failed`` state
+    # (a slow first boot, or a cp-size upgrade racing the initial
+    # install). Its recovery for a failed release is uninstall+reinstall,
+    # which would delete this Cluster CR → the CNPG operator GCs the
+    # PVCs → the reinstall runs a fresh ``initdb`` → the DB is wiped.
+    # Observed live on a #272 promote: the Postgres data volume was
+    # destroyed while Redis (a plain StatefulSet) scaled in place.
+    #
+    # ``resource-policy: keep`` makes Helm leave this resource untouched
+    # on uninstall/rollback. On the next reinstall Helm *adopts* the
+    # existing Cluster (it still carries Helm's managed-by + release
+    # annotations) and patches ``spec.instances`` in place, so a
+    # promote/demote *scales* the cluster rather than re-bootstrapping
+    # it. The data only ever goes away when the node/cluster is
+    # intentionally destroyed (factory reset / node delete).
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+spec:
+  instances: {{ .Values.postgresql.cnpg.instances }}
+  imageName: {{ .Values.postgresql.cnpg.imageName | quote }}
+
+  postgresql:
+    parameters:
+      {{- toYaml .Values.postgresql.cnpg.parameters | nindent 6 }}
+
+  bootstrap:
+    initdb:
+      database: {{ .Values.postgresql.auth.database | quote }}
+      owner: {{ .Values.postgresql.auth.username | quote }}
+      secret:
+        name: {{ include "spatiumddi.postgresSecretName" . }}
+
+  storage:
+    size: {{ .Values.postgresql.persistence.size | quote }}
+    {{- with .Values.postgresql.persistence.storageClass }}
+    storageClass: {{ . | quote }}
+    {{- end }}
+
+  resources:
+    {{- toYaml .Values.postgresql.resources | nindent 4 }}
+
+  {{- /* CNPG nests nodeSelector + tolerations under spec.affinity. Inline the
+         standard control-plane label merge from spatiumddi.controlPlaneNodeSelector
+         and add tolerations beside it. */ -}}
+  {{- $globalSel := default (dict) ((.Values.global | default (dict)).controlPlaneNodeSelector) -}}
+  {{- $componentSel := default (dict) .Values.postgresql.nodeSelector -}}
+  {{- $mergedSel := merge (dict) $componentSel $globalSel -}}
+  {{- if or $mergedSel .Values.postgresql.tolerations }}
+  affinity:
+    {{- if $mergedSel }}
+    nodeSelector:
+      {{- toYaml $mergedSel | nindent 6 }}
+    {{- end }}
+    {{- with .Values.postgresql.tolerations }}
+    tolerations:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  {{- end }}
+
+  {{- if .Values.postgresql.cnpg.monitoring.enablePodMonitor }}
+  monitoring:
+    enablePodMonitor: true
+  {{- end }}
+
+  {{- if .Values.postgresql.cnpg.backup.enabled }}
+  backup:
+    retentionPolicy: {{ .Values.postgresql.cnpg.backup.retentionPolicy | quote }}
+    {{- with .Values.postgresql.cnpg.backup.barmanObjectStore }}
+    barmanObjectStore:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  {{- end }}
+{{- end }}

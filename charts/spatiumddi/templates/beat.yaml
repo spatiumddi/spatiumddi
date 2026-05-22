@@ -2,6 +2,31 @@
 # Beat runs as a singleton — only 1 replica ever, Recreate strategy so
 # the old pod terminates before the new one starts (prevents two beat
 # schedulers racing to enqueue the same tasks).
+#
+# ── #272 Phase 4 DECISION: leader election ──────────────────────────
+# Three options were on the table for the multi-node control plane:
+#   (a) celery-redbeat — Redis-backed lock, lets N beat replicas run
+#       with only the lock-holder scheduling.
+#   (b) a k8s Lease object held by a sidecar.
+#   (c) keep beat as a 1-replica Deployment (this).
+# We picked (c). Rationale: beat only *enqueues* tasks; every task is
+# idempotent (CLAUDE.md non-negotiable #9), so a brief scheduling gap
+# during a failover is harmless (tasks catch up on the next tick). The
+# Recreate strategy already guarantees no two beats run at once across
+# a rollout. (a) adds a dependency + moves the schedule into Redis —
+# and our Redis is itself Sentinel-HA (#272 Phase 3), so redbeat would
+# need sentinel-aware config too; not worth it for a sub-30s gap. (b)
+# is more moving parts than (c) buys back. We deliberately do NOT add a
+# PodDisruptionBudget: a PDB with minAvailable:1 on a single-replica
+# workload would *block* node drains entirely (the singleton can never
+# be evicted), which is the opposite of what HA wants — beat must be
+# free to reschedule onto a surviving control-plane node.
+#
+# Hard node loss is the one weak spot of (c): the default ~5min
+# unreachable/not-ready eviction timeout leaves beat down that whole
+# window. We shorten it via tolerationSeconds below so beat reschedules
+# in ~30s after a node dies. If sub-30s beat failover ever becomes a
+# real requirement, revisit (a) celery-redbeat.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -58,14 +83,22 @@ spec:
             failureThreshold: 3
           resources:
             {{- toYaml .Values.beat.resources | nindent 12 }}
-      {{- with .Values.beat.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.beat.tolerations }}
+      {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.beat.nodeSelector) .) | nindent 6 }}
       tolerations:
+        # Reschedule the singleton fast on hard node loss (#272 Phase 4):
+        # default eviction is ~300s; we cut it to fastRescheduleSeconds so
+        # the beat scheduler is back ~30s after a control-plane node dies.
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: {{ .Values.beat.fastRescheduleSeconds | default 30 }}
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: {{ .Values.beat.fastRescheduleSeconds | default 30 }}
+        {{- with .Values.beat.tolerations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       {{- with .Values.beat.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}

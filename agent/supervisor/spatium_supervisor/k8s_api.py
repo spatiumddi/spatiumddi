@@ -188,9 +188,7 @@ def _parse_host_kubeconfig(path: Path) -> KubeConfig:
     if ca_b64:
         import base64  # noqa: PLC0415
 
-        state_dir = Path(
-            os.environ.get("STATE_DIR", "/var/lib/spatium-supervisor")
-        )
+        state_dir = Path(os.environ.get("STATE_DIR", "/var/lib/spatium-supervisor"))
         try:
             state_dir.mkdir(parents=True, exist_ok=True)
             target = state_dir / ".k3s-ca.crt"
@@ -312,9 +310,7 @@ def check_kubeapi_ready(timeout: float = 2.0) -> bool:
     return status == 200 and body.strip() == b"ok"
 
 
-def list_pods(
-    namespace: str = "spatium", label_selector: str | None = None
-) -> list[PodStatus]:
+def list_pods(namespace: str = "spatium", label_selector: str | None = None) -> list[PodStatus]:
     """List pods in ``namespace``, optionally filtered by
     ``label_selector`` (standard kubeapi label-selector syntax).
 
@@ -329,9 +325,7 @@ def list_pods(
         log.warning("supervisor.k8s_api.list_pods_failed", error=str(exc))
         return []
     if status != 200:
-        log.warning(
-            "supervisor.k8s_api.list_pods_status", status=status, body=body[:200]
-        )
+        log.warning("supervisor.k8s_api.list_pods_status", status=status, body=body[:200])
         return []
     try:
         data = json.loads(body)
@@ -416,9 +410,7 @@ def apply_helmchart(
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
-def delete_helmchart(
-    name: str, chart_namespace: str = "kube-system"
-) -> tuple[bool, str | None]:
+def delete_helmchart(name: str, chart_namespace: str = "kube-system") -> tuple[bool, str | None]:
     """Delete a HelmChart CR. k3s's helm-controller catches the
     delete event and runs ``helm uninstall``. Idempotent — deleting
     a non-existent CR returns success."""
@@ -430,6 +422,119 @@ def delete_helmchart(
     if status in (200, 202, 404):
         return True, None
     return False, f"kubeapi status {status}: {resp[:200]!r}"
+
+
+def delete_node(name: str) -> tuple[bool, str | None]:
+    """Delete a k8s Node. On k3s, deleting a server Node object makes
+    the cluster drop its etcd member — so this is how a dead
+    control-plane member is evicted (#272 Phase 9 dead-node
+    replacement). Only the seed runs it (it holds the admin kubeconfig).
+    Idempotent — a 404 (already gone) counts as success."""
+    path = f"/api/v1/nodes/{quote(name)}"
+    try:
+        status, resp = _request("DELETE", path)
+    except RuntimeError as exc:
+        return False, str(exc)
+    if status in (200, 202, 404):
+        return True, None
+    return False, f"kubeapi status {status}: {resp[:200]!r}"
+
+
+# #272 — durable control-plane state via k3s HelmChartConfig.
+#
+# The seed supervisor reflects cluster state (control-plane member count,
+# MetalLB pool + VIP) onto the helm releases. Patching the HelmChart CR's
+# valuesContent directly is NOT reboot-safe: the HelmChart is a k3s
+# auto-deploy manifest, so k3s re-applies the on-disk manifest (firstboot
+# defaults: cp-size=1, metallb off, VIP "") to the CR on every k3s restart
+# (i.e. every node reboot), clobbering the patch. A single seed reboot
+# then scaled the control plane to 1 replica + dropped MetalLB/the VIP.
+#
+# A HelmChartConfig is the k3s-native fix: a SEPARATE CR (not derived from
+# any manifest, so the deploy controller never touches it) whose
+# valuesContent helm-controller MERGES on top of the same-named
+# HelmChart's. We write the supervisor-owned overrides there → they
+# survive the manifest re-apply. The firstboot HelmChart keeps the
+# defaults as the floor.
+
+
+def _helmchartconfig_upsert(
+    name: str, values_yaml: str, *, namespace: str = "kube-system"
+) -> tuple[bool, str | None]:
+    """Create-or-update the HelmChartConfig ``name`` so its
+    ``spec.valuesContent`` equals ``values_yaml``. Idempotent — returns
+    ``(False, None)`` when already current. helm-controller merges this
+    on top of the same-named HelmChart's values, and it survives k3s
+    manifest re-apply on restart (unlike a HelmChart CR patch)."""
+    base = f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}/helmchartconfigs"
+    path = f"{base}/{quote(name)}"
+    try:
+        status, resp = _request("GET", path)
+    except RuntimeError as exc:
+        return False, str(exc)
+    if status == 200:
+        try:
+            cur = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
+        except (json.JSONDecodeError, ValueError):
+            cur = None
+        if cur == values_yaml:
+            return False, None
+        patch = json.dumps({"spec": {"valuesContent": values_yaml}}).encode("utf-8")
+        try:
+            st, rb = _request(
+                "PATCH", path, body=patch, content_type="application/merge-patch+json"
+            )
+        except RuntimeError as exc:
+            return False, str(exc)
+        return (st in (200, 201)), (
+            None if st in (200, 201) else f"PATCH status {st}: {rb[:200]!r}"
+        )
+    if status != 404:
+        return False, f"kubeapi GET status {status}"
+    body = json.dumps(
+        {
+            "apiVersion": "helm.cattle.io/v1",
+            "kind": "HelmChartConfig",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {"valuesContent": values_yaml},
+        }
+    ).encode("utf-8")
+    try:
+        st, rb = _request("POST", base, body=body, content_type="application/json")
+    except RuntimeError as exc:
+        return False, str(exc)
+    return (st in (200, 201)), (None if st in (200, 201) else f"POST status {st}: {rb[:200]!r}")
+
+
+def apply_control_plane_overrides(cp_size: int, control_plane_vip: str) -> tuple[bool, str | None]:
+    """Durably set the spatium-control overrides: api / frontend / worker
+    replicas + CNPG instances + redis sentinel replicas = ``cp_size``,
+    plus the frontend control-plane VIP. Written to the spatium-control
+    HelmChartConfig so it survives a k3s restart (#272)."""
+    if cp_size < 1:
+        return False, "cp_size < 1"
+    vip = (control_plane_vip or "").strip()
+    values = (
+        f"api:\n  replicas: {cp_size}\n"
+        f'frontend:\n  replicas: {cp_size}\n  controlPlaneVIP: "{vip}"\n'
+        f"worker:\n  replicas: {cp_size}\n"
+        f"postgresql:\n  cnpg:\n    instances: {cp_size}\n"
+        f"redis:\n  sentinel:\n    replicas: {cp_size}\n"
+    )
+    return _helmchartconfig_upsert("spatium-control", values)
+
+
+def apply_bootstrap_overrides(
+    *, metallb_enabled: bool, pool_addresses: list[str]
+) -> tuple[bool, str | None]:
+    """Durably set the spatium-bootstrap MetalLB overrides (enabled +
+    L2 pool). Written to the spatium-bootstrap HelmChartConfig (#272)."""
+    pool_json = json.dumps([a.strip() for a in pool_addresses if a and a.strip()])
+    values = (
+        f"metallb:\n  enabled: {'true' if metallb_enabled else 'false'}\n"
+        f"  ipPool:\n    addresses: {pool_json}\n"
+    )
+    return _helmchartconfig_upsert("spatium-bootstrap", values)
 
 
 def patch_node_labels(
@@ -477,9 +582,12 @@ def patch_node_labels(
 __all__ = [
     "KubeConfig",
     "PodStatus",
+    "apply_bootstrap_overrides",
+    "apply_control_plane_overrides",
     "apply_helmchart",
     "check_kubeapi_ready",
     "delete_helmchart",
+    "delete_node",
     "get_config",
     "patch_node_labels",
     "list_pods",

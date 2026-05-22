@@ -24,6 +24,20 @@ image:
   pullPolicy: IfNotPresent
   pullSecrets: []
 
+# Chart-wide settings the appliance + multi-node HA work consume.
+# Plain K8s / docker-compose installs leave these at defaults.
+global:
+  # #272 Phase 1 — every control-plane workload (api / frontend /
+  # worker / beat / postgres / redis) merges this map into its
+  # nodeSelector block on top of any per-component override. The
+  # appliance chart's firstboot flips it to
+  # ``{spatium.io/role-control-plane: "true"}`` so control-plane
+  # pods only schedule on nodes carrying the per-role label.
+  # Leaving it empty (the default) lets plain K8s clusters schedule
+  # control-plane workloads anywhere; multi-node HA (#272 later
+  # phases) configures the gate from the umbrella valuesContent.
+  controlPlaneNodeSelector: {}
+
 # Cluster-wide app name override. Leave empty to use `.Release.Name`.
 fullnameOverride: ""
 nameOverride: ""
@@ -95,6 +109,25 @@ frontend:
   service:
     type: ClusterIP
     port: 80
+  # #272 Phase 5 — control-plane VIP. When set (multi-node HA), the
+  # frontend Service becomes type=LoadBalancer requesting this exact IP
+  # from MetalLB's ``spatium-control-plane`` pool, so the operator's
+  # browser + every agent heartbeat hit one stable address regardless
+  # of which control-plane node is up. The frontend nginx proxies /api,
+  # so this single VIP fronts both the UI and the API. The supervisor
+  # threads this in (matching ``metallb.controlPlaneVIP`` on the
+  # appliance chart) on promote, and the VIP seeds the host cert SANs.
+  # When set, a MetalLB LoadBalancer VIP is added (address-pool /
+  # loadBalancerIPs annotations, externalTrafficPolicy: Local). The
+  # frontend KEEPS hostNetwork, so each node's IP stays a direct backup
+  # path while the VIP is the primary floating address — both front the
+  # same per-node frontend pods + the same cert (#272).
+  # Empty on single-node installs → behaves exactly as before.
+  controlPlaneVIP: ""
+  # MetalLB pool name the VIP is drawn from. Matches the IPAddressPool
+  # rendered by the appliance chart (charts/spatiumddi-appliance/
+  # templates/metallb-pool.yaml). Only used when controlPlaneVIP is set.
+  controlPlaneVIPPool: spatium-control-plane
   # Appliance use (#183 Phase 11) — flip to true to make the frontend
   # pod bind on the node's :80 directly via hostNetwork + hostPort.
   # Pair with ``replicas: 1`` (the single :80 host port is exclusive).
@@ -172,6 +205,11 @@ beat:
   tolerations: []
   affinity: {}
   podAnnotations: {}
+  # Beat is a singleton (see beat.yaml DECISION block). On a hard node
+  # loss it must reschedule onto a surviving control-plane node quickly;
+  # the chart emits unreachable/not-ready NoExecute tolerations with this
+  # tolerationSeconds so the gap is ~30s instead of the ~300s default.
+  fastRescheduleSeconds: 30
 
 # ── Migrate (Alembic upgrade head) ───────────────────────────────────────────
 # Regular Job (named per Helm revision so each install/upgrade creates
@@ -208,13 +246,26 @@ ingress:
     #     - spatiumddi.example.com
 
 # ── Postgres ─────────────────────────────────────────────────────────────────
-# In-chart single-node Postgres StatefulSet using the official
-# ``postgres:16-alpine`` image (matches docker-compose.yml). Sized for
-# small lab / single-VM deployments. For HA production set
-# ``postgresql.enabled=false`` and point ``externalDatabase`` at a
-# CloudNativePG / Patroni cluster (see k8s/ha/).
+# Two in-chart shapes, picked via ``postgresql.kind``:
+#
+# * ``standalone`` (default) — single-node StatefulSet using the
+#   official ``postgres:16-alpine`` image (matches docker-compose.yml).
+#   Sized for small lab / single-VM deployments. No HA, no failover.
+# * ``cnpg`` (#272 Phase 2) — CloudNativePG ``Cluster`` CR.
+#   Operator-managed primary + sync replicas + async replicas, with
+#   automatic failover. Requires the CloudNativePG operator already
+#   installed in the cluster (bundled in
+#   ``charts/spatiumddi-appliance/`` for appliance installs; for
+#   plain k8s installs apply the operator separately via:
+#   ``kubectl apply --server-side -f
+#    https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.29/releases/cnpg-1.29.1.yaml``
+#   ).
+#
+# For an externally-managed database, set ``postgresql.enabled=false``
+# and fill in the ``externalDatabase`` block below.
 postgresql:
   enabled: true
+  kind: standalone
   image:
     repository: postgres
     tag: "16-alpine"
@@ -236,8 +287,53 @@ postgresql:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 1000m, memory: 1Gi }
   nodeSelector: {}
-  tolerations: []
+  # #272 — fast failover on a hard node loss. k8s auto-injects a 300 s
+  # NoExecute tolerationSeconds (DefaultTolerationSeconds), so a CNPG
+  # primary on a powered-off node sits ~5 min before eviction → CNPG
+  # can't promote a replica → the -rw service has no endpoint → all
+  # writes (including login) stall. Override with 20 s so a dead primary
+  # node fails over in ~node-grace(40 s)+20 s ≈ 1 min. CNPG threads
+  # these into the instance pods via the Cluster CR's affinity block.
+  # Not lower than ~15 s: too-tight turns a transient blip (NIC hiccup,
+  # GC pause on a 1-CPU appliance) into a needless failover + re-sync.
+  tolerations:
+    - key: node.kubernetes.io/unreachable
+      operator: Exists
+      effect: NoExecute
+      tolerationSeconds: 20
+    - key: node.kubernetes.io/not-ready
+      operator: Exists
+      effect: NoExecute
+      tolerationSeconds: 20
   affinity: {}
+  # CNPG-specific topology (only used when ``kind: cnpg``).
+  cnpg:
+    # Replica count. 3 is the smallest etcd-quorum-friendly default
+    # (primary + sync replica + async replica). 5 / 7 for larger
+    # clusters. CNPG enforces odd counts implicitly via its leader-
+    # election layer.
+    instances: 3
+    # Postgres image used by CNPG-managed pods. Must be a CNPG-built
+    # image (regular ``postgres:16`` images are missing the WAL-G /
+    # barman wrappers CNPG relies on for backups + failover).
+    imageName: "ghcr.io/cloudnative-pg/postgresql:16"
+    # Server-side parameters. Tune for your workload; defaults match
+    # the prototype at ``k8s/ha/postgres-cluster.yaml``.
+    parameters:
+      max_connections: "200"
+      shared_buffers: "256MB"
+      work_mem: "16MB"
+    # PodMonitor for Prometheus Operator. Default false because most
+    # installs don't have Prometheus Operator + ServiceMonitor CRDs.
+    monitoring:
+      enablePodMonitor: false
+    # Continuous WAL archiving to an object store. Defer beyond #272
+    # Phase 2 — the existing pg_dump-based backup workflow already
+    # covers the disaster-recovery story for v1. See CNPG docs for
+    # ``barmanObjectStore`` shape.
+    backup:
+      enabled: false
+      retentionPolicy: "30d"
 
 # Used when postgresql.enabled=false.
 externalDatabase:
@@ -250,12 +346,23 @@ externalDatabase:
   existingSecretPasswordKey: "password"
 
 # ── Redis ────────────────────────────────────────────────────────────────────
-# In-chart single-node Redis StatefulSet using the official
-# ``redis:8.6-alpine`` image (matches docker-compose.yml). For HA
-# production set ``redis.enabled=false`` and point ``externalRedis`` at
-# a Redis Sentinel cluster (see k8s/ha/redis-sentinel.yaml).
+# Two in-chart shapes, picked via ``redis.kind``:
+#
+# * ``standalone`` (default) — single-node StatefulSet using the
+#   official ``redis:8.6-alpine`` image (matches docker-compose.yml).
+#   No HA, no failover.
+# * ``sentinel`` (#272 Phase 3) — a 3-replica StatefulSet where each
+#   pod runs a redis-server + a redis-sentinel sidecar. The sentinels
+#   elect a master + fail over automatically. The api / worker / beat
+#   pick up a ``sentinel://`` URL (see spatiumddi.commonEnv) and
+#   resolve the live master through the sentinels — no static master
+#   Service needed. ``master_name`` is fixed to ``mymaster``.
+#
+# For an externally-managed Redis, set ``redis.enabled=false`` and
+# fill in ``externalRedis``.
 redis:
   enabled: true
+  kind: standalone
   image:
     repository: redis
     tag: "8.6-alpine"
@@ -275,8 +382,33 @@ redis:
     requests: { cpu: 50m, memory: 64Mi }
     limits:   { cpu: 500m, memory: 512Mi }
   nodeSelector: {}
-  tolerations: []
+  # #272 — fast failover on a hard node loss (same rationale as
+  # postgresql.tolerations above). Sentinel elects a new master in
+  # seconds on its own, but the redis pod on a dead node otherwise sits
+  # ~5 min before eviction; 20 s keeps the StatefulSet membership fresh.
+  tolerations:
+    - key: node.kubernetes.io/unreachable
+      operator: Exists
+      effect: NoExecute
+      tolerationSeconds: 20
+    - key: node.kubernetes.io/not-ready
+      operator: Exists
+      effect: NoExecute
+      tolerationSeconds: 20
   affinity: {}
+  # Sentinel topology (only used when ``kind: sentinel``).
+  sentinel:
+    # Replica count — 3 is the smallest quorum (1 master + 2 replicas,
+    # 3 sentinels). The sentinel quorum to declare a master down is
+    # floor(replicas/2)+1 = 2 at 3 replicas.
+    replicas: 3
+    # The Sentinel-monitored master name. Must match the app's
+    # ``redis_sentinel_master`` setting (default ``mymaster``); the
+    # chart wires the env var to this value.
+    masterName: mymaster
+    # down-after / failover tuning (ms).
+    downAfterMs: 5000
+    failoverTimeoutMs: 60000
 
 # Used when redis.enabled=false.
 externalRedis:

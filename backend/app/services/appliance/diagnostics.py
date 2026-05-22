@@ -9,7 +9,7 @@ new chart topology.
 Three operator-facing surfaces:
 
 * **Log viewer** — tails host-side log files when the api pod has
-  ``/var/log/spatiumddi-host`` bind-mounted (full-stack appliance
+  ``/var/log/spatiumddi-host`` bind-mounted (control-plane appliance
   with k3s manifest-side host mount). Returns no sources when the
   bind mount is absent — that's the expected state on docker /
   K8s control planes and on agent-only appliances. Read-only.

@@ -52,6 +52,7 @@ from .role_orchestrator import (
     probe_port_conflicts,
     render_env_file,
 )
+
 # Issue #183 Phase 7 — k3s-only lifecycle. The pre-Phase-7 dispatcher
 # (compose vs k3s on ``detect_runtime()``) is gone with the rest of
 # docker; this is the only path now.
@@ -81,6 +82,57 @@ _NFT_TRIGGER_PATH = Path("/var/lib/spatiumddi-host/release-state/firewall-pendin
 _NFT_APPLIED_HASH_PATH = Path(
     "/var/lib/spatiumddi-host/release-state/firewall-applied-hash"
 )
+
+# #272 — in-cluster control-plane API Service. Every control-plane
+# node runs the api Deployment behind this headless-routable
+# ClusterIP Service, so a supervisor that is itself a cluster member
+# should heartbeat *the cluster*, not the seed node's IP that was
+# baked into CONTROL_PLANE_URL at install/join time. Reasons:
+#   * The seed IP is a single point of failure — if that one node is
+#     down, every other node's supervisor would lose its control
+#     plane even though the api is healthy on the surviving nodes.
+#   * kube-proxy load-balances the Service across all ready api pods,
+#     so heartbeats spread across the cluster instead of hammering
+#     one node.
+# Remote (off-cluster) DNS/DHCP agents keep using their configured
+# CONTROL_PLANE_URL — ideally the MetalLB VIP — since they have no
+# in-cluster DNS to resolve the .svc name. See
+# ``_effective_control_plane_url`` for the member-vs-remote split.
+_IN_CLUSTER_CONTROL_PLANE_URL = (
+    "http://spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000"
+)
+
+
+def _is_control_plane_member() -> bool:
+    """True when this supervisor runs on a node that is part of the
+    control-plane k3s cluster (the seed itself, or an appliance that
+    has been promoted and finished joining).
+
+    Two independent signals, either is sufficient:
+      * ``detect_appliance_variant() == "control-plane"`` — the node
+        was installed as a control-plane seed.
+      * ``read_cluster_join_state()[0] == "ready"`` — an appliance
+        that was promoted into the control plane and whose host
+        runner has reported the join completed.
+    """
+    if appliance_state.detect_appliance_variant() == "control-plane":
+        return True
+    join_state, _ = appliance_state.read_cluster_join_state()
+    return join_state == "ready"
+
+
+def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
+    """Resolve the heartbeat target.
+
+    Cluster members talk to the in-cluster api Service (resilient to
+    any single node loss + load-balanced); everyone else uses the
+    configured ``CONTROL_PLANE_URL``. Returns ``""`` only when a
+    non-member has no configured URL — the caller skips the
+    heartbeat in that case.
+    """
+    if _is_control_plane_member():
+        return _IN_CLUSTER_CONTROL_PLANE_URL
+    return cfg.control_plane_url
 
 
 # Issue #183 Phase 7 — capability reporting is now trivially true on
@@ -239,6 +291,11 @@ _WATCHDOG_INTERVAL_S = 300.0  # 5 minutes
 _last_watchdog_at: float = 0.0
 _cached_role_health: dict[str, Any] = {}
 
+# #272 Phase 9 — k8s Node names this seed has successfully evicted but
+# the backend hasn't yet confirmed cleared. Reported on each heartbeat
+# request; pruned once the backend drops the name from its evict list.
+_evicted_pending: set[str] = set()
+
 
 def _watchdog_check_due() -> bool:
     """First call always returns True (forces a probe within the
@@ -262,6 +319,7 @@ def _watchdog_check_due() -> bool:
 def _maybe_apply_firewall(
     role_assignment: dict[str, Any] | None,
     log: structlog.stdlib.BoundLogger,
+    cluster_peer_cidrs: list[Any] | None = None,
 ) -> None:
     """Render the firewall drop-in + write a trigger file the host
     runner picks up.
@@ -291,7 +349,7 @@ def _maybe_apply_firewall(
     if appliance_state.detect_deployment_kind() != "appliance":
         return
 
-    profile: FirewallProfile = render_drop_in(role_assignment)
+    profile: FirewallProfile = render_drop_in(role_assignment, cluster_peer_cidrs)
     body = profile.body
     body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -351,6 +409,10 @@ def heartbeat_once(
         # if the conflict went away. The probe is cheap (``ss``) so
         # running it every heartbeat is fine.
         "port_conflicts": probe_port_conflicts(),
+        # #272 Phase 9 — report the k8s Nodes this seed evicted on prior
+        # ticks so the backend clears their ``evict_requested`` flag +
+        # settles them to ``left``. Empty on non-seed / nothing-evicted.
+        "evicted_node_names": sorted(_evicted_pending),
     }
     # #170 Wave D follow-up — surface the outcome of the previous
     # heartbeat's compose-lifecycle apply. Empty / None on the first
@@ -381,7 +443,10 @@ def heartbeat_once(
         if _cached_role_health:
             body["role_health"] = _cached_role_health
     url_path = "/api/v1/appliance/supervisor/heartbeat"
-    url = cfg.control_plane_url.rstrip("/") + url_path
+    # #272 — cluster members POST to the in-cluster api Service; remote
+    # agents to their configured CONTROL_PLANE_URL. See
+    # ``_effective_control_plane_url``.
+    url = _effective_control_plane_url(cfg).rstrip("/") + url_path
 
     # #170 Wave D follow-up — cert auth supersedes session-token
     # auth once the cert is on disk. Build the headers + sign with
@@ -518,7 +583,8 @@ def heartbeat_once(
     # next heartbeat once it sees current_slot / durable_default match.
     if desired_next_boot_slot:
         if appliance_state.maybe_fire_set_next_boot(
-            desired_next_boot_slot, state.get("current_slot")  # type: ignore[arg-type]
+            desired_next_boot_slot,
+            state.get("current_slot"),  # type: ignore[arg-type]
         ):
             log.info(
                 "supervisor.heartbeat.set_next_boot_trigger_fired",
@@ -526,7 +592,8 @@ def heartbeat_once(
             )
     if desired_default_slot:
         if appliance_state.maybe_fire_set_default(
-            desired_default_slot, state.get("durable_default")  # type: ignore[arg-type]
+            desired_default_slot,
+            state.get("durable_default"),  # type: ignore[arg-type]
         ):
             log.info(
                 "supervisor.heartbeat.set_default_trigger_fired",
@@ -535,6 +602,97 @@ def heartbeat_once(
     if reboot_requested:
         if appliance_state.maybe_fire_reboot(True):
             log.info("supervisor.heartbeat.reboot_trigger_fired")
+
+    # #272 Phase 7b — control-plane promote/demote. The host-side runner
+    # (spatium-cluster-join) reconfigures k3s + reports back via the
+    # .state sidecar that collect() ships on the next heartbeat; the
+    # backend then settles cluster_role + clears the desired-state.
+    desired_cluster_role = body_out.get("desired_cluster_role")
+    if desired_cluster_role == "member":
+        if appliance_state.maybe_fire_cluster_join(
+            desired_cluster_role,
+            body_out.get("desired_k3s_server_url"),  # type: ignore[arg-type]
+            body_out.get("desired_k3s_join_token"),  # type: ignore[arg-type]
+        ):
+            log.info(
+                "supervisor.heartbeat.cluster_join_trigger_fired",
+                server_url=body_out.get("desired_k3s_server_url"),
+            )
+    elif desired_cluster_role == "none":
+        if appliance_state.maybe_fire_cluster_leave(desired_cluster_role):
+            log.info("supervisor.heartbeat.cluster_leave_trigger_fired")
+
+    # #277 — scale the CNPG postgres cluster + control-plane workload
+    # replicas to the committed member count. Only the SEED acts (the
+    # spatium-control HelmChart lives there; on members the GET 404s and
+    # this is a no-op). The seed is the lone control-plane-variant node;
+    # promoted members are `appliance` variant. Idempotent — patches
+    # only when the rendered cp-size differs, so it converges one tick
+    # after a promote/demote settles and stays quiet otherwise.
+    cp_size = body_out.get("control_plane_size")
+    if (
+        isinstance(cp_size, int)
+        and cp_size >= 1
+        and appliance_state.detect_appliance_variant() == "control-plane"
+    ):
+        from . import k8s_api  # noqa: PLC0415
+
+        # #272 — write the supervisor-owned overrides to HelmChartConfigs
+        # (reboot-safe). Patching the HelmChart CR directly is clobbered
+        # when k3s re-applies the on-disk firstboot manifest on restart;
+        # a HelmChartConfig is a separate CR helm-controller merges on top
+        # + the deploy controller never reverts. cp-size + the VIP go on
+        # spatium-control; the MetalLB pool on spatium-bootstrap.
+        # Idempotent — only writes when the rendered values differ.
+        ml_enabled = bool(body_out.get("desired_metallb_enabled"))
+        ml_pool = body_out.get("desired_metallb_pool_addresses") or []
+        ml_vip = body_out.get("desired_control_plane_vip") or ""
+
+        cp_changed, cp_err = k8s_api.apply_control_plane_overrides(cp_size, str(ml_vip))
+        if cp_changed:
+            log.info(
+                "supervisor.heartbeat.control_plane_overrides_applied",
+                size=cp_size,
+                vip=ml_vip,
+            )
+        elif cp_err:
+            log.warning(
+                "supervisor.heartbeat.control_plane_overrides_failed",
+                error=cp_err,
+                size=cp_size,
+            )
+
+        bs_changed, bs_err = k8s_api.apply_bootstrap_overrides(
+            metallb_enabled=ml_enabled, pool_addresses=list(ml_pool)
+        )
+        if bs_changed:
+            log.info(
+                "supervisor.heartbeat.metallb_overrides_applied",
+                enabled=ml_enabled,
+                pool=list(ml_pool),
+            )
+        elif bs_err:
+            log.warning("supervisor.heartbeat.metallb_overrides_failed", error=bs_err)
+
+        # #272 Phase 9 — dead-node replacement. The seed deletes each k8s
+        # Node the backend flagged for eviction (deleting the Node makes
+        # k3s drop the etcd member); newly-deleted names are stashed in
+        # ``_evicted_pending`` and reported on the next heartbeat so the
+        # backend clears the flag. Prune the stash to whatever the
+        # backend still lists as pending (everything else is confirmed).
+        evict_names = body_out.get("evict_node_names") or []
+        for name in evict_names:
+            if name in _evicted_pending:
+                continue
+            ok, evict_err = k8s_api.delete_node(str(name))
+            if ok:
+                _evicted_pending.add(str(name))
+                log.info("supervisor.heartbeat.node_evicted", node=name)
+            else:
+                log.warning(
+                    "supervisor.heartbeat.node_evict_failed", node=name, error=evict_err
+                )
+        _evicted_pending.intersection_update({str(n) for n in evict_names})
 
     # #170 Wave C2 — render the role-driven compose env. C3 will
     # consume this via ``docker compose --env-file`` to actually
@@ -552,8 +710,17 @@ def heartbeat_once(
     # operator-CIDR-allowlist (Phase 6 kubeapi_expose_cidrs) case,
     # which needs a host-side trigger-file path before it works
     # in-pod (Phase 9 follow-up).
-    if cfg.in_pod_firewall_enabled:
-        _maybe_apply_firewall(role_assignment, log)
+    # #272 Phase 7b — control-plane peer firewall openings. The base
+    # appliance /etc/nftables.conf only accepts :6443 from the pod CIDR,
+    # so a multi-node join + etcd quorum is dropped without opening the
+    # k3s server ports to the peer node IPs. Unlike the role-driven
+    # rules (which the host static config already covers, hence the
+    # default-off in_pod_firewall_enabled gate), the peer openings are
+    # ESSENTIAL — apply them whenever the control plane hands us a peer
+    # set, regardless of that gate.
+    cluster_peer_cidrs = body_out.get("cluster_peer_cidrs") or []
+    if cfg.in_pod_firewall_enabled or cluster_peer_cidrs:
+        _maybe_apply_firewall(role_assignment, log, cluster_peer_cidrs)
 
     target = compute_target_env(role_assignment)
     # #170 Wave D follow-up — the role env file carries ONLY role-
@@ -635,9 +802,7 @@ def heartbeat_once(
                     error=label_err,
                 )
         except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "supervisor.heartbeat.labels_reconcile_crashed", error=str(exc)
-            )
+            log.warning("supervisor.heartbeat.labels_reconcile_crashed", error=str(exc))
 
         env_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
         last_hash = _read_last_apply_hash(cfg.state_dir)

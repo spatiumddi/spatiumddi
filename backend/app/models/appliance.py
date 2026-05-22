@@ -226,6 +226,18 @@ class PairingCode(Base):
     # shown once on create and gone forever, matching #169 semantics).
     code_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
+    # #272 Phase 1 — self-bootstrap codes auto-approve on register.
+    # The endpoint that mints the code (``/self-register-bootstrap``,
+    # gated to the local supervisor on full-stack / frontend-core)
+    # flips this to True; ``/supervisor/register`` reads it and runs
+    # the cert-signing + state-flip path inline so the operator
+    # doesn't have to manually approve their own local supervisor.
+    # Stays False for every operator-typed pairing code minted via
+    # the Fleet → Pairing tab (those keep the manual-approve flow).
+    auto_approve: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.text("false")
+    )
+
     # Operator-driven cancellation. Independent of enabled —
     # revoking a code is permanent ("dead row"), disabling is
     # reversible ("paused"). Revoking a claimed code is a no-op for
@@ -311,6 +323,23 @@ APPLIANCE_STATES = (
     APPLIANCE_STATE_REJECTED,
     APPLIANCE_STATE_REVOKED,
 )
+
+# #272 Phase 7 — k3s control-plane cluster membership.
+CLUSTER_ROLE_PRIMARY = "primary"  # etcd seed (cluster-init); runs the control plane
+CLUSTER_ROLE_MEMBER = "member"  # server node that joined the seed
+CLUSTER_ROLES = (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+
+CLUSTER_JOIN_STATE_JOINING = "joining"  # promote in progress
+CLUSTER_JOIN_STATE_READY = "ready"  # promote complete — node is a member
+CLUSTER_JOIN_STATE_LEAVING = "leaving"  # demote in progress
+CLUSTER_JOIN_STATE_LEFT = "left"  # demote complete — node left the cluster
+CLUSTER_JOIN_STATE_FAILED = "failed"
+
+# Sentinel desired_cluster_role values handed to the supervisor:
+# "member" → join the seed; "none" → leave the cluster + revert to a
+# plain application appliance.
+DESIRED_CLUSTER_ROLE_MEMBER = "member"
+DESIRED_CLUSTER_ROLE_NONE = "none"
 
 
 class Appliance(Base):
@@ -442,6 +471,19 @@ class Appliance(Base):
     # is now the single producer; the fleet UI reads these columns
     # to drive the Upgrade affordance, slot chips, and reboot button.
     deployment_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # #272 — installer role baked into ``/etc/spatiumddi/
+    # role-config:ROLE``. One of ``control-plane`` / ``appliance``
+    # (matches the installer wizard's two choices; legacy
+    # ``full-stack`` / ``frontend-core`` / ``application`` strings from
+    # pre-#272 installs are still accepted as aliases). The supervisor
+    # reads the file on startup + reports the value here so the Fleet
+    # UI's two-table split (Control plane vs Service agents) can
+    # categorise each appliance, and the variant-aware label reconciler
+    # can apply the correct per-role labels on the node. NULL on the
+    # pre-#272 supervisor heartbeat
+    # shape — the handler leaves the column untouched when the field
+    # is missing so a stale supervisor doesn't null out its variant.
+    appliance_variant: Mapped[str | None] = mapped_column(String(32), nullable=True)
     installed_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     current_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
     durable_default: Mapped[str | None] = mapped_column(String(16), nullable=True)
@@ -610,6 +652,61 @@ class Appliance(Base):
         nullable=False,
         default=list,
         server_default=sa.text("'[]'::jsonb"),
+    )
+
+    # ── #272 Phase 7 — control-plane cluster membership ──────────────
+    # ``cluster_role`` is the appliance's settled role in the k3s
+    # control-plane cluster:
+    #   * ``primary``   — the etcd seed (booted ``cluster-init: true``);
+    #                     also where the SpatiumDDI control plane runs.
+    #   * ``member``    — a server node that joined the seed via
+    #                     ``--server <url> --token <token>``.
+    #   * NULL          — not a control-plane cluster member (a plain
+    #                     ``application`` data-plane appliance, or a
+    #                     single-node install that hasn't been promoted).
+    # The promote/demote endpoints stamp ``desired_cluster_role`` +
+    # the join coordinates below; the supervisor's host-side runner
+    # (Phase 7b) reconfigures k3s and reports ``cluster_join_state``.
+    cluster_role: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    desired_cluster_role: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Join coordinates handed to a node being promoted to ``member``:
+    # the seed's kubeapi URL (``https://<seed-ip>:6443``) + the cluster
+    # join token. Token is Fernet-encrypted at rest (it grants full
+    # server join). Both NULL except while a promote is in flight; the
+    # heartbeat handler clears them once the node reports ``ready``.
+    desired_k3s_server_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    desired_k3s_join_token_encrypted: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )
+    # The seed's own join token, reported by the PRIMARY's supervisor on
+    # heartbeat (read from ``/var/lib/rancher/k3s/server/token``), Fernet-
+    # encrypted at rest. The promote endpoint reads this off the primary
+    # row to populate ``desired_k3s_join_token_encrypted`` on each joiner.
+    k3s_join_token_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    # Supervisor-reported progress of the in-flight join/leave:
+    # ``joining`` | ``ready`` | ``leaving`` | ``failed`` | NULL (idle).
+    cluster_join_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    cluster_join_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The node's k3s-registered InternalIP, reported by the supervisor on
+    # heartbeat (``kubectl get node <self> -o …InternalIP``). This is the
+    # appliance's REAL routable host IP — distinct from ``last_seen_ip``,
+    # which is the supervisor POD's source IP (10.42.x.x) since it
+    # heartbeats from inside the cluster. The promote endpoint builds the
+    # join URL (``https://<node_ip>:6443``) from the seed's ``node_ip``; a
+    # pod/service IP there is unreachable by joiners. Also the source for
+    # the cross-node firewall peer set + the operator kubeconfig rewrite.
+    node_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # #272 Phase 9 — dead-node replacement. Set True by the
+    # ``/control-plane/{id}/replace`` endpoint on a member that has gone
+    # away ungracefully (its own supervisor can't run a leave — it's
+    # dead). The SEED supervisor reads the eviction list off its
+    # heartbeat response and deletes the k8s Node (k3s removes the etcd
+    # member with it), then reports the hostname back so the backend
+    # clears this flag + settles the row to ``left``. Distinct from a
+    # graceful demote, which the leaving node drives itself.
+    evict_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.text("false")
     )
 
     created_at: Mapped[datetime] = mapped_column(

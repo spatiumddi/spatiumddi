@@ -106,29 +106,38 @@ NET_PREFIX="24"
 NET_GATEWAY=""
 NET_DNS="1.1.1.1 1.0.0.1"
 TIMEZONE="UTC"
-# No default ROLE — every install must actively pick one. Hitting OK
-# without selecting an option on the role picker would otherwise
-# default to "full-stack" silently, and that's the wrong shape for any
-# Frontend-core or Application install. ask_role() loops until the
-# operator makes a selection.
-ROLE=""
-# Installer roles (#170):
-#   full-stack    — Full SpatiumDDI stack: api + worker + beat + db
-#                   + redis + frontend + bundled BIND9 + Kea (AIO).
-#   frontend-core — Control plane only, no bundled service workers.
-#   application   — Supervisor only. Pairs with a remote control
-#                   plane via a pairing code and sits in
-#                   pending_approval until an admin clicks Approve
-#                   in the fleet UI. The control plane assigns the
-#                   role(s) + group(s) after approval — operators
-#                   no longer pick DNS / DHCP / engine at install
-#                   time. Replaces the three per-service agent roles.
+# Default ROLE = appliance (the role screen frames it as "Additional
+# node"). #272 UX fix: operators don't read the body text, and a
+# misclick / blind Enter on "control plane" silently spins up a SECOND
+# standalone control plane (its own DB + cluster) instead of joining the
+# existing one. Defaulting to the additive, non-destructive role — plus
+# a confirm guard on the control-plane choice in ask_role() — makes that
+# accident hard. The very first install actively picks "First node".
+ROLE="appliance"
+# Installer roles (#272 — collapsed from the old three to two; the
+# old full-stack / frontend-core distinction is now a runtime DNS/DHCP
+# role toggle, not an install choice):
+#   control-plane — Runs the SpatiumDDI control plane (api + worker +
+#                   beat + db + redis + frontend) and is the k3s etcd
+#                   seed. DNS (BIND9) + DHCP (Kea) are OFF at install —
+#                   the operator enables them per node via the Fleet
+#                   role toggle (so the data plane is a deliberate
+#                   fleet decision, not a silent install default). The
+#                   required FIRST install; extra control-plane nodes
+#                   are made by promoting Appliances in the Fleet UI,
+#                   not installed as this role.
+#   appliance     — Supervisor only. Pairs with a remote control plane
+#                   via an 8-digit pairing code and sits in
+#                   pending_approval until an admin clicks Approve in
+#                   the Fleet UI. The control plane assigns the role(s)
+#                   + group(s) after approval (DNS / DHCP). Can later
+#                   be promoted to join the control-plane cluster.
 # Every role still creates an OS admin account so the operator can
 # SSH in and manage the appliance, irrespective of which web UI runs.
 CONTROL_PLANE_URL=""
 # Pairing code claimed by the supervisor on first boot. 8 decimal
 # digits — single-use ephemeral or persistent depending on what the
-# control-plane admin minted. Only meaningful when ROLE=application.
+# control-plane admin minted. Only meaningful when ROLE=appliance.
 BOOTSTRAP_PAIRING_CODE=""
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -139,7 +148,7 @@ welcome() {
         --msgbox "Welcome to the SpatiumDDI Appliance Installer.\n\n\
 This installer will ERASE a target disk and install SpatiumDDI to it.\n\n\
 You'll be asked for:\n\
-  - Role (Full stack / Frontend-core / Application)\n\
+  - Role (Control plane / Appliance)\n\
   - Target disk\n\
   - Hostname\n\
   - Admin OS user + password (for SSH access)\n\
@@ -151,49 +160,72 @@ Press OK to begin, or Cancel to drop to a shell." 18 70 \
 
 ask_role() {
     log "Step: ask_role"
-    # whiptail --radiolist returns the selected tag on stdout. There is
-    # no default — every install must actively pick one of the three
-    # roles. Three roles (#170 Wave B2):
-    #   full-stack    — control plane + bundled BIND9 + Kea
-    #                   (single-box AIO).
-    #   frontend-core — control plane only. Pairs with remote
-    #                   Application appliances via the fleet UI.
-    #   application   — supervisor only. Submits an Ed25519 pubkey
-    #                   against a pairing code, sits in pending until
-    #                   an admin clicks Approve; the control plane
-    #                   then assigns role(s) + group(s) and the
-    #                   supervisor pulls the matching service
-    #                   containers on its next poll.
+    # #272 UX — reframe the install role around the decision operators
+    # actually make ("is this my FIRST SpatiumDDI node, or am I adding
+    # one to an existing install?") instead of the jargon control-plane
+    # vs appliance, which most people don't read past. The radio TAGS
+    # are operator-facing (``add-node`` / ``first-node``) and map back to
+    # the internal ROLE values (``appliance`` / ``control-plane``) that
+    # firstboot + the supervisor consume — so downstream is unchanged.
     #
-    # The per-row ON/OFF flag reflects the current $ROLE so backing in
-    # from a later step preserves the previous selection. On the first
-    # pass $ROLE is empty so every row is OFF — whiptail returns ""
-    # and we re-prompt with a "pick one" msgbox until they choose.
+    # ``add-node`` (appliance) is listed first + default: it's the common
+    # case once a control plane exists, and it's the non-destructive
+    # choice. ``first-node`` (control-plane) creates a NEW, standalone
+    # SpatiumDDI (its own DB + cluster), so a wrong pick there is the
+    # real footgun — it's guarded by an explicit confirm below. The
+    # per-row ON flag reflects $ROLE so backing in preserves the pick.
+    local first_flag=OFF add_flag=OFF
+    case "$ROLE" in
+        control-plane) first_flag=ON ;;
+        *) add_flag=ON ;;  # appliance (or unset) → default
+    esac
     local pick
     while true; do
-        pick=$(whiptail --backtitle "$BACKTITLE" --title "Appliance role" \
+        pick=$(whiptail --backtitle "$BACKTITLE" --title "What is this node?" \
             --cancel-button "Back" \
-            --radiolist "What role does this appliance play?\n\nFull stack runs everything on one box (good for labs / small sites). Frontend / core runs just the control plane — pair Application appliances against it from the fleet UI for distributed deployments.\n\nApplication is the generic agent role: the supervisor pairs with a remote control plane, sits in pending approval, and is assigned its role(s) (DNS-BIND9 / DNS-PowerDNS / DHCP / multi-role) by an admin in the fleet UI. No DNS or DHCP pre-pick at install time." \
-            22 82 3 \
-            "full-stack"    "Full stack — control plane + BIND9 + Kea (AIO)" "$([ "$ROLE" = "full-stack"    ] && echo ON || echo OFF)" \
-            "frontend-core" "Frontend / core — control plane only"          "$([ "$ROLE" = "frontend-core" ] && echo ON || echo OFF)" \
-            "application"   "Application — supervisor only (pairs remote)"  "$([ "$ROLE" = "application"   ] && echo ON || echo OFF)" \
+            --radiolist "Is this your FIRST SpatiumDDI node, or are you adding one to an existing install?\n\n  Additional node  (default)\n    Pairs with an EXISTING SpatiumDDI over an 8-digit code; an\n    admin then approves it and assigns DNS / DHCP roles in the\n    Fleet UI. Can be PROMOTED into the control-plane cluster later\n    — this is how you add control-plane nodes for HA (NOT by\n    installing 'First node' again).\n\n  First node\n    Creates a NEW SpatiumDDI: the control plane (api + database +\n    web UI) + k3s seed. DNS + DHCP stay OFF — enable them per node\n    from the Fleet UI. Pick this for a homelab, a single box, or\n    the seed of a brand-new HA cluster." \
+            27 84 2 \
+            "add-node"   "Additional node — DNS/DHCP agent (promotable)" "$add_flag" \
+            "first-node" "First node — new control plane (api+db+UI)" "$first_flag" \
             3>&1 1>&2 2>&3) || return 1
         if [ -z "$pick" ]; then
-            whiptail --msgbox "Please pick a role to continue. There is no default — each role produces a meaningfully different appliance." 10 64 || true
+            whiptail --msgbox "Please pick an option to continue." 9 60 || true
             continue
         fi
-        ROLE="$pick"
-        break
+        case "$pick" in
+            add-node)
+                ROLE="appliance"
+                break
+                ;;
+            first-node)
+                # Confirm guard — the accidental-footgun direction. A new
+                # control plane is a separate database + cluster; adding
+                # to an existing SpatiumDDI must use "Additional node"
+                # then promote. --defaultno so a blind Enter says No.
+                if whiptail --backtitle "$BACKTITLE" \
+                    --title "Create a NEW control plane?" \
+                    --defaultno --yes-button "Yes, new" --no-button "Go back" \
+                    --yesno "This creates a NEW, standalone SpatiumDDI — its own database and cluster.\n\nIf you are ADDING a node to an existing SpatiumDDI (for HA, or as a DNS / DHCP agent), choose \"Additional node\" instead, then promote it from the Fleet UI.\n\nCreate a new control plane on this box?" \
+                    16 76; then
+                    ROLE="control-plane"
+                    break
+                fi
+                # No → re-show the radio with the safe default pre-selected.
+                first_flag=OFF
+                add_flag=ON
+                continue
+                ;;
+        esac
     done
     log "Selected role: $ROLE"
 }
 
 ask_application_config() {
-    # Only fires for the Application role. The full-stack and
-    # frontend-core roles ARE control planes — they don't need to be
-    # told where one is.
-    if [ "$ROLE" != "application" ]; then
+    # Only fires for the Appliance role. The control-plane role IS a
+    # control plane — it doesn't need to be told where one is.
+    # (Function/step name kept historical to avoid churning the wizard
+    # state machine; it gates on the appliance role now.)
+    if [ "$ROLE" != "appliance" ]; then
         return 0
     fi
     log "Step: ask_application_config"
@@ -203,8 +235,8 @@ ask_application_config() {
         CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
             --title "Control plane URL" \
             --cancel-button "Back" \
-            --inputbox "Where does this Application appliance register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nUse https:// in production; http:// is acceptable for lab installs." \
-            16 76 "$default_url" 3>&1 1>&2 2>&3) \
+            --inputbox "Where does this Application appliance register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nHA TIP: if the control plane is a multi-node cluster, point this at the MetalLB virtual IP (VIP), NOT a single node's IP — otherwise this appliance loses its control plane whenever that one node is down. Configure the VIP under Appliance -> Network & Host on the control plane.\n\nUse https:// in production; http:// is acceptable for lab installs." \
+            21 78 "$default_url" 3>&1 1>&2 2>&3) \
             || return 1
         if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
             whiptail --msgbox "Control-plane URL is required for an Application install." 8 60 || true
@@ -298,7 +330,61 @@ pick_disk() {
         fi
         log "Operator picked $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB) — below 24 GiB minimum; re-prompting"
         whiptail --backtitle "$BACKTITLE" --title "Disk too small" --msgbox \
-            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 24 GiB:\n  ESP        512 MiB\n  root_A       8 GiB\n  root_B       8 GiB\n  var       remainder (≥7 GiB usable)\n\nThe slots are sized to carry the full container image set (issue #170 Wave A4) so the appliance works air-gapped without ghcr.io.\n\nPick a different disk, or Cancel out to attach a larger one." 18 76
+            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 24 GiB:\n  ESP        512 MiB\n  STATE      256 MiB\n  root_A       8 GiB\n  root_B       8 GiB\n  var       remainder (≥7 GiB usable)\n\nThe slots are sized to carry the full container image set (issue #170 Wave A4) so the appliance works air-gapped without ghcr.io.\n\nPick a different disk, or Cancel out to attach a larger one." 19 76
+    done
+}
+
+# Issue #276 — partition-layout confirmation. Shows the exact GPT
+# layout that ``do_install`` will create on $TARGET_DISK and forces
+# the operator to tick a confirmation checkbox before proceeding.
+# Back (or an un-ticked box) returns to disk selection so a misclick
+# costs nothing.
+confirm_partition_layout() {
+    log "Step: confirm_partition_layout"
+    local DISK_BYTES disk_gib var_gib
+    DISK_BYTES=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
+    disk_gib=$((DISK_BYTES / 1024 / 1024 / 1024))
+    # var = total − (1 MiB BBP + 512 MiB ESP + 256 MiB STATE + 2× 8 GiB
+    # slots). Round the fixed overhead up to ~17 GiB and subtract 1 for
+    # GPT/rounding slack so the figure shown is a safe lower bound.
+    var_gib=$(( disk_gib - 17 - 1 ))
+    [ "$var_gib" -lt 1 ] && var_gib=1
+
+    local layout
+    layout="Layout to be created on $TARGET_DISK ($disk_gib GiB):\n\n"
+    layout+="  p1  BIOS boot   1 MiB    legacy boot chain-load\n"
+    layout+="  p2  ESP       512 MiB    /boot/efi (FAT32)\n"
+    layout+="  p3  STATE     256 MiB    /var/lib/spatium-state\n"
+    layout+="                           machine config + SSH host keys +\n"
+    layout+="                           supervisor identity (survives OS\n"
+    layout+="                           slot swaps + a /var factory reset)\n"
+    layout+="  p4  root_A      8 GiB    active OS slot (this install)\n"
+    layout+="  p5  root_B      8 GiB    standby OS slot (next upgrade)\n"
+    layout+="  p6  var       ~$var_gib GiB    /var — database, k3s, logs\n\n"
+    layout+="ALL EXISTING DATA on $TARGET_DISK will be ERASED.\n"
+    layout+="There is no undo.\n\n"
+    layout+="Tick the box and choose OK to proceed, or Back to pick\n"
+    layout+="a different disk."
+
+    while true; do
+        local choice
+        choice=$(whiptail --backtitle "$BACKTITLE" --title "Confirm Partition Layout" \
+            --cancel-button "Back" \
+            --checklist "$layout" 24 76 1 \
+            "erase" "I understand all data on $TARGET_DISK will be erased" OFF \
+            3>&1 1>&2 2>&3) \
+            || return 1
+        # whiptail returns the ticked tags quoted, e.g. "erase".
+        case "$choice" in
+            *erase*)
+                log "Operator confirmed partition layout for $TARGET_DISK"
+                return 0
+                ;;
+            *)
+                whiptail --backtitle "$BACKTITLE" --title "Confirmation required" \
+                    --msgbox "You must tick the confirmation box to continue.\n\nChoose Back on the next screen if you'd rather pick a different disk." 10 64 || true
+                ;;
+        esac
     done
 }
 
@@ -431,14 +517,13 @@ confirm() {
     log "Step: confirm"
     local role_label
     case "$ROLE" in
-        full-stack)    role_label="Full stack — control plane + BIND9 + Kea (AIO)" ;;
-        frontend-core) role_label="Frontend / core — control plane only" ;;
-        application)   role_label="Application — supervisor only (pairs remote)" ;;
+        control-plane) role_label="Control plane — api + db + DNS + DHCP (first node)" ;;
+        appliance)     role_label="Appliance — DNS / DHCP agent (pairs with a control plane)" ;;
         *)             role_label="$ROLE" ;;
     esac
     local s
     s="Role:        $role_label\n"
-    if [ "$ROLE" = "application" ]; then
+    if [ "$ROLE" = "appliance" ]; then
         s+="Control URL: $CONTROL_PLANE_URL\n"
         # Mask the code in the confirmation screen — the IPMI / serial
         # console operator already typed it; no need to flash all 8
@@ -479,15 +564,20 @@ do_install() {
     # and the EXIT trap drops the operator to a shell with the log.
     set -e
 
-    # Phase 8a-1 GPT layout — Atomic A/B image upgrade support (issue #138).
-    # Replaces the previous single-root layout with an A/B + /var
-    # split:
+    # GPT layout — Atomic A/B image upgrade (issue #138 Phase 8a-1) +
+    # Talos-style STATE partition (issue #276):
     #
     #   p1  BIOS Boot     1 MiB     ef02   legacy chain-load (grub i386-pc)
     #   p2  ESP          512 MiB    ef00   FAT32, /boot/efi
-    #   p3  root_A         8 GiB    8304   active slot (this install lands here)
-    #   p4  root_B         8 GiB    8304   inactive slot (staging next image)
-    #   p5  var          rest       8300   /var, persisted across slot swaps
+    #   p3  state        256 MiB    8300   /var/lib/spatium-state — machine
+    #                                      config, SSH host keys, supervisor
+    #                                      identity. Survives slot swaps AND
+    #                                      a /var factory reset; replaces
+    #                                      the per-slot /etc.image drift
+    #                                      that #272 Phase 1 bandaided.
+    #   p4  root_A         8 GiB    8304   active slot (this install lands here)
+    #   p5  root_B         8 GiB    8304   inactive slot (staging next image)
+    #   p6  var          rest       8310   /var, persisted across slot swaps
     #
     # Slot sizing — #170 Phase A4 bakes every container image into the
     # rootfs (~800 MB-1.2 GB compressed depending on third-party
@@ -498,23 +588,23 @@ do_install() {
     # Previous 4 GiB slots predated baking and are too tight once
     # the full container set lives on-rootfs.
     #
-    # Hard floor: 24 GiB target disk (= 1 MiB BBP + 512 MiB ESP + 2× 8
-    # GiB slots + at least 7 GiB usable /var). Below that, postgres +
-    # k3s state (containerd content store, local-path PV dirs) +
-    # audit log outgrow /var quickly. Bumped from the pre-A4 16 GiB
-    # floor.
-    local BBP ESP ROOT_A ROOT_B VAR
+    # Hard floor: 24 GiB target disk (= 1 MiB BBP + 512 MiB ESP + 256
+    # MiB STATE + 2× 8 GiB slots + at least 7 GiB usable /var). Below
+    # that, postgres + k3s state (containerd content store, local-path
+    # PV dirs) + audit log outgrow /var quickly.
+    local BBP ESP STATE ROOT_A ROOT_B VAR
     BBP=$(partition_node 1)
     ESP=$(partition_node 2)
-    ROOT_A=$(partition_node 3)
-    ROOT_B=$(partition_node 4)
-    VAR=$(partition_node 5)
+    STATE=$(partition_node 3)
+    ROOT_A=$(partition_node 4)
+    ROOT_B=$(partition_node 5)
+    VAR=$(partition_node 6)
 
     # Disk-size validation lives in ``pick_disk`` now (fires right
     # after the operator picks rather than at the end of the wizard
     # after they've typed hostname / admin / network / timezone).
 
-    log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP ROOT_A=$ROOT_A ROOT_B=$ROOT_B VAR=$VAR"
+    log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP STATE=$STATE ROOT_A=$ROOT_A ROOT_B=$ROOT_B VAR=$VAR"
 
     {
         echo "XXX"; echo "3"; echo "Releasing existing partitions on $TARGET_DISK..."; echo "XXX"
@@ -569,9 +659,10 @@ do_install() {
         #                                      partition discoverable.)
         sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
                -n2:0:+512M  -t2:ef00 -c2:ESP \
-               -n3:0:+8G    -t3:8304 -c3:root_A \
-               -n4:0:+8G    -t4:8304 -c4:root_B \
-               -n5:0:0      -t5:8310 -c5:var \
+               -n3:0:+256M  -t3:8300 -c3:state \
+               -n4:0:+8G    -t4:8304 -c4:root_A \
+               -n5:0:+8G    -t5:8304 -c5:root_B \
+               -n6:0:0      -t6:8310 -c6:var \
                "$TARGET_DISK"               >> "$INSTALL_LOG" 2>&1
         partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true
         udevadm settle                      >> "$INSTALL_LOG" 2>&1 || true
@@ -579,6 +670,11 @@ do_install() {
 
         echo "XXX"; echo "10"; echo "Formatting partitions..."; echo "XXX"
         mkfs.fat -F32 -n ESP "$ESP"         >> "$INSTALL_LOG" 2>&1
+        # STATE partition — issue #276. Small ext4 holding machine
+        # config + SSH host keys + supervisor identity. Mounted at
+        # /var/lib/spatium-state. Label ``state`` so fstab can
+        # ``LABEL=state`` it without chasing UUIDs across re-installs.
+        mkfs.ext4 -F -L state "$STATE"      >> "$INSTALL_LOG" 2>&1
         # Label the slots distinctly so the boot loader / sysupdate
         # can pick them by label rather than position. root_a is the
         # active slot for this install; root_b is empty until 8b's
@@ -597,6 +693,13 @@ do_install() {
         mount "$VAR" "$MOUNT/var"
         mkdir -p "$MOUNT/boot/efi"
         mount "$ESP" "$MOUNT/boot/efi"
+        # Issue #276 — mount the STATE partition under the eventual
+        # runtime path so the install-time render seeds it directly.
+        # The unmount step at the end of do_install drops it before
+        # /var (LIFO ordering); on next boot fstab re-mounts it via
+        # LABEL=state.
+        mkdir -p "$MOUNT/var/lib/spatium-state"
+        mount "$STATE" "$MOUNT/var/lib/spatium-state"
 
         echo "XXX"; echo "20"; echo "Copying root filesystem (3-5 min)..."; echo "XXX"
         rsync -aAXH \
@@ -672,10 +775,19 @@ do_install() {
         # /home + /root    — systemd .mount unit files (image-shipped
         #                    at /etc/systemd/system/home.mount +
         #                    root.mount). Not in fstab.
+        # /var/lib/spatium-state — LABEL=state (issue #276). Holds
+        # machine config + SSH host keys + supervisor identity.
+        # ``nofail`` so a missing/corrupt STATE partition degrades
+        # to a normal boot instead of dropping to emergency.target
+        # (the render service tolerates an absent STATE and falls
+        # back to image-baseline values). Mounted under /var so it
+        # orders after the /var mount — the render service's
+        # After=local-fs.target dependency covers ordering.
         cat > "$MOUNT/etc/fstab" <<'EOF'
-LABEL=var  /var       ext4   defaults                              0 2
-LABEL=ESP  /boot/efi  vfat   fmask=0133,dmask=0022,shortname=winnt 0 2
-tmpfs      /tmp       tmpfs  nosuid,nodev,noexec,mode=1777         0 0
+LABEL=var    /var                    ext4   defaults                              0 2
+LABEL=state  /var/lib/spatium-state  ext4   defaults,nofail                       0 2
+LABEL=ESP    /boot/efi               vfat   fmask=0133,dmask=0022,shortname=winnt 0 2
+tmpfs        /tmp                     tmpfs  nosuid,nodev,noexec,mode=1777         0 0
 EOF
         echo "$HOSTNAME" > "$MOUNT/etc/hostname"
 
@@ -699,6 +811,51 @@ EOF
         #   /var/persist/etc       upperdir  (operator writes land here)
         #   /var/persist/etc-work  workdir   (overlay scratch space)
         mkdir -p "$MOUNT/var/persist/etc" "$MOUNT/var/persist/etc-work"
+
+        # Issue #276 — SSH host keys + machine config are seeded into
+        # the STATE partition, which spatium-etc-render copies into
+        # /etc on every boot BEFORE sshd / k3s start. STATE survives
+        # both an OS slot swap AND a /var factory reset, so the host
+        # key + hostname stay stable forever. Strip the keys out of
+        # /etc.image (the overlay LOWER) so a future slot image's
+        # mkosi-built keys can never shadow the operator's. (Supersedes
+        # the #272 Phase 1 bandaid that parked keys in
+        # /var/persist/etc/ssh — STATE is the authoritative home now.)
+        STATE_MNT="$MOUNT/var/lib/spatium-state"
+        mkdir -p "$STATE_MNT/ssh"
+        for k in "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key \
+                 "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key.pub; do
+            [ -f "$k" ] || continue
+            cp -a "$k" "$STATE_MNT/ssh/" >> "$INSTALL_LOG" 2>&1
+            rm -f "$k"
+        done
+
+        # spatium-config.yaml — the operator-authoritative machine
+        # config the render service reads. Flat ``key: value`` shape
+        # (see spatium-etc-render's get_cfg parser). Network config is
+        # a follow-up; v1 carries hostname + role + control-plane
+        # pairing fields.
+        cat > "$STATE_MNT/spatium-config.yaml" <<EOF
+# SpatiumDDI appliance machine config (issue #276).
+# Authoritative source for hostname / role / pairing / network —
+# rendered into /etc by spatium-etc-render on every boot. Survives
+# OS slot swaps + a /var factory reset.
+hostname: "$HOSTNAME"
+role: "$ROLE"
+control_plane_url: "$CONTROL_PLANE_URL"
+bootstrap_pairing_code: "$BOOTSTRAP_PAIRING_CODE"
+# Network — flat keys (no nested map) so the render service's sed
+# parser stays dependency-free. mode=dhcp leaves NetworkManager on
+# its auto-DHCP default; mode=static makes the render service write
+# a keyfile connection profile.
+network_mode: "$NET_MODE"
+network_interface: "$NET_INTERFACE"
+network_ip: "$NET_IP"
+network_prefix: "$NET_PREFIX"
+network_gateway: "$NET_GATEWAY"
+network_dns: "$NET_DNS"
+EOF
+        chmod 0644 "$STATE_MNT/spatium-config.yaml"
 
         # Mount overlay over /target/etc for the REMAINDER of the
         # install. Every chroot useradd / chpasswd / file write that
@@ -757,39 +914,56 @@ ROLE=$ROLE
 CONTROL_PLANE_URL=$CONTROL_PLANE_URL
 BOOTSTRAP_PAIRING_CODE=$BOOTSTRAP_PAIRING_CODE
 EOF
-        # The pairing code is sensitive even before firstboot
-        # transcribes it into .env — restrict role-config to root.
-        chmod 0600 "$MOUNT/etc/spatiumddi/role-config"
+        # Mode 0644 — readable by the host's non-root user (`app`,
+        # uid 1000) so the api pod can introspect ``ROLE=`` via its
+        # ``/etc/spatiumddi-host/role-config`` bind mount (#272 Phase
+        # 1's self-bootstrap endpoint gates on that match). Pairing
+        # codes are single-use + 15 min TTL, so a non-root shell on
+        # the host already has access via ``sudo`` and the looser
+        # mode isn't a meaningful exfiltration vector. firstboot
+        # transcribes the value into ``/etc/spatiumddi/.env`` (also
+        # mode 0644) on first boot anyway.
+        chmod 0644 "$MOUNT/etc/spatiumddi/role-config"
 
-        # Phase 11 (#183) — full-stack runs DNS-BIND9 + Kea WITHOUT a
-        # supervisor, so the per-role node labels (which Phase 10
-        # delegated to the supervisor on application-role appliances)
-        # have to be pre-baked into k3s's config at install time. k3s
-        # merges drop-in YAML files under /etc/rancher/k3s/config.yaml
-        # .d/*.yaml — write a role-specific labels file. Other roles
-        # don't need this; the supervisor (application) or no-role
-        # (frontend-core) covers them.
+        # Phase 11 (#183) — pre-bake the per-role node labels at
+        # install time so the appliance chart's DaemonSets +
+        # umbrella chart's control-plane Deployments schedule at
+        # first boot without waiting for the supervisor pod to
+        # come up + apply labels via its heartbeat reconciler.
+        # The supervisor (now running on every variant per #272
+        # Phase 1) maintains the labels going forward.
+        #
+        # IMPORTANT: k3s ``config.yaml.d/*`` drop-ins REPLACE (not
+        # append to) list-valued keys from the main ``config.yaml``,
+        # so we must re-list the base ``spatium.io/role=appliance``
+        # label here. Without it, the chart's
+        # ``global.nodeSelector: {spatium.io/role: appliance}``
+        # default wouldn't match — DaemonSets compute DESIRED=0 and
+        # nothing schedules.
         mkdir -p "$MOUNT/etc/rancher/k3s/config.yaml.d"
-        if [ "$ROLE" = "full-stack" ]; then
+        if [ "$ROLE" = "control-plane" ]; then
+            # control-plane runs ONLY the umbrella control-plane
+            # workloads (api / frontend / worker / beat / postgres /
+            # redis) at install time. DNS / DHCP are NOT enabled by
+            # default (#272) — the operator turns them on per node via
+            # the Fleet role toggle, so DNS/DHCP are a deliberate fleet
+            # decision rather than a silent install-time default. Baked
+            # unconditionally so the umbrella pods can schedule before
+            # the supervisor pod itself is healthy.
             cat > "$MOUNT/etc/rancher/k3s/config.yaml.d/spatium-roles.yaml" <<EOF
-# Auto-generated by spatium-install for ROLE=full-stack.
-# Pre-bake the role labels so the appliance chart's DaemonSets
-# schedule at first boot without needing a supervisor to write
-# them at heartbeat time.
-#
-# IMPORTANT: k3s ``config.yaml.d/*`` drop-ins REPLACE (not append
-# to) list-valued keys from the main ``config.yaml``, so we must
-# re-list the base ``spatium.io/role=appliance`` label here. Without
-# it, the chart's ``global.nodeSelector: {spatium.io/role: appliance}``
-# default wouldn't match — agent-landing / dns-bind9 / dhcp-kea
-# DaemonSets compute DESIRED=0 and nothing schedules.
+# Auto-generated by spatium-install for ROLE=control-plane.
+# #272 — supervisor reconciles these on every heartbeat; install-time
+# bake is the boot-up bootstrap so pods schedule before the supervisor
+# is healthy. DNS/DHCP are enabled later via the Fleet role toggle.
 node-label:
   - spatium.io/role=appliance
-  - spatium.io/role-dns-bind9=true
-  - spatium.io/role-dhcp=true
+  - spatium.io/role-control-plane=true
 EOF
             chmod 0644 "$MOUNT/etc/rancher/k3s/config.yaml.d/spatium-roles.yaml"
         fi
+        # ROLE=appliance leaves the drop-in absent; the supervisor
+        # applies role-* labels dynamically via the heartbeat-driven
+        # role-assignment flow.
         cat > "$MOUNT/etc/hosts" <<EOF
 127.0.0.1 localhost
 127.0.1.1 $HOSTNAME
@@ -808,44 +982,14 @@ EOF
             echo "UTC" > "$MOUNT/etc/timezone"
         fi
 
-        # Static-IP override. The appliance runs NetworkManager (since
-        # the 2026.05.12 switch from systemd-networkd) — operator-set
-        # static config is a keyfile-format connection profile dropped
-        # under /etc/NetworkManager/system-connections/. NM auto-DHCPs
-        # every other ethernet interface by default, so we don't need
-        # an explicit "wired-default" file.
-        if [ "$NET_MODE" = "static" ]; then
-            install -d -m 0755 "$MOUNT/etc/NetworkManager/system-connections"
-            net_dns_csv=$(echo "$NET_DNS" | tr -s ' ' ';')
-            # NM keyfile UUIDs aren't load-bearing for our flow but
-            # must be present + unique. uuidgen is in util-linux on
-            # Debian; spatium-install runs in the live image where
-            # uuidgen is available.
-            net_uuid=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
-            cat > "$MOUNT/etc/NetworkManager/system-connections/10-spatium-static.nmconnection" <<EOF
-[connection]
-id=spatium-static
-uuid=$net_uuid
-type=ethernet
-interface-name=$NET_INTERFACE
-autoconnect=true
-
-[ethernet]
-
-[ipv4]
-method=manual
-address1=$NET_IP/$NET_PREFIX,$NET_GATEWAY
-dns=$net_dns_csv;
-
-[ipv6]
-method=auto
-EOF
-            # NM refuses to load system-connection keyfiles that
-            # aren't mode 600 (security check — they may carry wifi
-            # passphrases or VPN secrets). Same constraint applies to
-            # ethernet profiles for consistency.
-            chmod 0600 "$MOUNT/etc/NetworkManager/system-connections/10-spatium-static.nmconnection"
-        fi
+        # Static-IP config — issue #276. The NetworkManager keyfile is
+        # NOT written here anymore; spatium-etc-render materializes it
+        # from STATE's spatium-config.yaml (network_* keys, seeded
+        # above) on every boot, before NetworkManager starts. That
+        # makes the static config survive a /var factory reset (STATE
+        # outlives /var) and keeps a single source of truth. NM
+        # auto-DHCPs every ethernet interface by default, so dhcp mode
+        # needs no keyfile at all.
 
         echo "XXX"; echo "75"; echo "Creating admin user..."; echo "XXX"
         # Bind /proc /sys /dev for chroot operations.
@@ -1180,13 +1324,16 @@ EOF
         done
         umount "$MOUNT/boot/efi"
         # Phase 8a unmount order matters:
-        #   1. /home, /root    — bind mounts onto /var subdirs
-        #   2. /etc (overlay)  — upper is on /var, must release first
-        #   3. /var partition  — must be after /etc overlay + binds
-        #   4. root_A          — last
+        #   1. /home, /root            — bind mounts onto /var subdirs
+        #   2. /etc (overlay)          — upper is on /var, release first
+        #   3. /var/lib/spatium-state  — STATE partition, mounted under
+        #                                /var so release before /var (#276)
+        #   4. /var partition          — after /etc overlay + binds + STATE
+        #   5. root_A                  — last
         umount "$MOUNT/home"
         umount "$MOUNT/root"
         umount "$MOUNT/etc"
+        umount "$MOUNT/var/lib/spatium-state"
         umount "$MOUNT/var"
         umount "$MOUNT"
         sync
@@ -1279,8 +1426,8 @@ main() {
     # Cancel on Welcome is the only exit-installer path; every other
     # screen's Cancel button is renamed "Back" and walks the wizard
     # back one step. ask_application_config is conditional on
-    # ROLE=application — it returns 0 immediately for the other roles
-    # so Back from confirm walks through it transparently to
+    # ROLE=appliance — it returns 0 immediately for the control-plane
+    # role so Back from confirm walks through it transparently to
     # ask_timezone.
     local step="welcome"
     while [ -n "$step" ]; do
@@ -1297,10 +1444,13 @@ main() {
                 if ask_role; then step="pick_disk"; else step="welcome"; fi
                 ;;
             pick_disk)
-                if pick_disk; then step="ask_hostname"; else step="ask_role"; fi
+                if pick_disk; then step="confirm_partition_layout"; else step="ask_role"; fi
+                ;;
+            confirm_partition_layout)
+                if confirm_partition_layout; then step="ask_hostname"; else step="pick_disk"; fi
                 ;;
             ask_hostname)
-                if ask_hostname; then step="ask_user_password"; else step="pick_disk"; fi
+                if ask_hostname; then step="ask_user_password"; else step="confirm_partition_layout"; fi
                 ;;
             ask_user_password)
                 if ask_user_password; then step="ask_network"; else step="ask_hostname"; fi

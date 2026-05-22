@@ -73,6 +73,30 @@ Control-plane image — pass `imageName` (e.g. "spatiumddi-api") via merge:
 {{- end -}}
 
 {{/*
+Control-plane nodeSelector block. Issue #272 Phase 1 — emits a
+``nodeSelector:`` stanza when either ``.Values.global.controlPlane
+NodeSelector`` or the component-level override is non-empty, so the
+six umbrella control-plane workloads (api / frontend / worker / beat
+/ postgres / redis) share one selector path.
+
+Pass the per-component override via merge:
+  {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.api.nodeSelector) .) | nindent 6 }}
+
+The helper returns nothing on empty merged map, so plain K8s
+installs that haven't opted into the per-role label still let the
+scheduler pick.
+*/}}
+{{- define "spatiumddi.controlPlaneNodeSelector" -}}
+{{- $globalSel := default (dict) (.Values.global).controlPlaneNodeSelector -}}
+{{- $componentSel := default (dict) .componentNodeSelector -}}
+{{- $merged := merge (dict) $componentSel $globalSel -}}
+{{- if $merged }}
+nodeSelector:
+  {{- toYaml $merged | nindent 2 }}
+{{- end }}
+{{- end -}}
+
+{{/*
 Name of the chart-owned secret carrying SECRET_KEY.
 */}}
 {{- define "spatiumddi.appSecretName" -}}
@@ -91,7 +115,14 @@ keyRef — never inlined.
 */}}
 {{- define "spatiumddi.postgresHost" -}}
 {{- if .Values.postgresql.enabled -}}
+{{- if eq (.Values.postgresql.kind | default "standalone") "cnpg" -}}
+{{/* CNPG auto-creates ``<cluster>-rw`` for the primary read/write
+     service. The cluster object's name is the chart's fullname
+     (see templates/cnpg-cluster.yaml). */}}
+{{- printf "%s-postgresql-rw" (include "spatiumddi.fullname" .) -}}
+{{- else -}}
 {{- printf "%s-postgresql" (include "spatiumddi.fullname" .) -}}
+{{- end -}}
 {{- else -}}
 {{- required "externalDatabase.host is required when postgresql.enabled=false" .Values.externalDatabase.host -}}
 {{- end -}}
@@ -151,6 +182,32 @@ externalRedis.
 {{- if .Values.redis.enabled -}}6379{{- else -}}{{ .Values.externalRedis.port }}{{- end -}}
 {{- end -}}
 
+{{/*
+True when the chart-owned Redis runs in Sentinel mode (#272 Phase 3).
+Drives the sentinel:// URL branch in commonEnv + the master-name env.
+*/}}
+{{- define "spatiumddi.redisIsSentinel" -}}
+{{- if and .Values.redis.enabled (eq (.Values.redis.kind | default "standalone") "sentinel") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Comma-separated sentinel host:port list for the redis-py-style
+sentinel:// URL. Points at the per-pod headless DNS so the client can
+reach every sentinel even mid-failover; the sentinel Service fronts
+the same set for kombu.
+*/}}
+{{- define "spatiumddi.redisSentinelHosts" -}}
+{{- $fullname := include "spatiumddi.fullname" . -}}
+{{- $sts := printf "%s-redis" $fullname -}}
+{{- $headless := printf "%s-redis-headless" $fullname -}}
+{{- $n := int .Values.redis.sentinel.replicas -}}
+{{- $hosts := list -}}
+{{- range $i := until $n -}}
+{{- $hosts = append $hosts (printf "%s-%d.%s.%s.svc.cluster.local:26379" $sts $i $headless $.Release.Namespace) -}}
+{{- end -}}
+{{- join "," $hosts -}}
+{{- end -}}
+
 {{- define "spatiumddi.redisAuthEnabled" -}}
 {{- if .Values.redis.enabled -}}
 {{- if .Values.redis.auth.enabled -}}true{{- end -}}
@@ -207,7 +264,41 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
       key: secret-key
 - name: DATABASE_URL
   value: "postgresql+asyncpg://{{ include "spatiumddi.postgresUser" . }}:$(POSTGRES_PASSWORD)@{{ include "spatiumddi.postgresHost" . }}:{{ include "spatiumddi.postgresPort" . }}/{{ include "spatiumddi.postgresDatabase" . }}"
-{{- if eq (include "spatiumddi.redisAuthEnabled" .) "true" }}
+{{- if eq (include "spatiumddi.redisIsSentinel" .) "true" }}
+{{- $sentinelHosts := include "spatiumddi.redisSentinelHosts" . }}
+{{- $sentinelSvc := printf "%s-redis-sentinel" (include "spatiumddi.fullname" .) }}
+{{- /* #272 Phase 3 — Redis Sentinel. The app's redis-py helper parses
+       the comma-separated host list in REDIS_URL; Celery/kombu reaches
+       the sentinels through the Service VIP + the master_name set in
+       celery_app.py's broker_transport_options. */}}
+- name: REDIS_SENTINEL_MASTER
+  value: {{ .Values.redis.sentinel.masterName | quote }}
+{{- if .Values.redis.auth.enabled }}
+- name: REDIS_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.redisSecretName" . }}
+      key: {{ include "spatiumddi.redisSecretPasswordKey" . }}
+- name: REDIS_SENTINEL_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.redisSecretName" . }}
+      key: {{ include "spatiumddi.redisSecretPasswordKey" . }}
+- name: REDIS_URL
+  value: "sentinel://:$(REDIS_PASSWORD)@{{ $sentinelHosts }}/0"
+- name: CELERY_BROKER_URL
+  value: "sentinel://:$(REDIS_PASSWORD)@{{ $sentinelSvc }}:26379/1"
+- name: CELERY_RESULT_BACKEND
+  value: "sentinel://:$(REDIS_PASSWORD)@{{ $sentinelSvc }}:26379/2"
+{{- else }}
+- name: REDIS_URL
+  value: "sentinel://{{ $sentinelHosts }}/0"
+- name: CELERY_BROKER_URL
+  value: "sentinel://{{ $sentinelSvc }}:26379/1"
+- name: CELERY_RESULT_BACKEND
+  value: "sentinel://{{ $sentinelSvc }}:26379/2"
+{{- end }}
+{{- else if eq (include "spatiumddi.redisAuthEnabled" .) "true" }}
 - name: REDIS_PASSWORD
   valueFrom:
     secretKeyRef:
@@ -282,14 +373,22 @@ the api image (postgresql-client-16, see backend/Dockerfile).
 {{- end -}}
 
 {{/*
-Init container that blocks until alembic migrations have been applied
-(detected by presence of a row in the ``alembic_version`` table). Used
-by api / worker / beat so they don't roll out before the schema is in
-place. Uses ``psql`` from the api image.
+Init container that blocks until the DB schema reaches the alembic
+head(s) baked into THIS image. Used by api / worker / beat.
 
-The DATABASE_URL on commonEnv uses the asyncpg driver scheme; psql
-needs the plain ``postgresql://`` scheme, so we build connection
-arguments from the discrete pieces instead of the URL.
+Why "reach head" and not just "any alembic row exists" (#272 Phase 4 /
+Phase 8 — rolling-upgrade ordering): during a chart upgrade the new
+api/worker/beat Pods carry a newer image whose alembic head has moved.
+If we only waited for *some* alembic_version row, a new Pod could start
+against the OLD schema and hit UndefinedColumnError on the first request
+touching a new column. By comparing this image's ``alembic heads``
+against the live DB's ``alembic current`` we guarantee the migrate Job
+(same new image) has finished applying the new migration before any new
+app Pod accepts traffic.
+
+Uses ``alembic`` from the api image (same binary + DATABASE_URL the
+migrate Job uses), so no psql / secret plumbing is needed here — the
+URL comes from commonEnv.
 */}}
 {{- define "spatiumddi.waitForMigrateInit" -}}
 - name: wait-for-migrate
@@ -299,26 +398,20 @@ arguments from the discrete pieces instead of the URL.
     - sh
     - -c
     - |
-      export PGPASSWORD="$POSTGRES_PASSWORD"
-      until psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
-            -tAc "SELECT version_num FROM alembic_version LIMIT 1" 2>/dev/null \
-          | grep -qE '[a-f0-9]'; do
-        echo "waiting for alembic migrations to land..."
+      # Head(s) compiled into this image's migration tree. ``$1`` drops
+      # the trailing "(head)" annotation; sort makes the comparison
+      # order-independent across branched heads.
+      HEADS=$(alembic heads 2>/dev/null | awk '{print $1}' | sort | tr '\n' ',')
+      echo "this image's alembic head(s): ${HEADS:-<none>}"
+      while :; do
+        CUR=$(alembic current 2>/dev/null | awk '{print $1}' | sort | tr '\n' ',')
+        if [ -n "$CUR" ] && [ "$CUR" = "$HEADS" ]; then
+          echo "alembic at head ($CUR)"
+          break
+        fi
+        echo "waiting for alembic to reach head; current=${CUR:-<unreachable/empty>}"
         sleep 3
       done
-      echo "alembic schema present"
   env:
-    - name: POSTGRES_PASSWORD
-      valueFrom:
-        secretKeyRef:
-          name: {{ include "spatiumddi.postgresSecretName" . }}
-          key: {{ include "spatiumddi.postgresSecretPasswordKey" . }}
-    - name: PGHOST
-      value: {{ include "spatiumddi.postgresHost" . | quote }}
-    - name: PGPORT
-      value: {{ include "spatiumddi.postgresPort" . | quote }}
-    - name: PGUSER
-      value: {{ include "spatiumddi.postgresUser" . | quote }}
-    - name: PGDATABASE
-      value: {{ include "spatiumddi.postgresDatabase" . | quote }}
+    {{- include "spatiumddi.commonEnv" . | nindent 4 }}
 {{- end -}}

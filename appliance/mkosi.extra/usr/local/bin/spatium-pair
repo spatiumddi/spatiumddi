@@ -1,8 +1,8 @@
 #!/bin/bash
 # spatium-pair — re-enter control plane URL + pairing code on a
-# SpatiumDDI Application appliance after install.
+# SpatiumDDI Appliance after install.
 #
-# When the operator installs an Application appliance, the wizard
+# When the operator installs an Appliance, the wizard
 # asks for ``CONTROL_PLANE_URL`` + ``BOOTSTRAP_PAIRING_CODE`` and
 # writes them to ``/etc/spatiumddi/role-config``. The supervisor
 # reads those on first boot, claims the pairing code, and stamps
@@ -12,9 +12,8 @@
 # without a reinstall.
 #
 # Strict appliance-only — refuses to run on docker / k8s deployments
-# (no /etc/spatiumddi/role-config there). Strict ROLE=application
-# only — re-pairing a control plane (full-stack / frontend-core)
-# doesn't apply.
+# (no /etc/spatiumddi/role-config there). Strict ROLE=appliance
+# only — re-pairing a control-plane node doesn't apply.
 #
 # Usage:
 #   sudo spatium-pair           # interactive whiptail wizard
@@ -48,13 +47,13 @@ fi
 # shellcheck disable=SC1090
 . "$ROLE_CONFIG"
 case "${ROLE:-}" in
-    application) ;;
+    appliance|application) ;;
     *)
         cat >&2 <<EOF
 spatium-pair: ROLE=${ROLE:-(unset)} in $ROLE_CONFIG
 
-Re-pairing only applies to the ``application`` role — full-stack /
-frontend-core appliances ARE the control plane and don't pair.
+Re-pairing only applies to the ``appliance`` role — the control-plane
+node IS the control plane and doesn't pair.
 
 If this appliance was installed in the wrong role, reinstall with
 ``spatium-install`` against the right role choice.
@@ -71,7 +70,7 @@ fi
 # Whiptail wizard: current URL + code shown as the defaults so the
 # operator can fix a typo without re-typing the whole thing.
 NEW_URL=$(whiptail --title "Control plane URL" \
-    --inputbox "Where does this Application appliance pair against?\n\nFormat: https://<control-plane-host>/" \
+    --inputbox "Where does this Appliance pair against?\n\nFormat: https://<control-plane-host>/" \
     14 78 "${CONTROL_PLANE_URL:-https://}" 3>&1 1>&2 2>&3) || exit 1
 
 if [ -z "$NEW_URL" ] || [ "$NEW_URL" = "https://" ]; then
@@ -111,7 +110,7 @@ whiptail --yesno "$SUMMARY" 18 76 || {
 # successful register call).
 TMP="$ROLE_CONFIG.new"
 cat > "$TMP" <<EOF
-ROLE=application
+ROLE=appliance
 CONTROL_PLANE_URL=$NEW_URL
 BOOTSTRAP_PAIRING_CODE=$NEW_CODE
 EOF

@@ -30,15 +30,15 @@ Type=idle
 # before we claim the TTY. Mirrors spatium-live-banner.service's
 # pattern. Leading `-` keeps the unit healthy if getty isn't running.
 ExecStartPre=-/usr/bin/systemctl stop getty@tty1.service
-# Switch to a compact 8x8 font BEFORE python starts so rich's
-# Console picks up the bigger terminal size on its first probe.
-# Lat15-VGA8 is the Debian default tiny font shipped by console-setup.
-# Without KMS (legacy text mode) this still works — VGA hardware
-# supports a separate text mode at 80x50 when an 8x8 font is loaded.
-# With KMS (full kernel) we additionally get higher-density rendering
-# at the hypervisor's advertised resolution. Falls back silently if
-# the font file isn't present.
-ExecStartPre=-/usr/bin/setfont -C /dev/tty1 Lat15-VGA16
+# Switch to a compact 6x12 font BEFORE python starts so rich's Console
+# picks up the bigger terminal size (more rows + cols) on its first
+# probe. #272 — the multi-node console fits more (a Nodes panel + more
+# pods across the cluster) and operators want more log lines at the
+# bottom; Terminus 6x12 yields ~33% more rows than the old 8x16 VGA
+# font (~66 vs ~50 on a 1280x800 framebuffer) and is a crisp, terminal-
+# designed bitmap face. Falls back silently if the font file isn't
+# present (leading ``-``).
+ExecStartPre=-/usr/bin/setfont -C /dev/tty1 Lat15-Terminus12x6
 ExecStart=/usr/local/bin/spatium-console --tty /dev/tty1
 StandardInput=tty
 StandardOutput=tty

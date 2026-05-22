@@ -1,38 +1,17 @@
-{{- if .Values.redis.enabled }}
+{{- if and .Values.redis.enabled (eq (.Values.redis.kind | default "standalone") "standalone") }}
 {{- $cmp := "redis" -}}
 {{- $secretName := printf "%s-redis" (include "spatiumddi.fullname" .) -}}
 # ─────────────────────────────────────────────────────────────────────────────
 # In-chart Redis — single-node StatefulSet using the official
 # ``redis:8.6-alpine`` image. Sized for a small lab / single-VM
-# deployment. Real production HA installs should set
+# deployment. Real production HA installs flip ``redis.kind=sentinel``
+# (#272 Phase 3 — templates/redis-sentinel.yaml) or set
 # ``redis.enabled=false`` and point ``externalRedis`` at a
-# Redis Sentinel cluster (see k8s/ha/redis-sentinel.yaml).
+# self-managed Redis.
+#
+# The credentials Secret is rendered by templates/redis-secret.yaml —
+# shared with the sentinel kind so a kind switch reuses the password.
 # ─────────────────────────────────────────────────────────────────────────────
-
-{{- if and .Values.redis.auth.enabled (not .Values.redis.auth.existingSecret) }}
-{{- $existing := (lookup "v1" "Secret" .Release.Namespace $secretName) }}
-{{- $password := "" }}
-{{- if .Values.redis.auth.password }}
-{{- $password = .Values.redis.auth.password }}
-{{- else if $existing }}
-{{- $password = index $existing.data "redis-password" | b64dec }}
-{{- else }}
-{{- $password = randAlphaNum 32 }}
-{{- end }}
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ $secretName }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
-  annotations:
-    "helm.sh/resource-policy": keep
-type: Opaque
-data:
-  redis-password: {{ $password | b64enc | quote }}
----
-{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -101,10 +80,7 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.redis.resources | nindent 12 }}
-      {{- with .Values.redis.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.redis.nodeSelector) .) | nindent 6 }}
       {{- with .Values.redis.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}

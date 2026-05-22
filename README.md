@@ -600,7 +600,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Docker Compose
   - Kubernetes — Helm umbrella chart, OCI-published
   - Bare metal
-  - OS appliance ISO — beta (Debian 13 + full stack pre-installed, dedicated `/appliance` management hub with TLS, releases, containers, logs, host config; see [Getting Started](#quick-start-with-the-os-appliance-iso) + [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md))
+  - OS appliance ISO — beta (Debian 13 + k3s + full stack pre-installed, dedicated `/appliance` management hub with TLS, releases, containers, logs, host config; **multi-node control-plane HA** — promote appliances to a 3/5/7-node cluster with CloudNativePG + Redis Sentinel + a MetalLB VIP; see [Getting Started](#quick-start-with-the-os-appliance-iso) + [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md))
 
 ---
 
@@ -692,6 +692,10 @@ Operators get a real Kubernetes node without managing one.
   identical root partitions; an upgrade dd's the new image
   into the inactive one, reboots, and auto-reverts on
   `/health/live` failure. Worst case is one wasted reboot.
+- **Scale to a 3/5/7-node HA control plane** by promoting more
+  appliances from the Fleet UI — embedded-etcd quorum, replicated
+  PostgreSQL (CloudNativePG) + Redis Sentinel, and a MetalLB
+  control-plane VIP, all configured from the web UI (see below).
 
 #### Get the ISO
 
@@ -706,17 +710,34 @@ Operators get a real Kubernetes node without managing one.
 
 1. Attach the ISO as a CD-ROM in your hypervisor (Proxmox /
    VMware / Hyper-V / QEMU), or `dd` it to a USB stick for
-   bare metal. Hard floor: **32 GiB disk, 2 GiB RAM, amd64**
-   (arm64 ISO is planned).
+   bare metal. **amd64** (arm64 ISO is planned).
+
+   **Hard floor (installer refuses below this): 24 GiB disk,
+   2 GiB RAM** — the A/B atomic-upgrade layout needs two 8 GiB
+   OS slots that each carry the full container image set for
+   air-gapped boot.
+
+   **Recommended per role:**
+
+   | Role | vCPU | RAM | Disk |
+   |---|---|---|---|
+   | **Control plane** (api + worker + frontend + Postgres + Redis + k3s etcd) | 4 | 8 GiB | 40 GiB SSD |
+   | **Appliance** (DNS / DHCP agent box) | 2 | 4 GiB | 24 GiB SSD |
+
+   Each control-plane HA node sizes the same as a single control
+   plane (4 vCPU / 8 GiB) — every member runs a full api / worker /
+   Postgres replica / Redis. SSD strongly preferred for the
+   etcd + Postgres write path.
 2. Boot. The installer wizard asks for:
-   - **Variant** — *All-in-One* (control plane + DNS + DHCP
-     on this box), *Core-only* (control plane only; agents
-     pair against it from other boxes), or *Application*
-     (DNS / DHCP agent box; pairs against a remote control
-     plane).
+   - **Role** — *Control plane* (the required first install:
+     control plane on this box + the k3s etcd seed; DNS / DHCP
+     are off at install and enabled later per node from the
+     Fleet UI) or *Appliance* (DNS / DHCP agent box; pairs
+     against a remote control plane and can later be promoted
+     to join the control-plane cluster).
    - **Target disk**, **hostname**, **admin password**,
      **network** (DHCP or static), **timezone**.
-   - For *Application*, also **control plane URL** and a
+   - For *Appliance*, also **control plane URL** and a
      **bootstrap method** — see "Joining DNS / DHCP agents"
      below.
 3. The installer partitions, installs GRUB, and reboots.
@@ -741,9 +762,19 @@ beyond pasting the new cert in the UI.
 #### Joining DNS / DHCP agents
 
 For distributed deployments (control plane on one box, DNS
-and DHCP on others), install the **Application** variant on
+and DHCP on others), install the **Appliance** role on
 each agent box. Each agent needs a bootstrap secret to
 register with the control plane. Two ways to provide it:
+
+> **Point agents at the VIP, not a node IP.** When the
+> installer asks for the control-plane URL, and the control
+> plane is (or will become) a multi-node HA cluster, use the
+> **MetalLB control-plane VIP** — not any single node's
+> address. An agent pinned to one node's IP loses its control
+> plane whenever that node is down, even though the cluster is
+> healthy on the survivors. (Control-plane *cluster members*
+> need no such care — their supervisor automatically heartbeats
+> the in-cluster API Service rather than any fixed node IP.)
 
 **Pairing code (recommended).** Easy to type, even over an
 IPMI / serial console.
@@ -776,11 +807,62 @@ agent labels the k3s node (`spatium.io/role-<role>=true`)
 and the matching DaemonSet schedules the role pod. Total
 time from click to running pod: typically 25-35 s.
 
+#### Control-plane high availability (multi-node)
+
+A single appliance is a one-node control plane. To survive a
+node loss, **promote** more appliances into the control-plane
+cluster from **Appliance → Fleet → Manage control plane
+cluster…**. Pick the boxes to add and confirm — embedded-etcd
+HA wants an **odd** member count, so you grow 1 → 3 → 5 → 7
+(the API refuses a batch that would land on an even total).
+
+Promotion is hands-off. The supervisor on each promoted node
+does a full k3s cluster-identity reset and rejoins the seed's
+embedded-etcd cluster; within ~60 s the data layer scales
+itself to the new member count:
+
+- **PostgreSQL** ([CloudNativePG](https://cloudnative-pg.io/))
+  grows from one instance to a primary + streaming replicas
+  with automatic failover.
+- **Redis** runs in Sentinel mode — each member pairs a
+  redis-server with a sentinel that elects a master and fails
+  over; the app resolves the live master via a `sentinel://` URL.
+- **api / frontend / worker** spread to one replica per node.
+
+**One Web UI, one address.** Set a [MetalLB](https://metallb.io/)
+L2 address pool + a floating **control-plane VIP** in **Appliance →
+Network & Host**; the frontend Service moves onto the VIP so the
+UI (and every agent heartbeat) hits one stable address
+regardless of which node is up. The self-signed Web UI cert
+auto-grows its SAN list to cover every member's hostname + IP
+and the VIP, so it validates on any node — unless you've
+uploaded your own cert, which is never touched.
+
+Roll back by **demoting** members the same way (the etcd seed
+can't be demoted, and demoting to an even count is refused). A
+control-plane node can't be revoked until it's been demoted —
+revoking a live etcd member would break quorum. Control-plane
+workloads are pinned to control-plane nodes by a per-role node
+label, so promoting a DNS-only appliance never accidentally
+schedules Postgres onto it.
+
+> Multi-node HA shipped in
+> [#272](https://github.com/spatiumddi/spatiumddi/issues/272);
+> the live shake-out validated a 1 → 3 promote end-to-end. See
+> [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md)
+> for the architecture + the
+> [HA topologies in `docs/deployment/TOPOLOGIES.md`](docs/deployment/TOPOLOGIES.md).
+
 #### Managing the appliance
 
 The **Appliance** section in the sidebar groups every host
 concern:
 
+- **Fleet** — every registered appliance in two tables
+  (control-plane nodes + service agents): approve pairings,
+  assign DNS/DHCP roles, watch per-service health, and
+  promote/demote control-plane cluster members + set the
+  MetalLB control-plane VIP (see HA above).
 - **OS Versions** — atomic A/B slot upgrades for this
   appliance and every registered remote agent. Pick a
   release, optionally bulk-select agents, click Apply.

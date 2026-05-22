@@ -22,6 +22,14 @@ class Settings(BaseSettings):
 
     # Redis
     redis_url: str = "redis://redis:6379/0"
+    # Redis Sentinel (#272 Phase 3). When ``redis_url`` /
+    # ``celery_broker_url`` carry a ``sentinel://`` scheme, the
+    # connection helpers query Sentinel for the current master named
+    # ``redis_sentinel_master``. ``redis_sentinel_password`` is the
+    # password Sentinel itself requires (often the same as the data
+    # password); empty falls back to the password embedded in the URL.
+    redis_sentinel_master: str = "mymaster"
+    redis_sentinel_password: str = ""
 
     # Security
     secret_key: str = _SECRET_KEY_DEV_SENTINEL
@@ -114,6 +122,15 @@ class Settings(BaseSettings):
     # container's own socket-level view only knows the docker bridge IP).
     # Empty on non-appliance deploys.
     appliance_host_ips: str = ""
+    # #272 Phase 6 — extra SAN entries the self-signed cert MUST cover
+    # beyond the host's own IPs: the control-plane VIP (and any other
+    # floating address the operator's browser / agents hit). The
+    # umbrella chart threads ``frontend.controlPlaneVIP`` in here on
+    # promote; when set, the self-signed bootstrap regenerates an
+    # existing self-signed cert that doesn't already cover these, so a
+    # cert served on the VIP validates. Comma-separated IPs or DNS
+    # names. Empty on single-node / non-appliance deploys.
+    appliance_extra_cert_sans: str = ""
 
     # Where the cert deployer (Phase 4b.2) writes the currently-active
     # TLS cert + key. Mounted as a shared volume between the api

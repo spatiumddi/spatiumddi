@@ -36,12 +36,17 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- if .Values.frontend.hostNetwork }}
-      # Appliance use (#183 Phase 11): expose :80 on the node IP
-      # directly. The umbrella chart is otherwise pure ClusterIP,
-      # but the appliance disables klipper-lb + the default
-      # NodePort range excludes :80. hostNetwork is the simplest
-      # way to land on http://<appliance>/ for the operator. Pair
-      # with replicas=1 so the single host port doesn't conflict.
+      # Appliance use (#183 Phase 11): expose :80/:443 on the node IP
+      # directly. The umbrella chart is otherwise pure ClusterIP, but
+      # the appliance disables klipper-lb + the default NodePort range
+      # excludes :80/:443, so hostNetwork is the simplest way to land
+      # on https://<appliance>/ per node.
+      #
+      # #272 — KEPT even when a control-plane VIP is set. The frontend
+      # runs one replica per control-plane node (``# spatium:cp-size``),
+      # so hostNetwork gives every node's IP as a direct BACKUP path
+      # while the LoadBalancer VIP below (MetalLB) is the PRIMARY
+      # floating address. Both front the same pods + the same TLS cert.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
@@ -100,6 +105,17 @@ spec:
             - name: NGINX_LOCAL_RESOLVERS
               value: {{ . | quote }}
             {{- end }}
+            # nginx >=1.30's upstream 15-local-resolvers.envsh script
+            # is gated on this var being set — without it the script
+            # returns early and ``NGINX_LOCAL_RESOLVERS`` is never
+            # exported, so envsubst leaves the literal ``${NGINX_
+            # LOCAL_RESOLVERS}`` in the rendered config and nginx
+            # fails to start. Our image's COPY-replaced version of
+            # the script (frontend/15-local-resolvers.envsh) doesn't
+            # need the var, but setting it here is defensive — a
+            # build that somehow loses the COPY still works.
+            - name: NGINX_ENTRYPOINT_LOCAL_RESOLVERS
+              value: "1"
           livenessProbe:
             httpGet: { path: /, port: http }
             initialDelaySeconds: 5
@@ -124,10 +140,7 @@ spec:
             # races could otherwise wedge.
             optional: true
       {{- end }}
-      {{- with .Values.frontend.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.frontend.nodeSelector) .) | nindent 6 }}
       {{- with .Values.frontend.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
@@ -144,11 +157,35 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+  {{- if .Values.frontend.controlPlaneVIP }}
+  annotations:
+    # #272 Phase 5 — pin the control-plane VIP from MetalLB's pool.
+    metallb.universe.tf/address-pool: {{ .Values.frontend.controlPlaneVIPPool | quote }}
+    metallb.universe.tf/loadBalancerIPs: {{ .Values.frontend.controlPlaneVIP | quote }}
+  {{- end }}
 spec:
+  {{- if .Values.frontend.controlPlaneVIP }}
+  # A control-plane VIP forces a LoadBalancer Service regardless of the
+  # configured service.type, so MetalLB assigns the floating IP. With the
+  # frontend on hostNetwork (one pod per control-plane node),
+  # externalTrafficPolicy: Local makes MetalLB announce the VIP from a
+  # node that has a local frontend pod and keeps the traffic node-local —
+  # real client IP, no SNAT hairpin to a hostNetwork endpoint.
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  {{- else }}
   type: {{ .Values.frontend.service.type }}
+  {{- end }}
   selector:
     {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
   ports:
     - name: http
       port: {{ .Values.frontend.service.port }}
       targetPort: http
+    {{- if and .Values.frontend.controlPlaneVIP .Values.frontend.tls.enabled }}
+    # Expose :443 on the VIP. The per-node hostNetwork :443 is the backup
+    # path; this LoadBalancer port is the primary floating one.
+    - name: https
+      port: 443
+      targetPort: https
+    {{- end }}

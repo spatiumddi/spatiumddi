@@ -14,28 +14,31 @@ The appliance runs **k3s** as its container orchestrator. Pre-#183 it ran `docke
 
 ### One-paragraph summary
 
-`spatiumddi-firstboot` writes a HelmChart CR into k3s's auto-deploy directory (`/var/lib/rancher/k3s/server/manifests/`). The k3s-bundled helm-controller picks it up + runs `helm install` from a chart tarball baked into the appliance rootfs (`/usr/lib/spatiumddi/charts/`). Three install variants pick which chart + values get rendered:
+`spatiumddi-firstboot` writes a HelmChart CR into k3s's auto-deploy directory (`/var/lib/rancher/k3s/server/manifests/`). The k3s-bundled helm-controller picks it up + runs `helm install` from a chart tarball baked into the appliance rootfs (`/usr/lib/spatiumddi/charts/`).
 
-- **Application** — supervisor + agent-landing nginx. Pairs against a remote control plane via 8-digit pairing code; roles (`dns-bind9` / `dns-powerdns` / `dhcp`) are assigned post-approval from the control plane's `/appliance → Fleet` tab.
-- **All-in-One (AIO)** — control plane (api / frontend / worker / beat / migrate / Postgres / Redis) + role pods, all on the same single-node k3s. The umbrella chart deploys the control plane; node labels are baked into k3s's config at install time so DNS + DHCP DaemonSets schedule immediately. No supervisor, no pairing-code dance.
-- **Core-only** — control plane only. Remote Application appliances pair against this box.
+**#272 — two install roles** (the installer wizard collapsed from the earlier three; the old `full-stack` / `frontend-core` distinction is now a runtime DNS/DHCP role toggle, not an install choice — and legacy variant strings are still accepted from a not-yet-reinstalled box):
+
+- **Control plane** (the default; the required FIRST install) — control plane (api / frontend / worker / beat / migrate / Postgres / Redis) + the supervisor, all on a single-node k3s that is also the etcd seed. **DNS + DHCP are OFF at install** — the operator enables them per node from the `/appliance → Fleet` role toggle (so the data plane is always a deliberate fleet decision). The umbrella chart deploys the control plane; the supervisor owns the per-role node labels. More control-plane nodes are made by **promoting** Appliances in the Fleet UI (#272 Phase 7), not installed as this role.
+- **Appliance** — supervisor + agent-landing nginx. Pairs against a remote control plane via 8-digit pairing code; roles (`dns-bind9` / `dns-powerdns` / `dhcp`) are assigned post-approval from the control plane's `/appliance → Fleet` tab. Can later be promoted to join the control-plane cluster.
+
+The historical AIO / Core-only / Application narrative below documents the pre-#272 three-role world; the firstboot dispatch still handles those strings as aliases.
 
 ```
 [appliance: single-node k3s]
    ├─ /usr/local/bin/k3s (static binary, pinned via K3S_VERSION)
    ├─ /var/lib/rancher/k3s/agent/images/*.tar.zst   ← air-gap-preloaded
    ├─ /usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz   ← appliance chart
-   ├─ /usr/lib/spatiumddi/charts/spatiumddi.tgz             ← umbrella chart (AIO + Core)
+   ├─ /usr/lib/spatiumddi/charts/spatiumddi.tgz             ← umbrella chart (Control plane)
    └─ /var/lib/rancher/k3s/server/manifests/spatium-bootstrap.yaml
         ↓ (firstboot writes on every boot, content depends on variant)
    helm-controller reconciles → installs `spatium-bootstrap` release
         ↓
-   spatium-supervisor pod (DaemonSet, privileged, hostNetwork: false)   ← Application only
+   spatium-supervisor pod (DaemonSet, privileged, hostNetwork: false)   ← all roles
         ↓ (registers + heartbeats to control plane)
         ↓ (on role assignment: labels node → DaemonSet schedules)
    role pods: dns-bind9 / dns-powerdns / dhcp-kea (hostNetwork: true)
-   always-on: agent-landing nginx on :80                                 ← Application only
-   control plane pods (api / frontend / db / redis / worker / beat /     ← AIO + Core
+   always-on: agent-landing nginx on :80                                 ← Appliance only
+   control plane pods (api / frontend / db / redis / worker / beat /     ← Control plane
                        migrate, frontend on hostNetwork :80 + :443)
 ```
 
@@ -45,16 +48,16 @@ mkosi bakes everything the appliance needs to come up fully air-gapped:
 
 - **k3s static binary** (~70 MB) at `/usr/local/bin/k3s`; `kubectl` / `crictl` / `ctr` symlink to it.
 - **k3s airgap images** (CoreDNS / local-path / pause / metrics-server) as zst-compressed tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst`. k3s auto-imports them into containerd at boot.
-- **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.6-alpine for AIO / Core variants.
-- **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Application installs; the umbrella chart drives AIO + Core. Built at release time + signed.
+- **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.6-alpine for the Control plane role.
+- **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Appliance installs (and the supervisor on the Control plane); the umbrella chart drives the Control plane. Built at release time + signed.
 - **bash-completion + `k` alias** for kubectl — operator SSHing in for triage drops straight into a usable shell.
 
 A fresh appliance boot never reaches out to ghcr.io or any external registry. The first time it does is when an operator explicitly applies a new release through `/appliance → OS Versions` or `/appliance → Releases`.
 
 ### Two HelmChart CRs
 
-- **`spatium-bootstrap`** — written by `spatiumddi-firstboot` into k3s's auto-deploy directory on every boot. Content depends on install variant (Application / AIO / Core). Owns the always-on resources (supervisor + agent-landing on Application; control plane pods on AIO + Core).
-- **`spatiumddi-appliance`** — written by the supervisor on its first successful heartbeat (Application variant only). Deploys the three role DaemonSets (dns-bind9 / dns-powerdns / dhcp-kea). After #183 Phase 10, this release is installed once and never re-PATCHed for role changes — role swaps happen through node labels (`spatium.io/role-<role>=true`); the DaemonSet's matching-nodes semantics mean an unassigned role produces zero pods rather than a Pending one.
+- **`spatium-bootstrap`** — written by `spatiumddi-firstboot` into k3s's auto-deploy directory on every boot. Content depends on install role (Control plane / Appliance). Owns the always-on resources (supervisor on every role; agent-landing on Appliance; control plane pods on Control plane).
+- **`spatiumddi-appliance`** — written by the supervisor on its first successful heartbeat (every role runs a supervisor). Deploys the three role DaemonSets (dns-bind9 / dns-powerdns / dhcp-kea). After #183 Phase 10, this release is installed once and never re-PATCHed for role changes — role swaps happen through node labels (`spatium.io/role-<role>=true`); the DaemonSet's matching-nodes semantics mean an unassigned role produces zero pods rather than a Pending one.
 
 ### Why k3s
 
@@ -66,7 +69,16 @@ The pre-#183 docker-compose path fought us on three things every operator-facing
 
 k3s solves all three: HelmChart CRs as the declarative target, helm-controller as the reconciler, kine (SQLite) as the state store (survives slot swap because `/var/lib/rancher/` is on `/var`). The supervisor becomes a thin controller that PATCHes node labels per role-assignment change — the role pod schedules or terminates as a consequence of the label, not as a consequence of a `docker compose` invocation.
 
-The trade-off: k3s adds ~70 MB to the slot rootfs and a steady ~150 MB RAM footprint for the k3s server process itself. On the 16 GiB disk floor + 2 GiB RAM floor the appliance targets, both are well under budget.
+The trade-off: k3s adds ~70 MB to the slot rootfs and a steady ~150 MB RAM footprint for the k3s server process itself. On the 24 GiB disk floor + 2 GiB RAM floor the appliance targets, both are well under budget.
+
+**Recommended sizing (per role):**
+
+| Role | vCPU | RAM | Disk |
+|---|---|---|---|
+| **Control plane** (api + worker + frontend + Postgres + Redis + k3s etcd seed) | 4 | 8 GiB | 40 GiB SSD |
+| **Appliance** (DNS / DHCP agent) | 2 | 4 GiB | 24 GiB SSD |
+
+The 2 GiB RAM floor boots a single-node control plane but is tight once Postgres + Redis + the Python api/worker are all resident; 8 GiB is the comfortable recommendation. Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
 
 ### Appliance management surfaces (k3s-aware)
 
@@ -82,15 +94,129 @@ The api pod's ServiceAccount is namespace-scoped with minimal RBAC: pods + pods/
 
 ### From-zero operator flow
 
-1. Boot the ISO → installer wizard asks for **variant** + target disk + hostname + admin + network + timezone (+ pairing code / control-plane URL on Application).
+1. Boot the ISO → installer wizard asks for **role** + target disk + hostname + admin + network + timezone (+ pairing code / control-plane URL on Appliance).
 2. Installer partitions (BIOS Boot + ESP + root_A + root_B + var), writes fstab + grub menuentries, runs postinst hardening, reboots.
 3. First-boot: `spatiumddi-firstboot` generates `/etc/spatiumddi/.env` with secrets, bakes the self-signed cert, writes the HelmChart bootstrap manifest, starts k3s.
 4. k3s comes up + imports baked images + helm-controller installs the bootstrap release. 30-90 s for control plane pods to reach Ready; another 15-30 s for migrate Job to complete schema migrations.
 5. Operator browses to `https://<appliance-ip>/`, accepts the self-signed cert, signs in `admin / admin`, sets a real password.
-6. (Application variant only) Operator approves the appliance from the control plane's `/appliance → Fleet` tab, picks roles. DaemonSet schedules role pods within ~30 s.
+6. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
 
 For a step-by-step user-facing version, see the README's
 ["Quick start with the OS appliance ISO" section](../../README.md#quick-start-with-the-os-appliance-iso-recommended).
+
+---
+
+## Control-plane high availability (#272)
+
+A fresh install is a one-node control plane. Multi-node HA is built
+**by promoting Appliances**, not by a separate installer role — the
+operator scales the existing cluster from `/appliance → Fleet →
+Manage control plane cluster…`. Full design lives in
+[issue #272](https://github.com/spatiumddi/spatiumddi/issues/272);
+the reference topologies are in
+[`TOPOLOGIES.md`](TOPOLOGIES.md).
+
+### Topology + locked decisions
+
+- **k3s embedded etcd, 3 / 5 / 7 server nodes.** Every node boots
+  `cluster-init: true` (a one-member etcd). **Promotion does a full
+  cluster-identity reset + rejoin** — wiping only the etcd `db` is not
+  enough, the server CA / TLS / node password / flannel subnet all have
+  to go too, then the node rejoins the seed via
+  `https://<seed-node-ip>:6443` with the Fernet'd join token. The
+  host-side runner is `spatium-cluster-join` (etcd backup + rollback +
+  a confirmation-marker guardrail so a stray trigger file can't fire a
+  destructive wipe). **Even counts (2 / 4) are refused at the API** for
+  etcd quorum hygiene.
+- **PostgreSQL HA = CloudNativePG.** The operator-managed `Cluster` CR
+  is the permanent appliance default (`postgresql.kind=cnpg`); instances
+  scale with the committed member count (1 → 3/5/7, primary + streaming
+  replicas + automatic failover).
+- **Redis HA = Sentinel.** Each member pairs a redis-server + a sentinel
+  sidecar; app / worker / beat resolve the master via a `sentinel://`
+  URL. `sentinel.replicas` scales with the member count.
+- **MetalLB, v0.16.0, L2 mode** (air-gap baked: controller + speaker
+  only, `frrk8s.enabled=false`). Provides the control-plane VIP; BGP
+  templates render spec-only for the anycast-DNS follow-up.
+- **One TLS cert, cluster-wide**, in the `spatium-appliance-tls` Secret,
+  mounted by every frontend replica. The self-signed default uses stable
+  host identity (never the pod) and **auto-grows its SANs to cover every
+  member's hostname + node IP + the VIP** — an operator-uploaded / CSR
+  cert is never auto-replaced.
+
+### How a promote settles (per-tick, hands-off)
+
+The seed supervisor (control-plane variant) reconciles cluster-global
+state on its heartbeat:
+
+- **HelmChartConfig overrides (durable).** The seed supervisor writes a
+  `helm.cattle.io/v1 HelmChartConfig` CR per release —
+  `k8s_api.apply_control_plane_overrides()` upserts the `spatium-control`
+  override (api/frontend/worker `replicas` + CNPG `instances` + Redis
+  `sentinel.replicas` = committed member count, plus
+  `frontend.controlPlaneVIP`). helm-controller *merges* a
+  HelmChartConfig on top of its same-named HelmChart on every reconcile.
+  Crucially the HelmChartConfig is **not** in the auto-deploy manifests
+  dir, so a k3s restart's re-apply of the firstboot HelmChart defaults
+  (cp-size 1, metallb off, VIP "") no longer clobbers the live cluster
+  state — the override survives and re-wins the merge. (This replaced the
+  earlier `# spatium:cp-size` marked-line regex rewriter, which lost its
+  edits on every seed reboot — the systemic durability bug fixed in
+  `083f8d2`.)
+- **MetalLB / VIP (Phase 7c).** The operator's pool + VIP live on the
+  `platform_settings` singleton (`metallb_enabled` /
+  `metallb_pool_addresses` / `control_plane_vip`); the seed supervisor
+  upserts the `spatium-bootstrap` HelmChartConfig (`metallb.enabled` +
+  `ipPool.addresses`) via `k8s_api.apply_bootstrap_overrides()`, and
+  `frontend.controlPlaneVIP` rides the `spatium-control` override above.
+  The VIP also auto-threads into the api's `APPLIANCE_EXTRA_CERT_SANS` so
+  the served cert validates on it.
+- **Cert SAN reconcile (Phase 7c).** A periodic loop in the api lifespan
+  (`reconcile_cluster_cert_sans`, advisory-locked across the api
+  replicas, appliance-mode only) grows the self-signed cert as members
+  join, updates the Secret + rolls the frontend pods. Coverage only ever
+  grows, so a demote never churns the cert.
+- **Per-role node-label gating** keeps control-plane workloads on
+  control-plane nodes (`spatium.io/role-control-plane=true`), so
+  promoting a DNS-only appliance never schedules Postgres onto it
+  (CLAUDE.md non-negotiable #16).
+
+### Fleet UI
+
+`/appliance → Fleet` is two tables — **Control plane** (the 1–N k3s
+servers, including promoted Appliances) + **Service agents** (DNS/DHCP
+appliances). "Manage control plane cluster…" drives the batch
+promote/demote (odd-target enforced inline). The **MetalLB control-plane
+VIP** picker (enable + L2 pool + VIP, VIP-must-fall-in-pool validated)
+lives one tab over under **Network & Host**. The etcd seed can't be
+demoted, and a node can't be **revoked** while it's a live cluster member
+— it must be demoted first (revoking a live etcd member would break
+quorum).
+
+Once a multi-node control plane exists, the **Control plane** table
+surfaces a dismissible amber banner prompting the operator to configure a
+VIP if none is set yet (a single-node-IP URL is a latent SPOF for every
+agent). Dismissal requires a deliberate checkbox and is remembered
+client-side.
+
+**Heartbeat targets.** A supervisor that is itself a control-plane
+cluster member heartbeats the **in-cluster api Service**
+(`spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000`) rather
+than the seed node's IP it was installed/promoted against — so losing any
+single node never strands a member's control plane, and kube-proxy
+load-balances heartbeats across the ready api pods. Off-cluster DNS/DHCP
+agents have no in-cluster DNS to resolve that name, so they keep using
+their configured `CONTROL_PLANE_URL` — which should be the **VIP** on an
+HA cluster (see `_effective_control_plane_url` in the supervisor's
+`heartbeat.py`).
+
+### Storage note
+
+CNPG + Redis PVs use k3s local-path (`/var/lib/rancher/k3s/storage`,
+node-local on the dedicated `/var` partition so they survive A/B slot
+swaps). Replicas are per-node anyway, so node-pinned PVs are acceptable;
+a shared-storage class (Longhorn / Rook-Ceph / NFS) for true PV mobility
+is an open question on #272.
 
 ---
 
@@ -527,18 +653,23 @@ Apply a new slot image, reboot, `/health/live` confirms, grub
 auto-commits the swap — or auto-reverts on next reboot if the
 new slot didn't come up.
 
-**Partition layout (2026.05.12-1):**
+**Partition layout (#170 Wave A4 — 8 GiB slots):**
 
 ```
 p1 BIOS Boot    1 MiB    ef02
 p2 ESP        512 MiB    ef00   /boot/efi (FAT32, fmask=0133,dmask=0022)
-p3 root_A       4 GiB    8304   active slot (this install)
-p4 root_B       4 GiB    8304   inactive slot (staged by slot-upgrade)
-p5 var         balance   8300   shared across slots (/var/lib/docker,
+p3 STATE      256 MiB    8300   slot-state sidecars (grubenv, slot versions)
+p4 root_A       8 GiB    8304   active slot (this install)
+p5 root_B       8 GiB    8304   inactive slot (staged by slot-upgrade)
+p6 var         balance   8300   shared across slots (/var/lib/rancher,
                                 /var/persist/etc, /var/home, /var/root)
 ```
 
-Hard floor: 16 GiB target disk.
+Hard floor: **24 GiB target disk** (installer refuses below it). The
+slots grew from 4 → 8 GiB once the full container image set started
+baking into the rootfs (so the appliance boots air-gapped without
+ghcr.io) — base Debian + Python + the baked images is ~3 GiB, leaving
+~2.7× headroom per slot.
 
 **/etc overlayfs:** each slot ships an image-baseline `/etc`
 at `/usr/lib/etc.image/`. At boot, a systemd `etc.mount` unit
@@ -789,6 +920,14 @@ Phase 6 role-split appliances (``dns-agent-bind9`` / ``dns-agent-powerdns``
 / ``dhcp-agent``) need a control-plane URL + a bootstrap secret on
 first boot. The installer wizard offers two methods at the
 **Bootstrap method** prompt:
+
+> **Use the VIP for the control-plane URL on HA clusters.** When the
+> installer asks where this appliance registers, point it at the
+> **MetalLB control-plane VIP** rather than any single node's IP if the
+> control plane is (or may become) a multi-node cluster. An agent pinned
+> to one node's IP loses its control plane whenever that node is down,
+> even though the cluster is healthy on the survivors. Configure the VIP
+> on the control plane under **Appliance → Network & Host**.
 
 ### Pairing code (recommended) — issue #169
 

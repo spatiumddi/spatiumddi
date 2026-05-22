@@ -1,0 +1,106 @@
+#!/bin/sh
+# spatium-state — issue #276.
+#
+# Host-side helper for the STATE partition (/var/lib/spatium-state):
+# the small, durable home for machine config + SSH host keys +
+# supervisor identity that survives OS slot swaps AND a /var factory
+# reset.
+#
+# The control-plane's container-based backup workflow (pg_dump +
+# section dumps) can't reach the host STATE partition from inside a
+# pod, so STATE is backed up separately with this tool. STATE is
+# tiny (a few KB of keys + a YAML file), so a plain tar is plenty.
+#
+#   spatium-state info             show what's on STATE
+#   spatium-state backup [PATH]    tar STATE → PATH (default
+#                                  /var/tmp/spatium-state-<ts>.tar.gz)
+#   spatium-state restore PATH     extract a STATE backup into
+#                                  /var/lib/spatium-state (merges;
+#                                  existing files overwritten)
+#
+# Restore does NOT reboot or re-render /etc — run a reboot (or
+# ``systemctl restart spatium-etc-render`` then the affected
+# services) so spatium-etc-render re-materializes /etc from the
+# restored STATE.
+
+set -eu
+
+STATE_DIR=/var/lib/spatium-state
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+require_state_mount() {
+    if [ ! -d "$STATE_DIR" ]; then
+        die "$STATE_DIR does not exist — is this a #276 appliance with a STATE partition?"
+    fi
+}
+
+cmd_info() {
+    require_state_mount
+    echo "STATE partition: $STATE_DIR"
+    if command -v findmnt >/dev/null 2>&1; then
+        findmnt -no SOURCE,FSTYPE,SIZE,USED "$STATE_DIR" 2>/dev/null \
+            | sed 's/^/  device: /' || echo "  (not a separate mount — running on a pre-#276 layout?)"
+    fi
+    echo "Contents:"
+    if [ -f "$STATE_DIR/spatium-config.yaml" ]; then
+        echo "  spatium-config.yaml:"
+        sed 's/^/    /' "$STATE_DIR/spatium-config.yaml"
+    else
+        echo "  (no spatium-config.yaml)"
+    fi
+    if ls "$STATE_DIR"/ssh/ssh_host_*_key.pub >/dev/null 2>&1; then
+        echo "  SSH host keys:"
+        for k in "$STATE_DIR"/ssh/ssh_host_*_key.pub; do
+            echo "    $(basename "$k"): $(ssh-keygen -lf "$k" 2>/dev/null || echo '?')"
+        done
+    else
+        echo "  (no SSH host keys)"
+    fi
+    if [ -d "$STATE_DIR/spatium-supervisor" ]; then
+        echo "  supervisor identity: present ($(du -sh "$STATE_DIR/spatium-supervisor" 2>/dev/null | cut -f1))"
+    fi
+}
+
+cmd_backup() {
+    require_state_mount
+    dest="${1:-/var/tmp/spatium-state-$(date +%Y%m%d-%H%M%S).tar.gz}"
+    # tar from the parent so the archive carries the
+    # ``spatium-state/`` prefix — restore can extract anywhere safely.
+    tar -czf "$dest" -C "$(dirname "$STATE_DIR")" "$(basename "$STATE_DIR")"
+    chmod 0600 "$dest"   # SSH private keys + supervisor key live here
+    echo "✓ STATE backed up → $dest"
+    echo "  (mode 0600 — contains SSH host private keys + supervisor identity)"
+}
+
+cmd_restore() {
+    [ -n "${1:-}" ] || die "usage: spatium-state restore PATH"
+    src="$1"
+    [ -f "$src" ] || die "backup archive not found: $src"
+    require_state_mount
+    # Extract into the parent so the archive's ``spatium-state/`` prefix
+    # lands back at $STATE_DIR. Existing files are overwritten.
+    tar -xzf "$src" -C "$(dirname "$STATE_DIR")"
+    chmod 600 "$STATE_DIR"/ssh/ssh_host_*_key 2>/dev/null || true
+    chmod 644 "$STATE_DIR"/ssh/ssh_host_*_key.pub 2>/dev/null || true
+    echo "✓ STATE restored from $src"
+    echo "  Reboot (or restart spatium-etc-render + dependent services)"
+    echo "  so /etc is re-rendered from the restored STATE."
+}
+
+case "${1:-}" in
+    info)    cmd_info ;;
+    backup)  shift; cmd_backup "$@" ;;
+    restore) shift; cmd_restore "$@" ;;
+    *)
+        cat >&2 <<EOF
+spatium-state — STATE partition backup/restore (issue #276)
+
+usage:
+  spatium-state info             show STATE contents
+  spatium-state backup [PATH]    tar STATE → PATH
+  spatium-state restore PATH     restore STATE from a backup tar
+EOF
+        exit 2
+        ;;
+esac

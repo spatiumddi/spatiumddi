@@ -1,0 +1,239 @@
+{{- if and .Values.redis.enabled (eq (.Values.redis.kind | default "standalone") "sentinel") }}
+{{- $cmp := "redis" -}}
+{{- $fullname := include "spatiumddi.fullname" . -}}
+{{- $sts := printf "%s-redis" $fullname -}}
+{{- $headless := printf "%s-redis-headless" $fullname -}}
+{{- $replicas := int .Values.redis.sentinel.replicas -}}
+{{- $quorum := add (div $replicas 2) 1 -}}
+{{- $master := .Values.redis.sentinel.masterName -}}
+{{- $masterFqdn := printf "%s-0.%s.%s.svc.cluster.local" $sts $headless .Release.Namespace -}}
+{{- $authEnabled := .Values.redis.auth.enabled -}}
+# ─────────────────────────────────────────────────────────────────────────────
+# Redis HA via Sentinel (#272 Phase 3).
+#
+# A StatefulSet of N pods, each running a redis-server + a
+# redis-sentinel sidecar. Pod-0 starts as master; pods 1..N-1 start
+# as replicas of pod-0 (an init container writes ``replicaof`` into
+# the rendered redis.conf). The sentinels monitor the master + fail
+# over automatically — after a failover the master moves to whichever
+# replica wins the election, and clients (api / worker / beat) find it
+# by querying the sentinels through the ``sentinel://`` URL in
+# spatiumddi.commonEnv (no static master Service needed).
+#
+# Config is rendered by the init container from a ConfigMap template +
+# the password env (so the secret never lands in the ConfigMap).
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-redis-sentinel-tmpl
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+data:
+  # ``__PASSWORD__`` is substituted by the init container from the
+  # REDIS_PASSWORD env (sourced from the chart secret). On no-auth
+  # installs the password lines are dropped entirely.
+  redis.conf.tmpl: |
+    maxmemory {{ .Values.redis.maxmemory }}
+    maxmemory-policy allkeys-lru
+    appendonly yes
+    {{- if $authEnabled }}
+    requirepass __PASSWORD__
+    masterauth __PASSWORD__
+    {{- end }}
+  sentinel.conf.tmpl: |
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+    sentinel monitor {{ $master }} {{ $masterFqdn }} 6379 {{ $quorum }}
+    sentinel down-after-milliseconds {{ $master }} {{ .Values.redis.sentinel.downAfterMs }}
+    sentinel failover-timeout {{ $master }} {{ .Values.redis.sentinel.failoverTimeoutMs }}
+    sentinel parallel-syncs {{ $master }} 1
+    {{- if $authEnabled }}
+    sentinel auth-pass {{ $master }} __PASSWORD__
+    {{- end }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $sts }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+spec:
+  serviceName: {{ $headless }}
+  replicas: {{ $replicas }}
+  selector:
+    matchLabels:
+      {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        fsGroup: 999
+      initContainers:
+        # Render redis.conf + sentinel.conf from the ConfigMap
+        # template, substituting the password + setting replicaof on
+        # the non-master pods. ${HOSTNAME} is <sts>-<ordinal>.
+        - name: render-config
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              PW="${REDIS_PASSWORD:-}"
+              # Escape sed-replacement metacharacters (\ & and the /
+              # delimiter) so a password containing them renders a valid
+              # auth line instead of a broken one. The auto-generated
+              # chart secret is alnum, but a non-appliance operator may
+              # BYO a password with special chars.
+              ESC=$(printf '%s' "$PW" | sed -e 's/[\\/&]/\\&/g')
+              sed "s/__PASSWORD__/${ESC}/g" /tmpl/redis.conf.tmpl > /data/redis.conf
+              sed "s/__PASSWORD__/${ESC}/g" /tmpl/sentinel.conf.tmpl > /data/sentinel.conf
+              if [ "${HOSTNAME}" != "{{ $sts }}-0" ]; then
+                echo "replicaof {{ $masterFqdn }} 6379" >> /data/redis.conf
+              fi
+          {{- if $authEnabled }}
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "spatiumddi.redisSecretName" . }}
+                  key: {{ include "spatiumddi.redisSecretPasswordKey" . }}
+          {{- end }}
+          volumeMounts:
+            - name: tmpl
+              mountPath: /tmpl
+            - name: data
+              mountPath: /data
+      containers:
+        - name: redis
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          command: ["redis-server", "/data/redis.conf"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+        - name: sentinel
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          # Sentinel needs a brief delay so the local redis-server is
+          # up + (for replicas) has begun syncing before sentinel
+          # starts monitoring; otherwise the first probe flaps.
+          command: ["sh", "-c", "sleep 5 && exec redis-sentinel /data/sentinel.conf"]
+          ports:
+            - name: sentinel
+              containerPort: 26379
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            tcpSocket:
+              port: sentinel
+            initialDelaySeconds: 25
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+      volumes:
+        - name: tmpl
+          configMap:
+            name: {{ $fullname }}-redis-sentinel-tmpl
+        {{- if not .Values.redis.persistence.enabled }}
+        # No PVC — data dir is ephemeral (cache only; config is
+        # re-rendered by the init container on every restart).
+        - name: data
+          emptyDir: {}
+        {{- end }}
+      {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.redis.nodeSelector) .) | nindent 6 }}
+      {{- with .Values.redis.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Spread the redis pods across nodes so a single node loss
+      # doesn't take the quorum with it. Soft anti-affinity (best
+      # effort) keeps single-node dev installs schedulable.
+      affinity:
+        {{- with .Values.redis.affinity }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+  {{- if .Values.redis.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.redis.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.redis.persistence.size | quote }}
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $headless }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+    - name: sentinel
+      port: 26379
+      targetPort: sentinel
+---
+# Sentinel Service — the app's ``sentinel://`` URL points here. Load-
+# balances across all sentinel pods; redis-py / kombu try each in turn
+# to find the current master.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-redis-sentinel
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+  ports:
+    - name: sentinel
+      port: 26379
+      targetPort: sentinel
+{{- end }}

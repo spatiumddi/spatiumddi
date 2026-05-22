@@ -194,6 +194,14 @@ def cmd_apply(args) -> int:
     print(f"Writing image into INACTIVE slot {inactive['partlabel']} ({target_dev})")
     print(f"(Active slot stays untouched: {active['partlabel']} {active['device']})")
 
+    # SSH host key + hostname continuity across slot swaps is handled
+    # structurally by the STATE partition + spatium-etc-render (#276):
+    # both live on STATE, which the slot dd never touches, and the
+    # render service restores them into /etc on every boot. The earlier
+    # #272 Phase 1 per-apply bandaids (SSH-key migration into
+    # /var/persist/etc/ssh, hostname stamp into the new slot's
+    # /etc.image) are no longer needed and have been removed.
+
     workdir = Path("/var/lib/spatiumddi/slot-staging")
     workdir.mkdir(parents=True, exist_ok=True)
     staged = workdir / "slot.raw.xz"
@@ -266,6 +274,27 @@ def cmd_apply(args) -> int:
         _patch_grub_cfg_slot_label(inactive["partlabel"], new_version)
     sync_slot_versions()
 
+    # Hostname continuity across the slot swap is handled by the STATE
+    # partition + spatium-etc-render (#276): render sets the kernel
+    # hostname from STATE before k3s starts, so the empty
+    # /etc.image/hostname in the new slot no longer matters. The #272
+    # Phase 1 ``_stamp_lower_hostname`` bandaid has been removed.
+
+    # #272 Phase 1 audit — refresh the persistent /var partition's
+    # k3s airgap-image cache from the new slot's rootfs. Each baked
+    # slot ships its own ``/var/lib/rancher/k3s/agent/images/*.tar.zst``
+    # (the chart-aligned image tags for THIS slot's APPLIANCE_VERSION).
+    # The slot's tarballs sit on the slot's rootfs; once the slot
+    # boots, the persistent ``/var`` mount shadows them, so k3s scans
+    # the OLD (pre-upgrade) tarballs from the persistent /var and
+    # imports stale image tags. Any pod with ``imagePullPolicy:
+    # Never`` (every pod on the appliance) then fails ErrImageNeverPull
+    # because the chart now requests ``:<new-version>`` tags that the
+    # imported tarballs don't carry. Mount the new slot, copy its
+    # bake set across, unmount — k3s on next reboot scans /var, finds
+    # the new tarballs, imports them, the chart's tags resolve.
+    _refresh_baked_images(target_dev)
+
     print()
     print("✓ Image written to inactive slot.")
     print()
@@ -278,6 +307,43 @@ def cmd_apply(args) -> int:
     print(f"  spatium-upgrade-slot set-next-boot")
     print("  reboot")
     return 0
+
+
+def _refresh_baked_images(target_dev: str) -> None:
+    """Copy the new slot's baked image tarballs to the persistent /var
+    partition's k3s airgap-images dir. See cmd_apply for the
+    architecture background.
+
+    Best-effort: a mount failure just leaves the persistent /var with
+    its previous tarballs and the operator gets ErrImageNeverPull on
+    boot — same failure mode as before this fix, no regression.
+    """
+    mountpoint = Path("/tmp/spatium-slot-mnt")
+    dest = Path("/var/lib/rancher/k3s/agent/images")
+    try:
+        mountpoint.mkdir(parents=True, exist_ok=True)
+        rc = subprocess.run(
+            ["mount", "-o", "ro", target_dev, str(mountpoint)],
+            check=False,
+        ).returncode
+        if rc != 0:
+            print(f"  WARN: couldn't mount {target_dev} to refresh baked images")
+            return
+        try:
+            src = mountpoint / "var/lib/rancher/k3s/agent/images"
+            if not src.is_dir():
+                print(f"  WARN: no baked-image dir at {src}")
+                return
+            dest.mkdir(parents=True, exist_ok=True)
+            copied = 0
+            for tarball in src.glob("*.tar.zst"):
+                shutil.copy2(tarball, dest / tarball.name)
+                copied += 1
+            print(f"  refreshed {copied} baked tarballs → {dest}")
+        finally:
+            subprocess.run(["umount", str(mountpoint)], check=False)
+    except OSError as exc:
+        print(f"  WARN: baked-image refresh skipped ({exc})", file=sys.stderr)
 
 
 def _blkid_uuid(device: str) -> str | None:

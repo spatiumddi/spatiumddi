@@ -29,8 +29,12 @@ spec:
         app.kubernetes.io/name: dns-powerdns
         app.kubernetes.io/component: dns-powerdns
     spec:
+      {{- if not .Values.dns.useMetalLBVIP }}
+      # #272 Phase 5 — default path: bind :53 on the node IP. A DNS VIP
+      # drops hostNetwork in favour of the LoadBalancer Service below.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}
         # Phase 10 (#183) — per-role scheduling label.
@@ -81,8 +85,18 @@ metadata:
   labels:
     {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
     app.kubernetes.io/component: dns-powerdns
+  {{- if .Values.dns.useMetalLBVIP }}
+  annotations:
+    # #272 Phase 5 — pin the DNS resolver VIP from the MetalLB pool.
+    metallb.universe.tf/address-pool: {{ .Values.dns.vipPool | quote }}
+    metallb.universe.tf/loadBalancerIPs: {{ .Values.dns.vip | quote }}
+  {{- end }}
 spec:
+  {{- if .Values.dns.useMetalLBVIP }}
+  type: LoadBalancer
+  {{- else }}
   type: ClusterIP
+  {{- end }}
   selector:
     app.kubernetes.io/name: dns-powerdns
   ports:

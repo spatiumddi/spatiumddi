@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for SpatiumDDI control-plane leave trigger (#272 Phase 7b)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/272
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+PathChanged=/var/lib/spatiumddi/release-state/cluster-leave-pending
+
+[Install]
+WantedBy=multi-user.target

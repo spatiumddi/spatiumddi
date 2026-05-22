@@ -1,0 +1,15 @@
+[Unit]
+Description=Watch for SpatiumDDI control-plane join trigger (#272 Phase 7b)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/272
+# Installed appliances only — the trigger is written by the supervisor
+# via its release-state bind mount; never present on the live ISO.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# PathChanged fires on close-after-write. The supervisor atomically
+# renames a .new sibling onto the trigger, so this fires once per
+# promote, not on every incremental write.
+PathChanged=/var/lib/spatiumddi/release-state/cluster-join-pending
+
+[Install]
+WantedBy=multi-user.target

@@ -45,8 +45,16 @@ metadata:
   labels:
     {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
 rules:
+    # #272 — the supervisor scales the control plane + applies the
+    # MetalLB VIP by upserting HelmChartConfig CRs (overrides that
+    # helm-controller merges on top of the same-named HelmChart and
+    # that survive a k3s restart, unlike the auto-deploy manifest).
+    # helmchartconfigs MUST be here alongside helmcharts — without it
+    # ``apply_control_plane_overrides`` / ``apply_bootstrap_overrides``
+    # 403 on the GET, so a promote never scales workloads and the VIP
+    # never applies (regression caught on the #272 fresh-install test).
   - apiGroups: ["helm.cattle.io"]
-    resources: ["helmcharts"]
+    resources: ["helmcharts", "helmchartconfigs"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

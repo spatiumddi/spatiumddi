@@ -23,8 +23,26 @@ keywords:
   - k3s
 maintainers:
   - name: SpatiumDDI Contributors
-# No subchart dependencies — each role lives in its own template
-# under templates/<role>.yaml, gated on a top-level feature flag in
-# values.yaml. The supervisor's CRD reconciler (Phase 3) renders
-# values.yaml from the SpatiumApplianceRole spec + applies via the
-# k3s-builtin HelmChart CRD.
+# Subchart dependencies — #272 Phase 1 bundles MetalLB + CNPG as
+# helm dependencies. Both are gated behind ``<sub>.enabled: false``
+# in values.yaml so single-node installs leave them dormant and
+# behave identically to pre-#272. The supervisor's role-assignment
+# flow flips the right subset to ``true`` when promoting an
+# appliance into a multi-node control-plane cluster (Phase 7).
+#
+# The repo-level ``.gitignore`` keeps the vendored tarballs out of
+# git; ``appliance/scripts/bake-chart.sh`` and the release workflow
+# both ``helm dependency update`` before packaging so the published
+# .tgz carries the subcharts inline (air-gap render at runtime).
+# Refresh locally with:
+#   helm dependency update charts/spatiumddi-appliance
+dependencies:
+  - name: metallb
+    version: 0.16.0
+    repository: https://metallb.github.io/metallb
+    condition: metallb.enabled
+  - name: cloudnative-pg
+    alias: cnpg
+    version: 0.28.2
+    repository: https://cloudnative-pg.github.io/charts
+    condition: cnpg.enabled

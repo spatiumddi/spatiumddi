@@ -38,9 +38,12 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import re
+import secrets
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 
 import structlog
@@ -51,9 +54,9 @@ from cryptography.hazmat.primitives.serialization import (
     load_der_public_key,
 )
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func as sa_func
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import is_effective_superadmin, require_permission
@@ -61,6 +64,14 @@ from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
     APPLIANCE_STATE_REVOKED,
+    CLUSTER_JOIN_STATE_JOINING,
+    CLUSTER_JOIN_STATE_LEAVING,
+    CLUSTER_JOIN_STATE_LEFT,
+    CLUSTER_JOIN_STATE_READY,
+    CLUSTER_ROLE_MEMBER,
+    CLUSTER_ROLE_PRIMARY,
+    DESIRED_CLUSTER_ROLE_MEMBER,
+    DESIRED_CLUSTER_ROLE_NONE,
     Appliance,
     PairingClaim,
     PairingCode,
@@ -92,6 +103,48 @@ def _hash_code(code: str) -> str:
 
 def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
+
+
+# #272 Phase 1 — self-bootstrap path for the control-plane appliance.
+# The local supervisor calls
+# ``POST /api/v1/appliance/self-register-bootstrap`` with its
+# variant; the api gates on the host-mounted ``role-config`` (the
+# api itself has a bind mount of ``/etc/spatiumddi-host/role-
+# config`` per #209) so we can prove the caller is the local
+# supervisor by matching the variant claim against the file the
+# installer wrote. Only the control-plane node self-bootstraps (it IS
+# the control plane); an ``appliance`` pairs against a remote one.
+# Legacy ``full-stack`` / ``frontend-core`` accepted as aliases for a
+# not-yet-reinstalled box.
+_HOST_ROLE_CONFIG = Path("/etc/spatiumddi-host/role-config")
+_SELF_BOOTSTRAP_VARIANTS = frozenset({"control-plane", "full-stack", "frontend-core"})
+_SELF_BOOTSTRAP_CODE_TTL = timedelta(minutes=10)
+
+
+def _read_host_role() -> str | None:
+    """Parse ``ROLE=`` out of ``/etc/spatiumddi-host/role-config``.
+
+    Mirror of the supervisor's ``detect_appliance_variant`` — read by
+    the api via its #209 host bind mount. Returns None when the file
+    isn't mounted (docker / k8s) or the parsed value isn't one the
+    self-bootstrap gate recognises.
+    """
+    try:
+        text = _HOST_ROLE_CONFIG.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("ROLE="):
+            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            return value if value in _SELF_BOOTSTRAP_VARIANTS else None
+    return None
+
+
+def _gen_self_bootstrap_code() -> str:
+    """8-digit numeric pairing code, same shape the installer wizard
+    produces. ``secrets.choice`` for cryptographically-uniform
+    digits (no modulo bias from int conversion)."""
+    return "".join(secrets.choice("0123456789") for _ in range(_CODE_LENGTH))
 
 
 # ── Schemas ────────────────────────────────────────────────────────
@@ -150,6 +203,23 @@ class SupervisorRegisterRequest(BaseModel):
             "to filter role assignment options."
         ),
     )
+    # #272 Phase 1 — installer-role variant from
+    # /etc/spatiumddi-host/role-config:ROLE. Lets the control plane
+    # stamp ``appliance_variant`` + auto-assign the variant's fixed
+    # role set on the resulting Appliance row at register time
+    # instead of waiting for the first heartbeat. None for pre-#272
+    # supervisors.
+    appliance_variant: (
+        Literal[
+            "control-plane",
+            "appliance",
+            # legacy (pre-#272) — accepted from not-yet-reinstalled boxes
+            "full-stack",
+            "frontend-core",
+            "application",
+        ]
+        | None
+    ) = None
 
     @field_validator("pairing_code")
     @classmethod
@@ -258,6 +328,226 @@ async def _module_enabled(db: DB) -> bool:
     if row is None:
         return False
     return bool(row.supervisor_registration_enabled)
+
+
+# ── Self-bootstrap (full-stack / frontend-core) ────────────────────
+
+
+class SelfRegisterBootstrapRequest(BaseModel):
+    """Body for ``POST /appliance/self-register-bootstrap`` — the
+    local supervisor's first call on full-stack / frontend-core
+    variants, where the installer wizard didn't capture a pairing
+    code (the control plane IS local).
+
+    The supervisor claims its variant; the api validates against
+    the host-mounted ``role-config:ROLE`` before minting a code.
+    """
+
+    appliance_variant: Literal["control-plane", "full-stack", "frontend-core"]
+
+
+class SelfRegisterBootstrapResponse(BaseModel):
+    code: str = Field(min_length=_CODE_LENGTH, max_length=_CODE_LENGTH)
+    control_plane_url: str
+    expires_in_seconds: int
+
+
+@router.post(
+    "/self-register-bootstrap",
+    response_model=SelfRegisterBootstrapResponse,
+    summary=(
+        "Mint a pairing code for the local supervisor on full-stack / "
+        "frontend-core appliances (single-shot)"
+    ),
+)
+async def self_register_bootstrap(
+    body: SelfRegisterBootstrapRequest,
+    request: Request,
+    db: DB,
+) -> SelfRegisterBootstrapResponse:
+    """Mint a one-shot pairing code so the local supervisor can
+    register against its own control plane.
+
+    Gates (all required, in order):
+
+    1. Variant must be ``full-stack`` or ``frontend-core``.
+       ``application`` uses the operator-typed pairing code from
+       the installer wizard; this endpoint refuses to short-
+       circuit that flow.
+    2. The api's host bind mount ``/etc/spatiumddi-host/role-
+       config:ROLE`` must equal the requested variant. Proves the
+       caller has host access AND the host's installer-baked role
+       matches the claim. On non-appliance deploys the file isn't
+       mounted and the endpoint refuses outright.
+    3. No LIVE ``Appliance`` row may exist (``last_seen_at IS NOT
+       NULL``). Orphan rows (``last_seen_at IS NULL``) from a
+       botched earlier attempt get cleared on each call so the
+       endpoint is safe to re-fire when the supervisor lost its
+       local state. Multi-node HA (#272 Phase 7) provisions
+       additional supervisors through the operator-typed pairing-
+       code flow, not this endpoint.
+    4. Module gate (``supervisor_registration_enabled``) — same
+       gate the normal pair-and-register endpoint honours.
+
+    Failures collapse into 403 with a constant friction delay so
+    the gate decision doesn't leak via response-time delta. Hits
+    one of: variant mismatch / appliances already registered /
+    module disabled / role-config missing.
+
+    On success the response carries the cleartext pairing code +
+    the appliance-local control-plane URL (``https://localhost``).
+    The supervisor stamps these into its env and proceeds through
+    the normal ``/supervisor/register`` flow.
+
+    Note: this endpoint deliberately does NOT honour the
+    ``supervisor_registration_enabled`` module gate (which guards
+    the public ``/supervisor/register`` endpoint). The local
+    supervisor MUST be able to register or the appliance is
+    unusable; the operator-controlled module gate gets re-applied
+    once they reach the Fleet UI to control remote pairing.
+    Strong gates remain via host role-config + variant + single-
+    shot Appliance-count check below.
+    """
+    # Variant gate.
+    if body.appliance_variant not in _SELF_BOOTSTRAP_VARIANTS:
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="Self-bootstrap is only available for full-stack / frontend-core variants",
+        )
+
+    # Host role-config gate — read /etc/spatiumddi-host/role-config
+    # and verify ROLE matches what the caller claims. On non-appliance
+    # deploys the file doesn't exist and we refuse.
+    host_role = _read_host_role()
+    if host_role is None or host_role != body.appliance_variant:
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="Self-bootstrap unavailable on this host",
+        )
+
+    # Single-shot gate — refuse if any LIVE Appliance row exists.
+    # "Live" = at least one successful heartbeat (last_seen_at IS NOT
+    # NULL). Orphan rows from a botched earlier self-bootstrap (the
+    # supervisor minted a row, never finished register, then lost its
+    # local state — verified live on .199 after a Fleet-UI delete +
+    # service restart) leave a phantom row with last_seen_at=NULL
+    # that would otherwise lock this endpoint forever. Promotion of
+    # additional control-plane members (#272 Phase 7) uses operator-
+    # typed codes through the normal pairing flow, so this gate
+    # treats any heartbeating row as "real" and refuses.
+    live_count = await db.scalar(
+        select(sa_func.count(Appliance.id)).where(Appliance.last_seen_at.is_not(None))
+    )
+    if live_count and live_count > 0:
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="Live appliances already registered; self-bootstrap is single-shot",
+        )
+
+    # Clear orphan rows (last_seen_at IS NULL) before minting. These
+    # are leftovers from prior self-bootstrap attempts that didn't
+    # complete — leaving them would just confuse the Fleet UI with a
+    # ghost row that never resurrects. Audit-logged so the operator
+    # can trace what got removed if anything seemed odd.
+    orphan_rows = (
+        (await db.execute(select(Appliance).where(Appliance.last_seen_at.is_(None))))
+        .scalars()
+        .all()
+    )
+    for orphan in orphan_rows:
+        db.add(
+            AuditLog(
+                user_id=None,
+                user_display_name="anonymous supervisor",
+                auth_source="anonymous",
+                source_ip=_client_ip(request),
+                action="appliance.self_bootstrap_orphan_cleared",
+                resource_type="appliance",
+                resource_id=str(orphan.id),
+                resource_display=orphan.hostname or str(orphan.id),
+                result="ok",
+                old_value={
+                    "hostname": orphan.hostname,
+                    "state": orphan.state,
+                    "appliance_variant": orphan.appliance_variant,
+                },
+            )
+        )
+        await db.delete(orphan)
+
+    # Mint the code.
+    code = _gen_self_bootstrap_code()
+    expires_at = datetime.now(UTC) + _SELF_BOOTSTRAP_CODE_TTL
+    db.add(
+        PairingCode(
+            code_hash=_hash_code(code),
+            code_last_two=code[-2:],
+            expires_at=expires_at,
+            persistent=False,
+            enabled=True,
+            # The supervisor that consumes this code on
+            # /supervisor/register gets auto-approved (cert signed +
+            # state=approved). The operator doesn't have to manually
+            # approve their own local supervisor on full-stack /
+            # frontend-core — they'd have no other choice anyway.
+            auto_approve=True,
+            note=f"Self-bootstrap pairing code for {body.appliance_variant}",
+        )
+    )
+    # Atomically flip the supervisor_registration_enabled gate on so
+    # the supervisor's follow-up ``/supervisor/register`` call doesn't
+    # 404 against the same module gate that the public-endpoint
+    # default-off protects against. The operator can turn it off
+    # again in Settings once they're done pairing — single-shot
+    # on the self-bootstrap side (no further auto-enables) and the
+    # module gate works as before for any subsequent operator-driven
+    # remote pairings.
+    settings_row = (
+        await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    if settings_row is None:
+        db.add(PlatformSettings(id=1, supervisor_registration_enabled=True))
+    elif not settings_row.supervisor_registration_enabled:
+        settings_row.supervisor_registration_enabled = True
+    db.add(
+        AuditLog(
+            user_id=None,
+            user_display_name="anonymous supervisor",
+            auth_source="anonymous",
+            source_ip=_client_ip(request),
+            action="appliance.self_bootstrap_minted",
+            resource_type="pairing_code",
+            resource_id=code[-2:],
+            resource_display=f"self-bootstrap code (…{code[-2:]})",
+            result="ok",
+            new_value={
+                "appliance_variant": body.appliance_variant,
+                "expires_at": expires_at.isoformat(),
+            },
+        )
+    )
+    await db.commit()
+
+    logger.info(
+        "appliance.self_bootstrap.minted",
+        variant=body.appliance_variant,
+        code_last_two=code[-2:],
+        expires_at=expires_at.isoformat(),
+    )
+
+    # Return the in-cluster Service URL — ``https://localhost`` from
+    # inside a Kubernetes pod is the pod's own loopback, not the api.
+    # The supervisor will use this URL for every subsequent
+    # /supervisor/register + /supervisor/heartbeat call. http:// is
+    # fine inside the cluster — nothing exits the spatium namespace.
+    return SelfRegisterBootstrapResponse(
+        code=code,
+        control_plane_url="http://spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000",
+        expires_in_seconds=int(_SELF_BOOTSTRAP_CODE_TTL.total_seconds()),
+    )
 
 
 # ── Endpoint ───────────────────────────────────────────────────────
@@ -432,6 +722,15 @@ async def supervisor_register(
     # claim accounting lives in pairing_claim now (A3).
     appliance_id = uuid.uuid4()
     session_cleartext, session_hash = generate_session_token()
+    # #272 Phase 1 — stamp variant + auto-assign fixed roles at
+    # register time. Variant comes from /etc/spatiumddi-host/role-
+    # config:ROLE on the supervisor side; control plane uses it to
+    # populate ``Appliance.assigned_roles`` so the Fleet UI's
+    # Services chips render correctly without waiting for the
+    # operator to open the role-picker.
+    initial_assigned_roles: list[str] = []
+    if body.appliance_variant is not None:
+        initial_assigned_roles = list(_REGISTER_VARIANT_FIXED_ROLES.get(body.appliance_variant, []))
     appliance_row = Appliance(
         id=appliance_id,
         hostname=body.hostname,
@@ -444,8 +743,39 @@ async def supervisor_register(
         paired_from_ip=client_ip,
         paired_via_code_id=code_row.id,
         state=APPLIANCE_STATE_PENDING_APPROVAL,
+        appliance_variant=body.appliance_variant,
+        assigned_roles=initial_assigned_roles,
     )
     db.add(appliance_row)
+    # #272 Phase 1 — auto-approve when the consumed pairing code was
+    # minted by /self-register-bootstrap (i.e. the operator's own
+    # local supervisor on full-stack / frontend-core). The operator
+    # has no other choice but to approve themselves; doing it inline
+    # here saves a click + makes the Fleet row green from the first
+    # render. Operator-typed pairing codes from the Fleet → Pairing
+    # tab keep ``auto_approve=False`` so manual approval stays the
+    # norm for any remote pairing.
+    if code_row.auto_approve:
+        await _approve_appliance_inline(db, appliance_row, approved_by_user_id=None)
+        db.add(
+            AuditLog(
+                user_id=None,
+                user_display_name=body.hostname,
+                auth_source="self_bootstrap",
+                source_ip=client_ip,
+                action="appliance.auto_approved",
+                resource_type="appliance",
+                resource_id=str(appliance_id),
+                resource_display=body.hostname,
+                result="success",
+                new_value={
+                    "hostname": body.hostname,
+                    "fingerprint": pubkey_fingerprint,
+                    "appliance_variant": body.appliance_variant,
+                    "cert_serial": appliance_row.cert_serial,
+                },
+            )
+        )
     db.add(
         PairingClaim(
             pairing_code_id=code_row.id,
@@ -507,7 +837,9 @@ async def supervisor_register(
 
     return SupervisorRegisterResponse(
         appliance_id=appliance_id,
-        state=APPLIANCE_STATE_PENDING_APPROVAL,
+        # The auto-approve branch above flipped row.state to
+        # ``approved``; otherwise stays at ``pending_approval``.
+        state=appliance_row.state,  # type: ignore[arg-type]
         public_key_fingerprint=pubkey_fingerprint,
         session_token=session_cleartext,
     )
@@ -600,6 +932,21 @@ class SupervisorHeartbeatRequest(BaseModel):
     session_token: str | None = None
     capabilities: SupervisorCapabilities | None = None
     deployment_kind: Literal["appliance", "docker", "k8s", "unknown"] | None = None
+    # #272 Phase 1 — installer-role variant read by the supervisor from
+    # ``/etc/spatiumddi-host/role-config:ROLE``. None on pre-#272
+    # supervisors; the persistence handler leaves the column
+    # untouched in that case (no nulling of an existing variant).
+    appliance_variant: (
+        Literal[
+            "control-plane",
+            "appliance",
+            # legacy (pre-#272) — accepted from not-yet-reinstalled boxes
+            "full-stack",
+            "frontend-core",
+            "application",
+        ]
+        | None
+    ) = None
     installed_appliance_version: str | None = None
     current_slot: Literal["slot_a", "slot_b"] | None = None
     durable_default: Literal["slot_a", "slot_b"] | None = None
@@ -657,6 +1004,29 @@ class SupervisorHeartbeatRequest(BaseModel):
     # (ISO-8601 UTC). None when not k3s; the heartbeat handler
     # leaves the column untouched in that case.
     k3s_api_cert_expires_at: datetime | None = None
+    # #272 Phase 7 — control-plane cluster membership.
+    # ``k3s_join_token`` is the seed's node-token (read by the PRIMARY's
+    # supervisor from /var/lib/rancher/k3s/server/token); the backend
+    # Fernet-encrypts it and the promote endpoint hands it to joiners.
+    # Only the primary reports it; None elsewhere (leaves the column
+    # untouched). ``cluster_join_state`` / ``cluster_join_reason`` are
+    # the joiner/leaver's progress report (joining / ready / leaving /
+    # left / failed) that drives the desired-state auto-clear.
+    k3s_join_token: str | None = None
+    cluster_join_state: str | None = None
+    cluster_join_reason: str | None = None
+    # #272 Phase 7b — the node's real routable k3s InternalIP. Distinct
+    # from ``last_seen_ip`` (the supervisor POD's source IP, 10.42.x.x,
+    # since it heartbeats from inside the cluster). The promote endpoint
+    # builds the join URL from the seed's ``node_ip``. None on
+    # non-appliance / non-k3s; the handler leaves the column untouched.
+    node_ip: str | None = None
+    # #272 Phase 9 — dead-node replacement. The SEED supervisor reports
+    # the hostnames of k8s Nodes it successfully evicted (deleting the
+    # Node makes k3s drop the etcd member). The handler clears
+    # ``evict_requested`` + settles those rows to ``left``. Empty on
+    # every non-seed heartbeat + when there's nothing to evict.
+    evicted_node_names: list[str] = Field(default_factory=list)
 
 
 class SupervisorRoleAssignment(BaseModel):
@@ -749,6 +1119,48 @@ class SupervisorHeartbeatResponse(BaseModel):
     # service containers via docker compose. Empty roles list = idle
     # (approved but no service running).
     role_assignment: SupervisorRoleAssignment = Field(default_factory=SupervisorRoleAssignment)
+    # #272 Phase 7 — control-plane promote/demote desired state.
+    # ``desired_cluster_role`` = "member" → join the seed via
+    # ``desired_k3s_server_url`` + ``desired_k3s_join_token``; "none" →
+    # leave the cluster + revert to a plain application appliance.
+    # NULL = no change. The token is the plaintext node-token (the
+    # heartbeat channel is mTLS); the supervisor's host-side runner
+    # (Phase 7b) reconfigures k3s + reports back via cluster_join_state.
+    desired_cluster_role: Literal["member", "none"] | None = None
+    desired_k3s_server_url: str | None = None
+    desired_k3s_join_token: str | None = None
+    # #272 Phase 7b — the node IPs (as ``/32`` CIDRs) of every OTHER
+    # control-plane peer this node must reach (and be reachable from) on
+    # the k3s server ports (6443 apiserver, 2379/2380 etcd, 10250
+    # kubelet). The base appliance firewall only opens :6443 from the pod
+    # CIDR, so cross-node server traffic (the join handshake + etcd
+    # quorum) is dropped without this. The supervisor renders an
+    # nftables drop-in opening those ports from these peers. Empty on a
+    # single-node / non-control-plane appliance.
+    cluster_peer_cidrs: list[str] = Field(default_factory=list)
+    # #277 — the committed control-plane size (count of settled
+    # primary + member nodes, floored at 1). The seed's supervisor
+    # patches the spatium-control HelmChart's ``# spatium:cp-size`` lines
+    # to this so the CNPG postgres cluster + api/frontend/worker
+    # Deployments scale with the cluster (1 instance single-node →
+    # 3/5/7 with streaming replicas + failover after promote).
+    control_plane_size: int = 1
+    # #272 Phase 7c — cluster-wide MetalLB / control-plane-VIP desired
+    # state (from platform_settings). Returned to every supervisor but
+    # acted on only by the seed (control-plane variant): it patches
+    # ``metallb.*`` on spatium-bootstrap + ``frontend.controlPlaneVIP``
+    # on spatium-control. Disabled / empty = no VIP (hostNetwork
+    # frontend), the single-node default.
+    desired_metallb_enabled: bool = False
+    desired_metallb_pool_addresses: list[str] = Field(default_factory=list)
+    desired_control_plane_vip: str = ""
+    # #272 Phase 9 — dead-node replacement. Hostnames of k8s Nodes the
+    # SEED should evict (delete the Node → k3s removes the etcd member).
+    # Populated from rows flagged ``evict_requested``; only the
+    # control-plane-variant seed acts on it. The supervisor reports the
+    # ones it deleted back via ``evicted_node_names`` so the backend
+    # clears the flag. Empty in the steady state.
+    evict_node_names: list[str] = Field(default_factory=list)
 
 
 @router.post(
@@ -859,6 +1271,11 @@ async def supervisor_heartbeat(
     # doesn't currently know about.
     if body.deployment_kind is not None:
         row.deployment_kind = body.deployment_kind
+    if body.appliance_variant is not None:
+        # #272 Phase 1 — supervisor reads /etc/spatiumddi-host/role-
+        # config:ROLE and reports here. Leave the existing value alone
+        # if the supervisor didn't ship the field this tick (pre-#272).
+        row.appliance_variant = body.appliance_variant
     if body.installed_appliance_version is not None:
         row.installed_appliance_version = body.installed_appliance_version
     if body.current_slot is not None:
@@ -921,16 +1338,19 @@ async def supervisor_heartbeat(
         from app.core.crypto import encrypt_str  # noqa: PLC0415
 
         # Rewrite ``server: https://127.0.0.1:6443`` → the appliance's
-        # last-seen IP so the operator's downloaded kubeconfig
-        # actually works against the appliance over the wire. Falls
-        # back to localhost when last_seen_ip is unknown (operator
-        # can edit themselves). Same IP we surface in the row chip.
+        # real node IP so the operator's downloaded kubeconfig actually
+        # works against the appliance over the wire. Prefer the
+        # k3s-registered ``node_ip`` over ``last_seen_ip`` — the latter
+        # is the supervisor POD's source IP (10.42.x.x), which the
+        # operator can't reach. Falls back to localhost when neither is
+        # known (operator can edit themselves).
         rewritten = body.kubeconfig
-        if row.last_seen_ip:
+        kubeconfig_host = body.node_ip or row.node_ip or row.last_seen_ip
+        if kubeconfig_host:
             # k3s.yaml's server line is structured + greppable; the
             # supervisor doesn't run a port-7443 listener so 6443 is
             # always the right target port.
-            new_server = f"server: https://{row.last_seen_ip}:6443"
+            new_server = f"server: https://{kubeconfig_host}:6443"
             rewritten = re.sub(
                 r"server:\s*https://127\.0\.0\.1:6443",
                 new_server,
@@ -942,6 +1362,65 @@ async def supervisor_heartbeat(
                 rewritten,
             )
         row.kubeconfig_encrypted = encrypt_str(rewritten)
+
+    # #272 Phase 7 — persist control-plane cluster telemetry.
+    if body.k3s_join_token is not None:
+        from app.core.crypto import encrypt_str  # noqa: PLC0415
+
+        # Only the primary reports a token; store it Fernet-encrypted so
+        # the promote endpoint can hand it to joiners.
+        row.k3s_join_token_encrypted = encrypt_str(body.k3s_join_token)
+    if body.cluster_join_state is not None:
+        row.cluster_join_state = body.cluster_join_state
+        row.cluster_join_reason = body.cluster_join_reason
+    # The node's real routable InternalIP — used by the promote endpoint
+    # for the join URL + the cross-node firewall peer set. Only update
+    # when the supervisor sourced it (k3s appliances); None leaves the
+    # column untouched.
+    if body.node_ip is not None:
+        row.node_ip = body.node_ip
+
+    # #272 Phase 9 — the seed reports k8s Nodes it evicted (dead-node
+    # replacement). Clear the flag + settle those rows to ``left`` so
+    # they stop appearing in the seed's evict list on the next tick.
+    if body.evicted_node_names:
+        evicted = (
+            (
+                await db.execute(
+                    select(Appliance).where(
+                        Appliance.hostname.in_(body.evicted_node_names),
+                        Appliance.evict_requested.is_(True),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for ev in evicted:
+            ev.evict_requested = False
+            ev.cluster_join_state = CLUSTER_JOIN_STATE_LEFT
+            logger.info("control_plane_node_evicted", hostname=ev.hostname, by=str(row.id))
+
+    # Auto-clear the promote desired-state once the join landed: the
+    # supervisor reports ``ready`` → the node IS a member now, so settle
+    # cluster_role and drop the (sensitive) join coordinates.
+    if (
+        row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+        and row.cluster_join_state == CLUSTER_JOIN_STATE_READY
+    ):
+        row.cluster_role = CLUSTER_ROLE_MEMBER
+        row.desired_cluster_role = None
+        row.desired_k3s_server_url = None
+        row.desired_k3s_join_token_encrypted = None
+    # Auto-clear the demote desired-state once the leave landed: the
+    # supervisor reports ``left`` → the node is back to a plain
+    # application appliance.
+    if (
+        row.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
+        and row.cluster_join_state == CLUSTER_JOIN_STATE_LEFT
+    ):
+        row.cluster_role = None
+        row.desired_cluster_role = None
 
     # Auto-clear desired_appliance_version once installed matches +
     # the upgrade landed cleanly. Same shape as #138 Phase 8f-4's
@@ -1001,6 +1480,56 @@ async def supervisor_heartbeat(
         ca = await ensure_ca(db)
         ca_chain_pem = ca.cert_pem
 
+    # #272 Phase 7 — decrypt the join token for the joiner (mTLS channel).
+    desired_join_token: str | None = None
+    if (
+        row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+        and row.desired_k3s_join_token_encrypted is not None
+    ):
+        from app.core.crypto import decrypt_str  # noqa: PLC0415
+
+        try:
+            desired_join_token = decrypt_str(row.desired_k3s_join_token_encrypted)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "supervisor_heartbeat_join_token_decrypt_failed", appliance_id=str(row.id)
+            )
+
+    # #272 Phase 7b — the cross-node firewall peer set this node must
+    # open its k3s server ports to (empty unless row is a CP node).
+    cluster_peer_cidrs = await _cluster_peer_cidrs(db, row)
+
+    # #277 — committed control-plane size (settled primary + members,
+    # floored at 1). The seed supervisor scales CNPG instances +
+    # workload replicas to this.
+    control_plane_size = await _committed_cp_count(db)
+
+    # #272 Phase 7c — cluster-wide MetalLB / VIP desired state. Read
+    # from the platform_settings singleton; the seed supervisor applies
+    # it to the HelmCharts. Best-effort — a missing settings row (never
+    # the case in practice; seeded at startup) renders the disabled
+    # default so the heartbeat still succeeds.
+    cfg_row = (
+        await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    metallb_enabled = bool(cfg_row.metallb_enabled) if cfg_row else False
+    metallb_pool = list(cfg_row.metallb_pool_addresses or []) if cfg_row else []
+    metallb_vip = (cfg_row.control_plane_vip or "") if cfg_row else ""
+
+    # #272 Phase 9 — dead k8s Nodes the seed should evict. Returned to
+    # every CP supervisor but only the control-plane-variant seed acts.
+    evict_names = [
+        h
+        for (h,) in (
+            await db.execute(
+                select(Appliance.hostname).where(
+                    Appliance.evict_requested.is_(True),
+                    Appliance.hostname.isnot(None),
+                )
+            )
+        ).all()
+    ]
+
     return SupervisorHeartbeatResponse(
         appliance_id=row.id,
         state=row.state,  # type: ignore[arg-type]
@@ -1013,6 +1542,15 @@ async def supervisor_heartbeat(
         ca_chain_pem=ca_chain_pem,
         cert_expires_at=row.cert_expires_at,
         role_assignment=role_assignment,
+        desired_cluster_role=row.desired_cluster_role,  # type: ignore[arg-type]
+        desired_k3s_server_url=row.desired_k3s_server_url,
+        desired_k3s_join_token=desired_join_token,
+        cluster_peer_cidrs=cluster_peer_cidrs,
+        control_plane_size=control_plane_size,
+        desired_metallb_enabled=metallb_enabled,
+        desired_metallb_pool_addresses=metallb_pool,
+        desired_control_plane_vip=metallb_vip,
+        evict_node_names=evict_names,
     )
 
 
@@ -1101,6 +1639,9 @@ class ApplianceRow(BaseModel):
     cert_expires_at: datetime | None
     # #170 Wave C1 — slot telemetry surfaced from the appliance row.
     deployment_kind: str | None
+    # #272 Phase 1 — installer-role variant. NULL on pre-#272
+    # supervisors that haven't slot-upgraded yet.
+    appliance_variant: str | None
     installed_appliance_version: str | None
     current_slot: str | None
     durable_default: str | None
@@ -1153,6 +1694,14 @@ class ApplianceRow(BaseModel):
     # Issue #183 Phase 6 — operator-controlled CIDR allowlist for
     # direct kubeapi access on tcp/6443. Empty = proxy-only.
     kubeapi_expose_cidrs: list[str]
+    # #272 Phase 7 — control-plane cluster membership. ``cluster_role``
+    # is the settled role (primary / member / null); ``desired_*`` +
+    # ``cluster_join_state`` reflect an in-flight promote/demote so the
+    # Fleet UI can show a "joining…" / "leaving…" / "failed" chip.
+    cluster_role: str | None = None
+    desired_cluster_role: str | None = None
+    cluster_join_state: str | None = None
+    cluster_join_reason: str | None = None
     # #170 Wave E follow-up — soft-delete timestamp. Non-null on
     # ``state=revoked`` rows; cleared by re-authorize.
     revoked_at: datetime | None = None
@@ -1190,6 +1739,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         cert_issued_at=row.cert_issued_at,
         cert_expires_at=row.cert_expires_at,
         deployment_kind=row.deployment_kind,
+        appliance_variant=row.appliance_variant,
         installed_appliance_version=row.installed_appliance_version,
         current_slot=row.current_slot,
         durable_default=row.durable_default,
@@ -1220,6 +1770,10 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         kubeconfig_set=row.kubeconfig_encrypted is not None,
         k3s_api_cert_expires_at=row.k3s_api_cert_expires_at,
         kubeapi_expose_cidrs=list(row.kubeapi_expose_cidrs or []),
+        cluster_role=row.cluster_role,
+        desired_cluster_role=row.desired_cluster_role,
+        cluster_join_state=row.cluster_join_state,
+        cluster_join_reason=row.cluster_join_reason,
         revoked_at=row.revoked_at,
         created_at=row.created_at,
     )
@@ -1253,6 +1807,57 @@ async def get_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: 
     return _row_to_schema(row)
 
 
+async def _approve_appliance_inline(
+    db: DB,
+    row: Appliance,
+    approved_by_user_id: uuid.UUID | None,
+) -> None:
+    """Sign + persist a supervisor cert on the row, transition to
+    ``approved``. Shared by the operator-driven
+    /appliances/{id}/approve endpoint and the auto-approve path
+    that /supervisor/register hits for self-bootstrap codes (#272
+    Phase 1).
+
+    Caller commits. Idempotent on already-approved rows.
+    """
+    if row.state == APPLIANCE_STATE_APPROVED:
+        return
+    ca = await ensure_ca(db)
+    cert_pem, serial_hex, issued_at, expires_at = sign_supervisor_cert(
+        ca=ca,
+        appliance_id=row.id,
+        public_key_der=row.public_key_der,
+        public_key_fingerprint=row.public_key_fingerprint,
+        hostname=row.hostname,
+    )
+    row.cert_pem = cert_pem
+    row.cert_serial = serial_hex
+    row.cert_issued_at = issued_at
+    row.cert_expires_at = expires_at
+    row.state = APPLIANCE_STATE_APPROVED
+    row.approved_at = issued_at
+    row.approved_by_user_id = approved_by_user_id
+
+
+# #272 — per-variant DEFAULT role set the api stamps on
+# ``Appliance.assigned_roles`` when a supervisor registers.
+#
+# DNS/DHCP are NOT auto-assigned to the control-plane node: the
+# operator turns them on per node via the Fleet role toggle, so the
+# data plane is always a deliberate fleet decision and a fresh control
+# plane ships pure-control. Every variant therefore defaults to an
+# empty role set. Kept as a table (rather than dropped) for the
+# auto-assign mechanism + so a future variant can default differently.
+# Legacy variant strings map to the same empty default.
+_REGISTER_VARIANT_FIXED_ROLES: dict[str, list[str]] = {
+    "control-plane": [],
+    "appliance": [],
+    "full-stack": [],
+    "frontend-core": [],
+    "application": [],
+}
+
+
 @router.post(
     "/appliances/{appliance_id}/approve",
     response_model=ApplianceRow,
@@ -1274,24 +1879,9 @@ async def approve_appliance(
     if row.state == APPLIANCE_STATE_APPROVED:
         return _row_to_schema(row)  # idempotent
 
-    # Lazy CA bootstrap — first approve on a fresh control plane
-    # generates the singleton.
-    ca = await ensure_ca(db)
-
-    cert_pem, serial_hex, issued_at, expires_at = sign_supervisor_cert(
-        ca=ca,
-        appliance_id=row.id,
-        public_key_der=row.public_key_der,
-        public_key_fingerprint=row.public_key_fingerprint,
-        hostname=row.hostname,
-    )
-    row.cert_pem = cert_pem
-    row.cert_serial = serial_hex
-    row.cert_issued_at = issued_at
-    row.cert_expires_at = expires_at
-    row.state = APPLIANCE_STATE_APPROVED
-    row.approved_at = issued_at
-    row.approved_by_user_id = current_user.id
+    await _approve_appliance_inline(db, row, current_user.id)
+    serial_hex = row.cert_serial or ""
+    expires_at = row.cert_expires_at
     # Session token cleared — supervisor now uses mTLS. Keep the
     # current value on disk so an in-flight /poll succeeds before the
     # supervisor learns to switch; B3's UI will clarify the transition.
@@ -1313,7 +1903,7 @@ async def approve_appliance(
                 "hostname": row.hostname,
                 "fingerprint": row.public_key_fingerprint,
                 "cert_serial": serial_hex,
-                "cert_expires_at": expires_at.isoformat(),
+                "cert_expires_at": expires_at.isoformat() if expires_at else None,
             },
         )
     )
@@ -1438,6 +2028,41 @@ async def delete_appliance(
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+
+    # #272 — refuse revoking the only control-plane node. It runs THIS
+    # control plane (api / db / frontend) AND is the etcd seed; revoking
+    # it makes its heartbeats 403, trips the supervisor's revocation
+    # detector, and tears the control plane down — bricking the cluster.
+    # A control-plane node must be demoted (or another promoted) first.
+    def _is_control_plane(a: Appliance) -> bool:
+        return a.appliance_variant in _SELF_BOOTSTRAP_VARIANTS or a.cluster_role in (
+            CLUSTER_ROLE_PRIMARY,
+            CLUSTER_ROLE_MEMBER,
+        )
+
+    if _is_control_plane(row):
+        other_cp = (
+            await db.execute(
+                select(sa_func.count())
+                .select_from(Appliance)
+                .where(
+                    Appliance.id != row.id,
+                    Appliance.state != APPLIANCE_STATE_REVOKED,
+                    or_(
+                        Appliance.appliance_variant.in_(tuple(_SELF_BOOTSTRAP_VARIANTS)),
+                        Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                    ),
+                )
+            )
+        ).scalar() or 0
+        if other_cp == 0:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Refusing to revoke the only control-plane node — it runs the "
+                "control plane and is the etcd seed. Promote another node first, "
+                "or factory-reset / reinstall this box to decommission it.",
+            )
+
     state_at_delete = row.state
     row.state = APPLIANCE_STATE_REVOKED
     row.revoked_at = datetime.now(UTC)
@@ -1842,6 +2467,700 @@ async def update_appliance_roles(
         user=current_user.username,
     )
     return _row_to_schema(row)
+
+
+# ── Admin: control-plane promotion (#272 Phase 7) ────────────────
+
+
+class ControlPlaneMembersRequest(BaseModel):
+    """Batch promote/demote payload — a list of appliance IDs.
+
+    k3s embedded-etcd HA wants odd server counts (1 / 3 / 5 / 7), so
+    promotion is done in batches that land on an odd total instead of
+    one-at-a-time (which would pause at a fragile even count). The
+    endpoint validates the RESULTING committed-or-in-flight member
+    count is odd and refuses otherwise (operator sees it inline).
+    """
+
+    appliance_ids: list[uuid.UUID] = Field(..., min_length=1)
+
+
+async def _effective_cp_members(db: DB) -> list[Appliance]:
+    """Every appliance that is, or is becoming, a control-plane member.
+
+    Counts settled members (``cluster_role`` in primary/member) PLUS
+    in-flight joiners (``desired_cluster_role='member'``) and excludes
+    in-flight leavers (``desired_cluster_role='none'``) — so two
+    overlapping promote calls can't both think the cluster is still at
+    1 and each add 2 (→ silently landing at 5).
+    """
+    rows = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    or_(
+                        Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                        Appliance.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER,
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [r for r in rows if r.desired_cluster_role != DESIRED_CLUSTER_ROLE_NONE]
+
+
+async def _committed_cp_count(db: DB) -> int:
+    """Count of SETTLED control-plane nodes (``cluster_role`` in
+    primary/member), floored at 1 (#277).
+
+    Used to scale the CNPG postgres cluster + control-plane workload
+    replicas. Counts only settled members — NOT in-flight joiners
+    (``desired_cluster_role='member'`` but ``cluster_role`` still NULL)
+    — so CNPG doesn't try to provision a replica for a node that hasn't
+    finished joining + getting labeled yet. Floored at 1 so a fresh
+    single-node install (seed's cluster_role still NULL pre-promote)
+    renders instances=1, not 0.
+    """
+    n = (
+        await db.execute(
+            select(sa_func.count())
+            .select_from(Appliance)
+            .where(
+                Appliance.state == APPLIANCE_STATE_APPROVED,
+                Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+            )
+        )
+    ).scalar() or 0
+    return max(1, int(n))
+
+
+async def _cluster_peer_cidrs(db: DB, row: Appliance) -> list[str]:
+    """``/32`` CIDRs of every OTHER control-plane peer ``row`` must open
+    its k3s server ports to (#272 Phase 7b).
+
+    Only meaningful when ``row`` is itself a control-plane node — a
+    settled member/primary, or a node mid-promotion
+    (``desired_cluster_role='member'``). In-flight joiners need the peer
+    set too: the seed must open :6443 to the joiner BEFORE it connects,
+    and the joiner must open etcd ports back. Returns an empty list for
+    plain application appliances + single-node installs (no peers).
+    """
+    is_cp = (
+        row.cluster_role in (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+        or row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+    )
+    if not is_cp:
+        return []
+    members = await _effective_cp_members(db)
+    return sorted(f"{m.node_ip}/32" for m in members if m.id != row.id and m.node_ip)
+
+
+async def _resolve_primary(db: DB, members: list[Appliance]) -> Appliance | None:
+    """Return the etcd seed (``cluster_role='primary'``), designating
+    one on the first promote.
+
+    On a fresh single-node install no row carries ``cluster_role`` yet.
+    The seed is the lone approved control-plane appliance (full-stack /
+    frontend-core); designate it primary so subsequent joiners point at
+    it. Ambiguous (0 or >1 candidates) → caller raises 409.
+    """
+    for m in members:
+        if m.cluster_role == CLUSTER_ROLE_PRIMARY:
+            return m
+    candidates = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    Appliance.appliance_variant.in_(
+                        ("control-plane", "full-stack", "frontend-core")
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(candidates) == 1:
+        candidates[0].cluster_role = CLUSTER_ROLE_PRIMARY
+        return candidates[0]
+    return None
+
+
+@router.post(
+    "/fleet/control-plane/promote",
+    response_model=ApplianceList,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Promote application appliances into the control-plane cluster (superadmin)",
+)
+async def promote_control_plane(
+    body: ControlPlaneMembersRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceList:
+    """Batch-promote the given appliances to k3s control-plane members.
+
+    Stamps each with the seed's join coordinates (server URL + token);
+    the supervisor's host-side runner reconfigures k3s + reports back
+    via ``cluster_join_state``. Refuses a batch that wouldn't land on an
+    odd total member count (etcd quorum hygiene).
+    """
+    _require_superadmin(current_user)
+
+    members = await _effective_cp_members(db)
+    primary = await _resolve_primary(db, members)
+    if primary is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "No single control-plane seed found to join. Exactly one approved "
+            "full-stack / frontend-core appliance is required as the etcd seed.",
+        )
+    if primary.k3s_join_token_encrypted is None or not primary.node_ip:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The control-plane seed hasn't reported its k3s join token / node IP yet — "
+            "wait for its next heartbeat and retry. (The join URL needs the seed's real "
+            "node IP, not the supervisor pod IP.)",
+        )
+
+    # Count the seed even when it was just designated (cluster_role was
+    # NULL on a fresh single-node install, so it isn't in ``members``).
+    current_count = len({m.id for m in members} | {primary.id})
+    targets: list[Appliance] = []
+    seen: set[uuid.UUID] = set()
+    for aid in body.appliance_ids:
+        if aid in seen:
+            continue
+        seen.add(aid)
+        row = await db.get(Appliance, aid)
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Appliance {aid} not found.")
+        if row.id == primary.id:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Appliance {row.hostname!r} is the control-plane seed; it's already a member.",
+            )
+        if row.state != APPLIANCE_STATE_APPROVED:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Appliance {row.hostname!r} is in state {row.state!r}; approve it first.",
+            )
+        if row.cluster_role is not None or row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Appliance {row.hostname!r} is already a control-plane member (or joining).",
+            )
+        # A control-plane-variant node is already a control plane — you
+        # can't promote a control plane to a control plane. (The seed is
+        # caught by the primary check above; this catches any other
+        # control-plane-variant box, designated or not.)
+        if row.appliance_variant in _SELF_BOOTSTRAP_VARIANTS:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Appliance {row.hostname!r} is a control-plane node "
+                f"(variant {row.appliance_variant!r}) — it's already a control plane, "
+                "not promotable. Only Appliance-role nodes join as members.",
+            )
+        if row.deployment_kind != "appliance":
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Appliance {row.hostname!r} (deployment_kind={row.deployment_kind!r}) can't join "
+                "a k3s control-plane cluster — only OS-appliance nodes can.",
+            )
+        targets.append(row)
+
+    new_total = current_count + len(targets)
+    if new_total % 2 == 0:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Promoting {len(targets)} appliance(s) would leave the control-plane cluster at "
+            f"{new_total} members. etcd HA wants an ODD count (1 / 3 / 5 / 7) — promote "
+            f"{'one fewer' if len(targets) > 1 else 'one more'} so the total is odd.",
+        )
+
+    # Build the join URL from the seed's REAL node IP, never
+    # ``last_seen_ip`` (the supervisor pod IP, 10.42.x.x — unreachable
+    # by joiners). ``node_ip`` is the k3s-registered InternalIP the
+    # supervisor reports on heartbeat.
+    server_url = f"https://{primary.node_ip}:6443"
+    for row in targets:
+        row.desired_cluster_role = DESIRED_CLUSTER_ROLE_MEMBER
+        row.desired_k3s_server_url = server_url
+        row.desired_k3s_join_token_encrypted = primary.k3s_join_token_encrypted
+        row.cluster_join_state = CLUSTER_JOIN_STATE_JOINING
+        row.cluster_join_reason = None
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="appliance.control_plane_promoted",
+                resource_type="appliance",
+                resource_id=str(row.id),
+                resource_display=row.hostname,
+                result="success",
+                new_value={"server_url": server_url, "new_total_members": new_total},
+            )
+        )
+    await db.commit()
+    logger.info(
+        "control_plane_promote",
+        primary=str(primary.id),
+        promoted=[str(r.id) for r in targets],
+        new_total=new_total,
+        user=current_user.username,
+    )
+    return ApplianceList(appliances=[_row_to_schema(r) for r in targets])
+
+
+@router.post(
+    "/fleet/control-plane/demote",
+    response_model=ApplianceList,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Demote control-plane members back to application appliances (superadmin)",
+)
+async def demote_control_plane(
+    body: ControlPlaneMembersRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceList:
+    """Batch-demote the given control-plane members back to application
+    appliances. Refuses a batch that would leave the cluster at an even
+    count, and refuses demoting the seed (use a dedicated seed-migration
+    flow for that — out of scope for Phase 7)."""
+    _require_superadmin(current_user)
+
+    members = await _effective_cp_members(db)
+    current_count = len(members)
+
+    targets: list[Appliance] = []
+    seen: set[uuid.UUID] = set()
+    for aid in body.appliance_ids:
+        if aid in seen:
+            continue
+        seen.add(aid)
+        row = await db.get(Appliance, aid)
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Appliance {aid} not found.")
+        if row.cluster_role == CLUSTER_ROLE_PRIMARY:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Appliance {row.hostname!r} is the etcd seed and can't be demoted here.",
+            )
+        if row.cluster_role != CLUSTER_ROLE_MEMBER:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Appliance {row.hostname!r} isn't a control-plane member.",
+            )
+        targets.append(row)
+
+    remaining = current_count - len(targets)
+    if remaining % 2 == 0:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Demoting {len(targets)} appliance(s) would leave the control-plane cluster at "
+            f"{remaining} members. etcd HA wants an ODD count (1 / 3 / 5 / 7) — demote "
+            f"{'one fewer' if len(targets) > 1 else 'one more'} so the remainder is odd.",
+        )
+
+    for row in targets:
+        row.desired_cluster_role = DESIRED_CLUSTER_ROLE_NONE
+        row.cluster_join_state = CLUSTER_JOIN_STATE_LEAVING
+        row.cluster_join_reason = None
+        # The join coordinates aren't needed for a leave; clear any stale ones.
+        row.desired_k3s_server_url = None
+        row.desired_k3s_join_token_encrypted = None
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="appliance.control_plane_demoted",
+                resource_type="appliance",
+                resource_id=str(row.id),
+                resource_display=row.hostname,
+                result="success",
+                new_value={"remaining_members": remaining},
+            )
+        )
+    await db.commit()
+    logger.info(
+        "control_plane_demote",
+        demoted=[str(r.id) for r in targets],
+        remaining=remaining,
+        user=current_user.username,
+    )
+    return ApplianceList(appliances=[_row_to_schema(r) for r in targets])
+
+
+# ── Admin: dead-node replacement (#272 Phase 9) ──────────────────
+
+
+class ControlPlaneReplaceResponse(BaseModel):
+    """Result of replacing a dead control-plane member.
+
+    The dead row is flagged for eviction (the seed deletes its k8s Node
+    on the next heartbeat, which makes k3s drop the etcd member) and a
+    fresh single-use pairing code is minted so a replacement appliance
+    can pair → be approved → be promoted into the freed slot.
+    """
+
+    evicted: ApplianceRow
+    pairing_code: str
+    pairing_expires_at: datetime
+
+
+@router.post(
+    "/fleet/control-plane/{appliance_id}/replace",
+    response_model=ControlPlaneReplaceResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Replace a dead control-plane member — evict + mint a pairing code (superadmin)",
+)
+async def replace_control_plane_member(
+    appliance_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+) -> ControlPlaneReplaceResponse:
+    """Recover a control-plane node that died ungracefully.
+
+    Unlike demote (which the leaving node's own supervisor drives), a
+    dead node can't wipe itself — so the SEED evicts it: this endpoint
+    flags the row ``evict_requested`` + drops it from the cluster
+    accounting, the seed supervisor deletes the k8s Node on its next
+    heartbeat (k3s removes the etcd member with it), and a single-use
+    pairing code is minted for the replacement box. Refuses the etcd
+    seed (migrating the seed is a separate flow) and any row that isn't
+    a settled control-plane member.
+    """
+    _require_superadmin(current_user)
+
+    from app.api.v1.appliance.pairing import _generate_code, _hash_code  # noqa: PLC0415
+    from app.models.appliance import PairingCode  # noqa: PLC0415
+
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Appliance {appliance_id} not found.")
+    if row.cluster_role == CLUSTER_ROLE_PRIMARY:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Appliance {row.hostname!r} is the etcd seed — replacing the seed is a "
+            "separate migration flow, out of scope here.",
+        )
+    if row.cluster_role != CLUSTER_ROLE_MEMBER:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Appliance {row.hostname!r} isn't a settled control-plane member — nothing "
+            "to evict. (Demote in-flight joiners; this is for replacing a dead member.)",
+        )
+
+    # Drop the dead member from the cluster accounting + flag it for the
+    # seed to evict. Keep the hostname (the seed deletes the Node by
+    # name); clear the join coordinates + role.
+    row.cluster_role = None
+    row.desired_cluster_role = None
+    row.desired_k3s_server_url = None
+    row.desired_k3s_join_token_encrypted = None
+    row.cluster_join_state = "evicting"
+    row.cluster_join_reason = None
+    row.evict_requested = True
+
+    # Mint a single-use 60-min pairing code for the replacement box.
+    code = _generate_code()
+    expires_at = datetime.now(UTC) + timedelta(minutes=60)
+    pc_id = uuid.uuid4()
+    db.add(
+        PairingCode(
+            id=pc_id,
+            code_hash=_hash_code(code),
+            code_last_two=code[-2:],
+            persistent=False,
+            enabled=True,
+            expires_at=expires_at,
+            code_encrypted=None,
+            note=f"replacement for {row.hostname}",
+            created_by_user_id=current_user.id,
+        )
+    )
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.control_plane_replaced",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={"pairing_code_id": str(pc_id), "pairing_expires_at": expires_at.isoformat()},
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    logger.info(
+        "control_plane_replace",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        user=current_user.username,
+    )
+    return ControlPlaneReplaceResponse(
+        evicted=_row_to_schema(row),
+        pairing_code=code,
+        pairing_expires_at=expires_at,
+    )
+
+
+# ── Admin: MetalLB control-plane VIP (#272 Phase 7c) ─────────────
+
+
+def _parse_pool_entry(raw: str) -> tuple[int, int, int]:
+    """Normalise one MetalLB pool entry to ``(version, first_int, last_int)``.
+
+    Accepts a CIDR (``192.0.2.0/28``), a hyphen range
+    (``192.0.2.10-192.0.2.20``), or a single host (``192.0.2.5``).
+    Raises ``ValueError`` on anything malformed (so the field
+    validator can surface a 422 with the offending entry).
+    """
+    s = raw.strip()
+    if "-" in s and "/" not in s:
+        lo_s, _, hi_s = s.partition("-")
+        lo = ipaddress.ip_address(lo_s.strip())
+        hi = ipaddress.ip_address(hi_s.strip())
+        if lo.version != hi.version:
+            raise ValueError(f"range {raw!r} mixes IPv4 and IPv6")
+        if int(lo) > int(hi):
+            raise ValueError(f"range {raw!r} is reversed (start > end)")
+        return (lo.version, int(lo), int(hi))
+    if "/" in s:
+        net = ipaddress.ip_network(s, strict=False)
+        return (net.version, int(net.network_address), int(net.broadcast_address))
+    host = ipaddress.ip_address(s)
+    return (host.version, int(host), int(host))
+
+
+def _vip_in_pool(vip: str, pool: list[str]) -> bool:
+    """True when ``vip`` falls inside any entry of ``pool``."""
+    addr = ipaddress.ip_address(vip.strip())
+    for entry in pool:
+        try:
+            version, lo, hi = _parse_pool_entry(entry)
+        except ValueError:
+            continue
+        if version == addr.version and lo <= int(addr) <= hi:
+            return True
+    return False
+
+
+class MetalLBConfigResponse(BaseModel):
+    """Cluster-wide MetalLB / control-plane-VIP config + live status."""
+
+    enabled: bool = False
+    pool_addresses: list[str] = Field(default_factory=list)
+    control_plane_vip: str = ""
+    # #272 — live readiness, best-effort from the spatium-namespace pod
+    # list (reuses the api's existing pod-read RBAC). All zero/false when
+    # kubeapi is unreachable (docker/k8s control plane) or MetalLB is off.
+    controller_ready: bool = False
+    speakers_ready: int = 0
+    speakers_total: int = 0
+
+
+def _metallb_pod_status() -> tuple[bool, int, int]:
+    """Return ``(controller_ready, speakers_ready, speakers_total)`` from
+    the live MetalLB pods in the spatium namespace.
+
+    Best-effort: degrades to ``(False, 0, 0)`` on any error (no
+    ServiceAccount on a docker/k8s control plane, a kubeapi blip, or
+    MetalLB simply disabled so no pods exist). Uses the api pod's
+    existing pod-read RBAC — no extra grant needed.
+    """
+    from app.services.appliance import k8s  # noqa: PLC0415
+
+    def _ready(pod: dict[str, Any]) -> bool:
+        conds = (pod.get("status") or {}).get("conditions") or []
+        return any(c.get("type") == "Ready" and c.get("status") == "True" for c in conds)
+
+    try:
+        pods = k8s.list_pods("spatium")
+    except Exception:  # noqa: BLE001
+        return (False, 0, 0)
+    controller_ready = False
+    speakers_ready = 0
+    speakers_total = 0
+    for pod in pods:
+        name = ((pod.get("metadata") or {}).get("name")) or ""
+        if "metallb-controller" in name:
+            controller_ready = controller_ready or _ready(pod)
+        elif "metallb-speaker" in name:
+            speakers_total += 1
+            if _ready(pod):
+                speakers_ready += 1
+    return (controller_ready, speakers_ready, speakers_total)
+
+
+def _metallb_response(row: PlatformSettings) -> MetalLBConfigResponse:
+    controller_ready, speakers_ready, speakers_total = _metallb_pod_status()
+    return MetalLBConfigResponse(
+        enabled=row.metallb_enabled,
+        pool_addresses=list(row.metallb_pool_addresses or []),
+        control_plane_vip=row.control_plane_vip or "",
+        controller_ready=controller_ready,
+        speakers_ready=speakers_ready,
+        speakers_total=speakers_total,
+    )
+
+
+class MetalLBConfigUpdate(BaseModel):
+    """PUT body for the MetalLB / control-plane-VIP config.
+
+    All-or-nothing replace (not a partial merge) — the Fleet card
+    always submits the full state. Validators canonicalise pool
+    entries + enforce the VIP-in-pool / enabled-needs-pool invariants
+    so a half-configured state can never reach the chart.
+    """
+
+    enabled: bool = False
+    pool_addresses: list[str] = Field(default_factory=list)
+    control_plane_vip: str = ""
+
+    @field_validator("pool_addresses")
+    @classmethod
+    def _valid_pool(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in v:
+            s = raw.strip()
+            if not s:
+                continue
+            try:
+                _parse_pool_entry(s)
+            except ValueError as exc:
+                raise ValueError(f"invalid pool entry {raw!r}: {exc}") from exc
+            out.append(s)
+        return out
+
+    @field_validator("control_plane_vip")
+    @classmethod
+    def _valid_vip(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            return ""
+        try:
+            ipaddress.ip_address(s)
+        except ValueError as exc:
+            raise ValueError(f"control_plane_vip must be a single IP: {exc}") from exc
+        return s
+
+    @model_validator(mode="after")
+    def _cross_field(self) -> MetalLBConfigUpdate:
+        if self.enabled:
+            if not self.control_plane_vip:
+                raise ValueError("a control-plane VIP is required when MetalLB is enabled")
+            # #272 — auto-derive a single-address pool from the VIP when
+            # no explicit pool is given. This is the common case: the
+            # operator just wants one floating IP for the Web UI and
+            # shouldn't have to hand-craft a MetalLB pool + keep it in
+            # sync with the VIP. A /32 (v4) or /128 (v6) pool holding
+            # exactly the VIP is all MetalLB needs. Operators who want a
+            # range (headroom, future data-plane VIPs, BGP) can still
+            # supply one explicitly, and the VIP-in-pool check below
+            # applies to it.
+            if not self.pool_addresses:
+                prefix = 32 if ipaddress.ip_address(self.control_plane_vip).version == 4 else 128
+                self.pool_addresses = [f"{self.control_plane_vip}/{prefix}"]
+        if self.control_plane_vip and self.pool_addresses:
+            if not _vip_in_pool(self.control_plane_vip, self.pool_addresses):
+                raise ValueError(
+                    f"control-plane VIP {self.control_plane_vip} is not inside the " "address pool"
+                )
+        return self
+
+
+async def _get_or_create_settings(db: DB) -> PlatformSettings:
+    row = (
+        await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    if row is None:
+        row = PlatformSettings(id=1)
+        db.add(row)
+        await db.flush()
+    return row
+
+
+@router.get(
+    "/fleet/control-plane/metallb",
+    response_model=MetalLBConfigResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Read the cluster MetalLB / control-plane-VIP config (superadmin)",
+)
+async def get_metallb_config(
+    current_user: CurrentUser,
+    db: DB,
+) -> MetalLBConfigResponse:
+    _require_superadmin(current_user)
+    row = await _get_or_create_settings(db)
+    return _metallb_response(row)
+
+
+@router.put(
+    "/fleet/control-plane/metallb",
+    response_model=MetalLBConfigResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Set the cluster MetalLB / control-plane-VIP config (superadmin)",
+)
+async def put_metallb_config(
+    body: MetalLBConfigUpdate,
+    current_user: CurrentUser,
+    db: DB,
+) -> MetalLBConfigResponse:
+    """Persist the cluster-wide MetalLB pool + control-plane VIP.
+
+    Validated all-or-nothing (VIP must fall inside the pool; enabling
+    requires both). The seed supervisor picks the new values up on its
+    next heartbeat (``desired_metallb_*`` in the response) and patches
+    the spatium-bootstrap + spatium-control HelmCharts; helm-controller
+    then renders the IPAddressPool / L2Advertisement + flips the
+    frontend Service to a LoadBalancer on the VIP. Idempotent.
+    """
+    _require_superadmin(current_user)
+    row = await _get_or_create_settings(db)
+    old = {
+        "enabled": row.metallb_enabled,
+        "pool_addresses": list(row.metallb_pool_addresses or []),
+        "control_plane_vip": row.control_plane_vip or "",
+    }
+    row.metallb_enabled = body.enabled
+    row.metallb_pool_addresses = body.pool_addresses
+    row.control_plane_vip = body.control_plane_vip
+    new = {
+        "enabled": body.enabled,
+        "pool_addresses": body.pool_addresses,
+        "control_plane_vip": body.control_plane_vip,
+    }
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.metallb_config_updated",
+            resource_type="platform_settings",
+            resource_id="1",
+            resource_display="MetalLB control-plane VIP",
+            result="success",
+            old_value=old,
+            new_value=new,
+        )
+    )
+    await db.commit()
+    logger.info(
+        "metallb_config_updated",
+        enabled=body.enabled,
+        pool=body.pool_addresses,
+        vip=body.control_plane_vip,
+        user=current_user.username,
+    )
+    return _metallb_response(row)
 
 
 # ── Admin: OS upgrade + reboot (#170 Wave D1) ────────────────────

@@ -7113,6 +7113,25 @@ export interface FleetAgentRow {
   reboot_requested_at: string | null;
 }
 
+// #272 Phase 7c — cluster-wide MetalLB / control-plane-VIP config.
+export interface MetalLBConfig {
+  enabled: boolean;
+  pool_addresses: string[];
+  control_plane_vip: string;
+  // #272 — live readiness from the GET (best-effort; absent/zero when
+  // kubeapi is unreachable). Not sent on PUT.
+  controller_ready?: boolean;
+  speakers_ready?: number;
+  speakers_total?: number;
+}
+
+// #272 Phase 9 — dead-node replacement result.
+export interface ControlPlaneReplaceResult {
+  evicted: ApplianceRow;
+  pairing_code: string;
+  pairing_expires_at: string;
+}
+
 export const applianceFleetApi = {
   list: () =>
     api
@@ -7287,6 +7306,12 @@ export interface ApplianceRow {
   // run the supervisor heartbeat path, so these stay null on those
   // rows.
   deployment_kind: string | null;
+  // #272 — installer-role variant ("control-plane" / "appliance";
+  // legacy full-stack / frontend-core / application normalised away
+  // by the supervisor). Drives the Fleet UI's two-table split
+  // (Control plane vs Service agents). NULL on pre-#272 supervisors
+  // that haven't slot-upgraded yet.
+  appliance_variant: string | null;
   installed_appliance_version: string | null;
   current_slot: string | null;
   durable_default: string | null;
@@ -7367,6 +7392,14 @@ export interface ApplianceRow {
   // Issue #183 Phase 6 — operator-controlled CIDR allowlist for
   // direct kubeapi access on tcp/6443. Empty = proxy-only.
   kubeapi_expose_cidrs: string[];
+  // #272 Phase 7 — control-plane cluster membership. cluster_role is
+  // the settled role (primary / member / null); the desired_/join_state
+  // pair reflect an in-flight promote/demote (joining / ready / leaving
+  // / left / failed) so the UI can render a status chip.
+  cluster_role: string | null;
+  desired_cluster_role: string | null;
+  cluster_join_state: string | null;
+  cluster_join_reason: string | null;
   // Issue #170 Wave E follow-up — soft-delete timestamp. Non-null on
   // ``state=revoked`` rows; cleared by re-authorize.
   revoked_at: string | null;
@@ -7421,6 +7454,48 @@ export const applianceApprovalApi = {
   updateRoles: (id: string, body: ApplianceRolesUpdate) =>
     api
       .put<ApplianceRow>(`/appliance/appliances/${id}/roles`, body)
+      .then((r) => r.data),
+  // #272 Phase 7 — batch promote/demote control-plane cluster members.
+  // Promote turns approved Appliance nodes into k3s control-plane
+  // (etcd) members; demote reverses it. Batch (a list of ids) because
+  // etcd HA wants an ODD total — the API 422s if the resulting count
+  // would be even, and the message is surfaced inline.
+  promoteControlPlane: (applianceIds: string[]) =>
+    api
+      .post<{
+        appliances: ApplianceRow[];
+      }>("/appliance/fleet/control-plane/promote", {
+        appliance_ids: applianceIds,
+      })
+      .then((r) => r.data.appliances),
+  demoteControlPlane: (applianceIds: string[]) =>
+    api
+      .post<{
+        appliances: ApplianceRow[];
+      }>("/appliance/fleet/control-plane/demote", {
+        appliance_ids: applianceIds,
+      })
+      .then((r) => r.data.appliances),
+  // #272 Phase 9 — replace a DEAD control-plane member: the seed evicts
+  // its k8s Node (k3s drops the etcd member), and a single-use pairing
+  // code is minted for the replacement box. Returns the code (shown once).
+  replaceControlPlaneMember: (applianceId: string) =>
+    api
+      .post<ControlPlaneReplaceResult>(
+        `/appliance/fleet/control-plane/${applianceId}/replace`,
+      )
+      .then((r) => r.data),
+  // #272 Phase 7c — cluster-wide MetalLB pool + control-plane VIP. The
+  // seed supervisor picks the saved config up on heartbeat and patches
+  // the HelmCharts; the VIP must fall inside the pool (the API 422s
+  // otherwise, message surfaced inline).
+  getMetalLBConfig: () =>
+    api
+      .get<MetalLBConfig>("/appliance/fleet/control-plane/metallb")
+      .then((r) => r.data),
+  setMetalLBConfig: (body: MetalLBConfig) =>
+    api
+      .put<MetalLBConfig>("/appliance/fleet/control-plane/metallb", body)
       .then((r) => r.data),
   // #170 Wave D1 — OS slot upgrade + reboot affordances on the
   // Fleet drilldown. Appliance-only deployments; the API surfaces a

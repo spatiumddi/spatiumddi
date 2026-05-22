@@ -1,6 +1,7 @@
+import asyncio
 import uuid
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import structlog
 import structlog.contextvars
@@ -346,7 +347,42 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("demo_mode_lockdown_skipped", reason=str(exc))
+
+    # #272 Phase 7c — periodic self-signed cert SAN reconcile. On a
+    # multi-node appliance control plane the shared Web UI cert must
+    # cover every cluster member's hostname + node IP (and the VIP), so
+    # the UI validates on any node. This loop grows the self-signed cert
+    # as nodes join (no-op on operator-uploaded certs + once converged).
+    # All api replicas run it; a Postgres advisory lock + coverage check
+    # keep it to one cheap query per tick + a single regenerate per
+    # membership change. Appliance-mode only.
+    cert_reconcile_task: asyncio.Task[None] | None = None
+    if settings.appliance_mode:
+
+        async def _cert_reconcile_loop() -> None:
+            from app.services.appliance.bootstrap import (  # noqa: PLC0415
+                reconcile_cluster_cert_sans,
+            )
+
+            while True:
+                try:
+                    await asyncio.sleep(90)
+                    result = await reconcile_cluster_cert_sans()
+                    if result.get("status") == "regenerated":
+                        logger.info("appliance_cluster_cert_reconciled", **result)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("appliance_cert_reconcile_failed", error=str(exc))
+
+        cert_reconcile_task = asyncio.create_task(_cert_reconcile_loop())
+
     yield
+
+    if cert_reconcile_task is not None:
+        cert_reconcile_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cert_reconcile_task
     logger.info("shutdown", service="api")
 
 

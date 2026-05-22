@@ -187,12 +187,19 @@ menuentry "Install SpatiumDDI to disk" {
     initrd /live/initrd.img
 }
 
-menuentry "Try SpatiumDDI live (run from CD/USB without installing)" {
+# spatium-mode=live boots the OS from CD/USB WITHOUT starting the
+# SpatiumDDI stack (k3s + firstboot are gated ``!boot=live``) — it's a
+# rescue / diagnostics environment, NOT a product demo. Used to recover
+# an unbootable install (inspect/mount the installed disk, read logs,
+# re-run the installer). The ``spatium-mode=live`` keyword is unchanged
+# (it's wired into many unit ConditionKernelCommandLine= gates); only
+# the operator-facing labels + banner describe it accurately now.
+menuentry "Rescue / diagnostics shell (run from CD/USB, no install)" {
     linux /live/vmlinuz $common $quietkbd spatium-mode=live
     initrd /live/initrd.img
 }
 
-menuentry "Try SpatiumDDI live (verbose, for debugging)" {
+menuentry "Rescue / diagnostics shell (verbose, for debugging)" {
     linux /live/vmlinuz $common spatium-mode=live
     initrd /live/initrd.img
 }

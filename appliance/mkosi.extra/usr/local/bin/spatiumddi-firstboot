@@ -147,7 +147,11 @@ if [ ! -f "$ENV_FILE" ]; then
     # CONTROL_PLANE_URL + BOOTSTRAP_PAIRING_CODE for Application
     # appliances. The .env carries them so the supervisor pod's
     # entrypoint can source the file + propagate to the pod env.
-    ROLE=full-stack
+    # #272 — two roles: control-plane (default) + appliance. The old
+    # full-stack / frontend-core / application strings are accepted as
+    # legacy aliases (full-stack + frontend-core → control-plane,
+    # application → appliance) so a not-yet-reinstalled box still boots.
+    ROLE=control-plane
     INSTALL_CONTROL_PLANE_URL=""
     INSTALL_BOOTSTRAP_PAIRING_CODE=""
     if [ -f /etc/spatiumddi/role-config ]; then
@@ -159,23 +163,45 @@ if [ ! -f "$ENV_FILE" ]; then
 
     BOOTSTRAP_PAIRING_CODE_VAL=""
     case "$ROLE" in
-        application)
+        appliance|application)
+            # Supervisor-only data-plane node — pairs with a remote
+            # control plane. The supervisor injects per-role agent keys
+            # from the control plane at role-assign time, so none are
+            # baked here.
+            ROLE=appliance
             DNS_AGENT_KEY_VAL=""
             DHCP_AGENT_KEY_VAL=""
             BOOTSTRAP_PAIRING_CODE_VAL="$INSTALL_BOOTSTRAP_PAIRING_CODE"
             CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
             AGENT_GROUP_VAL="default"
             ;;
-        frontend-core)
-            DNS_AGENT_KEY_VAL=$(gen_hex 24)
-            DHCP_AGENT_KEY_VAL=$(gen_hex 24)
-            CONTROL_PLANE_URL_VAL=""
-            AGENT_GROUP_VAL="default"
-            ;;
         *)
-            ROLE=full-stack
+            # control-plane (or legacy full-stack / frontend-core). DNS
+            # + DHCP are OFF at install; the operator enables them per
+            # node via the Fleet role toggle. The agent keys are still
+            # generated here so the api can validate agent registrations
+            # once those roles ARE enabled (the api needs the key
+            # server-side, the role pods need it client-side).
+            ROLE=control-plane
             DNS_AGENT_KEY_VAL=$(gen_hex 24)
             DHCP_AGENT_KEY_VAL=$(gen_hex 24)
+            # #272 — leave CONTROL_PLANE_URL EMPTY on the control-plane
+            # node. Two reasons it must stay empty:
+            #   1. The supervisor's self-bootstrap path (mints the seed's
+            #      own pairing code against the in-cluster api so the seed
+            #      registers itself into Fleet) is gated on
+            #      ``not cfg.control_plane_url`` — a non-empty value here
+            #      silently disables it, so the seed never registers and
+            #      Fleet shows up empty. self-bootstrap sets
+            #      control_plane_url itself from the api response.
+            #   2. The heartbeat target no longer depends on this value:
+            #      ``heartbeat._effective_control_plane_url`` redirects any
+            #      control-plane *cluster member* to the in-cluster api
+            #      Service regardless of CONTROL_PLANE_URL, so the cp-size +
+            #      MetalLB reconcile (durable HelmChartConfig overrides)
+            #      still runs even with this empty. (An earlier draft set
+            #      this to the svc URL to force the heartbeat target — that
+            #      predated the resolver and broke #1; see issue #272.)
             CONTROL_PLANE_URL_VAL=""
             AGENT_GROUP_VAL="default"
             ;;
@@ -243,18 +269,16 @@ fi
 # wizard's ``ROLE`` selection lands in /etc/spatiumddi/.env above;
 # read it back to decide what chart(s) get installed:
 #
-#   application   — appliance chart only (supervisor + agent-landing).
+#   appliance     — appliance chart only (supervisor + agent-landing).
 #                   Supervisor pairs with a remote control plane;
 #                   role pods live in the supervisor-driven
 #                   spatiumddi-appliance release.
-#   full-stack    — control chart (api/frontend/db/redis/worker/
-#                   beat/migrate) PLUS the appliance chart with
-#                   dnsBind9 + dhcpKea enabled directly (no
-#                   supervisor — pre-baked node labels schedule
-#                   the role pods at boot).
-#   frontend-core — control chart only. No DNS/DHCP. Other
-#                   Application appliances pair against this box
-#                   from the Fleet UI.
+#   control-plane — control chart (api/frontend/db/redis/worker/
+#                   beat/migrate) PLUS the appliance chart (supervisor
+#                   enabled, role pods OFF at boot). DNS/DHCP are
+#                   enabled later per node via the Fleet role toggle —
+#                   the supervisor flips dnsBind9/dhcpKea + applies the
+#                   labels. (Legacy full-stack / frontend-core map here.)
 # ── Phase 11 wave 3 — self-signed TLS cert for the appliance UI ─────────────
 # Generated on every boot (overwriting an operator-uploaded cert
 # would be wrong — gated on the Secret manifest not already
@@ -323,10 +347,10 @@ _env_get() {
 }
 
 APPLIANCE_ROLE_VAL=$(_env_get APPLIANCE_ROLE)
-APPLIANCE_ROLE_VAL="${APPLIANCE_ROLE_VAL:-application}"
+APPLIANCE_ROLE_VAL="${APPLIANCE_ROLE_VAL:-control-plane}"
 
 # Agent pre-shared keys + in-cluster API service URL for the AIO
-# (full-stack) variant. The DNS + DHCP role pods need them to
+# control-plane node. The DNS + DHCP role pods need them to
 # register against the local control plane, AND the api pod needs
 # them server-side to validate incoming agent registrations
 # (otherwise the api returns 503 "DNS_AGENT_KEY is not configured
@@ -357,7 +381,7 @@ EOF
 #        dnsBind9/dnsPowerdns/dhcpKea all together
 #   $4 — agent_landing_enabled (true / false) — only the
 #        Application variant ships the "this is a SpatiumDDI
-#        appliance" landing page on :80. Full-stack + frontend-core
+#        appliance" landing page on :80. The control-plane node
 #        have the real control-plane frontend on :80, so leaving
 #        agent-landing enabled there gives us a pod stuck Pending
 #        on a port conflict that would also fight the frontend for
@@ -367,6 +391,10 @@ _render_appliance_helmchart() {
     local supervisor_enabled="$2"
     local role_pods_enabled="$3"
     local agent_landing_enabled="$4"
+    # #277 — the CNPG operator (cloudnative-pg subchart) runs only on the
+    # control-plane node, where the spatium-control chart's CNPG Cluster
+    # lives. Data-plane appliances don't host postgres, so they skip it.
+    local cnpg_enabled="${5:-false}"
     # role_pods_enabled=true (full-stack) needs control-plane URL +
     # pre-shared keys + a default server group name so the BIND9 /
     # Kea agents can bootstrap-register against the local control
@@ -403,11 +431,61 @@ spec:
       serverGroupName: default
     agentLanding:
       enabled: ${agent_landing_enabled}
+    # #277 — CloudNativePG operator (manages the control plane's
+    # postgres Cluster + streaming replicas + failover). Only the
+    # control-plane node enables it.
+    cnpg:
+      enabled: ${cnpg_enabled}
+    # #272 Phase 7c — MetalLB L2 pool for the control-plane VIP. Off /
+    # empty on a fresh install; the seed supervisor patches these marked
+    # lines from platform_settings when the operator sets a pool + VIP in
+    # Fleet → Control plane. ``ipPool.addresses`` renders as a flow-style
+    # YAML list (e.g. ["192.0.2.240/28"]); the supervisor writes JSON,
+    # which is valid flow YAML. When enabled, the controller/speaker come
+    # up + the IPAddressPool / L2Advertisement land (templates/
+    # metallb-pool.yaml). The VIP itself is set on the umbrella chart's
+    # frontend Service (see spatium-control above).
+    metallb:
+      enabled: false  # spatium:metallb-enabled
+      ipPool:
+        addresses: []  # spatium:metallb-pool
+      # The metallb subchart ships its CRDs as a (templated) sub-subchart.
+      # On the appliance metallb always starts DISABLED, so the subchart +
+      # its CRDs aren't rendered at first install; enabling it later is a
+      # helm UPGRADE, and helm won't establish those CRDs before applying
+      # the IPAddressPool / L2Advertisement CRs in the same release → the
+      # upgrade fails "no matches for kind IPAddressPool". So we DON'T let
+      # helm own the CRDs at all — they're pre-loaded unconditionally as a
+      # k3s auto-deploy manifest at firstboot (place_metallb_crds below).
+      crds:
+        enabled: false
 EOF
 }
 
-# Renders the control-plane HelmChart CR for full-stack /
-# frontend-core. Args:
+# #272 — pre-load the MetalLB CRDs as a k3s auto-deploy manifest so they
+# exist cluster-wide BEFORE the operator ever enables MetalLB. MetalLB
+# always starts disabled on the appliance and is turned on via a helm
+# UPGRADE of the spatium-bootstrap release; helm can't establish the
+# metallb subchart's CRDs before applying the IPAddressPool /
+# L2Advertisement CRs in that same release ("no matches for kind
+# IPAddressPool"). So we keep the CRDs out of helm entirely
+# (metallb.crds.enabled=false in the valuesContent above) and lay them
+# down here — k3s applies everything in its manifests dir at boot, well
+# before the operator could enable MetalLB. The baked file is vendored
+# from the metallb 0.16.0 chart (its {{ .Release.Namespace }} already
+# substituted to ``spatium``).
+place_metallb_crds() {
+    local src=/usr/local/share/spatiumddi/metallb-crds.yaml
+    if [ -r "$src" ]; then
+        install -m 0644 "$src" "$K3S_MANIFESTS_DIR/spatium-metallb-crds.yaml"
+        echo "Placed MetalLB CRDs at $K3S_MANIFESTS_DIR/spatium-metallb-crds.yaml"
+    else
+        echo "WARN: $src missing — MetalLB CRDs not pre-loaded; enabling MetalLB later will fail."
+    fi
+}
+
+# Renders the control-plane HelmChart CR for the control-plane
+# role. Args:
 #   $1 — chart_content_b64
 #   $2 — dns/dhcp agents enabled in umbrella (frontend-core=false,
 #        full-stack=false because the appliance chart owns them)
@@ -427,6 +505,16 @@ spec:
     image:
       tag: "${SPATIUMDDI_VERSION}"
       pullPolicy: IfNotPresent
+    # #272 Phase 1 — gate every control-plane workload onto nodes
+    # carrying ``spatium.io/role-control-plane=true``. Install-time
+    # bakes the label for full-stack + frontend-core variants (see
+    # spatium-install); the supervisor re-asserts it on every
+    # heartbeat. application appliances never carry the label and
+    # so never schedule control-plane workloads even if joined to
+    # the cluster.
+    global:
+      controlPlaneNodeSelector:
+        spatium.io/role-control-plane: "true"
     # Appliance overrides — collapse the frontend to a single
     # replica with hostNetwork on the node IP so http://<ip>/
     # serves the SpatiumDDI UI. klipper-lb is disabled in our
@@ -440,8 +528,17 @@ spec:
     # namespace BEFORE the chart applies, so the frontend pod's
     # subPath mount finds it on first scheduling.
     frontend:
-      replicas: 1
+      replicas: 1  # spatium:cp-size
       hostNetwork: true
+      # #272 Phase 7c — control-plane VIP. Empty on a fresh install
+      # (hostNetwork frontend, no VIP); the seed supervisor patches this
+      # marked line from platform_settings when the operator sets a VIP
+      # in Fleet → Control plane. A non-empty value supersedes
+      # hostNetwork (the chart drops it + flips the Service to a
+      # LoadBalancer) and threads the VIP into the api's
+      # APPLIANCE_EXTRA_CERT_SANS so the served cert validates on it.
+      controlPlaneVIP: ""  # spatium:metallb-vip
+      controlPlaneVIPPool: spatium-control-plane
       tls:
         enabled: true
         secretName: spatium-appliance-tls
@@ -455,7 +552,7 @@ spec:
     # Appliance is single-node — collapse api/worker to 1 replica
     # each + disable HPA (no horizontal scaling on a single host).
     api:
-      replicas: 1
+      replicas: 1  # spatium:cp-size
       autoscaling:
         enabled: false
       env:
@@ -471,6 +568,22 @@ spec:
           value: "${DNS_AGENT_KEY_VAL}"
         - name: DHCP_AGENT_KEY
           value: "${DHCP_AGENT_KEY_VAL}"
+        # #272 HA — stable identity for the self-signed Web UI cert.
+        # The api Deployment runs N replicas (one per control-plane
+        # node), all sharing one cluster TLS Secret. WITHOUT these the
+        # cert bootstrap falls back to the POD name/IP, so every replica
+        # regenerates a cert for its own ephemeral identity and clobbers
+        # the Secret — the operator-reported "3 certificates" churn.
+        # These env values are identical for every replica (the host's
+        # hostname + globally-scoped IPs, computed once at firstboot),
+        # so the first node's cert is generated once and every replica
+        # just re-deploys it. Operators add other node IPs as SANs via a
+        # CSR. (The control-plane VIP, when one is set on promote, is
+        # threaded separately as APPLIANCE_EXTRA_CERT_SANS.)
+        - name: APPLIANCE_HOSTNAME
+          value: "${APPLIANCE_HOSTNAME_VAL}"
+        - name: APPLIANCE_HOST_IPS
+          value: "${APPLIANCE_HOST_IPS_VAL}"
       serviceAccount:
         enabled: true
       # Appliance bind mounts. /var/lib/spatiumddi-host/release-state
@@ -484,7 +597,32 @@ spec:
       applianceHostMounts:
         enabled: true
     worker:
-      replicas: 1
+      replicas: 1  # spatium:cp-size
+    # #277 — PostgreSQL runs under CloudNativePG on every appliance, so
+    # the data layer scales with the control-plane cluster: 1 instance on
+    # a single node, growing to 3/5/7 (primary + streaming replicas with
+    # automatic failover) as nodes are promoted. The CNPG operator itself
+    # ships from the spatiumddi-appliance chart (cnpg.enabled). A fresh
+    # install is always a single control-plane node, so instances starts
+    # at 1; the seed supervisor patches the ``# spatium:cp-size`` marked
+    # lines (instances + api/frontend/worker replicas) to the committed
+    # member count on promote/demote, and helm-controller upgrades.
+    postgresql:
+      kind: cnpg
+      cnpg:
+        instances: 1  # spatium:cp-size
+    # #272 Phase 3 — Redis runs under Sentinel on every appliance so the
+    # cache/queue layer is HA like postgres: each replica pairs a
+    # redis-server with a redis-sentinel that elects a master + fails
+    # over automatically, and the app/worker/beat resolve the live
+    # master through a sentinel:// URL. replicas tracks the control-plane
+    # size via the same ``# spatium:cp-size`` marker — 1 on a single
+    # node (degenerate but functional), 3/5/7 with real quorum + failover
+    # after promote (the seed supervisor patches it alongside CNPG).
+    redis:
+      kind: sentinel
+      sentinel:
+        replicas: 1  # spatium:cp-size
     # DNS / DHCP agents from the umbrella chart are NOT used on the
     # appliance — the appliance chart (templates/dns-bind9.yaml etc.)
     # owns the role pods with hostNetwork + per-role node labels.
@@ -496,11 +634,11 @@ EOF
 }
 
 case "$APPLIANCE_ROLE_VAL" in
-    application)
+    appliance|application)
         if [ ! -f "$CHART_TGZ" ]; then
             echo "WARN: $CHART_TGZ missing — supervisor pod won't auto-deploy. Is the chart baked?"
         else
-            echo "Rendering $BOOTSTRAP_MANIFEST from $CHART_TGZ (role=application)"
+            echo "Rendering $BOOTSTRAP_MANIFEST from $CHART_TGZ (role=appliance)"
             CHART_B64=$(base64 -w0 "$CHART_TGZ")
             tmp="${BOOTSTRAP_MANIFEST}.new"
             {
@@ -514,7 +652,11 @@ case "$APPLIANCE_ROLE_VAL" in
             rm -f "$CONTROL_MANIFEST"
         fi
         ;;
-    full-stack|frontend-core)
+    control-plane|full-stack|frontend-core)
+        # #272 — lay down the MetalLB CRDs unconditionally (the seed is a
+        # control-plane node; CRDs are cluster-scoped so doing it here
+        # covers any node later promoted into the cluster).
+        place_metallb_crds
         # Both variants need the control-plane chart (api/frontend/db
         # /redis/worker/beat/migrate). full-stack ADDITIONALLY needs
         # the appliance chart with role pods enabled (supervisor
@@ -523,8 +665,19 @@ case "$APPLIANCE_ROLE_VAL" in
         if [ ! -f "$CONTROL_CHART_TGZ" ]; then
             echo "WARN: $CONTROL_CHART_TGZ missing — control plane won't auto-deploy. Did the bake step run?"
         else
-            echo "Rendering $CONTROL_MANIFEST from $CONTROL_CHART_TGZ (role=$APPLIANCE_ROLE_VAL)"
+            echo "Rendering $CONTROL_MANIFEST (deferred) from $CONTROL_CHART_TGZ (role=$APPLIANCE_ROLE_VAL)"
             CONTROL_CHART_B64=$(base64 -w0 "$CONTROL_CHART_TGZ")
+            # #277 — DEFER placing the control chart into the manifests
+            # dir. It creates a CNPG ``Cluster`` CR, which the operator's
+            # mutating webhook (mcluster.cnpg.io) must admit. The operator
+            # ships in the spatium-bootstrap chart below; if k3s applies
+            # the control chart before that operator + its webhook are
+            # ready, the helm install fails calling the webhook and
+            # retries — each retry rolls every workload (api/worker/migrate
+            # churn) until it converges. Writing to ``*.deferred`` (k3s
+            # only watches ``*.yaml``) holds it back; the post-readyz step
+            # at the end of firstboot waits for the webhook, then moves it
+            # into place so the Cluster CR is admitted on the first try.
             tmp="${CONTROL_MANIFEST}.new"
             {
                 echo "# Auto-generated by spatiumddi-firstboot — do not hand-edit."
@@ -532,24 +685,34 @@ case "$APPLIANCE_ROLE_VAL" in
                 echo "---"
                 _render_control_helmchart "$CONTROL_CHART_B64"
             } > "$tmp"
-            mv "$tmp" "$CONTROL_MANIFEST"
-            chmod 0600 "$CONTROL_MANIFEST"
+            mv "$tmp" "${CONTROL_MANIFEST}.deferred"
+            chmod 0600 "${CONTROL_MANIFEST}.deferred"
         fi
-        if [ "$APPLIANCE_ROLE_VAL" = "full-stack" ] && [ -f "$CHART_TGZ" ]; then
-            echo "Rendering $BOOTSTRAP_MANIFEST from $CHART_TGZ (role=full-stack, role pods enabled)"
+        if [ -f "$CHART_TGZ" ]; then
+            # #272 — the control-plane node renders the appliance chart
+            # so the supervisor pod is present (the supervisor is the
+            # source of truth for per-role node labels, reconciled every
+            # heartbeat against /etc/spatiumddi-host/role-config:ROLE).
+            #
+            # DNS / DHCP role pods are DISABLED at boot — the operator
+            # enables them per node via the Fleet role toggle, at which
+            # point the supervisor flips dnsBind9/dhcpKea enabled in
+            # this same bootstrap chart + applies the node labels. So a
+            # fresh control plane never silently runs DNS/DHCP.
+            role_pods_enabled="false"
+            echo "Rendering $BOOTSTRAP_MANIFEST from $CHART_TGZ (role=$APPLIANCE_ROLE_VAL, supervisor enabled, role_pods=$role_pods_enabled)"
             CHART_B64=$(base64 -w0 "$CHART_TGZ")
             tmp="${BOOTSTRAP_MANIFEST}.new"
             {
                 echo "# Auto-generated by spatiumddi-firstboot — do not hand-edit."
                 _render_namespace_yaml
                 echo "---"
-                _render_appliance_helmchart "$CHART_B64" "false" "true" "false"
+                _render_appliance_helmchart "$CHART_B64" "true" "$role_pods_enabled" "false" "true"
             } > "$tmp"
             mv "$tmp" "$BOOTSTRAP_MANIFEST"
             chmod 0600 "$BOOTSTRAP_MANIFEST"
         else
-            # frontend-core: drop the bootstrap manifest if it lingered
-            # from a previous reinstall as application/full-stack.
+            echo "WARN: $CHART_TGZ missing — supervisor pod won't auto-deploy."
             rm -f "$BOOTSTRAP_MANIFEST"
         fi
         ;;
@@ -642,6 +805,35 @@ commit_slot_if_healthy() {
         >> "$LOG" 2>&1 || true
 }
 
+# #277 — place the deferred control chart only AFTER the CNPG operator
+# webhook has endpoints, so the Cluster CR is admitted on the first
+# helm attempt (no failed-install rolling churn). Best-effort: if the
+# webhook never comes up (operator broken), apply anyway after the
+# timeout so the rest of the control plane still deploys + helm-
+# controller retries. No-op when there's no deferred manifest (the
+# appliance/application roles never write one).
+place_deferred_control_manifest() {
+    local deferred="${CONTROL_MANIFEST}.deferred"
+    [ -f "$deferred" ] || return 0
+    echo "Waiting for the CNPG operator webhook before applying the control chart…"
+    local up=0
+    for _ in $(seq 1 48); do   # up to 4 min
+        if /usr/local/bin/k3s kubectl get endpoints -n spatium cnpg-webhook-service \
+                -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null | grep -q '[0-9]'; then
+            up=1
+            break
+        fi
+        sleep 5
+    done
+    if [ "$up" = 1 ]; then
+        echo "CNPG webhook ready — applying control chart."
+    else
+        echo "WARN: CNPG webhook not ready after 4 min — applying control chart anyway (helm-controller retries)." >&2
+    fi
+    mv -f "$deferred" "$CONTROL_MANIFEST"
+    chmod 0600 "$CONTROL_MANIFEST"
+}
+
 # Wait for k3s to come up + helm-controller to apply the bootstrap
 # manifest. ``kubectl get --raw=/readyz`` is the canonical readiness
 # probe; once it returns 200 the supervisor pod can be scheduled.
@@ -662,9 +854,14 @@ if [ "$ready" = 1 ]; then
     date -Iseconds > "$STAMP"
     IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
     echo "Ready: k3s up on ${IP:-<appliance-ip>}; supervisor pod auto-deploys via $BOOTSTRAP_MANIFEST"
+    place_deferred_control_manifest
     commit_slot_if_healthy
     exit 0
 fi
 echo "WARN: k3s /readyz did not respond within 5 minutes." >&2
 echo "      Check 'systemctl status k3s' + 'journalctl -u k3s'." >&2
+# k3s never became ready, but don't strand the deferred control chart —
+# place it so a later k3s recovery (or manual restart) still deploys the
+# control plane. helm-controller will retry the webhook on its own.
+mv -f "${CONTROL_MANIFEST}.deferred" "$CONTROL_MANIFEST" 2>/dev/null || true
 exit 1

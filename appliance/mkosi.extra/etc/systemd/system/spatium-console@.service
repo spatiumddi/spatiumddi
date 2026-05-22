@@ -25,7 +25,7 @@ ExecStartPre=-/usr/bin/systemctl stop serial-getty@%i.service
 # Serial consoles already drive arbitrary character grids (the
 # software terminal on the host picks the size), so setfont is a
 # no-op here — left in for symmetry with the tty1 unit.
-ExecStartPre=-/usr/bin/setfont -C /dev/%I Lat15-VGA16
+ExecStartPre=-/usr/bin/setfont -C /dev/%I Lat15-Terminus12x6
 ExecStart=/usr/local/bin/spatium-console --tty /dev/%I
 StandardInput=tty
 StandardOutput=tty
@@ -41,7 +41,7 @@ RestartSec=2
 # /dev/ttyS0 with no actual serial device attached (kernel-cmdline
 # ``console=ttyS0`` creates the device node unconditionally; the VM
 # may have no serial port). Without this every respawn fires a
-# docker_ps() call that gets terminated mid-flight and spams the
+# cluster_pods() call that gets terminated mid-flight and spams the
 # docker daemon journal with "broken pipe" entries.
 RestartPreventExitStatus=75
 UtmpIdentifier=%I

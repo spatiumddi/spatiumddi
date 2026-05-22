@@ -54,10 +54,14 @@ FIRSTBOOT_STAMP = Path("/var/lib/spatiumddi/firstboot.done")
 APPLIANCE_RELEASE = Path("/etc/spatiumddi/appliance-release")
 
 
+# #272 — two variants: control-plane + appliance (legacy strings kept
+# as aliases for a not-yet-reinstalled box).
 ROLE_LABELS = {
-    "full-stack": "Full stack — control plane + BIND9 + Kea (AIO)",
-    "frontend-core": "Frontend / core — control plane only",
-    "application": "Application — supervisor (pairs remote)",
+    "control-plane": "Control plane — api + db + frontend (DNS/DHCP via Fleet toggle)",
+    "appliance": "Appliance — supervisor (pairs with a control plane)",
+    "full-stack": "Control plane (legacy full-stack)",
+    "frontend-core": "Control plane (legacy frontend-core)",
+    "application": "Appliance (legacy application)",
 }
 
 # Container service names we render per role. Names match the
@@ -65,22 +69,25 @@ ROLE_LABELS = {
 # already decides which subset actually runs, but we render the full
 # expected set so a missing-from-`docker ps` service shows up as
 # `(not running)` instead of being silently absent.
+# control-plane base = the umbrella control workloads. DNS/DHCP are
+# NOT in the base set (#272 — they're enabled per node via the Fleet
+# role toggle); render_services unions whichever supervisor-managed
+# dns/dhcp container is actually running so they appear when enabled
+# without a permanent ``(not running)`` row beforehand.
+# appliance base = supervisor + agent-landing; service containers
+# appear via the same dynamic union after approval + role assignment.
 ROLE_SERVICES = {
+    "control-plane": [
+        "postgres", "redis", "migrate", "api", "worker", "beat", "frontend",
+    ],
+    "appliance": ["spatium-supervisor", "agent-landing"],
+    # legacy aliases:
     "full-stack": [
-        "postgres", "redis", "migrate", "api", "worker", "beat",
-        "frontend", "dns-bind9", "dhcp-kea",
+        "postgres", "redis", "migrate", "api", "worker", "beat", "frontend",
     ],
     "frontend-core": [
         "postgres", "redis", "migrate", "api", "worker", "beat", "frontend",
     ],
-    # Application = supervisor + the agent-landing static page. The
-    # service container (dns-bind9 / dns-powerdns / dhcp-kea) starts
-    # only after admin approval + role assignment in the fleet UI
-    # (#170 Wave C); render_services unions any role-supervised
-    # container currently in ``docker ps`` so the operator sees them
-    # when they're running, without cluttering the dashboard with
-    # ``(not running)`` rows for roles the supervisor hasn't been
-    # given.
     "application": ["spatium-supervisor", "agent-landing"],
 }
 
@@ -237,12 +244,44 @@ def read_env(path: Path = ENV_FILE) -> dict[str, str]:
 
 
 def role_from_env(env: dict[str, str]) -> str:
-    raw = (env.get("APPLIANCE_ROLE") or "full-stack").strip()
-    return raw if raw in ROLE_LABELS else "full-stack"
+    raw = (env.get("APPLIANCE_ROLE") or "control-plane").strip()
+    return raw if raw in ROLE_LABELS else "control-plane"
 
 
 def role_label(role: str) -> str:
     return ROLE_LABELS.get(role, role)
+
+
+_CLUSTER_JOIN_STATE_FILE = Path("/var/lib/spatiumddi/release-state/cluster-join.state")
+
+
+def cluster_join_state() -> str | None:
+    """Read the host cluster-join runner's ``.state`` sidecar
+    (``state<TAB>reason``). Returns the state — joining / ready /
+    leaving / left / failed — or None when the node has never
+    joined/left a control-plane cluster (#272)."""
+    try:
+        raw = _CLUSTER_JOIN_STATE_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return raw.split("\t", 1)[0] or None if raw else None
+
+
+def effective_role_label(role: str) -> str:
+    """Role label that reflects k3s cluster membership. An ``appliance``
+    that has been PROMOTED + JOINED the control-plane cluster (#272)
+    shows as a control-plane member, not the install-time
+    "Appliance — supervisor" — its install role-config still says
+    appliance, but operationally it's now a control-plane/etcd node."""
+    if role in ("appliance", "application"):
+        st = cluster_join_state()
+        if st == "ready":
+            return "Control-plane member (promoted appliance)"
+        if st == "joining":
+            return "Appliance — joining control-plane cluster…"
+        if st == "leaving":
+            return "Appliance — leaving control-plane cluster…"
+    return role_label(role)
 
 
 # ── k3s pod state ─────────────────────────────────────────────────────
@@ -259,13 +298,47 @@ def role_label(role: str) -> str:
 
 _STATUS_HEALTH_RE = re.compile(r"\(([^)]+)\)")
 
+# Map a pod's owner-reference kind to a short workload type for the Pods
+# panel. A Deployment's pods are owned by a ReplicaSet (which the
+# Deployment owns), so ReplicaSet → "Deploy". CNPG postgres instance
+# pods are owned by a cloudnative-pg ``Cluster`` CR. Owner-less pods
+# (rare — bare/static) show "Static".
+_WORKLOAD_TYPE = {
+    "ReplicaSet": "Deploy",
+    "DaemonSet": "Daemon",
+    "StatefulSet": "Stateful",
+    "Job": "Job",
+    "Cluster": "CNPG",
+}
 
-def docker_ps() -> list[dict]:
+
+def _pod_workload_type(owner_refs: list) -> str:
+    if not owner_refs:
+        return "Static"
+    kind = owner_refs[0].get("kind") or ""
+    return _WORKLOAD_TYPE.get(kind, kind or "—")
+
+
+def visible_pods(ps_rows: list[dict]) -> list[dict]:
+    """#284 — pods worth showing on the live dashboard: everything
+    except completed (``Succeeded``) one-shot Jobs (the migrate Job +
+    CNPG's initdb / per-replica join Jobs). A finished Job carries no
+    signal and just consumes a row; ``kubectl get pods -A -a`` still has
+    the history. ``Failed`` pods are kept — those are real errors.
+
+    Used for BOTH the rendered rows AND the Pods-panel height
+    (``SVC_ROWS``). They MUST share this filter: sizing the panel off
+    the unfiltered list while rendering the filtered list would reserve
+    one blank line per hidden pod (the bug this helper closes)."""
+    return [r for r in ps_rows if (r.get("K8sState") or "") != "Succeeded"]
+
+
+def cluster_pods() -> list[dict]:
     """Return every pod on the local cluster via
     ``kubectl get pods -A -o json``, translated into the docker-ps
     dict shape the rest of the console expects.
 
-    Function name kept as ``docker_ps`` so the rest of the renderer
+    Pre-Phase-7 (was ``docker_ps``) this hit /var/run/docker.sock; the
     code doesn't have to change. Pre-Phase-7 this hit
     /var/run/docker.sock directly; now it shells to the local k3s
     binary's embedded kubectl. ~50 ms per call (fork + JSON parse)
@@ -388,10 +461,31 @@ def docker_ps() -> list[dict]:
                     }
                 )
 
+        # #272 — readiness / restarts / last-restart / pod IP for the
+        # Pods panel. All straight from pod status (no metrics-server).
+        ready_n = sum(1 for cs in container_statuses if cs.get("ready"))
+        ready_total = len(container_statuses) or len(containers)
+        restarts = sum(int(cs.get("restartCount") or 0) for cs in container_statuses)
+        # Last (re)start: when a container has restarted, its running
+        # state's startedAt is when the current instance came up. Pick
+        # the most recent across containers; blank when nothing restarted.
+        restarted_at = ""
+        if restarts > 0:
+            starts = [
+                (cs.get("state") or {}).get("running", {}).get("startedAt")
+                for cs in container_statuses
+                if int(cs.get("restartCount") or 0) > 0
+                and (cs.get("state") or {}).get("running")
+            ]
+            starts = [s for s in starts if s]
+            if starts:
+                restarted_at = max(starts)
+
         out.append(
             {
                 "Names": meta.get("name") or "",
                 "Namespace": meta.get("namespace") or "",
+                "Node": spec.get("nodeName") or "",
                 "Image": (first.get("image") or "") if first else "",
                 "Status": status_str,
                 "Labels": labels,
@@ -400,6 +494,11 @@ def docker_ps() -> list[dict]:
                 "Ports": ports_out,
                 "NetworkMode": "host" if spec.get("hostNetwork") else "default",
                 "CreationTimestamp": meta.get("creationTimestamp") or "",
+                "Ready": f"{ready_n}/{ready_total}",
+                "Restarts": restarts,
+                "RestartedAt": restarted_at,
+                "PodIP": status.get("podIP") or "",
+                "Type": _pod_workload_type(meta.get("ownerReferences") or []),
             }
         )
 
@@ -409,14 +508,157 @@ def docker_ps() -> list[dict]:
     return out
 
 
+def cluster_vip() -> str | None:
+    """The control-plane VIP — the frontend LoadBalancer Service's
+    assigned external IP (MetalLB), or ``None`` when no VIP is
+    configured (single-node / hostNetwork-only frontend) or k3s is
+    unreachable. Surfaced in the header so a physical-console operator
+    sees the one stable Web UI address."""
+    try:
+        proc = subprocess.run(
+            [
+                "/usr/local/bin/k3s",
+                "kubectl",
+                "get",
+                "svc",
+                "-n",
+                "spatium",
+                "-o",
+                "json",
+            ],
+            env={**os.environ, "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"},
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    for svc in data.get("items") or []:
+        spec = svc.get("spec") or {}
+        if spec.get("type") != "LoadBalancer":
+            continue
+        meta = svc.get("metadata") or {}
+        labels = meta.get("labels") or {}
+        name = meta.get("name") or ""
+        # The frontend Service is the control-plane VIP; match by the
+        # chart component label, falling back to a name substring.
+        if labels.get("app.kubernetes.io/component") != "frontend" and "frontend" not in name:
+            continue
+        ingress = ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+        for ing in ingress:
+            ip = ing.get("ip")
+            if ip:
+                return ip
+    return None
+
+
+def cluster_nodes() -> list[dict]:
+    """Return the k3s cluster's nodes via ``kubectl get nodes -o json``,
+    one dict per node: ``{name, ready, roles, version, internal_ip}``.
+
+    Surfaced on the console only when the cluster has >1 node (#272) —
+    a single-node box doesn't need a nodes table. ``ready`` is the
+    Ready condition's status ("True"/"False"/"Unknown"); ``roles`` is the
+    kubectl-shape ROLES column (e.g. "control-plane,etcd"). Returns []
+    on any failure so the dashboard degrades to pods-only.
+    """
+    try:
+        proc = subprocess.run(
+            ["/usr/local/bin/k3s", "kubectl", "get", "nodes", "-o", "json"],
+            env={**os.environ, "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"},
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    out: list[dict] = []
+    for node in data.get("items") or []:
+        meta = node.get("metadata") or {}
+        status = node.get("status") or {}
+        labels = meta.get("labels") or {}
+        ready = "Unknown"
+        for cond in status.get("conditions") or []:
+            if cond.get("type") == "Ready":
+                ready = cond.get("status") or "Unknown"
+                break
+        # ROLES column: node-role.kubernetes.io/<role>= labels, sorted.
+        # Split on the first "/" and compare the namespace exactly (an
+        # exact-match on the split component, not a substring/startswith
+        # check — keeps CodeQL's URL-sanitization heuristic quiet; this
+        # is a k8s label key, never a URL).
+        roles = sorted(
+            k.split("/", 1)[1]
+            for k in labels
+            if "/" in k and k.split("/", 1)[0] == "node-role.kubernetes.io"
+        )
+        internal_ip = ""
+        for addr in status.get("addresses") or []:
+            if addr.get("type") == "InternalIP":
+                internal_ip = addr.get("address") or ""
+                break
+        node_info = status.get("nodeInfo") or {}
+        # Health beyond Ready: cordoned (unschedulable) or any pressure
+        # / network condition True. "ok" when clean.
+        node_spec = node.get("spec") or {}
+        warns: list[str] = []
+        if node_spec.get("unschedulable"):
+            warns.append("Cordoned")
+        for cond in status.get("conditions") or []:
+            t = cond.get("type") or ""
+            if t in ("MemoryPressure", "DiskPressure", "PIDPressure") and cond.get("status") == "True":
+                warns.append(t.replace("Pressure", "Press"))
+            elif t == "NetworkUnavailable" and cond.get("status") == "True":
+                warns.append("NetDown")
+        conditions = ",".join(warns) if warns else "ok"
+        # Allocatable capacity (live usage% would need metrics-server,
+        # which the appliance disables). cpu cores + memory → e.g. "4c/7.8Gi".
+        alloc = status.get("allocatable") or {}
+        mem_raw = str(alloc.get("memory") or "")
+        gib = ""
+        if mem_raw.endswith("Ki"):
+            try:
+                gib = f"{int(mem_raw[:-2]) / 1048576:.1f}Gi"
+            except ValueError:
+                gib = ""
+        capacity = f"{alloc.get('cpu') or '?'}c/{gib or '?'}"
+        out.append(
+            {
+                "name": meta.get("name") or "",
+                "ready": ready,
+                "roles": ",".join(roles) if roles else "<none>",
+                "version": node_info.get("kubeletVersion") or "",
+                "internal_ip": internal_ip,
+                "created": meta.get("creationTimestamp") or "",
+                "conditions": conditions,
+                "capacity": capacity,
+            }
+        )
+    out.sort(key=lambda n: n["name"])
+    return out
+
+
 def container_port_summary(row: dict) -> str:
     """Return a compact ports / network-mode string for the Services
     column.
 
     Output shapes:
 
-    * ``Host Network`` — container in ``NetworkMode=host`` (DHCP-kea
-      runs here for broadcast-relay reachability).
+    * ``host`` — container in ``NetworkMode=host`` (DHCP-kea runs
+      here for broadcast-relay reachability). Compact label so the
+      Ports column stays narrow on the multi-node console.
     * ``53/tcp 53/udp`` — bridge-mode container with published
       ports; dedupes IPv4/IPv6 entries that the engine API returns
       twice for the same port.
@@ -424,7 +666,7 @@ def container_port_summary(row: dict) -> str:
       supervisor itself, internal-only containers).
     """
     if row.get("NetworkMode") == "host":
-        return "Host Network"
+        return "host"
     pairs: set[tuple[int, str]] = set()
     for p in row.get("Ports") or []:
         pub = p.get("PublicPort")
@@ -1014,7 +1256,7 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     left1.append("Host ", style="dim")
     left1.append(hostname, style="bold")
     left1.append("   Role ", style="dim")
-    left1.append(role_label(role), style="bold cyan")
+    left1.append(effective_role_label(role), style="bold cyan")
     right1 = Text()
     right1.append(clock, style="bold")
     right1.append("  ")
@@ -1045,13 +1287,24 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     line3.append("Build ", style="dim")
     line3.append(build)
 
-    # Line 3a — Control plane + Identity (only on application
-    # appliances; #170 Wave D). Inlining these into the header lets
-    # us drop the separate Agent panel, saving ~4 rows of vertical
-    # space the operator would otherwise spend looking at one panel
-    # title + two values.
+    # Control-plane VIP — the frontend's MetalLB LoadBalancer IP, when one
+    # is assigned. The single stable Web UI address; surfaced near the top
+    # so a physical-console operator knows where to point a browser no
+    # matter which node they're at. Quiet when no VIP is configured.
+    vip_line: Text | None = None
+    if state.vip:
+        vip_line = Text()
+        vip_line.append("VIP  ", style="dim")
+        vip_line.append(state.vip, style="bold bright_green")
+        vip_line.append("  Web UI (control-plane)", style="dim")
+
+    # Line 3a — Control plane + Identity (only on appliance nodes that
+    # pair with a remote control plane; #170 Wave D). Inlining these
+    # into the header lets us drop the separate Agent panel, saving ~4
+    # rows of vertical space the operator would otherwise spend looking
+    # at one panel title + two values.
     agent_line: Text | None = None
-    if role == "application":
+    if role in ("appliance", "application"):
         cp_url = env.get("CONTROL_PLANE_URL") or "(not configured)"
         pairing = pairing_status(env, role, state.ps_rows)
         agent_line = Text()
@@ -1069,7 +1322,7 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # mtime delta here gives the physical-console operator the same
     # signal the host watchdog acts on.
     watchdog_line: Text | None = None
-    if role == "application":
+    if role in ("appliance", "application"):
         wd_status = supervisor_watchdog_status()
         if wd_status is not None:
             label, wstyle = wd_status
@@ -1113,7 +1366,7 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # otherwise so a steady-state appliance doesn't carry a permanent
     # "no upgrade pending" row.
     upgrade_line: Text | None = None
-    if role == "application":
+    if role in ("appliance", "application"):
         ustatus = upgrade_status()
         if ustatus is not None:
             label, ustyle = ustatus
@@ -1144,10 +1397,13 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # Saves one vertical row on the dashboard.
     vitals = Text()
     vitals.append("Up ", style="dim"); vitals.append(uptime_str(), style="bold")
-    vitals.append("   CPU ", style="dim"); vitals.append(f"{cpu:.0f}%", style="bold")
+    # Pad the per-second-volatile percentages to a fixed 3-digit width
+    # (0–100) so the fields after them — RAM / Load / Disk — don't reflow
+    # left/right every tick as CPU/RAM jiggle between 1 and 3 digits.
+    vitals.append("   CPU ", style="dim"); vitals.append(f"{cpu:3.0f}%", style="bold")
     vitals.append("   RAM ", style="dim")
     vitals.append(
-        f"{state.ram_used_gib:.1f}/{state.ram_total_gib:.1f} GiB ({state.ram_percent:.0f}%)",
+        f"{state.ram_used_gib:.1f}/{state.ram_total_gib:.1f} GiB ({state.ram_percent:3.0f}%)",
         style="bold",
     )
     vitals.append("   Load ", style="dim"); vitals.append(load, style="bold")
@@ -1166,7 +1422,10 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # full-width because it's one long line of bits that flows
     # naturally. Everything else (IPs/Build/Agent/Watchdog/Slot/
     # Upgrade/k3s) is short enough to fit in a half-width cell.
-    short_lines: list[Text] = [line2, line3]
+    short_lines: list[Text] = []
+    if vip_line is not None:
+        short_lines.append(vip_line)
+    short_lines += [line2, line3]
     if agent_line is not None:
         short_lines.append(agent_line)
     if watchdog_line is not None:
@@ -1192,9 +1451,30 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
                  title="[bold]SpatiumDDI[/bold]", title_align="left")
 
 
+# Strip the long SpatiumDDI helm-release prefixes from pod names for the
+# Pods panel — ``spatium-control-spatiumddi-api-xxx`` reads as
+# ``api-xxx`` and ``spatium-bootstrap-cloudnative-pg-xxx`` as
+# ``cloudnative-pg-xxx``. ``spatium-supervisor-xxx`` is left alone (short
+# + clear already), as are non-SpatiumDDI pods (coredns, helm-install-*,
+# local-path-*).
+_POD_NAME_PREFIXES = (
+    "spatium-control-spatiumddi-",
+    "spatium-bootstrap-",
+)
+
+
+def _short_pod_name(name: str) -> str:
+    for p in _POD_NAME_PREFIXES:
+        if name.startswith(p):
+            return name[len(p):]
+    return name
+
+
 def render_services(role: str, ps_rows: list[dict]) -> Panel:
     """Render the Pods panel — every pod on the local k3s cluster
-    grouped by namespace, with status + ports + image.
+    with status + node + ports (the image column was dropped — on an
+    appliance every image is baked + known, so per-pod image was noise;
+    ``kubectl describe`` still has it).
 
     Function name kept as ``render_services`` so call sites in
     ``render_frame`` don't need to change. Pre-Phase-7 this was
@@ -1210,12 +1490,17 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
 
     tbl = Table.grid(padding=(0, 1), expand=True)
     tbl.add_column(width=1, no_wrap=True)          # health glyph
-    tbl.add_column(width=12, no_wrap=True)         # namespace
-    tbl.add_column(min_width=20, no_wrap=False)    # pod name
-    tbl.add_column(width=5, no_wrap=True, justify="right")  # age
-    tbl.add_column(width=18, no_wrap=True)         # k8s state (CrashLoopBackOff fits)
-    tbl.add_column(width=15, no_wrap=True)         # ports / net mode
-    tbl.add_column(min_width=14, no_wrap=False)    # image
+    tbl.add_column(width=11, no_wrap=True)         # namespace
+    tbl.add_column(min_width=16, no_wrap=False)    # pod name (prefix-stripped)
+    tbl.add_column(width=8, no_wrap=True)          # workload type (Deploy/Daemon/…)
+    tbl.add_column(width=8, no_wrap=True)          # node (#272 multi-node)
+    tbl.add_column(width=5, no_wrap=True)          # ready (n/m)
+    tbl.add_column(width=4, no_wrap=True, justify="right")  # restarts
+    tbl.add_column(width=7, no_wrap=True, justify="right")  # restart age
+    tbl.add_column(width=4, no_wrap=True, justify="right")  # age
+    tbl.add_column(width=16, no_wrap=True)         # k8s state (CrashLoopBackOff = 16)
+    tbl.add_column(width=14, no_wrap=True)         # pod IP
+    tbl.add_column(width=8, no_wrap=True)          # ports / net mode (compact)
 
     # Header row — column labels. dim style so the data rows below
     # stay the visual focus. ``rich.Table.grid`` doesn't have a
@@ -1227,28 +1512,38 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         Text("", style=header_style),
         Text("NAMESPACE", style=header_style),
         Text("NAME", style=header_style),
+        Text("TYPE", style=header_style),
+        Text("NODE", style=header_style),
+        Text("READY", style=header_style),
+        Text("RST", style=header_style),
+        Text("RST-AGE", style=header_style),
         Text("AGE", style=header_style),
         Text("STATE", style=header_style),
+        Text("IP", style=header_style),
         Text("PORTS", style=header_style),
-        Text("IMAGE", style=header_style),
     )
+
+    # #284 — drop completed one-shot pods (``Succeeded`` Jobs). Shares
+    # the ``visible_pods`` filter with the SVC_ROWS panel-height calc in
+    # render_frame so a hidden pod reserves no blank line. (The migrate
+    # Job is also TTL-GC'd by the cluster after
+    # migrate.ttlSecondsAfterFinished; this just stops it cluttering the
+    # TTY in the meantime.)
+    visible_rows = visible_pods(ps_rows)
 
     # Pure alphabetical by pod name. Operator feedback —
     # namespace-grouping made the spatium pods land at the top
     # consistently but obscured the natural "where is foo-pod"
     # scan; the namespace column itself still makes the grouping
     # obvious at a glance.
-    sorted_rows = sorted(ps_rows, key=lambda r: r.get("Names") or "")
+    sorted_rows = sorted(visible_rows, key=lambda r: r.get("Names") or "")
 
     if not sorted_rows:
         tbl.add_row(
             Text("·", style="dim"),
             Text("—", style="dim"),
             Text("no pods running (k3s not ready?)", style="dim"),
-            Text("", style="dim"),
-            Text("", style="dim"),
-            Text("", style="dim"),
-            Text("", style="dim"),
+            *[Text("", style="dim") for _ in range(9)],
         )
         return Panel(
             tbl, box=SQUARE, border_style="cyan",
@@ -1262,13 +1557,28 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
             verdict = "completed"
         glyph, style = HEALTH_STYLES[verdict]
 
-        image = row.get("Image") or ""
-        short_image = image.rsplit("/", 1)[1] if "/" in image else image
-
         ports = container_port_summary(row)
-        ports_style = "bold cyan" if ports == "Host Network" else "dim"
+        ports_style = "bold cyan" if ports == "host" else "dim"
 
         age = _format_pod_age(row.get("CreationTimestamp") or "")
+
+        # READY (n/m) — amber when not all containers are ready (a
+        # Running-but-0/1 pod is failing its probes).
+        ready = row.get("Ready") or "0/0"
+        try:
+            rn, rm = (int(x) for x in ready.split("/", 1))
+        except ValueError:
+            rn, rm = 0, 0
+        ready_style = "dim" if (rm and rn >= rm) else "yellow"
+
+        # RESTARTS — dim at 0, amber 1-5, red beyond (a flapping pod).
+        restarts = int(row.get("Restarts") or 0)
+        rst_text = str(restarts) if restarts else "·"
+        rst_style = "dim" if restarts == 0 else "yellow" if restarts <= 5 else "bold red"
+        # How long ago it last restarted (blank → "·").
+        rage = _format_pod_age(row.get("RestartedAt") or "") if row.get("RestartedAt") else "·"
+
+        pod_ip = row.get("PodIP") or "—"
 
         # Show the raw k8s state (Running / Pending / Succeeded /
         # CrashLoopBackOff / ImagePullBackOff / …) — same vocabulary
@@ -1292,16 +1602,92 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         tbl.add_row(
             Text(glyph, style=style),
             Text(row.get("Namespace") or "—", style="dim"),
-            Text(row.get("Names") or "", style="bold"),
+            Text(_short_pod_name(row.get("Names") or ""), style="bold"),
+            Text(row.get("Type") or "—", style="dim"),
+            Text(row.get("Node") or "—", style="dim"),
+            Text(ready, style=ready_style),
+            Text(rst_text, style=rst_style),
+            Text(rage, style="dim"),
             Text(age, style="dim"),
             Text(k8s_state, style=state_style),
+            Text(pod_ip, style="dim"),
             Text(ports or "—", style=ports_style),
-            Text(short_image, style="dim"),
         )
 
     return Panel(
         tbl, box=SQUARE, border_style="cyan",
         title="[bold]Pods[/bold]", title_align="left",
+    )
+
+
+def render_nodes(nodes: list[dict], pods: list[dict] | None = None) -> Panel:
+    """Render the cluster Nodes panel (#272) — one row per k3s node:
+    Ready / roles / pod count / health / capacity / age / IP / version.
+
+    Only shown when the cluster has >1 node (a single-node box doesn't
+    need it — render_frame gates on len). ``pods`` (the same list the
+    Pods panel uses) drives the per-node POD count, so an empty / under-
+    scheduled control-plane node is obvious at a glance.
+    """
+    # Pod count per node from the already-fetched pod list (no extra API).
+    pod_counts: dict[str, int] = {}
+    for p in pods or []:
+        nm = p.get("Node") or ""
+        if nm:
+            pod_counts[nm] = pod_counts.get(nm, 0) + 1
+
+    tbl = Table.grid(padding=(0, 1), expand=True)
+    tbl.add_column(width=1, no_wrap=True)            # ready glyph
+    tbl.add_column(min_width=10, no_wrap=True)       # node name
+    tbl.add_column(width=8, no_wrap=True)            # Ready/NotReady
+    tbl.add_column(width=18, no_wrap=True)           # roles
+    tbl.add_column(width=4, no_wrap=True, justify="right")  # pod count
+    tbl.add_column(width=13, no_wrap=True)           # conditions / health
+    tbl.add_column(width=10, no_wrap=True)           # capacity (cpu/mem)
+    tbl.add_column(width=5, no_wrap=True, justify="right")  # age
+    tbl.add_column(width=15, no_wrap=True)           # internal IP
+    tbl.add_column(min_width=12, no_wrap=False)      # version
+
+    header_style = "bold dim"
+    tbl.add_row(
+        Text("", style=header_style),
+        Text("NODE", style=header_style),
+        Text("READY", style=header_style),
+        Text("ROLES", style=header_style),
+        Text("PODS", style=header_style),
+        Text("COND", style=header_style),
+        Text("CPU/MEM", style=header_style),
+        Text("AGE", style=header_style),
+        Text("INTERNAL-IP", style=header_style),
+        Text("VERSION", style=header_style),
+    )
+    ready_total = sum(1 for n in nodes if n.get("ready") == "True")
+    for n in nodes:
+        ready = n.get("ready") or "Unknown"
+        if ready == "True":
+            glyph, gstyle, rtxt, rstyle = "●", "green", "Ready", "green"
+        elif ready == "False":
+            glyph, gstyle, rtxt, rstyle = "●", "red", "NotReady", "red"
+        else:
+            glyph, gstyle, rtxt, rstyle = "●", "yellow", "Unknown", "yellow"
+        cond = n.get("conditions") or "ok"
+        cond_style = "dim" if cond == "ok" else "bold yellow"
+        tbl.add_row(
+            Text(glyph, style=gstyle),
+            Text(n.get("name") or "", style="bold"),
+            Text(rtxt, style=rstyle),
+            Text(n.get("roles") or "<none>", style="dim"),
+            Text(str(pod_counts.get(n.get("name") or "", 0)), style="dim"),
+            Text(cond, style=cond_style),
+            Text(n.get("capacity") or "—", style="dim"),
+            Text(_format_pod_age(n.get("created") or ""), style="dim"),
+            Text(n.get("internal_ip") or "—", style="dim"),
+            Text(n.get("version") or "", style="dim"),
+        )
+    title = f"[bold]Cluster[/bold] · {ready_total}/{len(nodes)} Ready"
+    return Panel(
+        tbl, box=SQUARE, border_style="magenta",
+        title=title, title_align="left",
     )
 
 
@@ -1492,7 +1878,7 @@ def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple
 
     Returns ``(label, rich-style)`` so the renderer can colour the row.
     """
-    if role != "application":
+    if role not in ("appliance", "application"):
         return None
     state_dir = Path("/var/persist/spatium-supervisor")
     approval_state_file = state_dir / "approval-state"
@@ -1582,18 +1968,21 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # empty-state "no pods running" hint stays visible while k3s comes
     # up. Capped at terminal-height-aware ceiling in render_frame's
     # log_height clamp below.
-    pods_count = len(state.ps_rows) if state.ps_rows else 1
+    # #284 — size the Pods panel off the SAME filtered set render_services
+    # renders, so hidden (Succeeded) pods don't leave blank lines. ``or 1``
+    # keeps a single row for the "no pods" fallback when nothing's visible.
+    pods_count = len(visible_pods(state.ps_rows)) or 1
     # Header layout: 1 line1 (host+role | clock) + N rows of the
     # 2-col paired grid + 1 horizontal rule + 1 vitals + 2 panel
     # border. The grid packs IPs + Build + every conditional row
     # (agent / watchdog / slot / upgrade / k3s) 2-per-row, so
     # what would have been 5-7 separate rows becomes 3-4 paired
     # rows — saves ~3 vertical rows on a typical appliance.
-    has_agent_line = state.role == "application"
+    has_agent_line = state.role in ("appliance", "application")
     has_watchdog_line = (
-        state.role == "application" and supervisor_watchdog_status() is not None
+        state.role in ("appliance", "application") and supervisor_watchdog_status() is not None
     )
-    has_upgrade_line = state.role == "application" and upgrade_status() is not None
+    has_upgrade_line = state.role in ("appliance", "application") and upgrade_status() is not None
     has_k3s_line = k3s_status() is not None
     short_count = (
         2  # IPs + Build, always present
@@ -1614,13 +2003,28 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
         Layout(name="body", ratio=1),
         Layout(name="footer", size=FOOTER_ROWS),
     )
-    layout["body"].split_column(
-        Layout(name="services", size=SVC_ROWS),
-        Layout(name="log", ratio=1),
-    )
+    # #272 — on a multi-node control-plane cluster, show a Nodes panel
+    # (name / Ready / roles / IP / version) above Pods so operators see
+    # cluster membership + health at the TTY. Single-node boxes skip it
+    # (nothing to compare) and keep the original two-panel layout.
+    show_nodes = len(state.nodes) > 1
     layout["header"].update(render_header(state, mono_t))
+    if show_nodes:
+        NODES_ROWS = len(state.nodes) + 3  # 1 header row + 2 panel border
+        layout["body"].split_column(
+            Layout(name="nodes", size=NODES_ROWS),
+            Layout(name="services", size=SVC_ROWS),
+            Layout(name="log", ratio=1),
+        )
+        layout["body"]["nodes"].update(render_nodes(state.nodes, state.ps_rows))
+        fixed = HEADER_ROWS + NODES_ROWS + SVC_ROWS + FOOTER_ROWS
+    else:
+        layout["body"].split_column(
+            Layout(name="services", size=SVC_ROWS),
+            Layout(name="log", ratio=1),
+        )
+        fixed = HEADER_ROWS + SVC_ROWS + FOOTER_ROWS
     layout["body"]["services"].update(render_services(state.role, state.ps_rows))
-    fixed = HEADER_ROWS + SVC_ROWS + FOOTER_ROWS
     log_height = max(state.term_size[1] - fixed, 4)
     layout["body"]["log"].update(render_log(state.tail, log_height))
     layout["footer"].update(render_footer(state.status_message))
@@ -1637,6 +2041,8 @@ class DashboardState:
         self.tail = tail
         self.tty_path = tty_path
         self.ps_rows: list[dict] = []
+        self.nodes: list[dict] = []
+        self.vip: str | None = None
         self.status_message = ""
         self.status_expires = 0.0
         self.pending_action: str | None = None
@@ -1683,7 +2089,9 @@ class DashboardState:
         # Data tier (2 s) — docker ps + env re-read.
         if force or (now - self._last_data_refresh) >= DATA_REFRESH_EVERY:
             self._last_data_refresh = now
-            self.ps_rows = docker_ps()
+            self.ps_rows = cluster_pods()
+            self.nodes = cluster_nodes()
+            self.vip = cluster_vip()
             try:
                 self.env = read_env()
             except Exception:
@@ -2227,7 +2635,7 @@ def main() -> int:
     # spatium-console@ttyS0 instance inherits the same fate.
     # Without this guard the dashboard goes Live(...) → first frame
     # render → EIO on stdout.flush() → exit 1 → systemd Restart=always
-    # respawns in 2 s, repeat forever. Each spawn calls docker_ps()
+    # respawns in 2 s, repeat forever. Each spawn calls cluster_pods()
     # once before failing, which generates a broken-pipe entry on
     # docker.sock — and at 2 s intervals that's ~30 noise lines/min
     # in the docker daemon journal for the no-op crash loop. Bailing
@@ -2248,7 +2656,7 @@ def main() -> int:
             return 75  # EX_TEMPFAIL — paired with RestartPreventExitStatus=75
 
     env = read_env() if not args.dev else {
-        "APPLIANCE_ROLE": "full-stack",
+        "APPLIANCE_ROLE": "control-plane",
         "APPLIANCE_HOSTNAME": "ddi-dev-01",
         "APPLIANCE_VERSION": "0.1.0-dev",
         "SPATIUMDDI_VERSION": "dev",

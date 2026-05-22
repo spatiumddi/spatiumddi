@@ -41,7 +41,7 @@ from pathlib import Path
 
 import structlog
 
-from . import k8s_api
+from . import appliance_state, k8s_api
 
 
 @dataclass(frozen=True)
@@ -98,12 +98,42 @@ _PROFILE_TO_HELM_KEY = {
 # on the label being present, so role swap = label flip.
 #
 # Keep in lock-step with the per-template ``nodeSelector`` blocks in
-# charts/spatiumddi-appliance/templates/*.yaml.
+# charts/spatiumddi-appliance/templates/*.yaml (service-agent
+# workloads) and charts/spatiumddi/templates/*.yaml (control-plane
+# workloads).
 _ROLE_LABEL_KEYS = {
     "dns-bind9": "spatium.io/role-dns-bind9",
     "dns-powerdns": "spatium.io/role-dns-powerdns",
     "dhcp": "spatium.io/role-dhcp",
+    # #272 — gate the umbrella chart's frontend / api / worker / beat /
+    # postgres / redis workloads onto the control-plane variant (never
+    # an appliance). Multi-node HA selects between control-plane members
+    # via this label.
+    "control-plane": "spatium.io/role-control-plane",
 }
+
+# #272 — per-variant FORCED role set. The supervisor reads its variant
+# from ``/etc/spatiumddi-host/role-config:ROLE`` and always asserts
+# these labels on the node, on top of whatever operator-assigned roles
+# arrive via the heartbeat response. The supervisor is the single
+# source of truth for node labels; install-time drop-ins are only a
+# boot bootstrap (so pods can schedule before the supervisor is up).
+#
+# Two variants, and only ``control-plane`` is forced:
+#   * control-plane — forces the control-plane label so the umbrella
+#     workloads (api / frontend / db / redis / worker / beat) never
+#     lose their node. DNS/DHCP are NOT forced here AND NOT auto-
+#     assigned at register — the operator enables them per node via
+#     the Fleet role toggle (so the data plane is always a deliberate
+#     fleet decision, and a promoted control-plane node can shed them).
+#   * appliance — nothing forced. Operator-assigned roles only.
+# Forcing DNS/DHCP here would re-add the labels every tick and make the
+# Fleet toggle a no-op, so they must stay out of every forced set.
+_VARIANT_FIXED_ROLES: dict[str, frozenset[str]] = {
+    "control-plane": frozenset({"control-plane"}),
+    "appliance": frozenset(),
+}
+
 
 @dataclass(frozen=True)
 class K3sEnvironment:
@@ -160,12 +190,8 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
     here we only override what changes per-appliance (per-role
     enabled flags + agent keys + group names + control-plane URL).
     """
-    control_plane_url = env_vars.get("CONTROL_PLANE_URL") or os.environ.get(
-        "CONTROL_PLANE_URL", ""
-    )
-    image_tag = env_vars.get("SPATIUMDDI_VERSION") or os.environ.get(
-        "SPATIUMDDI_VERSION", "dev"
-    )
+    control_plane_url = env_vars.get("CONTROL_PLANE_URL") or os.environ.get("CONTROL_PLANE_URL", "")
+    image_tag = env_vars.get("SPATIUMDDI_VERSION") or os.environ.get("SPATIUMDDI_VERSION", "dev")
 
     # Phase 10 wave 2 — ``enabled`` flags here are RELEASE-ownership
     # scope (which helm release owns which Deployment), NOT
@@ -284,6 +310,7 @@ def apply_role_assignment(
     if not node_name:
         try:
             import socket as _socket
+
             node_name = _socket.gethostname()
         except OSError:
             node_name = ""
@@ -331,19 +358,45 @@ def reconcile_node_labels(profiles: list[str]) -> tuple[bool, str | None]:
     or a manual unlabeling without waiting for the values-hash to
     change.
 
+    The desired role set is the union of:
+
+      * Operator-assigned ``profiles`` from the heartbeat-response's
+        role-assignment block (passed through here every tick).
+      * The fixed per-variant set from ``_VARIANT_FIXED_ROLES``
+        (#272 Phase 7b) — full-stack + frontend-core always assert
+        ``control-plane``; DNS/DHCP are operator-toggleable on every
+        variant (full-stack just defaults them on at register time).
+        application contributes nothing fixed (operator chooses).
+
     Returns ``(ok, error_or_None)`` — caller logs but doesn't act
     on failure (next heartbeat re-attempts).
     """
     desired_role_set = {p for p in profiles if p in _ROLE_LABEL_KEYS}
+    # #272 Phase 1 — union with the variant's fixed roles. Variant
+    # detection reads /etc/spatiumddi-host/role-config:ROLE; falls
+    # back to no-op (empty set) on docker / k8s / unknown variants.
+    variant = appliance_state.detect_appliance_variant()
+    if variant is not None:
+        desired_role_set |= set(_VARIANT_FIXED_ROLES.get(variant, frozenset()))
+    # #277 — a promoted `appliance`-variant node (one that JOINED the
+    # control-plane cluster as a k3s server) must also carry the
+    # control-plane label so the control-plane workloads (api / frontend
+    # / worker + the CNPG postgres primary & replicas) can schedule onto
+    # it. The seed (control-plane variant) already gets this via
+    # _VARIANT_FIXED_ROLES; this covers members promoted from an
+    # `appliance` install. Key off the host runner's join-state sidecar:
+    # "ready" == joined and Ready as a cluster member.
+    join_state, _ = appliance_state.read_cluster_join_state()
+    if join_state == "ready":
+        desired_role_set.add("control-plane")
     label_diff: dict[str, str | None] = {}
     for role, label in _ROLE_LABEL_KEYS.items():
         label_diff[label] = "true" if role in desired_role_set else None
-    node_name = (
-        os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
-    )
+    node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
     if not node_name:
         try:
             import socket as _socket
+
             node_name = _socket.gethostname()
         except OSError:
             return False, "node_name unknown"
@@ -364,9 +417,7 @@ def tear_down_supervised_services() -> LifecycleResult:
     if not env.available:
         return LifecycleResult(state="idle", reason=env.reason)
 
-    ok, err = k8s_api.delete_helmchart(
-        _HELMCHART_NAME, chart_namespace=_CHART_NAMESPACE
-    )
+    ok, err = k8s_api.delete_helmchart(_HELMCHART_NAME, chart_namespace=_CHART_NAMESPACE)
     if not ok:
         return LifecycleResult(state="failed", reason=err or "kubeapi delete failed")
 
@@ -378,6 +429,7 @@ def tear_down_supervised_services() -> LifecycleResult:
     if not node_name:
         try:
             import socket as _socket
+
             node_name = _socket.gethostname()
         except OSError:
             node_name = ""

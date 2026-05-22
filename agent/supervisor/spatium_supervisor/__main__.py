@@ -27,10 +27,12 @@ import time
 import httpx
 import structlog
 
-from . import approval_state
+import dataclasses
+
+from . import appliance_state, approval_state
 from .cert_auth import clear_cert
 from .config import SupervisorConfig
-from .heartbeat import heartbeat_once
+from .heartbeat import _effective_control_plane_url, heartbeat_once
 from .k8s_proxy import start_proxy_thread
 from .identity import (
     clear_appliance_id,
@@ -74,13 +76,102 @@ def _build_http_client(
                 "set the env to 0 / unset on production deployments."
             ),
         )
-    return httpx.Client(verify=not skip_tls_verify)
+    # #272 Phase 1 — follow_redirects=True so an operator-typed
+    # http:// CONTROL_PLANE_URL doesn't 301-loop against the nginx
+    # http→https redirect on the appliance frontend. POST redirects
+    # are followed verbatim (httpx preserves the method on 301/302
+    # by default for non-safe methods unless explicitly disabled).
+    return httpx.Client(verify=not skip_tls_verify, follow_redirects=True)
 
 
-def _maybe_register(cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger) -> None:
+def _self_bootstrap_or_skip(
+    cfg: SupervisorConfig,
+    variant: str,
+    log: structlog.stdlib.BoundLogger,
+) -> SupervisorConfig:
+    """Mint a local pairing code via the in-cluster api Service and
+    return a config carrying it.
+
+    Only fires on the control-plane appliance where the
+    installer wizard didn't capture a pairing code (the control plane
+    IS local). The api gates the endpoint on (1) the host bind-mounted
+    ``role-config:ROLE`` matching this claim and (2) no existing
+    Appliance rows, so calling it from anywhere other than the local
+    supervisor on a fresh install fails 403/409.
+
+    On success we return a frozen copy of ``cfg`` with the new code +
+    control-plane URL stamped in. On any failure (api not reachable,
+    403, 409 because we're already registered, ...) we log + return
+    the original cfg so the caller's normal "skipped" log paths fire.
+    Idempotent — a transient 409 just means the existing register
+    flow will kick in once the supervisor's cached_appliance_id is
+    populated on the next loop iteration.
+    """
+    # In-cluster Service URL. The api Service is named
+    # ``<release>-spatiumddi-api`` in the spatium namespace; the
+    # appliance helm-chart release is ``spatium-control``.
+    # Hardcoded here so the supervisor doesn't need an extra env var
+    # for the discovery URL — multi-node HA (#272 later phases) can
+    # generalise this when we add real promotion-flow plumbing.
+    api_url = "http://spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000"
+    log.info("supervisor.self_bootstrap.attempting", variant=variant, api_url=api_url)
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(
+                f"{api_url}/api/v1/appliance/self-register-bootstrap",
+                json={"appliance_variant": variant},
+            )
+    except httpx.HTTPError as exc:
+        log.warning(
+            "supervisor.self_bootstrap.transport_failed",
+            error=str(exc),
+            hint="will retry on next register-loop tick",
+        )
+        return cfg
+    if resp.status_code == 409:
+        log.info("supervisor.self_bootstrap.already_registered")
+        return cfg
+    if resp.status_code != 200:
+        log.warning(
+            "supervisor.self_bootstrap.refused",
+            status=resp.status_code,
+            body=resp.text[:200],
+        )
+        return cfg
+    try:
+        payload = resp.json()
+        code = payload["code"]
+        control_plane_url = payload["control_plane_url"]
+    except (ValueError, KeyError) as exc:
+        log.warning("supervisor.self_bootstrap.malformed_response", error=str(exc))
+        return cfg
+    log.info(
+        "supervisor.self_bootstrap.minted",
+        variant=variant,
+        code_last_two=code[-2:],
+        control_plane_url=control_plane_url,
+    )
+    return dataclasses.replace(
+        cfg,
+        bootstrap_pairing_code=code,
+        control_plane_url=control_plane_url,
+    )
+
+
+def _maybe_register(
+    cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger
+) -> SupervisorConfig:
     """Run identity generation + register-if-needed in one shot. Logs
     its own status; never raises into the caller (the main loop
-    falls back to idle on any failure)."""
+    falls back to idle on any failure).
+
+    Returns the (possibly mutated) ``cfg`` — when the
+    self-bootstrap path fires on the control-plane node,
+    ``control_plane_url`` and ``bootstrap_pairing_code`` are
+    refreshed in the returned config so the caller's heartbeat
+    loop can use the new control-plane URL going forward.
+    Otherwise returns the input verbatim.
+    """
     identity, generated = load_or_generate(cfg.state_dir)
     if generated:
         log.info(
@@ -95,24 +186,37 @@ def _maybe_register(cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger) ->
 
     cached_appliance_id = load_appliance_id(cfg.state_dir)
     if cached_appliance_id is not None:
-        # Issue #170 Wave E follow-up — revoke recovery. If the
-        # supervisor flipped to ``approval-state=revoked`` (control
-        # plane returning 403/404 for our cached identity) and the
-        # operator handed us a fresh pairing code via spatium-pair,
-        # the cached appliance_id is stale by definition. Clear the
-        # soft state (appliance_id / session_token / cert.pem /
-        # approval-state / strikes) so the register call below
-        # actually fires against the new pairing code. The Ed25519
-        # keypair stays — it's stable across re-pairs and the
-        # control plane creates a new appliance row + cert against
-        # it on the next approve.
-        if (
-            approval_state.read_state(cfg.state_dir) == "revoked"
-            and cfg.bootstrap_pairing_code
+        # Issue #170 Wave E follow-up + #272 Phase 1 audit — revoke
+        # recovery. If the supervisor flipped to
+        # ``approval-state=revoked`` (control plane returning 403/404
+        # for our cached identity) we need to clear the stale soft
+        # state (appliance_id / session_token / cert.pem / approval-
+        # state / strikes) so the register call below mints a fresh
+        # identity. The Ed25519 keypair stays — it's stable across
+        # re-pairs and the control plane creates a new appliance row
+        # + cert against it on the next approve.
+        #
+        # Re-pair sources, in order of precedence:
+        #   1. ``cfg.bootstrap_pairing_code`` — operator handed us a
+        #      fresh code via spatium-pair (#170 Wave E flow).
+        #   2. Self-bootstrap variant (control-plane) —
+        #      #272 Phase 1; the supervisor mints its own pairing
+        #      code against the in-cluster api on the recovery path.
+        #
+        # Without case 2 the supervisor would stay locked in revoked
+        # after the operator deleted its row from the Fleet UI on a
+        # control-plane appliance (no pairing code env present, no
+        # human-mediated recovery path) — verified live on .199.
+        variant = appliance_state.detect_appliance_variant()
+        can_self_bootstrap = variant == "control-plane"
+        if approval_state.read_state(cfg.state_dir) == "revoked" and (
+            cfg.bootstrap_pairing_code or can_self_bootstrap
         ):
             log.info(
                 "supervisor.register.revoked_reregister",
                 stale_appliance_id=str(cached_appliance_id),
+                via_self_bootstrap=can_self_bootstrap
+                and not cfg.bootstrap_pairing_code,
             )
             clear_appliance_id(cfg.state_dir)
             clear_session_token(cfg.state_dir)
@@ -124,14 +228,26 @@ def _maybe_register(cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger) ->
                 "supervisor.register.cached",
                 appliance_id=str(cached_appliance_id),
             )
-            return
+            return cfg
+
+    # #272 — self-bootstrap on the control-plane node.
+    # The installer wizard doesn't capture a pairing code for these
+    # variants (the control plane is local), so on first boot both
+    # control_plane_url and bootstrap_pairing_code are empty. Try
+    # the in-cluster api's self-register-bootstrap endpoint first;
+    # on success the resulting code is reused as a normal pairing
+    # code through the standard register flow below.
+    if not cfg.control_plane_url and not cfg.bootstrap_pairing_code:
+        variant = appliance_state.detect_appliance_variant()
+        if variant == "control-plane":
+            cfg = _self_bootstrap_or_skip(cfg, variant, log)
 
     if not cfg.control_plane_url:
         log.warning("supervisor.register.skipped", reason="no control_plane_url")
-        return
+        return cfg
     if not cfg.bootstrap_pairing_code:
         log.warning("supervisor.register.skipped", reason="no bootstrap_pairing_code")
-        return
+        return cfg
 
     skip_tls = os.environ.get("SPATIUM_INSECURE_SKIP_TLS_VERIFY", "").lower() in (
         "1",
@@ -147,13 +263,18 @@ def _maybe_register(cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger) ->
                 hostname=cfg.hostname,
                 supervisor_version=_supervisor_version(),
                 client=client,
+                # #272 Phase 1 — let the control plane stamp the variant
+                # + auto-assign fixed roles at register time instead of
+                # waiting for the first heartbeat. None on docker / k8s
+                # supervisors (no role-config bind mount).
+                appliance_variant=appliance_state.detect_appliance_variant(),
             )
     except RegisterDisabled as exc:
         log.warning("supervisor.register.disabled", reason=str(exc))
-        return
+        return cfg
     except RegisterFatal as exc:
         log.error("supervisor.register.fatal", reason=str(exc))
-        return
+        return cfg
 
     import uuid
 
@@ -167,6 +288,7 @@ def _maybe_register(cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger) ->
         appliance_id=result.appliance_id,
         state=result.state,
     )
+    return cfg
 
 
 def _supervisor_version() -> str:
@@ -192,7 +314,7 @@ def main() -> int:
         heartbeat_interval_seconds=cfg.heartbeat_interval_seconds,
     )
 
-    _maybe_register(cfg, log)
+    cfg = _maybe_register(cfg, log)
 
     # Issue #183 Phase 4 — k3s proxy thread. Daemon thread that
     # long-polls the control plane for queued kubeapi requests +
@@ -245,7 +367,23 @@ def main() -> int:
         except OSError as exc:
             log.warning("supervisor.liveness.touch_failed", error=str(exc))
         appliance_id = load_appliance_id(cfg.state_dir)
-        if appliance_id is not None and cfg.control_plane_url:
+        # #272 Phase 1 — retry the register path each loop iteration
+        # while we haven't successfully registered. Catches the
+        # control-plane self-bootstrap case where the
+        # in-cluster api Service wasn't reachable on the supervisor's
+        # first attempt at startup (api pod still coming up). Cheap
+        # for the steady-state — cached_appliance_id short-circuits
+        # ``_maybe_register`` on its first line.
+        if appliance_id is None:
+            cfg = _maybe_register(cfg, log)
+            appliance_id = load_appliance_id(cfg.state_dir)
+        # #272 — cluster members heartbeat the in-cluster api Service
+        # (resolved here so the skip-gate matches what heartbeat_once
+        # will actually POST to). A control-plane member always has a
+        # target even if CONTROL_PLANE_URL was never set; a remote
+        # agent only proceeds when its configured URL is present.
+        effective_url = _effective_control_plane_url(cfg)
+        if appliance_id is not None and effective_url:
             session_token = load_session_token(cfg.state_dir)
             identity, _ = load_or_generate(cfg.state_dir)
             try:
@@ -270,6 +408,8 @@ def main() -> int:
                     if appliance_id is None
                     else "no_control_plane_url"
                 ),
+                # effective_url is empty here only when this is a
+                # remote agent with no configured CONTROL_PLANE_URL.
             )
         for _ in range(cfg.heartbeat_interval_seconds):
             if stop:

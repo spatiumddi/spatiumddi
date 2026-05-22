@@ -1,0 +1,55 @@
+{{- /* #272 Phase 5 — MetalLB BGP-mode plumbing (spec only).
+
+       Wired through the chart so the anycast-DNS roadmap item
+       (Phase 10 follow-up) has a runway, but gated OFF by default
+       (``metallb.bgp.enabled: false``) so this PR ships no behavior
+       change. BGP requires FRR mode — re-enable
+       ``metallb.speaker.frr.enabled`` and bake the
+       quay.io/frrouting/frr image before turning this on, or the
+       speaker won't have an FRR backend to peer with.
+
+       Renders one BGPPeer per ``metallb.bgp.peers`` entry and one
+       BGPAdvertisement per ``metallb.bgp.advertisements`` entry,
+       both metallb.io/v1beta1 in the controller's namespace. */}}
+{{- if and .Values.metallb.enabled .Values.metallb.bgp.enabled }}
+{{- range $i, $peer := .Values.metallb.bgp.peers }}
+apiVersion: metallb.io/v1beta1
+kind: BGPPeer
+metadata:
+  name: spatium-peer-{{ $i }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi-appliance.labels" $ | nindent 4 }}
+spec:
+  myASN: {{ required "metallb.bgp.peers[].myASN is required" $peer.myASN }}
+  peerASN: {{ required "metallb.bgp.peers[].peerASN is required" $peer.peerASN }}
+  peerAddress: {{ required "metallb.bgp.peers[].peerAddress is required" $peer.peerAddress | quote }}
+  {{- with $peer.peerPort }}
+  peerPort: {{ . }}
+  {{- end }}
+  {{- with $peer.holdTime }}
+  holdTime: {{ . | quote }}
+  {{- end }}
+---
+{{- end }}
+{{- range $i, $adv := .Values.metallb.bgp.advertisements }}
+apiVersion: metallb.io/v1beta1
+kind: BGPAdvertisement
+metadata:
+  name: spatium-adv-{{ $i }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi-appliance.labels" $ | nindent 4 }}
+spec:
+  ipAddressPools:
+    {{- toYaml ($adv.ipAddressPools | default (list "spatium-control-plane")) | nindent 4 }}
+  {{- with $adv.communities }}
+  communities:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $adv.aggregationLength }}
+  aggregationLength: {{ . }}
+  {{- end }}
+---
+{{- end }}
+{{- end }}

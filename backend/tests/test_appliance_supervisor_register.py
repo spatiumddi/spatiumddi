@@ -472,6 +472,80 @@ async def test_register_persistent_disabled_code_rejects_new_claims(
 
 
 @pytest.mark.asyncio
+async def test_register_with_auto_approve_code_signs_cert_inline(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """#272 Phase 1 — codes minted via /self-register-bootstrap carry
+    ``auto_approve=True``. The register endpoint signs the cert + flips
+    state to ``approved`` inline so the operator doesn't have to manually
+    approve their own local supervisor."""
+    await _enable_supervisor_registration(db_session)
+    code_row = await _make_pairing_code(db_session, code="77777777")
+    code_row.auto_approve = True
+    await db_session.commit()
+
+    _, _, _, pubkey_b64 = _new_keypair()
+    resp = await client.post(
+        "/api/v1/appliance/supervisor/register",
+        json={
+            "pairing_code": "77777777",
+            "hostname": "test1",
+            "public_key_der_b64": pubkey_b64,
+            "appliance_variant": "full-stack",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["state"] == "approved"
+
+    appliance = await db_session.get(Appliance, uuid.UUID(body["appliance_id"]))
+    assert appliance is not None
+    assert appliance.state == "approved"
+    assert appliance.cert_pem is not None  # cert signed inline
+    assert appliance.cert_serial is not None
+    assert appliance.cert_expires_at is not None
+    assert appliance.approved_at is not None
+    assert appliance.approved_by_user_id is None  # auto-approved (no admin)
+    # Variant stamped. #272 — DNS/DHCP are no longer auto-assigned at
+    # register; the operator enables them per node via the Fleet role
+    # toggle, so a fresh control-plane node starts with no roles.
+    assert appliance.appliance_variant == "full-stack"
+    assert appliance.assigned_roles == []
+
+
+@pytest.mark.asyncio
+async def test_register_operator_typed_code_does_not_auto_approve(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Codes minted via the Fleet → Pairing tab default to
+    ``auto_approve=False``. The register endpoint keeps the manual
+    approve flow for any remote pairing."""
+    await _enable_supervisor_registration(db_session)
+    await _make_pairing_code(db_session, code="88888888")
+    await db_session.commit()
+
+    _, _, _, pubkey_b64 = _new_keypair()
+    resp = await client.post(
+        "/api/v1/appliance/supervisor/register",
+        json={
+            "pairing_code": "88888888",
+            "hostname": "dns-east-1",
+            "public_key_der_b64": pubkey_b64,
+            "appliance_variant": "application",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == APPLIANCE_STATE_PENDING_APPROVAL
+
+    appliance = await db_session.get(Appliance, uuid.UUID(resp.json()["appliance_id"]))
+    assert appliance is not None
+    assert appliance.cert_pem is None  # NOT auto-approved
+    assert appliance.appliance_variant == "application"
+    # application variant has no fixed roles — operator picks.
+    assert appliance.assigned_roles == []
+
+
+@pytest.mark.asyncio
 async def test_register_no_expiry_persistent_code_accepts(
     db_session: AsyncSession, client: AsyncClient
 ) -> None:

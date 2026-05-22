@@ -17,10 +17,35 @@
 #
 # External reach is gated by nftables: tcp/6443 is only accepted from
 # the pod CIDR (10.42.0.0/16) on the input chain; all other origins
-# fall through to the default-drop policy. Phase 4 widens this to the
-# control-plane CIDR via the supervisor's nftables drop-in once the
-# operator approves the cross-network kubeapi surface.
+# fall through to the default-drop policy. #272 Phase 7b widens this on
+# control-plane nodes: when the control plane promotes peers, it hands
+# each member the peer node IPs and the supervisor renders an nftables
+# drop-in opening the k3s server ports (6443 apiserver, 2379/2380 etcd,
+# 10250 kubelet) to those peers — see firewall_renderer._K3S_PEER_PORTS_TCP.
 https-listen-port: 6443
+
+# #272 Phase 7 — embedded etcd from first boot. ``cluster-init: true``
+# makes even a single node a legitimate one-member etcd cluster that
+# additional server nodes can later join (``k3s server --server
+# https://<seed>:6443 --token <token>``). Without it k3s uses the
+# SQLite/kine datastore, which CANNOT be promoted to multi-node HA —
+# joiners would be refused. Baked on for every fresh install so the
+# control-plane promotion flow just works.
+#
+# NOTE: flipping SQLite→etcd is NOT an in-place migration; this only
+# applies to fresh installs. Pre-#272 appliances must re-install (the
+# partition layout changed in #276 anyway — see the release banner).
+cluster-init: true
+
+# #272 Phase 9 — automatic etcd snapshots for disaster recovery +
+# dead-node replacement. k3s snapshots the embedded etcd on this cron
+# and keeps the last N. Snapshots land under
+# /var/lib/rancher/k3s/server/db/snapshots (and as ETCDSnapshotFile CRs
+# on recent k3s, which the Fleet UI can list). Restore is a manual
+# ``k3s server --cluster-reset --cluster-reset-restore-path=…`` — a
+# guided restore flow is a Phase 9 follow-up.
+etcd-snapshot-schedule-cron: "0 */6 * * *"
+etcd-snapshot-retention: 8
 
 # Disable bundled components we replace or don't need:
 #   * traefik    — operator-facing TLS still goes through our nginx
