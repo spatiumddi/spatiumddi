@@ -185,7 +185,15 @@ if [ ! -f "$ENV_FILE" ]; then
             ROLE=control-plane
             DNS_AGENT_KEY_VAL=$(gen_hex 24)
             DHCP_AGENT_KEY_VAL=$(gen_hex 24)
-            CONTROL_PLANE_URL_VAL=""
+            # #272 — the control-plane node's supervisor MUST heartbeat to
+            # the LOCAL api, otherwise it skips heartbeat ("no_control_
+            # plane_url") and never runs the cp-size + MetalLB reconcile
+            # (which writes the durable HelmChartConfig overrides). Without
+            # it, a seed reboot strands the cluster at the manifest
+            # defaults (cp-size=1, MetalLB off). Point at the in-cluster
+            # api Service (plain http → no TLS-verify concern); same URL
+            # the role pods use as their control plane.
+            CONTROL_PLANE_URL_VAL="http://spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000"
             AGENT_GROUP_VAL="default"
             ;;
     esac

@@ -24,7 +24,6 @@ from __future__ import annotations
 import http.client
 import json
 import os
-import re
 import socket
 import ssl
 from dataclasses import dataclass, field
@@ -441,173 +440,101 @@ def delete_node(name: str) -> tuple[bool, str | None]:
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
-# #277 — matches the ``replicas: N  # spatium:cp-size`` /
-# ``instances: N  # spatium:cp-size`` lines firstboot renders into the
-# spatium-control HelmChart's valuesContent. The seed supervisor rewrites
-# N to the committed control-plane member count so the CNPG cluster +
-# api/frontend/worker Deployments scale with the cluster.
-_CP_SIZE_RE = re.compile(r"((?:replicas|instances):[ \t]*)\d+([ \t]*#[ \t]*spatium:cp-size)")
+# #272 — durable control-plane state via k3s HelmChartConfig.
+#
+# The seed supervisor reflects cluster state (control-plane member count,
+# MetalLB pool + VIP) onto the helm releases. Patching the HelmChart CR's
+# valuesContent directly is NOT reboot-safe: the HelmChart is a k3s
+# auto-deploy manifest, so k3s re-applies the on-disk manifest (firstboot
+# defaults: cp-size=1, metallb off, VIP "") to the CR on every k3s restart
+# (i.e. every node reboot), clobbering the patch. A single seed reboot
+# then scaled the control plane to 1 replica + dropped MetalLB/the VIP.
+#
+# A HelmChartConfig is the k3s-native fix: a SEPARATE CR (not derived from
+# any manifest, so the deploy controller never touches it) whose
+# valuesContent helm-controller MERGES on top of the same-named
+# HelmChart's. We write the supervisor-owned overrides there → they
+# survive the manifest re-apply. The firstboot HelmChart keeps the
+# defaults as the floor.
 
 
-def scale_control_plane_helmchart(
-    target_size: int,
-    *,
-    name: str = "spatium-control",
-    chart_namespace: str = "kube-system",
+def _helmchartconfig_upsert(
+    name: str, values_yaml: str, *, namespace: str = "kube-system"
 ) -> tuple[bool, str | None]:
-    """Patch the ``spatium-control`` HelmChart CR so every
-    ``# spatium:cp-size``-marked line (CNPG ``instances`` + api/frontend
-    /worker ``replicas``) equals ``target_size`` (#277).
-
-    Returns ``(changed, error)``. ``(False, None)`` means the values
-    already matched (idempotent no-op) OR the CR doesn't exist here (this
-    node isn't the seed). The seed supervisor calls this when the
-    committed control-plane member count changes; k3s's helm-controller
-    then upgrades the release (CNPG scales the postgres cluster, the
-    Deployments scale their replicas).
-    """
-    if target_size < 1:
-        return False, "target_size < 1"
-    path = (
-        f"/apis/helm.cattle.io/v1/namespaces/{quote(chart_namespace)}" f"/helmcharts/{quote(name)}"
-    )
+    """Create-or-update the HelmChartConfig ``name`` so its
+    ``spec.valuesContent`` equals ``values_yaml``. Idempotent — returns
+    ``(False, None)`` when already current. helm-controller merges this
+    on top of the same-named HelmChart's values, and it survives k3s
+    manifest re-apply on restart (unlike a HelmChart CR patch)."""
+    base = f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}/helmchartconfigs"
+    path = f"{base}/{quote(name)}"
     try:
         status, resp = _request("GET", path)
     except RuntimeError as exc:
         return False, str(exc)
-    if status == 404:
-        return False, None  # no control chart on this node — not the seed
-    if status != 200:
-        return False, f"kubeapi GET status {status}"
-    try:
-        obj = json.loads(resp)
-    except (json.JSONDecodeError, ValueError) as exc:
-        return False, f"bad helmchart json: {exc}"
-    values = (obj.get("spec") or {}).get("valuesContent") or ""
-    if not values:
-        return False, "no valuesContent"
-    new_values, n = _CP_SIZE_RE.subn(lambda m: f"{m.group(1)}{target_size}{m.group(2)}", values)
-    if n == 0:
-        return False, "no cp-size markers found"
-    if new_values == values:
-        return False, None  # already at target
-    patch = json.dumps({"spec": {"valuesContent": new_values}}).encode("utf-8")
-    try:
-        status, resp = _request(
-            "PATCH", path, body=patch, content_type="application/merge-patch+json"
+    if status == 200:
+        try:
+            cur = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
+        except (json.JSONDecodeError, ValueError):
+            cur = None
+        if cur == values_yaml:
+            return False, None
+        patch = json.dumps({"spec": {"valuesContent": values_yaml}}).encode("utf-8")
+        try:
+            st, rb = _request(
+                "PATCH", path, body=patch, content_type="application/merge-patch+json"
+            )
+        except RuntimeError as exc:
+            return False, str(exc)
+        return (st in (200, 201)), (
+            None if st in (200, 201) else f"PATCH status {st}: {rb[:200]!r}"
         )
-    except RuntimeError as exc:
-        return False, str(exc)
-    if status in (200, 201):
-        return True, None
-    return False, f"kubeapi PATCH status {status}: {resp[:200]!r}"
-
-
-# #272 Phase 7c — generic ``<key>: <val>  # spatium:<marker>`` rewriter.
-# Same shape as the cp-size rewrite above but keyed by an arbitrary
-# marker so one helper covers the MetalLB pool + VIP lines (and any
-# future marked value). The value is dropped in verbatim, so callers
-# pass valid YAML scalars / flow collections (``true`` / ``"1.2.3.4"`` /
-# ``["a","b"]``).
-def _marked_value_re(marker: str) -> "re.Pattern[str]":
-    return re.compile(
-        rf"^([ \t]*[\w.]+:[ \t]*).*?([ \t]*#[ \t]*spatium:{re.escape(marker)}(?![-\w]))[ \t]*$",
-        re.MULTILINE,
-    )
-
-
-def patch_marked_helmchart_values(
-    name: str,
-    marks: dict[str, str],
-    *,
-    chart_namespace: str = "kube-system",
-) -> tuple[bool, str | None]:
-    """GET the HelmChart CR ``name``, rewrite each
-    ``<key>: <val>  # spatium:<marker>`` line whose marker is a key in
-    ``marks`` to the mapped value, and PATCH if anything changed.
-
-    Returns ``(changed, error)``. ``(False, None)`` = idempotent no-op
-    (values already matched) OR the CR doesn't exist on this node (not
-    the seed). A present-but-marker-less chart returns ``(False, "no
-    markers matched")`` so a stale firstboot render surfaces once in the
-    log without crashing the heartbeat.
-    """
-    path = (
-        f"/apis/helm.cattle.io/v1/namespaces/{quote(chart_namespace)}" f"/helmcharts/{quote(name)}"
-    )
-    try:
-        status, resp = _request("GET", path)
-    except RuntimeError as exc:
-        return False, str(exc)
-    if status == 404:
-        return False, None  # chart not here — not the seed
-    if status != 200:
+    if status != 404:
         return False, f"kubeapi GET status {status}"
-    try:
-        obj = json.loads(resp)
-    except (json.JSONDecodeError, ValueError) as exc:
-        return False, f"bad helmchart json: {exc}"
-    values = (obj.get("spec") or {}).get("valuesContent") or ""
-    if not values:
-        return False, "no valuesContent"
-    new_values = values
-    total = 0
-    for marker, new_val in marks.items():
-        pat = _marked_value_re(marker)
-        new_values, n = pat.subn(lambda m, v=new_val: f"{m.group(1)}{v}{m.group(2)}", new_values)
-        total += n
-    if total == 0:
-        return False, "no markers matched"
-    if new_values == values:
-        return False, None  # already at target
-    patch = json.dumps({"spec": {"valuesContent": new_values}}).encode("utf-8")
-    try:
-        status, resp = _request(
-            "PATCH", path, body=patch, content_type="application/merge-patch+json"
-        )
-    except RuntimeError as exc:
-        return False, str(exc)
-    if status in (200, 201):
-        return True, None
-    return False, f"kubeapi PATCH status {status}: {resp[:200]!r}"
-
-
-def apply_metallb_config(
-    *,
-    enabled: bool,
-    pool_addresses: list[str],
-    control_plane_vip: str,
-) -> tuple[bool, str | None]:
-    """Apply the cluster-wide MetalLB / control-plane-VIP config (#272
-    Phase 7c).
-
-    Patches two HelmCharts (both live on the seed):
-    * ``spatium-bootstrap`` — ``metallb.enabled`` + ``metallb.ipPool.
-      addresses`` drive the MetalLB controller/speaker + IPAddressPool /
-      L2Advertisement CRs.
-    * ``spatium-control`` — ``frontend.controlPlaneVIP`` flips the
-      frontend Service to a LoadBalancer on the VIP (and drops
-      hostNetwork) + threads the VIP into the auto-issued cert's SANs.
-
-    Returns ``(changed, error)`` — ``changed`` is True if either chart
-    was patched; ``error`` is the first non-empty error from either
-    patch (a "no markers matched" / "not the seed" is reported as the
-    error string / None respectively but never raises).
-    """
-    pool_json = json.dumps([a.strip() for a in pool_addresses if a and a.strip()])
-    vip_json = json.dumps((control_plane_vip or "").strip())
-    changed_b, err_b = patch_marked_helmchart_values(
-        "spatium-bootstrap",
+    body = json.dumps(
         {
-            "metallb-enabled": "true" if enabled else "false",
-            "metallb-pool": pool_json,
-        },
+            "apiVersion": "helm.cattle.io/v1",
+            "kind": "HelmChartConfig",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {"valuesContent": values_yaml},
+        }
+    ).encode("utf-8")
+    try:
+        st, rb = _request("POST", base, body=body, content_type="application/json")
+    except RuntimeError as exc:
+        return False, str(exc)
+    return (st in (200, 201)), (None if st in (200, 201) else f"POST status {st}: {rb[:200]!r}")
+
+
+def apply_control_plane_overrides(cp_size: int, control_plane_vip: str) -> tuple[bool, str | None]:
+    """Durably set the spatium-control overrides: api / frontend / worker
+    replicas + CNPG instances + redis sentinel replicas = ``cp_size``,
+    plus the frontend control-plane VIP. Written to the spatium-control
+    HelmChartConfig so it survives a k3s restart (#272)."""
+    if cp_size < 1:
+        return False, "cp_size < 1"
+    vip = (control_plane_vip or "").strip()
+    values = (
+        f"api:\n  replicas: {cp_size}\n"
+        f'frontend:\n  replicas: {cp_size}\n  controlPlaneVIP: "{vip}"\n'
+        f"worker:\n  replicas: {cp_size}\n"
+        f"postgresql:\n  cnpg:\n    instances: {cp_size}\n"
+        f"redis:\n  sentinel:\n    replicas: {cp_size}\n"
     )
-    changed_c, err_c = patch_marked_helmchart_values(
-        "spatium-control",
-        {"metallb-vip": vip_json},
+    return _helmchartconfig_upsert("spatium-control", values)
+
+
+def apply_bootstrap_overrides(
+    *, metallb_enabled: bool, pool_addresses: list[str]
+) -> tuple[bool, str | None]:
+    """Durably set the spatium-bootstrap MetalLB overrides (enabled +
+    L2 pool). Written to the spatium-bootstrap HelmChartConfig (#272)."""
+    pool_json = json.dumps([a.strip() for a in pool_addresses if a and a.strip()])
+    values = (
+        f"metallb:\n  enabled: {'true' if metallb_enabled else 'false'}\n"
+        f"  ipPool:\n    addresses: {pool_json}\n"
     )
-    return (changed_b or changed_c), (err_b or err_c)
+    return _helmchartconfig_upsert("spatium-bootstrap", values)
 
 
 def patch_node_labels(
@@ -655,14 +582,13 @@ def patch_node_labels(
 __all__ = [
     "KubeConfig",
     "PodStatus",
+    "apply_bootstrap_overrides",
+    "apply_control_plane_overrides",
     "apply_helmchart",
-    "apply_metallb_config",
     "check_kubeapi_ready",
     "delete_helmchart",
     "delete_node",
     "get_config",
-    "patch_marked_helmchart_values",
     "patch_node_labels",
     "list_pods",
-    "scale_control_plane_helmchart",
 ]

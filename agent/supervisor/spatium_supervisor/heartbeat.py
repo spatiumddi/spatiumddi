@@ -581,36 +581,38 @@ def heartbeat_once(
     ):
         from . import k8s_api  # noqa: PLC0415
 
-        changed, err = k8s_api.scale_control_plane_helmchart(cp_size)
-        if changed:
-            log.info("supervisor.heartbeat.control_plane_scaled", size=cp_size)
-        elif err:
-            log.warning("supervisor.heartbeat.control_plane_scale_failed", error=err, size=cp_size)
-
-        # #272 Phase 7c — apply the cluster-wide MetalLB pool + control-
-        # plane VIP. Same seed-only gate as the cp-size scale above (the
-        # spatium-bootstrap + spatium-control HelmCharts live on the
-        # seed; on members the GET 404s → no-op). Idempotent — patches
-        # only when the rendered values differ, so it stays quiet once
-        # converged and reconverges one tick after the operator changes
-        # the config in the Fleet UI.
+        # #272 — write the supervisor-owned overrides to HelmChartConfigs
+        # (reboot-safe). Patching the HelmChart CR directly is clobbered
+        # when k3s re-applies the on-disk firstboot manifest on restart;
+        # a HelmChartConfig is a separate CR helm-controller merges on top
+        # + the deploy controller never reverts. cp-size + the VIP go on
+        # spatium-control; the MetalLB pool on spatium-bootstrap.
+        # Idempotent — only writes when the rendered values differ.
         ml_enabled = bool(body_out.get("desired_metallb_enabled"))
         ml_pool = body_out.get("desired_metallb_pool_addresses") or []
         ml_vip = body_out.get("desired_control_plane_vip") or ""
-        ml_changed, ml_err = k8s_api.apply_metallb_config(
-            enabled=ml_enabled,
-            pool_addresses=list(ml_pool),
-            control_plane_vip=str(ml_vip),
-        )
-        if ml_changed:
+
+        cp_changed, cp_err = k8s_api.apply_control_plane_overrides(cp_size, str(ml_vip))
+        if cp_changed:
             log.info(
-                "supervisor.heartbeat.metallb_applied",
+                "supervisor.heartbeat.control_plane_overrides_applied", size=cp_size, vip=ml_vip
+            )
+        elif cp_err:
+            log.warning(
+                "supervisor.heartbeat.control_plane_overrides_failed", error=cp_err, size=cp_size
+            )
+
+        bs_changed, bs_err = k8s_api.apply_bootstrap_overrides(
+            metallb_enabled=ml_enabled, pool_addresses=list(ml_pool)
+        )
+        if bs_changed:
+            log.info(
+                "supervisor.heartbeat.metallb_overrides_applied",
                 enabled=ml_enabled,
                 pool=list(ml_pool),
-                vip=ml_vip,
             )
-        elif ml_err:
-            log.warning("supervisor.heartbeat.metallb_apply_failed", error=ml_err)
+        elif bs_err:
+            log.warning("supervisor.heartbeat.metallb_overrides_failed", error=bs_err)
 
         # #272 Phase 9 — dead-node replacement. The seed deletes each k8s
         # Node the backend flagged for eviction (deleting the Node makes
