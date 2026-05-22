@@ -1509,12 +1509,22 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         Text("PORTS", style=header_style),
     )
 
+    # #284 — drop completed one-shot pods (``Succeeded`` Jobs: the
+    # migrate Job + CNPG's initdb / per-replica join Jobs). A finished
+    # Job carries no signal on a live dashboard and just consumes a row;
+    # operators who need job history still have ``kubectl get pods -A
+    # -a``. ``Failed`` pods are intentionally NOT filtered — those are a
+    # real error worth surfacing. (The migrate Job is also TTL-GC'd by
+    # the cluster after migrate.ttlSecondsAfterFinished; this just stops
+    # it cluttering the TTY in the meantime.)
+    visible_rows = [r for r in ps_rows if (r.get("K8sState") or "") != "Succeeded"]
+
     # Pure alphabetical by pod name. Operator feedback —
     # namespace-grouping made the spatium pods land at the top
     # consistently but obscured the natural "where is foo-pod"
     # scan; the namespace column itself still makes the grouping
     # obvious at a glance.
-    sorted_rows = sorted(ps_rows, key=lambda r: r.get("Names") or "")
+    sorted_rows = sorted(visible_rows, key=lambda r: r.get("Names") or "")
 
     if not sorted_rows:
         tbl.add_row(
