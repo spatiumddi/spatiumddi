@@ -327,6 +327,19 @@ async def create_domain(body: DomainCreate, db: DB, current_user: CurrentUser) -
     )
     await db.commit()
     await db.refresh(d)
+
+    # #278 — kick a one-shot RDAP refresh so the row is populated within
+    # seconds instead of sitting empty until the next refresh_due_domains
+    # beat tick (up to domain_whois_interval_hours away). Fire-and-forget:
+    # a broker hiccup must not fail the 201 — the scheduled sweep still
+    # picks the row up (it orders next_check_at IS NULL first).
+    try:
+        from app.tasks.domain_whois_refresh import refresh_one_domain_by_id
+
+        refresh_one_domain_by_id.delay(str(d.id))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("domain_whois_refresh_dispatch_failed", domain=d.name, error=str(exc))
+
     return _to_read(d)
 
 

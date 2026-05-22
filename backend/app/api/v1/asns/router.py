@@ -20,6 +20,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import String, func, or_, select
@@ -30,6 +31,8 @@ from app.core.permissions import require_resource_permission
 from app.models.asn import ASN, ASNRpkiRoa, BGPCommunity, BGPPeering
 from app.services.asns.classifier import REGISTRIES, classify_asn
 from app.services.tags import apply_tag_filter
+
+logger = structlog.get_logger(__name__)
 
 # Router-level permission gate — covers GET (read), POST/PUT (write),
 # DELETE on every endpoint mounted below.
@@ -232,6 +235,20 @@ async def create_asn(body: ASNCreate, db: DB, user: CurrentUser) -> ASNRead:
     )
     await db.commit()
     await db.refresh(row)
+
+    # #278 follow-up — kick a one-shot RDAP (+ RPKI for public ASNs)
+    # refresh so the row is populated within seconds instead of sitting at
+    # whois_state "n/a" until the next refresh_due_asns beat tick. Private
+    # ASNs short-circuit inside the task (no RDAP/ROAs issued for them).
+    # Fire-and-forget: a broker hiccup must not fail the 201 — the
+    # scheduled sweep still picks the row up (next_check_at IS NULL).
+    try:
+        from app.tasks.asn_whois_refresh import refresh_one_asn_by_id
+
+        refresh_one_asn_by_id.delay(str(row.id))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("asn_whois_refresh_dispatch_failed", asn=row.number, error=str(exc))
+
     return ASNRead.model_validate(row)
 
 

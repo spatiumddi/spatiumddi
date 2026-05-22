@@ -320,6 +320,15 @@ export function DomainsPage() {
   const { data, isLoading, refetch, isFetching } = useQuery({
     queryKey: ["domains", listParams],
     queryFn: () => domainsApi.list(listParams),
+    // #278 — a freshly-created domain's RDAP data lands a few seconds
+    // later via the one-shot worker task. ``whois_last_checked_at`` is
+    // null until that first lookup records an attempt (success OR
+    // unreachable), so poll while any row is still un-checked and stop
+    // once they've all reported — no manual Refresh needed.
+    refetchInterval: (query) => {
+      const rows = query.state.data?.items ?? [];
+      return rows.some((d) => d.whois_last_checked_at == null) ? 3000 : false;
+    },
   });
 
   const items = useMemo(() => data?.items ?? [], [data]);

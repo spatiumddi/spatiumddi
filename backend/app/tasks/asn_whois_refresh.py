@@ -32,6 +32,7 @@ Idempotent — re-running before any row is due is a no-op.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -260,4 +261,101 @@ def refresh_due_asns(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
         raise
 
 
-__all__ = ["refresh_due_asns"]
+async def _refresh_one_by_id_async(asn_id: str) -> dict[str, Any]:
+    """RDAP (+ RPKI for public ASNs) refresh a single ASN by id.
+
+    Reuses the same per-row services the beat sweeps + manual endpoints
+    use — the whois state machine here, plus rpki_roa_refresh's per-row
+    reconciler for public rows. Private rows skip both RDAP and RPKI
+    (RIRs issue neither for private AS numbers); ``_refresh_one_asn``
+    still stamps ``whois_last_checked_at`` so the UI poll converges.
+    """
+    async with task_session() as db:
+        row = await db.get(ASN, uuid.UUID(asn_id))
+        if row is None:
+            return {"status": "missing", "asn_id": asn_id}
+
+        ps = await db.get(PlatformSettings, _SINGLETON_ID)
+        whois_interval = 24
+        rpki_interval = 4
+        rpki_source = "cloudflare"
+        if ps is not None:
+            whois_interval = max(1, min(168, int(ps.asn_whois_interval_hours or 24)))
+            rpki_interval = max(1, min(168, int(ps.rpki_roa_refresh_interval_hours or 4)))
+            candidate = (ps.rpki_roa_source or "cloudflare").lower()
+            if candidate in {"cloudflare", "ripe"}:
+                rpki_source = candidate
+
+        now = datetime.now(UTC)
+
+        try:
+            summary = await _refresh_one_asn(db, row, whois_interval, now)
+        except Exception as exc:  # noqa: BLE001 — one bad lookup mustn't crash the worker
+            logger.warning("asn_whois_refresh_one_failed", asn=row.number, error=str(exc))
+            row.whois_last_checked_at = now  # record the attempt so the sweep paces itself
+            await db.commit()
+            return {"status": "error", "asn": row.number, "error": str(exc)}
+
+        if summary.get("transitioned"):
+            db.add(
+                AuditLog(
+                    user_display_name="<system>",
+                    auth_source="system",
+                    action="whois_state_transition",
+                    resource_type="asn",
+                    resource_id=str(row.id),
+                    resource_display=f"AS{row.number}",
+                    result="success",
+                    changed_fields=["whois_state"],
+                    old_value={"whois_state": summary.get("old_state")},
+                    new_value={
+                        "whois_state": summary.get("new_state"),
+                        "old_holder": summary.get("old_holder"),
+                        "new_holder": summary.get("new_holder"),
+                    },
+                )
+            )
+
+        # RPKI ROAs — public ASNs only (RIRs don't issue ROAs for private
+        # AS numbers). Best-effort: an RPKI failure shouldn't undo the
+        # whois refresh we just committed conceptually in the same txn.
+        rpki_result: str | None = None
+        if row.kind == "public":
+            from app.tasks.rpki_roa_refresh import _refresh_one_asn as _refresh_one_asn_rpki
+
+            try:
+                await _refresh_one_asn_rpki(db, row, rpki_source, rpki_interval, now)
+                rpki_result = "ok"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("asn_rpki_refresh_one_failed", asn=row.number, error=str(exc))
+                rpki_result = "error"
+
+        await db.commit()
+
+        logger.info(
+            "asn_whois_refresh_one_completed",
+            asn=row.number,
+            whois_result=summary.get("result"),
+            rpki_result=rpki_result,
+        )
+        return {
+            "status": "ran",
+            "asn": row.number,
+            "whois_result": summary.get("result"),
+            "rpki_result": rpki_result,
+        }
+
+
+@celery_app.task(name="app.tasks.asn_whois_refresh.refresh_one_asn_by_id", bind=True)
+def refresh_one_asn_by_id(self: object, asn_id: str) -> dict[str, Any]:  # type: ignore[type-arg]
+    """One-shot whois (+ RPKI) refresh for a single ASN, dispatched right
+    after create_asn (#278 follow-up) so a public AS is populated within
+    seconds instead of sitting at ``n/a`` until the next beat tick."""
+    try:
+        return asyncio.run(_refresh_one_by_id_async(asn_id))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("asn_whois_refresh_one_failed", asn_id=asn_id, error=str(exc))
+        raise
+
+
+__all__ = ["refresh_due_asns", "refresh_one_asn_by_id"]

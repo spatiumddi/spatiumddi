@@ -32,6 +32,19 @@ router = APIRouter(
 SiteKind = Literal["datacenter", "branch", "pop", "colo", "cloud_region", "customer_premise"]
 
 
+# An empty / whitespace ``code`` means "no code", which must be stored
+# as NULL — not ``""``. The sibling-uniqueness index treats NULL parents
+# as equal (so top-level codes are unique), and that flag would make two
+# empty-string codes collide too; normalising to NULL keeps the index's
+# ``WHERE code IS NOT NULL`` predicate excluding code-less siblings so
+# any number of them can coexist. Shared by create + update.
+def _normalize_code(v: str | None) -> str | None:
+    if v is None:
+        return None
+    v = v.strip()
+    return v or None
+
+
 class SiteCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     code: str | None = Field(default=None, max_length=64)
@@ -48,6 +61,11 @@ class SiteCreate(BaseModel):
             raise ValueError(f"kind must be one of {sorted(SITE_KINDS)}")
         return v
 
+    @field_validator("code")
+    @classmethod
+    def _v_code(cls, v: str | None) -> str | None:
+        return _normalize_code(v)
+
 
 class SiteUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
@@ -57,6 +75,11 @@ class SiteUpdate(BaseModel):
     parent_site_id: uuid.UUID | None = None
     notes: str | None = None
     tags: dict[str, Any] | None = None
+
+    @field_validator("code")
+    @classmethod
+    def _v_code(cls, v: str | None) -> str | None:
+        return _normalize_code(v)
 
 
 class SiteRead(BaseModel):
