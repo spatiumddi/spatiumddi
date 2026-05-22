@@ -692,9 +692,11 @@ export function SitesPage() {
   const [moving, setMoving] = useState<SiteRead | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // Tree is the primary view per #279 (hierarchy at a glance + drag-to-
+  // reparent); the flat table stays one click away via the toggle.
   const [view, setView] = useSessionState<"table" | "tree">(
     "sites.view",
-    "table",
+    "tree",
   );
   const [confirm, setConfirm] = useState<{
     title: string;
