@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import ForeignKey, Index, String, Text, UniqueConstraint
+from sqlalchemy import ForeignKey, Index, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -101,14 +101,25 @@ class Site(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         # Operator code is unique per parent for sub-site disambiguation
         # (e.g. two campuses with floors named ``F1``). NULL parents
-        # share one global namespace; ``NULLS NOT DISTINCT`` so two
-        # top-level sites can't share a code.
+        # share one global namespace; ``NULLS NOT DISTINCT`` makes the
+        # NULL parent_site_id values compare equal so two top-level sites
+        # can't share a *code*. But ``code`` itself is optional, and that
+        # same NULLS-NOT-DISTINCT flag also makes empty codes collide —
+        # so a second code-less sibling (top-level or otherwise) would
+        # 409 with "a sibling site with this code already exists" even
+        # though it has no code at all. The partial ``WHERE code IS NOT
+        # NULL`` predicate excludes code-less rows from the index, so any
+        # number of siblings may have no code while real codes stay
+        # unique per parent. (create/update normalise ``""`` → NULL so
+        # an empty input field is treated as "no code", not a code of
+        # "".) Requires PG 15+ for NULLS NOT DISTINCT.
         Index(
             "ix_site_parent_code_unique",
             "parent_site_id",
             "code",
             unique=True,
             postgresql_nulls_not_distinct=True,
+            postgresql_where=text("code IS NOT NULL"),
         ),
         Index("ix_site_kind", "kind"),
         Index("ix_site_region", "region"),
