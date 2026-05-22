@@ -38,12 +38,12 @@ from app.core.crypto import decrypt_dict, decrypt_str, encrypt_dict, encrypt_str
 _RECOVERY_CODE_COUNT: Final[int] = 10
 
 # Recovery-code alphabet — base32 minus the visually ambiguous
-# characters. 29 letters + digits.
+# characters (no I/O/0/1). 24 letters + 6 digits = 30 chars.
 _RECOVERY_ALPHABET: Final[str] = "ABCDEFGHJKLMNPQRSTUVWXYZ234567"
 
 # Code length per chunk + chunks per code. 4-4 split with a hyphen
 # so the operator can read it off paper without losing place. Total
-# entropy = 8 chars × log2(29) ≈ 38.8 bits per code; brute-forcing
+# entropy = 8 chars × log2(30) ≈ 39.3 bits per code; brute-forcing
 # even one is impractical against the rate-limited verify endpoint.
 _RECOVERY_CHUNK_LEN: Final[int] = 4
 _RECOVERY_CHUNK_COUNT: Final[int] = 2
