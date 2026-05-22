@@ -1,0 +1,83 @@
+# spatiumddi-metallb — MetalLB in its own metallb-system namespace.
+#
+# Deployed by firstboot as a SEPARATE ``spatium-metallb`` HelmChart CR
+# (targetNamespace: metallb-system, createNamespace: true), NOT as a
+# subchart of spatium-bootstrap — the upstream MetalLB chart hardcodes
+# ``namespace: {{ .Release.Namespace }}`` with no override, so a
+# separate release is the only way to land it in metallb-system. The
+# moved IPAddressPool / L2Advertisement render in the release namespace
+# (metallb-system) automatically; the frontend LoadBalancer Service
+# stays in spatium and references the pool by name.
+#
+# IMAGE PIN — v0.15.3, not the chart's v0.16.0 appVersion. v0.16.0
+# regressed the speaker's ServiceL2Status reconciler into an apiserver-
+# flooding create-fail/not-found loop (metallb/metallb#3063; clean
+# v0.15.3->v0.16.0 bisection — v0.15.3 ~0 errs, v0.16.0 ~200 errs/30s on
+# the same cluster + CRDs). v0.15.3 binaries are schema-compatible with
+# the v0.16.0 chart templates + CRDs (verified live). Revert to the
+# chart default once #3063 is fixed upstream. KEEP these tags in
+# lock-step with appliance/scripts/bake-images.sh ``METALLB_IMAGES``.
+metallb:
+  enabled: false
+
+  # CRDs are pre-loaded as a k3s auto-deploy manifest at firstboot
+  # (spatiumddi-firstboot place_metallb_crds → cluster-scoped, version-
+  # matched), so the chart's CRD sub-subchart stays OFF to avoid a
+  # double-owner conflict on the metallb.io CRDs.
+  crds:
+    enabled: false
+
+  # ── L2 (native) mode ──────────────────────────────────────────────
+  # Native L2 — no FRR, no frr-k8s. ``frrk8s.enabled=false`` (0.16.0
+  # made the frr-k8s subchart the default BGP backend, defaults TRUE; it
+  # would pull frr-k8s + frr images we don't bake). ``speaker.frr
+  # .enabled=false`` skips the in-speaker FRR sidecar. L2 ARP/NDP needs
+  # neither.
+  frrk8s:
+    enabled: false
+  speaker:
+    frr:
+      enabled: false
+    image:
+      repository: quay.io/metallb/speaker
+      tag: v0.15.3  # pinned back from v0.16.0 — metallb#3063 (header note)
+    # Speaker DaemonSet answers ARP for the VIP; gate it onto the
+    # control-plane nodes via the per-role label (CLAUDE.md non-neg #16).
+    nodeSelector:
+      spatium.io/role-control-plane: "true"
+  controller:
+    image:
+      repository: quay.io/metallb/controller
+      tag: v0.15.3  # pinned back from v0.16.0 — metallb#3063 (header note)
+    nodeSelector:
+      spatium.io/role-control-plane: "true"
+
+  # ── L2 IP pool ────────────────────────────────────────────────────
+  # ``ipPool.addresses`` is the L2 range MetalLB hands out. The operator
+  # picks a free slice via the Fleet → Network & Host UI; the supervisor
+  # writes it into this chart's HelmChartConfig on save. Empty → no
+  # IPAddressPool/L2Advertisement rendered even when ``enabled: true``.
+  ipPool:
+    addresses: []
+    # Only Services that explicitly request an IP (loadBalancerIPs
+    # annotation) draw from this pool — the control-plane VIP Service
+    # does exactly that. Flip true only for generic LB auto-assignment.
+    autoAssign: false
+
+  # ── BGP (spec-only, Phase 5 runway) ───────────────────────────────
+  # No behavior change while ``enabled: false``. Real peering needs an
+  # FRR backend (frrk8s.enabled=true + baking the frr images).
+  bgp:
+    enabled: false
+    peers: []
+    advertisements: []
+
+# Cross-namespace pod-read for the control-plane api SA so the
+# Network & Host MetalLB status card works now that MetalLB is in
+# metallb-system (the api SA is in spatium). The control chart's release
+# is always ``spatium-control`` on the appliance, so its api SA is
+# ``spatium-control-spatiumddi-api`` in ``spatium``.
+apiReader:
+  enabled: true
+  serviceAccountName: spatium-control-spatiumddi-api
+  serviceAccountNamespace: spatium

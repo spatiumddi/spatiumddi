@@ -1,0 +1,36 @@
+{{- /* #272 — let the control-plane api ServiceAccount (which lives in
+       the spatium namespace) read pods in metallb-system, so the
+       Network & Host MetalLB status card can report controller/speaker
+       readiness now that MetalLB lives here, not in spatium. Pod-read
+       only — same minimal scope as the api's spatium Role. The api SA
+       is created by the spatium-control chart; a cross-namespace
+       RoleBinding subject doesn't require it to exist at apply time. */}}
+{{- if .Values.apiReader.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spatium-metallb-api-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi-metallb.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spatium-metallb-api-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi-metallb.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.apiReader.serviceAccountName }}
+    namespace: {{ .Values.apiReader.serviceAccountNamespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spatium-metallb-api-reader
+{{- end }}

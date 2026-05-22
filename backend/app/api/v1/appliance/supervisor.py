@@ -2983,7 +2983,11 @@ def _metallb_pod_status() -> tuple[bool, int, int]:
         return any(c.get("type") == "Ready" and c.get("status") == "True" for c in conds)
 
     try:
-        pods = k8s.list_pods("spatium")
+        # #272 — MetalLB lives in its own metallb-system namespace now,
+        # not spatium. Best-effort: needs the api SA's metallb-system
+        # pod-read Role (appliance chart); degrades to (False,0,0) if the
+        # grant isn't present (status just shows "starting").
+        pods = k8s.list_pods("metallb-system")
     except Exception:  # noqa: BLE001
         return (False, 0, 0)
     controller_ready = False

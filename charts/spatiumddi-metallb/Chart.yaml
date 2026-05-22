@@ -1,0 +1,37 @@
+apiVersion: v2
+name: spatiumddi-metallb
+description: |
+  MetalLB, deployed in its own ``metallb-system`` namespace (the
+  conventional location) rather than co-located with the SpatiumDDI
+  control-plane workloads. Split out of charts/spatiumddi-appliance so
+  the MetalLB controller/speaker + the control-plane IPAddressPool /
+  L2Advertisement land in metallb-system. The frontend LoadBalancer
+  Service stays in the spatium namespace and references the pool by
+  name (cross-namespace assignment is standard MetalLB), so the VIP is
+  unaffected by the namespace.
+type: application
+version: 0.1.0
+appVersion: "0.0.0-dev"
+kubeVersion: ">=1.27.0-0"
+home: https://spatiumddi.github.io/spatiumddi/
+sources:
+  - https://github.com/spatiumddi/spatiumddi
+maintainers:
+  - name: SpatiumDDI Contributors
+# MetalLB subchart. Gated behind ``metallb.enabled: false`` so the
+# spatium-metallb HelmChart can be applied at firstboot (creating the
+# metallb-system namespace) while the controller/speaker stay dormant
+# until the operator sets a control-plane VIP — the supervisor flips
+# ``metallb.enabled: true`` + writes the pool via this chart's
+# HelmChartConfig on that change.
+#
+# Image pin: the chart is 0.16.0 but the controller/speaker images are
+# pinned to v0.15.3 in values.yaml — v0.16.0 regressed the speaker's
+# ServiceL2Status reconciler into an apiserver-flooding loop
+# (metallb/metallb#3063). v0.15.3 binaries are schema-compatible with
+# the v0.16.0 chart + CRDs.
+dependencies:
+  - name: metallb
+    version: 0.16.0
+    repository: https://metallb.github.io/metallb
+    condition: metallb.enabled

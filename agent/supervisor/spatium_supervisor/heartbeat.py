@@ -662,7 +662,7 @@ def heartbeat_once(
                 size=cp_size,
             )
 
-        bs_changed, bs_err = k8s_api.apply_bootstrap_overrides(
+        bs_changed, bs_err = k8s_api.apply_metallb_overrides(
             metallb_enabled=ml_enabled, pool_addresses=list(ml_pool)
         )
         if bs_changed:
