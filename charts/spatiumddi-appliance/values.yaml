@@ -38,16 +38,30 @@ dnsBind9:
     repository: ghcr.io/spatiumddi/dns-bind9
   # Pass-through to the agent via env. The supervisor fills these in
   # when assigning the DNS role.
+  # NOTE (#292): controlPlaneUrl is the EXTERNAL operator-facing URL
+  # (self-signed cert) — no longer used by the co-located DaemonSet
+  # agent, which registers against the in-cluster Service instead. Kept
+  # for the standalone docker-compose agent path.
   controlPlaneUrl: ""
+  # #292 — in-cluster API Service URL the co-located DaemonSet agent
+  # registers against (plain HTTP — no TLS to verify intra-cluster, so
+  # the appliance's self-signed cert is a non-issue). Empty → defaults
+  # to http://spatium-control-spatiumddi-api.<release-namespace>.svc:8000
+  # (the appliance's fixed spatium-control release). Override only for a
+  # non-standard control-release name/namespace.
+  inClusterApiUrl: ""
   agentKey: ""
   serverGroupName: ""
-  # hostPath bind mounts for persistent state. local-path-provisioner
-  # binds these to /var/lib/rancher/k3s/storage/<pvc>/ on the host.
-  persistence:
-    data:
-      size: 1Gi
-    keys:
-      size: 256Mi
+  # #292 — per-node state lives on a hostPath dir at
+  # /var/lib/spatiumddi/agents/dns-bind9/state, mounted at the agent's
+  # /var/lib/spatium-dns-agent. That dir holds the cached ConfigBundle +
+  # the rendered named.conf/zones + tsig/rndc keys — everything named
+  # serves from — so the node keeps serving from last-known-good config
+  # when the control plane is unreachable (#5). NOT a shared RWO PVC (it
+  # pins to one node → other DaemonSet pods Pending) and NOT emptyDir
+  # (wiped on restart → loses the cache). The old /var/named/{data,keys}
+  # mounts were dropped — bind9 never wrote to them. No size knob —
+  # hostPath grows with /var.
 
 # DNS — PowerDNS backend. Same shape as dnsBind9.
 dnsPowerdns:
@@ -55,11 +69,9 @@ dnsPowerdns:
   image:
     repository: ghcr.io/spatiumddi/dns-powerdns
   controlPlaneUrl: ""
+  inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
   serverGroupName: ""
-  persistence:
-    data:
-      size: 1Gi
 
 # DHCP — Kea backend. DaemonSet (single node) with ``hostNetwork:
 # true`` + ``CAP_NET_BIND_SERVICE`` so Kea sees DHCP-discover
@@ -70,15 +82,15 @@ dhcpKea:
   image:
     repository: ghcr.io/spatiumddi/dhcp-kea
   controlPlaneUrl: ""
+  inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
   serverGroupName: ""
   # ``host`` = listen on the host's NIC (the default + only mode
   # that lets DHCP broadcasts reach Kea). ``bridged`` would require
   # a relay-agent on every subnet — defer to Phase 5.
   networkMode: host
-  persistence:
-    leases:
-      size: 512Mi
+  # #292 — per-node hostPath state under /var/lib/spatiumddi/agents/
+  # dhcp-kea/ (agent cache + Kea leases), NOT a PVC. See dnsBind9.
   # #272 Phase 5 — DHCP relay-VIP (default off). When set, an ADDITIONAL
   # LoadBalancer Service (``dhcp-kea-relay``) requests this IP from the
   # MetalLB pool so a DHCP relay's ``forward-to`` target can outlive a
