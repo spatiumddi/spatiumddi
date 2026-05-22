@@ -494,6 +494,56 @@ def cluster_pods() -> list[dict]:
     return out
 
 
+def cluster_vip() -> str | None:
+    """The control-plane VIP — the frontend LoadBalancer Service's
+    assigned external IP (MetalLB), or ``None`` when no VIP is
+    configured (single-node / hostNetwork-only frontend) or k3s is
+    unreachable. Surfaced in the header so a physical-console operator
+    sees the one stable Web UI address."""
+    try:
+        proc = subprocess.run(
+            [
+                "/usr/local/bin/k3s",
+                "kubectl",
+                "get",
+                "svc",
+                "-n",
+                "spatium",
+                "-o",
+                "json",
+            ],
+            env={**os.environ, "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"},
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    for svc in data.get("items") or []:
+        spec = svc.get("spec") or {}
+        if spec.get("type") != "LoadBalancer":
+            continue
+        meta = svc.get("metadata") or {}
+        labels = meta.get("labels") or {}
+        name = meta.get("name") or ""
+        # The frontend Service is the control-plane VIP; match by the
+        # chart component label, falling back to a name substring.
+        if labels.get("app.kubernetes.io/component") != "frontend" and "frontend" not in name:
+            continue
+        ingress = ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+        for ing in ingress:
+            ip = ing.get("ip")
+            if ip:
+                return ip
+    return None
+
+
 def cluster_nodes() -> list[dict]:
     """Return the k3s cluster's nodes via ``kubectl get nodes -o json``,
     one dict per node: ``{name, ready, roles, version, internal_ip}``.
@@ -1223,6 +1273,17 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     line3.append("Build ", style="dim")
     line3.append(build)
 
+    # Control-plane VIP — the frontend's MetalLB LoadBalancer IP, when one
+    # is assigned. The single stable Web UI address; surfaced near the top
+    # so a physical-console operator knows where to point a browser no
+    # matter which node they're at. Quiet when no VIP is configured.
+    vip_line: Text | None = None
+    if state.vip:
+        vip_line = Text()
+        vip_line.append("VIP  ", style="dim")
+        vip_line.append(state.vip, style="bold bright_green")
+        vip_line.append("  Web UI (control-plane)", style="dim")
+
     # Line 3a — Control plane + Identity (only on appliance nodes that
     # pair with a remote control plane; #170 Wave D). Inlining these
     # into the header lets us drop the separate Agent panel, saving ~4
@@ -1347,7 +1408,10 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # full-width because it's one long line of bits that flows
     # naturally. Everything else (IPs/Build/Agent/Watchdog/Slot/
     # Upgrade/k3s) is short enough to fit in a half-width cell.
-    short_lines: list[Text] = [line2, line3]
+    short_lines: list[Text] = []
+    if vip_line is not None:
+        short_lines.append(vip_line)
+    short_lines += [line2, line3]
     if agent_line is not None:
         short_lines.append(agent_line)
     if watchdog_line is not None:
@@ -1953,6 +2017,7 @@ class DashboardState:
         self.tty_path = tty_path
         self.ps_rows: list[dict] = []
         self.nodes: list[dict] = []
+        self.vip: str | None = None
         self.status_message = ""
         self.status_expires = 0.0
         self.pending_action: str | None = None
@@ -2001,6 +2066,7 @@ class DashboardState:
             self._last_data_refresh = now
             self.ps_rows = cluster_pods()
             self.nodes = cluster_nodes()
+            self.vip = cluster_vip()
             try:
                 self.env = read_env()
             except Exception:
