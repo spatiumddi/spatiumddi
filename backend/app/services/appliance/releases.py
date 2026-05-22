@@ -1,18 +1,18 @@
-"""GitHub release listing + scheduled-apply trigger (Phase 4c).
+"""GitHub release listing (Phase 4c).
 
-The api container can't run ``docker-compose pull && up -d`` directly
-on the host — and even if it could, it can't gracefully recreate
-itself mid-request. Two-process design:
+Lists published SpatiumDDI releases from the GitHub API and reports the
+currently-installed version, so the Releases tab can show "what's
+available" + "what you're running". Read-only.
 
-* This module: lists releases from the GitHub API + writes a trigger
-  file (``/var/lib/spatiumddi/release-pending``) with the requested
-  tag. The endpoint returns 202 Accepted and exits the request.
-* Host-side ``/usr/local/bin/spatiumddi-update`` runs as a systemd
-  oneshot driven by a Path unit watching the trigger file. It edits
-  ``SPATIUMDDI_VERSION`` in ``/etc/spatiumddi/.env``, runs
-  ``docker-compose pull && docker-compose up -d``, then renames the
-  trigger so it doesn't re-fire. Log goes to
-  ``/var/log/spatiumddi/update.log`` for the UI to tail.
+#294 — the old one-click "apply" half of this module (a trigger file
+watched by a host-side ``spatiumddi-update.path`` unit running
+``docker-compose pull && up -d``) was removed: it's a pre-#183
+docker-compose-era mechanism that does nothing on the k3s appliance
+(no compose stack, no such unit). OS upgrades on the appliance go
+through the A/B slot image flow (``services/appliance/slot.py``,
+surfaced on the Fleet tab); docker/k8s control planes use the
+operator-run ``docker compose`` / ``helm upgrade`` commands shown in
+the UI's manual-upgrade modal.
 
 Cache: GitHub release listings are public + rate-limited (60 req/h
 unauthenticated). 60-second in-memory cache keeps the page snappy
@@ -23,7 +23,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 
 import httpx
 import structlog
@@ -33,12 +32,6 @@ from app.config import settings
 logger = structlog.get_logger(__name__)
 
 _GITHUB_API = "https://api.github.com"
-# Paths inside the api container — bind-mounted to the host's
-# /var/lib/spatiumddi/release-state/ and /var/log/spatiumddi/ via
-# the appliance docker-compose. The host's spatiumddi-update.path
-# unit watches the same trigger file on its side.
-_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/release-pending")
-_UPDATE_LOG = Path("/var/log/spatiumddi-host/update.log")
 _CACHE_TTL_SECONDS = 60
 
 
@@ -111,43 +104,3 @@ async def list_releases() -> list[Release]:
         )
     _CACHE["releases"] = (now, releases)
     return releases
-
-
-def schedule_apply(tag: str) -> None:
-    """Drop the trigger file the host-side updater watches.
-
-    Atomic via ``.new`` sibling + replace so the Path unit doesn't
-    fire on a half-written file. Raises if the trigger dir isn't
-    writable (e.g. dev environment without the appliance volume).
-    """
-    if not settings.appliance_mode:
-        raise RuntimeError("release apply is only supported on the SpatiumDDI OS appliance")
-    _TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _TRIGGER_FILE.with_suffix(".new")
-    tmp.write_text(f"{tag.strip()}\n", encoding="utf-8")
-    tmp.replace(_TRIGGER_FILE)
-    logger.info("appliance_release_scheduled", tag=tag)
-
-
-def get_update_log_tail(lines: int = 80) -> str:
-    """Return the last ``lines`` lines of /var/log/spatiumddi/update.log.
-
-    The UI polls this while an apply is in flight to show progress.
-    Empty string when the file doesn't exist (no apply has ever run).
-    """
-    if not _UPDATE_LOG.exists():
-        return ""
-    try:
-        text = _UPDATE_LOG.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-    return "\n".join(text.splitlines()[-lines:])
-
-
-def is_apply_in_flight() -> bool:
-    """True when a trigger file is present (host hasn't processed it yet).
-
-    The host's update runner renames the file to ``.done`` once it's
-    finished, so its presence is the "still working" signal.
-    """
-    return _TRIGGER_FILE.exists()

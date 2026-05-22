@@ -1,13 +1,17 @@
 """SpatiumDDI release management — Phase 4c.
 
-Mounted at ``/api/v1/appliance/releases``. Three endpoints:
-    GET    /                 — list available releases + installed + log tail
-    POST   /apply            — schedule an upgrade to the given tag (202)
-    GET    /log              — tail the host-side update log (polled by UI)
+Mounted at ``/api/v1/appliance/releases``. Read-only:
+    GET / — list available releases + currently-installed version.
 
-The actual upgrade runs as a host-side oneshot driven by a systemd
-Path unit watching ``/var/lib/spatiumddi/release-pending``; see
-``app/services/appliance/releases.py`` for the rationale.
+#294 — the old ``POST /apply`` + ``GET /log`` endpoints were removed.
+They drove a pre-#183 docker-compose update (a trigger file watched by
+a host-side ``spatiumddi-update.path`` unit running
+``docker-compose pull && up -d``), which does nothing on the k3s
+appliance — no compose stack, no such unit. OS upgrades on the
+appliance go through the A/B slot image flow (``slot.py`` /
+``services/appliance/slot.py``, surfaced on the Fleet tab); docker/k8s
+control planes run the manual ``docker compose`` / ``helm upgrade``
+commands the UI shows.
 """
 
 from __future__ import annotations
@@ -15,17 +19,12 @@ from __future__ import annotations
 from datetime import datetime
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 
-from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_permission
-from app.models.audit import AuditLog
 from app.services.appliance.releases import (
     get_installed_version,
-    get_update_log_tail,
-    is_apply_in_flight,
-    schedule_apply,
 )
 from app.services.appliance.releases import (
     list_releases as svc_list_releases,
@@ -48,17 +47,7 @@ class ReleaseInfo(BaseModel):
 
 class ReleasesResponse(BaseModel):
     installed_version: str
-    apply_in_flight: bool
     releases: list[ReleaseInfo]
-    update_log_tail: str
-
-
-class ApplyRequest(BaseModel):
-    tag: str = Field(min_length=1, max_length=80)
-
-
-class ApplyResponse(BaseModel):
-    scheduled: str
 
 
 @router.get(
@@ -71,7 +60,6 @@ async def list_releases() -> ReleasesResponse:
     rels = await svc_list_releases()
     return ReleasesResponse(
         installed_version=get_installed_version(),
-        apply_in_flight=is_apply_in_flight(),
         releases=[
             ReleaseInfo(
                 tag=r.tag,
@@ -84,58 +72,4 @@ async def list_releases() -> ReleasesResponse:
             )
             for r in rels
         ],
-        update_log_tail=get_update_log_tail(),
     )
-
-
-@router.post(
-    "/apply",
-    response_model=ApplyResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_permission("admin", "appliance"))],
-    summary="Schedule an upgrade to the named tag",
-)
-async def apply_release(
-    body: ApplyRequest,
-    db: DB,
-    user: CurrentUser,
-) -> ApplyResponse:
-    if is_apply_in_flight():
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "an upgrade is already in flight — wait for it to finish",
-        )
-    try:
-        schedule_apply(body.tag)
-    except RuntimeError as exc:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
-
-    db.add(
-        AuditLog(
-            user_id=user.id,
-            user_display_name=user.display_name,
-            auth_source=user.auth_source,
-            action="apply_release",
-            resource_type="appliance",
-            resource_id="release",
-            resource_display=body.tag,
-            new_value={"tag": body.tag},
-            result="success",
-        )
-    )
-    await db.commit()
-    logger.info("appliance_release_apply_requested", tag=body.tag, user=user.username)
-    return ApplyResponse(scheduled=body.tag)
-
-
-@router.get(
-    "/log",
-    response_model=dict,
-    dependencies=[Depends(require_permission("read", "appliance"))],
-    summary="Tail of the host-side update log",
-)
-async def get_log() -> dict:
-    return {
-        "apply_in_flight": is_apply_in_flight(),
-        "log_tail": get_update_log_tail(),
-    }

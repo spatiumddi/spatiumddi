@@ -246,7 +246,10 @@ export function AppliancePage() {
             isApplianceHost={isApplianceHost}
           />
         ) : effectiveTab === "releases" ? (
-          <ReleasesTab applianceMode={isApplianceHost} />
+          <ReleasesTab
+            applianceMode={isApplianceHost}
+            onNavigateTab={(t) => setTab(t as Tab)}
+          />
         ) : effectiveTab === "containers" ? (
           <ContainersTab />
         ) : effectiveTab === "logs" ? (

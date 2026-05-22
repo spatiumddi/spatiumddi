@@ -7024,26 +7024,17 @@ export interface ApplianceRelease {
 
 export interface ApplianceReleasesResponse {
   installed_version: string;
-  apply_in_flight: boolean;
   releases: ApplianceRelease[];
-  update_log_tail: string;
 }
 
+// #294 — read-only. The old one-click `apply` (+ `log` poll) drove a
+// docker-compose-era host updater that does nothing on the k3s
+// appliance; OS upgrades go through the A/B slot flow (Fleet tab) and
+// docker/k8s use the manual-command modal in the UI.
 export const applianceReleasesApi = {
   list: () =>
     api
       .get<ApplianceReleasesResponse>("/appliance/releases")
-      .then((r) => r.data),
-  apply: (tag: string) =>
-    api
-      .post<{ scheduled: string }>("/appliance/releases/apply", { tag })
-      .then((r) => r.data),
-  log: () =>
-    api
-      .get<{
-        apply_in_flight: boolean;
-        log_tail: string;
-      }>("/appliance/releases/log")
       .then((r) => r.data),
 };
 

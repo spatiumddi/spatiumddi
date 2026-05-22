@@ -1,13 +1,12 @@
 import { useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import {
-  AlertCircle,
   Box,
   CheckCircle2,
   ChevronRight,
   Download,
   ExternalLink,
-  Loader2,
+  Info,
   RefreshCw,
 } from "lucide-react";
 
@@ -24,49 +23,34 @@ import { Modal } from "@/components/ui/modal";
 const FULL_CARDS = 3;
 
 /**
- * Phase 4c — Release management.
+ * Phase 4c — Release listing (read-only).
  *
- * Lists recent GitHub releases (top 25, 60 s cached server-side),
- * shows the currently-installed version, and lets the operator
- * one-click an upgrade. The actual `docker-compose pull && up -d`
- * runs on the host via a systemd Path unit so the api container can
- * recreate itself cleanly mid-upgrade.
+ * Lists recent GitHub releases (top 25, 60 s cached server-side) and
+ * shows the currently-installed version.
  *
- * While an upgrade is in flight, the apply buttons are disabled and
- * a "Update log" card auto-tails /var/log/spatiumddi/update.log via
- * a 3-second poll. Once /api/v1/version reports a different version
- * the upgrade is complete (poll interval bumps back down).
- *
- * Apply is gated on ``applianceMode`` — the host-side systemd Path
- * unit (``spatiumddi-update.path``) only exists on a SpatiumDDI OS
- * appliance. On docker / k8s control planes, Apply is replaced with a
- * "manual upgrade" command modal carrying the appropriate
- * ``docker compose pull`` / ``helm upgrade`` invocation.
+ * #294 — there is no one-click "Apply" here anymore. It used to write a
+ * trigger file watched by a host-side ``spatiumddi-update.path`` unit
+ * running ``docker-compose pull && up -d`` — a pre-#183 mechanism that
+ * does nothing on the k3s appliance (no compose stack, no such unit).
+ * OS upgrades on the appliance go through the A/B slot image flow on the
+ * **Fleet** tab; docker / k8s control planes run the manual
+ * ``docker compose`` / ``helm upgrade`` command shown in the per-release
+ * "Manual…" modal. So this tab is informational: "what's available" +
+ * "what you're running".
  */
 export function ReleasesTab({
   applianceMode = false,
+  onNavigateTab,
 }: {
   applianceMode?: boolean;
+  // Lets the appliance-mode banner deep-link to the Fleet tab where OS
+  // slot upgrades actually live.
+  onNavigateTab?: (tab: string) => void;
 }) {
-  const qc = useQueryClient();
-  const [confirmTarget, setConfirmTarget] = useState<ApplianceRelease | null>(
-    null,
-  );
-
   const { data, isLoading, error } = useQuery({
     queryKey: ["appliance", "releases"],
     queryFn: applianceReleasesApi.list,
-    // Poll faster while an apply is in flight so the log + the
-    // is_installed marker on each card update without manual refresh.
-    refetchInterval: (q) => (q.state.data?.apply_in_flight ? 3_000 : 60_000),
-  });
-
-  const apply = useMutation({
-    mutationFn: applianceReleasesApi.apply,
-    onSuccess: () => {
-      setConfirmTarget(null);
-      qc.invalidateQueries({ queryKey: ["appliance", "releases"] });
-    },
+    refetchInterval: 60_000,
   });
 
   return (
@@ -78,11 +62,9 @@ export function ReleasesTab({
             SpatiumDDI Releases
           </h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            Updates pull new container images from{" "}
+            Published releases from{" "}
             <code className="rounded bg-muted px-1">ghcr.io/spatiumddi</code>{" "}
-            and recycle the stack via a host-side systemd unit so the api can
-            replace itself cleanly. The web UI reconnects automatically once the
-            new version is healthy.
+            and the version this control plane is running.
           </p>
         </div>
         <div className="shrink-0 rounded-md border bg-muted px-2 py-1.5 text-xs">
@@ -93,42 +75,39 @@ export function ReleasesTab({
         </div>
       </div>
 
-      {error && (
-        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
-          Failed to load releases: {formatApiError(error)}
-        </div>
-      )}
-
-      {data?.apply_in_flight && (
-        <div className="rounded-md border border-amber-500/50 bg-amber-500/10 p-3">
-          <div className="flex items-start gap-2">
-            <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-amber-600 dark:text-amber-400" />
-            <div className="flex-1 text-xs">
-              <p className="font-medium text-amber-700 dark:text-amber-400">
-                Upgrade in flight — pulling images + recycling the stack
+      {/* #294 — on the appliance, OS upgrades are NOT applied from here;
+          they go through the A/B slot image flow on the Fleet tab. This
+          list is read-only. */}
+      {applianceMode && (
+        <div className="rounded-md border border-sky-500/40 bg-sky-500/10 p-3">
+          <div className="flex items-start gap-2 text-xs">
+            <Info className="mt-0.5 h-4 w-4 shrink-0 text-sky-600 dark:text-sky-400" />
+            <div className="flex-1">
+              <p className="font-medium text-sky-700 dark:text-sky-300">
+                This list is informational
               </p>
-              <p className="mt-0.5 text-amber-700/80 dark:text-amber-400/80">
-                The api container will recycle itself; this page may go blank
-                for ~30 s and come back on the new version. Don't close the
-                browser tab.
+              <p className="mt-0.5 text-sky-700/80 dark:text-sky-300/80">
+                OS upgrades on the appliance are applied as atomic A/B slot
+                images from the Fleet tab — not from here.
               </p>
+              {onNavigateTab && (
+                <button
+                  type="button"
+                  onClick={() => onNavigateTab("fleet")}
+                  className="mt-1.5 inline-flex items-center gap-1 rounded-md border border-sky-500/50 bg-background px-2 py-1 text-xs font-medium text-sky-700 hover:bg-sky-500/10 dark:text-sky-300"
+                >
+                  Go to Fleet → OS upgrades
+                </button>
+              )}
             </div>
           </div>
         </div>
       )}
 
-      {(data?.update_log_tail ?? "").length > 0 && (
-        <details
-          className="rounded-md border bg-card"
-          open={data?.apply_in_flight}
-        >
-          <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-muted/50">
-            Update log (tail) — last apply
-          </summary>
-          <pre className="overflow-auto border-t bg-muted/30 px-3 py-2 font-mono text-[11px] leading-tight">
-            {data?.update_log_tail}
-          </pre>
-        </details>
+      {error && (
+        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+          Failed to load releases: {formatApiError(error)}
+        </div>
       )}
 
       {isLoading ? (
@@ -145,23 +124,7 @@ export function ReleasesTab({
           </p>
         </div>
       ) : (
-        <ReleasesList
-          releases={data.releases}
-          applyInFlight={data.apply_in_flight}
-          applianceMode={applianceMode}
-          onApply={(rel) => setConfirmTarget(rel)}
-        />
-      )}
-
-      {confirmTarget && (
-        <ApplyConfirmModal
-          release={confirmTarget}
-          installed={data?.installed_version ?? "—"}
-          onClose={() => !apply.isPending && setConfirmTarget(null)}
-          onConfirm={() => apply.mutate(confirmTarget.tag)}
-          submitting={apply.isPending}
-          error={apply.isError ? formatApiError(apply.error) : null}
-        />
+        <ReleasesList releases={data.releases} applianceMode={applianceMode} />
       )}
     </div>
   );
@@ -169,14 +132,10 @@ export function ReleasesTab({
 
 function ReleasesList({
   releases,
-  applyInFlight,
   applianceMode,
-  onApply,
 }: {
   releases: ApplianceRelease[];
-  applyInFlight: boolean;
   applianceMode: boolean;
-  onApply: (rel: ApplianceRelease) => void;
 }) {
   // Always render the top ``FULL_CARDS`` as full-detail cards. The
   // remainder collapses behind a disclosure to keep the page scannable
@@ -196,16 +155,11 @@ function ReleasesList({
         <ReleaseCard
           key={rel.tag}
           release={rel}
-          disabled={applyInFlight}
           applianceMode={applianceMode}
-          onApply={() => onApply(rel)}
         />
       ))}
       {older.length > 0 && (
-        <details
-          className="group rounded-lg border bg-card"
-          open={applyInFlight}
-        >
+        <details className="group rounded-lg border bg-card">
           <summary className="flex cursor-pointer items-center gap-2 px-4 py-2.5 text-sm hover:bg-muted/50">
             <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
             <span className="font-medium">
@@ -223,9 +177,7 @@ function ReleasesList({
               <CompactReleaseRow
                 key={rel.tag}
                 release={rel}
-                disabled={applyInFlight}
                 applianceMode={applianceMode}
-                onApply={() => onApply(rel)}
               />
             ))}
           </div>
@@ -241,14 +193,10 @@ function ReleasesList({
 // release's notes preview.
 function CompactReleaseRow({
   release,
-  disabled,
   applianceMode,
-  onApply,
 }: {
   release: ApplianceRelease;
-  disabled: boolean;
   applianceMode: boolean;
-  onApply: () => void;
 }) {
   const [manualOpen, setManualOpen] = useState(false);
   return (
@@ -278,19 +226,9 @@ function CompactReleaseRow({
         >
           <ExternalLink className="h-3 w-3" />
         </a>
-        {release.is_installed ? (
-          <span className="shrink-0 text-xs text-muted-foreground">Active</span>
-        ) : applianceMode ? (
-          <button
-            type="button"
-            onClick={onApply}
-            disabled={disabled}
-            className="inline-flex shrink-0 items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <Download className="h-3 w-3" />
-            Apply
-          </button>
-        ) : (
+        {/* No per-release apply on the appliance (OS upgrades live on the
+            Fleet tab). docker / k8s control planes get the manual command. */}
+        {!applianceMode && !release.is_installed && (
           <button
             type="button"
             onClick={() => setManualOpen(true)}
@@ -324,14 +262,10 @@ function CompactReleaseRow({
 
 function ReleaseCard({
   release,
-  disabled,
   applianceMode,
-  onApply,
 }: {
   release: ApplianceRelease;
-  disabled: boolean;
   applianceMode: boolean;
-  onApply: () => void;
 }) {
   const [manualOpen, setManualOpen] = useState(false);
   return (
@@ -384,17 +318,7 @@ function ReleaseCard({
         <div className="shrink-0">
           {release.is_installed ? (
             <span className="text-xs text-muted-foreground">Active</span>
-          ) : applianceMode ? (
-            <button
-              type="button"
-              onClick={onApply}
-              disabled={disabled}
-              className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <Download className="h-3 w-3" />
-              Apply
-            </button>
-          ) : (
+          ) : !applianceMode ? (
             <button
               type="button"
               onClick={() => setManualOpen(true)}
@@ -404,7 +328,7 @@ function ReleaseCard({
               <Download className="h-3 w-3" />
               Manual…
             </button>
-          )}
+          ) : null}
         </div>
       </div>
       {manualOpen && (
@@ -417,11 +341,9 @@ function ReleaseCard({
   );
 }
 
-// Replaces the Apply button on docker / k8s control planes. The
-// host-side systemd Path unit that the appliance flow relies on
-// (``spatiumddi-update.path``) doesn't exist here, so a one-click
-// apply isn't possible. Operator copies a command + runs it against
-// the deployment they manage.
+// Shown on docker / k8s control planes (no host-side update mechanism,
+// and no A/B slot flow either). The operator copies a command + runs it
+// against the deployment they manage.
 function ManualApplyModal({
   tag,
   onClose,
@@ -445,9 +367,8 @@ function ManualApplyModal({
     <Modal title={`Manual upgrade — ${tag}`} onClose={onClose} wide>
       <div className="space-y-3 text-sm">
         <p className="text-muted-foreground">
-          This control plane runs on docker / kubernetes — there's no host-side
-          update unit to trigger a one-click apply. Pick the deploy shape that
-          matches your install, copy the command, and run it on the
+          This control plane runs on docker / kubernetes — pick the deploy shape
+          that matches your install, copy the command, and run it on the
           control-plane host.
         </p>
         <div>
@@ -495,79 +416,6 @@ function ManualApplyModal({
             className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
           >
             Close
-          </button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function ApplyConfirmModal({
-  release,
-  installed,
-  onClose,
-  onConfirm,
-  submitting,
-  error,
-}: {
-  release: ApplianceRelease;
-  installed: string;
-  onClose: () => void;
-  onConfirm: () => void;
-  submitting: boolean;
-  error: string | null;
-}) {
-  return (
-    <Modal title="Apply release" onClose={onClose} wide>
-      <div className="space-y-3 text-sm">
-        <p>
-          Upgrade the appliance stack from{" "}
-          <code className="rounded bg-muted px-1 py-0.5 font-mono">
-            {installed}
-          </code>{" "}
-          to{" "}
-          <code className="rounded bg-muted px-1 py-0.5 font-mono">
-            {release.tag}
-          </code>
-          ?
-        </p>
-        <p className="text-xs text-muted-foreground">
-          The host will pull the new image set and recycle every container.
-          Expect a ~30 second blackout while the api container restarts. DNS and
-          DHCP service continue serving from cache during the recycle.
-        </p>
-        {release.is_prerelease && (
-          <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-2 text-xs">
-            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
-            <span className="text-amber-700 dark:text-amber-400">
-              This release is marked as pre-release on GitHub. Not recommended
-              for production appliances.
-            </span>
-          </div>
-        )}
-        {error && (
-          <div className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
-            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>{error}</span>
-          </div>
-        )}
-        <div className="flex justify-end gap-2 pt-2">
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={submitting}
-            className="rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={onConfirm}
-            disabled={submitting}
-            className="inline-flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            <Download className="h-3.5 w-3.5" />
-            {submitting ? "Scheduling…" : `Apply ${release.tag}`}
           </button>
         </div>
       </div>
