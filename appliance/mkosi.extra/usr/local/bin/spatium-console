@@ -319,6 +319,20 @@ def _pod_workload_type(owner_refs: list) -> str:
     return _WORKLOAD_TYPE.get(kind, kind or "—")
 
 
+def visible_pods(ps_rows: list[dict]) -> list[dict]:
+    """#284 — pods worth showing on the live dashboard: everything
+    except completed (``Succeeded``) one-shot Jobs (the migrate Job +
+    CNPG's initdb / per-replica join Jobs). A finished Job carries no
+    signal and just consumes a row; ``kubectl get pods -A -a`` still has
+    the history. ``Failed`` pods are kept — those are real errors.
+
+    Used for BOTH the rendered rows AND the Pods-panel height
+    (``SVC_ROWS``). They MUST share this filter: sizing the panel off
+    the unfiltered list while rendering the filtered list would reserve
+    one blank line per hidden pod (the bug this helper closes)."""
+    return [r for r in ps_rows if (r.get("K8sState") or "") != "Succeeded"]
+
+
 def cluster_pods() -> list[dict]:
     """Return every pod on the local cluster via
     ``kubectl get pods -A -o json``, translated into the docker-ps
@@ -1509,15 +1523,13 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         Text("PORTS", style=header_style),
     )
 
-    # #284 — drop completed one-shot pods (``Succeeded`` Jobs: the
-    # migrate Job + CNPG's initdb / per-replica join Jobs). A finished
-    # Job carries no signal on a live dashboard and just consumes a row;
-    # operators who need job history still have ``kubectl get pods -A
-    # -a``. ``Failed`` pods are intentionally NOT filtered — those are a
-    # real error worth surfacing. (The migrate Job is also TTL-GC'd by
-    # the cluster after migrate.ttlSecondsAfterFinished; this just stops
-    # it cluttering the TTY in the meantime.)
-    visible_rows = [r for r in ps_rows if (r.get("K8sState") or "") != "Succeeded"]
+    # #284 — drop completed one-shot pods (``Succeeded`` Jobs). Shares
+    # the ``visible_pods`` filter with the SVC_ROWS panel-height calc in
+    # render_frame so a hidden pod reserves no blank line. (The migrate
+    # Job is also TTL-GC'd by the cluster after
+    # migrate.ttlSecondsAfterFinished; this just stops it cluttering the
+    # TTY in the meantime.)
+    visible_rows = visible_pods(ps_rows)
 
     # Pure alphabetical by pod name. Operator feedback —
     # namespace-grouping made the spatium pods land at the top
@@ -1956,7 +1968,10 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # empty-state "no pods running" hint stays visible while k3s comes
     # up. Capped at terminal-height-aware ceiling in render_frame's
     # log_height clamp below.
-    pods_count = len(state.ps_rows) if state.ps_rows else 1
+    # #284 — size the Pods panel off the SAME filtered set render_services
+    # renders, so hidden (Succeeded) pods don't leave blank lines. ``or 1``
+    # keeps a single row for the "no pods" fallback when nothing's visible.
+    pods_count = len(visible_pods(state.ps_rows)) or 1
     # Header layout: 1 line1 (host+role | clock) + N rows of the
     # 2-col paired grid + 1 horizontal rule + 1 vitals + 2 panel
     # border. The grid packs IPs + Build + every conditional row
