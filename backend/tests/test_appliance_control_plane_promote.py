@@ -326,7 +326,14 @@ async def test_metallb_get_default(db_session: AsyncSession, client: AsyncClient
     resp = await client.get(_METALLB_URL, headers=_hdr(token))
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body == {"enabled": False, "pool_addresses": [], "control_plane_vip": ""}
+    assert body["enabled"] is False
+    assert body["pool_addresses"] == []
+    assert body["control_plane_vip"] == ""
+    # #272 — live-status fields default to false/0 when kubeapi is
+    # unavailable (no ServiceAccount mounted under pytest).
+    assert body["controller_ready"] is False
+    assert body["speakers_ready"] == 0
+    assert body["speakers_total"] == 0
 
 
 async def test_metallb_put_and_get(db_session: AsyncSession, client: AsyncClient) -> None:
@@ -343,13 +350,13 @@ async def test_metallb_put_and_get(db_session: AsyncSession, client: AsyncClient
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["control_plane_vip"] == "192.168.0.241"
-    # Round-trips through the GET.
+    # Round-trips through the GET (config fields; status fields default
+    # to false/0 in-test and are asserted in test_metallb_get_default).
     got = await client.get(_METALLB_URL, headers=_hdr(token))
-    assert got.json() == {
-        "enabled": True,
-        "pool_addresses": ["192.168.0.240/29"],
-        "control_plane_vip": "192.168.0.241",
-    }
+    body = got.json()
+    assert body["enabled"] is True
+    assert body["pool_addresses"] == ["192.168.0.240/29"]
+    assert body["control_plane_vip"] == "192.168.0.241"
 
 
 async def test_metallb_vip_outside_pool_refused(
@@ -370,7 +377,10 @@ async def test_metallb_vip_outside_pool_refused(
     assert "not inside" in resp.text
 
 
-async def test_metallb_enabled_requires_pool(db_session: AsyncSession, client: AsyncClient) -> None:
+async def test_metallb_enabled_requires_vip(db_session: AsyncSession, client: AsyncClient) -> None:
+    # #272 — enabling MetalLB requires a VIP. The address pool is now
+    # OPTIONAL (auto-derived as <vip>/32 when omitted), so the missing-VIP
+    # case is what 422s, not a missing pool.
     token = await _admin(db_session)
     await db_session.commit()
     resp = await client.put(
@@ -379,7 +389,25 @@ async def test_metallb_enabled_requires_pool(db_session: AsyncSession, client: A
         headers=_hdr(token),
     )
     assert resp.status_code == 422
-    assert "pool is required" in resp.text
+    assert "VIP is required" in resp.text
+
+
+async def test_metallb_vip_only_autoderives_pool(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    # #272 — enabled + VIP + no pool → succeeds, pool auto-set to <vip>/32.
+    # This is the common single-VIP path the operator takes (one field).
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={"enabled": True, "pool_addresses": [], "control_plane_vip": "192.168.0.250"},
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["pool_addresses"] == ["192.168.0.250/32"]
+    assert body["control_plane_vip"] == "192.168.0.250"
 
 
 async def test_metallb_invalid_pool_entry(db_session: AsyncSession, client: AsyncClient) -> None:
