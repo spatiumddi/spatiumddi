@@ -285,8 +285,17 @@ function ClusterMembershipModal({
         r.cluster_role === "primary" ||
         r.cluster_role === "member"),
   );
+  // Alphabetical by hostname (natural sort so ddi2 < ddi10), not the
+  // API's IP order — operators scan the promote/demote lists by name.
+  const byHostname = (a: ApplianceRow, b: ApplianceRow) =>
+    (a.hostname ?? "").localeCompare(b.hostname ?? "", undefined, {
+      numeric: true,
+      sensitivity: "base",
+    });
   // Only actually-joined members are demotable (never the seed).
-  const demotable = members.filter((r) => r.cluster_role === "member");
+  const demotable = members
+    .filter((r) => r.cluster_role === "member")
+    .sort(byHostname);
   const memberCount = members.length;
   // Eligible to promote: approved OS-appliance nodes that aren't already
   // a control-plane node (the seed / a promoted member) and aren't
@@ -294,14 +303,16 @@ function ClusterMembershipModal({
   // control-plane node is excluded even before it's formally designated
   // primary (cluster_role is null until the first promote) — you can't
   // promote a control plane to a control plane.
-  const eligible = rows.filter(
-    (r) =>
-      r.state === "approved" &&
-      r.deployment_kind === "appliance" &&
-      !isControlPlaneRow(r) &&
-      !r.cluster_role &&
-      r.desired_cluster_role !== "member",
-  );
+  const eligible = rows
+    .filter(
+      (r) =>
+        r.state === "approved" &&
+        r.deployment_kind === "appliance" &&
+        !isControlPlaneRow(r) &&
+        !r.cluster_role &&
+        r.desired_cluster_role !== "member",
+    )
+    .sort(byHostname);
 
   const refresh = () =>
     qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
