@@ -40,7 +40,9 @@ from app.core.auth.user_sync import (
     ExternalSyncRejected,
     sync_external_user,
 )
+from app.core.auth_throttle import login_rate_limited, mfa_challenge_consume
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.request_meta import clean_user_agent
 from app.core.security import (
     create_access_token,
     create_mfa_challenge_token,
@@ -192,7 +194,7 @@ async def _issue_tokens(db: DB, request: Request, user: User, auth_source: str) 
         user_id=user.id,
         refresh_token_hash=refresh_hash,
         source_ip=_client_ip(request),
-        user_agent=request.headers.get("user-agent"),
+        user_agent=clean_user_agent(request.headers.get("user-agent")),
         auth_source=auth_source,
         created_at=now,
         last_seen_at=now,
@@ -207,7 +209,7 @@ async def _issue_tokens(db: DB, request: Request, user: User, auth_source: str) 
             user_display_name=user.display_name,
             auth_source=auth_source,
             source_ip=_client_ip(request),
-            user_agent=request.headers.get("user-agent"),
+            user_agent=clean_user_agent(request.headers.get("user-agent")),
             action="login",
             resource_type="user",
             resource_id=str(user.id),
@@ -270,7 +272,7 @@ async def _audit_login_failure(
             user_display_name=user.display_name if user else (username or "<unknown>"),
             auth_source=auth_source,
             source_ip=_client_ip(request),
-            user_agent=request.headers.get("user-agent"),
+            user_agent=clean_user_agent(request.headers.get("user-agent")),
             action="login",
             resource_type="user",
             resource_id=str(user.id) if user else "",
@@ -289,7 +291,7 @@ async def _audit_login_failure(
                 user_display_name=user.display_name,
                 auth_source=auth_source,
                 source_ip=_client_ip(request),
-                user_agent=request.headers.get("user-agent"),
+                user_agent=clean_user_agent(request.headers.get("user-agent")),
                 action="account.locked",
                 resource_type="user",
                 resource_id=str(user.id),
@@ -379,7 +381,7 @@ async def _try_external_password_login(
                     user_display_name=username,
                     auth_source=provider.name,
                     source_ip=_client_ip(request),
-                    user_agent=request.headers.get("user-agent"),
+                    user_agent=clean_user_agent(request.headers.get("user-agent")),
                     action="login",
                     resource_type="auth_provider",
                     resource_id=str(provider.id),
@@ -397,7 +399,7 @@ async def _try_external_password_login(
                     user_display_name=username,
                     auth_source=provider.name,
                     source_ip=_client_ip(request),
-                    user_agent=request.headers.get("user-agent"),
+                    user_agent=clean_user_agent(request.headers.get("user-agent")),
                     action="login",
                     resource_type="auth_provider",
                     resource_id=str(provider.id),
@@ -436,6 +438,15 @@ async def _try_external_password_login(
 
 @router.post("/login", response_model=LoginResponse)
 async def login(body: LoginRequest, request: Request, db: DB) -> LoginResponse:
+    # Per-IP rate limit (#4) — complements the per-account lockout, which
+    # only engages once a valid username is hit. Fails open if Redis is
+    # down. 429 with a generic message (no account-existence leak).
+    if await login_rate_limited(_client_ip(request)):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts. Try again shortly.",
+        )
+
     result = await db.execute(select(User).where(User.username == body.username))
     user = result.scalar_one_or_none()
 
@@ -524,6 +535,14 @@ async def login_mfa(body: MfaLoginRequest, request: Request, db: DB) -> LoginRes
     only against a successful TOTP/recovery code, so an attacker who
     captures the challenge token still needs the second factor.
     """
+    # Same per-IP budget as /login (#4) — the MFA step is the other half
+    # of the credential surface.
+    if await login_rate_limited(_client_ip(request)):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts. Try again shortly.",
+        )
+
     if (body.code and body.recovery_code) or (not body.code and not body.recovery_code):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -582,7 +601,7 @@ async def login_mfa(body: MfaLoginRequest, request: Request, db: DB) -> LoginRes
                         user_display_name=user.display_name,
                         auth_source="local",
                         source_ip=_client_ip(request),
-                        user_agent=request.headers.get("user-agent"),
+                        user_agent=clean_user_agent(request.headers.get("user-agent")),
                         action="mfa.recovery_used",
                         resource_type="user",
                         resource_id=str(user.id),
@@ -597,6 +616,21 @@ async def login_mfa(body: MfaLoginRequest, request: Request, db: DB) -> LoginRes
     if not matched:
         await _audit_login_failure(db, request, user.username, reason="mfa_code_invalid", user=user)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid MFA code")
+
+    # Single-use guard (#7): claim the challenge jti now that the factor
+    # matched. A wrong code above never reaches here, so a legit user can
+    # still retry a fat-fingered code with the same challenge — but once a
+    # valid code is accepted, the challenge can't be replayed (the
+    # attacker who captured challenge+code loses the race / gets rejected).
+    # Fails open if Redis is down (reverts to the prior stateless behavior).
+    if not await mfa_challenge_consume(payload.get("jti")):
+        await _audit_login_failure(
+            db, request, user.username, reason="mfa_challenge_replayed", user=user
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="MFA challenge already used",
+        )
 
     # ── Success — issue real tokens ────────────────────────────────────────
     tokens = await _issue_tokens(db, request, user, auth_source="local")
@@ -897,7 +931,7 @@ async def mfa_enroll_verify(
             user_display_name=current_user.display_name,
             auth_source="local",
             source_ip=_client_ip(request),
-            user_agent=request.headers.get("user-agent"),
+            user_agent=clean_user_agent(request.headers.get("user-agent")),
             action="mfa.enabled",
             resource_type="user",
             resource_id=str(current_user.id),
@@ -940,7 +974,7 @@ async def mfa_disable(
             user_display_name=current_user.display_name,
             auth_source="local",
             source_ip=_client_ip(request),
-            user_agent=request.headers.get("user-agent"),
+            user_agent=clean_user_agent(request.headers.get("user-agent")),
             action="mfa.disabled",
             resource_type="user",
             resource_id=str(current_user.id),
@@ -986,7 +1020,7 @@ async def mfa_regenerate_recovery_codes(
             user_display_name=current_user.display_name,
             auth_source="local",
             source_ip=_client_ip(request),
-            user_agent=request.headers.get("user-agent"),
+            user_agent=clean_user_agent(request.headers.get("user-agent")),
             action="mfa.recovery_regenerated",
             resource_type="user",
             resource_id=str(current_user.id),
@@ -1240,7 +1274,7 @@ async def oidc_callback(
                 user_display_name="<unknown>",
                 auth_source=provider.name,
                 source_ip=_client_ip(request),
-                user_agent=request.headers.get("user-agent"),
+                user_agent=clean_user_agent(request.headers.get("user-agent")),
                 action="login",
                 resource_type="auth_provider",
                 resource_id=str(provider.id),
@@ -1315,7 +1349,7 @@ async def saml_callback(
                 user_display_name="<unknown>",
                 auth_source=provider.name,
                 source_ip=_client_ip(request),
-                user_agent=request.headers.get("user-agent"),
+                user_agent=clean_user_agent(request.headers.get("user-agent")),
                 action="login",
                 resource_type="auth_provider",
                 resource_id=str(provider.id),

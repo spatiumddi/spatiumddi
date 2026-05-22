@@ -37,6 +37,18 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 7
     credential_encryption_key: str = ""
 
+    # CORS — comma-separated allowed origins (e.g.
+    # "https://ddi.example.com,https://ipam.example.com"). Default "*"
+    # keeps dev / same-origin appliance deployments working out of the
+    # box. When left as "*" we serve a wildcard WITHOUT
+    # ``allow_credentials`` (the API authenticates via the Bearer
+    # Authorization header, not cookies, so cross-origin credentials
+    # aren't needed) — that avoids the dangerous "reflect any origin +
+    # allow credentials" combo Starlette produces for ``["*"]`` +
+    # ``allow_credentials=True``. Set explicit origins to lock the API
+    # down to your frontend(s); credentials are then enabled for them.
+    cors_origins: str = "*"
+
     # External auth providers (LDAP / OIDC / SAML) are configured via the GUI at
     # /admin/auth-providers — see backend/app/models/auth_provider.py. Secrets are
     # encrypted with the Fernet helper in app.core.crypto using
@@ -144,6 +156,16 @@ class Settings(BaseSettings):
     # TLS context. Matches the compose service name on the appliance.
     appliance_frontend_container: str = "spatiumddi-frontend"
 
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """``cors_origins`` parsed into a list. ``"*"`` (the default)
+        yields ``["*"]``; a comma-separated value yields the trimmed,
+        non-empty entries."""
+        raw = self.cors_origins.strip()
+        if raw == "*" or not raw:
+            return ["*"]
+        return [o.strip() for o in raw.split(",") if o.strip()]
+
     @model_validator(mode="after")
     def _check_secret_key_default(self) -> "Settings":
         # The sentinel JWT-signing key in ``.env.example`` MUST NOT
@@ -156,14 +178,19 @@ class Settings(BaseSettings):
                     "STRICT_SECRET_KEY=true. Generate a real key with "
                     "`openssl rand -hex 32` and set SECRET_KEY in .env."
                 )
-            print(
-                "WARNING: SECRET_KEY is still the .env.example sentinel. "
-                "Set SECRET_KEY=<openssl rand -hex 32> in .env. "
-                "Enable STRICT_SECRET_KEY=true in non-dev deployments to "
-                "make this a hard error.",
-                file=sys.stderr,
-                flush=True,
-            )
+            # Skip the stderr spam under pytest — Settings() is built at
+            # import time, so the sentinel (which every test DB uses) would
+            # print on every collection. ``pytest`` is always in
+            # sys.modules by the time the app imports during a test run.
+            if "pytest" not in sys.modules:
+                print(
+                    "WARNING: SECRET_KEY is still the .env.example sentinel. "
+                    "Set SECRET_KEY=<openssl rand -hex 32> in .env. "
+                    "Enable STRICT_SECRET_KEY=true in non-dev deployments to "
+                    "make this a hard error.",
+                    file=sys.stderr,
+                    flush=True,
+                )
         return self
 
 

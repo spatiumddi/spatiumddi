@@ -418,10 +418,19 @@ def create_app() -> FastAPI:
     if settings.prometheus_metrics_enabled:
         app.add_middleware(PrometheusMiddleware)
 
+    # CORS — origins come from ``CORS_ORIGINS`` (comma-separated; default
+    # "*"). With a wildcard we MUST NOT enable credentials: Starlette
+    # would otherwise reflect the request Origin back with
+    # Access-Control-Allow-Credentials: true, effectively trusting every
+    # site. The API authenticates via the Bearer Authorization header
+    # (not cookies), so wildcard-without-credentials is correct + safe.
+    # When the operator pins explicit origins we enable credentials for
+    # them (future cookie-based flows / withCredentials fetches).
+    _cors_origins = settings.cors_origins_list
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=_cors_origins,
+        allow_credentials=_cors_origins != ["*"],
         allow_methods=["*"],
         allow_headers=["*"],
     )

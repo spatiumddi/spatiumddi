@@ -2,6 +2,7 @@
 
 import hashlib
 import secrets
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -76,7 +77,15 @@ _MFA_TOKEN_TTL_MINUTES = 5
 
 def create_mfa_challenge_token(user_id: str) -> str:
     expire = datetime.now(UTC) + timedelta(minutes=_MFA_TOKEN_TTL_MINUTES)
-    payload: dict[str, Any] = {"sub": user_id, "exp": expire, "type": "mfa"}
+    # ``jti`` lets the redeem path mark the challenge single-use in Redis
+    # so a captured (challenge + TOTP) pair can't be replayed within the
+    # TTL (#7).
+    payload: dict[str, Any] = {
+        "sub": user_id,
+        "exp": expire,
+        "type": "mfa",
+        "jti": uuid.uuid4().hex,
+    }
     return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
 
 
