@@ -455,6 +455,10 @@ function ClusterMembershipModal({
   );
 }
 
+// #272 — localStorage key for the dismissable "set up a VIP" advisory
+// shown on the Control plane section once a multi-node cluster exists.
+const VIP_ADVISORY_DISMISS_KEY = "spatium.fleet.vipAdvisoryDismissed";
+
 export function FleetTab({
   onNavigateTab,
   isApplianceHost = false,
@@ -485,6 +489,17 @@ export function FleetTab({
     enabled: isSuperadmin,
   });
 
+  // #272 — the no-VIP advisory. Only meaningful on an appliance-hosted
+  // control plane (MetalLB is a baked-in appliance subsystem; docker/k8s
+  // control planes manage their own ingress/LB). We read the current
+  // MetalLB config to decide whether a VIP is set.
+  const { data: metallb } = useQuery({
+    queryKey: ["appliance", "metallb"],
+    queryFn: applianceApprovalApi.getMetalLBConfig,
+    enabled: isSuperadmin && isApplianceHost,
+    staleTime: 30_000,
+  });
+
   // #170 follow-up — left-sidebar nav mirroring SettingsPage's
   // shape. Sections: the appliance fleet table, pairing-code
   // management, air-gap slot-image uploads, plus NTP + SNMP
@@ -507,6 +522,13 @@ export function FleetTab({
   const [replaceTarget, setReplaceTarget] = useState<ApplianceRow | null>(null);
   const [replaceResult, setReplaceResult] =
     useState<ControlPlaneReplaceResult | null>(null);
+  // #272 — no-VIP advisory dismissal. Persisted in localStorage (not
+  // session) so it stays dismissed across browser restarts; the
+  // checkbox gate makes dismissal deliberate rather than a stray click.
+  const [vipAdvisoryDismissed, setVipAdvisoryDismissed] = useState<boolean>(
+    () => localStorage.getItem(VIP_ADVISORY_DISMISS_KEY) === "1",
+  );
+  const [vipDismissAck, setVipDismissAck] = useState(false);
 
   const approve = useMutation({
     mutationFn: (id: string) => applianceApprovalApi.approve(id),
@@ -640,6 +662,22 @@ export function FleetTab({
   });
   const controlPlane = splitByState(controlPlaneRows);
   const serviceAgents = splitByState(serviceAgentRows);
+
+  // #272 — show the "set up a VIP" advisory once a multi-node control
+  // plane exists but no MetalLB VIP is configured. A cluster with >1
+  // approved control-plane node and no floating VIP is a latent SPOF:
+  // every off-cluster agent + operator browser is pinned to whichever
+  // node IP they happened to type, so losing that node strands them
+  // even though the cluster itself is healthy.
+  const approvedControlPlaneCount = controlPlaneRows.filter(
+    (r) => r.state !== "pending_approval",
+  ).length;
+  const vipConfigured = !!(metallb?.enabled && metallb.control_plane_vip);
+  const showVipAdvisory =
+    isApplianceHost &&
+    approvedControlPlaneCount > 1 &&
+    !vipConfigured &&
+    !vipAdvisoryDismissed;
 
   if (!isSuperadmin) {
     return (
@@ -899,6 +937,60 @@ export function FleetTab({
                   </button>
                 </div>
               </div>
+
+              {showVipAdvisory && (
+                <div className="mb-4 rounded-md border border-amber-500/50 bg-amber-500/10 p-4">
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-700 dark:text-amber-400" />
+                    <div className="min-w-0 flex-1">
+                      <p className="font-semibold text-amber-700 dark:text-amber-400">
+                        Set up a control-plane VIP
+                      </p>
+                      <p className="mt-1 text-sm text-muted-foreground">
+                        This control plane has{" "}
+                        <strong>{approvedControlPlaneCount} nodes</strong> but no
+                        MetalLB virtual IP (VIP) is configured. Without a VIP,
+                        operator browsers and every off-cluster DNS / DHCP agent
+                        are pinned to a single node&apos;s address — if that node
+                        goes down they lose the control plane even though the
+                        cluster is still healthy on the surviving nodes. Set a
+                        floating VIP so there&apos;s one stable address that
+                        re-homes automatically on node loss.
+                      </p>
+                      <div className="mt-3 flex flex-wrap items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={() => onNavigateTab?.("network")}
+                          className="inline-flex items-center gap-1.5 rounded-md bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-700"
+                        >
+                          <Network className="h-3.5 w-3.5" />
+                          Set up a VIP
+                        </button>
+                        <label className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            checked={vipDismissAck}
+                            onChange={(e) => setVipDismissAck(e.target.checked)}
+                            className="h-3.5 w-3.5 rounded border-input"
+                          />
+                          I understand the risk and want to dismiss this
+                        </label>
+                        <button
+                          type="button"
+                          disabled={!vipDismissAck}
+                          onClick={() => {
+                            localStorage.setItem(VIP_ADVISORY_DISMISS_KEY, "1");
+                            setVipAdvisoryDismissed(true);
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {error ? (
                 <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-700 dark:text-rose-300">

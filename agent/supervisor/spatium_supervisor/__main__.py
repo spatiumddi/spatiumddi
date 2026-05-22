@@ -32,7 +32,7 @@ import dataclasses
 from . import appliance_state, approval_state
 from .cert_auth import clear_cert
 from .config import SupervisorConfig
-from .heartbeat import heartbeat_once
+from .heartbeat import _effective_control_plane_url, heartbeat_once
 from .k8s_proxy import start_proxy_thread
 from .identity import (
     clear_appliance_id,
@@ -158,7 +158,9 @@ def _self_bootstrap_or_skip(
     )
 
 
-def _maybe_register(cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger) -> SupervisorConfig:
+def _maybe_register(
+    cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger
+) -> SupervisorConfig:
     """Run identity generation + register-if-needed in one shot. Logs
     its own status; never raises into the caller (the main loop
     falls back to idle on any failure).
@@ -213,7 +215,8 @@ def _maybe_register(cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger) ->
             log.info(
                 "supervisor.register.revoked_reregister",
                 stale_appliance_id=str(cached_appliance_id),
-                via_self_bootstrap=can_self_bootstrap and not cfg.bootstrap_pairing_code,
+                via_self_bootstrap=can_self_bootstrap
+                and not cfg.bootstrap_pairing_code,
             )
             clear_appliance_id(cfg.state_dir)
             clear_session_token(cfg.state_dir)
@@ -374,7 +377,13 @@ def main() -> int:
         if appliance_id is None:
             cfg = _maybe_register(cfg, log)
             appliance_id = load_appliance_id(cfg.state_dir)
-        if appliance_id is not None and cfg.control_plane_url:
+        # #272 — cluster members heartbeat the in-cluster api Service
+        # (resolved here so the skip-gate matches what heartbeat_once
+        # will actually POST to). A control-plane member always has a
+        # target even if CONTROL_PLANE_URL was never set; a remote
+        # agent only proceeds when its configured URL is present.
+        effective_url = _effective_control_plane_url(cfg)
+        if appliance_id is not None and effective_url:
             session_token = load_session_token(cfg.state_dir)
             identity, _ = load_or_generate(cfg.state_dir)
             try:
@@ -394,7 +403,13 @@ def main() -> int:
         else:
             log.info(
                 "supervisor.heartbeat.skipped",
-                reason=("no_appliance_id" if appliance_id is None else "no_control_plane_url"),
+                reason=(
+                    "no_appliance_id"
+                    if appliance_id is None
+                    else "no_control_plane_url"
+                ),
+                # effective_url is empty here only when this is a
+                # remote agent with no configured CONTROL_PLANE_URL.
             )
         for _ in range(cfg.heartbeat_interval_seconds):
             if stop:

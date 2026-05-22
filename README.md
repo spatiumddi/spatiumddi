@@ -710,8 +710,24 @@ Operators get a real Kubernetes node without managing one.
 
 1. Attach the ISO as a CD-ROM in your hypervisor (Proxmox /
    VMware / Hyper-V / QEMU), or `dd` it to a USB stick for
-   bare metal. Hard floor: **32 GiB disk, 2 GiB RAM, amd64**
-   (arm64 ISO is planned).
+   bare metal. **amd64** (arm64 ISO is planned).
+
+   **Hard floor (installer refuses below this): 24 GiB disk,
+   2 GiB RAM** — the A/B atomic-upgrade layout needs two 8 GiB
+   OS slots that each carry the full container image set for
+   air-gapped boot.
+
+   **Recommended per role:**
+
+   | Role | vCPU | RAM | Disk |
+   |---|---|---|---|
+   | **Control plane** (api + worker + frontend + Postgres + Redis + k3s etcd) | 4 | 8 GiB | 40 GiB SSD |
+   | **Appliance** (DNS / DHCP agent box) | 2 | 4 GiB | 24 GiB SSD |
+
+   Each control-plane HA node sizes the same as a single control
+   plane (4 vCPU / 8 GiB) — every member runs a full api / worker /
+   Postgres replica / Redis. SSD strongly preferred for the
+   etcd + Postgres write path.
 2. Boot. The installer wizard asks for:
    - **Role** — *Control plane* (the required first install:
      control plane on this box + the k3s etcd seed; DNS / DHCP
@@ -749,6 +765,16 @@ For distributed deployments (control plane on one box, DNS
 and DHCP on others), install the **Appliance** role on
 each agent box. Each agent needs a bootstrap secret to
 register with the control plane. Two ways to provide it:
+
+> **Point agents at the VIP, not a node IP.** When the
+> installer asks for the control-plane URL, and the control
+> plane is (or will become) a multi-node HA cluster, use the
+> **MetalLB control-plane VIP** — not any single node's
+> address. An agent pinned to one node's IP loses its control
+> plane whenever that node is down, even though the cluster is
+> healthy on the survivors. (Control-plane *cluster members*
+> need no such care — their supervisor automatically heartbeats
+> the in-cluster API Service rather than any fixed node IP.)
 
 **Pairing code (recommended).** Easy to type, even over an
 IPMI / serial console.
@@ -804,8 +830,8 @@ itself to the new member count:
 - **api / frontend / worker** spread to one replica per node.
 
 **One Web UI, one address.** Set a [MetalLB](https://metallb.io/)
-L2 address pool + a floating **control-plane VIP** in **Fleet →
-Control plane**; the frontend Service moves onto the VIP so the
+L2 address pool + a floating **control-plane VIP** in **Appliance →
+Network & Host**; the frontend Service moves onto the VIP so the
 UI (and every agent heartbeat) hits one stable address
 regardless of which node is up. The self-signed Web UI cert
 auto-grows its SAN list to cover every member's hostname + IP

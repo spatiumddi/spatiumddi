@@ -69,7 +69,16 @@ The pre-#183 docker-compose path fought us on three things every operator-facing
 
 k3s solves all three: HelmChart CRs as the declarative target, helm-controller as the reconciler, kine (SQLite) as the state store (survives slot swap because `/var/lib/rancher/` is on `/var`). The supervisor becomes a thin controller that PATCHes node labels per role-assignment change — the role pod schedules or terminates as a consequence of the label, not as a consequence of a `docker compose` invocation.
 
-The trade-off: k3s adds ~70 MB to the slot rootfs and a steady ~150 MB RAM footprint for the k3s server process itself. On the 16 GiB disk floor + 2 GiB RAM floor the appliance targets, both are well under budget.
+The trade-off: k3s adds ~70 MB to the slot rootfs and a steady ~150 MB RAM footprint for the k3s server process itself. On the 24 GiB disk floor + 2 GiB RAM floor the appliance targets, both are well under budget.
+
+**Recommended sizing (per role):**
+
+| Role | vCPU | RAM | Disk |
+|---|---|---|---|
+| **Control plane** (api + worker + frontend + Postgres + Redis + k3s etcd seed) | 4 | 8 GiB | 40 GiB SSD |
+| **Appliance** (DNS / DHCP agent) | 2 | 4 GiB | 24 GiB SSD |
+
+The 2 GiB RAM floor boots a single-node control plane but is tight once Postgres + Redis + the Python api/worker are all resident; 8 GiB is the comfortable recommendation. Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
 
 ### Appliance management surfaces (k3s-aware)
 
@@ -140,19 +149,28 @@ the reference topologies are in
 The seed supervisor (control-plane variant) reconciles cluster-global
 state on its heartbeat:
 
-- **`# spatium:cp-size` marker.** firstboot tags the
-  CNPG `instances`, the Redis `sentinel.replicas`, and the
-  api/frontend/worker `replicas` lines in the `spatium-control`
-  HelmChart `valuesContent`. `k8s_api.scale_control_plane_helmchart()`
-  regex-rewrites them to the committed member count; helm-controller
-  upgrades the release.
+- **HelmChartConfig overrides (durable).** The seed supervisor writes a
+  `helm.cattle.io/v1 HelmChartConfig` CR per release —
+  `k8s_api.apply_control_plane_overrides()` upserts the `spatium-control`
+  override (api/frontend/worker `replicas` + CNPG `instances` + Redis
+  `sentinel.replicas` = committed member count, plus
+  `frontend.controlPlaneVIP`). helm-controller *merges* a
+  HelmChartConfig on top of its same-named HelmChart on every reconcile.
+  Crucially the HelmChartConfig is **not** in the auto-deploy manifests
+  dir, so a k3s restart's re-apply of the firstboot HelmChart defaults
+  (cp-size 1, metallb off, VIP "") no longer clobbers the live cluster
+  state — the override survives and re-wins the merge. (This replaced the
+  earlier `# spatium:cp-size` marked-line regex rewriter, which lost its
+  edits on every seed reboot — the systemic durability bug fixed in
+  `083f8d2`.)
 - **MetalLB / VIP (Phase 7c).** The operator's pool + VIP live on the
   `platform_settings` singleton (`metallb_enabled` /
   `metallb_pool_addresses` / `control_plane_vip`); the seed supervisor
-  patches `metallb.*` on `spatium-bootstrap` + `frontend.controlPlaneVIP`
-  on `spatium-control` via the same marked-line rewriter
-  (`apply_metallb_config`). The VIP also auto-threads into the api's
-  `APPLIANCE_EXTRA_CERT_SANS` so the served cert validates on it.
+  upserts the `spatium-bootstrap` HelmChartConfig (`metallb.enabled` +
+  `ipPool.addresses`) via `k8s_api.apply_bootstrap_overrides()`, and
+  `frontend.controlPlaneVIP` rides the `spatium-control` override above.
+  The VIP also auto-threads into the api's `APPLIANCE_EXTRA_CERT_SANS` so
+  the served cert validates on it.
 - **Cert SAN reconcile (Phase 7c).** A periodic loop in the api lifespan
   (`reconcile_cluster_cert_sans`, advisory-locked across the api
   replicas, appliance-mode only) grows the self-signed cert as members
@@ -168,12 +186,29 @@ state on its heartbeat:
 `/appliance → Fleet` is two tables — **Control plane** (the 1–N k3s
 servers, including promoted Appliances) + **Service agents** (DNS/DHCP
 appliances). "Manage control plane cluster…" drives the batch
-promote/demote (odd-target enforced inline). The **Control plane** view
-also carries the Web UI cert status and the **MetalLB control-plane VIP**
-picker (enable + L2 pool + VIP, VIP-must-fall-in-pool validated). The
-etcd seed can't be demoted, and a node can't be **revoked** while it's a
-live cluster member — it must be demoted first (revoking a live etcd
-member would break quorum).
+promote/demote (odd-target enforced inline). The **MetalLB control-plane
+VIP** picker (enable + L2 pool + VIP, VIP-must-fall-in-pool validated)
+lives one tab over under **Network & Host**. The etcd seed can't be
+demoted, and a node can't be **revoked** while it's a live cluster member
+— it must be demoted first (revoking a live etcd member would break
+quorum).
+
+Once a multi-node control plane exists, the **Control plane** table
+surfaces a dismissible amber banner prompting the operator to configure a
+VIP if none is set yet (a single-node-IP URL is a latent SPOF for every
+agent). Dismissal requires a deliberate checkbox and is remembered
+client-side.
+
+**Heartbeat targets.** A supervisor that is itself a control-plane
+cluster member heartbeats the **in-cluster api Service**
+(`spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000`) rather
+than the seed node's IP it was installed/promoted against — so losing any
+single node never strands a member's control plane, and kube-proxy
+load-balances heartbeats across the ready api pods. Off-cluster DNS/DHCP
+agents have no in-cluster DNS to resolve that name, so they keep using
+their configured `CONTROL_PLANE_URL` — which should be the **VIP** on an
+HA cluster (see `_effective_control_plane_url` in the supervisor's
+`heartbeat.py`).
 
 ### Storage note
 
@@ -618,18 +653,23 @@ Apply a new slot image, reboot, `/health/live` confirms, grub
 auto-commits the swap — or auto-reverts on next reboot if the
 new slot didn't come up.
 
-**Partition layout (2026.05.12-1):**
+**Partition layout (#170 Wave A4 — 8 GiB slots):**
 
 ```
 p1 BIOS Boot    1 MiB    ef02
 p2 ESP        512 MiB    ef00   /boot/efi (FAT32, fmask=0133,dmask=0022)
-p3 root_A       4 GiB    8304   active slot (this install)
-p4 root_B       4 GiB    8304   inactive slot (staged by slot-upgrade)
-p5 var         balance   8300   shared across slots (/var/lib/docker,
+p3 STATE      256 MiB    8300   slot-state sidecars (grubenv, slot versions)
+p4 root_A       8 GiB    8304   active slot (this install)
+p5 root_B       8 GiB    8304   inactive slot (staged by slot-upgrade)
+p6 var         balance   8300   shared across slots (/var/lib/rancher,
                                 /var/persist/etc, /var/home, /var/root)
 ```
 
-Hard floor: 16 GiB target disk.
+Hard floor: **24 GiB target disk** (installer refuses below it). The
+slots grew from 4 → 8 GiB once the full container image set started
+baking into the rootfs (so the appliance boots air-gapped without
+ghcr.io) — base Debian + Python + the baked images is ~3 GiB, leaving
+~2.7× headroom per slot.
 
 **/etc overlayfs:** each slot ships an image-baseline `/etc`
 at `/usr/lib/etc.image/`. At boot, a systemd `etc.mount` unit
@@ -880,6 +920,14 @@ Phase 6 role-split appliances (``dns-agent-bind9`` / ``dns-agent-powerdns``
 / ``dhcp-agent``) need a control-plane URL + a bootstrap secret on
 first boot. The installer wizard offers two methods at the
 **Bootstrap method** prompt:
+
+> **Use the VIP for the control-plane URL on HA clusters.** When the
+> installer asks where this appliance registers, point it at the
+> **MetalLB control-plane VIP** rather than any single node's IP if the
+> control plane is (or may become) a multi-node cluster. An agent pinned
+> to one node's IP loses its control plane whenever that node is down,
+> even though the cluster is healthy on the survivors. Configure the VIP
+> on the control plane under **Appliance → Network & Host**.
 
 ### Pairing code (recommended) — issue #169
 

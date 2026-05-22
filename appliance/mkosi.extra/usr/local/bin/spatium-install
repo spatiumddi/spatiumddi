@@ -235,8 +235,8 @@ ask_application_config() {
         CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
             --title "Control plane URL" \
             --cancel-button "Back" \
-            --inputbox "Where does this Application appliance register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nUse https:// in production; http:// is acceptable for lab installs." \
-            16 76 "$default_url" 3>&1 1>&2 2>&3) \
+            --inputbox "Where does this Application appliance register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nHA TIP: if the control plane is a multi-node cluster, point this at the MetalLB virtual IP (VIP), NOT a single node's IP — otherwise this appliance loses its control plane whenever that one node is down. Configure the VIP under Appliance -> Network & Host on the control plane.\n\nUse https:// in production; http:// is acceptable for lab installs." \
+            21 78 "$default_url" 3>&1 1>&2 2>&3) \
             || return 1
         if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
             whiptail --msgbox "Control-plane URL is required for an Application install." 8 60 || true

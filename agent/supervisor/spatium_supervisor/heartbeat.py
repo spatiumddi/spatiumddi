@@ -79,7 +79,60 @@ _ROLE_ENV_FILENAME = "role-compose.env"
 # used by snmp / chrony / slot-upgrade triggers). Writing to this
 # path = "host runner please re-render".
 _NFT_TRIGGER_PATH = Path("/var/lib/spatiumddi-host/release-state/firewall-pending")
-_NFT_APPLIED_HASH_PATH = Path("/var/lib/spatiumddi-host/release-state/firewall-applied-hash")
+_NFT_APPLIED_HASH_PATH = Path(
+    "/var/lib/spatiumddi-host/release-state/firewall-applied-hash"
+)
+
+# #272 — in-cluster control-plane API Service. Every control-plane
+# node runs the api Deployment behind this headless-routable
+# ClusterIP Service, so a supervisor that is itself a cluster member
+# should heartbeat *the cluster*, not the seed node's IP that was
+# baked into CONTROL_PLANE_URL at install/join time. Reasons:
+#   * The seed IP is a single point of failure — if that one node is
+#     down, every other node's supervisor would lose its control
+#     plane even though the api is healthy on the surviving nodes.
+#   * kube-proxy load-balances the Service across all ready api pods,
+#     so heartbeats spread across the cluster instead of hammering
+#     one node.
+# Remote (off-cluster) DNS/DHCP agents keep using their configured
+# CONTROL_PLANE_URL — ideally the MetalLB VIP — since they have no
+# in-cluster DNS to resolve the .svc name. See
+# ``_effective_control_plane_url`` for the member-vs-remote split.
+_IN_CLUSTER_CONTROL_PLANE_URL = (
+    "http://spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000"
+)
+
+
+def _is_control_plane_member() -> bool:
+    """True when this supervisor runs on a node that is part of the
+    control-plane k3s cluster (the seed itself, or an appliance that
+    has been promoted and finished joining).
+
+    Two independent signals, either is sufficient:
+      * ``detect_appliance_variant() == "control-plane"`` — the node
+        was installed as a control-plane seed.
+      * ``read_cluster_join_state()[0] == "ready"`` — an appliance
+        that was promoted into the control plane and whose host
+        runner has reported the join completed.
+    """
+    if appliance_state.detect_appliance_variant() == "control-plane":
+        return True
+    join_state, _ = appliance_state.read_cluster_join_state()
+    return join_state == "ready"
+
+
+def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
+    """Resolve the heartbeat target.
+
+    Cluster members talk to the in-cluster api Service (resilient to
+    any single node loss + load-balanced); everyone else uses the
+    configured ``CONTROL_PLANE_URL``. Returns ``""`` only when a
+    non-member has no configured URL — the caller skips the
+    heartbeat in that case.
+    """
+    if _is_control_plane_member():
+        return _IN_CLUSTER_CONTROL_PLANE_URL
+    return cfg.control_plane_url
 
 
 # Issue #183 Phase 7 — capability reporting is now trivially true on
@@ -390,7 +443,10 @@ def heartbeat_once(
         if _cached_role_health:
             body["role_health"] = _cached_role_health
     url_path = "/api/v1/appliance/supervisor/heartbeat"
-    url = cfg.control_plane_url.rstrip("/") + url_path
+    # #272 — cluster members POST to the in-cluster api Service; remote
+    # agents to their configured CONTROL_PLANE_URL. See
+    # ``_effective_control_plane_url``.
+    url = _effective_control_plane_url(cfg).rstrip("/") + url_path
 
     # #170 Wave D follow-up — cert auth supersedes session-token
     # auth once the cert is on disk. Build the headers + sign with
@@ -595,11 +651,15 @@ def heartbeat_once(
         cp_changed, cp_err = k8s_api.apply_control_plane_overrides(cp_size, str(ml_vip))
         if cp_changed:
             log.info(
-                "supervisor.heartbeat.control_plane_overrides_applied", size=cp_size, vip=ml_vip
+                "supervisor.heartbeat.control_plane_overrides_applied",
+                size=cp_size,
+                vip=ml_vip,
             )
         elif cp_err:
             log.warning(
-                "supervisor.heartbeat.control_plane_overrides_failed", error=cp_err, size=cp_size
+                "supervisor.heartbeat.control_plane_overrides_failed",
+                error=cp_err,
+                size=cp_size,
             )
 
         bs_changed, bs_err = k8s_api.apply_bootstrap_overrides(
@@ -629,7 +689,9 @@ def heartbeat_once(
                 _evicted_pending.add(str(name))
                 log.info("supervisor.heartbeat.node_evicted", node=name)
             else:
-                log.warning("supervisor.heartbeat.node_evict_failed", node=name, error=evict_err)
+                log.warning(
+                    "supervisor.heartbeat.node_evict_failed", node=name, error=evict_err
+                )
         _evicted_pending.intersection_update({str(n) for n in evict_names})
 
     # #170 Wave C2 — render the role-driven compose env. C3 will

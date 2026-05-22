@@ -291,10 +291,14 @@ recommended HA path for operators who installed from the ISO.
   supervisor's host-side `spatium-cluster-join` runner — backed up +
   guardrailed).
 - **One floating VIP, set in the UI.** A bundled MetalLB (L2) hands the
-  frontend Service a control-plane VIP you pick in `Fleet → Control
-  plane`. Point DNS/DHCP agents + operator browsers at the VIP, not a
-  single node IP. The self-signed Web UI cert auto-grows its SANs to
-  cover every member + the VIP (an uploaded cert is never touched).
+  frontend Service a control-plane VIP you pick in `Appliance → Network &
+  Host`. Point DNS/DHCP agents + operator browsers at the VIP, not a
+  single node IP — an agent pinned to one node's address loses its
+  control plane whenever that node is down. (Control-plane *cluster
+  members* need no such care: their supervisor heartbeats the in-cluster
+  API Service automatically.) The self-signed Web UI cert auto-grows its
+  SANs to cover every member + the VIP (an uploaded cert is never
+  touched).
 - **Singletons handled by the chart** — 1-replica `Recreate` beat with
   fast reschedule tolerations + a migrate Job gating app pods on the
   alembic head. No `celery-beat-leader` to run.
@@ -311,8 +315,9 @@ recommended HA path for operators who installed from the ISO.
 3. `/appliance → Fleet → Manage control plane cluster…` → select the two
    → promote. Within ~60 s: etcd quorum across 3, CNPG at 3 instances,
    Redis Sentinel 3-node, api/worker/frontend at 3 replicas.
-4. `Fleet → Control plane` → set a MetalLB pool + a control-plane VIP.
-   The frontend moves onto the VIP; the cert auto-covers it.
+4. `Appliance → Network & Host` → set a MetalLB pool + a control-plane
+   VIP. The frontend moves onto the VIP; the cert auto-covers it. Point
+   every off-cluster DNS/DHCP agent's control-plane URL at this VIP.
 
 **Failure behaviour:** lose one of three nodes → etcd keeps quorum (2/3),
 CNPG fails over to a replica, the MetalLB VIP re-homes to a surviving
