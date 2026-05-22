@@ -89,6 +89,23 @@ def _pg_env_from_url(url: str) -> tuple[dict[str, str], str]:
     return env, dbname
 
 
+# Env vars pg_dump / psql / pg_restore legitimately need: PATH to find the
+# binary, plus locale/timezone for correct output. Everything else in the
+# parent process env (OPENAI_API_KEY, fingerbank keys, …) is deliberately
+# NOT inherited by the subprocess (#10).
+_SUBPROCESS_ENV_ALLOW = ("PATH", "HOME", "LANG", "LC_", "TZ", "TMPDIR")
+
+
+def _pg_subprocess_env(pg_env: dict[str, str]) -> dict[str, str]:
+    """A minimal environment for a Postgres CLI subprocess: an allowlisted
+    slice of the parent env plus the PG* connection vars. Avoids leaking
+    unrelated parent-process secrets into pg_dump/psql via ``/proc/<pid>/
+    environ``."""
+    base = {k: v for k, v in os.environ.items() if k.startswith(_SUBPROCESS_ENV_ALLOW)}
+    base.update(pg_env)
+    return base
+
+
 # ── Archive building ───────────────────────────────────────────────────
 
 
@@ -117,7 +134,7 @@ async def _run_pg_dump(out_path: Path, *, snapshot_id: str | None = None) -> Non
     completes so the live DB never observes the NULLed state.
     """
     pg_env, _dbname = _pg_env_from_url(str(settings.database_url))
-    full_env = {**os.environ, **pg_env}
+    full_env = _pg_subprocess_env(pg_env)
     cmd = [
         "pg_dump",
         "--format=custom",
@@ -225,7 +242,7 @@ async def _run_pg_dump_plain(out_path: Path) -> None:
     is the simplest correct alternative.
     """
     pg_env, _dbname = _pg_env_from_url(str(settings.database_url))
-    full_env = {**os.environ, **pg_env}
+    full_env = _pg_subprocess_env(pg_env)
     cmd = [
         "pg_dump",
         "--format=plain",
