@@ -220,6 +220,17 @@ agentLanding:
 # (appliance/scripts/bake-images.sh ``METALLB_IMAGES``) so air-gapped
 # installs need zero outbound pulls. KEEP the pinned image refs below
 # in lock-step with that bake list.
+#
+# IMAGE PIN — v0.15.3, NOT the chart's v0.16.0 default. v0.16.0
+# regressed the speaker's ServiceL2Status reconciler into a tight
+# create-fail/not-found loop (~5/s per LB Service) that floods the
+# apiserver + etcd — see metallb/metallb#3063 (clean v0.15.3→v0.16.0
+# bisection; v0.15.3 is quiet, v0.16.0 churns ~200 errs/30s on the same
+# cluster + CRDs). v0.15.3 binaries are schema-compatible with the
+# v0.16.0 chart templates + CRDs (verified live: the controller rolls
+# out clean and the VIP is announced with zero churn), so we keep the
+# v0.16.0 chart and just pin the images back a minor. Revert this pin to
+# the chart default once #3063 lands an upstream fix.
 metallb:
   enabled: false
 
@@ -242,7 +253,7 @@ metallb:
       enabled: false
     image:
       repository: quay.io/metallb/speaker
-      tag: v0.16.0
+      tag: v0.15.3  # pinned back from v0.16.0 — see metallb#3063 (header note)
     # Speaker is a DaemonSet that answers ARP for the VIP; it must run
     # on the control-plane nodes that host the fronted Services. The
     # appliance control-plane cluster is all-control-plane nodes, so
@@ -253,7 +264,7 @@ metallb:
   controller:
     image:
       repository: quay.io/metallb/controller
-      tag: v0.16.0
+      tag: v0.15.3  # pinned back from v0.16.0 — see metallb#3063 (header note)
     nodeSelector:
       spatium.io/role-control-plane: "true"
 

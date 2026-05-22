@@ -97,9 +97,15 @@ OBSERVABILITY_IMAGES=(
 #
 # KEEP these refs in lock-step with the metallb.controller.image /
 # metallb.speaker.image pins in the appliance chart's values.yaml.
+#
+# Pinned to v0.15.3 (NOT the chart's v0.16.0 appVersion): v0.16.0
+# regressed the speaker's ServiceL2Status reconciler into an apiserver-
+# flooding create-fail/not-found loop — metallb/metallb#3063. v0.15.3
+# binaries are schema-compatible with the v0.16.0 chart + CRDs (verified
+# live). Bump back to the chart default once #3063 is fixed upstream.
 METALLB_IMAGES=(
-    "quay.io/metallb/controller:v0.16.0"
-    "quay.io/metallb/speaker:v0.16.0"
+    "quay.io/metallb/controller:v0.15.3"
+    "quay.io/metallb/speaker:v0.15.3"
 )
 
 # CloudNativePG (#272 / #277) — PostgreSQL is CNPG on every appliance
