@@ -372,10 +372,16 @@ jobs:
           # empty /usr/lib/spatiumddi/charts/ directory; firstboot's
           # WARN "missing — control plane won't auto-deploy" fires and
           # the appliance never installs anything via the HelmChart CR.
-          # Mirrors ``make appliance-bake-chart appliance-bake-control-chart``.
+          # Mirrors ``make appliance-bake-chart appliance-bake-control-chart
+          # appliance-bake-metallb-chart``.
           chmod +x appliance/scripts/bake-chart.sh
           appliance/scripts/bake-chart.sh
           CHART_NAME=spatiumddi appliance/scripts/bake-chart.sh
+          # #272 — the control-plane VIP ships in its own spatiumddi-metallb
+          # chart (deployed to metallb-system); firstboot renders a
+          # spatium-metallb HelmChart that references this .tgz. Without it
+          # MetalLB never deploys on a release-built appliance.
+          CHART_NAME=spatiumddi-metallb appliance/scripts/bake-chart.sh
           ls -lh appliance/mkosi.extra/usr/lib/spatiumddi/charts/*.tgz
       - name: Bake container images into rootfs overlay
         env:

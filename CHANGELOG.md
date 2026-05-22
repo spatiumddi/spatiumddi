@@ -20,6 +20,152 @@ the formatter handles the rest.
 
 ---
 
+## 2026.05.22-1 — 2026-05-22
+
+> ⚠️ **RELEASE NOTE — NO IN-PLACE UPGRADE.** This release changes the appliance partition layout (6-partition GPT + Talos-style `state` partition, #276) to support control-plane HA; A/B slot upgrades **cannot** cross that boundary. Existing appliances **must full-reinstall from the new ISO**. (No production installs exist yet — this affects field-test boxes only.)
+
+The **control-plane HA** release. The headline (#272, landed via #282
++ shake-out #287) takes the SpatiumDDI appliance from a single k3s node
+— Postgres / Redis / api / frontend all single-replica — to **N
+control-plane nodes (3 / 5 / 7)** with operator-visible promotion,
+replicated data, and dead-node replacement. Postgres HA runs on
+CloudNativePG (primary + streaming replicas + automatic failover);
+Redis HA on Sentinel; a MetalLB L2 control-plane VIP gives operators
+and off-cluster agents one stable address that floats across nodes;
+embedded-etcd quorum spans the members. Promote / demote is a
+multi-select Fleet action that enforces the odd-member rule, and a
+dead member can be evicted + replaced with a fresh pairing code. The
+same cut also ships the **Network → Sites** hierarchy (tree view with
+drag-and-drop re-parenting, default layout), immediate WHOIS/RDAP
+population on domain + ASN create, and a security-hardening pass
+across the auth surface. Six PRs since 2026.05.18-1 (#273 #275 #282
+#287 #288 #289).
+
+### Added
+
+Control-plane HA (#272 / #282) — the appliance becomes a true
+multi-node cluster:
+
+- **Multi-node k3s control plane** on embedded etcd (1 / 3 / 5 / 7
+  servers; odd-count enforced for quorum). The seed installs as a
+  control-plane variant; additional approved appliances are promoted
+  into the cluster from the Fleet tab.
+- **Postgres HA via CloudNativePG** — the Cluster CR reconciles a
+  primary + N-1 streaming replicas with automatic failover; api /
+  worker / beat point at the `-rw` service. CNPG is the permanent
+  appliance default.
+- **Redis HA via Sentinel** — 3-node Sentinel with master election;
+  the app talks `sentinel://` and re-resolves the master on failover.
+- **MetalLB control-plane VIP** (L2) — a floating HTTPS VIP for the
+  frontend Service so browsers + off-cluster DNS/DHCP agents have one
+  stable address. Operator sets the pool + VIP in Fleet → Network &
+  Host. Ships in its own `metallb-system` namespace.
+- **Promote / demote** control-plane members from the Fleet tab
+  (multi-select, odd-count guard), plus **dead-node replacement**
+  (evict the k8s Node → k3s drops the etcd member → mint a
+  replacement pairing code).
+- **Singleton-tolerant workloads** — beat / migrate / audit-chain
+  stay correct when api/worker scale to N replicas.
+- **One shared Web UI TLS cert** across replicas via the cluster
+  Secret; regenerates to add the VIP / new-node SANs.
+
+Network → Sites + WHOIS immediacy (#278 / #279 via #288):
+
+- **Sites hierarchy tree view** — indented campus → building → floor
+  tree as the default layout, with drag-and-drop re-parenting
+  (cycle-blocked targets dimmed) and a searchable **Move** modal for
+  keyboard / touch. Flat table stays one toggle away.
+- **Immediate RDAP on create** — a new Domain populates registrar /
+  expiry / nameservers within seconds (one-shot worker task) instead
+  of waiting for the next hourly sweep; the list auto-polls until it
+  lands. Same parity for **ASNs** (RDAP holder + RPKI ROAs).
+
+Security (#289):
+
+- **`CORS_ORIGINS`** config knob (comma-separated; default `*`).
+- **Per-IP login rate limiting** on `/auth/login` + `/auth/login/mfa`
+  and a **single-use MFA challenge** (replay guard), both Redis-backed
+  and fail-open.
+
+### Changed
+
+- **MetalLB pinned to the full v0.15.3 release** (chart + images +
+  CRDs) and moved into the `metallb-system` namespace (#287). v0.16.0
+  regressed the speaker's ServiceL2Status reconciler into an
+  apiserver-flooding loop (metallb#3063); an image-only pin doesn't
+  work (chart/binary probe skew), so the whole release is pinned.
+- **Sites default to the tree view** (#288); the flat table is a
+  toggle.
+- **`VERSION` env threaded into api / worker / beat** on the Helm
+  path so the running version is reported correctly (#275).
+- **Per-role node-label gating** documented as non-negotiable #16 —
+  every new top-level workload schedules on `spatium.io/role-*`, not
+  on chart `enabled` toggles (#273).
+- **`task_session` engine pool bounded** to `pool_size=1 /
+  max_overflow=0`; **pg_dump / psql / pg_restore** now run with a
+  minimal allowlisted env instead of inheriting the full parent
+  process environment (#289).
+- **User-Agent strings sanitised + truncated** before they land in
+  audit / session rows; **email format validated** on local user
+  create / update (#289).
+
+### Fixed
+
+- **CNPG never scaled on promote** — the Cluster carries
+  `helm.sh/resource-policy: keep` (so a failed-release recovery can't
+  wipe the DB), which also makes the helm-controller skip patching its
+  spec. The seed supervisor now scales `spec.instances` directly via a
+  merge-patch, with the matching RBAC grant — Postgres converges to
+  N/N on promote with no manual step (#287).
+- **A second code-less top-level Site 409'd** ("a sibling site with
+  this code already exists") — the unique index treated NULL/empty
+  codes as equal. Now a partial index (`WHERE code IS NOT NULL`) +
+  `"" → NULL` normalisation; real codes still unique per parent (#288).
+- **Promote / VIP-change left the page dead** — both regenerate the
+  API cert and roll the frontend pod, breaking the open TLS session.
+  New "wait then reload" progress modals track convergence and surface
+  a Reload button (#287).
+- **Wildcard CORS with credentials** reflected any Origin with
+  credentials; the wildcard path no longer enables credentials (the
+  API authenticates via the Bearer header, not cookies) (#289).
+- **Malformed `CREDENTIAL_ENCRYPTION_KEY`** silently re-keyed secrets
+  from `SECRET_KEY`; it now logs loudly and hard-fails under
+  `STRICT_SECRET_KEY` (#289).
+- Console vitals were clipped when the cluster VIP line was present
+  (#287).
+
+### Security
+
+- Per-IP login rate limiting + single-use MFA challenge replay guard
+  (#289).
+- User-Agent sanitisation (log-forging vector), local-user email
+  validation, minimal pg_dump subprocess env (no parent-secret
+  inheritance), and TLS-verification-disabled WARNING logs on the
+  proxmox / unifi / ftp clients when an operator enables `tls_insecure`
+  (#289).
+
+### Migrations
+
+- `a8d2e91f5c47` — `appliance.appliance_variant` (#272 Phase 1).
+- `b9e1c43f7d28` — `pairing_code.auto_approve` (#272 Phase 1).
+- `c263ae1d381a` — appliance control-plane cluster columns (#272
+  Phase 7).
+- `d5f1a37c20e9` — `appliance.node_ip` routable host IP (#272 Phase
+  7b).
+- `e7a2c91d4f60` — `platform_settings` MetalLB control-plane VIP
+  (#272 Phase 7c).
+- `f3b8d24a1c70` — `appliance.evict_requested` dead-node replacement
+  (#272 Phase 9).
+- `a1c7e9f32b84` — Site `(parent_site_id, code)` partial unique index
+  (#279).
+
+### Breaking
+
+- **Appliance partition-layout change → full reinstall.** See the
+  release note at the top: existing field-test appliances cannot A/B
+  upgrade across the new 6-partition layout and must be reinstalled
+  from this release's ISO.
+
 ## 2026.05.18-1 — 2026-05-18
 
 Bug-check housekeeping cut. After the 2026.05.17 hotfix chain
