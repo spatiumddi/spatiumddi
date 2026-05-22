@@ -7118,6 +7118,11 @@ export interface MetalLBConfig {
   enabled: boolean;
   pool_addresses: string[];
   control_plane_vip: string;
+  // #272 — live readiness from the GET (best-effort; absent/zero when
+  // kubeapi is unreachable). Not sent on PUT.
+  controller_ready?: boolean;
+  speakers_ready?: number;
+  speakers_total?: number;
 }
 
 // #272 Phase 9 — dead-node replacement result.

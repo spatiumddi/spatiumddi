@@ -121,20 +121,34 @@ function MetalLBConfigCard() {
     queryKey: ["appliance", "metallb"],
     queryFn: applianceApprovalApi.getMetalLBConfig,
     staleTime: 30_000,
+    // Poll so the live status (controller / speaker readiness, VIP
+    // claim) updates as MetalLB pods schedule after a save.
+    refetchInterval: 10_000,
   });
 
   const [enabled, setEnabled] = useState(false);
   const [poolText, setPoolText] = useState("");
   const [vip, setVip] = useState("");
   const [dirty, setDirty] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   // Seed the form from the server once it loads (and re-seed after a
   // save) — but never clobber in-progress operator edits.
   useEffect(() => {
     if (data && !dirty) {
       setEnabled(data.enabled);
-      setPoolText((data.pool_addresses ?? []).join("\n"));
+      const pool = data.pool_addresses ?? [];
+      setPoolText(pool.join("\n"));
       setVip(data.control_plane_vip ?? "");
+      // Auto-reveal the Advanced pool field when the saved pool is a
+      // real range (not just the auto-derived <vip>/32) so editing an
+      // existing custom pool isn't hidden behind the disclosure.
+      const autoPool = data.control_plane_vip
+        ? [`${data.control_plane_vip}/32`, `${data.control_plane_vip}/128`]
+        : [];
+      const isCustom =
+        pool.length > 1 || (pool.length === 1 && !autoPool.includes(pool[0]));
+      if (isCustom) setShowAdvanced(true);
     }
   }, [data, dirty]);
 
@@ -155,10 +169,21 @@ function MetalLBConfigCard() {
   const onSave = () => {
     save.mutate({
       enabled,
-      pool_addresses: poolAddresses,
+      // When the operator hasn't opened Advanced, send an empty pool —
+      // the backend auto-derives a <vip>/32 (or /128) pool. A custom
+      // range is only sent when Advanced is open.
+      pool_addresses: showAdvanced ? poolAddresses : [],
       control_plane_vip: vip.trim(),
     });
   };
+
+  // Live status descriptor (best-effort fields from the GET).
+  const speakersTotal = data?.speakers_total ?? 0;
+  const speakersReady = data?.speakers_ready ?? 0;
+  const controllerReady = data?.controller_ready ?? false;
+  const allReady =
+    controllerReady && speakersTotal > 0 && speakersReady === speakersTotal;
+  const statusTone = !data?.enabled ? "zinc" : allReady ? "emerald" : "amber";
 
   return (
     <section className="rounded-lg border bg-card p-4 shadow-sm">
@@ -167,7 +192,9 @@ function MetalLBConfigCard() {
           <span
             className={cn(
               "inline-block h-2 w-2 rounded-full",
-              data?.enabled ? "bg-emerald-500" : "bg-zinc-400",
+              statusTone === "emerald" && "bg-emerald-500",
+              statusTone === "amber" && "bg-amber-500",
+              statusTone === "zinc" && "bg-zinc-400",
             )}
           />
           <h3 className="text-sm font-semibold">Control-plane VIP (MetalLB)</h3>
@@ -181,10 +208,39 @@ function MetalLBConfigCard() {
       <p className="mt-2 text-xs text-muted-foreground">
         A single floating IP that fronts the Web UI so it stays reachable on one
         address regardless of which control-plane node is up (multi-node HA).
-        The VIP must fall inside the address pool. Applied across the cluster by
-        the seed within ~60&nbsp;s; the served certificate auto-adds the VIP to
-        its SANs.
+        Just enter the VIP — a matching <code>/32</code> pool is created for
+        you. Applied across the cluster by the seed within ~60&nbsp;s; the
+        served certificate auto-adds the VIP to its SANs.
       </p>
+
+      {/* Live status — only meaningful once enabled. */}
+      {data?.enabled && (
+        <div
+          className={cn(
+            "mt-3 rounded-md border p-2.5 text-xs",
+            statusTone === "emerald" &&
+              "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
+            statusTone === "amber" &&
+              "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+          )}
+        >
+          {allReady ? (
+            <>
+              <strong>Active</strong> — VIP{" "}
+              <span className="font-mono">{data.control_plane_vip}</span> is
+              served by MetalLB (controller ready, {speakersReady}/
+              {speakersTotal} speakers ready).
+            </>
+          ) : (
+            <>
+              <strong>Starting…</strong> controller{" "}
+              {controllerReady ? "ready" : "not ready"}, speakers{" "}
+              {speakersReady}/{speakersTotal} ready. The seed applies changes
+              within ~60&nbsp;s; MetalLB pods then schedule and claim the VIP.
+            </>
+          )}
+        </div>
+      )}
 
       {isLoading ? (
         <p className="mt-3 text-sm text-muted-foreground">Loading…</p>
@@ -203,21 +259,6 @@ function MetalLBConfigCard() {
           </label>
           <div className="flex flex-col gap-1">
             <span className="text-xs font-medium text-muted-foreground">
-              Address pool — one CIDR or range per line
-            </span>
-            <textarea
-              value={poolText}
-              onChange={(e) => {
-                setPoolText(e.target.value);
-                setDirty(true);
-              }}
-              rows={2}
-              placeholder={"192.168.0.240/29\n192.168.0.240-192.168.0.247"}
-              className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
-            />
-          </div>
-          <div className="flex flex-col gap-1">
-            <span className="text-xs font-medium text-muted-foreground">
               Control-plane VIP
             </span>
             <input
@@ -230,6 +271,39 @@ function MetalLBConfigCard() {
               className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
             />
           </div>
+
+          {/* Advanced — explicit address pool. Hidden by default; the
+              VIP alone is enough (backend auto-derives a /32). */}
+          <div className="flex flex-col gap-1">
+            <button
+              type="button"
+              onClick={() => setShowAdvanced((v) => !v)}
+              className="self-start text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+            >
+              {showAdvanced ? "▾" : "▸"} Advanced — custom address pool
+            </button>
+            {showAdvanced && (
+              <div className="flex flex-col gap-1">
+                <textarea
+                  value={poolText}
+                  onChange={(e) => {
+                    setPoolText(e.target.value);
+                    setDirty(true);
+                  }}
+                  rows={2}
+                  placeholder={"192.168.0.240/29\n192.168.0.240-192.168.0.247"}
+                  className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
+                />
+                <span className="text-[11px] text-muted-foreground">
+                  One CIDR or range per line. Leave blank to auto-create a{" "}
+                  <code>/32</code> from the VIP. Provide a range only for
+                  headroom, data-plane VIPs, or BGP. The VIP must fall inside
+                  the pool.
+                </span>
+              </div>
+            )}
+          </div>
+
           {save.isError && (
             <p className="text-xs text-rose-600">
               {formatApiError(save.error)}

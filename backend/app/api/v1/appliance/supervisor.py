@@ -2954,11 +2954,64 @@ def _vip_in_pool(vip: str, pool: list[str]) -> bool:
 
 
 class MetalLBConfigResponse(BaseModel):
-    """Cluster-wide MetalLB / control-plane-VIP config (Fleet UI)."""
+    """Cluster-wide MetalLB / control-plane-VIP config + live status."""
 
     enabled: bool = False
     pool_addresses: list[str] = Field(default_factory=list)
     control_plane_vip: str = ""
+    # #272 — live readiness, best-effort from the spatium-namespace pod
+    # list (reuses the api's existing pod-read RBAC). All zero/false when
+    # kubeapi is unreachable (docker/k8s control plane) or MetalLB is off.
+    controller_ready: bool = False
+    speakers_ready: int = 0
+    speakers_total: int = 0
+
+
+def _metallb_pod_status() -> tuple[bool, int, int]:
+    """Return ``(controller_ready, speakers_ready, speakers_total)`` from
+    the live MetalLB pods in the spatium namespace.
+
+    Best-effort: degrades to ``(False, 0, 0)`` on any error (no
+    ServiceAccount on a docker/k8s control plane, a kubeapi blip, or
+    MetalLB simply disabled so no pods exist). Uses the api pod's
+    existing pod-read RBAC — no extra grant needed.
+    """
+    from app.services.appliance import k8s  # noqa: PLC0415
+
+    def _ready(pod: dict[str, Any]) -> bool:
+        conds = (pod.get("status") or {}).get("conditions") or []
+        return any(
+            c.get("type") == "Ready" and c.get("status") == "True" for c in conds
+        )
+
+    try:
+        pods = k8s.list_pods("spatium")
+    except Exception:  # noqa: BLE001
+        return (False, 0, 0)
+    controller_ready = False
+    speakers_ready = 0
+    speakers_total = 0
+    for pod in pods:
+        name = ((pod.get("metadata") or {}).get("name")) or ""
+        if "metallb-controller" in name:
+            controller_ready = controller_ready or _ready(pod)
+        elif "metallb-speaker" in name:
+            speakers_total += 1
+            if _ready(pod):
+                speakers_ready += 1
+    return (controller_ready, speakers_ready, speakers_total)
+
+
+def _metallb_response(row: PlatformSettings) -> MetalLBConfigResponse:
+    controller_ready, speakers_ready, speakers_total = _metallb_pod_status()
+    return MetalLBConfigResponse(
+        enabled=row.metallb_enabled,
+        pool_addresses=list(row.metallb_pool_addresses or []),
+        control_plane_vip=row.control_plane_vip or "",
+        controller_ready=controller_ready,
+        speakers_ready=speakers_ready,
+        speakers_total=speakers_total,
+    )
 
 
 class MetalLBConfigUpdate(BaseModel):
@@ -3004,10 +3057,20 @@ class MetalLBConfigUpdate(BaseModel):
     @model_validator(mode="after")
     def _cross_field(self) -> MetalLBConfigUpdate:
         if self.enabled:
-            if not self.pool_addresses:
-                raise ValueError("an address pool is required when MetalLB is enabled")
             if not self.control_plane_vip:
                 raise ValueError("a control-plane VIP is required when MetalLB is enabled")
+            # #272 — auto-derive a single-address pool from the VIP when
+            # no explicit pool is given. This is the common case: the
+            # operator just wants one floating IP for the Web UI and
+            # shouldn't have to hand-craft a MetalLB pool + keep it in
+            # sync with the VIP. A /32 (v4) or /128 (v6) pool holding
+            # exactly the VIP is all MetalLB needs. Operators who want a
+            # range (headroom, future data-plane VIPs, BGP) can still
+            # supply one explicitly, and the VIP-in-pool check below
+            # applies to it.
+            if not self.pool_addresses:
+                prefix = 32 if ipaddress.ip_address(self.control_plane_vip).version == 4 else 128
+                self.pool_addresses = [f"{self.control_plane_vip}/{prefix}"]
         if self.control_plane_vip and self.pool_addresses:
             if not _vip_in_pool(self.control_plane_vip, self.pool_addresses):
                 raise ValueError(
@@ -3039,11 +3102,7 @@ async def get_metallb_config(
 ) -> MetalLBConfigResponse:
     _require_superadmin(current_user)
     row = await _get_or_create_settings(db)
-    return MetalLBConfigResponse(
-        enabled=row.metallb_enabled,
-        pool_addresses=list(row.metallb_pool_addresses or []),
-        control_plane_vip=row.control_plane_vip or "",
-    )
+    return _metallb_response(row)
 
 
 @router.put(
@@ -3103,11 +3162,7 @@ async def put_metallb_config(
         vip=body.control_plane_vip,
         user=current_user.username,
     )
-    return MetalLBConfigResponse(
-        enabled=row.metallb_enabled,
-        pool_addresses=list(row.metallb_pool_addresses or []),
-        control_plane_vip=row.control_plane_vip or "",
-    )
+    return _metallb_response(row)
 
 
 # ── Admin: OS upgrade + reboot (#170 Wave D1) ────────────────────
