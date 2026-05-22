@@ -89,20 +89,24 @@ OBSERVABILITY_IMAGES=(
 # environments with zero outbound pulls — same as every other image.
 #
 # L2 (native) mode only: ``metallb.speaker.frr.enabled=false`` AND
-# ``metallb.frrk8s.enabled=false`` in charts/spatiumddi-appliance/
-# values.yaml (0.16.0 made frr-k8s the default BGP backend), so the
-# quay.io/metallb/frr-k8s + quay.io/frrouting/frr images are
+# ``metallb.frrk8s.enabled=false`` in charts/spatiumddi-metallb/
+# values.yaml (the 0.15.3 chart defaults speaker.frr.enabled TRUE), so
+# the quay.io/metallb/frr-k8s + quay.io/frrouting/frr images are
 # intentionally NOT baked. If/when BGP mode lands (Phase 10), enable
 # frrk8s + add those two images here.
 #
 # KEEP these refs in lock-step with the metallb.controller.image /
-# metallb.speaker.image pins in the appliance chart's values.yaml.
+# metallb.speaker.image pins + the metallb dependency version in
+# charts/spatiumddi-metallb (#286 moved MetalLB into its own wrapper
+# chart + metallb-system namespace).
 #
-# Pinned to v0.15.3 (NOT the chart's v0.16.0 appVersion): v0.16.0
-# regressed the speaker's ServiceL2Status reconciler into an apiserver-
-# flooding create-fail/not-found loop — metallb/metallb#3063. v0.15.3
-# binaries are schema-compatible with the v0.16.0 chart + CRDs (verified
-# live). Bump back to the chart default once #3063 is fixed upstream.
+# Pinned to the full v0.15.3 release (chart + images + CRDs), NOT
+# v0.16.0: v0.16.0 regressed the speaker's ServiceL2Status reconciler
+# into an apiserver-flooding create-fail/not-found loop —
+# metallb/metallb#3063. An image-only pin on the v0.16.0 chart does NOT
+# work (its speaker probe hits /healthz:17472, which v0.15.3 doesn't
+# serve → crashloop), so charts/spatiumddi-metallb pins the 0.15.3 chart
+# end-to-end. Bump back to the chart default once #3063 is fixed upstream.
 METALLB_IMAGES=(
     "quay.io/metallb/controller:v0.15.3"
     "quay.io/metallb/speaker:v0.15.3"
