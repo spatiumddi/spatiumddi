@@ -3,7 +3,8 @@
         appliance appliance-builder appliance-iso appliance-clean \
         appliance-bake-images appliance-clean-baked-images appliance-dev-iso \
         appliance-baked-iso appliance-stamp-dev appliance-slot-image \
-        appliance-fetch-k3s appliance-bake-chart appliance-bake-control-chart
+        appliance-fetch-k3s appliance-bake-chart appliance-bake-control-chart \
+        appliance-bake-metallb-chart
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 COMPOSE        = docker compose
@@ -368,6 +369,13 @@ appliance-bake-chart:
 appliance-bake-control-chart:
 	@CHART_NAME=spatiumddi bash $(APPLIANCE_DIR)/scripts/bake-chart.sh
 
+# #272 — MetalLB chart bake. Separate chart so MetalLB lands in its own
+# metallb-system namespace (the upstream chart hardcodes .Release.Namespace,
+# so it can't be a subchart of spatiumddi-appliance and still escape the
+# spatium namespace). firstboot renders it as the spatium-metallb HelmChart.
+appliance-bake-metallb-chart:
+	@CHART_NAME=spatiumddi-metallb bash $(APPLIANCE_DIR)/scripts/bake-chart.sh
+
 appliance-bake-images: build-supervisor
 	@bash $(APPLIANCE_DIR)/scripts/bake-images.sh
 
@@ -377,7 +385,7 @@ appliance-bake-images: build-supervisor
 # rebuild + bake cycle. Skips the bake — firstboot falls back to
 # ``docker compose pull`` from ghcr.io on first boot. NOT how releases
 # are cut (the release pipeline always bakes — #170 Phase A4).
-appliance-dev-iso: appliance-clean-baked-images appliance-stamp-dev appliance-fetch-k3s appliance-bake-chart appliance-bake-control-chart appliance appliance-iso
+appliance-dev-iso: appliance-clean-baked-images appliance-stamp-dev appliance-fetch-k3s appliance-bake-chart appliance-bake-control-chart appliance-bake-metallb-chart appliance appliance-iso
 	@echo ""
 	@echo "✓ Dev-flavored appliance ISO ready at $(APPLIANCE_OUT)/spatiumddi-appliance_0.1.0.iso"
 	@echo "  All container images (api / frontend / DNS / DHCP agents) pull from"
@@ -390,7 +398,7 @@ appliance-dev-iso: appliance-clean-baked-images appliance-stamp-dev appliance-fe
 # builds the ISO + slot image. Mirrors what the release workflow
 # produces, just driven by your local :dev images instead of ghcr.io's
 # cut tag. ~1 GB larger than appliance-dev-iso.
-appliance-baked-iso: appliance-stamp-dev appliance-fetch-k3s appliance-bake-chart appliance-bake-control-chart appliance-bake-images appliance appliance-iso appliance-slot-image
+appliance-baked-iso: appliance-stamp-dev appliance-fetch-k3s appliance-bake-chart appliance-bake-control-chart appliance-bake-metallb-chart appliance-bake-images appliance appliance-iso appliance-slot-image
 	@echo ""
 	@echo "✓ Baked appliance ISO ready at $(APPLIANCE_OUT)/"
 	@echo "  All container images embedded. Air-gap-ready. First boot does no docker pull."

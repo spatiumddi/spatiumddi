@@ -260,6 +260,136 @@ function ClusterStatusChip({ row }: { row: ApplianceRow }) {
 // once to reach 3. The API enforces the odd-target rule; we both
 // pre-empt it (disable when the resulting count is even) and surface
 // its 422 message inline.
+// #272 — shown after a promote so the operator knows the work is async.
+// The POST only stamps desired-state; the k3s join (~30-60s) + the API
+// cert regeneration (which adds the new node's SAN and rolls the frontend
+// nginx pod, briefly closing :443) all happen after. Without this the
+// operator sees a silent success, then a dead page, with no idea a reload
+// fixes it. Polls the fleet so it can say WHEN it's safe to reload.
+function PromotionProgressModal({
+  promoted,
+  onClose,
+}: {
+  promoted: { id: string; hostname: string }[];
+  onClose: () => void;
+}) {
+  // Poll faster than the parent table's 15s cadence while the promote
+  // settles. Same query key → shares the cache (the table behind this
+  // modal updates too). retry rides out the brief API outage when the
+  // cert regenerates and the frontend nginx pod rolls.
+  const { data, error } = useQuery({
+    queryKey: ["appliance", "fleet"],
+    queryFn: applianceApprovalApi.list,
+    refetchInterval: 3000,
+    retry: true,
+  });
+
+  const rowById = new Map((data ?? []).map((r) => [r.id, r]));
+  const statuses = promoted.map((p) => {
+    const row = rowById.get(p.id);
+    const js = row?.cluster_join_state ?? null;
+    const role = row?.cluster_role ?? null;
+    return {
+      ...p,
+      // cluster_role flips to "member" once settled; cluster_join_state
+      // hits "ready" a beat earlier — treat either as done.
+      ready: role === "member" || js === "ready",
+      failed: js === "failed",
+      reason: row?.cluster_join_reason ?? null,
+    };
+  });
+  const allReady = statuses.length > 0 && statuses.every((s) => s.ready);
+  const anyFailed = statuses.some((s) => s.failed);
+
+  return (
+    <Modal title="Promotion started" onClose={onClose}>
+      <div className="space-y-4 text-sm">
+        <p className="text-muted-foreground">
+          {promoted.map((p) => p.hostname).join(", ")}{" "}
+          {promoted.length === 1 ? "is" : "are"} joining the control plane. This
+          takes about <strong>30–90 seconds</strong>. The API certificate
+          regenerates to cover the new node, so this page may briefly show a
+          connection error — that’s expected.
+        </p>
+
+        <div className="space-y-1">
+          {statuses.map((s) => (
+            <div key={s.id} className="flex items-center gap-2">
+              <span
+                className={cn(
+                  "h-2 w-2 rounded-full",
+                  s.failed
+                    ? "bg-rose-500"
+                    : s.ready
+                      ? "bg-emerald-500"
+                      : "animate-pulse bg-amber-500",
+                )}
+              />
+              <span>{s.hostname}</span>
+              <span
+                className={cn(
+                  "text-xs",
+                  s.failed
+                    ? "text-rose-500"
+                    : s.ready
+                      ? "text-emerald-600 dark:text-emerald-400"
+                      : "text-muted-foreground",
+                )}
+                title={s.reason ?? ""}
+              >
+                {s.failed ? "failed" : s.ready ? "ready" : "joining…"}
+              </span>
+            </div>
+          ))}
+        </div>
+
+        {error && !allReady && (
+          <p className="text-xs text-amber-600 dark:text-amber-400">
+            API briefly unreachable — expected while the certificate
+            regenerates. Reconnecting…
+          </p>
+        )}
+
+        {allReady ? (
+          <p className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-emerald-700 dark:text-emerald-300">
+            Cluster converged. Reload the page to reconnect over the new
+            certificate.
+          </p>
+        ) : anyFailed ? (
+          <p className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-rose-700 dark:text-rose-300">
+            A node failed to join — check the Fleet list / supervisor logs. You
+            can reload to refresh the view.
+          </p>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            Waiting for the cluster to converge…
+          </p>
+        )}
+
+        <div className="flex justify-end gap-2 pt-1">
+          <button
+            type="button"
+            className="rounded-md border px-3 py-1.5 text-sm"
+            onClick={onClose}
+          >
+            Dismiss
+          </button>
+          <button
+            type="button"
+            className={cn(
+              "rounded-md border px-3 py-1.5 text-sm",
+              allReady && "border-emerald-500/50 bg-emerald-500/10 font-medium",
+            )}
+            onClick={() => window.location.reload()}
+          >
+            Reload now
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function ClusterMembershipModal({
   rows,
   onClose,
@@ -314,11 +444,24 @@ function ClusterMembershipModal({
     )
     .sort(byHostname);
 
+  // Captured on a successful promote so PromotionProgressModal can track
+  // the very nodes we just promoted as they converge.
+  const [promotedProgress, setPromotedProgress] = useState<
+    { id: string; hostname: string }[] | null
+  >(null);
+
   const refresh = () =>
     qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
   const promote = useMutation({
     mutationFn: () => applianceApprovalApi.promoteControlPlane([...promoteSel]),
     onSuccess: () => {
+      // Snapshot the picked rows (hostname for display) before clearing
+      // the selection, then hand off to the progress modal.
+      setPromotedProgress(
+        eligible
+          .filter((r) => promoteSel.has(r.id))
+          .map((r) => ({ id: r.id, hostname: r.hostname ?? r.id })),
+      );
       refresh();
       setPromoteSel(new Set());
     },
@@ -348,121 +491,138 @@ function ClusterMembershipModal({
   const demoteEven = demoteSel.size > 0 && resultingDemote % 2 === 0;
 
   return (
-    <Modal title="Manage control plane cluster" onClose={onClose} wide>
-      <div className="space-y-5 text-sm">
-        <p className="text-muted-foreground">
-          The control-plane cluster runs on embedded etcd, which wants an{" "}
-          <strong>odd</strong> server count (1 / 3 / 5 / 7) for quorum. Promote
-          or demote in batches so the total lands on an odd number — the server
-          refuses an even result. Current members:{" "}
-          <strong>{memberCount}</strong>.
-        </p>
+    <>
+      {promotedProgress && (
+        <PromotionProgressModal
+          promoted={promotedProgress}
+          onClose={() => {
+            // Promote is done — close the progress modal and the cluster
+            // modal behind it; the operator reloads from a clean slate.
+            setPromotedProgress(null);
+            onClose();
+          }}
+        />
+      )}
+      <Modal title="Manage control plane cluster" onClose={onClose} wide>
+        <div className="space-y-5 text-sm">
+          <p className="text-muted-foreground">
+            The control-plane cluster runs on embedded etcd, which wants an{" "}
+            <strong>odd</strong> server count (1 / 3 / 5 / 7) for quorum.
+            Promote or demote in batches so the total lands on an odd number —
+            the server refuses an even result. Current members:{" "}
+            <strong>{memberCount}</strong>.
+          </p>
 
-        {/* ── Promote ──────────────────────────────────────────── */}
-        <section className="space-y-2">
-          <h4 className="font-medium">Promote appliances → control plane</h4>
-          {eligible.length === 0 ? (
-            <p className="text-xs text-muted-foreground">
-              No eligible appliance nodes (need an approved, paired Appliance
-              that isn’t already a member).
-            </p>
-          ) : (
-            <div className="space-y-1">
-              {eligible.map((r) => (
-                <label key={r.id} className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={promoteSel.has(r.id)}
-                    onChange={() => toggle(promoteSel, r.id, setPromoteSel)}
-                  />
-                  <span>{r.hostname}</span>
-                  {r.last_seen_ip && (
-                    <span className="text-xs text-muted-foreground">
-                      {r.last_seen_ip}
-                    </span>
-                  )}
-                </label>
-              ))}
-            </div>
-          )}
-          {promoteSel.size > 0 && (
-            <p
-              className={cn(
-                "text-xs",
-                promoteEven ? "text-rose-500" : "text-muted-foreground",
-              )}
+          {/* ── Promote ──────────────────────────────────────────── */}
+          <section className="space-y-2">
+            <h4 className="font-medium">Promote appliances → control plane</h4>
+            {eligible.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                No eligible appliance nodes (need an approved, paired Appliance
+                that isn’t already a member).
+              </p>
+            ) : (
+              <div className="space-y-1">
+                {eligible.map((r) => (
+                  <label key={r.id} className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={promoteSel.has(r.id)}
+                      onChange={() => toggle(promoteSel, r.id, setPromoteSel)}
+                    />
+                    <span>{r.hostname}</span>
+                    {r.last_seen_ip && (
+                      <span className="text-xs text-muted-foreground">
+                        {r.last_seen_ip}
+                      </span>
+                    )}
+                  </label>
+                ))}
+              </div>
+            )}
+            {promoteSel.size > 0 && (
+              <p
+                className={cn(
+                  "text-xs",
+                  promoteEven ? "text-rose-500" : "text-muted-foreground",
+                )}
+              >
+                Resulting members: {resultingPromote}
+                {promoteEven &&
+                  " — even; select one more (or fewer) to make it odd"}
+              </p>
+            )}
+            {promote.error && (
+              <p className="text-xs text-rose-500">
+                {formatApiError(promote.error)}
+              </p>
+            )}
+            <button
+              type="button"
+              className="rounded-md border px-3 py-1.5 text-sm disabled:opacity-50"
+              disabled={
+                promoteSel.size === 0 || promoteEven || promote.isPending
+              }
+              onClick={() => promote.mutate()}
             >
-              Resulting members: {resultingPromote}
-              {promoteEven &&
-                " — even; select one more (or fewer) to make it odd"}
-            </p>
-          )}
-          {promote.error && (
-            <p className="text-xs text-rose-500">
-              {formatApiError(promote.error)}
-            </p>
-          )}
-          <button
-            type="button"
-            className="rounded-md border px-3 py-1.5 text-sm disabled:opacity-50"
-            disabled={promoteSel.size === 0 || promoteEven || promote.isPending}
-            onClick={() => promote.mutate()}
-          >
-            {promote.isPending
-              ? "Promoting…"
-              : `Promote ${promoteSel.size || ""} to control plane`}
-          </button>
-        </section>
+              {promote.isPending
+                ? "Promoting…"
+                : `Promote ${promoteSel.size || ""} to control plane`}
+            </button>
+          </section>
 
-        {/* ── Demote ───────────────────────────────────────────── */}
-        <section className="space-y-2 border-t pt-4">
-          <h4 className="font-medium">Demote members → appliance</h4>
-          {demotable.length === 0 ? (
-            <p className="text-xs text-muted-foreground">
-              No demotable members (the etcd seed can’t be demoted here).
-            </p>
-          ) : (
-            <div className="space-y-1">
-              {demotable.map((r) => (
-                <label key={r.id} className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={demoteSel.has(r.id)}
-                    onChange={() => toggle(demoteSel, r.id, setDemoteSel)}
-                  />
-                  <span>{r.hostname}</span>
-                </label>
-              ))}
-            </div>
-          )}
-          {demoteSel.size > 0 && (
-            <p
-              className={cn(
-                "text-xs",
-                demoteEven ? "text-rose-500" : "text-muted-foreground",
-              )}
+          {/* ── Demote ───────────────────────────────────────────── */}
+          <section className="space-y-2 border-t pt-4">
+            <h4 className="font-medium">Demote members → appliance</h4>
+            {demotable.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                No demotable members (the etcd seed can’t be demoted here).
+              </p>
+            ) : (
+              <div className="space-y-1">
+                {demotable.map((r) => (
+                  <label key={r.id} className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={demoteSel.has(r.id)}
+                      onChange={() => toggle(demoteSel, r.id, setDemoteSel)}
+                    />
+                    <span>{r.hostname}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+            {demoteSel.size > 0 && (
+              <p
+                className={cn(
+                  "text-xs",
+                  demoteEven ? "text-rose-500" : "text-muted-foreground",
+                )}
+              >
+                Remaining members: {resultingDemote}
+                {demoteEven &&
+                  " — even; select one more (or fewer) to make it odd"}
+              </p>
+            )}
+            {demote.error && (
+              <p className="text-xs text-rose-500">
+                {formatApiError(demote.error)}
+              </p>
+            )}
+            <button
+              type="button"
+              className="rounded-md border px-3 py-1.5 text-sm disabled:opacity-50"
+              disabled={demoteSel.size === 0 || demoteEven || demote.isPending}
+              onClick={() => demote.mutate()}
             >
-              Remaining members: {resultingDemote}
-              {demoteEven &&
-                " — even; select one more (or fewer) to make it odd"}
-            </p>
-          )}
-          {demote.error && (
-            <p className="text-xs text-rose-500">
-              {formatApiError(demote.error)}
-            </p>
-          )}
-          <button
-            type="button"
-            className="rounded-md border px-3 py-1.5 text-sm disabled:opacity-50"
-            disabled={demoteSel.size === 0 || demoteEven || demote.isPending}
-            onClick={() => demote.mutate()}
-          >
-            {demote.isPending ? "Demoting…" : `Demote ${demoteSel.size || ""}`}
-          </button>
-        </section>
-      </div>
-    </Modal>
+              {demote.isPending
+                ? "Demoting…"
+                : `Demote ${demoteSel.size || ""}`}
+            </button>
+          </section>
+        </div>
+      </Modal>
+    </>
   );
 }
 

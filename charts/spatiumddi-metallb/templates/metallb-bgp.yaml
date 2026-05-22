@@ -2,15 +2,12 @@
 
        Wired through the chart so the anycast-DNS roadmap item
        (Phase 10 follow-up) has a runway, but gated OFF by default
-       (``metallb.bgp.enabled: false``) so this PR ships no behavior
-       change. BGP requires FRR mode — re-enable
-       ``metallb.speaker.frr.enabled`` and bake the
-       quay.io/frrouting/frr image before turning this on, or the
-       speaker won't have an FRR backend to peer with.
+       (``metallb.bgp.enabled: false``). BGP requires FRR mode — enable
+       ``metallb.frrk8s.enabled`` + bake the frr images first.
 
        Renders one BGPPeer per ``metallb.bgp.peers`` entry and one
-       BGPAdvertisement per ``metallb.bgp.advertisements`` entry,
-       both metallb.io/v1beta1 in the controller's namespace. */}}
+       BGPAdvertisement per ``metallb.bgp.advertisements`` entry, both
+       metallb.io/v1beta1 in the controller's namespace (metallb-system). */}}
 {{- if and .Values.metallb.enabled .Values.metallb.bgp.enabled }}
 {{- range $i, $peer := .Values.metallb.bgp.peers }}
 apiVersion: metallb.io/v1beta1
@@ -19,7 +16,7 @@ metadata:
   name: spatium-peer-{{ $i }}
   namespace: {{ $.Release.Namespace }}
   labels:
-    {{- include "spatiumddi-appliance.labels" $ | nindent 4 }}
+    {{- include "spatiumddi-metallb.labels" $ | nindent 4 }}
 spec:
   myASN: {{ required "metallb.bgp.peers[].myASN is required" $peer.myASN }}
   peerASN: {{ required "metallb.bgp.peers[].peerASN is required" $peer.peerASN }}
@@ -39,7 +36,7 @@ metadata:
   name: spatium-adv-{{ $i }}
   namespace: {{ $.Release.Namespace }}
   labels:
-    {{- include "spatiumddi-appliance.labels" $ | nindent 4 }}
+    {{- include "spatiumddi-metallb.labels" $ | nindent 4 }}
 spec:
   ipAddressPools:
     {{- toYaml ($adv.ipAddressPools | default (list "spatium-control-plane")) | nindent 4 }}

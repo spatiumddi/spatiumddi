@@ -1,0 +1,40 @@
+apiVersion: v2
+name: spatiumddi-metallb
+description: |
+  MetalLB, deployed in its own ``metallb-system`` namespace (the
+  conventional location) rather than co-located with the SpatiumDDI
+  control-plane workloads. Split out of charts/spatiumddi-appliance so
+  the MetalLB controller/speaker + the control-plane IPAddressPool /
+  L2Advertisement land in metallb-system. The frontend LoadBalancer
+  Service stays in the spatium namespace and references the pool by
+  name (cross-namespace assignment is standard MetalLB), so the VIP is
+  unaffected by the namespace.
+type: application
+version: 0.1.0
+appVersion: "0.0.0-dev"
+kubeVersion: ">=1.27.0-0"
+home: https://spatiumddi.github.io/spatiumddi/
+sources:
+  - https://github.com/spatiumddi/spatiumddi
+maintainers:
+  - name: SpatiumDDI Contributors
+# MetalLB subchart. Gated behind ``metallb.enabled: false`` so the
+# spatium-metallb HelmChart can be applied at firstboot (creating the
+# metallb-system namespace) while the controller/speaker stay dormant
+# until the operator sets a control-plane VIP — the supervisor flips
+# ``metallb.enabled: true`` + writes the pool via this chart's
+# HelmChartConfig on that change.
+#
+# Pinned to the full 0.15.3 chart (chart + images + CRDs all 0.15.3),
+# NOT 0.16.0. v0.16.0 regressed the speaker's ServiceL2Status reconciler
+# into an apiserver-flooding loop (metallb/metallb#3063). Pinning only
+# the images while keeping the 0.16.0 chart does NOT work — the 0.16.0
+# chart's speaker liveness probe hits /healthz:17472, which the v0.15.3
+# binary doesn't serve (it exposes /metrics on the monitoring port), so
+# the speaker crashloops. Use the matched 0.15.3 release end-to-end.
+# Bump back to the chart default once #3063 is fixed upstream.
+dependencies:
+  - name: metallb
+    version: 0.15.3
+    repository: https://metallb.github.io/metallb
+    condition: metallb.enabled

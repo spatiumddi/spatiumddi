@@ -1986,6 +1986,13 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     has_k3s_line = k3s_status() is not None
     short_count = (
         2  # IPs + Build, always present
+        # VIP line — present whenever a control-plane VIP is configured
+        # (``state.vip``), which is the multi-node cluster case. This MUST
+        # be counted: render_header prepends vip_line to short_lines, so
+        # omitting it here under-sized HEADER_ROWS by a row and the
+        # fixed-height header clipped its last element — the CPU/RAM/Disk
+        # vitals row vanished exactly when a VIP was set.
+        + (1 if state.vip else 0)
         + (1 if slot_info() is not None else 0)
         + (1 if has_agent_line else 0)
         + (1 if has_watchdog_line else 0)

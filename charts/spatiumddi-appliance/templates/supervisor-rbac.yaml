@@ -104,6 +104,43 @@ subjects:
     name: spatium-supervisor
     namespace: spatium
 ---
+{{- /* #272 — the supervisor scales the CNPG Postgres Cluster directly
+       (``k8s_api.patch_cnpg_instances`` from the heartbeat). It can't go
+       through the HelmChartConfig like the other workloads because the
+       Cluster carries ``helm.sh/resource-policy: keep`` (data-safety) and
+       the helm-controller won't patch a kept resource's spec — so a
+       promote left Postgres single-node while api/worker/redis scaled.
+       The direct merge-patch needs get + patch on the Cluster CR; without
+       it the GET 403s every heartbeat and CNPG never scales (caught on the
+       #272 fresh-install test). Namespaced to spatium — narrowest grant. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spatium-supervisor-cnpg
+  namespace: spatium
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spatium-supervisor-cnpg
+  namespace: spatium
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spatium-supervisor-cnpg
+subjects:
+  - kind: ServiceAccount
+    name: spatium-supervisor
+    namespace: spatium
+---
 {{- /* ClusterRole for node-level introspection (capabilities
        reporting). Single verb, single resource — narrowest grant
        that gets ``kubectl get nodes`` to work. */}}

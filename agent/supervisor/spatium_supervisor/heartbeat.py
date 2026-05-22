@@ -662,7 +662,24 @@ def heartbeat_once(
                 size=cp_size,
             )
 
-        bs_changed, bs_err = k8s_api.apply_bootstrap_overrides(
+        # #272 — the CNPG Cluster carries ``helm.sh/resource-policy: keep``
+        # (so a failed-release recovery can't wipe the DB), which also
+        # makes the helm-controller skip patching its spec on upgrade. The
+        # HelmChartConfig above scales api/worker/frontend/redis but the
+        # kept Cluster stays at its initial instance count, so scale it
+        # directly here (a merge-patch isn't a Helm op → keep doesn't
+        # apply). Idempotent — only patches on a real size change.
+        pg_changed, pg_err = k8s_api.patch_cnpg_instances(cp_size)
+        if pg_changed:
+            log.info("supervisor.heartbeat.cnpg_instances_scaled", size=cp_size)
+        elif pg_err:
+            log.warning(
+                "supervisor.heartbeat.cnpg_instances_scale_failed",
+                error=pg_err,
+                size=cp_size,
+            )
+
+        bs_changed, bs_err = k8s_api.apply_metallb_overrides(
             metallb_enabled=ml_enabled, pool_addresses=list(ml_pool)
         )
         if bs_changed:

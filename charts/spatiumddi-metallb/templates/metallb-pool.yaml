@@ -1,0 +1,43 @@
+{{- /* #272 — MetalLB L2 IP pool + advertisement.
+
+       Rendered only when MetalLB is enabled AND the operator has
+       picked an address range (``metallb.ipPool.addresses``). The
+       controller/speaker can come up with an empty pool; the
+       IPAddressPool lands once the operator chooses a free slice of the
+       appliance subnet via the Fleet → Network & Host UI (the
+       supervisor writes it into this chart's HelmChartConfig on save).
+
+       These CRs are metallb.io/v1beta1 and render in this chart's
+       release namespace — metallb-system — which is where the MetalLB
+       controller watches for pools. The frontend LoadBalancer Service
+       (in the spatium namespace) references the pool by NAME via its
+       ``metallb.universe.tf/address-pool`` annotation, so cross-
+       namespace assignment is standard MetalLB and the VIP is
+       unaffected by living in a different namespace from the Service. */}}
+{{- if and .Values.metallb.enabled .Values.metallb.ipPool.addresses }}
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: spatium-control-plane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi-metallb.labels" . | nindent 4 }}
+spec:
+  addresses:
+    {{- toYaml .Values.metallb.ipPool.addresses | nindent 4 }}
+  # Hand out the control-plane VIP only when a Service explicitly
+  # requests it (loadBalancerIPs annotation) — don't auto-assign these
+  # IPs to unrelated LoadBalancer Services that happen to omit a pool.
+  autoAssign: {{ .Values.metallb.ipPool.autoAssign | default false }}
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: spatium-control-plane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi-metallb.labels" . | nindent 4 }}
+spec:
+  ipAddressPools:
+    - spatium-control-plane
+{{- end }}

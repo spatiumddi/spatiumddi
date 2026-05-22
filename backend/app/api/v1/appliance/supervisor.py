@@ -2969,12 +2969,15 @@ class MetalLBConfigResponse(BaseModel):
 
 def _metallb_pod_status() -> tuple[bool, int, int]:
     """Return ``(controller_ready, speakers_ready, speakers_total)`` from
-    the live MetalLB pods in the spatium namespace.
+    the live MetalLB pods in the metallb-system namespace.
 
     Best-effort: degrades to ``(False, 0, 0)`` on any error (no
     ServiceAccount on a docker/k8s control plane, a kubeapi blip, or
-    MetalLB simply disabled so no pods exist). Uses the api pod's
-    existing pod-read RBAC — no extra grant needed.
+    MetalLB simply disabled so no pods exist). MetalLB moved to its own
+    metallb-system namespace (#286), so this needs the api SA's
+    cross-namespace pod-read Role there — provided by the
+    spatiumddi-metallb chart's api-reader-rbac.yaml, not the appliance
+    chart. Without that grant the read 403s and status shows "starting".
     """
     from app.services.appliance import k8s  # noqa: PLC0415
 
@@ -2983,7 +2986,12 @@ def _metallb_pod_status() -> tuple[bool, int, int]:
         return any(c.get("type") == "Ready" and c.get("status") == "True" for c in conds)
 
     try:
-        pods = k8s.list_pods("spatium")
+        # #272 / #286 — MetalLB lives in its own metallb-system namespace
+        # now, not spatium. Best-effort: needs the api SA's metallb-system
+        # pod-read Role (spatiumddi-metallb chart's api-reader-rbac.yaml);
+        # degrades to (False,0,0) if the grant isn't present (status just
+        # shows "starting").
+        pods = k8s.list_pods("metallb-system")
     except Exception:  # noqa: BLE001
         return (False, 0, 0)
     controller_ready = False
