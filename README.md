@@ -32,6 +32,7 @@
 </p>
 
 <p align="center">
+  <a href="https://discord.com/invite/ANJAnvg2Dd"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
   <a href="https://github.com/spatiumddi/spatiumddi/stargazers"><img src="https://img.shields.io/github/stars/spatiumddi/spatiumddi?style=social" alt="Stars"/></a>
   <a href="https://github.com/spatiumddi/spatiumddi/discussions"><img src="https://img.shields.io/github/discussions/spatiumddi/spatiumddi" alt="Discussions"/></a>
   <a href="https://github.com/spatiumddi/spatiumddi/graphs/contributors"><img src="https://img.shields.io/github/contributors/spatiumddi/spatiumddi" alt="Contributors"/></a>
