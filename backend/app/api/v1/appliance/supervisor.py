@@ -2980,9 +2980,7 @@ def _metallb_pod_status() -> tuple[bool, int, int]:
 
     def _ready(pod: dict[str, Any]) -> bool:
         conds = (pod.get("status") or {}).get("conditions") or []
-        return any(
-            c.get("type") == "Ready" and c.get("status") == "True" for c in conds
-        )
+        return any(c.get("type") == "Ready" and c.get("status") == "True" for c in conds)
 
     try:
         pods = k8s.list_pods("spatium")
