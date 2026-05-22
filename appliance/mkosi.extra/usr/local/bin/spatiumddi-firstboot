@@ -185,15 +185,24 @@ if [ ! -f "$ENV_FILE" ]; then
             ROLE=control-plane
             DNS_AGENT_KEY_VAL=$(gen_hex 24)
             DHCP_AGENT_KEY_VAL=$(gen_hex 24)
-            # #272 — the control-plane node's supervisor MUST heartbeat to
-            # the LOCAL api, otherwise it skips heartbeat ("no_control_
-            # plane_url") and never runs the cp-size + MetalLB reconcile
-            # (which writes the durable HelmChartConfig overrides). Without
-            # it, a seed reboot strands the cluster at the manifest
-            # defaults (cp-size=1, MetalLB off). Point at the in-cluster
-            # api Service (plain http → no TLS-verify concern); same URL
-            # the role pods use as their control plane.
-            CONTROL_PLANE_URL_VAL="http://spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000"
+            # #272 — leave CONTROL_PLANE_URL EMPTY on the control-plane
+            # node. Two reasons it must stay empty:
+            #   1. The supervisor's self-bootstrap path (mints the seed's
+            #      own pairing code against the in-cluster api so the seed
+            #      registers itself into Fleet) is gated on
+            #      ``not cfg.control_plane_url`` — a non-empty value here
+            #      silently disables it, so the seed never registers and
+            #      Fleet shows up empty. self-bootstrap sets
+            #      control_plane_url itself from the api response.
+            #   2. The heartbeat target no longer depends on this value:
+            #      ``heartbeat._effective_control_plane_url`` redirects any
+            #      control-plane *cluster member* to the in-cluster api
+            #      Service regardless of CONTROL_PLANE_URL, so the cp-size +
+            #      MetalLB reconcile (durable HelmChartConfig overrides)
+            #      still runs even with this empty. (An earlier draft set
+            #      this to the svc URL to force the heartbeat target — that
+            #      predated the resolver and broke #1; see issue #272.)
+            CONTROL_PLANE_URL_VAL=""
             AGENT_GROUP_VAL="default"
             ;;
     esac
