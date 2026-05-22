@@ -66,9 +66,9 @@ async def test_create_succeeds_when_dispatch_raises(
 
 
 @pytest.mark.asyncio
-async def test_refresh_one_by_id_missing_domain_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_refresh_one_by_id_missing_domain_is_noop() -> None:
     """The one-shot task tolerates a domain deleted before it ran."""
-    from app.tasks.domain_whois_refresh import _refresh_one_by_id_async
+    import app.tasks.domain_whois_refresh as task_mod
 
-    out = await _refresh_one_by_id_async(str(uuid.uuid4()))
+    out = await task_mod._refresh_one_by_id_async(str(uuid.uuid4()))
     assert out["status"] == "missing"
