@@ -948,14 +948,14 @@ export function FleetTab({
                       </p>
                       <p className="mt-1 text-sm text-muted-foreground">
                         This control plane has{" "}
-                        <strong>{approvedControlPlaneCount} nodes</strong> but no
-                        MetalLB virtual IP (VIP) is configured. Without a VIP,
-                        operator browsers and every off-cluster DNS / DHCP agent
-                        are pinned to a single node&apos;s address — if that node
-                        goes down they lose the control plane even though the
-                        cluster is still healthy on the surviving nodes. Set a
-                        floating VIP so there&apos;s one stable address that
-                        re-homes automatically on node loss.
+                        <strong>{approvedControlPlaneCount} nodes</strong> but
+                        no MetalLB virtual IP (VIP) is configured. Without a
+                        VIP, operator browsers and every off-cluster DNS / DHCP
+                        agent are pinned to a single node&apos;s address — if
+                        that node goes down they lose the control plane even
+                        though the cluster is still healthy on the surviving
+                        nodes. Set a floating VIP so there&apos;s one stable
+                        address that re-homes automatically on node loss.
                       </p>
                       <div className="mt-3 flex flex-wrap items-center gap-3">
                         <button
