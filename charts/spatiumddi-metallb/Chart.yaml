@@ -25,13 +25,16 @@ maintainers:
 # ``metallb.enabled: true`` + writes the pool via this chart's
 # HelmChartConfig on that change.
 #
-# Image pin: the chart is 0.16.0 but the controller/speaker images are
-# pinned to v0.15.3 in values.yaml — v0.16.0 regressed the speaker's
-# ServiceL2Status reconciler into an apiserver-flooding loop
-# (metallb/metallb#3063). v0.15.3 binaries are schema-compatible with
-# the v0.16.0 chart + CRDs.
+# Pinned to the full 0.15.3 chart (chart + images + CRDs all 0.15.3),
+# NOT 0.16.0. v0.16.0 regressed the speaker's ServiceL2Status reconciler
+# into an apiserver-flooding loop (metallb/metallb#3063). Pinning only
+# the images while keeping the 0.16.0 chart does NOT work — the 0.16.0
+# chart's speaker liveness probe hits /healthz:17472, which the v0.15.3
+# binary doesn't serve (it exposes /metrics on the monitoring port), so
+# the speaker crashloops. Use the matched 0.15.3 release end-to-end.
+# Bump back to the chart default once #3063 is fixed upstream.
 dependencies:
   - name: metallb
-    version: 0.16.0
+    version: 0.15.3
     repository: https://metallb.github.io/metallb
     condition: metallb.enabled

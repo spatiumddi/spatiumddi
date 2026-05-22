@@ -1,3 +1,18 @@
+# MetalLB CRDs — vendored from the metallb v0.15.3 Helm chart
+# (charts/crds subchart), rendered with --namespace metallb-system so
+# the BGPPeer conversion-webhook clientConfig points at the
+# metallb-webhook-service in metallb-system.
+#
+# Pre-loaded as a k3s auto-deploy manifest by spatiumddi-firstboot
+# (place_metallb_crds) BEFORE the spatium-metallb HelmChart, so the
+# chart runs with crds.enabled=false (no double-owner conflict).
+#
+# Keep in lock-step with charts/spatiumddi-metallb's pinned metallb
+# dependency version. Regenerate after a version bump with:
+#   helm template metallb-crds <chart>/charts/crds --namespace metallb-system
+# Do NOT hand-edit.
+---
+# Source: crds/templates/crds.yaml
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -119,6 +134,7 @@ spec:
       subresources:
         status: {}
 ---
+# Source: crds/templates/crds.yaml
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -315,64 +331,7 @@ spec:
                   items:
                     type: string
                   type: array
-                serviceSelectors:
-                  description: |-
-                    ServiceSelectors limits the set of services that will be advertised via this advertisement.
-                    If empty, all services from the selected pools are advertised.
-                    This field is mutually exclusive with aggregationLength and aggregationLengthV6 -
-                    services can only be selected when using the default /32 (IPv4) or /128 (IPv6) aggregation.
-                  items:
-                    description: |-
-                      A label selector is a label query over a set of resources. The result of matchLabels and
-                      matchExpressions are ANDed. An empty label selector matches all objects. A null
-                      label selector matches no objects.
-                    properties:
-                      matchExpressions:
-                        description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
-                        items:
-                          description: |-
-                            A label selector requirement is a selector that contains values, a key, and an operator that
-                            relates the key and values.
-                          properties:
-                            key:
-                              description: key is the label key that the selector applies to.
-                              type: string
-                            operator:
-                              description: |-
-                                operator represents a key's relationship to a set of values.
-                                Valid operators are In, NotIn, Exists and DoesNotExist.
-                              type: string
-                            values:
-                              description: |-
-                                values is an array of string values. If the operator is In or NotIn,
-                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
-                                the values array must be empty. This array is replaced during a strategic
-                                merge patch.
-                              items:
-                                type: string
-                              type: array
-                              x-kubernetes-list-type: atomic
-                          required:
-                            - key
-                            - operator
-                          type: object
-                        type: array
-                        x-kubernetes-list-type: atomic
-                      matchLabels:
-                        additionalProperties:
-                          type: string
-                        description: |-
-                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
-                          map is equivalent to an element of matchExpressions, whose key field is "key", the
-                          operator is "In", and the values array contains only "value". The requirements are ANDed.
-                        type: object
-                    type: object
-                    x-kubernetes-map-type: atomic
-                  type: array
               type: object
-              x-kubernetes-validations:
-                - message: serviceSelectors and aggregationLength are mutually exclusive, can only be used together with default aggregationLength (32) and aggregationLengthV6 (128)
-                  rule: '!has(self.serviceSelectors) || self.serviceSelectors.size() == 0 || ((!has(self.aggregationLength) || self.aggregationLength == 32) && (!has(self.aggregationLengthV6) || self.aggregationLengthV6 == 128))'
             status:
               description: BGPAdvertisementStatus defines the observed state of BGPAdvertisement.
               type: object
@@ -382,6 +341,7 @@ spec:
       subresources:
         status: {}
 ---
+# Source: crds/templates/crds.yaml
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -395,7 +355,7 @@ spec:
       clientConfig:
         service:
           name: metallb-webhook-service
-          namespace: spatium
+          namespace: metallb-system
           path: /convert
       conversionReviewVersions:
         - v1beta1
@@ -461,7 +421,7 @@ spec:
                   type: string
                 myASN:
                   description: AS number to use for the local end of the session.
-                  format: int64
+                  format: int32
                   maximum: 4294967295
                   minimum: 0
                   type: integer
@@ -500,7 +460,7 @@ spec:
                   type: string
                 peerASN:
                   description: AS number to expect from the remote end of the session.
-                  format: int64
+                  format: int32
                   maximum: 4294967295
                   minimum: 0
                   type: integer
@@ -604,14 +564,14 @@ spec:
                     - external
                   type: string
                 ebgpMultiHop:
-                  description: To set if the BGPPeer is multi-hops away. Needed for FRR-based modes (FRR-K8s, FRR) only.
+                  description: To set if the BGPPeer is multi-hops away. Needed for FRR mode only.
                   type: boolean
                 enableGracefulRestart:
                   description: |-
                     EnableGracefulRestart allows BGP peer to continue to forward data packets
                     along known routes while the routing protocol information is being
                     restored. This field is immutable because it requires restart of the BGP
-                    session. Supported for FRR-based modes (FRR-K8s, FRR) only.
+                    session. Supported for FRR mode only.
                   type: boolean
                   x-kubernetes-validations:
                     - message: EnableGracefulRestart cannot be changed after creation
@@ -630,20 +590,9 @@ spec:
                 keepaliveTime:
                   description: Requested BGP keepalive time, per RFC4271.
                   type: string
-                localASN:
-                  description: |-
-                    LocalASN allows advertising a different AS number to the peer using BGP's
-                    local-as feature. When set, MetalLB will advertise this ASN to the peer
-                    via "neighbor <peer> local-as <ASN> no-prepend replace-as", overriding
-                    the router-level MyASN for this specific session.
-                    Not supported in native BGP mode.
-                  format: int32
-                  maximum: 4294967295
-                  minimum: 1
-                  type: integer
                 myASN:
                   description: AS number to use for the local end of the session.
-                  format: int64
+                  format: int32
                   maximum: 4294967295
                   minimum: 0
                   type: integer
@@ -721,7 +670,7 @@ spec:
                   description: |-
                     AS number to expect from the remote end of the session.
                     ASN and DynamicASN are mutually exclusive and one of them must be specified.
-                  format: int64
+                  format: int32
                   maximum: 4294967295
                   minimum: 0
                   type: integer
@@ -757,6 +706,7 @@ spec:
       subresources:
         status: {}
 ---
+# Source: crds/templates/crds.yaml
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -822,6 +772,7 @@ spec:
       subresources:
         status: {}
 ---
+# Source: crds/templates/crds.yaml
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -954,6 +905,7 @@ spec:
       subresources:
         status: {}
 ---
+# Source: crds/templates/crds.yaml
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -1186,6 +1138,7 @@ spec:
       subresources:
         status: {}
 ---
+# Source: crds/templates/crds.yaml
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -1356,58 +1309,6 @@ spec:
                     type: object
                     x-kubernetes-map-type: atomic
                   type: array
-                serviceSelectors:
-                  description: |-
-                    ServiceSelectors limits the set of services that will be advertised via this advertisement.
-                    If empty, all services from the selected pools are advertised.
-                  items:
-                    description: |-
-                      A label selector is a label query over a set of resources. The result of matchLabels and
-                      matchExpressions are ANDed. An empty label selector matches all objects. A null
-                      label selector matches no objects.
-                    properties:
-                      matchExpressions:
-                        description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
-                        items:
-                          description: |-
-                            A label selector requirement is a selector that contains values, a key, and an operator that
-                            relates the key and values.
-                          properties:
-                            key:
-                              description: key is the label key that the selector applies to.
-                              type: string
-                            operator:
-                              description: |-
-                                operator represents a key's relationship to a set of values.
-                                Valid operators are In, NotIn, Exists and DoesNotExist.
-                              type: string
-                            values:
-                              description: |-
-                                values is an array of string values. If the operator is In or NotIn,
-                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
-                                the values array must be empty. This array is replaced during a strategic
-                                merge patch.
-                              items:
-                                type: string
-                              type: array
-                              x-kubernetes-list-type: atomic
-                          required:
-                            - key
-                            - operator
-                          type: object
-                        type: array
-                        x-kubernetes-list-type: atomic
-                      matchLabels:
-                        additionalProperties:
-                          type: string
-                        description: |-
-                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
-                          map is equivalent to an element of matchExpressions, whose key field is "key", the
-                          operator is "In", and the values array contains only "value". The requirements are ANDed.
-                        type: object
-                    type: object
-                    x-kubernetes-map-type: atomic
-                  type: array
               type: object
             status:
               description: L2AdvertisementStatus defines the observed state of L2Advertisement.
@@ -1418,6 +1319,7 @@ spec:
       subresources:
         status: {}
 ---
+# Source: crds/templates/crds.yaml
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -1503,6 +1405,7 @@ spec:
       subresources:
         status: {}
 ---
+# Source: crds/templates/crds.yaml
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
