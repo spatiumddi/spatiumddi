@@ -595,6 +595,68 @@ def patch_node_labels(
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+def patch_cnpg_instances(
+    instances: int,
+    *,
+    cluster_name: str = "spatium-control-spatiumddi-postgresql",
+    namespace: str = "spatium",
+) -> tuple[bool, str | None]:
+    """Directly scale the CNPG ``Cluster`` CR's ``spec.instances``.
+
+    #272 — the CNPG Cluster carries ``helm.sh/resource-policy: keep`` so
+    a failed-release recovery (uninstall+reinstall) can't delete it and
+    wipe the database. But ``keep`` also makes the k3s helm-controller
+    leave the resource's *spec* untouched on upgrade: when the seed
+    scales the control plane via the spatium-control HelmChartConfig,
+    Helm patches api/worker/frontend/redis to the new size but silently
+    skips the kept Cluster, so CNPG stays at its initial instance count
+    (observed live: a 1->3 promote left Postgres single-node while
+    everything else scaled). Patch the Cluster CR directly here instead —
+    a merge-patch isn't a Helm operation, so ``keep`` doesn't apply, and
+    the CNPG operator reconciles the new replica set normally.
+
+    Idempotent: GETs the current ``spec.instances`` first and only PATCHes
+    on a real change, so steady-state heartbeats stay quiet. Returns
+    ``(changed, error)`` mirroring the other override helpers.
+    """
+    if instances < 1:
+        return False, "instances < 1"
+    base = (
+        f"/apis/postgresql.cnpg.io/v1/namespaces/{quote(namespace)}"
+        f"/clusters/{quote(cluster_name)}"
+    )
+    # Read current size — skip the PATCH (and the heartbeat "applied" log)
+    # when it already matches. A 404 means the Cluster isn't up yet (early
+    # boot / not a cnpg deployment); treat as a quiet no-op, not an error.
+    try:
+        status, resp = _request("GET", base)
+    except RuntimeError as exc:
+        return False, str(exc)
+    if status == 404:
+        return False, None
+    if status != 200:
+        return False, f"kubeapi GET status {status}: {resp[:200]!r}"
+    try:
+        current = json.loads(resp).get("spec", {}).get("instances")
+    except (ValueError, AttributeError):
+        current = None
+    if current == instances:
+        return False, None
+    payload = json.dumps({"spec": {"instances": instances}}).encode("utf-8")
+    try:
+        status, resp = _request(
+            "PATCH",
+            base,
+            body=payload,
+            content_type="application/merge-patch+json",
+        )
+    except RuntimeError as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        return True, None
+    return False, f"kubeapi PATCH status {status}: {resp[:200]!r}"
+
+
 __all__ = [
     "KubeConfig",
     "PodStatus",
@@ -605,6 +667,7 @@ __all__ = [
     "delete_helmchart",
     "delete_node",
     "get_config",
+    "patch_cnpg_instances",
     "patch_node_labels",
     "list_pods",
 ]
