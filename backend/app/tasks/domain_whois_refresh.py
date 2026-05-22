@@ -25,6 +25,7 @@ the row that triggered them; the rest of the sweep proceeds.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -211,6 +212,77 @@ def refresh_due_domains(self: object) -> dict[str, Any]:  # type: ignore[type-ar
         return asyncio.run(_refresh_due_async())
     except Exception as exc:  # noqa: BLE001
         logger.exception("domain_whois_refresh_failed", error=str(exc))
+        raise
+
+
+async def _refresh_one_by_id_async(domain_id: str) -> dict[str, Any]:
+    """RDAP-refresh a single domain by id, in its own session.
+
+    Shares the exact ``refresh_one_domain`` service the beat sweep + the
+    manual endpoint use — no duplicated refresh logic. Writes a per-row
+    audit entry only on a meaningful change (the same gate the sweep
+    uses), so a freshly-created domain that RDAP can't resolve doesn't
+    add a noise row on top of the ``create`` audit already written.
+    """
+    async with task_session() as db:
+        d = await db.get(Domain, uuid.UUID(domain_id))
+        if d is None:
+            # Created then deleted before the task ran — nothing to do.
+            return {"status": "missing", "domain_id": domain_id}
+
+        ps = await db.get(PlatformSettings, _SINGLETON_ID)
+        interval_hours = _clamp_interval(ps.domain_whois_interval_hours if ps is not None else None)
+        now = datetime.now(UTC)
+
+        try:
+            result = await refresh_one_domain(d, interval_hours=interval_hours, now=now)
+        except Exception as exc:  # noqa: BLE001 — one bad lookup shouldn't crash the worker
+            logger.warning("domain_whois_refresh_one_failed", domain=d.name, error=str(exc))
+            d.whois_last_checked_at = now  # record the attempt so the beat sweep paces itself
+            await db.commit()
+            return {"status": "error", "domain": d.name, "error": str(exc)}
+
+        if result.any_meaningful_change:
+            db.add(
+                AuditLog(
+                    user_display_name="<system>",
+                    auth_source="system",
+                    action="refresh_whois",
+                    resource_type="domain",
+                    resource_id=str(d.id),
+                    resource_display=d.name,
+                    result="success",
+                    new_value=build_refresh_audit_payload(d, result),
+                )
+            )
+        await db.commit()
+
+        logger.info(
+            "domain_whois_refresh_one_completed",
+            domain=d.name,
+            rdap_reachable=result.rdap_reachable,
+            state_changed=result.state_changed,
+        )
+        return {
+            "status": "ran",
+            "domain": d.name,
+            "rdap_reachable": result.rdap_reachable,
+            "state_changed": result.state_changed,
+        }
+
+
+@celery_app.task(name="app.tasks.domain_whois_refresh.refresh_one_domain_by_id", bind=True)
+def refresh_one_domain_by_id(self: object, domain_id: str) -> dict[str, Any]:  # type: ignore[type-arg]
+    """One-shot RDAP refresh for a single domain, dispatched right after
+    ``create_domain`` (#278) so the row is populated within seconds
+    instead of sitting empty until the next ``refresh_due_domains`` beat
+    tick (up to ``domain_whois_interval_hours`` away). Thin wrapper around
+    the shared ``refresh_one_domain`` service.
+    """
+    try:
+        return asyncio.run(_refresh_one_by_id_async(domain_id))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("domain_whois_refresh_one_failed", domain_id=domain_id, error=str(exc))
         raise
 
 
