@@ -68,6 +68,16 @@ spec:
   instances: {{ .Values.postgresql.cnpg.instances }}
   imageName: {{ .Values.postgresql.cnpg.imageName | quote }}
 
+  # #296 Phase A — PDB on by default (set in values.yaml). Suspended
+  # during a rolling-upgrade node's maintenance window — the api-side
+  # orchestrator stamps + clears
+  # ``spec.nodeMaintenanceWindow.inProgress``. Outside the upgrade flow
+  # the PDB prevents accidental simultaneous primary eviction (e.g. a
+  # manual ``kubectl drain`` of two nodes at once). Sprig's ``| default``
+  # treats ``false`` as falsy and would emit ``true``, so we read the
+  # value directly and require the user to set it in values.yaml.
+  enablePDB: {{ .Values.postgresql.cnpg.enablePDB }}
+
   postgresql:
     parameters:
       {{- toYaml .Values.postgresql.cnpg.parameters | nindent 6 }}

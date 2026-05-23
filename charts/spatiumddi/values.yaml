@@ -327,6 +327,15 @@ postgresql:
     # installs don't have Prometheus Operator + ServiceMonitor CRDs.
     monitoring:
       enablePodMonitor: false
+    # PodDisruptionBudget for the primary (#296 Phase A). CNPG default
+    # is true; we set it explicitly so the contract is visible. During
+    # a rolling upgrade the orchestrator sets
+    # ``spec.nodeMaintenanceWindow.{inProgress: true, reusePVC: true}``
+    # which suspends this PDB for the node under maintenance — the
+    # CNPG-blessed pattern. Outside the upgrade window the PDB
+    # prevents accidental simultaneous evictions taking the primary
+    # offline (e.g. an operator running ``kubectl drain`` by hand).
+    enablePDB: true
     # Continuous WAL archiving to an object store. Defer beyond #272
     # Phase 2 — the existing pg_dump-based backup workflow already
     # covers the disaster-recovery story for v1. See CNPG docs for
