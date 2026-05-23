@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
@@ -251,6 +252,91 @@ def check_disk_headroom(
             "free_bytes": usage.free,
             "needed_bytes": need,
             "total_bytes": usage.total,
+        },
+    )
+
+
+async def check_mirror_disk_headroom(
+    *,
+    slot_image_size_bytes: int = 4 * 1024 * 1024 * 1024,
+    safety_margin_bytes: int = 1 * 1024 * 1024 * 1024,
+) -> PreflightResult:
+    """Mirror node has room for the slot image + a safety margin.
+
+    Phase B-only check — only fires when ``settings.slot_image_mirror_url``
+    is set. Queries the mirror's ``/api/v1/appliance/internal/slot-
+    images/_/disk-usage`` endpoint over the in-cluster Service to get
+    the real PVC volume's free space; ``check_disk_headroom`` above
+    looks at the api pod's /var which isn't where the slot image
+    actually lands in mirror mode.
+
+    On docker-compose / non-mirror shapes returns ``ok`` with detail
+    noting "no mirror configured" so the operator-facing report still
+    shows the row but doesn't surface a false warning.
+    """
+    if not settings.slot_image_mirror_url:
+        return PreflightResult(
+            name="mirror_disk_headroom",
+            level="ok",
+            message="no mirror configured — local disk_headroom covers it",
+            detail={"mirror_url": ""},
+        )
+
+    # Inline imports — the mirror client uses httpx which is a heavy-ish
+    # import. Skipping it on the docker-compose path keeps the cold-
+    # start cost on those deploys identical to pre-Phase-B.
+    import httpx  # noqa: PLC0415
+
+    from app.api.v1.appliance.slot_image_mirror import mirror_auth_token  # noqa: PLC0415
+
+    zero_id = uuid.UUID(int=0)
+    url = f"{settings.slot_image_mirror_url.rstrip('/')}/api/v1/appliance/internal/slot-images/_/disk-usage"
+    headers = {"X-Mirror-Auth": mirror_auth_token("disk-usage", zero_id)}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            resp = await client.get(url, headers=headers)
+    except httpx.HTTPError as exc:
+        return PreflightResult(
+            name="mirror_disk_headroom",
+            level="warn",
+            message=f"could not reach mirror Service: {exc}",
+            detail={"url": url, "error": str(exc)},
+        )
+    if resp.status_code != 200:
+        return PreflightResult(
+            name="mirror_disk_headroom",
+            level="warn",
+            message=f"mirror returned {resp.status_code}",
+            detail={"status": resp.status_code, "body": resp.text[:200]},
+        )
+    body = resp.json()
+    free = int(body.get("free_bytes") or 0)
+    total = int(body.get("total_bytes") or 0)
+    need = slot_image_size_bytes + safety_margin_bytes
+    if free < need:
+        return PreflightResult(
+            name="mirror_disk_headroom",
+            level="fail",
+            message=(
+                f"mirror has {free // (1024**3)} GiB free; "
+                f"need {need // (1024**3)} GiB (slot image + margin)"
+            ),
+            detail={
+                "free_bytes": free,
+                "needed_bytes": need,
+                "total_bytes": total,
+                "path": body.get("path"),
+            },
+        )
+    return PreflightResult(
+        name="mirror_disk_headroom",
+        level="ok",
+        message=(f"mirror: {free // (1024**3)} GiB free " f"(need {need // (1024**3)} GiB)"),
+        detail={
+            "free_bytes": free,
+            "needed_bytes": need,
+            "total_bytes": total,
+            "path": body.get("path"),
         },
     )
 
@@ -486,6 +572,7 @@ async def run_all(
         check_inflight_conflict(namespace=namespace),
         await check_replication_lag(),
         check_disk_headroom(),
+        await check_mirror_disk_headroom(),
         check_version_path(target_version=target_version),
         check_quorum(),
     ]

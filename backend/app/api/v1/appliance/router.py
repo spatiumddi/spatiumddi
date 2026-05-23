@@ -27,6 +27,7 @@ from app.api.v1.appliance.diagnostics import router as diagnostics_router
 from app.api.v1.appliance.pairing import router as pairing_router
 from app.api.v1.appliance.releases import router as releases_router
 from app.api.v1.appliance.slot import router as slot_router
+from app.api.v1.appliance.slot_image_mirror import router as slot_image_mirror_router
 from app.api.v1.appliance.slot_images import router as slot_images_router
 from app.api.v1.appliance.supervisor import router as supervisor_router
 from app.api.v1.appliance.system import router as system_router
@@ -46,6 +47,18 @@ router.include_router(slot_router, prefix="/slot-upgrade")
 # the ``/slot-images`` prefix in their decorators, so no nested
 # prefix here (matches the supervisor + pairing routers' shape).
 router.include_router(slot_images_router)
+# #296 Phase B — slot-image-mirror internal byte-op endpoints (PUT /
+# GET / DELETE under /internal/slot-images/{id}) ONLY register on
+# the mirror Deployment. The main api Deployment leaves the
+# settings.slot_image_mirror_mode flag false, so requests landing
+# here from a misrouted operator get a 404 from the router, not a
+# 500 or a partial accept. The endpoints themselves verify the
+# X-Mirror-Auth shared-secret header on top of this gate.
+if settings.slot_image_mirror_mode:
+    router.include_router(
+        slot_image_mirror_router,
+        prefix="/internal/slot-images",
+    )
 router.include_router(containers_router, prefix="/containers")
 router.include_router(diagnostics_router, prefix="/diagnostics")
 router.include_router(system_router, prefix="/system")

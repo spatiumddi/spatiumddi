@@ -104,6 +104,29 @@ class Settings(BaseSettings):
     # warning regardless of this flag. See #216.
     strict_secret_key: bool = False
 
+    # #296 Phase B — slot-image mirror config.
+    #
+    # ``slot_image_mirror_url`` — when set, the slot-image upload +
+    # download + delete handlers stream byte ops to this URL instead
+    # of touching local FS. The mirror is a single-replica Deployment
+    # with a node-pinned local-path PVC (see
+    # charts/spatiumddi/templates/slot-image-mirror.yaml). Empty on
+    # docker-compose / single-instance shapes — the api keeps its
+    # current "write to /var/lib/spatiumddi/slot-images" behaviour
+    # via the existing named volume.
+    slot_image_mirror_url: str = ""
+    # ``slot_image_mirror_secret`` — shared HMAC secret between the
+    # api and the mirror. The api adds an ``X-Mirror-Auth`` header on
+    # every internal call; the mirror verifies it before serving any
+    # byte op. Defence in depth alongside the in-cluster Service
+    # isolation. Auto-populated from the chart-rendered k8s Secret.
+    slot_image_mirror_secret: str = ""
+    # ``slot_image_mirror_mode`` — set on the mirror Deployment only.
+    # Flips the api process into "I am the byte store" mode so the
+    # ``/internal/slot-images`` endpoints accept X-Mirror-Auth
+    # traffic. Leave false on every other api Deployment.
+    slot_image_mirror_mode: bool = False
+
     # Demo mode — locks down abusable mutation surfaces (nmap, AI
     # provider creates, webhook targets, integration targets,
     # outbound mail/audit/backup, factory reset, password change)

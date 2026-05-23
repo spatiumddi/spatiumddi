@@ -219,7 +219,10 @@ async def test_run_all_overall_ok() -> None:
             report = await preflight.run_all(target_version="2026.06.01-1")
     assert report.overall == "ok"
     assert report.can_start is True
-    assert len(report.results) == 5
+    # 6 results: Phase A's 5 (inflight, replication_lag, disk_headroom,
+    # version_path, quorum) plus Phase B's mirror_disk_headroom which
+    # short-circuits to ok when ``slot_image_mirror_url`` is unset.
+    assert len(report.results) == 6
 
 
 @pytest.mark.asyncio
