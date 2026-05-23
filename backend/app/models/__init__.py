@@ -95,6 +95,7 @@ from app.models.overlay import (
 from app.models.ownership import Customer, Provider, Site
 from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
+from app.models.system_upgrade import SystemUpgradeRun
 from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
@@ -179,6 +180,7 @@ __all__ = [
     "Domain",
     "KubernetesCluster",
     "ProxmoxNode",
+    "SystemUpgradeRun",
     "TailscaleTenant",
     "UnifiController",
     "NetworkDevice",

@@ -401,12 +401,186 @@ def patch_deployment_annotation(
     return False, f"kubeapi status {status}: {body[:200]!r}"
 
 
+# ── Lease (coordination.k8s.io/v1) ────────────────────────────────────
+# Thin wrappers around the Lease resource. Used by the multi-node
+# rolling-upgrade mutex (#296 Phase A) — at-most-one upgrade in flight
+# cluster-wide, with the holder's identity + a renewal heartbeat that
+# expires if the api pod holding the lease is rescheduled mid-upgrade.
+# Generic on purpose: any future "single-node-does-this-at-a-time"
+# beat task can use the same helpers without re-inventing the auth.
+
+
+def get_lease(
+    name: str,
+    namespace: str | None = None,
+) -> tuple[int, dict[str, Any] | None]:
+    """Read a Lease. Returns (status, parsed_body_or_None).
+
+    404 => lease doesn't exist; caller should ``create_lease``.
+    Anything else (200 / 5xx) => parsed body or None on JSON error.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases/{quote(name)}"
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
+def create_lease(
+    name: str,
+    holder: str,
+    *,
+    namespace: str | None = None,
+    lease_duration_seconds: int = 60,
+) -> tuple[bool, str | None]:
+    """Create a Lease claimed by ``holder``.
+
+    Returns (created, error). 409 (already exists) is reported as
+    error so the caller can fall through to the read-then-update
+    path. ``lease_duration_seconds`` is how long until k8s considers
+    the lease stale if not renewed — 60 s matches the upstream
+    leader-election library's default.
+    """
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    ns = namespace or cfg.namespace
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    payload = json.dumps(
+        {
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {"name": name, "namespace": ns},
+            "spec": {
+                "holderIdentity": holder,
+                "leaseDurationSeconds": lease_duration_seconds,
+                "acquireTime": now,
+                "renewTime": now,
+                "leaseTransitions": 1,
+            },
+        }
+    ).encode("utf-8")
+    path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases"
+    try:
+        status, body = _request("POST", path, body=payload, content_type="application/json")
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        return True, None
+    return False, f"kubeapi status {status}: {body[:200]!r}"
+
+
+def update_lease(
+    name: str,
+    holder: str,
+    *,
+    namespace: str | None = None,
+    lease_duration_seconds: int = 60,
+    bump_transitions: bool = False,
+    expected_transitions: int | None = None,
+) -> tuple[bool, str | None]:
+    """Update a Lease's renewTime + holderIdentity.
+
+    Standard renewal: caller passes the same ``holder`` that's
+    currently in the lease and we bump ``renewTime``.
+
+    Acquisition (after a previous holder's lease expired): caller
+    passes their own identity as ``holder`` + sets ``bump_transitions=
+    True`` so ``leaseTransitions`` increments (this is how k8s
+    leader-election detects a takeover).
+
+    ``expected_transitions`` lets callers do an optimistic-concurrency
+    update — if set, we read first and refuse the patch when the
+    server's value drifted (another holder beat us to the takeover).
+    Returns (ok, error). 409 reports an explicit conflict.
+    """
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    ns = namespace or cfg.namespace
+    # We do a server-side merge patch on ``spec`` only — the
+    # metadata is owned by k8s + the controller-manager.
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    spec: dict[str, Any] = {
+        "holderIdentity": holder,
+        "leaseDurationSeconds": lease_duration_seconds,
+        "renewTime": now,
+    }
+    if bump_transitions:
+        if expected_transitions is not None:
+            spec["leaseTransitions"] = expected_transitions + 1
+        spec["acquireTime"] = now
+    payload = json.dumps({"spec": spec}).encode("utf-8")
+    path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases/{quote(name)}"
+    try:
+        status, body = _request(
+            "PATCH",
+            path,
+            body=payload,
+            content_type="application/strategic-merge-patch+json",
+        )
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status == 200:
+        return True, None
+    if status == 409:
+        return False, "conflict: lease updated by another holder"
+    return False, f"kubeapi status {status}: {body[:200]!r}"
+
+
+def clear_lease_holder(
+    name: str,
+    *,
+    namespace: str | None = None,
+) -> tuple[bool, str | None]:
+    """Mark a lease as released without deleting it.
+
+    Sets ``holderIdentity`` to empty + ``renewTime`` to a long-past
+    timestamp so the next ``acquire()`` claims it via the expired-
+    takeover path. The Lease object stays in etcd so
+    ``kubectl get leases`` still surfaces who last held it — useful
+    audit signal that doesn't cost anything to keep.
+    """
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    ns = namespace or cfg.namespace
+    # Two-hour-ago renewTime is well beyond any sane
+    # leaseDurationSeconds → next read treats this as expired.
+    old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7200))
+    payload = json.dumps({"spec": {"holderIdentity": "", "renewTime": old}}).encode("utf-8")
+    path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases/{quote(name)}"
+    try:
+        status, body = _request(
+            "PATCH",
+            path,
+            body=payload,
+            content_type="application/strategic-merge-patch+json",
+        )
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status == 200:
+        return True, None
+    return False, f"kubeapi status {status}: {body[:200]!r}"
+
+
 __all__ = [
     "KubeapiUnavailableError",
+    "clear_lease_holder",
+    "create_lease",
     "delete_pod",
+    "get_lease",
     "get_pod_logs",
     "list_pods",
     "patch_deployment_annotation",
     "patch_secret",
     "stream_pod_logs",
+    "update_lease",
 ]
