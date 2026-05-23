@@ -112,6 +112,7 @@ backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:93
 backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:94
 backend/alembic/versions/a8d2e91f5c47_appliance_variant.py:drop_column:38
 backend/alembic/versions/a8d31e6b2f47_ipv6_allocation_policy.py:drop_column:38
+backend/alembic/versions/a8e3f127c094_system_upgrade_run.py:drop_table:115
 backend/alembic/versions/a917b4c9e251_kubernetes_provenance.py:drop_column:50
 backend/alembic/versions/a91f72c4b1d8_appliance_slot_versions_and_boot_control.py:drop_column:67
 backend/alembic/versions/a91f72c4b1d8_appliance_slot_versions_and_boot_control.py:drop_column:68
