@@ -40,6 +40,9 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
+      # #296 Phase A2 — see dns-bind9.yaml for the rationale. pdns_server
+      # flushes in-flight queries on SIGTERM; 30 s matches BIND9.
+      terminationGracePeriodSeconds: 30
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}
         # Phase 10 (#183) — per-role scheduling label.
@@ -67,11 +70,21 @@ spec:
             - name: dns-tcp
               containerPort: 53
               protocol: TCP
+          # #296 Phase A2 — marker + ``dig id.server CH TXT`` (the PowerDNS
+          # analogue of BIND's ``version.bind`` CHAOS query, independent
+          # of any zone state, same shape as the image's HEALTHCHECK).
+          # See dns-bind9.yaml for the full rationale on why the marker
+          # gate matters for rolling upgrade.
           readinessProbe:
-            tcpSocket:
-              port: 53
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -f /var/lib/spatium-dns-agent/.ready && dig @127.0.0.1 -p 53 id.server CH TXT +short +timeout=2 +tries=1 >/dev/null"
             initialDelaySeconds: 5
             periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
           livenessProbe:
             tcpSocket:
               port: 53
