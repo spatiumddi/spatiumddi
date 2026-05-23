@@ -571,16 +571,296 @@ def clear_lease_holder(
     return False, f"kubeapi status {status}: {body[:200]!r}"
 
 
+# ── Node + drain primitives (#296 Phase C) ─────────────────────────────
+# Wrappers used by the per-node rolling-upgrade primitive. Each is
+# idempotent so a resumed orchestrator (e.g. after an api pod
+# reschedule mid-upgrade) can re-issue them without double-counting.
+
+
+def get_node(name: str) -> tuple[int, dict[str, Any] | None]:
+    """Read a Node. Returns (status, parsed_body_or_None)."""
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    path = f"/api/v1/nodes/{quote(name)}"
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
+def list_nodes(
+    label_selector: str | None = None,
+) -> tuple[int, list[dict[str, Any]]]:
+    """List Nodes, optionally filtered by label selector.
+
+    Returns (status, items). On non-200 returns the status + empty list
+    so the caller can branch cleanly without a None check.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    path = "/api/v1/nodes"
+    if label_selector:
+        path += f"?labelSelector={quote(label_selector)}"
+    status, body = _request("GET", path)
+    if status != 200:
+        return status, []
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return status, []
+    items = data.get("items") or []
+    return status, items
+
+
+def cordon_node(name: str) -> tuple[bool, str | None]:
+    """Mark a Node unschedulable (idempotent — k8s no-ops if already true)."""
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    payload = json.dumps({"spec": {"unschedulable": True}}).encode("utf-8")
+    path = f"/api/v1/nodes/{quote(name)}"
+    try:
+        status, body = _request(
+            "PATCH",
+            path,
+            body=payload,
+            content_type="application/strategic-merge-patch+json",
+        )
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        return True, None
+    return False, f"kubeapi status {status}: {body[:200]!r}"
+
+
+def uncordon_node(name: str) -> tuple[bool, str | None]:
+    """Clear unschedulable on a Node (idempotent)."""
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    # Explicitly setting to None so a strategic-merge-patch removes the
+    # field rather than ambiguously leaving it. ``unschedulable: false``
+    # is also valid; either has the same effect post-PATCH.
+    payload = json.dumps({"spec": {"unschedulable": False}}).encode("utf-8")
+    path = f"/api/v1/nodes/{quote(name)}"
+    try:
+        status, body = _request(
+            "PATCH",
+            path,
+            body=payload,
+            content_type="application/strategic-merge-patch+json",
+        )
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        return True, None
+    return False, f"kubeapi status {status}: {body[:200]!r}"
+
+
+def is_node_ready(node: dict[str, Any]) -> bool:
+    """True if the node's ``Ready`` condition is ``True``.
+
+    Defensive against a missing status block (a node mid-add can
+    surface that briefly).
+    """
+    conditions = (node.get("status") or {}).get("conditions") or []
+    return any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
+
+
+def list_pods_on_node(node_name: str) -> list[dict[str, Any]]:
+    """List all pods scheduled on ``node_name`` cluster-wide.
+
+    Uses ``fieldSelector=spec.nodeName=<n>`` so we filter server-side
+    rather than walking every namespace's pod list. Returns the raw
+    PodList ``items`` array.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    path = f"/api/v1/pods?fieldSelector=spec.nodeName%3D{quote(node_name)}"
+    status, body = _request("GET", path)
+    if status != 200:
+        raise KubeapiUnavailableError(
+            f"list pods-on-node {node_name} returned {status}: {body[:200]!r}"
+        )
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise KubeapiUnavailableError(f"list pods-on-node bad json: {exc}") from exc
+    return data.get("items") or []
+
+
+def pod_is_owned_by_daemonset(pod: dict[str, Any]) -> bool:
+    """True if any ownerReference on the pod is a DaemonSet.
+
+    Used by drain to skip DS pods — they reboot in place with the
+    node, exactly the same semantic as ``kubectl drain
+    --ignore-daemonsets``. The controller field is the standard
+    ownerReferences entry from the pod metadata.
+    """
+    owners = (pod.get("metadata") or {}).get("ownerReferences") or []
+    return any(o.get("kind") == "DaemonSet" for o in owners)
+
+
+def pod_is_terminal(pod: dict[str, Any]) -> bool:
+    """True if pod.status.phase is Succeeded or Failed.
+
+    Drain skips terminal pods — they're already done; evicting them
+    is a no-op that just adds noise to the log.
+    """
+    phase = (pod.get("status") or {}).get("phase")
+    return phase in ("Succeeded", "Failed")
+
+
+def pod_is_mirror(pod: dict[str, Any]) -> bool:
+    """True if the pod is a static-mirror pod (managed by kubelet,
+    not by the api server).
+
+    Mirror pods carry ``kubernetes.io/config.mirror`` in their
+    annotations and can't be evicted via the API — they're owned by
+    the node's kubelet config dir directly. kubectl drain skips
+    these for the same reason.
+    """
+    annotations = (pod.get("metadata") or {}).get("annotations") or {}
+    return "kubernetes.io/config.mirror" in annotations
+
+
+def evict_pod(
+    name: str,
+    namespace: str,
+    *,
+    grace_period_seconds: int | None = None,
+) -> tuple[int, str | None]:
+    """POST an Eviction subresource for a pod.
+
+    Returns (status, error). Status codes the caller cares about:
+
+    * 200/201 — eviction accepted; pod will start terminating.
+    * 404     — pod already gone (race with drain or another evictor);
+                treat as success.
+    * 429     — PDB blocks; caller retries.
+    * 500+    — other failure; surface to operator.
+
+    The eviction body uses ``policy/v1`` (GA since k8s 1.22).
+    """
+    cfg = get_config()
+    if cfg is None:
+        return -1, "ServiceAccount not mounted"
+    spec: dict[str, Any] = {
+        "apiVersion": "policy/v1",
+        "kind": "Eviction",
+        "metadata": {"name": name, "namespace": namespace},
+    }
+    if grace_period_seconds is not None:
+        spec["deleteOptions"] = {"gracePeriodSeconds": grace_period_seconds}
+    payload = json.dumps(spec).encode("utf-8")
+    path = f"/api/v1/namespaces/{quote(namespace)}/pods/{quote(name)}/eviction"
+    try:
+        status, body = _request("POST", path, body=payload, content_type="application/json")
+    except KubeapiUnavailableError as exc:
+        return -1, str(exc)
+    if status in (200, 201, 404):
+        return status, None
+    return status, body[:200].decode("utf-8", errors="replace")
+
+
+# ── CNPG Cluster CR primitives (#296 Phase C) ──────────────────────────
+# Tiny wrapper layer over the CNPG operator's Cluster resource.
+# Identical pattern to the supervisor's k8s_api.patch_cnpg_instances —
+# centralised here so the rolling-upgrade primitive can read +
+# mutate the Cluster's maintenance window without duplicating the
+# CR path math.
+
+
+def get_cnpg_cluster(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:
+    """Read a CNPG ``postgresql.cnpg.io/v1`` Cluster CR.
+
+    Returns (status, parsed_body_or_None). 404 + non-2xx come back as
+    just status + None so the caller can branch without an exception.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = f"/apis/postgresql.cnpg.io/v1/namespaces/{quote(ns)}/clusters/{quote(name)}"
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
+def patch_cnpg_maintenance_window(
+    name: str,
+    *,
+    in_progress: bool,
+    reuse_pvc: bool = True,
+    namespace: str | None = None,
+) -> tuple[bool, str | None]:
+    """Stamp / clear ``spec.nodeMaintenanceWindow`` on a CNPG Cluster.
+
+    The CNPG-blessed pattern for "we're about to drain a node, leave
+    the PVC alone + suspend the PDB until I clear this." See the
+    Phase C primitive in #296 + the CNPG kubernetes_upgrade doc.
+    """
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    ns = namespace or cfg.namespace
+    payload = json.dumps(
+        {
+            "spec": {
+                "nodeMaintenanceWindow": {
+                    "inProgress": in_progress,
+                    "reusePVC": reuse_pvc,
+                }
+            }
+        }
+    ).encode("utf-8")
+    path = f"/apis/postgresql.cnpg.io/v1/namespaces/{quote(ns)}/clusters/{quote(name)}"
+    try:
+        status, body = _request(
+            "PATCH",
+            path,
+            body=payload,
+            content_type="application/merge-patch+json",
+        )
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        return True, None
+    return False, f"kubeapi status {status}: {body[:200]!r}"
+
+
 __all__ = [
     "KubeapiUnavailableError",
     "clear_lease_holder",
+    "cordon_node",
     "create_lease",
     "delete_pod",
+    "evict_pod",
+    "get_cnpg_cluster",
     "get_lease",
+    "get_node",
     "get_pod_logs",
+    "is_node_ready",
+    "list_nodes",
     "list_pods",
+    "list_pods_on_node",
+    "patch_cnpg_maintenance_window",
     "patch_deployment_annotation",
     "patch_secret",
+    "pod_is_owned_by_daemonset",
+    "pod_is_mirror",
+    "pod_is_terminal",
     "stream_pod_logs",
+    "uncordon_node",
     "update_lease",
 ]
