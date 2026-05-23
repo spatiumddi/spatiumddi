@@ -82,6 +82,19 @@ api:
   # ``settings.appliance_mode`` gate.
   serviceAccount:
     enabled: false
+  # #296 Phase C/D/E — opt-in cluster-scoped + kube-system RBAC for
+  # the rolling-upgrade orchestrator. When ``enabled: true`` the api
+  # SA can: cordon/uncordon Nodes (cluster-scoped); list+evict pods
+  # cluster-wide (drain); GET+PATCH the CNPG Cluster CR
+  # (nodeMaintenanceWindow); manage the orchestrator's Lease in the
+  # api's own namespace; GET+PATCH HelmChartConfigs in kube-system
+  # (chart image-tag bump after every node is on the new slot).
+  # Plain docker/k8s deploys that don't run the rolling upgrade flow
+  # leave this off — the api stays scoped to namespace-only Pod /
+  # Secret / Deployment grants and can't touch cluster-scoped
+  # resources at all.
+  upgradeOrchestratorRBAC:
+    enabled: false
   # Appliance host bind mounts. The api writes the setup-complete
   # flag, slot-upgrade trigger files, rollback triggers, and the
   # maintenance flag into ``/var/lib/spatiumddi-host/release-state/``

@@ -839,18 +839,184 @@ def patch_cnpg_maintenance_window(
     return False, f"kubeapi status {status}: {body[:200]!r}"
 
 
+# ── HelmChartConfig + rollout primitives (#296 Phase E) ────────────────
+# The orchestrator's post-loop chart bump patches the same
+# ``helm.cattle.io/v1`` HelmChartConfig CR the supervisor writes to
+# for cp-size / VIP overrides. Helpers mirror the supervisor's
+# ``_helmchartconfig_upsert`` shape so both sides converge on identical
+# kubeapi semantics — see agent/supervisor/spatium_supervisor/k8s_api.py
+# for the durability rationale.
+
+
+def get_helmchartconfig(
+    name: str, namespace: str = "kube-system"
+) -> tuple[int, dict[str, Any] | None]:
+    """Read a HelmChartConfig CR. ``kube-system`` is the k3s default
+    namespace for chart configs.  Returns (status, parsed_body_or_None)
+    so the caller can branch on 404 cleanly."""
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    path = (
+        f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}" f"/helmchartconfigs/{quote(name)}"
+    )
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
+def upsert_helmchartconfig(
+    name: str,
+    values_yaml: str,
+    *,
+    namespace: str = "kube-system",
+) -> tuple[bool, str | None]:
+    """Create-or-update the HelmChartConfig so its ``spec.valuesContent``
+    equals ``values_yaml``. Idempotent — returns ``(True, None)`` when
+    already current. Same shape as the supervisor's
+    ``_helmchartconfig_upsert``."""
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    base = f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}/helmchartconfigs"
+    path = f"{base}/{quote(name)}"
+    try:
+        status, resp = _request("GET", path)
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status == 200:
+        try:
+            current = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
+        except (json.JSONDecodeError, ValueError):
+            current = None
+        if current == values_yaml:
+            return True, None
+        patch = json.dumps({"spec": {"valuesContent": values_yaml}}).encode("utf-8")
+        try:
+            st, rb = _request(
+                "PATCH", path, body=patch, content_type="application/merge-patch+json"
+            )
+        except KubeapiUnavailableError as exc:
+            return False, str(exc)
+        if st in (200, 201):
+            return True, None
+        return False, f"PATCH status {st}: {rb[:200]!r}"
+    if status != 404:
+        return False, f"kubeapi GET status {status}"
+    body = json.dumps(
+        {
+            "apiVersion": "helm.cattle.io/v1",
+            "kind": "HelmChartConfig",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {"valuesContent": values_yaml},
+        }
+    ).encode("utf-8")
+    try:
+        st, rb = _request("POST", base, body=body, content_type="application/json")
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if st in (200, 201):
+        return True, None
+    return False, f"POST status {st}: {rb[:200]!r}"
+
+
+def get_deployment(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:
+    """Read a Deployment. Used by the rollout-poll path to inspect
+    ``status.observedGeneration`` + ``status.updatedReplicas`` to know
+    when a chart bump's rolling update has settled."""
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = f"/apis/apps/v1/namespaces/{quote(ns)}/deployments/{quote(name)}"
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
+def deployment_is_rolled_out(deployment: dict[str, Any]) -> bool:
+    """True when a Deployment's rolling update has finished.
+
+    Matches ``kubectl rollout status`` semantics:
+
+    * ``status.observedGeneration`` >= ``metadata.generation`` (the
+      controller has seen the latest spec change).
+    * ``status.updatedReplicas`` >= ``spec.replicas`` (the new RS has
+      ramped to the desired count).
+    * ``status.availableReplicas`` >= ``spec.replicas`` (every pod
+      passed readiness; old RS is fully drained).
+    """
+    meta = deployment.get("metadata") or {}
+    spec = deployment.get("spec") or {}
+    status = deployment.get("status") or {}
+    spec_replicas = int(spec.get("replicas") or 0)
+    if spec_replicas == 0:
+        # Scaled to zero — trivially rolled out.
+        return True
+    return (
+        int(status.get("observedGeneration") or 0) >= int(meta.get("generation") or 0)
+        and int(status.get("updatedReplicas") or 0) >= spec_replicas
+        and int(status.get("availableReplicas") or 0) >= spec_replicas
+    )
+
+
+def get_job(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:
+    """Read a batch/v1 Job. The migrate Job's ``status.succeeded`` /
+    ``status.failed`` counters tell us whether the chart-bump's
+    schema migration ran cleanly."""
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = f"/apis/batch/v1/namespaces/{quote(ns)}/jobs/{quote(name)}"
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
+def job_terminal_state(job: dict[str, Any]) -> str | None:
+    """``'succeeded'`` / ``'failed'`` / ``None`` (still running).
+
+    The chart-bump's migrate Job is helm-hook-managed; we poll until
+    it transitions out of running so we can flip the orchestrator's
+    run state cleanly."""
+    status = job.get("status") or {}
+    if int(status.get("succeeded") or 0) >= 1:
+        return "succeeded"
+    if int(status.get("failed") or 0) >= 1:
+        return "failed"
+    return None
+
+
 __all__ = [
     "KubeapiUnavailableError",
     "clear_lease_holder",
     "cordon_node",
     "create_lease",
     "delete_pod",
+    "deployment_is_rolled_out",
     "evict_pod",
     "get_cnpg_cluster",
+    "get_deployment",
+    "get_helmchartconfig",
+    "get_job",
     "get_lease",
     "get_node",
     "get_pod_logs",
     "is_node_ready",
+    "job_terminal_state",
     "list_nodes",
     "list_pods",
     "list_pods_on_node",
@@ -863,4 +1029,5 @@ __all__ = [
     "stream_pod_logs",
     "uncordon_node",
     "update_lease",
+    "upsert_helmchartconfig",
 ]

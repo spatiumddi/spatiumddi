@@ -51,7 +51,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.audit import AuditLog
 from app.models.system_upgrade import LIFECYCLE_STATES, SystemUpgradeRun
 from app.services.appliance import k8s
-from app.services.upgrades import mutex, node_order, per_node, preflight
+from app.services.upgrades import chart_bump, mutex, node_order, per_node, preflight
 
 logger = structlog.get_logger(__name__)
 
@@ -524,19 +524,75 @@ async def _drive_loop(
         ]
         next_node = node_order.next_node_to_upgrade(plan_order, completed_nodes)
         if next_node is None:
-            # Every node done — transition to succeeded.
+            # Every node committed the new slot. Phase E — bump the
+            # chart's image.tag so the api / worker / frontend
+            # Deployments roll onto the new application code +
+            # migrate Job runs against the new schema. Until this
+            # fires, every pod is still on N-1 code despite N-baked
+            # images sitting on every node's new slot. The bump is
+            # idempotent so a resumed orchestrator (worker died
+            # between the all-nodes-done state + the chart bump
+            # completion) re-runs cleanly.
+            await _record_event(
+                db,
+                run,
+                "all_nodes_complete",
+                chart_bump_starting=True,
+            )
+            await db.commit()
+            chart_name: str = run.plan.get("chart_name") or chart_bump.DEFAULT_CHART_NAME
+            chart_ns: str = run.plan.get("chart_namespace") or chart_bump.DEFAULT_CHART_NS
+            release_ns: str = run.plan.get("release_namespace") or chart_bump.DEFAULT_RELEASE_NS
+            bump = await chart_bump.bump_chart_image_tag(
+                run.target_version,
+                chart_name=chart_name,
+                chart_namespace=chart_ns,
+                release_namespace=release_ns,
+            )
+            run.progress = {
+                **run.progress,
+                "chart_bump": chart_bump.result_to_dict(bump),
+            }
+            if not bump.ok:
+                run.last_error = f"chart bump to {run.target_version} failed: {bump.error}"
+                await _transition(
+                    db,
+                    run,
+                    "failed",
+                    allowed_from=("running",),
+                    event="chart_bump_failed",
+                    error=bump.error,
+                )
+                await db.commit()
+                ok, err = mutex.release()
+                if not ok:
+                    logger.warning("upgrade_lease_release_failed", error=err)
+                logger.warning(
+                    "upgrade_chart_bump_failed",
+                    run_id=str(run.id),
+                    error=bump.error,
+                )
+                return
+
             await _transition(
                 db,
                 run,
                 "succeeded",
                 allowed_from=("running",),
-                event="all_nodes_complete",
+                event="chart_bump_complete",
+                rolled_deployments=bump.rolled_deployments,
+                migrate_job_state=bump.migrate_job_state,
+                skipped=bump.skipped,
             )
             await db.commit()
             ok, err = mutex.release()
             if not ok:
                 logger.warning("upgrade_lease_release_failed", error=err)
-            logger.info("upgrade_succeeded", run_id=str(run.id))
+            logger.info(
+                "upgrade_succeeded",
+                run_id=str(run.id),
+                rolled=bump.rolled_deployments,
+            )
             return
 
         # Drive Phase C for this node.
