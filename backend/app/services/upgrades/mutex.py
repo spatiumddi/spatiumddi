@@ -152,7 +152,11 @@ def get_state(*, namespace: str | None = None) -> LeaseState:
     return _parse_lease(body)
 
 
-def acquire(*, namespace: str | None = None) -> tuple[bool, str | None]:
+def acquire(
+    *,
+    namespace: str | None = None,
+    lease_duration_seconds: int = LEASE_DURATION_S,
+) -> tuple[bool, str | None]:
     """Acquire the upgrade lease for this api pod.
 
     Three outcomes:
@@ -166,6 +170,10 @@ def acquire(*, namespace: str | None = None) -> tuple[bool, str | None]:
     Holder identity is this api pod's hostname (see ``_identity``).
     Not idempotent across holders — if this pod already holds it,
     use ``renew()`` instead (cheaper, doesn't increment transitions).
+
+    ``lease_duration_seconds`` overrides the default for callers that
+    run long enough that 60 s would expire mid-step (Phase D's
+    orchestrator passes ~600 s).
     """
     me = _identity()
     state = get_state(namespace=namespace)
@@ -174,7 +182,7 @@ def acquire(*, namespace: str | None = None) -> tuple[bool, str | None]:
             LEASE_NAME,
             me,
             namespace=namespace,
-            lease_duration_seconds=LEASE_DURATION_S,
+            lease_duration_seconds=lease_duration_seconds,
         )
         if ok:
             return True, None
@@ -187,7 +195,7 @@ def acquire(*, namespace: str | None = None) -> tuple[bool, str | None]:
         return False, err
     if state.held and state.holder == me:
         # Already ours; renew rather than re-acquire.
-        return renew(namespace=namespace)
+        return renew(namespace=namespace, lease_duration_seconds=lease_duration_seconds)
     if state.held and state.holder != me:
         return False, f"held by {state.holder}"
     # Expired — take over with a transitions bump.
@@ -195,7 +203,7 @@ def acquire(*, namespace: str | None = None) -> tuple[bool, str | None]:
         LEASE_NAME,
         me,
         namespace=namespace,
-        lease_duration_seconds=LEASE_DURATION_S,
+        lease_duration_seconds=lease_duration_seconds,
         bump_transitions=True,
         expected_transitions=state.transitions,
     )
@@ -204,20 +212,27 @@ def acquire(*, namespace: str | None = None) -> tuple[bool, str | None]:
     return False, err
 
 
-def renew(*, namespace: str | None = None) -> tuple[bool, str | None]:
+def renew(
+    *,
+    namespace: str | None = None,
+    lease_duration_seconds: int = LEASE_DURATION_S,
+) -> tuple[bool, str | None]:
     """Renew a lease we already hold.
 
     Does NOT bump ``leaseTransitions``. Used by Phase D's orchestrator
-    on a heartbeat (every ``LEASE_DURATION_S / 3`` seconds). If renew
-    fails because someone else has taken over, the caller should halt
-    the in-flight upgrade — they no longer hold the cluster lock.
+    on a heartbeat (every ``lease_duration_seconds / 3`` seconds). If
+    renew fails because someone else has taken over, the caller should
+    halt the in-flight upgrade — they no longer hold the cluster lock.
+
+    ``lease_duration_seconds`` lets the orchestrator extend its lease
+    window beyond the 60 s default that suits short read-only operations.
     """
     me = _identity()
     return k8s.update_lease(
         LEASE_NAME,
         me,
         namespace=namespace,
-        lease_duration_seconds=LEASE_DURATION_S,
+        lease_duration_seconds=lease_duration_seconds,
     )
 
 

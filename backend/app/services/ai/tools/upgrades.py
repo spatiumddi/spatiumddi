@@ -1,15 +1,16 @@
-"""Operator Copilot tools for multi-node rolling upgrades (#296 Phase A).
+"""Operator Copilot tools for multi-node rolling upgrades (#296 Phases A + D).
 
-Phase A ships a single read-only tool — ``find_upgrade_preflight`` —
-that lets the operator ask "what would block a rolling upgrade to
-2026.06.01-1?" without leaving the chat drawer. The tool calls the
-same preflight aggregator the REST endpoint uses, so the chat answer
-matches the Fleet UI's preflight panel exactly.
+Two read-only tools today:
 
-Phases C/D will add ``find_upgrade_runs`` (history list) and
-``propose_start_upgrade`` (apply-gated write) when those surfaces
-exist. Phase A's read-only-only scope means there's nothing the model
-can do here that an operator can't already do with the REST endpoint.
+* ``find_upgrade_preflight`` (Phase A) — runs preflight against a
+  target version; same aggregator the Fleet UI's preflight panel uses.
+* ``find_upgrade_runs`` (Phase D) — lists recent SystemUpgradeRun rows
+  so the chat drawer can answer "what's the upgrade history?" /
+  "what's the current upgrade doing?".
+
+Phase G will likely add ``propose_start_upgrade`` (apply-gated write)
+when the Fleet UI lands; today the chat-driven path is read-only —
+operators start upgrades through the REST endpoint.
 
 Superadmin-gated like every other appliance/fleet tool — operator
 access only.
@@ -24,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
 from app.services.ai.tools.base import register_tool
-from app.services.upgrades import preflight
+from app.services.upgrades import orchestrator, preflight
 
 
 def _superadmin_gate(user: User) -> dict[str, Any] | None:
@@ -75,3 +76,76 @@ async def find_upgrade_preflight(
         return err
     report = await preflight.run_all(target_version=args.target_version)
     return report.to_dict()
+
+
+# ── find_upgrade_runs (Phase D) ──────────────────────────────────────
+
+
+class FindUpgradeRunsArgs(BaseModel):
+    limit: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="Most-recent-first limit on the returned rows.",
+    )
+    state: str | None = Field(
+        default=None,
+        description=(
+            "Optional filter on lifecycle state: planned / running / "
+            "succeeded / failed / halted / aborted. Omit for all states."
+        ),
+    )
+
+
+@register_tool(
+    name="find_upgrade_runs",
+    description=(
+        "List recent SystemUpgradeRun rows from the multi-node rolling-"
+        "upgrade orchestrator (superadmin only, read-only). Each row "
+        "carries target_version + state (planned|running|succeeded|"
+        "failed|halted|aborted) + node_order from the plan + per-node "
+        "progress (which nodes succeeded, which failed at what step). "
+        "Use to answer 'is an upgrade running right now?', 'why did "
+        "yesterday's upgrade fail?', 'which node bombed?', or 'when "
+        "was the last successful rolling upgrade?'."
+    ),
+    args_model=FindUpgradeRunsArgs,
+    category="admin",
+    default_enabled=True,
+    module=None,
+)
+async def find_upgrade_runs(
+    db: AsyncSession,
+    user: User,
+    args: FindUpgradeRunsArgs,
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+    rows = await orchestrator.list_recent_runs(db, limit=args.limit)
+    if args.state:
+        rows = [r for r in rows if r.state == args.state]
+    return {
+        "runs": [
+            {
+                "id": str(r.id),
+                "kind": r.kind,
+                "state": r.state,
+                "target_version": r.target_version,
+                "lease_holder": r.lease_holder,
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+                "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+                "last_error": r.last_error,
+                "node_order": (r.plan or {}).get("node_order") or [],
+                "per_node_summary": {
+                    node: {
+                        "ok": entry.get("ok"),
+                        "failed_at": entry.get("failed_at"),
+                        "error": entry.get("error"),
+                    }
+                    for node, entry in ((r.progress or {}).get("per_node") or {}).items()
+                },
+            }
+            for r in rows
+        ],
+        "count": len(rows),
+    }
