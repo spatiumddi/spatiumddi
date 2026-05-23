@@ -103,6 +103,49 @@ api:
     hostLogDir: /var/log/spatiumddi
     hostEtcDir: /etc/spatiumddi
 
+# ── Slot-image mirror (#296 Phase B) ────────────────────────────────────────
+# A single-replica Deployment + node-pinned local-path PVC + ClusterIP
+# Service that holds the slot-image bytes for air-gapped appliance
+# upgrades. Without this, the upload endpoint writes to the api pod's
+# ephemeral local FS and every other api replica 404s on the serve
+# side. The api Deployment proxies byte ops to the mirror Service when
+# ``SLOT_IMAGE_MIRROR_URL`` is set on the api (via env wiring below).
+#
+# Disabled by default — only useful for multi-replica api deployments
+# that also use the slot-image upload feature (= multi-node appliance
+# installs). Single-instance docker-compose / plain k8s installs that
+# just helm-upgrade through standard rolling updates don't need it.
+slotImageMirror:
+  enabled: false
+  storage:
+    # 32 GiB default — fits ~7-8 typical slot images (4 GiB cap each,
+    # but real images today are ~800 MiB-1.2 GiB compressed). Bump
+    # via ``kubectl patch pvc`` if you keep more historical
+    # versions; the chart never resizes in place (helm.sh/resource-
+    # policy: keep on the PVC).
+    size: 32Gi
+    # Empty => uses the cluster's default StorageClass. The
+    # appliance uses ``local-path`` (k3s default), which is RWO +
+    # node-pinned — exactly the property we want here.
+    storageClass: ""
+  resources:
+    # Mostly idle process serving multipart streams. Resources match
+    # the api defaults so we can reuse the image without surprise
+    # OOM behaviour during a large upload.
+    requests: { cpu: 50m, memory: 128Mi }
+    limits:   { cpu: 500m, memory: 256Mi }
+  nodeSelector: {}
+  tolerations: []
+  auth:
+    # Optional operator-provided shared secret used in the
+    # ``X-Mirror-Auth`` header the api adds when proxying byte ops
+    # to the mirror. Empty => the chart generates a 64-char hex
+    # string on first install + persists it via the
+    # ``helm.sh/resource-policy: keep`` annotation on the Secret.
+    # Set only if you're consolidating secret management against
+    # an external vault.
+    secret: ""
+
 # ── Frontend (nginx + Vite build) ────────────────────────────────────────────
 frontend:
   replicas: 2
