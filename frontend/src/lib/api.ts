@@ -7308,9 +7308,19 @@ export interface ClusterUpgradePlanResponse {
   preflight: PreflightPlanRow[];
 }
 
+// Two source modes for the slot image — exactly one must be set.
+// ``slot_image_url`` is the connected / online path (operator pastes
+// an HTTPS URL like a GitHub release asset). ``slot_image_id`` is the
+// air-gap path: operator first uploads the .raw.xz via
+// ``applianceSlotImagesApi.upload`` (in the Fleet → Slot images
+// panel), then references the returned id here. The control plane
+// composes the authenticated internal URL server-side so every node's
+// host runner pulls bytes through the same control-plane → mirror
+// pipe as the per-box upgrade flow.
 export interface ClusterUpgradePlanRequest {
   target_version: string;
-  slot_image_url: string;
+  slot_image_url?: string;
+  slot_image_id?: string;
   cnpg_cluster_name?: string;
   cnpg_namespace?: string | null;
 }

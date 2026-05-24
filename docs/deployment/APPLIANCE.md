@@ -844,6 +844,115 @@ target version + agent ID; failed upgrades surface via the
 heartbeat's `last_upgrade_state = "failed"` so the Fleet UI can
 render a red state pill without polling per-agent endpoints.
 
+### 5d. Multi-node rolling cluster upgrade (#296)
+
+Same A/B slot machinery as 5b/5c, walked across **every node of the
+cluster** under coordination from one driver pod. Lives in
+`/appliance` → **Rolling Upgrade** tab; runs against the local
+control-plane cluster itself, not the registered agent fleet.
+
+**Two source modes for the slot image:**
+
+1. **Uploaded image** (air-gap). Operator uploads the `.raw.xz` +
+   sha256 sidecar once in **Fleet → Slot images**. The image is
+   stored on the in-cluster mirror PVC (`slot-image-mirror`
+   Deployment + PVC, gated behind `slotImageMirror.enabled`). On the
+   Rolling Upgrade tab the operator picks it from the dropdown — the
+   control plane composes an authenticated download URL with an HMAC
+   token, every per-node host runner pulls bytes through the same
+   control-plane → mirror pipe. No node ever talks to github.com.
+2. **URL** (connected install). Operator pastes the GitHub release
+   asset URL — same `https://github.com/.../spatiumddi-appliance-
+   slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches
+   independently.
+
+The tab's source toggle defaults to **Uploaded** when at least one
+image is on file; otherwise falls back to **URL**. The empty-state
+copy on the Uploaded picker points back to **Fleet → Slot images**
+so a first-time operator never gets stuck looking for the upload.
+
+**Flow (operator-facing):**
+
+1. Operator opens `/appliance` → **Rolling Upgrade**.
+2. Types the **Target version (CalVer)**. Tab refuses any tag that
+   doesn't match `YYYY.MM.DD-N` (preflight's `version_path` check).
+3. Picks source (Uploaded or URL — see above).
+4. Clicks **Run preflight**. Verdict surfaces inline as a checklist:
+   `inflight_conflict`, `replication_lag`, `disk_headroom`,
+   `mirror_disk_headroom` (mirror PVC; skipped if not configured),
+   `version_path`, `quorum`. Any `fail` blocks Plan; `warn` lets
+   Plan proceed but flags the row.
+5. Clicks **Plan**. A `system_upgrade_run` row is inserted in
+   `state='planned'` with the captured node order + the preflight
+   snapshot. Lease is **not** acquired yet.
+6. Clicks **Start**. Lease is claimed (`spatium-upgrade-lock` in
+   `coordination.k8s.io/v1/Lease`); the orchestrator celery task
+   begins walking nodes. Each node's primitive is:
+   cordon → CNPG switchover (if primary lands there) → drain →
+   `spatium-upgrade-slot apply` → set-next-boot → reboot →
+   health-gate → DaemonSet-ready gate → uncordon → settle pause.
+7. Live progress streams into the Plan banner (per-node state pills
+   + ETA). Halt / Resume / Abort buttons exposed.
+8. After every node is on the new slot, the orchestrator patches the
+   spatiumddi chart's `image.tag` via a HelmChartConfig (so api /
+   frontend / worker container images land too), waits for the
+   rollout, runs the migrate Job, and posts the cluster-wide
+   verification suite (CNPG instance count, DaemonSet pods Ready).
+9. Run flips to `state='succeeded'` (or `failed` / `halted` /
+   `aborted`). Lease is released. The OS Versions tab shows the new
+   default slot on every node.
+
+**Air-gap operator workflow (TL;DR):**
+
+```
+1. On a workstation with internet:
+   wget https://github.com/spatiumddi/spatiumddi/releases/download/
+        2026.06.01-1/spatiumddi-appliance-slot-amd64.raw.xz
+   wget https://github.com/spatiumddi/spatiumddi/releases/download/
+        2026.06.01-1/spatiumddi-appliance-slot-amd64.sha256
+
+2. Copy both files to the airgap LAN (USB stick, SCP through a jump
+   host, whatever your security team approves).
+
+3. In the SpatiumDDI UI (control-plane node, any operator browser
+   that can reach the cluster):
+     a. Fleet → Slot images → Upload .raw.xz + paste the SHA-256 +
+        type the CalVer tag → Upload. Bytes stream through the api
+        to the mirror PVC.
+     b. Rolling Upgrade → type 2026.06.01-1 → leave source as
+        "Uploaded" → pick the just-uploaded image from the dropdown
+        → Run preflight → review → Plan → Start.
+
+4. Watch the per-node progress pills. Done in ~10-15 min on a
+   3-node cluster; nodes go offline ~30-60 s each during reboot.
+```
+
+**Required RBAC.** The api pod's ServiceAccount needs the
+`api.upgradeOrchestratorRBAC` grants (namespace-scoped Deployments
++ Jobs + CNPG Cluster patch + Lease CRUD; cluster-scoped Nodes +
+Pods + pods/eviction; helm.cattle.io HelmChartConfigs in
+kube-system). Appliance installs flip this on at firstboot via
+`upgradeOrchestratorRBAC.enabled: true` in the `spatium-control`
+HelmChart's `valuesContent` (committed in `spatiumddi-firstboot`).
+Docker / plain-k8s installs leave it off by default — the rolling
+upgrade flow doesn't apply there. If preflight surfaces
+`inflight_conflict: lease held by '<rbac-missing>'`, the api SA is
+missing this grant; the live appliance fix is one `kubectl patch`
+on the seed `HelmChart spatium-control` (see #298 PR description
+for the one-liner).
+
+**Why a Lease + a DB row + a partial unique index?** Three nested
+defences against concurrent rollouts:
+- The Lease is the real cluster-wide lock (etcd-backed, expiry-
+  driven, survives DB blips).
+- The DB row is the audit trail + resumable state (per-node
+  progress, preflight verdict, last error).
+- The partial unique index
+  `ix_system_upgrade_run_one_active WHERE state IN ('planned',
+  'running', 'halted')` is the bug-budget backstop — a buggy
+  orchestrator can't race two rows into running at once even if it
+  ignores the Lease.
+
 ### Future: update channels (Phase 8d, pending)
 
 ```

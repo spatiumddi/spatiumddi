@@ -869,6 +869,15 @@ concern:
   release, optionally bulk-select agents, click Apply.
   Failed upgrades auto-revert on the next reboot; rollback
   is a single click.
+- **Rolling Upgrade** — coordinated, one-node-at-a-time
+  upgrade of every node in the local control-plane cluster
+  (preflight → CNPG cordon-triggered switchover → drain →
+  slot apply → reboot → health-gate → DaemonSet-ready gate
+  → uncordon → chart `image.tag` bump → migrate Job → post-
+  upgrade verification). Two source modes: upload `.raw.xz`
+  to the in-cluster mirror PVC (air-gap) or paste a GitHub
+  release URL (online). Halt / Resume / Abort exposed.
+  Detail: [`docs/deployment/APPLIANCE.md#5d-multi-node-rolling-cluster-upgrade-296`](docs/deployment/APPLIANCE.md#5d-multi-node-rolling-cluster-upgrade-296).
 - **Pairing** — generate single-use codes to onboard agents.
 - **Releases** — GitHub releases list with one-click upgrades.
 - **Web UI Certificate** — replace the self-signed cert with

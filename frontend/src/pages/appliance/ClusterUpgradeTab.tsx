@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 
 import {
+  applianceSlotImagesApi,
   clusterUpgradesApi,
   formatApiError,
   type ClusterUpgradeFailureCategory,
@@ -23,6 +24,7 @@ import {
   type PreflightCheck,
   type PreflightLevel,
   type PreflightReport,
+  type SlotImage,
   type SystemUpgradeRun,
 } from "@/lib/api";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -203,13 +205,42 @@ function LeasePill({ lease }: { lease: ReturnType<typeof useQuery>["data"] }) {
 
 // ── Plan form ────────────────────────────────────────────────────────
 
+// Slot-image source mode for the rolling upgrade. Air-gap operators
+// upload through Fleet → Slot images then pick from the dropdown
+// here ("uploaded"); connected installs paste a GitHub release URL
+// ("url"). Default is decided dynamically: "uploaded" if at least one
+// image is on file, else "url" — so the dropdown becomes invisible
+// to operators who don't use it.
+type SlotImageSource = "uploaded" | "url";
+
 function PlanFormPanel() {
   const qc = useQueryClient();
   const [targetVersion, setTargetVersion] = useState("");
   const [slotImageUrl, setSlotImageUrl] = useState("");
+  const [slotImageId, setSlotImageId] = useState<string>("");
+  // ``null`` means "use the smart default once the slot-images query
+  // resolves"; once the operator explicitly picks one we honour it.
+  const [sourceMode, setSourceMode] = useState<SlotImageSource | null>(null);
   const [cnpgClusterName, setCnpgClusterName] = useState("");
   const [preflightTarget, setPreflightTarget] = useState<string | null>(null);
   const [planError, setPlanError] = useState<string | null>(null);
+
+  const slotImagesQuery = useQuery({
+    queryKey: ["appliance", "slot-images"],
+    queryFn: applianceSlotImagesApi.list,
+    // Slot images change rarely (operator uploads on a fresh release)
+    // — 30 s is plenty of staleness for this picker. Same cadence the
+    // FleetTab SlotImagesPanel uses so the two surfaces don't race
+    // each other in cache.
+    staleTime: 30_000,
+  });
+  const slotImages: SlotImage[] = slotImagesQuery.data ?? [];
+
+  // Resolve the effective source mode. If the operator hasn't picked
+  // explicitly, default to "uploaded" iff at least one image is on
+  // file — air-gap operators land directly on the dropdown they need.
+  const effectiveSource: SlotImageSource =
+    sourceMode ?? (slotImages.length > 0 ? "uploaded" : "url");
 
   // Preflight runs on-demand — operator types a target then clicks
   // "Run preflight" before committing to the plan. Cached by target so
@@ -237,7 +268,12 @@ function PlanFormPanel() {
     mutationFn: () =>
       clusterUpgradesApi.plan({
         target_version: targetVersion,
-        slot_image_url: slotImageUrl,
+        // Send either ``slot_image_url`` OR ``slot_image_id`` — the
+        // backend's ``PlanRequest.model_validator`` rejects "both" /
+        // "neither" with a 422 so the UI guard mirrors that shape.
+        ...(effectiveSource === "uploaded"
+          ? { slot_image_id: slotImageId }
+          : { slot_image_url: slotImageUrl }),
         cnpg_cluster_name: cnpgClusterName,
       }),
     onSuccess: () => {
@@ -246,6 +282,13 @@ function PlanFormPanel() {
     },
     onError: (err) => setPlanError(formatApiError(err)),
   });
+
+  // Disable Plan / Run preflight when no image source is resolved.
+  // "uploaded" needs a picked image_id; "url" needs a non-empty URL.
+  const sourceReady =
+    effectiveSource === "uploaded"
+      ? slotImageId.trim().length > 0
+      : slotImageUrl.trim().length > 0;
 
   const startMut = useMutation({
     mutationFn: (runId: string) => clusterUpgradesApi.start(runId),
@@ -277,18 +320,76 @@ function PlanFormPanel() {
             className="rounded-md border bg-background px-2 py-1 font-mono text-sm"
           />
         </label>
-        <label className="flex flex-col gap-1">
-          <span className="text-xs font-medium text-muted-foreground">
-            Slot image URL
-          </span>
-          <input
-            type="text"
-            placeholder="https://github.com/.../spatiumddi-appliance-slot-amd64.raw.xz"
-            value={slotImageUrl}
-            onChange={(e) => setSlotImageUrl(e.target.value)}
-            className="rounded-md border bg-background px-2 py-1 text-sm"
-          />
-        </label>
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-muted-foreground">
+              Slot image source
+            </span>
+            {/* Air-gap-friendly + online: two radio chips. Selection
+                survives until the operator changes it; the default
+                tracks "is there at least one uploaded image?" so the
+                dropdown becomes visible only when it's useful. */}
+            <div className="flex items-center gap-1 text-xs">
+              <button
+                type="button"
+                onClick={() => setSourceMode("uploaded")}
+                className={cn(
+                  "rounded-l-md border px-2 py-0.5",
+                  effectiveSource === "uploaded"
+                    ? "border-primary bg-primary/10 text-primary"
+                    : "text-muted-foreground hover:bg-muted",
+                )}
+              >
+                Uploaded
+              </button>
+              <button
+                type="button"
+                onClick={() => setSourceMode("url")}
+                className={cn(
+                  "rounded-r-md border border-l-0 px-2 py-0.5",
+                  effectiveSource === "url"
+                    ? "border-primary bg-primary/10 text-primary"
+                    : "text-muted-foreground hover:bg-muted",
+                )}
+              >
+                URL
+              </button>
+            </div>
+          </div>
+          {effectiveSource === "uploaded" ? (
+            slotImages.length === 0 ? (
+              // Empty-state copy — point to Fleet → Slot images. Air-gap
+              // workflow is unambiguous: upload there, come back here.
+              <div className="rounded-md border border-dashed bg-muted/30 px-2 py-1.5 text-xs text-muted-foreground">
+                No uploaded slot images yet. Upload <code>.raw.xz</code> in{" "}
+                <strong>Fleet → Slot images</strong>, then return here. Or
+                switch to <strong>URL</strong> for an online install.
+              </div>
+            ) : (
+              <select
+                value={slotImageId}
+                onChange={(e) => setSlotImageId(e.target.value)}
+                className="rounded-md border bg-background px-2 py-1 text-sm"
+              >
+                <option value="">— pick an uploaded image —</option>
+                {slotImages.map((img) => (
+                  <option key={img.id} value={img.id}>
+                    {img.appliance_version} · {img.filename} ·{" "}
+                    {(img.size_bytes / (1024 * 1024)).toFixed(0)} MiB
+                  </option>
+                ))}
+              </select>
+            )
+          ) : (
+            <input
+              type="text"
+              placeholder="https://github.com/.../spatiumddi-appliance-slot-amd64.raw.xz"
+              value={slotImageUrl}
+              onChange={(e) => setSlotImageUrl(e.target.value)}
+              className="rounded-md border bg-background px-2 py-1 text-sm"
+            />
+          )}
+        </div>
         <label className="flex flex-col gap-1 sm:col-span-2">
           <span className="text-xs font-medium text-muted-foreground">
             CNPG cluster name (optional)
@@ -332,7 +433,7 @@ function PlanFormPanel() {
           type="button"
           disabled={
             !targetVersion ||
-            !slotImageUrl ||
+            !sourceReady ||
             !preflight ||
             !preflight.can_start ||
             // #296 review fix — refuse Plan when the typed target

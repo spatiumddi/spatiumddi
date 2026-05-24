@@ -33,8 +33,8 @@ import uuid
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field, field_validator
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_permission
@@ -108,18 +108,55 @@ async def get_lease_state() -> LeaseStateOut:
 
 
 class PlanRequest(BaseModel):
+    """Plan a cluster-wide rolling upgrade.
+
+    Two source modes for the slot image — exactly one of them must be
+    supplied. Same shape as ``POST /appliances/{id}/upgrade`` (the per-
+    box per-appliance scheduler in supervisor.py); kept in sync so
+    operators see the same affordances on both surfaces:
+
+    * **External URL** (``slot_image_url``) — caller provides the
+      ``http(s)://…/raw.xz`` URL spatium-upgrade-slot apply will pull
+      from on each node. Used in connected environments where every
+      appliance can reach github.com (or a private mirror) directly.
+
+    * **Uploaded image** (``slot_image_id``) — an
+      ``appliance_slot_image`` row id from
+      ``POST /api/v1/appliance/slot-images`` (the air-gap upload
+      endpoint). The control plane composes the authenticated internal
+      URL on plan-acceptance, so every per-node runner pulls bytes
+      through the same control-plane → mirror path the per-box flow
+      uses. Air-gap-friendly: no per-node egress.
+
+    The version label is always required so preflight's version_path
+    check can compare CalVer tuples + auto-clear logic on the appliance
+    row can detect "installed matches desired" without sniffing the
+    binary.
+    """
+
     target_version: str = Field(
         min_length=1,
         max_length=64,
         description="CalVer tag the cluster will be upgraded to.",
     )
-    slot_image_url: str = Field(
+    slot_image_url: str | None = Field(
+        default=None,
         min_length=1,
         description=(
-            "URL the host-side ``spatium-upgrade-slot apply`` will pull "
-            "from on each node. Either the slot-image mirror's HMAC-"
-            "tokenised /raw.xz URL (air-gap) or a GitHub release asset "
-            "URL (online)."
+            "External URL the host-side ``spatium-upgrade-slot apply`` "
+            "will pull from on each node. Either a GitHub release asset "
+            "(online) or any HTTP(S)-reachable mirror. Mutually "
+            "exclusive with ``slot_image_id``."
+        ),
+    )
+    slot_image_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "ID of an uploaded slot image (``appliance_slot_image`` row "
+            "from ``POST /api/v1/appliance/slot-images``). The control "
+            "plane composes the authenticated download URL on plan + "
+            "every node pulls bytes through it. Air-gap-friendly. "
+            "Mutually exclusive with ``slot_image_url``."
         ),
     )
     cnpg_cluster_name: str = Field(
@@ -139,12 +176,14 @@ class PlanRequest(BaseModel):
 
     @field_validator("slot_image_url")
     @classmethod
-    def _validate_slot_image_url(cls, v: str) -> str:
+    def _validate_slot_image_url(cls, v: str | None) -> str | None:
         # Review polish — catch operator typos at plan time rather than
         # surfacing a confusing "unsupported scheme" error 30 min into
         # the rolling upgrade when the host runner finally tries to
         # GET the URL. Only http(s) is accepted; file:// + s3:// are
         # deliberately not supported by spatium-upgrade-slot apply.
+        if v is None:
+            return v
         from urllib.parse import urlparse  # noqa: PLC0415
 
         try:
@@ -156,6 +195,23 @@ class PlanRequest(BaseModel):
         if not parsed.netloc:
             raise ValueError("slot_image_url must include a host")
         return v
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> PlanRequest:
+        # Same "exactly one of two" pattern as the per-box ``schedule_
+        # appliance_upgrade`` (ApplianceUpgradeRequest in supervisor.py).
+        # Pydantic-level enforcement so the orchestrator never has to
+        # decide between conflicting / missing inputs at plan time.
+        has_url = self.slot_image_url is not None and self.slot_image_url.strip() != ""
+        has_id = self.slot_image_id is not None
+        if has_url == has_id:
+            raise ValueError(
+                "Pass exactly one of ``slot_image_url`` or ``slot_image_id`` — "
+                "got both, or neither. URL is for online environments that "
+                "fetch directly; ID is for air-gap fleets that upload "
+                "through ``POST /api/v1/appliance/slot-images`` first."
+            )
+        return self
 
 
 class PreflightRowOut(BaseModel):
@@ -212,18 +268,31 @@ def _row_to_schema(run: Any) -> UpgradeRunOut:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Plan a rolling upgrade — preflight + node enumeration",
 )
-async def post_plan(body: PlanRequest, current_user: CurrentUser, db: DB) -> PlanResponse:
+async def post_plan(
+    body: PlanRequest,
+    request: Request,
+    current_user: CurrentUser,
+    db: DB,
+) -> PlanResponse:
     """Run preflight + capture the upgrade plan as a ``planned`` row.
 
     Does NOT acquire the upgrade lease yet; ``POST /{run_id}/start``
     does that. Refuses if another non-terminal run already exists or
     if preflight returns ``overall='fail'``.
+
+    The ``slot_image_id`` (air-gap) branch resolves to the same
+    token-authenticated mirror URL the per-box ``schedule_appliance_
+    upgrade`` produces, so the orchestrator only ever sees a URL string
+    + every per-node runner pulls bytes through the same control-plane
+    → mirror path. Operators on connected installs keep using
+    ``slot_image_url`` directly.
     """
+    resolved_url = await _resolve_slot_image_url(db, request, body)
     try:
         plan = await orchestrator.plan_upgrade(
             db,
             target_version=body.target_version,
-            slot_image_url=body.slot_image_url,
+            slot_image_url=resolved_url,
             cnpg_cluster_name=body.cnpg_cluster_name,
             cnpg_namespace=body.cnpg_namespace,
             started_by_user_id=current_user.id,
@@ -241,6 +310,47 @@ async def post_plan(body: PlanRequest, current_user: CurrentUser, db: DB) -> Pla
             PreflightRowOut(name=r["name"], level=r["level"], message=r["message"])
             for r in plan.preflight_results
         ],
+    )
+
+
+async def _resolve_slot_image_url(
+    db: DB,
+    request: Request,
+    body: PlanRequest,
+) -> str:
+    """Return the URL spatium-upgrade-slot apply will pull from.
+
+    Mirrors the resolution logic in supervisor.py's
+    ``schedule_appliance_upgrade`` — same HMAC token, same URL shape,
+    same operator-facing semantics. Centralised here so the rolling
+    upgrade flow + the per-box flow can't diverge on token shape
+    without both surfaces breaking together.
+
+    * ``slot_image_url`` → returned verbatim (operator-provided
+      external URL).
+    * ``slot_image_id`` → composed as
+      ``{request.base_url}/api/v1/appliance/slot-images/{id}/raw.xz
+      ?t={hmac}`` where the HMAC comes from
+      ``slot_image_download_token``.
+    """
+    if body.slot_image_url is not None:
+        return body.slot_image_url
+    assert body.slot_image_id is not None  # ruled out by model_validator
+    from app.api.v1.appliance.slot_images import (  # noqa: PLC0415
+        slot_image_download_token,
+    )
+    from app.models.appliance import ApplianceSlotImage  # noqa: PLC0415
+
+    image = await db.get(ApplianceSlotImage, body.slot_image_id)
+    if image is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Slot image {body.slot_image_id} not found.",
+        )
+    token = slot_image_download_token(image.id)
+    return (
+        f"{str(request.base_url).rstrip('/')}"
+        f"/api/v1/appliance/slot-images/{image.id}/raw.xz?t={token}"
     )
 
 
