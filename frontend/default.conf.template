@@ -38,6 +38,58 @@ server {
     # Kubernetes, host /etc/resolv.conf under ``--network=host``.
     resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
 
+    # Issue #299 phase 2 — when the api upstream isn't reachable
+    # (cold boot before the api passes /health/ready, mid-rolling-
+    # upgrade replica gap, mid-CNPG-failover blip) serve the
+    # friendly "still booting" page instead of bare nginx 502 HTML.
+    #
+    # Why 502 + 504 only:
+    # * 502 covers "upstream connect refused" (no ready pods in the
+    #   Service's endpoint slice; the schema-aware readiness probe
+    #   landed in phase 1 keeps api pods out of that slice until the
+    #   migrate Job lands the alembic head).
+    # * 504 covers "upstream timeout" (api responded slowly enough
+    #   to trip ``proxy_read_timeout``).
+    # * 503 is DELIBERATELY NOT intercepted — the api uses 503 for
+    #   real operator-actionable signals (demo-mode blocked write,
+    #   factory-reset cooldown, /health/ready when DB is up but
+    #   schema is behind). Replacing those with a generic page
+    #   would mask the cause.
+    # * 500 is also passed through — that's a real bug to fix, not
+    #   a "still booting" condition.
+    #
+    # Status is PRESERVED (no ``=`` after the status list) — the
+    # original 502/504 flows through to clients. The SPA's axios
+    # layer types every /api/* response as JSON; overriding to 200
+    # with an HTML body would make axios resolve "success" with a
+    # string payload and crash downstream (review polish from #301).
+    # Direct browser hits to ``/api/*`` URLs during a 502 window
+    # still get the friendly HTML body (status 502 with HTML is
+    # rendered by browsers identically to the body alone); the
+    # status-preservation only matters for programmatic clients.
+    error_page 502 504 @starting;
+
+    # The error_page is inherited into every location below, including
+    # ``/api/*``, ``/health/*``, ``/metrics``, and the SPA fallback at
+    # ``/``. Direct GET /_starting.html bypasses the upstream entirely.
+
+    location @starting {
+        # Static file under root — Vite copies frontend/public/_starting.html
+        # to /usr/share/nginx/html/_starting.html on every build, so the
+        # page is part of the same image as the SPA. The ``internal``
+        # directive would let us hide /_starting.html from external
+        # requests, but leaving it externally accessible is useful for
+        # operators previewing the look without a real upstream failure.
+        default_type text/html;
+        # Aggressive no-store: an operator hitting this page during a
+        # boot window must NOT have it cached for the next visit.
+        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+        # Surface what the upstream said so a curl debugger can tell
+        # "upstream is unreachable" from "upstream timed out".
+        add_header X-Upstream-Status $upstream_status always;
+        try_files /_starting.html =503;
+    }
+
     # Nginx-local healthcheck — answers without hitting any upstream,
     # so the frontend container's health reflects just nginx itself.
     location = /nginx-health {

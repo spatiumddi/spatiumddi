@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SpatiumDDI — initialising</title>
+    <!--
+      Served by the frontend nginx as the 502/504 ``error_page`` body
+      when the api upstream isn't reachable yet — issue #299 phase 2.
+
+      The cold-boot 502 window on a multi-node appliance is normally
+      90-120 s (CNPG primary + replicas + the migrate Job + the api
+      pod's first readiness pass). This page covers that window with
+      a real "we are booting" surface instead of bare nginx 502 HTML,
+      auto-refreshes every 5 s, and stops refreshing the moment the
+      upstream comes back (because the api's ``/`` then serves the
+      SPA, not this file). Also covers mid-rolling-upgrade gaps
+      (#296) and mid-CNPG-failover blips.
+
+      Self-contained — no external CSS, no scripts, no fetches. Lives
+      under frontend/public/ so Vite copies it to dist/ verbatim.
+    -->
+    <meta http-equiv="refresh" content="5" />
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, sans-serif;
+      }
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #f8fafc;
+        color: #0f172a;
+      }
+      @media (prefers-color-scheme: dark) {
+        body {
+          background: #020617;
+          color: #e2e8f0;
+        }
+        .card {
+          background: #0f172a;
+          border-color: #1e293b;
+        }
+        .muted {
+          color: #94a3b8;
+        }
+        .spinner {
+          border-color: #1e293b;
+          border-top-color: #2dd4bf;
+        }
+      }
+      .card {
+        max-width: 480px;
+        margin: 0 1rem;
+        padding: 2.5rem 2rem;
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        box-shadow: 0 4px 24px rgba(15, 23, 42, 0.08);
+        text-align: center;
+      }
+      .logo {
+        width: 64px;
+        height: 64px;
+        margin: 0 auto 1.25rem;
+        display: block;
+      }
+      h1 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        margin: 0 0 0.5rem;
+      }
+      .muted {
+        color: #475569;
+        font-size: 0.875rem;
+        line-height: 1.5;
+        margin: 0;
+      }
+      .spinner {
+        width: 28px;
+        height: 28px;
+        margin: 1.5rem auto 1rem;
+        border: 3px solid #e2e8f0;
+        border-top-color: #0d9488;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .small {
+        font-size: 0.75rem;
+        margin-top: 1.5rem;
+        color: #64748b;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <svg
+        class="logo"
+        viewBox="0 0 120 120"
+        xmlns="http://www.w3.org/2000/svg"
+        aria-hidden="true"
+      >
+        <rect width="120" height="120" rx="22" fill="#0f172a" />
+        <rect x="14" y="14" width="92" height="92" rx="13" fill="#134e4a" />
+        <rect x="28" y="28" width="64" height="64" rx="9" fill="#0d9488" />
+        <rect x="42" y="42" width="36" height="36" rx="5" fill="#2dd4bf" />
+        <circle cx="60" cy="60" r="9" fill="#ffffff" />
+      </svg>
+      <h1>SpatiumDDI is initialising</h1>
+      <p class="muted">
+        The control plane is still coming online. This usually takes about
+        1&ndash;2 minutes on a fresh install while the database initialises and
+        migrations land. This page auto-refreshes every few seconds.
+      </p>
+      <div class="spinner" role="status" aria-label="loading"></div>
+      <p class="small">
+        If this page hasn't cleared after a few minutes, check
+        <code>kubectl get pods -n spatium</code> for a stuck workload.
+      </p>
+    </div>
+  </body>
+</html>
