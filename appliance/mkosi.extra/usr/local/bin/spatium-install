@@ -106,6 +106,15 @@ NET_PREFIX="24"
 NET_GATEWAY=""
 NET_DNS="1.1.1.1 1.0.0.1"
 TIMEZONE="UTC"
+# Issue #302 — k3s pod + service CIDRs. Defaults match k3s upstream
+# defaults exactly so operators on a clean LAN don't have to touch
+# them. Customisable in ``ask_k3s_cidrs`` for installs where the LAN
+# already uses one of these ranges (Flannel ``host-gw`` writes routes
+# directly; an overlapping pod CIDR masks the LAN). The cluster-dns
+# IP is derived as ``<service_cidr_base>.0.10`` — k3s/kube-dns
+# convention.
+K3S_POD_CIDR="10.42.0.0/16"
+K3S_SERVICE_CIDR="10.43.0.0/16"
 # Default ROLE = appliance (the role screen frames it as "Additional
 # node"). #272 UX fix: operators don't read the body text, and a
 # misclick / blind Enter on "control plane" silently spins up a SECOND
@@ -513,6 +522,135 @@ ask_timezone() {
     fi
 }
 
+# Issue #302 — operator-customisable k3s pod + service CIDRs.
+#
+# k3s defaults (10.42.0.0/16 pods, 10.43.0.0/16 services) collide
+# with several common LAN ranges in the wild (Flannel docs example,
+# some VPN/overlay setups, branch SD-WAN). Defaults pre-filled so
+# clean-LAN operators just press Enter through this step; overrides
+# kick in for operators whose LAN already uses one of these ranges.
+#
+# Validation runs server-side via Python's ``ipaddress`` because bash
+# regex CIDR validation is awful and we want overlap detection
+# (between pod / service / operator's static-IP subnet) for free.
+ask_k3s_cidrs() {
+    log "Step: ask_k3s_cidrs"
+    while true; do
+        local pod
+        pod=$(whiptail --backtitle "$BACKTITLE" --title "k3s pod network" \
+            --cancel-button "Back" \
+            --inputbox "Pod CIDR — internal range Flannel uses for per-pod IPs. Default works for most LANs; change only if your network already uses 10.42.x.x.\n\nIPv4 CIDR (e.g. 10.42.0.0/16):" \
+            14 70 "$K3S_POD_CIDR" 3>&1 1>&2 2>&3) \
+            || return 1
+        local svc
+        svc=$(whiptail --backtitle "$BACKTITLE" --title "k3s service network" \
+            --cancel-button "Back" \
+            --inputbox "Service CIDR — internal range k8s uses for service ClusterIPs (incl. cluster DNS). Must not overlap with the pod CIDR or your LAN.\n\nIPv4 CIDR (e.g. 10.43.0.0/16):" \
+            14 70 "$K3S_SERVICE_CIDR" 3>&1 1>&2 2>&3) \
+            || return 1
+        if _validate_k3s_cidrs "$pod" "$svc"; then
+            K3S_POD_CIDR="$pod"
+            K3S_SERVICE_CIDR="$svc"
+            return 0
+        fi
+        # _validate_k3s_cidrs already showed the operator a msgbox
+        # with the reason — loop back to the pod CIDR prompt with the
+        # operator's just-typed values pre-filled so they don't lose
+        # them. Set the running defaults to what they typed so the
+        # next prompt-iteration's inputbox shows those values.
+        K3S_POD_CIDR="$pod"
+        K3S_SERVICE_CIDR="$svc"
+    done
+}
+
+# Helper: validate the two CIDRs typed by ask_k3s_cidrs. Returns 0 on
+# success; on fail, shows a whiptail msgbox describing the problem +
+# returns 1 so the caller re-prompts.
+_validate_k3s_cidrs() {
+    local pod="$1" svc="$2"
+    # Hand off to Python — ``ipaddress`` does parsing, prefix-len
+    # checking, and overlap detection in three idiomatic lines. The
+    # bash regex alternative would be 30 lines + still wrong on edge
+    # cases. We pass the operator's static-IP subnet (if static
+    # mode) so we can refuse pod/svc CIDRs that would mask the LAN.
+    local static_subnet=""
+    if [ "$NET_MODE" = "static" ] && [ -n "$NET_IP" ] && [ -n "$NET_PREFIX" ]; then
+        static_subnet="$NET_IP/$NET_PREFIX"
+    fi
+    local err
+    err=$(python3 - "$pod" "$svc" "$static_subnet" <<'PY' 2>&1
+import ipaddress
+import sys
+pod_s, svc_s, static_s = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    pod = ipaddress.ip_network(pod_s, strict=False)
+except ValueError as exc:
+    print(f"Pod CIDR is not a valid IPv4 network: {exc}")
+    sys.exit(1)
+try:
+    svc = ipaddress.ip_network(svc_s, strict=False)
+except ValueError as exc:
+    print(f"Service CIDR is not a valid IPv4 network: {exc}")
+    sys.exit(1)
+if pod.version != 4 or svc.version != 4:
+    print("Only IPv4 CIDRs are supported.")
+    sys.exit(1)
+# /22 is the upper bound — k3s allocates /24 per node out of the pod
+# CIDR (max ~64 nodes from /22) and /16 service CIDRs are k3s
+# convention. Tighter than /22 silently breaks at scale + once-
+# allocated CIDRs can't be expanded without a reinstall.
+if pod.prefixlen > 22:
+    print(f"Pod CIDR prefix {pod.prefixlen} is too small. Use /22 or wider (e.g. /16).")
+    sys.exit(1)
+if svc.prefixlen > 22:
+    print(f"Service CIDR prefix {svc.prefixlen} is too small. Use /22 or wider (e.g. /16).")
+    sys.exit(1)
+if pod.overlaps(svc):
+    print(f"Pod CIDR {pod} overlaps with service CIDR {svc}. They must be disjoint.")
+    sys.exit(1)
+if static_s:
+    try:
+        lan = ipaddress.ip_interface(static_s).network
+    except ValueError:
+        # Bad static-IP shape elsewhere in the wizard — let that
+        # surface there, not here.
+        sys.exit(0)
+    if pod.overlaps(lan):
+        print(
+            f"Pod CIDR {pod} overlaps with the LAN subnet {lan} you "
+            f"just configured. Flannel's host-gw backend would mask "
+            f"the LAN. Pick a non-overlapping range."
+        )
+        sys.exit(1)
+    if svc.overlaps(lan):
+        print(
+            f"Service CIDR {svc} overlaps with the LAN subnet {lan}. "
+            f"Pick a non-overlapping range."
+        )
+        sys.exit(1)
+PY
+)
+    if [ -z "$err" ]; then
+        return 0
+    fi
+    whiptail --backtitle "$BACKTITLE" --title "k3s networking — invalid" \
+        --msgbox "$err\n\nPress OK to fix." 14 72 || true
+    return 1
+}
+
+# Helper: compute the cluster-dns IP from the chosen service CIDR.
+# k3s + kube-dns convention is ``<service_cidr_base>.10`` (e.g. the
+# 10.43.0.0/16 default gives 10.43.0.10). Outputs the address only;
+# called by do_install when writing the k3s config drop-in.
+_cluster_dns_ip_from_svc_cidr() {
+    python3 - "$1" <<'PY'
+import ipaddress
+import sys
+net = ipaddress.ip_network(sys.argv[1], strict=False)
+print(str(net.network_address + 10))
+PY
+}
+
 confirm() {
     log "Step: confirm"
     local role_label
@@ -538,8 +676,14 @@ confirm() {
     if [ "$NET_MODE" = "static" ]; then
         s+=" ($NET_INTERFACE: $NET_IP/$NET_PREFIX via $NET_GATEWAY)"
     fi
-    s+="\nTimezone:    $TIMEZONE\n\n"
-    s+="WARNING: $TARGET_DISK will be ERASED. There is no undo.\n\n"
+    s+="\nTimezone:    $TIMEZONE\n"
+    # Only show the k3s CIDR row when the operator overrode either
+    # default — keeps the confirm screen short for the common case.
+    if [ "$K3S_POD_CIDR" != "10.42.0.0/16" ] || [ "$K3S_SERVICE_CIDR" != "10.43.0.0/16" ]; then
+        s+="K3s pod CIDR: $K3S_POD_CIDR\n"
+        s+="K3s svc CIDR: $K3S_SERVICE_CIDR\n"
+    fi
+    s+="\nWARNING: $TARGET_DISK will be ERASED. There is no undo.\n\n"
     s+="Proceed with installation?"
     whiptail --backtitle "$BACKTITLE" --title "Confirm" \
         --no-button "Back" \
@@ -961,9 +1105,42 @@ node-label:
 EOF
             chmod 0644 "$MOUNT/etc/rancher/k3s/config.yaml.d/spatium-roles.yaml"
         fi
-        # ROLE=appliance leaves the drop-in absent; the supervisor
-        # applies role-* labels dynamically via the heartbeat-driven
-        # role-assignment flow.
+        # ROLE=appliance leaves the role-label drop-in absent; the
+        # supervisor applies role-* labels dynamically via the
+        # heartbeat-driven role-assignment flow.
+
+        # Issue #302 — k3s pod + service CIDR drop-in. ALWAYS written,
+        # even on defaults, so the values are explicit on disk + a
+        # future operator editing /etc/rancher/k3s/config.yaml.d/
+        # spatium-cidrs.yaml sees what's in effect (instead of having
+        # to grep the upstream k3s default elsewhere). Drop-in form
+        # rather than editing the main config.yaml so the in-tree
+        # config.yaml stays operator-readable + the install-time
+        # choices are isolated in their own file.
+        #
+        # cluster-dns is derived from the service CIDR base + 10 —
+        # k3s + kube-dns convention. The coredns Deployment binds to
+        # this IP at startup; changing it post-install requires a
+        # coredns restart and is documented as "reinstall" today.
+        local cluster_dns_ip
+        cluster_dns_ip=$(_cluster_dns_ip_from_svc_cidr "$K3S_SERVICE_CIDR")
+        cat > "$MOUNT/etc/rancher/k3s/config.yaml.d/spatium-cidrs.yaml" <<EOF
+# Auto-generated by spatium-install (issue #302) — operator-chosen
+# k3s pod + service CIDRs from the install wizard. Values default to
+# k3s upstream defaults (10.42.0.0/16 / 10.43.0.0/16) unless the
+# operator overrode them on an installation where the LAN collided.
+#
+# These CANNOT be changed in-place — k3s does not support live CIDR
+# migration. Reinstall is required to change them (the partition
+# layout permits keeping /var across reinstalls; data + Postgres
+# state on the persistent volume survive).
+cluster-cidr: $K3S_POD_CIDR
+service-cidr: $K3S_SERVICE_CIDR
+cluster-dns: $cluster_dns_ip
+EOF
+        chmod 0644 "$MOUNT/etc/rancher/k3s/config.yaml.d/spatium-cidrs.yaml"
+        log "k3s CIDRs: pod=$K3S_POD_CIDR svc=$K3S_SERVICE_CIDR dns=$cluster_dns_ip"
+
         cat > "$MOUNT/etc/hosts" <<EOF
 127.0.0.1 localhost
 127.0.1.1 $HOSTNAME
@@ -1459,14 +1636,20 @@ main() {
                 if ask_network; then step="ask_timezone"; else step="ask_user_password"; fi
                 ;;
             ask_timezone)
-                if ask_timezone; then step="ask_application_config"; else step="ask_network"; fi
+                if ask_timezone; then step="ask_k3s_cidrs"; else step="ask_network"; fi
+                ;;
+            ask_k3s_cidrs)
+                # Issue #302 — operator picks (or accepts the defaults
+                # for) the k3s pod + service CIDRs. Forward → application
+                # role config; back → timezone.
+                if ask_k3s_cidrs; then step="ask_application_config"; else step="ask_timezone"; fi
                 ;;
             ask_application_config)
                 # Returns 0 immediately when ROLE != application — so
                 # forward navigation moves straight to confirm and
                 # backward navigation from confirm walks through here
                 # without showing any whiptail screen.
-                if ask_application_config; then step="confirm"; else step="ask_timezone"; fi
+                if ask_application_config; then step="confirm"; else step="ask_k3s_cidrs"; fi
                 ;;
             confirm)
                 if confirm; then step="do_install"; else step="ask_application_config"; fi
