@@ -46,6 +46,12 @@ spec:
       # resolve in-cluster service names even though it lives in the
       # host net namespace.
       dnsPolicy: ClusterFirstWithHostNet
+      # #296 Phase A2 — longer than DNS because the DHCP exchange is
+      # a 4-message DORA round-trip; a client mid-handshake when SIGTERM
+      # lands needs time to either complete or back off cleanly. The
+      # rolling upgrade orchestrator's per-node drain budgets ≥60 s
+      # per Kea pod.
+      terminationGracePeriodSeconds: 60
       containers:
         - name: dhcp-kea
           image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dhcpKea.image.repository) }}
@@ -81,18 +87,35 @@ spec:
           # control channel socket. Phase 3 wires this in for real;
           # Phase 2 ships a minimal tcpSocket-based liveness against
           # the v4 server.
+          #
+          # #296 Phase A2 — readiness gates the per-node Phase 8 rolling
+          # upgrade's uncordon step. A kubernetes-Ready node briefly
+          # served no DHCP while the new pod pulled its image + warmed
+          # its config-bundle cache from the control plane; this gate
+          # blocks until BOTH conditions hold:
+          #   1. ``.ready`` marker exists — set by the agent's sync loop
+          #      after the first successful ConfigBundle fetch + persist
+          #      + Kea reload. Persists across container restarts on the
+          #      hostPath volume (#292), so a warm-restart pod is Ready
+          #      immediately. A failed apply does NOT stamp it.
+          #   2. UDP/67 (hex :0043) is bound in /proc/net/udp — confirms
+          #      kea-dhcp4 is up + listening. ``ss`` isn't in the kea
+          #      image so we read /proc/net/udp directly; same approach
+          #      the pre-A2 probe used.
+          # Probe cadence matches DNS — 5s initial / 10s period / 3
+          # failures / 3s timeout — for consistency across the three
+          # DaemonSets; the pre-A2 10s/30s was too slow for the
+          # orchestrator's per-node uncordon gate.
           readinessProbe:
             exec:
               command:
                 - sh
                 - -c
-                # ``ss`` isn't in the kea image; read /proc/net/udp
-                # directly. UDP port 67 = hex 0043. Kea's kea-dhcp4
-                # process binds it on hostNetwork; matching ":0043"
-                # confirms the daemon is up + listening.
-                - "grep -q ':0043 ' /proc/net/udp"
-            initialDelaySeconds: 10
-            periodSeconds: 30
+                - "test -f /var/lib/spatium-dhcp-agent/.ready && grep -q ':0043 ' /proc/net/udp"
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
           volumeMounts:
             # #292 — persistent agent config-bundle cache (#5): on a pod
             # restart during a control-plane outage this is the only thing

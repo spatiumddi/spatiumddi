@@ -49,6 +49,15 @@ jobs:
       - name: mypy
         run: python -m mypy app
 
+      # Enforces the expand/contract migration contract (issue #296).
+      # Every Alembic migration must be safe against BOTH N-1 and N
+      # application code during the rolling-upgrade mixed-version
+      # window. The linter is stdlib-only and runs from repo root, so
+      # the ``working-directory: backend`` default is overridden here.
+      - name: Migration-shape linter
+        working-directory: ${{ github.workspace }}
+        run: python3 scripts/lint_migrations.py
+
   backend-test:
     name: Backend — Tests
     runs-on: ubuntu-latest

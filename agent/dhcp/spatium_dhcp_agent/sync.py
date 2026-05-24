@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -32,6 +33,26 @@ from .kea_ctrl import KeaCtrlError, config_reload
 from .render_kea import render as render_kea
 
 log = structlog.get_logger(__name__)
+
+
+def _touch_ready_marker(state_dir: Path) -> None:
+    """Stamp ``<state_dir>/.ready`` after the first successful sync (#296 A2).
+
+    The K8s DaemonSet readinessProbe execs a marker-file check + a light
+    daemon ping; the marker representing "I have synced at least once" plus
+    the hostPath bundle cache lets a pod that restarts into warm state be
+    Ready immediately. Idempotent — ``touch`` on an existing file is fine
+    and a no-op once stamped. Caller MUST only invoke after a successful
+    fetch + persist + driver-apply; a failed sync must not flip readiness
+    true. Best-effort: a marker write that races a filesystem error never
+    blocks the daemon — we just log and move on, and the next successful
+    apply retries.
+    """
+    try:
+        marker = state_dir / ".ready"
+        marker.touch(exist_ok=True)
+    except OSError:
+        log.exception("ready_marker_touch_failed", path=str(state_dir / ".ready"))
 
 _FAILURE_THRESHOLD = 3  # DHCP.md §6: offline after 3 consecutive failures
 _OFFLINE_RETRY_SECONDS = 60.0
@@ -82,6 +103,11 @@ class SyncLoop:
                     reload_kea=True,
                     reload_retry_timeout=_BOOTSTRAP_RELOAD_TIMEOUT,
                 )
+                # #296 A2 — warm-restart readiness. The hostPath cache carries
+                # the bundle we just successfully re-applied; the marker tells
+                # the K8s readinessProbe this pod is ready to serve without
+                # waiting for the next control-plane long-poll round-trip.
+                _touch_ready_marker(self.cfg.state_dir)
                 log.info("dhcp_agent_bootstrap_from_cache", etag=etag)
                 # #170 Wave C1 — fleet-upgrade / reboot / SNMP / NTP
                 # trigger-file writes moved to the supervisor's
@@ -293,6 +319,12 @@ class SyncLoop:
         self._current_etag = etag
         self._record_success()
         log.info("dhcp_config_applied", etag=etag)
+
+        # #296 A2 — stamp readiness marker AFTER the bundle was fetched,
+        # persisted to the hostPath cache, and the Kea reload succeeded.
+        # A failed apply returns early above so we never reach this point
+        # on error.
+        _touch_ready_marker(self.cfg.state_dir)
 
         # Ack any pending ops included in the bundle so the control plane
         # stops re-delivering them on the next long-poll.

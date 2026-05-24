@@ -396,6 +396,14 @@ async def run_target_now(target_id: uuid.UUID, db: DB, current_user: CurrentUser
     finish. The schedule sweep uses the same code path.
     """
     _require_superadmin(current_user)
+    # #296 Phase H — refuse if a rolling upgrade is in flight (same
+    # rationale as create-and-download: mid-upgrade snapshots are
+    # internally inconsistent + surprise the operator on restore).
+    from app.services.upgrades.safety import (  # noqa: PLC0415
+        assert_no_upgrade_in_flight,
+    )
+
+    await assert_no_upgrade_in_flight(db, operation_hint="manual backup run")
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")

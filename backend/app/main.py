@@ -282,6 +282,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_audit_chain_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("audit_chain_alert_rule_seed_skipped", reason=str(exc))
+    # cluster-upgrade-failed alert rule — singleton, enabled by default
+    # (issue #296 Phase F). Fires when the rolling-upgrade orchestrator
+    # flips a SystemUpgradeRun to ``state='failed'``.
+    try:
+        from app.services.upgrades.alerts import (  # noqa: PLC0415
+            seed_cluster_upgrade_failed_alert_rule,
+        )
+
+        await seed_cluster_upgrade_failed_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("cluster_upgrade_failed_alert_rule_seed_skipped", reason=str(exc))
     # Appliance Web UI cert bootstrap (issue #134, Phase 4b.5). On
     # appliance installs without an active row in appliance_certificate,
     # generate a self-signed default + deploy it to /etc/nginx/certs

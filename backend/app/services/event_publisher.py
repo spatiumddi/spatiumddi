@@ -154,6 +154,29 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     ("appliance.pairing_code_created", "pairing_code"): "appliance.pairing_code.created",
     ("appliance.pairing_code_claimed", "pairing_code"): "appliance.pairing_code.claimed",
     ("appliance.pairing_code_revoked", "pairing_code"): "appliance.pairing_code.revoked",
+    # Multi-node rolling upgrade orchestrator lifecycle (#296 Phase H).
+    # The orchestrator writes AuditLog rows with ``action=upgrade.<verb>``
+    # + ``resource_type='system_upgrade_run'`` on every state transition;
+    # this map collapses the redundant ``upgrade.upgrade.<verb>`` that
+    # the auto-derivation would produce into clean
+    # ``system.upgrade.<verb>`` event names downstream subscribers can
+    # pattern-match on.
+    ("upgrade.planned", "system_upgrade_run"): "system.upgrade.planned",
+    ("upgrade.started", "system_upgrade_run"): "system.upgrade.started",
+    ("upgrade.succeeded", "system_upgrade_run"): "system.upgrade.succeeded",
+    ("upgrade.halted", "system_upgrade_run"): "system.upgrade.halted",
+    ("upgrade.resumed", "system_upgrade_run"): "system.upgrade.resumed",
+    ("upgrade.aborted", "system_upgrade_run"): "system.upgrade.aborted",
+    # The orchestrator's three failure-path transitions all fold into
+    # the single ``system.upgrade.failed`` event so downstream
+    # subscribers wire one webhook for "the upgrade failed; go
+    # investigate" rather than three separate ones. The audit row's
+    # ``action`` + ``new_value.failure_category`` (Phase F) tell the
+    # operator which subtype + which node + what the next step is.
+    ("upgrade.failed", "system_upgrade_run"): "system.upgrade.failed",
+    ("upgrade.node_failed", "system_upgrade_run"): "system.upgrade.failed",
+    ("upgrade.chart_bump_failed", "system_upgrade_run"): "system.upgrade.failed",
+    ("upgrade.post_upgrade_verify_failed", "system_upgrade_run"): "system.upgrade.failed",
 }
 
 

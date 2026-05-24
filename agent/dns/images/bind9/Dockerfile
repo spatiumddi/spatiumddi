@@ -17,7 +17,17 @@ FROM alpine:3.22 AS runtime
 # starts but only ends up listening on the stats-channel port >1024,
 # silently failing on real DNS traffic). Alpine's ``bind`` package
 # does NOT set this cap automatically, unlike ``iputils-ping`` etc.
-RUN apk add --no-cache \
+#
+# ``apk upgrade --no-cache`` runs BEFORE ``apk add`` so the package
+# database is fresh and any previously-baked layer carrying an older
+# bind / bind-libs version (CVE-2026-3593, CVE-2026-3039, CVE-2026-5946
+# all fixed in 9.20.23-r0) gets re-resolved against the current
+# alpine 3.22 index. GitHub Actions Docker layer cache (the
+# ``cache-from: type=gha`` on the build workflow) is otherwise
+# perfectly happy to serve a 30-day-old ``apk add`` layer that
+# Trivy will then flag.
+RUN apk upgrade --no-cache \
+ && apk add --no-cache \
       bind bind-tools \
       tini su-exec \
       python3 py3-pip \

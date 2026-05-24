@@ -401,12 +401,633 @@ def patch_deployment_annotation(
     return False, f"kubeapi status {status}: {body[:200]!r}"
 
 
+# ── Lease (coordination.k8s.io/v1) ────────────────────────────────────
+# Thin wrappers around the Lease resource. Used by the multi-node
+# rolling-upgrade mutex (#296 Phase A) — at-most-one upgrade in flight
+# cluster-wide, with the holder's identity + a renewal heartbeat that
+# expires if the api pod holding the lease is rescheduled mid-upgrade.
+# Generic on purpose: any future "single-node-does-this-at-a-time"
+# beat task can use the same helpers without re-inventing the auth.
+
+
+def get_lease(
+    name: str,
+    namespace: str | None = None,
+) -> tuple[int, dict[str, Any] | None]:
+    """Read a Lease. Returns (status, parsed_body_or_None).
+
+    404 => lease doesn't exist; caller should ``create_lease``.
+    Anything else (200 / 5xx) => parsed body or None on JSON error.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases/{quote(name)}"
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
+def create_lease(
+    name: str,
+    holder: str,
+    *,
+    namespace: str | None = None,
+    lease_duration_seconds: int = 60,
+) -> tuple[bool, str | None]:
+    """Create a Lease claimed by ``holder``.
+
+    Returns (created, error). 409 (already exists) is reported as
+    error so the caller can fall through to the read-then-update
+    path. ``lease_duration_seconds`` is how long until k8s considers
+    the lease stale if not renewed — 60 s matches the upstream
+    leader-election library's default.
+    """
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    ns = namespace or cfg.namespace
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    payload = json.dumps(
+        {
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {"name": name, "namespace": ns},
+            "spec": {
+                "holderIdentity": holder,
+                "leaseDurationSeconds": lease_duration_seconds,
+                "acquireTime": now,
+                "renewTime": now,
+                "leaseTransitions": 1,
+            },
+        }
+    ).encode("utf-8")
+    path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases"
+    try:
+        status, body = _request("POST", path, body=payload, content_type="application/json")
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        return True, None
+    return False, f"kubeapi status {status}: {body[:200]!r}"
+
+
+def update_lease(
+    name: str,
+    holder: str,
+    *,
+    namespace: str | None = None,
+    lease_duration_seconds: int = 60,
+    bump_transitions: bool = False,
+    expected_transitions: int | None = None,
+) -> tuple[bool, str | None]:
+    """Update a Lease's renewTime + holderIdentity.
+
+    Standard renewal: caller passes the same ``holder`` that's
+    currently in the lease and we bump ``renewTime``.
+
+    Acquisition (after a previous holder's lease expired): caller
+    passes their own identity as ``holder`` + sets ``bump_transitions=
+    True`` so ``leaseTransitions`` increments (this is how k8s
+    leader-election detects a takeover).
+
+    ``expected_transitions`` lets callers do an optimistic-concurrency
+    update — if set, we read first and refuse the patch when the
+    server's value drifted (another holder beat us to the takeover).
+    Returns (ok, error). 409 reports an explicit conflict.
+    """
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    ns = namespace or cfg.namespace
+    # We do a server-side merge patch on ``spec`` only — the
+    # metadata is owned by k8s + the controller-manager.
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    spec: dict[str, Any] = {
+        "holderIdentity": holder,
+        "leaseDurationSeconds": lease_duration_seconds,
+        "renewTime": now,
+    }
+    if bump_transitions:
+        if expected_transitions is not None:
+            spec["leaseTransitions"] = expected_transitions + 1
+        spec["acquireTime"] = now
+    payload = json.dumps({"spec": spec}).encode("utf-8")
+    path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases/{quote(name)}"
+    try:
+        status, body = _request(
+            "PATCH",
+            path,
+            body=payload,
+            content_type="application/strategic-merge-patch+json",
+        )
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status == 200:
+        return True, None
+    if status == 409:
+        return False, "conflict: lease updated by another holder"
+    return False, f"kubeapi status {status}: {body[:200]!r}"
+
+
+def clear_lease_holder(
+    name: str,
+    *,
+    namespace: str | None = None,
+) -> tuple[bool, str | None]:
+    """Mark a lease as released without deleting it.
+
+    Sets ``holderIdentity`` to empty + ``renewTime`` to a long-past
+    timestamp so the next ``acquire()`` claims it via the expired-
+    takeover path. The Lease object stays in etcd so
+    ``kubectl get leases`` still surfaces who last held it — useful
+    audit signal that doesn't cost anything to keep.
+    """
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    ns = namespace or cfg.namespace
+    # Two-hour-ago renewTime is well beyond any sane
+    # leaseDurationSeconds → next read treats this as expired.
+    old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7200))
+    payload = json.dumps({"spec": {"holderIdentity": "", "renewTime": old}}).encode("utf-8")
+    path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases/{quote(name)}"
+    try:
+        status, body = _request(
+            "PATCH",
+            path,
+            body=payload,
+            content_type="application/strategic-merge-patch+json",
+        )
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status == 200:
+        return True, None
+    return False, f"kubeapi status {status}: {body[:200]!r}"
+
+
+# ── Node + drain primitives (#296 Phase C) ─────────────────────────────
+# Wrappers used by the per-node rolling-upgrade primitive. Each is
+# idempotent so a resumed orchestrator (e.g. after an api pod
+# reschedule mid-upgrade) can re-issue them without double-counting.
+
+
+def get_node(name: str) -> tuple[int, dict[str, Any] | None]:
+    """Read a Node. Returns (status, parsed_body_or_None)."""
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    path = f"/api/v1/nodes/{quote(name)}"
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
+def list_nodes(
+    label_selector: str | None = None,
+) -> tuple[int, list[dict[str, Any]]]:
+    """List Nodes, optionally filtered by label selector.
+
+    Returns (status, items). On non-200 returns the status + empty list
+    so the caller can branch cleanly without a None check.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    path = "/api/v1/nodes"
+    if label_selector:
+        path += f"?labelSelector={quote(label_selector)}"
+    status, body = _request("GET", path)
+    if status != 200:
+        return status, []
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return status, []
+    items = data.get("items") or []
+    return status, items
+
+
+def cordon_node(name: str) -> tuple[bool, str | None]:
+    """Mark a Node unschedulable (idempotent — k8s no-ops if already true)."""
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    payload = json.dumps({"spec": {"unschedulable": True}}).encode("utf-8")
+    path = f"/api/v1/nodes/{quote(name)}"
+    try:
+        status, body = _request(
+            "PATCH",
+            path,
+            body=payload,
+            content_type="application/strategic-merge-patch+json",
+        )
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        return True, None
+    return False, f"kubeapi status {status}: {body[:200]!r}"
+
+
+def uncordon_node(name: str) -> tuple[bool, str | None]:
+    """Clear unschedulable on a Node (idempotent)."""
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    # Explicitly setting to None so a strategic-merge-patch removes the
+    # field rather than ambiguously leaving it. ``unschedulable: false``
+    # is also valid; either has the same effect post-PATCH.
+    payload = json.dumps({"spec": {"unschedulable": False}}).encode("utf-8")
+    path = f"/api/v1/nodes/{quote(name)}"
+    try:
+        status, body = _request(
+            "PATCH",
+            path,
+            body=payload,
+            content_type="application/strategic-merge-patch+json",
+        )
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        return True, None
+    return False, f"kubeapi status {status}: {body[:200]!r}"
+
+
+def is_node_ready(node: dict[str, Any]) -> bool:
+    """True if the node's ``Ready`` condition is ``True``.
+
+    Defensive against a missing status block (a node mid-add can
+    surface that briefly).
+    """
+    conditions = (node.get("status") or {}).get("conditions") or []
+    return any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
+
+
+def list_pods_on_node(node_name: str) -> list[dict[str, Any]]:
+    """List all pods scheduled on ``node_name`` cluster-wide.
+
+    Uses ``fieldSelector=spec.nodeName=<n>`` so we filter server-side
+    rather than walking every namespace's pod list. Returns the raw
+    PodList ``items`` array.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    path = f"/api/v1/pods?fieldSelector=spec.nodeName%3D{quote(node_name)}"
+    status, body = _request("GET", path)
+    if status != 200:
+        raise KubeapiUnavailableError(
+            f"list pods-on-node {node_name} returned {status}: {body[:200]!r}"
+        )
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise KubeapiUnavailableError(f"list pods-on-node bad json: {exc}") from exc
+    return data.get("items") or []
+
+
+def pod_is_owned_by_daemonset(pod: dict[str, Any]) -> bool:
+    """True if any ownerReference on the pod is a DaemonSet.
+
+    Used by drain to skip DS pods — they reboot in place with the
+    node, exactly the same semantic as ``kubectl drain
+    --ignore-daemonsets``. The controller field is the standard
+    ownerReferences entry from the pod metadata.
+    """
+    owners = (pod.get("metadata") or {}).get("ownerReferences") or []
+    return any(o.get("kind") == "DaemonSet" for o in owners)
+
+
+def pod_is_terminal(pod: dict[str, Any]) -> bool:
+    """True if pod.status.phase is Succeeded or Failed.
+
+    Drain skips terminal pods — they're already done; evicting them
+    is a no-op that just adds noise to the log.
+    """
+    phase = (pod.get("status") or {}).get("phase")
+    return phase in ("Succeeded", "Failed")
+
+
+def pod_is_mirror(pod: dict[str, Any]) -> bool:
+    """True if the pod is a static-mirror pod (managed by kubelet,
+    not by the api server).
+
+    Mirror pods carry ``kubernetes.io/config.mirror`` in their
+    annotations and can't be evicted via the API — they're owned by
+    the node's kubelet config dir directly. kubectl drain skips
+    these for the same reason.
+    """
+    annotations = (pod.get("metadata") or {}).get("annotations") or {}
+    return "kubernetes.io/config.mirror" in annotations
+
+
+def evict_pod(
+    name: str,
+    namespace: str,
+    *,
+    grace_period_seconds: int | None = None,
+) -> tuple[int, str | None]:
+    """POST an Eviction subresource for a pod.
+
+    Returns (status, error). Status codes the caller cares about:
+
+    * 200/201 — eviction accepted; pod will start terminating.
+    * 404     — pod already gone (race with drain or another evictor);
+                treat as success.
+    * 429     — PDB blocks; caller retries.
+    * 500+    — other failure; surface to operator.
+
+    The eviction body uses ``policy/v1`` (GA since k8s 1.22).
+    """
+    cfg = get_config()
+    if cfg is None:
+        return -1, "ServiceAccount not mounted"
+    spec: dict[str, Any] = {
+        "apiVersion": "policy/v1",
+        "kind": "Eviction",
+        "metadata": {"name": name, "namespace": namespace},
+    }
+    if grace_period_seconds is not None:
+        spec["deleteOptions"] = {"gracePeriodSeconds": grace_period_seconds}
+    payload = json.dumps(spec).encode("utf-8")
+    path = f"/api/v1/namespaces/{quote(namespace)}/pods/{quote(name)}/eviction"
+    try:
+        status, body = _request("POST", path, body=payload, content_type="application/json")
+    except KubeapiUnavailableError as exc:
+        return -1, str(exc)
+    if status in (200, 201, 404):
+        return status, None
+    return status, body[:200].decode("utf-8", errors="replace")
+
+
+# ── CNPG Cluster CR primitives (#296 Phase C) ──────────────────────────
+# Tiny wrapper layer over the CNPG operator's Cluster resource.
+# Identical pattern to the supervisor's k8s_api.patch_cnpg_instances —
+# centralised here so the rolling-upgrade primitive can read +
+# mutate the Cluster's maintenance window without duplicating the
+# CR path math.
+
+
+def get_cnpg_cluster(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:
+    """Read a CNPG ``postgresql.cnpg.io/v1`` Cluster CR.
+
+    Returns (status, parsed_body_or_None). 404 + non-2xx come back as
+    just status + None so the caller can branch without an exception.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = f"/apis/postgresql.cnpg.io/v1/namespaces/{quote(ns)}/clusters/{quote(name)}"
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
+def patch_cnpg_maintenance_window(
+    name: str,
+    *,
+    in_progress: bool,
+    reuse_pvc: bool = True,
+    namespace: str | None = None,
+) -> tuple[bool, str | None]:
+    """Stamp / clear ``spec.nodeMaintenanceWindow`` on a CNPG Cluster.
+
+    The CNPG-blessed pattern for "we're about to drain a node, leave
+    the PVC alone + suspend the PDB until I clear this." See the
+    Phase C primitive in #296 + the CNPG kubernetes_upgrade doc.
+    """
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    ns = namespace or cfg.namespace
+    payload = json.dumps(
+        {
+            "spec": {
+                "nodeMaintenanceWindow": {
+                    "inProgress": in_progress,
+                    "reusePVC": reuse_pvc,
+                }
+            }
+        }
+    ).encode("utf-8")
+    path = f"/apis/postgresql.cnpg.io/v1/namespaces/{quote(ns)}/clusters/{quote(name)}"
+    try:
+        status, body = _request(
+            "PATCH",
+            path,
+            body=payload,
+            content_type="application/merge-patch+json",
+        )
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        return True, None
+    return False, f"kubeapi status {status}: {body[:200]!r}"
+
+
+# ── HelmChartConfig + rollout primitives (#296 Phase E) ────────────────
+# The orchestrator's post-loop chart bump patches the same
+# ``helm.cattle.io/v1`` HelmChartConfig CR the supervisor writes to
+# for cp-size / VIP overrides. Helpers mirror the supervisor's
+# ``_helmchartconfig_upsert`` shape so both sides converge on identical
+# kubeapi semantics — see agent/supervisor/spatium_supervisor/k8s_api.py
+# for the durability rationale.
+
+
+def get_helmchartconfig(
+    name: str, namespace: str = "kube-system"
+) -> tuple[int, dict[str, Any] | None]:
+    """Read a HelmChartConfig CR. ``kube-system`` is the k3s default
+    namespace for chart configs.  Returns (status, parsed_body_or_None)
+    so the caller can branch on 404 cleanly."""
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    path = (
+        f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}" f"/helmchartconfigs/{quote(name)}"
+    )
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
+def upsert_helmchartconfig(
+    name: str,
+    values_yaml: str,
+    *,
+    namespace: str = "kube-system",
+) -> tuple[bool, str | None]:
+    """Create-or-update the HelmChartConfig so its ``spec.valuesContent``
+    equals ``values_yaml``. Idempotent — returns ``(True, None)`` when
+    already current. Same shape as the supervisor's
+    ``_helmchartconfig_upsert``."""
+    cfg = get_config()
+    if cfg is None:
+        return False, "ServiceAccount not mounted"
+    base = f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}/helmchartconfigs"
+    path = f"{base}/{quote(name)}"
+    try:
+        status, resp = _request("GET", path)
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if status == 200:
+        try:
+            current = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
+        except (json.JSONDecodeError, ValueError):
+            current = None
+        if current == values_yaml:
+            return True, None
+        patch = json.dumps({"spec": {"valuesContent": values_yaml}}).encode("utf-8")
+        try:
+            st, rb = _request(
+                "PATCH", path, body=patch, content_type="application/merge-patch+json"
+            )
+        except KubeapiUnavailableError as exc:
+            return False, str(exc)
+        if st in (200, 201):
+            return True, None
+        return False, f"PATCH status {st}: {rb[:200]!r}"
+    if status != 404:
+        return False, f"kubeapi GET status {status}"
+    body = json.dumps(
+        {
+            "apiVersion": "helm.cattle.io/v1",
+            "kind": "HelmChartConfig",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {"valuesContent": values_yaml},
+        }
+    ).encode("utf-8")
+    try:
+        st, rb = _request("POST", base, body=body, content_type="application/json")
+    except KubeapiUnavailableError as exc:
+        return False, str(exc)
+    if st in (200, 201):
+        return True, None
+    return False, f"POST status {st}: {rb[:200]!r}"
+
+
+def get_deployment(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:
+    """Read a Deployment. Used by the rollout-poll path to inspect
+    ``status.observedGeneration`` + ``status.updatedReplicas`` to know
+    when a chart bump's rolling update has settled."""
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = f"/apis/apps/v1/namespaces/{quote(ns)}/deployments/{quote(name)}"
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
+def deployment_is_rolled_out(deployment: dict[str, Any]) -> bool:
+    """True when a Deployment's rolling update has finished.
+
+    Matches ``kubectl rollout status`` semantics:
+
+    * ``status.observedGeneration`` >= ``metadata.generation`` (the
+      controller has seen the latest spec change).
+    * ``status.updatedReplicas`` >= ``spec.replicas`` (the new RS has
+      ramped to the desired count).
+    * ``status.availableReplicas`` >= ``spec.replicas`` (every pod
+      passed readiness; old RS is fully drained).
+    """
+    meta = deployment.get("metadata") or {}
+    spec = deployment.get("spec") or {}
+    status = deployment.get("status") or {}
+    spec_replicas = int(spec.get("replicas") or 0)
+    if spec_replicas == 0:
+        # Scaled to zero — trivially rolled out.
+        return True
+    return (
+        int(status.get("observedGeneration") or 0) >= int(meta.get("generation") or 0)
+        and int(status.get("updatedReplicas") or 0) >= spec_replicas
+        and int(status.get("availableReplicas") or 0) >= spec_replicas
+    )
+
+
+def get_job(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:
+    """Read a batch/v1 Job. The migrate Job's ``status.succeeded`` /
+    ``status.failed`` counters tell us whether the chart-bump's
+    schema migration ran cleanly."""
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = f"/apis/batch/v1/namespaces/{quote(ns)}/jobs/{quote(name)}"
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
+def job_terminal_state(job: dict[str, Any]) -> str | None:
+    """``'succeeded'`` / ``'failed'`` / ``None`` (still running).
+
+    The chart-bump's migrate Job is helm-hook-managed; we poll until
+    it transitions out of running so we can flip the orchestrator's
+    run state cleanly."""
+    status = job.get("status") or {}
+    if int(status.get("succeeded") or 0) >= 1:
+        return "succeeded"
+    if int(status.get("failed") or 0) >= 1:
+        return "failed"
+    return None
+
+
 __all__ = [
     "KubeapiUnavailableError",
+    "clear_lease_holder",
+    "cordon_node",
+    "create_lease",
     "delete_pod",
+    "deployment_is_rolled_out",
+    "evict_pod",
+    "get_cnpg_cluster",
+    "get_deployment",
+    "get_helmchartconfig",
+    "get_job",
+    "get_lease",
+    "get_node",
     "get_pod_logs",
+    "is_node_ready",
+    "job_terminal_state",
+    "list_nodes",
     "list_pods",
+    "list_pods_on_node",
+    "patch_cnpg_maintenance_window",
     "patch_deployment_annotation",
     "patch_secret",
+    "pod_is_owned_by_daemonset",
+    "pod_is_mirror",
+    "pod_is_terminal",
     "stream_pod_logs",
+    "uncordon_node",
+    "update_lease",
+    "upsert_helmchartconfig",
 ]

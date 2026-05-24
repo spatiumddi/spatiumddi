@@ -45,6 +45,7 @@ celery_app = Celery(
         "app.tasks.domain_whois_refresh",
         "app.tasks.ai_digest",
         "app.tasks.audit_chain_verify",
+        "app.tasks.upgrade_orchestrator",
     ],
 )
 

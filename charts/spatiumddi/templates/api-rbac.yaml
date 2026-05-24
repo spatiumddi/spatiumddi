@@ -54,6 +54,33 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "patch"]
+  {{- if .Values.api.upgradeOrchestratorRBAC.enabled }}
+  # #296 Phase C/D/E — the rolling-upgrade orchestrator reads
+  # Deployments + Jobs in the release namespace during the chart-bump
+  # rollout poll; reads + patches the CNPG Cluster CR's
+  # nodeMaintenanceWindow during per-node primitive steps; creates +
+  # mutates the orchestrator Lease for the cluster-wide single-
+  # upgrader lock. All namespace-scoped (this Role); cluster-scoped
+  # cordon / drain / Node reads live in the ClusterRole rendered
+  # alongside this template.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    # NB: ``delete`` deliberately absent — Phase A's mutex.release()
+    # clears the holder via PATCH (``clear_lease_holder`` sets an
+    # empty ``holderIdentity`` + expired ``renewTime``) rather than
+    # deleting the Lease object, so ``kubectl get leases`` keeps the
+    # historical last-upgrade-holder visible.
+    verbs: ["get", "list", "create", "update", "patch"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -70,4 +97,86 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: {{ include "spatiumddi.fullname" . }}-api
+{{- if .Values.api.upgradeOrchestratorRBAC.enabled }}
+---
+# #296 Phase C/D/E — cluster-scoped grants for the rolling-upgrade
+# orchestrator's cordon / drain / Node-Ready introspection. Scoped to
+# the resources the orchestrator actually touches; no wildcards.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-api-upgrade-orchestrator
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "api") .) | nindent 4 }}
+rules:
+  # cordon / uncordon — PATCH .spec.unschedulable on the node;
+  # GET / list for readiness polling + plan_upgrade's appliance-node
+  # enumeration.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+  # Drain: list every pod scheduled on the node + POST policy/v1
+  # Eviction subresource. Cluster-wide because pods to evict can live
+  # in any namespace (DNS / DHCP DaemonSets are in kube-system,
+  # CNPG StatefulSet is in spatium, etc.).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-api-upgrade-orchestrator
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "api") .) | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "spatiumddi.fullname" . }}-api
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "spatiumddi.fullname" . }}-api-upgrade-orchestrator
+---
+# Phase E — the chart bump patches the umbrella HelmChartConfig that
+# lives in kube-system (k3s convention). Same shape as the
+# supervisor's spatium-supervisor-helm Role — scoped to the kube-
+# system namespace, not cluster-wide, so the api can't accidentally
+# edit OTHER chart configs an operator dropped there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-api-helm
+  namespace: kube-system
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "api") .) | nindent 4 }}
+rules:
+  - apiGroups: ["helm.cattle.io"]
+    # ``helmcharts`` deliberately NOT included — the chart-bump path
+    # in services/upgrades/chart_bump.py only touches ``helmchartconfigs``
+    # (which the helm-controller merges on top of the manifest-managed
+    # HelmChart). The supervisor's spatium-supervisor-helm Role keeps
+    # both for cp-size patches; the api's role-of-scope is narrower.
+    resources: ["helmchartconfigs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-api-helm
+  namespace: kube-system
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "api") .) | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "spatiumddi.fullname" . }}-api
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "spatiumddi.fullname" . }}-api-helm
+{{- end }}
 {{- end }}

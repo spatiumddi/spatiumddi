@@ -1,0 +1,222 @@
+{{- if .Values.slotImageMirror.enabled }}
+{{- $cmp := "slot-image-mirror" -}}
+{{- $fullname := include "spatiumddi.fullname" . -}}
+{{- $mirrorName := printf "%s-slot-image-mirror" $fullname -}}
+# ─────────────────────────────────────────────────────────────────────────────
+# Slot-image mirror (#296 Phase B).
+#
+# WHAT — a single-replica Deployment that holds the slot-image bytes on a
+# node-pinned local-path PVC and exposes three internal byte ops
+# (PUT/GET/DELETE under ``/api/v1/appliance/internal/slot-images/<id>``).
+# The api Deployment proxies upload + download + delete operations on
+# the actual bytes through this Service when ``SLOT_IMAGE_MIRROR_URL``
+# is set on the api. Metadata (filename / sha256 / appliance_version
+# row) stays in Postgres on the api.
+#
+# WHY — Phase B of issue #296 (multi-node rolling upgrade). Before
+# this, the upload endpoint wrote to the api pod's ephemeral local FS;
+# in a multi-replica api Deployment the file landed on whichever
+# replica handled the POST + 404'd from every other replica's serve
+# side. The locked design (issue #296 "Phase B" section) pins the
+# bytes to one node via a single-replica Deployment + local-path RWO
+# PVC — same node-pinned-PV pattern the appliance already runs for
+# CNPG / Redis / the agent state dirs — and exposes a stable Service
+# the api can stream through.
+#
+# Architecture choice (api-image-as-mirror): we reuse the api image
+# instead of building a new container. The mirror pod runs the
+# unmodified api codebase + flags ``SLOT_IMAGE_MIRROR_MODE=true``;
+# the api's internal byte-op endpoints check that flag + the
+# ``X-Mirror-Auth`` shared-secret header before serving. ~150 MiB
+# RAM cost on the mirror node in exchange for zero new images to
+# build, push, or maintain across releases. We can swap to a tiny
+# dedicated image in a later cut if the footprint matters more than
+# the maintenance saving.
+#
+# Authentication — operator traffic NEVER hits the mirror directly.
+# The frontend nginx + api Service own operator routing for the
+# public ``/api/v1/appliance/slot-images/*`` endpoints. The mirror's
+# internal endpoints sit behind an in-cluster ClusterIP Service plus
+# an X-Mirror-Auth shared-secret header derived from SECRET_KEY +
+# the slot-image-mirror's own k8s Secret. Network isolation is the
+# primary boundary; the header is defence in depth against a
+# compromised pod in the same cluster.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $mirrorName }}-data
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+  annotations:
+    # #296 Phase B — never delete the PVC on uninstall / failed
+    # release / rollback. Slot images are operator-uploaded blobs
+    # (1-4 GiB each on metered connections — re-uploading is real
+    # cost). Same data-safety annotation we put on the CNPG Cluster
+    # CR for the same reason. The helm-controller's "kept" rule
+    # means an upgrade also won't patch the PVC's storageClass /
+    # size in place; resize is an explicit operator action via
+    # ``kubectl patch pvc``.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.slotImageMirror.storage.size | quote }}
+  {{- with .Values.slotImageMirror.storage.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $mirrorName }}-auth
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+  annotations:
+    # Generated on first install + persisted across upgrades. Same
+    # rollback-safe ``lookup()`` pattern the chart's app-secret +
+    # postgres-secret use. Empty operator-supplied value generates a
+    # fresh 32-byte hex string; an operator who wants to bring their
+    # own shared secret can set ``slotImageMirror.auth.secret`` in
+    # the values.
+    helm.sh/resource-policy: keep
+type: Opaque
+data:
+  {{- $existing := (lookup "v1" "Secret" .Release.Namespace (printf "%s-auth" $mirrorName)) }}
+  {{- if and $existing $existing.data (index $existing.data "secret") }}
+  secret: {{ index $existing.data "secret" }}
+  {{- else if .Values.slotImageMirror.auth.secret }}
+  secret: {{ .Values.slotImageMirror.auth.secret | b64enc }}
+  {{- else }}
+  secret: {{ randAlphaNum 64 | b64enc }}
+  {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $mirrorName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+spec:
+  # Single replica — non-negotiable. The PVC is RWO local-path; a
+  # second pod would Pending forever waiting to mount it on the same
+  # node. The whole point of this Deployment is "one source of truth
+  # for the bytes, on one node". A node-down event pauses uploads /
+  # downloads until the node recovers; that's the trade we picked
+  # in the issue #296 Phase B design (see ``Caveats``).
+  replicas: 1
+  strategy:
+    # Recreate (not RollingUpdate) — only one pod can hold the PVC
+    # at a time. A rolling update would block on the new pod waiting
+    # for the old pod's PVC mount.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # Same migrate-wait pattern as the api — the mirror reads
+        # ``SECRET_KEY`` from the chart-owned secret but doesn't
+        # need any tables; the init keeps it from racing the
+        # umbrella's alembic Job.
+        {{- include "spatiumddi.waitForMigrateInit" . | nindent 8 }}
+      containers:
+        - name: slot-image-mirror
+          image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            {{- include "spatiumddi.commonEnv" . | nindent 12 }}
+            # Mirror-mode flag — flips the api process into "I am the
+            # slot-image byte store" mode. The /api/v1/appliance/
+            # internal/slot-images/* endpoints become live + serve
+            # under the X-Mirror-Auth gate; every other endpoint
+            # keeps working but isn't reachable through the Service
+            # selector below.
+            - name: SLOT_IMAGE_MIRROR_MODE
+              value: "true"
+            # Storage path inside the container — matches the
+            # default SLOT_IMAGE_DIR the api code reads, so the
+            # existing handler logic for write-tmp-then-rename Just
+            # Works on the PVC mount.
+            - name: SPATIUM_SLOT_IMAGE_DIR
+              value: /var/lib/spatiumddi/slot-images
+            # Shared secret. Pulled from the k8s Secret rendered
+            # above. The main api Deployment reads the same secret
+            # via ``SLOT_IMAGE_MIRROR_SECRET`` to mint the
+            # X-Mirror-Auth header. Rotation: delete the Secret +
+            # ``helm upgrade`` regenerates a fresh value (will
+            # require a restart of both Deployments).
+            - name: SLOT_IMAGE_MIRROR_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $mirrorName }}-auth
+                  key: secret
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.slotImageMirror.resources | nindent 12 }}
+          volumeMounts:
+            - name: slot-images
+              mountPath: /var/lib/spatiumddi/slot-images
+      volumes:
+        - name: slot-images
+          persistentVolumeClaim:
+            claimName: {{ $mirrorName }}-data
+      {{- /* No nodeSelector beyond the standard control-plane
+              merge — the mirror lands on whatever appliance node
+              the local-path provisioner picks for the PVC. Operators
+              who want to move it use the standard "kubectl drain +
+              delete PVC" dance; we don't pre-pin via affinity
+              because that'd defeat the "operator pins later"
+              flexibility the Phase B design called for. */}}
+      {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.slotImageMirror.nodeSelector) .) | nindent 6 }}
+      {{- with .Values.slotImageMirror.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $mirrorName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+{{- end }}

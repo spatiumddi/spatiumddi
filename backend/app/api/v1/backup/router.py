@@ -113,6 +113,15 @@ async def create_and_download_backup(
     operator re-enters them by hand.
     """
     _require_superadmin(current_user)
+    # #296 Phase H — refuse if a rolling upgrade is in flight. The
+    # backup snapshot captures schema + data state; running one mid-
+    # upgrade would capture a half-upgraded cluster that would surprise
+    # the operator on restore.
+    from app.services.upgrades.safety import (  # noqa: PLC0415
+        assert_no_upgrade_in_flight,
+    )
+
+    await assert_no_upgrade_in_flight(db, operation_hint="backup creation")
     try:
         archive_bytes, filename = await build_backup_archive(
             db,
@@ -244,6 +253,13 @@ async def restore_backup(
     from the archive while the rest stay untouched.
     """
     _require_superadmin(current_user)
+    # #296 Phase H — restoring a backup mid-upgrade would rip the
+    # schema + data state out from under the orchestrator. Refuse.
+    from app.services.upgrades.safety import (  # noqa: PLC0415
+        assert_no_upgrade_in_flight,
+    )
+
+    await assert_no_upgrade_in_flight(db, operation_hint="backup restore")
 
     archive_bytes = await archive.read()
     if not archive_bytes:

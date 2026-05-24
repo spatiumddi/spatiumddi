@@ -46,16 +46,19 @@ import hmac
 import os
 import shutil
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 import structlog
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
+from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
 from app.config import settings
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.models.appliance import ApplianceSlotImage
@@ -107,6 +110,166 @@ def _ensure_storage_dir() -> None:
         # chmod (e.g. tmpfs with default mode). Not load-bearing —
         # the api container's user owns the path already.
         pass
+
+
+# ── Mirror routing (#296 Phase B) ──────────────────────────────────────
+#
+# When ``settings.slot_image_mirror_url`` is set, the upload / download
+# / delete handlers stream byte ops through the mirror Deployment via
+# its in-cluster Service. The api keeps owning DB metadata + the
+# operator-facing endpoint shape; only the bytes themselves leave the
+# api pod. When the URL is unset (single-instance docker-compose / a
+# plain k8s install with the mirror disabled), the handlers fall back
+# to direct local-FS access — the pre-Phase-B behaviour.
+#
+# All three proxy helpers raise HTTPException on transport / status
+# failure so the operator-facing handler returns a clean error code
+# rather than a stack trace.
+
+
+def _mirror_url(image_id: uuid.UUID) -> str:
+    base = settings.slot_image_mirror_url.rstrip("/")
+    return f"{base}/api/v1/appliance/internal/slot-images/{image_id}"
+
+
+# Generous timeout — slot-image uploads are 1-4 GiB streams. 30 min
+# read budget covers a slow LAN / VPN tunnel; the api will already
+# have streamed enough body to trip a Starlette timeout long before
+# this if something's truly wedged.
+_MIRROR_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=1800.0, write=1800.0, pool=30.0)
+
+
+async def _stream_upload_through_mirror(
+    image_id: uuid.UUID,
+    body: AsyncIterator[bytes],
+) -> None:
+    """Stream the upload body to the mirror via PUT.
+
+    The api hashes + size-counts the chunks separately in the caller;
+    this helper just pipes bytes onward. A non-2xx from the mirror
+    raises 502 — the upload failed downstream, not at the operator.
+    """
+    headers = {"X-Mirror-Auth": mirror_auth_token("put", image_id)}
+    async with httpx.AsyncClient(timeout=_MIRROR_HTTP_TIMEOUT) as client:
+        try:
+            resp = await client.put(
+                _mirror_url(image_id),
+                content=body,
+                headers=headers,
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                f"Mirror upload failed: {exc}",
+            ) from exc
+    if resp.status_code not in (200, 201, 204):
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"Mirror upload returned {resp.status_code}: {resp.text[:200]!r}",
+        )
+
+
+async def _stream_download_from_mirror(
+    image_id: uuid.UUID,
+    *,
+    filename: str | None = None,
+) -> StreamingResponse:
+    """Stream bytes from the mirror back to the requester.
+
+    The mirror serves a FileResponse; we open a streaming GET against
+    it and pass the chunks through. The mirror's content-length passes
+    through too, so the host runner's progress bar still works.
+
+    ``filename`` controls the ``Content-Disposition`` header so the
+    browser / host runner sees the same filename as the local-FS path
+    (``FileResponse(..., filename=row.filename)``). Without it the
+    mirror path returns a no-Content-Disposition response + browsers
+    save the raw UUID as the filename. Defaults to ``<image_id>.raw.xz``
+    when not supplied so the host runner still gets a sensible name
+    even for direct mirror-only flows.
+    """
+    headers = {"X-Mirror-Auth": mirror_auth_token("get", image_id)}
+    client = httpx.AsyncClient(timeout=_MIRROR_HTTP_TIMEOUT)
+    try:
+        # Build the request manually so we can keep the client open
+        # for the duration of the stream — closing it inside the
+        # ``StreamingResponse`` generator yields a clean shutdown
+        # when the operator's tcp connection closes.
+        request = client.build_request("GET", _mirror_url(image_id), headers=headers)
+        upstream = await client.send(request, stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"Mirror download failed: {exc}",
+        ) from exc
+    if upstream.status_code == 404:
+        await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "Slot image bytes missing on mirror — re-upload required.",
+        )
+    if upstream.status_code != 200:
+        body_preview = (await upstream.aread())[:200]
+        await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"Mirror returned {upstream.status_code}: {body_preview!r}",
+        )
+
+    async def _iter() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in upstream.aiter_bytes(_CHUNK_BYTES):
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    # Preserve upstream content-length so progress bars work end-to-
+    # end. ``StreamingResponse`` doesn't set it on its own. Also set
+    # Content-Disposition with the original filename so the mirror
+    # path matches FileResponse's behaviour for the local path —
+    # without this, browsers + the host runner would see the
+    # response without a filename hint + fall back to the URL's last
+    # path segment ("raw.xz") or save the raw UUID. Copilot review
+    # finding.
+    resp_filename = filename or f"{image_id}.raw.xz"
+    resp_headers: dict[str, str] = {
+        "Content-Disposition": f'attachment; filename="{resp_filename}"',
+    }
+    if "content-length" in upstream.headers:
+        resp_headers["Content-Length"] = upstream.headers["content-length"]
+    return StreamingResponse(
+        _iter(),
+        media_type="application/octet-stream",
+        headers=resp_headers,
+    )
+
+
+async def _delete_from_mirror(image_id: uuid.UUID) -> None:
+    """Issue DELETE against the mirror; tolerate 404 (already gone)."""
+    headers = {"X-Mirror-Auth": mirror_auth_token("delete", image_id)}
+    async with httpx.AsyncClient(timeout=_MIRROR_HTTP_TIMEOUT) as client:
+        try:
+            resp = await client.delete(_mirror_url(image_id), headers=headers)
+        except httpx.HTTPError as exc:
+            # Log + continue — the DB row delete is the authoritative
+            # "this image is gone" signal. Stale bytes get reaped by
+            # the future prune task.
+            logger.warning(
+                "slot_image_mirror_delete_failed",
+                image_id=str(image_id),
+                error=str(exc),
+            )
+            return
+    if resp.status_code not in (200, 204, 404):
+        logger.warning(
+            "slot_image_mirror_delete_failed",
+            image_id=str(image_id),
+            status=resp.status_code,
+        )
 
 
 # ── Schemas ────────────────────────────────────────────────────────
@@ -188,7 +351,10 @@ async def upload_slot_image(
     ),
 ) -> SlotImageRow:
     _require_superadmin(current_user)
-    _ensure_storage_dir()
+    # #296 Phase B — only ensure the local dir when we're actually
+    # going to write to it. In mirror mode the local FS is untouched.
+    if not settings.slot_image_mirror_url:
+        _ensure_storage_dir()
 
     expected_sha = sha256.lower().strip()
     if not all(c in "0123456789abcdef" for c in expected_sha):
@@ -216,28 +382,38 @@ async def upload_slot_image(
         return _row_to_schema(existing)
 
     image_id = uuid.uuid4()
-    target_path = _image_path(image_id)
-    tmp_path = target_path.with_suffix(".raw.xz.partial")
     hasher = hashlib.sha256()
     bytes_written = 0
 
-    try:
-        with tmp_path.open("wb") as out:
+    if settings.slot_image_mirror_url:
+        # #296 Phase B — proxy the upload bytes to the mirror Deployment.
+        # We can't pre-compute the SHA (we'd have to buffer the entire
+        # 1-4 GiB body) so we tee the stream: every chunk goes both
+        # into the hasher + the mirror PUT body, and we validate the
+        # SHA after the PUT completes. On mismatch, fire a DELETE
+        # against the mirror to clean the orphan bytes.
+
+        async def _tee() -> AsyncIterator[bytes]:
+            nonlocal bytes_written
             while True:
                 chunk = await file.read(_CHUNK_BYTES)
                 if not chunk:
-                    break
+                    return
                 bytes_written += len(chunk)
                 if bytes_written > MAX_UPLOAD_BYTES:
+                    # Bailing the generator aborts the PUT body mid-
+                    # stream → mirror cleans up its .partial file.
                     raise HTTPException(
                         status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         f"Upload exceeds {MAX_UPLOAD_BYTES} bytes.",
                     )
                 hasher.update(chunk)
-                out.write(chunk)
+                yield chunk
+
+        await _stream_upload_through_mirror(image_id, _tee())
         actual_sha = hasher.hexdigest()
         if actual_sha != expected_sha:
-            tmp_path.unlink(missing_ok=True)
+            await _delete_from_mirror(image_id)
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 (
@@ -245,18 +421,47 @@ async def upload_slot_image(
                     f"{actual_sha}. Re-download the file + re-upload."
                 ),
             )
-        # Bytes pass verification — atomically move into place.
-        tmp_path.replace(target_path)
-    except HTTPException:
-        # Re-raise validation errors after cleaning up the partial.
-        tmp_path.unlink(missing_ok=True)
-        raise
-    except OSError as exc:
-        tmp_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            f"Failed to write slot image to disk: {exc}",
-        ) from exc
+    else:
+        # Single-instance / docker-compose path — write to local FS
+        # with the same atomic .partial → final rename pattern.
+        target_path = _image_path(image_id)
+        tmp_path = target_path.with_suffix(".raw.xz.partial")
+        try:
+            with tmp_path.open("wb") as out:
+                while True:
+                    chunk = await file.read(_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    bytes_written += len(chunk)
+                    if bytes_written > MAX_UPLOAD_BYTES:
+                        raise HTTPException(
+                            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            f"Upload exceeds {MAX_UPLOAD_BYTES} bytes.",
+                        )
+                    hasher.update(chunk)
+                    out.write(chunk)
+            actual_sha = hasher.hexdigest()
+            if actual_sha != expected_sha:
+                tmp_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    (
+                        f"SHA-256 mismatch — expected {expected_sha}, got "
+                        f"{actual_sha}. Re-download the file + re-upload."
+                    ),
+                )
+            # Bytes pass verification — atomically move into place.
+            tmp_path.replace(target_path)
+        except HTTPException:
+            # Re-raise validation errors after cleaning up the partial.
+            tmp_path.unlink(missing_ok=True)
+            raise
+        except OSError as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                f"Failed to write slot image to disk: {exc}",
+            ) from exc
 
     row = ApplianceSlotImage(
         id=image_id,
@@ -362,53 +567,63 @@ def _verify_slot_image_download_token(image_id: uuid.UUID, token: str) -> bool:
 @router.get(
     "/slot-images/{image_id}/raw.xz",
     summary="Download a slot image",
+    # Return type is FileResponse on the local path, StreamingResponse
+    # on the mirror-proxy path. FastAPI can't derive a pydantic model
+    # from that union — and there isn't one (raw bytes). Tell it
+    # explicitly to skip response-model generation.
+    response_model=None,
 )
 async def download_slot_image(
     image_id: uuid.UUID,
     db: DB,
     t: str | None = None,
-) -> FileResponse:
-    """Stream the raw.xz back. Two paths in:
+) -> FileResponse | StreamingResponse:
+    """Stream the raw.xz back — **token-only** access.
 
-    * ``?t=<hmac>`` — minted by the upgrade scheduler and embedded in
-      the ``desired_slot_image_url`` the supervisor relays to the
-      host-side ``spatium-upgrade-slot`` runner. Required because the
-      runner has no operator session / mTLS material.
-    * No token + an authenticated browser session — the operator can
-      hit the URL directly to re-verify bytes against the row's
-      sha256.
+    Only one auth path is currently accepted: a valid ``?t=<hmac>``
+    query param minted by the upgrade scheduler + embedded in the
+    ``desired_slot_image_url`` the supervisor relays to the host-side
+    ``spatium-upgrade-slot`` runner. The runner has no operator
+    session / mTLS material, which is why the token mechanism exists.
 
-    Both gates land in the same FileResponse stream below.
+    An authenticated-browser-session fallback was sketched in early
+    Phase B and **deliberately deferred** — operators who want to
+    re-verify bytes against the row's sha256 today use ``GET /api/v1/
+    appliance/slot-images`` for the metadata + a separate shell
+    workflow against the mirror PVC (or wait for the follow-up that
+    re-adds the CurrentUser dep here).
+
+    In multi-node mirror mode (#296 Phase B) the api proxies the
+    byte stream from the mirror Service; in single-instance mode it
+    serves directly from local FS.
     """
     row = await db.get(ApplianceSlotImage, image_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Slot image not found.")
 
-    # If a token is provided, it must validate — no fallback to
-    # browser auth so a bad token doesn't accidentally hit the auth
-    # path with a misleading 401. If no token is provided, fall back
-    # to requiring an authenticated superadmin session below.
-    if t is not None:
-        if not _verify_slot_image_download_token(image_id, t):
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Invalid slot-image download token.",
-            )
-    else:
-        # No token — browser-direct access path is rejected with 401.
-        # Operators who want a direct-download path can re-add the
-        # CurrentUser dep alongside the token check in a follow-up;
-        # for now the token-only path keeps the function signature
-        # minimal for the supervisor's host-side runner (its only
-        # legitimate caller).
+    # Token-only auth path. No fallback to browser auth — a missing
+    # token gets 401 with a clear hint at what's missing.
+    if t is None:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
-            "Slot-image downloads require either a ``?t=<token>`` "
-            "query param (minted by the upgrade scheduler) or an "
-            "authenticated superadmin session. Operator-direct "
-            "browser downloads can use the /api/v1/appliance/slot-images "
-            "list endpoint plus a manually-presented session.",
+            "Slot-image downloads require a ``?t=<token>`` query "
+            "param minted by the upgrade scheduler. Operator-direct "
+            "browser downloads aren't supported here today; use "
+            "``GET /api/v1/appliance/slot-images`` for metadata + the "
+            "row's sha256, then re-verify bytes through a separate "
+            "shell workflow against the mirror PVC.",
         )
+    if not _verify_slot_image_download_token(image_id, t):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Invalid slot-image download token.",
+        )
+
+    if settings.slot_image_mirror_url:
+        # #296 Phase B — bytes live on the mirror Deployment. Stream
+        # through. The mirror's 404 surfaces as 404 here; transport
+        # errors as 502.
+        return await _stream_download_from_mirror(row.id, filename=row.filename)
 
     path = _image_path(row.id)
     if not path.exists():
@@ -437,14 +652,19 @@ async def delete_slot_image(image_id: uuid.UUID, current_user: CurrentUser, db: 
     row = await db.get(ApplianceSlotImage, image_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Slot image not found.")
-    path = _image_path(row.id)
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        # Disk-side cleanup is best-effort — the row delete below is
-        # the authoritative "this image is gone" signal. Stale bytes
-        # on disk get reaped by the future prune task.
-        pass
+    if settings.slot_image_mirror_url:
+        # #296 Phase B — delete from the mirror Deployment. Best-effort:
+        # the DB row delete below is the authoritative signal; stale
+        # bytes on the mirror get reaped by the future prune task.
+        await _delete_from_mirror(row.id)
+    else:
+        path = _image_path(row.id)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            # Disk-side cleanup is best-effort — the row delete below
+            # is the authoritative "this image is gone" signal.
+            pass
     filename = row.filename
     version = row.appliance_version
     await db.delete(row)

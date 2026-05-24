@@ -55,6 +55,11 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
+      # #296 Phase A2 — give named time to flush in-flight queries during
+      # a rolling-upgrade drain. Without an explicit grace SIGTERM races
+      # the kernel's default 30s anyway, but stamping it here documents
+      # the contract the orchestrator's per-node cordon → drain relies on.
+      terminationGracePeriodSeconds: 30
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}
         # Phase 10 (#183) — per-role scheduling label. Pod stays
@@ -93,14 +98,32 @@ spec:
             - name: dns-tcp
               containerPort: 53
               protocol: TCP
-          # ``dig version.bind CH TXT`` against the local listener
-          # is the standard BIND9 readiness probe. Same shape kind-
-          # AXFR uses in our existing e2e workflow.
+          # #296 Phase A2 — readiness gates the per-node Phase 8 rolling
+          # upgrade's uncordon step. A kubernetes-Ready node briefly
+          # served no DNS while the new pod pulled its image + warmed
+          # its config-bundle cache from the control plane; this gate
+          # blocks until BOTH conditions hold:
+          #   1. ``.ready`` marker exists — set by the agent's sync loop
+          #      after the first successful ConfigBundle fetch + persist
+          #      + driver-apply. Persists across container restarts on
+          #      the hostPath volume (#292), so a warm-restart pod is
+          #      Ready immediately. A failed sync does NOT stamp it.
+          #   2. ``dig`` against the local listener confirms named is
+          #      actually answering queries. ``+timeout=2`` keeps the
+          #      probe well under the timeoutSeconds:3 budget.
+          # initialDelaySeconds:5 / periodSeconds:10 / failureThreshold:3
+          # means a hung named takes ~35 s to NotReady — not flaky, but
+          # fast enough that the orchestrator notices a sick node.
           readinessProbe:
-            tcpSocket:
-              port: 53
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -f /var/lib/spatium-dns-agent/.ready && dig @127.0.0.1 -p 53 . NS +short +timeout=2 +tries=1 >/dev/null"
             initialDelaySeconds: 5
             periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
           livenessProbe:
             tcpSocket:
               port: 53

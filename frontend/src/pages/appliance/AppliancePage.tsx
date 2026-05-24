@@ -4,6 +4,7 @@ import {
   Box,
   Container as ContainerIcon,
   Network,
+  Rocket,
   ScrollText,
   ShieldCheck,
   Stamp,
@@ -14,6 +15,7 @@ import { applianceApi } from "@/lib/api";
 import { useSessionState } from "@/lib/useSessionState";
 import { FleetTab } from "./FleetTab";
 import { CertificatesTab } from "./CertificatesTab";
+import { ClusterUpgradeTab } from "./ClusterUpgradeTab";
 import { ContainersTab } from "./ContainersTab";
 import { LogsTab } from "./LogsTab";
 import { MaintenanceTab } from "./MaintenanceTab";
@@ -42,7 +44,8 @@ type Tab =
   | "containers"
   | "logs"
   | "network"
-  | "maintenance";
+  | "maintenance"
+  | "cluster-upgrade";
 
 interface TabSpec {
   key: Tab;
@@ -82,6 +85,19 @@ const TABS: TabSpec[] = [
     icon: Stamp,
     summary:
       "Manage the Application appliance fleet — approve / reject pending pairings, assign roles + groups, schedule OS slot upgrades + reboots, re-key + delete. Pending rows pin at the top; approved rows open a per-appliance drilldown with capability detail + role assignment + firewall preview + OS upgrade controls.",
+  },
+  {
+    // #296 Phase G — Rolling Upgrade tab. Multi-node cluster upgrade
+    // orchestrator surface; consumes the Phase A-F endpoints under
+    // /api/v1/upgrades. selfOnly because the orchestrator requires
+    // kubeapi access (no docker-compose path).
+    key: "cluster-upgrade",
+    label: "Rolling Upgrade",
+    phase: "296",
+    icon: Rocket,
+    selfOnly: true,
+    summary:
+      "Multi-node rolling upgrade orchestrator — walks the cluster from version N-1 to N one node at a time with preflight gate, CNPG cordon-triggered switchover, drain, slot apply + reboot, health gate, DS-Ready gate, uncordon. Post-loop chart bump + migrate Job close the mixed-version window once every node commits the new slot.",
   },
   {
     key: "containers",
@@ -250,6 +266,8 @@ export function AppliancePage() {
             applianceMode={isApplianceHost}
             onNavigateTab={(t) => setTab(t as Tab)}
           />
+        ) : effectiveTab === "cluster-upgrade" ? (
+          <ClusterUpgradeTab />
         ) : effectiveTab === "containers" ? (
           <ContainersTab />
         ) : effectiveTab === "logs" ? (
