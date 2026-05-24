@@ -105,20 +105,7 @@ const CATEGORY_HINTS: Record<ClusterUpgradeFailureCategory, string> = {
   other: "Check progress.per_node[<node>].error for the raw message.",
 };
 
-type AppliancePageTab =
-  | "tls"
-  | "fleet"
-  | "releases"
-  | "containers"
-  | "logs"
-  | "network"
-  | "maintenance";
-
-interface Props {
-  onNavigateTab?: (tab: AppliancePageTab) => void;
-}
-
-export function ClusterUpgradeTab(_: Props) {
+export function ClusterUpgradeTab() {
   const qc = useQueryClient();
 
   const { data: lease, isLoading: leaseLoading } = useQuery({
@@ -135,6 +122,12 @@ export function ClusterUpgradeTab(_: Props) {
       const anyActive = list?.some((r) => ACTIVE_STATES.has(r.state));
       return anyActive ? 2_000 : 15_000;
     },
+    // Review polish — transient network blips during the 2 s active-run
+    // poll shouldn't strand the operator on stale data. Retry 3 times
+    // with a linear backoff (1 s / 2 s / 3 s) so a brief api restart
+    // self-recovers within ~10 s without surfacing an error banner.
+    retry: 3,
+    retryDelay: (attempt) => attempt * 1000,
   });
 
   const activeRun = useMemo(
@@ -230,6 +223,14 @@ function PlanFormPanel() {
     queryFn: () => clusterUpgradesApi.preflight(preflightTarget as string),
     enabled: !!preflightTarget && preflightTarget.length > 0,
     refetchOnWindowFocus: false,
+    // Preflight verdicts can move between an operator's preflight click
+    // + their Plan click (replication lag spikes, a node flips
+    // NotReady). Treat the cached result as stale immediately so any
+    // re-mount of the panel fetches a fresh verdict — the operator
+    // explicitly clicked Run preflight when they wanted the current
+    // value.
+    staleTime: 0,
+    gcTime: 60_000,
   });
 
   const planMut = useMutation({
@@ -535,7 +536,10 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
           → <code className="font-mono">{run.target_version}</code>
         </h3>
         <span className="text-xs text-muted-foreground">
-          run <code className="font-mono">{run.id.slice(0, 8)}</code>
+          run{" "}
+          <code className="font-mono" title={run.id}>
+            {run.id.slice(0, 8)}
+          </code>
           {run.lease_holder ? ` · holder ${run.lease_holder}` : ""}
         </span>
         <div className="ml-auto flex flex-wrap gap-2">

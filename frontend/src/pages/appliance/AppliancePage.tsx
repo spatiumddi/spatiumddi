@@ -267,7 +267,7 @@ export function AppliancePage() {
             onNavigateTab={(t) => setTab(t as Tab)}
           />
         ) : effectiveTab === "cluster-upgrade" ? (
-          <ClusterUpgradeTab onNavigateTab={(t) => setTab(t as Tab)} />
+          <ClusterUpgradeTab />
         ) : effectiveTab === "containers" ? (
           <ContainersTab />
         ) : effectiveTab === "logs" ? (

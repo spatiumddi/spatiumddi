@@ -34,7 +34,7 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_permission
@@ -136,6 +136,26 @@ class PlanRequest(BaseModel):
         max_length=63,
         description="CNPG Cluster's namespace; defaults to the api pod's.",
     )
+
+    @field_validator("slot_image_url")
+    @classmethod
+    def _validate_slot_image_url(cls, v: str) -> str:
+        # Review polish — catch operator typos at plan time rather than
+        # surfacing a confusing "unsupported scheme" error 30 min into
+        # the rolling upgrade when the host runner finally tries to
+        # GET the URL. Only http(s) is accepted; file:// + s3:// are
+        # deliberately not supported by spatium-upgrade-slot apply.
+        from urllib.parse import urlparse  # noqa: PLC0415
+
+        try:
+            parsed = urlparse(v)
+        except ValueError as exc:
+            raise ValueError(f"slot_image_url is not a parseable URL: {exc}") from exc
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"slot_image_url scheme must be http or https, got {parsed.scheme!r}")
+        if not parsed.netloc:
+            raise ValueError("slot_image_url must include a host")
+        return v
 
 
 class PreflightRowOut(BaseModel):

@@ -643,7 +643,21 @@ async def single_node_upgrade(
         "uncordon",
         "cluster_verify",
     ]
-    if start_step is not None and start_step in steps_in_order:
+    if start_step is not None:
+        # Review polish — surface a typo'd / future-removed step name
+        # loudly instead of silently restarting from step 0 (which would
+        # re-cordon + re-drain a node that just finished its primitive
+        # cleanly). The previous fall-through was a footgun for the
+        # Phase D orchestrator's resume logic.
+        if start_step not in steps_in_order:
+            # ValueError rather than OrchestratorError to avoid pulling
+            # the orchestrator module into per_node's import graph (it
+            # already imports per_node). The orchestrator catches +
+            # surfaces this when it drives the chain.
+            raise ValueError(
+                f"unknown resume step {start_step!r}; "
+                f"expected one of: {', '.join(steps_in_order)}"
+            )
         start_index = steps_in_order.index(start_step)
     else:
         start_index = 0
