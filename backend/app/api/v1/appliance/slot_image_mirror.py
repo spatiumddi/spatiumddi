@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
 import shutil
 import uuid
 from hashlib import sha256
@@ -54,6 +55,15 @@ logger = structlog.get_logger(__name__)
 
 _AUTH_HEADER = "X-Mirror-Auth"
 
+# Canonical UUID-string shape (8-4-4-4-12 lowercase hex). Used as a
+# CodeQL-recognised path-injection sanitiser barrier in ``_image_path``
+# — ``re.fullmatch`` against a character-set-restricted pattern is in
+# the upstream ``py/path-injection`` query's sanitiser set, whereas
+# ``pathlib.Path.is_relative_to`` is not (verified by re-run on PR
+# #298 — eight alerts persisted across the previous resolve-+-relative
+# check, all cleared once the value passed through this regex).
+_UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
 
 router = APIRouter()
 
@@ -65,19 +75,42 @@ def _image_dir() -> Path:
 def _image_path(image_id: uuid.UUID) -> Path:
     """Resolved path to the slot image under the mirror dir.
 
-    FastAPI's ``image_id: uuid.UUID`` type annotation already rejects
-    any value that isn't a valid UUID before the handler runs, so a
-    path-traversal payload can never reach here. Belt-and-braces: we
-    resolve the final path + assert it stays inside the base dir
-    anyway — closes CodeQL's path-injection alert (it can't see the
-    UUID validation upstream) and defends against any future
-    refactor that loosens the type.
+    Three layers of defence against path-injection on the
+    ``image_id`` path component:
+
+    1. FastAPI's ``image_id: uuid.UUID`` type annotation rejects any
+       non-UUID value before the handler runs (422 on a malformed
+       string). This alone is sufficient at runtime.
+
+    2. ``re.fullmatch`` against ``_UUID_PATTERN`` re-validates the
+       stringified form. Identity at runtime since a valid UUID
+       always matches; CodeQL's ``py/path-injection`` query
+       recognises ``re.fullmatch`` against a character-restricted
+       regex as a sanitiser barrier and so stops taint flow at
+       this point. (``Path.is_relative_to`` is NOT in CodeQL's
+       sanitiser set — verified on PR #298 #47-#57.)
+
+    3. Resolve-then-``is_relative_to`` on the final path. Belt and
+       braces against any future refactor that bypasses the regex
+       (e.g. switching the path param type from ``UUID`` to ``str``
+       without updating this helper).
     """
+    # Stringify + regex-match. Identity at runtime (the UUID type
+    # guard already enforces shape), but flips the taint-tracker
+    # off CodeQL's data-flow view.
+    safe_id = str(image_id)
+    if not _UUID_PATTERN.fullmatch(safe_id):
+        # Unreachable given the UUID type coercion; bail loudly if a
+        # future refactor loosens the type and an attacker reaches
+        # this branch.
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Invalid slot image id.",
+        )
     base = _image_dir().resolve()
-    candidate = (base / f"{image_id}.raw.xz").resolve()
+    candidate = (base / f"{safe_id}.raw.xz").resolve()
     if not candidate.is_relative_to(base):
-        # Unreachable given the UUID guard above; bail loudly if we
-        # ever get here so a regression surfaces immediately.
+        # Unreachable given the regex above; same reasoning.
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             "Resolved slot-image path escapes the mirror directory.",
