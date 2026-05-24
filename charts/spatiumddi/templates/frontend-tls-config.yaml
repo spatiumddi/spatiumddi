@@ -55,6 +55,23 @@ data:
 
         resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
 
+        # Issue #299 phase 2 — same friendly "still booting" page the
+        # non-TLS image template serves, mirrored here for the
+        # appliance's TLS-fronted shape. Only 502 + 504 (upstream
+        # connect refused / upstream timeout); 503 stays as-is so
+        # the api's intentional 503s (demo-mode, factory-reset
+        # cooldown, /health/ready with schema-behind) reach the
+        # operator unchanged. See frontend/default.conf.template's
+        # error_page comment for the full reasoning.
+        error_page 502 504 = @starting;
+
+        location @starting {
+            default_type text/html;
+            add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+            add_header X-Upstream-Status $upstream_status always;
+            try_files /_starting.html =503;
+        }
+
         # Large request bodies for the backup endpoint — keep the
         # same shape the default template uses.
         location /api/v1/backup/ {
