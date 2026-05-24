@@ -111,6 +111,15 @@ def _patch_image_tag(values_yaml: str, new_tag: str) -> str:
     ``image.tag`` gets stamped. An empty / missing ``image`` block is
     created.
 
+    Returns the **original** ``values_yaml`` unchanged when ``image.tag``
+    is already ``new_tag``. The Copilot review caught a real issue
+    here: ``yaml.safe_dump(sort_keys=True)`` rewrites key order, so
+    even a no-op call (already-current tag) used to produce a different
+    string than the input + the upsert's idempotent-check then
+    triggered a spurious HelmChartConfig PATCH → helm-controller
+    re-applies the chart → Deployments roll for no reason. The
+    no-op short-circuit avoids that.
+
     YAML parse failures fall back to writing a minimal fresh document
     rather than crashing — a previous operator's hand-edit shouldn't
     block the rolling-upgrade chart bump.
@@ -122,14 +131,21 @@ def _patch_image_tag(values_yaml: str, new_tag: str) -> str:
     if not isinstance(doc, dict):
         doc = {}
     image_block = doc.get("image")
+    # No-op short-circuit — if image.tag is already current AND the
+    # image block is a dict (well-formed YAML), return the input
+    # unchanged so the upsert's idempotent compare in
+    # ``k8s.upsert_helmchartconfig`` sees the current valuesContent
+    # equals the desired one + skips the PATCH.
+    if isinstance(image_block, dict) and image_block.get("tag") == new_tag:
+        return values_yaml
     if not isinstance(image_block, dict):
         image_block = {}
     image_block["tag"] = new_tag
     doc["image"] = image_block
-    # Stable key order + no aliases for a deterministic diff. The
-    # supervisor's apply_control_plane_overrides uses default key
-    # order which is fine since the helm-controller hashes the string
-    # before comparing.
+    # Stable key order so two clean rewrites produce byte-identical
+    # output. We only reach this path when the value actually needs to
+    # change; the no-op case above protects the byte-stable-on-no-
+    # change invariant.
     return yaml.safe_dump(doc, sort_keys=True, default_flow_style=False)
 
 

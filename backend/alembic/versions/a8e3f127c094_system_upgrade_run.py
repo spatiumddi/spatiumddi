@@ -1,9 +1,11 @@
 """system_upgrade_run table (#296 Phase A — rolling-upgrade state)
 
-One row per cluster-wide or single-node upgrade attempt. Phase A only
-writes a ``planned`` row from the read-only preflight endpoint; Phases
-C/D drive the lifecycle through running → succeeded | failed | halted
-| aborted as the orchestrator walks per-node.
+One row per cluster-wide or single-node upgrade attempt. Phase A
+ships the table shape; Phase D's ``plan_upgrade`` is the first code
+path that inserts a row (the preflight HTTP endpoint stays read-only
++ never writes here). From the initial ``planned`` insert the
+orchestrator walks the lifecycle through running → succeeded | failed
+| halted | aborted via ``_transition`` writes.
 
 The cluster-wide single-upgrader mutex lives in a
 ``coordination.k8s.io/v1/Lease``, NOT in this table — the lease holder
@@ -96,9 +98,11 @@ def upgrade() -> None:
     # Cluster-wide invariant: at most one non-terminal run at a time.
     # The k8s Lease is the real lock (survives DB blips); this index
     # is a backstop so a bug in the orchestrator can't race two rows
-    # into ``running`` simultaneously. Terminal states (succeeded,
-    # failed, halted, aborted) are excluded from the partial index so
-    # operators can keep full upgrade history without bumping into it.
+    # into ``running`` simultaneously. Non-terminal states (planned,
+    # running, halted — halted is resumable so it counts) are covered
+    # by the partial index; truly terminal states (succeeded, failed,
+    # aborted) are excluded so operators can keep full upgrade history
+    # without bumping into the unique constraint.
     op.execute(
         "CREATE UNIQUE INDEX ix_system_upgrade_run_one_active "
         "ON system_upgrade_run ((1)) "

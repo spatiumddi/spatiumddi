@@ -13,12 +13,14 @@ Two surfaces:
 
 2. **Post-upgrade cluster verification** — Phase C's per-node
    ``_step_cluster_verify`` re-runs a cheap subset of preflight
-   (replication lag + quorum). Phase H expands that with the
-   surface called out in the issue body: CNPG instance count =
+   (replication lag + quorum). Phase H expands that with two
+   cluster-wide checks: CNPG instance count =
    ``Cluster.status.readyInstances`` matches spec; every DaemonSet
    pod across the cluster reports Ready (closes failure-mode #21 at
-   the cluster scope rather than just per-node); the MetalLB VIP
-   Service has at least one endpoint.
+   the cluster scope rather than just per-node). The MetalLB VIP
+   Service endpoint check called out in the original issue body is
+   deferred — it depends on the data-plane VIP work (#272 Ph10) for
+   a shape-stable target to query.
 
 The mutex doesn't try to be a transactional lock — concurrent reads
 of the system_upgrade_run row are fine. A real race between the

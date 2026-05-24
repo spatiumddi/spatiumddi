@@ -40,14 +40,20 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, UUIDPrimaryKeyMixin
 
-# Lifecycle. Phase A only ever creates rows in ``planned`` (the
-# preflight endpoint stamps a row with the findings); Phases C/D add
-# the transitions through running → succeeded | failed | halted |
-# aborted. Kept as a plain string column so future kinds (e.g. a
-# "dry_run" state for the Phase G UI preview) slot in without an
+# Lifecycle. Phase D's ``plan_upgrade`` is the only path that creates
+# a row — it runs preflight (read-only, no writes) then persists a
+# ``planned`` row with the node order + the preflight findings as
+# audit context. Subsequent transitions through running → succeeded |
+# failed | halted | aborted are driven by the orchestrator's
+# ``_transition`` helper. The preflight HTTP endpoint
+# (``GET /api/v1/upgrades/preflight``) is purely read-only + never
+# touches this table.
+#
+# Kept as a plain string column (not a pg enum) so future states
+# (e.g. a ``dry_run`` for Phase G's UI preview) slot in without an
 # enum-migration round-trip.
 LIFECYCLE_STATES = (
-    "planned",  # preflight ran, plan written, awaiting operator confirm
+    "planned",  # plan_upgrade has run; awaiting operator /start
     "running",  # at least one node has started its per-node primitive
     "succeeded",  # every node committed the new slot durably
     "failed",  # a node hit a non-recoverable error (auto-revert, DB,

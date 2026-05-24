@@ -52,9 +52,6 @@ from app.config import settings
 logger = structlog.get_logger(__name__)
 
 
-# Streamed-write chunk size. 4 MiB matches the operator-facing
-# upload handler so the wire shape is identical end-to-end.
-_CHUNK_BYTES = 4 * 1024 * 1024
 _AUTH_HEADER = "X-Mirror-Auth"
 
 
@@ -66,7 +63,26 @@ def _image_dir() -> Path:
 
 
 def _image_path(image_id: uuid.UUID) -> Path:
-    return _image_dir() / f"{image_id}.raw.xz"
+    """Resolved path to the slot image under the mirror dir.
+
+    FastAPI's ``image_id: uuid.UUID`` type annotation already rejects
+    any value that isn't a valid UUID before the handler runs, so a
+    path-traversal payload can never reach here. Belt-and-braces: we
+    resolve the final path + assert it stays inside the base dir
+    anyway — closes CodeQL's path-injection alert (it can't see the
+    UUID validation upstream) and defends against any future
+    refactor that loosens the type.
+    """
+    base = _image_dir().resolve()
+    candidate = (base / f"{image_id}.raw.xz").resolve()
+    if not candidate.is_relative_to(base):
+        # Unreachable given the UUID guard above; bail loudly if we
+        # ever get here so a regression surfaces immediately.
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Resolved slot-image path escapes the mirror directory.",
+        )
+    return candidate
 
 
 def mirror_auth_token(operation: str, image_id: uuid.UUID) -> str:
@@ -123,6 +139,12 @@ async def put_image(image_id: uuid.UUID, request: Request) -> None:
     _ensure_dir()
     target = _image_path(image_id)
     tmp = target.with_suffix(".raw.xz.partial")
+    # ``streamed`` flips True after the stream-loop completes; the
+    # ``finally`` block uses it to decide whether to atomic-rename or
+    # clean up the partial. Catches client disconnects + asyncio
+    # cancellation mid-stream which would otherwise leave a stale
+    # ``.partial`` file on the PVC (Copilot review finding).
+    streamed = False
     try:
         with tmp.open("wb") as fh:
             # Stream the request body straight to disk — no buffering
@@ -131,6 +153,7 @@ async def put_image(image_id: uuid.UUID, request: Request) -> None:
             async for chunk in request.stream():
                 if chunk:
                     fh.write(chunk)
+        streamed = True
         # Atomic move into place — readers calling GET in parallel
         # see either the old file or nothing, never a half-written one.
         tmp.replace(target)
@@ -140,15 +163,30 @@ async def put_image(image_id: uuid.UUID, request: Request) -> None:
             size_bytes=target.stat().st_size,
         )
     except HTTPException:
-        tmp.unlink(missing_ok=True)
         raise
     except OSError as exc:
-        tmp.unlink(missing_ok=True)
         logger.exception("slot_image_mirror_put_failed", image_id=str(image_id))
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             f"Failed to write slot image: {exc}",
         ) from exc
+    finally:
+        # Any non-success exit (HTTPException, OSError, client
+        # disconnect, asyncio.CancelledError, …) leaves the partial
+        # file orphaned; clean it up unconditionally. The atomic
+        # rename above already removed the .partial on success, so
+        # ``missing_ok=True`` is the right idempotent shape.
+        if not streamed:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                # Best-effort cleanup; future prune task picks up
+                # anything we couldn't unlink here.
+                logger.warning(
+                    "slot_image_mirror_put_partial_cleanup_failed",
+                    image_id=str(image_id),
+                    path=str(tmp),
+                )
 
 
 @router.get(

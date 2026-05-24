@@ -169,12 +169,24 @@ async def _stream_upload_through_mirror(
         )
 
 
-async def _stream_download_from_mirror(image_id: uuid.UUID) -> StreamingResponse:
+async def _stream_download_from_mirror(
+    image_id: uuid.UUID,
+    *,
+    filename: str | None = None,
+) -> StreamingResponse:
     """Stream bytes from the mirror back to the requester.
 
     The mirror serves a FileResponse; we open a streaming GET against
     it and pass the chunks through. The mirror's content-length passes
     through too, so the host runner's progress bar still works.
+
+    ``filename`` controls the ``Content-Disposition`` header so the
+    browser / host runner sees the same filename as the local-FS path
+    (``FileResponse(..., filename=row.filename)``). Without it the
+    mirror path returns a no-Content-Disposition response + browsers
+    save the raw UUID as the filename. Defaults to ``<image_id>.raw.xz``
+    when not supplied so the host runner still gets a sensible name
+    even for direct mirror-only flows.
     """
     headers = {"X-Mirror-Auth": mirror_auth_token("get", image_id)}
     client = httpx.AsyncClient(timeout=_MIRROR_HTTP_TIMEOUT)
@@ -216,8 +228,17 @@ async def _stream_download_from_mirror(image_id: uuid.UUID) -> StreamingResponse
             await client.aclose()
 
     # Preserve upstream content-length so progress bars work end-to-
-    # end. ``StreamingResponse`` doesn't set it on its own.
-    resp_headers: dict[str, str] = {}
+    # end. ``StreamingResponse`` doesn't set it on its own. Also set
+    # Content-Disposition with the original filename so the mirror
+    # path matches FileResponse's behaviour for the local path —
+    # without this, browsers + the host runner would see the
+    # response without a filename hint + fall back to the URL's last
+    # path segment ("raw.xz") or save the raw UUID. Copilot review
+    # finding.
+    resp_filename = filename or f"{image_id}.raw.xz"
+    resp_headers: dict[str, str] = {
+        "Content-Disposition": f'attachment; filename="{resp_filename}"',
+    }
     if "content-length" in upstream.headers:
         resp_headers["Content-Length"] = upstream.headers["content-length"]
     return StreamingResponse(
@@ -557,56 +578,52 @@ async def download_slot_image(
     db: DB,
     t: str | None = None,
 ) -> FileResponse | StreamingResponse:
-    """Stream the raw.xz back. Two paths in:
+    """Stream the raw.xz back — **token-only** access.
 
-    * ``?t=<hmac>`` — minted by the upgrade scheduler and embedded in
-      the ``desired_slot_image_url`` the supervisor relays to the
-      host-side ``spatium-upgrade-slot`` runner. Required because the
-      runner has no operator session / mTLS material.
-    * No token + an authenticated browser session — the operator can
-      hit the URL directly to re-verify bytes against the row's
-      sha256.
+    Only one auth path is currently accepted: a valid ``?t=<hmac>``
+    query param minted by the upgrade scheduler + embedded in the
+    ``desired_slot_image_url`` the supervisor relays to the host-side
+    ``spatium-upgrade-slot`` runner. The runner has no operator
+    session / mTLS material, which is why the token mechanism exists.
 
-    Both gates land in the same response stream below. In multi-node
-    mirror mode (#296 Phase B) the api proxies the byte stream from
-    the mirror Service; in single-instance mode it serves directly
-    from local FS.
+    An authenticated-browser-session fallback was sketched in early
+    Phase B and **deliberately deferred** — operators who want to
+    re-verify bytes against the row's sha256 today use ``GET /api/v1/
+    appliance/slot-images`` for the metadata + a separate shell
+    workflow against the mirror PVC (or wait for the follow-up that
+    re-adds the CurrentUser dep here).
+
+    In multi-node mirror mode (#296 Phase B) the api proxies the
+    byte stream from the mirror Service; in single-instance mode it
+    serves directly from local FS.
     """
     row = await db.get(ApplianceSlotImage, image_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Slot image not found.")
 
-    # If a token is provided, it must validate — no fallback to
-    # browser auth so a bad token doesn't accidentally hit the auth
-    # path with a misleading 401. If no token is provided, fall back
-    # to requiring an authenticated superadmin session below.
-    if t is not None:
-        if not _verify_slot_image_download_token(image_id, t):
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Invalid slot-image download token.",
-            )
-    else:
-        # No token — browser-direct access path is rejected with 401.
-        # Operators who want a direct-download path can re-add the
-        # CurrentUser dep alongside the token check in a follow-up;
-        # for now the token-only path keeps the function signature
-        # minimal for the supervisor's host-side runner (its only
-        # legitimate caller).
+    # Token-only auth path. No fallback to browser auth — a missing
+    # token gets 401 with a clear hint at what's missing.
+    if t is None:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
-            "Slot-image downloads require either a ``?t=<token>`` "
-            "query param (minted by the upgrade scheduler) or an "
-            "authenticated superadmin session. Operator-direct "
-            "browser downloads can use the /api/v1/appliance/slot-images "
-            "list endpoint plus a manually-presented session.",
+            "Slot-image downloads require a ``?t=<token>`` query "
+            "param minted by the upgrade scheduler. Operator-direct "
+            "browser downloads aren't supported here today; use "
+            "``GET /api/v1/appliance/slot-images`` for metadata + the "
+            "row's sha256, then re-verify bytes through a separate "
+            "shell workflow against the mirror PVC.",
+        )
+    if not _verify_slot_image_download_token(image_id, t):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Invalid slot-image download token.",
         )
 
     if settings.slot_image_mirror_url:
         # #296 Phase B — bytes live on the mirror Deployment. Stream
         # through. The mirror's 404 surfaces as 404 here; transport
         # errors as 502.
-        return await _stream_download_from_mirror(row.id)
+        return await _stream_download_from_mirror(row.id, filename=row.filename)
 
     path = _image_path(row.id)
     if not path.exists():

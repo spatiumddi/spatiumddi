@@ -104,7 +104,7 @@ async def test_bump_creates_helmchartconfig_when_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """404 on the GET → upsert creates the CR with the new image.tag."""
-    monkeypatch.setattr(chart_bump.k8s, "get_config", lambda: MagicMock())
+    monkeypatch.setattr(chart_bump.k8s, "get_config", MagicMock)
     monkeypatch.setattr(
         chart_bump.k8s, "get_helmchartconfig", lambda _name, namespace="kube-system": (404, None)
     )
@@ -136,7 +136,7 @@ async def test_bump_patches_existing_helmchartconfig(
 ) -> None:
     """200 on GET with existing valuesContent → patch preserves other
     keys + stamps image.tag."""
-    monkeypatch.setattr(chart_bump.k8s, "get_config", lambda: MagicMock())
+    monkeypatch.setattr(chart_bump.k8s, "get_config", MagicMock)
     existing_body = {
         "spec": {"valuesContent": "api:\n  replicas: 3\nimage:\n  tag: 2026.05.22-2\n"}
     }
@@ -167,7 +167,7 @@ async def test_bump_patches_existing_helmchartconfig(
 
 @pytest.mark.asyncio
 async def test_bump_fails_on_upsert_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(chart_bump.k8s, "get_config", lambda: MagicMock())
+    monkeypatch.setattr(chart_bump.k8s, "get_config", MagicMock)
     monkeypatch.setattr(
         chart_bump.k8s, "get_helmchartconfig", lambda _name, namespace="kube-system": (404, None)
     )
@@ -185,7 +185,7 @@ async def test_bump_fails_on_upsert_error(monkeypatch: pytest.MonkeyPatch) -> No
 async def test_bump_fails_on_deployment_rollout_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(chart_bump.k8s, "get_config", lambda: MagicMock())
+    monkeypatch.setattr(chart_bump.k8s, "get_config", MagicMock)
     monkeypatch.setattr(
         chart_bump.k8s, "get_helmchartconfig", lambda _name, namespace="kube-system": (404, None)
     )
@@ -207,7 +207,7 @@ async def test_bump_fails_on_migrate_job_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Deployments rolled fine but migrate Job exited non-zero → fail."""
-    monkeypatch.setattr(chart_bump.k8s, "get_config", lambda: MagicMock())
+    monkeypatch.setattr(chart_bump.k8s, "get_config", MagicMock)
     monkeypatch.setattr(
         chart_bump.k8s, "get_helmchartconfig", lambda _name, namespace="kube-system": (404, None)
     )
@@ -235,7 +235,7 @@ async def test_bump_treats_absent_migrate_job_as_ok(
 ) -> None:
     """Helm pre-upgrade hooks GC the Job after success. ``absent`` is
     a clean signal not a failure."""
-    monkeypatch.setattr(chart_bump.k8s, "get_config", lambda: MagicMock())
+    monkeypatch.setattr(chart_bump.k8s, "get_config", MagicMock)
     monkeypatch.setattr(
         chart_bump.k8s, "get_helmchartconfig", lambda _name, namespace="kube-system": (404, None)
     )

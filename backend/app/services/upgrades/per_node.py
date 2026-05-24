@@ -48,7 +48,6 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.models.appliance import Appliance
 from app.services.appliance import k8s
 from app.services.upgrades import preflight
@@ -259,7 +258,10 @@ async def _step_verify_primary_moved(
         # any change means switchover landed, and CNPG won't pick a
         # pod on a cordoned node. We just need it to be NON-None +
         # NON-empty + verified.
-        if current_primary and instances > 1 and current_primary != "":
+        # Note: ``instances > 1`` was already enforced by the early-
+        # return on line 250-251, so the gate here is just on
+        # ``current_primary`` being non-empty.
+        if current_primary:
             # Check the primary pod's nodeName != our cordoned node.
             pods_status = status_block.get("instancesStatus") or {}
             on_target = False
@@ -769,9 +771,3 @@ __all__ = [
     "build_slot_image_url",
     "single_node_upgrade",
 ]
-
-
-# ``settings`` import is held above so a future "is this configured for
-# k8s mode" gate can short-circuit non-k8s callers cleanly. Suppressing
-# the unused-import warning until Phase D wires that.
-_ = settings

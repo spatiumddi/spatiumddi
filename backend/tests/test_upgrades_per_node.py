@@ -553,9 +553,6 @@ async def test_single_node_upgrade_step_crash_caught(
     Otherwise an orchestrator-pod crash mid-step would leave the
     SystemUpgradeRun row stuck in ``running`` forever."""
 
-    async def _ok(name: per_node.StepName) -> per_node.StepResult:
-        return per_node.StepResult(name=name, started_at="t", finished_at="t").finish(True)
-
     async def _crash(_target_version: str) -> per_node.StepResult:
         raise RuntimeError("kubeapi unreachable")
 
