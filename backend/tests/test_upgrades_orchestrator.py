@@ -352,6 +352,14 @@ async def test_drive_loop_halts_on_first_node_failure(
 
     monkeypatch.setattr(per_node, "single_node_upgrade", _fake_per_node)
     monkeypatch.setattr(orchestrator.mutex, "release", lambda **_kw: (True, None))
+    # Phase F — short-circuit the alert emit path (its async db.scalar
+    # call doesn't have an AsyncMock fake here; the alert wiring has
+    # its own dedicated tests).
+    monkeypatch.setattr(
+        orchestrator.upgrade_alerts,
+        "emit_upgrade_failed_alert",
+        AsyncMock(return_value=None),
+    )
 
     await orchestrator._drive_loop(db, run, stop)  # type: ignore[arg-type]
     assert calls == ["node-a"]

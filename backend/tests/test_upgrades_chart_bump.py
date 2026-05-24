@@ -519,6 +519,14 @@ async def test_orchestrator_flips_to_failed_on_chart_bump_failure(
 
     monkeypatch.setattr(orchestrator.chart_bump, "bump_chart_image_tag", _failed_bump)
     monkeypatch.setattr(orchestrator.mutex, "release", lambda **_kw: (True, None))
+    # Phase F — short-circuit the alert emit path (its async db.scalar
+    # call doesn't have an AsyncMock fake here; the alert wiring has
+    # its own dedicated tests in test_upgrades_alerts.py).
+    monkeypatch.setattr(
+        orchestrator.upgrade_alerts,
+        "emit_upgrade_failed_alert",
+        AsyncMock(return_value=None),
+    )
 
     stop = asyncio.Event()
     await orchestrator._drive_loop(db, run, stop)  # type: ignore[arg-type]

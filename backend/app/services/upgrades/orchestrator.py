@@ -51,7 +51,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.audit import AuditLog
 from app.models.system_upgrade import LIFECYCLE_STATES, SystemUpgradeRun
 from app.services.appliance import k8s
-from app.services.upgrades import chart_bump, mutex, node_order, per_node, preflight
+from app.services.upgrades import (
+    alerts as upgrade_alerts,
+)
+from app.services.upgrades import (
+    chart_bump,
+    mutex,
+    node_order,
+    per_node,
+    preflight,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -555,6 +564,20 @@ async def _drive_loop(
             }
             if not bump.ok:
                 run.last_error = f"chart bump to {run.target_version} failed: {bump.error}"
+                # Phase F — classify + fire the cluster-upgrade-failed
+                # alert so the operator gets the same notification as
+                # any other AlertRule firing rather than having to
+                # poll ``GET /upgrades/runs``.
+                category = upgrade_alerts.classify_per_node_failure(
+                    failed_at="chart_bump", error=bump.error
+                )
+                await upgrade_alerts.emit_upgrade_failed_alert(
+                    db,
+                    run,
+                    failed_node=None,
+                    failed_at_step="chart_bump",
+                    category=category,
+                )
                 await _transition(
                     db,
                     run,
@@ -562,6 +585,7 @@ async def _drive_loop(
                     allowed_from=("running",),
                     event="chart_bump_failed",
                     error=bump.error,
+                    failure_category=category,
                 )
                 await db.commit()
                 ok, err = mutex.release()
@@ -571,6 +595,7 @@ async def _drive_loop(
                     "upgrade_chart_bump_failed",
                     run_id=str(run.id),
                     error=bump.error,
+                    category=category,
                 )
                 return
 
@@ -629,6 +654,22 @@ async def _drive_loop(
             run.last_error = (
                 f"node {next_node} failed at step {result.failed_at}: " f"{result.error}"
             )
+            # Phase F — classify the per-node failure so the alert
+            # body + ``progress.per_node[<node>].failure_category``
+            # can hint at the right operator action (drain stuck vs
+            # auto-revert vs dead-node replacement).
+            category = upgrade_alerts.classify_per_node_failure(
+                failed_at=result.failed_at, error=result.error
+            )
+            per_node_progress[next_node]["failure_category"] = category
+            run.progress = {**run.progress, "per_node": per_node_progress}
+            await upgrade_alerts.emit_upgrade_failed_alert(
+                db,
+                run,
+                failed_node=next_node,
+                failed_at_step=result.failed_at,
+                category=category,
+            )
             await _transition(
                 db,
                 run,
@@ -637,6 +678,7 @@ async def _drive_loop(
                 event="node_failed",
                 node=next_node,
                 failed_at=result.failed_at,
+                failure_category=category,
             )
             await db.commit()
             ok, err = mutex.release()
@@ -647,6 +689,7 @@ async def _drive_loop(
                 run_id=str(run.id),
                 node=next_node,
                 failed_at=result.failed_at,
+                category=category,
             )
             return
 

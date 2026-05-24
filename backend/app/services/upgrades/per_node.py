@@ -444,17 +444,24 @@ async def _step_health_gate(
         detail={"node": node_name, "target_version": target_version},
     )
     deadline = time.monotonic() + timeout_s
+    # Last installed version we saw — Phase F's classifier uses this to
+    # distinguish "node never came back up" (installed_version still
+    # the pre-upgrade value past the timeout) from "node came back on
+    # the old slot" (Phase 8c health-gate auto-revert — installed
+    # moved but landed on the wrong slot).
+    last_installed: str | None = None
     while time.monotonic() < deadline:
         appliance = await _resolve_appliance(db, node_name)
         if appliance is None:
             return step.finish(False, error=f"appliance row vanished mid-upgrade: {node_name}")
         # Refresh so we see the supervisor's heartbeat updates.
         await db.refresh(appliance)
+        last_installed = appliance.installed_appliance_version
         if appliance.last_upgrade_state == "failed":
             return step.finish(
                 False,
                 error="supervisor reported upgrade failed",
-                installed_version=appliance.installed_appliance_version,
+                installed_version=last_installed,
             )
         if (
             appliance.installed_appliance_version == target_version
@@ -462,12 +469,13 @@ async def _step_health_gate(
         ):
             return step.finish(
                 True,
-                installed_version=appliance.installed_appliance_version,
+                installed_version=last_installed,
             )
         await asyncio.sleep(_POLL_INTERVAL_S)
     return step.finish(
         False,
         error=f"health gate timed out after {timeout_s:.0f}s",
+        installed_version=last_installed,
     )
 
 
