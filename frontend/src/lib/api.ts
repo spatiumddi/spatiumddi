@@ -7162,6 +7162,186 @@ export const applianceFleetApi = {
       .then((r) => r.data),
 };
 
+// ── Multi-node rolling upgrade orchestrator (#296 Phases A-F) ──────
+// Consumed by the Fleet UI's Rolling Upgrade tab. Wraps every endpoint
+// in /api/v1/upgrades — preflight (Phase A), lease state (A),
+// plan + lifecycle endpoints (D), and run details / history (D).
+//
+// The orchestrator drives Phases C (per-node primitive), E (post-loop
+// chart bump), and F (alert + failure classifier) under the hood;
+// from the UI's perspective it's one state machine on a
+// SystemUpgradeRun row that walks planned → running → succeeded |
+// failed | halted | aborted with rich per-node progress along the way.
+
+export type ClusterUpgradeState =
+  | "planned"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "halted"
+  | "aborted";
+
+export type ClusterUpgradeFailureCategory =
+  | "preflight_fail"
+  | "drain_stuck"
+  | "cordon_fail"
+  | "cnpg_primary_stuck"
+  | "node_auto_reverted"
+  | "node_unreachable_after_apply"
+  | "supervisor_reported_failed"
+  | "node_did_not_rejoin"
+  | "chart_bump_failed"
+  | "uncordon_fail"
+  | "other";
+
+export type PreflightLevel = "ok" | "warn" | "fail";
+
+export interface PreflightCheck {
+  name: string;
+  level: PreflightLevel;
+  message: string;
+  detail: Record<string, unknown>;
+}
+
+export interface PreflightReport {
+  target_version: string;
+  current_version: string;
+  overall: PreflightLevel;
+  can_start: boolean;
+  results: PreflightCheck[];
+}
+
+export interface UpgradeLeaseState {
+  held: boolean;
+  holder: string | null;
+  renew_time: string | null;
+  transitions: number;
+  expired: boolean;
+}
+
+export interface PerNodeStepProgress {
+  name: string;
+  ok: boolean;
+  started_at: string | null;
+  finished_at: string | null;
+  detail: Record<string, unknown>;
+  error: string | null;
+}
+
+export interface PerNodeProgress {
+  ok: boolean;
+  failed_at: string | null;
+  error: string | null;
+  steps: PerNodeStepProgress[];
+  // Phase F — stable category string the Fleet UI keys off to
+  // render the right operator-action hint. Absent on still-in-flight
+  // nodes; set when the node's primitive returns ok=False.
+  failure_category?: ClusterUpgradeFailureCategory;
+}
+
+export interface ChartBumpProgress {
+  ok: boolean;
+  new_tag: string;
+  chart_name: string;
+  namespace: string;
+  started_at: string;
+  finished_at: string | null;
+  rolled_deployments: string[] | null;
+  migrate_job_state: string | null;
+  error: string | null;
+  skipped: boolean;
+  skip_reason: string | null;
+}
+
+export interface UpgradeRunEvent {
+  event: string;
+  at: string;
+  [k: string]: unknown;
+}
+
+export interface UpgradeRunProgress {
+  events: UpgradeRunEvent[];
+  per_node: Record<string, PerNodeProgress>;
+  chart_bump?: ChartBumpProgress;
+}
+
+export interface UpgradeRunPlan {
+  node_order: string[];
+  slot_image_url: string;
+  cnpg_cluster_name: string;
+  cnpg_namespace: string | null;
+  preflight_at_plan?: Array<{
+    name: string;
+    level: PreflightLevel;
+    message: string;
+  }>;
+  [k: string]: unknown;
+}
+
+export interface SystemUpgradeRun {
+  id: string;
+  kind: string;
+  state: ClusterUpgradeState;
+  target_version: string;
+  source_versions: Record<string, string | null>;
+  plan: UpgradeRunPlan;
+  progress: UpgradeRunProgress;
+  lease_holder: string | null;
+  lease_acquired_at: string | null;
+  last_error: string | null;
+  started_by_user_id: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface PreflightPlanRow {
+  name: string;
+  level: PreflightLevel;
+  message: string;
+}
+
+export interface ClusterUpgradePlanResponse {
+  run_id: string;
+  target_version: string;
+  node_order: string[];
+  preflight_overall: PreflightLevel;
+  preflight: PreflightPlanRow[];
+}
+
+export interface ClusterUpgradePlanRequest {
+  target_version: string;
+  slot_image_url: string;
+  cnpg_cluster_name?: string;
+  cnpg_namespace?: string | null;
+}
+
+export const clusterUpgradesApi = {
+  preflight: (target: string) =>
+    api
+      .get<PreflightReport>("/upgrades/preflight", { params: { target } })
+      .then((r) => r.data),
+  lease: () =>
+    api.get<UpgradeLeaseState>("/upgrades/lease").then((r) => r.data),
+  plan: (body: ClusterUpgradePlanRequest) =>
+    api
+      .post<ClusterUpgradePlanResponse>("/upgrades/plan", body)
+      .then((r) => r.data),
+  start: (runId: string) =>
+    api.post<SystemUpgradeRun>(`/upgrades/${runId}/start`).then((r) => r.data),
+  halt: (runId: string) =>
+    api.post<SystemUpgradeRun>(`/upgrades/${runId}/halt`).then((r) => r.data),
+  resume: (runId: string) =>
+    api.post<SystemUpgradeRun>(`/upgrades/${runId}/resume`).then((r) => r.data),
+  abort: (runId: string) =>
+    api.post<SystemUpgradeRun>(`/upgrades/${runId}/abort`).then((r) => r.data),
+  get: (runId: string) =>
+    api.get<SystemUpgradeRun>(`/upgrades/${runId}`).then((r) => r.data),
+  runs: (limit = 25) =>
+    api
+      .get<SystemUpgradeRun[]>("/upgrades/runs", { params: { limit } })
+      .then((r) => r.data),
+};
+
 // ── Appliance: pairing codes (issue #169) ──────────────────────────
 // Pairing codes (#169 + #170 Wave A3 reshape).
 //
