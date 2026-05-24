@@ -25,7 +25,16 @@ FROM alpine:3.22 AS runtime
 # only sets the container bounding set; for a non-root process to
 # actually use the cap, the binary needs file caps. Same fix as
 # named + pdns_server in the DNS image family.
-RUN apk add --no-cache \
+#
+# ``apk upgrade --no-cache`` runs BEFORE ``apk add`` so the package
+# database is fresh and any previously-baked layer carrying an older
+# libpq version (CVE-2026-6638 fixed in 17.10-r0 — pulled in
+# transitively by kea-admin's optional psql backend wiring) gets
+# re-resolved against the current alpine 3.22 index. GitHub Actions
+# Docker layer cache (``cache-from: type=gha``) is otherwise happy
+# to serve a 30-day-old ``apk add`` layer that Trivy will then flag.
+RUN apk upgrade --no-cache \
+ && apk add --no-cache \
       kea kea-dhcp4 kea-ctrl-agent kea-admin \
       kea-hook-lease-cmds kea-hook-ha \
       tini su-exec \
