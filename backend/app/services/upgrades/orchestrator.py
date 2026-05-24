@@ -488,7 +488,12 @@ async def drive_upgrade(
         await _drive_loop(db, run, stop_event)
     finally:
         stop_event.set()
-        await renewal_task
+        # Explicit discard of the awaited task's return value (None).
+        # Plain ``await renewal_task`` was flagged as a no-effect
+        # statement by github-code-quality's expression-statement
+        # check, which doesn't recognise ``await`` on a task as a
+        # side-effect. Bind to ``_`` to make intent unambiguous.
+        _ = await renewal_task
 
     await db.refresh(run)
     return run
