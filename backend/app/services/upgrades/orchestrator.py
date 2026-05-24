@@ -764,4 +764,9 @@ async def _drive_loop(
             await asyncio.wait_for(stop_event.wait(), timeout=_BETWEEN_NODES_PAUSE_S)
             # stop_event fired during the pause — loop will exit.
         except TimeoutError:
+            # Expected fall-through: the pause is a settle interval
+            # between nodes, not a wait-for-stop. Timeout means no
+            # halt/abort arrived during the window — proceed to the
+            # next node on the next loop iteration. No log so we
+            # don't add a line on every healthy between-node tick.
             pass

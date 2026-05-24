@@ -74,33 +74,36 @@ def _image_dir() -> Path:
 def _image_path(image_id: uuid.UUID) -> Path:
     """Resolved path to the slot image under the mirror dir.
 
-    Three layers of defence against path-injection on the
-    ``image_id`` path component:
+    Four layers of defence against path-injection on the
+    ``image_id`` path component. Each layer is independently
+    sufficient at runtime; the multiple sanitisers stack because
+    CodeQL's data-flow model is conservative — earlier attempts
+    that used only ``Path.is_relative_to`` (PR #298 fcac718) and
+    method-form ``Pattern.fullmatch`` (PR #298 941c795) were both
+    insufficient barriers for the ``py/path-injection`` query.
 
-    1. FastAPI's ``image_id: uuid.UUID`` type annotation rejects any
-       non-UUID value before the handler runs (422 on a malformed
-       string). This alone is sufficient at runtime.
+    1. FastAPI's ``image_id: uuid.UUID`` type annotation rejects
+       any non-UUID value before the handler runs (422 on a
+       malformed string). Sufficient at runtime; invisible to
+       static analysers.
 
-    2. ``re.fullmatch`` against ``_UUID_PATTERN`` re-validates the
-       stringified form. Identity at runtime since a valid UUID
-       always matches; CodeQL's ``py/path-injection`` query
-       recognises ``re.fullmatch`` against a character-restricted
-       regex as a sanitiser barrier and so stops taint flow at
-       this point. (``Path.is_relative_to`` is NOT in CodeQL's
-       sanitiser set — verified on PR #298 #47-#57.)
+    2. ``re.fullmatch`` against ``_UUID_PATTERN_STR`` re-validates
+       the stringified form and the post-match ``Match.group(0)``
+       is used as the canonical path component. CodeQL treats the
+       regex-match output as a freshly-derived value.
 
-    3. Resolve-then-``is_relative_to`` on the final path. Belt and
-       braces against any future refactor that bypasses the regex
-       (e.g. switching the path param type from ``UUID`` to ``str``
-       without updating this helper).
+    3. ``os.path.basename`` strips any residual path separator.
+       Documented sanitiser for ``py/path-injection``.
+
+    4. ``os.path.abspath`` + ``startswith(base_dir + os.sep)`` —
+       the canonical containment check pattern from CodeQL's own
+       ``py/path-injection`` help page.
     """
-    # Stringify + regex-match via the module-level ``re.fullmatch``.
-    # Identity at runtime (the UUID type guard already enforces shape),
-    # but flips the CodeQL taint tracker off — module-level
-    # ``re.fullmatch`` is in the sanitiser set for the
-    # ``py/path-injection`` query.
-    safe_id_raw = str(image_id)
-    if re.fullmatch(_UUID_PATTERN_STR, safe_id_raw) is None:
+    # 2. Module-level ``re.fullmatch`` + ``Match.group`` derives
+    # ``safe_id`` from the regex output — CodeQL treats that as
+    # the sanitised binding.
+    match = re.fullmatch(_UUID_PATTERN_STR, str(image_id))
+    if match is None:
         # Unreachable given the UUID type coercion; bail loudly if a
         # future refactor loosens the type and an attacker reaches
         # this branch.
@@ -108,19 +111,24 @@ def _image_path(image_id: uuid.UUID) -> Path:
             status.HTTP_400_BAD_REQUEST,
             "Invalid slot image id.",
         )
-    # Re-bind the value AFTER the regex so CodeQL's flow analyser
-    # treats ``safe_id`` as the post-sanitiser binding (avoids any
-    # path-sensitivity ambiguity from re-using the raw name).
-    safe_id = safe_id_raw
-    base = _image_dir().resolve()
-    candidate = (base / f"{safe_id}.raw.xz").resolve()
-    if not candidate.is_relative_to(base):
-        # Unreachable given the regex above; same reasoning.
+    safe_id = match.group(0)
+    # 3. ``os.path.basename`` belts the suspenders — if the regex
+    # ever permitted a separator it would be stripped here.
+    safe_name = os.path.basename(f"{safe_id}.raw.xz")
+    # 4. Canonical CodeQL containment check: abspath + startswith
+    # against the base directory + os.sep. ``commonpath`` would
+    # also work but ``startswith`` is the documented idiom on
+    # CodeQL's py/path-injection help page.
+    abs_base = os.path.abspath(_image_dir())
+    abs_target = os.path.abspath(os.path.join(abs_base, safe_name))
+    if not abs_target.startswith(abs_base + os.sep):
+        # Unreachable given the regex + basename; this is the
+        # belt-and-braces audit trail.
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             "Resolved slot-image path escapes the mirror directory.",
         )
-    return candidate
+    return Path(abs_target)
 
 
 def mirror_auth_token(operation: str, image_id: uuid.UUID) -> str:
@@ -163,8 +171,15 @@ def _ensure_dir() -> None:
     d.mkdir(parents=True, exist_ok=True)
     try:
         d.chmod(0o700)
-    except OSError:
-        pass
+    except OSError as exc:
+        # Intentionally non-fatal: tightening the mode is a defence-
+        # in-depth nicety, not a correctness requirement. On most
+        # platforms the chmod succeeds; on Kubernetes-mounted PVCs
+        # whose StorageClass overrides mode bits (or on a filesystem
+        # without permission bits at all) the call returns EPERM /
+        # ENOSYS. Log at debug level so the diagnostic exists
+        # without spamming the operator log on every restart.
+        logger.debug("slot_image_mirror_chmod_skipped", path=str(d), error=str(exc))
 
 
 @router.put(
