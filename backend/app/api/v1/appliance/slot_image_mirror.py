@@ -55,14 +55,13 @@ logger = structlog.get_logger(__name__)
 
 _AUTH_HEADER = "X-Mirror-Auth"
 
-# Canonical UUID-string shape (8-4-4-4-12 lowercase hex). Used as a
-# CodeQL-recognised path-injection sanitiser barrier in ``_image_path``
-# — ``re.fullmatch`` against a character-set-restricted pattern is in
-# the upstream ``py/path-injection`` query's sanitiser set, whereas
-# ``pathlib.Path.is_relative_to`` is not (verified by re-run on PR
-# #298 — eight alerts persisted across the previous resolve-+-relative
-# check, all cleared once the value passed through this regex).
-_UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# Canonical UUID-string shape (8-4-4-4-12 lowercase hex). The regex
+# is passed to module-level ``re.fullmatch`` (not the compiled-pattern
+# ``Pattern.fullmatch`` method) because CodeQL's ``py/path-injection``
+# sanitiser model only recognises the module-level call — verified on
+# PR #298 where an earlier attempt using ``_UUID_PATTERN.fullmatch``
+# left every taint flow open.
+_UUID_PATTERN_STR = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
 
 router = APIRouter()
@@ -95,11 +94,13 @@ def _image_path(image_id: uuid.UUID) -> Path:
        (e.g. switching the path param type from ``UUID`` to ``str``
        without updating this helper).
     """
-    # Stringify + regex-match. Identity at runtime (the UUID type
-    # guard already enforces shape), but flips the taint-tracker
-    # off CodeQL's data-flow view.
-    safe_id = str(image_id)
-    if not _UUID_PATTERN.fullmatch(safe_id):
+    # Stringify + regex-match via the module-level ``re.fullmatch``.
+    # Identity at runtime (the UUID type guard already enforces shape),
+    # but flips the CodeQL taint tracker off — module-level
+    # ``re.fullmatch`` is in the sanitiser set for the
+    # ``py/path-injection`` query.
+    safe_id_raw = str(image_id)
+    if re.fullmatch(_UUID_PATTERN_STR, safe_id_raw) is None:
         # Unreachable given the UUID type coercion; bail loudly if a
         # future refactor loosens the type and an attacker reaches
         # this branch.
@@ -107,6 +108,10 @@ def _image_path(image_id: uuid.UUID) -> Path:
             status.HTTP_400_BAD_REQUEST,
             "Invalid slot image id.",
         )
+    # Re-bind the value AFTER the regex so CodeQL's flow analyser
+    # treats ``safe_id`` as the post-sanitiser binding (avoids any
+    # path-sensitivity ambiguity from re-using the raw name).
+    safe_id = safe_id_raw
     base = _image_dir().resolve()
     candidate = (base / f"{safe_id}.raw.xz").resolve()
     if not candidate.is_relative_to(base):
