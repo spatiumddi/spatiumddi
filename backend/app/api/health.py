@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Awaitable
 from datetime import UTC, datetime
+from pathlib import Path
 from time import monotonic
 from typing import Any, cast
 
@@ -18,6 +19,114 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(tags=["health"])
 
 
+# ── Schema-at-head cache (issue #299 phase 1) ──────────────────────
+#
+# The api image bundles a fixed set of alembic revisions, so the
+# "expected head" is constant for the lifetime of the process — read
+# it once, cache it, never re-read. On the appliance shape the
+# migrate Job lands the head into the DB AFTER the api Deployment
+# starts (CNPG bootstrap takes 1-2 min on a multi-node cluster), so
+# without a schema-aware readiness probe the api passes /health/ready
+# the moment Postgres accepts a SELECT 1 — even though every route
+# handler then 500s against missing tables. The operator-visible
+# symptom is a ~1-2 min window of bare nginx 502s on every login
+# attempt (issue #299). Fixing /health/ready to require the schema
+# at head makes the k8s readinessProbe accurately reflect "can serve
+# traffic"; the readinessProbe controlling the Service endpoint set
+# is what nginx upstream resolution depends on.
+_EXPECTED_HEAD: str | None = None
+_EXPECTED_HEAD_ERROR: str | None = None
+
+
+def _expected_alembic_head() -> tuple[str | None, str | None]:
+    """Read + cache the bundled alembic head.
+
+    Returns ``(head, None)`` on success, ``(None, error_str)`` if the
+    alembic.ini / scripts directory is missing or malformed.
+
+    Cached at first call. Re-reading the script directory on every
+    readiness probe call would be wasteful (and confusing during a
+    multi-node rolling upgrade where the head DOES change between
+    different api pods running different image tags — but each pod
+    has its own image, so each pod's cache is correct for itself).
+    """
+    global _EXPECTED_HEAD, _EXPECTED_HEAD_ERROR
+    if _EXPECTED_HEAD is not None or _EXPECTED_HEAD_ERROR is not None:
+        return _EXPECTED_HEAD, _EXPECTED_HEAD_ERROR
+    try:
+        # Same pattern as app/services/backup/migrations.py — the
+        # alembic.ini lives at /app/alembic.ini inside the api
+        # container image. ScriptDirectory.get_current_head() walks
+        # the versions/ tree and returns the leaf revision (single-
+        # head schemas only; multi-head environments aren't supported
+        # by the SpatiumDDI shape).
+        from alembic.config import Config  # noqa: PLC0415
+        from alembic.script import ScriptDirectory  # noqa: PLC0415
+
+        cfg = Config(str(Path("/app/alembic.ini")))
+        script = ScriptDirectory.from_config(cfg)
+        head = script.get_current_head()
+        if head is None:
+            _EXPECTED_HEAD_ERROR = "no head revision in script directory"
+            return None, _EXPECTED_HEAD_ERROR
+        _EXPECTED_HEAD = head
+        logger.info("readiness_schema_head_cached", expected_head=head)
+        return head, None
+    except Exception as exc:  # noqa: BLE001 — surface ANY exception
+        # Don't cache transient errors — if the container's alembic
+        # files genuinely missing this is a config bug operators need
+        # to see; if it's a one-off blip, the next probe re-reads.
+        msg = f"could not read alembic head: {exc}"
+        logger.warning("readiness_schema_head_read_failed", error=str(exc))
+        return None, msg
+
+
+async def _check_schema_ready() -> tuple[str, str]:
+    """Verify the DB schema is at the head this api image expects.
+
+    Returns ``("ok", "<detail>")`` if the schema matches; otherwise
+    ``("error", "<detail>")`` with a message the operator can act on
+    ("migrate not run", "schema at X, image expects Y", etc.). The
+    caller folds this into the readiness verdict alongside DB + Redis.
+
+    Failure modes covered:
+
+    * ``alembic_version`` table doesn't exist — the migrate Job hasn't
+      created the schema at all. ProgrammingError / UndefinedTable
+      from asyncpg surfaces as an exception; we map it to a 503 with
+      "schema not initialised" so operators see the cause.
+    * ``alembic_version`` row missing — alembic stamp / upgrade was
+      interrupted. The api isn't ready; surface as 503.
+    * ``version_num != expected_head`` — schema is behind (migrate
+      still running, or a rolling upgrade started but didn't finish).
+      Same 503 with the actual vs expected revisions so operators can
+      compare.
+    """
+    expected, head_err = _expected_alembic_head()
+    if head_err is not None:
+        return "error", head_err
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(text("SELECT version_num FROM alembic_version"))
+            row = result.fetchone()
+    except Exception as exc:  # noqa: BLE001 — surface ANY exception
+        # Most common shape here is asyncpg.exceptions.UndefinedTableError
+        # ("relation 'alembic_version' does not exist") — migrate Job
+        # hasn't run yet. Keep the error string short for the
+        # operator-facing readiness response; full traceback is logged.
+        logger.warning("readiness_schema_check_failed", error=str(exc), expected_head=expected)
+        # Truncate "relation \"alembic_version\" does not exist" to a
+        # one-liner the operator can match against migrate Job logs.
+        short = str(exc).splitlines()[0][:160]
+        return "error", f"schema not initialised: {short}"
+    if row is None:
+        return "error", "alembic_version row missing — migrate not stamped"
+    actual = row[0]
+    if actual != expected:
+        return "error", f"schema at {actual}, image expects {expected}"
+    return "ok", f"schema at head {expected}"
+
+
 @router.get("/health/live", status_code=status.HTTP_200_OK)
 async def liveness() -> dict:
     """Liveness probe — returns 200 if the process is running."""
@@ -27,13 +136,26 @@ async def liveness() -> dict:
 @router.get("/health/ready")
 async def readiness() -> JSONResponse:
     """
-    Readiness probe — checks DB and Redis connectivity.
-    Returns 200 if ready, 503 with failed-check details if not.
+    Readiness probe — checks DB connectivity, DB SCHEMA-at-head, and
+    Redis connectivity. Returns 200 if ready, 503 with failed-check
+    details if not.
+
+    Schema-at-head is the key check for the cold-boot + post-restore
+    + mid-rolling-upgrade windows where Postgres is up + accepting
+    connections but the migrate Job hasn't landed the bundled
+    alembic revisions yet. Without this check the api passes the
+    readiness probe the moment a ``SELECT 1`` succeeds, gets added to
+    the Service endpoint set, and serves 500s on every actual route
+    handler until migrations finish — which the operator sees as
+    bare nginx 502s through the frontend proxy (issue #299).
     """
     checks: dict[str, str] = {}
     healthy = True
 
-    # Database check
+    # Database connectivity check. Same SELECT 1 as before — separate
+    # from the schema check so an operator looking at a 503 response
+    # can tell "Postgres is down" apart from "Postgres is up but the
+    # schema is behind."
     try:
         async with AsyncSessionLocal() as session:
             await session.execute(text("SELECT 1"))
@@ -42,6 +164,15 @@ async def readiness() -> JSONResponse:
         logger.warning("readiness_check_failed", check="database", error=str(exc))
         checks["database"] = f"error: {exc}"
         healthy = False
+
+    # Schema-at-head check. Only run when the DB connect succeeded —
+    # otherwise the schema check would surface a confusing
+    # "could not connect" error on top of the database error above.
+    if checks["database"] == "ok":
+        verdict, detail = await _check_schema_ready()
+        checks["schema"] = "ok" if verdict == "ok" else f"error: {detail}"
+        if verdict != "ok":
+            healthy = False
 
     # Redis check
     try:
