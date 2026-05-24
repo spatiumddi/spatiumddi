@@ -74,6 +74,13 @@ const CATEGORY_LABELS: Record<ClusterUpgradeFailureCategory, string> = {
   other: "Other",
 };
 
+// NB: keep in sync with backend/app/services/upgrades/alerts.py:operator_hint().
+// The strings are intentionally shorter here (UI surface is tighter than an
+// alert email body); a CI smoke test that walks every category and asserts
+// the frontend has a non-empty entry is in test_upgrades_alerts.py's
+// test_operator_hint_non_empty parametrisation. If you add a new
+// CATEGORY_* constant to the backend, the TypeScript enum guarantees this
+// table needs a corresponding entry to compile.
 const CATEGORY_HINTS: Record<ClusterUpgradeFailureCategory, string> = {
   preflight_fail:
     "Re-run preflight to see which check failed; resolve before retrying.",
@@ -327,6 +334,15 @@ function PlanFormPanel() {
             !slotImageUrl ||
             !preflight ||
             !preflight.can_start ||
+            // #296 review fix — refuse Plan when the typed target
+            // has drifted from the preflight target. Otherwise the
+            // operator could type a version, run preflight, then
+            // type a different version + click Plan, getting a Plan
+            // against version X but with preflight verdict from
+            // version Y. The backend re-runs preflight inside plan()
+            // so the worst case is a 409, but the UI shouldn't
+            // surface a green Plan button against a stale verdict.
+            preflightTarget !== targetVersion ||
             planMut.isPending
           }
           onClick={() => planMut.mutate()}
@@ -334,7 +350,9 @@ function PlanFormPanel() {
           title={
             preflight && !preflight.can_start
               ? "Preflight failed — resolve before planning."
-              : ""
+              : preflightTarget !== targetVersion
+                ? "Re-run preflight against the current target version first."
+                : ""
           }
         >
           {planMut.isPending ? (
@@ -456,21 +474,49 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
   const [halting, setHalting] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [aborting, setAborting] = useState(false);
+  // Mutation errors that don't fit cleanly in a modal — surfaced as a
+  // banner inside the panel. Cleared on the next successful mutation.
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const haltMut = useMutation({
     mutationFn: () => clusterUpgradesApi.halt(run.id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["upgrades"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["upgrades"] });
+      setActionError(null);
+    },
+    onError: (err) => setActionError(`Halt failed: ${formatApiError(err)}`),
     onSettled: () => setHalting(false),
   });
   const resumeMut = useMutation({
     mutationFn: () => clusterUpgradesApi.resume(run.id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["upgrades"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["upgrades"] });
+      setActionError(null);
+    },
+    onError: (err) => setActionError(`Resume failed: ${formatApiError(err)}`),
     onSettled: () => setResuming(false),
   });
   const abortMut = useMutation({
     mutationFn: () => clusterUpgradesApi.abort(run.id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["upgrades"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["upgrades"] });
+      setActionError(null);
+    },
+    onError: (err) => setActionError(`Abort failed: ${formatApiError(err)}`),
     onSettled: () => setAborting(false),
+  });
+  // #296 review fix — a ``planned`` run that the operator landed on
+  // after refresh (the original PlanFormPanel start button is gone
+  // since activeRun is now truthy + PlanFormPanel doesn't render).
+  // Surfacing Start in the ActiveRunPanel for that state means the
+  // operator isn't stranded.
+  const startMut = useMutation({
+    mutationFn: () => clusterUpgradesApi.start(run.id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["upgrades"] });
+      setActionError(null);
+    },
+    onError: (err) => setActionError(`Start failed: ${formatApiError(err)}`),
   });
 
   const planOrder = run.plan?.node_order ?? [];
@@ -493,6 +539,25 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
           {run.lease_holder ? ` · holder ${run.lease_holder}` : ""}
         </span>
         <div className="ml-auto flex flex-wrap gap-2">
+          {run.state === "planned" ? (
+            // #296 review fix — a planned-but-not-started run that
+            // the operator left behind (e.g. closed the tab between
+            // Plan + Start) needs a way to start. Without this the
+            // operator's only choices are Abort + re-plan from scratch.
+            <button
+              type="button"
+              disabled={startMut.isPending}
+              onClick={() => startMut.mutate()}
+              className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-xs text-white hover:bg-emerald-700 disabled:opacity-50"
+            >
+              {startMut.isPending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Play className="h-3.5 w-3.5" />
+              )}
+              Start
+            </button>
+          ) : null}
           {run.state === "running" ? (
             <button
               type="button"
@@ -526,6 +591,12 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
         </div>
       </header>
 
+      {actionError ? (
+        <div className="mt-3 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+          {actionError}
+        </div>
+      ) : null}
+
       <div className="mt-3 grid grid-cols-1 gap-2 text-xs sm:grid-cols-3">
         <div className="rounded-md border px-2 py-1.5">
           <div className="text-muted-foreground">Progress</div>
@@ -548,7 +619,7 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
       {failedNode ? (
         <FailureBanner
           node={failedNode}
-          progress={run.progress.per_node[failedNode]}
+          progress={run.progress?.per_node?.[failedNode]}
           runError={run.last_error}
         />
       ) : null}

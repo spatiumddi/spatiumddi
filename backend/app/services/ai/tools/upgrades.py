@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
 from app.services.ai.tools.base import register_tool
-from app.services.upgrades import orchestrator, preflight
+from app.services.upgrades import mutex, orchestrator, preflight
 
 
 def _superadmin_gate(user: User) -> dict[str, Any] | None:
@@ -148,4 +148,51 @@ async def find_upgrade_runs(
             for r in rows
         ],
         "count": len(rows),
+    }
+
+
+# ── find_upgrade_lease (Phase A + Phase H review) ────────────────────
+
+
+class FindUpgradeLeaseArgs(BaseModel):
+    """No args — the lease is a singleton per cluster."""
+
+
+@register_tool(
+    name="find_upgrade_lease",
+    description=(
+        "Read the cluster-wide rolling-upgrade single-upgrader Lease "
+        "state (superadmin only, read-only). Mirrors the "
+        "``GET /api/v1/upgrades/lease`` REST endpoint. Returns "
+        "``held`` (whether a holder is currently claiming it), "
+        "``holder`` (the api-pod hostname if held), ``renew_time`` "
+        "(last RFC3339 renewal stamp), ``transitions`` (k8s "
+        "leader-election change counter), and ``expired`` (true when "
+        "renewTime + leaseDurationSeconds is in the past — the "
+        "previous holder crashed before releasing). Use to answer "
+        "'is the upgrade orchestrator running right now?' / 'which "
+        "api pod is driving the current upgrade?' / 'is the lease "
+        "stuck after a crash?' without needing the full "
+        "``find_upgrade_runs`` history. Closes the MCP coverage gap "
+        "for /upgrades/lease that the Phase H code review surfaced."
+    ),
+    args_model=FindUpgradeLeaseArgs,
+    category="admin",
+    default_enabled=True,
+    module=None,
+)
+async def find_upgrade_lease(
+    db: AsyncSession,  # noqa: ARG001 — registered tools share signature
+    user: User,
+    args: FindUpgradeLeaseArgs,  # noqa: ARG001 — no args
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+    state = mutex.get_state()
+    return {
+        "held": state.held,
+        "holder": state.holder,
+        "renew_time": state.renew_time,
+        "transitions": state.transitions,
+        "expired": state.expired,
     }

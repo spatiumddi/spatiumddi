@@ -305,6 +305,14 @@ async def _transition(
     # actor null because they're not operator-driven; operator
     # transitions (halted / resumed / aborted) thread the calling
     # user through so the event body carries who did it.
+    # Audit-log row result reflects the UPGRADE outcome, not the
+    # transition operation. A transition to ``failed`` / ``aborted``
+    # records ``result='error'`` so audit consumers (alerts dashboard,
+    # forwarded SIEM) can filter on upgrade failures without parsing
+    # ``new_value.to_state``. Operator-cancelled (aborted) counts as
+    # error because the cluster is in a partial state; ``succeeded``
+    # + non-terminal transitions are ``success``.
+    audit_result = "error" if new_state in ("failed", "aborted") else "success"
     db.add(
         AuditLog(
             user_id=actor_user_id,
@@ -314,7 +322,7 @@ async def _transition(
             resource_type="system_upgrade_run",
             resource_id=str(run.id),
             resource_display=run.target_version,
-            result="success",
+            result=audit_result,
             new_value={"from_state": old, "to_state": new_state, **event_detail},
         )
     )

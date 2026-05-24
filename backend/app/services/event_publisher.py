@@ -164,10 +164,19 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     ("upgrade.planned", "system_upgrade_run"): "system.upgrade.planned",
     ("upgrade.started", "system_upgrade_run"): "system.upgrade.started",
     ("upgrade.succeeded", "system_upgrade_run"): "system.upgrade.succeeded",
-    ("upgrade.failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.halted", "system_upgrade_run"): "system.upgrade.halted",
     ("upgrade.resumed", "system_upgrade_run"): "system.upgrade.resumed",
     ("upgrade.aborted", "system_upgrade_run"): "system.upgrade.aborted",
+    # The orchestrator's three failure-path transitions all fold into
+    # the single ``system.upgrade.failed`` event so downstream
+    # subscribers wire one webhook for "the upgrade failed; go
+    # investigate" rather than three separate ones. The audit row's
+    # ``action`` + ``new_value.failure_category`` (Phase F) tell the
+    # operator which subtype + which node + what the next step is.
+    ("upgrade.failed", "system_upgrade_run"): "system.upgrade.failed",
+    ("upgrade.node_failed", "system_upgrade_run"): "system.upgrade.failed",
+    ("upgrade.chart_bump_failed", "system_upgrade_run"): "system.upgrade.failed",
+    ("upgrade.post_upgrade_verify_failed", "system_upgrade_run"): "system.upgrade.failed",
 }
 
 

@@ -310,6 +310,80 @@ async def test_transition_writes_audit_log_with_event_action() -> None:
 
 
 @pytest.mark.asyncio
+async def test_transition_records_audit_result_error_on_failure() -> None:
+    """Phase H review fix — a transition to ``failed`` or ``aborted``
+    writes ``AuditLog.result='error'`` so downstream consumers (alerts
+    dashboard, SIEM forwarders) can filter on upgrade failures without
+    parsing ``new_value.to_state``. Non-terminal + succeeded
+    transitions keep ``result='success'``."""
+    from app.services.upgrades import orchestrator  # noqa: PLC0415
+
+    class _Run:
+        def __init__(self, state: str) -> None:
+            self.id = uuid.uuid4()
+            self.state = state
+            self.target_version = "2026.06.01-1"
+            self.progress: dict[str, Any] = {"events": []}
+            self.finished_at: Any = None
+
+    # Failure transition → result="error".
+    run = _Run("running")
+    db = MagicMock()
+    db.add = MagicMock()
+    await orchestrator._transition(
+        db,  # type: ignore[arg-type]
+        run,  # type: ignore[arg-type]
+        "failed",
+        allowed_from=("running",),
+        event="node_failed",
+    )
+    audit = next(c.args[0] for c in db.add.call_args_list if hasattr(c.args[0], "action"))
+    assert audit.result == "error"
+
+    # Abort transition → result="error".
+    run2 = _Run("running")
+    db2 = MagicMock()
+    db2.add = MagicMock()
+    await orchestrator._transition(
+        db2,  # type: ignore[arg-type]
+        run2,  # type: ignore[arg-type]
+        "aborted",
+        allowed_from=("running",),
+        event="aborted",
+    )
+    audit2 = next(c.args[0] for c in db2.add.call_args_list if hasattr(c.args[0], "action"))
+    assert audit2.result == "error"
+
+    # Succeeded transition → result="success".
+    run3 = _Run("running")
+    db3 = MagicMock()
+    db3.add = MagicMock()
+    await orchestrator._transition(
+        db3,  # type: ignore[arg-type]
+        run3,  # type: ignore[arg-type]
+        "succeeded",
+        allowed_from=("running",),
+        event="succeeded",
+    )
+    audit3 = next(c.args[0] for c in db3.add.call_args_list if hasattr(c.args[0], "action"))
+    assert audit3.result == "success"
+
+    # Non-terminal transition → result="success".
+    run4 = _Run("running")
+    db4 = MagicMock()
+    db4.add = MagicMock()
+    await orchestrator._transition(
+        db4,  # type: ignore[arg-type]
+        run4,  # type: ignore[arg-type]
+        "halted",
+        allowed_from=("running",),
+        event="halted",
+    )
+    audit4 = next(c.args[0] for c in db4.add.call_args_list if hasattr(c.args[0], "action"))
+    assert audit4.result == "success"
+
+
+@pytest.mark.asyncio
 async def test_transition_terminal_state_sets_finished_at() -> None:
     """succeeded / failed / aborted → finished_at gets stamped."""
     from app.services.upgrades import orchestrator  # noqa: PLC0415
@@ -357,6 +431,14 @@ def test_event_publisher_maps_upgrade_actions_cleanly() -> None:
         "upgrade.halted": "system.upgrade.halted",
         "upgrade.resumed": "system.upgrade.resumed",
         "upgrade.aborted": "system.upgrade.aborted",
+        # Phase H review fix — three failure-path transitions also
+        # fold into system.upgrade.failed so a downstream subscriber
+        # wires one webhook for "the upgrade failed" rather than
+        # three. The audit row's new_value carries the specific
+        # subtype (failure_category from Phase F).
+        "upgrade.node_failed": "system.upgrade.failed",
+        "upgrade.chart_bump_failed": "system.upgrade.failed",
+        "upgrade.post_upgrade_verify_failed": "system.upgrade.failed",
     }
     for action, expected in cases.items():
         assert _audit_to_event_type(action, "system_upgrade_run") == expected

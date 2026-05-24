@@ -74,7 +74,12 @@ rules:
     verbs: ["get", "patch"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "list", "create", "update", "patch", "delete"]
+    # NB: ``delete`` deliberately absent — Phase A's mutex.release()
+    # clears the holder via PATCH (``clear_lease_holder`` sets an
+    # empty ``holderIdentity`` + expired ``renewTime``) rather than
+    # deleting the Lease object, so ``kubectl get leases`` keeps the
+    # historical last-upgrade-holder visible.
+    verbs: ["get", "list", "create", "update", "patch"]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -150,7 +155,12 @@ metadata:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "api") .) | nindent 4 }}
 rules:
   - apiGroups: ["helm.cattle.io"]
-    resources: ["helmcharts", "helmchartconfigs"]
+    # ``helmcharts`` deliberately NOT included — the chart-bump path
+    # in services/upgrades/chart_bump.py only touches ``helmchartconfigs``
+    # (which the helm-controller merges on top of the manifest-managed
+    # HelmChart). The supervisor's spatium-supervisor-helm Role keeps
+    # both for cp-size patches; the api's role-of-scope is narrower.
+    resources: ["helmchartconfigs"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
