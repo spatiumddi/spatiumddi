@@ -200,6 +200,18 @@ async def execute(body: ExecuteRequest, db: DB, current_user: CurrentUser) -> Ex
     """
     forbid_in_demo_mode("Factory reset is disabled")
     _require_superadmin(current_user)
+    # #296 Phase H — refuse if a rolling upgrade is in flight. A
+    # mid-upgrade factory reset would leave the orchestrator's
+    # SystemUpgradeRun row pointing at a wiped cluster. The Lease
+    # would also persist in etcd (factory reset is namespace-scoped
+    # to Postgres tables; it doesn't touch the coordination.k8s.io
+    # Lease) and block subsequent legitimate upgrades until
+    # manually cleaned up.
+    from app.services.upgrades.safety import (  # noqa: PLC0415
+        assert_no_upgrade_in_flight,
+    )
+
+    await assert_no_upgrade_in_flight(db, operation_hint="factory reset")
 
     # 1. Validate section keys.
     for k in body.section_keys:

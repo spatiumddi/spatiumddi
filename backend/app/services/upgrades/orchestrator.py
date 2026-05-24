@@ -60,6 +60,7 @@ from app.services.upgrades import (
     node_order,
     per_node,
     preflight,
+    safety,
 )
 
 logger = structlog.get_logger(__name__)
@@ -279,6 +280,9 @@ async def _transition(
     *,
     allowed_from: tuple[str, ...],
     event: str,
+    actor_user_id: uuid.UUID | None = None,
+    actor_display: str | None = None,
+    actor_source: str | None = None,
     **event_detail: Any,
 ) -> None:
     if new_state not in LIFECYCLE_STATES:
@@ -292,6 +296,28 @@ async def _transition(
     if new_state in ("succeeded", "failed", "aborted"):
         run.finished_at = _now()
     await _record_event(db, run, event, from_state=old, **event_detail)
+    # #296 Phase H — write an AuditLog row on every transition so the
+    # event_publisher's flush hook fires the matching typed
+    # ``system.upgrade.<event>`` event to every subscribed webhook.
+    # The (action, resource_type) pair maps via _SPECIAL_EVENT_MAP in
+    # event_publisher.py. Internal orchestrator transitions (started /
+    # succeeded / failed / chart_bump_failed / node_failed) leave the
+    # actor null because they're not operator-driven; operator
+    # transitions (halted / resumed / aborted) thread the calling
+    # user through so the event body carries who did it.
+    db.add(
+        AuditLog(
+            user_id=actor_user_id,
+            user_display_name=actor_display,
+            auth_source=actor_source,
+            action=f"upgrade.{event}",
+            resource_type="system_upgrade_run",
+            resource_id=str(run.id),
+            resource_display=run.target_version,
+            result="success",
+            new_value={"from_state": old, "to_state": new_state, **event_detail},
+        )
+    )
 
 
 async def halt_upgrade(
@@ -312,19 +338,9 @@ async def halt_upgrade(
         "halted",
         allowed_from=("running",),
         event="halted",
-        actor=actor_display,
-    )
-    db.add(
-        AuditLog(
-            user_id=actor_user_id,
-            user_display_name=actor_display,
-            auth_source=actor_source,
-            action="upgrade.halted",
-            resource_type="system_upgrade_run",
-            resource_id=str(run.id),
-            resource_display=run.target_version,
-            result="success",
-        )
+        actor_user_id=actor_user_id,
+        actor_display=actor_display,
+        actor_source=actor_source,
     )
     await db.commit()
     await db.refresh(run)
@@ -349,19 +365,9 @@ async def resume_upgrade(
         "running",
         allowed_from=("halted",),
         event="resumed",
-        actor=actor_display,
-    )
-    db.add(
-        AuditLog(
-            user_id=actor_user_id,
-            user_display_name=actor_display,
-            auth_source=actor_source,
-            action="upgrade.resumed",
-            resource_type="system_upgrade_run",
-            resource_id=str(run.id),
-            resource_display=run.target_version,
-            result="success",
-        )
+        actor_user_id=actor_user_id,
+        actor_display=actor_display,
+        actor_source=actor_source,
     )
     await db.commit()
     await db.refresh(run)
@@ -388,19 +394,9 @@ async def abort_upgrade(
         "aborted",
         allowed_from=("planned", "running", "halted"),
         event="aborted",
-        actor=actor_display,
-    )
-    db.add(
-        AuditLog(
-            user_id=actor_user_id,
-            user_display_name=actor_display,
-            auth_source=actor_source,
-            action="upgrade.aborted",
-            resource_type="system_upgrade_run",
-            resource_id=str(run.id),
-            resource_display=run.target_version,
-            result="success",
-        )
+        actor_user_id=actor_user_id,
+        actor_display=actor_display,
+        actor_source=actor_source,
     )
     await db.commit()
     # Release the lease so a new run can plan immediately.
@@ -599,15 +595,72 @@ async def _drive_loop(
                 )
                 return
 
+            # #296 Phase H — post-upgrade cluster verification. Runs
+            # after the chart bump landed cleanly. Stamps results
+            # into ``progress.post_upgrade_verify`` so the Fleet UI
+            # can render a checklist; a ``fail`` aggregates to
+            # ``state='failed'`` so a flaky cluster shape (CNPG
+            # instance count, DS pods NotReady cluster-wide) doesn't
+            # silently report success.
+            verify_results = await safety.verify_post_upgrade(
+                cnpg_cluster_name=cnpg_name,
+                cnpg_namespace=cnpg_namespace,
+            )
+            verify_overall = safety.verification_overall(verify_results)
+            run.progress = {
+                **run.progress,
+                "post_upgrade_verify": {
+                    "overall": verify_overall,
+                    "results": [
+                        {
+                            "name": r.name,
+                            "level": r.level,
+                            "message": r.message,
+                            "detail": r.detail,
+                        }
+                        for r in verify_results
+                    ],
+                },
+            }
+            if verify_overall == "fail":
+                fails = [r.name for r in verify_results if r.level == "fail"]
+                run.last_error = f"post-upgrade verification failed: {', '.join(fails)}"
+                await upgrade_alerts.emit_upgrade_failed_alert(
+                    db,
+                    run,
+                    failed_node=None,
+                    failed_at_step="post_upgrade_verify",
+                    category=upgrade_alerts.CATEGORY_OTHER,
+                )
+                await _transition(
+                    db,
+                    run,
+                    "failed",
+                    allowed_from=("running",),
+                    event="post_upgrade_verify_failed",
+                    failed_checks=fails,
+                )
+                await db.commit()
+                ok, err = mutex.release()
+                if not ok:
+                    logger.warning("upgrade_lease_release_failed", error=err)
+                logger.warning(
+                    "upgrade_post_verify_failed",
+                    run_id=str(run.id),
+                    failed_checks=fails,
+                )
+                return
+
             await _transition(
                 db,
                 run,
                 "succeeded",
                 allowed_from=("running",),
-                event="chart_bump_complete",
+                event="succeeded",
                 rolled_deployments=bump.rolled_deployments,
                 migrate_job_state=bump.migrate_job_state,
                 skipped=bump.skipped,
+                post_upgrade_verify=verify_overall,
             )
             await db.commit()
             ok, err = mutex.release()
@@ -617,6 +670,7 @@ async def _drive_loop(
                 "upgrade_succeeded",
                 run_id=str(run.id),
                 rolled=bump.rolled_deployments,
+                post_upgrade_verify=verify_overall,
             )
             return
 

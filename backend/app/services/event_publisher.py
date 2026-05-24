@@ -154,6 +154,20 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     ("appliance.pairing_code_created", "pairing_code"): "appliance.pairing_code.created",
     ("appliance.pairing_code_claimed", "pairing_code"): "appliance.pairing_code.claimed",
     ("appliance.pairing_code_revoked", "pairing_code"): "appliance.pairing_code.revoked",
+    # Multi-node rolling upgrade orchestrator lifecycle (#296 Phase H).
+    # The orchestrator writes AuditLog rows with ``action=upgrade.<verb>``
+    # + ``resource_type='system_upgrade_run'`` on every state transition;
+    # this map collapses the redundant ``upgrade.upgrade.<verb>`` that
+    # the auto-derivation would produce into clean
+    # ``system.upgrade.<verb>`` event names downstream subscribers can
+    # pattern-match on.
+    ("upgrade.planned", "system_upgrade_run"): "system.upgrade.planned",
+    ("upgrade.started", "system_upgrade_run"): "system.upgrade.started",
+    ("upgrade.succeeded", "system_upgrade_run"): "system.upgrade.succeeded",
+    ("upgrade.failed", "system_upgrade_run"): "system.upgrade.failed",
+    ("upgrade.halted", "system_upgrade_run"): "system.upgrade.halted",
+    ("upgrade.resumed", "system_upgrade_run"): "system.upgrade.resumed",
+    ("upgrade.aborted", "system_upgrade_run"): "system.upgrade.aborted",
 }
 
 
