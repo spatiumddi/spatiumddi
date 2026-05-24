@@ -488,12 +488,16 @@ async def drive_upgrade(
         await _drive_loop(db, run, stop_event)
     finally:
         stop_event.set()
-        # Explicit discard of the awaited task's return value (None).
-        # Plain ``await renewal_task`` was flagged as a no-effect
-        # statement by github-code-quality's expression-statement
-        # check, which doesn't recognise ``await`` on a task as a
-        # side-effect. Bind to ``_`` to make intent unambiguous.
-        _ = await renewal_task
+        # Wait for the renewal loop to exit cleanly. The ``await`` IS
+        # the side-effect — it blocks until the task finishes after
+        # the ``stop_event.set()`` above. github-code-quality's
+        # "Statement has no effect" check fires here as a false
+        # positive (the check doesn't model ``await`` on a coroutine
+        # / Task as effectful). Binding to ``_ = await renewal_task``
+        # would silence it but trips mypy's ``func-returns-value``
+        # since ``_lease_renewal_loop`` returns ``None`` — pick the
+        # bare-await form because mypy is the gating CI check.
+        await renewal_task
 
     await db.refresh(run)
     return run
