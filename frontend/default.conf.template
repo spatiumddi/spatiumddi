@@ -58,12 +58,16 @@ server {
     # * 500 is also passed through — that's a real bug to fix, not
     #   a "still booting" condition.
     #
-    # The ``= @starting`` form overrides the response status to 200
-    # so well-behaved clients (curl + jq automation, browser cache,
-    # the SPA's error-handler) get a clean body. Operators chasing
-    # real outages still see the underlying status in the upstream's
-    # access log + the ``X-Upstream-Status`` debug header below.
-    error_page 502 504 = @starting;
+    # Status is PRESERVED (no ``=`` after the status list) — the
+    # original 502/504 flows through to clients. The SPA's axios
+    # layer types every /api/* response as JSON; overriding to 200
+    # with an HTML body would make axios resolve "success" with a
+    # string payload and crash downstream (review polish from #301).
+    # Direct browser hits to ``/api/*`` URLs during a 502 window
+    # still get the friendly HTML body (status 502 with HTML is
+    # rendered by browsers identically to the body alone); the
+    # status-preservation only matters for programmatic clients.
+    error_page 502 504 @starting;
 
     # The error_page is inherited into every location below, including
     # ``/api/*``, ``/health/*``, ``/metrics``, and the SPA fallback at

@@ -11,6 +11,7 @@ from typing import Any, cast
 import structlog
 from fastapi import APIRouter
 from sqlalchemy import text
+from sqlalchemy.exc import ProgrammingError
 from starlette import status
 from starlette.responses import JSONResponse
 
@@ -51,6 +52,37 @@ class _SchemaHeadCache:
 _head_cache = _SchemaHeadCache()
 
 
+def _locate_alembic_ini() -> Path | None:
+    """Find ``alembic.ini`` for the running process.
+
+    Two production deployments + the test path each put the file in
+    a different place:
+
+    * **Container image** (api / migrate Job) — baked at
+      ``/app/alembic.ini`` by the Dockerfile's ``COPY``. This is
+      where every appliance + helm install reads it.
+    * **CI ``Backend — Tests``** — pytest runs against the source
+      tree directly, working dir ``backend/``, so the file is at
+      ``./alembic.ini`` relative to cwd.
+    * **Dev (host venv)** — same as CI; pytest from ``backend/``.
+
+    Search order: container path → relative to this module → cwd.
+    Returns ``None`` if no candidate exists; caller surfaces a clear
+    "could not read alembic head" message.
+    """
+    candidates = [
+        Path("/app/alembic.ini"),
+        # ``app/api/health.py`` → ``app/api`` → ``app`` → ``backend``,
+        # where alembic.ini lives.
+        Path(__file__).resolve().parent.parent.parent / "alembic.ini",
+        Path.cwd() / "alembic.ini",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _expected_alembic_head() -> tuple[str | None, str | None]:
     """Read + cache the bundled alembic head.
 
@@ -65,24 +97,32 @@ def _expected_alembic_head() -> tuple[str | None, str | None]:
     """
     if _head_cache.head is not None or _head_cache.error is not None:
         return _head_cache.head, _head_cache.error
+    ini_path = _locate_alembic_ini()
+    if ini_path is None:
+        # Don't cache — the absence may be a packaging bug operators
+        # need to see, but tests / dev environments swap in a fresh
+        # working dir between fixtures and we want the next probe to
+        # re-find the file.
+        msg = "alembic.ini not found (looked in /app, source tree, cwd)"
+        logger.warning("readiness_schema_head_read_failed", error=msg)
+        return None, msg
     try:
-        # Same pattern as app/services/backup/migrations.py — the
-        # alembic.ini lives at /app/alembic.ini inside the api
-        # container image. ScriptDirectory.get_current_head() walks
-        # the versions/ tree and returns the leaf revision (single-
-        # head schemas only; multi-head environments aren't supported
-        # by the SpatiumDDI shape).
+        # Same ScriptDirectory pattern as
+        # app/services/backup/migrations.py. ScriptDirectory.
+        # get_current_head() walks the versions/ tree and returns the
+        # leaf revision (single-head schemas only; multi-head
+        # environments aren't supported by the SpatiumDDI shape).
         from alembic.config import Config  # noqa: PLC0415
         from alembic.script import ScriptDirectory  # noqa: PLC0415
 
-        cfg = Config(str(Path("/app/alembic.ini")))
+        cfg = Config(str(ini_path))
         script = ScriptDirectory.from_config(cfg)
         head = script.get_current_head()
         if head is None:
             _head_cache.error = "no head revision in script directory"
             return None, _head_cache.error
         _head_cache.head = head
-        logger.info("readiness_schema_head_cached", expected_head=head)
+        logger.info("readiness_schema_head_cached", expected_head=head, ini_path=str(ini_path))
         return head, None
     except Exception as exc:  # noqa: BLE001 — surface ANY exception
         # Don't cache transient errors — if the container's alembic
@@ -101,18 +141,25 @@ async def _check_schema_ready() -> tuple[str, str]:
     ("migrate not run", "schema at X, image expects Y", etc.). The
     caller folds this into the readiness verdict alongside DB + Redis.
 
-    Failure modes covered:
+    Failure modes covered (each gets a distinct operator-actionable
+    detail string so the cause isn't ambiguous):
 
     * ``alembic_version`` table doesn't exist — the migrate Job hasn't
-      created the schema at all. ProgrammingError / UndefinedTable
-      from asyncpg surfaces as an exception; we map it to a 503 with
-      "schema not initialised" so operators see the cause.
+      created the schema at all. SQLAlchemy ``ProgrammingError``
+      wrapping asyncpg ``UndefinedTableError``, message contains
+      ``does not exist``. Reported as ``schema not initialised: …``.
+    * Other ``ProgrammingError`` shapes — permission denied,
+      malformed schema, etc. Reported as
+      ``schema check failed: …`` so operators don't get misled into
+      thinking migrations need to run (review polish from #301).
     * ``alembic_version`` row missing — alembic stamp / upgrade was
-      interrupted. The api isn't ready; surface as 503.
+      interrupted. Reported as ``alembic_version row missing — …``.
     * ``version_num != expected_head`` — schema is behind (migrate
       still running, or a rolling upgrade started but didn't finish).
-      Same 503 with the actual vs expected revisions so operators can
-      compare.
+      Reported with both revisions so operators can compare.
+    * Any other exception (asyncio timeout, connection blip not
+      caught upstream by the SELECT 1 check, …). Reported as
+      ``schema check failed: …``.
     """
     expected, head_err = _expected_alembic_head()
     if head_err is not None:
@@ -121,16 +168,25 @@ async def _check_schema_ready() -> tuple[str, str]:
         async with AsyncSessionLocal() as session:
             result = await session.execute(text("SELECT version_num FROM alembic_version"))
             row = result.fetchone()
-    except Exception as exc:  # noqa: BLE001 — surface ANY exception
-        # Most common shape here is asyncpg.exceptions.UndefinedTableError
-        # ("relation 'alembic_version' does not exist") — migrate Job
-        # hasn't run yet. Keep the error string short for the
-        # operator-facing readiness response; full traceback is logged.
+    except ProgrammingError as exc:
+        # asyncpg.exceptions.UndefinedTableError → "relation
+        # 'alembic_version' does not exist". Other ProgrammingError
+        # shapes (permission denied, syntax error, etc.) are real
+        # config bugs the operator needs to see — don't lump them in
+        # with the "schema not initialised" cold-boot case.
         logger.warning("readiness_schema_check_failed", error=str(exc), expected_head=expected)
-        # Truncate "relation \"alembic_version\" does not exist" to a
-        # one-liner the operator can match against migrate Job logs.
         short = str(exc).splitlines()[0][:160]
-        return "error", f"schema not initialised: {short}"
+        if "does not exist" in short:
+            return "error", f"schema not initialised: {short}"
+        return "error", f"schema check failed: {short}"
+    except Exception as exc:  # noqa: BLE001 — surface ANY exception
+        # Any other DB error — connection blip after the SELECT 1
+        # succeeded, statement timeout against a wedged server, etc.
+        # Don't claim "schema not initialised" — operators chasing a
+        # connection issue shouldn't be sent down the migrate path.
+        logger.warning("readiness_schema_check_failed", error=str(exc), expected_head=expected)
+        short = str(exc).splitlines()[0][:160]
+        return "error", f"schema check failed: {short}"
     if row is None:
         return "error", "alembic_version row missing — migrate not stamped"
     actual = row[0]

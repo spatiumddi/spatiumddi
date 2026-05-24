@@ -61,9 +61,11 @@ data:
         # connect refused / upstream timeout); 503 stays as-is so
         # the api's intentional 503s (demo-mode, factory-reset
         # cooldown, /health/ready with schema-behind) reach the
-        # operator unchanged. See frontend/default.conf.template's
-        # error_page comment for the full reasoning.
-        error_page 502 504 = @starting;
+        # operator unchanged. Status preserved (no ``=``) so the
+        # SPA's axios calls reject cleanly instead of resolving with
+        # an HTML string body (review polish from #301). See
+        # frontend/default.conf.template for the full reasoning.
+        error_page 502 504 @starting;
 
         location @starting {
             default_type text/html;

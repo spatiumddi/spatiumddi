@@ -25,6 +25,7 @@ from unittest.mock import patch
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import text
+from sqlalchemy.exc import ProgrammingError
 
 from app.api import health as health_module
 from app.db import AsyncSessionLocal
@@ -153,7 +154,8 @@ async def test_schema_check_reports_missing_table() -> None:
     """alembic_version table doesn't exist — migrate Job hasn't run
     yet, which is the cold-boot 502 window from issue #299. We
     simulate by patching ``AsyncSessionLocal`` to a session whose
-    SELECT raises an UndefinedTable-shape exception."""
+    SELECT raises an UndefinedTable-shape ProgrammingError (the
+    SQLAlchemy wrapper around asyncpg's UndefinedTableError)."""
 
     class _FakeSession:
         async def __aenter__(self) -> _FakeSession:
@@ -163,9 +165,18 @@ async def test_schema_check_reports_missing_table() -> None:
             return None
 
         async def execute(self, *_args: object, **_kwargs: object) -> None:
-            # Mirror the asyncpg shape — first line of the message is
-            # what ends up in the readiness response detail.
-            raise RuntimeError('relation "alembic_version" does not exist')
+            # Mirror the SQLAlchemy → asyncpg shape: ProgrammingError
+            # carrying ``relation … does not exist`` as the .orig
+            # exception's message. The helper's substring match on
+            # "does not exist" is what triggers the "schema not
+            # initialised" path; other ProgrammingError shapes fall
+            # through to the generic "schema check failed" path
+            # (covered separately below).
+            raise ProgrammingError(
+                "SELECT version_num FROM alembic_version",
+                {},
+                Exception('relation "alembic_version" does not exist'),
+            )
 
     @asynccontextmanager
     async def _fake_session_factory() -> AsyncIterator[_FakeSession]:
@@ -176,6 +187,68 @@ async def test_schema_check_reports_missing_table() -> None:
     assert verdict == "error"
     assert "schema not initialised" in detail
     assert "alembic_version" in detail
+
+
+@pytest.mark.asyncio
+async def test_schema_check_reports_other_programming_error() -> None:
+    """ProgrammingError that ISN'T a missing-table case (permission
+    denied, syntax error, etc.) gets the generic "schema check
+    failed" detail — review polish to stop misdirecting operators
+    down the migrate path when the real cause is something else."""
+
+    class _FakeSession:
+        async def __aenter__(self) -> _FakeSession:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def execute(self, *_args: object, **_kwargs: object) -> None:
+            raise ProgrammingError(
+                "SELECT version_num FROM alembic_version",
+                {},
+                Exception("permission denied for table alembic_version"),
+            )
+
+    @asynccontextmanager
+    async def _fake_session_factory() -> AsyncIterator[_FakeSession]:
+        yield _FakeSession()
+
+    with patch.object(health_module, "AsyncSessionLocal", _fake_session_factory):
+        verdict, detail = await health_module._check_schema_ready()
+    assert verdict == "error"
+    # NOT "schema not initialised" — operator needs to see "permission
+    # denied" or similar, not be sent down the migrate path.
+    assert "schema not initialised" not in detail
+    assert "schema check failed" in detail
+    assert "permission denied" in detail
+
+
+@pytest.mark.asyncio
+async def test_schema_check_reports_generic_exception() -> None:
+    """Non-ProgrammingError exception (asyncio timeout, connection
+    blip, …) — also reported as "schema check failed", separate from
+    the cold-boot path."""
+
+    class _FakeSession:
+        async def __aenter__(self) -> _FakeSession:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def execute(self, *_args: object, **_kwargs: object) -> None:
+            raise TimeoutError("query timed out after 30s")
+
+    @asynccontextmanager
+    async def _fake_session_factory() -> AsyncIterator[_FakeSession]:
+        yield _FakeSession()
+
+    with patch.object(health_module, "AsyncSessionLocal", _fake_session_factory):
+        verdict, detail = await health_module._check_schema_ready()
+    assert verdict == "error"
+    assert "schema check failed" in detail
+    assert "timed out" in detail
 
 
 @pytest.mark.asyncio
