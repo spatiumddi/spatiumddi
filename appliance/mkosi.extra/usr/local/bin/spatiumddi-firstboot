@@ -595,6 +595,25 @@ spec:
           value: "${APPLIANCE_HOST_IPS_VAL}"
       serviceAccount:
         enabled: true
+      # #296 Phase A-H — the rolling-upgrade orchestrator needs three
+      # extra RBAC grants beyond the basic appliance set: namespace-
+      # scoped read/list of Deployments + Jobs (chart-bump rollout
+      # poll), patch on CNPG Cluster CR (cordon-triggered switchover
+      # via nodeMaintenanceWindow), create/get/list/update/patch on
+      # coordination.k8s.io Leases (cluster-wide single-upgrader mutex);
+      # cluster-scoped get/list/watch/patch on Nodes (cordon + plan
+      # enumeration), get/list/watch on Pods, create on pods/eviction
+      # (drain); and namespace-scoped get/list/watch/create/update/
+      # patch on helm.cattle.io/HelmChartConfigs in kube-system (image
+      # tag bump after every node is on the new slot). Without this the
+      # /api/v1/upgrades/preflight endpoint reads back 403 on every
+      # kubeapi-touching check and the operator UI surfaces
+      # "lease held by '<unreachable>'" / "kubeapi node list returned
+      # 403" instead of real cluster state. Always on for appliance
+      # installs since the rolling-upgrade flow IS the appliance's
+      # upgrade path; docker/k8s installs leave this off by default.
+      upgradeOrchestratorRBAC:
+        enabled: true
       # Appliance bind mounts. /var/lib/spatiumddi-host/release-state
       # backs the setup-complete flag, slot-upgrade triggers, and the
       # maintenance flag; without this the wizard's "Finish setup"

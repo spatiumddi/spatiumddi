@@ -139,12 +139,23 @@ def get_state(*, namespace: str | None = None) -> LeaseState:
             expired=False,
         )
     if status != 200 or body is None:
-        # Treat ambiguity as "held" so we don't race into a second
-        # upgrade on a transient kubeapi blip.
-        logger.warning("upgrade_lease_read_failed", status=status)
+        # Distinguish RBAC-missing (403) from kubeapi-blip (5xx). Both
+        # are "conservatively held" so we don't race a second upgrade
+        # into a real concurrent run, but the holder label is the
+        # operator's hint to fix the right thing — 403 means "fix your
+        # RBAC", 5xx means "wait for the api to recover then retry".
+        # (Verified on a 3-node appliance: pre-#296 charts that didn't
+        # opt-in to upgradeOrchestratorRBAC surfaced the same code path
+        # but with the misleading ``<unreachable>`` label.)
+        holder_hint = (
+            "<rbac-missing>"
+            if status == 403
+            else "<forbidden>" if status == 401 else "<unreachable>"
+        )
+        logger.warning("upgrade_lease_read_failed", status=status, holder=holder_hint)
         return LeaseState(
             held=True,
-            holder="<unreachable>",
+            holder=holder_hint,
             renew_time=None,
             transitions=0,
             expired=False,
