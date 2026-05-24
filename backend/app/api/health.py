@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
@@ -34,8 +35,20 @@ router = APIRouter(tags=["health"])
 # at head makes the k8s readinessProbe accurately reflect "can serve
 # traffic"; the readinessProbe controlling the Service endpoint set
 # is what nginx upstream resolution depends on.
-_EXPECTED_HEAD: str | None = None
-_EXPECTED_HEAD_ERROR: str | None = None
+#
+# Single dataclass instance instead of parallel scalars so the
+# linter sees one used global instead of two it doesn't recognise
+# via the ``global`` declaration. Same semantics — ``head`` is set
+# once on success, ``error`` is set on "no head revision" config
+# bugs (also persistent), and transient exceptions are NOT cached
+# (the function re-tries on the next probe).
+@dataclass(slots=True)
+class _SchemaHeadCache:
+    head: str | None = None
+    error: str | None = None
+
+
+_head_cache = _SchemaHeadCache()
 
 
 def _expected_alembic_head() -> tuple[str | None, str | None]:
@@ -50,9 +63,8 @@ def _expected_alembic_head() -> tuple[str | None, str | None]:
     different api pods running different image tags — but each pod
     has its own image, so each pod's cache is correct for itself).
     """
-    global _EXPECTED_HEAD, _EXPECTED_HEAD_ERROR
-    if _EXPECTED_HEAD is not None or _EXPECTED_HEAD_ERROR is not None:
-        return _EXPECTED_HEAD, _EXPECTED_HEAD_ERROR
+    if _head_cache.head is not None or _head_cache.error is not None:
+        return _head_cache.head, _head_cache.error
     try:
         # Same pattern as app/services/backup/migrations.py — the
         # alembic.ini lives at /app/alembic.ini inside the api
@@ -67,9 +79,9 @@ def _expected_alembic_head() -> tuple[str | None, str | None]:
         script = ScriptDirectory.from_config(cfg)
         head = script.get_current_head()
         if head is None:
-            _EXPECTED_HEAD_ERROR = "no head revision in script directory"
-            return None, _EXPECTED_HEAD_ERROR
-        _EXPECTED_HEAD = head
+            _head_cache.error = "no head revision in script directory"
+            return None, _head_cache.error
+        _head_cache.head = head
         logger.info("readiness_schema_head_cached", expected_head=head)
         return head, None
     except Exception as exc:  # noqa: BLE001 — surface ANY exception

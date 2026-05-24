@@ -39,8 +39,8 @@ def _reset_head_cache() -> None:
     versions directory on every probe; the cache survives across
     tests in the same worker without this fixture.
     """
-    health_module._EXPECTED_HEAD = None
-    health_module._EXPECTED_HEAD_ERROR = None
+    health_module._head_cache.head = None
+    health_module._head_cache.error = None
 
 
 @pytest.fixture(autouse=True)
