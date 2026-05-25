@@ -1972,6 +1972,121 @@ class DeleteApplianceRequest(BaseModel):
     password: str = Field(min_length=1, max_length=256)
 
 
+# Issue #197 — dependents preview + cleanup helpers.
+#
+# When an operator deletes an appliance, the dns_server / dhcp_server
+# rows the supervisor registered as part of role assignment must go
+# too — otherwise they linger as ghost offline servers, eat long-poll
+# connections, generate 404-on-heartbeat noise, and count against HA
+# Kea quorum. This module discovers the dependents both by FK
+# (``appliance_id`` populated at supervisor-driven register time —
+# forward-compatible; legacy rows stay NULL) and by hostname match
+# (covers every pre-#197 row + handles edge cases where the FK
+# wiring didn't catch).
+
+
+class AppliancedDependentServer(BaseModel):
+    """One DNS or DHCP server row tied to an appliance about to be
+    deleted. Surfaced to the operator in the delete-confirm modal so
+    they see the full blast radius before clicking."""
+
+    kind: str  # "dns" | "dhcp"
+    id: uuid.UUID
+    name: str
+    host: str
+    status: str
+
+
+class ApplianceDependents(BaseModel):
+    dns: list[AppliancedDependentServer]
+    dhcp: list[AppliancedDependentServer]
+
+
+async def _find_appliance_dependents(
+    db: DB,
+    appliance: Appliance,
+) -> ApplianceDependents:
+    """Return the dns_server + dhcp_server rows that belong to this
+    appliance. Matches on EITHER ``appliance_id`` (FK populated at
+    register time per #197) OR ``hostname`` (legacy / pre-FK rows).
+    Duplicates de-duped by row id.
+    """
+    from app.models.dhcp import DHCPServer  # noqa: PLC0415
+    from app.models.dns import DNSServer  # noqa: PLC0415
+
+    # DNS — FK match OR hostname match. ``host`` on DNSServer stores
+    # the operator-facing hostname; ``name`` is the operator-set
+    # label. Most appliance-registered rows have both equal to the
+    # appliance's hostname (see ``register`` in dns/agents.py).
+    dns_rows = (
+        (
+            await db.execute(
+                select(DNSServer).where(
+                    or_(
+                        DNSServer.appliance_id == appliance.id,
+                        DNSServer.host == appliance.hostname,
+                        DNSServer.name == appliance.hostname,
+                    )
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    dhcp_rows = (
+        (
+            await db.execute(
+                select(DHCPServer).where(
+                    or_(
+                        DHCPServer.appliance_id == appliance.id,
+                        DHCPServer.host == appliance.hostname,
+                        DHCPServer.name == appliance.hostname,
+                    )
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return ApplianceDependents(
+        dns=[
+            AppliancedDependentServer(
+                kind="dns", id=r.id, name=r.name, host=r.host, status=r.status
+            )
+            for r in dns_rows
+        ],
+        dhcp=[
+            AppliancedDependentServer(
+                kind="dhcp", id=r.id, name=r.name, host=r.host, status=r.status
+            )
+            for r in dhcp_rows
+        ],
+    )
+
+
+@router.get(
+    "/appliances/{appliance_id}/dependents",
+    response_model=ApplianceDependents,
+    dependencies=[Depends(require_permission("read", "appliance"))],
+    summary="Preview dns_server + dhcp_server rows tied to this appliance",
+)
+async def get_appliance_dependents(
+    appliance_id: uuid.UUID,
+    db: DB,
+) -> ApplianceDependents:
+    """Returns the dns_server + dhcp_server rows that the
+    delete-appliance flow will sweep. Operator-facing preview so the
+    delete-confirm modal can render "this will also remove X DNS
+    servers and Y DHCP servers" — no surprises (#197).
+    """
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    return await _find_appliance_dependents(db, row)
+
+
 @router.delete(
     "/appliances/{appliance_id}",
     response_model=ApplianceRow,
@@ -2066,6 +2181,37 @@ async def delete_appliance(
     state_at_delete = row.state
     row.state = APPLIANCE_STATE_REVOKED
     row.revoked_at = datetime.now(UTC)
+
+    # Issue #197 — drop the dependent dns_server / dhcp_server rows
+    # in the same transaction as the appliance revoke. Operator
+    # expectation is "Delete = gone"; leaving ghost server rows in the
+    # DNS / DHCP server-groups view is the exact bug this issue fixes.
+    # Reauthorize (the soft-delete recovery flow) doesn't lose data —
+    # the supervisor's next heartbeat post-reauthorize re-runs role
+    # assignment and the agent containers re-register, recreating the
+    # rows automatically. Eventual consistency, but operator-invisible.
+    dependents = await _find_appliance_dependents(db, row)
+    dependent_dns_names = [d.name for d in dependents.dns]
+    dependent_dhcp_names = [d.name for d in dependents.dhcp]
+    if dependents.dns or dependents.dhcp:
+        from app.models.dhcp import DHCPServer  # noqa: PLC0415
+        from app.models.dns import DNSServer  # noqa: PLC0415
+
+        for d in dependents.dns:
+            dns_server = await db.get(DNSServer, d.id)
+            if dns_server is not None:
+                await db.delete(dns_server)
+        for d in dependents.dhcp:
+            dhcp_server = await db.get(DHCPServer, d.id)
+            if dhcp_server is not None:
+                await db.delete(dhcp_server)
+        logger.info(
+            "appliance_dependents_cleaned",
+            appliance_id=str(appliance_id),
+            dns_dropped=len(dependent_dns_names),
+            dhcp_dropped=len(dependent_dhcp_names),
+        )
+
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -2079,6 +2225,11 @@ async def delete_appliance(
             new_value={
                 "state_at_delete": state_at_delete,
                 "revoked_at": row.revoked_at.isoformat(),
+                # #197 — recorded for audit so an operator chasing
+                # "what disappeared on 2026-05-25 14:22" can match the
+                # appliance delete to the missing server rows.
+                "cascaded_dns_servers": dependent_dns_names,
+                "cascaded_dhcp_servers": dependent_dhcp_names,
             },
         )
     )

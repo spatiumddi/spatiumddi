@@ -112,7 +112,7 @@ backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:93
 backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:94
 backend/alembic/versions/a8d2e91f5c47_appliance_variant.py:drop_column:38
 backend/alembic/versions/a8d31e6b2f47_ipv6_allocation_policy.py:drop_column:38
-backend/alembic/versions/a8e3f127c094_system_upgrade_run.py:drop_table:115
+backend/alembic/versions/a8e3f127c094_system_upgrade_run.py:drop_table:119
 backend/alembic/versions/a917b4c9e251_kubernetes_provenance.py:drop_column:50
 backend/alembic/versions/a91f72c4b1d8_appliance_slot_versions_and_boot_control.py:drop_column:67
 backend/alembic/versions/a91f72c4b1d8_appliance_slot_versions_and_boot_control.py:drop_column:68
@@ -125,6 +125,8 @@ backend/alembic/versions/a9b3c7d5e2f1_add_vlans_module.py:drop_constraint_fk:91
 backend/alembic/versions/a9b3c7d5e2f1_add_vlans_module.py:drop_table:94
 backend/alembic/versions/a9b3c7d5e2f1_add_vlans_module.py:drop_table:96
 backend/alembic/versions/ac3e1f0d8b42_acme_account.py:drop_table:104
+backend/alembic/versions/b1d4c9e57f02_appliance_id_fk_on_dns_dhcp_server.py:drop_column:81
+backend/alembic/versions/b1d4c9e57f02_appliance_id_fk_on_dns_dhcp_server.py:drop_column:83
 backend/alembic/versions/b2c84f7a91d3_unifi_integration.py:drop_column:168
 backend/alembic/versions/b2c84f7a91d3_unifi_integration.py:drop_column:171
 backend/alembic/versions/b2c84f7a91d3_unifi_integration.py:drop_table:173
@@ -187,6 +189,7 @@ backend/alembic/versions/c2a7e4f81b69_logical_ownership_entities.py:drop_constra
 backend/alembic/versions/c2a7e4f81b69_logical_ownership_entities.py:drop_table:279
 backend/alembic/versions/c2a7e4f81b69_logical_ownership_entities.py:drop_table:285
 backend/alembic/versions/c2a7e4f81b69_logical_ownership_entities.py:drop_table:290
+backend/alembic/versions/c2e6a89d4b15_platform_settings_timezone.py:drop_column:40
 backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_column:72
 backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_column:73
 backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_column:74

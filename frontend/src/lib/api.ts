@@ -7625,6 +7625,31 @@ export const applianceApprovalApi = {
         data: { password },
       })
       .then((r) => r.data),
+  // Issue #197 — preview the dns_server + dhcp_server rows that
+  // ``remove`` will sweep alongside the appliance. UI calls this
+  // before showing the delete-confirm modal so the operator sees the
+  // full blast radius before clicking. Matches by appliance_id FK
+  // (populated at supervisor-driven register time, forward-compat)
+  // OR by hostname (legacy / pre-FK rows).
+  dependents: (id: string) =>
+    api
+      .get<{
+        dns: Array<{
+          kind: "dns";
+          id: string;
+          name: string;
+          host: string;
+          status: string;
+        }>;
+        dhcp: Array<{
+          kind: "dhcp";
+          id: string;
+          name: string;
+          host: string;
+          status: string;
+        }>;
+      }>(`/appliance/appliances/${id}/dependents`)
+      .then((r) => r.data),
   reauthorize: (id: string) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/reauthorize`)
