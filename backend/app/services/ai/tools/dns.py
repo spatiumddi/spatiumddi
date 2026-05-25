@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import uuid
 from typing import Any
 
 import dns.exception
@@ -623,6 +624,45 @@ async def list_dns_views(
         }
         for v in rows
     ]
+
+
+class FindZoneDNSSECInfoArgs(BaseModel):
+    zone_id: uuid.UUID = Field(
+        description="UUID of the dns_zone row to inspect.",
+    )
+
+
+@register_tool(
+    name="find_zone_dnssec_info",
+    description=(
+        "Return the DNSSEC posture of one DNS zone: ``dnssec_enabled`` "
+        "flag, the list of DS records (key tag, algorithm, digest "
+        "type, digest — formatted for parent-registrar paste), and "
+        "the ``dnssec_synced_at`` timestamp the agent last reported. "
+        "When enabled but ``dnssec_synced_at`` is null the zone is "
+        "mid-signing or the agent hasn't reported back yet. Use this "
+        "to answer 'is example.com signed?' or 'give me the DS "
+        "records to paste into the registrar'. Read-only — the "
+        "matching ``propose_sign_zone_dnssec`` write is deferred."
+    ),
+    args_model=FindZoneDNSSECInfoArgs,
+    category="dns",
+    module="dns",
+)
+async def find_zone_dnssec_info(
+    db: AsyncSession, user: User, args: FindZoneDNSSECInfoArgs
+) -> dict[str, Any]:
+    zone = await db.get(DNSZone, args.zone_id)
+    if zone is None:
+        return {"error": "DNS zone not found", "zone_id": str(args.zone_id)}
+    return {
+        "zone_id": str(zone.id),
+        "name": zone.name,
+        "dnssec_enabled": zone.dnssec_enabled,
+        "dnssec_ds_records": zone.dnssec_ds_records,
+        "dnssec_synced_at": (zone.dnssec_synced_at.isoformat() if zone.dnssec_synced_at else None),
+        "last_serial": zone.last_serial,
+    }
 
 
 # Silence false-positive on lifted imports — Python pulls them in at

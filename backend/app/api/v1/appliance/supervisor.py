@@ -1161,6 +1161,12 @@ class SupervisorHeartbeatResponse(BaseModel):
     # ones it deleted back via ``evicted_node_names`` so the backend
     # clears the flag. Empty in the steady state.
     evict_node_names: list[str] = Field(default_factory=list)
+    # Issue #165 — operator-set IANA timezone from
+    # ``platform_settings.timezone``. Empty string = follow the
+    # install-time default (no override). The supervisor compares
+    # against the host's current tz on every heartbeat + writes the
+    # ``spatium-tz-reload`` trigger file when they differ.
+    desired_timezone: str = ""
 
 
 @router.post(
@@ -1515,6 +1521,8 @@ async def supervisor_heartbeat(
     metallb_enabled = bool(cfg_row.metallb_enabled) if cfg_row else False
     metallb_pool = list(cfg_row.metallb_pool_addresses or []) if cfg_row else []
     metallb_vip = (cfg_row.control_plane_vip or "") if cfg_row else ""
+    # Issue #165 — operator-set timezone. Empty string = no override.
+    desired_timezone = (cfg_row.timezone or "") if cfg_row else ""
 
     # #272 Phase 9 — dead k8s Nodes the seed should evict. Returned to
     # every CP supervisor but only the control-plane-variant seed acts.
@@ -1551,6 +1559,7 @@ async def supervisor_heartbeat(
         desired_metallb_pool_addresses=metallb_pool,
         desired_control_plane_vip=metallb_vip,
         evict_node_names=evict_names,
+        desired_timezone=desired_timezone,
     )
 
 

@@ -1341,10 +1341,8 @@ export function FleetTab({
                             DNS
                           </span>{" "}
                           <span className="text-foreground">{d.name}</span>
-                          {d.host !== d.name && (
-                            <span> ({d.host})</span>
-                          )}{" "}
-                          — {d.status}
+                          {d.host !== d.name && <span> ({d.host})</span>} —{" "}
+                          {d.status}
                         </li>
                       ))}
                       {dependentsQuery.data.dhcp.map((d) => (
@@ -1353,10 +1351,8 @@ export function FleetTab({
                             DHCP
                           </span>{" "}
                           <span className="text-foreground">{d.name}</span>
-                          {d.host !== d.name && (
-                            <span> ({d.host})</span>
-                          )}{" "}
-                          — {d.status}
+                          {d.host !== d.name && <span> ({d.host})</span>} —{" "}
+                          {d.status}
                         </li>
                       ))}
                     </ul>

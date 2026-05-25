@@ -2788,6 +2788,9 @@ export interface PlatformSettings {
   ntp_custom_servers: NtpCustomServer[];
   ntp_allow_clients: boolean;
   ntp_allow_client_networks: string[];
+  // Issue #165 — operator-set IANA timezone. Empty = no override
+  // (host falls back to install-time default).
+  timezone: string;
 }
 
 export type NtpSourceMode = "pool" | "servers" | "mixed";

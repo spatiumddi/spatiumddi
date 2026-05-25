@@ -1,0 +1,15 @@
+[Unit]
+Description=Watch for SpatiumDDI timezone-reload trigger (issue #165)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/165
+# Skip on the live ISO — installer environment doesn't drive timezone
+# via SpatiumDDI; the wizard sets /etc/timezone directly.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# Same atomic-rename trigger pattern the chrony + SNMP units use:
+# supervisor writes <name>.new, then mv → <name>. PathChanged fires
+# once per applied tz (close-after-write semantics).
+PathChanged=/var/lib/spatiumddi/release-state/tz-pending
+
+[Install]
+WantedBy=multi-user.target

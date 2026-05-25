@@ -1,0 +1,110 @@
+#!/bin/bash
+# spatiumddi-tz-reload — host-side timezone-apply runner (#165).
+#
+# The supervisor writes
+# /var/lib/spatiumddi/release-state/tz-pending whenever the operator's
+# desired timezone (from platform_settings.timezone) differs from the
+# value reported back by this runner's last successful apply. File
+# format (matches the spatium-chrony-reload pattern for simplicity):
+#
+#   line 1: IANA tz name (``UTC``, ``America/Toronto``, …)
+#
+# Apply flow:
+#   1. Validate against ``timedatectl list-timezones`` — refuse on
+#      mismatch, leave the trigger in place so the operator sees the
+#      error in the next heartbeat without a flapping rewrite loop.
+#   2. ``timedatectl set-timezone <name>`` — symlinks /etc/localtime
+#      atomically and writes /etc/timezone. systemd-timedated handles
+#      service reload for the time-aware daemons it knows about.
+#   3. Write the applied value to the status sidecar.
+#   4. Write the hash sidecar (the IANA name itself) so the supervisor
+#      can short-circuit the trigger write on the next heartbeat.
+#
+# Persistence across A/B slot swaps (Phase 8a, issue #138):
+#
+#   /etc/timezone, /etc/localtime → /var/persist/etc/...
+#   /var/lib/spatiumddi/release-state/tz-{pending,hash,status}
+#                                  → on /var directly
+#
+# A slot upgrade or rollback preserves the operator-set tz
+# automatically — same overlay-on-/etc + /var-sidecar story as the
+# chrony / SNMP runners.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/tz-pending
+HASH_SIDECAR=/var/lib/spatiumddi/release-state/tz-hash
+STATUS_SIDECAR=/var/lib/spatiumddi/release-state/tz-status
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/tz-reload.log"
+LOCK=/run/spatiumddi-tz-reload.lock
+
+mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")"
+
+log() { printf '%s spatiumddi-tz-reload: %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG"; }
+
+# Single-instance lock — the path unit can race itself if two writes
+# land within milliseconds (atomic rename → PathChanged fires once,
+# but operator-driven re-applies + supervisor heartbeats can overlap).
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    log "another instance is running — exiting"
+    exit 0
+fi
+
+if [ ! -f "$TRIGGER" ]; then
+    log "no trigger file — nothing to do"
+    exit 0
+fi
+
+tz="$(head -n1 "$TRIGGER" | tr -d '[:space:]')"
+if [ -z "$tz" ]; then
+    log "trigger file is empty — clearing without apply"
+    rm -f "$TRIGGER"
+    exit 0
+fi
+
+# Validate against the host's known-timezone list. ``timedatectl
+# list-timezones`` enumerates every IANA name systemd's tz parser
+# accepts; a value not in this list would be silently swallowed by
+# ``timedatectl set-timezone`` with the host left on the previous
+# value — exactly the silent-fail mode we want to avoid.
+if ! timedatectl list-timezones 2>/dev/null | grep -Fxq "$tz"; then
+    log "REJECT: '$tz' is not a known IANA timezone on this host"
+    # Leave the trigger in place; the supervisor will keep re-firing
+    # it which surfaces the issue in the heartbeat's last-apply
+    # status. Write the status sidecar so the heartbeat reports an
+    # operator-readable error.
+    printf 'state=failed\nreason=unknown_timezone\nrequested=%s\napplied_at=%s\n' \
+        "$tz" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
+    exit 1
+fi
+
+# Already at the requested value? Don't re-fire timedatectl — it's
+# idempotent but each call rotates /etc/localtime which churns the
+# /etc overlay's upper layer for no reason.
+current="$(timedatectl show --property=Timezone --value 2>/dev/null || echo "")"
+if [ "$current" = "$tz" ]; then
+    log "already on '$tz' — no apply needed"
+else
+    log "apply: $current → $tz"
+    if ! timedatectl set-timezone "$tz" 2>&1 | tee -a "$LOG"; then
+        log "ERROR: timedatectl set-timezone failed"
+        printf 'state=failed\nreason=set_timezone_failed\nrequested=%s\napplied_at=%s\n' \
+            "$tz" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
+        exit 1
+    fi
+fi
+
+# Apply landed. Write the hash sidecar (the IANA name itself — for
+# tz it's small enough to use verbatim instead of sha256) so the
+# supervisor short-circuits the next heartbeat's trigger write.
+printf '%s\n' "$tz" > "$HASH_SIDECAR"
+printf 'state=ok\nrequested=%s\napplied=%s\napplied_at=%s\n' \
+    "$tz" "$tz" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
+
+# Drop the trigger so the .path unit doesn't re-fire (the trigger's
+# absence is the marker; presence means "operator wants a change").
+rm -f "$TRIGGER"
+
+log "OK"

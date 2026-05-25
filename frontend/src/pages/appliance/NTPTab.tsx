@@ -3,6 +3,7 @@ import { Loader2 } from "lucide-react";
 
 import { authApi, settingsApi, versionApi } from "@/lib/api";
 import { NTPSection } from "@/components/NTPSection";
+import { TimezoneSection } from "@/components/TimezoneSection";
 
 /**
  * Appliance → NTP tab (issue #154).
@@ -61,6 +62,18 @@ export function NTPTab() {
         applianceMode={applianceMode}
         inputCls={inputCls}
       />
+      {/* Issue #165 — operator-set IANA timezone, applied to the
+          appliance host via the supervisor heartbeat →
+          spatiumddi-tz-reload pipeline. Lives in the same tab as
+          NTP because operators expect "the place I set time-related
+          host config". */}
+      <div className="mt-6">
+        <TimezoneSection
+          currentValue={settings.timezone ?? ""}
+          isSuperadmin={isSuperadmin}
+          applianceMode={applianceMode}
+        />
+      </div>
     </div>
   );
 }
