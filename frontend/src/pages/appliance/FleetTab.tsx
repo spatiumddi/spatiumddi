@@ -735,6 +735,21 @@ export function FleetTab({
   // surfaces the server's 403 response inline so a typo doesn't
   // bounce the operator out of the modal.
   const [deletePwError, setDeletePwError] = useState<string | null>(null);
+  // Issue #197 — preview the dns_server + dhcp_server rows that the
+  // revoke flow will sweep alongside the appliance. The query is
+  // ``enabled`` only when ``deleteTarget`` is set so we don't hit
+  // the endpoint on every row hover. Stays stale-while-revalidate
+  // until the modal closes — operator's choice doesn't change once
+  // they've opened the modal.
+  const dependentsQuery = useQuery({
+    queryKey: ["appliance", "dependents", deleteTarget?.id ?? null],
+    queryFn: () =>
+      deleteTarget
+        ? applianceApprovalApi.dependents(deleteTarget.id)
+        : Promise.resolve({ dns: [], dhcp: [] }),
+    enabled: !!deleteTarget,
+    staleTime: 30_000,
+  });
   const remove = useMutation({
     mutationFn: ({ id, password }: { id: string; password: string }) =>
       applianceApprovalApi.remove(id, password),
@@ -1307,6 +1322,46 @@ export function FleetTab({
                 by mistake. The <em>Delete</em> button appears on revoked rows
                 for permanent removal.
               </p>
+              {/* Issue #197 — list the dns_server + dhcp_server rows
+                  that will be swept alongside the revoke. Operator
+                  sees the full blast radius before clicking; if the
+                  appliance has zero dependent rows the block stays
+                  out so the modal isn't padded for the common case. */}
+              {dependentsQuery.data &&
+                (dependentsQuery.data.dns.length > 0 ||
+                  dependentsQuery.data.dhcp.length > 0) && (
+                  <div className="mt-2 rounded-md border bg-muted/30 p-2 text-xs">
+                    <p className="font-medium">
+                      Will also remove the following server rows:
+                    </p>
+                    <ul className="mt-1 list-inside list-disc text-muted-foreground">
+                      {dependentsQuery.data.dns.map((d) => (
+                        <li key={d.id}>
+                          <span className="rounded bg-sky-500/15 px-1 font-mono text-[10px] uppercase text-sky-700 dark:text-sky-400">
+                            DNS
+                          </span>{" "}
+                          <span className="text-foreground">{d.name}</span>
+                          {d.host !== d.name && <span> ({d.host})</span>} —{" "}
+                          {d.status}
+                        </li>
+                      ))}
+                      {dependentsQuery.data.dhcp.map((d) => (
+                        <li key={d.id}>
+                          <span className="rounded bg-emerald-500/15 px-1 font-mono text-[10px] uppercase text-emerald-700 dark:text-emerald-400">
+                            DHCP
+                          </span>{" "}
+                          <span className="text-foreground">{d.name}</span>
+                          {d.host !== d.name && <span> ({d.host})</span>} —{" "}
+                          {d.status}
+                        </li>
+                      ))}
+                    </ul>
+                    <p className="mt-2 text-[11px] text-muted-foreground">
+                      Re-authorize re-creates these on the supervisor's next
+                      heartbeat — data on the appliance itself isn't lost.
+                    </p>
+                  </div>
+                )}
               <p className="mt-2 text-xs text-muted-foreground">
                 Cert serial:{" "}
                 <code className="text-foreground">

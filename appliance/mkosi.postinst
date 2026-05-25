@@ -50,6 +50,7 @@ for unit in chrony.service ssh.service \
             k3s.service \
             spatiumddi-snmp-reload.path \
             spatiumddi-chrony-reload.path \
+            spatiumddi-tz-reload.path \
             spatium-firewall-reload.path \
             spatium-install.service \
             spatium-live-banner.service \

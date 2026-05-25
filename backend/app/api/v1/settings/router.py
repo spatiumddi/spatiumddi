@@ -141,6 +141,9 @@ class SettingsResponse(BaseModel):
     ntp_custom_servers: list[dict[str, Any]] = []
     ntp_allow_clients: bool = False
     ntp_allow_client_networks: list[str] = []
+    # ── Appliance timezone (issue #165) ───────────────────────────
+    # Empty string means "follow install-time default" (no override).
+    timezone: str = ""
 
     model_config = {"from_attributes": True}
 
@@ -385,6 +388,25 @@ class SettingsUpdate(BaseModel):
     ntp_custom_servers: list[NTPCustomServerUpdate] | None = None
     ntp_allow_clients: bool | None = None
     ntp_allow_client_networks: list[str] | None = None
+    # ── Appliance timezone (issue #165) ───────────────────────────
+    timezone: str | None = None
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, v: str | None) -> str | None:
+        """Validate IANA tz name on PUT. Empty string is allowed
+        (clears the override). Non-empty must parse via
+        ``zoneinfo.ZoneInfo`` — anything else 422s with a clean
+        message instead of waiting for the host runner to bounce."""
+        if v is None or v == "":
+            return v
+        try:
+            from zoneinfo import ZoneInfo  # noqa: PLC0415
+
+            ZoneInfo(v)
+        except Exception as exc:  # noqa: BLE001 — surface the parse failure
+            raise ValueError(f"timezone {v!r} is not a valid IANA tz name: {exc}") from exc
+        return v
 
     @field_validator("lockout_threshold")
     @classmethod

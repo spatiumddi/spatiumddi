@@ -412,6 +412,18 @@ class PlatformSettings(Base):
         JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
     )
 
+    # ── Appliance timezone (issue #165) ─────────────────────────────
+    # IANA tz name (``UTC``, ``America/Toronto``, …). Installer wizard
+    # captures the initial value into ``/etc/timezone`` at install
+    # time; this column tracks the operator-set desired value so
+    # post-install changes through the Settings UI flow through the
+    # same heartbeat → host-runner pattern NTP / SNMP use. Empty
+    # string means "follow the install-time default" — supervisor
+    # heartbeat skips sending it in that case.
+    timezone: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=sa_text("''")
+    )
+
     # ── Aggregation candidate snooze (issue #114) ───────────────────
     # Operator-driven hide-list for the IPAM aggregation badge popover.
     # Keys are stable per-candidate hashes derived from the parent

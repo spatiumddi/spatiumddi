@@ -2788,6 +2788,9 @@ export interface PlatformSettings {
   ntp_custom_servers: NtpCustomServer[];
   ntp_allow_clients: boolean;
   ntp_allow_client_networks: string[];
+  // Issue #165 — operator-set IANA timezone. Empty = no override
+  // (host falls back to install-time default).
+  timezone: string;
 }
 
 export type NtpSourceMode = "pool" | "servers" | "mixed";
@@ -7624,6 +7627,31 @@ export const applianceApprovalApi = {
       .delete<ApplianceRow>(`/appliance/appliances/${id}`, {
         data: { password },
       })
+      .then((r) => r.data),
+  // Issue #197 — preview the dns_server + dhcp_server rows that
+  // ``remove`` will sweep alongside the appliance. UI calls this
+  // before showing the delete-confirm modal so the operator sees the
+  // full blast radius before clicking. Matches by appliance_id FK
+  // (populated at supervisor-driven register time, forward-compat)
+  // OR by hostname (legacy / pre-FK rows).
+  dependents: (id: string) =>
+    api
+      .get<{
+        dns: Array<{
+          kind: "dns";
+          id: string;
+          name: string;
+          host: string;
+          status: string;
+        }>;
+        dhcp: Array<{
+          kind: "dhcp";
+          id: string;
+          name: string;
+          host: string;
+          status: string;
+        }>;
+      }>(`/appliance/appliances/${id}/dependents`)
       .then((r) => r.data),
   reauthorize: (id: string) =>
     api

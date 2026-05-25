@@ -1,0 +1,16 @@
+[Unit]
+Description=Apply pending SpatiumDDI timezone change (issue #165)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/165
+# Defensive ordering — the runner calls ``timedatectl`` which needs
+# systemd-timedated. /var/lib/spatiumddi/release-state (the trigger
+# location) isn't available until local-fs.target. The /etc overlay
+# must also be up so the writes systemd-timedated makes to
+# /etc/timezone + /etc/localtime land on the /var-backed upper layer.
+After=etc.mount local-fs.target systemd-timedated.service
+Requires=etc.mount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-tz-reload
+# No Install section — only invoked by the matching .path unit, never
+# directly enabled at boot.

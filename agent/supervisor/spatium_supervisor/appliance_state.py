@@ -302,6 +302,12 @@ _REBOOT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/reboot-pendi
 # from the host. We pass values through verbatim; the Fleet UI
 # normalises them in ``slotVersion()``.
 _SLOT_VERSIONS_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-versions.json")
+# Issue #165 — operator-set timezone trigger + applied-hash sidecar.
+# Trigger carries a single line (the IANA tz name); host runner
+# rewrites the hash sidecar after a successful apply so the
+# supervisor short-circuits the next heartbeat's trigger write.
+_TZ_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/tz-pending")
+_TZ_APPLIED_HASH_FILE = Path("/var/lib/spatiumddi-host/release-state/tz-hash")
 # Per-slot boot-control trigger files. Each carries a single line:
 # the target slot name (``slot_a`` / ``slot_b``). The host-side
 # ``spatiumddi-slot-set-next-boot.path`` / ``spatiumddi-slot-set-
@@ -441,6 +447,48 @@ def maybe_fire_reboot(reboot_requested: bool) -> bool:
             encoding="utf-8",
         )
         tmp.replace(_REBOOT_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def maybe_fire_timezone(desired_timezone: str | None) -> bool:
+    """Issue #165 — write the tz-reload trigger when the operator's
+    desired timezone (from ``platform_settings.timezone``) doesn't
+    match the value the host runner last applied.
+
+    Returns True if a trigger was fired, False otherwise. Idempotent
+    via the ``tz-hash`` sidecar — the host runner writes the IANA
+    name it applied; we compare against the desired value and skip
+    the rewrite when they match. Empty / None desired means "no
+    override" — the supervisor leaves the host alone.
+
+    Strict appliance-only gate (mirrors ``maybe_fire_reboot``):
+    docker / k8s / unknown deploys NEVER fire the trigger even if
+    the field somehow flips through.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not desired_timezone or not desired_timezone.strip():
+        return False
+    desired = desired_timezone.strip()
+    # Read the applied-hash sidecar (single-line IANA name) the host
+    # runner writes after a successful apply.
+    try:
+        applied = _TZ_APPLIED_HASH_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        applied = ""
+    if applied == desired:
+        return False
+    try:
+        _TZ_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _TZ_TRIGGER_FILE.with_suffix(".new")
+        tmp.write_text(desired + "\n", encoding="utf-8")
+        # Atomic rename — the .path unit watches PathChanged which
+        # fires on close-after-write of the final path, so the
+        # rename ensures the runner sees the complete trigger file
+        # rather than a half-written one.
+        tmp.replace(_TZ_TRIGGER_FILE)
         return True
     except OSError:
         return False

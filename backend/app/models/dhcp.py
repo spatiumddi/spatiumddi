@@ -144,6 +144,18 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # to identify which host runs each agent in NAT / distributed
     # deployments. See dns_server.last_seen_ip for the same field.
     last_seen_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+
+    # Issue #197 — same shape as ``DNSServer.appliance_id``. Populated
+    # at supervisor-driven register time so the operator's "Delete
+    # appliance" click in the Fleet UI atomically drops the matching
+    # dhcp_server rows via ``ON DELETE CASCADE``. NULL for operator-
+    # registered DHCP servers (off-fleet box, manual register).
+    appliance_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("appliance.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     agent_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     agent_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     agent_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)

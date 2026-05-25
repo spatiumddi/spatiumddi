@@ -222,6 +222,21 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # (the operator-set ``host``/``name`` is just a label; a NAT'd
     # agent in a different subnet would otherwise be invisible).
     last_seen_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+
+    # Issue #197 — link back to the parent Application appliance
+    # (when the row was registered through the supervisor's role-
+    # assignment flow). ``ON DELETE CASCADE`` does the orphan-row
+    # cleanup automatically when the operator deletes the appliance,
+    # so the operator never has to manually prune ghost server rows
+    # from the DNS → Server Groups view. Nullable because operators
+    # ALSO register DNS servers manually (a remote BIND9 / PowerDNS
+    # pointing at an off-fleet box) — those rows stay NULL forever.
+    appliance_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("appliance.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     last_config_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
     pending_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

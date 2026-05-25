@@ -603,6 +603,19 @@ def heartbeat_once(
         if appliance_state.maybe_fire_reboot(True):
             log.info("supervisor.heartbeat.reboot_trigger_fired")
 
+    # Issue #165 — operator-set timezone. Empty / missing → no
+    # override (host stays on install-time default). Non-empty +
+    # different from the host runner's last-applied → trigger
+    # ``spatiumddi-tz-reload`` via the trigger-file convention the
+    # SNMP / chrony / firewall / slot-upgrade runners all use.
+    desired_timezone = body_out.get("desired_timezone")
+    if desired_timezone and isinstance(desired_timezone, str):
+        if appliance_state.maybe_fire_timezone(desired_timezone):
+            log.info(
+                "supervisor.heartbeat.timezone_trigger_fired",
+                desired_timezone=desired_timezone,
+            )
+
     # #272 Phase 7b — control-plane promote/demote. The host-side runner
     # (spatium-cluster-join) reconfigures k3s + reports back via the
     # .state sidecar that collect() ships on the next heartbeat; the

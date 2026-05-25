@@ -13,6 +13,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     appliance,
     backup,
     bgp,
+    conformity,
     copilot,
     dhcp,
     diagnostics,
@@ -32,6 +33,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     snmp,
     upgrades,
     vendor,
+    webhooks,
     whois,
 )
 from app.services.ai.tools.base import (
