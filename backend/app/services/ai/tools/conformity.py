@@ -162,10 +162,13 @@ class GetConformitySummaryArgs(BaseModel):
         "Per-framework rollup of policy + result counts. Returns a "
         "list of ``{framework, policy_count, enabled_count, "
         "pass_count, fail_count, warn_count, not_applicable_count}``. "
-        "Counts only the MOST-RECENT result per (policy × resource) "
-        "pair so a failing run two days ago doesn't double-count "
-        "against today's pass. Useful for 'are we PCI-clean today?' "
-        "rollups. Read-only."
+        "Counts EVERY ``conformity_result`` row by status — the "
+        "evaluator overwrites results per pass via UPSERT keyed on "
+        "(policy × resource), so the trailing-edge of a given "
+        "eval-interval window is what these counts reflect. Useful "
+        "for 'roughly how do we look against PCI?' rollups. For "
+        "point-in-time precise per-resource status, query "
+        "``find_conformity_results`` directly. Read-only."
     ),
     args_model=GetConformitySummaryArgs,
     category="compliance",

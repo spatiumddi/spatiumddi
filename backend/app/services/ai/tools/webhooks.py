@@ -31,6 +31,23 @@ from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services.ai.tools.base import register_tool
 
 
+def _superadmin_gate(user: User) -> dict[str, Any] | None:
+    """Webhook config surfaces URLs + delivery history that the REST
+    endpoint gates to superadmin-only (operators may treat webhook
+    URLs as semi-private — e.g. SIEM ingestion URLs with embedded
+    auth tokens). Mirror the gate at the MCP layer so a non-
+    superadmin's chat session can't read it either.
+    """
+    if not user.is_superadmin:
+        return {
+            "error": (
+                "Webhook config is restricted to superadmin users. "
+                "Ask your platform admin to run the query."
+            )
+        }
+    return None
+
+
 class ListWebhooksArgs(BaseModel):
     enabled: bool | None = Field(
         default=None,
@@ -55,7 +72,10 @@ class ListWebhooksArgs(BaseModel):
 )
 async def list_webhooks(
     db: AsyncSession, user: User, args: ListWebhooksArgs
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | dict[str, Any]:
+    gate = _superadmin_gate(user)
+    if gate is not None:
+        return gate
     stmt = select(EventSubscription)
     if args.enabled is not None:
         stmt = stmt.where(EventSubscription.enabled.is_(args.enabled))
@@ -151,7 +171,10 @@ class FindWebhookDeliveriesArgs(BaseModel):
 )
 async def find_webhook_deliveries(
     db: AsyncSession, user: User, args: FindWebhookDeliveriesArgs
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | dict[str, Any]:
+    gate = _superadmin_gate(user)
+    if gate is not None:
+        return gate
     stmt = select(EventOutbox)
     if args.subscription_id:
         stmt = stmt.where(EventOutbox.subscription_id == args.subscription_id)

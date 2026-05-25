@@ -10,8 +10,16 @@ import { settingsApi, formatApiError } from "@/lib/api";
  * Settings → NTP tab uses this. The picker is a text input backed by
  * a ``<datalist>`` of every IANA tz name the browser reports via
  * ``Intl.supportedValuesOf("timeZone")`` — gives auto-complete
- * without committing to a long ``<select>`` UX. Empty string clears
- * the override (host falls back to install-time default).
+ * without committing to a long ``<select>`` UX.
+ *
+ * Empty string clears the operator-set override BUT does NOT revert
+ * the host's actual timezone — the supervisor's
+ * ``maybe_fire_timezone`` short-circuits on empty so no trigger
+ * file is written. To revert to UTC (or any other tz), the operator
+ * picks that value explicitly. Documented as such in the form copy
+ * so this doesn't surprise anyone (#305 review polish — Copilot
+ * caught the original "falls back to install-time default" wording
+ * which was a misread of the supervisor behaviour).
  *
  * Apply flow: PUT ``/api/v1/settings`` → ``platform_settings.timezone``
  * → supervisor heartbeat ships ``desired_timezone`` → supervisor's
@@ -101,7 +109,7 @@ export function TimezoneSection({
       qc.invalidateQueries({ queryKey: ["settings"] });
       setSavedNote(
         tz === ""
-          ? "Timezone override cleared — host falls back to install-time default."
+          ? "Timezone override cleared — the host keeps its current value. Set the field to your desired tz to change it."
           : `Timezone set to ${tz}. Applies on the host within one heartbeat cycle.`,
       );
     },
@@ -123,8 +131,10 @@ export function TimezoneSection({
         IANA timezone name applied to the appliance host (e.g.{" "}
         <code>America/Toronto</code>, <code>Europe/Berlin</code>,{" "}
         <code>UTC</code>). The installer wizard captures the initial value; this
-        control changes it post-install. Leave empty to clear the override and
-        fall back to the install-time default.
+        control changes it post-install. Clearing this field stops SpatiumDDI
+        from pushing further timezone changes — the host stays on whatever
+        timezone the runner most recently applied. To actually revert to the
+        install-time default, set the field to that default explicitly and save.
       </p>
       {!applianceMode && (
         <p className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">

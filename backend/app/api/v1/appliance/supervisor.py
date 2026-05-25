@@ -1994,7 +1994,7 @@ class DeleteApplianceRequest(BaseModel):
 # wiring didn't catch).
 
 
-class AppliancedDependentServer(BaseModel):
+class ApplianceDependentServer(BaseModel):
     """One DNS or DHCP server row tied to an appliance about to be
     deleted. Surfaced to the operator in the delete-confirm modal so
     they see the full blast radius before clicking."""
@@ -2007,8 +2007,8 @@ class AppliancedDependentServer(BaseModel):
 
 
 class ApplianceDependents(BaseModel):
-    dns: list[AppliancedDependentServer]
-    dhcp: list[AppliancedDependentServer]
+    dns: list[ApplianceDependentServer]
+    dhcp: list[ApplianceDependentServer]
 
 
 async def _find_appliance_dependents(
@@ -2023,10 +2023,14 @@ async def _find_appliance_dependents(
     from app.models.dhcp import DHCPServer  # noqa: PLC0415
     from app.models.dns import DNSServer  # noqa: PLC0415
 
-    # DNS — FK match OR hostname match. ``host`` on DNSServer stores
-    # the operator-facing hostname; ``name`` is the operator-set
-    # label. Most appliance-registered rows have both equal to the
-    # appliance's hostname (see ``register`` in dns/agents.py).
+    # DNS — FK match OR host-match. We DELIBERATELY do NOT match on
+    # ``DNSServer.name`` because ``name`` is an operator-controlled
+    # label (not a hostname guarantee) and could collide with an
+    # unrelated remote DNS server an operator labelled with the
+    # appliance's hostname. Review polish from #305 — Copilot caught
+    # the over-match. ``DNSServer.host`` is set to the appliance's
+    # hostname by the agent's ``register`` call (see dns/agents.py)
+    # so it's the reliable identifier for appliance-owned rows.
     dns_rows = (
         (
             await db.execute(
@@ -2034,7 +2038,6 @@ async def _find_appliance_dependents(
                     or_(
                         DNSServer.appliance_id == appliance.id,
                         DNSServer.host == appliance.hostname,
-                        DNSServer.name == appliance.hostname,
                     )
                 )
             )
@@ -2043,6 +2046,9 @@ async def _find_appliance_dependents(
         .all()
     )
 
+    # DHCP — same logic. ``DHCPServer.name`` is unique + operator-
+    # set; matching against it risks deleting unrelated server rows
+    # an operator labelled with the appliance's hostname.
     dhcp_rows = (
         (
             await db.execute(
@@ -2050,7 +2056,6 @@ async def _find_appliance_dependents(
                     or_(
                         DHCPServer.appliance_id == appliance.id,
                         DHCPServer.host == appliance.hostname,
-                        DHCPServer.name == appliance.hostname,
                     )
                 )
             )
@@ -2061,13 +2066,11 @@ async def _find_appliance_dependents(
 
     return ApplianceDependents(
         dns=[
-            AppliancedDependentServer(
-                kind="dns", id=r.id, name=r.name, host=r.host, status=r.status
-            )
+            ApplianceDependentServer(kind="dns", id=r.id, name=r.name, host=r.host, status=r.status)
             for r in dns_rows
         ],
         dhcp=[
-            AppliancedDependentServer(
+            ApplianceDependentServer(
                 kind="dhcp", id=r.id, name=r.name, host=r.host, status=r.status
             )
             for r in dhcp_rows
