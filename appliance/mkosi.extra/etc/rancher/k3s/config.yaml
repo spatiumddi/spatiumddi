@@ -15,13 +15,18 @@
 # rejects loopback IPs ("may not be in the loopback range") — coredns
 # / local-path / helm-controller all fail to reach the cluster IP.
 #
-# External reach is gated by nftables: tcp/6443 is only accepted from
-# the pod CIDR (10.42.0.0/16) on the input chain; all other origins
-# fall through to the default-drop policy. #272 Phase 7b widens this on
-# control-plane nodes: when the control plane promotes peers, it hands
-# each member the peer node IPs and the supervisor renders an nftables
-# drop-in opening the k3s server ports (6443 apiserver, 2379/2380 etcd,
-# 10250 kubelet) to those peers — see firewall_renderer._K3S_PEER_PORTS_TCP.
+# Network-layer posture: tcp/6443, 2379/2380, 10250 are OPEN on the
+# LAN-facing INPUT chain (see /etc/nftables.conf "k3s-ha" rule). k3s
+# itself token+mTLS protects the apiserver and requires client certs
+# for etcd — LAN exposure on a single-tenant appliance is acceptable.
+# #272 Phase 7b's per-peer drop-ins under /etc/nftables.d/ are kept
+# as defence-in-depth + documentation of the active peer set.
+#
+# Pod + service CIDRs are operator-chosen at install time (issue
+# #302); see /etc/rancher/k3s/config.yaml.d/spatium-cidrs.yaml for
+# the values in effect. Defaults are k3s upstream (10.42.0.0/16 pods,
+# 10.43.0.0/16 services); the install wizard customises them when
+# the operator's LAN already uses one of those ranges.
 https-listen-port: 6443
 
 # #272 Phase 7 — embedded etcd from first boot. ``cluster-init: true``

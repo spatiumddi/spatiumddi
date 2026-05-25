@@ -555,6 +555,33 @@ trigger: tag push (CalVer)
 > `spatiumddi-firstboot` runs after collecting answers has
 > changed.
 
+> **#302 update — k3s CIDR step in the wizard.** The interactive
+> installer (`spatium-install`) now asks for the k3s pod + service
+> CIDRs between the timezone step and the role-config step. Both
+> default to the k3s upstream defaults (`10.42.0.0/16` pods,
+> `10.43.0.0/16` services); operators on a clean LAN just press
+> Enter through both prompts.
+>
+> Operators whose LAN already uses one of these ranges (Flannel
+> docs example uses `10.42.0.0/24`; some VPN/SD-WAN deployments use
+> `10.42.x` or `10.43.x` for branch routing) can override them. The
+> wizard validates that:
+>
+> - Both CIDRs are syntactically valid IPv4 networks.
+> - Prefixes are wide enough (≤ /22 — k3s allocates a /24 per node
+>   out of the pod CIDR, plus headroom for service ClusterIPs).
+> - Pod CIDR and service CIDR are disjoint.
+> - On static-IP installs, neither CIDR overlaps with the LAN
+>   subnet the operator just configured (Flannel's `host-gw`
+>   backend writes routes that would mask the LAN otherwise).
+>
+> The chosen values land in
+> `/etc/rancher/k3s/config.yaml.d/spatium-cidrs.yaml` (always
+> written, even on defaults, so the active values are visible on
+> disk). **In-place change is NOT supported** — k3s requires a
+> reinstall to change `cluster-cidr` / `service-cidr`. The
+> partition layout permits keeping `/var` across reinstalls.
+
 ### Phase 1 (pre-#183, replaced): headless via cloud-init NoCloud
 
 Phase 1 ships with `cloud-init` enabled and the NoCloud datasource
