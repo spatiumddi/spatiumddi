@@ -171,8 +171,11 @@ across 3 modules (matching `propose_*` writes deferred to #304):
 - **dns** — `find_zone_dnssec_info` (DS records + `dnssec_synced_at`
   timestamp).
 
-The README's "tools total" count moves from 101 → 118 (this
-release: +7 above; #298 added +3 upgrade tools).
+Tool registry total moves from 108 (at 2026.05.22-2) → 118 (this
+release: +3 from #298's `find_upgrade_*` reads, +7 from #280
+above). The README's "tools total" mention was stale at "101"
+pre-release; it is bumped to the live count of 118 in the same
+commit.
 
 ### Changed
 

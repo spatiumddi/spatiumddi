@@ -520,9 +520,11 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - **Reasoning-channel fallback** — `qwen3.5` / DeepSeek-R1 / o1 / o3 family that route their answer to `reasoning` instead of `content` are handled transparently by the driver
   - **Ollama context-window forwarding** — driver forwards `options.num_ctx` / `num_predict` / `extra_body` so Ollama respects the configured context window. Operators can also set `OLLAMA_CONTEXT_LENGTH` env var on the server side (recommended); without one or the other, Ollama silently truncates to 2048 tokens and small models hallucinate tool names from a half-cut tool list
 
-  **Tool registry (118 tools)**
+  **Tool registry (118 tools — highlights below)**
 
   Each tool is gated by both the `feature_module` it belongs to (`integrations.unifi` off → UniFi tool disappears from the registry) and an admin-controlled per-tool allowlist at **Admin → AI → Tools**, so operators can trim what the model can see without touching code. Every tool can also be flipped per-provider via the AI Provider modal's Tools tab — the right call for small Ollama models that struggle with 100+ tool schemas.
+
+  The per-category bullets below are a representative tour, not an exhaustive enumeration — the canonical inventory is `backend/app/services/ai/tools/` (one module per category, every `@register_tool(...)` decorator is a live entry) and the live `/api/v1/ai/tools` endpoint on a running install. Categories not surfaced here (multicast, appliance fleet, …) round out the 118 total.
 
   - **IPAM (10)** — `list_ip_spaces`, `list_ip_blocks`, `list_subnets`, `get_subnet_summary`, `find_ip` (returns MAC + **vendor**), `find_by_tag`, `count_ipam_resources`, `find_devices_by_vendor`, `count_devices_by_vendor`, `propose_create_ip_address`. Name-or-UUID resolution on `space_id` / `block_id` so the model can pass `"home"` directly without a UUID-lookup hop
   - **DNS (10)** — `list_dns_server_groups`, `list_dns_zones`, `list_dns_views`, `list_dns_records` (cross-zone substring search), `list_dns_pools` (GSLB pools + per-member health), `list_dns_blocklists` (RPZ rows + sync state), `query_dns_records`, `forward_dns`, `reverse_dns`, `propose_create_dns_record`
