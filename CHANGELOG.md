@@ -20,6 +20,216 @@ the formatter handles the rest.
 
 ---
 
+## 2026.05.26-1 — 2026-05-26
+
+The **multi-node rolling upgrade + cold-boot UX + operator-quality**
+release. The headline (#296, landed via #298) closes the last gap
+left by 2026.05.22-1's control-plane HA cut: SpatiumDDI can now
+walk an OS+app upgrade across every node of a 3/5/7-node appliance
+cluster from a single click in `/appliance` → **Rolling Upgrade**.
+Both source modes are wired (air-gap mirror PVC + connected URL),
+preflight verifies replication lag / disk headroom / quorum before
+the lease lock comes out, and the orchestrator handles
+cordon → CNPG switchover → drain → A/B slot apply → reboot →
+health-gate → uncordon → settle for each node in turn, then
+patches the chart's `image.tag` so api / worker / frontend images
+follow the OS to the new version. The same cut closes the
+operator-visible cold-boot 502 (#299 — schema-aware readiness +
+friendly initialising page), lets installers carve non-default k3s
+pod / service CIDRs on networks that already use 10.42 / 10.43
+(#302), cascades dependent DNS/DHCP server rows when an appliance
+is revoked (#197), adds an IANA timezone picker to Settings → NTP
+that drives `timedatectl` on the host (#165), and lights up 7 new
+Operator Copilot read tools across the conformity / webhooks /
+DNSSEC surfaces (#280 — the matching write proposals tracked in
+#304). Four PRs since 2026.05.22-2 (#298 #301 #303 #305).
+
+### Added
+
+Multi-node rolling OS+app upgrade (#296 / #298) — the appliance
+cluster upgrades itself end-to-end:
+
+- **Rolling Upgrade tab** at `/appliance` → **Rolling Upgrade**.
+  Type the target CalVer tag, pick a source (Uploaded image from
+  the new in-cluster mirror PVC for air-gap, or a GitHub release
+  URL for connected installs), run preflight, plan, start. Per-
+  node progress streams as state pills (cordon → switchover →
+  drain → apply → reboot → health-gate → uncordon → settle) with
+  Halt / Resume / Abort controls.
+- **Slot image mirror PVC** (`slot-image-mirror` Deployment + PVC,
+  gated by `slotImageMirror.enabled`) and a **Fleet → Slot
+  images** upload surface. Bytes stream through the api to the
+  mirror once; every node fetches through an authenticated
+  control-plane URL with an HMAC token. No node ever talks to
+  github.com on an air-gap install.
+- **Preflight framework** with six checks
+  (`inflight_conflict` / `replication_lag` / `disk_headroom` /
+  `mirror_disk_headroom` / `version_path` / `quorum`). Any `fail`
+  blocks Plan; `warn` flags the row but lets the operator proceed.
+- **Cluster mutex** as a `coordination.k8s.io/v1/Lease`
+  (`spatium-upgrade-lock`) — only one rolling-upgrade run holds
+  the lease at a time; per-node primitives short-circuit if it
+  evaporates mid-walk.
+- **CNPG-aware node walk** — if the current primary lands on the
+  node being walked, the orchestrator issues a switchover via the
+  CNPG `switchover` annotation + waits for the replica to be
+  promoted before draining. PDB stays armed for unrelated
+  evictions throughout.
+- **HelmChartConfig overlay** patches `image.tag` on the umbrella
+  chart after every node has the new slot booted + healthy — api /
+  worker / frontend / migrate Job all follow the OS image
+  forward in one atomic chart reconcile.
+- **3 new Operator Copilot read tools** — `find_upgrade_preflight`
+  / `find_upgrade_runs` / `find_upgrade_lease` — so the LLM can
+  answer "what's the current rolling-upgrade run?" without the
+  operator pasting status into chat.
+
+Cold-boot UX (#299 / #301) — first-login no longer 502s on a fresh
+appliance:
+
+- **Schema-aware `/health/ready` probe.** The api process reads
+  the bundled alembic head once on import and on every readiness
+  probe compares against `SELECT version_num FROM
+  alembic_version`. Three distinct failure detail strings —
+  missing-table, missing-row, version-mismatch — keep operators
+  out of "is this a migrate bug or a connectivity bug?" guessing.
+  Pods stay out of the Service endpoint set until the migrate Job
+  lands the expected head.
+- **Friendly initialising page.** The frontend nginx serves a
+  self-contained 4 KB `_starting.html` (inlined SVG, dark/light
+  via `prefers-color-scheme`, `<meta refresh=5>`) instead of the
+  bare nginx 502 HTML on `502` / `504` from the upstream — covers
+  the cold-boot 1–2 min window on a fresh multi-node install,
+  the mid-rolling-upgrade replica gap, and mid-CNPG-failover
+  blips. Real `500` / `503` pass through untouched so demo-mode
+  blocks, factory-reset cooldown, and schema-behind detail strings
+  still surface to the operator.
+
+K3s install-time customisation (#302 / #303):
+
+- **K3s pod + service CIDR step** in the `spatium-install` wizard
+  (between Timezone and Application config). Defaults match k3s
+  upstream (`10.42.0.0/16` pods + `10.43.0.0/16` services) so the
+  one-press-Enter common case still works. Operators on a LAN
+  that already uses one of those ranges (Flannel `host-gw` writes
+  routes directly — overlapping pod CIDR masks the LAN) type
+  their own; `ipaddress`-based validation enforces ≤ /22 prefix
+  per CIDR, pod/service disjoint, and (on static-IP installs) no
+  overlap with the just-configured LAN subnet. Choices land in
+  `/etc/rancher/k3s/config.yaml.d/spatium-cidrs.yaml` (drop-in
+  form so the upstream `config.yaml` stays operator-readable);
+  cluster-DNS IP is auto-derived from the service-CIDR base + 10
+  per k3s/kube-dns convention.
+
+Appliance delete cascades to managed servers (#197):
+
+- **`GET /appliance/appliances/{id}/dependents`** lists the
+  `dns_server` + `dhcp_server` rows that the delete flow will
+  sweep — matched on either the new `appliance_id` FK (forward-
+  compatible) or `host == hostname` (legacy / pre-FK rows).
+- **`DELETE /appliance/appliances/{id}`** sweeps the dependents
+  in the same transaction; audit log captures the cascaded server
+  names + ids. Re-authorising the appliance re-creates the rows
+  via the supervisor's next heartbeat → role-assignment →
+  register flow, so an accidental revoke is a single-click undo.
+- **Fleet delete-confirm modal** renders the dependents list
+  before the operator clicks Revoke so the blast radius is
+  visible.
+
+GUI timezone control (#165):
+
+- **`Settings → NTP` gains a Host timezone section** — text input
+  backed by a `<datalist>` of `Intl.supportedValuesOf("timeZone")`
+  for full IANA autocomplete on modern browsers (curated fallback
+  for the old-browser path). Empty = "don't push further changes";
+  set the field to an IANA name to apply.
+- **Supervisor → host pipeline.** `PlatformSettings.timezone`
+  flows through the heartbeat's new `desired_timezone` field;
+  `appliance_state.maybe_fire_timezone` writes
+  `/var/lib/spatiumddi-host/release-state/tz-pending`; the new
+  host-side `spatiumddi-tz-reload.path` unit picks it up, the
+  runner validates against `timedatectl list-timezones` + applies
+  via `timedatectl set-timezone`. Status sidecar surfaces
+  failures (e.g. `unknown_timezone`) back to the api. Survives
+  A/B slot swaps via the `/etc` overlay → `/var/persist/etc`.
+
+Operator Copilot read-tool catch-up (#280 / #305) — 7 new tools
+across 3 modules (matching `propose_*` writes deferred to #304):
+
+- **conformity** (3 tools, default-enabled) —
+  `list_conformity_policies` (per-framework registry filter),
+  `find_conformity_results` (append-only evaluation history),
+  `get_conformity_summary` (per-framework rollup).
+- **webhooks** (3 tools, default-enabled, superadmin-gated —
+  webhook URLs may embed SIEM auth tokens, secrets NEVER
+  returned, only a `secret_set` boolean) — `list_webhooks`
+  (registry), `get_webhook_event_types` (the full typed-event
+  vocabulary the publisher emits so the LLM can validate
+  `event_types[]` references before proposing a subscription),
+  `find_webhook_deliveries` (outbox history with state /
+  attempts / last_error / last_status_code).
+- **dns** — `find_zone_dnssec_info` (DS records + `dnssec_synced_at`
+  timestamp).
+
+The README's "tools total" count moves from 101 → 118 (this
+release: +7 above; #298 added +3 upgrade tools).
+
+### Changed
+
+- **MetalLB stays pinned at v0.15.3** (carried forward from
+  2026.05.22-2 #287) — v0.16.x speaker regression
+  ([metallb#3063](https://github.com/metallb/metallb/issues/3063))
+  still unresolved upstream as of this cut.
+- **Helm chart versioning** — chart `version` and `appVersion`
+  remain placeholder (`0.1.0` / `0.0.0-dev`); the release
+  workflow overrides both via `helm package --version
+  --app-version` using the CalVer release tag, so no manual bump
+  per release.
+
+### Fixed
+
+- **Cold-boot 502 on a fresh appliance install (#299).** The api
+  pod previously passed `/health/ready` the moment Postgres
+  accepted `SELECT 1`, before the migrate Job populated the
+  schema; route handlers then 500'd and the frontend nginx
+  returned 502 to the operator. Schema-at-head check above closes
+  the gap; the friendly initialising page covers the still-no-
+  ready-pods sub-window from the operator's perspective.
+- **Stale `Apply` shape on the Releases tab** (carried forward
+  from 2026.05.22-2 #294) — the Rolling Upgrade tab is now the
+  canonical multi-node OS upgrade path; the Releases tab remains
+  read-only with a pointer.
+- **Class name typo** in the appliance delete-dependents response
+  model (`AppliancedDependentServer` → `ApplianceDependentServer`)
+  surfaced in Copilot PR review (#305).
+- **Webhook MCP tools missing the superadmin gate** — caught in
+  Copilot PR review; webhook URLs + delivery history now mirror
+  the REST endpoint's superadmin-only access (#305).
+- **TimezoneSection saved-state copy** was misleading
+  ("clearing falls back to install-time default") — supervisor
+  short-circuits on empty so the host stays on whatever was last
+  applied. Form copy + saved-note rewritten to match reality
+  (#305).
+
+### Migrations
+
+- `b1d4c9e57f02` — `dns_server.appliance_id` +
+  `dhcp_server.appliance_id` nullable FKs with `ON DELETE
+  CASCADE` (#197).
+- `c2e6a89d4b15` — `platform_settings.timezone` (`String(64)`,
+  default `''`) (#165).
+- Multi-node rolling upgrade tables — `system_upgrade_run`,
+  `system_upgrade_node`, `system_upgrade_preflight`,
+  `slot_image_mirror` row state (#296 — see `backend/alembic/`
+  for the head chain).
+
+### Deferred
+
+- 17 `propose_*` write tools for the conformity / webhooks /
+  backup / DNS import / multicast / SNMP / NTP surfaces — each
+  needs an `Operation` class with preview + apply, tracked as
+  **#304** for a focused follow-up PR.
+
 ## 2026.05.22-2 — 2026-05-22
 
 Same-day shake-out cut. Testing the 2026.05.22-1 control-plane HA
