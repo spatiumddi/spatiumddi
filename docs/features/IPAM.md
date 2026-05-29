@@ -264,27 +264,95 @@ Import behavior:
 
 ## 8. Discovery / Reconciliation
 
+> **Status (issue #23): shipped.** Opt-in per subnet — default off,
+> because a sweep is only meaningful for subnets the SpatiumDDI worker
+> can actually route to, and unsolicited probes can trip an IDS.
+
 ### IP Discovery
 
-A scheduled Celery task performs network scanning to discover IPs that are in use but not recorded in IPAM.
+A per-subnet-opt-in Celery sweep discovers IPs that are live but not
+recorded in IPAM. Enable it on a subnet (Edit Subnet → *IP discovery*)
+and set the sweep interval; a beat dispatcher (`dispatch_due_subnets`,
+ticks every 60 s) queues `run_subnet_discovery` for each subnet whose
+`discovery_interval_minutes` has elapsed since its `last_discovery_at`.
+Interval changes take effect without restarting beat. Operators can
+also sweep on demand: **Tools → Reconcile (IP discovery) → Discover
+now**, or `POST /api/v1/ipam/subnets/{id}/discover`.
 
-Methods:
-- **Ping sweep** (ICMP) — pure Python asyncio, no external tools required
-- **ARP scan** — requires the scanner to run on-subnet or have access to ARP tables
-- **SNMP polling** — poll ARP tables from routers (future phase)
+Methods (run together per pass):
+- **Ping sweep** — pure-Python asyncio using an *unprivileged*
+  `SOCK_DGRAM` ICMP socket. When that socket can't be created (the
+  worker's uid is outside `net.ipv4.ping_group_range`), it falls back
+  to a TCP-connect probe across a small set of common ports — a
+  connect success **or** a connection-refused (RST) both prove the host
+  is up. No raw sockets / CAP_NET_RAW required.
+- **ARP scan** — reads the worker's own ARP cache (`/proc/net/arp`).
+  Only useful for subnets the worker is L2-adjacent to, but it catches
+  hosts that drop ICMP and enriches `mac_address`.
+- **SNMP polling** — ARP tables pulled from routers/switches (already
+  shipped separately; feeds the same `last_seen_at` columns).
 
-Results update `IPAddress.last_seen_at` and flag `status = discovered` for IPs not in IPAM.
+Reconciliation writes (`services/ipam/discovery.reconcile_subnet`):
+- existing rows → `last_seen_at` / `last_seen_method` refreshed (MAC
+  filled only when NULL — operator data is never overwritten);
+- live IPs with no row → inserted `status='discovered'`, **unless** the
+  IP is in a dynamic DHCP pool (owned by the DHCP server) or is the
+  network / broadcast address.
+
+Operator-locked rows (`user_modified_at` set) keep their status; a
+sweep only refreshes their `last_seen_at`. Subnets larger than a /20
+(`MAX_SWEEP_HOSTS = 4096`) and IPv6 subnets are skipped.
 
 ### Reconciliation Report
 
-Available at `GET /api/v1/ipam/subnets/{id}/reconciliation`:
+`GET /api/v1/ipam/subnets/{id}/reconciliation?stale_minutes=1440`
+(also surfaced to the Operator Copilot as `find_subnet_reconciliation`):
 
 | Category | Description |
 |---|---|
-| In IPAM, not discovered | Allocated but no recent ping response |
-| Discovered, not in IPAM | Active IP not tracked |
-| DHCP lease, no IPAM record | Lease IP falls outside known subnets |
-| IP status mismatch | IPAM says "available" but IP is active |
+| `in_ipam_not_seen` | Allocated / reserved / static but nothing answered within the stale window |
+| `discovered_not_allocated` | Live on the wire but never formally allocated |
+| `status_mismatch` | Marked `available` but a host is answering right now |
+
+`stale_minutes` (default 24 h) is the window after which a row's
+`last_seen_at` counts as stale.
+
+### Stale-IP Report (issue #45)
+
+A cross-subnet "address-space hygiene" view that reads the discovery
+`last_seen_at` signal from the other direction: which IPs are still
+marked `allocated` but haven't been seen on the wire in *N* days?
+Those are reclaim candidates — hosts decommissioned without anyone
+freeing the IPAM row.
+
+`GET /api/v1/ipam/reports/stale-ips?stale_days=90&include_never_seen=false`
+(also surfaced to the Operator Copilot as `find_stale_ips`):
+
+- **Candidate status** is `allocated` only — `reserved` / `static_dhcp`
+  are deliberately held, and DHCP-lease mirrors (`auto_from_lease`)
+  churn on their own cadence, so all of those are excluded.
+- **Stale** means `last_seen_at` older than the cutoff. Rows that were
+  *never* seen (`last_seen_at IS NULL`) are excluded by default —
+  many live in subnets where discovery was never enabled — and fold in
+  only with `include_never_seen=true`.
+- Optional `space_id` / `block_id` / `subnet_id` scope the report.
+  Stalest rows sort first (`NULLS FIRST` ascending).
+
+**One-click bulk-deprecate.** `POST /api/v1/ipam/reports/stale-ips/deprecate`
+flips stale rows to `deprecated` (reversible from the normal IP edit
+path) and stamps `user_modified_at` so a later discovery / integration
+sweep won't silently un-deprecate them. Provide `ip_ids` to deprecate a
+hand-picked set, or `all_matching=true` with the report filter to
+deprecate every matching row in one shot (capped at `MAX_BULK_DEPRECATE`
+= 5000; the response `capped` flag tells the operator to re-run for the
+remainder). System placeholders and DHCP mirrors are skipped even if an
+id slips through. The page lives at **Stale IPs** in the sidebar.
+
+**Hygiene alert.** A `stale_ip_count` alert rule fires when any subnet
+holds at least `threshold_percent` (re-used as a raw count) allocated
+IPs older than `threshold_days` (default 90). It reads the same signal
+but excludes never-seen rows so the passive feed stays high-confidence;
+operators chase the full list, including never-seen, from the report.
 
 ---
 

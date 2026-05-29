@@ -504,6 +504,29 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         Integer, nullable=False, default=30, server_default=sa_text("30")
     )
 
+    # ── IP discovery — opt-in scheduled ping/ARP sweep (issue #23) ────
+    # When enabled, a Celery beat task periodically sweeps this subnet
+    # for live hosts (unprivileged ICMP with a TCP-connect fallback) +
+    # reads the worker's ARP table, stamping ``last_seen_at`` /
+    # ``last_seen_method`` on existing rows and inserting
+    # ``status='discovered'`` rows for live IPs not yet in IPAM.
+    # Default-off + per-subnet because a sweep is only meaningful for
+    # subnets the worker can actually reach, and unsolicited probes can
+    # trip an IDS. Locked rows (``user_modified_at`` set) and dynamic
+    # DHCP pool ranges are never auto-created/clobbered. ``last_discovery_at``
+    # gates the beat dispatcher the same way ``next_poll_at`` gates the
+    # SNMP poller — change the interval in the UI and it takes effect
+    # without restarting beat.
+    discovery_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    discovery_interval_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=360, server_default=sa_text("360")
+    )
+    last_discovery_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # IPv6 auto-allocation policy (ignored for IPv4 subnets — those use
     # PlatformSettings.ip_allocation_strategy which is sequential /
     # random only). Values:

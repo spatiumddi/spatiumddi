@@ -1606,6 +1606,9 @@ class SubnetCreate(BaseModel):
     auto_profile_on_dhcp_lease: bool = False
     auto_profile_preset: str = "service_and_os"
     auto_profile_refresh_days: int = 30
+    # IP discovery (issue #23) — opt-in scheduled ping/ARP sweep.
+    discovery_enabled: bool = False
+    discovery_interval_minutes: int = 360
     ipv6_allocation_policy: str = "random"
     # Compliance / classification flags — see Subnet model.
     pci_scope: bool = False
@@ -1671,6 +1674,15 @@ class SubnetCreate(BaseModel):
             raise ValueError("auto_profile_refresh_days must be between 1 and 365")
         return v
 
+    @field_validator("discovery_interval_minutes")
+    @classmethod
+    def validate_discovery_interval_create(cls, v: int) -> int:
+        # 5 min floor (matches the beat dispatcher's clamp) so a misclick
+        # can't hammer the network; 1-week ceiling.
+        if v < 5 or v > 10080:
+            raise ValueError("discovery_interval_minutes must be between 5 and 10080")
+        return v
+
     @field_validator("network")
     @classmethod
     def validate_network(cls, v: str) -> str:
@@ -1728,6 +1740,8 @@ class SubnetUpdate(BaseModel):
     auto_profile_on_dhcp_lease: bool | None = None
     auto_profile_preset: str | None = None
     auto_profile_refresh_days: int | None = None
+    discovery_enabled: bool | None = None
+    discovery_interval_minutes: int | None = None
     ipv6_allocation_policy: str | None = None
     pci_scope: bool | None = None
     hipaa_scope: bool | None = None
@@ -1735,6 +1749,13 @@ class SubnetUpdate(BaseModel):
     subnet_role: str | None = None
     customer_id: uuid.UUID | None = None
     site_id: uuid.UUID | None = None
+
+    @field_validator("discovery_interval_minutes")
+    @classmethod
+    def validate_discovery_interval_update(cls, v: int | None) -> int | None:
+        if v is not None and (v < 5 or v > 10080):
+            raise ValueError("discovery_interval_minutes must be between 5 and 10080")
+        return v
 
     @field_validator("subnet_role")
     @classmethod
@@ -1863,6 +1884,9 @@ class SubnetResponse(BaseModel):
     auto_profile_on_dhcp_lease: bool = False
     auto_profile_preset: str = "service_and_os"
     auto_profile_refresh_days: int = 30
+    discovery_enabled: bool = False
+    discovery_interval_minutes: int = 360
+    last_discovery_at: datetime | None = None
     ipv6_allocation_policy: str = "random"
     pci_scope: bool = False
     hipaa_scope: bool = False
@@ -3628,6 +3652,230 @@ async def get_subnet(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB) ->
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     return subnet
+
+
+@router.get("/subnets/{subnet_id}/reconciliation")
+async def get_subnet_reconciliation(
+    subnet_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    stale_minutes: int = 1440,
+) -> dict:
+    """IP-discovery reconciliation report for a subnet (issue #23).
+
+    Three buckets — allocated-but-not-seen, discovered-but-not-allocated,
+    and available-but-active (status mismatch). ``stale_minutes`` (default
+    24 h) is the window after which a row's ``last_seen_at`` counts as
+    stale. See docs/features/IPAM.md §8.
+    """
+    from app.services.ipam.discovery import build_reconciliation_report
+
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    stale_minutes = max(1, min(stale_minutes, 525600))  # clamp 1 min … 1 year
+    return await build_reconciliation_report(db, subnet, stale_minutes=stale_minutes)
+
+
+@router.post("/subnets/{subnet_id}/discover", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_subnet_discovery(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB) -> dict:
+    """Queue an on-demand IP-discovery sweep for this subnet (issue #23).
+
+    Runs the same ``run_subnet_discovery`` Celery task the beat
+    dispatcher uses, independent of the per-subnet schedule / enabled
+    toggle — an operator can sweep on demand even with the scheduled
+    sweep off.
+    """
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    queued = True
+    try:
+        from app.tasks.ipam_discovery import run_subnet_discovery
+
+        run_subnet_discovery.delay(str(subnet_id))
+    except Exception as exc:  # noqa: BLE001 — broker unreachable; report, don't 500
+        queued = False
+        logger.warning("ipam_discovery_trigger_enqueue_failed", error=str(exc))
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="discover",
+            resource_type="subnet",
+            resource_id=str(subnet.id),
+            resource_display=str(subnet.network),
+            result="success" if queued else "error",
+            error_detail=None if queued else "task broker unreachable",
+        )
+    )
+    await db.commit()
+    return {"status": "queued" if queued else "enqueue_failed", "subnet_id": str(subnet_id)}
+
+
+# ── Stale-IP report + one-click bulk-deprecate (issue #45) ──────────────────
+# Cross-subnet hygiene view over the discovery (#23) ``last_seen_at`` signal:
+# which allocated IPs has nothing seen on the wire in N days? The deprecate
+# action flips them to ``deprecated`` (reversible — the operator can re-edit
+# any row back), stamping ``user_modified_at`` so a later sweep won't undo it.
+
+
+@router.get("/reports/stale-ips")
+async def get_stale_ip_report(
+    current_user: CurrentUser,
+    db: DB,
+    stale_days: int = Query(90, ge=1, le=3650),
+    include_never_seen: bool = Query(False),
+    space_id: uuid.UUID | None = Query(None),
+    block_id: uuid.UUID | None = Query(None),
+    subnet_id: uuid.UUID | None = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """Allocated IPs nothing has seen in ``stale_days`` days (issue #45).
+
+    Optional ``space_id`` / ``block_id`` / ``subnet_id`` scope the report.
+    ``include_never_seen`` folds in allocated rows that were never seen on
+    the wire (off by default — those are often in subnets where discovery
+    was never enabled). See docs/features/IPAM.md §9.
+    """
+    from app.services.ipam.stale_ips import build_stale_ip_report
+
+    return await build_stale_ip_report(
+        db,
+        stale_days=stale_days,
+        include_never_seen=include_never_seen,
+        space_id=space_id,
+        block_id=block_id,
+        subnet_id=subnet_id,
+        limit=limit,
+        offset=offset,
+    )
+
+
+class StaleIPDeprecateRequest(BaseModel):
+    # Either deprecate a hand-picked set (``ip_ids`` — the rows the operator
+    # ticked) or every row the current filter selects (``all_matching`` —
+    # reuses the same filter params the report endpoint takes).
+    ip_ids: list[uuid.UUID] | None = None
+    all_matching: bool = False
+    stale_days: int = 90
+    include_never_seen: bool = False
+    space_id: uuid.UUID | None = None
+    block_id: uuid.UUID | None = None
+    subnet_id: uuid.UUID | None = None
+
+
+class StaleIPDeprecateResponse(BaseModel):
+    batch_id: uuid.UUID
+    deprecated_count: int
+    skipped: list[uuid.UUID] = []
+    # True when ``all_matching`` hit the server-side cap — the operator
+    # should re-run to sweep the remainder.
+    capped: bool = False
+
+
+@router.post("/reports/stale-ips/deprecate", response_model=StaleIPDeprecateResponse)
+async def deprecate_stale_ips(
+    body: StaleIPDeprecateRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> StaleIPDeprecateResponse:
+    """One-click bulk-deprecate of stale allocated IPs (issue #45).
+
+    Provide ``ip_ids`` to deprecate a hand-picked set, or
+    ``all_matching=true`` to deprecate every IP the report filter selects
+    (capped at ``MAX_BULK_DEPRECATE``). Only genuinely ``allocated`` rows
+    are touched; system placeholders and DHCP-lease mirrors are skipped
+    even if an id slips through a stale client-side selection. Each row's
+    status flips to ``deprecated`` and ``user_modified_at`` is stamped so a
+    later discovery / integration sweep won't silently un-deprecate it.
+    """
+    from app.services.ipam.stale_ips import MAX_BULK_DEPRECATE, select_stale_ip_ids
+
+    stale_days = max(1, min(body.stale_days, 3650))
+    now = datetime.now(UTC)
+    stale_cutoff = now - timedelta(days=stale_days)
+
+    capped = False
+    if body.all_matching:
+        # Fetch one past the cap so "exactly at cap, no remainder" doesn't
+        # read as capped — a false "re-run to finish" prompt otherwise.
+        ids = await select_stale_ip_ids(
+            db,
+            stale_days=stale_days,
+            include_never_seen=body.include_never_seen,
+            space_id=body.space_id,
+            block_id=body.block_id,
+            subnet_id=body.subnet_id,
+            cap=MAX_BULK_DEPRECATE + 1,
+        )
+        capped = len(ids) > MAX_BULK_DEPRECATE
+        ids = ids[:MAX_BULK_DEPRECATE]
+    else:
+        ids = list(body.ip_ids or [])
+    if not ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Provide ip_ids or set all_matching=true with a filter that matches rows",
+        )
+
+    batch_id = uuid.uuid4()
+    rows = list((await db.execute(select(IPAddress).where(IPAddress.id.in_(ids)))).scalars().all())
+    deprecated = 0
+    skipped: list[uuid.UUID] = []
+    for ip in rows:
+        if ip.status != "allocated" or ip.auto_from_lease:
+            skipped.append(ip.id)
+            continue
+        # Re-check staleness against the request's window so a row that came
+        # back to life after the report page loaded isn't deprecated out from
+        # under a live host. The all_matching path already filtered on this,
+        # so the re-check is a no-op there and the real guard for explicit
+        # ip_ids (the frontend passes the filter it showed the operator).
+        is_stale = ip.last_seen_at is not None and ip.last_seen_at < stale_cutoff
+        if not is_stale and not (body.include_never_seen and ip.last_seen_at is None):
+            skipped.append(ip.id)
+            continue
+        old_status = ip.status
+        ip.status = "deprecated"
+        ip.user_modified_at = now
+        db.add(
+            _audit(
+                current_user,
+                "update",
+                "ip_address",
+                str(ip.id),
+                str(ip.address),
+                old_value={"status": old_status},
+                new_value={
+                    "status": "deprecated",
+                    "reason": "stale_ip_deprecate",
+                    "batch_id": str(batch_id),
+                },
+            )
+        )
+        deprecated += 1
+
+    await db.commit()
+    logger.info(
+        "stale_ip_bulk_deprecate",
+        user=current_user.username,
+        batch_id=str(batch_id),
+        deprecated=deprecated,
+        skipped=len(skipped),
+        all_matching=body.all_matching,
+        capped=capped,
+    )
+    return StaleIPDeprecateResponse(
+        batch_id=batch_id,
+        deprecated_count=deprecated,
+        skipped=skipped,
+        capped=capped,
+    )
 
 
 @router.get("/subnets/{subnet_id}/effective-dns", response_model=EffectiveDnsResponse)
