@@ -16,11 +16,13 @@ import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from jose import JWTError
 from pydantic import BaseModel
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 
 from app.api.deps import DB
 from app.models.audit import AuditLog
 from app.models.dns import (
+    DNSKey,
     DNSRecordOp,
     DNSServer,
     DNSServerGroup,
@@ -270,7 +272,11 @@ async def agent_register(
             resource_type="dns_server",
             resource_id=str(server.id),
             resource_display=body.hostname,
-            new_value={"driver": body.driver, "version": body.version, "roles": body.roles},
+            new_value={
+                "driver": body.driver,
+                "version": body.version,
+                "roles": body.roles,
+            },
             result="success",
         )
     )
@@ -551,16 +557,30 @@ async def agent_zone_state(
     return {"updated": updated}
 
 
+class DNSKeyReport(BaseModel):
+    """One DNSSEC key's public state (issue #49 — BIND9 ``rndc dnssec
+    -status``). No private material; BIND owns + rotates the keys."""
+
+    key_tag: int
+    key_type: str = "zsk"  # ksk | zsk | csk
+    algorithm: int = 0
+    state: str = "unknown"
+    ds_records: list[str] = []
+    timing: dict[str, Any] = {}
+
+
 class DNSSECStateReport(BaseModel):
     """One zone's DNSSEC state, posted by the agent after signing.
 
-    The DS rrset strings come straight from PowerDNS's
-    ``GET /zones/{z}/cryptokeys`` response — operator copies them
-    into the parent registrar verbatim. Empty list = unsigned.
+    ``ds_records`` is the zone-level DS rrset the operator copies into the
+    parent registrar verbatim (empty = unsigned). ``keys`` is the optional
+    per-key breakdown BIND9 agents report from ``rndc dnssec -status``
+    (issue #49); PowerDNS agents omit it.
     """
 
     zone_name: str
     ds_records: list[str]
+    keys: list[DNSKeyReport] = []
 
 
 class DNSSECStateBatch(BaseModel):
@@ -616,6 +636,26 @@ async def agent_dnssec_state(
             continue
         zone.dnssec_ds_records = entry.ds_records or None
         zone.dnssec_synced_at = now
+        # Per-key state (issue #49) — replace the zone's DNSKey rows wholesale
+        # so the table mirrors the agent's latest ``rndc dnssec -status``.
+        # ``keys`` PRESENT (even empty) replaces — so an unsign that reports
+        # ``keys: []`` clears stale rows. ``keys`` OMITTED (PowerDNS agents)
+        # leaves existing rows untouched.
+        if "keys" in entry.model_fields_set:
+            await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
+            for k in entry.keys:
+                db.add(
+                    DNSKey(
+                        zone_id=zone.id,
+                        key_tag=k.key_tag,
+                        key_type=k.key_type,
+                        algorithm=k.algorithm,
+                        state=k.state,
+                        ds_records=k.ds_records or None,
+                        timing=k.timing or None,
+                        reported_at=now,
+                    )
+                )
         updated += 1
 
     await db.commit()

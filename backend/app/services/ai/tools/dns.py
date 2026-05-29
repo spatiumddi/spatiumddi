@@ -652,16 +652,72 @@ class FindZoneDNSSECInfoArgs(BaseModel):
 async def find_zone_dnssec_info(
     db: AsyncSession, user: User, args: FindZoneDNSSECInfoArgs
 ) -> dict[str, Any]:
+    from app.models.dns import DNSKey  # noqa: PLC0415
+
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None:
         return {"error": "DNS zone not found", "zone_id": str(args.zone_id)}
+    keys = (await db.execute(select(DNSKey).where(DNSKey.zone_id == zone.id))).scalars().all()
     return {
         "zone_id": str(zone.id),
         "name": zone.name,
         "dnssec_enabled": zone.dnssec_enabled,
+        "dnssec_policy_id": str(zone.dnssec_policy_id) if zone.dnssec_policy_id else None,
         "dnssec_ds_records": zone.dnssec_ds_records,
         "dnssec_synced_at": (zone.dnssec_synced_at.isoformat() if zone.dnssec_synced_at else None),
         "last_serial": zone.last_serial,
+        "keys": [
+            {
+                "key_tag": k.key_tag,
+                "key_type": k.key_type,
+                "algorithm": k.algorithm,
+                "state": k.state,
+                "ds_records": k.ds_records or [],
+            }
+            for k in keys
+        ],
+    }
+
+
+class ListDNSSECPoliciesArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="list_dnssec_policies",
+    description=(
+        "List the DNSSEC signing policies operators can attach to BIND9 "
+        "zones (issue #49): name, algorithm, NSEC3 settings, and KSK/ZSK "
+        "lifetimes. The built-in 'default' policy always exists. Use this "
+        "to answer 'what DNSSEC policies are available?' or 'what algorithm "
+        "does policy X use?'. Read-only."
+    ),
+    args_model=ListDNSSECPoliciesArgs,
+    category="dns",
+    module="dns",
+)
+async def list_dnssec_policies(
+    db: AsyncSession, user: User, args: ListDNSSECPoliciesArgs
+) -> dict[str, Any]:
+    from app.models.dns import DNSSECPolicy  # noqa: PLC0415
+
+    rows = (await db.execute(select(DNSSECPolicy).order_by(DNSSECPolicy.name))).scalars().all()
+    return {
+        "policies": [
+            {
+                "id": str(p.id),
+                "name": p.name,
+                "is_builtin": p.is_builtin,
+                "algorithm": p.algorithm,
+                "ksk_lifetime_days": p.ksk_lifetime_days,
+                "zsk_lifetime_days": p.zsk_lifetime_days,
+                "nsec3": p.nsec3,
+                "nsec3_iterations": p.nsec3_iterations,
+                "nsec3_salt_length": p.nsec3_salt_length,
+                "nsec3_optout": p.nsec3_optout,
+            }
+            for p in rows
+        ]
     }
 
 

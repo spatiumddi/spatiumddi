@@ -24,6 +24,7 @@ from app.models.dns import (
     DNSAcl,
     DNSRecord,
     DNSRecordOp,
+    DNSSECPolicy,
     DNSServer,
     DNSServerGroup,
     DNSServerOptions,
@@ -127,6 +128,20 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             "port": r.port,
         }
 
+    # DNSSEC policies (issue #49) — resolve each signed zone's policy name +
+    # ship the referenced custom policy definitions so the BIND9 agent can
+    # render ``dnssec-policy { ... }`` blocks + per-zone inline-signing. The
+    # built-in "default" carries no block (BIND ships it).
+    dnssec_policy_rows = list((await db.execute(select(DNSSECPolicy))).scalars().all())
+    dnssec_policies_by_id = {p.id: p for p in dnssec_policy_rows}
+
+    def _zone_policy_name(z: DNSZone) -> str | None:
+        pid = getattr(z, "dnssec_policy_id", None)
+        if not getattr(z, "dnssec_enabled", False) or pid is None:
+            return None
+        pol = dnssec_policies_by_id.get(pid)
+        return pol.name if pol is not None else None
+
     zone_payload: list[dict[str, Any]] = []
     for z in zones:
         base_zp: dict[str, Any] = {
@@ -137,6 +152,10 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             # Forward-zone-only fields (ignored by the agent for other types).
             "forwarders": list(getattr(z, "forwarders", []) or []),
             "forward_only": bool(getattr(z, "forward_only", True)),
+            # DNSSEC inline-signing (issue #49). policy_name None ⇒ BIND
+            # built-in "default".
+            "dnssec_enabled": bool(getattr(z, "dnssec_enabled", False)),
+            "dnssec_policy_name": _zone_policy_name(z),
         }
         # Ship records to every server in the group. The is_primary flag
         # historically gated this, but agents need records to render zone
@@ -434,6 +453,27 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         }
     )
 
+    # Ship only the custom policies referenced by a signed zone (the agent
+    # renders one ``dnssec-policy { ... }`` block per entry; "default" is
+    # BIND's own and needs none).
+    _referenced_policy_names = {
+        _zone_policy_name(z) for z in zones if getattr(z, "dnssec_enabled", False)
+    }
+    dnssec_policies_block = [
+        {
+            "name": p.name,
+            "algorithm": p.algorithm,
+            "ksk_lifetime_days": p.ksk_lifetime_days,
+            "zsk_lifetime_days": p.zsk_lifetime_days,
+            "nsec3": p.nsec3,
+            "nsec3_iterations": p.nsec3_iterations,
+            "nsec3_salt_length": p.nsec3_salt_length,
+            "nsec3_optout": p.nsec3_optout,
+        }
+        for p in dnssec_policy_rows
+        if p.name != "default" and p.name in _referenced_policy_names
+    ]
+
     bundle_body: dict[str, Any] = {
         "server_id": str(server.id),
         "driver": server.driver,
@@ -449,6 +489,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "fleet_upgrade": fleet_upgrade_block,
         "snmp_settings": snmp_block,
         "ntp_settings": ntp_block,
+        "dnssec_policies": dnssec_policies_block,
     }
 
     # Structural fingerprint excludes records and pending ops so record-only
@@ -469,6 +510,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "zones_structural": [
             {k: val for k, val in z.items() if (k != "records" or has_views)} for z in zone_payload
         ],
+        # DNSSEC signing intent / policy params rewrite named.conf, so a
+        # change must trigger a full reload (issue #49).
+        "dnssec_policies": dnssec_policies_block,
         # Blocklists affect named.conf (response-policy block) + RPZ zone
         # files, so a change MUST trigger a daemon reload.
         "blocklists": blocklists_payload,

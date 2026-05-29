@@ -13,6 +13,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
@@ -24,9 +25,12 @@ from app.drivers.dns import is_agentless
 from app.drivers.dns.windows import test_winrm_credentials
 from app.models.audit import AuditLog
 from app.models.dns import (
+    DNSSEC_ALGORITHMS,
     DNSAcl,
     DNSAclEntry,
+    DNSKey,
     DNSRecord,
+    DNSSECPolicy,
     DNSServer,
     DNSServerGroup,
     DNSServerOptions,
@@ -112,8 +116,13 @@ _DRIVER_GATED_RECORD_TYPES: dict[str, frozenset[str]] = {
 # online via REST and BIND9 needs the manual ``dnssec-keygen``
 # dance that's #49's umbrella scope.
 _DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
-    "dnssec_sign": frozenset({"powerdns"}),
-    "dnssec_unsign": frozenset({"powerdns"}),
+    # Both PowerDNS (online signing) and BIND9 (inline-signing via
+    # dnssec-policy, issue #49) support sign/unsign. Windows DNS does not.
+    "dnssec_sign": frozenset({"powerdns", "bind9"}),
+    "dnssec_unsign": frozenset({"powerdns", "bind9"}),
+    # Manual key rollover is BIND9-only (rndc dnssec -rollover); PowerDNS
+    # rolls on its own schedule + Windows DNS isn't supported.
+    "dnssec_rollover": frozenset({"bind9"}),
 }
 VALID_FORWARD_POLICIES = {"first", "only"}
 VALID_DNSSEC = {"auto", "yes", "no"}
@@ -618,6 +627,8 @@ class ZoneUpdate(BaseModel):
     primary_ns: str | None = None
     admin_email: str | None = None
     dnssec_enabled: bool | None = None
+    # DNSSEC signing policy (issue #49). null ⇒ BIND built-in "default".
+    dnssec_policy_id: uuid.UUID | None = None
     color: str | None = None
     linked_subnet_id: uuid.UUID | None = None
     domain_id: uuid.UUID | None = None
@@ -673,6 +684,7 @@ class ZoneResponse(BaseModel):
     linked_subnet_id: uuid.UUID | None
     domain_id: uuid.UUID | None = None
     dnssec_enabled: bool
+    dnssec_policy_id: uuid.UUID | None = None
     color: str | None
     last_serial: int
     last_pushed_at: datetime | None
@@ -897,7 +909,9 @@ async def list_servers(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[Serv
 
 
 @router.post(
-    "/groups/{group_id}/servers", response_model=ServerResponse, status_code=status.HTTP_201_CREATED
+    "/groups/{group_id}/servers",
+    response_model=ServerResponse,
+    status_code=status.HTTP_201_CREATED,
 )
 async def create_server(
     group_id: uuid.UUID, body: ServerCreate, db: DB, current_user: SuperAdmin
@@ -908,7 +922,8 @@ async def create_server(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
-            status_code=409, detail="A server with that name already exists in this group"
+            status_code=409,
+            detail="A server with that name already exists in this group",
         )
 
     data = body.model_dump(exclude={"api_key", "windows_credentials"})
@@ -967,7 +982,11 @@ async def create_server(
 
 @router.put("/groups/{group_id}/servers/{server_id}", response_model=ServerResponse)
 async def update_server(
-    group_id: uuid.UUID, server_id: uuid.UUID, body: ServerUpdate, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID,
+    server_id: uuid.UUID,
+    body: ServerUpdate,
+    db: DB,
+    current_user: SuperAdmin,
 ) -> ServerResponse:
     server = await _require_server(group_id, server_id, db)
     changes = body.model_dump(exclude_none=True, exclude={"api_key", "windows_credentials"})
@@ -1849,7 +1868,9 @@ async def update_options(
 
 
 @router.post(
-    "/groups/{group_id}/options/trust-anchors", response_model=TrustAnchorResponse, status_code=201
+    "/groups/{group_id}/options/trust-anchors",
+    response_model=TrustAnchorResponse,
+    status_code=201,
 )
 async def add_trust_anchor(
     group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
@@ -1957,7 +1978,11 @@ async def create_acl(
 
 @router.put("/groups/{group_id}/acls/{acl_id}", response_model=AclResponse)
 async def update_acl(
-    group_id: uuid.UUID, acl_id: uuid.UUID, body: AclUpdate, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID,
+    acl_id: uuid.UUID,
+    body: AclUpdate,
+    db: DB,
+    current_user: SuperAdmin,
 ) -> DNSAcl:
     acl = await _require_acl(group_id, acl_id, db)
     changes = body.model_dump(exclude_none=True, exclude={"entries"})
@@ -2158,7 +2183,8 @@ async def create_tsig_key(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
-            status_code=409, detail="A TSIG key with that name already exists in this group"
+            status_code=409,
+            detail="A TSIG key with that name already exists in this group",
         )
 
     plaintext = body.secret.strip() if body.secret else _generate_tsig_secret(body.algorithm)
@@ -2346,7 +2372,11 @@ async def create_view(
 
 @router.put("/groups/{group_id}/views/{view_id}", response_model=ViewResponse)
 async def update_view(
-    group_id: uuid.UUID, view_id: uuid.UUID, body: ViewUpdate, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID,
+    view_id: uuid.UUID,
+    body: ViewUpdate,
+    db: DB,
+    current_user: SuperAdmin,
 ) -> DNSView:
     view = await _require_view(group_id, view_id, db)
     changes = body.model_dump(exclude_none=True)
@@ -2425,7 +2455,8 @@ async def create_zone(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
-            status_code=409, detail="A zone with that name already exists in this group/view"
+            status_code=409,
+            detail="A zone with that name already exists in this group/view",
         )
 
     zone = DNSZone(group_id=group_id, **body.model_dump())
@@ -2887,7 +2918,11 @@ async def get_server_rndc_status(
 
 @router.put("/groups/{group_id}/zones/{zone_id}", response_model=ZoneResponse)
 async def update_zone(
-    group_id: uuid.UUID, zone_id: uuid.UUID, body: ZoneUpdate, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: ZoneUpdate,
+    db: DB,
+    current_user: SuperAdmin,
 ) -> DNSZone:
     zone = await _require_zone(group_id, zone_id, db)
     _reject_if_synthesised_zone(zone, "edit")
@@ -2897,6 +2932,10 @@ async def update_zone(
     # None in the incoming payload — exclude_none would otherwise drop it.
     if "color" in body.model_fields_set and body.color is None:
         changes["color"] = None
+    # Same NULL-is-meaningful treatment for the DNSSEC policy (issue #49):
+    # explicit null ⇒ fall back to BIND's built-in "default" policy.
+    if "dnssec_policy_id" in body.model_fields_set and body.dnssec_policy_id is None:
+        changes["dnssec_policy_id"] = None
     for k, v in changes.items():
         setattr(zone, k, v)
     db.add(
@@ -2917,6 +2956,168 @@ async def update_zone(
     return zone
 
 
+# ── DNSSEC policies (issue #49) ─────────────────────────────────────────────
+
+
+class DNSSECPolicyCreate(BaseModel):
+    name: str
+    description: str = ""
+    algorithm: str = "ecdsap256sha256"
+    ksk_lifetime_days: int = 0
+    zsk_lifetime_days: int = 90
+    nsec3: bool = False
+    nsec3_iterations: int = 0
+    nsec3_salt_length: int = 0
+    nsec3_optout: bool = False
+
+    @field_validator("algorithm")
+    @classmethod
+    def _algo(cls, v: str) -> str:
+        if v not in DNSSEC_ALGORITHMS:
+            raise ValueError(f"algorithm must be one of {sorted(DNSSEC_ALGORITHMS)}")
+        return v
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", v):
+            raise ValueError("name must be 1-64 chars of [A-Za-z0-9_-]")
+        return v
+
+
+class DNSSECPolicyUpdate(BaseModel):
+    description: str | None = None
+    algorithm: str | None = None
+    ksk_lifetime_days: int | None = None
+    zsk_lifetime_days: int | None = None
+    nsec3: bool | None = None
+    nsec3_iterations: int | None = None
+    nsec3_salt_length: int | None = None
+    nsec3_optout: bool | None = None
+
+    @field_validator("algorithm")
+    @classmethod
+    def _algo(cls, v: str | None) -> str | None:
+        if v is not None and v not in DNSSEC_ALGORITHMS:
+            raise ValueError(f"algorithm must be one of {sorted(DNSSEC_ALGORITHMS)}")
+        return v
+
+
+class DNSSECPolicyResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    description: str
+    is_builtin: bool
+    algorithm: str
+    ksk_lifetime_days: int
+    zsk_lifetime_days: int
+    nsec3: bool
+    nsec3_iterations: int
+    nsec3_salt_length: int
+    nsec3_optout: bool
+    created_at: datetime
+    modified_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+@router.get("/dnssec-policies", response_model=list[DNSSECPolicyResponse])
+async def list_dnssec_policies(db: DB, _: CurrentUser) -> list[DNSSECPolicy]:
+    rows = (await db.execute(select(DNSSECPolicy).order_by(DNSSECPolicy.name))).scalars().all()
+    return list(rows)
+
+
+@router.post("/dnssec-policies", response_model=DNSSECPolicyResponse, status_code=201)
+async def create_dnssec_policy(
+    body: DNSSECPolicyCreate, db: DB, current_user: SuperAdmin
+) -> DNSSECPolicy:
+    existing = (
+        await db.execute(select(DNSSECPolicy).where(DNSSECPolicy.name == body.name))
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail=f"Policy '{body.name}' already exists")
+    pol = DNSSECPolicy(**body.model_dump())
+    db.add(pol)
+    await db.flush()  # populate pol.id so the audit row can correlate
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="create",
+            resource_type="dnssec_policy",
+            resource_id=str(pol.id),
+            resource_display=body.name,
+            new_value=body.model_dump(),
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(pol)
+    return pol
+
+
+@router.put("/dnssec-policies/{policy_id}", response_model=DNSSECPolicyResponse)
+async def update_dnssec_policy(
+    policy_id: uuid.UUID, body: DNSSECPolicyUpdate, db: DB, current_user: SuperAdmin
+) -> DNSSECPolicy:
+    pol = await db.get(DNSSECPolicy, policy_id)
+    if pol is None:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    if pol.is_builtin:
+        raise HTTPException(status_code=422, detail="Built-in policies cannot be edited")
+    changes = body.model_dump(exclude_none=True)
+    for k, v in changes.items():
+        setattr(pol, k, v)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="update",
+            resource_type="dnssec_policy",
+            resource_id=str(pol.id),
+            resource_display=pol.name,
+            new_value=changes,
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(pol)
+    return pol
+
+
+@router.delete("/dnssec-policies/{policy_id}", status_code=204)
+async def delete_dnssec_policy(policy_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> None:
+    pol = await db.get(DNSSECPolicy, policy_id)
+    if pol is None:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    if pol.is_builtin:
+        raise HTTPException(status_code=422, detail="Built-in policies cannot be deleted")
+    # Zones referencing it fall back to the built-in default (FK SET NULL).
+    in_use = (
+        await db.execute(
+            select(func.count()).select_from(DNSZone).where(DNSZone.dnssec_policy_id == policy_id)
+        )
+    ).scalar_one()
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="delete",
+            resource_type="dnssec_policy",
+            resource_id=str(pol.id),
+            resource_display=pol.name,
+            new_value={"zones_reset_to_default": int(in_use)},
+            result="success",
+        )
+    )
+    await db.delete(pol)
+    await db.commit()
+
+
 @router.get("/groups/{group_id}/zones/{zone_id}/dnssec/info")
 async def get_zone_dnssec_info(
     group_id: uuid.UUID,
@@ -2933,13 +3134,43 @@ async def get_zone_dnssec_info(
     sync cycle (typically <30s after the operator clicks Sign).
     """
     zone = await _require_zone(group_id, zone_id, db)
+    keys = (
+        (
+            await db.execute(
+                select(DNSKey)
+                .where(DNSKey.zone_id == zone.id)
+                .order_by(DNSKey.key_type, DNSKey.key_tag)
+            )
+        )
+        .scalars()
+        .all()
+    )
     return {
         "zone_id": str(zone.id),
         "zone_name": zone.name,
         "dnssec_enabled": zone.dnssec_enabled,
+        "dnssec_policy_id": (str(zone.dnssec_policy_id) if zone.dnssec_policy_id else None),
         "dnssec_ds_records": zone.dnssec_ds_records or [],
         "dnssec_synced_at": (zone.dnssec_synced_at.isoformat() if zone.dnssec_synced_at else None),
+        "keys": [
+            {
+                "key_tag": k.key_tag,
+                "key_type": k.key_type,
+                "algorithm": k.algorithm,
+                "state": k.state,
+                "ds_records": k.ds_records or [],
+                "timing": k.timing or {},
+                "reported_at": k.reported_at.isoformat() if k.reported_at else None,
+            }
+            for k in keys
+        ],
     }
+
+
+class DNSSECSignRequest(BaseModel):
+    # Optional signing policy. null ⇒ BIND9 built-in "default". Ignored by
+    # the PowerDNS path (online signing uses its own defaults).
+    policy_id: uuid.UUID | None = None
 
 
 @router.post("/groups/{group_id}/zones/{zone_id}/dnssec/sign", response_model=ZoneResponse)
@@ -2948,21 +3179,36 @@ async def sign_zone_dnssec(
     zone_id: uuid.UUID,
     db: DB,
     current_user: SuperAdmin,
+    body: DNSSECSignRequest | None = None,
 ) -> DNSZone:
-    """Trigger PowerDNS online DNSSEC signing for the zone (issue #127, Phase 3c).
+    """Enable DNSSEC signing for the zone (PowerDNS online signing #127 /
+    BIND9 inline-signing #49).
 
-    Driver-aware — refuses if any server in the zone's group is non-PowerDNS
-    (BIND9's manual ``dnssec-keygen`` flow is the #49 umbrella). The agent
-    picks up the enqueued ``dnssec_sign`` op on its next long-poll, generates
-    KSK + ZSK via ``POST /zones/{z}/cryptokeys``, sets ``PRESIGNED`` zone
-    metadata, and rectifies. The zone's ``dnssec_enabled`` flag flips to
-    True synchronously so the UI reflects intent immediately; actual
-    signed-state confirmation lands when the agent reports back.
+    Driver-aware (``_check_driver_gated_operation``): allowed on PowerDNS +
+    BIND9 groups, refused on Windows DNS. For BIND9 the signing is
+    config-driven — flipping ``dnssec_enabled`` (+ optional ``policy_id``)
+    reshapes the agent ConfigBundle, the agent re-renders the zone with
+    ``dnssec-policy`` + ``inline-signing yes``, BIND auto-generates keys and
+    signs, then reports DS + per-key state back. The enqueued op is a no-op
+    on BIND9 (PowerDNS consumes it to drive its REST sign). The
+    ``dnssec_enabled`` flag flips synchronously so the UI reflects intent
+    immediately.
     """
     zone = await _require_zone(group_id, zone_id, db)
     _reject_if_synthesised_zone(zone, "DNSSEC-sign")
     await _check_driver_gated_operation("dnssec_sign", group_id, db)
     zone.dnssec_enabled = True
+    # Policy semantics: field present + value → set; field present + null →
+    # reset to BIND's built-in ``default``; field omitted → leave unchanged
+    # (so a re-sign that doesn't touch the picker keeps the current policy).
+    if body is not None and "policy_id" in body.model_fields_set:
+        if body.policy_id is None:
+            zone.dnssec_policy_id = None
+        else:
+            pol = await db.get(DNSSECPolicy, body.policy_id)
+            if pol is None:
+                raise HTTPException(status_code=404, detail="DNSSEC policy not found")
+            zone.dnssec_policy_id = body.policy_id
     await enqueue_record_op(
         db,
         zone,
@@ -3005,6 +3251,10 @@ async def unsign_zone_dnssec(
     _reject_if_synthesised_zone(zone, "DNSSEC-unsign")
     await _check_driver_gated_operation("dnssec_unsign", group_id, db)
     zone.dnssec_enabled = False
+    # Clear cached DS + per-key state now — the BIND9 agent only reports
+    # signed zones, so it won't send a keys=[] report to clear these.
+    zone.dnssec_ds_records = None
+    await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
     await enqueue_record_op(
         db,
         zone,
@@ -3026,6 +3276,53 @@ async def unsign_zone_dnssec(
     await db.commit()
     await db.refresh(zone)
     return zone
+
+
+class DNSSECRolloverRequest(BaseModel):
+    key_tag: int
+
+
+@router.post("/groups/{group_id}/zones/{zone_id}/dnssec/rollover")
+async def rollover_zone_dnssec_key(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: DNSSECRolloverRequest,
+    db: DB,
+    current_user: SuperAdmin,
+) -> dict[str, Any]:
+    """Force a manual KSK/ZSK rollover for a signed BIND9 zone (issue #49).
+
+    BIND9-only (``rndc dnssec -rollover``); PowerDNS rolls on its own
+    schedule and Windows DNS isn't supported. Enqueues a ``dnssec_rollover``
+    op carrying the key tag; the agent runs the rollover and reports the new
+    key set back on its next sync. The zone must already be signed.
+    """
+    zone = await _require_zone(group_id, zone_id, db)
+    _reject_if_synthesised_zone(zone, "DNSSEC-rollover")
+    if not zone.dnssec_enabled:
+        raise HTTPException(status_code=409, detail="Zone is not DNSSEC-signed")
+    await _check_driver_gated_operation("dnssec_rollover", group_id, db)
+    await enqueue_record_op(
+        db,
+        zone,
+        "dnssec_rollover",
+        {"name": "@", "type": "DNSSEC_OP", "key_tag": body.key_tag},
+    )
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="dnssec_rollover",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            new_value={"key_tag": body.key_tag},
+            result="success",
+        )
+    )
+    await db.commit()
+    return {"status": "queued", "zone_id": str(zone.id), "key_tag": body.key_tag}
 
 
 @router.delete("/groups/{group_id}/zones/{zone_id}", status_code=204)
@@ -3165,7 +3462,8 @@ async def create_zone_from_template(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
-            status_code=409, detail="A zone with that name already exists in this group/view"
+            status_code=409,
+            detail="A zone with that name already exists in this group/view",
         )
 
     zone = DNSZone(
@@ -3522,10 +3820,16 @@ async def list_records(
 
 
 @router.post(
-    "/groups/{group_id}/zones/{zone_id}/records", response_model=RecordResponse, status_code=201
+    "/groups/{group_id}/zones/{zone_id}/records",
+    response_model=RecordResponse,
+    status_code=201,
 )
 async def create_record(
-    group_id: uuid.UUID, zone_id: uuid.UUID, body: RecordCreate, db: DB, current_user: CurrentUser
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: RecordCreate,
+    db: DB,
+    current_user: CurrentUser,
 ) -> DNSRecord:
     zone = await _require_zone(group_id, zone_id, db)
     _reject_if_synthesised_zone(zone, "add records to")
@@ -3573,7 +3877,10 @@ async def create_record(
     return record
 
 
-@router.put("/groups/{group_id}/zones/{zone_id}/records/{record_id}", response_model=RecordResponse)
+@router.put(
+    "/groups/{group_id}/zones/{zone_id}/records/{record_id}",
+    response_model=RecordResponse,
+)
 async def update_record(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,

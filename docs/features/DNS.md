@@ -29,7 +29,7 @@ SpatiumDDI ships three authoritative DNS drivers. Pick **per server group** — 
 | Zone CRUD wire protocol | rndc addzone / delzone | REST API | WinRM (Path B only) |
 | ALIAS records (CNAME at apex) | — | ✅ | — |
 | LUA records (computed responses) | — | ✅ | — |
-| Online DNSSEC signing | manual | ✅ one-toggle | manual |
+| Online DNSSEC signing | ✅ inline-signing (#49) | ✅ one-toggle | manual |
 | Catalog zones (RFC 9432) — producer | ✅ | ✅ | — |
 | Catalog zones (RFC 9432) — consumer | ✅ | — (waits for pdns 4.10+) | — |
 | First-class views / split-horizon | ✅ | tag-based, not surfaced as views in UI | — (replication scope) |
@@ -174,6 +174,41 @@ DNSTrustAnchor
 - **BIND9:** `dnssec-validation auto|yes|no;` in `options {}` or per-view; trust anchors go in `managed-keys {}` or `trust-anchors {}`
 - The root DNSSEC trust anchor (ICANN KSK) is pre-loaded automatically when `dnssec_validation: auto`
 - UI shows DNSSEC chain validation status for each zone
+
+> **Validation vs. signing.** The setting above controls whether the
+> server *validates* answers as a resolver. *Signing* your own zones is a
+> separate feature — see §3.3a (BIND9) / §0 (PowerDNS).
+
+### 3.3a Zone signing — BIND9 inline-signing (issue #49)
+
+BIND9 9.16+ `dnssec-policy` inline-signing. A **DNSSECPolicy** maps 1:1
+to a BIND `dnssec-policy "<name>" { ... };` block — algorithm, NSEC3
+params, KSK/ZSK lifetimes — and a zone references one. **BIND owns and
+auto-rotates the private keys** (the modern, recommended model); SpatiumDDI
+stores only the *public* state it reports back (DS rrset + per-key status),
+so there is no private-key custody.
+
+- **Policies** are managed at **DNS → DNSSEC Policies** (`/dns/dnssec-policies`).
+  A built-in `default` policy (ECDSAP256SHA256, NSEC, unlimited KSK +
+  90-day auto-rolled ZSK) is seeded and read-only.
+- **Sign a zone** from its DNSSEC card (`POST .../dnssec/sign` with an
+  optional `policy_id` — null ⇒ `default`). Signing is **config-driven**:
+  flipping `dnssec_enabled` (+ policy) reshapes the agent ConfigBundle, the
+  agent renders `dnssec-policy "<name>"; inline-signing yes;` into the zone
+  stanza (and a top-level `dnssec-policy { }` block for custom policies),
+  BIND auto-generates keys in `key-directory` and signs.
+- **DS export.** After signing the agent runs `rndc dnssec -status` +
+  `dnssec-dsfromkey` and reports the DS rrset + per-key state back via
+  `POST /dns/agents/dnssec-state`; the card surfaces the DS records to
+  paste at the parent registrar, plus a per-key table (tag / type / state).
+- **Manual rollover.** The card's per-key **Roll** button
+  (`POST .../dnssec/rollover`) enqueues a `dnssec_rollover` op; the agent
+  runs `rndc dnssec -rollover -key <tag>`. Routine rollover is automatic
+  per the policy — this is the "roll now" escape hatch.
+- **Driver gating.** Sign/unsign are allowed on BIND9 + PowerDNS groups,
+  rollover on BIND9 only; Windows DNS is refused (422). NSEC3 follows
+  RFC 9276 (iterations 0 + salt-length 0 recommended) — the policy editor
+  warns when iterations > 0.
 
 ### 3.4 GSS-TSIG
 

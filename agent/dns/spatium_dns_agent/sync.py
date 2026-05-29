@@ -44,7 +44,9 @@ def _touch_ready_marker(state_dir: Path) -> None:
 
 
 class SyncLoop:
-    def __init__(self, cfg: AgentConfig, token_ref: list[str], driver: DriverBase, heartbeat: Any):
+    def __init__(
+        self, cfg: AgentConfig, token_ref: list[str], driver: DriverBase, heartbeat: Any
+    ):
         self.cfg = cfg
         self.token_ref = token_ref
         self.driver = driver
@@ -102,7 +104,9 @@ class SyncLoop:
         elif self.cfg.tls_ca_path:
             verify = self.cfg.tls_ca_path
         # server holds for ~30s, give client a bit more
-        return httpx.Client(base_url=self.cfg.control_plane_url, verify=verify, timeout=60.0)
+        return httpx.Client(
+            base_url=self.cfg.control_plane_url, verify=verify, timeout=60.0
+        )
 
     def _poll_once(self) -> None:
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
@@ -129,6 +133,7 @@ class SyncLoop:
                 reason="token_invalid" if resp.status_code == 401 else "server_missing",
             )
             from .cache import save_token
+
             save_token(self.cfg.state_dir, "")
             self._stop.set()
             return
@@ -183,6 +188,19 @@ class SyncLoop:
             # roll back the apply (we already serve the new config).
             self._report_zone_state(bundle)
 
+            # DNSSEC (issue #49): BIND9 signs inline from the rendered
+            # config, so after a structural reload we read each signed
+            # zone's DS + per-key state and report it. PowerDNS reports via
+            # the op path below instead (so its driver has no collector).
+            collect = getattr(self.driver, "collect_dnssec_state", None)
+            if collect is not None:
+                try:
+                    bind_states = collect(bundle)
+                    if bind_states:
+                        self._report_dnssec_state(bind_states)
+                except Exception:
+                    log.exception("dnssec_collect_failed")
+
             # Push the on-disk rendered config snapshot so the Server
             # Detail modal's Config tab can show "what's actually live
             # right now" — operators no longer need to SSH in to verify.
@@ -198,9 +216,15 @@ class SyncLoop:
         for op in bundle.get("pending_record_ops", []):
             try:
                 result = self.driver.apply_record_op(op)
-                self.heartbeat.pending_acks.append({"op_id": op["op_id"], "result": "ok"})
-                log.info("record_op_applied", op_id=op["op_id"], op=op.get("op"),
-                         zone=op.get("zone_name"))
+                self.heartbeat.pending_acks.append(
+                    {"op_id": op["op_id"], "result": "ok"}
+                )
+                log.info(
+                    "record_op_applied",
+                    op_id=op["op_id"],
+                    op=op.get("op"),
+                    zone=op.get("zone_name"),
+                )
                 # PowerDNS DNSSEC ops return the DS rrset so we can ship
                 # it back to the control plane in one batched POST below.
                 if isinstance(result, dict) and "dnssec_state" in result:

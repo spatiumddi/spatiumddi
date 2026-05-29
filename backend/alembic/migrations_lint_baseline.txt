@@ -436,6 +436,10 @@ backend/alembic/versions/f1c9a4d2b8e6_ip_role_reserved_mac_history.py:drop_table
 backend/alembic/versions/f1e7a3c92b40_multicast_groups.py:drop_table:230
 backend/alembic/versions/f1e7a3c92b40_multicast_groups.py:drop_table:233
 backend/alembic/versions/f1e7a3c92b40_multicast_groups.py:drop_table:241
+backend/alembic/versions/f2b6d4a91c37_dnssec_bind9.py:drop_column:115
+backend/alembic/versions/f2b6d4a91c37_dnssec_bind9.py:drop_constraint_fk:114
+backend/alembic/versions/f2b6d4a91c37_dnssec_bind9.py:drop_table:117
+backend/alembic/versions/f2b6d4a91c37_dnssec_bind9.py:drop_table:119
 backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:132
 backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:133
 backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:134

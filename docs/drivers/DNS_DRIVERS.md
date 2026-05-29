@@ -154,6 +154,37 @@ class BIND9DriverConfig:
     rndc_port: int = 953
 ```
 
+### 2.5 DNSSEC — inline-signing (issue #49)
+
+BIND9 9.16+ `dnssec-policy` inline-signing. **BIND owns + auto-rotates the
+private keys**; the control plane stores only public state. The flow is
+config-driven, not op-driven (unlike PowerDNS's REST sign):
+
+1. **Control plane.** A signed zone (`DNSZone.dnssec_enabled`) carries an
+   optional `dnssec_policy_id` → a `DNSSECPolicy` row (algorithm / NSEC3 /
+   KSK+ZSK lifetimes). The bundle assembler stamps `dnssec_enabled` +
+   `dnssec_policy_name` onto each zone and ships referenced custom policies
+   in `dnssec_policies` (the built-in `default` carries no block). Both flow
+   into the structural ETag, so a sign/policy change triggers a re-render.
+2. **Agent render.** `named.conf` gets `key-directory "/var/cache/bind/keys"`,
+   a top-level `dnssec-policy "<name>" { keys { ksk … ; zsk … ; }; nsec3param … ; };`
+   per custom policy, and each signed primary zone's stanza gets
+   `dnssec-policy "<name>"; inline-signing yes;`. BIND auto-generates keys in
+   the key-directory and signs on load.
+3. **DS + key-state report.** After a reload the agent's `collect_dnssec_state`
+   runs `rndc dnssec -status <zone>` (parsed by the version-tolerant
+   `_parse_dnssec_status`) + `dnssec-dsfromkey` over the KSK key files, and
+   POSTs the DS rrset + per-key state to `/dns/agents/dnssec-state`. The
+   control plane mirrors it into `DNSZone.dnssec_ds_records` + `DNSKey` rows
+   (replace-per-zone) for the operator's DS-export + key-status view.
+4. **Manual rollover.** `POST .../dnssec/rollover` enqueues a
+   `dnssec_rollover` op (key tag); the agent runs
+   `rndc dnssec -rollover -key <tag> <zone>` and re-reports. Sign/unsign ops
+   are no-ops on the BIND9 agent (the config render drives signing).
+
+Gating: `_DRIVER_GATED_OPERATIONS` allows `dnssec_sign`/`dnssec_unsign` on
+`{powerdns, bind9}` and `dnssec_rollover` on `{bind9}`.
+
 ---
 
 ## 3. Windows DNS Driver

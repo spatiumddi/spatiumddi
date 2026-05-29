@@ -11,6 +11,7 @@ import { DashboardPage } from "@/pages/DashboardPage";
 import { IPAMPage } from "@/pages/ipam/IPAMPage";
 import { NATPage } from "@/pages/ipam/NATPage";
 import { StaleIPReportPage } from "@/pages/ipam/StaleIPReportPage";
+import { DNSSECPoliciesPage } from "@/pages/dns/DNSSECPoliciesPage";
 import { DNSPage } from "@/pages/dns/DNSPage";
 import { DNSPoolsPage } from "@/pages/dns/DNSPoolsPage";
 import { VLANsPage } from "@/pages/vlans/VLANsPage";
@@ -99,6 +100,7 @@ export default function App() {
         <Route path="ipam/plans/:id" element={<SubnetPlannerEditorPage />} />
         <Route path="dns" element={<DNSPage />} />
         <Route path="dns/pools" element={<DNSPoolsPage />} />
+        <Route path="dns/dnssec-policies" element={<DNSSECPoliciesPage />} />
         {/* Network section — Devices / VLANs / VRFs / ASNs. The old top-
             level /network and /vlans paths redirect here so existing
             bookmarks keep working. See issue #84. */}

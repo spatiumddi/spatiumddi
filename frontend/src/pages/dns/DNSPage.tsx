@@ -1244,6 +1244,7 @@ function DnssecCard({
   const qc = useQueryClient();
   const [error, setError] = useState<string | null>(null);
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+  const [policyId, setPolicyId] = useState<string>("");
 
   const info = useQuery({
     queryKey: ["dns-zone-dnssec-info", groupId, zoneId],
@@ -1251,15 +1252,33 @@ function DnssecCard({
     refetchOnWindowFocus: true,
     refetchInterval: initiallyEnabled ? 10_000 : false,
   });
+  // DNSSEC policies (issue #49) — operator picks one when signing a BIND9
+  // zone; null/empty ⇒ BIND built-in "default".
+  const policies = useQuery({
+    queryKey: ["dns-dnssec-policies"],
+    queryFn: () => dnsApi.listDnssecPolicies(),
+  });
+  // Seed the picker from the zone's stored policy so it reflects what's
+  // actually applied (rather than always showing "default policy").
+  useEffect(() => {
+    if (info.data?.dnssec_policy_id) setPolicyId(info.data.dnssec_policy_id);
+  }, [info.data?.dnssec_policy_id]);
 
+  const invalidate = () => {
+    qc.invalidateQueries({
+      queryKey: ["dns-zone-dnssec-info", groupId, zoneId],
+    });
+    qc.invalidateQueries({ queryKey: ["dns-zones", groupId] });
+  };
+
+  // policy: a UUID / null sets-or-resets the policy (fresh sign);
+  // ``undefined`` omits it so a re-sign keeps the zone's current policy.
   const signMut = useMutation({
-    mutationFn: () => dnsApi.signZoneDnssec(groupId, zoneId),
+    mutationFn: (policy: string | null | undefined) =>
+      dnsApi.signZoneDnssec(groupId, zoneId, policy),
     onSuccess: () => {
       setError(null);
-      qc.invalidateQueries({
-        queryKey: ["dns-zone-dnssec-info", groupId, zoneId],
-      });
-      qc.invalidateQueries({ queryKey: ["dns-zones", groupId] });
+      invalidate();
     },
     onError: (e: ApiError) => setError(formatApiError(e, "Sign failed")),
   });
@@ -1267,18 +1286,26 @@ function DnssecCard({
     mutationFn: () => dnsApi.unsignZoneDnssec(groupId, zoneId),
     onSuccess: () => {
       setError(null);
-      qc.invalidateQueries({
-        queryKey: ["dns-zone-dnssec-info", groupId, zoneId],
-      });
-      qc.invalidateQueries({ queryKey: ["dns-zones", groupId] });
+      invalidate();
     },
     onError: (e: ApiError) => setError(formatApiError(e, "Unsign failed")),
+  });
+  const rolloverMut = useMutation({
+    mutationFn: (keyTag: number) =>
+      dnsApi.rolloverZoneDnssecKey(groupId, zoneId, keyTag),
+    onSuccess: () => {
+      setError(null);
+      invalidate();
+    },
+    onError: (e: ApiError) => setError(formatApiError(e, "Rollover failed")),
   });
 
   const enabled = info.data?.dnssec_enabled ?? initiallyEnabled;
   const dsRecords = info.data?.dnssec_ds_records ?? [];
   const syncedAt = info.data?.dnssec_synced_at ?? null;
-  const busy = signMut.isPending || unsignMut.isPending;
+  const keys = info.data?.keys ?? [];
+  const busy =
+    signMut.isPending || unsignMut.isPending || rolloverMut.isPending;
 
   function copyDs(idx: number, value: string) {
     navigator.clipboard.writeText(value).then(
@@ -1318,20 +1345,20 @@ function DnssecCard({
               <>
                 Zone is <span className="font-medium">unsigned</span>. Sign to
                 generate KSK + ZSK and publish DS records to the parent
-                registrar. PowerDNS-only.
+                registrar. BIND9 (inline-signing) + PowerDNS.
               </>
             )}
           </div>
         </div>
-        <div className="flex shrink-0 gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           {enabled ? (
             <>
               <button
                 type="button"
                 disabled={busy}
-                onClick={() => signMut.mutate()}
+                onClick={() => signMut.mutate(undefined)}
                 className="rounded border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
-                title="Re-run sign — pdns regenerates keys + rectifies"
+                title="Re-run sign (keeps the current policy)"
               >
                 {signMut.isPending ? "Re-signing…" : "Re-sign"}
               </button>
@@ -1345,14 +1372,32 @@ function DnssecCard({
               </button>
             </>
           ) : (
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => signMut.mutate()}
-              className="rounded bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
-            >
-              {signMut.isPending ? "Signing…" : "Sign zone"}
-            </button>
+            <>
+              <select
+                value={policyId}
+                onChange={(e) => setPolicyId(e.target.value)}
+                className="rounded border bg-background px-2 py-1 text-xs"
+                title="DNSSEC signing policy (BIND9)"
+              >
+                <option value="">default policy</option>
+                {(policies.data ?? [])
+                  .filter((p) => p.name !== "default")
+                  .map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} ({p.algorithm}
+                      {p.nsec3 ? ", NSEC3" : ""})
+                    </option>
+                  ))}
+              </select>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => signMut.mutate(policyId || null)}
+                className="rounded bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+              >
+                {signMut.isPending ? "Signing…" : "Sign zone"}
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -1360,6 +1405,46 @@ function DnssecCard({
       {error && (
         <div className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
           {error}
+        </div>
+      )}
+
+      {enabled && keys.length > 0 && (
+        <div>
+          <div className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            Keys
+          </div>
+          <table className="w-full text-[11px]">
+            <thead className="text-left text-muted-foreground">
+              <tr>
+                <th className="py-0.5 pr-2">Tag</th>
+                <th className="py-0.5 pr-2">Type</th>
+                <th className="py-0.5 pr-2">Algo</th>
+                <th className="py-0.5 pr-2">State</th>
+                <th className="py-0.5" />
+              </tr>
+            </thead>
+            <tbody>
+              {keys.map((k) => (
+                <tr key={`${k.key_type}-${k.key_tag}`} className="border-t">
+                  <td className="py-0.5 pr-2 font-mono">{k.key_tag}</td>
+                  <td className="py-0.5 pr-2 uppercase">{k.key_type}</td>
+                  <td className="py-0.5 pr-2">{k.algorithm}</td>
+                  <td className="py-0.5 pr-2">{k.state}</td>
+                  <td className="py-0.5 text-right">
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => rolloverMut.mutate(k.key_tag)}
+                      className="rounded border px-1.5 py-0.5 text-[10px] hover:bg-accent disabled:opacity-50"
+                      title="Force a key rollover (BIND9 rndc dnssec -rollover)"
+                    >
+                      Roll
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
 
@@ -1396,8 +1481,9 @@ function DnssecCard({
             </ul>
           )}
           <div className="mt-2 text-[11px] text-muted-foreground">
-            Multiple algorithms are normal — publish them all. PowerDNS rotates
-            keys automatically; this list refreshes after each rollover.
+            Multiple algorithms are normal — publish them all. Keys rotate
+            automatically per the policy (BIND9) or pdns schedule; this list
+            refreshes after each rollover.
           </div>
         </div>
       )}
