@@ -18,7 +18,7 @@
     "@radix-ui/react-context-menu": "^2.2.2",
     "@tanstack/react-query": "^5.62.0",
     "@tanstack/react-query-devtools": "^5.62.0",
-    "axios": "^1.15.2",
+    "axios": "^1.16.0",
     "clsx": "^2.1.1",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
