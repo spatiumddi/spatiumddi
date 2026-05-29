@@ -29,6 +29,7 @@ celery_app = Celery(
         "app.tasks.trash_purge",
         "app.tasks.ipam_reservation_sweep",
         "app.tasks.ipam_discovery",
+        "app.tasks.reverse_dns",
         "app.tasks.dhcp_lease_history_prune",
         "app.tasks.update_check",
         "app.tasks.kubernetes_sync",
@@ -79,6 +80,7 @@ celery_app.conf.update(
         "app.tasks.trash_purge.*": {"queue": "default"},
         "app.tasks.ipam_reservation_sweep.*": {"queue": "ipam"},
         "app.tasks.ipam_discovery.*": {"queue": "ipam"},
+        "app.tasks.reverse_dns.*": {"queue": "ipam"},
         "app.tasks.dhcp_lease_history_prune.*": {"queue": "dhcp"},
         "app.tasks.update_check.*": {"queue": "default"},
         "app.tasks.kubernetes_sync.*": {"queue": "default"},
@@ -140,6 +142,14 @@ celery_app.conf.update(
         # take effect without restarting beat.
         "ipam-discovery-dispatch": {
             "task": "app.tasks.ipam_discovery.dispatch_due_subnets",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Every 60 s, tick the reverse-DNS (PTR) auto-population sweep
+        # (issue #41). The task gates on ``PlatformSettings.reverse_dns_enabled``
+        # and the per-run interval, so cadence changes in the UI take effect
+        # without restarting celery-beat.
+        "reverse-dns-sweep": {
+            "task": "app.tasks.reverse_dns.sweep_reverse_dns",
             "schedule": schedule(run_every=60.0),
         },
         # Every 60 s, tick the DNS pull-from-server task. The task itself

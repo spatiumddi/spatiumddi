@@ -2800,6 +2800,11 @@ export interface PlatformSettings {
   dns_auto_sync_interval_minutes: number;
   dns_auto_sync_delete_stale: boolean;
   dns_auto_sync_last_run_at: string | null;
+  // Reverse-DNS (PTR) auto-population — issue #41.
+  reverse_dns_enabled: boolean;
+  reverse_dns_interval_minutes: number;
+  reverse_dns_resolvers: string[] | null;
+  reverse_dns_last_run_at: string | null;
   dns_pull_from_server_enabled: boolean;
   dns_pull_from_server_interval_minutes: number;
   dns_pull_from_server_last_run_at: string | null;
@@ -3054,6 +3059,15 @@ export const settingsApi = {
   getDefaults: () =>
     api
       .get<Partial<PlatformSettings>>("/settings/defaults")
+      .then((r) => r.data),
+  /** Issue #41 — queue an on-demand reverse-DNS (PTR) sweep, bypassing
+   *  the enabled-gate + interval. */
+  runReverseDns: () =>
+    api
+      .post<{
+        status: string;
+        task_id: string | null;
+      }>("/settings/reverse-dns/run")
       .then((r) => r.data),
   /** Issue #153 — reveal the configured SNMP v2c community after a
    *  password re-verify. Superadmin + local-auth only; every reveal
