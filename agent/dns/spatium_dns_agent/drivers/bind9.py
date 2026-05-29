@@ -94,9 +94,7 @@ class Bind9Driver(DriverBase):
             dnssec = "no"
         fwd_block = ""
         if forwarders:
-            fwd_block = "    forwarders {{ {fs}; }};\n".format(
-                fs="; ".join(forwarders)
-            )
+            fwd_block = "    forwarders {{ {fs}; }};\n".format(fs="; ".join(forwarders))
 
         tsig_keys = bundle.get("tsig_keys") or []
         tsig_key_name = tsig_keys[0]["name"] if tsig_keys else None
@@ -104,11 +102,20 @@ class Bind9Driver(DriverBase):
             'include "/var/lib/spatium-dns-agent/tsig/ddns.key";\n' if tsig_keys else ""
         )
 
+        # Split-horizon (issue #24): when the group defines views, every
+        # zone — and every RPZ/response-policy — lives INSIDE a
+        # ``view { match-clients … }`` block. BIND9 forbids mixing
+        # top-level zones with views, so the global response-policy below
+        # is only emitted in the no-views path; with views it's rendered
+        # per-view further down.
+        views = bundle.get("views") or []
+        has_views = bool(views)
+
         # Response-policy block needs to list every RPZ zone we're about to
         # declare, otherwise BIND9 won't consult them on lookups.
         blocklists = bundle.get("blocklists") or []
         response_policy_block = ""
-        if blocklists:
+        if blocklists and not has_views:
             zones_list = "; ".join(
                 f'zone "{bl["rpz_zone_name"].rstrip(".")}"' for bl in blocklists
             )
@@ -120,9 +127,7 @@ class Bind9Driver(DriverBase):
                 f"    response-policy {{ {zones_list}; }} break-dnssec yes;\n"
             )
 
-        logging_block = (
-            _QUERY_LOG_BLOCK if bool(opts.get("query_log_enabled")) else ""
-        )
+        logging_block = _QUERY_LOG_BLOCK if bool(opts.get("query_log_enabled")) else ""
         conf = NAMED_CONF_SKELETON.format(
             recursion=recursion,
             allow_query=allow_query,
@@ -144,99 +149,155 @@ class Bind9Driver(DriverBase):
         if rndc_key_path.exists():
             conf += (
                 f'include "{rndc_key_path}";\n'
-                'controls {\n'
-                '    inet 127.0.0.1 port 953 allow { 127.0.0.1; } '
+                "controls {\n"
+                "    inet 127.0.0.1 port 953 allow { 127.0.0.1; } "
                 'keys { "spatium-rndc"; };\n'
-                '};\n'
+                "};\n"
             )
 
-        for zone in bundle.get("zones", []):
+        def _zone_stanza(zone: dict[str, Any], file_prefix: str) -> str:
+            """Build one ``zone "..." { ... };`` and write its zone file.
+
+            ``file_prefix`` namespaces the on-disk file (e.g.
+            ``"internal/"``) so the SAME zone name served from multiple
+            views doesn't clobber files (issue #24). Returns "" for a
+            zone that shouldn't be emitted (forward zone w/o upstreams).
+            """
             zname = zone.get("name") or ""
             if not zname:
-                continue
+                return ""
             zone_type = zone.get("type", "primary")
-            # Forward zones: BIND9 doesn't expect a file or allow-update — just
-            # a forwarders block. Skip the per-zone file write entirely.
+            # Forward zones: just a forwarders block, no file / allow-update.
             if zone_type == "forward":
                 fwds = [str(f) for f in (zone.get("forwarders") or []) if f]
                 if not fwds:
-                    # Forward zone with no upstreams is invalid — skip rather
-                    # than emit a malformed stanza.
-                    continue
-                forward_only = bool(zone.get("forward_only", True))
-                policy = "only" if forward_only else "first"
-                conf += (
-                    f'zone "{zname}" {{ type forward; '
-                    f"forward {policy}; "
+                    return ""
+                policy = "only" if bool(zone.get("forward_only", True)) else "first"
+                return (
+                    f'zone "{zname}" {{ type forward; forward {policy}; '
                     f'forwarders {{ {"; ".join(fwds)}; }}; }};\n'
                 )
-                continue
-            # Relative path used inside the rendered tree; absolute path
-            # written into named.conf so BIND9 doesn't resolve against its
-            # `directory` (which is /var/cache/bind, not our rendered tree).
-            rel_zfile = f"zones/{zname.rstrip('.')}.db"
-            current_dir = self.state_dir / self.rendered_dir_name
-            abs_zfile = current_dir / rel_zfile
+            # Relative path inside the rendered tree; absolute path written
+            # into named.conf so BIND9 doesn't resolve against its
+            # `directory` (/var/cache/bind, not our rendered tree).
+            rel_zfile = f"zones/{file_prefix}{zname.rstrip('.')}.db"
+            abs_zfile = self.state_dir / self.rendered_dir_name / rel_zfile
             bind_type = "master" if zone_type in {"primary", "master"} else "slave"
             allow_update = (
                 f'allow-update {{ key "{tsig_key_name}"; }}; ' if tsig_key_name else ""
             )
-            conf += (
-                f'zone "{zname}" {{ type {bind_type}; file "{abs_zfile}"; '
-                f'{allow_update}}};\n'
-            )
             if zone_type in {"primary", "master"}:
                 self._write_zone_file(new_dir / rel_zfile, zone)
-
-        # BIND9 catalog zone (RFC 9432). When the group has catalog zones
-        # enabled, the producer (is_primary=True) renders a master catalog
-        # zone whose contents describe every primary zone in the group.
-        # Consumers get a single `catalog-zones` directive in options{};
-        # BIND9 auto-pulls the catalog and creates each member zone as a
-        # secondary served from the producer.
-        catalog = bundle.get("catalog") or None
-        if catalog and catalog.get("mode") == "producer":
-            cname = catalog["zone_name"]
-            rel = f"zones/{cname.rstrip('.')}.db"
-            abs_zfile = self.state_dir / self.rendered_dir_name / rel
-            conf += (
-                f'zone "{cname}" {{ type master; file "{abs_zfile}"; '
-                f"allow-transfer {{ any; }}; notify yes; }};\n"
+            return (
+                f'zone "{zname}" {{ type {bind_type}; file "{abs_zfile}"; '
+                f"{allow_update}}};\n"
             )
-            self._write_catalog_zone_file(new_dir / rel, catalog)
-        elif catalog and catalog.get("mode") == "consumer":
-            cname = catalog["zone_name"]
-            producer_addr = (catalog.get("producer_addr") or "").strip()
-            if producer_addr:
-                # `catalog-zones` lives inside options{}; inject just before
-                # the closing brace of the options block we already rendered
-                # via NAMED_CONF_SKELETON. ``in-memory yes`` keeps the
-                # member zones cached in RAM so we don't litter the
-                # rendered tree with per-member files.
-                injection = (
-                    f"    catalog-zones {{ "
-                    f'zone "{cname}" default-masters {{ {producer_addr}; }} '
-                    f"in-memory yes; }};"
-                )
-                target = "    check-integrity no;"
-                if target in conf and injection not in conf:
-                    conf = conf.replace(target, target + "\n" + injection, 1)
 
-        # RPZ zones for blocklists. Each blocklist becomes a master zone named
-        # after its rpz_zone_name. Entries are rendered as CNAME records:
-        # - nxdomain     → CNAME .                  (synthesize NXDOMAIN)
-        # - sinkhole     → CNAME rpz-drop.          (drop silently)
-        # - redirect     → CNAME <target>.          (CNAME to target)
-        # Exceptions (allow-list) are CNAME rpz-passthru.  (explicit bypass)
-        for bl in blocklists:
+        def _rpz_stanza(bl: dict[str, Any], file_prefix: str) -> str:
+            """Build an RPZ ``zone "..." { ... };`` and write its file.
+
+            Entries render as CNAME records: nxdomain → CNAME .,
+            sinkhole → CNAME rpz-drop., redirect → CNAME <target>.,
+            exceptions → CNAME rpz-passthru.
+            """
             zname = bl["rpz_zone_name"]
-            rel = f"zones/{zname.rstrip('.')}.db"
+            rel = f"zones/{file_prefix}{zname.rstrip('.')}.db"
             abs_zfile = self.state_dir / self.rendered_dir_name / rel
-            conf += (
+            self._write_rpz_zone_file(new_dir / rel, bl)
+            return (
                 f'zone "{zname}" {{ type master; file "{abs_zfile}"; '
                 f"allow-query {{ localhost; }}; }};\n"
             )
-            self._write_rpz_zone_file(new_dir / rel, bl)
+
+        def _indent(text: str, spaces: int = 4) -> str:
+            pad = " " * spaces
+            return "".join(
+                (pad + ln if ln.strip() else ln)
+                for ln in text.splitlines(keepends=True)
+            )
+
+        if has_views:
+            # Split-horizon (issue #24): every zone + RPZ lives inside its
+            # view block. Group-level blocklists (view_name=None) replicate
+            # into EVERY view; per-view blocklists land only in their own
+            # view. Files are namespaced per view (zones/<view>/...) so
+            # identical zone names across views don't collide. Views are
+            # already ordered low→high by the control plane for first-match
+            # precedence.
+            global_bls = [bl for bl in blocklists if bl.get("view_name") is None]
+            for view in views:
+                vname = view.get("name") or ""
+                if not vname:
+                    continue
+                match_clients = "; ".join(
+                    str(c) for c in (view.get("match_clients") or ["any"])
+                )
+                recursion_v = "yes" if view.get("recursion", True) else "no"
+                view_bls = [
+                    bl for bl in blocklists if bl.get("view_name") == vname
+                ] + global_bls
+                body = ""
+                if view_bls:
+                    zlist = "; ".join(
+                        f'zone "{bl["rpz_zone_name"].rstrip(".")}"' for bl in view_bls
+                    )
+                    body += f"response-policy {{ {zlist}; }} break-dnssec yes;\n"
+                for zone in bundle.get("zones", []):
+                    if zone.get("view_name") != vname:
+                        continue
+                    body += _zone_stanza(zone, f"{vname}/")
+                for bl in view_bls:
+                    body += _rpz_stanza(bl, f"{vname}/")
+                md = view.get("match_destinations") or []
+                md_line = (
+                    f"    match-destinations {{ {'; '.join(str(m) for m in md)}; }};\n"
+                    if md
+                    else ""
+                )
+                conf += (
+                    f'view "{vname}" {{\n'
+                    f"    match-clients {{ {match_clients}; }};\n"
+                    f"{md_line}"
+                    f"    recursion {recursion_v};\n"
+                    f"{_indent(body)}"
+                    f"}};\n"
+                )
+        else:
+            for zone in bundle.get("zones", []):
+                conf += _zone_stanza(zone, "")
+
+            # BIND9 catalog zone (RFC 9432) — flat path only. Catalog + views
+            # is an unsupported combo in this cut (views render their own
+            # per-view zones); the producer/consumer wiring assumes top-level
+            # zones, which BIND9 forbids alongside views.
+            catalog = bundle.get("catalog") or None
+            if catalog and catalog.get("mode") == "producer":
+                cname = catalog["zone_name"]
+                rel = f"zones/{cname.rstrip('.')}.db"
+                abs_zfile = self.state_dir / self.rendered_dir_name / rel
+                conf += (
+                    f'zone "{cname}" {{ type master; file "{abs_zfile}"; '
+                    f"allow-transfer {{ any; }}; notify yes; }};\n"
+                )
+                self._write_catalog_zone_file(new_dir / rel, catalog)
+            elif catalog and catalog.get("mode") == "consumer":
+                cname = catalog["zone_name"]
+                producer_addr = (catalog.get("producer_addr") or "").strip()
+                if producer_addr:
+                    # `catalog-zones` lives inside options{}; inject before
+                    # the closing brace of the options block. ``in-memory
+                    # yes`` keeps member zones in RAM (no per-member files).
+                    injection = (
+                        f"    catalog-zones {{ "
+                        f'zone "{cname}" default-masters {{ {producer_addr}; }} '
+                        f"in-memory yes; }};"
+                    )
+                    target = "    check-integrity no;"
+                    if target in conf and injection not in conf:
+                        conf = conf.replace(target, target + "\n" + injection, 1)
+
+            for bl in blocklists:
+                conf += _rpz_stanza(bl, "")
 
         (new_dir / "named.conf").write_text(conf)
 
@@ -299,11 +360,14 @@ class Bind9Driver(DriverBase):
             # RFC 9432 §4.1: hash is SHA-1 of the *wire-format* zone
             # name (each label prefixed with its length byte, root null
             # byte at the end).
-            wire = b"".join(
-                bytes([len(label)]) + label.encode("ascii")
-                for label in text.split(".")
-                if label
-            ) + b"\x00"
+            wire = (
+                b"".join(
+                    bytes([len(label)]) + label.encode("ascii")
+                    for label in text.split(".")
+                    if label
+                )
+                + b"\x00"
+            )
             digest = hashlib.sha1(wire).hexdigest()
             text_with_dot = text + "." if text else "."
             lines.append(f"{digest}.zones IN PTR {text_with_dot}")
@@ -430,7 +494,9 @@ class Bind9Driver(DriverBase):
             res = subprocess.run(cmd, capture_output=True, text=True, check=False)
             rndc_ok = res.returncode == 0
             if not rndc_ok:
-                log.warning("rndc_failed_falling_back_to_sighup", stderr=res.stderr.strip())
+                log.warning(
+                    "rndc_failed_falling_back_to_sighup", stderr=res.stderr.strip()
+                )
         if not rndc_ok and self.daemon_pid:
             try:
                 os.kill(self.daemon_pid, signal.SIGHUP)
@@ -459,6 +525,7 @@ class Bind9Driver(DriverBase):
             # Very small parser — supports the one-line key we render above.
             content = tsig_path.read_text()
             import re
+
             m = re.search(r'key\s+"([^"]+)".*?secret\s+"([^"]+)"', content, re.DOTALL)
             if m:
                 keyring = dns.tsigkeyring.from_text({m.group(1): m.group(2)})
@@ -540,9 +607,7 @@ class Bind9Driver(DriverBase):
         # running unprivileged as ``spatium`` (entrypoint dropped privs
         # via su-exec), so don't pass ``-u`` — named would try to
         # setgid() to a different user and fail.
-        self.daemon_pid = subprocess.Popen(
-            ["named", "-f", "-c", str(conf_path)]
-        ).pid
+        self.daemon_pid = subprocess.Popen(["named", "-f", "-c", str(conf_path)]).pid
         log.info("named_started", pid=self.daemon_pid)
 
     def daemon_running(self) -> bool:

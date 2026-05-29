@@ -19,6 +19,7 @@ from app.drivers.dns.base import (
     ServerOptions,
     TrustAnchorData,
     TsigKey,
+    ViewData,
     ZoneData,
 )
 from app.drivers.dns.bind9 import BIND9Driver
@@ -168,6 +169,69 @@ def test_render_server_config_includes_acl_and_forwarders(bundle: ConfigBundle) 
     assert 'zone "example.com."' in out
     # No view wrapping when views=()
     assert 'view "' not in out
+
+
+def test_render_server_config_split_horizon_views() -> None:
+    """Issue #24: the same zone name materialises once per view (with
+    each view's filtered records pre-expanded by the bundle builder),
+    and the driver wraps each copy in its own ``view { … }`` block —
+    the stanza dict is keyed by (view_name, name) so the copies don't
+    collapse."""
+
+    def _z(view_name: str) -> ZoneData:
+        return ZoneData(
+            name="example.com.",
+            zone_type="primary",
+            kind="forward",
+            ttl=3600,
+            refresh=86400,
+            retry=7200,
+            expire=3600000,
+            minimum=3600,
+            primary_ns="ns1.example.com.",
+            admin_email="hostmaster.example.com.",
+            serial=2026041401,
+            records=(),
+            view_name=view_name,
+        )
+
+    b = ConfigBundle(
+        server_id=str(uuid.uuid4()),
+        server_name="ns1",
+        driver="bind9",
+        roles=("authoritative",),
+        options=ServerOptions(),
+        acls=(),
+        views=(
+            ViewData(
+                name="internal",
+                match_clients=("10.0.0.0/8",),
+                match_destinations=(),
+                recursion=True,
+                order=0,
+            ),
+            ViewData(
+                name="external",
+                match_clients=("any",),
+                match_destinations=(),
+                recursion=False,
+                order=1,
+            ),
+        ),
+        zones=(_z("internal"), _z("external")),
+        tsig_keys=(),
+        blocklists=(),
+        generated_at=datetime(2026, 4, 14, 12, 0, tzinfo=UTC),
+    )
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id=b.server_id, name=b.server_name), b.options, bundle=b
+    )
+    assert 'view "internal" {' in out
+    assert 'view "external" {' in out
+    assert "match-clients { 10.0.0.0/8; };" in out
+    # The zone stanza appears inside BOTH view blocks (keyed by
+    # (view_name, name), so neither copy is dropped).
+    assert out.count('zone "example.com."') == 2
 
 
 # ── RPZ rendering ─────────────────────────────────────────────────────────

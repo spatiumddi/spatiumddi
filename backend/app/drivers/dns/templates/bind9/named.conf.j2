@@ -81,14 +81,14 @@ view "{{ view.name }}" {
     recursion {{ "yes" if view.recursion else "no" }};
 {%- for zone in zones %}
 {%- if zone.view_name == view.name %}
-{{ zone_stanzas[zone.name] | indent(4, true) }}
+{{ zone_stanzas[(zone.view_name, zone.name)] | indent(4, true) }}
 {%- endif %}
 {%- endfor %}
 };
 {% endfor %}
 {%- else %}
 {%- for zone in zones %}
-{{ zone_stanzas[zone.name] }}
+{{ zone_stanzas[(zone.view_name, zone.name)] }}
 {%- endfor %}
 {%- endif %}
 

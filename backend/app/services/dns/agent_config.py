@@ -97,6 +97,12 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # Views
     views_res = await db.execute(select(DNSView).where(DNSView.group_id == server.group_id))
     views = views_res.scalars().all()
+    # Split-horizon (issue #24). When the group defines views, every zone is
+    # rendered INSIDE a ``view { match-clients … }`` block and records are
+    # scoped per view (``DNSRecord.view_id``; NULL = shared across all
+    # views). Lower ``order`` first → BIND first-match precedence.
+    has_views = bool(views)
+    ordered_views = sorted(views, key=lambda v: (v.order, v.name))
 
     # ACLs
     acls_res = await db.execute(
@@ -110,9 +116,20 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     zones_res = await db.execute(select(DNSZone).where(DNSZone.group_id == server.group_id))
     zones = zones_res.scalars().all()
 
+    def _rec_dict(r: DNSRecord) -> dict[str, Any]:
+        return {
+            "name": r.name,
+            "type": r.record_type,
+            "ttl": r.ttl,
+            "value": r.value,
+            "priority": r.priority,
+            "weight": r.weight,
+            "port": r.port,
+        }
+
     zone_payload: list[dict[str, Any]] = []
     for z in zones:
-        zp: dict[str, Any] = {
+        base_zp: dict[str, Any] = {
             "id": str(z.id),
             "name": getattr(z, "name", None) or getattr(z, "fqdn", None),
             "type": getattr(z, "zone_type", "primary"),
@@ -125,20 +142,41 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         # historically gated this, but agents need records to render zone
         # files for serving — primary/secondary distinction matters for
         # accepting RFC 2136 updates, not for which server gets the data.
-        rec_res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == z.id))
-        zp["records"] = [
-            {
-                "name": r.name,
-                "type": r.record_type,
-                "ttl": r.ttl,
-                "value": r.value,
-                "priority": r.priority,
-                "weight": r.weight,
-                "port": r.port,
-            }
-            for r in rec_res.scalars().all()
-        ]
-        zone_payload.append(zp)
+        rec_rows = list(
+            (await db.execute(select(DNSRecord).where(DNSRecord.zone_id == z.id))).scalars().all()
+        )
+
+        if not has_views:
+            # Flat render — one zone copy, all records, no view (today's path).
+            zone_payload.append(
+                {**base_zp, "view_name": None, "records": [_rec_dict(r) for r in rec_rows]}
+            )
+            continue
+
+        # Split-horizon expansion (issue #24). The zone materialises in
+        # every view it has content for: each view referenced by a scoped
+        # record PLUS the zone's own pinned ``view_id``. With no explicit
+        # scoping the zone is "global" — rendered into EVERY view with all
+        # records (also fixes the prior gap where a view-group zone with no
+        # ``view_id`` rendered in no view at all). Per view, the record set
+        # is (scoped-to-this-view) ∪ (shared, i.e. ``view_id IS NULL``).
+        record_view_ids = {r.view_id for r in rec_rows if r.view_id is not None}
+        zone_view_ids = {z.view_id} if z.view_id is not None else set()
+        target_view_ids = record_view_ids | zone_view_ids
+        emit_views = (
+            [v for v in ordered_views if v.id in target_view_ids]
+            if target_view_ids
+            else list(ordered_views)
+        )
+        for v in emit_views:
+            recs = (
+                [r for r in rec_rows if r.view_id == v.id or r.view_id is None]
+                if target_view_ids
+                else rec_rows
+            )
+            zone_payload.append(
+                {**base_zp, "view_name": v.name, "records": [_rec_dict(r) for r in recs]}
+            )
 
     # Pending record ops — every agent-based server in the group
     # gets its own queue (one op row per server per record change,
@@ -158,8 +196,33 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # Issue #182: pause pending-op dispatch when the server is in
     # operator-set maintenance mode. Ops accumulate in ``state=pending``
     # and ship as soon as the operator resumes — no work is lost.
+    ops_to_dispatch: list[DNSRecordOp] = []
     if server.maintenance_mode:
-        ops_to_dispatch: list[DNSRecordOp] = []
+        pass
+    elif has_views:
+        # Split-horizon: the incremental RFC 2136 path can't target a
+        # specific view (an nsupdate to loopback lands in whichever view
+        # matches 127.0.0.1, not necessarily the record's view). Records
+        # are folded into the structural fingerprint below so every record
+        # change triggers a full, view-correct re-render instead. Retire any
+        # queued ops as ``applied`` — the bundle the agent is about to render
+        # already reflects them — so they don't pile up in ``pending``.
+        stale_ops = (
+            (
+                await db.execute(
+                    select(DNSRecordOp).where(
+                        DNSRecordOp.server_id == server.id,
+                        DNSRecordOp.state.in_(("pending", "in_flight")),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for op in stale_ops:
+            op.state = "applied"
+        if stale_ops:
+            await db.flush()
     else:
         op_res = await db.execute(
             select(DNSRecordOp)
@@ -233,9 +296,14 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         {
             "id": str(v.id),
             "name": v.name,
-            "match_clients": getattr(v, "match_clients", []),
+            "match_clients": getattr(v, "match_clients", []) or ["any"],
+            "match_destinations": getattr(v, "match_destinations", []) or [],
+            "recursion": bool(getattr(v, "recursion", True)),
+            "order": getattr(v, "order", 0),
         }
-        for v in views
+        # Ordered low→high so the rendered view blocks honour BIND's
+        # first-match-wins precedence (issue #24).
+        for v in ordered_views
     ]
     acls_block = [{"id": str(a.id), "name": a.name} for a in acls]
 
@@ -300,6 +368,10 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
                         "rpz_zone_name": f"spatium-blocklist-{v.name}.rpz.",
                         "entries": _entries_payload(eff_v.entries),
                         "exceptions": sorted(eff_v.exceptions),
+                        # Issue #24 — when views exist, RPZ zones + the
+                        # response-policy directive must live INSIDE the
+                        # owning view block, not at global options scope.
+                        "view_name": v.name,
                     }
                 )
     eff_g = await build_effective_for_group(db, server.group_id)
@@ -309,6 +381,10 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
                 "rpz_zone_name": "spatium-blocklist.rpz.",
                 "entries": _entries_payload(eff_g.entries),
                 "exceptions": sorted(eff_g.exceptions),
+                # Group-level blocklist. With views, it applies to EVERY
+                # view (rendered into each); with no views it's the single
+                # global RPZ as before. ``view_name=None`` marks it global.
+                "view_name": None,
             }
         )
 
@@ -384,7 +460,15 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "views": views_block,
         "acls": acls_block,
         "tsig_keys": tsig_keys,
-        "zones_structural": [{k: v for k, v in z.items() if k != "records"} for z in zone_payload],
+        # Records are normally excluded so a record-only change rides the
+        # incremental RFC 2136 path without a full reload. But under
+        # split-horizon (issue #24) the incremental path can't target a
+        # view, so records are folded in here — any record/view change then
+        # shifts the structural etag and triggers a full, view-correct
+        # re-render. ``view_name`` is always retained either way.
+        "zones_structural": [
+            {k: val for k, val in z.items() if (k != "records" or has_views)} for z in zone_payload
+        ],
         # Blocklists affect named.conf (response-policy block) + RPZ zone
         # files, so a change MUST trigger a daemon reload.
         "blocklists": blocklists_payload,

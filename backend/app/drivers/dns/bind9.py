@@ -113,7 +113,10 @@ class BIND9Driver(DNSDriver):
             server_name = bundle.server_name
             generated_at = bundle.generated_at.isoformat() if bundle.generated_at else ""
 
-        zone_stanzas = {z.name: self.render_zone_config(z) for z in zones}
+        # Key by (view_name, name): under split-horizon (issue #24) the same
+        # zone name appears once per view, so a name-only key would collapse
+        # the copies and drop all but one view's stanza from the preview.
+        zone_stanzas = {(z.view_name, z.name): self.render_zone_config(z) for z in zones}
 
         return tmpl.render(
             server_id=str(server_id),
