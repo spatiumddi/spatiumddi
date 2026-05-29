@@ -45,6 +45,25 @@ export function cidrContains(parent: string, child: string): boolean {
 }
 
 /**
+ * Return true when an IPv4 CIDR sits inside CGNAT space (RFC 6598,
+ * 100.64.0.0/10). Mirrors the backend ``is_cgnat_cidr`` so the
+ * New-Subnet modal can warn the operator live as they type, before
+ * the server round-trip (issue #42). IPv6 / malformed input → false.
+ *
+ * A bare IPv4 with no prefix is coerced to /32 to match the backend
+ * (which parses with ``strict=False``), so e.g. ``100.64.5.5`` warns
+ * just like ``100.64.5.5/32`` does. Leading/trailing whitespace is
+ * trimmed for the same reason.
+ */
+export function isCgnatCidr(cidr: string): boolean {
+  const trimmed = cidr.trim();
+  const normalized = trimmed.includes("/") ? trimmed : `${trimmed}/32`;
+  const c = parseCidr(normalized);
+  if (!c) return false; // not a valid IPv4 CIDR (incl. any IPv6 input)
+  return cidrContains("100.64.0.0/10", normalized);
+}
+
+/**
  * Convert a bare IP address (no prefix) to a BigInt for numeric ordering.
  * Works for both IPv4 ("10.0.0.0") and IPv6 ("2001:db8::1"). Returns 0n
  * for malformed input — callers should only feed strings that came from

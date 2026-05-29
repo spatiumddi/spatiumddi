@@ -1829,6 +1829,12 @@ class SubnetResponse(BaseModel):
     # ranges (issue #126 Phase 2). Operator-readable; not
     # operator-settable.
     kind: str = "unicast"
+    # Auto-derived (issue #42): True when ``network`` sits inside
+    # CGNAT space (RFC 6598, ``100.64.0.0/10``). Operator-readable,
+    # NOT operator-settable — computed from the CIDR, no column. Drives
+    # the "CGNAT" badge so operators don't mistake carrier-grade NAT /
+    # Tailscale-overlay space for a normal on-prem LAN.
+    is_cgnat: bool = False
     vlan_id: int | None
     vxlan_id: int | None
     vlan_ref_id: uuid.UUID | None = None
@@ -1874,6 +1880,16 @@ class SubnetResponse(BaseModel):
     @classmethod
     def coerce_inet(cls, v: Any) -> Any:
         return str(v) if v is not None else v
+
+    @model_validator(mode="after")
+    def _derive_is_cgnat(self) -> "SubnetResponse":
+        # Computed from the (already-coerced) network CIDR regardless of
+        # input shape, so the ``_attach_vlan`` dict path and the plain
+        # ORM path both get a correct value. See issue #42.
+        from app.services.ipam.classify import is_cgnat_cidr
+
+        self.is_cgnat = is_cgnat_cidr(self.network)
+        return self
 
     @model_validator(mode="before")
     @classmethod

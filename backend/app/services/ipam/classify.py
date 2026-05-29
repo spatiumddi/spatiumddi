@@ -17,10 +17,13 @@ from typing import Final
 # non-private — but for split-horizon-publishing safety it's the same
 # class as RFC 1918: not routed on the public internet, so publishing
 # it through a public-facing resolver is a misconfiguration.
-_CGNAT_V4: Final = ipaddress.ip_network("100.64.0.0/10")
+# Constructed via the concrete IPv4Network (not ``ip_network``, which
+# infers the IPv4|IPv6 union) so ``subnet_of`` in ``is_cgnat_cidr``
+# type-checks against a definite IPv4Network arg.
+_CGNAT_V4: Final = ipaddress.IPv4Network("100.64.0.0/10")
 
 # Unique-Local Addresses (RFC 4193). Not on the public internet.
-_ULA_V6: Final = ipaddress.ip_network("fc00::/7")
+_ULA_V6: Final = ipaddress.IPv6Network("fc00::/7")
 
 
 def is_private_ip(value: str) -> bool:
@@ -52,4 +55,30 @@ def is_private_ip(value: str) -> bool:
     return False
 
 
-__all__ = ["is_private_ip"]
+def is_cgnat_cidr(value: str) -> bool:
+    """Return True when a network (CIDR) sits inside CGNAT space
+    (RFC 6598, ``100.64.0.0/10``).
+
+    Operator-facing classification only (issue #42): drives the
+    "CGNAT" subnet badge + the New-Subnet advisory hint. CGNAT is the
+    one reserved IPv4 range that's actively *allocated* by overlays
+    (Tailscale carves ``100.64.0.0/10`` per-tenant), so operators who
+    reach for it as a normal on-prem LAN hit silent overlap pain —
+    surfacing it is a footgun-preventer.
+
+    A leaf subnet is "CGNAT" when its whole CIDR is contained in
+    ``100.64.0.0/10``. Supernets that merely *overlap* (e.g. a
+    hypothetical ``100.0.0.0/8``) are not flagged — real managed
+    subnets are leaves well inside the range. IPv6 always returns
+    False (CGNAT is an IPv4-only concept).
+    """
+    try:
+        net = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return False
+    if not isinstance(net, ipaddress.IPv4Network):
+        return False
+    return net.subnet_of(_CGNAT_V4)
+
+
+__all__ = ["is_private_ip", "is_cgnat_cidr"]

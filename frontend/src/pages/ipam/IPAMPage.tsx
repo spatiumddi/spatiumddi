@@ -119,7 +119,7 @@ import {
   MergeSubnetSiblingPicker,
   SplitSubnetModal,
 } from "./SubnetOpsModals";
-import { cidrContains, compareNetwork } from "@/lib/cidr";
+import { cidrContains, compareNetwork, isCgnatCidr } from "@/lib/cidr";
 import { FreeSpaceBand } from "@/components/ipam/FreeSpaceBand";
 import { PlanAllocationModal } from "@/components/ipam/PlanAllocationModal";
 import { AggregationCandidatesBadge } from "@/components/ipam/AggregationSuggestions";
@@ -2040,6 +2040,14 @@ function CreateSubnetModal({
               placeholder="e.g. 10.0.1.0/24 or 2001:db8:1::/64"
               autoFocus
             />
+            {isCgnatCidr(network) && (
+              <p className="mt-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-300">
+                This is RFC 6598 carrier-grade NAT space (100.64.0.0/10).
+                Overlays like Tailscale allocate it per-tenant — double-check
+                before using it for a normal on-prem LAN, or you may hit silent
+                overlap with an overlay route.
+              </p>
+            )}
           </Field>
         ) : (
           <div className="space-y-2">
@@ -3911,6 +3919,14 @@ function SubnetDetail({
               title="Multicast subnet — addresses are stream identities, managed under /network/multicast"
             >
               multicast
+            </span>
+          )}
+          {subnet.is_cgnat && (
+            <span
+              className="inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium uppercase tracking-wider bg-amber-100 text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+              title="CGNAT space (RFC 6598, 100.64.0.0/10) — carrier-grade NAT, also the range overlays like Tailscale allocate. Not publicly routable; double-check before using for a normal on-prem LAN."
+            >
+              CGNAT
             </span>
           )}
           {subnet.name && (
