@@ -370,6 +370,69 @@ async def find_subnet_reconciliation(
     return await build_reconciliation_report(db, subnet, stale_minutes=stale)
 
 
+# ── find_stale_ips ─────────────────────────────────────────────────────
+
+
+class FindStaleIPsArgs(BaseModel):
+    stale_days: int = Field(
+        default=90,
+        description="Allocated IPs not seen on the wire in this many days count as stale. Default 90.",
+    )
+    include_never_seen: bool = Field(
+        default=False,
+        description=(
+            "Also include allocated IPs that were never seen on the wire "
+            "(often in subnets where discovery was never enabled). Off by default."
+        ),
+    )
+    space_id: str | None = Field(
+        default=None, description="Optional IP-space UUID to scope the report to."
+    )
+    subnet_id: str | None = Field(
+        default=None, description="Optional subnet UUID to scope the report to."
+    )
+    limit: int = Field(default=100, description="Max rows to return (1–500). Default 100.")
+
+
+@register_tool(
+    name="find_stale_ips",
+    description=(
+        "Address-space hygiene report (issue #45): allocated IPs that "
+        "nothing has seen on the wire in N days (default 90), drawn from "
+        "the discovery last-seen signal. Use when the operator asks "
+        "'what's stale?', 'which IPs can I reclaim?', 'what allocations "
+        "are dead?', or 'find addresses to clean up'. Read-only — to "
+        "actually deprecate, point the operator at the Stale-IP report's "
+        "bulk-deprecate action. Optionally scope by space or subnet."
+    ),
+    args_model=FindStaleIPsArgs,
+    category="ipam",
+)
+async def find_stale_ips(db: AsyncSession, user: User, args: FindStaleIPsArgs) -> dict[str, Any]:
+    from app.services.ipam.stale_ips import build_stale_ip_report
+
+    space_uuid: uuid.UUID | None = None
+    subnet_uuid: uuid.UUID | None = None
+    if args.space_id:
+        try:
+            space_uuid = uuid.UUID(args.space_id)
+        except (ValueError, TypeError):
+            return {"error": "space_id must be a UUID", "space_id": args.space_id}
+    if args.subnet_id:
+        try:
+            subnet_uuid = uuid.UUID(args.subnet_id)
+        except (ValueError, TypeError):
+            return {"error": "subnet_id must be a UUID", "subnet_id": args.subnet_id}
+    return await build_stale_ip_report(
+        db,
+        stale_days=max(1, min(args.stale_days, 3650)),
+        include_never_seen=args.include_never_seen,
+        space_id=space_uuid,
+        subnet_id=subnet_uuid,
+        limit=max(1, min(args.limit, 500)),
+    )
+
+
 # ── find_ip ───────────────────────────────────────────────────────────
 
 

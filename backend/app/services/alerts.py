@@ -91,6 +91,13 @@ RULE_TYPE_VOICE_LEASE_COUNT_BELOW = "voice_lease_count_below"
 # critical as expiry approaches. Default threshold 30 d.
 RULE_TYPE_K3S_API_CERT_EXPIRING = "k3s_api_cert_expiring"
 
+# Address-space hygiene — issue #45. Fires when a subnet holds more than
+# ``threshold_percent`` (re-used as a raw count) allocated IPs whose
+# ``last_seen_at`` is older than ``threshold_days`` (default 90). The
+# companion to the Stale-IP report: the report is the operator-driven
+# drilldown, this is the passive "your hygiene is slipping" feed.
+RULE_TYPE_STALE_IP_COUNT = "stale_ip_count"
+
 RULE_TYPES = frozenset(
     {
         RULE_TYPE_SUBNET_UTILIZATION,
@@ -111,8 +118,13 @@ RULE_TYPES = frozenset(
         RULE_TYPE_AUDIT_CHAIN_BROKEN,
         RULE_TYPE_VOICE_LEASE_COUNT_BELOW,
         RULE_TYPE_K3S_API_CERT_EXPIRING,
+        RULE_TYPE_STALE_IP_COUNT,
     }
 )
+
+# Default stale-IP alert params when the rule doesn't pin them.
+_STALE_IP_DEFAULT_COUNT_THRESHOLD = 10
+_STALE_IP_DEFAULT_DAYS = 90
 
 # Compliance-change rule constants. Keep in lock-step with the
 # Subnet model in ``backend/app/models/ipam.py`` — only flags that
@@ -281,6 +293,51 @@ async def _matching_voice_lease_count_below_subjects(
         message = (
             f"Voice subnet {display} has {int(count or 0)} active lease(s) "
             f"(threshold {threshold}) — possible mass-disconnect event"
+        )
+        matches.append((str(s.id), display, message))
+    return matches
+
+
+async def _matching_stale_ip_count_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """Subnets holding ≥ ``threshold_percent`` (raw count) allocated IPs
+    whose ``last_seen_at`` is older than ``threshold_days`` (default 90).
+
+    Reads the same discovery (#23) liveness signal the Stale-IP report
+    uses. ``include_never_seen`` is intentionally off for the alert —
+    never-seen rows are noisy (often in discovery-disabled subnets), so
+    the alert fires only on the high-confidence "seen, then went dark"
+    signal. Operators chase the full list, including never-seen, from the
+    report page.
+    """
+    from app.services.ipam.stale_ips import count_stale_per_subnet
+
+    threshold = (
+        int(rule.threshold_percent)
+        if rule.threshold_percent is not None
+        else _STALE_IP_DEFAULT_COUNT_THRESHOLD
+    )
+    stale_days = (
+        int(rule.threshold_days) if rule.threshold_days is not None else _STALE_IP_DEFAULT_DAYS
+    )
+    counts = await count_stale_per_subnet(db, stale_days=stale_days, include_never_seen=False)
+    over = {sid: n for sid, n in counts.items() if n >= max(1, threshold)}
+    if not over:
+        return []
+
+    subnets = list(
+        (await db.execute(select(Subnet).where(Subnet.id.in_(over.keys())))).scalars().all()
+    )
+    matches: list[tuple[str, str, str]] = []
+    for s in subnets:
+        n = over[s.id]
+        display = f"{s.network}" + (f" — {s.name}" if s.name else "")
+        message = (
+            f"Subnet {display} has {n} stale allocated IP(s) not seen on the "
+            f"wire in {stale_days}+ days (threshold {threshold}) — review for "
+            f"deprecation from the Stale-IP report"
         )
         matches.append((str(s.id), display, message))
     return matches
@@ -1491,6 +1548,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 subject_type = "subnet"
             elif rule.rule_type == RULE_TYPE_VOICE_LEASE_COUNT_BELOW:
                 base = await _matching_voice_lease_count_below_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "subnet"
+            elif rule.rule_type == RULE_TYPE_STALE_IP_COUNT:
+                base = await _matching_stale_ip_count_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "subnet"
             elif rule.rule_type == RULE_TYPE_SERVER_UNREACHABLE:

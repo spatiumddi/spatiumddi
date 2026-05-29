@@ -3716,6 +3716,152 @@ async def trigger_subnet_discovery(subnet_id: uuid.UUID, current_user: CurrentUs
     return {"status": "queued" if queued else "enqueue_failed", "subnet_id": str(subnet_id)}
 
 
+# ── Stale-IP report + one-click bulk-deprecate (issue #45) ──────────────────
+# Cross-subnet hygiene view over the discovery (#23) ``last_seen_at`` signal:
+# which allocated IPs has nothing seen on the wire in N days? The deprecate
+# action flips them to ``deprecated`` (reversible — the operator can re-edit
+# any row back), stamping ``user_modified_at`` so a later sweep won't undo it.
+
+
+@router.get("/reports/stale-ips")
+async def get_stale_ip_report(
+    current_user: CurrentUser,
+    db: DB,
+    stale_days: int = Query(90, ge=1, le=3650),
+    include_never_seen: bool = Query(False),
+    space_id: uuid.UUID | None = Query(None),
+    block_id: uuid.UUID | None = Query(None),
+    subnet_id: uuid.UUID | None = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """Allocated IPs nothing has seen in ``stale_days`` days (issue #45).
+
+    Optional ``space_id`` / ``block_id`` / ``subnet_id`` scope the report.
+    ``include_never_seen`` folds in allocated rows that were never seen on
+    the wire (off by default — those are often in subnets where discovery
+    was never enabled). See docs/features/IPAM.md §9.
+    """
+    from app.services.ipam.stale_ips import build_stale_ip_report
+
+    return await build_stale_ip_report(
+        db,
+        stale_days=stale_days,
+        include_never_seen=include_never_seen,
+        space_id=space_id,
+        block_id=block_id,
+        subnet_id=subnet_id,
+        limit=limit,
+        offset=offset,
+    )
+
+
+class StaleIPDeprecateRequest(BaseModel):
+    # Either deprecate a hand-picked set (``ip_ids`` — the rows the operator
+    # ticked) or every row the current filter selects (``all_matching`` —
+    # reuses the same filter params the report endpoint takes).
+    ip_ids: list[uuid.UUID] | None = None
+    all_matching: bool = False
+    stale_days: int = 90
+    include_never_seen: bool = False
+    space_id: uuid.UUID | None = None
+    block_id: uuid.UUID | None = None
+    subnet_id: uuid.UUID | None = None
+
+
+class StaleIPDeprecateResponse(BaseModel):
+    batch_id: uuid.UUID
+    deprecated_count: int
+    skipped: list[uuid.UUID] = []
+    # True when ``all_matching`` hit the server-side cap — the operator
+    # should re-run to sweep the remainder.
+    capped: bool = False
+
+
+@router.post("/reports/stale-ips/deprecate", response_model=StaleIPDeprecateResponse)
+async def deprecate_stale_ips(
+    body: StaleIPDeprecateRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> StaleIPDeprecateResponse:
+    """One-click bulk-deprecate of stale allocated IPs (issue #45).
+
+    Provide ``ip_ids`` to deprecate a hand-picked set, or
+    ``all_matching=true`` to deprecate every IP the report filter selects
+    (capped at ``MAX_BULK_DEPRECATE``). Only genuinely ``allocated`` rows
+    are touched; system placeholders and DHCP-lease mirrors are skipped
+    even if an id slips through a stale client-side selection. Each row's
+    status flips to ``deprecated`` and ``user_modified_at`` is stamped so a
+    later discovery / integration sweep won't silently un-deprecate it.
+    """
+    from app.services.ipam.stale_ips import MAX_BULK_DEPRECATE, select_stale_ip_ids
+
+    capped = False
+    if body.all_matching:
+        ids = await select_stale_ip_ids(
+            db,
+            stale_days=max(1, min(body.stale_days, 3650)),
+            include_never_seen=body.include_never_seen,
+            space_id=body.space_id,
+            block_id=body.block_id,
+            subnet_id=body.subnet_id,
+        )
+        capped = len(ids) >= MAX_BULK_DEPRECATE
+    else:
+        ids = list(body.ip_ids or [])
+    if not ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Provide ip_ids or set all_matching=true with a filter that matches rows",
+        )
+
+    batch_id = uuid.uuid4()
+    rows = list((await db.execute(select(IPAddress).where(IPAddress.id.in_(ids)))).scalars().all())
+    deprecated = 0
+    skipped: list[uuid.UUID] = []
+    now = datetime.now(UTC)
+    for ip in rows:
+        if ip.status != "allocated" or ip.auto_from_lease:
+            skipped.append(ip.id)
+            continue
+        old_status = ip.status
+        ip.status = "deprecated"
+        ip.user_modified_at = now
+        db.add(
+            _audit(
+                current_user,
+                "update",
+                "ip_address",
+                str(ip.id),
+                str(ip.address),
+                old_value={"status": old_status},
+                new_value={
+                    "status": "deprecated",
+                    "reason": "stale_ip_deprecate",
+                    "batch_id": str(batch_id),
+                },
+            )
+        )
+        deprecated += 1
+
+    await db.commit()
+    logger.info(
+        "stale_ip_bulk_deprecate",
+        user=current_user.username,
+        batch_id=str(batch_id),
+        deprecated=deprecated,
+        skipped=len(skipped),
+        all_matching=body.all_matching,
+        capped=capped,
+    )
+    return StaleIPDeprecateResponse(
+        batch_id=batch_id,
+        deprecated_count=deprecated,
+        skipped=skipped,
+        capped=capped,
+    )
+
+
 @router.get("/subnets/{subnet_id}/effective-dns", response_model=EffectiveDnsResponse)
 async def get_effective_subnet_dns(
     subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
