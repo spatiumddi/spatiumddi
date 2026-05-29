@@ -67,6 +67,10 @@ class SettingsResponse(BaseModel):
     dns_auto_sync_interval_minutes: int
     dns_auto_sync_delete_stale: bool
     dns_auto_sync_last_run_at: datetime | None
+    reverse_dns_enabled: bool
+    reverse_dns_interval_minutes: int
+    reverse_dns_resolvers: list[str] | None
+    reverse_dns_last_run_at: datetime | None
     dns_pull_from_server_enabled: bool
     dns_pull_from_server_interval_minutes: int
     dns_pull_from_server_last_run_at: datetime | None
@@ -320,6 +324,9 @@ class SettingsUpdate(BaseModel):
     dns_auto_sync_enabled: bool | None = None
     dns_auto_sync_interval_minutes: int | None = None
     dns_auto_sync_delete_stale: bool | None = None
+    reverse_dns_enabled: bool | None = None
+    reverse_dns_interval_minutes: int | None = None
+    reverse_dns_resolvers: list[str] | None = None
     dns_pull_from_server_enabled: bool | None = None
     dns_pull_from_server_interval_minutes: int | None = None
     dhcp_pull_leases_enabled: bool | None = None
@@ -464,6 +471,7 @@ class SettingsUpdate(BaseModel):
     @field_validator(
         "dns_auto_sync_interval_minutes",
         "dns_pull_from_server_interval_minutes",
+        "reverse_dns_interval_minutes",
         "oui_update_interval_hours",
     )
     @classmethod
@@ -471,6 +479,25 @@ class SettingsUpdate(BaseModel):
         if v is not None and v < 1:
             raise ValueError("Must be >= 1")
         return v
+
+    @field_validator("reverse_dns_resolvers")
+    @classmethod
+    def validate_resolvers(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        import ipaddress
+
+        cleaned: list[str] = []
+        for entry in v:
+            host = (entry or "").strip()
+            if not host:
+                continue
+            try:
+                ipaddress.ip_address(host)
+            except ValueError as exc:
+                raise ValueError(f"Invalid resolver IP: {entry!r}") from exc
+            cleaned.append(host)
+        return cleaned
 
     @field_validator("asn_whois_interval_hours", "rpki_roa_refresh_interval_hours")
     @classmethod
@@ -762,6 +789,54 @@ async def update_settings(
     await db.refresh(settings)
     logger.info("platform_settings_updated", user=current_user.username, changes=changes)
     return settings
+
+
+class ReverseDnsRunResponse(BaseModel):
+    status: str  # "queued" | "enqueue_failed"
+    task_id: str | None = None
+
+
+@router.post("/reverse-dns/run", response_model=ReverseDnsRunResponse)
+async def trigger_reverse_dns_run(current_user: CurrentUser, db: DB) -> ReverseDnsRunResponse:
+    """Queue an on-demand reverse-DNS sweep (issue #41).
+
+    Runs the same ``sweep_reverse_dns`` task the beat dispatcher uses, with
+    ``force=True`` so it bypasses the enabled-gate + per-run interval — an
+    operator can sweep on demand even with the scheduled sweep off.
+    """
+    forbid_in_demo_mode("Reverse-DNS sweep is disabled")
+    if not user_has_permission(current_user, "write", "settings"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: need 'write' on 'settings'",
+        )
+
+    from app.models.audit import AuditLog
+
+    task_id: str | None = None
+    try:
+        from app.tasks.reverse_dns import sweep_reverse_dns
+
+        result = sweep_reverse_dns.delay(force=True)
+        task_id = result.id
+    except Exception as exc:  # noqa: BLE001 — broker unreachable; report, don't 500
+        logger.warning("reverse_dns_trigger_enqueue_failed", error=str(exc))
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="reverse-dns",
+            resource_type="platform",
+            resource_id="1",
+            resource_display="reverse-dns-run",
+            result="success" if task_id else "error",
+            error_detail=None if task_id else "task broker unreachable",
+        )
+    )
+    await db.commit()
+    return ReverseDnsRunResponse(status="queued" if task_id else "enqueue_failed", task_id=task_id)
 
 
 # ── OUI vendor database ───────────────────────────────────────────────────────

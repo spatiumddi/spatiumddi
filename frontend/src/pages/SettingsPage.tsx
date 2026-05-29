@@ -51,6 +51,7 @@ type SectionId =
   | "branding"
   | "dns"
   | "dns-auto-sync"
+  | "reverse-dns"
   | "dns-pull-from-server"
   | "dhcp"
   | "dhcp-lease-sync"
@@ -114,6 +115,11 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
     "dns_auto_sync_enabled",
     "dns_auto_sync_interval_minutes",
     "dns_auto_sync_delete_stale",
+  ],
+  "reverse-dns": [
+    "reverse_dns_enabled",
+    "reverse_dns_interval_minutes",
+    "reverse_dns_resolvers",
   ],
   "dns-pull-from-server": [
     "dns_pull_from_server_enabled",
@@ -811,6 +817,24 @@ const SECTIONS: SectionDef[] = [
     ],
   },
   {
+    id: "reverse-dns",
+    title: "Reverse DNS (PTR)",
+    group: "IPAM",
+    description:
+      "Periodically PTR-resolve IP rows that have no hostname and fill in the name from reverse DNS. Hostname gets the short label; the full FQDN goes in the description (only when it's blank). Skips integration-owned rows whose name is authoritative upstream. Opt-in — off by default.",
+    keywords: [
+      "reverse",
+      "ptr",
+      "dns",
+      "hostname",
+      "resolve",
+      "lookup",
+      "auto",
+      "populate",
+      "rdns",
+    ],
+  },
+  {
     id: "dns-pull-from-server",
     title: "Zone ↔ Server Reconciliation",
     group: "DNS",
@@ -969,6 +993,21 @@ export function SettingsPage() {
       setForm({});
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
+    },
+  });
+
+  // Issue #41 — on-demand reverse-DNS sweep ("Run now"). Independent of
+  // the save flow; reports a transient queued/failed status.
+  const [rdnsRun, setRdnsRun] = useState<"idle" | "queued" | "error">("idle");
+  const runReverseDns = useMutation({
+    mutationFn: () => settingsApi.runReverseDns(),
+    onSuccess: (res) => {
+      setRdnsRun(res.status === "queued" ? "queued" : "error");
+      setTimeout(() => setRdnsRun("idle"), 4000);
+    },
+    onError: () => {
+      setRdnsRun("error");
+      setTimeout(() => setRdnsRun("idle"), 4000);
     },
   });
 
@@ -1321,6 +1360,95 @@ export function SettingsPage() {
                         ).toLocaleString()
                       : "never"}
                   </span>
+                </Field>
+              </>
+            )}
+
+            {activeId === "reverse-dns" && (
+              <>
+                <Field
+                  label="Enable Reverse-DNS"
+                  description="Periodically PTR-resolve IP rows with no hostname and fill the name from reverse DNS. Only allocated / reserved / static_dhcp / discovered rows are resolved; integration-owned rows (Docker / Kubernetes / Proxmox / Tailscale / UniFi / DHCP leases) are skipped since their name is authoritative upstream."
+                >
+                  <Toggle
+                    checked={!!values.reverse_dns_enabled}
+                    onChange={(v) => set("reverse_dns_enabled", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                <Field
+                  label="Sweep Interval"
+                  description="How often the reverse-DNS sweep runs."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      value={values.reverse_dns_interval_minutes ?? 360}
+                      onChange={(e) =>
+                        set(
+                          "reverse_dns_interval_minutes",
+                          Number(e.target.value),
+                        )
+                      }
+                      disabled={!isSuperadmin || !values.reverse_dns_enabled}
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">min</span>
+                  </div>
+                </Field>
+                <Field
+                  label="Resolvers"
+                  description="Comma-separated resolver IPs to query for PTR records. Leave blank to use the worker's system resolvers."
+                >
+                  <input
+                    type="text"
+                    value={(values.reverse_dns_resolvers ?? []).join(", ")}
+                    onChange={(e) =>
+                      set(
+                        "reverse_dns_resolvers",
+                        e.target.value
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                      )
+                    }
+                    placeholder="10.0.0.53, 1.1.1.1 (blank = system)"
+                    disabled={!isSuperadmin || !values.reverse_dns_enabled}
+                    className={inputCls}
+                  />
+                </Field>
+                <Field
+                  label="Last Run"
+                  description="Timestamp of the most recent reverse-DNS sweep."
+                >
+                  <div className="flex items-center gap-3">
+                    <span className="rounded bg-muted px-2 py-1 text-xs font-mono text-muted-foreground">
+                      {values.reverse_dns_last_run_at
+                        ? new Date(
+                            values.reverse_dns_last_run_at,
+                          ).toLocaleString()
+                        : "never"}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => runReverseDns.mutate()}
+                      disabled={!isSuperadmin || runReverseDns.isPending}
+                      className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+                    >
+                      {runReverseDns.isPending ? "Queuing…" : "Run now"}
+                    </button>
+                    {rdnsRun === "queued" && (
+                      <span className="text-xs text-emerald-600 dark:text-emerald-400">
+                        Sweep queued
+                      </span>
+                    )}
+                    {rdnsRun === "error" && (
+                      <span className="text-xs text-destructive">
+                        Could not queue — broker unreachable?
+                      </span>
+                    )}
+                  </div>
                 </Field>
               </>
             )}

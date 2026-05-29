@@ -144,6 +144,24 @@ class PlatformSettings(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Reverse-DNS (PTR) auto-population — issue #41. Beat fires every 60s;
+    # the task gates on ``reverse_dns_enabled`` + the per-run interval so
+    # cadence changes in the UI take effect without restarting beat. The
+    # sweep fills ``IPAddress.hostname`` (short label) + ``description``
+    # (full PTR FQDN, only when description is empty) for operator-owned
+    # rows whose hostname is NULL. ``reverse_dns_resolvers`` is a list of
+    # resolver IPs to query; NULL / empty = the worker's system resolvers.
+    reverse_dns_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    reverse_dns_interval_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=360, server_default="360"
+    )
+    reverse_dns_resolvers: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    reverse_dns_last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # Scheduled "pull from authoritative server" (AXFR → additive import).
     # Complements the IPAM→DNS push direction above; together they keep
     # SpatiumDDI's DB in sync with both its own intent (IPAM) and the live

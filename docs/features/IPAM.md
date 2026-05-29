@@ -354,6 +354,34 @@ IPs older than `threshold_days` (default 90). It reads the same signal
 but excludes never-seen rows so the passive feed stays high-confidence;
 operators chase the full list, including never-seen, from the report.
 
+### Reverse-DNS auto-population (issue #41)
+
+A scheduled, platform-opt-in sweep that names IP rows from reverse DNS.
+The reverse-DNS beat task (every 60 s, gated on `reverse_dns_enabled` +
+`reverse_dns_interval_minutes`) finds rows where `hostname IS NULL`,
+issues a PTR lookup against the configured resolvers, and fills:
+
+- `hostname` ← the **short, leftmost label** of the PTR FQDN
+  (`server01` from `server01.corp.example.com`);
+- `description` ← the **full PTR FQDN**, but **only when the description
+  is currently empty** so an operator's note is never clobbered. (The
+  dedicated `fqdn` column is intentionally left to the forward-DNS sync,
+  which derives it from the assigned zone.)
+
+Candidate rows are `allocated` / `reserved` / `static_dhcp` /
+`discovered` only. Rows whose hostname is authoritative from an upstream
+integration are skipped — anything carrying an integration provenance FK
+(Docker / Kubernetes / Proxmox / Tailscale / UniFi) or `auto_from_lease`
+(a DHCP lease mirror). `discovered` rows *are* included because
+ping/ARP/nmap discovery (#23) never provides a hostname. The sweep only
+ever touches `hostname IS NULL` rows, so it never overwrites a name.
+
+Configured under **Settings → IPAM → Reverse DNS (PTR)**: enable toggle,
+sweep interval, and a comma-separated resolver list (blank = the
+worker's system resolvers). A **Run now** button queues an on-demand
+sweep (`POST /api/v1/settings/reverse-dns/run`) that bypasses the
+enabled-gate + interval. Each sweep writes one summary audit row.
+
 ---
 
 ## 9. Utilization Tracking
