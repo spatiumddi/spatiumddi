@@ -3796,17 +3796,25 @@ async def deprecate_stale_ips(
     """
     from app.services.ipam.stale_ips import MAX_BULK_DEPRECATE, select_stale_ip_ids
 
+    stale_days = max(1, min(body.stale_days, 3650))
+    now = datetime.now(UTC)
+    stale_cutoff = now - timedelta(days=stale_days)
+
     capped = False
     if body.all_matching:
+        # Fetch one past the cap so "exactly at cap, no remainder" doesn't
+        # read as capped — a false "re-run to finish" prompt otherwise.
         ids = await select_stale_ip_ids(
             db,
-            stale_days=max(1, min(body.stale_days, 3650)),
+            stale_days=stale_days,
             include_never_seen=body.include_never_seen,
             space_id=body.space_id,
             block_id=body.block_id,
             subnet_id=body.subnet_id,
+            cap=MAX_BULK_DEPRECATE + 1,
         )
-        capped = len(ids) >= MAX_BULK_DEPRECATE
+        capped = len(ids) > MAX_BULK_DEPRECATE
+        ids = ids[:MAX_BULK_DEPRECATE]
     else:
         ids = list(body.ip_ids or [])
     if not ids:
@@ -3819,9 +3827,17 @@ async def deprecate_stale_ips(
     rows = list((await db.execute(select(IPAddress).where(IPAddress.id.in_(ids)))).scalars().all())
     deprecated = 0
     skipped: list[uuid.UUID] = []
-    now = datetime.now(UTC)
     for ip in rows:
         if ip.status != "allocated" or ip.auto_from_lease:
+            skipped.append(ip.id)
+            continue
+        # Re-check staleness against the request's window so a row that came
+        # back to life after the report page loaded isn't deprecated out from
+        # under a live host. The all_matching path already filtered on this,
+        # so the re-check is a no-op there and the real guard for explicit
+        # ip_ids (the frontend passes the filter it showed the operator).
+        is_stale = ip.last_seen_at is not None and ip.last_seen_at < stale_cutoff
+        if not is_stale and not (body.include_never_seen and ip.last_seen_at is None):
             skipped.append(ip.id)
             continue
         old_status = ip.status

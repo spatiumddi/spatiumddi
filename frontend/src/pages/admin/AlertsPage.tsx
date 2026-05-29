@@ -26,6 +26,21 @@ import { AskAIButton } from "@/components/copilot/AskAIButton";
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
+// Per-rule-type sensible starting values, seeded when the operator picks a
+// type in the New-rule modal. Without this, switching to e.g. stale_ip_count
+// would inherit subnet_utilization's 90 / 30 and create a 90-count / 30-day
+// rule that contradicts the documented 10 / 90 semantics.
+const RULE_TYPE_PARAM_DEFAULTS: Partial<
+  Record<AlertRuleType, { threshold?: number; thresholdDays?: number }>
+> = {
+  subnet_utilization: { threshold: 90 },
+  voice_lease_count_below: { threshold: 10 },
+  stale_ip_count: { threshold: 10, thresholdDays: 90 },
+  domain_expiring: { thresholdDays: 30 },
+  circuit_term_expiring: { thresholdDays: 30 },
+  service_term_expiring: { thresholdDays: 30 },
+};
+
 function Field({
   label,
   hint,
@@ -161,7 +176,14 @@ function RuleEditorModal({
             <select
               className={inputCls}
               value={ruleType}
-              onChange={(e) => setRuleType(e.target.value as AlertRuleType)}
+              onChange={(e) => {
+                const next = e.target.value as AlertRuleType;
+                setRuleType(next);
+                const d = RULE_TYPE_PARAM_DEFAULTS[next];
+                if (d?.threshold !== undefined) setThreshold(d.threshold);
+                if (d?.thresholdDays !== undefined)
+                  setThresholdDays(d.thresholdDays);
+              }}
             >
               <optgroup label="Infrastructure">
                 <option value="subnet_utilization">Subnet utilization</option>

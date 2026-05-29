@@ -213,6 +213,35 @@ async def test_endpoint_deprecate_requires_target(
     assert r.status_code == 422
 
 
+async def test_endpoint_deprecate_explicit_id_rechecks_staleness(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # A row that went live after the report loaded (fresh last_seen) must be
+    # skipped even when its id is posted explicitly — the server re-checks
+    # against the request's window rather than trusting the client selection.
+    _, token = await _make_user(db_session)
+    h = {"Authorization": f"Bearer {token}"}
+    subnet = await _make_subnet(db_session)
+    stale = IPAddress(
+        subnet_id=subnet.id, address="192.0.2.10", status="allocated", last_seen_at=STALE
+    )
+    fresh = IPAddress(
+        subnet_id=subnet.id, address="192.0.2.11", status="allocated", last_seen_at=FRESH
+    )
+    db_session.add_all([stale, fresh])
+    await db_session.commit()
+
+    r = await client.post(
+        "/api/v1/ipam/reports/stale-ips/deprecate",
+        headers=h,
+        json={"ip_ids": [str(stale.id), str(fresh.id)], "stale_days": 90},
+    )
+    assert r.status_code == 200, r.text
+    res = r.json()
+    assert res["deprecated_count"] == 1
+    assert str(fresh.id) in res["skipped"]
+
+
 # ── Alert rule ─────────────────────────────────────────────────────────
 
 

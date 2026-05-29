@@ -6,6 +6,7 @@ import { History, RefreshCw, Trash2 } from "lucide-react";
 import {
   ipamApi,
   type StaleIPDeprecateRequest,
+  type StaleIPDeprecateResponse,
   type StaleIPEntry,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -15,6 +16,10 @@ import { humanTime } from "@/pages/network/_shared";
 import { cn } from "@/lib/utils";
 
 const PAGE_SIZE = 200;
+// Mirrors MAX_BULK_DEPRECATE on the backend — one "Deprecate all" call
+// processes at most this many rows, then reports ``capped`` so the
+// operator knows to run it again for the remainder.
+const BULK_CAP = 5000;
 
 const inputCls =
   "rounded-md border bg-background px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring";
@@ -38,6 +43,11 @@ export function StaleIPReportPage() {
   const [pending, setPending] = useState<
     { kind: "selected"; ids: string[] } | { kind: "all"; count: number } | null
   >(null);
+  // Result of the last deprecate — surfaces the server's ``capped`` flag
+  // (``all_matching`` only processes MAX_BULK_DEPRECATE rows per call).
+  const [lastResult, setLastResult] = useState<StaleIPDeprecateResponse | null>(
+    null,
+  );
 
   const params = useMemo(
     () => ({
@@ -63,9 +73,10 @@ export function StaleIPReportPage() {
   const deprecate = useMutation({
     mutationFn: (body: StaleIPDeprecateRequest) =>
       ipamApi.deprecateStaleIPs(body),
-    onSuccess: () => {
+    onSuccess: (res) => {
       setSelected(new Set());
       setPending(null);
+      setLastResult(res);
       qc.invalidateQueries({ queryKey: ["stale-ips"] });
     },
   });
@@ -96,7 +107,14 @@ export function StaleIPReportPage() {
   const confirmDeprecate = () => {
     if (!pending) return;
     if (pending.kind === "selected") {
-      deprecate.mutate({ ip_ids: pending.ids });
+      // Pass the current filter so the server re-checks each row against the
+      // same window the operator saw — a row that went live after the page
+      // loaded is skipped rather than wrongly deprecated.
+      deprecate.mutate({
+        ip_ids: pending.ids,
+        stale_days: staleDays,
+        include_never_seen: includeNeverSeen,
+      });
     } else {
       deprecate.mutate({
         all_matching: true,
@@ -141,6 +159,37 @@ export function StaleIPReportPage() {
           </HeaderButton>
         </div>
       </div>
+
+      {/* Result banner — emphasise the capped case (more rows remain) */}
+      {lastResult && (
+        <div
+          className={cn(
+            "flex items-center justify-between rounded-md border px-3 py-2 text-sm",
+            lastResult.capped
+              ? "border-amber-300 bg-amber-50 dark:border-amber-700 dark:bg-amber-950/30"
+              : "border-emerald-300 bg-emerald-50 dark:border-emerald-700 dark:bg-emerald-950/30",
+          )}
+        >
+          <span>
+            Deprecated {lastResult.deprecated_count} IP(s)
+            {lastResult.skipped.length > 0
+              ? `, skipped ${lastResult.skipped.length}`
+              : ""}
+            .
+            {lastResult.capped
+              ? ` Hit the ${BULK_CAP}-row per-call limit — more matches remain. Run "Deprecate all" again to continue.`
+              : ""}
+          </span>
+          <button
+            type="button"
+            className="ml-3 shrink-0 text-muted-foreground hover:text-foreground"
+            onClick={() => setLastResult(null)}
+            aria-label="Dismiss"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* Filter bar */}
       <div className="flex flex-wrap items-end gap-4 rounded-md border bg-muted/20 p-3">
@@ -331,19 +380,29 @@ export function StaleIPReportPage() {
         title="Deprecate stale IPs?"
         confirmLabel={
           pending?.kind === "all"
-            ? `Deprecate all ${pending.count}`
+            ? pending.count > BULK_CAP
+              ? `Deprecate ${BULK_CAP}`
+              : `Deprecate all ${pending.count}`
             : `Deprecate ${pending?.kind === "selected" ? pending.ids.length : 0}`
         }
         loading={deprecate.isPending}
         message={
           pending?.kind === "all" ? (
             <>
-              This flips <strong>all {pending.count}</strong> matching allocated
-              IPs to <strong>deprecated</strong> in the current filter (
-              {staleDays}+ days stale
+              This flips{" "}
+              <strong>
+                {pending.count > BULK_CAP
+                  ? `the first ${BULK_CAP} of ${pending.count}`
+                  : `all ${pending.count}`}
+              </strong>{" "}
+              matching allocated IPs to <strong>deprecated</strong> in the
+              current filter ({staleDays}+ days stale
               {includeNeverSeen ? ", including never-seen" : ""}). DHCP-lease
-              mirrors and system rows are skipped. This is reversible — edit any
-              row back from the IPAM page.
+              mirrors and system rows are skipped.
+              {pending.count > BULK_CAP
+                ? " You'll need to run this again for the remainder."
+                : ""}{" "}
+              This is reversible — edit any row back from the IPAM page.
             </>
           ) : (
             <>
