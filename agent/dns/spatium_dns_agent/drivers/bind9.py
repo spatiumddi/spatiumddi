@@ -720,6 +720,9 @@ class Bind9Driver(DriverBase):
                 f"nsupdate returned rcode={rcode} "
                 f"(zone={zone} op={op['op']} name={name} type={rtype})"
             )
+        # Explicit None so the record-op path matches the dict|None return
+        # type the DNSSEC branches use (no implicit fall-through).
+        return None
 
     # ── DNSSEC (issue #49) ──────────────────────────────────────────────────
 

@@ -13,6 +13,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
@@ -908,7 +909,9 @@ async def list_servers(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[Serv
 
 
 @router.post(
-    "/groups/{group_id}/servers", response_model=ServerResponse, status_code=status.HTTP_201_CREATED
+    "/groups/{group_id}/servers",
+    response_model=ServerResponse,
+    status_code=status.HTTP_201_CREATED,
 )
 async def create_server(
     group_id: uuid.UUID, body: ServerCreate, db: DB, current_user: SuperAdmin
@@ -919,7 +922,8 @@ async def create_server(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
-            status_code=409, detail="A server with that name already exists in this group"
+            status_code=409,
+            detail="A server with that name already exists in this group",
         )
 
     data = body.model_dump(exclude={"api_key", "windows_credentials"})
@@ -978,7 +982,11 @@ async def create_server(
 
 @router.put("/groups/{group_id}/servers/{server_id}", response_model=ServerResponse)
 async def update_server(
-    group_id: uuid.UUID, server_id: uuid.UUID, body: ServerUpdate, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID,
+    server_id: uuid.UUID,
+    body: ServerUpdate,
+    db: DB,
+    current_user: SuperAdmin,
 ) -> ServerResponse:
     server = await _require_server(group_id, server_id, db)
     changes = body.model_dump(exclude_none=True, exclude={"api_key", "windows_credentials"})
@@ -1860,7 +1868,9 @@ async def update_options(
 
 
 @router.post(
-    "/groups/{group_id}/options/trust-anchors", response_model=TrustAnchorResponse, status_code=201
+    "/groups/{group_id}/options/trust-anchors",
+    response_model=TrustAnchorResponse,
+    status_code=201,
 )
 async def add_trust_anchor(
     group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
@@ -1968,7 +1978,11 @@ async def create_acl(
 
 @router.put("/groups/{group_id}/acls/{acl_id}", response_model=AclResponse)
 async def update_acl(
-    group_id: uuid.UUID, acl_id: uuid.UUID, body: AclUpdate, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID,
+    acl_id: uuid.UUID,
+    body: AclUpdate,
+    db: DB,
+    current_user: SuperAdmin,
 ) -> DNSAcl:
     acl = await _require_acl(group_id, acl_id, db)
     changes = body.model_dump(exclude_none=True, exclude={"entries"})
@@ -2169,7 +2183,8 @@ async def create_tsig_key(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
-            status_code=409, detail="A TSIG key with that name already exists in this group"
+            status_code=409,
+            detail="A TSIG key with that name already exists in this group",
         )
 
     plaintext = body.secret.strip() if body.secret else _generate_tsig_secret(body.algorithm)
@@ -2357,7 +2372,11 @@ async def create_view(
 
 @router.put("/groups/{group_id}/views/{view_id}", response_model=ViewResponse)
 async def update_view(
-    group_id: uuid.UUID, view_id: uuid.UUID, body: ViewUpdate, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID,
+    view_id: uuid.UUID,
+    body: ViewUpdate,
+    db: DB,
+    current_user: SuperAdmin,
 ) -> DNSView:
     view = await _require_view(group_id, view_id, db)
     changes = body.model_dump(exclude_none=True)
@@ -2436,7 +2455,8 @@ async def create_zone(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
-            status_code=409, detail="A zone with that name already exists in this group/view"
+            status_code=409,
+            detail="A zone with that name already exists in this group/view",
         )
 
     zone = DNSZone(group_id=group_id, **body.model_dump())
@@ -2898,7 +2918,11 @@ async def get_server_rndc_status(
 
 @router.put("/groups/{group_id}/zones/{zone_id}", response_model=ZoneResponse)
 async def update_zone(
-    group_id: uuid.UUID, zone_id: uuid.UUID, body: ZoneUpdate, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: ZoneUpdate,
+    db: DB,
+    current_user: SuperAdmin,
 ) -> DNSZone:
     zone = await _require_zone(group_id, zone_id, db)
     _reject_if_synthesised_zone(zone, "edit")
@@ -3015,6 +3039,7 @@ async def create_dnssec_policy(
         raise HTTPException(status_code=409, detail=f"Policy '{body.name}' already exists")
     pol = DNSSECPolicy(**body.model_dump())
     db.add(pol)
+    await db.flush()  # populate pol.id so the audit row can correlate
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -3022,13 +3047,12 @@ async def create_dnssec_policy(
             auth_source=current_user.auth_source,
             action="create",
             resource_type="dnssec_policy",
-            resource_id="",
+            resource_id=str(pol.id),
             resource_display=body.name,
             new_value=body.model_dump(),
             result="success",
         )
     )
-    await db.flush()
     await db.commit()
     await db.refresh(pol)
     return pol
@@ -3125,7 +3149,7 @@ async def get_zone_dnssec_info(
         "zone_id": str(zone.id),
         "zone_name": zone.name,
         "dnssec_enabled": zone.dnssec_enabled,
-        "dnssec_policy_id": str(zone.dnssec_policy_id) if zone.dnssec_policy_id else None,
+        "dnssec_policy_id": (str(zone.dnssec_policy_id) if zone.dnssec_policy_id else None),
         "dnssec_ds_records": zone.dnssec_ds_records or [],
         "dnssec_synced_at": (zone.dnssec_synced_at.isoformat() if zone.dnssec_synced_at else None),
         "keys": [
@@ -3174,11 +3198,17 @@ async def sign_zone_dnssec(
     _reject_if_synthesised_zone(zone, "DNSSEC-sign")
     await _check_driver_gated_operation("dnssec_sign", group_id, db)
     zone.dnssec_enabled = True
-    if body is not None and body.policy_id is not None:
-        pol = await db.get(DNSSECPolicy, body.policy_id)
-        if pol is None:
-            raise HTTPException(status_code=404, detail="DNSSEC policy not found")
-        zone.dnssec_policy_id = body.policy_id
+    # Policy semantics: field present + value → set; field present + null →
+    # reset to BIND's built-in ``default``; field omitted → leave unchanged
+    # (so a re-sign that doesn't touch the picker keeps the current policy).
+    if body is not None and "policy_id" in body.model_fields_set:
+        if body.policy_id is None:
+            zone.dnssec_policy_id = None
+        else:
+            pol = await db.get(DNSSECPolicy, body.policy_id)
+            if pol is None:
+                raise HTTPException(status_code=404, detail="DNSSEC policy not found")
+            zone.dnssec_policy_id = body.policy_id
     await enqueue_record_op(
         db,
         zone,
@@ -3221,6 +3251,10 @@ async def unsign_zone_dnssec(
     _reject_if_synthesised_zone(zone, "DNSSEC-unsign")
     await _check_driver_gated_operation("dnssec_unsign", group_id, db)
     zone.dnssec_enabled = False
+    # Clear cached DS + per-key state now — the BIND9 agent only reports
+    # signed zones, so it won't send a keys=[] report to clear these.
+    zone.dnssec_ds_records = None
+    await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
     await enqueue_record_op(
         db,
         zone,
@@ -3428,7 +3462,8 @@ async def create_zone_from_template(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
-            status_code=409, detail="A zone with that name already exists in this group/view"
+            status_code=409,
+            detail="A zone with that name already exists in this group/view",
         )
 
     zone = DNSZone(
@@ -3785,10 +3820,16 @@ async def list_records(
 
 
 @router.post(
-    "/groups/{group_id}/zones/{zone_id}/records", response_model=RecordResponse, status_code=201
+    "/groups/{group_id}/zones/{zone_id}/records",
+    response_model=RecordResponse,
+    status_code=201,
 )
 async def create_record(
-    group_id: uuid.UUID, zone_id: uuid.UUID, body: RecordCreate, db: DB, current_user: CurrentUser
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: RecordCreate,
+    db: DB,
+    current_user: CurrentUser,
 ) -> DNSRecord:
     zone = await _require_zone(group_id, zone_id, db)
     _reject_if_synthesised_zone(zone, "add records to")
@@ -3836,7 +3877,10 @@ async def create_record(
     return record
 
 
-@router.put("/groups/{group_id}/zones/{zone_id}/records/{record_id}", response_model=RecordResponse)
+@router.put(
+    "/groups/{group_id}/zones/{zone_id}/records/{record_id}",
+    response_model=RecordResponse,
+)
 async def update_record(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,

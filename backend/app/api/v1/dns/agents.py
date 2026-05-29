@@ -272,7 +272,11 @@ async def agent_register(
             resource_type="dns_server",
             resource_id=str(server.id),
             resource_display=body.hostname,
-            new_value={"driver": body.driver, "version": body.version, "roles": body.roles},
+            new_value={
+                "driver": body.driver,
+                "version": body.version,
+                "roles": body.roles,
+            },
             result="success",
         )
     )
@@ -633,10 +637,11 @@ async def agent_dnssec_state(
         zone.dnssec_ds_records = entry.ds_records or None
         zone.dnssec_synced_at = now
         # Per-key state (issue #49) — replace the zone's DNSKey rows wholesale
-        # so the table always mirrors the agent's latest ``rndc dnssec
-        # -status``. Only BIND9 agents send ``keys``; PowerDNS leaves it empty
-        # (and we leave any existing rows untouched in that case).
-        if entry.keys:
+        # so the table mirrors the agent's latest ``rndc dnssec -status``.
+        # ``keys`` PRESENT (even empty) replaces — so an unsign that reports
+        # ``keys: []`` clears stale rows. ``keys`` OMITTED (PowerDNS agents)
+        # leaves existing rows untouched.
+        if "keys" in entry.model_fields_set:
             await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
             for k in entry.keys:
                 db.add(

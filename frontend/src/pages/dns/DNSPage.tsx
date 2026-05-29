@@ -1258,6 +1258,11 @@ function DnssecCard({
     queryKey: ["dns-dnssec-policies"],
     queryFn: () => dnsApi.listDnssecPolicies(),
   });
+  // Seed the picker from the zone's stored policy so it reflects what's
+  // actually applied (rather than always showing "default policy").
+  useEffect(() => {
+    if (info.data?.dnssec_policy_id) setPolicyId(info.data.dnssec_policy_id);
+  }, [info.data?.dnssec_policy_id]);
 
   const invalidate = () => {
     qc.invalidateQueries({
@@ -1266,8 +1271,11 @@ function DnssecCard({
     qc.invalidateQueries({ queryKey: ["dns-zones", groupId] });
   };
 
+  // policy: a UUID / null sets-or-resets the policy (fresh sign);
+  // ``undefined`` omits it so a re-sign keeps the zone's current policy.
   const signMut = useMutation({
-    mutationFn: () => dnsApi.signZoneDnssec(groupId, zoneId, policyId || null),
+    mutationFn: (policy: string | null | undefined) =>
+      dnsApi.signZoneDnssec(groupId, zoneId, policy),
     onSuccess: () => {
       setError(null);
       invalidate();
@@ -1348,9 +1356,9 @@ function DnssecCard({
               <button
                 type="button"
                 disabled={busy}
-                onClick={() => signMut.mutate()}
+                onClick={() => signMut.mutate(undefined)}
                 className="rounded border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
-                title="Re-run sign / re-apply policy"
+                title="Re-run sign (keeps the current policy)"
               >
                 {signMut.isPending ? "Re-signing…" : "Re-sign"}
               </button>
@@ -1384,7 +1392,7 @@ function DnssecCard({
               <button
                 type="button"
                 disabled={busy}
-                onClick={() => signMut.mutate()}
+                onClick={() => signMut.mutate(policyId || null)}
                 className="rounded bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
               >
                 {signMut.isPending ? "Signing…" : "Sign zone"}

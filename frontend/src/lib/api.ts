@@ -4590,11 +4590,14 @@ export const dnsApi = {
     api
       .get<ZoneDnssecInfo>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/info`)
       .then((r) => r.data),
+  // policyId undefined ⇒ omit (backend leaves the zone's policy unchanged);
+  // null ⇒ reset to built-in default; a UUID ⇒ set that policy.
   signZoneDnssec: (groupId: string, zoneId: string, policyId?: string | null) =>
     api
-      .post<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/sign`, {
-        policy_id: policyId ?? null,
-      })
+      .post<DNSZone>(
+        `/dns/groups/${groupId}/zones/${zoneId}/dnssec/sign`,
+        policyId === undefined ? {} : { policy_id: policyId },
+      )
       .then((r) => r.data),
   unsignZoneDnssec: (groupId: string, zoneId: string) =>
     api

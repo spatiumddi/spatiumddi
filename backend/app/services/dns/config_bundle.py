@@ -31,7 +31,6 @@ from app.drivers.dns.base import (
 )
 from app.models.dns import (
     DNSAcl,
-    DNSKey,  # noqa: F401 — registers the mapper so DNSZone.dnssec relationship resolves
     DNSRecord,
     DNSSECPolicy,
     DNSServer,
