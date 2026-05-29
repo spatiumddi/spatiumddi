@@ -32,13 +32,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress
-
-logger = structlog.get_logger(__name__)
 
 # Statuses worth a PTR lookup — real allocations / sightings an operator
 # would want named. ``dhcp`` (lease mirror) is excluded via

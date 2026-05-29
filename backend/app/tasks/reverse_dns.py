@@ -55,19 +55,22 @@ async def _run_sweep(force: bool = False) -> dict[str, Any]:
             counts = await populate_reverse_dns(db, resolvers=ps.reverse_dns_resolvers or None)
             ps.reverse_dns_last_run_at = now
 
-            if counts["updated"]:
-                db.add(
-                    AuditLog(
-                        user_display_name="<system>",
-                        auth_source="system",
-                        action="reverse-dns",
-                        resource_type="platform",
-                        resource_id=str(_SINGLETON_ID),
-                        resource_display="reverse-dns-sweep",
-                        result="success",
-                        new_value={"forced": force, **counts},
-                    )
+            # One summary row per actual sweep — the enabled-gate + interval
+            # early-returns above mean we only reach here on a real run (not
+            # every 60s tick), so this matches the documented contract
+            # without spamming the audit log.
+            db.add(
+                AuditLog(
+                    user_display_name="<system>",
+                    auth_source="system",
+                    action="reverse-dns",
+                    resource_type="platform",
+                    resource_id=str(_SINGLETON_ID),
+                    resource_display="reverse-dns-sweep",
+                    result="success",
+                    new_value={"forced": force, **counts},
                 )
+            )
             await db.commit()
 
             logger.info("reverse_dns_sweep_completed", forced=force, **counts)

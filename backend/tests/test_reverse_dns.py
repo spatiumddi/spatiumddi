@@ -149,6 +149,41 @@ async def test_populate_skips_integration_and_lease_and_noncandidate(
     assert good.hostname == "disco"
 
 
+async def test_populate_skips_row_with_integration_fk(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A candidate-status row (allocated) that carries an integration
+    # provenance FK must be excluded by the FK guard — its hostname is
+    # authoritative from the upstream reconciler.
+    from app.models.docker import DockerHost
+
+    subnet = await _make_subnet(db_session)
+    host = DockerHost(
+        name=f"dh-{uuid.uuid4().hex[:6]}",
+        endpoint="tcp://1.2.3.4:2375",
+        ipam_space_id=subnet.space_id,
+    )
+    db_session.add(host)
+    await db_session.flush()
+    row = IPAddress(
+        subnet_id=subnet.id,
+        address="192.0.2.40",
+        status="allocated",
+        docker_host_id=host.id,
+    )
+    db_session.add(row)
+    await db_session.flush()
+
+    monkeypatch.setattr(
+        reverse_dns, "resolve_ptr", _fake_ptr({"192.0.2.40": "claimed.example.com"})
+    )
+    counts = await populate_reverse_dns(db_session, resolvers=RESOLVERS)
+    await db_session.flush()
+    assert counts["scanned"] == 0  # FK guard excluded it from the candidate query
+    await db_session.refresh(row)
+    assert row.hostname is None
+
+
 async def test_populate_no_ptr_leaves_row_untouched(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
