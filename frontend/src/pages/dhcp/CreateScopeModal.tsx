@@ -85,6 +85,12 @@ export function CreateScopeModal({
     scope?.hostname_sync_mode ?? "ipam",
   );
   const [options, setOptions] = useState<DHCPOption[]>(scope?.options ?? []);
+  // DHCPv6 mode (issue #52) — only surfaced/sent for IPv6 scopes.
+  const [v6Mode, setV6Mode] = useState<"stateful" | "stateless" | "slaac">(
+    scope?.v6_address_mode ?? "stateful",
+  );
+  const [raManaged, setRaManaged] = useState(scope?.ra_managed_flag ?? true);
+  const [raOther, setRaOther] = useState(scope?.ra_other_flag ?? true);
   // Initial pool — only used when creating; edits happen in the Pools tab.
   const [poolStart, setPoolStart] = useState("");
   const [poolEnd, setPoolEnd] = useState("");
@@ -147,6 +153,25 @@ export function CreateScopeModal({
     queryFn: () => ipamApi.getSubnet(subnetId),
     enabled: !editing && !!subnetId,
   });
+
+  // Is this an IPv6 scope? On edit we trust the stored family; on create
+  // we sniff the selected subnet's CIDR (": " ⇒ v6). Drives the DHCPv6
+  // mode section + whether the initial-pool block applies.
+  const selectedNetwork =
+    subnetDetail?.network ??
+    pinnedSubnet?.network ??
+    subnets.find((s) => s.id === subnetId)?.network ??
+    null;
+  const isV6 = editing
+    ? scope?.address_family === "ipv6"
+    : !!selectedNetwork && selectedNetwork.includes(":");
+  // When the operator picks a v6 mode, seed the recommended RA M/O flags
+  // (they can still override). stateful → M+O, stateless → O, slaac → none.
+  function applyV6Mode(m: "stateful" | "stateless" | "slaac") {
+    setV6Mode(m);
+    setRaManaged(m === "stateful");
+    setRaOther(m !== "slaac");
+  }
 
   const [prefilled, setPrefilled] = useState(false);
   useEffect(() => {
@@ -219,6 +244,12 @@ export function CreateScopeModal({
         hostname_sync_mode: hostnameSync,
         options,
       };
+      // DHCPv6 mode + RA flags only apply to v6 scopes (issue #52).
+      if (isV6) {
+        data.v6_address_mode = v6Mode;
+        data.ra_managed_flag = raManaged;
+        data.ra_other_flag = raOther;
+      }
       // PXE binding (issue #51). The backend distinguishes "no
       // change" from "explicit detach" via ``clear_pxe_profile``;
       // pass it true when the operator picked "(none)" on an
@@ -413,7 +444,71 @@ export function CreateScopeModal({
           </Field>
         </div>
 
-        {!editing && (
+        {isV6 && (
+          <div className="space-y-3 rounded-md border p-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold">DHCPv6 mode</h3>
+              <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
+                IPv6 scope
+              </span>
+            </div>
+            <Field
+              label="Address assignment"
+              hint="How clients on this subnet obtain their IPv6 address."
+            >
+              <select
+                className={inputCls}
+                value={v6Mode}
+                onChange={(e) =>
+                  applyV6Mode(
+                    e.target.value as "stateful" | "stateless" | "slaac",
+                  )
+                }
+              >
+                <option value="stateful">
+                  Stateful — Kea assigns addresses from the pool
+                </option>
+                <option value="stateless">
+                  Stateless — clients SLAAC their address; Kea serves options
+                  (DNS, etc.)
+                </option>
+                <option value="slaac">
+                  SLAAC only — the router&apos;s RA does everything; no DHCPv6
+                </option>
+              </select>
+            </Field>
+            <div className="rounded border bg-muted/20 p-2 text-[11px] text-muted-foreground">
+              Set these Router Advertisement flags on your{" "}
+              <strong>router</strong> (radvd / gateway) — SpatiumDDI&apos;s Kea
+              agent doesn&apos;t send RAs. These are recorded as intent and
+              auto-suggested from the mode above.
+              <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-foreground">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={raManaged}
+                    onChange={(e) => setRaManaged(e.target.checked)}
+                  />
+                  <span>
+                    <strong>M</strong> (Managed) — use DHCPv6 for addresses
+                  </span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={raOther}
+                    onChange={(e) => setRaOther(e.target.checked)}
+                  />
+                  <span>
+                    <strong>O</strong> (Other) — use DHCPv6 for other config
+                  </span>
+                </label>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {!editing && !(isV6 && v6Mode !== "stateful") && (
           <div className="rounded-md border bg-muted/30 p-3">
             <div className="mb-2 flex items-baseline justify-between">
               <span className="text-sm font-medium">Initial pool</span>

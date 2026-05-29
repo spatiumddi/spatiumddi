@@ -33,6 +33,8 @@ router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permiss
 
 VALID_HOSTNAME_POLICIES = {"client", "server_name", "derived", "none"}
 VALID_SYNC_MODES = {"disabled", "on_lease", "on_static_only", "ipam", "learned"}
+# DHCPv6 operating modes (issue #52). Only meaningful for ipv6 scopes.
+VALID_V6_MODES = {"stateful", "stateless", "slaac"}
 
 _CODE_TO_NAME: dict[int, str] = {
     2: "time-offset",
@@ -94,6 +96,10 @@ class ScopeCreate(BaseModel):
     ddns_hostname_policy: str | None = "client"
     hostname_to_ipam_sync: str = "on_static_only"
     hostname_sync_mode: str | None = None
+    # DHCPv6 operating mode (issue #52) — ignored for v4 scopes.
+    v6_address_mode: str = "stateful"
+    ra_managed_flag: bool = True
+    ra_other_flag: bool = True
     tags: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("ddns_hostname_policy")
@@ -105,6 +111,15 @@ class ScopeCreate(BaseModel):
             raise ValueError(
                 f"ddns_hostname_policy must be one of {sorted(VALID_HOSTNAME_POLICIES)}"
             )
+        return v
+
+    @field_validator("v6_address_mode")
+    @classmethod
+    def _v6mode(cls, v: str | None) -> str:
+        if v in (None, ""):
+            return "stateful"
+        if v not in VALID_V6_MODES:
+            raise ValueError(f"v6_address_mode must be one of {sorted(VALID_V6_MODES)}")
         return v
 
 
@@ -132,7 +147,20 @@ class ScopeUpdate(BaseModel):
     # treats null + missing identically by default. We need this to
     # support detaching a previously-bound profile.
     clear_pxe_profile: bool | None = None
+    # DHCPv6 operating mode (issue #52) — ignored for v4 scopes.
+    v6_address_mode: str | None = None
+    ra_managed_flag: bool | None = None
+    ra_other_flag: bool | None = None
     tags: dict[str, Any] | None = None
+
+    @field_validator("v6_address_mode")
+    @classmethod
+    def _v6mode(cls, v: str | None) -> str | None:
+        if v in (None, ""):
+            return None
+        if v not in VALID_V6_MODES:
+            raise ValueError(f"v6_address_mode must be one of {sorted(VALID_V6_MODES)}")
+        return v
 
 
 _NAME_TO_CODE = {v: k for k, v in _CODE_TO_NAME.items()}
@@ -154,6 +182,9 @@ class ScopeResponse(BaseModel):
     ddns_domain_override: str | None = None
     hostname_sync_mode: str
     address_family: str = "ipv4"
+    v6_address_mode: str = "stateful"
+    ra_managed_flag: bool = True
+    ra_other_flag: bool = True
     last_pushed_at: datetime | None
     tags: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
@@ -184,6 +215,9 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
         ddns_domain_override=None,
         hostname_sync_mode=scope.hostname_to_ipam_sync,
         address_family=getattr(scope, "address_family", "ipv4") or "ipv4",
+        v6_address_mode=getattr(scope, "v6_address_mode", "stateful") or "stateful",
+        ra_managed_flag=getattr(scope, "ra_managed_flag", True),
+        ra_other_flag=getattr(scope, "ra_other_flag", True),
         last_pushed_at=scope.last_pushed_at,
         tags=scope.tags or {},
         created_at=scope.created_at,
@@ -277,6 +311,9 @@ async def create_scope(
         ddns_hostname_policy=body.ddns_hostname_policy or "client",
         hostname_to_ipam_sync=sync_mode,
         address_family=address_family,
+        v6_address_mode=body.v6_address_mode,
+        ra_managed_flag=body.ra_managed_flag,
+        ra_other_flag=body.ra_other_flag,
     )
     db.add(scope)
     await db.flush()

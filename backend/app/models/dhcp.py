@@ -277,6 +277,31 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         String(4), nullable=False, default="ipv4", server_default="ipv4"
     )
 
+    # ── DHCPv6 operating mode (issue #52) ───────────────────────────
+    # Only meaningful for ``address_family == "ipv6"`` scopes; v4 ignores
+    # it. Drives how the Kea driver renders the subnet6:
+    #   * "stateful"  — Kea hands out addresses from the pools (IA_NA) and
+    #                   serves option data. RA M-flag=1, O-flag=1.
+    #   * "stateless" — no address pools; Kea serves only option data
+    #                   (DNS / domain-search) via Information-Request.
+    #                   Clients SLAAC their address from the router's RA.
+    #                   RA M-flag=0, O-flag=1.
+    #   * "slaac"     — no DHCPv6 address service at all; the router's RA
+    #                   does everything. RA M-flag=0, O-flag=0.
+    # ``ra_managed_flag`` / ``ra_other_flag`` capture the intended RA M/O
+    # flags — these are operator intent applied on the *router* (SpatiumDDI's
+    # Kea agent doesn't emit Router Advertisements), surfaced in the UI as
+    # "what to set upstream". They don't affect the rendered Kea config.
+    v6_address_mode: Mapped[str] = mapped_column(
+        String(12), nullable=False, default="stateful", server_default="stateful"
+    )
+    ra_managed_flag: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+    ra_other_flag: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+
     lease_time: Mapped[int] = mapped_column(Integer, nullable=False, default=86400)
     min_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)

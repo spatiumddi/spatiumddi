@@ -157,20 +157,39 @@ def _render_reservation(s: StaticAssignmentDef, *, address_family: str = "ipv4")
 
 def _render_scope(scope: ScopeDef) -> dict[str, Any]:
     af = scope.address_family  # "ipv4" | "ipv6"
-    dynamic_pools = [p for p in scope.pools if p.pool_type == "dynamic"]
-    subnet_key = "subnet"  # Kea names the CIDR field "subnet" for both families
-    pools_key = "pools" if af != "ipv6" else "pools"  # same in both
+    # DHCPv6 operating mode (issue #52) gates what Kea serves for a v6
+    # subnet6. v4 always serves both addresses + options (mode is ignored).
+    #   stateful  → address pools + option-data
+    #   stateless → no pools, option-data only (Information-Request)
+    #   slaac     → no pools, no option-data (the router's RA does it all)
+    mode = getattr(scope, "v6_address_mode", "stateful") or "stateful"
+    if af == "ipv6":
+        serve_addresses = mode == "stateful"
+        serve_options = mode in ("stateful", "stateless")
+    else:
+        serve_addresses = True
+        serve_options = True
+
+    dynamic_pools = [p for p in scope.pools if p.pool_type == "dynamic"] if serve_addresses else []
     out: dict[str, Any] = {
-        subnet_key: scope.subnet_cidr,
-        pools_key: [_render_pool(p, address_family=af) for p in dynamic_pools],
-        "reservations": [_render_reservation(s, address_family=af) for s in scope.statics],
+        # Kea names the CIDR field "subnet" and the pool list "pools" in
+        # both Dhcp4 and Dhcp6 modes.
+        "subnet": scope.subnet_cidr,
+        "pools": [_render_pool(p, address_family=af) for p in dynamic_pools],
+        # A pure-SLAAC subnet has no DHCP role, so host reservations (which
+        # assign addresses / host-specific options) are dropped too.
+        "reservations": (
+            [_render_reservation(s, address_family=af) for s in scope.statics]
+            if (serve_addresses or serve_options)
+            else []
+        ),
         "valid-lifetime": scope.lease_time,
     }
     if scope.min_lease_time is not None:
         out["min-valid-lifetime"] = scope.min_lease_time
     if scope.max_lease_time is not None:
         out["max-valid-lifetime"] = scope.max_lease_time
-    if scope.options:
+    if scope.options and serve_options:
         out["option-data"] = _render_option_data(scope.options, address_family=af)
     return out
 

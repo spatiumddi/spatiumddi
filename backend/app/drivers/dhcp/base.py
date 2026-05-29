@@ -153,6 +153,11 @@ class ScopeDef:
     # "ipv4" → Dhcp4 rendering, "ipv6" → Dhcp6 rendering. Defaults to "ipv4"
     # so legacy bundles (before address_family existed) keep working.
     address_family: str = "ipv4"
+    # DHCPv6 operating mode (issue #52) — "stateful" | "stateless" | "slaac".
+    # Only consulted when ``address_family == "ipv6"``; drives whether the
+    # Kea driver renders address pools and/or option-data for the subnet6.
+    # Defaults to "stateful" so v4 scopes + pre-#52 bundles render unchanged.
+    v6_address_mode: str = "stateful"
 
 
 @dataclass(frozen=True)
