@@ -110,6 +110,9 @@ backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:91
 backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:92
 backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:93
 backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:94
+backend/alembic/versions/a7e3c1f49d20_subnet_ip_discovery.py:drop_column:54
+backend/alembic/versions/a7e3c1f49d20_subnet_ip_discovery.py:drop_column:55
+backend/alembic/versions/a7e3c1f49d20_subnet_ip_discovery.py:drop_column:56
 backend/alembic/versions/a8d2e91f5c47_appliance_variant.py:drop_column:38
 backend/alembic/versions/a8d31e6b2f47_ipv6_allocation_policy.py:drop_column:38
 backend/alembic/versions/a8e3f127c094_system_upgrade_run.py:drop_table:119
