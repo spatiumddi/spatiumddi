@@ -1606,6 +1606,9 @@ class SubnetCreate(BaseModel):
     auto_profile_on_dhcp_lease: bool = False
     auto_profile_preset: str = "service_and_os"
     auto_profile_refresh_days: int = 30
+    # IP discovery (issue #23) — opt-in scheduled ping/ARP sweep.
+    discovery_enabled: bool = False
+    discovery_interval_minutes: int = 360
     ipv6_allocation_policy: str = "random"
     # Compliance / classification flags — see Subnet model.
     pci_scope: bool = False
@@ -1671,6 +1674,15 @@ class SubnetCreate(BaseModel):
             raise ValueError("auto_profile_refresh_days must be between 1 and 365")
         return v
 
+    @field_validator("discovery_interval_minutes")
+    @classmethod
+    def validate_discovery_interval_create(cls, v: int) -> int:
+        # 5 min floor (matches the beat dispatcher's clamp) so a misclick
+        # can't hammer the network; 1-week ceiling.
+        if v < 5 or v > 10080:
+            raise ValueError("discovery_interval_minutes must be between 5 and 10080")
+        return v
+
     @field_validator("network")
     @classmethod
     def validate_network(cls, v: str) -> str:
@@ -1728,6 +1740,8 @@ class SubnetUpdate(BaseModel):
     auto_profile_on_dhcp_lease: bool | None = None
     auto_profile_preset: str | None = None
     auto_profile_refresh_days: int | None = None
+    discovery_enabled: bool | None = None
+    discovery_interval_minutes: int | None = None
     ipv6_allocation_policy: str | None = None
     pci_scope: bool | None = None
     hipaa_scope: bool | None = None
@@ -1735,6 +1749,13 @@ class SubnetUpdate(BaseModel):
     subnet_role: str | None = None
     customer_id: uuid.UUID | None = None
     site_id: uuid.UUID | None = None
+
+    @field_validator("discovery_interval_minutes")
+    @classmethod
+    def validate_discovery_interval_update(cls, v: int | None) -> int | None:
+        if v is not None and (v < 5 or v > 10080):
+            raise ValueError("discovery_interval_minutes must be between 5 and 10080")
+        return v
 
     @field_validator("subnet_role")
     @classmethod
@@ -1863,6 +1884,9 @@ class SubnetResponse(BaseModel):
     auto_profile_on_dhcp_lease: bool = False
     auto_profile_preset: str = "service_and_os"
     auto_profile_refresh_days: int = 30
+    discovery_enabled: bool = False
+    discovery_interval_minutes: int = 360
+    last_discovery_at: datetime | None = None
     ipv6_allocation_policy: str = "random"
     pci_scope: bool = False
     hipaa_scope: bool = False
@@ -3628,6 +3652,68 @@ async def get_subnet(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB) ->
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     return subnet
+
+
+@router.get("/subnets/{subnet_id}/reconciliation")
+async def get_subnet_reconciliation(
+    subnet_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    stale_minutes: int = 1440,
+) -> dict:
+    """IP-discovery reconciliation report for a subnet (issue #23).
+
+    Three buckets — allocated-but-not-seen, discovered-but-not-allocated,
+    and available-but-active (status mismatch). ``stale_minutes`` (default
+    24 h) is the window after which a row's ``last_seen_at`` counts as
+    stale. See docs/features/IPAM.md §8.
+    """
+    from app.services.ipam.discovery import build_reconciliation_report
+
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    stale_minutes = max(1, min(stale_minutes, 525600))  # clamp 1 min … 1 year
+    return await build_reconciliation_report(db, subnet, stale_minutes=stale_minutes)
+
+
+@router.post("/subnets/{subnet_id}/discover", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_subnet_discovery(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB) -> dict:
+    """Queue an on-demand IP-discovery sweep for this subnet (issue #23).
+
+    Runs the same ``run_subnet_discovery`` Celery task the beat
+    dispatcher uses, independent of the per-subnet schedule / enabled
+    toggle — an operator can sweep on demand even with the scheduled
+    sweep off.
+    """
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    queued = True
+    try:
+        from app.tasks.ipam_discovery import run_subnet_discovery
+
+        run_subnet_discovery.delay(str(subnet_id))
+    except Exception as exc:  # noqa: BLE001 — broker unreachable; report, don't 500
+        queued = False
+        logger.warning("ipam_discovery_trigger_enqueue_failed", error=str(exc))
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="discover",
+            resource_type="subnet",
+            resource_id=str(subnet.id),
+            resource_display=str(subnet.network),
+            result="success" if queued else "error",
+            error_detail=None if queued else "task broker unreachable",
+        )
+    )
+    await db.commit()
+    return {"status": "queued" if queued else "enqueue_failed", "subnet_id": str(subnet_id)}
 
 
 @router.get("/subnets/{subnet_id}/effective-dns", response_model=EffectiveDnsResponse)

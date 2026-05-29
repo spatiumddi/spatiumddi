@@ -548,6 +548,10 @@ export interface Subnet {
     | "udp_top1000"
     | "aggressive";
   auto_profile_refresh_days?: number;
+  // IP discovery (issue #23) — opt-in scheduled ping/ARP sweep.
+  discovery_enabled?: boolean;
+  discovery_interval_minutes?: number;
+  last_discovery_at?: string | null;
   // Compliance / classification flags. First-class booleans (rather
   // than freeform tags) so auditor queries — "show me every PCI
   // subnet" — are clean indexed predicates. Default false on every
@@ -569,6 +573,34 @@ export interface Subnet {
   site_id?: string | null;
   created_at?: string;
   modified_at?: string;
+}
+
+/** One IP row in a reconciliation bucket (issue #23). */
+export interface ReconciliationEntry {
+  id: string;
+  address: string;
+  status: string;
+  hostname: string | null;
+  mac_address: string | null;
+  last_seen_at: string | null;
+  last_seen_method: string | null;
+}
+
+/** IP-discovery reconciliation report for a subnet (issue #23). */
+export interface SubnetReconciliation {
+  subnet_id: string;
+  network: string;
+  generated_at: string;
+  stale_minutes: number;
+  last_discovery_at: string | null;
+  counts: {
+    in_ipam_not_seen: number;
+    discovered_not_allocated: number;
+    status_mismatch: number;
+  };
+  in_ipam_not_seen: ReconciliationEntry[];
+  discovered_not_allocated: ReconciliationEntry[];
+  status_mismatch: ReconciliationEntry[];
 }
 
 /** Optional role tag, orthogonal to ``status``. Roles in
@@ -1292,6 +1324,21 @@ export const ipamApi = {
   }) => api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
   getSubnet: (id: string) =>
     api.get<Subnet>(`/ipam/subnets/${id}`).then((r) => r.data),
+  // IP discovery reconciliation report (issue #23).
+  getReconciliation: (id: string, staleMinutes?: number) =>
+    api
+      .get<SubnetReconciliation>(`/ipam/subnets/${id}/reconciliation`, {
+        params: staleMinutes ? { stale_minutes: staleMinutes } : undefined,
+      })
+      .then((r) => r.data),
+  // Queue an on-demand discovery sweep (independent of the schedule).
+  triggerDiscovery: (id: string) =>
+    api
+      .post<{
+        status: string;
+        subnet_id: string;
+      }>(`/ipam/subnets/${id}/discover`)
+      .then((r) => r.data),
   createSubnet: (data: Partial<Subnet> & { template_id?: string | null }) =>
     api.post<Subnet>("/ipam/subnets", data).then((r) => r.data),
   updateSubnet: (
