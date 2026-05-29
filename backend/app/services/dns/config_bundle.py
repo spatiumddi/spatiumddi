@@ -20,6 +20,7 @@ from app.drivers.dns.base import (
     AclData,
     BlocklistEntry,
     ConfigBundle,
+    DNSSECPolicyData,
     EffectiveBlocklistData,
     RecordData,
     ServerOptions,
@@ -30,7 +31,9 @@ from app.drivers.dns.base import (
 )
 from app.models.dns import (
     DNSAcl,
+    DNSKey,  # noqa: F401 — registers the mapper so DNSZone.dnssec relationship resolves
     DNSRecord,
+    DNSSECPolicy,
     DNSServer,
     DNSServerOptions,
     DNSView,
@@ -185,6 +188,18 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             port=r.port,
         )
 
+    # DNSSEC policies (issue #49) — resolve each signed zone's policy name
+    # and ship the referenced custom policy definitions so the agent can
+    # render the matching ``dnssec-policy { ... }`` blocks. The built-in
+    # "default" needs no block (BIND ships it), so it's never collected.
+    policies_by_id = {p.id: p for p in (await db.execute(select(DNSSECPolicy))).scalars().all()}
+
+    def _zone_policy_name(z: DNSZone) -> str | None:
+        if not z.dnssec_enabled or z.dnssec_policy_id is None:
+            return None
+        pol = policies_by_id.get(z.dnssec_policy_id)
+        return pol.name if pol is not None else None
+
     def _zone_data(z: DNSZone, records: tuple[RecordData, ...], view_name: str | None) -> ZoneData:
         return ZoneData(
             name=z.name,
@@ -206,6 +221,8 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             view_name=view_name,
             forwarders=tuple(z.forwarders or ()),
             forward_only=bool(z.forward_only),
+            dnssec_enabled=bool(z.dnssec_enabled),
+            dnssec_policy_name=_zone_policy_name(z),
         )
 
     zones: list[ZoneData] = []
@@ -268,6 +285,26 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     if tsig_name and tsig_secret:
         tsig_keys = (TsigKey(name=tsig_name, algorithm=tsig_algo, secret=tsig_secret),)
 
+    # Collect the custom (non-"default") policies referenced by signed zones
+    # so the agent has a ``dnssec-policy { ... }`` block to render for each.
+    referenced_policy_ids = {
+        z.dnssec_policy_id for z in zone_rows if z.dnssec_enabled and z.dnssec_policy_id is not None
+    }
+    dnssec_policies = tuple(
+        DNSSECPolicyData(
+            name=p.name,
+            algorithm=p.algorithm,
+            ksk_lifetime_days=p.ksk_lifetime_days,
+            zsk_lifetime_days=p.zsk_lifetime_days,
+            nsec3=p.nsec3,
+            nsec3_iterations=p.nsec3_iterations,
+            nsec3_salt_length=p.nsec3_salt_length,
+            nsec3_optout=p.nsec3_optout,
+        )
+        for pid in referenced_policy_ids
+        if (p := policies_by_id.get(pid)) is not None and p.name != "default"
+    )
+
     bundle = ConfigBundle(
         server_id=str(server.id),
         server_name=server.name,
@@ -280,6 +317,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         tsig_keys=tsig_keys,
         blocklists=tuple(blocklists),
         generated_at=datetime.now(UTC),
+        dnssec_policies=dnssec_policies,
     )
     bundle.etag = bundle.compute_etag()
     return bundle

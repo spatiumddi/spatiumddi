@@ -61,6 +61,29 @@ class ZoneData:
     # (false — the resolver may fall back to recursion if all forwarders fail).
     forwarders: tuple[str, ...] = ()
     forward_only: bool = True
+    # DNSSEC inline-signing (issue #49). When ``dnssec_enabled`` the BIND9
+    # driver renders ``dnssec-policy "<dnssec_policy_name>"; inline-signing
+    # yes;`` into the zone stanza and BIND auto-signs. ``dnssec_policy_name``
+    # is None ⇒ BIND's built-in ``default`` policy. Only consulted for
+    # primary zones; PowerDNS ignores both (online-signing is op-driven).
+    dnssec_enabled: bool = False
+    dnssec_policy_name: str | None = None
+
+
+@dataclass(frozen=True)
+class DNSSECPolicyData:
+    """A BIND9 ``dnssec-policy`` definition shipped in the ConfigBundle
+    so the agent can render the matching ``dnssec-policy { ... };`` block
+    (issue #49). ``default`` is BIND's built-in and is never shipped."""
+
+    name: str
+    algorithm: str = "ecdsap256sha256"
+    ksk_lifetime_days: int = 0
+    zsk_lifetime_days: int = 90
+    nsec3: bool = False
+    nsec3_iterations: int = 0
+    nsec3_salt_length: int = 0
+    nsec3_optout: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,6 +192,9 @@ class ConfigBundle:
     blocklists: tuple[EffectiveBlocklistData, ...]
     generated_at: datetime
     etag: str = ""
+    # DNSSEC signing policies referenced by signed zones (issue #49).
+    # Defaulted so existing constructors keep working.
+    dnssec_policies: tuple[DNSSECPolicyData, ...] = ()
 
     def compute_etag(self) -> str:
         """Compute a stable SHA-256 of the bundle contents (excluding the etag/timestamp)."""
@@ -191,6 +217,7 @@ class ConfigBundle:
                 }
                 for b in self.blocklists
             ],
+            "dnssec_policies": [asdict(p) for p in self.dnssec_policies],
         }
         blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         return "sha256:" + hashlib.sha256(blob).hexdigest()

@@ -68,6 +68,7 @@ const baseMainNav = [
   { label: "DHCP", icon: Server, to: "/dhcp" },
   { label: "DNS", icon: Globe, to: "/dns", end: true },
   { label: "DNS Pools", icon: Workflow, to: "/dns/pools" },
+  { label: "DNSSEC Policies", icon: KeyRound, to: "/dns/dnssec-policies" },
   { label: "Domains", icon: Earth, to: "/admin/domains" },
   { label: "Logs", icon: ScrollText, to: "/logs" },
   { label: "NAT Mappings", icon: Shuffle, to: "/ipam/nat" },

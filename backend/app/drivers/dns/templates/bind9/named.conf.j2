@@ -34,6 +34,20 @@ options {
     {%- endif %}
 };
 
+{#- DNSSEC signing policies (issue #49). Custom policies referenced by a
+    signed zone; BIND's built-in "default" needs no block. #}
+{%- for p in dnssec_policies %}
+dnssec-policy "{{ p.name }}" {
+    keys {
+        ksk lifetime {{ "unlimited" if p.ksk_lifetime_days == 0 else (p.ksk_lifetime_days|string ~ "d") }} algorithm {{ p.algorithm }};
+        zsk lifetime {{ "unlimited" if p.zsk_lifetime_days == 0 else (p.zsk_lifetime_days|string ~ "d") }} algorithm {{ p.algorithm }};
+    };
+    {%- if p.nsec3 %}
+    nsec3param iterations {{ p.nsec3_iterations }} optout {{ "yes" if p.nsec3_optout else "no" }} salt-length {{ p.nsec3_salt_length }};
+    {%- endif %}
+};
+{% endfor %}
+
 {%- if options.query_log_enabled %}
 logging {
     channel queries_channel {

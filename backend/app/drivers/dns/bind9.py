@@ -100,6 +100,7 @@ class BIND9Driver(DNSDriver):
             acls: tuple[Any, ...] = ()
             tsig_keys: tuple[Any, ...] = ()
             blocklists: tuple[EffectiveBlocklistData, ...] = ()
+            dnssec_policies: tuple[Any, ...] = ()
             server_id = getattr(server, "id", "")
             server_name = getattr(server, "name", "")
             generated_at = ""
@@ -109,6 +110,7 @@ class BIND9Driver(DNSDriver):
             acls = bundle.acls
             tsig_keys = bundle.tsig_keys
             blocklists = bundle.blocklists
+            dnssec_policies = bundle.dnssec_policies
             server_id = bundle.server_id
             server_name = bundle.server_name
             generated_at = bundle.generated_at.isoformat() if bundle.generated_at else ""
@@ -128,6 +130,7 @@ class BIND9Driver(DNSDriver):
             zones=zones,
             tsig_keys=tsig_keys,
             blocklists=blocklists,
+            dnssec_policies=dnssec_policies,
             zone_stanzas=zone_stanzas,
         )
 

@@ -621,6 +621,17 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     dnssec_synced_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # BIND9 DNSSEC signing policy (issue #49). NULL while signing is off, or
+    # when signing with BIND's built-in ``default`` policy. Set to a
+    # ``DNSSECPolicy`` row to sign with a custom algorithm / NSEC3 / key
+    # lifetimes. SET NULL on policy delete so the zone falls back to the
+    # built-in default rather than orphaning. Only consulted by the BIND9
+    # driver; PowerDNS uses its own online-signing defaults.
+    dnssec_policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dnssec_policy.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     last_serial: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -1030,3 +1041,126 @@ class DNSBlockListException(UUIDPrimaryKeyMixin, Base):
     )
 
     blocklist: Mapped["DNSBlockList"] = relationship("DNSBlockList", back_populates="exceptions")
+
+
+# ── DNSSEC (issue #49) ──────────────────────────────────────────────────────
+#
+# BIND9 9.16+ inline signing via ``dnssec-policy``. BIND owns the private
+# key material and rotates keys automatically per the policy; SpatiumDDI
+# only stores the *public* state (DS rrsets + per-key status) the agent
+# reports back, so there is no private-key custody here. A ``DNSSECPolicy``
+# maps 1:1 to a BIND ``dnssec-policy { ... }`` block; a zone references one
+# via ``DNSZone.dnssec_policy_id`` (NULL ⇒ BIND's built-in ``default``).
+
+# Algorithms we expose in the policy editor → BIND dnssec-policy ``algorithm``
+# token. ECDSAP256SHA256 is the modern default (small keys, fast, broad
+# resolver support). The map is also the API validator's allow-list.
+DNSSEC_ALGORITHMS: frozenset[str] = frozenset(
+    {
+        "ecdsap256sha256",
+        "ecdsap384sha384",
+        "ed25519",
+        "ed448",
+        "rsasha256",
+        "rsasha512",
+    }
+)
+
+# Per-key lifecycle states BIND reports via ``rndc dnssec -status`` (the
+# RFC 7583 key-timing "states"). Stored verbatim on DNSKey.state.
+DNSKEY_STATES: frozenset[str] = frozenset(
+    {"generated", "published", "rumoured", "active", "omnipresent", "retired", "removed", "unknown"}
+)
+
+
+class DNSSECPolicy(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A reusable BIND9 ``dnssec-policy`` definition (issue #49).
+
+    Renders to a ``dnssec-policy "<name>" { ... };`` block in named.conf.
+    Lifetimes are in days; 0 = unlimited (BIND ``lifetime unlimited``),
+    which is the normal choice for a KSK (rolled manually via the parent
+    DS update) paired with an auto-rolled ZSK.
+    """
+
+    __tablename__ = "dnssec_policy"
+    __table_args__ = (UniqueConstraint("name", name="uq_dnssec_policy_name"),)
+
+    name: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Built-in seeds (e.g. "default") can't be deleted or renamed.
+    is_builtin: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+
+    algorithm: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="ecdsap256sha256", server_default="ecdsap256sha256"
+    )
+    # KSK / ZSK lifetimes in days (0 = unlimited). For ECDSA the key size is
+    # fixed by the algorithm, so no explicit bits field is needed.
+    ksk_lifetime_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    zsk_lifetime_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=90, server_default="90"
+    )
+
+    # NSEC3 (opt-in). When false the zone uses plain NSEC. iterations 0 +
+    # salt-length 0 is the modern best-practice NSEC3 config (RFC 9276).
+    nsec3: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    nsec3_iterations: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    nsec3_salt_length: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    nsec3_optout: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+
+    zones: Mapped[list["DNSZone"]] = relationship(
+        "DNSZone",
+        primaryjoin="DNSSECPolicy.id == foreign(DNSZone.dnssec_policy_id)",
+        viewonly=True,
+    )
+
+
+class DNSKey(UUIDPrimaryKeyMixin, Base):
+    """Public DNSSEC key state for one zone, reported by the agent.
+
+    Populated from ``rndc dnssec -status <zone>`` (per-key states + timing)
+    plus ``dnssec-dsfromkey`` for the KSK DS rrset. **No private key
+    material** — BIND holds and rotates the private keys; these rows are a
+    read-only mirror for the operator's "is it signed / what do I give the
+    registrar / where is the rollover" view. Replaced wholesale per zone on
+    each agent report.
+    """
+
+    __tablename__ = "dnssec_key"
+    __table_args__ = (Index("ix_dnssec_key_zone", "zone_id"),)
+
+    zone_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_zone.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # DNSKEY key tag (RFC 4034 §5.1.4) — the operator-visible key id.
+    key_tag: Mapped[int] = mapped_column(Integer, nullable=False)
+    # "ksk" | "zsk" | "csk" (combined signing key).
+    key_type: Mapped[str] = mapped_column(String(4), nullable=False)
+    # DNSSEC algorithm number (e.g. 13 for ECDSAP256SHA256).
+    algorithm: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # RFC 7583 lifecycle state (see ``DNSKEY_STATES``).
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
+    # DS rrset string(s) for a KSK/CSK (empty for a ZSK). Operator pastes
+    # these into the parent registrar.
+    ds_records: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # ISO-8601 timing hints from ``rndc dnssec -status`` (published / active
+    # / retire / remove). Free-form so we don't chase BIND's exact phrasing.
+    timing: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    reported_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    zone: Mapped["DNSZone"] = relationship("DNSZone")

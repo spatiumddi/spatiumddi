@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -38,6 +39,7 @@ options {{
     recursion {recursion};
     allow-query {{ {allow_query}; }};
     dnssec-validation {dnssec};
+    key-directory "/var/cache/bind/keys";
     check-integrity no;
 {forwarders}{response_policy}
 }};
@@ -66,6 +68,111 @@ logging {
     category query-errors { queries_channel; };
 };
 """
+
+
+def _lifetime(days: int) -> str:
+    """BIND ``lifetime`` token — 0 ⇒ unlimited, else ``<days>d``."""
+    return "unlimited" if not days else f"{int(days)}d"
+
+
+# DNSSEC algorithm name → IANA number (issue #49). Used when parsing
+# ``rndc dnssec -status`` output, which prints the algorithm by name.
+_DNSSEC_ALGO_NUM: dict[str, int] = {
+    "RSASHA256": 8,
+    "RSASHA512": 10,
+    "ECDSAP256SHA256": 13,
+    "ECDSAP384SHA384": 14,
+    "ED25519": 15,
+    "ED448": 16,
+}
+
+
+def _parse_dnssec_status(text: str) -> list[dict[str, Any]]:
+    """Parse ``rndc dnssec -status <zone>`` into per-key state dicts.
+
+    The header line ``key: <tag> (<ALGO>), <KSK|ZSK|CSK>`` is stable across
+    BIND versions; the per-key body varies, so we derive a coarse state
+    ("active" once the key is signing, else "published") + keep the raw
+    timing lines. Pure + version-tolerant so it's unit-testable.
+    """
+    keys: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        m = re.match(r"key:\s+(\d+)\s+\(([^)]+)\),\s+(KSK|ZSK|CSK)", line)
+        if m:
+            if cur is not None:
+                keys.append(cur)
+            cur = {
+                "key_tag": int(m.group(1)),
+                "algorithm": _DNSSEC_ALGO_NUM.get(m.group(2).upper(), 0),
+                "key_type": m.group(3).lower(),
+                "state": "published",
+                "ds_records": [],
+                "timing": {},
+            }
+            continue
+        if cur is None:
+            continue
+        low = line.lower()
+        if ("key signing:" in low or "zone signing:" in low) and "yes" in low:
+            cur["state"] = "active"
+        mt = re.match(
+            r"(published|active|retire|remove|key signing|zone signing):\s*(.+)", low
+        )
+        if mt:
+            cur["timing"][mt.group(1).replace(" ", "_")] = mt.group(2).strip()
+    if cur is not None:
+        keys.append(cur)
+    return keys
+
+
+def _keyfile_is_ksk(path: str) -> bool:
+    """True if a BIND ``K*.key`` file holds a KSK (DNSKEY flags SEP bit set)."""
+    try:
+        with open(path) as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith(";"):
+                    continue
+                m = re.search(r"\bDNSKEY\s+(\d+)\s", s)
+                if m:
+                    return bool(int(m.group(1)) & 1)  # SEP bit ⇒ KSK
+    except OSError:
+        return False
+    return False
+
+
+def _render_dnssec_policies(policies: list[dict[str, Any]]) -> str:
+    """Render top-level ``dnssec-policy "<name>" { ... };`` blocks (issue #49).
+
+    BIND's built-in ``default`` policy is never shipped here (zones that use
+    it reference it by name without a definition). Each entry is a dict from
+    the ConfigBundle: name / algorithm / ksk_lifetime_days / zsk_lifetime_days
+    / nsec3 + nsec3_iterations / nsec3_salt_length / nsec3_optout.
+    """
+    out = ""
+    for p in policies:
+        name = p.get("name")
+        if not name or name == "default":
+            continue
+        algo = p.get("algorithm") or "ecdsap256sha256"
+        block = (
+            f'dnssec-policy "{name}" {{\n'
+            "    keys {\n"
+            f"        ksk lifetime {_lifetime(p.get('ksk_lifetime_days', 0))} algorithm {algo};\n"
+            f"        zsk lifetime {_lifetime(p.get('zsk_lifetime_days', 90))} algorithm {algo};\n"
+            "    };\n"
+        )
+        if p.get("nsec3"):
+            optout = "yes" if p.get("nsec3_optout") else "no"
+            block += (
+                f"    nsec3param iterations {int(p.get('nsec3_iterations', 0))} "
+                f"optout {optout} salt-length {int(p.get('nsec3_salt_length', 0))};\n"
+            )
+        block += "};\n"
+        out += block
+    return out
 
 
 class Bind9Driver(DriverBase):
@@ -155,6 +262,12 @@ class Bind9Driver(DriverBase):
                 "};\n"
             )
 
+        # DNSSEC signing policies (issue #49). Custom policies referenced by
+        # a signed zone render as top-level ``dnssec-policy { ... }`` blocks;
+        # BIND's built-in "default" needs none. The key-directory above is
+        # where BIND auto-generates + rotates the private keys.
+        conf += _render_dnssec_policies(bundle.get("dnssec_policies") or [])
+
         def _zone_stanza(zone: dict[str, Any], file_prefix: str) -> str:
             """Build one ``zone "..." { ... };`` and write its zone file.
 
@@ -186,11 +299,18 @@ class Bind9Driver(DriverBase):
             allow_update = (
                 f'allow-update {{ key "{tsig_key_name}"; }}; ' if tsig_key_name else ""
             )
+            # DNSSEC inline-signing (issue #49): primary zones with signing on
+            # reference a dnssec-policy + enable inline-signing; BIND
+            # auto-generates keys in key-directory + signs on load.
+            dnssec_clause = ""
+            if zone_type in {"primary", "master"} and zone.get("dnssec_enabled"):
+                pol = zone.get("dnssec_policy_name") or "default"
+                dnssec_clause = f'dnssec-policy "{pol}"; inline-signing yes; '
             if zone_type in {"primary", "master"}:
                 self._write_zone_file(new_dir / rel_zfile, zone)
             return (
                 f'zone "{zname}" {{ type {bind_type}; file "{abs_zfile}"; '
-                f"{allow_update}}};\n"
+                f"{allow_update}{dnssec_clause}}};\n"
             )
 
         def _rpz_stanza(bl: dict[str, Any], file_prefix: str) -> str:
@@ -506,7 +626,17 @@ class Bind9Driver(DriverBase):
 
     # ── Record ops (RFC 2136 over loopback) ─────────────────────────────────
 
-    def apply_record_op(self, op: dict[str, Any]) -> None:
+    def apply_record_op(self, op: dict[str, Any]) -> dict[str, Any] | None:
+        # DNSSEC ops (issue #49). BIND9 signs from the rendered config
+        # (inline-signing), so sign/unsign need no per-op action here — the
+        # zone's dnssec_enabled flip already reshaped the bundle + triggered a
+        # reload. A manual rollover is the one thing that needs an rndc call.
+        op_kind = op.get("op")
+        if op_kind == "dnssec_rollover":
+            return self._dnssec_rollover(op)
+        if op_kind in ("dnssec_sign", "dnssec_unsign"):
+            return None
+
         if dns is None:
             raise RuntimeError("dnspython not installed — cannot apply record ops")
         zone = op["zone_name"].rstrip(".") + "."
@@ -590,6 +720,106 @@ class Bind9Driver(DriverBase):
                 f"nsupdate returned rcode={rcode} "
                 f"(zone={zone} op={op['op']} name={name} type={rtype})"
             )
+
+    # ── DNSSEC (issue #49) ──────────────────────────────────────────────────
+
+    def _rndc_base(self) -> list[str]:
+        cmd = ["rndc"]
+        agent_conf = self.state_dir / "rndc.conf"
+        if agent_conf.exists():
+            cmd += ["-c", str(agent_conf)]
+        return cmd
+
+    def collect_dnssec_state(self, bundle: dict[str, Any]) -> list[dict[str, Any]]:
+        """For every signed primary zone, read its DS rrset + per-key state
+        and return report entries for ``POST /dns/agents/dnssec-state``.
+
+        BIND owns the private keys (inline-signing); this is a read-only
+        mirror via ``rndc dnssec -status`` + ``dnssec-dsfromkey``. Best
+        effort — a zone still mid-key-generation just reports empty DS, and
+        the next sync picks it up.
+        """
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for z in bundle.get("zones", []):
+            if not z.get("dnssec_enabled"):
+                continue
+            ztype = z.get("type", "primary")
+            if ztype not in {"primary", "master"}:
+                continue
+            zname = (z.get("name") or "").rstrip(".")
+            if not zname or zname in seen:
+                continue
+            seen.add(zname)
+            try:
+                out.append(self._zone_dnssec_state(zname))
+            except Exception as e:  # noqa: BLE001 — never let one zone block the rest
+                log.warning("dnssec_state_collect_failed", zone=zname, error=str(e))
+        return out
+
+    def _zone_dnssec_state(self, zone: str) -> dict[str, Any]:
+        keys: list[dict[str, Any]] = []
+        ds_records: list[str] = []
+        if shutil.which("rndc"):
+            res = subprocess.run(
+                [*self._rndc_base(), "dnssec", "-status", zone],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if res.returncode == 0:
+                keys = _parse_dnssec_status(res.stdout)
+        # DS rrset(s) from the KSK public-key files BIND wrote into the
+        # key-directory. The CDS records BIND publishes are an alternative,
+        # but dnssec-dsfromkey is deterministic + version-stable.
+        key_dir = "/var/cache/bind/keys"
+        if shutil.which("dnssec-dsfromkey") and os.path.isdir(key_dir):
+            for fn in sorted(os.listdir(key_dir)):
+                if not fn.endswith(".key") or not fn.startswith(f"K{zone}.+"):
+                    continue
+                path = os.path.join(key_dir, fn)
+                try:
+                    if not _keyfile_is_ksk(path):
+                        continue
+                    dres = subprocess.run(
+                        ["dnssec-dsfromkey", "-2", path],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    for ln in dres.stdout.splitlines():
+                        ln = ln.strip()
+                        if ln and " DS " in ln:
+                            ds_records.append(ln)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("dsfromkey_failed", zone=zone, file=fn, error=str(e))
+        # Attach DS to the KSK key entries so the per-key UI can show them.
+        for k in keys:
+            if k.get("key_type") in ("ksk", "csk"):
+                k["ds_records"] = ds_records
+        return {"zone_name": zone + ".", "ds_records": ds_records, "keys": keys}
+
+    def _dnssec_rollover(self, op: dict[str, Any]) -> dict[str, Any] | None:
+        """Force a key rollover for the zone (``rndc dnssec -rollover``).
+
+        The op record carries the ``key_tag`` to roll. After triggering, we
+        re-read the zone's state so the control plane reflects the new key
+        set on the next heartbeat.
+        """
+        zone = op["zone_name"].rstrip(".")
+        rec = op.get("record") or {}
+        key_tag = rec.get("key_tag")
+        if not shutil.which("rndc"):
+            raise RuntimeError("rndc not available — cannot roll DNSSEC key")
+        cmd = [*self._rndc_base(), "dnssec", "-rollover", "-key", str(key_tag), zone]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if res.returncode != 0:
+            raise RuntimeError(f"rndc dnssec -rollover failed: {res.stderr.strip()}")
+        log.info("dnssec_rollover_triggered", zone=zone, key_tag=key_tag)
+        try:
+            return {"dnssec_state": self._zone_dnssec_state(zone)}
+        except Exception:  # noqa: BLE001
+            return None
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 

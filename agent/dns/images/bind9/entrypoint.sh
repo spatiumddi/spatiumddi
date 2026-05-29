@@ -10,8 +10,11 @@ set -eu
 # spatium (see start_daemon — no `-u` flag), so the directory needs
 # to be owned by that user before the daemon can open the file. The
 # log file itself is created by named on first query.
-mkdir -p /var/lib/spatium-dns-agent /var/cache/bind /var/log/named
-chown -R spatium:spatium /var/lib/spatium-dns-agent /var/log/named || true
+# /var/cache/bind/keys is the DNSSEC key-directory (issue #49): BIND9
+# auto-generates + rotates the inline-signing private keys there, so it
+# must exist and be writable by the unprivileged named (spatium) user.
+mkdir -p /var/lib/spatium-dns-agent /var/cache/bind/keys /var/log/named
+chown -R spatium:spatium /var/lib/spatium-dns-agent /var/log/named /var/cache/bind || true
 
 # Agent-controlled rndc credentials. The alpine bind package's
 # /etc/bind/rndc.key lives in a directory `spatium` can't traverse,

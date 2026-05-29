@@ -4117,6 +4117,7 @@ export interface DNSZone {
   linked_subnet_id: string | null;
   domain_id?: string | null;
   dnssec_enabled: boolean;
+  dnssec_policy_id?: string | null;
   dnssec_ds_records: string[] | null;
   dnssec_synced_at: string | null;
   color: string | null;
@@ -4319,6 +4320,45 @@ export interface PropagationCheckResult {
   record_type: string;
   queried_at_ms: number;
   results: PropagationResolverResult[];
+}
+
+/** One DNSSEC key's public state (issue #49). No private material. */
+export interface DNSKeyState {
+  key_tag: number;
+  key_type: "ksk" | "zsk" | "csk";
+  algorithm: number;
+  state: string;
+  ds_records: string[];
+  timing?: Record<string, string>;
+  reported_at?: string | null;
+}
+
+/** Zone DNSSEC posture for the zone-edit DNSSEC card. */
+export interface ZoneDnssecInfo {
+  zone_id: string;
+  zone_name: string;
+  dnssec_enabled: boolean;
+  dnssec_policy_id: string | null;
+  dnssec_ds_records: string[];
+  dnssec_synced_at: string | null;
+  keys: DNSKeyState[];
+}
+
+/** A reusable BIND9 dnssec-policy definition (issue #49). */
+export interface DNSSECPolicy {
+  id: string;
+  name: string;
+  description: string;
+  is_builtin: boolean;
+  algorithm: string;
+  ksk_lifetime_days: number;
+  zsk_lifetime_days: number;
+  nsec3: boolean;
+  nsec3_iterations: number;
+  nsec3_salt_length: number;
+  nsec3_optout: boolean;
+  created_at: string;
+  modified_at: string;
 }
 
 export const dnsApi = {
@@ -4544,25 +4584,42 @@ export const dnsApi = {
       )
       .then((r) => r.data),
 
-  // PowerDNS online DNSSEC (issue #127, Phase 3c)
+  // DNSSEC — PowerDNS online signing (#127) + BIND9 inline-signing (#49)
+  // (types declared above `dnsApi`; see DNSKeyState / ZoneDnssecInfo / DNSSECPolicy)
   getZoneDnssecInfo: (groupId: string, zoneId: string) =>
     api
-      .get<{
-        zone_id: string;
-        zone_name: string;
-        dnssec_enabled: boolean;
-        dnssec_ds_records: string[];
-        dnssec_synced_at: string | null;
-      }>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/info`)
+      .get<ZoneDnssecInfo>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/info`)
       .then((r) => r.data),
-  signZoneDnssec: (groupId: string, zoneId: string) =>
+  signZoneDnssec: (groupId: string, zoneId: string, policyId?: string | null) =>
     api
-      .post<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/sign`)
+      .post<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/sign`, {
+        policy_id: policyId ?? null,
+      })
       .then((r) => r.data),
   unsignZoneDnssec: (groupId: string, zoneId: string) =>
     api
       .post<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/unsign`)
       .then((r) => r.data),
+  rolloverZoneDnssecKey: (groupId: string, zoneId: string, keyTag: number) =>
+    api
+      .post<{
+        status: string;
+        zone_id: string;
+        key_tag: number;
+      }>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/rollover`, {
+        key_tag: keyTag,
+      })
+      .then((r) => r.data),
+  // DNSSEC policies (issue #49)
+  listDnssecPolicies: () =>
+    api.get<DNSSECPolicy[]>("/dns/dnssec-policies").then((r) => r.data),
+  createDnssecPolicy: (data: Partial<DNSSECPolicy>) =>
+    api.post<DNSSECPolicy>("/dns/dnssec-policies", data).then((r) => r.data),
+  updateDnssecPolicy: (id: string, data: Partial<DNSSECPolicy>) =>
+    api
+      .put<DNSSECPolicy>(`/dns/dnssec-policies/${id}`, data)
+      .then((r) => r.data),
+  deleteDnssecPolicy: (id: string) => api.delete(`/dns/dnssec-policies/${id}`),
 
   // Delegation wizard
   getDelegationPreview: (groupId: string, zoneId: string) =>
