@@ -49,9 +49,12 @@ def _tuple_or_none(v: list | None) -> tuple[str, ...] | None:
     return tuple(str(x) for x in v)
 
 
-def _to_blocklist_data(eff: EffectiveBlocklist, rpz_name: str) -> EffectiveBlocklistData:
+def _to_blocklist_data(
+    eff: EffectiveBlocklist, rpz_name: str, view_name: str | None = None
+) -> EffectiveBlocklistData:
     return EffectiveBlocklistData(
         rpz_zone_name=rpz_name,
+        view_name=view_name,
         entries=tuple(
             BlocklistEntry(
                 domain=e.domain,
@@ -249,7 +252,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         for v in view_rows:
             eff = await build_effective_for_view(db, v.id)
             if eff.entries:
-                blocklists.append(_to_blocklist_data(eff, f"spatium-blocklist-{v.name}.rpz."))
+                blocklists.append(
+                    _to_blocklist_data(eff, f"spatium-blocklist-{v.name}.rpz.", view_name=v.name)
+                )
     else:
         eff = await build_effective_for_group(db, server.group_id)
         if eff.entries:
