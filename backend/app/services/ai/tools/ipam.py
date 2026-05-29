@@ -325,6 +325,51 @@ async def get_subnet_summary(
     }
 
 
+# ── find_subnet_reconciliation ────────────────────────────────────────
+
+
+class SubnetReconciliationArgs(BaseModel):
+    subnet_id: str = Field(description="Subnet UUID.")
+    stale_minutes: int = Field(
+        default=1440,
+        description=(
+            "How old (minutes) a row's last-seen timestamp may be before it "
+            "counts as stale. Default 1440 (24h)."
+        ),
+    )
+
+
+@register_tool(
+    name="find_subnet_reconciliation",
+    description=(
+        "IP-discovery reconciliation for one subnet (issue #23): which "
+        "allocated IPs aren't answering on the wire, which live IPs were "
+        "discovered but never formally allocated, and which IPs marked "
+        "'available' are actually active right now (status mismatch). Use "
+        "when the operator asks 'what's stale in X?', 'what did discovery "
+        "find in X?', or 'is anything using IPs we think are free?'. "
+        "Read-only — reflects the last sweep; trigger a fresh sweep from "
+        "the subnet's Reconciliation panel."
+    ),
+    args_model=SubnetReconciliationArgs,
+    category="ipam",
+)
+async def find_subnet_reconciliation(
+    db: AsyncSession, user: User, args: SubnetReconciliationArgs
+) -> dict[str, Any]:
+    from app.services.ipam.discovery import build_reconciliation_report
+
+    try:
+        subnet_uuid = uuid.UUID(args.subnet_id)
+    except (ValueError, TypeError):
+        return {"error": "subnet_id must be a UUID", "subnet_id": args.subnet_id}
+    subnet = await db.get(Subnet, subnet_uuid)
+    if subnet is None or subnet.deleted_at is not None:
+        return {"error": "subnet not found", "subnet_id": args.subnet_id}
+    stale = max(1, min(args.stale_minutes, 525600))
+    return await build_reconciliation_report(db, subnet, stale_minutes=stale)
+
+
 # ── find_ip ───────────────────────────────────────────────────────────
 
 

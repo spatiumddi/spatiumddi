@@ -28,6 +28,7 @@ celery_app = Celery(
         "app.tasks.prune_revoked_appliances",
         "app.tasks.trash_purge",
         "app.tasks.ipam_reservation_sweep",
+        "app.tasks.ipam_discovery",
         "app.tasks.dhcp_lease_history_prune",
         "app.tasks.update_check",
         "app.tasks.kubernetes_sync",
@@ -77,6 +78,7 @@ celery_app.conf.update(
         "app.tasks.prune_pairing_codes.*": {"queue": "default"},
         "app.tasks.trash_purge.*": {"queue": "default"},
         "app.tasks.ipam_reservation_sweep.*": {"queue": "ipam"},
+        "app.tasks.ipam_discovery.*": {"queue": "ipam"},
         "app.tasks.dhcp_lease_history_prune.*": {"queue": "dhcp"},
         "app.tasks.update_check.*": {"queue": "default"},
         "app.tasks.kubernetes_sync.*": {"queue": "default"},
@@ -129,6 +131,15 @@ celery_app.conf.update(
         # restarting celery-beat.
         "ipam-dns-auto-sync": {
             "task": "app.tasks.ipam_dns_sync.auto_sync_ipam_dns",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Every 60 s, dispatch IP-discovery sweeps for subnets whose
+        # per-subnet interval has elapsed (issue #23). Per-subnet gating
+        # lives in the task (``discovery_enabled`` + ``last_discovery_at``
+        # vs ``discovery_interval_minutes``) so cadence changes in the UI
+        # take effect without restarting beat.
+        "ipam-discovery-dispatch": {
+            "task": "app.tasks.ipam_discovery.dispatch_due_subnets",
             "schedule": schedule(run_every=60.0),
         },
         # Every 60 s, tick the DNS pull-from-server task. The task itself

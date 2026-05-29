@@ -61,6 +61,8 @@ import {
   type IPSpace,
   type IPBlock,
   type Subnet,
+  type SubnetReconciliation,
+  type ReconciliationEntry,
   type SubnetRole,
   type IPAddress,
   type IPRole,
@@ -1188,6 +1190,82 @@ function ProfilingSettingsSection({
 }
 
 /**
+ * IP discovery (issue #23) — opt-in scheduled ping/ARP sweep. Mirrors
+ * the profiling section's shape. Default-off + per-subnet because a
+ * sweep only makes sense for subnets the worker can reach, and
+ * unsolicited probes can trip an IDS. The sweep stamps last-seen on
+ * existing rows and inserts ``discovered`` rows for live IPs not yet
+ * in IPAM (locked rows + dynamic DHCP pools are never clobbered).
+ */
+function DiscoverySettingsSection({
+  enabled,
+  intervalMinutes,
+  onEnabledChange,
+  onIntervalChange,
+}: {
+  enabled: boolean;
+  intervalMinutes: number;
+  onEnabledChange: (v: boolean) => void;
+  onIntervalChange: (v: number) => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <Radar className="h-3.5 w-3.5 text-muted-foreground" />
+          <span className="text-xs font-medium">
+            IP discovery (scheduled ping / ARP sweep)
+          </span>
+        </div>
+        <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => onEnabledChange(e.target.checked)}
+            className="h-3.5 w-3.5"
+          />
+          Enabled
+        </label>
+      </div>
+      {!enabled && (
+        <p className="text-xs text-muted-foreground italic">
+          When enabled, SpatiumDDI periodically pings this subnet (and reads the
+          worker's ARP table), stamping last-seen on tracked IPs and flagging
+          live-but-untracked IPs as <code>discovered</code>. Only useful for
+          subnets the worker can route to.
+        </p>
+      )}
+      {enabled && (
+        <div className="space-y-2 pl-5 border-l-2 border-muted">
+          <label className="block text-xs">
+            <span className="block text-muted-foreground mb-0.5">
+              Sweep interval (minutes)
+            </span>
+            <input
+              type="number"
+              min={5}
+              max={10080}
+              value={intervalMinutes}
+              onChange={(e) => {
+                const v = e.target.value.trim();
+                if (!v) return;
+                const n = parseInt(v, 10);
+                if (!isNaN(n)) onIntervalChange(n);
+              }}
+              className="w-full rounded-md border bg-background px-2 py-1 text-sm"
+            />
+            <span className="mt-0.5 block text-[11px] text-muted-foreground">
+              How often to sweep. 360 (6h) is a sane default; 5-minute floor.
+              Subnets larger than a /20 are skipped (too big to sweep safely).
+            </span>
+          </label>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * Compliance classification — first-class boolean flags on the
  * subnet for PCI / HIPAA / internet-facing scope. Used by the
  * Compliance dashboard at /admin/compliance to answer auditor
@@ -1848,6 +1926,9 @@ function CreateSubnetModal({
   const [autoProfilePreset, setAutoProfilePreset] =
     useState<AutoProfilePreset>("service_and_os");
   const [autoProfileRefreshDays, setAutoProfileRefreshDays] = useState(30);
+  // IP discovery (issue #23) — opt-in scheduled ping/ARP sweep.
+  const [discoveryEnabled, setDiscoveryEnabled] = useState(false);
+  const [discoveryIntervalMinutes, setDiscoveryIntervalMinutes] = useState(360);
   // Compliance / classification flags (issue #75).
   const [pciScope, setPciScope] = useState(false);
   const [hipaaScope, setHipaaScope] = useState(false);
@@ -1955,6 +2036,8 @@ function CreateSubnetModal({
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
+        discovery_enabled: discoveryEnabled,
+        discovery_interval_minutes: discoveryIntervalMinutes,
         pci_scope: pciScope,
         hipaa_scope: hipaaScope,
         internet_facing: internetFacing,
@@ -2260,6 +2343,14 @@ function CreateSubnetModal({
             onPresetChange={setAutoProfilePreset}
             onRefreshDaysChange={setAutoProfileRefreshDays}
           />
+          <div className="border-t pt-4">
+            <DiscoverySettingsSection
+              enabled={discoveryEnabled}
+              intervalMinutes={discoveryIntervalMinutes}
+              onEnabledChange={setDiscoveryEnabled}
+              onIntervalChange={setDiscoveryIntervalMinutes}
+            />
+          </div>
           <div className="border-t pt-4">
             <ClassificationSection
               pciScope={pciScope}
@@ -3198,6 +3289,168 @@ function SyncMenu({
 
 // ─── Tools dropdown — alphabetical bundle of low-frequency subnet ops ───────
 //
+// IP-discovery reconciliation modal (issue #23). Reads the per-subnet
+// reconciliation report (last sweep) into three buckets and offers a
+// "Discover now" trigger that queues an on-demand sweep. The sweep is
+// async (Celery), so after triggering we tell the operator to Refresh
+// in a moment rather than blocking on it.
+function ReconciliationModal({
+  subnet,
+  onClose,
+}: {
+  subnet: Subnet;
+  onClose: () => void;
+}) {
+  const {
+    data: report,
+    isLoading,
+    refetch,
+    isFetching,
+  } = useQuery({
+    queryKey: ["subnet-reconciliation", subnet.id],
+    queryFn: () => ipamApi.getReconciliation(subnet.id),
+  });
+  const [note, setNote] = useState<string | null>(null);
+  const discover = useMutation({
+    mutationFn: () => ipamApi.triggerDiscovery(subnet.id),
+    onSuccess: (r) =>
+      setNote(
+        r.status === "queued"
+          ? "Sweep queued — it runs in the background. Refresh in a few seconds to see results."
+          : "Couldn't queue the sweep (task broker unreachable).",
+      ),
+    onError: () => setNote("Failed to queue the sweep."),
+  });
+
+  const buckets: {
+    key: keyof SubnetReconciliation["counts"];
+    title: string;
+    hint: string;
+    rows: ReconciliationEntry[];
+    tone: string;
+  }[] = report
+    ? [
+        {
+          key: "in_ipam_not_seen",
+          title: "Allocated but not seen",
+          hint: "Tracked as allocated/reserved/static but nothing answered within the stale window.",
+          rows: report.in_ipam_not_seen,
+          tone: "text-amber-600 dark:text-amber-400",
+        },
+        {
+          key: "discovered_not_allocated",
+          title: "Discovered, not allocated",
+          hint: "Live on the wire but never formally allocated. Promote via Edit, or leave as a heads-up.",
+          rows: report.discovered_not_allocated,
+          tone: "text-sky-600 dark:text-sky-400",
+        },
+        {
+          key: "status_mismatch",
+          title: "Marked available but active",
+          hint: "IPAM says these are free, but a host is answering. Likely a silent squatter.",
+          rows: report.status_mismatch,
+          tone: "text-rose-600 dark:text-rose-400",
+        },
+      ]
+    : [];
+
+  return (
+    <Modal title={`Reconciliation — ${subnet.network}`} onClose={onClose} wide>
+      <div className="space-y-4">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-xs text-muted-foreground">
+            {report?.last_discovery_at
+              ? `Last sweep: ${new Date(report.last_discovery_at).toLocaleString()}`
+              : "No sweep has run yet for this subnet."}
+          </p>
+          <div className="flex items-center gap-2">
+            <HeaderButton
+              icon={RefreshCw}
+              onClick={() => refetch()}
+              disabled={isFetching}
+            >
+              Refresh
+            </HeaderButton>
+            <HeaderButton
+              icon={Radar}
+              variant="primary"
+              onClick={() => discover.mutate()}
+              disabled={discover.isPending}
+            >
+              {discover.isPending ? "Queuing…" : "Discover now"}
+            </HeaderButton>
+          </div>
+        </div>
+        {note && (
+          <p className="rounded-md border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-700 dark:text-sky-300">
+            {note}
+          </p>
+        )}
+        {isLoading && (
+          <p className="text-sm text-muted-foreground">Loading report…</p>
+        )}
+        {report && (
+          <div className="space-y-4">
+            {buckets.map((b) => (
+              <section key={b.key}>
+                <div className="mb-1 flex items-baseline gap-2">
+                  <h4 className={cn("text-sm font-semibold", b.tone)}>
+                    {b.title}
+                  </h4>
+                  <span className="text-xs text-muted-foreground">
+                    {report.counts[b.key]}
+                  </span>
+                </div>
+                <p className="mb-1.5 text-[11px] text-muted-foreground">
+                  {b.hint}
+                </p>
+                {b.rows.length === 0 ? (
+                  <p className="text-xs text-muted-foreground italic">None.</p>
+                ) : (
+                  <div className="overflow-x-auto rounded-md border">
+                    <table className="w-full min-w-[480px] text-xs">
+                      <thead className="bg-muted/50 text-left text-muted-foreground">
+                        <tr>
+                          <th className="px-2 py-1 font-medium">Address</th>
+                          <th className="px-2 py-1 font-medium">Status</th>
+                          <th className="px-2 py-1 font-medium">Hostname</th>
+                          <th className="px-2 py-1 font-medium">MAC</th>
+                          <th className="px-2 py-1 font-medium">Last seen</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {b.rows.map((r) => (
+                          <tr key={r.id} className="border-t">
+                            <td className="px-2 py-1 font-mono">{r.address}</td>
+                            <td className="px-2 py-1">{r.status}</td>
+                            <td className="px-2 py-1">{r.hostname || "—"}</td>
+                            <td className="px-2 py-1 font-mono">
+                              {r.mac_address || "—"}
+                            </td>
+                            <td className="px-2 py-1">
+                              {r.last_seen_at
+                                ? `${new Date(r.last_seen_at).toLocaleString()}${
+                                    r.last_seen_method
+                                      ? ` (${r.last_seen_method})`
+                                      : ""
+                                  }`
+                                : "never"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+            ))}
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
 // Collapses Clean Orphans / Merge / Resize / Scan with nmap / Split into a
 // single dropdown so the subnet header doesn't accumulate a row of 9+ buttons
 // as we add features. Items are alphabetical to make discovery predictable —
@@ -3207,6 +3460,7 @@ function ToolsMenu({
   onBulkAllocate,
   onCleanOrphans,
   onMerge,
+  onReconcile,
   onResize,
   onScan,
   onSplit,
@@ -3214,6 +3468,7 @@ function ToolsMenu({
   onBulkAllocate: () => void;
   onCleanOrphans: () => void;
   onMerge: () => void;
+  onReconcile: () => void;
   onResize: () => void;
   onScan: () => void;
   onSplit: () => void;
@@ -3278,6 +3533,16 @@ function ToolsMenu({
             className={itemCls}
           >
             <GitMerge className="h-3.5 w-3.5" /> Merge…
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              onReconcile();
+            }}
+            className={itemCls}
+          >
+            <Radar className="h-3.5 w-3.5" /> Reconcile (IP discovery)
           </button>
           <button
             type="button"
@@ -3399,6 +3664,7 @@ function SubnetDetail({
   } | null>(null);
   const [showEditSubnet, setShowEditSubnet] = useState(false);
   const [showResizeSubnet, setShowResizeSubnet] = useState(false);
+  const [showReconcile, setShowReconcile] = useState(false);
   const [showSplitSubnet, setShowSplitSubnet] = useState(false);
   const [showMergeSubnet, setShowMergeSubnet] = useState(false);
   // Scan-the-whole-subnet trigger from the Tools menu. Re-uses the
@@ -3870,6 +4136,7 @@ function SubnetDetail({
               onBulkAllocate={() => setShowBulkAllocate(true)}
               onCleanOrphans={() => setShowOrphans(true)}
               onMerge={() => setShowMergeSubnet(true)}
+              onReconcile={() => setShowReconcile(true)}
               onResize={() => setShowResizeSubnet(true)}
               onScan={() => setShowSubnetScan(true)}
               onSplit={() => setShowSplitSubnet(true)}
@@ -4978,6 +5245,12 @@ function SubnetDetail({
           }}
         />
       )}
+      {showReconcile && (
+        <ReconciliationModal
+          subnet={subnet}
+          onClose={() => setShowReconcile(false)}
+        />
+      )}
       {showSplitSubnet && (
         <SplitSubnetModal
           subnet={subnet}
@@ -5871,6 +6144,13 @@ function EditSubnetModal({
   const [autoProfileRefreshDays, setAutoProfileRefreshDays] = useState(
     subnet.auto_profile_refresh_days ?? 30,
   );
+  // IP discovery (issue #23) — opt-in scheduled ping/ARP sweep.
+  const [discoveryEnabled, setDiscoveryEnabled] = useState(
+    subnet.discovery_enabled ?? false,
+  );
+  const [discoveryIntervalMinutes, setDiscoveryIntervalMinutes] = useState(
+    subnet.discovery_interval_minutes ?? 360,
+  );
   // Compliance / classification flags (issue #75). First-class
   // booleans rather than freeform tags so the Compliance dashboard
   // queries hit indexed predicates.
@@ -5991,6 +6271,8 @@ function EditSubnetModal({
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
+        discovery_enabled: discoveryEnabled,
+        discovery_interval_minutes: discoveryIntervalMinutes,
         pci_scope: pciScope,
         hipaa_scope: hipaaScope,
         internet_facing: internetFacing,
@@ -6335,6 +6617,14 @@ function EditSubnetModal({
             onPresetChange={setAutoProfilePreset}
             onRefreshDaysChange={setAutoProfileRefreshDays}
           />
+          <div className="border-t pt-4">
+            <DiscoverySettingsSection
+              enabled={discoveryEnabled}
+              intervalMinutes={discoveryIntervalMinutes}
+              onEnabledChange={setDiscoveryEnabled}
+              onIntervalChange={setDiscoveryIntervalMinutes}
+            />
+          </div>
           <div className="border-t pt-4">
             <ClassificationSection
               pciScope={pciScope}
