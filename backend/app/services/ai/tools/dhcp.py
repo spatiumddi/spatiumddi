@@ -103,6 +103,7 @@ async def list_dhcp_scopes(
             "subnet": str(s.subnet),
             "name": s.name,
             "address_family": s.address_family,
+            "v6_address_mode": getattr(s, "v6_address_mode", "stateful"),
         }
         for s in rows
     ]

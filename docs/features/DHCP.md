@@ -78,8 +78,32 @@ DHCPScope
   }
   ddns_enabled: bool
   ddns_hostname_policy: enum(client_provided, client_or_generated, always_generate, disabled)
+  address_family: enum(ipv4, ipv6)   -- inferred from the bound subnet's CIDR
+  v6_address_mode: enum(stateful, stateless, slaac)  -- v6 only (issue #52)
+  ra_managed_flag: bool              -- intended RA M-flag (router-side intent)
+  ra_other_flag: bool                -- intended RA O-flag (router-side intent)
   last_pushed_at: timestamp
 ```
+
+#### DHCPv6 operating mode (issue #52)
+
+For IPv6 scopes, `v6_address_mode` chooses how clients on the subnet get
+their address, and drives what the Kea driver renders into the `subnet6`:
+
+| Mode | Kea `subnet6` render | RA flags (set on the router) | Client behaviour |
+|---|---|---|---|
+| `stateful` | address `pools` + `option-data` + reservations | M=1, O=1 | DHCPv6 hands out the address (IA_NA) and options |
+| `stateless` | **no pools**, `option-data` only + reservations | M=0, O=1 | Client SLAACs its address from the RA prefix, asks DHCPv6 (Information-Request) for DNS / domain-search |
+| `slaac` | bare subnet — **no pools, no options, no reservations** | M=0, O=0 | The router's RA does everything; DHCPv6 is not involved |
+
+The `ra_managed_flag` (M) / `ra_other_flag` (O) columns record the
+intended Router-Advertisement flags. **SpatiumDDI's Kea agent does not
+send RAs** — these are operator intent surfaced in the scope modal
+("set these on your router / radvd"), auto-suggested from the chosen
+mode (and freely overridable). The mode picker only appears on IPv6
+scopes; v4 scopes ignore these columns and always serve addresses +
+options. Changing the mode shifts the agent ConfigBundle ETag, so the
+Kea agent re-pulls and re-renders.
 
 ### DHCPPool Model (Dynamic Ranges)
 

@@ -5389,6 +5389,14 @@ export interface DHCPScope {
   hostname_sync_mode: string;
   // "ipv4" → Kea Dhcp4; "ipv6" → Kea Dhcp6. Inferred from subnet CIDR.
   address_family?: "ipv4" | "ipv6";
+  // DHCPv6 operating mode (issue #52). Only meaningful for ipv6 scopes.
+  // "stateful" = DHCP hands out addresses; "stateless" = options only
+  // (clients SLAAC their address); "slaac" = no DHCP address service.
+  // ra_managed_flag / ra_other_flag are the intended Router-Advertisement
+  // M/O flags — configured on the upstream router, not pushed by Kea.
+  v6_address_mode?: "stateful" | "stateless" | "slaac";
+  ra_managed_flag?: boolean;
+  ra_other_flag?: boolean;
   options: DHCPOption[];
   // PXE / iPXE profile binding (issue #51). Null = no PXE on this
   // scope. Bound profile renders one Kea client-class per arch-match
