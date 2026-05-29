@@ -73,25 +73,34 @@ key "{{ key.name }}" {
 
 {%- if views %}
 {%- for view in views %}
+{# Per-view RPZ (issue #24): each view owns its blocklist + the
+   response-policy directive. ``view_name == none`` is a group-level
+   blocklist that applies to EVERY view; BIND9 forbids top-level
+   ``zone {}`` alongside views, so RPZ can't be hoisted out. #}
+{%- set view_bls = blocklists | selectattr("view_name", "in", [view.name, none]) | list %}
 view "{{ view.name }}" {
     match-clients { {% for c in view.match_clients %}{{ c }}; {% endfor %}};
     {%- if view.match_destinations %}
     match-destinations { {% for c in view.match_destinations %}{{ c }}; {% endfor %}};
     {%- endif %}
     recursion {{ "yes" if view.recursion else "no" }};
+    {%- if view_bls %}
+    response-policy { {% for bl in view_bls %}zone "{{ bl.rpz_zone_name }}"; {% endfor %}} break-dnssec yes;
+    {%- endif %}
 {%- for zone in zones %}
 {%- if zone.view_name == view.name %}
-{{ zone_stanzas[zone.name] | indent(4, true) }}
+{{ zone_stanzas[(zone.view_name, zone.name)] | indent(4, true) }}
 {%- endif %}
+{%- endfor %}
+{%- for bl in view_bls %}
+    zone "{{ bl.rpz_zone_name }}" { type primary; file "/var/cache/bind/rpz/{{ view.name }}/{{ bl.rpz_zone_name }}db"; allow-query { none; }; };
 {%- endfor %}
 };
 {% endfor %}
 {%- else %}
 {%- for zone in zones %}
-{{ zone_stanzas[zone.name] }}
+{{ zone_stanzas[(zone.view_name, zone.name)] }}
 {%- endfor %}
-{%- endif %}
-
 {%- for bl in blocklists %}
 zone "{{ bl.rpz_zone_name }}" {
     type primary;
@@ -99,3 +108,4 @@ zone "{{ bl.rpz_zone_name }}" {
     allow-query { none; };
 };
 {%- endfor %}
+{%- endif %}

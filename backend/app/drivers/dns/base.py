@@ -141,6 +141,12 @@ class EffectiveBlocklistData:
     rpz_zone_name: str  # e.g. "spatium-blocklist.rpz."
     entries: tuple[BlocklistEntry, ...]
     exceptions: frozenset[str]
+    # Issue #24 — which view this RPZ belongs to. ``None`` = group-level
+    # (global; rendered into every view, or top-level when no views
+    # exist). When views exist, RPZ zones + the response-policy directive
+    # must live INSIDE the owning view block — BIND9 forbids top-level
+    # ``zone {}`` alongside ``view {}``.
+    view_name: str | None = None
 
 
 @dataclass
@@ -179,6 +185,7 @@ class ConfigBundle:
             "blocklists": [
                 {
                     "rpz_zone_name": b.rpz_zone_name,
+                    "view_name": b.view_name,
                     "entries": [asdict(e) for e in b.entries],
                     "exceptions": sorted(b.exceptions),
                 }

@@ -19,6 +19,7 @@ from app.drivers.dns.base import (
     ServerOptions,
     TrustAnchorData,
     TsigKey,
+    ViewData,
     ZoneData,
 )
 from app.drivers.dns.bind9 import BIND9Driver
@@ -168,6 +169,125 @@ def test_render_server_config_includes_acl_and_forwarders(bundle: ConfigBundle) 
     assert 'zone "example.com."' in out
     # No view wrapping when views=()
     assert 'view "' not in out
+
+
+def test_render_server_config_split_horizon_views() -> None:
+    """Issue #24: the same zone name materialises once per view (with
+    each view's filtered records pre-expanded by the bundle builder),
+    and the driver wraps each copy in its own ``view { … }`` block —
+    the stanza dict is keyed by (view_name, name) so the copies don't
+    collapse."""
+
+    def _z(view_name: str) -> ZoneData:
+        return ZoneData(
+            name="example.com.",
+            zone_type="primary",
+            kind="forward",
+            ttl=3600,
+            refresh=86400,
+            retry=7200,
+            expire=3600000,
+            minimum=3600,
+            primary_ns="ns1.example.com.",
+            admin_email="hostmaster.example.com.",
+            serial=2026041401,
+            records=(),
+            view_name=view_name,
+        )
+
+    b = ConfigBundle(
+        server_id=str(uuid.uuid4()),
+        server_name="ns1",
+        driver="bind9",
+        roles=("authoritative",),
+        options=ServerOptions(),
+        acls=(),
+        views=(
+            ViewData(
+                name="internal",
+                match_clients=("10.0.0.0/8",),
+                match_destinations=(),
+                recursion=True,
+                order=0,
+            ),
+            ViewData(
+                name="external",
+                match_clients=("any",),
+                match_destinations=(),
+                recursion=False,
+                order=1,
+            ),
+        ),
+        zones=(_z("internal"), _z("external")),
+        tsig_keys=(),
+        blocklists=(),
+        generated_at=datetime(2026, 4, 14, 12, 0, tzinfo=UTC),
+    )
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id=b.server_id, name=b.server_name), b.options, bundle=b
+    )
+    assert 'view "internal" {' in out
+    assert 'view "external" {' in out
+    assert "match-clients { 10.0.0.0/8; };" in out
+    # The zone stanza appears inside BOTH view blocks (keyed by
+    # (view_name, name), so neither copy is dropped).
+    assert out.count('zone "example.com."') == 2
+
+
+def test_render_server_config_views_put_rpz_inside_view() -> None:
+    """Issue #24 (review): with views present, RPZ zones + the
+    response-policy directive must render INSIDE the owning view block,
+    never at the top level — BIND9 rejects top-level ``zone {}``
+    alongside ``view {}``. A ``view_name=None`` blocklist is group-level
+    and replicates into every view."""
+    b = ConfigBundle(
+        server_id=str(uuid.uuid4()),
+        server_name="ns1",
+        driver="bind9",
+        roles=("authoritative",),
+        options=ServerOptions(),
+        acls=(),
+        views=(
+            ViewData(
+                name="internal",
+                match_clients=("10.0.0.0/8",),
+                match_destinations=(),
+                recursion=True,
+                order=0,
+            ),
+        ),
+        zones=(),
+        tsig_keys=(),
+        blocklists=(
+            EffectiveBlocklistData(
+                rpz_zone_name="spatium-blocklist-internal.rpz.",
+                entries=(
+                    BlocklistEntry(
+                        domain="ads.example.com",
+                        action="block",
+                        block_mode="nxdomain",
+                        sinkhole_ip=None,
+                        target=None,
+                        is_wildcard=False,
+                    ),
+                ),
+                exceptions=frozenset(),
+                view_name="internal",
+            ),
+        ),
+        generated_at=datetime(2026, 4, 14, 12, 0, tzinfo=UTC),
+    )
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id=b.server_id, name=b.server_name), b.options, bundle=b
+    )
+    # The RPZ zone declaration + response-policy live inside the view
+    # block, not at top level. Slice from the view header onward.
+    view_block = out.split('view "internal" {', 1)[1]
+    assert "response-policy {" in view_block
+    assert 'zone "spatium-blocklist-internal.rpz.";' in view_block
+    # And the RPZ zone is NOT declared before the view block opens.
+    preamble = out.split('view "internal" {', 1)[0]
+    assert 'zone "spatium-blocklist-internal.rpz." {' not in preamble
 
 
 # ── RPZ rendering ─────────────────────────────────────────────────────────
