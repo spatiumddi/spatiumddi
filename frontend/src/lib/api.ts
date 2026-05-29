@@ -492,6 +492,11 @@ export interface Subnet {
    *     groups are managed under /multicast/groups instead.
    */
   kind?: string;
+  // Auto-derived server-side (issue #42): true when ``network`` sits
+  // inside CGNAT space (RFC 6598, 100.64.0.0/10). Read-only — drives
+  // the "CGNAT" badge. Carrier-grade NAT space that overlays like
+  // Tailscale allocate, so it's worth flagging vs a normal LAN.
+  is_cgnat?: boolean;
   vlan_id: number | null;
   vxlan_id: number | null;
   vlan_ref_id?: string | null;
