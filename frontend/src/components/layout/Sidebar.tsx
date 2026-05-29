@@ -43,6 +43,7 @@ import {
   Radio,
   Shuffle,
   Trash2,
+  History,
   Search,
   Calculator,
   Webhook,
@@ -70,6 +71,7 @@ const baseMainNav = [
   { label: "Domains", icon: Earth, to: "/admin/domains" },
   { label: "Logs", icon: ScrollText, to: "/logs" },
   { label: "NAT Mappings", icon: Shuffle, to: "/ipam/nat" },
+  { label: "Stale IPs", icon: History, to: "/ipam/stale" },
   { label: "Subnet Planner", icon: Workflow, to: "/ipam/plans" },
 ];
 

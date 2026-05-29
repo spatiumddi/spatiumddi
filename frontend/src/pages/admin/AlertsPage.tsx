@@ -26,6 +26,21 @@ import { AskAIButton } from "@/components/copilot/AskAIButton";
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
+// Per-rule-type sensible starting values, seeded when the operator picks a
+// type in the New-rule modal. Without this, switching to e.g. stale_ip_count
+// would inherit subnet_utilization's 90 / 30 and create a 90-count / 30-day
+// rule that contradicts the documented 10 / 90 semantics.
+const RULE_TYPE_PARAM_DEFAULTS: Partial<
+  Record<AlertRuleType, { threshold?: number; thresholdDays?: number }>
+> = {
+  subnet_utilization: { threshold: 90 },
+  voice_lease_count_below: { threshold: 10 },
+  stale_ip_count: { threshold: 10, thresholdDays: 90 },
+  domain_expiring: { thresholdDays: 30 },
+  circuit_term_expiring: { thresholdDays: 30 },
+  service_term_expiring: { thresholdDays: 30 },
+};
+
 function Field({
   label,
   hint,
@@ -101,13 +116,15 @@ function RuleEditorModal({
         notify_smtp: notifySmtp,
         threshold_percent:
           ruleType === "subnet_utilization" ||
-          ruleType === "voice_lease_count_below"
+          ruleType === "voice_lease_count_below" ||
+          ruleType === "stale_ip_count"
             ? threshold
             : null,
         threshold_days:
           ruleType === "domain_expiring" ||
           ruleType === "circuit_term_expiring" ||
-          ruleType === "service_term_expiring"
+          ruleType === "service_term_expiring" ||
+          ruleType === "stale_ip_count"
             ? thresholdDays
             : null,
         server_type: ruleType === "server_unreachable" ? serverType : null,
@@ -159,11 +176,21 @@ function RuleEditorModal({
             <select
               className={inputCls}
               value={ruleType}
-              onChange={(e) => setRuleType(e.target.value as AlertRuleType)}
+              onChange={(e) => {
+                const next = e.target.value as AlertRuleType;
+                setRuleType(next);
+                const d = RULE_TYPE_PARAM_DEFAULTS[next];
+                if (d?.threshold !== undefined) setThreshold(d.threshold);
+                if (d?.thresholdDays !== undefined)
+                  setThresholdDays(d.thresholdDays);
+              }}
             >
               <optgroup label="Infrastructure">
                 <option value="subnet_utilization">Subnet utilization</option>
                 <option value="server_unreachable">Server unreachable</option>
+                <option value="stale_ip_count">
+                  Stale IP count (address-space hygiene)
+                </option>
               </optgroup>
               <optgroup label="Network (ASN / RPKI)">
                 <option value="asn_holder_drift">ASN holder drift</option>
@@ -242,6 +269,35 @@ function RuleEditorModal({
               onChange={(e) => setThreshold(Number(e.target.value))}
             />
           </Field>
+        )}
+        {ruleType === "stale_ip_count" && (
+          <>
+            <Field
+              label="Stale IP count threshold"
+              hint="Fires when a subnet holds at least this many allocated IPs that haven't been seen on the wire in the window below. Reads the discovery last-seen signal; never-seen rows are excluded (chase those from the Stale-IP report)."
+            >
+              <input
+                type="number"
+                min={1}
+                className={inputCls}
+                value={threshold}
+                onChange={(e) => setThreshold(Number(e.target.value))}
+              />
+            </Field>
+            <Field
+              label="Stale window (days)"
+              hint="An allocated IP counts as stale once its last-seen timestamp is older than this. Default 90."
+            >
+              <input
+                type="number"
+                min={1}
+                max={3650}
+                className={inputCls}
+                value={thresholdDays}
+                onChange={(e) => setThresholdDays(Number(e.target.value))}
+              />
+            </Field>
+          </>
         )}
         {ruleType === "server_unreachable" && (
           <Field label="Server type">
@@ -563,15 +619,17 @@ export function AlertsPage() {
                         ? `≥ ${r.threshold_percent}%`
                         : r.rule_type === "voice_lease_count_below"
                           ? `< ${r.threshold_percent ?? 1} leases`
-                          : r.rule_type === "server_unreachable"
-                            ? `type=${r.server_type ?? "any"}`
-                            : r.rule_type === "domain_expiring" ||
-                                r.rule_type === "circuit_term_expiring" ||
-                                r.rule_type === "service_term_expiring"
-                              ? `≤ ${r.threshold_days ?? 30} d`
-                              : r.rule_type === "compliance_change"
-                                ? `${r.classification ?? "?"} · ${r.change_scope ?? "any_change"}`
-                                : "—"}
+                          : r.rule_type === "stale_ip_count"
+                            ? `≥ ${r.threshold_percent ?? 10} stale · ${r.threshold_days ?? 90}d`
+                            : r.rule_type === "server_unreachable"
+                              ? `type=${r.server_type ?? "any"}`
+                              : r.rule_type === "domain_expiring" ||
+                                  r.rule_type === "circuit_term_expiring" ||
+                                  r.rule_type === "service_term_expiring"
+                                ? `≤ ${r.threshold_days ?? 30} d`
+                                : r.rule_type === "compliance_change"
+                                  ? `${r.classification ?? "?"} · ${r.change_scope ?? "any_change"}`
+                                  : "—"}
                     </td>
                     <td className="px-4 py-2">
                       <SeverityBadge severity={r.severity} />

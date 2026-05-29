@@ -317,6 +317,43 @@ sweep only refreshes their `last_seen_at`. Subnets larger than a /20
 `stale_minutes` (default 24 h) is the window after which a row's
 `last_seen_at` counts as stale.
 
+### Stale-IP Report (issue #45)
+
+A cross-subnet "address-space hygiene" view that reads the discovery
+`last_seen_at` signal from the other direction: which IPs are still
+marked `allocated` but haven't been seen on the wire in *N* days?
+Those are reclaim candidates — hosts decommissioned without anyone
+freeing the IPAM row.
+
+`GET /api/v1/ipam/reports/stale-ips?stale_days=90&include_never_seen=false`
+(also surfaced to the Operator Copilot as `find_stale_ips`):
+
+- **Candidate status** is `allocated` only — `reserved` / `static_dhcp`
+  are deliberately held, and DHCP-lease mirrors (`auto_from_lease`)
+  churn on their own cadence, so all of those are excluded.
+- **Stale** means `last_seen_at` older than the cutoff. Rows that were
+  *never* seen (`last_seen_at IS NULL`) are excluded by default —
+  many live in subnets where discovery was never enabled — and fold in
+  only with `include_never_seen=true`.
+- Optional `space_id` / `block_id` / `subnet_id` scope the report.
+  Stalest rows sort first (`NULLS FIRST` ascending).
+
+**One-click bulk-deprecate.** `POST /api/v1/ipam/reports/stale-ips/deprecate`
+flips stale rows to `deprecated` (reversible from the normal IP edit
+path) and stamps `user_modified_at` so a later discovery / integration
+sweep won't silently un-deprecate them. Provide `ip_ids` to deprecate a
+hand-picked set, or `all_matching=true` with the report filter to
+deprecate every matching row in one shot (capped at `MAX_BULK_DEPRECATE`
+= 5000; the response `capped` flag tells the operator to re-run for the
+remainder). System placeholders and DHCP mirrors are skipped even if an
+id slips through. The page lives at **Stale IPs** in the sidebar.
+
+**Hygiene alert.** A `stale_ip_count` alert rule fires when any subnet
+holds at least `threshold_percent` (re-used as a raw count) allocated
+IPs older than `threshold_days` (default 90). It reads the same signal
+but excludes never-seen rows so the passive feed stays high-confidence;
+operators chase the full list, including never-seen, from the report.
+
 ---
 
 ## 9. Utilization Tracking

@@ -10,6 +10,7 @@ import { SetupWizardPage } from "@/pages/appliance/SetupWizardPage";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { IPAMPage } from "@/pages/ipam/IPAMPage";
 import { NATPage } from "@/pages/ipam/NATPage";
+import { StaleIPReportPage } from "@/pages/ipam/StaleIPReportPage";
 import { DNSPage } from "@/pages/dns/DNSPage";
 import { DNSPoolsPage } from "@/pages/dns/DNSPoolsPage";
 import { VLANsPage } from "@/pages/vlans/VLANsPage";
@@ -93,6 +94,7 @@ export default function App() {
         <Route path="dashboard" element={<DashboardPage />} />
         <Route path="ipam" element={<IPAMPage />} />
         <Route path="ipam/nat" element={<NATPage />} />
+        <Route path="ipam/stale" element={<StaleIPReportPage />} />
         <Route path="ipam/plans" element={<SubnetPlannerListPage />} />
         <Route path="ipam/plans/:id" element={<SubnetPlannerEditorPage />} />
         <Route path="dns" element={<DNSPage />} />
