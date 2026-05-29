@@ -160,6 +160,16 @@ async def test_reconcile_skips_dynamic_pool(db_session: AsyncSession) -> None:
     assert pool_rows == []
 
 
+async def test_reconcile_creates_discovered_on_slash31(db_session: AsyncSession) -> None:
+    # RFC 3021 /31: both addresses are usable hosts, so neither is a
+    # skip-able network/broadcast placeholder — both get discovered rows.
+    subnet = await _make_subnet(db_session, cidr="192.0.2.0/31")
+    sweep = SweepResult(ping_alive={"192.0.2.0", "192.0.2.1"})
+    counts = await reconcile_subnet(db_session, subnet, sweep)
+    await db_session.flush()
+    assert counts["created"] == 2
+
+
 async def test_reconcile_preserves_operator_locked_row(db_session: AsyncSession) -> None:
     subnet = await _make_subnet(db_session)
     locked = IPAddress(

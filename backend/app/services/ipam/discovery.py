@@ -92,8 +92,10 @@ class SweepResult:
 def enumerate_hosts(cidr: str) -> list[str] | None:
     """Host addresses for an IPv4 subnet, or None if it's too big / v6.
 
-    Returns ``[]`` for a subnet with no usable hosts (e.g. /31, /32).
-    IPv6 returns None — ARP + the /proc/net/arp read are IPv4-only and
+    Uses ``ipaddress.ip_network(...).hosts()``, which per RFC 3021
+    returns both addresses for a /31 and the single address for a /32
+    (so those tiny subnets DO yield hosts, not an empty list). IPv6
+    returns None — ARP + the /proc/net/arp read are IPv4-only and
     enumerating a v6 subnet is infeasible.
     """
     try:
@@ -166,7 +168,9 @@ async def _icmp_sweep(hosts: list[str], timeout: float) -> set[str] | None:
             try:
                 sock.sendto(_icmp_echo(ident, i & 0xFFFF), (host, 0))
             except OSError:
-                pass
+                # One unreachable host (e.g. EHOSTUNREACH / no route) must
+                # not abort the whole sweep — skip it and keep blasting.
+                continue
             if i % 128 == 0:
                 await asyncio.sleep(0)  # cooperative yield while blasting
         await asyncio.sleep(timeout)
@@ -174,6 +178,9 @@ async def _icmp_sweep(hosts: list[str], timeout: float) -> set[str] | None:
         try:
             loop.remove_reader(sock.fileno())
         except (OSError, ValueError):
+            # Best-effort cleanup — the reader may already be gone (e.g.
+            # the loop is shutting down). The socket is closed next
+            # regardless, so swallow and move on.
             pass
         sock.close()
     return alive
@@ -188,6 +195,9 @@ async def _tcp_alive(host: str, ports: tuple[int, ...], timeout: float) -> bool:
             try:
                 await writer.wait_closed()
             except OSError:
+                # The connect already proved the host is up; a failure
+                # tearing the probe socket down doesn't change that, so
+                # ignore it and report alive.
                 pass
             return True
         except ConnectionRefusedError:
@@ -317,8 +327,14 @@ async def reconcile_subnet(db: AsyncSession, subnet: Subnet, sweep: SweepResult)
     except ValueError:
         return counts
 
-    network_int = int(net.network_address)
-    broadcast_int = int(net.broadcast_address) if net.version == 4 else None
+    # Network / broadcast are real placeholders only for prefixes ≤ /30.
+    # On /31 (RFC 3021) and /32 both endpoints are usable hosts, so don't
+    # treat them as skip-able there — otherwise discovery could never
+    # create a row for a point-to-point link or a single-host subnet
+    # (matches the resize service's prefixlen ≤ 30 convention).
+    skip_endpoints = net.version == 4 and net.prefixlen <= 30
+    network_int = int(net.network_address) if skip_endpoints else None
+    broadcast_int = int(net.broadcast_address) if skip_endpoints else None
     dynamic_ranges = await _dynamic_pool_ranges(db, subnet.id)
 
     existing_rows = list(

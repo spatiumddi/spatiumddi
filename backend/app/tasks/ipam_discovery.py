@@ -23,6 +23,7 @@ refreshes ``last_seen_at``.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -43,8 +44,15 @@ async def _run_subnet_discovery_async(subnet_id_str: str) -> dict[str, Any]:
     engine = create_async_engine(settings.database_url, future=True)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
+        subnet_id = uuid.UUID(subnet_id_str)
+    except (ValueError, TypeError):
+        return {"status": "skipped", "reason": "bad_subnet_id"}
+    try:
         async with factory() as db:
-            subnet = await db.get(Subnet, subnet_id_str)
+            # Subnet.id is UUID(as_uuid=True) — pass a real UUID, not the
+            # raw string, so the bind is unambiguous on asyncpg/psycopg
+            # (matches the convention in the other Celery tasks).
+            subnet = await db.get(Subnet, subnet_id)
             if subnet is None or subnet.deleted_at is not None:
                 return {"status": "skipped", "reason": "subnet_missing"}
 
