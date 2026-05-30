@@ -1063,7 +1063,20 @@ async def update_server(
     # Cloud DNS driver credentials (issue #37): None → leave alone,
     # {} → clear, non-empty dict → full replace (the modal sends the
     # complete provider cred set, so no partial-merge needed).
+    # ``server.driver`` here is the EFFECTIVE driver (the changes loop
+    # above already applied any driver change). Reject cloud_credentials
+    # on a non-cloud driver so we never clobber a Windows server's
+    # ``credentials_encrypted`` (or set a meaningless blob on bind9).
     if body.cloud_credentials is not None:
+        if server.driver not in CLOUD_DNS_DRIVERS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "cloud_credentials is only valid for cloud DNS drivers "
+                    f"({', '.join(sorted(CLOUD_DNS_DRIVERS))}); this server's driver "
+                    f"is {server.driver!r}"
+                ),
+            )
         if body.cloud_credentials == {}:
             server.credentials_encrypted = None
             changes["cloud_credentials_cleared"] = True

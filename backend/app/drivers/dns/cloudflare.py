@@ -29,7 +29,6 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
-import structlog
 
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
@@ -38,8 +37,6 @@ from app.drivers.dns._cloud_base import (
     normalize_fqdn,
 )
 from app.drivers.dns.base import RecordChange, RecordData
-
-logger = structlog.get_logger(__name__)
 
 # Cloudflare API v4 base. Pinned here (not configurable) — there is no
 # self-hosted Cloudflare. The token in the Authorization header is the

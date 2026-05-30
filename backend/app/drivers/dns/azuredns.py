@@ -29,8 +29,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-import structlog
-
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -38,9 +36,6 @@ from app.drivers.dns._cloud_base import (
     normalize_fqdn,
 )
 from app.drivers.dns.base import RecordChange, RecordData
-
-logger = structlog.get_logger(__name__)
-
 
 # Azure record-set ``type`` is the full ARM resource type. Map the suffix
 # back to the neutral record-type label we expose everywhere else. SOA is
@@ -55,6 +50,22 @@ _AZURE_TYPE_TO_RECORD_TYPE = {
     "Microsoft.Network/dnszones/SRV": "SRV",
     "Microsoft.Network/dnszones/PTR": "PTR",
     "Microsoft.Network/dnszones/CAA": "CAA",
+}
+
+# Neutral record type → the typed record-list attribute on an Azure record
+# set (``a_records`` / ``mx_records`` / …). Used by the read-merge path to
+# pull the live RRset's per-record entries off whatever the SDK returned.
+# ``CNAME`` is intentionally absent — it is a single-valued ``cname_record``,
+# never a list, so it always uses the replace path.
+_RECORD_TYPE_TO_AZURE_ATTR = {
+    "A": "a_records",
+    "AAAA": "aaaa_records",
+    "MX": "mx_records",
+    "TXT": "txt_records",
+    "NS": "ns_records",
+    "SRV": "srv_records",
+    "PTR": "ptr_records",
+    "CAA": "caa_records",
 }
 
 
@@ -231,18 +242,19 @@ class AzureDNSDriver(CloudDNSDriverBase):
         rtype = change.record.record_type.upper()
 
         if change.op == "delete":
-
-            def _delete() -> None:
-                client.record_sets.delete(rg, zone_label, relative, rtype)
-
-            try:
-                await asyncio.to_thread(_delete)
-            except Exception as exc:  # noqa: BLE001 — wrapped into CloudDNSError
-                raise self._wrap_errors(exc) from exc
+            await self._apply_delete(client, rg, zone_label, relative, rtype, change.record)
             return
 
-        # create / update — Azure has no distinct create vs update, both
-        # are a PUT (create_or_update) of the full record set.
+        if change.op == "create":
+            await self._apply_create(client, rg, zone_label, relative, rtype, change.record)
+            return
+
+        # update — keep the single-value replace-the-RRset behaviour. The
+        # update op carries only the NEW value (no old value to match
+        # against), so a correct multi-value merge is impossible at this
+        # layer. Replace is right for the common single-value RRset (CNAME,
+        # a host with one A/TXT). Multi-value value-edits are an inherent
+        # per-row→RRset limitation tracked in issue #29.
         params = self._build_record_set_params(change.record)
 
         def _put() -> None:
@@ -252,6 +264,202 @@ class AzureDNSDriver(CloudDNSDriverBase):
             await asyncio.to_thread(_put)
         except Exception as exc:  # noqa: BLE001 — wrapped into CloudDNSError
             raise self._wrap_errors(exc) from exc
+
+    async def _apply_create(
+        self,
+        client: Any,
+        rg: str,
+        zone_label: str,
+        relative: str,
+        rtype: str,
+        record: RecordData,
+    ) -> None:
+        """Create one record value, read-merging into the live RRset.
+
+        Cloud providers group every value under one RRset keyed by
+        ``{name, type}`` (round-robin A, multiple MX/NS/TXT). SpatiumDDI
+        emits one op per stored row, so we must read the provider's current
+        RRset and write back the union — otherwise the first PUT would drop
+        every sibling value already in the set.
+        """
+        # CNAME (and any non-listable type) is single-valued — there is no
+        # set to merge into, so use the plain replace path.
+        if rtype not in _RECORD_TYPE_TO_AZURE_ATTR:
+            params = self._build_record_set_params(record)
+
+            def _put() -> None:
+                client.record_sets.create_or_update(rg, zone_label, relative, rtype, params)
+
+            try:
+                await asyncio.to_thread(_put)
+            except Exception as exc:  # noqa: BLE001 — wrapped into CloudDNSError
+                raise self._wrap_errors(exc) from exc
+            return
+
+        new_entry = self._build_record_entry(record)
+
+        def _merge_and_put() -> None:
+            existing = self._get_record_set(client, rg, zone_label, relative, rtype)
+            entries = [] if existing is None else self._existing_entries(existing, rtype)
+            # Dedupe: if this value is already in the set, it's a no-op.
+            present = {self._entry_key(rtype, e) for e in entries}
+            if self._entry_key(rtype, new_entry) not in present:
+                entries = entries + [new_entry]
+            # TTL: prefer the change's ttl, fall back to the existing set's,
+            # then the driver default.
+            ttl = record.ttl
+            if ttl is None and existing is not None:
+                ttl = getattr(existing, "ttl", None)
+            if ttl is None:
+                ttl = 3600
+            params = {"ttl": ttl, _RECORD_TYPE_TO_AZURE_ATTR[rtype]: entries}
+            client.record_sets.create_or_update(rg, zone_label, relative, rtype, params)
+
+        try:
+            await asyncio.to_thread(_merge_and_put)
+        except Exception as exc:  # noqa: BLE001 — wrapped into CloudDNSError
+            raise self._wrap_errors(exc) from exc
+
+    async def _apply_delete(
+        self,
+        client: Any,
+        rg: str,
+        zone_label: str,
+        relative: str,
+        rtype: str,
+        record: RecordData,
+    ) -> None:
+        """Delete one record value, reducing the live RRset.
+
+        Reads the current RRset, removes THIS value, and writes the reduced
+        set. If the value was the last one (or the set is gone) the whole
+        RRset is deleted. A missing value/RRset is an idempotent no-op.
+        """
+
+        def _read_and_reduce() -> None:
+            existing = self._get_record_set(client, rg, zone_label, relative, rtype)
+            if existing is None:
+                # RRset already absent — idempotent no-op.
+                return
+
+            # CNAME / unlistable types: deleting the value deletes the set.
+            if rtype not in _RECORD_TYPE_TO_AZURE_ATTR:
+                client.record_sets.delete(rg, zone_label, relative, rtype)
+                return
+
+            target_key = self._entry_key(rtype, self._build_record_entry(record))
+            entries = self._existing_entries(existing, rtype)
+            remaining = [e for e in entries if self._entry_key(rtype, e) != target_key]
+            if len(remaining) == len(entries):
+                # Value isn't present — idempotent no-op.
+                return
+            if not remaining:
+                client.record_sets.delete(rg, zone_label, relative, rtype)
+                return
+            ttl = getattr(existing, "ttl", None) or 3600
+            params = {"ttl": ttl, _RECORD_TYPE_TO_AZURE_ATTR[rtype]: remaining}
+            client.record_sets.create_or_update(rg, zone_label, relative, rtype, params)
+
+        try:
+            await asyncio.to_thread(_read_and_reduce)
+        except Exception as exc:  # noqa: BLE001 — wrapped into CloudDNSError
+            raise self._wrap_errors(exc) from exc
+
+    def _get_record_set(
+        self, client: Any, rg: str, zone_label: str, relative: str, rtype: str
+    ) -> Any | None:
+        """Read the live record set, or ``None`` when it doesn't exist.
+
+        Azure raises ``ResourceNotFoundError`` (a ``HttpResponseError``
+        subclass) for an absent set; we lazy-import both and treat either as
+        "no existing set". Any other SDK error propagates to be wrapped.
+        """
+        not_found_types: tuple[type[Exception], ...] = ()
+        http_error_type: type[Exception] | None = None
+        try:
+            from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+
+            not_found_types = (ResourceNotFoundError,)
+            http_error_type = HttpResponseError
+        except ImportError:  # pragma: no cover — env-dependent
+            pass
+        try:
+            return client.record_sets.get(rg, zone_label, relative, rtype)
+        except Exception as exc:  # noqa: BLE001 — narrowed below
+            if not_found_types and isinstance(exc, not_found_types):
+                return None
+            if (
+                http_error_type is not None
+                and isinstance(exc, http_error_type)
+                and getattr(getattr(exc, "response", None), "status_code", None) == 404
+            ):
+                return None
+            raise
+
+    def _existing_entries(self, record_set: Any, rtype: str) -> list[dict[str, Any]]:
+        """Normalise a live record set's typed records into entry dicts.
+
+        Returns the same dict shape :meth:`_build_record_entry` produces so
+        merge/dedupe/removal can compare with ``==`` / ``in``.
+        """
+        attr = _RECORD_TYPE_TO_AZURE_ATTR[rtype]
+        records = getattr(record_set, attr, None) or []
+        out: list[dict[str, Any]] = []
+        for r in records:
+            if rtype == "A":
+                out.append({"ipv4_address": r.ipv4_address})
+            elif rtype == "AAAA":
+                out.append({"ipv6_address": r.ipv6_address})
+            elif rtype == "MX":
+                out.append({"preference": int(r.preference), "exchange": r.exchange})
+            elif rtype == "TXT":
+                out.append({"value": list(r.value)})
+            elif rtype == "NS":
+                out.append({"nsdname": r.nsdname})
+            elif rtype == "SRV":
+                out.append(
+                    {
+                        "priority": int(r.priority),
+                        "weight": int(r.weight),
+                        "port": int(r.port),
+                        "target": r.target,
+                    }
+                )
+            elif rtype == "PTR":
+                out.append({"ptrdname": r.ptrdname})
+            elif rtype == "CAA":
+                out.append({"flags": int(r.flags), "tag": r.tag, "value": r.value})
+        return out
+
+    def _build_record_entry(self, record: RecordData) -> dict[str, Any]:
+        """Build the single per-type record-entry dict for one neutral value.
+
+        This is the element that lives inside the typed record list
+        (``a_records[i]`` etc.); :meth:`_build_record_set_params` wraps it as
+        a one-element list. Sharing this builder keeps the merge path's
+        dedupe comparison identical to what a plain write would produce.
+        """
+        rtype = record.record_type.upper()
+        params = self._build_record_set_params(record)
+        attr = _RECORD_TYPE_TO_AZURE_ATTR.get(rtype)
+        if attr is None:  # pragma: no cover — only listable types reach here
+            raise CloudDNSError(f"azure_dns: {rtype!r} is not a multi-value record type")
+        entry: dict[str, Any] = params[attr][0]
+        return entry
+
+    def _entry_key(self, rtype: str, entry: dict[str, Any]) -> tuple[Any, ...]:
+        """A hashable, comparison-stable identity for one record entry.
+
+        Used for dedupe (create) and removal (delete) so the same value
+        compares equal regardless of incidental representation. The TXT case
+        joins the value chunks: Azure may store a long TXT string split into
+        several 255-byte chunks (``["v=spf1 ", "-all"]``) while a freshly
+        built entry has a single chunk (``["v=spf1 -all"]``) — both denote
+        the same record and must dedupe / remove correctly.
+        """
+        if rtype == "TXT":
+            return ("TXT", "".join(entry.get("value", [])))
+        return (rtype, tuple(sorted(entry.items(), key=lambda kv: kv[0])))
 
     def _build_record_set_params(self, record: RecordData) -> dict[str, Any]:
         """Build the create_or_update body for one neutral record.

@@ -217,7 +217,7 @@ def _make_connector(
     )
     net = network_client or _StubNetworkClient()
     comp = compute_client or _StubComputeClient()
-    conn._credential = lambda: SimpleNamespace()  # type: ignore[method-assign]
+    conn._credential = SimpleNamespace  # type: ignore[method-assign]
     if network_factory is not None:
         conn._network_client = network_factory  # type: ignore[method-assign]
     else:
@@ -318,7 +318,7 @@ async def test_per_subscription_failure_folds_into_warnings() -> None:
         provider_config={"subscription_ids": ["sub-1", "sub-2"]},
         regions=None,
     )
-    conn._credential = lambda: SimpleNamespace()  # type: ignore[method-assign]
+    conn._credential = SimpleNamespace  # type: ignore[method-assign]
     conn._network_client = factory  # type: ignore[method-assign]
     conn._compute_client = lambda subscription_id: _StubComputeClient()  # type: ignore[method-assign]
 

@@ -56,7 +56,7 @@ components. Grouped by role; license + project URL for each.
 - boto3 / botocore (AWS — infra mirror + Route 53 DNS) — Apache 2.0 — https://github.com/boto/boto3
 - azure-identity / azure-mgmt-network / azure-mgmt-compute / azure-mgmt-dns / azure-mgmt-resource (Azure — infra mirror + Azure DNS) — MIT — https://github.com/Azure/azure-sdk-for-python
 - google-cloud-compute / google-cloud-dns / google-auth (GCP — infra mirror + Cloud DNS) — Apache 2.0 — https://github.com/googleapis/google-cloud-python
-- Cloudflare DNS is reached via plain REST over httpx (no SDK dependency)
+- Cloudflare DNS API (Cloud DNS driver) — service API, no SDK (plain REST via httpx) — https://api.cloudflare.com
 
 ── Frontend (TypeScript / React) ──────────────────────────────────────────
 - React — MIT — https://react.dev

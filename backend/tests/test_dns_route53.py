@@ -210,11 +210,17 @@ async def test_list_zone_records_zone_not_found(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.asyncio
-async def test_apply_record_upsert_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_apply_record_create_new_rrset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Creating a value when no rrset exists yet writes just that value."""
     driver = Route53DNSDriver()
     client = MagicMock()
     client.list_hosted_zones_by_name.return_value = {
         "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    # Read-merge: Route 53 returns the lexically-next rrset (a non-match),
+    # so the driver treats {www, A} as absent.
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [{"Name": "zzz.example.com.", "Type": "A"}]
     }
     _patch_client(monkeypatch, driver, client)
 
@@ -237,6 +243,119 @@ async def test_apply_record_upsert_batch(monkeypatch: pytest.MonkeyPatch) -> Non
         "TTL": 120,
         "ResourceRecords": [{"Value": "10.0.0.1"}],
     }
+
+
+@pytest.mark.asyncio
+async def test_apply_record_create_merges_into_existing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Creating a 2nd value for an existing {name,type} writes BOTH values."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    # Live rrset already carries one A value at the round-robin host.
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [
+            {
+                "Name": "rr.example.com.",
+                "Type": "A",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "10.0.0.1"}],
+            }
+        ]
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="rr", record_type="A", value="10.0.0.2", ttl=None),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    # The read used the absolute name + type as the start key.
+    read_kwargs = client.list_resource_record_sets.call_args.kwargs
+    assert read_kwargs["StartRecordName"] == "rr.example.com."
+    assert read_kwargs["StartRecordType"] == "A"
+    assert read_kwargs["MaxItems"] == "1"
+
+    batch_change = client.change_resource_record_sets.call_args.kwargs["ChangeBatch"]["Changes"][0]
+    assert batch_change["Action"] == "UPSERT"
+    rrset = batch_change["ResourceRecordSet"]
+    assert rrset["Name"] == "rr.example.com."
+    assert rrset["Type"] == "A"
+    # TTL falls back to the live rrset's TTL when the change carries none.
+    assert rrset["TTL"] == 300
+    # BOTH values present — the sibling was NOT clobbered.
+    assert {v["Value"] for v in rrset["ResourceRecords"]} == {"10.0.0.1", "10.0.0.2"}
+
+
+@pytest.mark.asyncio
+async def test_apply_record_create_duplicate_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Creating a value already in the rrset writes nothing (idempotent)."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [
+            {
+                "Name": "rr.example.com.",
+                "Type": "A",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "10.0.0.1"}],
+            }
+        ]
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="rr", record_type="A", value="10.0.0.1", ttl=300),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    # Value already present — no write submitted.
+    client.change_resource_record_sets.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_apply_record_create_skips_alias_merge(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An ALIAS rrset is single-valued — create replaces, never merges."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [
+            {
+                "Name": "app.example.com.",
+                "Type": "A",
+                "AliasTarget": {"DNSName": "elb-123.elb.amazonaws.com."},
+            }
+        ]
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="app", record_type="A", value="10.0.0.5", ttl=120),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    rrset = client.change_resource_record_sets.call_args.kwargs["ChangeBatch"]["Changes"][0][
+        "ResourceRecordSet"
+    ]
+    # Replaced with the value-bearing rrset; no alias merge attempted.
+    assert "AliasTarget" not in rrset
+    assert rrset["ResourceRecords"] == [{"Value": "10.0.0.5"}]
 
 
 @pytest.mark.asyncio
@@ -264,11 +383,24 @@ async def test_apply_record_apex_and_default_ttl(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.asyncio
-async def test_apply_record_delete_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_apply_record_delete_last_value_removes_rrset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleting the only value submits a DELETE of the EXACT live rrset."""
     driver = Route53DNSDriver()
     client = MagicMock()
     client.list_hosted_zones_by_name.return_value = {
         "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [
+            {
+                "Name": "old.example.com.",
+                "Type": "A",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "10.0.0.9"}],
+            }
+        ]
     }
     _patch_client(monkeypatch, driver, client)
 
@@ -282,7 +414,7 @@ async def test_apply_record_delete_batch(monkeypatch: pytest.MonkeyPatch) -> Non
 
     batch_change = client.change_resource_record_sets.call_args.kwargs["ChangeBatch"]["Changes"][0]
     assert batch_change["Action"] == "DELETE"
-    # DELETE must reconstruct the exact rrset (TTL + value).
+    # DELETE must carry the EXACT existing rrset (TTL + value) verbatim.
     assert batch_change["ResourceRecordSet"] == {
         "Name": "old.example.com.",
         "Type": "A",
@@ -292,11 +424,120 @@ async def test_apply_record_delete_batch(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.asyncio
-async def test_apply_record_delete_missing_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_apply_record_delete_one_of_many_leaves_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleting one value of a multi-value rrset UPSERTs the reduced set."""
     driver = Route53DNSDriver()
     client = MagicMock()
     client.list_hosted_zones_by_name.return_value = {
         "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [
+            {
+                "Name": "rr.example.com.",
+                "Type": "A",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "10.0.0.1"}, {"Value": "10.0.0.2"}],
+            }
+        ]
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="rr", record_type="A", value="10.0.0.1", ttl=300),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    batch_change = client.change_resource_record_sets.call_args.kwargs["ChangeBatch"]["Changes"][0]
+    # Reduced set is UPSERTed, NOT deleted — the surviving sibling stays.
+    assert batch_change["Action"] == "UPSERT"
+    rrset = batch_change["ResourceRecordSet"]
+    assert rrset["TTL"] == 300
+    assert rrset["ResourceRecords"] == [{"Value": "10.0.0.2"}]
+
+
+@pytest.mark.asyncio
+async def test_apply_record_delete_value_not_present_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleting a value absent from the live rrset writes nothing."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [
+            {
+                "Name": "rr.example.com.",
+                "Type": "A",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "10.0.0.1"}],
+            }
+        ]
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="rr", record_type="A", value="10.0.0.9", ttl=300),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    client.change_resource_record_sets.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_apply_record_delete_missing_rrset_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No rrset at all for {name,type} → idempotent no-op (no write)."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    # Route 53 returns a neighbouring rrset, not the one we asked for.
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [{"Name": "zzz.example.com.", "Type": "A"}]
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="ghost", record_type="A", value="10.0.0.9", ttl=300),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    client.change_resource_record_sets.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_apply_record_delete_invalid_batch_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A racing InvalidChangeBatch on the DELETE write is still a no-op."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [
+            {
+                "Name": "old.example.com.",
+                "Type": "A",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "10.0.0.9"}],
+            }
+        ]
     }
     client.change_resource_record_sets.side_effect = _ClientError(
         "InvalidChangeBatch", "tried to delete a record that doesn't exist"
@@ -306,10 +547,10 @@ async def test_apply_record_delete_missing_is_noop(monkeypatch: pytest.MonkeyPat
     change = RecordChange(
         op="delete",
         zone_name="example.com.",
-        record=RecordData(name="ghost", record_type="A", value="10.0.0.9", ttl=300),
+        record=RecordData(name="old", record_type="A", value="10.0.0.9", ttl=300),
         target_serial=1,
     )
-    # No raise — idempotent delete of an absent record.
+    # No raise — InvalidChangeBatch on the write is treated as idempotent.
     await driver._apply_record(_server(), CREDS, change)
 
 
@@ -320,6 +561,8 @@ async def test_apply_record_wraps_client_error(monkeypatch: pytest.MonkeyPatch) 
     client.list_hosted_zones_by_name.return_value = {
         "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
     }
+    # Read-merge finds no existing rrset; the write then fails on auth.
+    client.list_resource_record_sets.return_value = {"ResourceRecordSets": []}
     client.change_resource_record_sets.side_effect = _ClientError("AccessDenied", "not authorized")
     _patch_client(monkeypatch, driver, client)
 
@@ -331,6 +574,52 @@ async def test_apply_record_wraps_client_error(monkeypatch: pytest.MonkeyPatch) 
     )
     with pytest.raises(CloudDNSError, match="change_resource_record_sets"):
         await driver._apply_record(_server(), CREDS, change)
+
+
+@pytest.mark.asyncio
+async def test_apply_record_wraps_read_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failure on the read-merge call surfaces as a CloudDNSError."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    client.list_resource_record_sets.side_effect = _ClientError("AccessDenied", "not authorized")
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300),
+        target_serial=1,
+    )
+    with pytest.raises(CloudDNSError, match="read-merge"):
+        await driver._apply_record(_server(), CREDS, change)
+
+
+@pytest.mark.asyncio
+async def test_apply_record_update_replaces_without_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Update keeps single-value replace — it never reads the live rrset."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="update",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.7", ttl=120),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    # No read-merge for update (the op carries only the new value).
+    client.list_resource_record_sets.assert_not_called()
+    batch_change = client.change_resource_record_sets.call_args.kwargs["ChangeBatch"]["Changes"][0]
+    assert batch_change["Action"] == "UPSERT"
+    assert batch_change["ResourceRecordSet"]["ResourceRecords"] == [{"Value": "10.0.0.7"}]
 
 
 # ── Zone write ─────────────────────────────────────────────────────────────

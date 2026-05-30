@@ -315,15 +315,15 @@ class AzureConnector(CloudConnector):
 
         A missing resource group or an instance-view error is treated as
         "not running" rather than failing the whole sync; the running
-        flag is advisory and the reconciler still mirrors the row.
+        flag is advisory and the reconciler still mirrors the row. Any
+        probe failure (HTTP error, transient network, SDK quirk) is
+        caught — a per-VM power-state lookup must never abort the sweep.
         """
-        from azure.core.exceptions import HttpResponseError
-
         if not resource_group:
             return False
         try:
             view = compute_client.virtual_machines.instance_view(resource_group, name)
-        except HttpResponseError as exc:
+        except Exception as exc:  # noqa: BLE001 — best-effort probe; any failure → "not running"
             logger.warning(
                 "cloud.azure.instance_view_failed",
                 vm=name,

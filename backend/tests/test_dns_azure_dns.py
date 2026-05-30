@@ -234,12 +234,21 @@ async def test_list_zone_records_expands_srv_and_caa(
 
 
 # ── Record write (create_or_update param building) ──────────────────────────
+#
+# Cloud providers group every value under one RRset keyed by {name, type}.
+# SpatiumDDI stores one row per value and emits one op per row, so the create
+# / delete paths read-merge against the provider's live RRset rather than
+# blindly writing a single-value set (which would silently drop the siblings
+# of a round-robin A / multi-MX / multi-NS set). ``record_sets.get`` is mocked
+# to return ``None`` for "no existing set" and a ``SimpleNamespace`` shaped
+# like the SDK model for an existing one.
 
 
-async def test_apply_record_create_builds_a_params(
+async def test_apply_record_create_into_empty_set_builds_a_params(
     monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
 ) -> None:
     client = Mock()
+    client.record_sets.get.return_value = None  # no existing RRset
     _patch_client(monkeypatch, driver, client)
 
     change = RecordChange(
@@ -255,9 +264,111 @@ async def test_apply_record_create_builds_a_params(
     )
 
 
-async def test_apply_record_update_builds_mx_params(
+async def test_apply_record_create_merges_into_existing_rrset(
     monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
 ) -> None:
+    """Creating a 2nd A value writes BOTH values (no silent sibling drop)."""
+    client = Mock()
+    client.record_sets.get.return_value = SimpleNamespace(
+        ttl=300, a_records=[SimpleNamespace(ipv4_address="10.0.0.1")]
+    )
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.2", ttl=300),
+        target_serial=1,
+    )
+    await driver._apply_record(server, dict(_CREDS), change)
+
+    client.record_sets.get.assert_called_once_with("rg", "example.com", "www", "A")
+    client.record_sets.create_or_update.assert_called_once_with(
+        "rg",
+        "example.com",
+        "www",
+        "A",
+        {"ttl": 300, "a_records": [{"ipv4_address": "10.0.0.1"}, {"ipv4_address": "10.0.0.2"}]},
+    )
+
+
+async def test_apply_record_create_dedupes_existing_value(
+    monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
+) -> None:
+    """Creating a value already in the RRset is a merge no-op (no duplicate)."""
+    client = Mock()
+    client.record_sets.get.return_value = SimpleNamespace(
+        ttl=300,
+        a_records=[
+            SimpleNamespace(ipv4_address="10.0.0.1"),
+            SimpleNamespace(ipv4_address="10.0.0.2"),
+        ],
+    )
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300),
+        target_serial=1,
+    )
+    await driver._apply_record(server, dict(_CREDS), change)
+
+    _, _, _, _, params = client.record_sets.create_or_update.call_args.args
+    assert params["a_records"] == [{"ipv4_address": "10.0.0.1"}, {"ipv4_address": "10.0.0.2"}]
+
+
+async def test_apply_record_create_falls_back_to_existing_ttl(
+    monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
+) -> None:
+    """When the change carries no TTL, the existing RRset's TTL is kept."""
+    client = Mock()
+    client.record_sets.get.return_value = SimpleNamespace(
+        ttl=900, a_records=[SimpleNamespace(ipv4_address="10.0.0.1")]
+    )
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.2", ttl=None),
+        target_serial=1,
+    )
+    await driver._apply_record(server, dict(_CREDS), change)
+
+    _, _, _, _, params = client.record_sets.create_or_update.call_args.args
+    assert params["ttl"] == 900
+
+
+async def test_apply_record_create_cname_uses_replace_no_get(
+    monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
+) -> None:
+    """CNAME is single-valued (``cname_record``) — replace, never read-merge."""
+    client = Mock()
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="alias", record_type="CNAME", value="target.example.com", ttl=300),
+        target_serial=1,
+    )
+    await driver._apply_record(server, dict(_CREDS), change)
+
+    client.record_sets.get.assert_not_called()
+    client.record_sets.create_or_update.assert_called_once_with(
+        "rg",
+        "example.com",
+        "alias",
+        "CNAME",
+        {"ttl": 300, "cname_record": {"cname": "target.example.com"}},
+    )
+
+
+async def test_apply_record_update_replaces_rrset(
+    monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
+) -> None:
+    """update keeps single-value replace — it never read-merges (see #29)."""
     client = Mock()
     _patch_client(monkeypatch, driver, client)
 
@@ -269,6 +380,7 @@ async def test_apply_record_update_builds_mx_params(
     )
     await driver._apply_record(server, dict(_CREDS), change)
 
+    client.record_sets.get.assert_not_called()
     _, _, _, rtype, params = client.record_sets.create_or_update.call_args.args
     assert rtype == "MX"
     assert params == {
@@ -277,10 +389,11 @@ async def test_apply_record_update_builds_mx_params(
     }
 
 
-async def test_apply_record_builds_srv_params(
+async def test_apply_record_create_builds_srv_params(
     monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
 ) -> None:
     client = Mock()
+    client.record_sets.get.return_value = None
     _patch_client(monkeypatch, driver, client)
 
     change = RecordChange(
@@ -299,10 +412,42 @@ async def test_apply_record_builds_srv_params(
     ]
 
 
-async def test_apply_record_delete_dispatches_to_delete(
+async def test_apply_record_delete_one_of_two_leaves_the_other(
     monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
 ) -> None:
+    """Deleting one value of a 2-value RRset writes the reduced set, not delete."""
     client = Mock()
+    client.record_sets.get.return_value = SimpleNamespace(
+        ttl=300,
+        a_records=[
+            SimpleNamespace(ipv4_address="10.0.0.1"),
+            SimpleNamespace(ipv4_address="10.0.0.2"),
+        ],
+    )
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.1"),
+        target_serial=4,
+    )
+    await driver._apply_record(server, dict(_CREDS), change)
+
+    client.record_sets.delete.assert_not_called()
+    client.record_sets.create_or_update.assert_called_once_with(
+        "rg", "example.com", "www", "A", {"ttl": 300, "a_records": [{"ipv4_address": "10.0.0.2"}]}
+    )
+
+
+async def test_apply_record_delete_last_value_removes_rrset(
+    monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
+) -> None:
+    """Deleting the last remaining value removes the whole RRset."""
+    client = Mock()
+    client.record_sets.get.return_value = SimpleNamespace(
+        ttl=300, a_records=[SimpleNamespace(ipv4_address="10.0.0.9")]
+    )
     _patch_client(monkeypatch, driver, client)
 
     change = RecordChange(
@@ -315,6 +460,75 @@ async def test_apply_record_delete_dispatches_to_delete(
 
     client.record_sets.delete.assert_called_once_with("rg", "example.com", "old", "A")
     client.record_sets.create_or_update.assert_not_called()
+
+
+async def test_apply_record_delete_missing_value_is_noop(
+    monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
+) -> None:
+    """Deleting a value that isn't in the RRset is an idempotent no-op."""
+    client = Mock()
+    client.record_sets.get.return_value = SimpleNamespace(
+        ttl=300, a_records=[SimpleNamespace(ipv4_address="10.0.0.1")]
+    )
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.99"),
+        target_serial=4,
+    )
+    await driver._apply_record(server, dict(_CREDS), change)
+
+    client.record_sets.delete.assert_not_called()
+    client.record_sets.create_or_update.assert_not_called()
+
+
+async def test_apply_record_delete_missing_rrset_is_noop(
+    monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
+) -> None:
+    """Deleting from an absent RRset is an idempotent no-op."""
+    client = Mock()
+    client.record_sets.get.return_value = None
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="gone", record_type="A", value="10.0.0.9"),
+        target_serial=4,
+    )
+    await driver._apply_record(server, dict(_CREDS), change)
+
+    client.record_sets.delete.assert_not_called()
+    client.record_sets.create_or_update.assert_not_called()
+
+
+async def test_apply_record_delete_txt_dedupes_across_chunk_split(
+    monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
+) -> None:
+    """A TXT value Azure stored as multiple chunks still matches for removal."""
+    client = Mock()
+    client.record_sets.get.return_value = SimpleNamespace(
+        ttl=3600,
+        txt_records=[
+            SimpleNamespace(value=["v=spf1 ", "-all"]),
+            SimpleNamespace(value=["keep-me"]),
+        ],
+    )
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="@", record_type="TXT", value="v=spf1 -all"),
+        target_serial=4,
+    )
+    await driver._apply_record(server, dict(_CREDS), change)
+
+    client.record_sets.delete.assert_not_called()
+    _, _, _, _, params = client.record_sets.create_or_update.call_args.args
+    assert params["txt_records"] == [{"value": ["keep-me"]}]
 
 
 # ── Zone write ───────────────────────────────────────────────────────────────
@@ -368,6 +582,7 @@ async def test_apply_record_wraps_error_as_cloud_dns_error(
     monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
 ) -> None:
     client = Mock()
+    client.record_sets.get.return_value = None  # no existing set → reach create_or_update
     client.record_sets.create_or_update.side_effect = _FakeHttpResponseError("boom")
     _patch_client(monkeypatch, driver, client)
 

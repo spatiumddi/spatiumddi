@@ -377,6 +377,170 @@ async def test_apply_record_delete_missing_is_noop(monkeypatch: pytest.MonkeyPat
     assert ch.deleted == []
 
 
+# ── Record write: multi-value RRset read-merge (the #328 data-loss fix) ─────
+
+
+@pytest.mark.asyncio
+async def test_apply_record_create_merges_into_existing_rrset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Creating a 2nd value for an existing {name,type} keeps the sibling.
+
+    A round-robin A record: the rrset already holds 10.0.0.1; creating
+    10.0.0.2 must write the FULL merged set, not drop the original.
+    """
+    driver = GoogleCloudDNSDriver()
+    existing = _rrset("www.example.com.", "A", 300, ["10.0.0.1"])
+    zone = _StubZone("example-com", "example.com.", rrsets=[existing])
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.2", ttl=300),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    ch = zone.changes_obj
+    assert ch.created is True
+    # Old rrset deleted, merged rrset (both values) added — one atomic change.
+    assert ch.deleted == [existing]
+    assert zone.built_rrsets == [("www.example.com.", "A", 300, ["10.0.0.1", "10.0.0.2"])]
+    assert len(ch.added) == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_record_create_existing_value_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-creating an already-present value writes nothing (idempotent)."""
+    driver = GoogleCloudDNSDriver()
+    existing = _rrset("www.example.com.", "A", 300, ["10.0.0.1"])
+    zone = _StubZone("example-com", "example.com.", rrsets=[existing])
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    ch = zone.changes_obj
+    assert ch.created is False
+    assert ch.added == []
+    assert ch.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_apply_record_create_uses_change_ttl_on_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A merge applies the change's ttl across the whole rrset."""
+    driver = GoogleCloudDNSDriver()
+    existing = _rrset("@", "MX", 3600, ["10 mail1.example.com."])
+    # Apex rrset is stored under the absolute apex FQDN.
+    existing.name = "example.com."
+    zone = _StubZone("example-com", "example.com.", rrsets=[existing])
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="@", record_type="MX", value="20 mail2.example.com.", ttl=600),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    # Both MX values present, ttl from the change (600).
+    assert zone.built_rrsets == [
+        ("example.com.", "MX", 600, ["10 mail1.example.com.", "20 mail2.example.com."])
+    ]
+
+
+@pytest.mark.asyncio
+async def test_apply_record_delete_one_of_two_leaves_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleting one value of a 2-value rrset re-writes the reduced set."""
+    driver = GoogleCloudDNSDriver()
+    existing = _rrset("www.example.com.", "A", 300, ["10.0.0.1", "10.0.0.2"])
+    zone = _StubZone("example-com", "example.com.", rrsets=[existing])
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    ch = zone.changes_obj
+    assert ch.created is True
+    # Old (full) rrset deleted; reduced rrset (the surviving value) re-added.
+    assert ch.deleted == [existing]
+    assert zone.built_rrsets == [("www.example.com.", "A", 300, ["10.0.0.2"])]
+    assert len(ch.added) == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_record_delete_last_value_removes_rrset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleting the only value removes the whole rrset (no re-add)."""
+    driver = GoogleCloudDNSDriver()
+    existing = _rrset("www.example.com.", "A", 300, ["10.0.0.1"])
+    zone = _StubZone("example-com", "example.com.", rrsets=[existing])
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    ch = zone.changes_obj
+    assert ch.created is True
+    assert ch.deleted == [existing]
+    assert ch.added == []
+    assert zone.built_rrsets == []
+
+
+@pytest.mark.asyncio
+async def test_apply_record_delete_value_not_in_rrset_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleting a value absent from the live rrset is an idempotent no-op."""
+    driver = GoogleCloudDNSDriver()
+    existing = _rrset("www.example.com.", "A", 300, ["10.0.0.1", "10.0.0.2"])
+    zone = _StubZone("example-com", "example.com.", rrsets=[existing])
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.9", ttl=300),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    ch = zone.changes_obj
+    assert ch.created is False
+    assert ch.added == []
+    assert ch.deleted == []
+
+
 @pytest.mark.asyncio
 async def test_apply_record_bad_op(monkeypatch: pytest.MonkeyPatch) -> None:
     driver = GoogleCloudDNSDriver()

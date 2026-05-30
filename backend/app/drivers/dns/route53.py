@@ -218,19 +218,171 @@ class Route53DNSDriver(CloudDNSDriverBase):
         rr = change.record
         rtype = rr.record_type.upper()
         absolute = self._absolutize(rr.name, apex)
-        ttl = int(rr.ttl) if rr.ttl else 300
+        default_ttl = int(rr.ttl) if rr.ttl else 300
 
-        rrset: dict[str, Any] = {
-            "Name": absolute,
-            "Type": rtype,
-            "TTL": ttl,
-            # MX / SRV: ``value`` already carries the priority/target, so a
-            # single ResourceRecords entry is correct.
-            "ResourceRecords": [{"Value": rr.value}],
-        }
-        action = "DELETE" if change.op == "delete" else "UPSERT"
+        # SpatiumDDI stores one DB row per record value and emits one
+        # RecordChange per row, but Route 53 groups every value sharing the
+        # same {Name, Type} into a single ResourceRecordSet. Writing only
+        # this op's value would clobber the rrset's siblings (round-robin A,
+        # multiple MX/NS/TXT). For create/delete we read the live rrset and
+        # merge so siblings survive; update keeps the single-value replace
+        # (see below).
+        if change.op == "update":
+            # Replace the rrset with this single value. The update op carries
+            # only the NEW value (no old value), so a correct multi-value
+            # merge is impossible at this per-row→RRset layer — replace is
+            # correct for the common single-value rrset (CNAME, SOA, a host
+            # with one A/TXT). Multi-value value-edits are an inherent
+            # per-row→RRset limitation tracked in #29.
+            rrset: dict[str, Any] = {
+                "Name": absolute,
+                "Type": rtype,
+                "TTL": default_ttl,
+                # MX / SRV: ``value`` already carries the priority/target, so
+                # a single ResourceRecords entry is correct.
+                "ResourceRecords": [{"Value": rr.value}],
+            }
+            await self._submit_change(server, client, zone_id, "UPSERT", rrset, change)
+            return
+
+        # Read the provider's current rrset for {name, type} so we can merge.
+        existing = await self._read_rrset(server, client, zone_id, absolute, rtype)
+
+        if change.op == "create":
+            if existing is not None and existing.get("AliasTarget"):
+                # ALIAS rrsets (AliasTarget) are single-valued and have no
+                # ResourceRecords — never merge a value into an alias rrset.
+                # Replace it with the new value-bearing rrset instead.
+                existing = None
+            existing_values = self._existing_values(existing)
+            if rr.value in existing_values:
+                # Value already present — the desired set is unchanged, so
+                # this is an idempotent no-op.
+                logger.info(
+                    "route53.apply_record.create_noop",
+                    server=str(getattr(server, "id", "")),
+                    zone=change.zone_name,
+                    name=rr.name,
+                    rtype=rtype,
+                )
+                return
+            merged_values = existing_values + [rr.value]
+            ttl = self._merge_ttl(rr.ttl, existing, default_ttl)
+            rrset = {
+                "Name": absolute,
+                "Type": rtype,
+                "TTL": ttl,
+                "ResourceRecords": [{"Value": v} for v in merged_values],
+            }
+            await self._submit_change(server, client, zone_id, "UPSERT", rrset, change)
+            return
+
+        # op == "delete": remove this value from the live rrset.
+        if existing is None or existing.get("AliasTarget"):
+            # Nothing to delete (or an alias rrset whose single value isn't a
+            # plain ResourceRecords value) — idempotent no-op.
+            logger.info(
+                "route53.apply_record.delete_noop",
+                server=str(getattr(server, "id", "")),
+                zone=change.zone_name,
+                name=rr.name,
+                rtype=rtype,
+            )
+            return
+        existing_values = self._existing_values(existing)
+        if rr.value not in existing_values:
+            # Value isn't in the rrset — idempotent no-op.
+            logger.info(
+                "route53.apply_record.delete_noop",
+                server=str(getattr(server, "id", "")),
+                zone=change.zone_name,
+                name=rr.name,
+                rtype=rtype,
+            )
+            return
+        remaining = [v for v in existing_values if v != rr.value]
+        if remaining:
+            # Other values survive — UPSERT the reduced set, keeping the
+            # rrset's live TTL.
+            ttl = int(existing.get("TTL", default_ttl) or default_ttl)
+            rrset = {
+                "Name": absolute,
+                "Type": rtype,
+                "TTL": ttl,
+                "ResourceRecords": [{"Value": v} for v in remaining],
+            }
+            await self._submit_change(server, client, zone_id, "UPSERT", rrset, change)
+            return
+        # Last value removed — delete the whole rrset. Route 53 requires the
+        # EXACT existing rrset (incl. its TTL + every value) to delete.
+        await self._submit_change(server, client, zone_id, "DELETE", existing, change)
+
+    async def _read_rrset(
+        self, server: Any, client: Any, zone_id: str, absolute: str, rtype: str
+    ) -> dict[str, Any] | None:
+        """Return the live Route 53 rrset for exactly ``{absolute, rtype}``.
+
+        ``list_resource_record_sets`` returns the first rrset at-or-after the
+        start key lexically, so when no exact match exists Route 53 hands
+        back the NEXT rrset — we compare normalised names + type and discard
+        a non-match. Returns ``None`` when no such rrset exists.
+        """
+        try:
+            resp = await asyncio.to_thread(
+                client.list_resource_record_sets,
+                HostedZoneId=zone_id,
+                StartRecordName=absolute,
+                StartRecordType=rtype,
+                MaxItems="1",
+            )
+        except Exception as exc:  # noqa: BLE001 — wrap any botocore/SDK error
+            raise CloudDNSError(
+                f"route53 list_resource_record_sets (read-merge) failed for "
+                f"{absolute!r} {rtype} on {zone_id!r}: {exc}"
+            ) from exc
+        for candidate in resp.get("ResourceRecordSets", []):
+            if (
+                normalize_fqdn(str(candidate.get("Name", ""))) == normalize_fqdn(absolute)
+                and str(candidate.get("Type", "")).upper() == rtype
+            ):
+                return candidate
+        return None
+
+    @staticmethod
+    def _existing_values(rrset: dict[str, Any] | None) -> list[str]:
+        """Return the rrset's current ``ResourceRecords[].Value`` list."""
+        if not rrset:
+            return []
+        return [
+            str(rr["Value"])
+            for rr in rrset.get("ResourceRecords", [])
+            if rr.get("Value") is not None
+        ]
+
+    @staticmethod
+    def _merge_ttl(
+        change_ttl: int | None, existing: dict[str, Any] | None, default_ttl: int
+    ) -> int:
+        """TTL for a merged rrset: the change's ttl, else the live rrset's,
+        else the default."""
+        if change_ttl:
+            return int(change_ttl)
+        if existing and existing.get("TTL") is not None:
+            return int(existing["TTL"])
+        return default_ttl
+
+    async def _submit_change(
+        self,
+        server: Any,
+        client: Any,
+        zone_id: str,
+        action: str,
+        rrset: dict[str, Any],
+        change: RecordChange,
+    ) -> None:
+        """Submit a single-change ChangeBatch, wrapping errors + treating an
+        InvalidChangeBatch on DELETE as an idempotent no-op."""
         change_batch = {"Changes": [{"Action": action, "ResourceRecordSet": rrset}]}
-
         try:
             await asyncio.to_thread(
                 client.change_resource_record_sets,
@@ -246,13 +398,14 @@ class Route53DNSDriver(CloudDNSDriverBase):
                     "route53.apply_record.delete_noop",
                     server=str(getattr(server, "id", "")),
                     zone=change.zone_name,
-                    name=rr.name,
-                    rtype=rtype,
+                    name=change.record.name,
+                    rtype=change.record.record_type.upper(),
                 )
                 return
             raise CloudDNSError(
                 f"route53 change_resource_record_sets ({action}) failed for "
-                f"{rr.name!r} {rtype} in {change.zone_name!r}: {exc}"
+                f"{change.record.name!r} {change.record.record_type.upper()} "
+                f"in {change.zone_name!r}: {exc}"
             ) from exc
 
     def _absolutize(self, name: str, apex: str) -> str:

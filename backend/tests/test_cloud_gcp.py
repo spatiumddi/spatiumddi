@@ -108,7 +108,7 @@ def _make_connector(
     )
 
     # Skip the real SDK credential build entirely.
-    monkeypatch.setattr(conn, "_credentials", lambda: object())
+    monkeypatch.setattr(conn, "_credentials", object)
 
     def _client(list_items: list[Any] | None = None, agg_pages: Any = None) -> Mock:
         m = Mock()
@@ -341,7 +341,7 @@ async def test_per_project_failure_becomes_warning(monkeypatch: pytest.MonkeyPat
         credentials={"service_account_json": _KEY},
         provider_config={"project_ids": ["proj-1"]},
     )
-    monkeypatch.setattr(conn, "_credentials", lambda: object())
+    monkeypatch.setattr(conn, "_credentials", object)
     monkeypatch.setattr(conn, "_describe_error", staticmethod(lambda exc: f"boom: {exc}"))
 
     def _boom(_c: Any) -> Mock:
@@ -363,7 +363,7 @@ async def test_fetch_inventory_no_projects_warns(monkeypatch: pytest.MonkeyPatch
         credentials={"service_account_json": _KEY},
         provider_config={"project_ids": []},
     )
-    monkeypatch.setattr(conn, "_credentials", lambda: object())
+    monkeypatch.setattr(conn, "_credentials", object)
 
     inv = await conn.fetch_inventory()
 
@@ -411,7 +411,7 @@ async def test_probe_auth_failure_returns_not_ok(monkeypatch: pytest.MonkeyPatch
         credentials={"service_account_json": _KEY},
         provider_config={"project_ids": ["proj-1"]},
     )
-    monkeypatch.setattr(conn, "_credentials", lambda: object())
+    monkeypatch.setattr(conn, "_credentials", object)
     monkeypatch.setattr(conn, "_describe_error", staticmethod(lambda exc: "GCP auth failed"))
 
     def _boom(_c: Any) -> Mock:
@@ -448,7 +448,7 @@ async def test_probe_no_projects_returns_not_ok(monkeypatch: pytest.MonkeyPatch)
         credentials={"service_account_json": _KEY},
         provider_config={"project_ids": []},
     )
-    monkeypatch.setattr(conn, "_credentials", lambda: object())
+    monkeypatch.setattr(conn, "_credentials", object)
 
     result = await conn.probe()
 

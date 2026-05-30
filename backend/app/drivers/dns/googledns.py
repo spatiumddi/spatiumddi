@@ -27,8 +27,11 @@ A few Cloud-DNS-specific wrinkles the hooks paper over:
 * **rrdatas is a list.** A single ``ResourceRecordSet`` carries one or
   more ``rrdatas`` strings (Cloud DNS groups same-name/same-type values
   into one rrset; the rest of SpatiumDDI keys records per value). We
-  expand one ``RecordData`` per ``rrdata`` on read, and collapse back to
-  a single-value rrset on write.
+  expand one ``RecordData`` per ``rrdata`` on read. On write, a per-value
+  create / delete **read-merges** against the provider's live rrset so a
+  single-value op never drops the sibling values that share the rrset
+  (see ``_apply_record``); an update replaces the rrset with its single
+  new value (per-row→RRset value-edit limitation, tracked in #29).
 * **Changes are transactional + asynchronous.** A write builds a
   ``Changes`` object (additions + deletions), commits it with
   ``changes.create()``, and the change goes ``pending`` → ``done``. We
@@ -232,31 +235,60 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
         rr = change.record
         rtype = rr.record_type.upper()
         absolute = self._absolutize(rr.name, apex)
-        ttl = int(rr.ttl) if rr.ttl else 300
 
-        # Build the transactional change set. A create adds the new
-        # rrset; a delete removes the exact existing rrset (Cloud DNS
-        # requires the deletion to match name + type + ttl + rrdatas);
-        # an update does both in one atomic change set.
+        # Cloud DNS groups every same-{name,type} value under a single
+        # rrset (round-robin A, multiple MX/NS/TXT, …) but SpatiumDDI
+        # stores one DB row → one ``RecordChange`` per value. Writing a
+        # one-value rrset on create / delete would silently DROP the
+        # sibling values that share the rrset. So create + delete
+        # read-merge against the provider's CURRENT rrset and write the
+        # FULL merged/reduced value set in one transactional change.
         def _build_and_commit() -> Any:
             changes = zone.changes()
-            wants_add = change.op in {"create", "update"}
-            wants_delete = change.op in {"update", "delete"}
 
-            if wants_delete:
+            if change.op == "create":
                 existing = self._find_rrset(zone, absolute, rtype)
+                merged, ttl = self._merge_create(existing, rr.value, rr.ttl)
+                if existing is not None and self._rrdatas(existing) == merged:
+                    # Value already present with an unchanged set — no-op.
+                    return None
                 if existing is not None:
+                    # Cloud DNS has no in-place update; replace the whole
+                    # rrset (delete old + add merged) in one atomic change.
                     changes.delete_record_set(existing)
-                elif change.op == "delete":
-                    # Nothing to delete — desired end state already met.
-                    # Skip the commit entirely so we don't fire an empty
+                new_rrset = zone.resource_record_set(absolute, rtype, ttl, merged)
+                changes.add_record_set(new_rrset)
+                changes.create()
+                return changes
+
+            if change.op == "delete":
+                existing = self._find_rrset(zone, absolute, rtype)
+                if existing is None or rr.value not in self._rrdatas(existing):
+                    # Value (or whole rrset) already gone — idempotent
+                    # no-op. Skip the commit so we don't fire an empty
                     # change set (Cloud DNS rejects those).
                     return None
+                reduced = [v for v in self._rrdatas(existing) if v != rr.value]
+                changes.delete_record_set(existing)
+                if reduced:
+                    # Siblings remain — re-add the reduced rrset rather
+                    # than dropping the whole set.
+                    ttl = int(existing.ttl) if existing.ttl is not None else 300
+                    changes.add_record_set(zone.resource_record_set(absolute, rtype, ttl, reduced))
+                changes.create()
+                return changes
 
-            if wants_add:
-                new_rrset = zone.resource_record_set(absolute, rtype, ttl, [rr.value])
-                changes.add_record_set(new_rrset)
-
+            # ``update`` carries only the NEW value (no old value), so a
+            # correct multi-value merge is impossible at this layer —
+            # replace the whole rrset with the single new value. Correct
+            # for the common single-value rrset (CNAME, SOA, a host with
+            # one A/TXT); multi-value value-edits are an inherent
+            # per-row→RRset limitation tracked in #29.
+            ttl = int(rr.ttl) if rr.ttl else 300
+            existing = self._find_rrset(zone, absolute, rtype)
+            if existing is not None:
+                changes.delete_record_set(existing)
+            changes.add_record_set(zone.resource_record_set(absolute, rtype, ttl, [rr.value]))
             changes.create()
             return changes
 
@@ -264,15 +296,44 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
             self._wrap_call, "change_record_sets", _build_and_commit
         )
         if committed is None:
+            # create-already-present or delete-missing — desired end state
+            # already met, nothing to commit.
             logger.info(
-                "google_dns.apply_record.delete_noop",
+                "google_dns.apply_record.noop",
                 server=str(getattr(server, "id", "")),
                 zone=change.zone_name,
                 name=rr.name,
                 rtype=rtype,
+                op=change.op,
             )
             return
         await self._wait_for_change(committed)
+
+    @staticmethod
+    def _rrdatas(rrset: Any) -> list[str]:
+        """Return an rrset's values as a list of strings (empty if none)."""
+        return [str(v) for v in (getattr(rrset, "rrdatas", None) or [])]
+
+    def _merge_create(
+        self, existing: Any | None, value: str, change_ttl: int | None
+    ) -> tuple[list[str], int]:
+        """Compute the merged value set + ttl for a create.
+
+        New values = existing values ∪ {``value``}, order-preserving + de-
+        duped (an already-present value yields an unchanged set, which the
+        caller treats as a no-op). TTL is the change's ttl, falling back to
+        the existing rrset's ttl, then the 300 s default.
+        """
+        merged: list[str] = list(self._rrdatas(existing)) if existing is not None else []
+        if value not in merged:
+            merged.append(value)
+        if change_ttl:
+            ttl = int(change_ttl)
+        elif existing is not None and existing.ttl is not None:
+            ttl = int(existing.ttl)
+        else:
+            ttl = 300
+        return merged, ttl
 
     def _find_rrset(self, zone: Any, absolute_name: str, rtype: str) -> Any | None:
         """Fetch the existing rrset matching ``absolute_name`` + ``rtype``.
