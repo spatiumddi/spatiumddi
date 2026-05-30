@@ -249,6 +249,8 @@ backend/alembic/versions/c7e9b3a481f2_appliance_approval_workflow.py:drop_column
 backend/alembic/versions/c7e9b3a481f2_appliance_approval_workflow.py:drop_column:163
 backend/alembic/versions/c7e9b3a481f2_appliance_approval_workflow.py:drop_table:162
 backend/alembic/versions/c7e9d4f81a26_internal_error_table.py:drop_table:125
+backend/alembic/versions/c7f1a3e58b94_dhcp_import_source.py:drop_column:81
+backend/alembic/versions/c7f1a3e58b94_dhcp_import_source.py:drop_column:82
 backend/alembic/versions/c87a3f29d108_appliance_ntp_settings.py:drop_column:85
 backend/alembic/versions/c8a3f1e94d27_user_mfa.py:drop_column:39
 backend/alembic/versions/c8a3f1e94d27_user_mfa.py:drop_column:51

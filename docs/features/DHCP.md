@@ -369,6 +369,35 @@ Available from the admin UI: compares IPAM DB state vs. live DHCP server state a
 - Dry-run mode: shows what would be created before committing
 - Conflict resolution: skip / overwrite / error on duplicates
 
+### Migrating from an existing DHCP server (issue #129)
+
+The **DHCP configuration importer** is the one-shot path for loading a
+real DHCP estate into SpatiumDDI without retyping every scope, pool,
+reservation, and option-set. It lives under **DHCP Import** in the
+sidebar (gated by the `dhcp.import` feature module, default-on) and
+covers three sources:
+
+- **Kea** — upload a `kea-dhcp4.conf` / `kea-dhcp6.conf` from a
+  non-managed daemon.
+- **Windows DHCP** — live-pull every IPv4 scope from a registered
+  `windows_dhcp` server over WinRM (reuses the Path A read driver).
+- **ISC DHCP** — upload a `dhcpd.conf` (the importer ships its own
+  tokeniser; ISC is supported as an *import source* only — SpatiumDDI
+  does not run ISC daemons).
+
+The flow is preview → commit: the preview parses the source and shows
+the would-create scopes (with pool / reservation counts, conflicts,
+IPAM linkage, and a "didn't import" panel) before any DB write; commit
+writes each scope in its own savepoint. Every imported row is stamped
+with `import_source` + `imported_at` provenance. Each scope either
+links to an existing IPAM subnet on its CIDR or auto-creates one under
+an operator-chosen IP space + block. **Live leases are never imported**
+— they repopulate from the running daemon once a Kea server is attached
+to the target group.
+
+Full reference: [Migration](MIGRATION.md). Parser internals:
+[DHCP Drivers § Importing existing daemon configs](../drivers/DHCP_DRIVERS.md).
+
 ---
 
 ## 9. DHCP Permissions

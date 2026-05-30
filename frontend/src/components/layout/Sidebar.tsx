@@ -207,9 +207,16 @@ const adminConfigurationNav = [
     module: "ai.copilot",
   },
   { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
-  // DNS configuration importer (issue #128). Module-gated so
+  // DHCP configuration importer (issue #129). Module-gated so
   // operators who don't need the surface can hide it via Settings →
-  // Features.
+  // Features. Listed before DNS Import to keep this nav alphabetical.
+  {
+    label: "DHCP Import",
+    icon: Upload,
+    to: "/admin/dhcp-import",
+    module: "dhcp.import",
+  },
+  // DNS configuration importer (issue #128) — sister to DHCP Import.
   {
     label: "DNS Import",
     icon: Upload,

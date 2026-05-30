@@ -160,6 +160,19 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="DNS",
         description="One-shot import from BIND9 / Windows DNS / PowerDNS into SpatiumDDI's native zones + records. Settings → Import → DNS surface; sources gate behind their own credential / file-upload step.",
     ),
+    # DHCP — sister importer to ``dns.import`` (issue #129). One-shot
+    # import of scopes / pools / reservations / classes from Kea JSON /
+    # Windows DHCP live-pull / ISC dhcpd.conf so operators can seed a
+    # sandbox SpatiumDDI from their real DHCP estate. Same default-on
+    # rationale as the DNS importer: no blast radius from the toggle
+    # (endpoints are RBAC-gated separately), operators flip it off to
+    # hide the surface.
+    ModuleSpec(
+        id="dhcp.import",
+        label="DHCP configuration import",
+        group="DHCP",
+        description="One-shot import from Kea / Windows DHCP / ISC dhcpd.conf into SpatiumDDI's native scopes + pools + reservations + classes. Settings → Import → DHCP surface; sources gate behind their own credential / file-upload step.",
+    ),
     # Integrations — read-only mirrors of external orchestrators.
     # Default-disabled: each one needs operator-supplied credentials
     # before it does anything useful, and the kickoff lives behind

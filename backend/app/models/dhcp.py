@@ -336,6 +336,12 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
     )
 
+    # Provenance — set by the DHCP configuration importer (issue #129).
+    # ``import_source`` ∈ {kea, windows_dhcp, isc_dhcp}; NULL for
+    # hand-created scopes. ``imported_at`` is the commit timestamp.
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     group: Mapped[DHCPServerGroup] = relationship("DHCPServerGroup", back_populates="scopes")
     pools: Mapped[list[DHCPPool]] = relationship(
         "DHCPPool",
@@ -383,6 +389,10 @@ class DHCPPool(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     lease_time_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
     options_override: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
+    # Provenance — set by the DHCP configuration importer (issue #129).
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     scope: Mapped[DHCPScope] = relationship("DHCPScope", back_populates="pools")
 
 
@@ -426,6 +436,10 @@ class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
     )
 
+    # Provenance — set by the DHCP configuration importer (issue #129).
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     scope: Mapped[DHCPScope] = relationship("DHCPScope", back_populates="statics")
 
 
@@ -447,6 +461,10 @@ class DHCPClientClass(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     match_expression: Mapped[str] = mapped_column(Text, nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
+
+    # Provenance — set by the DHCP configuration importer (issue #129).
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     group: Mapped[DHCPServerGroup] = relationship(
         "DHCPServerGroup", back_populates="client_classes"
