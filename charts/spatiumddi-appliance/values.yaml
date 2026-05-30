@@ -243,6 +243,43 @@ cnpg:
   # rendered consistently) back to ``cloudnative-pg`` so self-discovery
   # works. Do NOT remove without also de-aliasing the dependency.
   nameOverride: cloudnative-pg
+  # #315 — pin the operator pod's resources + loosen its startup probe.
+  #
+  # The upstream chart ships ``resources: {}``, which makes the operator
+  # pod **BestEffort** QoS — the first thing kubelet evicts / OOM-kills
+  # under node memory pressure. On the all-in-one control node (api + db
+  # + frontend + observability on one box) that bites: when the node
+  # gets tight the operator dies, then its restart re-attaches every
+  # watched volume at once → a reconciliation storm + log flood (the
+  # operator restart was observed alongside an ``api`` pod restart,
+  # i.e. node-level pressure, while the Postgres ``Cluster`` itself
+  # stayed healthy). Setting requests moves it to **Burstable** so it is
+  # no longer first in the eviction line; the (generous) memory limit is
+  # a backstop against a genuine runaway — well above the operator's
+  # real footprint (~30-150 MiB) so it never cgroup-OOMKills normal
+  # reconciliation.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  # Loosen the default 3s-delay / 30s-window (6 × 5s) startup gate — on
+  # constrained appliance VMs the operator + its webhook TLS bootstrap
+  # can take longer than 30s to answer ``/readyz``, and a startup-probe
+  # miss is itself a restart cause. 60s window + later liveness/readiness
+  # start give honest headroom without masking a truly wedged operator.
+  # These keys merge into the chart's webhook defaults (port / mutating /
+  # validating stay intact).
+  webhook:
+    livenessProbe:
+      initialDelaySeconds: 15
+    readinessProbe:
+      initialDelaySeconds: 10
+    startupProbe:
+      failureThreshold: 12
+      periodSeconds: 5
   # Replica topology for the SpatiumDDI ``Cluster`` CR. 3 replicas
   # (primary + sync + async) is the etcd-quorum-friendly default;
   # 5 / 7 work for larger clusters. Even counts refused at the
