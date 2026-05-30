@@ -1,4 +1,4 @@
-"""Tests for the cloud DNS live-pull importer (issue #37, Part C).
+"""Tests for the cloud DNS live-pull importer (issue #37, Part B).
 
 The four cloud drivers (Cloudflare / Route 53 / Azure DNS / Google
 Cloud DNS) hit a real provider API, so we monkeypatch the ``get_driver``

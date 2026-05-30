@@ -1,4 +1,4 @@
-"""Cloud DNS live-pull importer (issue #37, Part C).
+"""Cloud DNS live-pull importer (issue #37, Part B).
 
 Reuses the agentless :class:`CloudDNSDriverBase` read surface that the
 four cloud drivers (Cloudflare / Route 53 / Azure DNS / Google Cloud
@@ -36,12 +36,11 @@ driver after import.
 (``cloudflare`` / ``route53`` / ``azure_dns`` / ``google_dns``), not a
 generic ``"cloud"`` — that's the same string stamped into every created
 row's ``import_source`` column so provenance stays queryable per
-provider. See the module-level note + the integrator summary: the
-:data:`app.services.dns_import.canonical.ImportSource` ``Literal`` is a
-closed enum that currently lists only ``bind9`` / ``windows_dns`` /
-``powerdns``, so the four provider names are ``cast`` to it here and the
-integrator must widen the ``Literal`` (and the ``import_source`` column
-comment) to include them.
+provider. The :data:`app.services.dns_import.canonical.ImportSource`
+``Literal`` is widened to include all four provider names, so the label
+is type-honest; ``server.driver`` (a runtime ``str``) is ``cast`` to
+``ImportSource`` at the assignment site since the column type is plain
+``String(20)``.
 """
 
 from __future__ import annotations

@@ -320,11 +320,22 @@ async def update_endpoint(
     if {"ipam_space_id", "public_space_id", "dns_group_id"} & changes.keys():
         await _validate_bindings(db, new_ipam, new_public, new_dns)
 
-    # Re-validate provider payload when credentials or routing config change.
+    # Re-validate the provider payload when EITHER credentials or the
+    # routing config (provider_config) changes — clearing
+    # subscription_ids / project_ids without rotating creds would
+    # otherwise save an invalid endpoint that only fails later at
+    # sync/probe time. When creds aren't being rotated, validate the new
+    # config against the stored creds.
     new_creds = changes.get("credentials")
-    if new_creds:
+    if new_creds or "provider_config" in changes:
+        creds_for_check: dict[str, Any] = new_creds or {}
+        if not new_creds and e.credentials_encrypted:
+            try:
+                creds_for_check = decrypt_dict(e.credentials_encrypted)
+            except ValueError:
+                creds_for_check = {}
         _validate_provider_payload(
-            e.provider, new_creds, changes.get("provider_config", e.provider_config or {})
+            e.provider, creds_for_check, changes.get("provider_config", e.provider_config or {})
         )
 
     for k, v in changes.items():
