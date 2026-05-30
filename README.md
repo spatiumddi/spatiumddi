@@ -718,22 +718,27 @@ Operators get a real Kubernetes node without managing one.
    VMware / Hyper-V / QEMU), or `dd` it to a USB stick for
    bare metal. **amd64** (arm64 ISO is planned).
 
-   **Hard floor (installer refuses below this): 24 GiB disk,
-   2 GiB RAM** — the A/B atomic-upgrade layout needs two 8 GiB
-   OS slots that each carry the full container image set for
-   air-gapped boot.
+   **Hard floor (installer refuses below this): 32 GiB disk** —
+   the A/B atomic-upgrade layout needs two 8 GiB OS slots that
+   each carry the full container image set for air-gapped boot,
+   and `/var` must hold the k3s image store + database + logs.
+   (The floor was 24 GiB; it was raised to 32 because the
+   Control plane's first boot otherwise tipped the kubelet
+   DiskPressure threshold into an eviction storm — issue #312.)
 
    **Recommended per role:**
 
    | Role | vCPU | RAM | Disk |
    |---|---|---|---|
    | **Control plane** (api + worker + frontend + Postgres + Redis + k3s etcd) | 4 | 8 GiB | 40 GiB SSD |
-   | **Appliance** (DNS / DHCP agent box) | 2 | 4 GiB | 24 GiB SSD |
+   | **Appliance** (DNS / DHCP agent box) | 2 | 4 GiB | 32 GiB SSD |
 
    Each control-plane HA node sizes the same as a single control
    plane (4 vCPU / 8 GiB) — every member runs a full api / worker /
    Postgres replica / Redis. SSD strongly preferred for the
-   etcd + Postgres write path.
+   etcd + Postgres write path. When you pick the **Control plane**
+   role on a box below the recommended 40 GiB / 8 GiB, the installer
+   shows a sizing warning before proceeding.
 2. Boot. The installer wizard asks for:
    - **Role** — *Control plane* (the required first install:
      control plane on this box + the k3s etcd seed; DNS / DHCP

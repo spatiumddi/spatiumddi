@@ -115,6 +115,26 @@ TIMEZONE="UTC"
 # convention.
 K3S_POD_CIDR="10.42.0.0/16"
 K3S_SERVICE_CIDR="10.43.0.0/16"
+# Disk / RAM sizing (#312).
+#   MIN_DISK_GIB     — absolute hard floor for the A/B partition layout;
+#                      pick_disk refuses below it for ANY role. Raised
+#                      24 → 32 because the 24 GiB floor left /var only
+#                      ~7 GiB, and the Control plane's first boot (k3s
+#                      image import + CNPG/Redis PVCs all on /var) tipped
+#                      the kubelet DiskPressure threshold into an
+#                      eviction / image-GC thrash loop that never
+#                      converges. 32 GiB leaves ~14 GiB usable /var.
+#   REC_CP_DISK_GIB /
+#   REC_CP_RAM_GIB   — RECOMMENDED Control-plane figures. Between the
+#                      floor and these, pick_disk soft-warns (install
+#                      proceeds) because the box still risks DiskPressure
+#                      under load. The Appliance/agent role is light and
+#                      gets no soft warning. Keep in sync with the
+#                      "Recommended sizing" table in README +
+#                      docs/deployment/APPLIANCE.md.
+MIN_DISK_GIB=32
+REC_CP_DISK_GIB=40
+REC_CP_RAM_GIB=8
 # Default ROLE = appliance (the role screen frames it as "Additional
 # node"). #272 UX fix: operators don't read the body text, and a
 # misclick / blind Enter on "control plane" silently spins up a SECOND
@@ -324,7 +344,7 @@ pick_disk() {
     # back to the menu — used to fire much later from inside
     # do_install AFTER the operator had already filled out hostname /
     # admin user / network / timezone, which was wasted typing.
-    local MIN_BYTES=$((24 * 1024 * 1024 * 1024))
+    local MIN_BYTES=$((MIN_DISK_GIB * 1024 * 1024 * 1024))
     while true; do
         TARGET_DISK=$(whiptail --backtitle "$BACKTITLE" --title "Target Disk" \
             --cancel-button "Back" \
@@ -334,13 +354,75 @@ pick_disk() {
         local DISK_BYTES
         DISK_BYTES=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
         if [ "$DISK_BYTES" -ge "$MIN_BYTES" ]; then
-            log "Picked target disk $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB)"
-            break
+            # Hard floor cleared. The Control plane role gets a second,
+            # SOFT check against the recommended figures (#312) — it can
+            # proceed under-spec but is warned about first-boot
+            # DiskPressure. A declined warning re-prompts the disk menu.
+            if _control_plane_sizing_ok "$DISK_BYTES"; then
+                log "Picked target disk $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB)"
+                break
+            fi
+            continue
         fi
-        log "Operator picked $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB) — below 24 GiB minimum; re-prompting"
+        log "Operator picked $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB) — below ${MIN_DISK_GIB} GiB minimum; re-prompting"
         whiptail --backtitle "$BACKTITLE" --title "Disk too small" --msgbox \
-            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 24 GiB:\n  ESP        512 MiB\n  STATE      256 MiB\n  root_A       8 GiB\n  root_B       8 GiB\n  var       remainder (≥7 GiB usable)\n\nThe slots are sized to carry the full container image set (issue #170 Wave A4) so the appliance works air-gapped without ghcr.io.\n\nPick a different disk, or Cancel out to attach a larger one." 19 76
+            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least ${MIN_DISK_GIB} GiB:\n  ESP        512 MiB\n  STATE      256 MiB\n  root_A       8 GiB\n  root_B       8 GiB\n  var       remainder (≥14 GiB usable)\n\nThe slots carry the full container image set (issue #170 Wave A4) so the appliance works air-gapped without ghcr.io, and /var must hold the k3s image store + database + logs without tipping the kubelet DiskPressure threshold on the Control plane role (issue #312).\n\nPick a different disk, or Cancel out to attach a larger one." 21 76
     done
+}
+
+# #312 — soft sizing gate for the heavy Control plane role. The hard
+# floor in pick_disk only guarantees the appliance installs + boots; the
+# Control plane (k3s etcd + CloudNativePG + Redis + api/worker/beat/
+# frontend, plus 2× HA replicas) wants REC_CP_DISK_GIB / REC_CP_RAM_GIB
+# or its first boot risks a DiskPressure eviction storm — the image pull
+# + Postgres/Redis PVCs land on a small /var and tip the kubelet nodefs
+# threshold into an evict / image-GC thrash loop that never converges.
+#
+# Warns, does not block (the operator can knowingly proceed). Returns 0
+# to proceed with the picked disk, 1 to send them back to the disk menu.
+# No-op for the lightweight Appliance/agent role — 32 GiB is plenty
+# there, so it never sees this.
+_control_plane_sizing_ok() {
+    local disk_bytes="$1"
+    [ "$ROLE" = "control-plane" ] || return 0
+
+    local disk_gib ram_kib ram_gib under_disk=0 under_ram=0
+    disk_gib=$((disk_bytes / 1024 / 1024 / 1024))
+    ram_kib=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
+    # Round RAM to the nearest GiB for display; MemTotal sits a little
+    # under provisioned RAM (kernel reserve).
+    ram_gib=$(((ram_kib + 524288) / 1024 / 1024))
+
+    [ "$disk_gib" -lt "$REC_CP_DISK_GIB" ] && under_disk=1
+    # Warn one GiB under the recommendation so a box provisioned at
+    # exactly REC_CP_RAM_GIB (whose MemTotal reads slightly low) doesn't
+    # false-warn. ram_kib==0 means /proc/meminfo was unreadable — skip
+    # the RAM dimension rather than warn on bad data.
+    if [ "$ram_kib" -gt 0 ] && [ "$ram_kib" -lt $(((REC_CP_RAM_GIB - 1) * 1024 * 1024)) ]; then
+        under_ram=1
+    fi
+    if [ "$under_disk" -eq 0 ] && [ "$under_ram" -eq 0 ]; then
+        return 0
+    fi
+
+    local msg
+    msg="The Control plane is the heaviest role — k3s + PostgreSQL (CloudNativePG) + Redis + api / worker / beat / frontend, plus 2× HA replicas.\n\n"
+    msg+="Recommended:  ≥ ${REC_CP_DISK_GIB} GiB disk,  ≥ ${REC_CP_RAM_GIB} GiB RAM\n"
+    msg+="This machine:  ${disk_gib} GiB disk"
+    [ "$ram_kib" -gt 0 ] && msg+=",  ~${ram_gib} GiB RAM"
+    msg+="\n\nIt will INSTALL and boot, but at this size the first boot pulls the full control-plane image set onto /var while the Postgres + Redis volumes also land there — very likely tipping the kubelet's DiskPressure threshold into a pod-eviction / image-GC thrash loop that never converges.\n\n"
+    msg+="See \"Recommended sizing\" in the README / docs/deployment/APPLIANCE.md.\n\n"
+    msg+="Continue with this disk anyway?"
+
+    # --defaultno so a careless Enter re-picks rather than committing to a
+    # known-risky control-plane install.
+    if whiptail --backtitle "$BACKTITLE" --title "Control plane: below recommended size" \
+        --defaultno --yesno "$msg" 23 78; then
+        log "Operator acknowledged under-spec control-plane sizing (disk=${disk_gib}G ram=${ram_gib}G); proceeding"
+        return 0
+    fi
+    log "Operator declined under-spec control-plane sizing (disk=${disk_gib}G ram=${ram_gib}G); re-prompting disk"
+    return 1
 }
 
 # Issue #276 — partition-layout confirmation. Shows the exact GPT
@@ -732,10 +814,12 @@ do_install() {
     # Previous 4 GiB slots predated baking and are too tight once
     # the full container set lives on-rootfs.
     #
-    # Hard floor: 24 GiB target disk (= 1 MiB BBP + 512 MiB ESP + 256
-    # MiB STATE + 2× 8 GiB slots + at least 7 GiB usable /var). Below
+    # Hard floor: MIN_DISK_GIB (32) target disk (= 1 MiB BBP + 512 MiB
+    # ESP + 256 MiB STATE + 2× 8 GiB slots + ~14 GiB usable /var). Below
     # that, postgres + k3s state (containerd content store, local-path
-    # PV dirs) + audit log outgrow /var quickly.
+    # PV dirs) + audit log outgrow /var quickly — on the Control plane
+    # role a 24 GiB disk's ~7 GiB /var tipped the kubelet DiskPressure
+    # threshold into an eviction storm on first boot (issue #312).
     local BBP ESP STATE ROOT_A ROOT_B VAR
     BBP=$(partition_node 1)
     ESP=$(partition_node 2)
