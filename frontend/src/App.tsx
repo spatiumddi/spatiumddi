@@ -45,6 +45,7 @@ import { LogsPage } from "@/pages/LogsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
 import { DNSImportPage } from "@/pages/admin/DNSImportPage";
+import { DHCPImportPage } from "@/pages/admin/DHCPImportPage";
 import { BackupPage } from "@/pages/admin/BackupPage";
 import { DiagnosticsErrorsPage } from "@/pages/admin/DiagnosticsErrorsPage";
 import { AIProvidersPage } from "@/pages/admin/AIProvidersPage";
@@ -152,6 +153,7 @@ export default function App() {
         <Route path="admin/roles" element={<RolesPage />} />
         <Route path="admin/audit" element={<AuditPage />} />
         <Route path="admin/dns-import" element={<DNSImportPage />} />
+        <Route path="admin/dhcp-import" element={<DHCPImportPage />} />
         <Route path="admin/backup" element={<BackupPage />} />
         <Route
           path="admin/diagnostics/errors"

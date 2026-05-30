@@ -298,6 +298,67 @@ For WinRM drivers, `pywinrm` errors get caught and re-raised as `DriverConnectio
 
 ---
 
+## 8. Importing existing daemon configs (issue #129)
+
+The **DHCP configuration importer** is separate from the driver
+abstraction: drivers *render + push* config to managed servers; the
+importer *reads* a foreign daemon's config one-shot and writes the
+canonical SpatiumDDI rows. It never touches a live daemon's config
+file. Code lives in `backend/app/services/dhcp_import/`.
+
+**Canonical IR** (`canonical.py`) — every source parses into the same
+neutral shapes: `ImportedScope` (CIDR, address family, lease times,
+options, DDNS), `ImportedPool`, `ImportedReservation`,
+`ImportedClientClass`, rolled into an `ImportPreview`. The shared
+`commit.py` is the only module that touches the DB, so all three
+sources share IPAM linkage, conflict handling, audit logging, and the
+per-scope savepoint pattern.
+
+**Parsers:**
+
+- `kea_parser.py` — strips Kea's JSON-with-comments (`//`, `#`,
+  `/* */`) string-aware, then walks `Dhcp4.subnet4` / `Dhcp6.subnet6`.
+  Inverts the Kea driver's option-name map (`shared/options.py` builds
+  the inverse of `_KEA_OPTION_NAMES` / `_KEA_OPTION_NAMES_V6`). Pools
+  parse both `"a - b"` and CIDR forms; `code:NN` option-data round-trips
+  the same way the driver renders it. DUID-only v6 reservations are
+  skipped (our reservations are MAC-keyed). Top-level `client-classes`
+  import verbatim — Kea `test` expressions are SpatiumDDI's native class
+  shape. `hooks-libraries` / `control-socket` / `lease-database` /
+  `loggers` are listed unsupported.
+- `windows_dhcp_pull.py` — reuses `WindowsDHCPReadOnlyDriver.get_scopes()`
+  (the same Path A read path the Logs surface uses), reshaping its
+  neutral dicts. IPv4 only; option names already arrive canonical.
+- `isc_dhcp_parser.py` — a self-contained tokeniser (comment- +
+  string-aware) → recursive-descent statement tree → walker.
+  `subnet` / `subnet6` → scopes; `range` / `range6` / `pool {}` →
+  pools (with `allow members of "class"` → `class_restriction`);
+  `host` → reservations (global hosts attach to the subnet containing
+  their `fixed-address`); `option` → canonical options;
+  `shared-network` / `group` are flattened. ISC's runtime-expression
+  classifier DSL doesn't map to our model, so `class` declarations are
+  emitted `supported=false` (manual review, never auto-created);
+  `failover` / `key` / `zone` / `include` are listed unsupported.
+
+**IPAM linkage** — `DHCPScope.subnet_id` is mandatory, so each commit
+resolves a `Subnet`: link to an existing one whose CIDR matches, or
+auto-create under the operator-chosen IP space + block (containment +
+non-overlap validated). Link-only mode (no space/block) reports an
+actionable per-scope error for unmatched CIDRs rather than failing the
+whole batch.
+
+**Provenance** — `import_source` (`kea` / `windows_dhcp` / `isc_dhcp`)
++ `imported_at` are stamped on every `dhcp_scope` / `dhcp_pool` /
+`dhcp_static_assignment` / `dhcp_client_class` row the importer creates
+(migration `c7f1a3e58b94`). Endpoints under
+`/api/v1/dhcp/import/{kea,windows,isc}/…` are gated by the `dhcp.import`
+feature module + superadmin RBAC.
+
+See [Migration](../features/MIGRATION.md) for the operator-facing flow
+and the DNS-importer sibling.
+
+---
+
 ## Related docs
 
 - [DHCP Features](../features/DHCP.md) — user-facing: scopes, pools, leases, HA modes.

@@ -22,6 +22,7 @@ from app.api.v1.conformity import router as conformity_router
 from app.api.v1.custom_fields.router import router as custom_fields_router
 from app.api.v1.dashboards import router as dashboards_router
 from app.api.v1.dhcp import router as dhcp_router
+from app.api.v1.dhcp_import.router import router as dhcp_import_router
 from app.api.v1.diagnostics import router as diagnostics_router
 from app.api.v1.dns.agents import router as dns_agents_router
 from app.api.v1.dns.blocklist_router import router as dns_blocklist_router
@@ -119,6 +120,12 @@ api_v1_router.include_router(
     dependencies=[Depends(require_module("network.customer"))],
 )
 api_v1_router.include_router(dhcp_router, prefix="/dhcp", tags=["dhcp"])
+api_v1_router.include_router(
+    dhcp_import_router,
+    prefix="/dhcp/import",
+    tags=["dhcp-import"],
+    dependencies=[Depends(require_module("dhcp.import"))],
+)
 api_v1_router.include_router(diagnostics_router, prefix="/diagnostics", tags=["diagnostics"])
 api_v1_router.include_router(dns_router, prefix="/dns", tags=["dns"])
 api_v1_router.include_router(dns_agents_router, prefix="/dns", tags=["dns-agents"])

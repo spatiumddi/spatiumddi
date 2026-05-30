@@ -43,6 +43,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/features/AUTH.md` | Authentication, LDAP/OIDC/SAML, roles, group-scoped permissions, API tokens |
 | `docs/features/ACME.md` | ACME DNS-01 provider — acme-dns-compatible HTTP surface for LE / public-CA cert issuance |
 | `docs/features/INTEGRATIONS.md` | Read-only Kubernetes + Docker mirror integrations; setup, semantics, dashboard surface |
+| `docs/features/MIGRATION.md` | One-shot importers — DNS (BIND9 / Windows DNS / PowerDNS) + DHCP (Kea / Windows DHCP / ISC dhcpd.conf) into native rows; preview → commit, provenance, IPAM linkage |
 | `docs/PERMISSIONS.md` | RBAC permission grammar (`{action, resource_type, resource_id?}`), builtin roles, wildcards |
 | `docs/features/SYSTEM_ADMIN.md` | System config, health dashboard, notifications, backup/restore, service control |
 | `docs/deployment/APPLIANCE.md` | OS appliance build, base OS selection, licensing |

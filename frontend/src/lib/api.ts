@@ -5086,6 +5086,175 @@ export interface PowerDNSConnectionInfo {
   url: string;
 }
 
+// ── DHCP configuration importer (issue #129) ────────────────────────
+
+export type DHCPImportSource = "kea" | "windows_dhcp" | "isc_dhcp";
+export type DHCPImportConflictAction = "skip" | "overwrite";
+
+export interface DHCPImportedReservation {
+  ip_address: string;
+  mac_address: string;
+  hostname: string;
+  client_id: string | null;
+  options: Record<string, unknown>;
+}
+
+export interface DHCPImportedPool {
+  start_ip: string;
+  end_ip: string;
+  pool_type: string;
+  name: string;
+  class_restriction: string | null;
+}
+
+export interface DHCPImportedClientClass {
+  name: string;
+  match_expression: string;
+  description: string;
+  options: Record<string, unknown>;
+  supported: boolean;
+  warning: string | null;
+}
+
+export interface DHCPImportedScope {
+  subnet_cidr: string;
+  address_family: string;
+  name: string;
+  description: string;
+  lease_time: number;
+  min_lease_time: number | null;
+  max_lease_time: number | null;
+  is_active: boolean;
+  options: Record<string, unknown>;
+  pools: DHCPImportedPool[];
+  reservations: DHCPImportedReservation[];
+  ddns_enabled: boolean;
+  ddns_hostname_policy: string;
+  v6_address_mode: string;
+  skipped_options: Record<string, unknown>;
+  ha_info: string | null;
+  parse_warnings: string[];
+}
+
+export interface DHCPImportScopeConflict {
+  subnet_cidr: string;
+  existing_scope_id: string | null;
+  existing_subnet_id: string | null;
+  existing_subnet_name: string | null;
+  existing_pool_count: number;
+  existing_reservation_count: number;
+  soft_deleted: boolean;
+  action: DHCPImportConflictAction;
+}
+
+export interface DHCPImportPreview {
+  source: DHCPImportSource;
+  scopes: DHCPImportedScope[];
+  client_classes: DHCPImportedClientClass[];
+  conflicts: DHCPImportScopeConflict[];
+  warnings: string[];
+  unsupported: string[];
+  total_pools: number;
+  total_reservations: number;
+  address_family_histogram: Record<string, number>;
+}
+
+export interface DHCPImportConflictDecision {
+  action: DHCPImportConflictAction;
+}
+
+export interface DHCPImportCommitScope {
+  subnet_cidr: string;
+  action_taken: "created" | "overwrote" | "skipped" | "failed";
+  scope_id: string | null;
+  subnet_id: string | null;
+  subnet_created: boolean;
+  pools_created: number;
+  reservations_created: number;
+  error: string | null;
+}
+
+export interface DHCPImportCommitResult {
+  target_group_id: string;
+  scopes: DHCPImportCommitScope[];
+  client_classes_created: number;
+  warnings: string[];
+  total_scopes_created: number;
+  total_scopes_overwrote: number;
+  total_scopes_skipped: number;
+  total_scopes_failed: number;
+  total_subnets_created: number;
+  total_pools_created: number;
+  total_reservations_created: number;
+}
+
+export interface WindowsDHCPServerOption {
+  id: string;
+  name: string;
+  host: string;
+  group_id: string | null;
+  group_name: string | null;
+  has_credentials: boolean;
+}
+
+interface DHCPImportCommitBody {
+  target_group_id: string;
+  ipam_space_id?: string | null;
+  ipam_block_id?: string | null;
+  plan: DHCPImportPreview;
+  conflict_actions: Record<string, DHCPImportConflictDecision>;
+}
+
+export const dhcpImportApi = {
+  // Kea — JSON config file upload.
+  keaPreview: (file: File, target_group_id: string, ipam_space_id?: string) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("target_group_id", target_group_id);
+    if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
+    return api
+      .post<DHCPImportPreview>("/dhcp/import/kea/preview", fd)
+      .then((r) => r.data);
+  },
+  keaCommit: (body: DHCPImportCommitBody) =>
+    api
+      .post<DHCPImportCommitResult>("/dhcp/import/kea/commit", body)
+      .then((r) => r.data),
+
+  // ISC — dhcpd.conf file upload.
+  iscPreview: (file: File, target_group_id: string, ipam_space_id?: string) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("target_group_id", target_group_id);
+    if (ipam_space_id) fd.append("ipam_space_id", ipam_space_id);
+    return api
+      .post<DHCPImportPreview>("/dhcp/import/isc/preview", fd)
+      .then((r) => r.data);
+  },
+  iscCommit: (body: DHCPImportCommitBody) =>
+    api
+      .post<DHCPImportCommitResult>("/dhcp/import/isc/commit", body)
+      .then((r) => r.data),
+
+  // Windows DHCP — server-side live pull.
+  windowsServers: () =>
+    api
+      .get<WindowsDHCPServerOption[]>("/dhcp/import/windows/servers")
+      .then((r) => r.data),
+  windowsPreview: (body: {
+    server_id: string;
+    target_group_id: string;
+    ipam_space_id?: string | null;
+  }) =>
+    api
+      .post<DHCPImportPreview>("/dhcp/import/windows/preview", body)
+      .then((r) => r.data),
+  windowsCommit: (body: DHCPImportCommitBody) =>
+    api
+      .post<DHCPImportCommitResult>("/dhcp/import/windows/commit", body)
+      .then((r) => r.data),
+};
+
 export const dnsBlocklistApi = {
   list: () => api.get<DNSBlockList[]>("/dns/blocklists").then((r) => r.data),
   catalog: () =>
