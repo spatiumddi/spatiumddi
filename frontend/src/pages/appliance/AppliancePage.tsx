@@ -1,3 +1,5 @@
+import { useEffect } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
@@ -182,6 +184,28 @@ export function AppliancePage() {
   // last visited a now-hidden tab (e.g. after a deployment-kind change).
   const defaultTab: Tab = isApplianceHost ? "tls" : "releases";
   const [tab, setTab] = useSessionState<Tab>("appliance.tab", defaultTab);
+
+  // Deep-link support: ``/appliance?tab=<key>`` forces a specific tab on
+  // arrival regardless of the session-stored last-active tab — e.g. the
+  // Setup Wizard's "Manage certificate" CTA (→ ?tab=tls) and "View
+  // releases" (→ ?tab=releases). We honor it once, persist the choice
+  // into the session-backed tab state, then strip the param so a later
+  // manual tab switch (or a refresh) isn't overridden. Validating
+  // against the full TABS list (not visibleTabs) sidesteps the async
+  // ``info`` load race; ``effectiveTab`` below already falls back when a
+  // deep-linked tab turns out to be hidden on a docker/k8s control plane.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedTab = searchParams.get("tab");
+  useEffect(() => {
+    if (!requestedTab) return;
+    if (TABS.some((t) => t.key === requestedTab)) {
+      setTab(requestedTab as Tab);
+    }
+    const next = new URLSearchParams(searchParams);
+    next.delete("tab");
+    setSearchParams(next, { replace: true });
+  }, [requestedTab, searchParams, setSearchParams, setTab]);
+
   const effectiveTab: Tab = visibleTabs.some((t) => t.key === tab)
     ? tab
     : defaultTab;

@@ -119,7 +119,7 @@ export function SetupWizardPage() {
               : "Currently serving the self-signed default — replace with a real cert or Let's Encrypt"
           }
           actionLabel="Manage certificate"
-          onAction={() => navigate("/appliance")}
+          onAction={() => navigate("/appliance?tab=tls")}
           icon={KeyRound}
         />
         <Step
@@ -140,7 +140,7 @@ export function SetupWizardPage() {
           actionLabel={
             version.data?.update_available ? "View releases" : undefined
           }
-          onAction={() => navigate("/appliance")}
+          onAction={() => navigate("/appliance?tab=releases")}
         />
       </section>
 
