@@ -7936,7 +7936,7 @@ export interface ApplianceRow {
     pods_total?: number;
     pods_by_phase?: Record<string, number>;
   };
-  // Issue #183 Phase 5 — installed k3s version (e.g. ``v1.35.4+k3s1``).
+  // Issue #183 Phase 5 — installed k3s version (e.g. ``v1.35.5+k3s1``).
   // Null on legacy compose / pre-#183 supervisors.
   k3s_version: string | null;
   // Issue #183 Phase 5 — boolean "supervisor has shipped a kubeconfig".

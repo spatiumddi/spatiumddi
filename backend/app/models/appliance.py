@@ -621,7 +621,7 @@ class Appliance(Base):
 
     # Issue #183 Phase 5 — operator-facing k3s metadata.
     # ``k3s_version`` is the upstream release tag the slot was baked
-    # against (e.g. ``v1.35.4+k3s1``); Fleet UI shows it on the row.
+    # against (e.g. ``v1.35.5+k3s1``); Fleet UI shows it on the row.
     # ``kubeconfig_encrypted`` is the supervisor-supplied admin
     # kubeconfig, Fernet-encrypted at rest. NULL until the supervisor
     # ships one (legacy compose / pre-#183 supervisors / k3s not yet
