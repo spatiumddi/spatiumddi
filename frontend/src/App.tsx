@@ -22,6 +22,7 @@ import { PXEProfilesPage } from "@/pages/dhcp/PXEProfilesPage";
 import { KubernetesPage } from "@/pages/kubernetes/KubernetesPage";
 import { DockerPage } from "@/pages/docker/DockerPage";
 import { ProxmoxPage } from "@/pages/proxmox/ProxmoxPage";
+import { CloudPage } from "@/pages/cloud/CloudPage";
 import { TailscalePage } from "@/pages/tailscale/TailscalePage";
 import { UnifiPage } from "@/pages/unifi/UnifiPage";
 import { UnifiControllerDetailPage } from "@/pages/unifi/UnifiControllerDetailPage";
@@ -145,6 +146,7 @@ export default function App() {
         <Route path="kubernetes" element={<KubernetesPage />} />
         <Route path="docker" element={<DockerPage />} />
         <Route path="proxmox" element={<ProxmoxPage />} />
+        <Route path="cloud" element={<CloudPage />} />
         <Route path="tailscale" element={<TailscalePage />} />
         <Route path="unifi" element={<UnifiPage />} />
         <Route path="unifi/:id" element={<UnifiControllerDetailPage />} />

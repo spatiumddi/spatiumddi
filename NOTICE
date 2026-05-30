@@ -53,6 +53,10 @@ components. Grouped by role; license + project URL for each.
 - reportlab (PDF export) — BSD 3-Clause — https://www.reportlab.com
 - Scapy (passive DHCP fingerprinting) — GPL v2 — https://scapy.net
 - nmap (network scanning) — NPSL (Nmap Public Source License) — https://nmap.org
+- boto3 / botocore (AWS — infra mirror + Route 53 DNS) — Apache 2.0 — https://github.com/boto/boto3
+- azure-identity / azure-mgmt-network / azure-mgmt-compute / azure-mgmt-dns / azure-mgmt-resource (Azure — infra mirror + Azure DNS) — MIT — https://github.com/Azure/azure-sdk-for-python
+- google-cloud-compute / google-cloud-dns / google-auth (GCP — infra mirror + Cloud DNS) — Apache 2.0 — https://github.com/googleapis/google-cloud-python
+- Cloudflare DNS is reached via plain REST over httpx (no SDK dependency)
 
 ── Frontend (TypeScript / React) ──────────────────────────────────────────
 - React — MIT — https://react.dev

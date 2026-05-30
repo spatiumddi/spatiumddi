@@ -1,8 +1,10 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useLocation } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   AlertTriangle,
   CheckCircle2,
+  Cloud,
   Database,
   Download,
   FileArchive,
@@ -18,6 +20,7 @@ import {
 import {
   dnsApi,
   dnsImportApi,
+  type CloudDNSServerOption,
   type DNSImportCommitResult,
   type DNSImportConflictDecision,
   type DNSImportPreview,
@@ -34,7 +37,10 @@ import { HeaderButton } from "@/components/ui/header-button";
 // stay rendered (so the operator sees the roadmap) but are
 // click-disabled with a "Phase 2/3" badge. When those phases land,
 // flip ``available`` and add the matching tab body.
-type TabId = DNSImportSource;
+// ``cloud`` isn't a ``DNSImportSource`` (that union is the wire-level
+// importer type and lives in lib/api.ts); it's a UI-only tab that pulls
+// from a registered cloud-DNS server row via the dedicated endpoints.
+type TabId = DNSImportSource | "cloud";
 
 interface TabDef {
   id: TabId;
@@ -45,6 +51,7 @@ interface TabDef {
   description: string;
 }
 
+// Tabs ordered alphabetically by label: BIND9 / Cloud / PowerDNS / Windows DNS.
 const TABS: TabDef[] = [
   {
     id: "bind9",
@@ -55,12 +62,12 @@ const TABS: TabDef[] = [
       "Upload a tarball or zip containing your named.conf plus all referenced zone files. The importer parses every zone declaration (including those nested inside view {} blocks), reads the master file from the archive, and stages the canonical zone + record IR for review. SOA, MX priority, SRV priority/weight/port, and CNAME records all carry through. DNSSEC records (DNSKEY/RRSIG/NSEC*/DS) get stripped — re-sign post-import via the zone DNSSEC tab.",
   },
   {
-    id: "windows_dns",
-    label: "Windows DNS",
-    short: "WinRM live pull",
+    id: "cloud",
+    label: "Cloud",
+    short: "provider API live pull",
     available: true,
     description:
-      "Live-pull every zone + record from a Windows DNS server using the same WinRM read driver the Logs surface uses. Pick a Windows DNS server already registered in SpatiumDDI (with WinRM credentials configured) and the importer walks Get-DnsServerZone + Get-DnsServerResourceRecord. Windows owns SOA on the server side — imported zones get default SOA values that you can edit via the zone editor post-import.",
+      "Live-pull every hosted zone + record set from a cloud DNS provider (Cloudflare / AWS Route 53 / Azure DNS / Google Cloud DNS) already registered as a cloud-driver DNS server in SpatiumDDI. Pick the server — its stored provider credentials drive the pull — and the importer walks the provider's hosted-zone + record APIs. Provider-managed apex records (SOA / provider NS) get default values you can edit post-import.",
   },
   {
     id: "powerdns",
@@ -69,6 +76,14 @@ const TABS: TabDef[] = [
     available: true,
     description:
       "Live-pull every zone + record from a PowerDNS Authoritative REST API. Provide the API URL + API key; the importer walks /api/v1/servers/{server}/zones and resolves each zone's full record set. Credentials are read-once and never persisted. DNSSEC records get stripped — re-sign post-import via the zone DNSSEC tab.",
+  },
+  {
+    id: "windows_dns",
+    label: "Windows DNS",
+    short: "WinRM live pull",
+    available: true,
+    description:
+      "Live-pull every zone + record from a Windows DNS server using the same WinRM read driver the Logs surface uses. Pick a Windows DNS server already registered in SpatiumDDI (with WinRM credentials configured) and the importer walks Get-DnsServerZone + Get-DnsServerResourceRecord. Windows owns SOA on the server side — imported zones get default SOA values that you can edit via the zone editor post-import.",
   },
 ];
 
@@ -99,7 +114,14 @@ function emptyState(): BindUploadState {
 }
 
 export function DNSImportPage() {
-  const [tab, setTab] = useState<TabId>("bind9");
+  const location = useLocation();
+  // Deep-link from the DNS server modal / list "Sync from provider" button:
+  // navigate("/admin/dns-import", { state: { cloudServerId } }). Open the
+  // Cloud tab pre-selected to that server.
+  const deepLinkServerId =
+    (location.state as { cloudServerId?: string } | null)?.cloudServerId ??
+    null;
+  const [tab, setTab] = useState<TabId>(deepLinkServerId ? "cloud" : "bind9");
   const active = TABS.find((t) => t.id === tab) ?? TABS[0];
 
   return (
@@ -110,9 +132,10 @@ export function DNSImportPage() {
           <div className="min-w-0">
             <h1 className="text-lg font-semibold">DNS configuration import</h1>
             <p className="text-xs text-muted-foreground">
-              One-shot import of zones + records from BIND9 / Windows DNS /
-              PowerDNS into native SpatiumDDI rows. Once imported, SpatiumDDI is
-              the source of truth — there is no continuous two-way mirror.
+              One-shot import of zones + records from BIND9 / Cloud DNS /
+              PowerDNS / Windows DNS into native SpatiumDDI rows. Once imported,
+              SpatiumDDI is the source of truth — there is no continuous two-way
+              mirror.
             </p>
           </div>
         </div>
@@ -154,6 +177,9 @@ export function DNSImportPage() {
         </div>
 
         {tab === "bind9" && <BindTab />}
+        {tab === "cloud" && (
+          <CloudDNSTab initialServerId={deepLinkServerId ?? undefined} />
+        )}
         {tab === "windows_dns" && <WindowsDNSTab />}
         {tab === "powerdns" && <PowerDNSTab />}
       </div>
@@ -584,6 +610,343 @@ function WindowsDNSPullForm({
         <HeaderButton
           variant="primary"
           icon={previewing ? Loader2 : ServerIcon}
+          iconClassName={previewing ? "animate-spin" : undefined}
+          onClick={onPreview}
+          disabled={!canPreview}
+        >
+          {previewing ? "Pulling zones…" : "Preview import"}
+        </HeaderButton>
+      </div>
+    </div>
+  );
+}
+
+// ── Cloud DNS tab body (issue #37, Part B) ───────────────────────────
+
+const CLOUD_DRIVER_LABELS: Record<string, string> = {
+  cloudflare: "Cloudflare",
+  route53: "AWS Route 53",
+  azure_dns: "Azure DNS",
+  google_dns: "Google Cloud DNS",
+};
+
+function cloudDriverLabel(driver: string): string {
+  return CLOUD_DRIVER_LABELS[driver] ?? driver;
+}
+
+interface CloudDNSState {
+  serverId: string;
+  groupId: string;
+  viewId: string;
+  preview: DNSImportPreview | null;
+  decisions: Record<string, DNSImportConflictDecision>;
+  result: DNSImportCommitResult | null;
+  phase: Phase;
+  error: string | null;
+}
+
+function emptyCloudState(serverId = ""): CloudDNSState {
+  return {
+    serverId,
+    groupId: "",
+    viewId: "",
+    preview: null,
+    decisions: {},
+    result: null,
+    phase: "select",
+    error: null,
+  };
+}
+
+function CloudDNSTab({ initialServerId }: { initialServerId?: string }) {
+  const [state, setState] = useState<CloudDNSState>(() =>
+    emptyCloudState(initialServerId),
+  );
+
+  const groupsQ = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: () => dnsApi.listGroups(),
+  });
+  const viewsQ = useQuery({
+    queryKey: ["dns-views", state.groupId],
+    queryFn: () =>
+      state.groupId ? dnsApi.listViews(state.groupId) : Promise.resolve([]),
+    enabled: Boolean(state.groupId),
+  });
+  const serversQ = useQuery({
+    queryKey: ["dns-import-cloud-servers"],
+    queryFn: () => dnsImportApi.cloudDNSServers(),
+  });
+
+  // When deep-linked to a server that has no creds (or that isn't in the
+  // list yet), don't silently keep an invalid id selected. Once the server
+  // list resolves, clear the selection if the deep-linked row isn't eligible.
+  useEffect(() => {
+    if (!state.serverId || !serversQ.data) return;
+    const row = serversQ.data.find((s) => s.id === state.serverId);
+    if (!row || !row.has_credentials) {
+      setState((s) => ({ ...s, serverId: "" }));
+    }
+    // Only re-run when the server list arrives.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serversQ.data]);
+
+  const selectedServer = useMemo(
+    () => serversQ.data?.find((s) => s.id === state.serverId) ?? null,
+    [serversQ.data, state.serverId],
+  );
+
+  const previewMut = useMutation({
+    mutationFn: () => {
+      if (!state.serverId || !state.groupId) {
+        throw new Error(
+          "Pick a cloud DNS server and target server group first",
+        );
+      }
+      return dnsImportApi.cloudDNSPreview({
+        server_id: state.serverId,
+        target_group_id: state.groupId,
+        target_view_id: state.viewId || null,
+      });
+    },
+    onSuccess: (preview) => {
+      const decisions: Record<string, DNSImportConflictDecision> = {};
+      for (const c of preview.conflicts) {
+        decisions[c.zone_name] = { action: c.action, rename_to: c.rename_to };
+      }
+      setState((s) => ({
+        ...s,
+        preview,
+        decisions,
+        phase: "ready",
+        error: null,
+      }));
+    },
+    onError: (err: unknown) => {
+      const detail =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? formatApiError(err);
+      setState((s) => ({ ...s, phase: "select", error: detail }));
+    },
+  });
+
+  const commitMut = useMutation({
+    mutationFn: () => {
+      if (!state.preview) throw new Error("Preview the server first");
+      return dnsImportApi.cloudDNSCommit({
+        target_group_id: state.groupId,
+        target_view_id: state.viewId || null,
+        plan: state.preview,
+        conflict_actions: state.decisions,
+      });
+    },
+    onSuccess: (result) => {
+      setState((s) => ({ ...s, result, phase: "result", error: null }));
+    },
+    onError: (err: unknown) => {
+      const detail =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? formatApiError(err);
+      setState((s) => ({ ...s, phase: "ready", error: detail }));
+    },
+  });
+
+  const conflictByZone = useMemo(() => {
+    const m = new Map<string, DNSImportZoneConflict>();
+    for (const c of state.preview?.conflicts ?? []) m.set(c.zone_name, c);
+    return m;
+  }, [state.preview]);
+
+  const reset = () => setState(emptyCloudState());
+
+  return (
+    <div className="space-y-4">
+      {state.error && (
+        <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+          <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+          <div>{state.error}</div>
+        </div>
+      )}
+
+      {state.phase === "result" && state.result ? (
+        <CommitResultPanel result={state.result} onReset={reset} />
+      ) : (
+        <>
+          <CloudDNSPullForm
+            state={state}
+            setState={setState}
+            servers={serversQ.data ?? []}
+            serversLoading={serversQ.isLoading}
+            selectedServer={selectedServer}
+            groups={groupsQ.data ?? []}
+            views={viewsQ.data ?? []}
+            onPreview={() => {
+              setState((s) => ({ ...s, phase: "previewing", error: null }));
+              previewMut.mutate();
+            }}
+            previewing={previewMut.isPending}
+          />
+
+          {state.preview && state.phase !== "previewing" && (
+            <PreviewPanel
+              preview={state.preview}
+              decisions={state.decisions}
+              setDecisions={(updater) =>
+                setState((s) => ({ ...s, decisions: updater(s.decisions) }))
+              }
+              conflictByZone={conflictByZone}
+              onCommit={() => {
+                setState((s) => ({ ...s, phase: "committing", error: null }));
+                commitMut.mutate();
+              }}
+              committing={commitMut.isPending}
+              onReset={reset}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function CloudDNSPullForm({
+  state,
+  setState,
+  servers,
+  serversLoading,
+  selectedServer,
+  groups,
+  views,
+  onPreview,
+  previewing,
+}: {
+  state: CloudDNSState;
+  setState: React.Dispatch<React.SetStateAction<CloudDNSState>>;
+  servers: CloudDNSServerOption[];
+  serversLoading: boolean;
+  selectedServer: CloudDNSServerOption | null;
+  groups: { id: string; name: string }[];
+  views: { id: string; name: string }[];
+  onPreview: () => void;
+  previewing: boolean;
+}) {
+  const canPreview = Boolean(state.serverId && state.groupId) && !previewing;
+  const eligible = servers.filter((s) => s.has_credentials);
+  const hasIneligible = servers.length > eligible.length;
+
+  return (
+    <div className="rounded-md border bg-muted/20 p-4">
+      <div className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        1. Pick source + target
+      </div>
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <div>
+          <label className="block text-sm font-medium">Cloud DNS server</label>
+          <p className="mb-2 text-[11px] text-muted-foreground">
+            Pick a registered cloud-driver DNS server (Cloudflare / Route 53 /
+            Azure DNS / Google Cloud DNS) with provider credentials configured.
+            The pull walks the provider's hosted-zone + record APIs. Servers
+            without credentials are greyed out — open the DNS server modal to
+            add them.
+          </p>
+          <select
+            value={state.serverId}
+            onChange={(e) =>
+              setState((s) => ({
+                ...s,
+                serverId: e.target.value,
+                preview: null,
+                error: null,
+              }))
+            }
+            disabled={serversLoading}
+            className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+          >
+            <option value="">
+              {serversLoading
+                ? "Loading…"
+                : eligible.length === 0
+                  ? "— no eligible servers —"
+                  : "— select —"}
+            </option>
+            {servers.map((srv) => (
+              <option
+                key={srv.id}
+                value={srv.id}
+                disabled={!srv.has_credentials}
+              >
+                {srv.group_name} / {srv.name} ({cloudDriverLabel(srv.driver)})
+                {!srv.has_credentials ? " — no creds" : ""}
+              </option>
+            ))}
+          </select>
+          {selectedServer && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Source provider:{" "}
+              <span className="font-medium text-foreground">
+                {cloudDriverLabel(selectedServer.driver)}
+              </span>
+            </p>
+          )}
+          {hasIneligible && (
+            <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-400">
+              Some servers are listed but disabled — they don't have provider
+              credentials configured yet.
+            </p>
+          )}
+        </div>
+        <div className="space-y-3">
+          <div>
+            <label className="block text-sm font-medium">
+              Target server group
+            </label>
+            <p className="mb-2 text-[11px] text-muted-foreground">
+              Imported zones land in this group — usually the same one the
+              source server already belongs to, but you can land them in a
+              different group (e.g., a staging group) for review.
+            </p>
+            <select
+              value={state.groupId}
+              onChange={(e) =>
+                setState((s) => ({ ...s, groupId: e.target.value, viewId: "" }))
+              }
+              className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            >
+              <option value="">— select —</option>
+              {groups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          {views.length > 0 && (
+            <div>
+              <label className="block text-sm font-medium">
+                Target view (optional)
+              </label>
+              <select
+                value={state.viewId}
+                onChange={(e) =>
+                  setState((s) => ({ ...s, viewId: e.target.value }))
+                }
+                className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="">Default view</option>
+                {views.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="mt-4 flex justify-end gap-2">
+        <HeaderButton
+          variant="primary"
+          icon={previewing ? Loader2 : Cloud}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
           disabled={!canPreview}

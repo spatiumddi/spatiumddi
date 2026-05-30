@@ -266,9 +266,7 @@ class CloudDNSDriverBase(DNSDriver):
         """Return records for ``zone_name`` (FQDN), names relative to apex."""
 
     @abstractmethod
-    async def _apply_record(
-        self, server: Any, creds: dict[str, Any], change: RecordChange
-    ) -> None:
+    async def _apply_record(self, server: Any, creds: dict[str, Any], change: RecordChange) -> None:
         """Create / update / delete one record on the provider."""
 
     @abstractmethod

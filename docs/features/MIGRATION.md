@@ -19,7 +19,7 @@ surface can hide it (Settings → Features).
 |---|---|---|
 | Feature module | `dns.import` | `dhcp.import` |
 | Admin surface | DNS Import (sidebar) | DHCP Import (sidebar) |
-| Sources | BIND9 archive · Windows DNS live-pull · PowerDNS REST | Kea JSON file · Windows DHCP live-pull · ISC `dhcpd.conf` |
+| Sources | BIND9 archive · Windows DNS live-pull · PowerDNS REST · Cloud DNS live-pull (Cloudflare / Route 53 / Azure DNS / Google Cloud DNS) | Kea JSON file · Windows DHCP live-pull · ISC `dhcpd.conf` |
 | Target | DNS server group (+ optional view) | DHCP server group (+ IPAM linkage) |
 | Provenance columns | `dns_zone` / `dns_record` `import_source` + `imported_at` | `dhcp_scope` / `dhcp_pool` / `dhcp_static_assignment` / `dhcp_client_class` `import_source` + `imported_at` |
 | Conflict actions | skip / overwrite / rename (per zone) | skip / overwrite (per scope) |
@@ -73,12 +73,38 @@ Three sources, all reducing to canonical `ImportedZone` + `ImportedRecord`:
   `Get-DnsServerResourceRecord`.
 - **PowerDNS REST** — paste an API URL + key (read once, never
   persisted); the importer walks `/api/v1/servers/{server}/zones`.
+- **Cloud DNS live-pull** *(issue #37)* — pick a registered cloud DNS
+  server (driver in `{cloudflare, route53, azure_dns, google_dns}`)
+  that has its provider credentials configured. The control plane
+  pulls every hosted zone + its records through the agentless driver's
+  `pull_zones_from_server` / `pull_zone_records` reads — the same
+  method names Windows DNS uses, so this source is a near-clone of the
+  Windows live-pull. Cloud providers own the SOA + apex NS on their
+  side, so the importer applies standards-compliant SOA defaults
+  (rewritten from the zone's own `primary_ns` / `admin_email` at push
+  time) and surfaces a per-zone warning; a DNSSEC-signed source zone
+  warns that signing state isn't imported and must be re-established on
+  the destination driver after commit.
+
+Endpoints: `GET /dns/import/cloud/servers` (the credentialled
+server picker), `POST /dns/import/cloud/preview`, and
+`POST /dns/import/cloud/commit` — same preview → commit shape, same
+per-zone conflict actions (below). This is also the engine behind a
+cloud DNS server's **Sync from provider** button.
 
 Per-zone conflict actions: **skip** (default — never trample an
 existing zone), **overwrite** (delete + recreate), **rename** (create
 under an operator-typed FQDN).
 
-See `docs/drivers/DNS_DRIVERS.md` for parser internals.
+**Per-provider provenance.** Unlike the other DNS sources (which stamp
+a single `bind9` / `windows_dns` / `powerdns` label), the cloud source
+stamps the **provider name** — `cloudflare`, `route53`, `azure_dns`,
+or `google_dns` — into every created row's `import_source` column, so
+provenance stays queryable per provider. The plan's `source` field
+must match the endpoint or the commit is rejected.
+
+See `docs/drivers/DNS_DRIVERS.md` for parser + agentless-driver
+internals.
 
 ---
 

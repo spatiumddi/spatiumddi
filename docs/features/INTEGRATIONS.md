@@ -232,11 +232,98 @@ Shipped as Option 2 from the original plan (synthetic `DNSZone` materialised by 
 
 ---
 
+## Cloud (AWS / Azure / GCP)
+
+**Phase status**: Part A shipped (read-only infrastructure mirror). Cloud DNS — the agentless authoritative-DNS driver family for Cloudflare / Route 53 / Azure DNS / Google Cloud DNS — is **Part B** and is *not* part of this integration; it ships through the Add DNS server flow instead (see [DNS.md](DNS.md) and [DNS_DRIVERS.md](../drivers/DNS_DRIVERS.md)).
+
+Gated behind the `integrations.cloud` feature module (**default off** — Settings → Features). One `CloudEndpoint` row per cloud account / subscription set / project set. AWS, Azure, and GCP are wired today; the model reserves the token-only providers (Hetzner / DigitalOcean / Linode / Vultr) for a future phase without a schema change.
+
+Per-endpoint config (`CloudEndpoint` rows):
+
+| Field | Notes |
+|---|---|
+| `provider` | `aws` \| `azure` \| `gcp`. Immutable after create (re-create to switch). |
+| `credentials` | Provider-specific secret dict, Fernet-encrypted at rest. AWS: `{access_key_id, secret_access_key}`. Azure: `{tenant_id, client_id, client_secret}`. GCP: `{service_account_json}` (the whole key file as a string). |
+| `provider_config` | Non-secret routing scope, shown in the UI without a decrypt. Azure: `{subscription_ids: [...]}` (required). GCP: `{project_ids: [...]}` (required). AWS: `{}` — AWS scopes by `regions`. |
+| `regions` | Region / location allow-list. Empty = all regions the account can see. AWS fans out one client per region (empty → `ec2:DescribeRegions` discovers every opted-in region); Azure / GCP filter the flat resource list. |
+| `ipam_space_id` | **Required.** Private VPC/VNet networks + their subnets + instance NICs land under this space (one `IPBlock` per VPC CIDR, `Subnet` rows beneath). |
+| `public_space_id` | Optional. A separate space for `cloud-public` / `cloud-lb` IPs. NULL keeps them in `ipam_space_id`. |
+| `dns_group_id` | Optional. Held for future cloud-DNS surfacing; unused by the infra mirror today. |
+| `mirror_load_balancers` | Default `true`. Mirror load-balancer frontend IPs as `cloud-lb` rows. |
+| `mirror_stopped_instances` | Default `false` — only running instances land in IPAM. On keeps stopped / deallocated instances too (capacity-planning views). |
+| `sync_interval_seconds` | Default `300`. Floor `60`. Cloud APIs are slower + rate-limited, so the cadence is deliberately longer than the 30 s shared default. Swept by `sweep_cloud_endpoints` on a 30 s beat tick. |
+
+### Mirror semantics
+
+- **VPCs / VNets** → one `IPBlock` per address-space CIDR under the bound space, named `<provider>:<network>` (the CIDR suffix is appended only when a network declares more than one CIDR). When an operator (or other-integration) block already encloses the CIDR, the reconciler nests beneath it rather than creating a same-CIDR duplicate.
+- **GCP networks carry no CIDR of their own** — a GCP VPC is a global CIDR-less container and the addressing lives entirely on its (regional) subnetworks. For those the reconciler creates one block per distinct subnet CIDR, and the subnet nests directly inside its same-CIDR block. No supernet is speculatively invented.
+- **Subnets** → one `Subnet` each, enclosed by the network's block. Cloud subnets are routed overlays: they are created with `kubernetes_semantics=True` so the IPAM tree suppresses the LAN-specific network / broadcast / gateway placeholder rows (same as Kubernetes pod-CIDR / Tailnet subnets). The gateway defaults to the first usable host (`x.x.x.1`) unless the provider reports one.
+- **Instance NICs** → `IPAddress` with `status="cloud-instance"`, hostname = instance name, MAC from the NIC when the provider exposes it (AWS / Azure do; GCP does not). A NIC's public IP, if present, also yields a `cloud-public` row.
+- **Standalone public / Elastic / external IPs** → `IPAddress` with `status="cloud-public"`.
+- **Load-balancer frontends** (when `mirror_load_balancers`) → `IPAddress` with `status="cloud-lb"`. AWS NLBs expose static frontend IPs; AWS ALBs + classic ELBs are DNS-name-only (their public IPs float) so they are skipped with a warning.
+- **Public + LB IPs are usually out-of-band /32s.** A `cloud-public` / `cloud-lb` row only materialises when an enclosing **mirrored** subnet exists (in `public_space_id` when set, else `ipam_space_id`). IPs that fall outside every mirrored subnet are counted under `skipped_no_subnet` — a documented limitation, not an error.
+
+### Lock semantics
+
+Same ownership shape as Proxmox / Tailscale: pre-existing operator rows at a desired address are claimed (FK stamped, `user_modified_at` set so the operator's soft fields lock); rows owned by another integration are skipped with a warning; locked rows whose upstream resource disappears release the FK (appear as "manually managed") instead of being deleted; an operator subnet at an exact-CIDR match is reused untouched (`subnets_matched`). The reconciler always corrects the factual `subnet_id`.
+
+### Setup — least-privilege credentials
+
+The admin page at `/cloud` ships a per-provider copy-paste guide. **Test Connection** (`POST /endpoints/test`) does a cheap auth + reachability probe — AWS resolves the account via `sts:GetCallerIdentity` + counts VPCs in one region; Azure lists VNets in the first subscription; GCP lists networks in the first project — and surfaces a clean message on failure rather than a raw SDK traceback.
+
+**AWS** — create an IAM user with programmatic access and attach the three AWS-managed read-only policies:
+
+```
+AmazonVPCReadOnlyAccess
+AmazonEC2ReadOnlyAccess
+ElasticLoadBalancingReadOnly
+```
+
+Paste the access key id + secret access key into the form. Leave **Regions** blank to walk every opted-in region, or pin a subset.
+
+**Azure** — create a read-only service principal scoped to the subscription(s):
+
+```sh
+az ad sp create-for-rbac --name spatiumddi-readonly --role Reader \
+  --scopes /subscriptions/<subscription-id>
+```
+
+Paste the printed `tenant` / `appId` / `password` into **Tenant ID** / **Client ID** / **Client secret**, and the subscription id(s) into **Subscription IDs** (required — Azure scopes by subscription).
+
+**GCP** — create a service account, grant it `roles/compute.viewer`, and download a JSON key:
+
+```sh
+gcloud iam service-accounts create spatiumddi-readonly
+gcloud projects add-iam-policy-binding <project-id> \
+  --member="serviceAccount:spatiumddi-readonly@<project-id>.iam.gserviceaccount.com" \
+  --role="roles/compute.viewer"
+gcloud iam service-accounts keys create key.json \
+  --iam-account=spatiumddi-readonly@<project-id>.iam.gserviceaccount.com
+```
+
+Paste the whole `key.json` contents into **Service account JSON** and the project id(s) into **Project IDs** (required).
+
+### Discovery modal
+
+The reconciler writes a `last_discovery` JSONB snapshot on every successful sync — category counters (networks / subnets / public IPs / load balancers totals, instances running / mirrored / no-subnet / no-NIC) plus a per-instance diagnostic list categorising each instance as `mirrored`, `no_subnet` (its private IP isn't enclosed by any mirrored subnet — check the VPC subnet was discovered in this region), or `no_nic`. Same shape + magnifier-icon button as the Proxmox Discovery modal. Disabled until the endpoint has synced at least once.
+
+### Delete semantics
+
+Mirror rows provenance via the `cloud_endpoint_id` FK on `IPBlock` / `Subnet` / `IPAddress` with `ON DELETE CASCADE`, so deleting the endpoint sweeps every materialised row atomically. Endpoint-owned blocks that no longer back any subnet are dropped on each reconcile.
+
+### Non-goals
+
+- **Read-only.** SpatiumDDI never writes back to the cloud — no instance / network / DNS mutation, no tagging.
+- **Cloudflare is not a Part A provider.** It has no VPC / instance concept; it appears only as a Part B cloud-DNS driver.
+- **No per-resource management surface** (start / stop / console) — outside the read-only-mirror scope.
+
+---
+
 ## Dashboard surface
 
 When **any** integration toggle is on, the dashboard renders an **Integrations panel** below the service health strip with:
 
-- One column per enabled integration (Kubernetes / Docker / Proxmox / Tailscale), header linking to the full admin page.
+- One column per enabled integration (Kubernetes / Docker / Proxmox / Tailscale / UniFi / Cloud), header linking to the full admin page.
 - Per-row: status dot (green = synced recently, amber = stalled > 3× sync interval, red = `last_sync_error`, gray = disabled or never synced), name, endpoint, node / container count, humanized last-synced age.
 - `last_sync_error` is exposed as the row tooltip so operators can triage without leaving the dashboard.
 
@@ -248,6 +335,6 @@ Tier 1 remaining (tracked in [CLAUDE.md §Future Phases § Additional integratio
 
 Tier 2 (narrower): MikroTik RouterOS 7, Incus / LXD, HashiCorp Nomad, NetBox one-shot import.
 
-Tier 3 (cloud — AWS / Azure / GCP / Hetzner / DO / Linode / Vultr VPC family): roadmap-coherent but not a lab-first priority.
+Tier 3 (cloud VPC family): AWS / Azure / GCP **shipped** (see [Cloud](#cloud-aws--azure--gcp) above). The token-only providers (Hetzner / DigitalOcean / Linode / Vultr) are reserved in the `CloudEndpoint` provider enum for a future phase.
 
 **Explicit non-goals**: VMware vCenter / ESXi (SOAP-heavy, enterprise effort), SNMP polling (tracked as a separate IPAM discovery line item), WireGuard raw config (no API).

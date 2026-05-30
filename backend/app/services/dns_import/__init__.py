@@ -20,6 +20,12 @@ from .canonical import (
     ImportSource,
     ZoneConflict,
 )
+from .cloud import (
+    CLOUD_DRIVERS,
+    CloudDNSImportError,
+    commit_cloud_import,
+    preview_cloud_import,
+)
 from .commit import CommitResult, CommitZoneResult, commit_import, detect_conflicts
 from .powerdns import (
     PowerDNSImportError,
@@ -29,6 +35,8 @@ from .powerdns import (
 from .windows_dns import WindowsDNSImportError, parse_windows_dns_server
 
 __all__ = [
+    "CLOUD_DRIVERS",
+    "CloudDNSImportError",
     "CommitResult",
     "CommitZoneResult",
     "ConflictAction",
@@ -41,9 +49,11 @@ __all__ = [
     "PowerDNSImportError",
     "WindowsDNSImportError",
     "ZoneConflict",
+    "commit_cloud_import",
     "commit_import",
     "detect_conflicts",
     "parse_bind9_archive",
+    "preview_cloud_import",
     "parse_powerdns_server",
     "parse_windows_dns_server",
     "test_powerdns_connection",

@@ -21,7 +21,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.permissions import require_any_resource_permission
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
-from app.drivers.dns import is_agentless
+from app.drivers.dns import CLOUD_DNS_DRIVERS, is_agentless
 from app.drivers.dns.windows import test_winrm_credentials
 from app.models.audit import AuditLog
 from app.models.dns import (
@@ -231,6 +231,11 @@ class ServerCreate(BaseModel):
     # falls back to Path A (RFC 2136 record CRUD only, no zone topology
     # management).
     windows_credentials: WindowsCredentialsInput | None = None
+    # Provider-specific credential dict for cloud DNS drivers
+    # (cloudflare/route53/azure_dns/google_dns — issue #37 Part B).
+    # Fernet-encrypted into the same ``credentials_encrypted`` column.
+    # Shape varies per driver (e.g. {"api_token"} for cloudflare).
+    cloud_credentials: dict[str, Any] | None = None
 
     @field_validator("driver")
     @classmethod
@@ -257,6 +262,9 @@ class ServerUpdate(BaseModel):
     #   * dict → partial patch if server already has creds (decrypt-merge-
     #            reencrypt), full username+password if it doesn't
     windows_credentials: WindowsCredentialsInput | dict[str, Any] | None = None
+    # Cloud DNS driver credentials (issue #37). Same contract as the
+    # windows block: None = leave alone, {} = clear, dict = replace.
+    cloud_credentials: dict[str, Any] | None = None
 
     @field_validator("driver")
     @classmethod
@@ -926,7 +934,7 @@ async def create_server(
             detail="A server with that name already exists in this group",
         )
 
-    data = body.model_dump(exclude={"api_key", "windows_credentials"})
+    data = body.model_dump(exclude={"api_key", "windows_credentials", "cloud_credentials"})
     data["group_id"] = group_id
     if body.api_key:
         # Issue #210 — Fernet-encrypted at rest, matching the unifi /
@@ -962,6 +970,17 @@ async def create_server(
         creds.setdefault("verify_tls", False)
         server.credentials_encrypted = encrypt_dict(creds)
 
+    # Cloud DNS driver credentials (issue #37) — provider-specific dict,
+    # Fernet-encrypted into the same column. Required on create for an
+    # agentless cloud driver (without them the driver can't reach the API).
+    if body.driver in CLOUD_DNS_DRIVERS:
+        if not body.cloud_credentials:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{body.driver} create requires cloud_credentials",
+            )
+        server.credentials_encrypted = encrypt_dict(body.cloud_credentials)
+
     db.add(server)
     db.add(
         AuditLog(
@@ -989,7 +1008,9 @@ async def update_server(
     current_user: SuperAdmin,
 ) -> ServerResponse:
     server = await _require_server(group_id, server_id, db)
-    changes = body.model_dump(exclude_none=True, exclude={"api_key", "windows_credentials"})
+    changes = body.model_dump(
+        exclude_none=True, exclude={"api_key", "windows_credentials", "cloud_credentials"}
+    )
     if body.api_key is not None:
         # Issue #210 — Fernet-encrypted at rest; matches the create
         # path above. ``body.api_key == ""`` clears the column.
@@ -1038,6 +1059,17 @@ async def update_server(
         elif body.windows_credentials == {}:
             server.credentials_encrypted = None
             changes["windows_credentials_cleared"] = True
+
+    # Cloud DNS driver credentials (issue #37): None → leave alone,
+    # {} → clear, non-empty dict → full replace (the modal sends the
+    # complete provider cred set, so no partial-merge needed).
+    if body.cloud_credentials is not None:
+        if body.cloud_credentials == {}:
+            server.credentials_encrypted = None
+            changes["cloud_credentials_cleared"] = True
+        else:
+            server.credentials_encrypted = encrypt_dict(body.cloud_credentials)
+            changes["cloud_credentials_set"] = True
 
     db.add(
         AuditLog(
@@ -1254,25 +1286,31 @@ async def pull_zones_from_server(
     — caller decides what to do next (show in UI, import, reconcile).
     """
     server = await _require_server(group_id, server_id, db)
-    if server.driver != "windows_dns":
+    # Zone-topology reads are supported by the agentless drivers that
+    # implement ``pull_zones_from_server`` — Windows DNS (WinRM) + the
+    # cloud DNS drivers (provider API, issue #37).
+    if server.driver != "windows_dns" and server.driver not in CLOUD_DNS_DRIVERS:
         raise HTTPException(
             status_code=400,
-            detail=f"pull-zones is only supported on windows_dns (got {server.driver!r})",
+            detail=(
+                f"pull-zones is only supported on windows_dns + cloud DNS drivers "
+                f"(got {server.driver!r})"
+            ),
         )
     if not server.credentials_encrypted:
         raise HTTPException(
             status_code=400,
             detail=(
-                "This server has no Windows credentials configured. "
-                "Add credentials on the server to enable WinRM zone topology reads."
+                "This server has no credentials configured. Add credentials on the "
+                "server to enable zone topology reads."
             ),
         )
 
-    from app.drivers.dns.windows import WindowsDNSDriver  # noqa: PLC0415
+    from app.drivers.dns import get_driver  # noqa: PLC0415
 
-    driver = WindowsDNSDriver()
+    driver = get_driver(server.driver)
     try:
-        zones = await driver.pull_zones_from_server(server)
+        zones = await driver.pull_zones_from_server(server)  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001 — surface PS / WinRM errors verbatim
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -1402,18 +1440,23 @@ async def _sync_single_server(
          on the first record-push — exactly the joe.com drift we hit.
       4. Run the existing bi-directional per-zone sync for records.
     """
-    from app.drivers.dns.windows import WindowsDNSDriver  # noqa: PLC0415
+    from app.drivers.dns import get_driver  # noqa: PLC0415
     from app.services.dns.pull_from_server import sync_zone_with_server  # noqa: PLC0415
 
     group_id = server.group_id
+    # Agentless drivers that can list zones from the authoritative side:
+    # Windows DNS (WinRM Path B) + the cloud DNS drivers (provider API).
+    topology_capable = (
+        server.driver == "windows_dns" or server.driver in CLOUD_DNS_DRIVERS
+    ) and bool(server.credentials_encrypted)
 
-    # 1. Path B discovery.
+    # 1. Topology discovery (Path B for Windows / provider API for cloud).
     zones_on_server: list[str] = []
     zone_meta_by_name: dict[str, dict[str, Any]] = {}
-    if server.driver == "windows_dns" and server.credentials_encrypted:
+    if topology_capable:
         try:
-            winrm_zones = await WindowsDNSDriver().pull_zones_from_server(server)
-            for z in winrm_zones:
+            discovered = await get_driver(server.driver).pull_zones_from_server(server)  # type: ignore[attr-defined]
+            for z in discovered:
                 name = str(z.get("name") or "").rstrip(".")
                 if not name:
                     continue
@@ -1421,8 +1464,9 @@ async def _sync_single_server(
                 zone_meta_by_name[name] = z
         except Exception as exc:  # noqa: BLE001 — informational, keep going
             logger.warning(
-                "dns.sync_from_server.pull_zones_winrm_failed",
+                "dns.sync_from_server.pull_zones_failed",
                 server=str(server.id),
+                driver=server.driver,
                 error=str(exc),
             )
 
@@ -1477,12 +1521,13 @@ async def _sync_single_server(
         if zones_imported:
             await db.flush()
 
-    # 3. Push missing zones DB→server (windows_dns+creds only).
+    # 3. Push missing zones DB→server (topology-capable drivers only:
+    #    Windows DNS over WinRM + cloud DNS via provider API).
     zones_pushed_to_server: list[str] = []
     zones_push_to_server_errors: list[str] = []
-    if server.driver == "windows_dns" and server.credentials_encrypted:
+    if topology_capable:
         server_zone_set = {n for n in zones_on_server}
-        driver = WindowsDNSDriver()
+        driver = get_driver(server.driver)
         # Re-query zones after the import step so newly-imported rows
         # are excluded from the "missing on server" set automatically.
         db_zones_res = await db.execute(select(DNSZone).where(DNSZone.group_id == group_id))
@@ -3659,10 +3704,13 @@ async def apply_delegation(
 async def _push_zone_to_agentless_servers(db: DB, zone: DNSZone, op: str) -> None:
     """Push ``create`` / ``delete`` to every agentless-with-creds server.
 
-    "Agentless" today means ``windows_dns``; "with creds" means Path B
-    (WinRM). Those are the only servers that have an admin channel the
-    control plane can use directly — agent-based drivers (bind9) get
-    zone changes through the ConfigBundle long-poll, not here.
+    "Agentless" means ``windows_dns`` (WinRM Path B) + the cloud DNS
+    drivers (cloudflare / route53 / azure_dns / google_dns — issue #37),
+    each of which implements ``apply_zone_change``. "With creds" means a
+    credential blob is configured. Those are the servers with an admin
+    channel the control plane can drive directly — agent-based drivers
+    (bind9 / powerdns) get zone changes through the ConfigBundle
+    long-poll, not here.
 
     Failure surfaces as a 502 so the caller's ``db.commit()`` never runs
     — the DB row stays in an uncommitted state and the session rollback

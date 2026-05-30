@@ -235,13 +235,15 @@ Required security group for the service account: `DnsAdmins` on the domain (or a
 
 ### 3.4 Driver registry classification
 
-In [`app/drivers/dns/registry.py`](../../backend/app/drivers/dns/registry.py):
+In [`app/drivers/dns/__init__.py`](../../backend/app/drivers/dns/__init__.py):
 
 ```python
-AGENTLESS_DRIVERS: frozenset[str] = frozenset({"windows_dns"})
+AGENTLESS_DRIVERS: frozenset[str] = frozenset(
+    {"windows_dns", "cloudflare", "route53", "azure_dns", "google_dns"}
+)
 ```
 
-Agentless drivers don't emit a `ConfigBundle`; the API's `record_ops.enqueue_record_op` short-circuits them and calls `apply_record_change` directly instead of queueing for a co-located agent.
+Agentless drivers don't emit a `ConfigBundle`; the API's `record_ops.enqueue_record_op` short-circuits them and calls `apply_record_change` directly instead of queueing for a co-located agent. The four cloud-hosted DNS providers (§4A) joined this set in issue #37.
 
 ### 3.5 Write-through pattern
 
@@ -433,19 +435,87 @@ LMDB cache survives control-plane outages — non-negotiable #5 in `CLAUDE.md`. 
 
 ---
 
+## 4A. Cloud DNS drivers (agentless) — issue #37 Part B
+
+Four cloud-hosted authoritative-DNS providers ship as a driver family: **Cloudflare**, **Amazon Route 53** (`route53`), **Azure DNS** (`azure_dns`), and **Google Cloud DNS** (`google_dns`). SpatiumDDI manages their zones and records exactly like a local BIND9 / PowerDNS / Windows zone — same Zones / Records / group surfaces — except the control plane calls the provider's REST/SDK API directly. There is **no agent**.
+
+These are infrastructure-DNS drivers, distinct from the *Cloud (AWS / Azure / GCP)* read-only infrastructure mirror (issue #37 Part A, in [INTEGRATIONS.md](../features/INTEGRATIONS.md)). A cloud DNS server is added through the normal Add DNS server flow and lives in a `DNSServerGroup`; it has no `CloudEndpoint` row.
+
+### 4A.1 Agentless shape (reuses Windows-DNS Path B)
+
+The shared base [`drivers/dns/_cloud_base.py`](../../backend/app/drivers/dns/_cloud_base.py) (`CloudDNSDriverBase`) mirrors how `windows_dns` Path B already works (§3 above):
+
+- **No ConfigBundle / long-poll.** The `render_*` methods return `""` and the `reload_*` methods are no-ops — agentless drivers never render daemon config. `validate_config` accepts anything.
+- **Credentials in the existing column.** The per-provider credential dict is Fernet-encrypted in the existing `DNSServer.credentials_encrypted` column — no new credential store. `_load_credentials` decrypts it, raising a clean `CloudDNSError` when unset vs. when the API rejects the key.
+- **Record writes run synchronously from the control plane.** Once the driver name is listed in `AGENTLESS_DRIVERS` (registry §5), the API's `record_ops._apply_agentless` calls `apply_record_change` directly and records each op as `applied` / `failed` on a `DNSRecordOp` row — exactly the path Windows DNS uses. The default batch loop in `DNSDriver` isolates a per-op failure into a `RecordChangeResult(ok=False)`.
+- **Zone create / delete via `apply_zone_change(server, zone, op)`** (`op` ∈ `create` / `delete`) — cloud providers have no rename, so the caller sends delete+create. Routed through the same write-through pattern as Windows zone CRUD (§3.5): pushed to the provider before the SpatiumDDI DB commit so the two states stay consistent.
+- **Reads via `pull_zones_from_server` / `pull_zone_records`** — the same method names Windows DNS exposes, returning the same neutral dict / `RecordData` shape (record names relative to the apex, `@` for apex). So the existing `sync-from-server` drift path *and* the cloud import service (§ MIGRATION.md) both work against any cloud driver with no per-provider glue.
+
+A concrete provider subclasses `CloudDNSDriverBase` and implements only five cloud-specific hooks — `_list_zones`, `_list_zone_records`, `_apply_record`, `_apply_zone`, `capabilities` — plus the `name` / `credential_fields` class attrs. Everything DNSDriver-shaped lives in the base.
+
+### 4A.2 Per-driver credential dict shapes
+
+`credential_fields` is an ordered tuple the Add-DNS-server modal renders and the probe validates as required:
+
+| Driver | `name` | Credential dict (decrypted from `DNSServer.credentials_encrypted`) | SDK / transport |
+|---|---|---|---|
+| Cloudflare | `cloudflare` | `{api_token}` — `account_id` optional, only consulted on zone create | plain `httpx` REST against `api.cloudflare.com/client/v4` (no vendor SDK) |
+| Route 53 | `route53` | `{access_key_id, secret_access_key}` — global service, no region | `boto3` |
+| Azure DNS | `azure_dns` | `{tenant_id, client_id, client_secret, subscription_id, resource_group}` | `azure-identity` + `azure-mgmt-dns` |
+| Google Cloud DNS | `google_dns` | `{service_account_json, project_id}` | `google-cloud-dns` |
+
+All SDK imports are lazy (inside the client factory) so the modules import cleanly without the optional wheel, and tests can patch the factory; blocking SDK calls run under `asyncio.to_thread`. Cloudflare is the exception — pure JSON over HTTPS, so it uses `httpx` directly.
+
+### 4A.3 Capabilities + online-DNSSEC matrix
+
+Each driver's `capabilities()` returns the same dict shape Windows / PowerDNS use (`agentless: True`, `manages_zones: True`, `views: False`, `rpz: False`, a `record_types` list, a `notes` blurb). The operator-visible differences:
+
+| | Cloudflare | Route 53 | Azure DNS | Google Cloud DNS |
+|---|:---:|:---:|:---:|:---:|
+| `dnssec_online` | ✅ | ✅ | ❌ | ✅ |
+| ALIAS records | apex CNAME auto-flattened | ✅ (`AliasTarget`, null TTL) | ✅ | — |
+| Apex handling | Cloudflare flattens CNAME-at-apex | apex SOA / NS provider-managed | apex SOA Azure-managed (skipped on read) | apex SOA provider-managed |
+
+`azure_dns` is the only cloud driver without online DNSSEC support — its capability dict carries `dnssec_online: False` and the notes call it out. The DNSSEC sign/unsign/rollover operations stay gated server-side by `_DRIVER_GATED_OPERATIONS` as for every other driver.
+
+### 4A.4 Provider-specific wrinkles the hooks paper over
+
+- **Cloudflare** — every reply is wrapped in a `{success, errors, result, result_info}` envelope; `_unwrap` raises `CloudDNSError` on non-2xx *or* a `success: false` (the API returns 200 with `success: false` for some validation failures). The opaque zone id is resolved by name per call. "Automatic" TTL is the sentinel `1`, surfaced as `ttl=None`. `update` is create-on-miss.
+- **Route 53** — MX / SRV priority is baked into the record value (`"10 mail.example.com."`), kept raw so it isn't double-encoded on write. ALIAS rrsets (`AliasTarget`) have no TTL → surfaced with `ttl=None`. Writes are `UPSERT`/`DELETE` change batches; a `DELETE` of a non-existent rrset (`InvalidChangeBatch`) is treated as an idempotent no-op. Hosted-zone id resolved from the FQDN via `list_hosted_zones_by_name` with an exact-name match.
+- **Azure DNS** — records live in *record sets*, one per `(name, type)`, each with a typed list (`a_records`, `mx_records`, …); each set expands into one neutral `RecordData` per contained record. Create and update are both a `create_or_update` PUT of the full set. SOA is Azure-managed and dropped on read.
+- **Google Cloud DNS** — calls scope by the managed-zone *id* (a slug like `example-com`), not the DNS name, so the hooks re-resolve the managed zone by matching `dns_name`. A single rrset carries one or more `rrdatas` (one `RecordData` each on read, collapsed to a single-value rrset on write). Writes are transactional change sets (`changes.create()`); the op polls `changes.status` until `done` (bounded ~60 s) so it only returns once Cloud DNS has applied it.
+
+### 4A.5 Probe
+
+`CloudDNSDriverBase.probe(server)` is the cheap credential check behind the Add-DNS-server **Test** button — by default it lists zones and reports the count, never raising for an expected failure (returns `ok=False` with the provider message). The Cloudflare driver's `_unwrap`, Route 53's `_is_invalid_change_batch`, Azure's `_wrap_errors`, and Google's `_wrap_call` all normalise raw SDK faults into operator-facing `CloudDNSError` messages first.
+
+---
+
 ## 5. Driver Selection and Registration
 
 Drivers are registered by name and instantiated by the service layer:
 
 ```python
-# app/drivers/dns/registry.py
+# app/drivers/dns/__init__.py
 _DRIVERS: dict[str, type[DNSDriver]] = {
     "bind9": BIND9Driver,
     "powerdns": PowerDNSDriver,
     "windows_dns": WindowsDNSDriver,
+    # Agentless cloud-hosted DNS providers (issue #37, Part B).
+    "cloudflare": CloudflareDNSDriver,
+    "route53": Route53DNSDriver,
+    "azure_dns": AzureDNSDriver,
+    "google_dns": GoogleCloudDNSDriver,
 }
 
-AGENTLESS_DRIVERS: frozenset[str] = frozenset({"windows_dns"})
+# Drivers whose record ops run from the control plane directly, no agent.
+AGENTLESS_DRIVERS: frozenset[str] = frozenset(
+    {"windows_dns", "cloudflare", "route53", "azure_dns", "google_dns"}
+)
+# The cloud subset (used by the cloud import + sync-from-server widening).
+CLOUD_DNS_DRIVERS: frozenset[str] = frozenset(
+    {"cloudflare", "route53", "azure_dns", "google_dns"}
+)
 
 def get_driver(server_type: str) -> DNSDriver:
     cls = _DRIVERS.get(server_type)

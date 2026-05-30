@@ -17,7 +17,18 @@ from typing import Literal
 
 # Stable enum the importer stamps on every row it creates. Keep in
 # sync with the values the migration writes into ``import_source``.
-ImportSource = Literal["bind9", "windows_dns", "powerdns"]
+# The cloud-hosted DNS sources (issue #37, Part B) stamp the provider
+# name directly so provenance stays queryable per provider; all four
+# fit the ``import_source`` String(20) column.
+ImportSource = Literal[
+    "bind9",
+    "windows_dns",
+    "powerdns",
+    "cloudflare",
+    "route53",
+    "azure_dns",
+    "google_dns",
+]
 
 # Per-zone conflict resolution. ``rename`` requires ``rename_to`` to
 # carry the new FQDN; the commit endpoint validates that.

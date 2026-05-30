@@ -26,16 +26,17 @@ drivers reuse the existing ``dns_server.driver`` string + the
 ``dns_record`` ``import_source`` / ``imported_at`` provenance columns.
 """
 
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects import postgresql
 
+from alembic import op
+
 revision: str = "d1e7c4a90fb3"
-down_revision: Union[str, None] = "c7f1a3e58b94"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "c7f1a3e58b94"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 _FK_TABLES = ("ip_block", "subnet", "ip_address")
@@ -45,8 +46,18 @@ def upgrade() -> None:
     op.create_table(
         "cloud_endpoint",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.Column("modified_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "modified_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
         sa.Column("name", sa.String(length=255), nullable=False),
         sa.Column("description", sa.Text(), nullable=False, server_default=""),
         sa.Column("enabled", sa.Boolean(), nullable=False, server_default=sa.text("true")),
@@ -72,9 +83,14 @@ def upgrade() -> None:
         sa.Column("ipam_space_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("public_space_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("dns_group_id", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("mirror_load_balancers", sa.Boolean(), nullable=False, server_default=sa.text("true")),
         sa.Column(
-            "mirror_stopped_instances", sa.Boolean(), nullable=False, server_default=sa.text("false")
+            "mirror_load_balancers", sa.Boolean(), nullable=False, server_default=sa.text("true")
+        ),
+        sa.Column(
+            "mirror_stopped_instances",
+            sa.Boolean(),
+            nullable=False,
+            server_default=sa.text("false"),
         ),
         sa.Column("sync_interval_seconds", sa.Integer(), nullable=False, server_default="300"),
         sa.Column("last_synced_at", sa.DateTime(timezone=True), nullable=True),
@@ -121,15 +137,11 @@ def upgrade() -> None:
     )
 
     # ── feature_module seed (disabled; operator opts in) ────────────────
-    op.execute(
-        sa.text(
-            """
+    op.execute(sa.text("""
             INSERT INTO feature_module (id, enabled)
             VALUES ('integrations.cloud', FALSE)
             ON CONFLICT (id) DO NOTHING
-            """
-        )
-    )
+            """))
 
 
 def downgrade() -> None:

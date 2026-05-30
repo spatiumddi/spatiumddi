@@ -18,6 +18,7 @@ from app.api.v1.auth_providers.router import router as auth_providers_router
 from app.api.v1.backup import router as backup_router
 from app.api.v1.bgp import router as bgp_router
 from app.api.v1.circuits import router as circuits_router
+from app.api.v1.cloud import router as cloud_router
 from app.api.v1.conformity import router as conformity_router
 from app.api.v1.custom_fields.router import router as custom_fields_router
 from app.api.v1.dashboards import router as dashboards_router
@@ -104,6 +105,12 @@ api_v1_router.include_router(
     prefix="/circuits",
     tags=["circuits"],
     dependencies=[Depends(require_module("network.circuit"))],
+)
+api_v1_router.include_router(
+    cloud_router,
+    prefix="/cloud",
+    tags=["cloud"],
+    dependencies=[Depends(require_module("integrations.cloud"))],
 )
 api_v1_router.include_router(
     conformity_router,
