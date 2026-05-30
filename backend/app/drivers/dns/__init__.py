@@ -11,6 +11,7 @@ service layer.
 
 from __future__ import annotations
 
+from app.drivers.dns.azuredns import AzureDNSDriver
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
@@ -22,20 +23,39 @@ from app.drivers.dns.base import (
     ZoneData,
 )
 from app.drivers.dns.bind9 import BIND9Driver
+from app.drivers.dns.cloudflare import CloudflareDNSDriver
+from app.drivers.dns.googledns import GoogleCloudDNSDriver
 from app.drivers.dns.powerdns import PowerDNSDriver
+from app.drivers.dns.route53 import Route53DNSDriver
 from app.drivers.dns.windows import WindowsDNSDriver
 
 _DRIVERS: dict[str, type[DNSDriver]] = {
     "bind9": BIND9Driver,
     "powerdns": PowerDNSDriver,
     "windows_dns": WindowsDNSDriver,
+    # Agentless cloud-hosted DNS providers (issue #37, Part B). The
+    # control plane calls the provider REST/SDK API directly — same
+    # shape as windows_dns Path B. Their modules lazy-import their heavy
+    # SDKs inside methods, so importing them here is cheap + safe.
+    "cloudflare": CloudflareDNSDriver,
+    "route53": Route53DNSDriver,
+    "azure_dns": AzureDNSDriver,
+    "google_dns": GoogleCloudDNSDriver,
 }
 
 # Drivers whose record ops run from the control plane directly, with no
 # agent co-located with the daemon. The record_ops service short-circuits
 # the queue for these — applying the change synchronously and writing a
 # DNSRecordOp row as ``applied`` / ``failed`` for audit purposes.
-AGENTLESS_DRIVERS: frozenset[str] = frozenset({"windows_dns"})
+AGENTLESS_DRIVERS: frozenset[str] = frozenset(
+    {"windows_dns", "cloudflare", "route53", "azure_dns", "google_dns"}
+)
+
+# Agentless cloud-hosted DNS drivers (subset of AGENTLESS_DRIVERS).
+# Used by the DNS server create/update path + the cloud import + the
+# sync-from-server widening to recognise a cloud DNS server (credentials
+# live in DNSServer.credentials_encrypted as a provider-specific dict).
+CLOUD_DNS_DRIVERS: frozenset[str] = frozenset({"cloudflare", "route53", "azure_dns", "google_dns"})
 
 
 def is_agentless(driver_name: str) -> bool:
@@ -57,6 +77,8 @@ def register_driver(name: str, driver_cls: type[DNSDriver]) -> None:
 
 
 __all__ = [
+    "AGENTLESS_DRIVERS",
+    "CLOUD_DNS_DRIVERS",
     "ConfigBundle",
     "DNSDriver",
     "EffectiveBlocklistData",

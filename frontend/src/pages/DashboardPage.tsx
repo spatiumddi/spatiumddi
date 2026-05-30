@@ -10,6 +10,7 @@ import {
   ChevronDown,
   ClipboardCheck,
   Clock,
+  Cloud,
   Container as ContainerIcon,
   Cpu,
   FileDown,
@@ -42,6 +43,7 @@ import {
   kubernetesApi,
   dockerApi,
   proxmoxApi,
+  cloudApi,
   tailscaleApi,
   unifiApi,
   platformHealthApi,
@@ -59,6 +61,7 @@ import {
   type KubernetesCluster,
   type DockerHost,
   type ProxmoxNode,
+  type CloudEndpoint,
   type TailscaleTenant,
   type UnifiController,
   type PlatformHealthResponse,
@@ -840,6 +843,7 @@ export function DashboardPage() {
   const kubernetesEnabled = settings?.integration_kubernetes_enabled ?? false;
   const dockerEnabled = settings?.integration_docker_enabled ?? false;
   const proxmoxEnabled = settings?.integration_proxmox_enabled ?? false;
+  const cloudEnabled = settings?.integration_cloud_enabled ?? false;
   const tailscaleEnabled = settings?.integration_tailscale_enabled ?? false;
   const unifiEnabled = settings?.integration_unifi_enabled ?? false;
   const { data: k8sClusters = [] } = useQuery<KubernetesCluster[]>({
@@ -864,6 +868,13 @@ export function DashboardPage() {
     queryKey: ["proxmox-nodes"],
     queryFn: proxmoxApi.listNodes,
     enabled: proxmoxEnabled,
+    refetchInterval: 30_000,
+  });
+
+  const { data: cloudEndpoints = [] } = useQuery<CloudEndpoint[]>({
+    queryKey: ["cloud-endpoints"],
+    queryFn: cloudApi.listEndpoints,
+    enabled: cloudEnabled,
     refetchInterval: 30_000,
   });
 
@@ -1544,6 +1555,7 @@ export function DashboardPage() {
           (kubernetesEnabled ||
             dockerEnabled ||
             proxmoxEnabled ||
+            cloudEnabled ||
             tailscaleEnabled ||
             unifiEnabled) && (
             <div className="space-y-1.5">
@@ -1557,11 +1569,13 @@ export function DashboardPage() {
                 kubernetesEnabled={kubernetesEnabled}
                 dockerEnabled={dockerEnabled}
                 proxmoxEnabled={proxmoxEnabled}
+                cloudEnabled={cloudEnabled}
                 tailscaleEnabled={tailscaleEnabled}
                 unifiEnabled={unifiEnabled}
                 clusters={k8sClusters}
                 hosts={dockerHosts}
                 proxmoxNodes={proxmoxNodes}
+                cloudEndpoints={cloudEndpoints}
                 tailscaleTenants={tailscaleTenants}
                 unifiControllers={unifiControllers}
               />
@@ -1960,37 +1974,48 @@ function IntegrationsPanel({
   kubernetesEnabled,
   dockerEnabled,
   proxmoxEnabled,
+  cloudEnabled,
   tailscaleEnabled,
   unifiEnabled,
   clusters,
   hosts,
   proxmoxNodes,
+  cloudEndpoints,
   tailscaleTenants,
   unifiControllers,
 }: {
   kubernetesEnabled: boolean;
   dockerEnabled: boolean;
   proxmoxEnabled: boolean;
+  cloudEnabled: boolean;
   tailscaleEnabled: boolean;
   unifiEnabled: boolean;
   clusters: KubernetesCluster[];
   hosts: DockerHost[];
   proxmoxNodes: ProxmoxNode[];
+  cloudEndpoints: CloudEndpoint[];
   tailscaleTenants: TailscaleTenant[];
   unifiControllers: UnifiController[];
 }) {
   const hasK8s = kubernetesEnabled;
   const hasDocker = dockerEnabled;
   const hasProxmox = proxmoxEnabled;
+  const hasCloud = cloudEnabled;
   const hasTailscale = tailscaleEnabled;
   const hasUnifi = unifiEnabled;
-  const cols = [hasK8s, hasDocker, hasProxmox, hasTailscale, hasUnifi].filter(
-    Boolean,
-  ).length;
+  const cols = [
+    hasK8s,
+    hasDocker,
+    hasProxmox,
+    hasCloud,
+    hasTailscale,
+    hasUnifi,
+  ].filter(Boolean).length;
   const totalTargets =
     clusters.length +
     hosts.length +
     proxmoxNodes.length +
+    cloudEndpoints.length +
     tailscaleTenants.length +
     unifiControllers.length;
   return (
@@ -2014,6 +2039,7 @@ function IntegrationsPanel({
           cols === 3 && "md:grid-cols-3 md:divide-x md:divide-y-0",
           cols === 4 && "md:grid-cols-4 md:divide-x md:divide-y-0",
           cols === 5 && "md:grid-cols-5 md:divide-x md:divide-y-0",
+          cols === 6 && "md:grid-cols-6 md:divide-x md:divide-y-0",
         )}
       >
         {hasK8s && (
@@ -2125,6 +2151,51 @@ function IntegrationsPanel({
                     lastSyncError={p.last_sync_error}
                     intervalSeconds={p.sync_interval_seconds}
                     enabled={p.enabled}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {hasCloud && (
+          <div className="min-w-0">
+            <Link
+              to="/cloud"
+              className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
+            >
+              <Cloud className="h-3 w-3" />
+              Cloud ({cloudEndpoints.length})
+              <span className="ml-auto text-[10px] text-muted-foreground/70">
+                view all →
+              </span>
+            </Link>
+            {cloudEndpoints.length === 0 ? (
+              <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
+                No accounts registered.
+              </p>
+            ) : (
+              <div className="divide-y">
+                {cloudEndpoints.map((ep) => (
+                  <IntegrationRow
+                    key={ep.id}
+                    to={`/cloud`}
+                    name={ep.name}
+                    subtitle={
+                      ep.provider_account_id
+                        ? `${ep.provider} · ${ep.provider_account_id}`
+                        : ep.provider
+                    }
+                    meta={
+                      ep.network_count != null || ep.instance_count != null
+                        ? `${ep.network_count ?? 0} net${
+                            ep.network_count === 1 ? "" : "s"
+                          } · ${ep.instance_count ?? 0} inst`
+                        : "—"
+                    }
+                    lastSyncedAt={ep.last_synced_at}
+                    lastSyncError={ep.last_sync_error}
+                    intervalSeconds={ep.sync_interval_seconds}
+                    enabled={ep.enabled}
                   />
                 ))}
               </div>

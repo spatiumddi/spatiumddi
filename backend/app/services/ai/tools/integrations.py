@@ -28,6 +28,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
+from app.models.cloud import CloudEndpoint
 from app.models.docker import DockerHost
 from app.models.kubernetes import KubernetesCluster
 from app.models.proxmox import ProxmoxNode
@@ -371,6 +372,78 @@ async def list_unifi_targets(
             "site_count": r.site_count,
             "network_count": r.network_count,
             "client_count": r.client_count,
+        }
+        for r in rows
+    ]
+
+
+# ── list_cloud_targets ────────────────────────────────────────────────
+
+
+class ListCloudTargetsArgs(BaseModel):
+    search: str | None = _common_target_args()["search"]
+    enabled: bool | None = _common_target_args()["enabled"]
+    limit: int = _common_target_args()["limit"]
+    provider: str | None = Field(
+        default=None,
+        description="Filter by cloud provider: 'aws', 'azure', or 'gcp'.",
+    )
+
+
+@register_tool(
+    name="list_cloud_targets",
+    module="integrations.cloud",
+    description=(
+        "List configured public-cloud accounts (AWS / Azure / GCP) that "
+        "SpatiumDDI mirrors into IPAM. Each row carries id, name, "
+        "description, provider, enabled flag, regions, ipam_space_id, "
+        "public_space_id, dns_group_id, mirror_load_balancers / "
+        "mirror_stopped_instances, sync_interval_seconds, last_synced_at, "
+        "last_sync_error, provider_account_id, network_count, and "
+        "instance_count. Use for 'which cloud accounts are connected?', "
+        "'is the AWS prod account syncing?', or 'how many VPCs does the "
+        "Azure account expose?'. Credentials never appear."
+    ),
+    args_model=ListCloudTargetsArgs,
+    category="integrations",
+)
+async def list_cloud_targets(
+    db: AsyncSession, user: User, args: ListCloudTargetsArgs
+) -> list[dict[str, Any]]:
+    stmt = select(CloudEndpoint)
+    if args.search:
+        like = f"%{args.search.lower()}%"
+        stmt = stmt.where(
+            or_(
+                func.lower(CloudEndpoint.name).like(like),
+                func.lower(CloudEndpoint.description).like(like),
+            )
+        )
+    if args.enabled is not None:
+        stmt = stmt.where(CloudEndpoint.enabled.is_(args.enabled))
+    if args.provider:
+        stmt = stmt.where(CloudEndpoint.provider == args.provider.strip().lower())
+    stmt = stmt.order_by(CloudEndpoint.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(r.id),
+            "name": r.name,
+            "description": r.description,
+            "provider": r.provider,
+            "enabled": r.enabled,
+            "regions": list(r.regions or []),
+            "ipam_space_id": str(r.ipam_space_id),
+            "public_space_id": str(r.public_space_id) if r.public_space_id else None,
+            "dns_group_id": str(r.dns_group_id) if r.dns_group_id else None,
+            "mirror_load_balancers": r.mirror_load_balancers,
+            "mirror_stopped_instances": r.mirror_stopped_instances,
+            "sync_interval_seconds": r.sync_interval_seconds,
+            "last_synced_at": r.last_synced_at.isoformat() if r.last_synced_at else None,
+            "last_sync_error": r.last_sync_error,
+            "provider_account_id": r.provider_account_id,
+            "network_count": r.network_count,
+            "instance_count": r.instance_count,
         }
         for r in rows
     ]

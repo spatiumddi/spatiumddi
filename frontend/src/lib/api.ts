@@ -2845,6 +2845,7 @@ export interface PlatformSettings {
   integration_proxmox_enabled: boolean;
   integration_tailscale_enabled: boolean;
   integration_unifi_enabled: boolean;
+  integration_cloud_enabled: boolean;
   /** Domain WHOIS refresh cadence (hours). Beat ticks hourly; the
    *  task itself reads this on every fire so cadence changes take
    *  effect on the next tick without restarting beat. 1–168 h range
@@ -4391,6 +4392,9 @@ export const dnsApi = {
     data: Partial<DNSServer> & {
       api_key?: string;
       windows_credentials?: WindowsDNSCredentials | Record<string, never>;
+      // Cloud DNS driver credentials (issue #37). Provider-specific dict
+      // (e.g. {api_token} for cloudflare); Fernet-encrypted server-side.
+      cloud_credentials?: Record<string, string>;
     },
   ) =>
     api
@@ -4404,6 +4408,8 @@ export const dnsApi = {
       windows_credentials?:
         | Partial<WindowsDNSCredentials>
         | Record<string, never>;
+      // None = leave alone, {} = clear, dict = replace.
+      cloud_credentials?: Record<string, string> | Record<string, never>;
     },
   ) =>
     api
@@ -4995,6 +5001,19 @@ export interface WindowsDNSServerOption {
   has_credentials: boolean;
 }
 
+// Cloud DNS import (issue #37, Part B). One row in the cloud-DNS server
+// picker — filtered to cloud-driver rows (cloudflare/route53/azure_dns/
+// google_dns). Mirrors WindowsDNSServerOption but carries the driver
+// name instead of a host.
+export interface CloudDNSServerOption {
+  id: string;
+  name: string;
+  driver: string;
+  group_id: string;
+  group_name: string;
+  has_credentials: boolean;
+}
+
 export const dnsImportApi = {
   bind9Preview: (
     file: File,
@@ -5075,6 +5094,31 @@ export const dnsImportApi = {
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/powerdns/commit", body)
+      .then((r) => r.data),
+
+  // Cloud DNS (issue #37, Part B) — live pull of hosted zones + records
+  // from a cloud DNS provider. Also the engine behind "Sync from
+  // provider" on a cloud DNS server.
+  cloudDNSServers: () =>
+    api
+      .get<CloudDNSServerOption[]>("/dns/import/cloud/servers")
+      .then((r) => r.data),
+  cloudDNSPreview: (body: {
+    server_id: string;
+    target_group_id: string;
+    target_view_id?: string | null;
+  }) =>
+    api
+      .post<DNSImportPreview>("/dns/import/cloud/preview", body)
+      .then((r) => r.data),
+  cloudDNSCommit: (body: {
+    target_group_id: string;
+    target_view_id?: string | null;
+    plan: DNSImportPreview;
+    conflict_actions: Record<string, DNSImportConflictDecision>;
+  }) =>
+    api
+      .post<DNSImportCommitResult>("/dns/import/cloud/commit", body)
       .then((r) => r.data),
 };
 
@@ -6931,7 +6975,8 @@ export type IntegrationDashboardKind =
   | "docker"
   | "proxmox"
   | "tailscale"
-  | "unifi";
+  | "unifi"
+  | "cloud";
 export interface IntegrationsDashboardTargetRow {
   id: string;
   display: string;
@@ -8817,6 +8862,100 @@ export const proxmoxApi = {
   syncNow: (id: string) =>
     api
       .post<{ status: string; task_id: string }>(`/proxmox/nodes/${id}/sync`)
+      .then((r) => r.data),
+};
+
+// ── Cloud integration (issue #37, Part A — AWS / Azure / GCP) ──────
+
+export type CloudProvider = "aws" | "azure" | "gcp";
+
+export interface CloudEndpoint {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  provider: CloudProvider;
+  credentials_present: boolean;
+  // Non-secret routing scope: azure {subscription_ids}, gcp {project_ids}.
+  provider_config: Record<string, unknown>;
+  regions: string[];
+  ipam_space_id: string;
+  public_space_id: string | null;
+  dns_group_id: string | null;
+  mirror_load_balancers: boolean;
+  mirror_stopped_instances: boolean;
+  sync_interval_seconds: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  provider_account_id: string | null;
+  network_count: number | null;
+  instance_count: number | null;
+  last_discovery: Record<string, unknown> | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface CloudEndpointCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  provider: CloudProvider;
+  credentials: Record<string, string>;
+  provider_config?: Record<string, unknown>;
+  regions?: string[];
+  ipam_space_id: string;
+  public_space_id?: string | null;
+  dns_group_id?: string | null;
+  mirror_load_balancers?: boolean;
+  mirror_stopped_instances?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface CloudEndpointUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  // Omit/empty to keep stored creds; non-empty rotates.
+  credentials?: Record<string, string>;
+  provider_config?: Record<string, unknown>;
+  regions?: string[];
+  ipam_space_id?: string;
+  public_space_id?: string | null;
+  dns_group_id?: string | null;
+  mirror_load_balancers?: boolean;
+  mirror_stopped_instances?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface CloudTestResult {
+  ok: boolean;
+  message: string;
+  provider_account_id: string | null;
+  network_count: number | null;
+  instance_count: number | null;
+}
+
+export const cloudApi = {
+  listEndpoints: () =>
+    api.get<CloudEndpoint[]>("/cloud/endpoints").then((r) => r.data),
+  createEndpoint: (data: CloudEndpointCreate) =>
+    api.post<CloudEndpoint>("/cloud/endpoints", data).then((r) => r.data),
+  updateEndpoint: (id: string, data: CloudEndpointUpdate) =>
+    api.put<CloudEndpoint>(`/cloud/endpoints/${id}`, data).then((r) => r.data),
+  deleteEndpoint: (id: string) => api.delete(`/cloud/endpoints/${id}`),
+  testConnection: (body: {
+    endpoint_id?: string;
+    provider?: CloudProvider;
+    credentials?: Record<string, string>;
+    provider_config?: Record<string, unknown>;
+    regions?: string[];
+  }) =>
+    api
+      .post<CloudTestResult>("/cloud/endpoints/test", body)
+      .then((r) => r.data),
+  syncNow: (id: string) =>
+    api
+      .post<{ status: string; task_id: string }>(`/cloud/endpoints/${id}/sync`)
       .then((r) => r.data),
 };
 

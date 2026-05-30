@@ -48,6 +48,13 @@ IP_STATUSES_INTEGRATION_OWNED: frozenset[str] = frozenset(
         "proxmox-vm",
         "proxmox-lxc",
         "tailscale-node",
+        # Cloud integration (issue #37, Part A). cloud-instance = a
+        # VM/EC2/GCE NIC private IP; cloud-public = an Elastic/public
+        # IP or external address; cloud-lb = a load-balancer frontend
+        # IP (ELB/ALB/NLB, Azure LB, GCP forwarding rule).
+        "cloud-instance",
+        "cloud-public",
+        "cloud-lb",
         # Stamped by the nmap "Stamp alive hosts → IPAM" action on a
         # multi-host (CIDR) scan result. Marks an IP as "we saw a host
         # on the wire here" without claiming it's allocated. Operators
@@ -253,6 +260,15 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     unifi_controller_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("unifi_controller.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Set by the Cloud reconciler (issue #37) for the IPBlock it creates
+    # per VPC/VNet address-space CIDR under the bound space. Cascades on
+    # endpoint delete.
+    cloud_endpoint_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("cloud_endpoint.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )
@@ -639,6 +655,18 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # Cloud integration provenance (issue #37). Set on subnets the Cloud
+    # reconciler mirrors from a VPC subnet. Cloud subnets are routed
+    # overlays whose first usable host is the gateway by convention
+    # (x.x.x.1 on AWS/Azure/GCP) but carry no broadcast row — the
+    # reconciler creates them with ``kubernetes_semantics``-style
+    # suppression. Cascades on endpoint delete.
+    cloud_endpoint_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("cloud_endpoint.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # Computed / cached. ``total_ips`` is BigInteger because IPv6 subnets can
     # be as large as 2^64 addresses (a /64 — the standard LAN size) which
@@ -815,6 +843,15 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     unifi_controller_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("unifi_controller.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Cloud provenance (issue #37) — set on rows mirrored from an
+    # instance NIC (cloud-instance), public IP (cloud-public), or
+    # load-balancer frontend (cloud-lb). Cascades on endpoint delete.
+    cloud_endpoint_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("cloud_endpoint.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )

@@ -24,6 +24,8 @@ from sqlalchemy import select
 from app.api.deps import DB, SuperAdmin
 from app.models.dns import DNSServer, DNSServerGroup
 from app.services.dns_import import (
+    CLOUD_DRIVERS,
+    CloudDNSImportError,
     CommitResult,
     ImportSourceError,
     PowerDNSImportError,
@@ -31,6 +33,7 @@ from app.services.dns_import import (
     parse_bind9_archive,
     parse_powerdns_server,
     parse_windows_dns_server,
+    preview_cloud_import,
     test_powerdns_connection,
 )
 from app.services.dns_import.canonical import (
@@ -99,7 +102,15 @@ class PreviewOut(BaseModel):
     """Preview response shape — also the commit request payload's
     ``plan`` field, so the UI hands back the same shape it received."""
 
-    source: Literal["bind9", "windows_dns", "powerdns"]
+    source: Literal[
+        "bind9",
+        "windows_dns",
+        "powerdns",
+        "cloudflare",
+        "route53",
+        "azure_dns",
+        "google_dns",
+    ]
     zones: list[ImportedZoneOut]
     conflicts: list[ZoneConflictOut]
     warnings: list[str]
@@ -145,6 +156,33 @@ class WindowsDNSServerOption(BaseModel):
     id: uuid.UUID
     name: str
     host: str
+    group_id: uuid.UUID
+    group_name: str
+    has_credentials: bool
+
+
+class CloudDNSPreviewIn(BaseModel):
+    """Body shape for ``POST /dns/import/cloud/preview``.
+
+    Like Windows DNS, cloud DNS is a live pull — the operator picks a
+    pre-registered cloud DNS server row (driver in {cloudflare, route53,
+    azure_dns, google_dns}) and the control plane pulls hosted zones +
+    records via the provider API. This is also the engine behind the
+    "Sync from provider" button on a cloud DNS server.
+    """
+
+    server_id: uuid.UUID
+    target_group_id: uuid.UUID
+    target_view_id: uuid.UUID | None = None
+
+
+class CloudDNSServerOption(BaseModel):
+    """One row in the cloud-DNS server picker — filtered to cloud-driver
+    rows that have credentials configured."""
+
+    id: uuid.UUID
+    name: str
+    driver: str
     group_id: uuid.UUID
     group_name: str
     has_credentials: bool
@@ -683,6 +721,138 @@ async def powerdns_commit(
 
     logger.info(
         "dns_import_powerdns_commit",
+        target_group_id=str(body.target_group_id),
+        zones_created=result.total_zones_created,
+        zones_overwrote=result.total_zones_overwrote,
+        zones_renamed=result.total_zones_renamed,
+        zones_skipped=result.total_zones_skipped,
+        zones_failed=result.total_zones_failed,
+        records_created=result.total_records_created,
+        user=current_user.display_name,
+    )
+    return _commit_result_to_pydantic(result)
+
+
+# ── Cloud DNS endpoints (issue #37, Part B) ──────────────────────────
+
+
+@router.get("/cloud/servers", response_model=list[CloudDNSServerOption])
+async def cloud_dns_servers(
+    _: SuperAdmin,
+    db: DB,
+) -> list[CloudDNSServerOption]:
+    """List every cloud-driver DNS server with its group, for the UI's
+    server picker.
+
+    Returns ``has_credentials`` so the picker can grey out servers
+    missing their provider API token / key — the live pull needs them.
+    """
+
+    rows = (
+        await db.execute(
+            select(DNSServer, DNSServerGroup)
+            .join(DNSServerGroup, DNSServer.group_id == DNSServerGroup.id)
+            .where(DNSServer.driver.in_(sorted(CLOUD_DRIVERS)))
+            .order_by(DNSServerGroup.name, DNSServer.name)
+        )
+    ).all()
+    return [
+        CloudDNSServerOption(
+            id=server.id,
+            name=server.name,
+            driver=server.driver,
+            group_id=group.id,
+            group_name=group.name,
+            has_credentials=bool(server.credentials_encrypted),
+        )
+        for (server, group) in rows
+    ]
+
+
+@router.post("/cloud/preview", response_model=PreviewOut)
+async def cloud_dns_preview(
+    current_user: SuperAdmin,
+    db: DB,
+    body: CloudDNSPreviewIn = Body(...),
+) -> PreviewOut:
+    """Live-pull every hosted zone + record from a cloud DNS provider.
+
+    Delegates to :func:`preview_cloud_import`, which validates the
+    server is a cloud driver, pulls zones + records through the driver,
+    and stamps the provider name as ``import_source``. Side-effect-free
+    — only the commit endpoint mutates state.
+    """
+
+    try:
+        preview = await preview_cloud_import(
+            db,
+            server_id=body.server_id,
+            target_group_id=body.target_group_id,
+            target_view_id=body.target_view_id,
+        )
+    except CloudDNSImportError as exc:
+        # Validation failures (not a cloud driver / unknown server) → 400.
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    logger.info(
+        "dns_import_cloud_preview",
+        server_id=str(body.server_id),
+        source=preview.source,
+        zone_count=len(preview.zones),
+        record_count=preview.total_records,
+        conflict_count=len(preview.conflicts),
+        warning_count=len(preview.warnings),
+        target_group_id=str(body.target_group_id),
+        user=current_user.display_name,
+    )
+    return _preview_to_pydantic(preview)
+
+
+@router.post("/cloud/commit", response_model=CommitOut)
+async def cloud_dns_commit(
+    current_user: SuperAdmin,
+    db: DB,
+    body: CommitIn = Body(...),
+) -> CommitOut:
+    """Apply a previously-previewed cloud DNS import.
+
+    Identical pipeline to the other sources (re-detect conflicts,
+    per-zone savepoints, audit per zone). The plan's ``source`` must be
+    one of the cloud provider names so provenance stays per-provider.
+    """
+
+    if body.plan.source not in CLOUD_DRIVERS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Plan source mismatch: endpoint=cloud plan={body.plan.source} "
+                f"(expected one of {', '.join(sorted(CLOUD_DRIVERS))})"
+            ),
+        )
+
+    preview = _preview_from_pydantic(body.plan)
+    actions: dict[str, tuple[ConflictAction, str | None]] = {
+        zone_name: (decision.action, decision.rename_to)
+        for zone_name, decision in body.conflict_actions.items()
+    }
+
+    try:
+        result = await commit_import(
+            db,
+            preview=preview,
+            target_group_id=body.target_group_id,
+            target_view_id=body.target_view_id,
+            conflict_actions=actions,
+            current_user=current_user,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    logger.info(
+        "dns_import_cloud_commit",
+        source=body.plan.source,
         target_group_id=str(body.target_group_id),
         zones_created=result.total_zones_created,
         zones_overwrote=result.total_zones_overwrote,

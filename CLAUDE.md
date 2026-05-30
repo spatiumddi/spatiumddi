@@ -267,7 +267,7 @@ further down.
 - ⬜ [**IP discovery**](https://github.com/spatiumddi/spatiumddi/issues/23)
 - ⬜ [**DNS Views — end-to-end split-horizon wiring**](https://github.com/spatiumddi/spatiumddi/issues/24)
 - ⬜ [**ACME embedded client — certs for SpatiumDDI's own services**](https://github.com/spatiumddi/spatiumddi/issues/28)
-- ⬜ [**Cloud DNS driver family — Route 53 / Azure DNS / Cisco DNA**](https://github.com/spatiumddi/spatiumddi/issues/29)
+- 🟡 [**Cloud DNS driver family — Route 53 / Azure DNS / Cisco DNA**](https://github.com/spatiumddi/spatiumddi/issues/29) — Route 53 + Azure DNS + Cloudflare + Google Cloud DNS landed as agentless first-class drivers via #37 Part B (`issue-37`, pending release). Cisco DNA stays out of scope (SD-Access controller, not a hosted-DNS service).
 - ⬜ [**DHCP configuration importer — ISC DHCP, Kea, Windows DHCP**](https://github.com/spatiumddi/spatiumddi/issues/129)
 
 ### Integration roadmap (⬜ pending)
@@ -290,7 +290,7 @@ write surface, not a read-only pull mirror.
 - ⬜ [**Incus / LXD (tier 2 — Docker-adjacent)**](https://github.com/spatiumddi/spatiumddi/issues/34)
 - ⬜ [**HashiCorp Nomad (tier 2 — Kubernetes alt)**](https://github.com/spatiumddi/spatiumddi/issues/35)
 - ⬜ [**NetBox read-only import (one-shot)**](https://github.com/spatiumddi/spatiumddi/issues/36)
-- ⬜ [**Cloud connectors — unified "Cloud" integration with per-provider picker (Azure / AWS / GCP)**](https://github.com/spatiumddi/spatiumddi/issues/37)
+- ✅ [**Cloud connectors — unified "Cloud" integration with per-provider picker (Azure / AWS / GCP)**](https://github.com/spatiumddi/spatiumddi/issues/37) — implemented on `issue-37` (pending release cut). Part A: read-only infra mirror (`cloud_endpoint` + AWS/Azure/GCP connectors → IPBlock/Subnet/IPAddress, `services/cloud/`, feature module `integrations.cloud`). Part B: Cloudflare / Route 53 / Azure DNS / Google Cloud DNS as agentless first-class DNS drivers (`drivers/dns/{cloudflare,route53,azuredns,googledns}.py`) with import-existing-zones (`services/dns_import/cloud.py`). See `docs/features/INTEGRATIONS.md` + `docs/drivers/DNS_DRIVERS.md`. Stretch token-only DNS providers (DigitalOcean / Hetzner / Linode / Vultr) deferred.
 - ⬜ [**Load balancer family (F5 BIG-IP, HAProxy, nginx, KEMP, A10, Citrix ADC)**](https://github.com/spatiumddi/spatiumddi/issues/38)
 - **VMware vCenter / ESXi.** Bigger enterprise audience, but
   vCenter's SOAP-heavy + licensed API makes it a significantly

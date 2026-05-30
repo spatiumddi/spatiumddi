@@ -47,6 +47,16 @@ PowerDNS-only features (ALIAS / LUA / online DNSSEC sign+unsign) are server-side
 
 The Operator Copilot's `propose_create_dns_zone` tool accepts an explicit `driver_hint` argument (`bind9` / `powerdns` / `windows_dns`) so the LLM can route DNSSEC-required zones to PowerDNS groups without operators having to specify the group UUID by hand. See `app.services.ai.operations.CreateDNSZoneArgs`.
 
+### 0a. Cloud DNS providers — Cloudflare / Route 53 / Azure DNS / Google Cloud DNS (issue #37)
+
+**Add DNS server** also offers four cloud-hosted authoritative-DNS providers as driver choices: **Cloudflare**, **Amazon Route 53**, **Azure DNS**, and **Google Cloud DNS**. Once added, their zones and records are managed exactly like a local BIND9 / PowerDNS zone — same Zones / Records / group surfaces, same CRUD — but the control plane drives the provider's REST/SDK API directly instead of an agent (an *agentless* driver, the same shape as Windows DNS Path B). A cloud DNS server lives in a normal `DNSServerGroup`; credentials are a provider-specific dict (Cloudflare API token, Route 53 access keys, an Azure service-principal triple + subscription / resource group, or a GCP service-account JSON + project id) entered in the Add DNS server modal and Fernet-encrypted in `DNSServer.credentials_encrypted`.
+
+The modal renders a per-driver **in-modal setup guide** for the required credential fields and a **Test** button that does a cheap auth + list-zones probe before save. Online DNSSEC is supported on Cloudflare / Route 53 / Google Cloud DNS but **not** Azure DNS. Full per-driver internals (credential shapes, capability matrix, per-provider wrinkles) are in [DNS_DRIVERS.md §4A](../drivers/DNS_DRIVERS.md).
+
+**Bringing existing zones in.** A cloud account that already hosts zones imports through the DNS importer's cloud source (preview → commit; see [MIGRATION.md](MIGRATION.md)). After that, ongoing drift is reconciled the same way as any other server — the **sync-from-server** path pulls the provider's live zone/record state via the driver's `pull_zones_from_server` / `pull_zone_records` reads.
+
+These cloud-DNS drivers are distinct from the *Cloud (AWS / Azure / GCP)* read-only **infrastructure** mirror (issue #37 Part A — VPCs / subnets / instance IPs into IPAM; see [INTEGRATIONS.md](INTEGRATIONS.md)). One is authoritative-DNS management; the other is an IPAM reconciler. They share a provider vocabulary, not a code path.
+
 ---
 
 ## 1. DNS Server Groups

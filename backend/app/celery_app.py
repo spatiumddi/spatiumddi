@@ -37,6 +37,7 @@ celery_app = Celery(
         "app.tasks.proxmox_sync",
         "app.tasks.tailscale_sync",
         "app.tasks.unifi_sync",
+        "app.tasks.cloud_sync",
         "app.tasks.snmp_poll",
         "app.tasks.nmap",
         "app.tasks.dns_pool_healthcheck",
@@ -88,6 +89,7 @@ celery_app.conf.update(
         "app.tasks.proxmox_sync.*": {"queue": "default"},
         "app.tasks.tailscale_sync.*": {"queue": "default"},
         "app.tasks.unifi_sync.*": {"queue": "default"},
+        "app.tasks.cloud_sync.*": {"queue": "default"},
         "app.tasks.snmp_poll.*": {"queue": "default"},
         "app.tasks.nmap.*": {"queue": "default"},
         "app.tasks.dns_pool_healthcheck.*": {"queue": "dns"},
@@ -308,6 +310,13 @@ celery_app.conf.update(
         # Cloud-mode controllers floor at 60 s inside the task.
         "unifi-sync-sweep": {
             "task": "app.tasks.unifi_sync.sweep_unifi_controllers",
+            "schedule": schedule(run_every=30.0),
+        },
+        # Cloud (AWS/Azure/GCP) — same 30 s beat, per-endpoint interval
+        # gate (300 s default, cloud APIs are rate-limited). Gated overall
+        # by ``PlatformSettings.integration_cloud_enabled``.
+        "cloud-sync-sweep": {
+            "task": "app.tasks.cloud_sync.sweep_cloud_endpoints",
             "schedule": schedule(run_every=30.0),
         },
         # Every 60 s, fan-out SNMP polls to network devices whose

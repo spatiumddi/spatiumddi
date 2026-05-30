@@ -33,6 +33,7 @@ import {
   BellRing,
   Sparkles,
   Boxes,
+  Cloud,
   Container as ContainerIcon,
   Cpu,
   Earth,
@@ -494,6 +495,9 @@ export function Sidebar({
   // of the order we added integrations here — adding a new one later
   // shouldn't re-shuffle the sidebar for operators already using it.
   const integrationsNav = [
+    ...(moduleEnabled("integrations.cloud")
+      ? [{ label: "Cloud", icon: Cloud, to: "/cloud" }]
+      : []),
     ...(moduleEnabled("integrations.kubernetes")
       ? [{ label: "Kubernetes", icon: Boxes, to: "/kubernetes" }]
       : []),

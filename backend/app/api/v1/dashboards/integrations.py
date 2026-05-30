@@ -27,6 +27,7 @@ from sqlalchemy import desc, select
 
 from app.api.deps import DB, CurrentUser  # noqa: F401
 from app.models.audit import AuditLog
+from app.models.cloud import CloudEndpoint
 from app.models.docker import DockerHost
 from app.models.kubernetes import KubernetesCluster
 from app.models.proxmox import ProxmoxNode
@@ -87,6 +88,7 @@ _INTEGRATION_RESOURCE_TYPES = (
     "proxmox_node",
     "tailscale_tenant",
     "unifi_controller",
+    "cloud_endpoint",
 )
 
 
@@ -164,6 +166,7 @@ async def integrations_summary(
     proxmox_targets = list((await db.execute(select(ProxmoxNode))).scalars().all())
     tailscale_targets = list((await db.execute(select(TailscaleTenant))).scalars().all())
     unifi_targets = list((await db.execute(select(UnifiController))).scalars().all())
+    cloud_targets = list((await db.execute(select(CloudEndpoint))).scalars().all())
 
     panels = [
         _build_panel(
@@ -203,6 +206,14 @@ async def integrations_summary(
             label="UniFi",
             enabled=getattr(settings, "integration_unifi_enabled", False),
             targets=unifi_targets,
+            display_attr="name",
+            now=now,
+        ),
+        _build_panel(
+            kind="cloud",
+            label="Cloud (AWS / Azure / GCP)",
+            enabled=getattr(settings, "integration_cloud_enabled", False),
+            targets=cloud_targets,
             display_attr="name",
             now=now,
         ),

@@ -35,7 +35,12 @@ import {
   Copy,
   Pause,
   Play,
+  Check,
+  Clipboard,
+  Cloud,
+  ExternalLink,
 } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
 import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
@@ -140,6 +145,225 @@ function Btns({
         {pending ? "Saving…" : (label ?? "Save")}
       </button>
     </div>
+  );
+}
+
+// ── CLI setup-guide copy block (mirrors ProxmoxPage / DHCP CreateServerModal) ──
+
+function CopyablePre({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+  async function handle() {
+    const ok = await copyToClipboard(text);
+    if (ok) {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    }
+  }
+  return (
+    <div className="relative">
+      <pre className="overflow-auto rounded bg-background p-2 pr-20 font-mono text-[11px] leading-tight whitespace-pre-wrap">
+        {text}
+      </pre>
+      <button
+        type="button"
+        onClick={handle}
+        className="absolute right-1.5 top-1.5 inline-flex items-center gap-1 rounded border bg-background px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+        aria-label={`Copy ${label}`}
+        title={`Copy ${label}`}
+      >
+        {copied ? (
+          <>
+            <Check className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
+            Copied
+          </>
+        ) : (
+          <>
+            <Clipboard className="h-3 w-3" />
+            Copy
+          </>
+        )}
+      </button>
+    </div>
+  );
+}
+
+// ── Cloud DNS driver metadata (issue #37, Part B) ────────────────────────────
+//
+// The 4 cloud DNS drivers are agentless — record CRUD runs from the control
+// plane against the provider API. The server modal hides the agent/host/api
+// fields and renders a provider-specific credential form + setup guide.
+
+const CLOUD_DNS_DRIVERS = [
+  "cloudflare",
+  "route53",
+  "azure_dns",
+  "google_dns",
+] as const;
+type CloudDNSDriver = (typeof CLOUD_DNS_DRIVERS)[number];
+
+const CLOUD_DNS_LABELS: Record<CloudDNSDriver, string> = {
+  cloudflare: "Cloudflare",
+  route53: "AWS Route 53",
+  azure_dns: "Azure DNS",
+  google_dns: "Google Cloud DNS",
+};
+
+function isCloudDriver(d: string): d is CloudDNSDriver {
+  return (CLOUD_DNS_DRIVERS as readonly string[]).includes(d);
+}
+
+// One credential field rendered in the provider form. ``textarea`` is used
+// for the GCP service-account JSON blob.
+interface CloudCredField {
+  key: string;
+  label: string;
+  placeholder?: string;
+  secret?: boolean;
+  textarea?: boolean;
+}
+
+const CLOUD_DNS_FIELDS: Record<CloudDNSDriver, CloudCredField[]> = {
+  cloudflare: [
+    {
+      key: "api_token",
+      label: "API token",
+      placeholder: "cloudflare scoped API token",
+      secret: true,
+    },
+  ],
+  route53: [
+    {
+      key: "access_key_id",
+      label: "Access key ID",
+      placeholder: "AKIA…",
+    },
+    {
+      key: "secret_access_key",
+      label: "Secret access key",
+      placeholder: "secret access key",
+      secret: true,
+    },
+  ],
+  azure_dns: [
+    { key: "tenant_id", label: "Tenant ID", placeholder: "00000000-0000-…" },
+    { key: "client_id", label: "Client ID (app ID)", placeholder: "app id" },
+    {
+      key: "client_secret",
+      label: "Client secret",
+      placeholder: "client secret",
+      secret: true,
+    },
+    {
+      key: "subscription_id",
+      label: "Subscription ID",
+      placeholder: "subscription id",
+    },
+    {
+      key: "resource_group",
+      label: "Resource group",
+      placeholder: "my-dns-rg",
+    },
+  ],
+  google_dns: [
+    {
+      key: "service_account_json",
+      label: "Service account key (JSON)",
+      placeholder: "Paste the full service-account key JSON",
+      secret: true,
+      textarea: true,
+    },
+    { key: "project_id", label: "Project ID", placeholder: "my-gcp-project" },
+  ],
+};
+
+function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
+  return (
+    <details className="rounded border bg-background/40 text-xs">
+      <summary className="cursor-pointer px-3 py-2 font-medium select-none">
+        {CLOUD_DNS_LABELS[driver]} setup guide — click to expand
+      </summary>
+      <div className="space-y-3 border-t px-3 py-2.5 text-muted-foreground">
+        {driver === "cloudflare" && (
+          <div>
+            <p>
+              In the Cloudflare dashboard go to{" "}
+              <span className="font-medium text-foreground">
+                My Profile → API Tokens → Create Token
+              </span>{" "}
+              and use the{" "}
+              <span className="font-medium text-foreground">Edit zone DNS</span>{" "}
+              template (grants{" "}
+              <code className="font-mono">Zone : DNS : Edit</code> +{" "}
+              <code className="font-mono">Zone : Zone : Read</code>), optionally
+              scoped to specific zones. Paste the generated token into the field
+              above.
+            </p>
+          </div>
+        )}
+        {driver === "route53" && (
+          <div>
+            <p>
+              Create an IAM user (or role) and attach{" "}
+              <code className="font-mono">AmazonRoute53ReadOnlyAccess</code> for
+              import plus{" "}
+              <code className="font-mono">
+                route53:ChangeResourceRecordSets
+              </code>{" "}
+              on the hosted zone for writes. Then generate an access key and
+              paste the key ID + secret above.
+            </p>
+          </div>
+        )}
+        {driver === "azure_dns" && (
+          <div className="space-y-2">
+            <p>
+              Create a service principal scoped to the resource group holding
+              your DNS zones with the{" "}
+              <span className="font-medium text-foreground">
+                DNS Zone Contributor
+              </span>{" "}
+              role:
+            </p>
+            <CopyablePre
+              label="az service principal"
+              text={
+                'az ad sp create-for-rbac --role "DNS Zone Contributor" \\\n  --scopes /subscriptions/<sub>/resourceGroups/<rg>'
+              }
+            />
+            <p>
+              The command prints <code className="font-mono">appId</code>{" "}
+              (client ID), <code className="font-mono">password</code> (client
+              secret), and <code className="font-mono">tenant</code> (tenant
+              ID).
+            </p>
+          </div>
+        )}
+        {driver === "google_dns" && (
+          <div className="space-y-2">
+            <p>
+              Create a service account, grant it the{" "}
+              <span className="font-medium text-foreground">DNS Admin</span>{" "}
+              role, and download a JSON key:
+            </p>
+            <CopyablePre
+              label="gcloud service account"
+              text={
+                "gcloud iam service-accounts create spatiumddi\n" +
+                "gcloud projects add-iam-policy-binding <proj> \\\n" +
+                "  --member serviceAccount:spatiumddi@<proj>.iam.gserviceaccount.com \\\n" +
+                "  --role roles/dns.admin\n" +
+                "gcloud iam service-accounts keys create key.json \\\n" +
+                "  --iam-account spatiumddi@<proj>.iam.gserviceaccount.com"
+              }
+            />
+            <p>
+              Paste the contents of <code className="font-mono">key.json</code>{" "}
+              into the field above.
+            </p>
+          </div>
+        )}
+      </div>
+    </details>
   );
 }
 
@@ -739,6 +963,7 @@ function ServerModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const editing = !!server;
   const [name, setName] = useState(server?.name ?? "");
   const [driver, setDriver] = useState(server?.driver ?? "bind9");
@@ -768,7 +993,16 @@ function ServerModal({
     message: string;
   } | null>(null);
 
+  // Cloud DNS credential state (issue #37, Part B). Provider-specific dict
+  // keyed by field. On edit, fields render blank ("leave blank to keep") and
+  // we only send the cloud_credentials block when the operator types
+  // something — or {} to clear.
+  const [cloudCreds, setCloudCreds] = useState<Record<string, string>>({});
+  const [cloudClearCreds, setCloudClearCreds] = useState(false);
+
   const hasExistingCreds = !!server?.has_credentials;
+
+  const cloudDriver = isCloudDriver(driver) ? driver : null;
 
   const testMut = useMutation({
     mutationFn: () => {
@@ -817,17 +1051,57 @@ function ServerModal({
       .map((r) => r.trim())
       .filter(Boolean);
 
+    const cloud = isCloudDriver(driver);
+
     const payload: Record<string, unknown> = {
       name,
       driver,
-      host,
-      port: parseInt(port, 10),
-      api_port: apiPort ? parseInt(apiPort, 10) : null,
+      // Cloud drivers are agentless — there's no host/port/api_port to reach.
+      // Send a stable sentinel host so the row is valid; the provider API is
+      // addressed via the stored cloud credentials, not host:port.
+      host: cloud ? driver : host,
+      port: cloud ? 443 : parseInt(port, 10),
+      api_port: cloud ? null : apiPort ? parseInt(apiPort, 10) : null,
       roles: roleList,
       notes,
       is_enabled: isEnabled,
-      ...(apiKey ? { api_key: apiKey } : {}),
+      ...(apiKey && !cloud ? { api_key: apiKey } : {}),
     };
+
+    if (cloud) {
+      if (cloudClearCreds) {
+        payload.cloud_credentials = {};
+      } else {
+        const fields = CLOUD_DNS_FIELDS[driver as CloudDNSDriver];
+        const entered: Record<string, string> = {};
+        for (const f of fields) {
+          const v = (cloudCreds[f.key] ?? "").trim();
+          if (v) entered[f.key] = v;
+        }
+        if (Object.keys(entered).length > 0) {
+          // First-time create requires every field — a partial cloud
+          // credential set can't authenticate. On edit a partial set merges
+          // server-side only when stored creds already exist.
+          const missing = fields.filter((f) => !entered[f.key]);
+          if (!editing && missing.length > 0) {
+            setError(
+              `${CLOUD_DNS_LABELS[driver as CloudDNSDriver]} requires all credential fields: ${fields
+                .map((f) => f.label)
+                .join(", ")}.`,
+            );
+            return;
+          }
+          payload.cloud_credentials = entered;
+        } else if (!editing) {
+          setError(
+            `Enter ${CLOUD_DNS_LABELS[driver as CloudDNSDriver]} credentials to enable this server.`,
+          );
+          return;
+        }
+        // editing + nothing entered → omit cloud_credentials entirely
+        // (None = leave stored creds alone).
+      }
+    }
 
     if (driver === "windows_dns") {
       if (winClearCreds) {
@@ -887,12 +1161,22 @@ function ServerModal({
               className={inputCls}
               value={driver}
               onChange={(e) => setDriver(e.target.value)}
+              // Provider/driver is immutable on edit — changing it would
+              // strand the stored credentials + rendered config.
+              disabled={editing}
             >
               <option value="bind9">BIND9 (agent-managed)</option>
               <option value="powerdns">PowerDNS (agent-managed)</option>
               <option value="windows_dns">
                 Windows DNS (agentless, RFC 2136 + optional WinRM)
               </option>
+              <optgroup label="Cloud DNS (agentless)">
+                {CLOUD_DNS_DRIVERS.map((d) => (
+                  <option key={d} value={d}>
+                    {CLOUD_DNS_LABELS[d]}
+                  </option>
+                ))}
+              </optgroup>
             </select>
           </Field>
         </div>
@@ -920,63 +1204,80 @@ function ServerModal({
             and rotates the API key automatically — leave the field below blank.
           </div>
         )}
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Host / IP">
-            <input
-              className={inputCls}
-              value={host}
-              onChange={(e) => setHost(e.target.value)}
-              placeholder="10.0.0.53"
-              required
-            />
-          </Field>
-          <Field label="DNS Port">
-            <input
-              className={inputCls}
-              value={port}
-              onChange={(e) => setPort(e.target.value)}
-              placeholder="53"
-            />
-          </Field>
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="API Port (rndc / REST)">
-            <input
-              className={inputCls}
-              value={apiPort}
-              onChange={(e) => setApiPort(e.target.value)}
-              placeholder={
-                driver === "powerdns"
-                  ? "8081 (PowerDNS REST, loopback)"
-                  : driver === "bind9"
-                    ? "953 (rndc)"
-                    : "953 / 8081"
-              }
-            />
-          </Field>
-          {driver === "powerdns" ? (
-            <Field label="API Key">
-              <input
-                className={`${inputCls} bg-muted/50 cursor-not-allowed`}
-                value="(generated by agent on first boot)"
-                disabled
-                readOnly
-              />
-            </Field>
-          ) : (
-            <Field
-              label={server ? "New API Key (leave blank to keep)" : "API Key"}
-            >
-              <input
-                type="password"
-                className={inputCls}
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder={server ? "unchanged" : "optional"}
-              />
-            </Field>
-          )}
-        </div>
+        {cloudDriver && (
+          <div className="rounded-md border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-800 dark:text-sky-300">
+            <strong>{CLOUD_DNS_LABELS[cloudDriver]}:</strong> agentless. Record
+            CRUD runs from the SpatiumDDI control plane against the provider API
+            — no agent container, host, or port to configure. Provide the
+            provider credentials below; they're stored Fernet-encrypted and
+            never returned by the API. Once registered you can pull existing
+            hosted zones in via{" "}
+            <span className="font-medium">DNS Import → Cloud</span>.
+          </div>
+        )}
+        {!cloudDriver && (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Host / IP">
+                <input
+                  className={inputCls}
+                  value={host}
+                  onChange={(e) => setHost(e.target.value)}
+                  placeholder="10.0.0.53"
+                  required
+                />
+              </Field>
+              <Field label="DNS Port">
+                <input
+                  className={inputCls}
+                  value={port}
+                  onChange={(e) => setPort(e.target.value)}
+                  placeholder="53"
+                />
+              </Field>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="API Port (rndc / REST)">
+                <input
+                  className={inputCls}
+                  value={apiPort}
+                  onChange={(e) => setApiPort(e.target.value)}
+                  placeholder={
+                    driver === "powerdns"
+                      ? "8081 (PowerDNS REST, loopback)"
+                      : driver === "bind9"
+                        ? "953 (rndc)"
+                        : "953 / 8081"
+                  }
+                />
+              </Field>
+              {driver === "powerdns" ? (
+                <Field label="API Key">
+                  <input
+                    className={`${inputCls} bg-muted/50 cursor-not-allowed`}
+                    value="(generated by agent on first boot)"
+                    disabled
+                    readOnly
+                  />
+                </Field>
+              ) : (
+                <Field
+                  label={
+                    server ? "New API Key (leave blank to keep)" : "API Key"
+                  }
+                >
+                  <input
+                    type="password"
+                    className={inputCls}
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    placeholder={server ? "unchanged" : "optional"}
+                  />
+                </Field>
+              )}
+            </div>
+          </>
+        )}
         <Field label="Roles (comma-separated)">
           <input
             className={inputCls}
@@ -1200,7 +1501,117 @@ function ServerModal({
           </div>
         )}
 
-        {server && (
+        {cloudDriver && (
+          <div className="rounded-md border border-sky-500/40 bg-sky-500/5 p-3 space-y-3">
+            <div className="text-xs">
+              <div className="font-medium text-sky-600 dark:text-sky-400">
+                {CLOUD_DNS_LABELS[cloudDriver]} credentials
+              </div>
+              <p className="mt-1 text-muted-foreground">
+                Stored Fernet-encrypted and never returned by the API.
+                {editing && hasExistingCreds
+                  ? " Leave fields blank to keep the stored credentials, or enter new values to replace them."
+                  : ""}
+              </p>
+            </div>
+
+            <CloudSetupGuide driver={cloudDriver} />
+
+            {editing && hasExistingCreds && !cloudClearCreds && (
+              <div className="flex items-center justify-between rounded border bg-background/50 px-3 py-2 text-xs">
+                <span>
+                  <span className="font-medium">Credentials set.</span> Leave
+                  fields blank to keep them, or enter new values to replace.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setCloudClearCreds(true)}
+                  className="rounded border px-2 py-0.5 text-[11px] hover:bg-muted"
+                >
+                  Clear
+                </button>
+              </div>
+            )}
+            {cloudClearCreds && (
+              <div className="flex items-center justify-between rounded border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs">
+                <span className="text-destructive">
+                  Credentials will be removed on save — this server won't be
+                  able to reach the provider until new credentials are set.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setCloudClearCreds(false)}
+                  className="rounded border px-2 py-0.5 text-[11px] hover:bg-muted"
+                >
+                  Undo
+                </button>
+              </div>
+            )}
+
+            <div
+              className={`space-y-3 ${cloudClearCreds ? "opacity-40 pointer-events-none" : ""}`}
+            >
+              {CLOUD_DNS_FIELDS[cloudDriver].map((f) => (
+                <Field key={f.key} label={f.label}>
+                  {f.textarea ? (
+                    <textarea
+                      className={`${inputCls} font-mono text-xs`}
+                      rows={6}
+                      value={cloudCreds[f.key] ?? ""}
+                      onChange={(e) =>
+                        setCloudCreds((c) => ({
+                          ...c,
+                          [f.key]: e.target.value,
+                        }))
+                      }
+                      placeholder={
+                        editing && hasExistingCreds
+                          ? "(unchanged)"
+                          : (f.placeholder ?? "")
+                      }
+                      autoComplete="off"
+                    />
+                  ) : (
+                    <input
+                      type={f.secret ? "password" : "text"}
+                      className={inputCls}
+                      value={cloudCreds[f.key] ?? ""}
+                      onChange={(e) =>
+                        setCloudCreds((c) => ({
+                          ...c,
+                          [f.key]: e.target.value,
+                        }))
+                      }
+                      placeholder={
+                        editing && hasExistingCreds
+                          ? "(unchanged)"
+                          : (f.placeholder ?? "")
+                      }
+                      autoComplete="off"
+                    />
+                  )}
+                </Field>
+              ))}
+            </div>
+
+            {editing && server && (
+              <button
+                type="button"
+                onClick={() =>
+                  navigate("/admin/dns-import", {
+                    state: { cloudServerId: server.id },
+                  })
+                }
+                className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                Sync from provider (DNS Import → Cloud)
+              </button>
+            )}
+          </div>
+        )}
+
+        {server && !cloudDriver && (
           <p className="text-xs text-muted-foreground">
             Servers can also be auto-registered by the DNS agent container — see{" "}
             <code>DNS_AGENT_KEY</code> in deployment docs.
@@ -3269,6 +3680,7 @@ function Stat({
 
 function ServersTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const [showAdd, setShowAdd] = useState(false);
   const [editServer, setEditServer] = useState<DNSServer | null>(null);
   const [detailServer, setDetailServer] = useState<DNSServer | null>(null);
@@ -3450,6 +3862,22 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
               </div>
             </div>
             <div className="flex items-center gap-1">
+              {isCloudDriver(s.driver) && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    navigate("/admin/dns-import", {
+                      state: { cloudServerId: s.id },
+                    });
+                  }}
+                  className="inline-flex items-center gap-1 rounded border border-sky-600/40 bg-sky-500/10 px-1.5 py-1 text-[11px] font-medium text-sky-700 hover:bg-sky-500/20 dark:text-sky-400"
+                  title="Sync existing hosted zones in from the provider"
+                >
+                  <Cloud className="h-3 w-3" />
+                  Sync
+                </button>
+              )}
               {s.maintenance_mode ? (
                 <button
                   type="button"

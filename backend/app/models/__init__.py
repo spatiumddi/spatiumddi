@@ -20,6 +20,7 @@ from app.models.auth_provider import AuthGroupMapping, AuthProvider
 from app.models.backup import BackupTarget
 from app.models.base import Base
 from app.models.circuit import Circuit
+from app.models.cloud import CloudEndpoint
 from app.models.conformity import ConformityPolicy, ConformityResult
 from app.models.dhcp import (
     DHCPClientClass,
@@ -176,6 +177,7 @@ __all__ = [
     "DHCPMetricSample",
     "DNSQueryLogEntry",
     "DHCPLogEntry",
+    "CloudEndpoint",
     "DockerHost",
     "Domain",
     "KubernetesCluster",
