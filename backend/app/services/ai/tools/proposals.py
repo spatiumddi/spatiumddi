@@ -399,3 +399,352 @@ async def propose_archive_session(
     db: AsyncSession, user: User, args: ArchiveSessionArgs
 ) -> dict[str, Any]:
     return await _propose_via(db=db, user=user, operation_name="archive_session", args=args)
+
+
+# ── MCP coverage catch-up (#280 / #304) ───────────────────────────────
+#
+# Each tool below mirrors a sibling read tool's category + module so the
+# write proposal is gated identically. All ship default-disabled —
+# operators opt in via Settings → AI → Tool Catalog after reviewing the
+# blast radius. Backup writes are intentionally absent (restore needs an
+# uploaded archive + passphrase + a typed confirm phrase that an MCP
+# apply can't supply); the backup read tools remain the supported
+# surface.
+
+from app.services.ai.operations_writes import (  # noqa: E402
+    CommitDHCPImportArgs,
+    CommitDNSImportArgs,
+    CreateConformityPolicyArgs,
+    CreateMulticastDomainArgs,
+    CreateWebhookArgs,
+    DeleteMulticastDomainArgs,
+    EvaluateConformityPolicyArgs,
+    SignZoneDNSSECArgs,
+    TestWebhookArgs,
+    UnsignZoneDNSSECArgs,
+    UpdateConformityPolicyArgs,
+    UpdateMulticastDomainArgs,
+    UpdateNTPSettingsArgs,
+    UpdateSNMPSettingsArgs,
+    UpdateWebhookArgs,
+)
+
+# ── Conformity (#105 / #106) ──────────────────────────────────────────
+
+
+@register_tool(
+    name="propose_create_conformity_policy",
+    description=(
+        "Prepare a custom conformity policy. Pass name, target_kind "
+        "(platform/subnet/ip_address/dns_zone/dhcp_scope), check_kind "
+        "(from the conformity check catalog), and optional framework / "
+        "severity / check_args. Operator clicks Approve to create it."
+    ),
+    args_model=CreateConformityPolicyArgs,
+    writes=False,
+    category="compliance",
+    default_enabled=False,
+    module="compliance",
+)
+async def propose_create_conformity_policy(
+    db: AsyncSession, user: User, args: CreateConformityPolicyArgs
+) -> dict[str, Any]:
+    return await _propose_via(
+        db=db, user=user, operation_name="create_conformity_policy", args=args
+    )
+
+
+@register_tool(
+    name="propose_update_conformity_policy",
+    description=(
+        "Prepare a conformity-policy update. Pass policy_id plus the "
+        "fields to change. Built-in policies only accept enabled / "
+        "severity / eval_interval_hours / description / fail_alert_rule. "
+        "Operator clicks Approve."
+    ),
+    args_model=UpdateConformityPolicyArgs,
+    writes=False,
+    category="compliance",
+    default_enabled=False,
+    module="compliance",
+)
+async def propose_update_conformity_policy(
+    db: AsyncSession, user: User, args: UpdateConformityPolicyArgs
+) -> dict[str, Any]:
+    return await _propose_via(
+        db=db, user=user, operation_name="update_conformity_policy", args=args
+    )
+
+
+@register_tool(
+    name="propose_evaluate_conformity_policy",
+    description=(
+        "Prepare an on-demand conformity evaluation. Pass policy_id; "
+        "apply runs the check now and returns the pass/fail rollup. Use "
+        "when the operator asks to 'check PCI compliance now'."
+    ),
+    args_model=EvaluateConformityPolicyArgs,
+    writes=False,
+    category="compliance",
+    default_enabled=False,
+    module="compliance",
+)
+async def propose_evaluate_conformity_policy(
+    db: AsyncSession, user: User, args: EvaluateConformityPolicyArgs
+) -> dict[str, Any]:
+    return await _propose_via(
+        db=db, user=user, operation_name="evaluate_conformity_policy", args=args
+    )
+
+
+# ── Webhooks (superadmin) ─────────────────────────────────────────────
+
+
+@register_tool(
+    name="propose_create_webhook",
+    description=(
+        "Prepare a typed-event webhook subscription. Pass name + url "
+        "(https recommended); optional event_types filter. A signing "
+        "secret is auto-generated and revealed once on apply. Superadmin "
+        "+ Approve required — deliveries make off-prem HTTP calls."
+    ),
+    args_model=CreateWebhookArgs,
+    writes=False,
+    category="webhooks",
+    default_enabled=False,
+    module="webhooks",
+)
+async def propose_create_webhook(
+    db: AsyncSession, user: User, args: CreateWebhookArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="create_webhook", args=args)
+
+
+@register_tool(
+    name="propose_update_webhook",
+    description=(
+        "Prepare a webhook-subscription update. Pass subscription_id plus "
+        "the fields to change (name / url / enabled / event_types / "
+        "timeouts). The signing secret is left untouched. Superadmin + "
+        "Approve."
+    ),
+    args_model=UpdateWebhookArgs,
+    writes=False,
+    category="webhooks",
+    default_enabled=False,
+    module="webhooks",
+)
+async def propose_update_webhook(
+    db: AsyncSession, user: User, args: UpdateWebhookArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="update_webhook", args=args)
+
+
+@register_tool(
+    name="propose_test_webhook",
+    description=(
+        "Prepare a webhook test. Pass subscription_id; apply pushes a "
+        "synthetic test.ping through the real signing + delivery path "
+        "and returns the HTTP status. No DB write, but it does make an "
+        "off-prem call, so it's Approve-gated. Superadmin only."
+    ),
+    args_model=TestWebhookArgs,
+    writes=False,
+    category="webhooks",
+    default_enabled=False,
+    module="webhooks",
+)
+async def propose_test_webhook(
+    db: AsyncSession, user: User, args: TestWebhookArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="test_webhook", args=args)
+
+
+# ── DNSSEC sign / unsign (#49 / #127) ─────────────────────────────────
+
+
+@register_tool(
+    name="propose_sign_zone_dnssec",
+    description=(
+        "Prepare a DNSSEC-signing proposal for a zone. Pass group_id + "
+        "zone_id; optional policy_id. BIND9 / PowerDNS only. Operator "
+        "clicks Approve — signing propagates to live nameservers and the "
+        "parent registrar's DS must be updated afterwards."
+    ),
+    args_model=SignZoneDNSSECArgs,
+    writes=False,
+    category="dns",
+    default_enabled=False,
+    module="dns",
+)
+async def propose_sign_zone_dnssec(
+    db: AsyncSession, user: User, args: SignZoneDNSSECArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="sign_zone_dnssec", args=args)
+
+
+@register_tool(
+    name="propose_unsign_zone_dnssec",
+    description=(
+        "Prepare a DNSSEC-unsign proposal. Pass group_id + zone_id. "
+        "Clears keys + DS; validating resolvers SERVFAIL until the "
+        "parent DS is removed. Operator clicks Approve."
+    ),
+    args_model=UnsignZoneDNSSECArgs,
+    writes=False,
+    category="dns",
+    default_enabled=False,
+    module="dns",
+)
+async def propose_unsign_zone_dnssec(
+    db: AsyncSession, user: User, args: UnsignZoneDNSSECArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="unsign_zone_dnssec", args=args)
+
+
+# ── Multicast domain CRUD (#126) ──────────────────────────────────────
+
+
+@register_tool(
+    name="propose_create_multicast_domain",
+    description=(
+        "Prepare a multicast PIM domain. Pass name + pim_mode "
+        "(sparse/dense/ssm/bidir/none); optional vrf_id, rendezvous "
+        "point, ssm_range. Operator clicks Approve."
+    ),
+    args_model=CreateMulticastDomainArgs,
+    writes=False,
+    category="multicast",
+    default_enabled=False,
+    module="network.multicast",
+)
+async def propose_create_multicast_domain(
+    db: AsyncSession, user: User, args: CreateMulticastDomainArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="create_multicast_domain", args=args)
+
+
+@register_tool(
+    name="propose_update_multicast_domain",
+    description=(
+        "Prepare a multicast-domain update. Pass domain_id plus the "
+        "fields to change (name / pim_mode / rendezvous point / "
+        "ssm_range / notes). Operator clicks Approve."
+    ),
+    args_model=UpdateMulticastDomainArgs,
+    writes=False,
+    category="multicast",
+    default_enabled=False,
+    module="network.multicast",
+)
+async def propose_update_multicast_domain(
+    db: AsyncSession, user: User, args: UpdateMulticastDomainArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="update_multicast_domain", args=args)
+
+
+@register_tool(
+    name="propose_delete_multicast_domain",
+    description=(
+        "Prepare a multicast-domain deletion. Pass domain_id. Groups "
+        "that reference it have their domain link cleared (not deleted). "
+        "Operator clicks Approve."
+    ),
+    args_model=DeleteMulticastDomainArgs,
+    writes=False,
+    category="multicast",
+    default_enabled=False,
+    module="network.multicast",
+)
+async def propose_delete_multicast_domain(
+    db: AsyncSession, user: User, args: DeleteMulticastDomainArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="delete_multicast_domain", args=args)
+
+
+# ── SNMP / NTP appliance host config (#153 / #154) ────────────────────
+
+
+@register_tool(
+    name="propose_update_snmp_settings",
+    description=(
+        "Prepare an SNMP host-config update. Pass enabled + version "
+        "(v2c/v3); optional community (stored encrypted), "
+        "allowed_sources CIDRs, sys_contact/location. Superadmin + "
+        "Approve — the community string is a secret."
+    ),
+    args_model=UpdateSNMPSettingsArgs,
+    writes=False,
+    category="admin",
+    default_enabled=False,
+    module="appliance.snmp",
+)
+async def propose_update_snmp_settings(
+    db: AsyncSession, user: User, args: UpdateSNMPSettingsArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="update_snmp_settings", args=args)
+
+
+@register_tool(
+    name="propose_update_ntp_settings",
+    description=(
+        "Prepare an NTP / chrony host-config update. Pass source_mode "
+        "(pool/servers/mixed); optional pool_servers, allow_clients, "
+        "allow_client_networks. Superadmin + Approve."
+    ),
+    args_model=UpdateNTPSettingsArgs,
+    writes=False,
+    category="admin",
+    default_enabled=False,
+    module="appliance.ntp",
+)
+async def propose_update_ntp_settings(
+    db: AsyncSession, user: User, args: UpdateNTPSettingsArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="update_ntp_settings", args=args)
+
+
+# ── DNS / DHCP config import — live-pull commit (#128 / #129) ─────────
+
+
+@register_tool(
+    name="propose_commit_dns_import",
+    description=(
+        "Prepare a DNS config import from a live source. source must be "
+        "'windows_dns' (pass server_id of a registered windows_dns "
+        "server) or 'powerdns' (pass api_url + api_key). target_group_id "
+        "is where zones land. File uploads (bind9) must use the UI. "
+        "Preview shows zone/record counts + conflicts (skipped on "
+        "apply); operator clicks Approve to commit."
+    ),
+    args_model=CommitDNSImportArgs,
+    writes=False,
+    category="dns",
+    default_enabled=False,
+    module="dns.import",
+)
+async def propose_commit_dns_import(
+    db: AsyncSession, user: User, args: CommitDNSImportArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="commit_dns_import", args=args)
+
+
+@register_tool(
+    name="propose_commit_dhcp_import",
+    description=(
+        "Prepare a DHCP config import from a live Windows DHCP server. "
+        "Pass source='windows_dhcp', server_id, target_group_id; "
+        "optional ipam_space_id + ipam_block_id to auto-create matching "
+        "IPAM subnets. Kea/ISC file uploads must use the UI. Operator "
+        "clicks Approve to commit."
+    ),
+    args_model=CommitDHCPImportArgs,
+    writes=False,
+    category="dhcp",
+    default_enabled=False,
+    module="dhcp.import",
+)
+async def propose_commit_dhcp_import(
+    db: AsyncSession, user: User, args: CommitDHCPImportArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="commit_dhcp_import", args=args)
