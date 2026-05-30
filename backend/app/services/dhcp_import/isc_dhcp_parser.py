@@ -158,7 +158,6 @@ def _parse_block(toks: list[_Tok], i: int) -> tuple[list[_Stmt], int]:
         elif t.kind == "rbrace":
             if cur:
                 stmts.append(_Stmt(parts=cur))
-                cur = []
             return stmts, i + 1
         else:
             cur.append(t)

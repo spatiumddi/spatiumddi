@@ -37,7 +37,15 @@ interface TabDef {
   description: string;
 }
 
+// Tabs sorted alphabetically by label (ISC DHCP / Kea / Windows DHCP).
 const TABS: TabDef[] = [
+  {
+    id: "isc_dhcp",
+    label: "ISC DHCP",
+    short: "dhcpd.conf",
+    description:
+      "Upload an ISC dhcpd.conf. The importer tokenises subnet / pool / range / host / class declarations and maps the modellable subset. ISC classifier expressions (class match rules) don't translate to SpatiumDDI's class model — they're surfaced for manual review, never auto-created. failover / key / zone / include declarations are listed in the 'didn't import' panel.",
+  },
   {
     id: "kea",
     label: "Kea",
@@ -51,13 +59,6 @@ const TABS: TabDef[] = [
     short: "WinRM live pull",
     description:
       "Live-pull every IPv4 scope from a Windows DHCP server using the same WinRM read driver the Logs surface uses. Pick a registered windows_dhcp server (with credentials configured) and the importer walks Get-DhcpServerv4Scope + option values + exclusions + reservations. IPv4 only.",
-  },
-  {
-    id: "isc_dhcp",
-    label: "ISC DHCP",
-    short: "dhcpd.conf",
-    description:
-      "Upload an ISC dhcpd.conf. The importer tokenises subnet / pool / range / host / class declarations and maps the modellable subset. ISC classifier expressions (class match rules) don't translate to SpatiumDDI's class model — they're surfaced for manual review, never auto-created. failover / key / zone / include declarations are listed in the 'didn't import' panel.",
   },
 ];
 
@@ -646,7 +647,10 @@ function PreviewPanel({
                       {hasScopeConflict ? (
                         <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
                           <AlertTriangle className="h-3 w-3" />
-                          scope exists ({conflict?.existing_pool_count}p/
+                          {conflict?.soft_deleted
+                            ? "scope in Trash"
+                            : "scope exists"}{" "}
+                          ({conflict?.existing_pool_count}p/
                           {conflict?.existing_reservation_count}r)
                         </span>
                       ) : (

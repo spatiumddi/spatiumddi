@@ -136,6 +136,12 @@ class ScopeConflict:
     existing_subnet_name: str | None = None
     existing_pool_count: int = 0
     existing_reservation_count: int = 0
+    # True when the matched scope is soft-deleted (in Trash). It still
+    # occupies the ``(group_id, subnet_id)`` unique slot, so a plain
+    # create would hit an IntegrityError — surfacing it as a conflict
+    # lets the operator overwrite (hard-delete the trashed row + create
+    # fresh) instead of seeing a cryptic SQL error.
+    soft_deleted: bool = False
     action: ConflictAction = "skip"
 
 

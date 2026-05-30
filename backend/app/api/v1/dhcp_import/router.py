@@ -107,6 +107,7 @@ class ScopeConflictOut(BaseModel):
     existing_subnet_name: str | None = None
     existing_pool_count: int = 0
     existing_reservation_count: int = 0
+    soft_deleted: bool = False
     action: Literal["skip", "overwrite"] = "skip"
 
 

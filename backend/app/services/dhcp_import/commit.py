@@ -116,13 +116,26 @@ async def _find_subnet(db: AsyncSession, cidr: str, space_id: uuid.UUID | None) 
 
 
 async def _existing_scope(
-    db: AsyncSession, group_id: uuid.UUID, subnet_id: uuid.UUID
+    db: AsyncSession,
+    group_id: uuid.UUID,
+    subnet_id: uuid.UUID,
+    *,
+    include_deleted: bool = False,
 ) -> DHCPScope | None:
+    """Find the scope on ``(group_id, subnet_id)``.
+
+    ``include_deleted=True`` bypasses the global soft-delete filter so
+    the importer also catches a *soft-deleted* scope — it still occupies
+    the ``uq_dhcp_scope_group_subnet`` unique slot, so a blind create
+    would raise IntegrityError. Surfacing it lets the operator overwrite
+    (which hard-deletes the trashed row + recreates)."""
     stmt = select(DHCPScope).where(
         DHCPScope.group_id == group_id,
         DHCPScope.subnet_id == subnet_id,
-        DHCPScope.deleted_at.is_(None),
     )
+    if include_deleted:
+        # Disable the global ``deleted_at IS NULL`` filter for this query.
+        stmt = stmt.execution_options(include_deleted=True)
     return (await db.execute(stmt)).scalars().first()
 
 
@@ -149,12 +162,14 @@ async def detect_conflicts(
         subnet = await _find_subnet(db, cidr, ipam_space_id)
         existing_scope_id: str | None = None
         pool_count = res_count = 0
+        soft_deleted = False
         if subnet is not None:
-            scope = await _existing_scope(db, target_group_id, subnet.id)
+            scope = await _existing_scope(db, target_group_id, subnet.id, include_deleted=True)
             if scope is not None:
                 existing_scope_id = str(scope.id)
                 pool_count = len(scope.pools)
                 res_count = len(scope.statics)
+                soft_deleted = scope.deleted_at is not None
         # Emit a row when there's anything to tell the operator: an
         # existing scope (blocking) or an existing subnet (link vs
         # create). Pure-new scopes don't generate a row.
@@ -167,6 +182,7 @@ async def detect_conflicts(
                     existing_subnet_name=(subnet.name or cidr) if subnet else None,
                     existing_pool_count=pool_count,
                     existing_reservation_count=res_count,
+                    soft_deleted=soft_deleted,
                 )
             )
     return out
@@ -308,7 +324,10 @@ async def _commit_one_scope(
         )
         subnet_created = True
 
-    existing = await _existing_scope(db, target_group_id, subnet.id)
+    # include_deleted so a soft-deleted scope (still holding the unique
+    # slot) is handled via skip/overwrite rather than blowing up on the
+    # constraint at flush time.
+    existing = await _existing_scope(db, target_group_id, subnet.id, include_deleted=True)
     overwrote = False
     if existing is not None:
         if action == "skip":
@@ -318,7 +337,9 @@ async def _commit_one_scope(
                 subnet_id=str(subnet.id),
                 subnet_created=subnet_created,
             )
-        # overwrite — delete the existing scope (cascades pools + statics)
+        # overwrite — hard-delete the existing scope (cascades pools +
+        # statics, and purges it from Trash if it was soft-deleted),
+        # freeing the unique slot before the recreate flush.
         await db.delete(existing)
         await db.flush()
         overwrote = True

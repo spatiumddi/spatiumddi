@@ -5143,6 +5143,7 @@ export interface DHCPImportScopeConflict {
   existing_subnet_name: string | null;
   existing_pool_count: number;
   existing_reservation_count: number;
+  soft_deleted: boolean;
   action: DHCPImportConflictAction;
 }
 

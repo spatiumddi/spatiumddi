@@ -453,6 +453,62 @@ async def test_kea_commit_skip_then_overwrite(
 
 
 @pytest.mark.asyncio
+async def test_kea_commit_soft_deleted_scope_overwrite(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """A soft-deleted scope still holds the (group, subnet) unique slot.
+    The importer must flag it as a conflict (in Trash) and let overwrite
+    hard-delete + recreate — not blow up on an IntegrityError."""
+    from datetime import UTC, datetime
+
+    _, token = await _make_admin(db_session)
+    group = await _make_group(db_session)
+    space = await _make_space(db_session)
+    block = await _make_block(db_session, space, "192.0.2.0/24")
+    subnet = await _make_subnet(db_session, space, block, "192.0.2.0/24")
+    trashed = DHCPScope(
+        group_id=group.id,
+        subnet_id=subnet.id,
+        name="trashed",
+        deleted_at=datetime.now(UTC),
+    )
+    db_session.add(trashed)
+    await db_session.commit()
+
+    preview = (await _kea_preview(client, token, str(group.id))).json()
+    conflict = preview["conflicts"][0]
+    assert conflict["existing_scope_id"] is not None
+    assert conflict["soft_deleted"] is True
+
+    resp = await client.post(
+        "/api/v1/dhcp/import/kea/commit",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "target_group_id": str(group.id),
+            "plan": preview,
+            "conflict_actions": {"192.0.2.0/24": {"action": "overwrite"}},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["total_scopes_overwrote"] == 1
+    # exactly one live scope on the subnet, and the trashed one is purged
+    live = (
+        (
+            await db_session.execute(
+                select(DHCPScope).where(
+                    DHCPScope.subnet_id == subnet.id, DHCPScope.deleted_at.is_(None)
+                )
+            )
+        )
+        .unique()
+        .scalars()
+        .all()
+    )
+    assert len(live) == 1
+    assert live[0].import_source == "kea"
+
+
+@pytest.mark.asyncio
 async def test_isc_preview_and_commit(db_session: AsyncSession, client: AsyncClient) -> None:
     _, token = await _make_admin(db_session)
     group = await _make_group(db_session)
