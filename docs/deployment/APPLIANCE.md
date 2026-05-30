@@ -69,16 +69,16 @@ The pre-#183 docker-compose path fought us on three things every operator-facing
 
 k3s solves all three: HelmChart CRs as the declarative target, helm-controller as the reconciler, kine (SQLite) as the state store (survives slot swap because `/var/lib/rancher/` is on `/var`). The supervisor becomes a thin controller that PATCHes node labels per role-assignment change — the role pod schedules or terminates as a consequence of the label, not as a consequence of a `docker compose` invocation.
 
-The trade-off: k3s adds ~70 MB to the slot rootfs and a steady ~150 MB RAM footprint for the k3s server process itself. On the 24 GiB disk floor + 2 GiB RAM floor the appliance targets, both are well under budget.
+The trade-off: k3s adds ~70 MB to the slot rootfs and a steady ~150 MB RAM footprint for the k3s server process itself. On the 32 GiB disk floor the appliance targets, both are well under budget.
 
 **Recommended sizing (per role):**
 
 | Role | vCPU | RAM | Disk |
 |---|---|---|---|
 | **Control plane** (api + worker + frontend + Postgres + Redis + k3s etcd seed) | 4 | 8 GiB | 40 GiB SSD |
-| **Appliance** (DNS / DHCP agent) | 2 | 4 GiB | 24 GiB SSD |
+| **Appliance** (DNS / DHCP agent) | 2 | 4 GiB | 32 GiB SSD |
 
-The 2 GiB RAM floor boots a single-node control plane but is tight once Postgres + Redis + the Python api/worker are all resident; 8 GiB is the comfortable recommendation. Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
+The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). 2 GiB RAM boots a single-node control plane but is tight once Postgres + Redis + the Python api/worker are all resident; 8 GiB is the comfortable recommendation. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
 
 ### Appliance management surfaces (k3s-aware)
 
@@ -698,11 +698,14 @@ p6 var         balance   8300   shared across slots (/var/lib/rancher,
                                 /var/persist/etc, /var/home, /var/root)
 ```
 
-Hard floor: **24 GiB target disk** (installer refuses below it). The
-slots grew from 4 → 8 GiB once the full container image set started
-baking into the rootfs (so the appliance boots air-gapped without
-ghcr.io) — base Debian + Python + the baked images is ~3 GiB, leaving
-~2.7× headroom per slot.
+Hard floor: **32 GiB target disk** (installer refuses below it; raised
+from 24 GiB in issue #312 so `/var` gets ~14 GiB rather than ~7 GiB —
+the Control plane's first-boot image import + Postgres/Redis PVCs
+otherwise tipped the kubelet DiskPressure threshold). The slots grew
+from 4 → 8 GiB once the full container image set started baking into
+the rootfs (so the appliance boots air-gapped without ghcr.io) — base
+Debian + Python + the baked images is ~3 GiB, leaving ~2.7× headroom
+per slot.
 
 **/etc overlayfs:** each slot ships an image-baseline `/etc`
 at `/usr/lib/etc.image/`. At boot, a systemd `etc.mount` unit
