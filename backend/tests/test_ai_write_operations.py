@@ -18,9 +18,6 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# Importing the tools package triggers registration of operations_writes
-# via proposals.py's import side effect.
-import app.services.ai.tools  # noqa: F401
 from app.core.security import hash_password
 from app.models.audit import AuditLog
 from app.models.auth import User
@@ -294,3 +291,93 @@ async def test_commit_dhcp_import_rejects_missing_server(db_session: AsyncSessio
     )
     assert preview.ok is False
     assert "not found" in preview.detail.lower()
+
+
+# ── Review-fix coverage (PR #323): superadmin gates + semantics ───────
+
+
+@pytest.mark.asyncio
+async def test_dnssec_sign_requires_superadmin(db_session: AsyncSession) -> None:
+    from app.services.ai.operations_writes import SignZoneDNSSECArgs
+
+    viewer = await _user(db_session, superadmin=False, name="viewer")
+    op = get_operation("sign_zone_dnssec")
+    assert op is not None
+    preview = await op.preview(
+        db_session, viewer, SignZoneDNSSECArgs(group_id=uuid.uuid4(), zone_id=uuid.uuid4())
+    )
+    assert preview.ok is False
+    assert "superadmin" in preview.detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_commit_dns_import_requires_superadmin(db_session: AsyncSession) -> None:
+    from app.services.ai.operations_writes import CommitDNSImportArgs
+
+    viewer = await _user(db_session, superadmin=False, name="viewer")
+    op = get_operation("commit_dns_import")
+    assert op is not None
+    # superadmin gate fires BEFORE the off-prem pull
+    preview = await op.preview(
+        db_session,
+        viewer,
+        CommitDNSImportArgs(
+            source="powerdns",
+            api_url="http://pdns:8081",
+            api_key="x",
+            target_group_id=uuid.uuid4(),
+        ),
+    )
+    assert preview.ok is False
+    assert "superadmin" in preview.detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_update_multicast_domain_to_sparse_requires_rp(db_session: AsyncSession) -> None:
+    from app.services.ai.operations_writes import (
+        CreateMulticastDomainArgs,
+        UpdateMulticastDomainArgs,
+    )
+
+    user = await _user(db_session)
+    created = await get_operation("create_multicast_domain").apply(  # type: ignore[union-attr]
+        db_session, user, CreateMulticastDomainArgs(name="flip-pim", pim_mode="dense")
+    )
+    did = uuid.UUID(created["id"])
+    op = get_operation("update_multicast_domain")
+    assert op is not None
+    # flipping to sparse with no RP must be rejected at preview + apply
+    preview = await op.preview(
+        db_session, user, UpdateMulticastDomainArgs(domain_id=did, pim_mode="sparse")
+    )
+    assert preview.ok is False
+    with pytest.raises(ValueError):
+        await op.apply(
+            db_session, user, UpdateMulticastDomainArgs(domain_id=did, pim_mode="sparse")
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_webhook_can_clear_event_types(db_session: AsyncSession) -> None:
+    from app.models.event_subscription import EventSubscription
+    from app.services.ai.operations_writes import CreateWebhookArgs, UpdateWebhookArgs
+
+    admin = await _user(db_session)
+    created = await get_operation("create_webhook").apply(  # type: ignore[union-attr]
+        db_session,
+        admin,
+        CreateWebhookArgs(name="hook", url="https://h.example/x", event_types=["subnet.created"]),
+    )
+    sid = uuid.UUID(created["id"])
+    upd = get_operation("update_webhook")
+    assert upd is not None
+
+    # omitting event_types keeps the existing filter
+    await upd.apply(db_session, admin, UpdateWebhookArgs(subscription_id=sid, description="kept"))
+    row = await db_session.get(EventSubscription, sid)
+    assert row is not None and row.event_types == ["subnet.created"]
+
+    # explicitly passing event_types=None clears it back to all-events
+    await upd.apply(db_session, admin, UpdateWebhookArgs(subscription_id=sid, event_types=None))
+    await db_session.refresh(row)
+    assert row.event_types is None

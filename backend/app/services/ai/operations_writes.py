@@ -394,8 +394,10 @@ async def _apply_create_webhook(
 ) -> dict[str, Any]:
     _require_superadmin(user)
     from app.api.v1.webhooks.router import _apply_body  # noqa: PLC0415
+    from app.core.demo_mode import forbid_in_demo_mode  # noqa: PLC0415
     from app.models.event_subscription import EventSubscription  # noqa: PLC0415
 
+    forbid_in_demo_mode("Webhook subscription creation is disabled")
     sub = EventSubscription()
     plaintext = _apply_body(sub, _webhook_write_body(args), creating=True)
     db.add(sub)
@@ -457,20 +459,30 @@ async def _apply_update_webhook(
         WebhookSubscriptionWrite,
         _apply_body,
     )
+    from app.core.demo_mode import forbid_in_demo_mode  # noqa: PLC0415
     from app.models.event_subscription import EventSubscription  # noqa: PLC0415
 
+    forbid_in_demo_mode("Webhook subscription updates are disabled")
     sub = await db.get(EventSubscription, args.subscription_id)
     if sub is None:
         raise ValueError(f"Webhook {args.subscription_id} not found")
     # _apply_body does a full replace, so merge existing values for any
     # field the operator didn't override. secret=None keeps the existing.
+    # event_types is special: ``None`` is a meaningful value ("subscribe
+    # to all events"), so distinguish "explicitly set (even to None)"
+    # from "omitted" via model_fields_set — otherwise an update could
+    # never clear a filter back to all-events.
+    if "event_types" in args.model_fields_set:
+        event_types = args.event_types
+    else:
+        event_types = sub.event_types
     body = WebhookSubscriptionWrite(
         name=args.name if args.name is not None else sub.name,
         url=args.url if args.url is not None else sub.url,
         description=args.description if args.description is not None else sub.description,
         enabled=args.enabled if args.enabled is not None else sub.enabled,
         secret=None,
-        event_types=args.event_types if args.event_types is not None else sub.event_types,
+        event_types=event_types,
         timeout_seconds=(
             args.timeout_seconds if args.timeout_seconds is not None else sub.timeout_seconds
         ),
@@ -608,6 +620,18 @@ register(
 # ══════════════════════════════════════════════════════════════════════
 
 _PIM_MODES = frozenset({"sparse", "dense", "ssm", "bidir", "none"})
+# Modes that need a rendezvous point — mirrors the multicast router's
+# ``_validate_rp_for_mode`` so an update can't leave an invalid state.
+_PIM_MODES_REQUIRING_RP = frozenset({"sparse", "bidir"})
+
+
+def _validate_multicast_rp(mode: str, device_id: Any, rp_address: str | None) -> str | None:
+    if mode in _PIM_MODES_REQUIRING_RP and device_id is None and not rp_address:
+        return (
+            f"pim_mode={mode!r} requires a rendezvous point "
+            "(rendezvous_point_device_id or rendezvous_point_address)"
+        )
+    return None
 
 
 class CreateMulticastDomainArgs(BaseModel):
@@ -729,6 +753,15 @@ async def _preview_update_multicast_domain(
         return PreviewResult(ok=False, detail="No fields to update")
     if args.pim_mode is not None and args.pim_mode not in _PIM_MODES:
         return PreviewResult(ok=False, detail=f"pim_mode must be one of {sorted(_PIM_MODES)}")
+    new_mode = args.pim_mode or row.pim_mode
+    new_rp = (
+        args.rendezvous_point_address
+        if args.rendezvous_point_address is not None
+        else row.rendezvous_point_address
+    )
+    rp_err = _validate_multicast_rp(new_mode, row.rendezvous_point_device_id, new_rp)
+    if rp_err:
+        return PreviewResult(ok=False, detail=rp_err)
     summary = ", ".join(f"{k}={_clip(str(v), 40)}" for k, v in changes.items())
     return PreviewResult(
         ok=True, detail="ready", preview_text=f"Update multicast domain {row.name!r}: {summary}"
@@ -748,6 +781,15 @@ async def _apply_update_multicast_domain(
         raise ValueError("No fields to update")
     if args.pim_mode is not None and args.pim_mode not in _PIM_MODES:
         raise ValueError(f"pim_mode must be one of {sorted(_PIM_MODES)}")
+    new_mode = args.pim_mode or row.pim_mode
+    new_rp = (
+        args.rendezvous_point_address
+        if args.rendezvous_point_address is not None
+        else row.rendezvous_point_address
+    )
+    rp_err = _validate_multicast_rp(new_mode, row.rendezvous_point_device_id, new_rp)
+    if rp_err:
+        raise ValueError(rp_err)
     applied: dict[str, Any] = {}
     for key, value in changes.items():
         if getattr(row, key) != value:
@@ -870,9 +912,14 @@ class UnsignZoneDNSSECArgs(BaseModel):
     zone_id: uuid.UUID
 
 
-async def _dnssec_lookup(db: AsyncSession, group_id: uuid.UUID, zone_id: uuid.UUID, op: str) -> Any:
+async def _dnssec_lookup(
+    db: AsyncSession, user: User, group_id: uuid.UUID, zone_id: uuid.UUID, op: str
+) -> Any:
     """Fetch+gate the zone the way the DNS router does, translating its
-    HTTPException into an operator-facing ValueError."""
+    HTTPException into an operator-facing ValueError. The DNS router's
+    sign/unsign endpoints are superadmin-only, so re-check that here —
+    a proposal approval must not bypass the REST authorization."""
+    _require_superadmin(user)
     from fastapi import HTTPException  # noqa: PLC0415
 
     from app.api.v1.dns import router as dns_router  # noqa: PLC0415
@@ -890,7 +937,7 @@ async def _preview_sign_zone_dnssec(
     db: AsyncSession, user: User, args: SignZoneDNSSECArgs
 ) -> PreviewResult:
     try:
-        zone = await _dnssec_lookup(db, args.group_id, args.zone_id, "dnssec_sign")
+        zone = await _dnssec_lookup(db, user, args.group_id, args.zone_id, "dnssec_sign")
     except ValueError as exc:
         return PreviewResult(ok=False, detail=str(exc))
     pol = ""
@@ -909,7 +956,7 @@ async def _apply_sign_zone_dnssec(
     from app.api.v1.dns import router as dns_router  # noqa: PLC0415
     from app.models.dns import DNSSECPolicy  # noqa: PLC0415
 
-    zone = await _dnssec_lookup(db, args.group_id, args.zone_id, "dnssec_sign")
+    zone = await _dnssec_lookup(db, user, args.group_id, args.zone_id, "dnssec_sign")
     zone.dnssec_enabled = True
     if args.policy_id is not None:
         pol = await db.get(DNSSECPolicy, args.policy_id)
@@ -938,7 +985,7 @@ async def _preview_unsign_zone_dnssec(
     db: AsyncSession, user: User, args: UnsignZoneDNSSECArgs
 ) -> PreviewResult:
     try:
-        zone = await _dnssec_lookup(db, args.group_id, args.zone_id, "dnssec_unsign")
+        zone = await _dnssec_lookup(db, user, args.group_id, args.zone_id, "dnssec_unsign")
     except ValueError as exc:
         return PreviewResult(ok=False, detail=str(exc))
     return PreviewResult(
@@ -959,7 +1006,7 @@ async def _apply_unsign_zone_dnssec(
     from app.api.v1.dns import router as dns_router  # noqa: PLC0415
     from app.models.dns import DNSKey  # noqa: PLC0415
 
-    zone = await _dnssec_lookup(db, args.group_id, args.zone_id, "dnssec_unsign")
+    zone = await _dnssec_lookup(db, user, args.group_id, args.zone_id, "dnssec_unsign")
     zone.dnssec_enabled = False
     zone.dnssec_ds_records = None
     await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
@@ -1050,7 +1097,9 @@ async def _apply_update_snmp_settings(
         raise ValueError(f"version must be one of {sorted(_SNMP_VERSIONS)}")
     from app.api.v1.settings.router import _get_or_create  # noqa: PLC0415
     from app.core.crypto import encrypt_str  # noqa: PLC0415
+    from app.core.demo_mode import forbid_in_demo_mode  # noqa: PLC0415
 
+    forbid_in_demo_mode("Platform settings updates are disabled")
     settings = await _get_or_create(db)
     settings.snmp_enabled = args.enabled
     settings.snmp_version = args.version
@@ -1108,7 +1157,9 @@ async def _apply_update_ntp_settings(
     if args.source_mode not in _NTP_SOURCE_MODES:
         raise ValueError(f"source_mode must be one of {sorted(_NTP_SOURCE_MODES)}")
     from app.api.v1.settings.router import _get_or_create  # noqa: PLC0415
+    from app.core.demo_mode import forbid_in_demo_mode  # noqa: PLC0415
 
+    forbid_in_demo_mode("Platform settings updates are disabled")
     settings = await _get_or_create(db)
     settings.ntp_source_mode = args.source_mode
     if args.pool_servers is not None:
@@ -1237,6 +1288,8 @@ def _dns_preview_text(preview: Any) -> str:
 async def _preview_commit_dns_import(
     db: AsyncSession, user: User, args: CommitDNSImportArgs
 ) -> PreviewResult:
+    if (block := _superadmin_preview_block(user)) is not None:
+        return block
     try:
         preview = await _dns_import_pull(db, args)
     except ValueError as exc:
@@ -1249,6 +1302,7 @@ async def _preview_commit_dns_import(
 async def _apply_commit_dns_import(
     db: AsyncSession, user: User, args: CommitDNSImportArgs
 ) -> dict[str, Any]:
+    _require_superadmin(user)
     from app.services.dns_import import commit_import  # noqa: PLC0415
 
     preview = await _dns_import_pull(db, args)
@@ -1322,6 +1376,8 @@ def _dhcp_preview_text(preview: Any) -> str:
 async def _preview_commit_dhcp_import(
     db: AsyncSession, user: User, args: CommitDHCPImportArgs
 ) -> PreviewResult:
+    if (block := _superadmin_preview_block(user)) is not None:
+        return block
     try:
         preview = await _dhcp_import_pull(db, args)
     except ValueError as exc:
@@ -1334,6 +1390,7 @@ async def _preview_commit_dhcp_import(
 async def _apply_commit_dhcp_import(
     db: AsyncSession, user: User, args: CommitDHCPImportArgs
 ) -> dict[str, Any]:
+    _require_superadmin(user)
     from app.services.dhcp_import import commit_import  # noqa: PLC0415
 
     preview = await _dhcp_import_pull(db, args)
