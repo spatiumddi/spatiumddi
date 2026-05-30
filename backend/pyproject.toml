@@ -45,6 +45,19 @@ dependencies = [
     "azure-storage-blob>=12.20.0",
     "smbprotocol>=1.13.0",
     "google-cloud-storage>=2.18.0",
+    # Cloud integration (issue #37). AWS (infra mirror + Route 53 DNS) is
+    # covered by the existing boto3. Azure + GCP infra + DNS need their
+    # management SDKs; Cloudflare DNS uses plain REST via httpx (no SDK
+    # pin — keeps the dependency surface small + avoids the heavy
+    # cloudflare SDK's pydantic-v1 shim).
+    "azure-identity>=1.19.0",
+    "azure-mgmt-network>=28.0.0",
+    "azure-mgmt-compute>=33.0.0",
+    "azure-mgmt-dns>=8.2.0",
+    "azure-mgmt-resource>=23.0.0",
+    "google-cloud-compute>=1.19.0",
+    "google-cloud-dns>=0.35.0",
+    "google-auth>=2.35.0",
     # docker SDK — only used on the SpatiumDDI OS appliance to send
     # SIGHUP to the frontend container when a new TLS cert is
     # activated (Phase 4b.2, issue #134). The cert deployer is gated

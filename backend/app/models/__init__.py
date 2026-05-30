@@ -92,6 +92,7 @@ from app.models.overlay import (
     OverlaySite,
     RoutingPolicy,
 )
+from app.models.cloud import CloudEndpoint
 from app.models.ownership import Customer, Provider, Site
 from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
@@ -176,6 +177,7 @@ __all__ = [
     "DHCPMetricSample",
     "DNSQueryLogEntry",
     "DHCPLogEntry",
+    "CloudEndpoint",
     "DockerHost",
     "Domain",
     "KubernetesCluster",

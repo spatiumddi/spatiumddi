@@ -1,0 +1,499 @@
+"""Unit tests for the Google Cloud DNS cloud DNS driver (issue #37).
+
+All tests are offline: the ``google-cloud-dns`` SDK is not installed in
+CI (it's an optional tier-3 dependency), so we
+
+* monkeypatch the client factory (``_client``) to return a stub whose
+  ``list_zones()`` yields ``SimpleNamespace`` managed-zone objects, and
+* inject stub ``google.api_core.exceptions`` / ``google.auth.exceptions``
+  modules into ``sys.modules`` so the driver's lazily-imported error
+  wrapping resolves without the real SDK.
+
+Nothing ever touches GCP.
+"""
+
+from __future__ import annotations
+
+import sys
+import types
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from app.drivers.dns._cloud_base import CloudDNSError
+from app.drivers.dns.base import RecordChange, RecordData
+from app.drivers.dns.googledns import GoogleCloudDNSDriver
+
+# ── Stub GCP exception modules (installed for the whole test module) ───────
+
+
+class _GoogleAPICallError(Exception):
+    """Stand-in for google.api_core.exceptions.GoogleAPICallError (offline)."""
+
+
+class _GoogleAuthError(Exception):
+    """Stand-in for google.auth.exceptions.GoogleAuthError (offline)."""
+
+
+@pytest.fixture(autouse=True)
+def _stub_google_modules() -> Any:
+    """Make the driver's lazy ``from google... import exceptions`` resolve.
+
+    The driver imports ``google.api_core.exceptions`` +
+    ``google.auth.exceptions`` inside ``_wrap_call`` so the module imports
+    cleanly without the SDK. Inject stub modules carrying our exception
+    classes so the except clauses bind to types we can raise in tests.
+    """
+    created: list[str] = []
+    for mod_name in (
+        "google",
+        "google.api_core",
+        "google.api_core.exceptions",
+        "google.auth",
+        "google.auth.exceptions",
+    ):
+        if mod_name not in sys.modules:
+            sys.modules[mod_name] = types.ModuleType(mod_name)
+            created.append(mod_name)
+    sys.modules["google.api_core.exceptions"].GoogleAPICallError = _GoogleAPICallError  # type: ignore[attr-defined]
+    sys.modules["google.auth.exceptions"].GoogleAuthError = _GoogleAuthError  # type: ignore[attr-defined]
+    yield
+    for mod_name in created:
+        sys.modules.pop(mod_name, None)
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+
+def _server() -> SimpleNamespace:
+    """A stand-in DNS server row (the driver only touches a few attrs)."""
+    return SimpleNamespace(id="srv-1", name="gcp", credentials_encrypted=None)
+
+
+CREDS = {"service_account_json": '{"type": "service_account"}', "project_id": "proj-1"}
+
+
+def _patch_client(
+    monkeypatch: pytest.MonkeyPatch, driver: GoogleCloudDNSDriver, client: Any
+) -> None:
+    """Wire ``driver._client`` to return ``client`` regardless of creds."""
+    monkeypatch.setattr(driver, "_client", lambda creds: client)
+
+
+def _rrset(name: str, rtype: str, ttl: int | None, rrdatas: list[str]) -> SimpleNamespace:
+    """A stub Cloud DNS ``ResourceRecordSet``."""
+    return SimpleNamespace(name=name, record_type=rtype, ttl=ttl, rrdatas=rrdatas)
+
+
+class _StubChanges:
+    """A stub Cloud DNS ``Changes`` transaction.
+
+    Records ``add_record_set`` / ``delete_record_set`` calls, flips to
+    ``done`` on ``create()`` so the driver's bounded poll loop returns on
+    the first check.
+    """
+
+    def __init__(self) -> None:
+        self.added: list[Any] = []
+        self.deleted: list[Any] = []
+        self.created = False
+        self.status = "pending"
+
+    def add_record_set(self, rrset: Any) -> None:
+        self.added.append(rrset)
+
+    def delete_record_set(self, rrset: Any) -> None:
+        self.deleted.append(rrset)
+
+    def create(self) -> None:
+        self.created = True
+        self.status = "done"
+
+    def reload(self) -> None:  # pragma: no cover — done before first poll
+        self.status = "done"
+
+
+class _StubZone:
+    """A stub Cloud DNS managed zone (``ManagedZone``)."""
+
+    def __init__(
+        self, name: str, dns_name: str, rrsets: list[SimpleNamespace] | None = None
+    ) -> None:
+        self.name = name  # GCP managed-zone id (slug)
+        self.dns_name = dns_name  # FQDN
+        self._rrsets = rrsets or []
+        self.changes_obj = _StubChanges()
+        self.created = False
+        self.deleted = False
+        # Capture the args to ``resource_record_set`` for assertions.
+        self.built_rrsets: list[tuple[str, str, int, list[str]]] = []
+
+    def list_resource_record_sets(self) -> list[SimpleNamespace]:
+        return list(self._rrsets)
+
+    def changes(self) -> _StubChanges:
+        return self.changes_obj
+
+    def resource_record_set(
+        self, name: str, record_type: str, ttl: int, rrdatas: list[str]
+    ) -> SimpleNamespace:
+        self.built_rrsets.append((name, record_type, ttl, rrdatas))
+        return _rrset(name, record_type, ttl, rrdatas)
+
+    def create(self) -> None:
+        self.created = True
+
+    def delete(self) -> None:
+        self.deleted = True
+
+
+def _client_with_zones(*zones: _StubZone) -> SimpleNamespace:
+    """A stub ``dns.Client`` whose ``list_zones()`` yields ``zones``."""
+    return SimpleNamespace(
+        list_zones=lambda: iter(zones),
+        zone=lambda slug, dns_name=None: _StubZone(slug, dns_name or ""),
+    )
+
+
+# ── Zone listing ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_zones_name_and_reverse(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+    client = _client_with_zones(
+        _StubZone("example-com", "example.com."),
+        _StubZone("rev-10", "10.in-addr.arpa."),
+    )
+    _patch_client(monkeypatch, driver, client)
+
+    zones = await driver._list_zones(_server(), CREDS)
+
+    # ``name`` is the normalised DNS name; ``zone_id`` is the GCP slug.
+    assert [z.name for z in zones] == ["example.com.", "10.in-addr.arpa."]
+    assert [z.zone_id for z in zones] == ["example-com", "rev-10"]
+    assert [z.is_reverse for z in zones] == [False, True]
+    assert all(z.dnssec_enabled is False for z in zones)
+
+
+@pytest.mark.asyncio
+async def test_pull_zones_from_server_neutral_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+    client = _client_with_zones(_StubZone("example-com", "Example.COM."))
+    _patch_client(monkeypatch, driver, client)
+    # Bypass credential decrypt — the base loads from credentials_encrypted.
+    monkeypatch.setattr(driver, "_load_credentials", lambda server: CREDS)
+
+    out = await driver.pull_zones_from_server(_server())
+
+    assert out == [
+        {
+            "name": "example.com.",
+            "zone_type": "Primary",
+            "is_reverse_lookup": False,
+            "dnssec_enabled": False,
+            "zone_id": "example-com",
+            "record_count": None,
+        }
+    ]
+
+
+# ── Record listing / relativization / rrdata expansion ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_zone_records_expand_and_relativize(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+    zone = _StubZone(
+        "example-com",
+        "example.com.",
+        rrsets=[
+            _rrset("example.com.", "SOA", 21600, ["ns dns 1 2 3 4 5"]),  # skipped
+            _rrset(
+                "example.com.",
+                "NS",
+                172800,
+                ["ns-cloud-a1.googledomains.com.", "ns-cloud-a2.googledomains.com."],
+            ),
+            _rrset("www.example.com.", "A", 300, ["10.0.0.1"]),
+            _rrset("example.com.", "MX", 3600, ["10 mail.example.com."]),
+        ],
+    )
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    records = await driver._list_zone_records(_server(), CREDS, "example.com.")
+
+    # SOA is skipped.
+    assert all(r.record_type != "SOA" for r in records)
+
+    # NS rrset with two rrdatas expands into two RecordData rows, apex → "@".
+    ns = [r for r in records if r.record_type == "NS"]
+    assert len(ns) == 2
+    assert {r.value for r in ns} == {
+        "ns-cloud-a1.googledomains.com.",
+        "ns-cloud-a2.googledomains.com.",
+    }
+    assert all(r.name == "@" for r in ns)
+
+    # www relativized to "www" with its TTL.
+    www = next(r for r in records if r.record_type == "A")
+    assert www.name == "www"
+    assert www.value == "10.0.0.1"
+    assert www.ttl == 300
+
+    # MX keeps priority baked into the value.
+    mx = next(r for r in records if r.record_type == "MX")
+    assert mx.value == "10 mail.example.com."
+    assert mx.name == "@"
+    assert mx.priority is None
+
+
+@pytest.mark.asyncio
+async def test_list_zone_records_zone_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+    # Client returns a neighbouring zone, not the one we asked for.
+    client = _client_with_zones(_StubZone("other-com", "other.com."))
+    _patch_client(monkeypatch, driver, client)
+
+    with pytest.raises(CloudDNSError, match="not found"):
+        await driver._list_zone_records(_server(), CREDS, "example.com.")
+
+
+# ── Record write: change-set build for create / update / delete ────────────
+
+
+@pytest.mark.asyncio
+async def test_apply_record_create_builds_add_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+    zone = _StubZone("example-com", "example.com.")
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.1", ttl=120),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    ch = zone.changes_obj
+    assert ch.created is True
+    assert ch.deleted == []
+    # The added rrset is the absolutized name + single-value rrdatas.
+    assert zone.built_rrsets == [("www.example.com.", "A", 120, ["10.0.0.1"])]
+    assert len(ch.added) == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_record_apex_and_default_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+    zone = _StubZone("example-com", "example.com.")
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="@", record_type="TXT", value="v=spf1 -all", ttl=None),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    # Apex absolutized to the zone FQDN, default TTL 300 when None.
+    assert zone.built_rrsets == [("example.com.", "TXT", 300, ["v=spf1 -all"])]
+
+
+@pytest.mark.asyncio
+async def test_apply_record_update_deletes_old_then_adds_new(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = GoogleCloudDNSDriver()
+    existing = _rrset("www.example.com.", "A", 300, ["10.0.0.9"])
+    zone = _StubZone("example-com", "example.com.", rrsets=[existing])
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="update",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.1", ttl=600),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    ch = zone.changes_obj
+    # One atomic change set: delete the exact existing rrset + add the new.
+    assert ch.deleted == [existing]
+    assert zone.built_rrsets == [("www.example.com.", "A", 600, ["10.0.0.1"])]
+    assert len(ch.added) == 1
+    assert ch.created is True
+
+
+@pytest.mark.asyncio
+async def test_apply_record_delete_existing(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+    existing = _rrset("old.example.com.", "A", 300, ["10.0.0.9"])
+    zone = _StubZone("example-com", "example.com.", rrsets=[existing])
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="old", record_type="A", value="10.0.0.9", ttl=300),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    ch = zone.changes_obj
+    # Delete references the exact existing rrset; nothing added.
+    assert ch.deleted == [existing]
+    assert ch.added == []
+    assert ch.created is True
+
+
+@pytest.mark.asyncio
+async def test_apply_record_delete_missing_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+    zone = _StubZone("example-com", "example.com.", rrsets=[])  # nothing to delete
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="ghost", record_type="A", value="10.0.0.9", ttl=300),
+        target_serial=1,
+    )
+    # No raise — and no empty change set committed.
+    await driver._apply_record(_server(), CREDS, change)
+
+    ch = zone.changes_obj
+    assert ch.created is False
+    assert ch.added == []
+    assert ch.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_apply_record_bad_op(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+    _patch_client(monkeypatch, driver, _client_with_zones(_StubZone("z", "x.test.")))
+    change = RecordChange(
+        op="rename",  # type: ignore[arg-type]
+        zone_name="x.test.",
+        record=RecordData(name="a", record_type="A", value="1.2.3.4", ttl=300),
+        target_serial=1,
+    )
+    with pytest.raises(CloudDNSError, match="bad op"):
+        await driver._apply_record(_server(), CREDS, change)
+
+
+# ── Zone write ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_create(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+    created_zones: list[_StubZone] = []
+
+    def _zone_factory(slug: str, dns_name: str | None = None) -> _StubZone:
+        z = _StubZone(slug, dns_name or "")
+        created_zones.append(z)
+        return z
+
+    client = SimpleNamespace(list_zones=lambda: iter(()), zone=_zone_factory)
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="New.Example.")
+    await driver._apply_zone(_server(), CREDS, zone, "create")
+
+    assert len(created_zones) == 1
+    made = created_zones[0]
+    # Slug derived from the FQDN; dns_name is the normalised FQDN.
+    assert made.name == "new-example"
+    assert made.dns_name == "new.example."
+    assert made.created is True
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_delete_resolves_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+    target = _StubZone("doomed-example", "doomed.example.")
+    client = _client_with_zones(target)
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="doomed.example.")
+    await driver._apply_zone(_server(), CREDS, zone, "delete")
+
+    assert target.deleted is True
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_bad_op(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+    _patch_client(monkeypatch, driver, _client_with_zones())
+    with pytest.raises(CloudDNSError, match="unsupported op"):
+        await driver._apply_zone(_server(), CREDS, SimpleNamespace(name="x.test."), "rename")
+
+
+# ── Error wrapping ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_zones_wraps_google_api_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+
+    def _boom() -> Any:
+        raise _GoogleAPICallError("permission denied")
+
+    client = SimpleNamespace(list_zones=_boom, zone=lambda *a, **k: None)
+    _patch_client(monkeypatch, driver, client)
+
+    with pytest.raises(CloudDNSError, match="list_zones failed"):
+        await driver._list_zones(_server(), CREDS)
+
+
+@pytest.mark.asyncio
+async def test_apply_record_wraps_google_auth_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+
+    class _AuthZone(_StubZone):
+        def changes(self) -> _StubChanges:
+            raise _GoogleAuthError("invalid credentials")
+
+    zone = _AuthZone("example-com", "example.com.")
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.1", ttl=120),
+        target_serial=1,
+    )
+    with pytest.raises(CloudDNSError, match="change_record_sets failed"):
+        await driver._apply_record(_server(), CREDS, change)
+
+
+# ── Capabilities + credential fields ───────────────────────────────────────
+
+
+def test_capabilities_shape() -> None:
+    caps = GoogleCloudDNSDriver().capabilities()
+    assert caps["name"] == "google_dns"
+    assert caps["agentless"] is True
+    assert caps["manages_zones"] is True
+    assert caps["dnssec_online"] is True
+    assert caps["views"] is False
+    assert caps["rpz"] is False
+    assert "A" in caps["record_types"]
+    assert "SOA" in caps["record_types"]
+
+
+def test_credential_fields() -> None:
+    driver = GoogleCloudDNSDriver()
+    assert driver.name == "google_dns"
+    assert driver.credential_fields == ("service_account_json", "project_id")

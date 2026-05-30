@@ -97,6 +97,7 @@ class SettingsResponse(BaseModel):
     integration_docker_enabled: bool
     integration_proxmox_enabled: bool
     integration_tailscale_enabled: bool
+    integration_cloud_enabled: bool
     domain_whois_interval_hours: int
     # Device profiling — fingerbank API key. Boolean reflects whether
     # an encrypted key is stored; the plaintext is never returned.
@@ -350,6 +351,7 @@ class SettingsUpdate(BaseModel):
     integration_docker_enabled: bool | None = None
     integration_proxmox_enabled: bool | None = None
     integration_tailscale_enabled: bool | None = None
+    integration_cloud_enabled: bool | None = None
     domain_whois_interval_hours: int | None = None
     # Device profiling — fingerbank API key. Plaintext on the wire
     # (TLS-protected); empty string clears the stored value. Omit the
