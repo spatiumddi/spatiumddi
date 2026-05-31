@@ -657,7 +657,7 @@ class FindDHCPPoolOccupancyArgs(BaseModel):
 async def find_dhcp_pool_occupancy(
     db: AsyncSession, user: User, args: FindDHCPPoolOccupancyArgs
 ) -> list[dict[str, Any]]:
-    from app.services.dhcp.pool_occupancy import compute_pool_occupancy
+    from app.services.dhcp.pool_occupancy import compute_pool_occupancy_batch
 
     stmt = select(DHCPPool, DHCPScope).join(DHCPScope, DHCPScope.id == DHCPPool.scope_id)
     stmt = stmt.where(DHCPPool.pool_type == "dynamic")
@@ -669,9 +669,12 @@ async def find_dhcp_pool_occupancy(
     # collection relationships (DHCPScope.pools etc.).
     rows = (await db.execute(stmt)).unique().all()
 
+    # One batched lease query for all pools rather than one per pool (N+1).
+    occ_by_pool = await compute_pool_occupancy_batch(db, [pool for pool, _ in rows])
+
     out: list[dict[str, Any]] = []
     for pool, scope in rows:
-        occ = await compute_pool_occupancy(db, pool)
+        occ = occ_by_pool[pool.id]
         if occ.percent < args.min_percent:
             continue
         out.append(

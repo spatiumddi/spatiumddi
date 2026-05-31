@@ -270,18 +270,27 @@ class HetznerDNSDriver(CloudDNSDriverBase):
         RRset and would update/delete the wrong value (issue #331).
 
         Hetzner has no server-side ``value`` filter on ``GET /records``, so
-        we list the zone's records and match client-side (``priority`` too
-        for MX/SRV).
+        we page the whole zone's record set and match client-side
+        (``priority`` too for MX/SRV). Pagination is required — without it a
+        zone with more than ``_PER_PAGE`` records could miss the target row
+        and wrongly fall back to create-on-miss (update) or no-op (delete).
         """
-        resp = await client.get("/records", params={"zone_id": zone_id})
-        body = self._unwrap(resp)
+        all_records: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            resp = await client.get(
+                "/records",
+                params={"zone_id": zone_id, "per_page": _PER_PAGE, "page": page},
+            )
+            body = self._unwrap(resp)
+            all_records.extend(body.get("records") or [])
+            pagination = (body.get("meta") or {}).get("pagination") or {}
+            if page >= int(pagination.get("last_page") or 1):
+                break
+            page += 1
         # ``name`` here is already the relative label the payload uses (apex
         # as "@"), which is exactly how Hetzner stores it — compare directly.
-        results = [
-            r
-            for r in (body.get("records") or [])
-            if r.get("name") == name and r.get("type") == record_type
-        ]
+        results = [r for r in all_records if r.get("name") == name and r.get("type") == record_type]
         if not results:
             return None
         # Name+type-only lookup (value unknown): keep legacy first-match.

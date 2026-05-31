@@ -315,13 +315,13 @@ async def _matching_dhcp_pool_exhaustion_subjects(
     dropped below ``min_free_addresses`` free addresses (issue #339).
 
     Occupancy is live, from active ``DHCPLease`` rows inside the pool range
-    (see :func:`app.services.dhcp.pool_occupancy.compute_pool_occupancy`), so
-    it works for Kea and Windows alike. Only ``pool_type='dynamic'`` pools are
-    considered — excluded / reserved ranges never hand out leases. With
+    (see :func:`app.services.dhcp.pool_occupancy.compute_pool_occupancy_batch`),
+    so it works for Kea and Windows alike. Only ``pool_type='dynamic'`` pools
+    are considered — excluded / reserved ranges never hand out leases. With
     neither threshold set the rule defaults to 90% occupancy so a bare
     enable still does something sensible.
     """
-    from app.services.dhcp.pool_occupancy import compute_pool_occupancy
+    from app.services.dhcp.pool_occupancy import compute_pool_occupancy_batch
 
     pct_threshold = rule.threshold_percent
     min_free = rule.min_free_addresses
@@ -341,9 +341,12 @@ async def _matching_dhcp_pool_exhaustion_subjects(
     ).all()
     scope_names: dict[uuid.UUID, str] = {row[0]: row[1] for row in scope_rows}
 
+    # One batched lease query for all pools rather than one per pool (N+1).
+    occ_by_pool = await compute_pool_occupancy_batch(db, pools)
+
     matches: list[tuple[str, str, str]] = []
     for pool in pools:
-        occ = await compute_pool_occupancy(db, pool)
+        occ = occ_by_pool[pool.id]
         if occ.total <= 0:
             continue
         over_pct = pct_threshold is not None and occ.percent >= pct_threshold

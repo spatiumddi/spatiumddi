@@ -18,7 +18,11 @@ from app.models.auth import User
 from app.models.dhcp import DHCPLease, DHCPPool, DHCPScope, DHCPServer, DHCPServerGroup
 from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.services.alerts import RULE_TYPE_DHCP_POOL_EXHAUSTION, evaluate_all
-from app.services.dhcp.pool_occupancy import compute_pool_occupancy, pool_total_addresses
+from app.services.dhcp.pool_occupancy import (
+    compute_pool_occupancy,
+    compute_pool_occupancy_batch,
+    pool_total_addresses,
+)
 
 CIDR = "10.60.0.0/24"
 POOL_START = "10.60.0.10"
@@ -119,6 +123,54 @@ async def test_compute_pool_occupancy_dedupes_ha_peers(db_session: AsyncSession)
 
     occ = await compute_pool_occupancy(db_session, pool)
     assert occ.assigned == 1
+
+
+async def test_compute_pool_occupancy_invalid_range_is_zero(db_session: AsyncSession) -> None:
+    # An inverted range yields total 0; occupancy must short-circuit to (0, 0)
+    # and never count leases — a bad pool can't make occupancy blow up.
+    scope, server = await _scope_and_server(db_session)
+    bad = DHCPPool(
+        scope_id=scope.id,
+        name="inverted",
+        start_ip="10.60.0.19",
+        end_ip="10.60.0.10",
+        pool_type="dynamic",
+    )
+    db_session.add(bad)
+    await db_session.flush()
+    for octet in (10, 11, 12):
+        await _lease(db_session, server, scope, octet)
+    await db_session.flush()
+
+    occ = await compute_pool_occupancy(db_session, bad)
+    assert occ.total == 0
+    assert occ.assigned == 0
+
+
+async def test_compute_pool_occupancy_batch_matches_single(db_session: AsyncSession) -> None:
+    scope, server = await _scope_and_server(db_session)
+    pool = await _pool(db_session, scope)
+    # A second dynamic pool in the same scope, different sub-range.
+    pool2 = DHCPPool(
+        scope_id=scope.id,
+        name="pool-b",
+        start_ip="10.60.0.20",
+        end_ip="10.60.0.29",
+        pool_type="dynamic",
+    )
+    db_session.add(pool2)
+    await db_session.flush()
+    for octet in (10, 11, 12, 20):  # 3 in pool, 1 in pool2
+        await _lease(db_session, server, scope, octet)
+    await db_session.flush()
+
+    batch = await compute_pool_occupancy_batch(db_session, [pool, pool2])
+    assert batch[pool.id].assigned == 3
+    assert batch[pool.id].total == 10
+    assert batch[pool2.id].assigned == 1
+    # Batch result matches the per-pool helper exactly.
+    single = await compute_pool_occupancy(db_session, pool)
+    assert (batch[pool.id].assigned, batch[pool.id].total) == (single.assigned, single.total)
 
 
 # ── Alert evaluator ───────────────────────────────────────────────────────

@@ -323,6 +323,46 @@ async def test_apply_record_delete_dispatches(monkeypatch: pytest.MonkeyPatch) -
     assert delete["path"] == "/records/rid"
 
 
+# ── _find_record_id pages the full record set (issue #344 review) ───────
+async def test_find_record_id_paginates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The target record sits on page 2 of GET /records. Without pagination
+    _find_record_id would miss it and the delete would silently no-op."""
+    page1 = _records_env(
+        [{"id": "other", "name": "a", "type": "A", "value": "9.9.9.9"}],
+        last_page=2,
+    )
+    page2 = _records_env(
+        [{"id": "rid", "name": "www", "type": "A", "value": "1.1.1.1"}],
+        last_page=2,
+        page=2,
+    )
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _zones_env([{"id": "zid", "name": "example.com"}])),
+                _FakeResponse(200, page1),
+                _FakeResponse(200, page2),
+            ],
+            "delete": [_FakeResponse(200, {})],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="1.1.1.1"),
+        target_serial=1,
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    # Both record pages were fetched, and the page-2 row was deleted.
+    record_gets = [c for c in fake.calls if c["method"] == "get" and c["path"] == "/records"]
+    assert len(record_gets) == 2
+    delete = next(c for c in fake.calls if c["method"] == "delete")
+    assert delete["path"] == "/records/rid"
+
+
 # ── _apply_record delete with no match → no-op (no DELETE issued) ───────
 async def test_apply_record_delete_missing_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient(

@@ -832,15 +832,17 @@ async def _flush_dns_op_collector(
 async def _batched_dns_ops(db: AsyncSession) -> Any:
     """Collect every ``_enqueue_dns_op`` fired inside the block and flush it
     grouped by zone on a clean exit. On an exception the partial collector is
-    dropped unflushed — callers handle per-row failures inside the loop so the
-    block body itself stays exception-free in the happy path."""
+    dropped unflushed — the flush sits on the success path inside ``try`` so
+    an aborting body never half-applies a batch (callers also handle per-row
+    failures inside the loop so the happy path stays exception-free)."""
     collector: list[tuple[DNSZone, dict[str, Any]]] = []
     token = _dns_op_collector.set(collector)
     try:
         yield
+        # Reached only when the block body completed without raising.
+        await _flush_dns_op_collector(db, collector)
     finally:
         _dns_op_collector.reset(token)
-    await _flush_dns_op_collector(db, collector)
 
 
 async def _create_alias_records(
