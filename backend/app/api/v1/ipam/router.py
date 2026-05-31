@@ -1,5 +1,7 @@
 """IPAM API — IP spaces, blocks, subnets, and addresses."""
 
+import contextlib
+import contextvars
 import hashlib
 import ipaddress
 import re
@@ -764,6 +766,18 @@ async def _resolve_reverse_zone(
     return best
 
 
+# When set (inside a ``_batched_dns_ops`` block), ``_enqueue_dns_op`` defers
+# every op into this collector instead of enqueuing it inline. The bulk
+# IPAM→DNS paths (sync / bulk-allocate / bulk-edit) then flush the collector
+# grouped by zone so an agentless Windows-DNS primary takes ONE WinRM round
+# trip per zone instead of one per record (issue #341). A contextvar avoids
+# threading a parameter through ``_sync_dns_record``'s dozen enqueue calls;
+# it is task-local so concurrent requests never share a collector.
+_dns_op_collector: contextvars.ContextVar[list[tuple[DNSZone, dict[str, Any]]] | None] = (
+    contextvars.ContextVar("_dns_op_collector", default=None)
+)
+
+
 async def _enqueue_dns_op(
     db: AsyncSession, zone: DNSZone, op: str, name: str, rtype: str, value: str, ttl: int | None
 ) -> None:
@@ -773,13 +787,60 @@ async def _enqueue_dns_op(
     from app.services.dns.serial import bump_zone_serial
 
     target_serial = bump_zone_serial(zone)
-    await enqueue_record_op(
-        db,
-        zone,
-        op,
-        {"name": name, "type": rtype, "value": value, "ttl": ttl},
-        target_serial=target_serial,
-    )
+    record = {"name": name, "type": rtype, "value": value, "ttl": ttl}
+
+    collector = _dns_op_collector.get()
+    if collector is not None:
+        # Batch mode — defer; the enclosing ``_batched_dns_ops`` flushes per
+        # zone. The serial bump above still happens per op exactly as the
+        # inline path does, so ``target_serial`` snapshots match.
+        collector.append((zone, {"op": op, "record": record, "target_serial": target_serial}))
+        return
+
+    await enqueue_record_op(db, zone, op, record, target_serial=target_serial)
+
+
+async def _flush_dns_op_collector(
+    db: AsyncSession, collector: list[tuple[DNSZone, dict[str, Any]]]
+) -> None:
+    """Flush deferred record ops, one batched driver call per zone.
+
+    ``enqueue_record_ops_batch`` already does the right thing per driver: an
+    agentless primary gets a single batched apply; an agent-based primary
+    falls through to per-op DB rows (identical to the inline path), so this
+    is safe for every group shape — no ``is_agentless`` gate needed here.
+    Zone order is preserved so a delete-then-recreate (address-family swap)
+    applies in the same order it was collected.
+    """
+    if not collector:
+        return
+    from app.services.dns.record_ops import enqueue_record_ops_batch
+
+    by_zone: dict[uuid.UUID, tuple[DNSZone, list[dict[str, Any]]]] = {}
+    order: list[uuid.UUID] = []
+    for zone, op in collector:
+        if zone.id not in by_zone:
+            by_zone[zone.id] = (zone, [])
+            order.append(zone.id)
+        by_zone[zone.id][1].append(op)
+    for zid in order:
+        zone, ops = by_zone[zid]
+        await enqueue_record_ops_batch(db, zone, ops)
+
+
+@contextlib.asynccontextmanager
+async def _batched_dns_ops(db: AsyncSession) -> Any:
+    """Collect every ``_enqueue_dns_op`` fired inside the block and flush it
+    grouped by zone on a clean exit. On an exception the partial collector is
+    dropped unflushed — callers handle per-row failures inside the loop so the
+    block body itself stays exception-free in the happy path."""
+    collector: list[tuple[DNSZone, dict[str, Any]]] = []
+    token = _dns_op_collector.set(collector)
+    try:
+        yield
+    finally:
+        _dns_op_collector.reset(token)
+    await _flush_dns_op_collector(db, collector)
 
 
 async def _create_alias_records(
@@ -5304,22 +5365,26 @@ async def _apply_dns_sync(
         ips_res = await db.execute(q)
         # Cache subnets so we don't re-fetch per IP in the same subnet.
         subnet_cache: dict[uuid.UUID, Subnet | None] = {}
-        for ip in ips_res.scalars().all():
-            sn = subnet_cache.get(ip.subnet_id)
-            if sn is None and ip.subnet_id not in subnet_cache:
-                sn = await db.get(Subnet, ip.subnet_id)
-                subnet_cache[ip.subnet_id] = sn
-            if sn is None:
-                errors.append(f"{ip.address}: parent subnet missing")
-                continue
-            try:
-                await _sync_dns_record(db, ip, sn, action="create")
-                if ip.id in body.create_for_ip_ids:
-                    created += 1
-                else:
-                    updated += 1
-            except Exception as exc:
-                errors.append(f"{ip.address}: {exc}")
+        # Batch the forward/reverse ops per zone so an agentless Windows-DNS
+        # primary takes one WinRM round trip per zone, matching the delete
+        # branch below (issue #341).
+        async with _batched_dns_ops(db):
+            for ip in ips_res.scalars().all():
+                sn = subnet_cache.get(ip.subnet_id)
+                if sn is None and ip.subnet_id not in subnet_cache:
+                    sn = await db.get(Subnet, ip.subnet_id)
+                    subnet_cache[ip.subnet_id] = sn
+                if sn is None:
+                    errors.append(f"{ip.address}: parent subnet missing")
+                    continue
+                try:
+                    await _sync_dns_record(db, ip, sn, action="create")
+                    if ip.id in body.create_for_ip_ids:
+                        created += 1
+                    else:
+                        updated += 1
+                except Exception as exc:
+                    errors.append(f"{ip.address}: {exc}")
 
     if body.delete_stale_record_ids:
         from app.services.dns.record_ops import (  # noqa: PLC0415
@@ -6953,41 +7018,45 @@ async def bulk_allocate_commit(
 
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     created_addrs: list[str] = []
-    for item in items:
-        if item.in_use or item.in_dynamic_pool or item.fqdn_collision:
-            continue
-        ip = IPAddress(
-            subnet_id=subnet_id,
-            address=item.address,
-            status=body.status,
-            hostname=item.hostname,
-            description=body.description,
-            tags=dict(body.tags),
-            custom_fields=dict(body.custom_fields),
-            created_by_user_id=current_user.id,
-        )
-        db.add(ip)
-        await db.flush()
-
-        if body.create_dns_records:
-            await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
-
-        db.add(
-            _audit(
-                current_user,
-                "create",
-                "ip_address",
-                str(ip.id),
-                item.address,
-                new_value={
-                    "address": item.address,
-                    "hostname": item.hostname,
-                    "status": body.status,
-                    "reason": "bulk_allocate",
-                },
+    # Every allocated IP lands in the same subnet → same zone(s); batch the
+    # DNS ops per zone so an agentless Windows-DNS primary takes one WinRM
+    # round trip instead of one per IP (issue #341).
+    async with _batched_dns_ops(db):
+        for item in items:
+            if item.in_use or item.in_dynamic_pool or item.fqdn_collision:
+                continue
+            ip = IPAddress(
+                subnet_id=subnet_id,
+                address=item.address,
+                status=body.status,
+                hostname=item.hostname,
+                description=body.description,
+                tags=dict(body.tags),
+                custom_fields=dict(body.custom_fields),
+                created_by_user_id=current_user.id,
             )
-        )
-        created_addrs.append(item.address)
+            db.add(ip)
+            await db.flush()
+
+            if body.create_dns_records:
+                await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
+
+            db.add(
+                _audit(
+                    current_user,
+                    "create",
+                    "ip_address",
+                    str(ip.id),
+                    item.address,
+                    new_value={
+                        "address": item.address,
+                        "hostname": item.hostname,
+                        "status": body.status,
+                        "reason": "bulk_allocate",
+                    },
+                )
+            )
+            created_addrs.append(item.address)
 
     await db.flush()
     db.add(
@@ -7903,64 +7972,70 @@ async def bulk_edit_addresses(
     # Cache the subnet rows so per-IP DNS sync doesn't re-query for every row.
     subnet_cache: dict[uuid.UUID, Subnet] = {}
 
-    for ip in rows:
-        if ip.status in ("network", "broadcast", "orphan"):
-            skipped.append(ip.id)
-            continue
-        # Skip dynamic-lease mirrors — DHCP server owns their state and any
-        # edit here would be overwritten on the next pull. The UI already
-        # blocks these from being selected; this is defence-in-depth.
-        if ip.auto_from_lease:
-            skipped.append(ip.id)
-            continue
+    # A zone re-assignment edit fans the same op out to one new zone across
+    # every selected IP — batch per zone so an agentless Windows-DNS primary
+    # takes one WinRM round trip instead of one per IP (issue #341).
+    async with _batched_dns_ops(db):
+        for ip in rows:
+            if ip.status in ("network", "broadcast", "orphan"):
+                skipped.append(ip.id)
+                continue
+            # Skip dynamic-lease mirrors — DHCP server owns their state and any
+            # edit here would be overwritten on the next pull. The UI already
+            # blocks these from being selected; this is defence-in-depth.
+            if ip.auto_from_lease:
+                skipped.append(ip.id)
+                continue
 
-        old: dict[str, Any] = {}
-        for k in scalar_changes:
-            old[k] = getattr(ip, k, None)
-        for k, v in scalar_changes.items():
-            setattr(ip, k, v)
+            old: dict[str, Any] = {}
+            for k in scalar_changes:
+                old[k] = getattr(ip, k, None)
+            for k, v in scalar_changes.items():
+                setattr(ip, k, v)
 
-        if tags_patch is not None:
-            merged = dict(ip.tags or {})
-            for k, v in tags_patch.items():
-                if v is None:
-                    merged.pop(k, None)
-                else:
-                    merged[k] = v
-            old["tags"] = ip.tags or {}
-            ip.tags = merged
-        if cf_patch is not None:
-            merged_cf = dict(ip.custom_fields or {})
-            for k, v in cf_patch.items():
-                if v is None:
-                    merged_cf.pop(k, None)
-                else:
-                    merged_cf[k] = v
-            old["custom_fields"] = ip.custom_fields or {}
-            ip.custom_fields = merged_cf
+            if tags_patch is not None:
+                merged = dict(ip.tags or {})
+                for k, v in tags_patch.items():
+                    if v is None:
+                        merged.pop(k, None)
+                    else:
+                        merged[k] = v
+                old["tags"] = ip.tags or {}
+                ip.tags = merged
+            if cf_patch is not None:
+                merged_cf = dict(ip.custom_fields or {})
+                for k, v in cf_patch.items():
+                    if v is None:
+                        merged_cf.pop(k, None)
+                    else:
+                        merged_cf[k] = v
+                old["custom_fields"] = ip.custom_fields or {}
+                ip.custom_fields = merged_cf
 
-        if apply_zone:
-            subnet = subnet_cache.get(ip.subnet_id)
-            if subnet is None:
-                subnet = await db.get(Subnet, ip.subnet_id)
+            if apply_zone:
+                subnet = subnet_cache.get(ip.subnet_id)
+                if subnet is None:
+                    subnet = await db.get(Subnet, ip.subnet_id)
+                    if subnet is not None:
+                        subnet_cache[ip.subnet_id] = subnet
                 if subnet is not None:
-                    subnet_cache[ip.subnet_id] = subnet
-            if subnet is not None:
-                old["forward_zone_id"] = str(ip.forward_zone_id) if ip.forward_zone_id else None
-                await _sync_dns_record(db, ip, subnet, zone_id=new_zone_id, action="update")
+                    old["forward_zone_id"] = str(ip.forward_zone_id) if ip.forward_zone_id else None
+                    await _sync_dns_record(db, ip, subnet, zone_id=new_zone_id, action="update")
 
-        db.add(
-            _audit(
-                current_user,
-                "update",
-                "ip_address",
-                str(ip.id),
-                str(ip.address),
-                old_value={k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in old.items()},
-                new_value={**changes, "batch_id": str(batch_id)},
+            db.add(
+                _audit(
+                    current_user,
+                    "update",
+                    "ip_address",
+                    str(ip.id),
+                    str(ip.address),
+                    old_value={
+                        k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in old.items()
+                    },
+                    new_value={**changes, "batch_id": str(batch_id)},
+                )
             )
-        )
-        updated += 1
+            updated += 1
 
     await db.commit()
     logger.info(
