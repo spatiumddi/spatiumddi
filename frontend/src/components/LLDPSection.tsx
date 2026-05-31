@@ -84,7 +84,9 @@ export function LLDPSection({
     sysDesc !== values.lldp_sys_description ||
     agentx !== values.lldp_snmp_agentx ||
     elin !==
-      String((values.lldp_med_location as { elin?: unknown } | null)?.elin ?? "");
+      String(
+        (values.lldp_med_location as { elin?: unknown } | null)?.elin ?? "",
+      );
 
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
@@ -278,7 +280,11 @@ export function LLDPSection({
         label="SNMP AgentX (LLDP-MIB)"
         description="Register lldpd as an AgentX subagent of the host snmpd so LLDP-MIB (lldpRemTable) is queryable over SNMP. Only meaningful when SNMP is also enabled. Loopback only — no firewall change."
       >
-        <Toggle checked={agentx} onChange={setAgentx} disabled={!isSuperadmin} />
+        <Toggle
+          checked={agentx}
+          onChange={setAgentx}
+          disabled={!isSuperadmin}
+        />
       </Field>
 
       <Field
