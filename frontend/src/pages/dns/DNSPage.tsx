@@ -412,12 +412,13 @@ function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
                 API → Tokens → Generate New Token
               </span>
               , give it a name and{" "}
+              <span className="font-medium text-foreground">Write</span> scope
+              (the DNS API rides the same personal access token), then paste it
+              above. The domains you manage must already be added under{" "}
               <span className="font-medium text-foreground">
-                Write
-              </span>{" "}
-              scope (the DNS API rides the same personal access token), then
-              paste it above. The domains you manage must already be added under{" "}
-              <span className="font-medium text-foreground">Networking → Domains</span>.
+                Networking → Domains
+              </span>
+              .
             </p>
           </div>
         )}
@@ -454,9 +455,7 @@ function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
           <div>
             <p>
               In the Vultr customer portal go to{" "}
-              <span className="font-medium text-foreground">
-                Account → API
-              </span>
+              <span className="font-medium text-foreground">Account → API</span>
               , enable the API, and copy your{" "}
               <span className="font-medium text-foreground">API key</span>. Add
               your IP to the access-control allowlist if enabled, then paste the

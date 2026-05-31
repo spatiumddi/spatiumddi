@@ -6643,7 +6643,8 @@ export type AlertRuleType =
   | "service_resource_orphaned"
   | "compliance_change"
   | "voice_lease_count_below"
-  | "stale_ip_count";
+  | "stale_ip_count"
+  | "dhcp_pool_exhaustion";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with
@@ -6663,6 +6664,7 @@ export interface AlertRule {
   rule_type: AlertRuleType;
   threshold_percent: number | null;
   threshold_days: number | null;
+  min_free_addresses: number | null;
   server_type: AlertServerType | null;
   classification: AlertClassification | null;
   change_scope: AlertChangeScope | null;
@@ -6682,6 +6684,7 @@ export interface AlertRuleCreate {
   rule_type: AlertRuleType;
   threshold_percent?: number | null;
   threshold_days?: number | null;
+  min_free_addresses?: number | null;
   server_type?: AlertServerType | null;
   classification?: AlertClassification | null;
   change_scope?: AlertChangeScope | null;
@@ -6697,6 +6700,7 @@ export interface AlertRuleUpdate {
   enabled?: boolean;
   threshold_percent?: number | null;
   threshold_days?: number | null;
+  min_free_addresses?: number | null;
   server_type?: AlertServerType | null;
   classification?: AlertClassification | null;
   change_scope?: AlertChangeScope | null;
