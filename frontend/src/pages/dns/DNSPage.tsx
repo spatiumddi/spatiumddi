@@ -198,6 +198,10 @@ const CLOUD_DNS_DRIVERS = [
   "route53",
   "azure_dns",
   "google_dns",
+  "digitalocean",
+  "hetzner",
+  "linode",
+  "vultr",
 ] as const;
 type CloudDNSDriver = (typeof CLOUD_DNS_DRIVERS)[number];
 
@@ -206,6 +210,10 @@ const CLOUD_DNS_LABELS: Record<CloudDNSDriver, string> = {
   route53: "AWS Route 53",
   azure_dns: "Azure DNS",
   google_dns: "Google Cloud DNS",
+  digitalocean: "DigitalOcean",
+  hetzner: "Hetzner DNS",
+  linode: "Linode",
+  vultr: "Vultr",
 };
 
 function isCloudDriver(d: string): d is CloudDNSDriver {
@@ -273,6 +281,40 @@ const CLOUD_DNS_FIELDS: Record<CloudDNSDriver, CloudCredField[]> = {
       textarea: true,
     },
     { key: "project_id", label: "Project ID", placeholder: "my-gcp-project" },
+  ],
+  // Token-only providers (issue #327) — a single API token authenticates
+  // both the DNS read + write surfaces.
+  digitalocean: [
+    {
+      key: "api_token",
+      label: "API token",
+      placeholder: "DigitalOcean personal access token",
+      secret: true,
+    },
+  ],
+  hetzner: [
+    {
+      key: "api_token",
+      label: "API token",
+      placeholder: "Hetzner DNS API token",
+      secret: true,
+    },
+  ],
+  linode: [
+    {
+      key: "api_token",
+      label: "API token",
+      placeholder: "Linode personal access token",
+      secret: true,
+    },
+  ],
+  vultr: [
+    {
+      key: "api_token",
+      label: "API key",
+      placeholder: "Vultr API key",
+      secret: true,
+    },
   ],
 };
 
@@ -359,6 +401,66 @@ function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
             <p>
               Paste the contents of <code className="font-mono">key.json</code>{" "}
               into the field above.
+            </p>
+          </div>
+        )}
+        {driver === "digitalocean" && (
+          <div>
+            <p>
+              In the DigitalOcean control panel go to{" "}
+              <span className="font-medium text-foreground">
+                API → Tokens → Generate New Token
+              </span>
+              , give it a name and{" "}
+              <span className="font-medium text-foreground">
+                Write
+              </span>{" "}
+              scope (the DNS API rides the same personal access token), then
+              paste it above. The domains you manage must already be added under{" "}
+              <span className="font-medium text-foreground">Networking → Domains</span>.
+            </p>
+          </div>
+        )}
+        {driver === "hetzner" && (
+          <div>
+            <p>
+              Open the{" "}
+              <span className="font-medium text-foreground">
+                Hetzner DNS Console
+              </span>{" "}
+              (dns.hetzner.com) and go to{" "}
+              <span className="font-medium text-foreground">
+                API tokens → Create access token
+              </span>
+              . This is a DNS-specific token (separate from the Hetzner Cloud
+              API). Paste it above.
+            </p>
+          </div>
+        )}
+        {driver === "linode" && (
+          <div>
+            <p>
+              In the Linode Cloud Manager go to{" "}
+              <span className="font-medium text-foreground">
+                Profile → API Tokens → Create a Personal Access Token
+              </span>{" "}
+              and grant{" "}
+              <span className="font-medium text-foreground">Domains</span>{" "}
+              read/write access. Paste the token above.
+            </p>
+          </div>
+        )}
+        {driver === "vultr" && (
+          <div>
+            <p>
+              In the Vultr customer portal go to{" "}
+              <span className="font-medium text-foreground">
+                Account → API
+              </span>
+              , enable the API, and copy your{" "}
+              <span className="font-medium text-foreground">API key</span>. Add
+              your IP to the access-control allowlist if enabled, then paste the
+              key above.
             </p>
           </div>
         )}
