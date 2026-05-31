@@ -1162,6 +1162,20 @@ class SupervisorHeartbeatResponse(BaseModel):
     # nftables drop-in opening those ports from these peers. Empty on a
     # single-node / non-control-plane appliance.
     cluster_peer_cidrs: list[str] = Field(default_factory=list)
+    # #285 Phase 1 — derived firewall inputs the in-pod renderer uses to
+    # scope the k3s rules. ``firewall_pod_cidrs`` / ``firewall_service_cidrs``
+    # widen the 6443 accept (in-cluster apiserver access traverses INPUT
+    # via the service-IP DNAT with saddr=pod-IP); sent only for nodes that
+    # run the apiserver. ``firewall_dataplane_backend`` +
+    # ``firewall_dataplane_peer_cidrs`` drive the data-plane floor (flannel
+    # VXLAN 8472/udp or wireguard 51820/51821) scoped to the cluster node
+    # IPs so cross-node pod networking survives the base-accept removal.
+    # All additive on the current base conf; authoritative once #285 Phase
+    # 1b removes the LAN-wide base accept.
+    firewall_pod_cidrs: list[str] = Field(default_factory=list)
+    firewall_service_cidrs: list[str] = Field(default_factory=list)
+    firewall_dataplane_backend: str = ""
+    firewall_dataplane_peer_cidrs: list[str] = Field(default_factory=list)
     # #277 — the committed control-plane size (count of settled
     # primary + member nodes, floored at 1). The seed's supervisor
     # patches the spatium-control HelmChart's ``# spatium:cp-size`` lines
@@ -1632,6 +1646,27 @@ async def supervisor_heartbeat(
     # open its k3s server ports to (empty unless row is a CP node).
     cluster_peer_cidrs = await _cluster_peer_cidrs(db, row)
 
+    # #285 Phase 1 — derived firewall inputs for the in-pod renderer.
+    # A node "runs the apiserver" (so 6443 must accept from the pod /
+    # service CIDR) when it's a control-plane variant OR a settled /
+    # in-flight / leaving CP member. pod/service CIDR are sent only for
+    # those nodes so a plain worker doesn't pointlessly open 6443.
+    runs_apiserver = (
+        row.appliance_variant in ("control-plane", "full-stack", "frontend-core")
+        or row.cluster_role in (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+        or row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+        or (
+            row.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
+            and row.cluster_join_state != CLUSTER_JOIN_STATE_LEFT
+        )
+    )
+    firewall_pod_cidrs = _split_cidr_csv(row.pod_cidr) if runs_apiserver else []
+    firewall_service_cidrs = _split_cidr_csv(row.service_cidr) if runs_apiserver else []
+    # Default to the k3s upstream backend when a pre-#285 supervisor
+    # hasn't reported one yet, so the data-plane floor still renders.
+    firewall_dataplane_backend = row.dataplane_backend or "vxlan"
+    firewall_dataplane_peer_cidrs = await _all_cluster_node_cidrs(db, row)
+
     # #277 — committed control-plane size (settled primary + members,
     # floored at 1). The seed supervisor scales CNPG instances +
     # workload replicas to this.
@@ -1700,6 +1735,10 @@ async def supervisor_heartbeat(
         desired_k3s_server_url=row.desired_k3s_server_url,
         desired_k3s_join_token=desired_join_token,
         cluster_peer_cidrs=cluster_peer_cidrs,
+        firewall_pod_cidrs=firewall_pod_cidrs,
+        firewall_service_cidrs=firewall_service_cidrs,
+        firewall_dataplane_backend=firewall_dataplane_backend,
+        firewall_dataplane_peer_cidrs=firewall_dataplane_peer_cidrs,
         control_plane_size=control_plane_size,
         desired_metallb_enabled=metallb_enabled,
         desired_metallb_pool_addresses=metallb_pool,
@@ -2849,25 +2888,126 @@ async def _committed_cp_count(db: DB) -> int:
     return max(1, int(n))
 
 
+def _split_cidr_csv(value: str | None) -> list[str]:
+    """Split a (possibly comma-joined dual-stack) CIDR field into entries.
+
+    k3s ``cluster-cidr`` / ``service-cidr`` are a single value on a
+    v4-only cluster and a comma-joined pair on a dual-stack cluster
+    (``10.42.0.0/16,2001:cafe:42::/56``). The renderer family-splits the
+    result, so order doesn't matter here.
+    """
+    return [c.strip() for c in (value or "").split(",") if c.strip()]
+
+
+def _node_cidrs(ap: Appliance) -> list[str]:
+    """Every InternalIP of an appliance as a host CIDR — ``/32`` for v4,
+    ``/128`` for v6 (#285 Phase 1).
+
+    Prefers the all-family ``node_ips`` list; falls back to the single
+    ``node_ip`` (as ``/32``) for a pre-#285 supervisor that hasn't
+    reported ``node_ips`` yet. The family split is what lets a v6 peer
+    be scoped by its real ``/128`` rather than a fabricated ``/32``.
+    """
+    ips = list(ap.node_ips or [])
+    if not ips and ap.node_ip:
+        ips = [ap.node_ip]
+    out: list[str] = []
+    for ip in ips:
+        try:
+            addr = ipaddress.ip_address(str(ip).strip())
+        except ValueError:
+            continue
+        out.append(f"{addr}/{128 if addr.version == 6 else 32}")
+    return out
+
+
+async def _firewall_peer_members(db: DB) -> list[Appliance]:
+    """CP members for firewall peer-scoping — like ``_effective_cp_members``
+    but ASYMMETRIC ON LEAVE (#285 Phase 1).
+
+    An in-flight leaver (``desired_cluster_role='none'``) is KEPT in the
+    set until its ``cluster_join_state`` reaches ``left``, so the
+    destructive etcd member-remove can still reach its peers (and they
+    it) during the leave window. Only the next render after ``left``
+    drops it. Mirrors the cert-SAN only-grow safety exactly — the
+    dangerous direction (removing a peer) is delayed until the operation
+    that needs the rule has completed.
+    """
+    rows = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    or_(
+                        Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                        Appliance.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER,
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Keep settled members + in-flight joiners + in-flight leavers; drop
+    # only a leaver that has fully reported ``left`` (its etcd surgery is
+    # done, so it no longer needs — nor should be granted — peer access).
+    return [r for r in rows if r.cluster_join_state != CLUSTER_JOIN_STATE_LEFT]
+
+
 async def _cluster_peer_cidrs(db: DB, row: Appliance) -> list[str]:
-    """``/32`` CIDRs of every OTHER control-plane peer ``row`` must open
-    its k3s server ports to (#272 Phase 7b).
+    """Host CIDRs (``/32`` v4 + ``/128`` v6) of every OTHER control-plane
+    peer ``row`` must open its k3s server ports to (#272 Phase 7b, #285).
 
     Only meaningful when ``row`` is itself a control-plane node — a
-    settled member/primary, or a node mid-promotion
-    (``desired_cluster_role='member'``). In-flight joiners need the peer
-    set too: the seed must open :6443 to the joiner BEFORE it connects,
-    and the joiner must open etcd ports back. Returns an empty list for
-    plain application appliances + single-node installs (no peers).
+    settled member/primary, a node mid-promotion
+    (``desired_cluster_role='member'``), or a node mid-LEAVE that hasn't
+    fully left yet (so the etcd member-remove can complete). In-flight
+    joiners need the peer set too: the seed must open :6443 to the joiner
+    BEFORE it connects, and the joiner must open etcd ports back. Returns
+    an empty list for plain application appliances + single-node installs
+    (no peers).
     """
     is_cp = (
         row.cluster_role in (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
         or row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+        or (
+            row.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
+            and row.cluster_join_state != CLUSTER_JOIN_STATE_LEFT
+        )
     )
     if not is_cp:
         return []
-    members = await _effective_cp_members(db)
-    return sorted(f"{m.node_ip}/32" for m in members if m.id != row.id and m.node_ip)
+    members = await _firewall_peer_members(db)
+    out: list[str] = []
+    for m in members:
+        if m.id == row.id:
+            continue
+        out.extend(_node_cidrs(m))
+    return sorted(set(out))
+
+
+async def _all_cluster_node_cidrs(db: DB, row: Appliance) -> list[str]:
+    """Host CIDRs of every OTHER cluster node — the data-plane peer set
+    (#285 Phase 1).
+
+    flannel VXLAN / wireguard runs between every pod-running node, so the
+    data-plane floor must open the inter-node port to all of them, not
+    just the control-plane peers. Phase-1 superset = every approved
+    appliance with a node IP (minus self); harmless if it includes a few
+    non-cluster boxes (they never send VXLAN). Refined to the precise
+    cluster-node set in a later phase once node membership is mirrored.
+    """
+    rows = (
+        (await db.execute(select(Appliance).where(Appliance.state == APPLIANCE_STATE_APPROVED)))
+        .scalars()
+        .all()
+    )
+    out: list[str] = []
+    for m in rows:
+        if m.id == row.id:
+            continue
+        out.extend(_node_cidrs(m))
+    return sorted(set(out))
 
 
 async def _resolve_primary(db: DB, members: list[Appliance]) -> Appliance | None:

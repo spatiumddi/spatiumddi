@@ -1,7 +1,8 @@
 """Role-driven nftables drop-in renderer for the supervisor (#170 Wave C3).
 
 Builds the body of ``/etc/nftables.d/spatium-role.nft`` from the
-control plane's ``role_assignment`` block. The host's master
+control plane's ``role_assignment`` block plus the derived firewall
+inputs the heartbeat now carries (#285 Phase 1). The host's master
 ``/etc/nftables.conf`` includes everything under
 ``/etc/nftables.d/*.nft`` inside the inet filter table's ``input``
 chain (same pattern the SNMP / NTP drop-ins already use, per
@@ -10,17 +11,43 @@ chain (same pattern the SNMP / NTP drop-ins already use, per
 Always-open management rules (regardless of role):
 
 * SSH (operator escape hatch).
-* ICMP echo-request (monitoring).
+* ICMP / ICMPv6 echo-request (monitoring).
 * Loopback.
 * Established / related (the master conf's first input rule
   already covers this — we don't restate it).
+
+Data-plane floor (#285 Phase 1 — every pod-running node):
+
+* flannel VXLAN ``udp/8472`` (or wireguard-native ``udp/51820`` +
+  ``udp/51821``) scoped to the cluster node IPs, so cross-node pod
+  networking survives once the LAN-wide base accept is removed. Read
+  from the k3s ``flannel-backend`` setting — never assumed; an
+  unknown / host-gw backend opens nothing (host-gw routes via the
+  FORWARD chain, not INPUT) and is treated as fail-open for the data
+  plane (the base policy / operator handles it).
 
 Per-role openings:
 
 * ``dns-bind9`` / ``dns-powerdns``: UDP + TCP / 53.
 * ``dhcp``: UDP / 67, 68.
-* ``observer``: no ports — runs as a metrics shipper.
-* ``custom``: no ports.
+* ``observer`` / ``custom``: no ports.
+
+Control-plane derived (#272 Phase 7b + #285 Phase 1 — CP nodes only):
+
+* etcd ``2379`` / ``2380`` + kubelet ``10250`` scoped to the peer
+  node IPs — NEVER LAN-wide (the #285 hardening).
+* kube-apiserver ``6443`` scoped to peers ∪ pod CIDR ∪ service CIDR ∪
+  the operator ``kubeapi_expose_cidrs`` allowlist (in-cluster
+  apiserver access traverses INPUT via the service-IP DNAT with
+  ``saddr=pod-IP``).
+* MetalLB memberlist ``7946`` tcp+udp scoped to peers, emitted only
+  when the cluster is genuinely multi-node (``cp_member_count >= 2``)
+  AND a control-plane VIP is configured — otherwise VIP failover
+  silently stops the moment the base accept is removed.
+
+All saddr sets are family-split (``ip saddr`` for v4, ``ip6 saddr``
+for v6) so a v6 peer is scoped by its real ``/128`` rather than a
+fabricated ``/32``, and a v6 entry can never leak into a v4 set.
 
 Operator override: ``firewall_extra`` is appended verbatim at the
 end of the drop-in. The supervisor runs ``nft -c -f`` against the
@@ -44,15 +71,15 @@ log = structlog.get_logger(__name__)
 
 
 def _validated_cidrs(raw: list[Any]) -> list[str]:
-    """Filter ``raw`` down to syntactically valid CIDR strings.
+    """Filter ``raw`` down to syntactically valid, canonicalised CIDR
+    strings.
 
-    Issue #236 — the control plane's ``kubeapi_expose_cidrs`` list was
-    previously inlined verbatim into the nft rule. An invalid (or
-    malicious) entry like ``1.2.3.4 }, drop; tcp dport 22 accept; #``
-    would inject extra nft rules into the host firewall. Reject
-    anything that doesn't round-trip through ``ipaddress.ip_network``
-    in strict=False mode; log the bad entry + drop it from the
-    rendered allowlist.
+    Issue #236 — the control plane's CIDR lists were previously inlined
+    verbatim into the nft rule. An invalid (or malicious) entry like
+    ``1.2.3.4 }, drop; tcp dport 22 accept; #`` would inject extra nft
+    rules into the host firewall. Reject anything that doesn't round-trip
+    through ``ipaddress.ip_network`` in strict=False mode; log the bad
+    entry + drop it from the rendered allowlist.
     """
     out: list[str] = []
     for c in raw:
@@ -78,6 +105,27 @@ def _validated_cidrs(raw: list[Any]) -> list[str]:
     return out
 
 
+def _split_families(cidrs: list[Any]) -> tuple[list[str], list[str]]:
+    """Validate ``cidrs`` and split into (v4, v6) canonical lists.
+
+    Each list is de-duplicated + sorted so the rendered saddr set is
+    deterministic (a benign reorder upstream doesn't shift the body
+    hash the heartbeat compares against). #285 Phase 1 — the
+    family-split is what lets a v6 peer be scoped by its ``/128``
+    instead of leaking into / fabricating a v4 ``/32``.
+    """
+    v4: set[str] = set()
+    v6: set[str] = set()
+    for c in _validated_cidrs(cidrs):
+        # _validated_cidrs already round-tripped through ip_network, so
+        # this parse can't raise.
+        if ipaddress.ip_network(c, strict=False).version == 6:
+            v6.add(c)
+        else:
+            v4.add(c)
+    return sorted(v4), sorted(v6)
+
+
 @dataclass(frozen=True)
 class FirewallProfile:
     """Result of compiling a role_assignment block into an nftables
@@ -88,12 +136,10 @@ class FirewallProfile:
     logs it on each apply so journalctl shows the active profile
     without having to inspect the file itself.
 
-    ``expected_tcp_ports`` + ``expected_udp_ports`` carry the role-
-    derived service ports the supervisor's periodic live-ruleset
-    check inspects via ``nft list chain inet filter input`` (#170
-    Wave D follow-up — drift detection on the firewall, mirroring
-    the same shape as the container-watchdog idea in the open #170
-    follow-up). Empty for idle / observer / custom roles.
+    ``expected_tcp_ports`` + ``expected_udp_ports`` carry the union of
+    service ports the drop-in opens. Retained for reference / any
+    future live-ruleset check; the supervisor's drift detection keys
+    off the full-body hash (heartbeat.py Phase 9), not these sets.
     """
 
     name: str
@@ -102,9 +148,9 @@ class FirewallProfile:
     expected_udp_ports: frozenset[int] = frozenset()
 
 
-# Per-role port set. Empty list = no service ports opened (the
-# role still runs, just doesn't accept inbound traffic on a known
-# port — observer is the canonical example).
+# Per-role service port set. Empty = no service ports opened (the role
+# still runs, just doesn't accept inbound on a known port — observer is
+# the canonical example).
 _ROLE_PORTS_TCP: dict[str, list[int]] = {
     "dns-bind9": [53],
     "dns-powerdns": [53],
@@ -113,6 +159,25 @@ _ROLE_PORTS_UDP: dict[str, list[int]] = {
     "dns-bind9": [53],
     "dns-powerdns": [53],
     "dhcp": [67, 68],
+}
+
+# #285 Phase 1 — control-plane peer ports, split by purpose so each can
+# carry the right source scope. etcd + kubelet are peer-ONLY (the #285
+# hardening); 6443 widens to peers ∪ pod ∪ svc ∪ kubeapi_expose;
+# memberlist is peer-only + gated on multi-node + VIP.
+_K3S_ETCD_KUBELET_TCP: tuple[int, ...] = (2379, 2380, 10250)
+_K3S_APISERVER_TCP = 6443
+_METALLB_MEMBERLIST = 7946
+# Union of every k3s server port this renderer scopes — kept as a module
+# constant for reference / tests.
+_K3S_PEER_PORTS_TCP: tuple[int, ...] = (2379, 2380, 6443, 10250)
+
+# #285 Phase 1 — k3s data-plane backend → the inter-node INPUT port(s)
+# that must stay open between cluster nodes. host-gw / unknown route via
+# FORWARD (no INPUT port) so they map to no ports (fail-open).
+_DATAPLANE_UDP_PORTS: dict[str, list[int]] = {
+    "vxlan": [8472],
+    "wireguard-native": [51820, 51821],
 }
 
 
@@ -128,48 +193,68 @@ def _profile_name(roles: list[str]) -> str:
     return "idle"
 
 
-# #272 Phase 7b — k3s server-to-server ports a control-plane member
-# must accept FROM its peers' node IPs. The base appliance firewall
-# only opens :6443 from the pod CIDR (10.42.0.0/16), so the cross-node
-# join handshake (joiner → seed:6443) + etcd quorum (2379/2380) +
-# kubelet (10250) are dropped by the default policy without these.
-# Restricted to the peer saddr set so we don't expose the kubeapi /
-# etcd to the whole LAN.
-_K3S_PEER_PORTS_TCP: tuple[int, ...] = (2379, 2380, 6443, 10250)
+def _emit_family_rule(
+    lines: list[str],
+    v4: list[str],
+    v6: list[str],
+    rule_suffix: str,
+    comment: str,
+) -> None:
+    """Append family-split ``ip[6] saddr { ... } <rule_suffix>`` lines
+    for whichever family has members. ``rule_suffix`` is e.g.
+    ``tcp dport { 2379, 2380, 10250 } accept`` or ``udp dport 8472
+    accept``."""
+    if v4:
+        lines.append(f'ip saddr {{ {", ".join(v4)} }} {rule_suffix} comment "{comment}-v4"')
+    if v6:
+        lines.append(f'ip6 saddr {{ {", ".join(v6)} }} {rule_suffix} comment "{comment}-v6"')
 
 
 def render_drop_in(
     role_assignment: dict[str, Any] | None,
     cluster_peer_cidrs: list[Any] | None = None,
+    *,
+    pod_cidrs: list[Any] | None = None,
+    service_cidrs: list[Any] | None = None,
+    dataplane_backend: str | None = None,
+    dataplane_peer_cidrs: list[Any] | None = None,
+    cp_member_count: int = 1,
+    vip_configured: bool = False,
 ) -> FirewallProfile:
-    """Translate a role_assignment block into an nftables drop-in body.
+    """Translate a role_assignment + the heartbeat's derived firewall
+    inputs into an nftables drop-in body.
 
-    Always emits the management rules + per-role rules + the
-    operator's ``firewall_extra`` (if any). Idle (no roles)
-    appliances get a body with management rules only — the appliance
-    stays SSH-reachable + pingable but doesn't accept any service
-    traffic.
+    Always emits the management rules; then the data-plane floor (if a
+    backend port + peer set are known); then per-role service rules;
+    then the control-plane-derived peer/apiserver/memberlist rules (CP
+    nodes only — ``cluster_peer_cidrs`` empty ⇒ skip etcd/kubelet);
+    then the operator's ``firewall_extra``. Idle appliances get
+    management rules only.
 
-    Header carries a "generated by spatium-supervisor" warning + the
-    profile name so operators inspecting the file know what created
-    it and what role set is currently active.
+    Every fragment is a bare ``proto dport N accept`` (or
+    ``ip[6] saddr { ... } …``) since the include glob sits *inside*
+    ``chain input`` in the master conf.
+
+    This drop-in is purely ADDITIVE on the current baked base conf
+    (which still opens the k3s ports LAN-wide); it only becomes
+    authoritative once the base conf's LAN-wide ``k3s-ha`` accept is
+    removed (#285 Phase 1b, slot-image change).
     """
     role_assignment = role_assignment or {}
     roles = [r for r in (role_assignment.get("roles") or []) if isinstance(r, str)]
     firewall_extra = role_assignment.get("firewall_extra") or ""
-    # Issue #183 Phase 6 — operator-controlled CIDR allowlist for
-    # direct kubeapi access on tcp/6443. Empty / missing = proxy-
-    # only (kubeapi stays on 127.0.0.1; only the supervisor's
-    # outbound proxy channel can drive it).
-    #
-    # Issue #236 — each entry MUST validate via ipaddress.ip_network
-    # before it lands in the nft saddr set. The pre-#236 path
-    # ``c.strip()``-cleaned but never type-checked, so an injected
-    # ``1.2.3.4 }, drop; ... #`` would slip arbitrary nft into the
-    # filter table when ``nft -f`` reloaded the drop-in.
-    kubeapi_cidrs = _validated_cidrs(role_assignment.get("kubeapi_expose_cidrs") or [])
+    # Issue #183 Phase 6 — operator-controlled CIDR allowlist for direct
+    # kubeapi access on tcp/6443. Folded into the 6443 saddr set below.
+    # Issue #236 — each entry MUST validate before it lands in the set.
+    kubeapi_cidrs = role_assignment.get("kubeapi_expose_cidrs") or []
 
     profile = _profile_name(roles)
+    peer_v4, peer_v6 = _split_families(cluster_peer_cidrs or [])
+    is_cp = bool(peer_v4 or peer_v6) or bool(pod_cidrs) or bool(service_cidrs)
+
+    tcp_ports: set[int] = set()
+    udp_ports: set[int] = set()
+
     lines: list[str] = []
     lines.append(
         "# Auto-generated by spatium-supervisor — do not hand-edit. "
@@ -185,61 +270,94 @@ def render_drop_in(
     lines.append('icmpv6 type echo-request accept comment "icmpv6 ping"')
     lines.append('iif lo accept comment "loopback"')
 
-    # Per-role openings. UDP first then TCP so re-reading the file
-    # follows the "lower-layer protocol then higher" mental model.
-    tcp_ports: set[int] = set()
-    udp_ports: set[int] = set()
-    for role in roles:
-        tcp_ports.update(_ROLE_PORTS_TCP.get(role, []))
-        udp_ports.update(_ROLE_PORTS_UDP.get(role, []))
+    # ── Data-plane floor (#285 Phase 1) ────────────────────────────────
+    # flannel VXLAN / wireguard between cluster nodes. Peer-scoped on
+    # every pod-running node so cross-node pod networking survives the
+    # base-accept removal. host-gw / unknown backend → no INPUT port.
+    dp_ports = _DATAPLANE_UDP_PORTS.get((dataplane_backend or "").strip().lower(), [])
+    dp_v4, dp_v6 = _split_families(dataplane_peer_cidrs or [])
+    if dp_ports and (dp_v4 or dp_v6):
+        lines.append("")
+        lines.append("# ── Data-plane floor (k3s inter-node, #285) ────────────")
+        port_set = (
+            "{ " + ", ".join(str(p) for p in dp_ports) + " }"
+            if len(dp_ports) > 1
+            else str(dp_ports[0])
+        )
+        _emit_family_rule(
+            lines, dp_v4, dp_v6, f"udp dport {port_set} accept", f"dataplane-{dataplane_backend}"
+        )
+        udp_ports.update(dp_ports)
 
-    if udp_ports or tcp_ports:
+    # ── Per-role service ports ─────────────────────────────────────────
+    role_tcp: set[int] = set()
+    role_udp: set[int] = set()
+    for role in roles:
+        role_tcp.update(_ROLE_PORTS_TCP.get(role, []))
+        role_udp.update(_ROLE_PORTS_UDP.get(role, []))
+    if role_udp or role_tcp:
         lines.append("")
         lines.append("# ── Per-role service ports ─────────────────────────────")
-    for port in sorted(udp_ports):
+    for port in sorted(role_udp):
         lines.append(f'udp dport {port} accept comment "role:{profile}"')
-    for port in sorted(tcp_ports):
+    for port in sorted(role_tcp):
         lines.append(f'tcp dport {port} accept comment "role:{profile}"')
+    tcp_ports.update(role_tcp)
+    udp_ports.update(role_udp)
 
-    # Issue #183 Phase 6 — kubeapi direct-access allowlist. One
-    # ``ip saddr { ... } tcp dport 6443 accept`` rule when non-
-    # empty; complements the Phase 4 outbound proxy (which works
-    # regardless of these CIDRs). The supervisor's drift checker
-    # tracks ``tcp/6443`` in ``expected_tcp_ports`` only when the
-    # allowlist is non-empty — proxy-only mode keeps it OUT of the
-    # expected set so the drift watcher doesn't false-positive a
-    # missing rule.
-    if kubeapi_cidrs:
+    # ── Control-plane derived (CP nodes only) ──────────────────────────
+    if is_cp:
         lines.append("")
-        lines.append("# ── kubeapi (operator-allowed CIDRs, #183 Phase 6) ──────")
-        # ``_validated_cidrs`` above already canonicalised each entry
-        # via ``ipaddress.ip_network``; safe to inline.
-        cidrs_inline = ", ".join(kubeapi_cidrs)
-        lines.append(
-            f"ip saddr {{ {cidrs_inline} }} tcp dport 6443 accept " f'comment "kubeapi-direct"'
-        )
-        tcp_ports.add(6443)
-
-    # #272 Phase 7b — control-plane peer ports. One ``ip saddr { ... }``
-    # rule per k3s server port, restricted to the peer node IPs the
-    # control plane handed us. ``_validated_cidrs`` canonicalises +
-    # rejects injection, same as the kubeapi allowlist above.
-    peer_cidrs = _validated_cidrs(cluster_peer_cidrs or [])
-    if peer_cidrs:
-        lines.append("")
-        lines.append("# ── k3s control-plane peers (#272 Phase 7b) ────────────")
-        peers_inline = ", ".join(peer_cidrs)
-        for port in _K3S_PEER_PORTS_TCP:
-            lines.append(
-                f"ip saddr {{ {peers_inline} }} tcp dport {port} accept " f'comment "k3s-cp-peer"'
+        lines.append("# ── Control-plane derived (peer-scoped, #272/#285) ─────")
+        # etcd + kubelet — peers ONLY, never LAN-wide (the #285 fix).
+        if peer_v4 or peer_v6:
+            etcd_kubelet = "{ " + ", ".join(str(p) for p in _K3S_ETCD_KUBELET_TCP) + " }"
+            _emit_family_rule(
+                lines, peer_v4, peer_v6, f"tcp dport {etcd_kubelet} accept", "k3s-peer"
             )
-            tcp_ports.add(port)
+            tcp_ports.update(_K3S_ETCD_KUBELET_TCP)
+        # apiserver 6443 — peers ∪ pod ∪ svc ∪ kubeapi_expose.
+        api_v4, api_v6 = _split_families(
+            list(cluster_peer_cidrs or [])
+            + list(pod_cidrs or [])
+            + list(service_cidrs or [])
+            + list(kubeapi_cidrs)
+        )
+        if api_v4 or api_v6:
+            _emit_family_rule(
+                lines,
+                api_v4,
+                api_v6,
+                f"tcp dport {_K3S_APISERVER_TCP} accept",
+                "kubeapi",
+            )
+            tcp_ports.add(_K3S_APISERVER_TCP)
+        # MetalLB memberlist 7946 tcp+udp — peers only, gated on a
+        # genuinely multi-node cluster + a configured VIP. Derived from
+        # the membership model, NOT a metallb_enabled flag the
+        # supervisor doesn't mirror; without it VIP failover silently
+        # stops the moment the base accept is removed.
+        if (peer_v4 or peer_v6) and cp_member_count >= 2 and vip_configured:
+            _emit_family_rule(
+                lines,
+                peer_v4,
+                peer_v6,
+                f"tcp dport {_METALLB_MEMBERLIST} accept",
+                "metallb-memberlist-tcp",
+            )
+            _emit_family_rule(
+                lines,
+                peer_v4,
+                peer_v6,
+                f"udp dport {_METALLB_MEMBERLIST} accept",
+                "metallb-memberlist-udp",
+            )
+            tcp_ports.add(_METALLB_MEMBERLIST)
+            udp_ports.add(_METALLB_MEMBERLIST)
 
     if firewall_extra.strip():
         lines.append("")
         lines.append("# ── Operator override (firewall_extra) ─────────────────")
-        # Strip a trailing newline so we don't get a blank line at EOF;
-        # we'll add one in the join below.
         lines.append(firewall_extra.rstrip("\n"))
 
     body = "\n".join(lines) + "\n"

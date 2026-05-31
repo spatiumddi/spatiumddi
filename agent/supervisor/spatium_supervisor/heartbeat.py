@@ -318,6 +318,13 @@ def _maybe_apply_firewall(
     role_assignment: dict[str, Any] | None,
     log: structlog.stdlib.BoundLogger,
     cluster_peer_cidrs: list[Any] | None = None,
+    *,
+    pod_cidrs: list[Any] | None = None,
+    service_cidrs: list[Any] | None = None,
+    dataplane_backend: str | None = None,
+    dataplane_peer_cidrs: list[Any] | None = None,
+    cp_member_count: int = 1,
+    vip_configured: bool = False,
 ) -> None:
     """Render the firewall drop-in + write a trigger file the host
     runner picks up.
@@ -347,7 +354,16 @@ def _maybe_apply_firewall(
     if appliance_state.detect_deployment_kind() != "appliance":
         return
 
-    profile: FirewallProfile = render_drop_in(role_assignment, cluster_peer_cidrs)
+    profile: FirewallProfile = render_drop_in(
+        role_assignment,
+        cluster_peer_cidrs,
+        pod_cidrs=pod_cidrs,
+        service_cidrs=service_cidrs,
+        dataplane_backend=dataplane_backend,
+        dataplane_peer_cidrs=dataplane_peer_cidrs,
+        cp_member_count=cp_member_count,
+        vip_configured=vip_configured,
+    )
     body = profile.body
     body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -758,8 +774,29 @@ def heartbeat_once(
     # ESSENTIAL — apply them whenever the control plane hands us a peer
     # set, regardless of that gate.
     cluster_peer_cidrs = body_out.get("cluster_peer_cidrs") or []
-    if cfg.in_pod_firewall_enabled or cluster_peer_cidrs:
-        _maybe_apply_firewall(role_assignment, log, cluster_peer_cidrs)
+    # #285 Phase 1 — derived firewall inputs the control plane now ships:
+    # pod/service CIDR widen the 6443 accept, and the data-plane peer set
+    # drives the flannel/wireguard floor so cross-node pod networking
+    # survives the base-accept removal. cp_member_count + the VIP gate
+    # whether MetalLB memberlist (7946) is opened.
+    fw_pod_cidrs = body_out.get("firewall_pod_cidrs") or []
+    fw_service_cidrs = body_out.get("firewall_service_cidrs") or []
+    fw_dataplane_backend = body_out.get("firewall_dataplane_backend") or ""
+    fw_dataplane_peer_cidrs = body_out.get("firewall_dataplane_peer_cidrs") or []
+    fw_cp_member_count = int(body_out.get("control_plane_size") or 1)
+    fw_vip_configured = bool(body_out.get("desired_control_plane_vip") or "")
+    if cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_dataplane_peer_cidrs or fw_pod_cidrs:
+        _maybe_apply_firewall(
+            role_assignment,
+            log,
+            cluster_peer_cidrs,
+            pod_cidrs=fw_pod_cidrs,
+            service_cidrs=fw_service_cidrs,
+            dataplane_backend=fw_dataplane_backend,
+            dataplane_peer_cidrs=fw_dataplane_peer_cidrs,
+            cp_member_count=fw_cp_member_count,
+            vip_configured=fw_vip_configured,
+        )
 
     target = compute_target_env(role_assignment)
     # #170 Wave D follow-up — the role env file carries ONLY role-
