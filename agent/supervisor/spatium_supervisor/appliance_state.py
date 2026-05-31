@@ -30,6 +30,7 @@ circuited by ``detect_deployment_kind()``'s appliance gate.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1045,6 +1046,16 @@ _HOST_K3S_KUBECONFIG = Path("/etc/spatiumddi-host/rancher/k3s/k3s.yaml")
 _DIRECT_K3S_KUBECONFIG = Path("/etc/rancher/k3s/k3s.yaml")
 _K3S_VERSION_SIDECAR = Path("/usr/share/doc/k3s/.version")
 
+# Issue #285 Phase 1 — firewall prerequisites. The k3s config files are
+# already reachable via the ``/etc/rancher/k3s`` (kubeconfig) bind mount;
+# the live base nftables.conf is exposed by a dedicated read-only File
+# mount the supervisor DaemonSet adds in #285 (absent on older charts /
+# non-appliance, where the reader returns None).
+_K3S_CIDRS_DROPIN = Path("/etc/rancher/k3s/config.yaml.d/spatium-cidrs.yaml")
+_K3S_MAIN_CONFIG = Path("/etc/rancher/k3s/config.yaml")
+_K3S_CONFIG_DIR = Path("/etc/rancher/k3s/config.yaml.d")
+_HOST_NFTABLES_CONF = Path("/etc/nftables-host.conf")
+
 
 def read_k3s_version() -> str | None:
     """Issue #183 Phase 5 — installed k3s version stamped by the
@@ -1271,6 +1282,143 @@ def read_node_ip() -> str | None:
     return None
 
 
+# ── Issue #285 Phase 1 — fleet-firewall prerequisites ────────────────
+
+
+def read_node_ips() -> list[str] | None:
+    """Every k3s-registered InternalIP for this node (#285 Phase 1).
+
+    Unlike ``read_node_ip()`` (the first InternalIP, the join-URL
+    source), this returns ALL InternalIPs — both families on a dual-stack
+    cluster — so the firewall compiler can derive a family-split peer set
+    (``/32`` v4 + ``/128`` v6) instead of fabricating a garbage ``/32``
+    from a v6 address. Returns ``None`` when not k3s / NODE_NAME unset /
+    probe fails / no InternalIP found, so the backend's "only update when
+    not None" semantics leave the column alone.
+    """
+    if detect_runtime() != "k3s":
+        return None
+    node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME")
+    if not node_name:
+        return None
+
+    from urllib.parse import quote  # noqa: PLC0415
+
+    from . import k8s_api  # noqa: PLC0415
+
+    try:
+        status_code, body = k8s_api._request("GET", f"/api/v1/nodes/{quote(node_name)}")
+    except (RuntimeError, OSError):
+        return None
+    if status_code != 200:
+        return None
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    ips = [
+        str(addr["address"])
+        for addr in (data.get("status") or {}).get("addresses") or []
+        if addr.get("type") == "InternalIP" and addr.get("address")
+    ]
+    return ips or None
+
+
+def _scan_flannel_backend(text: str) -> str | None:
+    """Return the ``flannel-backend:`` value from a k3s YAML config body,
+    or None when the key isn't present."""
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("flannel-backend:"):
+            return s.split(":", 1)[1].strip().strip('"').strip("'") or None
+    return None
+
+
+def read_cluster_cidrs() -> tuple[str | None, str | None, str | None]:
+    """Parse ``(pod_cidr, service_cidr, dataplane_backend)`` from the k3s
+    config (#285 / #302 Phase 1).
+
+    pod/service CIDR come from the ``spatium-cidrs.yaml`` drop-in the
+    install wizard writes (``cluster-cidr`` / ``service-cidr``; may be a
+    comma-joined dual-stack pair). ``flannel-backend`` is scanned across
+    the main ``config.yaml`` + every ``config.yaml.d/*.yaml`` drop-in,
+    defaulting to ``vxlan`` (k3s upstream default) when unset.
+
+    Returns ``(None, None, None)`` off k3s. On a k3s appliance the
+    backend always resolves (defaults to ``vxlan``); pod/service CIDR may
+    still be None on a pre-#302 install with no drop-in, so the backend's
+    "only update when not None" semantics leave those columns alone.
+    """
+    if detect_runtime() != "k3s":
+        return None, None, None
+
+    pod_cidr: str | None = None
+    service_cidr: str | None = None
+    if _K3S_CIDRS_DROPIN.exists():
+        try:
+            for line in _K3S_CIDRS_DROPIN.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                s = line.strip()
+                if s.startswith("cluster-cidr:"):
+                    pod_cidr = s.split(":", 1)[1].strip().strip('"').strip("'") or None
+                elif s.startswith("service-cidr:"):
+                    service_cidr = s.split(":", 1)[1].strip().strip('"').strip("'") or None
+        except OSError:
+            pass
+
+    # flannel-backend: main config first, then drop-ins in sorted order;
+    # first match wins. Default to the k3s upstream ``vxlan`` when nothing
+    # set it explicitly.
+    backend: str | None = None
+    candidates = [_K3S_MAIN_CONFIG]
+    try:
+        candidates += sorted(_K3S_CONFIG_DIR.glob("*.yaml"))
+    except OSError:
+        pass
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            found = _scan_flannel_backend(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if found:
+            backend = found
+            break
+    if backend is None:
+        backend = "vxlan"
+
+    return pod_cidr, service_cidr, backend
+
+
+def read_base_conf_marker() -> tuple[str | None, bool | None]:
+    """Hash the live base ``/etc/nftables.conf`` + detect the legacy
+    LAN-wide k3s accept (#285 Phase 1).
+
+    Returns ``(sha256_hex, lanwide_k3s_present)``. The boolean is the
+    self-describing "is this the legacy LAN-wide base or a hardened one"
+    signal that gates the UI/compliance claim; the hash is for generic
+    change detection. ``(None, None)`` when the file isn't mounted
+    (non-appliance / older chart without the read-only mount), so the
+    backend leaves both columns untouched.
+    """
+    if detect_deployment_kind() != "appliance":
+        return None, None
+    if not _HOST_NFTABLES_CONF.exists():
+        return None, None
+    try:
+        raw = _HOST_NFTABLES_CONF.read_bytes()
+    except OSError:
+        return None, None
+    marker = hashlib.sha256(raw).hexdigest()
+    # The legacy LAN-wide accept carries the literal ``comment "k3s-ha"``
+    # tag (see appliance/mkosi.extra/etc/nftables.conf). Its presence ⇒
+    # etcd/kubelet are still LAN-wide; its absence ⇒ a hardened base.
+    lanwide = 'comment "k3s-ha"' in raw.decode("utf-8", errors="replace")
+    return marker, lanwide
+
+
 def collect() -> dict[str, object]:
     """Snapshot the agent's slot + deployment state for the heartbeat.
 
@@ -1296,6 +1444,13 @@ def collect() -> dict[str, object]:
     kubeconfig = read_kubeconfig() if is_appliance else None
     k3s_api_cert_expires_at = read_k3s_api_cert_expiry() if is_appliance else None
     node_ip = read_node_ip() if is_appliance else None
+
+    # Issue #285 Phase 1 — firewall prerequisites.
+    node_ips = read_node_ips() if is_appliance else None
+    pod_cidr, service_cidr, dataplane_backend = (
+        read_cluster_cidrs() if is_appliance else (None, None, None)
+    )
+    base_conf_marker, base_lanwide_k3s = read_base_conf_marker() if is_appliance else (None, None)
 
     return {
         "deployment_kind": deployment_kind,
@@ -1357,4 +1512,14 @@ def collect() -> dict[str, object]:
         # node_ip; ``last_seen_ip`` is the supervisor POD IP (10.42.x.x),
         # which joiners can't reach. None on non-appliance / non-k3s.
         "node_ip": node_ip,
+        # Issue #285 Phase 1 — fleet-firewall prerequisites. All None
+        # off-appliance / off-k3s so the backend's "only update when not
+        # None" semantics leave the columns alone. Purely additive
+        # telemetry — nothing here changes a live firewall yet.
+        "node_ips": node_ips,
+        "pod_cidr": pod_cidr,
+        "service_cidr": service_cidr,
+        "dataplane_backend": dataplane_backend,
+        "base_conf_marker": base_conf_marker,
+        "base_lanwide_k3s": base_lanwide_k3s,
     }

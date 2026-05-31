@@ -88,6 +88,14 @@ spec:
             - name: kubeconfig
               mountPath: /etc/rancher/k3s
               readOnly: true
+            # Issue #285 Phase 1 — the live base nftables.conf, read-only,
+            # so the supervisor can report the base-conf marker (sha256 +
+            # legacy-LAN-wide-k3s flag) on the heartbeat. Purely a read;
+            # the supervisor never writes it (the host-side firewall
+            # runner does, via the release-state trigger plane).
+            - name: nftables-conf
+              mountPath: /etc/nftables-host.conf
+              readOnly: true
       volumes:
         - name: etc-spatiumddi-host
           hostPath:
@@ -117,4 +125,13 @@ spec:
           hostPath:
             path: /etc/rancher/k3s
             type: Directory
+        - name: nftables-conf
+          hostPath:
+            path: {{ .Values.supervisor.hostMounts.nftablesConf }}
+            # FileOrCreate (not File) so a node missing the file can
+            # never block the supervisor from scheduling — every
+            # appliance bakes /etc/nftables.conf, so it's never actually
+            # created there; the marker reader tolerates an empty/absent
+            # file by reporting None.
+            type: FileOrCreate
 {{- end }}

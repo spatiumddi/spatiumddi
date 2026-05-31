@@ -697,6 +697,40 @@ class Appliance(Base):
     # the cross-node firewall peer set + the operator kubeconfig rewrite.
     node_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # Issue #285 Phase 1 — fleet-firewall prerequisites. The supervisor
+    # reports these on every heartbeat so the (future) server-side
+    # firewall compiler can scope the k3s data-plane + apiserver rules
+    # correctly BEFORE the LAN-wide base accept is removed. All follow
+    # "only update when not None" so a legacy / pre-#285 supervisor never
+    # blanks them.
+    #
+    # ``node_ips`` is every k3s-registered InternalIP (both families on a
+    # dual-stack cluster) — distinct from the single ``node_ip`` above,
+    # which stays the join-URL source. Family-split peer scoping derives
+    # /32 (v4) + /128 (v6) from this list, fixing the v6-garbage-/32 bug.
+    node_ips: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa.text("'[]'::jsonb")
+    )
+    # Pod + service CIDR the operator chose at install (#302), read from
+    # the k3s ``spatium-cidrs.yaml`` drop-in. May be a comma-joined
+    # dual-stack pair. The 6443 rule must accept from the pod/service CIDR
+    # — in-cluster apiserver access traverses INPUT via the service-IP
+    # DNAT with ``saddr=pod-IP``.
+    pod_cidr: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    service_cidr: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # k3s data-plane backend (``vxlan`` default / ``wireguard-native`` /
+    # ``host-gw`` / …). Selects the inter-node data-plane port that must
+    # be peer-opened on every pod-running node before the base accept is
+    # cut (vxlan → 8472/udp; wireguard-native → 51820+51821/udp).
+    dataplane_backend: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Which baked ``/etc/nftables.conf`` is live on this node: a sha256
+    # marker (generic change detection) + a self-describing flag for
+    # whether the legacy LAN-wide ``k3s-ha`` accept is still present. Lets
+    # the control plane tell a half-A/B-upgraded fleet apart from a
+    # hardened one, and gates the UI "hardened" claim + compliance verdict.
+    base_conf_marker: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    base_lanwide_k3s: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
     # #272 Phase 9 — dead-node replacement. Set True by the
     # ``/control-plane/{id}/replace`` endpoint on a member that has gone
     # away ungracefully (its own supervisor can't run a leave — it's

@@ -1028,6 +1028,23 @@ class SupervisorHeartbeatRequest(BaseModel):
     # builds the join URL from the seed's ``node_ip``. None on
     # non-appliance / non-k3s; the handler leaves the column untouched.
     node_ip: str | None = None
+    # Issue #285 Phase 1 — fleet-firewall prerequisites. The (future)
+    # server-side firewall compiler needs these to scope the k3s rules
+    # before the LAN-wide base accept is removed. All None / absent on a
+    # legacy supervisor → the handler leaves the columns alone. Purely
+    # additive telemetry; nothing here changes a live firewall yet.
+    #   node_ips           — every InternalIP (both families) for
+    #                        family-split /32 + /128 peer scoping.
+    #   pod_cidr/service_cidr — operator-chosen k3s CIDRs (#302).
+    #   dataplane_backend  — vxlan / wireguard-native / … (data-plane port).
+    #   base_conf_marker   — sha256 of the live /etc/nftables.conf.
+    #   base_lanwide_k3s   — legacy LAN-wide k3s-ha accept still present?
+    node_ips: list[str] | None = None
+    pod_cidr: str | None = None
+    service_cidr: str | None = None
+    dataplane_backend: str | None = None
+    base_conf_marker: str | None = None
+    base_lanwide_k3s: bool | None = None
     # #272 Phase 9 — dead-node replacement. The SEED supervisor reports
     # the hostnames of k8s Nodes it successfully evicted (deleting the
     # Node makes k3s drop the etcd member). The handler clears
@@ -1480,6 +1497,21 @@ async def supervisor_heartbeat(
     # column untouched.
     if body.node_ip is not None:
         row.node_ip = body.node_ip
+
+    # Issue #285 Phase 1 — fleet-firewall prerequisites. "Only update when
+    # not None" so a legacy / pre-#285 supervisor never blanks them.
+    if body.node_ips is not None:
+        row.node_ips = list(body.node_ips)
+    if body.pod_cidr is not None:
+        row.pod_cidr = body.pod_cidr
+    if body.service_cidr is not None:
+        row.service_cidr = body.service_cidr
+    if body.dataplane_backend is not None:
+        row.dataplane_backend = body.dataplane_backend
+    if body.base_conf_marker is not None:
+        row.base_conf_marker = body.base_conf_marker
+    if body.base_lanwide_k3s is not None:
+        row.base_lanwide_k3s = body.base_lanwide_k3s
 
     # #272 Phase 9 — the seed reports k8s Nodes it evicted (dead-node
     # replacement). Clear the flag + settle those rows to ``left`` so

@@ -202,6 +202,10 @@ supervisor:
     # bytes to base64-encode into spec.chartContent. The path
     # matches service_lifecycle._BAKED_CHART_TARBALL.
     chartDir: /usr/lib/spatiumddi/charts
+    # Issue #285 Phase 1 — the live base nftables.conf, mounted read-only
+    # so the supervisor reports the base-conf marker (sha256 + whether the
+    # legacy LAN-wide k3s-ha accept is still present) on the heartbeat.
+    nftablesConf: /etc/nftables.conf
 
 # Always-on landing page served on :80 — "this is a SpatiumDDI
 # appliance" + hostname / control-plane URL / version. firstboot
