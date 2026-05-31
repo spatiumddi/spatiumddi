@@ -2911,9 +2911,23 @@ export interface PlatformSettings {
   // Issue #165 — operator-set IANA timezone. Empty = no override
   // (host falls back to install-time default).
   timezone: string;
+  /** Appliance LLDP (issue #343). No secrets — LLDP advertises public
+   *  identity, so read + write shapes match. ``lldp_protocols`` enables
+   *  reception of CDP/EDP/FDP/SONMP alongside LLDP. */
+  lldp_enabled: boolean;
+  lldp_tx_interval: number;
+  lldp_tx_hold: number;
+  lldp_protocols: LldpProtocol[];
+  lldp_interface_pattern: string;
+  lldp_management_pattern: string;
+  lldp_sys_name: string;
+  lldp_sys_description: string;
+  lldp_med_location: Record<string, unknown>;
+  lldp_snmp_agentx: boolean;
 }
 
 export type NtpSourceMode = "pool" | "servers" | "mixed";
+export type LldpProtocol = "cdp" | "edp" | "fdp" | "sonmp";
 
 export interface NtpCustomServer {
   host: string;

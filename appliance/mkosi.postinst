@@ -50,6 +50,7 @@ for unit in chrony.service ssh.service \
             k3s.service \
             spatiumddi-snmp-reload.path \
             spatiumddi-chrony-reload.path \
+            spatiumddi-lldp-reload.path \
             spatiumddi-tz-reload.path \
             spatium-firewall-reload.path \
             spatium-install.service \
@@ -85,6 +86,14 @@ done
 # ``systemctl enable --now snmpd``. Disable (not mask) so the
 # runner's enable+start works without an unmask step.
 rm -f "$BUILDROOT/etc/systemd/system/multi-user.target.wants/snmpd.service"
+
+# Issue #343 — lldpd is installed but NOT auto-started, same rationale as
+# snmpd above. Debian's lldpd postinst enables lldpd.service by default;
+# remove that symlink so a fresh appliance comes up with lldpd inactive.
+# Operator opts in via Appliance → LLDP, which writes the lldp-config-pending
+# trigger; the spatiumddi-lldp-reload runner then ``enable --now``s it.
+# Disable (not mask) so the runner's enable+start works without an unmask.
+rm -f "$BUILDROOT/etc/systemd/system/multi-user.target.wants/lldpd.service"
 
 # Mask systemd-networkd so it doesn't fight NetworkManager for
 # the same interfaces. The package stays installed (it ships in
@@ -232,6 +241,9 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-snmp-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-chrony-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.service"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-lldp-reload"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-firewall-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-firewall-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-firewall-reload.service"

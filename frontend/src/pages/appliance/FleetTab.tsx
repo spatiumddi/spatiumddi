@@ -37,6 +37,7 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
+import { LLDPTab } from "./LLDPTab";
 import { NTPTab } from "./NTPTab";
 import { PairingTab } from "./PairingTab";
 import { SNMPTab } from "./SNMPTab";
@@ -679,7 +680,7 @@ export function FleetTab({
   // persists the operator's pick so a refresh inside the same tab
   // lands them back on the same section.
   const [view, setView] = useSessionState<
-    "appliances" | "pairing" | "slot-images" | "ntp" | "snmp"
+    "appliances" | "pairing" | "slot-images" | "lldp" | "ntp" | "snmp"
   >("appliance.fleet.section", "appliances");
 
   const [drilldown, setDrilldown] = useState<ApplianceRow | null>(null);
@@ -896,7 +897,7 @@ export function FleetTab({
   // host-OS surfaces (#155-#166 — APT proxy, syslog forwarder, SSH
   // authorized_keys, etc.) drop into Services without restructuring.
   type NavItem = {
-    key: "appliances" | "pairing" | "slot-images" | "ntp" | "snmp";
+    key: "appliances" | "pairing" | "slot-images" | "lldp" | "ntp" | "snmp";
     label: string;
     summary: string;
     badge?: string | number;
@@ -929,6 +930,11 @@ export function FleetTab({
     {
       heading: "Services",
       items: [
+        {
+          key: "lldp",
+          label: "LLDP",
+          summary: "Fleet-wide lldpd config.",
+        },
         {
           key: "ntp",
           label: "NTP",
@@ -1038,6 +1044,19 @@ export function FleetTab({
                 upgrade points at the uploaded row.
               </p>
               <SlotImageManager />
+            </div>
+          )}
+
+          {view === "lldp" && (
+            <div>
+              <h2 className="mb-1 text-base font-semibold">LLDP (lldpd)</h2>
+              <p className="mb-4 text-xs text-muted-foreground">
+                Fleet-wide lldpd configuration. The rendered config ships
+                through the ConfigBundle long-poll to every appliance host
+                (local + every registered supervisor). LLDP is raw Layer-2 — no
+                firewall port is opened.
+              </p>
+              <LLDPTab />
             </div>
           )}
 

@@ -443,6 +443,52 @@ class PlatformSettings(Base):
         String(64), nullable=False, default="", server_default=sa_text("''")
     )
 
+    # ── Appliance LLDP support (issue #343) ─────────────────────────
+    # lldpd runs at the Debian host level on every appliance host (same
+    # host-config plane as SNMP / chrony) so it can see the host's real
+    # L2 interfaces and send/receive raw ethertype-0x88cc frames. No
+    # Fernet — LLDP advertises public identity, not secrets. Default-off
+    # so existing appliances leak no topology. ``lldp_interface_pattern``
+    # is an lldpd ``configure system interface pattern`` whitelist that
+    # excludes container / k3s vNICs by default (we never advertise into
+    # the overlay network). ``lldp_protocols`` enables RECEPTION of extra
+    # neighbour protocols (cdp / edp / fdp / sonmp) on top of LLDP.
+    # ``lldp_med_location`` + ``lldp_snmp_agentx`` are stored for Phase 3
+    # (LLDP-MED location + AgentX-to-snmpd) and not yet rendered.
+    lldp_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    lldp_tx_interval: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=30, server_default=sa_text("30")
+    )
+    lldp_tx_hold: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=4, server_default=sa_text("4")
+    )
+    lldp_protocols: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    lldp_interface_pattern: Mapped[str] = mapped_column(
+        String(512),
+        nullable=False,
+        default="eth*,en*,!docker*,!veth*,!br-*,!cni0,!flannel.1",
+        server_default=sa_text("'eth*,en*,!docker*,!veth*,!br-*,!cni0,!flannel.1'"),
+    )
+    lldp_management_pattern: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default=sa_text("''")
+    )
+    lldp_sys_name: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default=sa_text("''")
+    )
+    lldp_sys_description: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default=sa_text("''")
+    )
+    lldp_med_location: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
+    )
+    lldp_snmp_agentx: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+
     # ── Aggregation candidate snooze (issue #114) ───────────────────
     # Operator-driven hide-list for the IPAM aggregation badge popover.
     # Keys are stable per-candidate hashes derived from the parent
