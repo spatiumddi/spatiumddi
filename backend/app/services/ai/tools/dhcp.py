@@ -631,3 +631,66 @@ async def list_dhcp_mac_blocks(
         }
         for b in rows
     ]
+
+
+class FindDHCPPoolOccupancyArgs(BaseModel):
+    group_id: str | None = Field(default=None, description="Filter to one DHCP server group UUID.")
+    scope_id: str | None = Field(default=None, description="Filter to one DHCP scope UUID.")
+    min_percent: float = Field(
+        default=0.0,
+        description="Only return pools at or above this live occupancy percent (0-100).",
+    )
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+@register_tool(
+    name="find_dhcp_pool_occupancy",
+    description=(
+        "Live occupancy of dynamic DHCP pools — assigned vs total addresses, "
+        "free count, and occupancy percent, computed from active leases inside "
+        "each pool range (works for Kea and Windows DHCP). Sorted most-full "
+        "first. Use to answer 'which pools are near capacity / exhausted?'."
+    ),
+    args_model=FindDHCPPoolOccupancyArgs,
+    category="dhcp",
+)
+async def find_dhcp_pool_occupancy(
+    db: AsyncSession, user: User, args: FindDHCPPoolOccupancyArgs
+) -> list[dict[str, Any]]:
+    from app.services.dhcp.pool_occupancy import compute_pool_occupancy_batch
+
+    stmt = select(DHCPPool, DHCPScope).join(DHCPScope, DHCPScope.id == DHCPPool.scope_id)
+    stmt = stmt.where(DHCPPool.pool_type == "dynamic")
+    if args.scope_id:
+        stmt = stmt.where(DHCPPool.scope_id == args.scope_id)
+    if args.group_id:
+        stmt = stmt.where(DHCPScope.group_id == args.group_id)
+    # ``.unique()`` is required because the ORM entities carry eager-loaded
+    # collection relationships (DHCPScope.pools etc.).
+    rows = (await db.execute(stmt)).unique().all()
+
+    # One batched lease query for all pools rather than one per pool (N+1).
+    occ_by_pool = await compute_pool_occupancy_batch(db, [pool for pool, _ in rows])
+
+    out: list[dict[str, Any]] = []
+    for pool, scope in rows:
+        occ = occ_by_pool[pool.id]
+        if occ.percent < args.min_percent:
+            continue
+        out.append(
+            {
+                "pool_id": str(pool.id),
+                "pool_name": pool.name or None,
+                "scope_id": str(pool.scope_id),
+                "scope_name": scope.name or None,
+                "group_id": str(scope.group_id),
+                "start_ip": str(pool.start_ip),
+                "end_ip": str(pool.end_ip),
+                "assigned": occ.assigned,
+                "total": occ.total,
+                "free": occ.free,
+                "occupancy_percent": round(occ.percent, 1),
+            }
+        )
+    out.sort(key=lambda r: r["occupancy_percent"], reverse=True)
+    return out[: args.limit]

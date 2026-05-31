@@ -26,6 +26,9 @@ SUPPORTED_RECORD_TYPES = {
     "NAPTR",
     "LOC",
     "SOA",
+    "SVCB",
+    "HTTPS",
+    "DNAME",
 }
 
 

@@ -21,6 +21,9 @@ export const RECORD_TYPE_BADGE: Record<string, string> = {
   PTR: "bg-cyan-500/15 text-cyan-600",
   SRV: "bg-teal-500/15 text-teal-600",
   SOA: "bg-stone-500/15 text-stone-600",
+  HTTPS: "bg-sky-500/15 text-sky-600",
+  SVCB: "bg-indigo-500/15 text-indigo-600",
+  DNAME: "bg-amber-500/15 text-amber-600",
 };
 
 export const RECORD_TYPE_BADGE_FALLBACK = "bg-muted text-muted-foreground";

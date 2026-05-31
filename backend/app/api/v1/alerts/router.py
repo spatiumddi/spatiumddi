@@ -45,6 +45,8 @@ class AlertRuleCreate(BaseModel):
     rule_type: str
     threshold_percent: int | None = None
     threshold_days: int | None = None
+    # ``dhcp_pool_exhaustion`` absolute free-address floor (issue #339).
+    min_free_addresses: int | None = None
     server_type: str | None = None
     # ``compliance_change`` params — see issue #105.
     classification: str | None = None
@@ -101,6 +103,15 @@ class AlertRuleCreate(BaseModel):
             raise ValueError("threshold_days must be 1..3650")
         return v
 
+    @field_validator("min_free_addresses")
+    @classmethod
+    def _v_min_free(cls, v: int | None) -> int | None:
+        if v is None:
+            return None
+        if v < 1:
+            raise ValueError("min_free_addresses must be ≥ 1")
+        return v
+
     @field_validator("classification")
     @classmethod
     def _v_classification(cls, v: str | None) -> str | None:
@@ -132,6 +143,7 @@ class AlertRuleUpdate(BaseModel):
     enabled: bool | None = None
     threshold_percent: int | None = None
     threshold_days: int | None = None
+    min_free_addresses: int | None = None
     server_type: str | None = None
     classification: str | None = None
     change_scope: str | None = None
@@ -176,6 +188,15 @@ class AlertRuleUpdate(BaseModel):
             raise ValueError("threshold_days must be 1..3650")
         return v
 
+    @field_validator("min_free_addresses")
+    @classmethod
+    def _v_min_free(cls, v: int | None) -> int | None:
+        if v is None:
+            return None
+        if v < 1:
+            raise ValueError("min_free_addresses must be ≥ 1")
+        return v
+
     @field_validator("classification")
     @classmethod
     def _v_classification(cls, v: str | None) -> str | None:
@@ -209,6 +230,7 @@ class AlertRuleResponse(BaseModel):
     rule_type: str
     threshold_percent: int | None
     threshold_days: int | None
+    min_free_addresses: int | None
     server_type: str | None
     classification: str | None
     change_scope: str | None

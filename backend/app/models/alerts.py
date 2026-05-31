@@ -79,8 +79,16 @@ class AlertRule(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     #                                    issue #105.
     rule_type: Mapped[str] = mapped_column(String(40), nullable=False)
 
-    # Subnet utilization params.
+    # Subnet utilization params. Re-used as the occupancy-% threshold by
+    # ``dhcp_pool_exhaustion`` (issue #339) and as a raw-count threshold by
+    # ``voice_lease_count_below`` / ``stale_ip_count``.
     threshold_percent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # ``dhcp_pool_exhaustion`` params (issue #339) — absolute free-address
+    # floor. The rule fires when a dynamic pool's occupancy reaches
+    # ``threshold_percent`` OR its free-address count drops below this; both
+    # are optional so an operator can alert on either signal (or both).
+    min_free_addresses: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Server-unreachable params.
     server_type: Mapped[str | None] = mapped_column(String(10), nullable=True)

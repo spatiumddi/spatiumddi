@@ -28,6 +28,10 @@ ImportSource = Literal[
     "route53",
     "azure_dns",
     "google_dns",
+    "digitalocean",
+    "hetzner",
+    "linode",
+    "vultr",
 ]
 
 # Per-zone conflict resolution. ``rename`` requires ``rename_to`` to

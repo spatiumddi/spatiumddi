@@ -36,6 +36,7 @@ const RULE_TYPE_PARAM_DEFAULTS: Partial<
   subnet_utilization: { threshold: 90 },
   voice_lease_count_below: { threshold: 10 },
   stale_ip_count: { threshold: 10, thresholdDays: 90 },
+  dhcp_pool_exhaustion: { threshold: 90 },
   domain_expiring: { thresholdDays: 30 },
   circuit_term_expiring: { thresholdDays: 30 },
   service_term_expiring: { thresholdDays: 30 },
@@ -83,6 +84,10 @@ function RuleEditorModal({
   const [thresholdDays, setThresholdDays] = useState<number>(
     existing?.threshold_days ?? 30,
   );
+  // dhcp_pool_exhaustion: 0 means "no free-address floor" (occupancy % only).
+  const [minFree, setMinFree] = useState<number>(
+    existing?.min_free_addresses ?? 0,
+  );
   const [serverType, setServerType] = useState<AlertServerType>(
     (existing?.server_type as AlertServerType | null) ?? "any",
   );
@@ -117,9 +122,12 @@ function RuleEditorModal({
         threshold_percent:
           ruleType === "subnet_utilization" ||
           ruleType === "voice_lease_count_below" ||
-          ruleType === "stale_ip_count"
+          ruleType === "stale_ip_count" ||
+          ruleType === "dhcp_pool_exhaustion"
             ? threshold
             : null,
+        min_free_addresses:
+          ruleType === "dhcp_pool_exhaustion" && minFree > 0 ? minFree : null,
         threshold_days:
           ruleType === "domain_expiring" ||
           ruleType === "circuit_term_expiring" ||
@@ -187,6 +195,9 @@ function RuleEditorModal({
             >
               <optgroup label="Infrastructure">
                 <option value="subnet_utilization">Subnet utilization</option>
+                <option value="dhcp_pool_exhaustion">
+                  DHCP pool exhaustion (dynamic pool pressure)
+                </option>
                 <option value="server_unreachable">Server unreachable</option>
                 <option value="stale_ip_count">
                   Stale IP count (address-space hygiene)
@@ -269,6 +280,35 @@ function RuleEditorModal({
               onChange={(e) => setThreshold(Number(e.target.value))}
             />
           </Field>
+        )}
+        {ruleType === "dhcp_pool_exhaustion" && (
+          <>
+            <Field
+              label="Occupancy threshold (%)"
+              hint="Fires when a dynamic DHCP pool's live occupancy (active leases ÷ pool size) reaches this. Orthogonal to subnet utilization, which counts allocated IPAM rows — a pool can be exhausted while the subnet looks empty."
+            >
+              <input
+                type="number"
+                min={0}
+                max={100}
+                className={inputCls}
+                value={threshold}
+                onChange={(e) => setThreshold(Number(e.target.value))}
+              />
+            </Field>
+            <Field
+              label="Minimum free addresses (optional)"
+              hint="Also fire when fewer than this many addresses are free in the pool, regardless of percent. Set 0 to use the percent threshold only."
+            >
+              <input
+                type="number"
+                min={0}
+                className={inputCls}
+                value={minFree}
+                onChange={(e) => setMinFree(Number(e.target.value))}
+              />
+            </Field>
+          </>
         )}
         {ruleType === "stale_ip_count" && (
           <>

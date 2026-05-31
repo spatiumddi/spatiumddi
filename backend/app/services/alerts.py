@@ -41,7 +41,7 @@ from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN, ASNRpkiRoa
 from app.models.audit import AuditLog
 from app.models.circuit import Circuit
-from app.models.dhcp import DHCPLease, DHCPScope, DHCPServer
+from app.models.dhcp import DHCPLease, DHCPPool, DHCPScope, DHCPServer
 from app.models.dns import DNSServer, DNSZone
 from app.models.domain import Domain
 from app.models.ipam import IPAddress, IPBlock, Subnet
@@ -98,6 +98,14 @@ RULE_TYPE_K3S_API_CERT_EXPIRING = "k3s_api_cert_expiring"
 # drilldown, this is the passive "your hygiene is slipping" feed.
 RULE_TYPE_STALE_IP_COUNT = "stale_ip_count"
 
+# A dynamic DHCP pool whose live occupancy has reached ``threshold_percent``
+# (assigned ÷ range size) OR whose free-address count has dropped below
+# ``min_free_addresses``. Orthogonal to ``subnet_utilization`` — that counts
+# allocated IPAM rows, this counts active DHCP leases inside the pool range,
+# so a pool can be exhausted (clients failing to get a lease) while the IPAM
+# subnet shows low allocated-row utilisation. Issue #339.
+RULE_TYPE_DHCP_POOL_EXHAUSTION = "dhcp_pool_exhaustion"
+
 RULE_TYPES = frozenset(
     {
         RULE_TYPE_SUBNET_UTILIZATION,
@@ -119,6 +127,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_VOICE_LEASE_COUNT_BELOW,
         RULE_TYPE_K3S_API_CERT_EXPIRING,
         RULE_TYPE_STALE_IP_COUNT,
+        RULE_TYPE_DHCP_POOL_EXHAUSTION,
     }
 )
 
@@ -295,6 +304,68 @@ async def _matching_voice_lease_count_below_subjects(
             f"(threshold {threshold}) — possible mass-disconnect event"
         )
         matches.append((str(s.id), display, message))
+    return matches
+
+
+async def _matching_dhcp_pool_exhaustion_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """Dynamic DHCP pools that have hit ``threshold_percent`` occupancy OR
+    dropped below ``min_free_addresses`` free addresses (issue #339).
+
+    Occupancy is live, from active ``DHCPLease`` rows inside the pool range
+    (see :func:`app.services.dhcp.pool_occupancy.compute_pool_occupancy_batch`),
+    so it works for Kea and Windows alike. Only ``pool_type='dynamic'`` pools
+    are considered — excluded / reserved ranges never hand out leases. With
+    neither threshold set the rule defaults to 90% occupancy so a bare
+    enable still does something sensible.
+    """
+    from app.services.dhcp.pool_occupancy import compute_pool_occupancy_batch
+
+    pct_threshold = rule.threshold_percent
+    min_free = rule.min_free_addresses
+    if pct_threshold is None and min_free is None:
+        pct_threshold = 90
+
+    pools = list(
+        (await db.execute(select(DHCPPool).where(DHCPPool.pool_type == "dynamic"))).scalars().all()
+    )
+    if not pools:
+        return []
+
+    # Resolve scope display names in one query (pool → scope name).
+    scope_ids = {p.scope_id for p in pools}
+    scope_rows = (
+        await db.execute(select(DHCPScope.id, DHCPScope.name).where(DHCPScope.id.in_(scope_ids)))
+    ).all()
+    scope_names: dict[uuid.UUID, str] = {row[0]: row[1] for row in scope_rows}
+
+    # One batched lease query for all pools rather than one per pool (N+1).
+    occ_by_pool = await compute_pool_occupancy_batch(db, pools)
+
+    matches: list[tuple[str, str, str]] = []
+    for pool in pools:
+        occ = occ_by_pool[pool.id]
+        if occ.total <= 0:
+            continue
+        over_pct = pct_threshold is not None and occ.percent >= pct_threshold
+        under_free = min_free is not None and occ.free < min_free
+        if not (over_pct or under_free):
+            continue
+        scope_name = scope_names.get(pool.scope_id) or ""
+        pool_label = pool.name or f"{pool.start_ip}–{pool.end_ip}"
+        display = pool_label + (f" ({scope_name})" if scope_name else "")
+        reasons = []
+        if over_pct:
+            reasons.append(f"{occ.percent:.1f}% occupied (threshold {pct_threshold}%)")
+        if under_free:
+            reasons.append(f"{occ.free} free (floor {min_free})")
+        message = (
+            f"DHCP pool {display} — {', '.join(reasons)}; "
+            f"{occ.assigned}/{occ.total} addresses leased"
+        )
+        matches.append((str(pool.id), display, message))
     return matches
 
 
@@ -1554,6 +1625,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_stale_ip_count_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "subnet"
+            elif rule.rule_type == RULE_TYPE_DHCP_POOL_EXHAUSTION:
+                base = await _matching_dhcp_pool_exhaustion_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "dhcp_pool"
             elif rule.rule_type == RULE_TYPE_SERVER_UNREACHABLE:
                 base = await _matching_server_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]

@@ -24,9 +24,13 @@ from app.drivers.dns.base import (
 )
 from app.drivers.dns.bind9 import BIND9Driver
 from app.drivers.dns.cloudflare import CloudflareDNSDriver
+from app.drivers.dns.digitalocean import DigitalOceanDNSDriver
 from app.drivers.dns.googledns import GoogleCloudDNSDriver
+from app.drivers.dns.hetzner import HetznerDNSDriver
+from app.drivers.dns.linode import LinodeDNSDriver
 from app.drivers.dns.powerdns import PowerDNSDriver
 from app.drivers.dns.route53 import Route53DNSDriver
+from app.drivers.dns.vultr import VultrDNSDriver
 from app.drivers.dns.windows import WindowsDNSDriver
 
 _DRIVERS: dict[str, type[DNSDriver]] = {
@@ -41,6 +45,12 @@ _DRIVERS: dict[str, type[DNSDriver]] = {
     "route53": Route53DNSDriver,
     "azure_dns": AzureDNSDriver,
     "google_dns": GoogleCloudDNSDriver,
+    # Token-only providers (issue #327) — single API token, plain JSON
+    # over httpx, same agentless CloudDNSDriverBase shape.
+    "digitalocean": DigitalOceanDNSDriver,
+    "hetzner": HetznerDNSDriver,
+    "linode": LinodeDNSDriver,
+    "vultr": VultrDNSDriver,
 }
 
 # Drivers whose record ops run from the control plane directly, with no
@@ -48,14 +58,35 @@ _DRIVERS: dict[str, type[DNSDriver]] = {
 # the queue for these — applying the change synchronously and writing a
 # DNSRecordOp row as ``applied`` / ``failed`` for audit purposes.
 AGENTLESS_DRIVERS: frozenset[str] = frozenset(
-    {"windows_dns", "cloudflare", "route53", "azure_dns", "google_dns"}
+    {
+        "windows_dns",
+        "cloudflare",
+        "route53",
+        "azure_dns",
+        "google_dns",
+        "digitalocean",
+        "hetzner",
+        "linode",
+        "vultr",
+    }
 )
 
 # Agentless cloud-hosted DNS drivers (subset of AGENTLESS_DRIVERS).
 # Used by the DNS server create/update path + the cloud import + the
 # sync-from-server widening to recognise a cloud DNS server (credentials
 # live in DNSServer.credentials_encrypted as a provider-specific dict).
-CLOUD_DNS_DRIVERS: frozenset[str] = frozenset({"cloudflare", "route53", "azure_dns", "google_dns"})
+CLOUD_DNS_DRIVERS: frozenset[str] = frozenset(
+    {
+        "cloudflare",
+        "route53",
+        "azure_dns",
+        "google_dns",
+        "digitalocean",
+        "hetzner",
+        "linode",
+        "vultr",
+    }
+)
 
 
 def is_agentless(driver_name: str) -> bool:

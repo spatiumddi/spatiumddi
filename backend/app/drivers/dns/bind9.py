@@ -316,6 +316,9 @@ class BIND9Driver(DNSDriver):
                 "SSHFP",
                 "NAPTR",
                 "LOC",
+                "SVCB",
+                "HTTPS",
+                "DNAME",
             ],
         }
 

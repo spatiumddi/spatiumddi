@@ -99,6 +99,11 @@ VALID_RECORD_TYPES = {
     "NAPTR",
     "LOC",
     "LUA",
+    # RFC 9460 service binding (HTTP/3, ECH, alt-svc) + RFC 6672 subtree
+    # redirection. Self-hosted authoritative only (see the gate below).
+    "SVCB",
+    "HTTPS",
+    "DNAME",
 }
 
 # Record types only some drivers support. Used to gate at the create /
@@ -108,6 +113,14 @@ VALID_RECORD_TYPES = {
 _DRIVER_GATED_RECORD_TYPES: dict[str, frozenset[str]] = {
     "ALIAS": frozenset({"powerdns"}),
     "LUA": frozenset({"powerdns"}),
+    # SVCB / HTTPS (RFC 9460) + DNAME (RFC 6672) are served natively only by
+    # our self-hosted authoritative backends. The hosted-DNS providers vary
+    # (and would fail at apply rather than create), so gate to bind9 + pdns
+    # and let a follow-up widen the set once a provider's apply path is
+    # verified. issue #338.
+    "SVCB": frozenset({"bind9", "powerdns"}),
+    "HTTPS": frozenset({"bind9", "powerdns"}),
+    "DNAME": frozenset({"bind9", "powerdns"}),
 }
 
 # Zone-level operations only some drivers support. Same shape as

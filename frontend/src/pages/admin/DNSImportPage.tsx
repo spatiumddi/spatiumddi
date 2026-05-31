@@ -628,6 +628,10 @@ const CLOUD_DRIVER_LABELS: Record<string, string> = {
   route53: "AWS Route 53",
   azure_dns: "Azure DNS",
   google_dns: "Google Cloud DNS",
+  digitalocean: "DigitalOcean",
+  hetzner: "Hetzner DNS",
+  linode: "Linode",
+  vultr: "Vultr",
 };
 
 function cloudDriverLabel(driver: string): string {

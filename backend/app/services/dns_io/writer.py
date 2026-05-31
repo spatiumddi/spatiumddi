@@ -27,7 +27,10 @@ def _format_record(zone_name: str, r: DNSRecord) -> str:
         wgt = r.weight if r.weight is not None else 0
         prt = r.port if r.port is not None else 0
         rdata = f"{pri} {wgt} {prt} {_fqdn(r.value)}"
-    elif rtype in {"CNAME", "NS", "PTR"}:
+    elif rtype in {"CNAME", "NS", "PTR", "DNAME"}:
+        # DNAME (RFC 6672) rdata is a single redirection target — normalise
+        # to an FQDN like the other name-valued types. SVCB/HTTPS rdata
+        # (priority + target + SvcParams) falls through to verbatim passthrough.
         rdata = _fqdn(r.value)
     elif rtype == "TXT":
         v = r.value

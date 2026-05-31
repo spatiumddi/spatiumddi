@@ -52,7 +52,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.drivers.dns import get_driver
+from app.drivers.dns import CLOUD_DNS_DRIVERS, get_driver
 from app.models.auth import User
 from app.models.dns import DNSServer
 
@@ -83,13 +83,13 @@ class CloudDNSImportError(ValueError):
     """
 
 
-# Driver names that route through this importer. Kept in lockstep with
-# the four concrete cloud drivers + ``CloudDNSDriverBase`` subclasses
-# the integrator registers in ``app.drivers.dns``. The preview validates
-# ``server.driver`` against this set before touching the driver so a
-# BIND9 / PowerDNS / Windows server gets a clear error rather than a
-# confusing AttributeError downstream.
-CLOUD_DRIVERS: frozenset[str] = frozenset({"cloudflare", "route53", "azure_dns", "google_dns"})
+# Driver names that route through this importer — sourced directly from the
+# driver registry so a newly-registered CloudDNSDriverBase subclass (e.g. the
+# token-only providers in #327) is recognised here with no second edit. The
+# preview validates ``server.driver`` against this set before touching the
+# driver so a BIND9 / PowerDNS / Windows server gets a clear error rather than
+# a confusing AttributeError downstream.
+CLOUD_DRIVERS: frozenset[str] = CLOUD_DNS_DRIVERS
 
 # Default SOA fields applied when the source doesn't provide them.
 # Same conservative RFC 1035 reference numbers ``windows_dns`` uses so
