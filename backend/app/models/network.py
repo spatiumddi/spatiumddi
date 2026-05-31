@@ -407,10 +407,63 @@ class NetworkNeighbour(UUIDPrimaryKeyMixin, Base):
     device: Mapped[NetworkDevice] = relationship("NetworkDevice", back_populates="neighbours")
 
 
+class ApplianceLldpNeighbour(UUIDPrimaryKeyMixin, Base):
+    """An LLDP neighbour an appliance host discovered via its local lldpd.
+
+    Distinct from :class:`NetworkNeighbour` (the SNMP-MIB-shaped table for
+    switch-polled neighbours): this matches ``lldpcli show neighbors -f json0``
+    output directly — local interface *name* + the remote's string-decoded
+    chassis/port — so there is no MIB-subtype impedance and no synthesised
+    ``NetworkDevice`` row. Issue #347.
+
+    Keyed on ``(appliance, local_iface, remote_chassis_id, remote_port_id)`` —
+    the same identity lldpd uses to dedupe. Absence-deleted on every supervisor
+    heartbeat ingest, mirroring how ``NetworkNeighbour`` / FDB rows behave; the
+    audit log is the place to look for historical "what used to be here".
+    """
+
+    __tablename__ = "appliance_lldp_neighbour"
+    __table_args__ = (
+        UniqueConstraint(
+            "appliance_id",
+            "local_iface",
+            "remote_chassis_id",
+            "remote_port_id",
+            name="uq_appliance_lldp_neighbour",
+        ),
+        Index("ix_appliance_lldp_neighbour_appliance", "appliance_id"),
+    )
+
+    appliance_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("appliance.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    local_iface: Mapped[str] = mapped_column(String(64), nullable=False)
+    remote_chassis_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    remote_port_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    remote_port_descr: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    remote_sys_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    remote_sys_descr: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Management IP as a plain string (v4 / v6 / absent) — lldpcli reports it
+    # verbatim and we don't index/range-query it, so no INET typing needed.
+    remote_mgmt_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Comma-joined capability names (e.g. "Bridge,Router") straight from lldpcli.
+    remote_caps: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    first_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 __all__ = [
     "NetworkDevice",
     "NetworkInterface",
     "NetworkArpEntry",
     "NetworkFdbEntry",
     "NetworkNeighbour",
+    "ApplianceLldpNeighbour",
 ]

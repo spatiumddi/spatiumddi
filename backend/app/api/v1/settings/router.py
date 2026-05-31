@@ -478,6 +478,20 @@ class SettingsUpdate(BaseModel):
             raise ValueError("must not contain control characters or newlines")
         return v
 
+    @field_validator("lldp_med_location")
+    @classmethod
+    def _valid_lldp_med_location(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        # LLDP-MED location (issue #348). The only rendered form today is ELIN
+        # (E911 number) — must be digits, since it's rendered bare into
+        # ``configure med location elin <n>``. Other keys are accepted + stored
+        # for future coordinate/civic support but not yet rendered.
+        if v is None:
+            return None
+        elin = v.get("elin")
+        if elin is not None and not str(elin).strip().isdigit():
+            raise ValueError("lldp_med_location.elin must be a numeric E911 ELIN")
+        return v
+
     @field_validator("timezone")
     @classmethod
     def _validate_timezone(cls, v: str | None) -> str | None:

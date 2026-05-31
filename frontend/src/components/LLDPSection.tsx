@@ -67,6 +67,10 @@ export function LLDPSection({
   );
   const [sysName, setSysName] = useState<string>(values.lldp_sys_name);
   const [sysDesc, setSysDesc] = useState<string>(values.lldp_sys_description);
+  const [agentx, setAgentx] = useState<boolean>(values.lldp_snmp_agentx);
+  const [elin, setElin] = useState<string>(
+    String((values.lldp_med_location as { elin?: unknown } | null)?.elin ?? ""),
+  );
 
   const dirty =
     enabled !== values.lldp_enabled ||
@@ -77,7 +81,12 @@ export function LLDPSection({
     ifacePattern !== values.lldp_interface_pattern ||
     mgmtPattern !== values.lldp_management_pattern ||
     sysName !== values.lldp_sys_name ||
-    sysDesc !== values.lldp_sys_description;
+    sysDesc !== values.lldp_sys_description ||
+    agentx !== values.lldp_snmp_agentx ||
+    elin !==
+      String(
+        (values.lldp_med_location as { elin?: unknown } | null)?.elin ?? "",
+      );
 
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
@@ -94,6 +103,12 @@ export function LLDPSection({
       setMgmtPattern(updated.lldp_management_pattern);
       setSysName(updated.lldp_sys_name);
       setSysDesc(updated.lldp_sys_description);
+      setAgentx(updated.lldp_snmp_agentx);
+      setElin(
+        String(
+          (updated.lldp_med_location as { elin?: unknown } | null)?.elin ?? "",
+        ),
+      );
       setSaveErr(null);
       setSavedAt(Date.now());
       setTimeout(() => setSavedAt(null), 2500);
@@ -119,6 +134,8 @@ export function LLDPSection({
       lldp_management_pattern: mgmtPattern.trim(),
       lldp_sys_name: sysName,
       lldp_sys_description: sysDesc,
+      lldp_snmp_agentx: agentx,
+      lldp_med_location: elin.trim() ? { elin: elin.trim() } : {},
     });
   }
 
@@ -256,6 +273,32 @@ export function LLDPSection({
           placeholder="(default)"
           disabled={!isSuperadmin}
           className={cn(inputCls, "w-96 max-w-full")}
+        />
+      </Field>
+
+      <Field
+        label="SNMP AgentX (LLDP-MIB)"
+        description="Register lldpd as an AgentX subagent of the host snmpd so LLDP-MIB (lldpRemTable) is queryable over SNMP. Only meaningful when SNMP is also enabled. Loopback only — no firewall change."
+      >
+        <Toggle
+          checked={agentx}
+          onChange={setAgentx}
+          disabled={!isSuperadmin}
+        />
+      </Field>
+
+      <Field
+        label="MED location (ELIN)"
+        description="LLDP-MED Emergency Location Identification Number advertised to MED endpoints (IP phones) for E911 routing. Digits only; empty = none. Coordinate / civic forms are API-only for now."
+      >
+        <input
+          type="text"
+          inputMode="numeric"
+          value={elin}
+          onChange={(e) => setElin(e.target.value)}
+          placeholder="(none)"
+          disabled={!isSuperadmin}
+          className={cn(inputCls, "w-48")}
         />
       </Field>
 

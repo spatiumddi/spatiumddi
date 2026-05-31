@@ -84,6 +84,9 @@ from app.services.appliance.ca import (
     sign_supervisor_cert,
     verify_session_token,
 )
+from app.services.appliance.lldp import lldp_bundle
+from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.snmp import snmp_bundle
 
 logger = structlog.get_logger(__name__)
 
@@ -965,6 +968,10 @@ class SupervisorHeartbeatRequest(BaseModel):
     last_upgrade_state_at: datetime | None = None
     snmpd_running: bool | None = None
     ntp_sync_state: Literal["synchronized", "unsynchronized", "unknown"] | None = None
+    # Issue #347 — LLDP neighbours the local lldpd discovered. ``None`` = not
+    # collected (leave the stored set alone); a list (possibly empty) is the
+    # authoritative current set the handler upserts + absence-deletes against.
+    lldp_neighbours: list[dict[str, Any]] | None = None
     # #170 Phase E2 — host-side port conflicts probed by the
     # supervisor. Free-form dict keyed by ``<proto>_<port>``; values
     # are the ``users`` string from ``ss -p`` (process name / pid).
@@ -1167,6 +1174,90 @@ class SupervisorHeartbeatResponse(BaseModel):
     # against the host's current tz on every heartbeat + writes the
     # ``spatium-tz-reload`` trigger file when they differ.
     desired_timezone: str = ""
+    # Issue #346 — appliance host-config blocks delivered to the supervisor,
+    # which compares each block's ``config_hash`` against its applied sidecar
+    # and fires the matching ``spatium-{snmp,chrony,lldp}-reload`` trigger when
+    # it differs. Same shape the DHCP-agent ConfigBundle ships; rendered from
+    # ``platform_settings`` via the ``*_bundle`` helpers. Empty/disabled blocks
+    # are still sent (stable key set) so the supervisor can retract config.
+    snmp_settings: dict[str, Any] = Field(default_factory=dict)
+    ntp_settings: dict[str, Any] = Field(default_factory=dict)
+    lldp_settings: dict[str, Any] = Field(default_factory=dict)
+
+
+def _s(v: object, limit: int = 255) -> str | None:
+    """Normalise a neighbour string field — trim, truncate, empty → None."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s[:limit] if s else None
+
+
+async def _ingest_lldp_neighbours(
+    db: DB, appliance_id: uuid.UUID, neighbours: list[dict[str, Any]]
+) -> None:
+    """Upsert the appliance's LLDP neighbours + absence-delete the rest (#347).
+
+    ``neighbours`` is the authoritative current set from the supervisor's local
+    lldpd. Keyed on ``(local_iface, remote_chassis_id, remote_port_id)`` — the
+    same identity the model's unique constraint uses. Rows no longer present
+    are deleted, mirroring how the switch-polled NetworkNeighbour table behaves.
+    """
+    from app.models.network import ApplianceLldpNeighbour
+
+    desired: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for n in neighbours:
+        if not isinstance(n, dict):
+            continue
+        li = _s(n.get("local_iface"), 64)
+        ch = _s(n.get("remote_chassis_id"))
+        pt = _s(n.get("remote_port_id"))
+        if not (li and ch and pt):
+            continue
+        desired[(li, ch, pt)] = n
+
+    existing = (
+        (
+            await db.execute(
+                select(ApplianceLldpNeighbour).where(
+                    ApplianceLldpNeighbour.appliance_id == appliance_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_key = {(e.local_iface, e.remote_chassis_id, e.remote_port_id): e for e in existing}
+    now = datetime.now(UTC)
+
+    for key, n in desired.items():
+        row = by_key.get(key)
+        if row is None:
+            db.add(
+                ApplianceLldpNeighbour(
+                    appliance_id=appliance_id,
+                    local_iface=key[0],
+                    remote_chassis_id=key[1],
+                    remote_port_id=key[2],
+                    remote_port_descr=_s(n.get("remote_port_descr")),
+                    remote_sys_name=_s(n.get("remote_sys_name")),
+                    remote_sys_descr=_s(n.get("remote_sys_descr"), 4096),
+                    remote_mgmt_ip=_s(n.get("remote_mgmt_ip"), 64),
+                    remote_caps=_s(n.get("remote_caps")),
+                    last_seen=now,
+                )
+            )
+        else:
+            row.remote_port_descr = _s(n.get("remote_port_descr"))
+            row.remote_sys_name = _s(n.get("remote_sys_name"))
+            row.remote_sys_descr = _s(n.get("remote_sys_descr"), 4096)
+            row.remote_mgmt_ip = _s(n.get("remote_mgmt_ip"), 64)
+            row.remote_caps = _s(n.get("remote_caps"))
+            row.last_seen = now
+
+    for key, row in by_key.items():
+        if key not in desired:
+            await db.delete(row)
 
 
 @router.post(
@@ -1302,6 +1393,10 @@ async def supervisor_heartbeat(
         row.snmpd_running = body.snmpd_running
     if body.ntp_sync_state is not None:
         row.ntp_sync_state = body.ntp_sync_state
+    # Issue #347 — ingest the supervisor's local LLDP neighbours (upsert +
+    # absence-delete). None = not collected (leave the set alone).
+    if body.lldp_neighbours is not None:
+        await _ingest_lldp_neighbours(db, row.id, body.lldp_neighbours)
     if body.port_conflicts is not None:
         # Overwrite verbatim — the supervisor's probe is the source of
         # truth. Empty dict explicitly clears prior conflicts; the
@@ -1523,6 +1618,25 @@ async def supervisor_heartbeat(
     metallb_vip = (cfg_row.control_plane_vip or "") if cfg_row else ""
     # Issue #165 — operator-set timezone. Empty string = no override.
     desired_timezone = (cfg_row.timezone or "") if cfg_row else ""
+    # Issue #346 — host-config blocks for snmp / chrony / lldp. Built from the
+    # same ``*_bundle`` helpers the DHCP-agent ConfigBundle uses; the
+    # disabled-shape fallback keeps a stable key set when no settings row
+    # exists yet so the supervisor's hash compare never KeyErrors.
+    snmp_block = (
+        snmp_bundle(cfg_row)
+        if cfg_row is not None
+        else {"enabled": False, "config_hash": "", "snmpd_conf": ""}
+    )
+    ntp_block = (
+        ntp_bundle(cfg_row)
+        if cfg_row is not None
+        else {"enabled": False, "allow_clients": False, "config_hash": "", "chrony_conf": ""}
+    )
+    lldp_block = (
+        lldp_bundle(cfg_row)
+        if cfg_row is not None
+        else {"enabled": False, "config_hash": "", "lldpd_conf": "", "daemon_args": ""}
+    )
 
     # #272 Phase 9 — dead k8s Nodes the seed should evict. Returned to
     # every CP supervisor but only the control-plane-variant seed acts.
@@ -1560,6 +1674,9 @@ async def supervisor_heartbeat(
         desired_control_plane_vip=metallb_vip,
         evict_node_names=evict_names,
         desired_timezone=desired_timezone,
+        snmp_settings=snmp_block,
+        ntp_settings=ntp_block,
+        lldp_settings=lldp_block,
     )
 
 
