@@ -97,6 +97,15 @@ def render_lldpd_conf(settings: PlatformSettings) -> str:
     lines.append("configure lldp management-addresses-advertisements enable")
     lines.append("configure lldp capabilities-advertisements enable")
 
+    # LLDP-MED ELIN location (issue #348) — Emergency Location Identification
+    # Number, advertised to MED-capable endpoints (IP phones) for E911 routing.
+    # Coordinate / civic forms are richer and stay API-only for now; ELIN is a
+    # single value with the clearest operator use.
+    med = settings.lldp_med_location or {}
+    elin = str(med.get("elin") or "").strip() if isinstance(med, dict) else ""
+    if elin:
+        lines.append(f"configure med location elin {elin}")
+
     return "\n".join(lines) + "\n"
 
 
@@ -104,10 +113,17 @@ def render_lldpd_daemon_args(settings: PlatformSettings) -> str:
     """Return the ``DAEMON_ARGS`` value for ``/etc/default/lldpd``.
 
     Enables reception of the operator-selected legacy/vendor protocols on top
-    of LLDP. Deterministic flag order so the bundle hash is stable.
+    of LLDP, plus the SNMP AgentX subagent (``-x``) when requested. Deterministic
+    flag order so the bundle hash is stable.
     """
     protocols = {str(p).strip().lower() for p in (settings.lldp_protocols or [])}
     flags = [_PROTOCOL_FLAGS[p] for p in ("cdp", "edp", "fdp", "sonmp") if p in protocols]
+    # ``-x`` registers lldpd as an AgentX subagent so LLDP-MIB (lldpRemTable)
+    # is queryable through the host's snmpd when both are enabled (issue #348).
+    # Loopback AgentX socket — still no firewall change. Harmless if snmpd is
+    # off (lldpd just can't connect to the master and logs a warning).
+    if bool(getattr(settings, "lldp_snmp_agentx", False)):
+        flags.append("-x")
     return " ".join(flags)
 
 

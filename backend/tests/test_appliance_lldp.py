@@ -88,6 +88,23 @@ def test_daemon_args_flags_in_deterministic_order() -> None:
     assert render_lldpd_daemon_args(s) == ""
 
 
+def test_agentx_appends_x_flag() -> None:
+    s = _bare_settings()
+    s.lldp_protocols = ["cdp"]
+    assert render_lldpd_daemon_args(s) == "-c"
+    s.lldp_snmp_agentx = True
+    assert render_lldpd_daemon_args(s) == "-c -x"  # issue #348
+    s.lldp_protocols = []
+    assert render_lldpd_daemon_args(s) == "-x"
+
+
+def test_med_elin_renders() -> None:
+    s = _bare_settings()
+    assert "med location" not in render_lldpd_conf(s)  # none by default
+    s.lldp_med_location = {"elin": "911"}
+    assert "configure med location elin 911" in render_lldpd_conf(s)
+
+
 def test_renderer_is_deterministic() -> None:
     s = _bare_settings()
     s.lldp_protocols = ["cdp"]
@@ -187,3 +204,24 @@ async def test_settings_lldp_validators(client: AsyncClient, db_session: AsyncSe
     assert (
         await client.put("/api/v1/settings", headers=h, json={"lldp_sys_name": "a\nb"})
     ).status_code == 422
+    # non-numeric MED ELIN (issue #348).
+    assert (
+        await client.put(
+            "/api/v1/settings", headers=h, json={"lldp_med_location": {"elin": "nope"}}
+        )
+    ).status_code == 422
+
+
+async def test_settings_lldp_agentx_and_elin_round_trip(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _admin_headers(db_session)
+    r = await client.put(
+        "/api/v1/settings",
+        headers=h,
+        json={"lldp_snmp_agentx": True, "lldp_med_location": {"elin": "911"}},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["lldp_snmp_agentx"] is True
+    assert body["lldp_med_location"] == {"elin": "911"}
