@@ -4,9 +4,21 @@ zone "{{ zone.name }}" {
     forward {{ "only" if zone.forward_only else "first" }};
     forwarders { {% for f in zone.forwarders %}{{ f }}; {% endfor %}};
 };
+{%- elif zone.zone_type in ("secondary", "slave", "stub") %}
+zone "{{ zone.name }}" {
+    type {{ "stub" if zone.zone_type == "stub" else "slave" }};
+    file "/var/cache/bind/zones/{{ zone.name }}db";
+    masters { {% for m in zone.masters %}{{ m.replace("@", " port ") }}; {% endfor %}};
+    {%- if zone.allow_query %}
+    allow-query { {% for a in zone.allow_query %}{{ a }}; {% endfor %}};
+    {%- endif %}
+    {%- if zone.allow_transfer %}
+    allow-transfer { {% for a in zone.allow_transfer %}{{ a }}; {% endfor %}};
+    {%- endif %}
+};
 {%- else %}
 zone "{{ zone.name }}" {
-    type {{ "master" if zone.zone_type == "primary" else zone.zone_type }};
+    type master;
     file "/var/cache/bind/zones/{{ zone.name }}db";
     {%- if zone.dnssec_enabled and zone.zone_type == "primary" %}
     dnssec-policy "{{ zone.dnssec_policy_name or "default" }}";

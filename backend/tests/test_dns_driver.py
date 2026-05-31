@@ -134,6 +134,52 @@ def test_render_zone_config_primary(zone: ZoneData) -> None:
     assert 'file "/var/cache/bind/zones/example.com.db"' in out
 
 
+def test_render_zone_config_secondary_with_masters() -> None:
+    # Issue #336 — a secondary zone must render ``type slave;`` + a
+    # ``masters { ... };`` clause, otherwise named refuses to load it.
+    z = ZoneData(
+        name="example.com.",
+        zone_type="secondary",
+        kind="forward",
+        ttl=3600,
+        refresh=86400,
+        retry=7200,
+        expire=3600000,
+        minimum=3600,
+        primary_ns="",
+        admin_email="",
+        serial=0,
+        masters=("192.0.2.1", "192.0.2.2@5353"),
+    )
+    out = BIND9Driver().render_zone_config(z)
+    assert 'zone "example.com."' in out
+    assert "type slave;" in out
+    assert "192.0.2.1;" in out
+    assert "192.0.2.2 port 5353;" in out
+    assert "masters {" in out
+
+
+def test_render_zone_config_stub_with_masters() -> None:
+    z = ZoneData(
+        name="stub.example.com.",
+        zone_type="stub",
+        kind="forward",
+        ttl=3600,
+        refresh=86400,
+        retry=7200,
+        expire=3600000,
+        minimum=3600,
+        primary_ns="",
+        admin_email="",
+        serial=0,
+        masters=("198.51.100.5",),
+    )
+    out = BIND9Driver().render_zone_config(z)
+    assert "type stub;" in out
+    assert "198.51.100.5;" in out
+    assert "masters {" in out
+
+
 def test_render_zone_file_mixed_records(zone: ZoneData, records: list[RecordData]) -> None:
     out = BIND9Driver().render_zone_file(zone, records)
     assert "$TTL 3600" in out
