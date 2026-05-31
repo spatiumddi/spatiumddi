@@ -79,9 +79,7 @@ _ROLE_ENV_FILENAME = "role-compose.env"
 # used by snmp / chrony / slot-upgrade triggers). Writing to this
 # path = "host runner please re-render".
 _NFT_TRIGGER_PATH = Path("/var/lib/spatiumddi-host/release-state/firewall-pending")
-_NFT_APPLIED_HASH_PATH = Path(
-    "/var/lib/spatiumddi-host/release-state/firewall-applied-hash"
-)
+_NFT_APPLIED_HASH_PATH = Path("/var/lib/spatiumddi-host/release-state/firewall-applied-hash")
 
 # #272 — in-cluster control-plane API Service. Every control-plane
 # node runs the api Deployment behind this headless-routable
@@ -616,6 +614,19 @@ def heartbeat_once(
                 desired_timezone=desired_timezone,
             )
 
+    # Issue #346 — appliance host-config (snmp / chrony / lldp). The control
+    # plane ships each rendered block + its config_hash; the maybe_fire_*
+    # writers compare against their applied-hash sidecar and fire the matching
+    # host-side reload trigger only when it differs (appliance-only, idempotent
+    # — safe to call every heartbeat). This is the runtime-activation path for
+    # #153 / #154 / #343.
+    if appliance_state.maybe_fire_snmp_reload(body_out.get("snmp_settings")):
+        log.info("supervisor.heartbeat.snmp_trigger_fired")
+    if appliance_state.maybe_fire_ntp_reload(body_out.get("ntp_settings")):
+        log.info("supervisor.heartbeat.ntp_trigger_fired")
+    if appliance_state.maybe_fire_lldp_reload(body_out.get("lldp_settings")):
+        log.info("supervisor.heartbeat.lldp_trigger_fired")
+
     # #272 Phase 7b — control-plane promote/demote. The host-side runner
     # (spatium-cluster-join) reconfigures k3s + reports back via the
     # .state sidecar that collect() ships on the next heartbeat; the
@@ -719,9 +730,7 @@ def heartbeat_once(
                 _evicted_pending.add(str(name))
                 log.info("supervisor.heartbeat.node_evicted", node=name)
             else:
-                log.warning(
-                    "supervisor.heartbeat.node_evict_failed", node=name, error=evict_err
-                )
+                log.warning("supervisor.heartbeat.node_evict_failed", node=name, error=evict_err)
         _evicted_pending.intersection_update({str(n) for n in evict_names})
 
     # #170 Wave C2 — render the role-driven compose env. C3 will

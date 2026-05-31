@@ -84,6 +84,9 @@ from app.services.appliance.ca import (
     sign_supervisor_cert,
     verify_session_token,
 )
+from app.services.appliance.lldp import lldp_bundle
+from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.snmp import snmp_bundle
 
 logger = structlog.get_logger(__name__)
 
@@ -1167,6 +1170,15 @@ class SupervisorHeartbeatResponse(BaseModel):
     # against the host's current tz on every heartbeat + writes the
     # ``spatium-tz-reload`` trigger file when they differ.
     desired_timezone: str = ""
+    # Issue #346 — appliance host-config blocks delivered to the supervisor,
+    # which compares each block's ``config_hash`` against its applied sidecar
+    # and fires the matching ``spatium-{snmp,chrony,lldp}-reload`` trigger when
+    # it differs. Same shape the DHCP-agent ConfigBundle ships; rendered from
+    # ``platform_settings`` via the ``*_bundle`` helpers. Empty/disabled blocks
+    # are still sent (stable key set) so the supervisor can retract config.
+    snmp_settings: dict[str, Any] = Field(default_factory=dict)
+    ntp_settings: dict[str, Any] = Field(default_factory=dict)
+    lldp_settings: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.post(
@@ -1523,6 +1535,25 @@ async def supervisor_heartbeat(
     metallb_vip = (cfg_row.control_plane_vip or "") if cfg_row else ""
     # Issue #165 — operator-set timezone. Empty string = no override.
     desired_timezone = (cfg_row.timezone or "") if cfg_row else ""
+    # Issue #346 — host-config blocks for snmp / chrony / lldp. Built from the
+    # same ``*_bundle`` helpers the DHCP-agent ConfigBundle uses; the
+    # disabled-shape fallback keeps a stable key set when no settings row
+    # exists yet so the supervisor's hash compare never KeyErrors.
+    snmp_block = (
+        snmp_bundle(cfg_row)
+        if cfg_row is not None
+        else {"enabled": False, "config_hash": "", "snmpd_conf": ""}
+    )
+    ntp_block = (
+        ntp_bundle(cfg_row)
+        if cfg_row is not None
+        else {"enabled": False, "allow_clients": False, "config_hash": "", "chrony_conf": ""}
+    )
+    lldp_block = (
+        lldp_bundle(cfg_row)
+        if cfg_row is not None
+        else {"enabled": False, "config_hash": "", "lldpd_conf": "", "daemon_args": ""}
+    )
 
     # #272 Phase 9 — dead k8s Nodes the seed should evict. Returned to
     # every CP supervisor but only the control-plane-variant seed acts.
@@ -1560,6 +1591,9 @@ async def supervisor_heartbeat(
         desired_control_plane_vip=metallb_vip,
         evict_node_names=evict_names,
         desired_timezone=desired_timezone,
+        snmp_settings=snmp_block,
+        ntp_settings=ntp_block,
+        lldp_settings=lldp_block,
     )
 
 
