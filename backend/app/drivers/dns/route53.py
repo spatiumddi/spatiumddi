@@ -458,23 +458,44 @@ class Route53DNSDriver(CloudDNSDriverBase):
     async def _resolve_zone_id(self, client: Any, zone_name: str) -> str:
         """Resolve a hosted-zone id from a zone FQDN.
 
-        Uses ``list_hosted_zones_by_name`` (an exact-name prefix query)
-        and matches the normalised ``Name`` exactly — the API returns the
-        first zone at-or-after ``DNSName`` alphabetically, which may be a
-        different zone when ours doesn't exist.
+        ``list_hosted_zones_by_name`` returns hosted zones in Route 53's
+        name sort order starting at-or-after ``DNSName``. A single
+        ``MaxItems='1'`` result can be a *neighbouring* zone (one that
+        sorts at-or-after the queried name but isn't the exact match —
+        common when the account holds sibling / sub-zones), so we must not
+        conclude "not found" from one row. Instead we page through the
+        result set via the ``IsTruncated`` / ``NextDNSName`` /
+        ``NextHostedZoneId`` continuation tokens, scanning each page for the
+        exact apex match. A modest page size keeps the common case (the
+        match is the first row) to a single round-trip.
         """
         apex = normalize_fqdn(zone_name)
-        try:
-            resp = await asyncio.to_thread(
-                client.list_hosted_zones_by_name, DNSName=apex, MaxItems="1"
-            )
-        except Exception as exc:  # noqa: BLE001 — wrap any botocore/SDK error
-            raise CloudDNSError(
-                f"route53 list_hosted_zones_by_name failed for {zone_name!r}: {exc}"
-            ) from exc
-        for z in resp.get("HostedZones", []):
-            if normalize_fqdn(z.get("Name", "")) == apex:
-                return str(z.get("Id", "")).split("/")[-1]
+        next_dns_name: str | None = apex
+        next_zone_id: str | None = None
+        while True:
+            kwargs: dict[str, Any] = {"MaxItems": "100"}
+            if next_dns_name is not None:
+                kwargs["DNSName"] = next_dns_name
+            if next_zone_id is not None:
+                kwargs["HostedZoneId"] = next_zone_id
+            try:
+                resp = await asyncio.to_thread(client.list_hosted_zones_by_name, **kwargs)
+            except Exception as exc:  # noqa: BLE001 — wrap any botocore/SDK error
+                raise CloudDNSError(
+                    f"route53 list_hosted_zones_by_name failed for {zone_name!r}: {exc}"
+                ) from exc
+            for z in resp.get("HostedZones", []):
+                if normalize_fqdn(z.get("Name", "")) == apex:
+                    return str(z.get("Id", "")).split("/")[-1]
+            if not resp.get("IsTruncated"):
+                break
+            # Route 53 hands back the start key for the NEXT page. Without
+            # both tokens advancing we'd re-request the same page forever, so
+            # bail out (treat as exhausted) if the API omits them.
+            next_dns_name = resp.get("NextDNSName")
+            next_zone_id = resp.get("NextHostedZoneId")
+            if next_dns_name is None and next_zone_id is None:
+                break
         raise CloudDNSError(f"route53: hosted zone {zone_name!r} not found")
 
     # ── Capabilities ────────────────────────────────────────────────────

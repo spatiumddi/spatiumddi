@@ -50,6 +50,7 @@ DEMO_RESTRICTED_MODULES: Final[frozenset[str]] = frozenset(
         "integrations.proxmox",
         "integrations.tailscale",
         "integrations.unifi",
+        "integrations.cloud",
     }
 )
 

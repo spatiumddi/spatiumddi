@@ -188,7 +188,8 @@ async def test_apply_record_update_puts_existing(monkeypatch: pytest.MonkeyPatch
         {
             "get": [
                 _FakeResponse(200, _env([{"id": "zid"}])),  # resolve zone
-                _FakeResponse(200, _env([{"id": "rid"}])),  # find existing record
+                # find existing record (content-keyed lookup)
+                _FakeResponse(200, _env([{"id": "rid", "content": "2.2.2.2"}])),
             ],
             "put": [_FakeResponse(200, _env({"id": "rid"}))],
         }
@@ -242,7 +243,7 @@ async def test_apply_record_delete_dispatches(monkeypatch: pytest.MonkeyPatch) -
         {
             "get": [
                 _FakeResponse(200, _env([{"id": "zid"}])),
-                _FakeResponse(200, _env([{"id": "rid"}])),
+                _FakeResponse(200, _env([{"id": "rid", "content": "1.1.1.1"}])),
             ],
             "delete": [_FakeResponse(200, _env({"id": "rid"}))],
         }
@@ -283,6 +284,168 @@ async def test_apply_record_delete_missing_is_noop(monkeypatch: pytest.MonkeyPat
 
     # Only the two lookups happened — no DELETE.
     assert [c["method"] for c in fake.calls] == ["get", "get"]
+
+
+# ── _apply_record update targets the right value of a multi-value RRset ──
+async def test_apply_record_update_matches_content_in_multivalue_rrset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A round-robin A name has two values on Cloudflare; updating the TTL of
+    the ``5.6.7.8`` record must PUT against *its* id, not the first row's
+    (issue #331)."""
+    multi = _env(
+        [
+            {"id": "rid-a", "type": "A", "name": "www.example.com", "content": "1.2.3.4"},
+            {"id": "rid-b", "type": "A", "name": "www.example.com", "content": "5.6.7.8"},
+        ]
+    )
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),  # resolve zone
+                _FakeResponse(200, multi),  # find existing record (content-filtered)
+            ],
+            "put": [_FakeResponse(200, _env({"id": "rid-b"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="update",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="5.6.7.8", ttl=600),
+        target_serial=1,
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    # The lookup carried the content filter so Cloudflare narrows the RRset…
+    lookup = fake.calls[1]
+    assert lookup["params"] == {"name": "www.example.com", "type": "A", "content": "5.6.7.8"}
+    # …and we PUT against the id whose content actually matched the op value.
+    put = next(c for c in fake.calls if c["method"] == "put")
+    assert put["path"] == "/zones/zid/dns_records/rid-b"
+    assert put["json"]["content"] == "5.6.7.8"
+    assert put["json"]["ttl"] == 600
+
+
+# ── _apply_record delete targets the right value of a multi-value RRset ──
+async def test_apply_record_delete_matches_content_in_multivalue_rrset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``delete A 1.2.3.4`` against a 2-value RRset must DELETE the row holding
+    ``1.2.3.4`` even if Cloudflare lists ``5.6.7.8`` first (issue #331)."""
+    multi = _env(
+        [
+            {"id": "rid-keep", "type": "A", "name": "www.example.com", "content": "5.6.7.8"},
+            {"id": "rid-drop", "type": "A", "name": "www.example.com", "content": "1.2.3.4"},
+        ]
+    )
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(200, multi),
+            ],
+            "delete": [_FakeResponse(200, _env({"id": "rid-drop"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="1.2.3.4"),
+        target_serial=1,
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    lookup = fake.calls[1]
+    assert lookup["params"]["content"] == "1.2.3.4"
+    delete = next(c for c in fake.calls if c["method"] == "delete")
+    # The value-keyed row, not the first-listed sibling.
+    assert delete["path"] == "/zones/zid/dns_records/rid-drop"
+
+
+# ── _apply_record delete is a no-op when no value matches ───────────────
+async def test_apply_record_delete_no_content_match_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If Cloudflare returns sibling values but none equal the op value, the
+    delete must be a safe no-op (no DELETE issued) rather than removing a
+    wrong-value row (issue #331)."""
+    multi = _env(
+        [
+            {"id": "rid-a", "type": "A", "name": "www.example.com", "content": "5.6.7.8"},
+            {"id": "rid-b", "type": "A", "name": "www.example.com", "content": "9.9.9.9"},
+        ]
+    )
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(200, multi),
+            ]
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="1.2.3.4"),
+        target_serial=1,
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    # Only the two lookups happened — no DELETE against a non-matching value.
+    assert [c["method"] for c in fake.calls] == ["get", "get"]
+
+
+# ── _find_record_id disambiguates MX rows by priority too ───────────────
+async def test_apply_record_delete_mx_matches_priority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two MX records at the apex share a content host but differ by priority;
+    deleting one must match content *and* priority (issue #331)."""
+    multi = _env(
+        [
+            {
+                "id": "mx-10",
+                "type": "MX",
+                "name": "example.com",
+                "content": "mail.example.com",
+                "priority": 10,
+            },
+            {
+                "id": "mx-20",
+                "type": "MX",
+                "name": "example.com",
+                "content": "mail.example.com",
+                "priority": 20,
+            },
+        ]
+    )
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(200, multi),
+            ],
+            "delete": [_FakeResponse(200, _env({"id": "mx-20"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="@", record_type="MX", value="mail.example.com", priority=20),
+        target_serial=1,
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    delete = next(c for c in fake.calls if c["method"] == "delete")
+    assert delete["path"] == "/zones/zid/dns_records/mx-20"
 
 
 # ── _apply_zone create includes account when account_id present ─────────

@@ -41,6 +41,13 @@ async def _run_sweep() -> dict[str, Any]:
                 .scalars()
                 .all()
             )
+            # Snapshot the gate fields into plain values before the loop. A
+            # per-endpoint rollback (below) expires every ORM object on the
+            # shared session, so reading ``endpoint.last_synced_at`` straight
+            # off ``rows`` on a later iteration would trigger a sync lazy-load
+            # and blow up with MissingGreenlet. We re-fetch each endpoint
+            # inside the loop instead (issue #333).
+            endpoint_ids = [endpoint.id for endpoint in rows]
 
             now = datetime.now(UTC)
             ran = 0
@@ -49,7 +56,10 @@ async def _run_sweep() -> dict[str, Any]:
             err_count = 0
             errors: list[str] = []
 
-            for endpoint in rows:
+            for endpoint_id in endpoint_ids:
+                endpoint = await db.get(CloudEndpoint, endpoint_id)
+                if endpoint is None:
+                    continue
                 if endpoint.last_synced_at is not None:
                     elapsed = now - endpoint.last_synced_at
                     if elapsed < timedelta(seconds=endpoint.sync_interval_seconds):
@@ -65,6 +75,12 @@ async def _run_sweep() -> dict[str, Any]:
                         endpoint=str(endpoint.id),
                         error=str(exc),
                     )
+                    # A crash inside reconcile_endpoint leaves the shared
+                    # session in a failed-transaction state; without this
+                    # rollback the next endpoint's first query raises
+                    # PendingRollbackError, turning one bad endpoint into a
+                    # sweep-wide failure (issue #333).
+                    await db.rollback()
                     continue
                 ran += 1
                 if summary.ok:

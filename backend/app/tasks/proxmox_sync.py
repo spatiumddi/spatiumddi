@@ -42,6 +42,13 @@ async def _run_sweep() -> dict[str, Any]:
                 .scalars()
                 .all()
             )
+            # Snapshot the gate fields into plain values before the loop. A
+            # per-node rollback (below) expires every ORM object on the shared
+            # session, so reading ``node.last_synced_at`` straight off ``rows``
+            # on a later iteration would trigger a sync lazy-load and blow up
+            # with MissingGreenlet. We re-fetch each node inside the loop
+            # instead (issue #333).
+            node_ids = [node.id for node in rows]
 
             now = datetime.now(UTC)
             ran = 0
@@ -50,7 +57,10 @@ async def _run_sweep() -> dict[str, Any]:
             err_count = 0
             errors: list[str] = []
 
-            for node in rows:
+            for node_id in node_ids:
+                node = await db.get(ProxmoxNode, node_id)
+                if node is None:
+                    continue
                 if node.last_synced_at is not None:
                     elapsed = now - node.last_synced_at
                     if elapsed < timedelta(seconds=node.sync_interval_seconds):
@@ -66,6 +76,11 @@ async def _run_sweep() -> dict[str, Any]:
                         node=str(node.id),
                         error=str(exc),
                     )
+                    # A crash inside reconcile_node leaves the shared session
+                    # in a failed-transaction state; without this rollback the
+                    # next node's first query raises PendingRollbackError,
+                    # turning one bad node into a sweep-wide failure (#333).
+                    await db.rollback()
                     continue
                 ran += 1
                 if summary.ok:

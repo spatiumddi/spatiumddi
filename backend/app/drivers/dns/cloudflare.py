@@ -240,17 +240,43 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         zone_id: str,
         name: str,
         record_type: str,
+        content: str | None = None,
+        priority: int | None = None,
     ) -> str | None:
-        """Return the Cloudflare record id matching name+type, or ``None``."""
-        resp = await client.get(
-            f"/zones/{zone_id}/dns_records",
-            params={"name": name, "type": record_type},
-        )
+        """Return the Cloudflare record id matching name+type+value, or ``None``.
+
+        SpatiumDDI keys DNS records per value and supports round-robin (multiple
+        A/AAAA at one hostname) and multiple MX/NS/TXT. So when ``content`` is
+        given we must match the *specific* value being changed — matching on
+        name+type alone returns the first row of a multi-value RRset and would
+        update/delete the wrong value (issue #331).
+
+        We narrow server-side with the ``content`` filter, then verify the
+        match client-side over the returned list (``priority`` too for
+        MX/SRV) so a content filter that normalises differently for a given
+        rrtype can't silently hand back a sibling value.
+        """
+        params: dict[str, Any] = {"name": name, "type": record_type}
+        if content is not None:
+            params["content"] = content
+        resp = await client.get(f"/zones/{zone_id}/dns_records", params=params)
         body = self._unwrap(resp)
         results = body.get("result") or []
         if not results:
             return None
-        return str(results[0]["id"])
+        # Name+type-only lookup (content unknown): keep legacy first-match.
+        if content is None:
+            return str(results[0]["id"])
+        # Value-keyed lookup: pick the row whose content (and priority for
+        # MX/SRV) actually matches — the server-side filter is a narrowing
+        # hint, not a guarantee.
+        for rec in results:
+            if rec.get("content") != content:
+                continue
+            if priority is not None and rec.get("priority") != priority:
+                continue
+            return str(rec["id"])
+        return None
 
     async def _apply_record(self, server: Any, creds: dict[str, Any], change: RecordChange) -> None:
         token = self._token(creds)
@@ -266,7 +292,12 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
 
             if change.op == "update":
                 rid = await self._find_record_id(
-                    client, zone_id, payload["name"], change.record.record_type
+                    client,
+                    zone_id,
+                    payload["name"],
+                    change.record.record_type,
+                    content=change.record.value,
+                    priority=change.record.priority,
                 )
                 if rid is None:
                     # No existing row to update — treat as create so the
@@ -281,7 +312,12 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
 
             if change.op == "delete":
                 rid = await self._find_record_id(
-                    client, zone_id, payload["name"], change.record.record_type
+                    client,
+                    zone_id,
+                    payload["name"],
+                    change.record.record_type,
+                    content=change.record.value,
+                    priority=change.record.priority,
                 )
                 if rid is None:
                     # Idempotent delete — nothing to remove.
