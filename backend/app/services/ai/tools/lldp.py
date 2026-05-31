@@ -13,6 +13,7 @@ the Phase-1 config-visibility counterpart, matching ``find_snmp_settings``.
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -102,7 +103,13 @@ async def find_lldp_neighbors(
         Appliance, Appliance.id == ApplianceLldpNeighbour.appliance_id
     )
     if args.appliance_id:
-        stmt = stmt.where(ApplianceLldpNeighbour.appliance_id == args.appliance_id)
+        try:
+            aid = uuid.UUID(args.appliance_id)
+        except ValueError:
+            # Malformed UUID — return empty rather than letting a bad value
+            # hit the UUID column (driver-dependent error).
+            return []
+        stmt = stmt.where(ApplianceLldpNeighbour.appliance_id == aid)
     stmt = stmt.order_by(ApplianceLldpNeighbour.last_seen.desc()).limit(args.limit)
     rows = (await db.execute(stmt)).all()
     return [

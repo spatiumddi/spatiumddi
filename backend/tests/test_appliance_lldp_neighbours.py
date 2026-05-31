@@ -166,3 +166,15 @@ async def test_find_lldp_neighbors_tool(client: AsyncClient, db_session: AsyncSe
     assert mine[0]["remote_sys_name"] == "sw1"
     assert mine[0]["appliance_hostname"] == "agent-1"
     assert mine[0]["local_iface"] == "eth0"
+
+    # Filter by the appliance UUID works…
+    filtered = await find_lldp_neighbors(
+        db_session, user, FindLLDPNeighborsArgs(appliance_id=str(row.id))
+    )
+    assert len(filtered) == 1
+    # …and a malformed UUID returns empty rather than erroring at the DB layer.
+    assert (
+        await find_lldp_neighbors(
+            db_session, user, FindLLDPNeighborsArgs(appliance_id="not-a-uuid")
+        )
+    ) == []

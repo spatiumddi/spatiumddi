@@ -83,6 +83,8 @@ def test_parse_handles_name_keyed_chassis() -> None:
     assert len(out) == 1
     assert out[0]["remote_chassis_id"] == "de:ad:be:ef:00:01"
     assert out[0]["remote_port_id"] == "7"
+    # The chassis KEY is the sys-name in this shape — must be preserved (#349).
+    assert out[0]["remote_sys_name"] == "sw2"
 
 
 def test_parse_empty_and_garbage() -> None:

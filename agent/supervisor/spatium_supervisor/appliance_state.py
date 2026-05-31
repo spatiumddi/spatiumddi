@@ -887,10 +887,13 @@ def _lldp_chassis(iface: dict) -> dict:
     if items and isinstance(items[0], dict):
         c = items[0]
         # Name-keyed single-entry dict (no "id" key) → unwrap the inner value.
+        # The KEY is the chassis sys-name in this shape, so fold it in as
+        # ``name`` (unless the inner dict already carries one) — otherwise
+        # remote_sys_name is silently lost for those lldpd builds.
         if "id" not in c and len(c) == 1:
-            inner = next(iter(c.values()))
+            key, inner = next(iter(c.items()))
             if isinstance(inner, dict):
-                return inner
+                return inner if "name" in inner else {**inner, "name": key}
         return c
     return {}
 
