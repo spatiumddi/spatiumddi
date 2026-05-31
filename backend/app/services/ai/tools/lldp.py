@@ -15,10 +15,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.appliance import Appliance
 from app.models.auth import User
+from app.models.network import ApplianceLldpNeighbour
 from app.models.settings import PlatformSettings
 from app.services.ai.tools.base import register_tool
 
@@ -68,3 +71,52 @@ async def find_lldp_settings(
         "system_name_override": settings.lldp_sys_name or None,
         "system_description_override": settings.lldp_sys_description or None,
     }
+
+
+class FindLLDPNeighborsArgs(BaseModel):
+    appliance_id: str | None = Field(
+        default=None, description="Filter to one appliance UUID (the host that saw the neighbour)."
+    )
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+@register_tool(
+    name="find_lldp_neighbors",
+    description=(
+        "List LLDP neighbours discovered by SpatiumDDI appliance hosts via their "
+        "local lldpd — local interface, the remote switch/device's chassis-id, "
+        "port-id, system name, management IP, and capabilities. Use to answer "
+        "'what is appliance X plugged into?', 'which switch/port is it on?', or "
+        "'what are my appliances' L2 neighbours?'. Populated by the supervisor "
+        "heartbeat (issue #347), absence-deleted when a neighbour ages out."
+    ),
+    args_model=FindLLDPNeighborsArgs,
+    category="network",
+    default_enabled=True,
+    module=None,
+)
+async def find_lldp_neighbors(
+    db: AsyncSession, user: User, args: FindLLDPNeighborsArgs
+) -> list[dict[str, Any]]:
+    stmt = select(ApplianceLldpNeighbour, Appliance.hostname).join(
+        Appliance, Appliance.id == ApplianceLldpNeighbour.appliance_id
+    )
+    if args.appliance_id:
+        stmt = stmt.where(ApplianceLldpNeighbour.appliance_id == args.appliance_id)
+    stmt = stmt.order_by(ApplianceLldpNeighbour.last_seen.desc()).limit(args.limit)
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "appliance_id": str(n.appliance_id),
+            "appliance_hostname": hostname,
+            "local_iface": n.local_iface,
+            "remote_chassis_id": n.remote_chassis_id,
+            "remote_port_id": n.remote_port_id,
+            "remote_port_descr": n.remote_port_descr,
+            "remote_sys_name": n.remote_sys_name,
+            "remote_mgmt_ip": n.remote_mgmt_ip,
+            "remote_caps": n.remote_caps,
+            "last_seen": n.last_seen.isoformat() if n.last_seen else None,
+        }
+        for n, hostname in rows
+    ]

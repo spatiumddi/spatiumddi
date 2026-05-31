@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -855,6 +856,118 @@ def read_lldpd_running() -> bool | None:
     return None
 
 
+# ── LLDP neighbour discovery (#347) ──────────────────────────────────
+
+
+def _lldp_list(x: object) -> list:
+    """lldpd's json0 wraps even single items in arrays; tolerate both."""
+    if isinstance(x, list):
+        return x
+    return [x] if x is not None else []
+
+
+def _lldp_scalar(x: object) -> str:
+    """Pull a leaf string from a json0 node — ``[{"value": v}]`` / ``{"value":
+    v}`` / a bare scalar all collapse to ``str(v)``."""
+    items = _lldp_list(x)
+    if not items:
+        return ""
+    first = items[0]
+    if isinstance(first, dict):
+        return str(first.get("value", "")).strip()
+    return str(first).strip()
+
+
+def _lldp_chassis(iface: dict) -> dict:
+    """Return the chassis object for an interface entry, tolerating both the
+    json0 array shape (``"chassis": [{"id": ...}]``) and the name-keyed
+    ``json`` shape (``"chassis": {"sw1": {"id": ...}}``)."""
+    raw = iface.get("chassis")
+    items = _lldp_list(raw)
+    if items and isinstance(items[0], dict):
+        c = items[0]
+        # Name-keyed single-entry dict (no "id" key) → unwrap the inner value.
+        if "id" not in c and len(c) == 1:
+            inner = next(iter(c.values()))
+            if isinstance(inner, dict):
+                return inner
+        return c
+    return {}
+
+
+def _parse_lldp_neighbours(doc: object) -> list[dict]:
+    """Flatten ``lldpcli show neighbors -f json0`` into neutral neighbour
+    dicts the control plane ingests. Defensive — skips malformed entries
+    rather than raising, so one weird neighbour can't drop the whole batch.
+    """
+    out: list[dict] = []
+    if not isinstance(doc, dict):
+        return out
+    for lldp in _lldp_list(doc.get("lldp")):
+        if not isinstance(lldp, dict):
+            continue
+        for iface in _lldp_list(lldp.get("interface")):
+            if not isinstance(iface, dict):
+                continue
+            # ``_lldp_scalar`` handles both a plain ``"eth0"`` and json0's
+            # array-wrapped ``[{"value": "eth0"}]`` forms uniformly.
+            local = _lldp_scalar(iface.get("name"))
+            chassis = _lldp_chassis(iface)
+            ports = _lldp_list(iface.get("port"))
+            port = ports[0] if ports and isinstance(ports[0], dict) else {}
+
+            chassis_id = _lldp_scalar(chassis.get("id"))
+            port_id = _lldp_scalar(port.get("id"))
+            if not local or not chassis_id or not port_id:
+                continue  # the identity tuple must be complete
+
+            caps = [
+                str(c.get("type"))
+                for c in _lldp_list(chassis.get("capability"))
+                if isinstance(c, dict) and c.get("enabled") and c.get("type")
+            ]
+            out.append(
+                {
+                    "local_iface": local[:64],
+                    "remote_chassis_id": chassis_id[:255],
+                    "remote_port_id": port_id[:255],
+                    "remote_port_descr": (_lldp_scalar(port.get("descr")) or None),
+                    "remote_sys_name": (_lldp_scalar(chassis.get("name")) or None),
+                    "remote_sys_descr": (_lldp_scalar(chassis.get("descr")) or None),
+                    "remote_mgmt_ip": (_lldp_scalar(chassis.get("mgmt-ip")) or None),
+                    "remote_caps": (",".join(caps) or None),
+                }
+            )
+    return out
+
+
+def read_lldp_neighbours() -> list[dict] | None:
+    """Run ``lldpcli show neighbors -f json0`` + parse it (#347).
+
+    Returns the neighbour list (possibly empty) on a successful run, or
+    ``None`` when not on an appliance / lldpcli is unavailable or errors — so
+    the control plane leaves the stored set alone rather than wiping it on a
+    transient failure. An empty list DOES wipe (lldpd ran, saw nothing)."""
+    if detect_deployment_kind() != "appliance":
+        return None
+    try:
+        proc = subprocess.run(
+            ["lldpcli", "-f", "json0", "show", "neighbors"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        doc = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    return _parse_lldp_neighbours(doc)
+
+
 def maybe_fire_ntp_reload(bundle_block: object) -> bool:
     """Issue #154 — write the ntp-config trigger when the control
     plane's rendered chrony.conf hash differs from the last applied.
@@ -1208,6 +1321,10 @@ def collect() -> dict[str, object]:
         # Issue #343 — lldpd running state from the host-side runner's
         # status sidecar. None on non-appliance deploys.
         "lldpd_running": read_lldpd_running() if is_appliance else None,
+        # Issue #347 — LLDP neighbours discovered by local lldpd. None when
+        # not collected (off-appliance / lldpcli error) so the backend leaves
+        # the stored set alone; an empty list means "ran, saw none" (wipe).
+        "lldp_neighbours": read_lldp_neighbours() if is_appliance else None,
         # Issue #183 Phase 4 — local k3s health summary. Slow drift
         # signals that ride the heartbeat (fast actions go through
         # the proxy). Empty dict on non-k3s appliances; never None
