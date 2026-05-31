@@ -1,8 +1,12 @@
-"""Neutral ConfigBundle → Kea ``Dhcp4`` JSON renderer.
+"""Neutral ConfigBundle → Kea ``Dhcp4`` + ``Dhcp6`` JSON renderer.
 
 The control plane emits a backend-neutral ConfigBundle describing scopes,
 pools, statics, client classes, reservations and global/scope-level options.
-This module converts that into a Kea-specific ``Dhcp4`` JSON document.
+This module converts that into a Kea-specific config document carrying BOTH
+a ``Dhcp4`` and a ``Dhcp6`` block (the agent runs both daemons always-on;
+the ``Dhcp6`` block is an idle skeleton when no v6 scopes exist). The two
+blocks are split into separate files by ``sync.py`` because ``kea-dhcp4 -t``
+rejects a stray ``Dhcp6`` key (and vice-versa).
 
 A minimal bundle looks like::
 
@@ -513,12 +517,19 @@ def render(
 ) -> dict[str, Any]:
     """Render a ConfigBundle into a Kea config document.
 
-    Returns ``{"Dhcp4": {...}}`` when only v4 scopes are present (or no
-    scopes at all — the default daemon is Dhcp4). When the bundle carries
-    any ``address_family == "ipv6"`` scope, a ``"Dhcp6"`` block is added
-    alongside (Kea runs the Dhcp4 / Dhcp6 daemons as separate processes;
-    the agent runs whichever it has scopes for). This mirrors the v4/v6
-    split in ``backend/app/drivers/dhcp/kea.py``.
+    Always returns BOTH a ``{"Dhcp4": {...}}`` and a ``{"Dhcp6": {...}}``
+    block — the agent container runs kea-dhcp4 AND kea-dhcp6 always-on
+    (dual-stack). When the bundle carries no ``address_family == "ipv6"``
+    scope the Dhcp6 block is an idle skeleton (empty ``subnet6``, no
+    option-data / client-classes) that binds nothing; when v6 scopes are
+    present they render into ``subnet6``. Each daemon is a separate Kea
+    process with its own control socket + lease store. This mirrors the
+    v4/v6 split in ``backend/app/drivers/dhcp/kea.py``.
+
+    NOTE: the two blocks MUST be written to SEPARATE config files —
+    ``kea-dhcp4 -t`` rejects a document containing a stray ``Dhcp6`` key
+    (and vice-versa). ``sync.py`` splits this combined return into
+    ``kea-dhcp4.conf`` (Dhcp4 only) and ``kea-dhcp6.conf`` (Dhcp6 only).
 
     ``control_socket_v6`` / ``lease_file_v6`` default to the v4 paths with
     the ``4`` swapped for ``6`` (``kea4-ctrl-socket`` → ``kea6-ctrl-socket``,
@@ -648,60 +659,72 @@ def render(
 
     out: dict[str, Any] = {"Dhcp4": dhcp4}
 
-    # Dhcp6 block — only when the bundle carries v6 scopes. The Dhcp6
-    # daemon is a separate Kea process with its own control socket +
-    # lease store; option-data renders through the v6 name map (v4-only
-    # options dropped with a warning), and reservations use the v6
-    # ``ip-addresses`` (plural) shape. Mirrors the ``Dhcp6`` block in
+    # Dhcp6 block — ALWAYS emitted. The agent container runs kea-dhcp6
+    # always-on (dual-stack), so a valid Dhcp6 doc must always be
+    # rendered. When the bundle carries no v6 scopes the block is an
+    # idle skeleton: no host interfaces bound (``interfaces: []``, safe
+    # on IPv6-less hosts), empty ``subnet6``, and no global option-data /
+    # client-classes. When v6 scopes ARE present the daemon binds the
+    # bundle's interfaces and serves them. The Dhcp6 daemon is a separate
+    # Kea process with its own control socket + lease store; option-data
+    # renders through the v6 name map (v4-only options dropped with a
+    # warning), and reservations use the v6 ``ip-addresses`` (plural)
+    # shape. Mirrors the ``Dhcp6`` block in
     # ``backend/app/drivers/dhcp/kea.py``.
+    ctrl6 = control_socket_v6 or control_socket.replace("kea4", "kea6")
+    lease6 = lease_file_v6 or lease_file.replace("leases4", "leases6")
+    # Idle skeleton binds nothing; an active v6 config binds the bundle's
+    # interfaces just like Dhcp4.
+    v6_interfaces = list(interfaces) if v6_scopes else []
+    dhcp6: dict[str, Any] = {
+        "interfaces-config": {"interfaces": v6_interfaces},
+        "control-socket": {
+            "socket-type": "unix",
+            "socket-name": ctrl6,
+        },
+        "lease-database": {
+            "type": "memfile",
+            "persist": True,
+            "name": lease6,
+            "lfc-interval": 3600,
+        },
+        "expired-leases-processing": {
+            "reclaim-timer-wait-time": 10,
+            "flush-reclaimed-timer-wait-time": 25,
+            "hold-reclaimed-time": 3600,
+            "max-reclaim-leases": 100,
+            "max-reclaim-time": 250,
+            "unwarned-reclaim-cycles": 5,
+        },
+        "valid-lifetime": int(
+            bundle.get("global_options", {}).get("lease_time") or 3600
+        ),
+        "renew-timer": 900,
+        "rebind-timer": 1800,
+        "hooks-libraries": [
+            {"library": "/usr/lib/kea/hooks/libdhcp_lease_cmds.so"},
+        ],
+        "subnet6": [_scope_to_subnet6(s) for s in v6_scopes],
+        "loggers": [
+            {
+                "name": "kea-dhcp6",
+                "output_options": [
+                    {"output": "stdout"},
+                    {
+                        "output": "/var/log/kea/kea-dhcp6.log",
+                        "maxsize": 50_000_000,
+                        "maxver": 5,
+                        "flush": True,
+                    },
+                ],
+                "severity": "INFO",
+            }
+        ],
+    }
+    # Global option-data + client classes only apply when v6 scopes are
+    # being served — the idle skeleton stays bare so it can't reject on
+    # an inherited v4-only global option.
     if v6_scopes:
-        ctrl6 = control_socket_v6 or control_socket.replace("kea4", "kea6")
-        lease6 = lease_file_v6 or lease_file.replace("leases4", "leases6")
-        dhcp6: dict[str, Any] = {
-            "interfaces-config": {"interfaces": list(interfaces)},
-            "control-socket": {
-                "socket-type": "unix",
-                "socket-name": ctrl6,
-            },
-            "lease-database": {
-                "type": "memfile",
-                "persist": True,
-                "name": lease6,
-                "lfc-interval": 3600,
-            },
-            "expired-leases-processing": {
-                "reclaim-timer-wait-time": 10,
-                "flush-reclaimed-timer-wait-time": 25,
-                "hold-reclaimed-time": 3600,
-                "max-reclaim-leases": 100,
-                "max-reclaim-time": 250,
-                "unwarned-reclaim-cycles": 5,
-            },
-            "valid-lifetime": int(
-                bundle.get("global_options", {}).get("lease_time") or 3600
-            ),
-            "renew-timer": 900,
-            "rebind-timer": 1800,
-            "hooks-libraries": [
-                {"library": "/usr/lib/kea/hooks/libdhcp_lease_cmds.so"},
-            ],
-            "subnet6": [_scope_to_subnet6(s) for s in v6_scopes],
-            "loggers": [
-                {
-                    "name": "kea-dhcp6",
-                    "output_options": [
-                        {"output": "stdout"},
-                        {
-                            "output": "/var/log/kea/kea-dhcp6.log",
-                            "maxsize": 50_000_000,
-                            "maxver": 5,
-                            "flush": True,
-                        },
-                    ],
-                    "severity": "INFO",
-                }
-            ],
-        }
         opts6 = _options_from_mapping_v6(bundle.get("global_options"))
         if opts6:
             dhcp6["option-data"] = opts6
@@ -726,6 +749,6 @@ def render(
         ]
         if rendered_classes_v6:
             dhcp6["client-classes"] = rendered_classes_v6
-        out["Dhcp6"] = dhcp6
+    out["Dhcp6"] = dhcp6
 
     return out

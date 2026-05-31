@@ -137,6 +137,28 @@ async def test_create_secondary_zone_with_masters_succeeds(
     assert body["masters"] == ["192.0.2.10", "192.0.2.11@5353"]
 
 
+async def test_create_secondary_zone_rejects_injection_in_masters(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # masters is rendered straight into ``masters { ... };`` — a value carrying
+    # named-config metacharacters must be rejected, not persisted + injected
+    # into the rendered server config (#336 config-injection hardening).
+    h = await _admin_headers(db_session)
+    grp = await _group(db_session)
+    await db_session.commit()
+    for bad in ('192.0.2.10; } ; zone "evil" { type master', "192.0.2.10 extra", "not-an-ip"):
+        r = await client.post(
+            f"/api/v1/dns/groups/{grp.id}/zones",
+            headers=h,
+            json={
+                "name": "secondary.example.com.",
+                "zone_type": "secondary",
+                "masters": [bad],
+            },
+        )
+        assert r.status_code == 422, f"{bad!r} should be rejected: {r.text}"
+
+
 async def test_update_to_secondary_without_masters_rejected(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:

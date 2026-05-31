@@ -399,11 +399,48 @@ def test_v6_separate_socket_and_lease_paths(wire_bundle_v6: dict) -> None:
     assert out["Dhcp6"]["lease-database"]["name"] == "/var/lib/kea/kea-leases6.csv"
 
 
-def test_no_dhcp6_block_when_all_v4(wire_bundle: dict) -> None:
-    """A pure-v4 bundle must not grow a stray empty Dhcp6 block."""
+def test_dhcp6_idle_skeleton_always_emitted(wire_bundle: dict) -> None:
+    """The agent runs kea-dhcp6 always-on (dual-stack), so a pure-v4
+    bundle must still render a VALID idle Dhcp6 skeleton — binds nothing
+    (``interfaces: []``), empty ``subnet6``, its own v6 control socket +
+    lease store, and no stray global option-data / client-classes that
+    could make kea-dhcp6 -t reject."""
     out = render(wire_bundle)
-    assert "Dhcp6" not in out
     assert "Dhcp4" in out
+    assert "Dhcp6" in out
+    d6 = out["Dhcp6"]
+    # Idle skeleton binds no interfaces — safe on IPv6-less hosts.
+    assert d6["interfaces-config"]["interfaces"] == []
+    assert d6["subnet6"] == []
+    # Distinct v6 socket + lease store.
+    assert d6["control-socket"]["socket-name"] == "/run/kea/kea6-ctrl-socket"
+    assert d6["lease-database"]["name"] == "/var/lib/kea/kea-leases6.csv"
+    # No global option-data / client-classes leaked onto the idle skeleton.
+    assert "option-data" not in d6
+    assert "client-classes" not in d6
+
+
+def test_dhcp6_idle_skeleton_for_empty_bundle() -> None:
+    """Even a totally empty bundle renders a valid idle Dhcp6 block."""
+    out = render({"server": {}, "subnets": []})
+    assert out["Dhcp6"]["subnet6"] == []
+    assert out["Dhcp6"]["interfaces-config"]["interfaces"] == []
+    # The lease_cmds hook is loaded so the daemon starts cleanly.
+    libs = [h["library"] for h in out["Dhcp6"]["hooks-libraries"]]
+    assert any("libdhcp_lease_cmds.so" in lib for lib in libs)
+
+
+def test_dhcp6_control_socket_override_on_idle_skeleton() -> None:
+    """The idle skeleton must honour the explicit v6 control-socket
+    override (sync.py passes the configured path)."""
+    out = render(
+        {"server": {}, "subnets": []},
+        control_socket="/run/kea/kea4-ctrl-socket",
+        control_socket_v6="/custom/kea6.sock",
+        lease_file_v6="/custom/leases6.csv",
+    )
+    assert out["Dhcp6"]["control-socket"]["socket-name"] == "/custom/kea6.sock"
+    assert out["Dhcp6"]["lease-database"]["name"] == "/custom/leases6.csv"
 
 
 def test_v6_slaac_mode_serves_no_pools_or_options() -> None:

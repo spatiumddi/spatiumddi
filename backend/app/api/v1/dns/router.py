@@ -570,6 +570,32 @@ VALID_ZONE_COLORS = {
 }
 
 
+def _validate_masters_format(v: list[str] | None) -> list[str]:
+    """Validate each ``masters`` entry is a bare IP or ``ip@port`` — the only
+    shapes the BIND9 ``masters { ... };`` renderer accepts. Rejects anything
+    carrying named-config metacharacters (``;`` ``{`` ``}`` whitespace, etc.)
+    so a crafted value can't be injected into the rendered server config
+    (issue #336 — config-injection hardening)."""
+    import ipaddress  # noqa: PLC0415
+
+    cleaned: list[str] = []
+    for raw in v or []:
+        entry = str(raw).strip()
+        if not entry:
+            continue
+        host, sep, port = entry.partition("@")
+        try:
+            ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ValueError(
+                f"master {entry!r} must be a bare IPv4/IPv6 address (optionally 'ip@port')"
+            ) from exc
+        if sep and (not port.isdigit() or not (1 <= int(port) <= 65535)):
+            raise ValueError(f"master {entry!r}: port must be an integer in 1..65535")
+        cleaned.append(entry)
+    return cleaned
+
+
 class ZoneCreate(BaseModel):
     name: str
     view_id: uuid.UUID | None = None
@@ -610,6 +636,11 @@ class ZoneCreate(BaseModel):
         if v not in VALID_ZONE_TYPES:
             raise ValueError(f"zone_type must be one of {sorted(VALID_ZONE_TYPES)}")
         return v
+
+    @field_validator("masters")
+    @classmethod
+    def validate_masters(cls, v: list[str]) -> list[str]:
+        return _validate_masters_format(v)
 
     @model_validator(mode="after")
     def require_masters_for_secondary(self) -> ZoneCreate:
@@ -679,6 +710,11 @@ class ZoneUpdate(BaseModel):
         if v is not None and v not in VALID_ZONE_TYPES:
             raise ValueError(f"zone_type must be one of {sorted(VALID_ZONE_TYPES)}")
         return v
+
+    @field_validator("masters")
+    @classmethod
+    def validate_masters(cls, v: list[str] | None) -> list[str] | None:
+        return None if v is None else _validate_masters_format(v)
 
     @field_validator("color")
     @classmethod

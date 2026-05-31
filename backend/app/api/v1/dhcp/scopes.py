@@ -105,6 +105,29 @@ def _validate_relay_addresses(v: list[str] | None) -> list[str]:
     return out
 
 
+def _validate_relay_family(addrs: list[str], address_family: str) -> None:
+    """Reject relay addresses whose IP family doesn't match the scope's
+    family. A v4 (subnet4) scope's giaddr relays must be IPv4 and a v6
+    (subnet6) scope's relays IPv6 — a mismatch renders an invalid Kea
+    subnet (issue #337). Format is already validated upstream; this only
+    checks the family against the scope's subnet-derived address_family.
+    """
+    want_v6 = address_family == "ipv6"
+    for raw in addrs or []:
+        try:
+            ip = ipaddress.ip_address(str(raw).strip())
+        except ValueError:
+            continue
+        if (ip.version == 6) != want_v6:
+            fam = "IPv6" if want_v6 else "IPv4"
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"relay address {raw!r} must be {fam} to match this " f"{address_family} scope"
+                ),
+            )
+
+
 class ScopeCreate(BaseModel):
     model_config = {"extra": "ignore"}
 
@@ -341,6 +364,7 @@ async def create_scope(
         address_family = "ipv6" if isinstance(_net, ipaddress.IPv6Network) else "ipv4"
     except ValueError:
         address_family = "ipv4"
+    _validate_relay_family(body.relay_addresses, address_family)
     scope = DHCPScope(
         subnet_id=subnet_id,
         group_id=group_id,
@@ -410,6 +434,10 @@ async def update_scope(
     # detaches one profile and binds another) still wins.
     if changes.pop("clear_pxe_profile", False):
         scope.pxe_profile_id = None
+    if "relay_addresses" in changes:
+        # Family must match the scope's (subnet-derived) address_family;
+        # address_family itself is immutable on update (#337).
+        _validate_relay_family(changes["relay_addresses"], scope.address_family or "ipv4")
     for k, v in changes.items():
         setattr(scope, k, v)
     await db.flush()

@@ -1,6 +1,14 @@
 #!/bin/sh
-# Container entrypoint — starts kea-dhcp4, kea-ctrl-agent, and the
-# spatium-dhcp-agent. tini (PID 1) reaps zombies and forwards signals.
+# Container entrypoint — starts kea-dhcp4, kea-dhcp6, kea-ctrl-agent,
+# and the spatium-dhcp-agent. tini (PID 1) reaps zombies and forwards
+# signals.
+#
+# kea-dhcp6 runs always-on alongside kea-dhcp4 (dual-stack): it boots
+# from a minimal idle config (``interfaces: []`` + empty ``subnet6``)
+# that binds nothing, so it is safe on hosts with no IPv6. Once the
+# control plane ships a v6 scope, the agent's sync loop rewrites
+# kea-dhcp6.conf and reloads the v6 control socket — the daemon is
+# already running and just picks up the new subnets.
 #
 # Each Kea daemon runs under a supervise-loop so a transient crash
 # (bind race against Docker/k8s networking during restart, partner
@@ -29,7 +37,9 @@ chown -R spatium:spatium /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /var/
 chmod 0750 /run/kea
 
 KEA_CFG="${KEA_CONFIG_PATH:-/etc/kea/kea-dhcp4.conf}"
+KEA_CFG6="${KEA_CONFIG_PATH_V6:-/etc/kea/kea-dhcp6.conf}"
 KEA_PID_FILE="/run/kea/kea-dhcp4.kea-dhcp4.pid"
+KEA6_PID_FILE="/run/kea/kea-dhcp6.kea-dhcp6.pid"
 CTRL_PID_FILE="/run/kea/kea-ctrl-agent.kea-ctrl-agent.pid"
 
 # Top-level cleanup — scrub any leftover PID files from a prior
@@ -37,7 +47,7 @@ CTRL_PID_FILE="/run/kea/kea-ctrl-agent.kea-ctrl-agent.pid"
 # suspenders: the per-iteration rm below catches in-container
 # crashes, this handles the docker-compose-restart case where the
 # entire container came back up with the tmpfs state intact.
-rm -f "$KEA_PID_FILE" "$CTRL_PID_FILE" 2>/dev/null || true
+rm -f "$KEA_PID_FILE" "$KEA6_PID_FILE" "$CTRL_PID_FILE" 2>/dev/null || true
 
 supervise_kea() {
     STOPPING=0
@@ -70,6 +80,38 @@ supervise_kea() {
             return "$code"
         fi
         echo "kea-dhcp4 exited code=$code after ${runtime}s, restarting (attempt $fails/5)" >&2
+        sleep 2
+    done
+    return 0
+}
+
+supervise_kea6() {
+    STOPPING=0
+    KEA6_CHILD=
+    # shellcheck disable=SC2064
+    trap 'STOPPING=1; [ -n "$KEA6_CHILD" ] && kill -TERM "$KEA6_CHILD" 2>/dev/null; exit 0' TERM INT
+    fails=0
+    while [ "$STOPPING" -eq 0 ]; do
+        rm -f "$KEA6_PID_FILE" 2>/dev/null || true
+        start_ts=$(date +%s)
+        su-exec spatium:spatium kea-dhcp6 -c "$KEA_CFG6" &
+        KEA6_CHILD=$!
+        wait "$KEA6_CHILD" || true
+        code=$?
+        KEA6_CHILD=
+        [ "$STOPPING" -eq 1 ] && break
+        end_ts=$(date +%s)
+        runtime=$((end_ts - start_ts))
+        if [ "$runtime" -ge 30 ]; then
+            fails=0
+        else
+            fails=$((fails + 1))
+        fi
+        if [ "$fails" -ge 5 ]; then
+            echo "kea-dhcp6 crash-looping (5x in <30s), giving up code=$code" >&2
+            return "$code"
+        fi
+        echo "kea-dhcp6 exited code=$code after ${runtime}s, restarting (attempt $fails/5)" >&2
         sleep 2
     done
     return 0
@@ -110,13 +152,16 @@ supervise_ctrl_agent() {
 supervise_kea &
 KEA_PID=$!
 
+supervise_kea6 &
+KEA6_PID=$!
+
 supervise_ctrl_agent &
 CTRL_PID=$!
 
-# Forward container SIGTERM to both supervisor subshells and the
+# Forward container SIGTERM to all supervisor subshells and the
 # agent. The supervisors' own traps handle the in-flight daemon.
 _term() {
-    kill -TERM "$KEA_PID" "$CTRL_PID" "${AGENT_PID:-0}" 2>/dev/null || true
+    kill -TERM "$KEA_PID" "$KEA6_PID" "$CTRL_PID" "${AGENT_PID:-0}" 2>/dev/null || true
 }
 trap _term TERM INT
 
@@ -125,7 +170,8 @@ AGENT_PID=$!
 
 # wait -n is a bash-ism; busybox ash accepts it too as of 1.30+
 # (Alpine 3.11+). Fall back to plain wait on older variants.
-wait -n "$KEA_PID" "$CTRL_PID" "$AGENT_PID" 2>/dev/null || wait "$KEA_PID" "$CTRL_PID" "$AGENT_PID"
+wait -n "$KEA_PID" "$KEA6_PID" "$CTRL_PID" "$AGENT_PID" 2>/dev/null \
+    || wait "$KEA_PID" "$KEA6_PID" "$CTRL_PID" "$AGENT_PID"
 EXIT_CODE=$?
 _term
 wait

@@ -17,8 +17,10 @@ class AgentConfig:
         SPATIUM_SERVER_NAME        — hostname reported to the control plane
         CACHE_DIR                  — state directory (default /var/lib/spatium-dhcp-agent)
         KEA_CONFIG_PATH            — Kea dhcp4 config path (default /etc/kea/kea-dhcp4.conf)
-        KEA_CONTROL_SOCKET         — Kea control unix socket (default /run/kea/kea4-ctrl-socket)
-        KEA_LEASE_FILE             — Kea leases memfile (default /var/lib/kea/kea-leases4.csv)
+        KEA_CONTROL_SOCKET         — Kea dhcp4 control unix socket (default /run/kea/kea4-ctrl-socket)
+        KEA_LEASE_FILE             — Kea dhcp4 leases memfile (default /var/lib/kea/kea-leases4.csv)
+        KEA_CONFIG_PATH_V6         — Kea dhcp6 config path (default /etc/kea/kea-dhcp6.conf)
+        KEA_CONTROL_SOCKET_V6      — Kea dhcp6 control unix socket (default /run/kea/kea6-ctrl-socket)
         LONGPOLL_TIMEOUT           — seconds the control plane holds a long-poll (default 30)
         HEARTBEAT_INTERVAL         — seconds between heartbeats (default 30)
         AGENT_GROUP                — optional DHCP server group to join
@@ -39,6 +41,8 @@ class AgentConfig:
     kea_config_path: Path
     kea_control_socket: Path
     kea_lease_file: Path
+    kea_config_path_v6: Path
+    kea_control_socket_v6: Path
     group_name: str | None
     roles: list[str]
     tls_ca_path: str | None
@@ -92,6 +96,12 @@ class AgentConfig:
             ),
             kea_lease_file=Path(
                 os.environ.get("KEA_LEASE_FILE", "/var/lib/kea/kea-leases4.csv")
+            ),
+            kea_config_path_v6=Path(
+                os.environ.get("KEA_CONFIG_PATH_V6", "/etc/kea/kea-dhcp6.conf")
+            ),
+            kea_control_socket_v6=Path(
+                os.environ.get("KEA_CONTROL_SOCKET_V6", "/run/kea/kea6-ctrl-socket")
             ),
             group_name=os.environ.get("AGENT_GROUP") or None,
             roles=roles,

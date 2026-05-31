@@ -168,3 +168,24 @@ async def test_scope_api_rejects_bad_relay_address(
         },
     )
     assert r.status_code == 422
+
+
+async def test_scope_api_rejects_relay_family_mismatch(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # A v4 scope (subnet is V4_CIDR) must reject an IPv6 relay address —
+    # rendering it under subnet4 would produce an invalid Kea subnet (#337).
+    token = await _make_user(db_session)
+    subnet, grp = await _subnet_and_group(db_session)
+    await db_session.commit()
+    r = await client.post(
+        f"/api/v1/dhcp/subnets/{subnet.id}/dhcp-scopes",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "group_id": str(grp.id),
+            "name": "v6-relay-on-v4",
+            "relay_addresses": ["2001:db8:337::1"],
+        },
+    )
+    assert r.status_code == 422, r.text
+    assert "IPv4" in r.text
