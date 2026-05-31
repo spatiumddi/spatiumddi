@@ -327,6 +327,10 @@ _SNMP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/snmp-status"
 _NTP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/ntp-config-pending")
 _NTP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-config-hash")
 _NTP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-status")
+# Issue #343 — LLDP / lldpd equivalents. Same shape as SNMP / NTP.
+_LLDP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/lldp-config-pending")
+_LLDP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/lldp-config-hash")
+_LLDP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/lldp-status")
 
 # #272 Phase 7b — control-plane cluster join/leave. The join trigger
 # carries the seed's kubeapi URL + join token; the host-side runner
@@ -693,9 +697,7 @@ def maybe_fire_cluster_join(
     try:
         _CLUSTER_JOIN_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _CLUSTER_JOIN_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(
-            f"{_CLUSTER_JOIN_CONFIRM}\n{server_url}\n{join_token}\n", encoding="utf-8"
-        )
+        tmp.write_text(f"{_CLUSTER_JOIN_CONFIRM}\n{server_url}\n{join_token}\n", encoding="utf-8")
         tmp.replace(_CLUSTER_JOIN_TRIGGER_FILE)
         return True
     except OSError:
@@ -779,6 +781,71 @@ def read_snmpd_running() -> bool | None:
         return None
     try:
         text = _SNMP_STATUS_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if text == "running":
+        return True
+    if text == "stopped":
+        return False
+    return None
+
+
+def maybe_fire_lldp_reload(bundle_block: object) -> bool:
+    """Issue #343 — write the lldp-config trigger when the control plane's
+    rendered lldpd config hash differs from the last one this agent applied.
+
+    Identical idempotency + appliance-only gate to ``maybe_fire_snmp_reload``.
+    The payload is four sections (LLDP carries an extra ``daemon_args`` line
+    for the CDP/EDP/FDP/SONMP reception flags, which live in
+    ``/etc/default/lldpd`` rather than the lldpcli conf body):
+
+        line 1:   ``enabled`` | ``disabled`` marker
+        line 2:   config_hash (sha256 hex, blank when disabled)
+        line 3:   daemon_args (``-c -e`` …, blank when none)
+        line 4+:  rendered /etc/lldpd.d/spatium.conf body (ends with \\n)
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not isinstance(bundle_block, dict):
+        return False
+    config_hash = str(bundle_block.get("config_hash") or "")
+    lldpd_conf = str(bundle_block.get("lldpd_conf") or "")
+    daemon_args = str(bundle_block.get("daemon_args") or "")
+    enabled = bool(bundle_block.get("enabled"))
+    last_hash = ""
+    if _LLDP_HASH_SIDECAR.exists():
+        try:
+            last_hash = _LLDP_HASH_SIDECAR.read_text(encoding="utf-8").strip()
+        except OSError:
+            last_hash = ""
+    if config_hash == last_hash:
+        return False
+    if _LLDP_TRIGGER_FILE.exists():
+        return False
+    try:
+        _LLDP_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = (
+            ("enabled\n" if enabled else "disabled\n")
+            + (config_hash + "\n")
+            + (daemon_args + "\n")
+            + lldpd_conf
+        )
+        tmp = _LLDP_TRIGGER_FILE.with_suffix(".new")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(_LLDP_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def read_lldpd_running() -> bool | None:
+    """Read lldpd's last-reported status from the sidecar the host-side
+    runner writes after each apply. ``True`` = running, ``False`` = stopped,
+    ``None`` = unknown (sidecar missing / unreadable / non-appliance)."""
+    if not _LLDP_STATUS_SIDECAR.exists():
+        return None
+    try:
+        text = _LLDP_STATUS_SIDECAR.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     if text == "running":
@@ -1138,6 +1205,9 @@ def collect() -> dict[str, object]:
         # reference / stratum >= 16; ``unknown`` = chronyc unreadable
         # (transient at boot). None on non-appliance deploys.
         "ntp_sync_state": read_ntp_sync_state() if is_appliance else None,
+        # Issue #343 — lldpd running state from the host-side runner's
+        # status sidecar. None on non-appliance deploys.
+        "lldpd_running": read_lldpd_running() if is_appliance else None,
         # Issue #183 Phase 4 — local k3s health summary. Slow drift
         # signals that ride the heartbeat (fast actions go through
         # the proxy). Empty dict on non-k3s appliances; never None

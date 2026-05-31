@@ -358,7 +358,17 @@ The Talos-style console got a wave of usability fixes:
 ### Fleet UI updates
 
 - File rename `frontend/src/pages/appliance/ApprovalsTab.tsx` → `FleetTab.tsx` (component + React-Query keys + URL hash all migrated from `approvals` → `fleet`). The original "Approvals" framing predates the full Fleet management surface that now lives in the tab.
-- Sidebar regrouped into two sub-headings — **Infrastructure** (Appliances / Pairing codes / Slot images) and **Services** (NTP / SNMP) — so future Wave-E host-config surfaces (#155–#166) drop into Services without restructuring.
+- Sidebar regrouped into two sub-headings — **Infrastructure** (Appliances / Pairing codes / Slot images) and **Services** (LLDP / NTP / SNMP) — so future Wave-E host-config surfaces (#155–#166) drop into Services without restructuring.
+
+### LLDP (lldpd) — issue #343
+
+`lldpd` runs as a **host OS package** on every appliance host (same host-config plane as SNMP / chrony), configured from **Appliance → Fleet → Services → LLDP**. It advertises the node to upstream switches (chassis-id, system name, management IP, capabilities) and learns its L2 neighbours.
+
+- **Default-off**, opt-in per the standard `platform_settings` → ConfigBundle → trigger-file → `spatiumddi-lldp-reload` host-runner pattern. Config persists across A/B slot swaps via the `/etc` overlay.
+- **No firewall change.** Unlike snmpd (UDP 161) and chrony (UDP 123), LLDP is raw Layer-2 multicast (`01:80:c2:00:00:0e`, ethertype `0x88cc`) — there is no IP port to open, so the runner deliberately writes **no** `/etc/nftables.d/` drop-in.
+- **Interface allowlist** defaults to `eth*,en*,!docker*,!veth*,!br-*,!cni0,!flannel.1` so the appliance never advertises into the docker / k3s overlay network.
+- Optional reception of CDP / EDP / FDP / SONMP alongside LLDP (`/etc/default/lldpd` `DAEMON_ARGS`).
+- Phase 2 (deferred): the supervisor ships `lldpcli show neighbors` back to the control plane to populate the existing `NetworkNeighbour` discovery surface, and the `find_lldp_neighbors` MCP tool. Phase 1 exposes config + the read-only `find_lldp_settings` MCP tool. Runtime activation rides the shared #155–#166 host-config-delivery plane.
 - New **Services** column on the Appliances list with per-role chips coloured by `role_switch_state` (green `ready` ✓ / amber `pending` / rose `failed` / neutral `observer`) so operators see at a glance what's actually configured and running on each box.
 - **Service health** section in the per-appliance drilldown rendering one row per `role_health` entry — service name · role · status chip · relative `since` (e.g. "3m ago") · short container id.
 - **Approve + sign cert** mutation now refreshes the drilldown row on success (was leaving the operator staring at a stale `pending_approval` modal).

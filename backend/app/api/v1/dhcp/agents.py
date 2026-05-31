@@ -31,6 +31,7 @@ from app.models.dhcp import (
 from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.models.settings import PlatformSettings
+from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.dhcp.agent_token import (
@@ -338,6 +339,13 @@ async def agent_config_longpoll(
                 "chrony_conf": "",
             }
         )
+        # Issue #343 — same pattern for lldpd. Stable dict shape so the etag
+        # math stays uniform whether settings exist or not.
+        lldp_block = (
+            lldp_bundle(settings_row)
+            if settings_row is not None
+            else {"enabled": False, "config_hash": "", "lldpd_conf": "", "daemon_args": ""}
+        )
         # Phase 8f-3 — mix the fleet-upgrade intent into the ETag so a
         # Fleet view change wakes the agent's long-poll even when the
         # driver-side bundle is unchanged. Deterministic — re-reading
@@ -348,6 +356,7 @@ async def agent_config_longpoll(
             f"|{int(server.reboot_requested)}"
             f"|snmp:{int(bool(snmp_block.get('enabled')))}:{snmp_block.get('config_hash', '')}"
             f"|ntp:{int(bool(ntp_block.get('allow_clients')))}:{ntp_block.get('config_hash', '')}"
+            f"|lldp:{int(bool(lldp_block.get('enabled')))}:{lldp_block.get('config_hash', '')}"
         )
         etag = "sha256:" + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
 
@@ -486,6 +495,10 @@ async def agent_config_longpoll(
                 # writes ntp-config-pending on hash change; host-side
                 # spatiumddi-chrony-reload.path applies + reloads.
                 "ntp_settings": ntp_block,
+                # Issue #343 — rendered lldpd config + daemon args. Agent
+                # writes lldp-config-pending on hash change; host-side
+                # spatiumddi-lldp-reload.path applies + reloads lldpd.
+                "lldp_settings": lldp_block,
             }
         if asyncio.get_running_loop().time() >= deadline:
             return Response(status_code=304, headers={"ETag": etag})

@@ -21,6 +21,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     imports,
     integrations,
     ipam,
+    lldp,
     multicast,
     network,
     network_modeling,

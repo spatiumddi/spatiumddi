@@ -13,6 +13,7 @@ components. Grouped by role; license + project URL for each.
 - NetworkManager — GPL v2+ — https://networkmanager.dev
 - chrony (NTP) — GPL v2 — https://chrony-project.org
 - Net-SNMP (snmpd) — BSD-style (multiple) — https://net-snmp.org
+- lldpd — ISC — https://lldpd.github.io
 - nftables — GPL v2 — https://netfilter.org
 
 ── Kubernetes control plane / orchestration (multi-node HA appliance) ─────

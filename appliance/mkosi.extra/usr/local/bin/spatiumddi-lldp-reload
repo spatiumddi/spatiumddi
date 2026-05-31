@@ -1,0 +1,149 @@
+#!/bin/bash
+# spatiumddi-lldp-reload — host-side lldpd config-apply runner (issue #343).
+#
+# The supervisor writes
+# /var/lib/spatiumddi/release-state/lldp-config-pending whenever the control
+# plane's rendered lldpd config changes vs. what's been applied here. File
+# format (no JSON to keep the runner dependency-free):
+#   line 1:    "enabled" | "disabled"
+#   line 2:    sha256 hex of the rendered config (blank when disabled)
+#   line 3:    DAEMON_ARGS for /etc/default/lldpd ("-c -e" …, blank = none)
+#   line 4+:   rendered /etc/lldpd.d/spatium.conf body (lldpcli directives)
+#
+# ⚠️ NO FIREWALL CHANGE. Unlike spatiumddi-snmp-reload (UDP 161) and
+# spatiumddi-chrony-reload (UDP 123), LLDP is raw L2 multicast
+# (01:80:c2:00:00:0e, ethertype 0x88cc) — it never traverses IP/UDP and
+# cannot be filtered by an nftables port rule. This runner therefore does
+# NOT write an /etc/nftables.d/ drop-in. There is no port to open.
+#
+# Apply flow when enabled:
+#   1. Extract body → /etc/lldpd.d/spatium.conf (atomic swap)
+#   2. Write DAEMON_ARGS → /etc/default/lldpd (managed file)
+#   3. systemctl enable --now lldpd; restart so the new conf + args load
+#   4. Verify active; write hash + status sidecars
+#
+# Apply flow when disabled:
+#   1. systemctl disable --now lldpd (idempotent)
+#   2. Stub /etc/lldpd.d/spatium.conf + clear DAEMON_ARGS
+#   3. Write hash sidecar (empty) + status sidecar (stopped)
+#
+# Persistence across A/B slot swaps (Phase 8a, issue #138): /etc/lldpd.d/ +
+# /etc/default/lldpd live on the /etc overlay upper (/var/persist/etc) and
+# the sidecars on /var directly, so operator LLDP config + lldpd's enable
+# state survive a slot swap with no reapply.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/lldp-config-pending
+HASH_SIDECAR=/var/lib/spatiumddi/release-state/lldp-config-hash
+STATUS_SIDECAR=/var/lib/spatiumddi/release-state/lldp-status
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/lldp-reload.log"
+ETC_CONF=/etc/lldpd.d/spatium.conf
+ETC_DEFAULT=/etc/default/lldpd
+LOCK=/run/spatiumddi-lldp-reload.lock
+
+mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$(dirname "$ETC_CONF")"
+exec >> "$LOG" 2>&1
+
+echo
+echo "[$(date -Iseconds)] === spatiumddi-lldp-reload fired ==="
+
+if [ ! -f "$TRIGGER" ]; then
+    echo "  no trigger file at $TRIGGER, nothing to do"
+    exit 0
+fi
+
+# Serialise concurrent invocations.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "  another reload in progress, deferring"
+    exit 0
+fi
+
+MARKER=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
+HASH=$(sed -n '2p' "$TRIGGER" | tr -d '\r\n')
+DAEMON_ARGS=$(sed -n '3p' "$TRIGGER" | tr -d '\r\n')
+TMP_BODY=$(mktemp /tmp/spatium-lldpd.conf.XXXXXX)
+trap 'rm -f "$TMP_BODY"' EXIT
+tail -n +4 "$TRIGGER" > "$TMP_BODY"
+
+echo "  marker:      $MARKER"
+echo "  hash:        ${HASH:-<empty>}"
+echo "  daemon_args: ${DAEMON_ARGS:-<none>}"
+echo "  body size:   $(wc -c < "$TMP_BODY") bytes"
+
+write_default() {
+    # Managed /etc/default/lldpd carrying DAEMON_ARGS (the -c/-e/-f/-s
+    # protocol-reception flags). Whole-file rewrite keeps it simple; lldpd's
+    # init sources this for the daemon command line.
+    cat > "$ETC_DEFAULT" <<EOF
+# Managed by spatiumddi-lldp-reload — do not edit manually.
+# Source of truth: Appliance → LLDP in the SpatiumDDI UI.
+DAEMON_ARGS="${1}"
+EOF
+    chmod 0644 "$ETC_DEFAULT"
+}
+
+case "$MARKER" in
+    enabled)
+        if ! command -v lldpd >/dev/null 2>&1; then
+            echo "  ✗ lldpd binary not found — is lldpd installed?"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        # Atomic swap of the lldpcli-directive config + the daemon args.
+        install -o root -g root -m 0644 "$TMP_BODY" "$ETC_CONF"
+        write_default "$DAEMON_ARGS"
+
+        # Restart so the daemon picks up new DAEMON_ARGS (a plain reload
+        # wouldn't re-read /etc/default). enable --now covers first apply.
+        if ! systemctl enable --now lldpd; then
+            echo "  ✗ systemctl enable --now lldpd failed"
+            echo "stopped" > "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        systemctl restart lldpd >/dev/null 2>&1 || true
+        sleep 2
+        if systemctl is-active --quiet lldpd; then
+            echo "  ✓ lldpd is active"
+            # Push the running config through lldpcli too so a live daemon
+            # (that didn't restart cleanly) still converges. Best-effort.
+            lldpcli -c "$ETC_CONF" >/dev/null 2>&1 || true
+            echo "running" > "$STATUS_SIDECAR"
+            echo "$HASH" > "$HASH_SIDECAR"
+            echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        else
+            echo "  ✗ lldpd not active after start"
+            systemctl status lldpd --no-pager | sed 's/^/      /' || true
+            echo "stopped" > "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        ;;
+    disabled)
+        systemctl disable --now lldpd >/dev/null 2>&1 || true
+        cat > "$ETC_CONF" <<'EOF'
+# Managed by SpatiumDDI — LLDP is currently disabled.
+# Enable via the LLDP tab under Appliance → Fleet → Services.
+EOF
+        chmod 0644 "$ETC_CONF"
+        write_default ""
+        echo "stopped" > "$STATUS_SIDECAR"
+        : > "$HASH_SIDECAR"
+        echo "  ✓ lldpd stopped + disabled, config stubbed (no firewall change needed)"
+        echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        ;;
+    *)
+        echo "  ✗ unknown marker line: ${MARKER:-<empty>}"
+        echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+        mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+        exit 1
+        ;;
+esac

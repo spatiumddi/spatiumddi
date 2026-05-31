@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from ipaddress import ip_network
 from typing import Any
@@ -149,6 +150,19 @@ class SettingsResponse(BaseModel):
     # ── Appliance timezone (issue #165) ───────────────────────────
     # Empty string means "follow install-time default" (no override).
     timezone: str = ""
+    # ── Appliance LLDP (issue #343) ───────────────────────────────
+    # No secrets — LLDP advertises public identity, so the read shape
+    # mirrors the stored shape directly (like NTP).
+    lldp_enabled: bool = False
+    lldp_tx_interval: int = 30
+    lldp_tx_hold: int = 4
+    lldp_protocols: list[str] = []
+    lldp_interface_pattern: str = ""
+    lldp_management_pattern: str = ""
+    lldp_sys_name: str = ""
+    lldp_sys_description: str = ""
+    lldp_med_location: dict[str, Any] = {}
+    lldp_snmp_agentx: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -399,6 +413,70 @@ class SettingsUpdate(BaseModel):
     ntp_allow_client_networks: list[str] | None = None
     # ── Appliance timezone (issue #165) ───────────────────────────
     timezone: str | None = None
+    # ── Appliance LLDP (issue #343) ───────────────────────────────
+    lldp_enabled: bool | None = None
+    lldp_tx_interval: int | None = None
+    lldp_tx_hold: int | None = None
+    lldp_protocols: list[str] | None = None
+    lldp_interface_pattern: str | None = None
+    lldp_management_pattern: str | None = None
+    lldp_sys_name: str | None = None
+    lldp_sys_description: str | None = None
+    lldp_med_location: dict[str, Any] | None = None
+    lldp_snmp_agentx: bool | None = None
+
+    @field_validator("lldp_tx_interval")
+    @classmethod
+    def _valid_lldp_tx_interval(cls, v: int | None) -> int | None:
+        if v is not None and not (1 <= v <= 3600):
+            raise ValueError("lldp_tx_interval must be 1..3600 seconds")
+        return v
+
+    @field_validator("lldp_tx_hold")
+    @classmethod
+    def _valid_lldp_tx_hold(cls, v: int | None) -> int | None:
+        if v is not None and not (1 <= v <= 100):
+            raise ValueError("lldp_tx_hold must be 1..100")
+        return v
+
+    @field_validator("lldp_protocols")
+    @classmethod
+    def _valid_lldp_protocols(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        allowed = {"cdp", "edp", "fdp", "sonmp"}
+        out: list[str] = []
+        for p in v:
+            pl = str(p).strip().lower()
+            if pl not in allowed:
+                raise ValueError(f"lldp_protocols entries must be one of {sorted(allowed)}")
+            if pl not in out:
+                out.append(pl)
+        return out
+
+    @field_validator("lldp_interface_pattern", "lldp_management_pattern")
+    @classmethod
+    def _valid_lldp_pattern(cls, v: str | None) -> str | None:
+        # Rendered straight into an lldpcli ``configure … pattern`` directive,
+        # so reject anything outside the glob/CIDR charset to keep config
+        # injection out (newlines, quotes, shell metachars).
+        if v is None:
+            return None
+        v = v.strip()
+        if v and not re.fullmatch(r"[A-Za-z0-9_*!,.\- /:]+", v):
+            raise ValueError("pattern may only contain letters, digits, and * ! , . - _ / : space")
+        return v
+
+    @field_validator("lldp_sys_name", "lldp_sys_description")
+    @classmethod
+    def _valid_lldp_sys_text(cls, v: str | None) -> str | None:
+        # Quoted by the renderer, but reject control chars / newlines outright
+        # so a value can't break out of the lldpcli line.
+        if v is None:
+            return None
+        if any(ord(c) < 32 for c in v):
+            raise ValueError("must not contain control characters or newlines")
+        return v
 
     @field_validator("timezone")
     @classmethod
