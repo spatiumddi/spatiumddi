@@ -277,3 +277,265 @@ def test_user_drop_class_not_clobbered() -> None:
     # The user's test expression wins; the blocklist is silently skipped.
     assert "option[60]" in drops[0]["test"]
     assert "aa:bb:cc:dd:ee:ff" not in drops[0]["test"]
+
+
+# ── DHCPv6 — Dhcp6 / subnet6 render branch (issue #330) ────────────────
+
+
+@pytest.fixture
+def wire_bundle_v6() -> dict:
+    """A v6 wire scope alongside a v4 scope — proves the renderer splits
+    by ``address_family`` and emits a ``Dhcp6`` block with a ``subnet6``
+    entry rather than folding the v6 prefixes into ``subnet4``."""
+    return {
+        "etag": "sha256:test-v6",
+        "server_name": "dhcp-kea",
+        "driver": "kea",
+        "roles": [],
+        "global_options": {"dns_servers": ["2001:db8::1"], "lease_time": 7200},
+        "scopes": [
+            {
+                "subnet_cidr": "192.0.2.0/24",
+                "lease_time": 3600,
+                "address_family": "ipv4",
+                "options": {"routers": ["192.0.2.1"]},
+                "pools": [
+                    {
+                        "start_ip": "192.0.2.10",
+                        "end_ip": "192.0.2.200",
+                        "pool_type": "dynamic",
+                    }
+                ],
+                "statics": [],
+                "ddns_enabled": False,
+            },
+            {
+                "subnet_cidr": "2001:db8:0:1::/64",
+                "lease_time": 4800,
+                "address_family": "ipv6",
+                "v6_address_mode": "stateful",
+                "options": {
+                    "dns_servers": ["2001:db8::53"],
+                    # v4-only option that must be dropped from the v6 scope.
+                    "routers": ["2001:db8::1"],
+                },
+                "pools": [
+                    {
+                        "start_ip": "2001:db8:0:1::1000",
+                        "end_ip": "2001:db8:0:1::2000",
+                        "pool_type": "dynamic",
+                    },
+                    {
+                        "start_ip": "2001:db8:0:1::ff00",
+                        "end_ip": "2001:db8:0:1::ffff",
+                        "pool_type": "excluded",
+                    },
+                ],
+                "statics": [
+                    {
+                        "ip_address": "2001:db8:0:1::50",
+                        "mac_address": "aa:bb:cc:dd:ee:ff",
+                        "hostname": "v6host",
+                    }
+                ],
+                "ddns_enabled": False,
+            },
+        ],
+    }
+
+
+def test_v6_scope_renders_dhcp6_not_subnet4(wire_bundle_v6: dict) -> None:
+    out = render(wire_bundle_v6)
+    # v4 scope stays in subnet4 …
+    subs4 = out["Dhcp4"]["subnet4"]
+    assert [s["subnet"] for s in subs4] == ["192.0.2.0/24"]
+    # … and the v6 scope lands in a Dhcp6/subnet6 entry, NOT subnet4.
+    assert "Dhcp6" in out
+    subs6 = out["Dhcp6"]["subnet6"]
+    assert [s["subnet"] for s in subs6] == ["2001:db8:0:1::/64"]
+    # No v6 prefix leaked into the Dhcp4 block.
+    assert all("2001:db8" not in s["subnet"] for s in subs4)
+
+
+def test_v6_subnet6_pools_and_reservation_shape(wire_bundle_v6: dict) -> None:
+    out = render(wire_bundle_v6)
+    sub6 = out["Dhcp6"]["subnet6"][0]
+    # Only the dynamic pool survives — the excluded range is IPAM-level.
+    assert sub6["pools"] == [{"pool": "2001:db8:0:1::1000 - 2001:db8:0:1::2000"}]
+    # Dhcp6 reservations use ``ip-addresses`` (plural list), not ip-address.
+    resv = sub6["reservations"][0]
+    assert resv["ip-addresses"] == ["2001:db8:0:1::50"]
+    assert "ip-address" not in resv
+    assert resv["hw-address"] == "aa:bb:cc:dd:ee:ff"
+    assert resv["hostname"] == "v6host"
+    # stable positive subnet id, same hashing as v4.
+    assert isinstance(sub6["id"], int) and sub6["id"] > 0
+
+
+def test_v6_options_use_v6_names_and_drop_v4_only(wire_bundle_v6: dict) -> None:
+    out = render(wire_bundle_v6)
+    opts = out["Dhcp6"]["subnet6"][0]["option-data"]
+    names = {o["name"] for o in opts}
+    # dns-servers maps to the Dhcp6 ``dns-servers`` name …
+    assert "dns-servers" in names
+    dns = next(o for o in opts if o["name"] == "dns-servers")
+    assert dns["data"] == "2001:db8::53"
+    # … and ``routers`` (no DHCPv6 equivalent) is dropped, not emitted.
+    assert "routers" not in names
+    # No v4 ``code``/``space`` shape leaked in (those are v4-only).
+    assert all(o.get("space") != "dhcp4" for o in opts)
+
+
+def test_v6_separate_socket_and_lease_paths(wire_bundle_v6: dict) -> None:
+    """The Dhcp6 daemon must not share the Dhcp4 socket / lease store."""
+    out = render(
+        wire_bundle_v6,
+        control_socket="/run/kea/kea4-ctrl-socket",
+        lease_file="/var/lib/kea/kea-leases4.csv",
+    )
+    assert out["Dhcp4"]["control-socket"]["socket-name"] == "/run/kea/kea4-ctrl-socket"
+    assert out["Dhcp6"]["control-socket"]["socket-name"] == "/run/kea/kea6-ctrl-socket"
+    assert out["Dhcp4"]["lease-database"]["name"] == "/var/lib/kea/kea-leases4.csv"
+    assert out["Dhcp6"]["lease-database"]["name"] == "/var/lib/kea/kea-leases6.csv"
+
+
+def test_no_dhcp6_block_when_all_v4(wire_bundle: dict) -> None:
+    """A pure-v4 bundle must not grow a stray empty Dhcp6 block."""
+    out = render(wire_bundle)
+    assert "Dhcp6" not in out
+    assert "Dhcp4" in out
+
+
+def test_v6_slaac_mode_serves_no_pools_or_options() -> None:
+    """A SLAAC v6 scope is a no-DHCP-role subnet: no pools, no
+    option-data, no reservations (the router's RA does it all)."""
+    bundle = {
+        "scopes": [
+            {
+                "subnet_cidr": "2001:db8:0:2::/64",
+                "lease_time": 3600,
+                "address_family": "ipv6",
+                "v6_address_mode": "slaac",
+                "options": {"dns_servers": ["2001:db8::53"]},
+                "pools": [
+                    {
+                        "start_ip": "2001:db8:0:2::10",
+                        "end_ip": "2001:db8:0:2::20",
+                        "pool_type": "dynamic",
+                    }
+                ],
+                "statics": [
+                    {
+                        "ip_address": "2001:db8:0:2::5",
+                        "mac_address": "aa:bb:cc:dd:ee:ff",
+                        "hostname": "x",
+                    }
+                ],
+            }
+        ],
+    }
+    sub6 = render(bundle)["Dhcp6"]["subnet6"][0]
+    assert "pools" not in sub6
+    assert "option-data" not in sub6
+    assert "reservations" not in sub6
+
+
+def test_v6_stateless_mode_serves_options_only() -> None:
+    """A stateless v6 scope serves option-data (Information-Request) but
+    no address pools."""
+    bundle = {
+        "scopes": [
+            {
+                "subnet_cidr": "2001:db8:0:3::/64",
+                "lease_time": 3600,
+                "address_family": "ipv6",
+                "v6_address_mode": "stateless",
+                "options": {"dns_servers": ["2001:db8::53"]},
+                "pools": [
+                    {
+                        "start_ip": "2001:db8:0:3::10",
+                        "end_ip": "2001:db8:0:3::20",
+                        "pool_type": "dynamic",
+                    }
+                ],
+                "statics": [],
+            }
+        ],
+    }
+    sub6 = render(bundle)["Dhcp6"]["subnet6"][0]
+    assert "pools" not in sub6
+    assert sub6["option-data"][0]["name"] == "dns-servers"
+
+
+# ── DHCP relay-agent matching (issue #337) ─────────────────────────────
+
+
+def test_v4_scope_emits_relay_ip_addresses() -> None:
+    """A v4 scope with ``relay_addresses`` renders Kea's
+    ``relay: {"ip-addresses": [...]}`` so a centralized server selects
+    the subnet for relayed (giaddr-stamped) traffic."""
+    bundle = {
+        "scopes": [
+            {
+                "subnet_cidr": "10.50.0.0/24",
+                "lease_time": 3600,
+                "pools": [
+                    {"start_ip": "10.50.0.10", "end_ip": "10.50.0.50", "pool_type": "dynamic"}
+                ],
+                "statics": [],
+                "relay_addresses": ["10.50.0.1", "192.0.2.250"],
+            }
+        ],
+    }
+    sub4 = render(bundle)["Dhcp4"]["subnet4"][0]
+    assert sub4["relay"] == {"ip-addresses": ["10.50.0.1", "192.0.2.250"]}
+
+
+def test_v6_scope_emits_relay_ip_addresses() -> None:
+    bundle = {
+        "scopes": [
+            {
+                "subnet_cidr": "2001:db8:337::/64",
+                "lease_time": 3600,
+                "address_family": "ipv6",
+                "v6_address_mode": "stateful",
+                "pools": [
+                    {
+                        "start_ip": "2001:db8:337::10",
+                        "end_ip": "2001:db8:337::20",
+                        "pool_type": "dynamic",
+                    }
+                ],
+                "statics": [],
+                "relay_addresses": ["2001:db8:337::1"],
+            }
+        ],
+    }
+    sub6 = render(bundle)["Dhcp6"]["subnet6"][0]
+    assert sub6["relay"] == {"ip-addresses": ["2001:db8:337::1"]}
+
+
+def test_no_relay_block_when_unset() -> None:
+    bundle = {
+        "scopes": [
+            {
+                "subnet_cidr": "10.50.0.0/24",
+                "lease_time": 3600,
+                "pools": [],
+                "statics": [],
+            }
+        ],
+    }
+    assert "relay" not in render(bundle)["Dhcp4"]["subnet4"][0]
+
+
+def test_legacy_subnets_relay_ips_still_render() -> None:
+    """The pre-canonical ``subnets`` wire shape carries ``relay_ips`` —
+    keep that path working for hand-crafted bundles / fixtures."""
+    bundle = {
+        "server": {"name": "t", "interfaces": ["eth0"]},
+        "subnets": [
+            {"id": 1, "subnet": "10.60.0.0/24", "pools": [], "relay_ips": ["10.60.0.1"]}
+        ],
+    }
+    assert render(bundle)["Dhcp4"]["subnet4"][0]["relay"] == {"ip-addresses": ["10.60.0.1"]}

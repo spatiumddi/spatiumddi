@@ -80,6 +80,31 @@ def _normalize_sync_mode(v: str | None) -> str:
     return v or "on_static_only"
 
 
+def _validate_relay_addresses(v: list[str] | None) -> list[str]:
+    """Validate + de-dupe relay-agent IPs (issue #337).
+
+    Each entry must parse as a bare IPv4/IPv6 address (no CIDR — Kea's
+    ``relay.ip-addresses`` takes literal giaddr values). Order is
+    preserved minus duplicates so the rendered config is stable.
+    """
+    if not v:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in v:
+        addr = str(raw).strip()
+        if not addr:
+            continue
+        try:
+            normalized = str(ipaddress.ip_address(addr))
+        except ValueError as exc:
+            raise ValueError(f"invalid relay address: {addr!r}") from exc
+        if normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
+    return out
+
+
 class ScopeCreate(BaseModel):
     model_config = {"extra": "ignore"}
 
@@ -100,7 +125,14 @@ class ScopeCreate(BaseModel):
     v6_address_mode: str = "stateful"
     ra_managed_flag: bool = True
     ra_other_flag: bool = True
+    # Relay-agent (giaddr) IPs (issue #337) — see DHCPScope.relay_addresses.
+    relay_addresses: list[str] = Field(default_factory=list)
     tags: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("relay_addresses")
+    @classmethod
+    def _relay(cls, v: list[str] | None) -> list[str]:
+        return _validate_relay_addresses(v)
 
     @field_validator("ddns_hostname_policy")
     @classmethod
@@ -151,6 +183,9 @@ class ScopeUpdate(BaseModel):
     v6_address_mode: str | None = None
     ra_managed_flag: bool | None = None
     ra_other_flag: bool | None = None
+    # Relay-agent (giaddr) IPs (issue #337). Pass a list to replace the
+    # scope's relay set (empty list clears it); omit to leave unchanged.
+    relay_addresses: list[str] | None = None
     tags: dict[str, Any] | None = None
 
     @field_validator("v6_address_mode")
@@ -161,6 +196,13 @@ class ScopeUpdate(BaseModel):
         if v not in VALID_V6_MODES:
             raise ValueError(f"v6_address_mode must be one of {sorted(VALID_V6_MODES)}")
         return v
+
+    @field_validator("relay_addresses")
+    @classmethod
+    def _relay(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        return _validate_relay_addresses(v)
 
 
 _NAME_TO_CODE = {v: k for k, v in _CODE_TO_NAME.items()}
@@ -185,6 +227,7 @@ class ScopeResponse(BaseModel):
     v6_address_mode: str = "stateful"
     ra_managed_flag: bool = True
     ra_other_flag: bool = True
+    relay_addresses: list[str] = Field(default_factory=list)
     last_pushed_at: datetime | None
     tags: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
@@ -218,6 +261,7 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
         v6_address_mode=getattr(scope, "v6_address_mode", "stateful") or "stateful",
         ra_managed_flag=getattr(scope, "ra_managed_flag", True),
         ra_other_flag=getattr(scope, "ra_other_flag", True),
+        relay_addresses=list(getattr(scope, "relay_addresses", None) or []),
         last_pushed_at=scope.last_pushed_at,
         tags=scope.tags or {},
         created_at=scope.created_at,
@@ -314,6 +358,7 @@ async def create_scope(
         v6_address_mode=body.v6_address_mode,
         ra_managed_flag=body.ra_managed_flag,
         ra_other_flag=body.ra_other_flag,
+        relay_addresses=body.relay_addresses,
     )
     db.add(scope)
     await db.flush()

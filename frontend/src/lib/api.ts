@@ -4131,6 +4131,10 @@ export interface DNSZone {
   // Conditional-forwarder config. Meaningful only when zone_type==="forward".
   forwarders: string[];
   forward_only: boolean;
+  // Secondary / stub primaries (issue #336). The master server IPs this
+  // zone transfers FROM (ip or ip@port). Required when
+  // zone_type==="secondary" | "stub"; empty otherwise.
+  masters: string[];
   // Non-null when the zone was synthesised by the Tailscale Phase 2
   // reconciler. The UI shows a read-only badge and disables edit /
   // delete controls on the zone + its records.
@@ -5670,6 +5674,11 @@ export interface DHCPScope {
   v6_address_mode?: "stateful" | "stateless" | "slaac";
   ra_managed_flag?: boolean;
   ra_other_flag?: boolean;
+  // DHCP relay-agent (giaddr) IPs (issue #337). When non-empty, Kea
+  // renders relay.ip-addresses on the subnet so a centralized server
+  // selects this scope for relayed traffic from a remote, non-attached
+  // subnet. Empty = direct-attach subnet selection (default).
+  relay_addresses?: string[];
   options: DHCPOption[];
   // PXE / iPXE profile binding (issue #51). Null = no PXE on this
   // scope. Bound profile renders one Kea client-class per arch-match

@@ -17,7 +17,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from jose import JWTError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB
@@ -127,7 +127,10 @@ class LeaseEvent(BaseModel):
 
 
 class LeaseEventBatch(BaseModel):
-    leases: list[LeaseEvent]
+    # The agent batches up to 100 events per POST (``leases._BATCH_MAX_EVENTS``);
+    # cap with generous headroom so a malformed/hostile client can't ship an
+    # unbounded batch into the per-event ingestion loop.
+    leases: list[LeaseEvent] = Field(default_factory=list, max_length=500)
 
 
 class DHCPFingerprintEntry(BaseModel):
@@ -388,6 +391,19 @@ async def agent_config_longpoll(
                             "subnet_cidr": s.subnet_cidr,
                             "lease_time": s.lease_time,
                             "options": s.options,
+                            # Issue #330 — the agent's render_kea branches on
+                            # these to emit a Dhcp6/subnet6 entry for v6
+                            # scopes. Without them every scope rendered as
+                            # Dhcp4 regardless of family. v6_address_mode
+                            # gates whether the v6 subnet serves pools /
+                            # options (stateful | stateless | slaac).
+                            "address_family": s.address_family,
+                            "v6_address_mode": s.v6_address_mode,
+                            # Issue #337 — relay-agent IPs the agent's
+                            # render_kea emits as ``relay: {"ip-addresses":
+                            # [...]}`` so a centralized Kea matches this
+                            # scope on giaddr for relayed remote subnets.
+                            "relay_addresses": list(s.relay_addresses),
                             "pools": [
                                 {
                                     "start_ip": p.start_ip,
@@ -587,22 +603,42 @@ async def agent_lease_events(
         co-exists in DHCPLease).
       - Released/expired lease → if the IPAM row is auto_from_lease, remove it.
     """
-    from sqlalchemy import func as sa_func
-
-    from app.models.ipam import IPAddress, Subnet
+    from app.models.ipam import IPAddress
+    from app.services.dhcp.pull_leases import _find_containing_subnet, _load_subnet_cache
 
     server, _ = auth
     now = datetime.now(UTC)
-    upserted = 0
-    for ev in body.leases:
-        res = await db.execute(
-            select(DHCPLease).where(
-                DHCPLease.server_id == server.id,
-                DHCPLease.ip_address == ev.ip_address,
-                DHCPLease.mac_address == ev.mac_address,
+    events = body.leases
+    if not events:
+        return {"upserted": 0}
+
+    # ── Bulk preload (avoid the per-event N+1: this is the hottest DHCP
+    # ingestion path, up to 100 events/POST). Three queries total instead
+    # of ~3 per event. ──────────────────────────────────────────────────
+    ips = list({ev.ip_address for ev in events})
+
+    existing_leases = (
+        (
+            await db.execute(
+                select(DHCPLease).where(
+                    DHCPLease.server_id == server.id,
+                    DHCPLease.ip_address.in_(ips),
+                )
             )
         )
-        lease = res.scalar_one_or_none()
+        .scalars()
+        .all()
+    )
+    lease_by_key: dict[tuple[str, str], DHCPLease] = {
+        (lease.ip_address, lease.mac_address): lease for lease in existing_leases
+    }
+
+    # Upsert every DHCPLease first, then a single flush so new rows get
+    # their ids before we wire dhcp_lease_id on the IPAM mirror.
+    upserted = 0
+    for ev in events:
+        key = (ev.ip_address, ev.mac_address)
+        lease = lease_by_key.get(key)
         if lease is None:
             lease = DHCPLease(
                 server_id=server.id,
@@ -618,6 +654,7 @@ async def agent_lease_events(
                 last_seen_at=now,
             )
             db.add(lease)
+            lease_by_key[key] = lease
         else:
             lease.hostname = ev.hostname
             lease.client_id = ev.client_id
@@ -628,23 +665,27 @@ async def agent_lease_events(
             lease.expires_at = ev.expires_at
             lease.last_seen_at = now
         upserted += 1
+    await db.flush()
 
-        # ── IPAM mirror ────────────────────────────────────────────────────
-        # Find the subnet whose CIDR contains this IP (server-side via PG).
-        subnet_res = await db.execute(
-            select(Subnet).where(Subnet.network.op(">>=")(sa_func.inet(ev.ip_address)))
-        )
-        subnet = subnet_res.scalars().first()
+    # Resolve subnets once (Python longest-prefix match, no per-IP SQL) and
+    # bulk-load the existing IPAM mirror rows. Keyed by (subnet_id, address)
+    # so overlapping ranges across spaces stay disambiguated.
+    subnets = await _load_subnet_cache(db)
+    subnet_for_ip = {ip: _find_containing_subnet(ip, subnets) for ip in ips}
+    ipam_existing = (
+        (await db.execute(select(IPAddress).where(IPAddress.address.in_(ips)))).scalars().all()
+    )
+    ipam_by_key: dict[tuple[Any, str], IPAddress] = {
+        (row.subnet_id, row.address): row for row in ipam_existing
+    }
+
+    # ── IPAM mirror pass ────────────────────────────────────────────────
+    for ev in events:
+        subnet = subnet_for_ip.get(ev.ip_address)
         if subnet is None:
             continue  # IP not in any known subnet — can't mirror
-
-        ipam_res = await db.execute(
-            select(IPAddress).where(
-                IPAddress.subnet_id == subnet.id,
-                IPAddress.address == ev.ip_address,
-            )
-        )
-        ipam_row = ipam_res.scalar_one_or_none()
+        lease = lease_by_key[(ev.ip_address, ev.mac_address)]
+        ipam_row = ipam_by_key.get((subnet.id, ev.ip_address))
 
         is_active = ev.state == "active"
         if is_active:
@@ -659,6 +700,7 @@ async def agent_lease_events(
                     dhcp_lease_id=str(lease.id) if lease.id else None,
                 )
                 db.add(ipam_row)
+                ipam_by_key[(subnet.id, ev.ip_address)] = ipam_row
             elif ipam_row.status in ("available",) or ipam_row.auto_from_lease:
                 ipam_row.hostname = (ev.hostname or ipam_row.hostname or "")[:253]
                 ipam_row.mac_address = ev.mac_address
@@ -725,6 +767,7 @@ async def agent_lease_events(
                         error=str(exc),
                     )
                 await db.delete(ipam_row)
+                ipam_by_key.pop((subnet.id, ev.ip_address), None)
 
     await db.commit()
     return {"upserted": upserted}

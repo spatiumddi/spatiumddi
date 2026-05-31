@@ -144,6 +144,10 @@ async def pull_leases_from_server(
     result.server_leases = len(wire)
 
     scope_cache = await _load_scope_cache(db, server.server_group_id)
+    # Inverse map (scope_id -> subnet_id) so the absence-delete branch can
+    # resolve a stale lease's owning subnet straight from its scope FK,
+    # without an extra query per stale row.
+    scope_subnet_ids = {scope_id: subnet_id for subnet_id, scope_id in scope_cache.items()}
 
     now = datetime.now(UTC)
 
@@ -287,14 +291,27 @@ async def pull_leases_from_server(
         stale_q = stale_q.where(~DHCPLease.ip_address.in_(wire_ips))
     stale_leases = list((await db.execute(stale_q)).scalars().all())
     for stale in stale_leases:
-        mirror = (
-            await db.execute(
-                select(IPAddress).where(
-                    IPAddress.address == stale.ip_address,
-                    IPAddress.auto_from_lease.is_(True),
+        # Scope the mirror lookup to the lease's owning subnet — the same
+        # discipline as the upsert/create branch above. The unscoped
+        # address-only lookup both crashed (MultipleResultsFound) and
+        # revoked unrelated mirrors when two IPSpaces/VRFs carry the same
+        # private address (e.g. 10.0.0.50). Resolve the subnet via the
+        # lease's scope FK when present, else longest-prefix match.
+        stale_subnet_id = scope_subnet_ids.get(stale.scope_id) if stale.scope_id else None
+        if stale_subnet_id is None:
+            stale_containing = _find_containing_subnet(stale.ip_address, subnets)
+            stale_subnet_id = stale_containing.id if stale_containing else None
+        mirror = None
+        if stale_subnet_id is not None:
+            mirror = (
+                await db.execute(
+                    select(IPAddress).where(
+                        IPAddress.subnet_id == stale_subnet_id,
+                        IPAddress.address == stale.ip_address,
+                        IPAddress.auto_from_lease.is_(True),
+                    )
                 )
-            )
-        ).scalar_one_or_none()
+            ).scalar_one_or_none()
         if mirror is not None:
             if apply:
                 await db.delete(mirror)

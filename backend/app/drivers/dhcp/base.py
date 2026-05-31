@@ -158,6 +158,12 @@ class ScopeDef:
     # Kea driver renders address pools and/or option-data for the subnet6.
     # Defaults to "stateful" so v4 scopes + pre-#52 bundles render unchanged.
     v6_address_mode: str = "stateful"
+    # DHCP relay-agent IPs (issue #337). When non-empty the Kea driver
+    # emits ``relay: {"ip-addresses": [...]}`` on the rendered subnet so a
+    # centralized server selects this scope for traffic forwarded by a
+    # relay (matched on ``giaddr``). Empty tuple (default) → no relay
+    # block, preserving direct-attach subnet selection + legacy bundles.
+    relay_addresses: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
