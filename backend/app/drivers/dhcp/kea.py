@@ -191,6 +191,12 @@ def _render_scope(scope: ScopeDef) -> dict[str, Any]:
         out["max-valid-lifetime"] = scope.max_lease_time
     if scope.options and serve_options:
         out["option-data"] = _render_option_data(scope.options, address_family=af)
+    # Relay-agent matching (issue #337). Kea selects this subnet for
+    # packets whose ``giaddr`` is one of these relay IPs — required when
+    # the subnet isn't directly attached to the server. Valid in both
+    # Dhcp4 (``subnet4``) and Dhcp6 (``subnet6``) blocks.
+    if scope.relay_addresses:
+        out["relay"] = {"ip-addresses": list(scope.relay_addresses)}
     return out
 
 

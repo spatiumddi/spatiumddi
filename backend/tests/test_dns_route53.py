@@ -196,14 +196,109 @@ async def test_list_zone_records_relativize_and_expand(
 async def test_list_zone_records_zone_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     driver = Route53DNSDriver()
     client = MagicMock()
-    # API returns a neighbouring zone, not the one we asked for.
+    # API returns a neighbouring zone, not the one we asked for, and the
+    # result set is exhausted (not truncated) — so the zone really is absent.
     client.list_hosted_zones_by_name.return_value = {
-        "HostedZones": [{"Id": "/hostedzone/Z9", "Name": "other.com."}]
+        "HostedZones": [{"Id": "/hostedzone/Z9", "Name": "other.com."}],
+        "IsTruncated": False,
     }
     _patch_client(monkeypatch, driver, client)
 
     with pytest.raises(CloudDNSError, match="not found"):
         await driver._list_zone_records(_server(), CREDS, "example.com.")
+
+
+# ── Hosted-zone id resolution (issue #334) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resolve_zone_id_skips_lexical_neighbour_same_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lexical neighbour ahead of the target on the same page is skipped.
+
+    ``list_hosted_zones_by_name`` returns zones at-or-after ``DNSName`` in
+    Route 53's sort order, so the target need not be the first row. The
+    resolver must scan the whole (non-truncated) page rather than trusting
+    the first entry — the old ``MaxItems='1'`` path would have raised
+    'not found' here.
+    """
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [
+            # Sorts at-or-after the queried name but isn't the match.
+            {"Id": "/hostedzone/Zneighbour", "Name": "example-staging.com."},
+            {"Id": "/hostedzone/Ztarget", "Name": "example.com."},
+        ],
+        "IsTruncated": False,
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    zone_id = await driver._resolve_zone_id(client, "example.com.")
+
+    assert zone_id == "Ztarget"
+    # Single round-trip: page wasn't truncated, no continuation needed.
+    assert client.list_hosted_zones_by_name.call_count == 1
+    first = client.list_hosted_zones_by_name.call_args_list[0].kwargs
+    assert first["DNSName"] == "example.com."
+    # No longer capped at one row.
+    assert first["MaxItems"] != "1"
+
+
+@pytest.mark.asyncio
+async def test_resolve_zone_id_paginates_to_find_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the first page is a truncated run of neighbours, follow the
+    continuation tokens until the exact apex match is found."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.side_effect = [
+        {
+            "HostedZones": [{"Id": "/hostedzone/Zn1", "Name": "alpha.com."}],
+            "IsTruncated": True,
+            "NextDNSName": "example.com.",
+            "NextHostedZoneId": "Zmarker",
+        },
+        {
+            "HostedZones": [
+                {"Id": "/hostedzone/Zn2", "Name": "example-staging.com."},
+                {"Id": "/hostedzone/Ztarget", "Name": "example.com."},
+            ],
+            "IsTruncated": False,
+        },
+    ]
+    _patch_client(monkeypatch, driver, client)
+
+    zone_id = await driver._resolve_zone_id(client, "example.com.")
+
+    assert zone_id == "Ztarget"
+    assert client.list_hosted_zones_by_name.call_count == 2
+    # The second page must carry the continuation tokens from the first.
+    second = client.list_hosted_zones_by_name.call_args_list[1].kwargs
+    assert second["DNSName"] == "example.com."
+    assert second["HostedZoneId"] == "Zmarker"
+
+
+@pytest.mark.asyncio
+async def test_resolve_zone_id_truncated_no_tokens_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A truncated page with no continuation tokens stops (no infinite loop)
+    and reports the zone as not found."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Zn1", "Name": "other.com."}],
+        "IsTruncated": True,
+        # NextDNSName / NextHostedZoneId intentionally omitted.
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    with pytest.raises(CloudDNSError, match="not found"):
+        await driver._resolve_zone_id(client, "example.com.")
+    assert client.list_hosted_zones_by_name.call_count == 1
 
 
 # ── Record write: UPSERT vs DELETE change batches ─────────────────────────

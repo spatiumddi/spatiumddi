@@ -75,6 +75,25 @@ def _lifetime(days: int) -> str:
     return "unlimited" if not days else f"{int(days)}d"
 
 
+def _format_master(entry: str) -> str:
+    """Render one secondary/stub master entry as a BIND9 ``masters`` token.
+
+    Accepts ``ip`` or ``ip@port`` (the control-plane wire shape, matching
+    the forwarders convention) and emits ``<ip>`` or ``<ip> port <n>``.
+    A non-numeric / malformed port suffix is dropped — better to AXFR
+    from the default port 53 than to render an un-loadable stanza.
+    """
+    entry = entry.strip()
+    if "@" in entry:
+        ip, _, port = entry.partition("@")
+        ip = ip.strip()
+        port = port.strip()
+        if port.isdigit():
+            return f"{ip} port {port}"
+        return ip
+    return entry
+
+
 # DNSSEC algorithm name → IANA number (issue #49). Used when parsing
 # ``rndc dnssec -status`` output, which prints the algorithm by name.
 _DNSSEC_ALGO_NUM: dict[str, int] = {
@@ -290,12 +309,30 @@ class Bind9Driver(DriverBase):
                     f'zone "{zname}" {{ type forward; forward {policy}; '
                     f'forwarders {{ {"; ".join(fwds)}; }}; }};\n'
                 )
+            # Secondary / stub zones (issue #336): the daemon AXFRs the zone
+            # from the configured masters, so we emit no zone file (BIND
+            # writes it on first transfer) and a ``masters { <ip> [port
+            # <n>]; … };`` clause. Without masters, ``named-checkconf``
+            # rejects the stanza, so a misconfigured zone (no masters) is
+            # simply skipped rather than poisoning the whole config.
+            if zone_type in {"secondary", "slave", "stub"}:
+                masters = [str(m) for m in (zone.get("masters") or []) if m]
+                if not masters:
+                    log.warning("bind9_secondary_zone_no_masters_skipped", zone=zname)
+                    return ""
+                rel_zfile = f"zones/{file_prefix}{zname.rstrip('.')}.db"
+                abs_zfile = self.state_dir / self.rendered_dir_name / rel_zfile
+                bind_type = "stub" if zone_type == "stub" else "slave"
+                masters_clause = "; ".join(_format_master(m) for m in masters)
+                return (
+                    f'zone "{zname}" {{ type {bind_type}; file "{abs_zfile}"; '
+                    f"masters {{ {masters_clause}; }}; }};\n"
+                )
             # Relative path inside the rendered tree; absolute path written
             # into named.conf so BIND9 doesn't resolve against its
             # `directory` (/var/cache/bind, not our rendered tree).
             rel_zfile = f"zones/{file_prefix}{zname.rstrip('.')}.db"
             abs_zfile = self.state_dir / self.rendered_dir_name / rel_zfile
-            bind_type = "master" if zone_type in {"primary", "master"} else "slave"
             allow_update = (
                 f'allow-update {{ key "{tsig_key_name}"; }}; ' if tsig_key_name else ""
             )
@@ -303,13 +340,12 @@ class Bind9Driver(DriverBase):
             # reference a dnssec-policy + enable inline-signing; BIND
             # auto-generates keys in key-directory + signs on load.
             dnssec_clause = ""
-            if zone_type in {"primary", "master"} and zone.get("dnssec_enabled"):
+            if zone.get("dnssec_enabled"):
                 pol = zone.get("dnssec_policy_name") or "default"
                 dnssec_clause = f'dnssec-policy "{pol}"; inline-signing yes; '
-            if zone_type in {"primary", "master"}:
-                self._write_zone_file(new_dir / rel_zfile, zone)
+            self._write_zone_file(new_dir / rel_zfile, zone)
             return (
-                f'zone "{zname}" {{ type {bind_type}; file "{abs_zfile}"; '
+                f'zone "{zname}" {{ type master; file "{abs_zfile}"; '
                 f"{allow_update}{dnssec_clause}}};\n"
             )
 

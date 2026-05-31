@@ -1934,6 +1934,12 @@ function ZoneModal({
     (zone?.forwarders ?? []).join(", "),
   );
   const [forwardOnly, setForwardOnly] = useState(zone?.forward_only ?? true);
+  // Secondary / stub primaries (issue #336) — the master IPs (ip or
+  // ip@port) this zone transfers FROM. Only shown / submitted for
+  // secondary + stub types.
+  const [mastersText, setMastersText] = useState(
+    (zone?.masters ?? []).join(", "),
+  );
   const [domainId, setDomainId] = useState<string | null>(
     zone?.domain_id ?? null,
   );
@@ -1986,6 +1992,19 @@ function ZoneModal({
       }
       payload.forwarders = fwds;
       payload.forward_only = forwardOnly;
+    }
+    if (zoneType === "secondary" || zoneType === "stub") {
+      const masters = mastersText
+        .split(/[,\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (masters.length === 0) {
+        setError(
+          `${zoneType === "stub" ? "Stub" : "Secondary"} zones need at least one master (primary server IP) to transfer from`,
+        );
+        return;
+      }
+      payload.masters = masters;
     }
     mut.mutate(payload);
   }
@@ -2063,6 +2082,27 @@ function ZoneModal({
                   forward first — fall back if all forwarders fail
                 </option>
               </select>
+            </Field>
+          </div>
+        )}
+        {(zoneType === "secondary" || zoneType === "stub") && (
+          <div className="space-y-3 rounded border border-dashed bg-muted/20 p-3">
+            <p className="text-[11px] text-muted-foreground">
+              <strong>
+                {zoneType === "stub" ? "Stub zone." : "Secondary zone."}
+              </strong>{" "}
+              This server transfers{" "}
+              <span className="font-mono">{name || "this zone"}</span> from the
+              primary (master) server(s) below via AXFR/IXFR — no records are
+              edited here. At least one master is required.
+            </p>
+            <Field label="Master IPs (comma- or space-separated; ip or ip@port)">
+              <input
+                className={inputCls}
+                value={mastersText}
+                onChange={(e) => setMastersText(e.target.value)}
+                placeholder="192.0.2.10, 192.0.2.11@5353"
+              />
             </Field>
           </div>
         )}

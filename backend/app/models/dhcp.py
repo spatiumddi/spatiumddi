@@ -306,6 +306,19 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     min_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # ── DHCP relay / giaddr matching (issue #337) ───────────────────
+    # List of relay-agent IP addresses (the ``giaddr`` a DHCP relay /
+    # ``ip helper-address`` stamps into relayed packets). When non-empty,
+    # the Kea driver emits ``relay: {"ip-addresses": [...]}`` on the
+    # rendered ``subnet4`` / ``subnet6`` so a centralized Kea selects
+    # this scope for traffic arriving via the relay — required for
+    # subnets that are NOT directly attached to the server. Empty list
+    # (default) preserves today's direct-attach behaviour: Kea matches
+    # the subnet by the interface the packet arrived on.
+    relay_addresses: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+
     options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
 
     # DDNS

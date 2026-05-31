@@ -10,16 +10,19 @@ expired and its IPAM row (if auto_from_lease) removed.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.celery_app import celery_app
 from app.db import task_session
-from app.models.dhcp import DHCPLease
-from app.models.ipam import IPAddress
+from app.models.dhcp import DHCPLease, DHCPScope
+from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.lease_history import record_lease_history
 
 logger = structlog.get_logger(__name__)
@@ -27,6 +30,38 @@ logger = structlog.get_logger(__name__)
 # How long past expires_at before we clean up. Covers small clock skew and
 # the agent's lease-event batch interval.
 EXPIRY_GRACE = timedelta(minutes=5)
+
+
+async def _resolve_lease_subnet_id(db: AsyncSession, lease: DHCPLease) -> uuid.UUID | None:
+    """Find the IPAM subnet that owns this lease's address.
+
+    SpatiumDDI allows overlapping private ranges across IPSpaces/VRFs, so
+    the same address (e.g. 10.0.0.50) can be a valid auto_from_lease
+    mirror in multiple subnets. Scope the mirror cleanup to the lease's
+    own subnet so expiring one subnet's lease can't drop another's
+    mirror. Prefer the lease's scope FK (DHCPScope.subnet_id); fall back
+    to longest-prefix match when the lease has no scope backlink.
+    """
+    if lease.scope_id is not None:
+        subnet_id = (
+            await db.execute(select(DHCPScope.subnet_id).where(DHCPScope.id == lease.scope_id))
+        ).scalar_one_or_none()
+        if subnet_id is not None:
+            return subnet_id
+
+    try:
+        addr = ipaddress.ip_address(str(lease.ip_address))
+    except (ValueError, TypeError):
+        return None
+    best: tuple[int, uuid.UUID] | None = None
+    for sid, network in (await db.execute(select(Subnet.id, Subnet.network))).all():
+        try:
+            net = ipaddress.ip_network(str(network), strict=False)
+        except (ValueError, TypeError):
+            continue
+        if addr in net and (best is None or net.prefixlen > best[0]):
+            best = (net.prefixlen, sid)
+    return best[1] if best else None
 
 
 async def _sweep() -> int:
@@ -54,10 +89,16 @@ async def _sweep() -> int:
             # the two apart.
             record_lease_history(db, lease, lease_state="expired", expired_at=now_ts)
             lease.state = "expired"
-            # Remove mirrored IPAM row if auto_from_lease.
+            # Remove the mirrored IPAM row if auto_from_lease — but only
+            # within this lease's owning subnet. An address-only lookup
+            # would delete same-address mirrors in other subnets too.
+            subnet_id = await _resolve_lease_subnet_id(db, lease)
+            if subnet_id is None:
+                continue
             ipam_res = await db.execute(
                 select(IPAddress)
                 .where(
+                    IPAddress.subnet_id == subnet_id,
                     IPAddress.address == lease.ip_address,
                     IPAddress.auto_from_lease.is_(True),
                 )

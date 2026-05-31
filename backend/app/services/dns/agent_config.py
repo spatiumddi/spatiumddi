@@ -152,6 +152,10 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             # Forward-zone-only fields (ignored by the agent for other types).
             "forwarders": list(getattr(z, "forwarders", []) or []),
             "forward_only": bool(getattr(z, "forward_only", True)),
+            # Secondary / stub primaries (issue #336). The agent renders these
+            # as ``masters { <ip> [port <n>]; … };`` for slave/stub zones;
+            # ignored for primary / forward.
+            "masters": list(getattr(z, "masters", []) or []),
             # DNSSEC inline-signing (issue #49). policy_name None ⇒ BIND
             # built-in "default".
             "dnssec_enabled": bool(getattr(z, "dnssec_enabled", False)),

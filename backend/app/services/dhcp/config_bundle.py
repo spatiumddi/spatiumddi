@@ -2,10 +2,11 @@
 
 Scopes + client classes live on ``DHCPServerGroup`` — every server in
 a group renders the same config. HA tuning also lives on the group;
-a group with ≥ 2 Kea members is an HA pair and emits a
-``FailoverConfig``, a single-member group is standalone and doesn't.
-Peer URLs are per-server (``DHCPServer.ha_peer_url``) — Kea uses them
-to reach the other peer for heartbeats + lease updates.
+a group with ≥ 2 Kea members emits a ``FailoverConfig`` (the first two
+sorted members are the primary + secondary/standby partners, any 3rd+
+members are ``backup`` peers), a single-member group is standalone and
+doesn't. Peer URLs are per-server (``DHCPServer.ha_peer_url``) — Kea
+uses them to reach the other peers for heartbeats + lease updates.
 
 Mirrors ``app.services.dns.config_bundle``.
 """
@@ -46,48 +47,62 @@ from app.models.ipam import Subnet
 async def _resolve_failover(
     db: AsyncSession, server: DHCPServer, group: DHCPServerGroup | None
 ) -> FailoverConfig | None:
-    """Return the FailoverConfig for ``server`` if its group is an HA pair.
+    """Return the FailoverConfig for ``server`` if its group is an HA group.
 
-    An HA pair is a DHCPServerGroup with exactly 2 Kea members. The
-    ``peers`` array carries both entries regardless of this server's
-    role; ``this_server_name`` tells Kea which one is "us". Non-Kea
-    servers in the group (e.g. Windows DHCP read-only) are ignored
-    for HA purposes — Kea HA only speaks to Kea.
+    An HA group is a DHCPServerGroup with >= 2 Kea members. The
+    ``peers`` array carries an entry for *every* Kea member regardless
+    of this server's role; ``this_server_name`` tells Kea which one is
+    "us". Non-Kea servers in the group (e.g. Windows DHCP read-only)
+    are ignored for HA purposes — Kea HA only speaks to Kea.
+
+    Kea's ``libdhcp_ha.so`` requires ``this-server-name`` to match an
+    entry in the ``peers`` array. The first sorted Kea member plays the
+    ``primary`` role, the second plays ``secondary`` (load-balancing) /
+    ``standby`` (hot-standby), and every additional member (3rd, 4th, …)
+    plays the ``backup`` role. Backup servers don't partner in the
+    heartbeat but receive lease updates — this keeps a group's 3rd+
+    member valid instead of rendering a config whose own name is absent
+    from its 2-entry peers list (issue #332).
 
     Peer URLs come from ``DHCPServer.ha_peer_url`` on each member.
-    An empty peer URL on either server suppresses HA rendering (the
-    operator hasn't finished setting things up yet).
+    An empty peer URL on any Kea member suppresses HA rendering for the
+    whole group (the operator hasn't finished setting things up yet).
     """
     if group is None:
         return None
     kea_peers = [s for s in group.servers if s.driver == "kea"]
     if len(kea_peers) < 2:
         return None
-    # Stable ordering so both peers render the same peers array regardless
-    # of which server is asking for its bundle. Sort by id (UUID) — the
-    # concept of "primary" in a group is not a model field today; whichever
-    # Kea peer ends up first in the sort plays the ``primary`` role.
+    # Stable ordering so every member renders the same peers array
+    # regardless of which server is asking for its bundle. Sort by id
+    # (UUID) — the concept of "primary" in a group is not a model field
+    # today; whichever Kea peer ends up first in the sort plays the
+    # ``primary`` role, the second ``secondary``/``standby``, the rest
+    # ``backup``.
     kea_peers.sort(key=lambda s: str(s.id))
-    primary, secondary = kea_peers[0], kea_peers[1]
 
-    if not primary.ha_peer_url or not secondary.ha_peer_url:
+    # Every Kea member needs a peer URL — an HA peer with no URL can't be
+    # reached for heartbeats or lease updates, so the group isn't ready.
+    if any(not s.ha_peer_url for s in kea_peers):
         return None
 
     secondary_role = "standby" if group.mode == "hot-standby" else "secondary"
-    peers: list[dict] = [
-        {
-            "name": primary.name,
-            "url": primary.ha_peer_url,
-            "role": "primary",
-            "auto-failover": group.auto_failover,
-        },
-        {
-            "name": secondary.name,
-            "url": secondary.ha_peer_url,
-            "role": secondary_role,
-            "auto-failover": group.auto_failover,
-        },
-    ]
+    peers: list[dict] = []
+    for index, peer in enumerate(kea_peers):
+        if index == 0:
+            role = "primary"
+        elif index == 1:
+            role = secondary_role
+        else:
+            role = "backup"
+        peers.append(
+            {
+                "name": peer.name,
+                "url": peer.ha_peer_url,
+                "role": role,
+                "auto-failover": group.auto_failover,
+            }
+        )
     return FailoverConfig(
         channel_id=str(group.id),
         channel_name=group.name,
@@ -216,6 +231,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 is_active=sc.is_active,
                 address_family=getattr(sc, "address_family", "ipv4") or "ipv4",
                 v6_address_mode=getattr(sc, "v6_address_mode", "stateful") or "stateful",
+                relay_addresses=tuple(getattr(sc, "relay_addresses", None) or ()),
             )
         )
 

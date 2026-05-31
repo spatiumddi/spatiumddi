@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# SpatiumDDI Kea DHCP container — kea-dhcp4 + kea-ctrl-agent + spatium-dhcp-agent
+# SpatiumDDI Kea DHCP container — kea-dhcp4 + kea-dhcp6 + kea-ctrl-agent + spatium-dhcp-agent
 # Multi-arch: linux/amd64, linux/arm64 (non-negotiable #11)
 ARG PYTHON_VERSION=3.12
 
@@ -18,13 +18,21 @@ FROM alpine:3.22 AS runtime
 # without compilation. The container also needs CAP_NET_RAW at run-time
 # for the sniffer to bind the socket — see docs/deployment/DOCKER.md.
 #
-# ``libcap`` brings in ``setcap`` so we can grant ``kea-dhcp4`` the
-# CAP_NET_BIND_SERVICE file capability — without it, the unprivileged
-# ``spatium`` user the entrypoint drops to can't bind UDP/67 (the
-# DHCPv4 server port). Compose-side ``cap_add: NET_BIND_SERVICE``
-# only sets the container bounding set; for a non-root process to
-# actually use the cap, the binary needs file caps. Same fix as
-# named + pdns_server in the DNS image family.
+# ``libcap`` brings in ``setcap`` so we can grant ``kea-dhcp4`` /
+# ``kea-dhcp6`` the CAP_NET_BIND_SERVICE file capability — without it,
+# the unprivileged ``spatium`` user the entrypoint drops to can't bind
+# UDP/67 (the DHCPv4 server port) or UDP/547 (the DHCPv6 server port).
+# Compose-side ``cap_add: NET_BIND_SERVICE`` only sets the container
+# bounding set; for a non-root process to actually use the cap, the
+# binary needs file caps. Same fix as named + pdns_server in the DNS
+# image family.
+#
+# ``kea>=2.6.5-r0`` ships the CVE-2026-3608 (HIGH) fix that Trivy flags
+# in 2.6.3-r0; the explicit ``>=`` lower-bound both pulls the patched
+# package AND busts the BuildKit ``cache-from`` layer so a stale
+# ``apk add`` layer can't serve the vulnerable version. ``kea-dhcp6``
+# is named explicitly (the ``kea`` meta-package pulls it in too) so it
+# is obvious the v6 daemon is part of the always-on dual-stack image.
 #
 # ``apk upgrade --no-cache`` runs BEFORE ``apk add`` so the package
 # database is fresh and any previously-baked layer carrying an older
@@ -35,13 +43,14 @@ FROM alpine:3.22 AS runtime
 # to serve a 30-day-old ``apk add`` layer that Trivy will then flag.
 RUN apk upgrade --no-cache \
  && apk add --no-cache \
-      kea kea-dhcp4 kea-ctrl-agent kea-admin \
+      'kea>=2.6.5-r0' kea-dhcp4 kea-dhcp6 kea-ctrl-agent kea-admin \
       kea-hook-lease-cmds kea-hook-ha \
       tini su-exec \
       python3 py3-pip libpcap \
       libcap \
       ca-certificates tzdata \
  && setcap cap_net_bind_service=+ep /usr/sbin/kea-dhcp4 \
+ && setcap cap_net_bind_service=+ep /usr/sbin/kea-dhcp6 \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
  && mkdir -p /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea \
@@ -56,21 +65,27 @@ RUN apk upgrade --no-cache \
 
 COPY --from=agent-build /install /usr/local
 COPY agent/dhcp/images/kea/kea-dhcp4.conf /etc/kea/kea-dhcp4.conf
+COPY agent/dhcp/images/kea/kea-dhcp6.conf /etc/kea/kea-dhcp6.conf
 COPY agent/dhcp/images/kea/kea-ctrl-agent.conf /etc/kea/kea-ctrl-agent.conf
 COPY agent/dhcp/images/kea/entrypoint.sh /usr/local/bin/spatium-dhcp-entrypoint
 RUN chmod +x /usr/local/bin/spatium-dhcp-entrypoint \
- && chown spatium:spatium /etc/kea/kea-dhcp4.conf /etc/kea/kea-ctrl-agent.conf
+ && chown spatium:spatium \
+      /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf /etc/kea/kea-ctrl-agent.conf
 
 ENV CACHE_DIR=/var/lib/spatium-dhcp-agent \
     KEA_CONFIG_PATH=/etc/kea/kea-dhcp4.conf \
     KEA_CONTROL_SOCKET=/run/kea/kea4-ctrl-socket \
     KEA_LEASE_FILE=/var/lib/kea/kea-leases4.csv \
+    KEA_CONFIG_PATH_V6=/etc/kea/kea-dhcp6.conf \
+    KEA_CONTROL_SOCKET_V6=/run/kea/kea6-ctrl-socket \
     PYTHONPATH=/usr/local/lib/python3.12/site-packages \
     LOG_LEVEL=INFO
 
 VOLUME ["/var/lib/spatium-dhcp-agent", "/var/lib/kea"]
 # DHCPv4 server
 EXPOSE 67/udp
+# DHCPv6 server (always-on dual-stack — kea-dhcp6 binds 547 once started)
+EXPOSE 547/udp
 # Kea HA hook peer-to-peer HTTP listener (CmdHttpListener bound to the
 # this-server peer URL). When HA is inactive the port is unused.
 EXPOSE 8000/tcp

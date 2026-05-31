@@ -372,6 +372,7 @@ async def delete_endpoint(endpoint_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
 
 @router.post("/endpoints/{endpoint_id}/sync", status_code=status.HTTP_202_ACCEPTED)
 async def sync_endpoint(endpoint_id: uuid.UUID, db: DB, _: SuperAdmin) -> dict[str, str]:
+    forbid_in_demo_mode("Cloud sync is disabled")
     e = await db.get(CloudEndpoint, endpoint_id)
     if e is None:
         raise HTTPException(status_code=404, detail="Cloud endpoint not found")
@@ -389,6 +390,7 @@ async def sync_endpoint(endpoint_id: uuid.UUID, db: DB, _: SuperAdmin) -> dict[s
 async def test_connection(
     body: TestConnectionRequest, db: DB, _: SuperAdmin
 ) -> TestConnectionResponse:
+    forbid_in_demo_mode("Cloud connection testing is disabled")
     provider = (body.provider or "").strip().lower()
     credentials = body.credentials
     provider_config = body.provider_config if body.provider_config is not None else {}

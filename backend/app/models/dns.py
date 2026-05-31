@@ -652,6 +652,17 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
 
+    # Primary (master) server IPs this zone transfers FROM (issue #336).
+    # Required + non-empty for ``zone_type`` in {secondary, stub}: a
+    # secondary / stub zone with no masters renders un-loadable BIND9
+    # config (``named-checkconf`` rejects ``type slave;`` / ``type stub;``
+    # with no ``primaries`` clause). Each entry is an ``ip`` or ``ip@port``
+    # string — the renderer maps ``ip@port`` → ``ip port <n>;``. Ignored
+    # for primary / forward zones (those don't pull from a master).
+    masters: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+
     # Logical ownership (issue #91). DNS zones often map 1:1 to a
     # customer (managed-DNS engagements) or to a site (per-DC zones);
     # the FK keeps that visible without resorting to tags.

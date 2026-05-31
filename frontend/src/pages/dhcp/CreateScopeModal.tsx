@@ -91,6 +91,12 @@ export function CreateScopeModal({
   );
   const [raManaged, setRaManaged] = useState(scope?.ra_managed_flag ?? true);
   const [raOther, setRaOther] = useState(scope?.ra_other_flag ?? true);
+  // Relay-agent (giaddr) IPs (issue #337). Freeform multiline / comma
+  // textarea; parsed into a list on submit. Set when a centralized DHCP
+  // server serves this subnet through an upstream relay / ip-helper.
+  const [relayAddresses, setRelayAddresses] = useState(
+    (scope?.relay_addresses ?? []).join("\n"),
+  );
   // Initial pool — only used when creating; edits happen in the Pools tab.
   const [poolStart, setPoolStart] = useState("");
   const [poolEnd, setPoolEnd] = useState("");
@@ -243,6 +249,13 @@ export function CreateScopeModal({
         ddns_domain_override: ddnsDomain || null,
         hostname_sync_mode: hostnameSync,
         options,
+        // Relay-agent IPs (issue #337). Split on commas / whitespace /
+        // newlines; the backend validates each entry as an IP. Always
+        // sent so clearing the textarea clears the scope's relay set.
+        relay_addresses: relayAddresses
+          .split(/[\s,]+/)
+          .map((s) => s.trim())
+          .filter(Boolean),
       };
       // DHCPv6 mode + RA flags only apply to v6 scopes (issue #52).
       if (isV6) {
@@ -507,6 +520,18 @@ export function CreateScopeModal({
             </div>
           </div>
         )}
+
+        <Field
+          label="Relay agents (giaddr)"
+          hint="Optional. Relay / ip-helper IP addresses (one per line or comma-separated). Set this when a centralized DHCP server serves this subnet through a relay it isn't directly attached to. Leave blank for directly-connected subnets."
+        >
+          <textarea
+            className={`${inputCls} min-h-[60px] font-mono`}
+            placeholder={"10.20.0.1\n192.0.2.250"}
+            value={relayAddresses}
+            onChange={(e) => setRelayAddresses(e.target.value)}
+          />
+        </Field>
 
         {!editing && !(isV6 && v6Mode !== "stateful") && (
           <div className="rounded-md border bg-muted/30 p-3">

@@ -61,6 +61,13 @@ class ZoneData:
     # (false — the resolver may fall back to recursion if all forwarders fail).
     forwarders: tuple[str, ...] = ()
     forward_only: bool = True
+    # Secondary / stub primaries (issue #336). The master server IPs this
+    # zone transfers FROM, as ``ip`` or ``ip@port`` strings. Required +
+    # non-empty for ``zone_type`` in {secondary, stub} — the BIND9 renderer
+    # emits ``primaries { <ip> [port <n>]; … };`` from this. Ignored for
+    # primary / forward zones. Defaulted empty so existing constructors keep
+    # working.
+    masters: tuple[str, ...] = ()
     # DNSSEC inline-signing (issue #49). When ``dnssec_enabled`` the BIND9
     # driver renders ``dnssec-policy "<dnssec_policy_name>"; inline-signing
     # yes;`` into the zone stanza and BIND auto-signs. ``dnssec_policy_name``

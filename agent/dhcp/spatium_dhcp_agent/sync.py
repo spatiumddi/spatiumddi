@@ -4,9 +4,12 @@ Hits ``GET /api/v1/dhcp/agents/config`` with ``If-None-Match``. On 200 the
 agent:
 
 1. atomically writes the new bundle to the on-disk cache,
-2. renders the bundle into a Kea ``Dhcp4`` JSON document,
-3. writes that document to ``KEA_CONFIG_PATH``,
-4. asks kea-dhcp4 to reload via the control socket.
+2. renders the bundle into a combined Kea ``{"Dhcp4": ..., "Dhcp6": ...}``
+   document,
+3. SPLITS it and atomically writes ``{"Dhcp4": ...}`` to ``KEA_CONFIG_PATH``
+   and ``{"Dhcp6": ...}`` to ``KEA_CONFIG_PATH_V6`` — they MUST be separate
+   files because ``kea-dhcp4 -t`` rejects a stray ``Dhcp6`` key (and v.v.),
+4. asks BOTH kea-dhcp4 and kea-dhcp6 to reload via their control sockets.
 
 On 304 the loop just continues. The control plane holds the connection open
 for ~LONGPOLL_TIMEOUT seconds, so this is cheap.
@@ -132,6 +135,54 @@ class SyncLoop:
             timeout=self.cfg.longpoll_timeout + 15.0,
         )
 
+    @staticmethod
+    def _atomic_write_json(path: Path, doc: dict[str, Any]) -> None:
+        """Write ``doc`` to ``path`` via the temp-write-then-rename pattern.
+
+        The rename is atomic on POSIX so a reader (or a crash mid-write)
+        never sees a half-written Kea config.
+        """
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(doc, indent=2, sort_keys=True))
+        tmp.replace(path)
+
+    def _reload_socket(
+        self, socket_path: Path, daemon: str, reload_retry_timeout: float
+    ) -> bool:
+        """Ask one Kea daemon to reload, retrying until its socket answers.
+
+        Returns ``True`` on a successful reload, ``False`` otherwise. A
+        failure is logged + reflected in ``heartbeat.daemon_status`` but
+        does not raise, so a v6 reload failure can't abort the v4 apply
+        (and vice-versa). The retry covers Kea's own startup window where
+        the control socket may not exist yet.
+        """
+        deadline = time.monotonic() + reload_retry_timeout
+        last_err: Exception | None = None
+        while True:
+            try:
+                config_reload(socket_path)
+                return True
+            except (KeaCtrlError, OSError) as e:
+                last_err = e
+                if time.monotonic() >= deadline:
+                    break
+                log.debug(
+                    "kea_config_reload_retry",
+                    daemon=daemon,
+                    error=str(e),
+                    wait=_BOOTSTRAP_RELOAD_INTERVAL,
+                )
+                if self._stop.wait(_BOOTSTRAP_RELOAD_INTERVAL):
+                    break
+        log.warning("kea_config_reload_failed", daemon=daemon, error=str(last_err))
+        self.heartbeat.daemon_status = {
+            "status": "degraded",
+            "reason": f"{daemon}_reload_failed: {last_err}",
+        }
+        return False
+
     def _apply_bundle(
         self,
         bundle: dict[str, Any],
@@ -167,10 +218,16 @@ class SyncLoop:
                 inner_type=type(inner_candidate).__name__,
             )
             return
+        # ``leases6`` mirrors the v4 lease file with the family digit
+        # swapped (``kea-leases4.csv`` → ``kea-leases6.csv``) so the v6
+        # daemon never writes the v4 lease store.
+        lease_file_v6 = str(self.cfg.kea_lease_file).replace("leases4", "leases6")
         rendered = render_kea(
             inner,
             control_socket=str(self.cfg.kea_control_socket),
             lease_file=str(self.cfg.kea_lease_file),
+            control_socket_v6=str(self.cfg.kea_control_socket_v6),
+            lease_file_v6=lease_file_v6,
         )
         # Keep the HA poller aligned with whether Kea is about to load
         # the HA hook — when the bundle has no failover block the hook
@@ -179,43 +236,40 @@ class SyncLoop:
         # won't answer.
         if self.ha_poller is not None:
             self.ha_poller.set_enabled(bool(inner.get("failover")))
-        # Write to rendered/ (for audit) and then to the live Kea config path.
+
+        # Split the combined render into the two daemon-specific files.
+        # kea-dhcp4 rejects a doc containing a stray ``Dhcp6`` key (and
+        # kea-dhcp6 a stray ``Dhcp4``), so each file carries exactly one
+        # top-level block. ``render_kea`` always emits both blocks (the
+        # Dhcp6 one is an idle skeleton when there are no v6 scopes).
+        dhcp4_doc = {"Dhcp4": rendered.get("Dhcp4", {})}
+        dhcp6_doc = {"Dhcp6": rendered.get("Dhcp6", {})}
+
+        # Write the combined render to rendered/ (for audit/debug) and
+        # then atomically write each split doc to its live config path.
         save_rendered_kea(self.cfg.state_dir, rendered)
-        tmp = self.cfg.kea_config_path.with_suffix(self.cfg.kea_config_path.suffix + ".tmp")
-        tmp.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(rendered, indent=2, sort_keys=True))
-        tmp.replace(self.cfg.kea_config_path)
+        self._atomic_write_json(self.cfg.kea_config_path, dhcp4_doc)
+        self._atomic_write_json(self.cfg.kea_config_path_v6, dhcp6_doc)
         log.info(
             "dhcp_config_written",
             path=str(self.cfg.kea_config_path),
-            subnets=len(rendered.get("Dhcp4", {}).get("subnet4", [])),
+            path_v6=str(self.cfg.kea_config_path_v6),
+            subnets=len(dhcp4_doc["Dhcp4"].get("subnet4", [])),
+            subnets_v6=len(dhcp6_doc["Dhcp6"].get("subnet6", [])),
         )
         if reload_kea:
-            deadline = time.monotonic() + reload_retry_timeout
-            last_err: Exception | None = None
-            while True:
-                try:
-                    config_reload(self.cfg.kea_control_socket)
-                    self.heartbeat.daemon_status = {"status": "ok"}
-                    last_err = None
-                    break
-                except (KeaCtrlError, OSError) as e:
-                    last_err = e
-                    if time.monotonic() >= deadline:
-                        break
-                    log.debug(
-                        "kea_config_reload_retry",
-                        error=str(e),
-                        wait=_BOOTSTRAP_RELOAD_INTERVAL,
-                    )
-                    if self._stop.wait(_BOOTSTRAP_RELOAD_INTERVAL):
-                        break
-            if last_err is not None:
-                log.warning("kea_config_reload_failed", error=str(last_err))
-                self.heartbeat.daemon_status = {
-                    "status": "degraded",
-                    "reason": f"reload_failed: {last_err}",
-                }
+            # Reload both daemons independently. A v6 reload failure must
+            # not abort the v4 apply (and vice-versa) — each is wrapped in
+            # the same retry / tolerate-missing-socket logic, and the
+            # heartbeat daemon_status reflects the worst of the two.
+            ok4 = self._reload_socket(
+                self.cfg.kea_control_socket, "dhcp4", reload_retry_timeout
+            )
+            ok6 = self._reload_socket(
+                self.cfg.kea_control_socket_v6, "dhcp6", reload_retry_timeout
+            )
+            if ok4 and ok6:
+                self.heartbeat.daemon_status = {"status": "ok"}
         # Feed the peer-resolve watcher the bundle so it can track
         # hostname → IP drift and trigger a re-render if any peer's
         # IP changes. No-op when the bundle has no failover block.

@@ -80,6 +80,54 @@ def _normalize_sync_mode(v: str | None) -> str:
     return v or "on_static_only"
 
 
+def _validate_relay_addresses(v: list[str] | None) -> list[str]:
+    """Validate + de-dupe relay-agent IPs (issue #337).
+
+    Each entry must parse as a bare IPv4/IPv6 address (no CIDR — Kea's
+    ``relay.ip-addresses`` takes literal giaddr values). Order is
+    preserved minus duplicates so the rendered config is stable.
+    """
+    if not v:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in v:
+        addr = str(raw).strip()
+        if not addr:
+            continue
+        try:
+            normalized = str(ipaddress.ip_address(addr))
+        except ValueError as exc:
+            raise ValueError(f"invalid relay address: {addr!r}") from exc
+        if normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
+    return out
+
+
+def _validate_relay_family(addrs: list[str], address_family: str) -> None:
+    """Reject relay addresses whose IP family doesn't match the scope's
+    family. A v4 (subnet4) scope's giaddr relays must be IPv4 and a v6
+    (subnet6) scope's relays IPv6 — a mismatch renders an invalid Kea
+    subnet (issue #337). Format is already validated upstream; this only
+    checks the family against the scope's subnet-derived address_family.
+    """
+    want_v6 = address_family == "ipv6"
+    for raw in addrs or []:
+        try:
+            ip = ipaddress.ip_address(str(raw).strip())
+        except ValueError:
+            continue
+        if (ip.version == 6) != want_v6:
+            fam = "IPv6" if want_v6 else "IPv4"
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"relay address {raw!r} must be {fam} to match this " f"{address_family} scope"
+                ),
+            )
+
+
 class ScopeCreate(BaseModel):
     model_config = {"extra": "ignore"}
 
@@ -100,7 +148,14 @@ class ScopeCreate(BaseModel):
     v6_address_mode: str = "stateful"
     ra_managed_flag: bool = True
     ra_other_flag: bool = True
+    # Relay-agent (giaddr) IPs (issue #337) — see DHCPScope.relay_addresses.
+    relay_addresses: list[str] = Field(default_factory=list)
     tags: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("relay_addresses")
+    @classmethod
+    def _relay(cls, v: list[str] | None) -> list[str]:
+        return _validate_relay_addresses(v)
 
     @field_validator("ddns_hostname_policy")
     @classmethod
@@ -151,6 +206,9 @@ class ScopeUpdate(BaseModel):
     v6_address_mode: str | None = None
     ra_managed_flag: bool | None = None
     ra_other_flag: bool | None = None
+    # Relay-agent (giaddr) IPs (issue #337). Pass a list to replace the
+    # scope's relay set (empty list clears it); omit to leave unchanged.
+    relay_addresses: list[str] | None = None
     tags: dict[str, Any] | None = None
 
     @field_validator("v6_address_mode")
@@ -161,6 +219,13 @@ class ScopeUpdate(BaseModel):
         if v not in VALID_V6_MODES:
             raise ValueError(f"v6_address_mode must be one of {sorted(VALID_V6_MODES)}")
         return v
+
+    @field_validator("relay_addresses")
+    @classmethod
+    def _relay(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        return _validate_relay_addresses(v)
 
 
 _NAME_TO_CODE = {v: k for k, v in _CODE_TO_NAME.items()}
@@ -185,6 +250,7 @@ class ScopeResponse(BaseModel):
     v6_address_mode: str = "stateful"
     ra_managed_flag: bool = True
     ra_other_flag: bool = True
+    relay_addresses: list[str] = Field(default_factory=list)
     last_pushed_at: datetime | None
     tags: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
@@ -218,6 +284,7 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
         v6_address_mode=getattr(scope, "v6_address_mode", "stateful") or "stateful",
         ra_managed_flag=getattr(scope, "ra_managed_flag", True),
         ra_other_flag=getattr(scope, "ra_other_flag", True),
+        relay_addresses=list(getattr(scope, "relay_addresses", None) or []),
         last_pushed_at=scope.last_pushed_at,
         tags=scope.tags or {},
         created_at=scope.created_at,
@@ -297,6 +364,7 @@ async def create_scope(
         address_family = "ipv6" if isinstance(_net, ipaddress.IPv6Network) else "ipv4"
     except ValueError:
         address_family = "ipv4"
+    _validate_relay_family(body.relay_addresses, address_family)
     scope = DHCPScope(
         subnet_id=subnet_id,
         group_id=group_id,
@@ -314,6 +382,7 @@ async def create_scope(
         v6_address_mode=body.v6_address_mode,
         ra_managed_flag=body.ra_managed_flag,
         ra_other_flag=body.ra_other_flag,
+        relay_addresses=body.relay_addresses,
     )
     db.add(scope)
     await db.flush()
@@ -365,6 +434,10 @@ async def update_scope(
     # detaches one profile and binds another) still wins.
     if changes.pop("clear_pxe_profile", False):
         scope.pxe_profile_id = None
+    if "relay_addresses" in changes:
+        # Family must match the scope's (subnet-derived) address_family;
+        # address_family itself is immutable on update (#337).
+        _validate_relay_family(changes["relay_addresses"], scope.address_family or "ipv4")
     for k, v in changes.items():
         setattr(scope, k, v)
     await db.flush()

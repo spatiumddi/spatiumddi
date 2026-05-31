@@ -12,7 +12,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
@@ -570,6 +570,32 @@ VALID_ZONE_COLORS = {
 }
 
 
+def _validate_masters_format(v: list[str] | None) -> list[str]:
+    """Validate each ``masters`` entry is a bare IP or ``ip@port`` — the only
+    shapes the BIND9 ``masters { ... };`` renderer accepts. Rejects anything
+    carrying named-config metacharacters (``;`` ``{`` ``}`` whitespace, etc.)
+    so a crafted value can't be injected into the rendered server config
+    (issue #336 — config-injection hardening)."""
+    import ipaddress  # noqa: PLC0415
+
+    cleaned: list[str] = []
+    for raw in v or []:
+        entry = str(raw).strip()
+        if not entry:
+            continue
+        host, sep, port = entry.partition("@")
+        try:
+            ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ValueError(
+                f"master {entry!r} must be a bare IPv4/IPv6 address (optionally 'ip@port')"
+            ) from exc
+        if sep and (not port.isdigit() or not (1 <= int(port) <= 65535)):
+            raise ValueError(f"master {entry!r}: port must be an integer in 1..65535")
+        cleaned.append(entry)
+    return cleaned
+
+
 class ZoneCreate(BaseModel):
     name: str
     view_id: uuid.UUID | None = None
@@ -594,6 +620,10 @@ class ZoneCreate(BaseModel):
     # ignored otherwise.
     forwarders: list[str] = []
     forward_only: bool = True
+    # Secondary / stub primaries (issue #336). Required + non-empty when
+    # ``zone_type`` in {secondary, stub}; ignored otherwise. Each entry is
+    # an ``ip`` or ``ip@port`` string — the IP that this zone AXFRs from.
+    masters: list[str] = []
     # Logical ownership (issue #91). Optional FK to the Customer that
     # owns this zone (managed-DNS engagements typically have one
     # customer per zone).
@@ -606,6 +636,27 @@ class ZoneCreate(BaseModel):
         if v not in VALID_ZONE_TYPES:
             raise ValueError(f"zone_type must be one of {sorted(VALID_ZONE_TYPES)}")
         return v
+
+    @field_validator("masters")
+    @classmethod
+    def validate_masters(cls, v: list[str]) -> list[str]:
+        return _validate_masters_format(v)
+
+    @model_validator(mode="after")
+    def require_masters_for_secondary(self) -> ZoneCreate:
+        # A secondary / stub zone with no masters renders un-loadable BIND9
+        # config (``type slave;`` / ``type stub;`` with no ``masters`` clause
+        # is hard-rejected by named-checkconf). Reject at create time so
+        # operators never persist a silently-broken zone (issue #336).
+        if self.zone_type in {"secondary", "stub"}:
+            cleaned = [m.strip() for m in self.masters if m and m.strip()]
+            if not cleaned:
+                raise ValueError(
+                    f"a {self.zone_type} zone requires at least one master "
+                    "(primary server IP) to transfer from"
+                )
+            self.masters = cleaned
+        return self
 
     @field_validator("color")
     @classmethod
@@ -646,6 +697,10 @@ class ZoneUpdate(BaseModel):
     notify_enabled: str | None = None
     forwarders: list[str] | None = None
     forward_only: bool | None = None
+    # Secondary / stub primaries (issue #336). Validated against the
+    # effective zone_type in the handler (the new value may come from this
+    # same payload or stay as-is on the existing row).
+    masters: list[str] | None = None
     customer_id: uuid.UUID | None = None
     tags: dict[str, Any] | None = None
 
@@ -655,6 +710,11 @@ class ZoneUpdate(BaseModel):
         if v is not None and v not in VALID_ZONE_TYPES:
             raise ValueError(f"zone_type must be one of {sorted(VALID_ZONE_TYPES)}")
         return v
+
+    @field_validator("masters")
+    @classmethod
+    def validate_masters(cls, v: list[str] | None) -> list[str] | None:
+        return None if v is None else _validate_masters_format(v)
 
     @field_validator("color")
     @classmethod
@@ -702,6 +762,7 @@ class ZoneResponse(BaseModel):
     notify_enabled: str | None
     forwarders: list[str]
     forward_only: bool
+    masters: list[str]
     # Non-null when the zone was synthesised by the Tailscale Phase 2
     # reconciler. The UI uses this to render a read-only badge and
     # disable edit/delete controls; the API enforces it on the
@@ -2994,6 +3055,24 @@ async def update_zone(
     # explicit null ⇒ fall back to BIND's built-in "default" policy.
     if "dnssec_policy_id" in body.model_fields_set and body.dnssec_policy_id is None:
         changes["dnssec_policy_id"] = None
+    # Secondary / stub zones need at least one master to render loadable
+    # BIND9 config (issue #336). Validate against the *effective* state —
+    # the new zone_type/masters from this payload OR what's already on the
+    # row — so an operator can't flip a zone to secondary without masters,
+    # nor empty the masters on an existing secondary.
+    if "masters" in changes:
+        changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
+    effective_zone_type = changes.get("zone_type", zone.zone_type)
+    if effective_zone_type in {"secondary", "stub"}:
+        effective_masters = changes.get("masters", zone.masters) or []
+        if not effective_masters:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"a {effective_zone_type} zone requires at least one master "
+                    "(primary server IP) to transfer from"
+                ),
+            )
     for k, v in changes.items():
         setattr(zone, k, v)
     db.add(
