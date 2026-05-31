@@ -80,6 +80,9 @@ _SUPPORTED_RECORD_TYPES = frozenset(
         "LOC",
         "LUA",
         "SOA",
+        "SVCB",
+        "HTTPS",
+        "DNAME",
     }
 )
 

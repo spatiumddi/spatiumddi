@@ -2234,6 +2234,9 @@ const RECORD_TYPES = [
   "NAPTR",
   "LOC",
   "LUA",
+  "SVCB",
+  "HTTPS",
+  "DNAME",
 ];
 
 function RecordModal({
