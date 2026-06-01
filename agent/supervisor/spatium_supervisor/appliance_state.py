@@ -1364,8 +1364,11 @@ def read_cluster_cidrs() -> tuple[str | None, str | None, str | None]:
                     pod_cidr = s.split(":", 1)[1].strip().strip('"').strip("'") or None
                 elif s.startswith("service-cidr:"):
                     service_cidr = s.split(":", 1)[1].strip().strip('"').strip("'") or None
-        except OSError:
-            pass
+        except OSError as exc:
+            # Drop-in unreadable (perms / mid-write) — fall through with
+            # pod/service CIDR as None (the backend leaves those columns
+            # alone). Note it so a recurring bind-mount issue isn't silent.
+            log.debug("supervisor.cluster_cidrs.dropin_read_failed", error=str(exc))
 
     # flannel-backend: main config first, then drop-ins in sorted order;
     # first match wins. Default to the k3s upstream ``vxlan`` when nothing
@@ -1374,8 +1377,10 @@ def read_cluster_cidrs() -> tuple[str | None, str | None, str | None]:
     candidates = [_K3S_MAIN_CONFIG]
     try:
         candidates += sorted(_K3S_CONFIG_DIR.glob("*.yaml"))
-    except OSError:
-        pass
+    except OSError as exc:
+        # config.yaml.d enumeration failed — continue with the main
+        # config + the vxlan default rather than erroring.
+        log.debug("supervisor.cluster_cidrs.dropin_glob_failed", error=str(exc))
     for path in candidates:
         if not path.exists():
             continue

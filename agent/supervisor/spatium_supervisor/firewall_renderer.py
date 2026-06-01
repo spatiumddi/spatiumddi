@@ -168,9 +168,6 @@ _ROLE_PORTS_UDP: dict[str, list[int]] = {
 _K3S_ETCD_KUBELET_TCP: tuple[int, ...] = (2379, 2380, 10250)
 _K3S_APISERVER_TCP = 6443
 _METALLB_MEMBERLIST = 7946
-# Union of every k3s server port this renderer scopes — kept as a module
-# constant for reference / tests.
-_K3S_PEER_PORTS_TCP: tuple[int, ...] = (2379, 2380, 6443, 10250)
 
 # #285 Phase 1 — k3s data-plane backend → the inter-node INPUT port(s)
 # that must stay open between cluster nodes. host-gw / unknown route via
