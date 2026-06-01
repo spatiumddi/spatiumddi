@@ -51,6 +51,10 @@ set -eu
 TRIGGER_FILE=/var/lib/spatiumddi/release-state/firewall-pending
 APPLIED_HASH=/var/lib/spatiumddi/release-state/firewall-applied-hash
 APPLIED_STATUS=/var/lib/spatiumddi/release-state/firewall-applied-status
+# #285 Phase 2b — sha256 of the live base /etc/nftables.conf we applied
+# against, echoed on the heartbeat so the control plane can tell a node
+# still on the pre-#285 LAN-wide base apart from a hardened one.
+BASE_MARKER=/var/lib/spatiumddi/release-state/firewall-applied-base-marker
 DROP_IN=/etc/nftables.d/spatium-role.nft
 NFT_MAIN=/etc/nftables.conf
 STAGING=/etc/nftables.d/.spatium-role.nft.new
@@ -154,5 +158,9 @@ fi
 
 mkdir -p "$(dirname "$APPLIED_HASH")"
 printf '%s\n' "$HASH" > "$APPLIED_HASH"
+# #285 Phase 2b — record which base conf we applied against (sha256 of the
+# merged master file). An old runner won't write this → control plane sees
+# None → leaves the column untouched (forward-compatible).
+sha256sum "$NFT_MAIN" | cut -d' ' -f1 > "$BASE_MARKER" 2>/dev/null || true
 write_status "ok"
 log "applied drop-in (hash=$HASH)"

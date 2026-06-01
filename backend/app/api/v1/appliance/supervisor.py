@@ -57,6 +57,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func as sa_func
 from sqlalchemy import or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import is_effective_superadmin, require_permission
@@ -77,6 +78,7 @@ from app.models.appliance import (
     PairingCode,
 )
 from app.models.audit import AuditLog
+from app.models.firewall import FirewallApplyState
 from app.models.settings import PlatformSettings
 from app.services.appliance.ca import (
     ensure_ca,
@@ -1045,6 +1047,18 @@ class SupervisorHeartbeatRequest(BaseModel):
     dataplane_backend: str | None = None
     base_conf_marker: str | None = None
     base_lanwide_k3s: bool | None = None
+    # Issue #285 Phase 2b — the host runner's firewall apply outcome,
+    # echoed back so the control plane can see drift + drive the apply
+    # alarm. The runner already WRITES these sidecars; nothing read them
+    # back before. None on a legacy runner / non-appliance → the upsert
+    # leaves the column untouched. ``firewall_base_marker`` is the sha256
+    # of the live base /etc/nftables.conf (distinct from the Phase-1
+    # ``base_conf_marker`` telemetry above, which the supervisor reads
+    # directly off the mounted file — this one is what the RUNNER applied
+    # against).
+    firewall_applied_hash: str | None = None
+    firewall_applied_status: str | None = None
+    firewall_base_marker: str | None = None
     # #272 Phase 9 — dead-node replacement. The SEED supervisor reports
     # the hostnames of k8s Nodes it successfully evicted (deleting the
     # Node makes k3s drop the etcd member). The handler clears
@@ -1521,6 +1535,30 @@ async def supervisor_heartbeat(
         row.base_conf_marker = body.base_conf_marker
     if body.base_lanwide_k3s is not None:
         row.base_lanwide_k3s = body.base_lanwide_k3s
+
+    # Issue #285 Phase 2b — mirror the host runner's firewall apply outcome
+    # into firewall_apply_state. Upsert (on_conflict_do_update) rather than
+    # get-or-create so overlapping/retried heartbeats from one appliance
+    # can't 500, and a field absent this tick is never clobbered. Only
+    # touch the row when the runner actually reported something.
+    if (
+        body.firewall_applied_hash is not None
+        or body.firewall_applied_status is not None
+        or body.firewall_base_marker is not None
+    ):
+        fw_sets: dict[str, Any] = {}
+        if body.firewall_applied_hash is not None:
+            fw_sets["applied_hash"] = body.firewall_applied_hash
+            fw_sets["last_applied_at"] = datetime.now(UTC)
+        if body.firewall_applied_status is not None:
+            fw_sets["applied_status"] = body.firewall_applied_status
+        if body.firewall_base_marker is not None:
+            fw_sets["base_conf_marker"] = body.firewall_base_marker
+        await db.execute(
+            pg_insert(FirewallApplyState)
+            .values(appliance_id=row.id, **fw_sets)
+            .on_conflict_do_update(index_elements=["appliance_id"], set_=fw_sets)
+        )
 
     # #272 Phase 9 — the seed reports k8s Nodes it evicted (dead-node
     # replacement). Clear the flag + settle those rows to ``left`` so

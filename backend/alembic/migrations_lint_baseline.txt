@@ -96,6 +96,8 @@ backend/alembic/versions/a1f4d97c8e25_network_device_poll_igmp.py:drop_column:49
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:83
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:84
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:85
+backend/alembic/versions/a3f1d9e07c52_firewall_apply_state.py:drop_column:66
+backend/alembic/versions/a3f1d9e07c52_firewall_apply_state.py:drop_table:67
 backend/alembic/versions/a3f7b2c8d419_add_name_description_to_dhcp_scope.py:drop_column:33
 backend/alembic/versions/a3f7b2c8d419_add_name_description_to_dhcp_scope.py:drop_column:34
 backend/alembic/versions/a4b8c2d619e7_ai_provider.py:drop_table:92

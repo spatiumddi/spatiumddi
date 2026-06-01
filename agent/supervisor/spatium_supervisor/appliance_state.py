@@ -333,6 +333,20 @@ _NTP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-status")
 _LLDP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/lldp-config-pending")
 _LLDP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/lldp-config-hash")
 _LLDP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/lldp-status")
+# Issue #285 Phase 2b — firewall apply-state sidecars the host-side
+# spatium-firewall-reload runner writes after each apply; echoed on the
+# heartbeat so the control plane can see drift + drive the apply alarm.
+# The runner writes the bare /var/lib/spatiumddi/release-state path; the
+# supervisor reads the same dir through the -host bind mount.
+_FIREWALL_APPLIED_HASH_SIDECAR = Path(
+    "/var/lib/spatiumddi-host/release-state/firewall-applied-hash"
+)
+_FIREWALL_APPLIED_STATUS_SIDECAR = Path(
+    "/var/lib/spatiumddi-host/release-state/firewall-applied-status"
+)
+_FIREWALL_BASE_MARKER_SIDECAR = Path(
+    "/var/lib/spatiumddi-host/release-state/firewall-applied-base-marker"
+)
 
 # #272 Phase 7b — control-plane cluster join/leave. The join trigger
 # carries the seed's kubeapi URL + join token; the host-side runner
@@ -855,6 +869,41 @@ def read_lldpd_running() -> bool | None:
     if text == "stopped":
         return False
     return None
+
+
+# ── Firewall apply-state read-back (#285 Phase 2b) ───────────────────
+
+
+def _read_release_state_line(path: Path) -> str | None:
+    """Return the stripped single-line content of a release-state sidecar,
+    or None when missing / unreadable / empty."""
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def read_firewall_applied_hash() -> str | None:
+    """sha256 of the drop-in the firewall runner last applied (#285 Phase 2b).
+    None when never applied / non-appliance → the control plane leaves the
+    column untouched."""
+    return _read_release_state_line(_FIREWALL_APPLIED_HASH_SIDECAR)
+
+
+def read_firewall_applied_status() -> str | None:
+    """The firewall runner's last outcome — ``ok`` / ``error:*`` / ``reverted``
+    (#285 Phase 2b). None when the sidecar is missing."""
+    return _read_release_state_line(_FIREWALL_APPLIED_STATUS_SIDECAR)
+
+
+def read_firewall_base_marker() -> str | None:
+    """sha256 of the base /etc/nftables.conf the firewall runner last applied
+    against (#285 Phase 2b) — lets the control plane tell a node still on the
+    pre-#285 LAN-wide base apart from a hardened one. None when missing."""
+    return _read_release_state_line(_FIREWALL_BASE_MARKER_SIDECAR)
 
 
 # ── LLDP neighbour discovery (#347) ──────────────────────────────────
@@ -1527,4 +1576,10 @@ def collect() -> dict[str, object]:
         "dataplane_backend": dataplane_backend,
         "base_conf_marker": base_conf_marker,
         "base_lanwide_k3s": base_lanwide_k3s,
+        # Issue #285 Phase 2b — firewall apply-state read-back. None
+        # off-appliance so the backend's "only-when-not-None" upsert never
+        # blanks the columns. Surfaces what the runner already writes.
+        "firewall_applied_hash": read_firewall_applied_hash() if is_appliance else None,
+        "firewall_applied_status": read_firewall_applied_status() if is_appliance else None,
+        "firewall_base_marker": read_firewall_base_marker() if is_appliance else None,
     }
