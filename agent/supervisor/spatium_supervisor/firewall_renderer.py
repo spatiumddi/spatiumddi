@@ -169,14 +169,6 @@ _K3S_ETCD_KUBELET_TCP: tuple[int, ...] = (2379, 2380, 10250)
 _K3S_APISERVER_TCP = 6443
 _METALLB_MEMBERLIST = 7946
 
-# #285 Phase 1 — k3s data-plane backend → the inter-node INPUT port(s)
-# that must stay open between cluster nodes. host-gw / unknown route via
-# FORWARD (no INPUT port) so they map to no ports (fail-open).
-_DATAPLANE_UDP_PORTS: dict[str, list[int]] = {
-    "vxlan": [8472],
-    "wireguard-native": [51820, 51821],
-}
-
 
 def _profile_name(roles: list[str]) -> str:
     has_dns = any(r in roles for r in ("dns-bind9", "dns-powerdns"))
@@ -199,8 +191,7 @@ def _emit_family_rule(
 ) -> None:
     """Append family-split ``ip[6] saddr { ... } <rule_suffix>`` lines
     for whichever family has members. ``rule_suffix`` is e.g.
-    ``tcp dport { 2379, 2380, 10250 } accept`` or ``udp dport 8472
-    accept``."""
+    ``tcp dport { 2379, 2380, 10250 } accept``."""
     if v4:
         lines.append(f'ip saddr {{ {", ".join(v4)} }} {rule_suffix} comment "{comment}-v4"')
     if v6:
@@ -213,29 +204,32 @@ def render_drop_in(
     *,
     pod_cidrs: list[Any] | None = None,
     service_cidrs: list[Any] | None = None,
-    dataplane_backend: str | None = None,
-    dataplane_peer_cidrs: list[Any] | None = None,
     cp_member_count: int = 1,
     vip_configured: bool = False,
 ) -> FirewallProfile:
     """Translate a role_assignment + the heartbeat's derived firewall
     inputs into an nftables drop-in body.
 
-    Always emits the management rules; then the data-plane floor (if a
-    backend port + peer set are known); then per-role service rules;
-    then the control-plane-derived peer/apiserver/memberlist rules (CP
-    nodes only — ``cluster_peer_cidrs`` empty ⇒ skip etcd/kubelet);
-    then the operator's ``firewall_extra``. Idle appliances get
-    management rules only.
+    Emits the management rules, then per-role service rules, then the
+    control-plane-derived peer/apiserver/memberlist rules (CP nodes only
+    — ``cluster_peer_cidrs`` empty ⇒ skip etcd/kubelet), then the
+    operator's ``firewall_extra``. Idle appliances get management rules
+    only.
+
+    The header carries a ``# spatium-bootstrap: retire|keep`` directive
+    the host-side reload runner reads to retire the baked 6443 bootstrap
+    sentinel once the cluster is genuinely multi-node (#285 Phase 1b —
+    6443 then narrows to the scoped ``kubeapi`` rule below).
 
     Every fragment is a bare ``proto dport N accept`` (or
     ``ip[6] saddr { ... } …``) since the include glob sits *inside*
     ``chain input`` in the master conf.
 
-    This drop-in is purely ADDITIVE on the current baked base conf
-    (which still opens the k3s ports LAN-wide); it only becomes
-    authoritative once the base conf's LAN-wide ``k3s-ha`` accept is
-    removed (#285 Phase 1b, slot-image change).
+    No data-plane (flannel VXLAN / wireguard) rule is emitted: on
+    k3s+flannel that inter-node traffic does not traverse the host's
+    ``inet filter`` INPUT chain (field-verified on a 3-node appliance —
+    cross-node pods stay healthy with no 8472 accept), so an INPUT rule
+    for it would be dead weight.
     """
     role_assignment = role_assignment or {}
     roles = [r for r in (role_assignment.get("roles") or []) if isinstance(r, str)]
@@ -260,31 +254,22 @@ def render_drop_in(
     lines.append("# for the operator-override surface that lands at the end of this file.")
     lines.append(f"# profile: {profile}")
     lines.append(f"# roles: {','.join(roles) if roles else '(idle)'}")
+    # #285 Phase 1b — host-runner directive: retire the baked 6443
+    # bootstrap sentinel once the control plane is genuinely multi-node
+    # (settled CP members >= 2), at which point the scoped ``kubeapi``
+    # rule below (peers ∪ pod ∪ svc ∪ kubeapi_expose) is the only path to
+    # 6443 and the LAN-wide sentinel is no longer needed. Single-node →
+    # keep it (etcd is loopback-only; 6443 must stay LAN-reachable for the
+    # node's own pods + a first promote/join). The runner restores a
+    # retired sentinel if the cluster ever shrinks back to single-node.
+    bootstrap_action = "retire" if cp_member_count >= 2 else "keep"
+    lines.append(f"# spatium-bootstrap: {bootstrap_action}")
     lines.append("")
     lines.append("# ── Management (always open) ────────────────────────────────")
     lines.append('tcp dport 22 accept comment "ssh"')
     lines.append('icmp type echo-request accept comment "icmpv4 ping"')
     lines.append('icmpv6 type echo-request accept comment "icmpv6 ping"')
     lines.append('iif lo accept comment "loopback"')
-
-    # ── Data-plane floor (#285 Phase 1) ────────────────────────────────
-    # flannel VXLAN / wireguard between cluster nodes. Peer-scoped on
-    # every pod-running node so cross-node pod networking survives the
-    # base-accept removal. host-gw / unknown backend → no INPUT port.
-    dp_ports = _DATAPLANE_UDP_PORTS.get((dataplane_backend or "").strip().lower(), [])
-    dp_v4, dp_v6 = _split_families(dataplane_peer_cidrs or [])
-    if dp_ports and (dp_v4 or dp_v6):
-        lines.append("")
-        lines.append("# ── Data-plane floor (k3s inter-node, #285) ────────────")
-        port_set = (
-            "{ " + ", ".join(str(p) for p in dp_ports) + " }"
-            if len(dp_ports) > 1
-            else str(dp_ports[0])
-        )
-        _emit_family_rule(
-            lines, dp_v4, dp_v6, f"udp dport {port_set} accept", f"dataplane-{dataplane_backend}"
-        )
-        udp_ports.update(dp_ports)
 
     # ── Per-role service ports ─────────────────────────────────────────
     role_tcp: set[int] = set()

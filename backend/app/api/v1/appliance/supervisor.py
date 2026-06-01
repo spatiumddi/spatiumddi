@@ -1166,16 +1166,11 @@ class SupervisorHeartbeatResponse(BaseModel):
     # scope the k3s rules. ``firewall_pod_cidrs`` / ``firewall_service_cidrs``
     # widen the 6443 accept (in-cluster apiserver access traverses INPUT
     # via the service-IP DNAT with saddr=pod-IP); sent only for nodes that
-    # run the apiserver. ``firewall_dataplane_backend`` +
-    # ``firewall_dataplane_peer_cidrs`` drive the data-plane floor (flannel
-    # VXLAN 8472/udp or wireguard 51820/51821) scoped to the cluster node
-    # IPs so cross-node pod networking survives the base-accept removal.
-    # All additive on the current base conf; authoritative once #285 Phase
-    # 1b removes the LAN-wide base accept.
+    # run the apiserver. (No data-plane / flannel-VXLAN fields: that
+    # inter-node traffic doesn't traverse the host INPUT chain on
+    # k3s+flannel — field-verified — so no INPUT rule is needed for it.)
     firewall_pod_cidrs: list[str] = Field(default_factory=list)
     firewall_service_cidrs: list[str] = Field(default_factory=list)
-    firewall_dataplane_backend: str = ""
-    firewall_dataplane_peer_cidrs: list[str] = Field(default_factory=list)
     # #277 — the committed control-plane size (count of settled
     # primary + member nodes, floored at 1). The seed's supervisor
     # patches the spatium-control HelmChart's ``# spatium:cp-size`` lines
@@ -1662,10 +1657,6 @@ async def supervisor_heartbeat(
     )
     firewall_pod_cidrs = _split_cidr_csv(row.pod_cidr) if runs_apiserver else []
     firewall_service_cidrs = _split_cidr_csv(row.service_cidr) if runs_apiserver else []
-    # Default to the k3s upstream backend when a pre-#285 supervisor
-    # hasn't reported one yet, so the data-plane floor still renders.
-    firewall_dataplane_backend = row.dataplane_backend or "vxlan"
-    firewall_dataplane_peer_cidrs = await _all_cluster_node_cidrs(db, row)
 
     # #277 — committed control-plane size (settled primary + members,
     # floored at 1). The seed supervisor scales CNPG instances +
@@ -1737,8 +1728,6 @@ async def supervisor_heartbeat(
         cluster_peer_cidrs=cluster_peer_cidrs,
         firewall_pod_cidrs=firewall_pod_cidrs,
         firewall_service_cidrs=firewall_service_cidrs,
-        firewall_dataplane_backend=firewall_dataplane_backend,
-        firewall_dataplane_peer_cidrs=firewall_dataplane_peer_cidrs,
         control_plane_size=control_plane_size,
         desired_metallb_enabled=metallb_enabled,
         desired_metallb_pool_addresses=metallb_pool,
@@ -2980,30 +2969,6 @@ async def _cluster_peer_cidrs(db: DB, row: Appliance) -> list[str]:
     members = await _firewall_peer_members(db)
     out: list[str] = []
     for m in members:
-        if m.id == row.id:
-            continue
-        out.extend(_node_cidrs(m))
-    return sorted(set(out))
-
-
-async def _all_cluster_node_cidrs(db: DB, row: Appliance) -> list[str]:
-    """Host CIDRs of every OTHER cluster node — the data-plane peer set
-    (#285 Phase 1).
-
-    flannel VXLAN / wireguard runs between every pod-running node, so the
-    data-plane floor must open the inter-node port to all of them, not
-    just the control-plane peers. Phase-1 superset = every approved
-    appliance with a node IP (minus self); harmless if it includes a few
-    non-cluster boxes (they never send VXLAN). Refined to the precise
-    cluster-node set in a later phase once node membership is mirrored.
-    """
-    rows = (
-        (await db.execute(select(Appliance).where(Appliance.state == APPLIANCE_STATE_APPROVED)))
-        .scalars()
-        .all()
-    )
-    out: list[str] = []
-    for m in rows:
         if m.id == row.id:
             continue
         out.extend(_node_cidrs(m))

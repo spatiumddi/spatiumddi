@@ -321,8 +321,6 @@ def _maybe_apply_firewall(
     *,
     pod_cidrs: list[Any] | None = None,
     service_cidrs: list[Any] | None = None,
-    dataplane_backend: str | None = None,
-    dataplane_peer_cidrs: list[Any] | None = None,
     cp_member_count: int = 1,
     vip_configured: bool = False,
 ) -> None:
@@ -359,8 +357,6 @@ def _maybe_apply_firewall(
         cluster_peer_cidrs,
         pod_cidrs=pod_cidrs,
         service_cidrs=service_cidrs,
-        dataplane_backend=dataplane_backend,
-        dataplane_peer_cidrs=dataplane_peer_cidrs,
         cp_member_count=cp_member_count,
         vip_configured=vip_configured,
     )
@@ -775,25 +771,21 @@ def heartbeat_once(
     # set, regardless of that gate.
     cluster_peer_cidrs = body_out.get("cluster_peer_cidrs") or []
     # #285 Phase 1 — derived firewall inputs the control plane now ships:
-    # pod/service CIDR widen the 6443 accept, and the data-plane peer set
-    # drives the flannel/wireguard floor so cross-node pod networking
-    # survives the base-accept removal. cp_member_count + the VIP gate
-    # whether MetalLB memberlist (7946) is opened.
+    # pod/service CIDR widen the 6443 accept (in-cluster apiserver access).
+    # cp_member_count + the VIP gate whether MetalLB memberlist (7946) is
+    # opened, and cp_member_count >= 2 drives the bootstrap-sentinel retire
+    # directive the renderer emits.
     fw_pod_cidrs = body_out.get("firewall_pod_cidrs") or []
     fw_service_cidrs = body_out.get("firewall_service_cidrs") or []
-    fw_dataplane_backend = body_out.get("firewall_dataplane_backend") or ""
-    fw_dataplane_peer_cidrs = body_out.get("firewall_dataplane_peer_cidrs") or []
     fw_cp_member_count = int(body_out.get("control_plane_size") or 1)
     fw_vip_configured = bool(body_out.get("desired_control_plane_vip") or "")
-    if cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_dataplane_peer_cidrs or fw_pod_cidrs:
+    if cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs:
         _maybe_apply_firewall(
             role_assignment,
             log,
             cluster_peer_cidrs,
             pod_cidrs=fw_pod_cidrs,
             service_cidrs=fw_service_cidrs,
-            dataplane_backend=fw_dataplane_backend,
-            dataplane_peer_cidrs=fw_dataplane_peer_cidrs,
             cp_member_count=fw_cp_member_count,
             vip_configured=fw_vip_configured,
         )

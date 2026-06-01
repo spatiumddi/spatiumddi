@@ -60,7 +60,7 @@ async def _heartbeat(client: AsyncClient, row: Appliance, token: str) -> dict:
     return r.json()
 
 
-async def test_peer_and_dataplane_sets_family_split(
+async def test_peer_and_apiserver_sets_family_split(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     await _enable(db_session)
@@ -73,7 +73,6 @@ async def test_peer_and_dataplane_sets_family_split(
         node_ips=["192.168.1.11"],
         pod_cidr="10.42.0.0/16,2001:cafe:42::/56",
         service_cidr="10.43.0.0/16",
-        dataplane_backend="vxlan",
         session_token_hash=token_hash,
     )
     m2 = _cp(
@@ -95,10 +94,6 @@ async def test_peer_and_dataplane_sets_family_split(
         "192.168.1.13/32",
         "2001:db8::12/128",
     ]
-    # Data-plane set = all OTHER cluster nodes (same here, all CP).
-    assert "192.168.1.12/32" in body["firewall_dataplane_peer_cidrs"]
-    assert "2001:db8::12/128" in body["firewall_dataplane_peer_cidrs"]
-    assert body["firewall_dataplane_backend"] == "vxlan"
     # pod/service CIDR split for the apiserver node.
     assert body["firewall_pod_cidrs"] == ["10.42.0.0/16", "2001:cafe:42::/56"]
     assert body["firewall_service_cidrs"] == ["10.43.0.0/16"]

@@ -87,35 +87,35 @@ def test_single_node_cp_opens_6443_to_pod_only_no_etcd() -> None:
     assert "k3s-peer" not in p.body  # no etcd/kubelet without peers
 
 
-# ── Data-plane floor ─────────────────────────────────────────────────
+# ── No data-plane floor (VXLAN bypasses our INPUT on k3s+flannel) ────
 
 
-def test_dataplane_vxlan() -> None:
-    p = render_drop_in(
-        {"roles": []}, _PEERS_V4, dataplane_backend="vxlan", dataplane_peer_cidrs=_PEERS_V4
-    )
-    assert "ip saddr { 192.168.0.125/32, 192.168.0.133/32 } udp dport 8472 accept" in p.body
-    assert 8472 in p.expected_udp_ports
+def test_no_dataplane_floor_emitted() -> None:
+    # The renderer never emits a flannel/wireguard data-plane rule — that
+    # inter-node traffic doesn't traverse the host INPUT chain (#285,
+    # field-verified). No 8472 / 51820, ever.
+    p = render_drop_in({"roles": []}, _PEERS_V4, pod_cidrs=["10.42.0.0/16"])
+    assert "8472" not in p.body and "dataplane" not in p.body
+    assert 8472 not in p.expected_udp_ports
 
 
-def test_dataplane_wireguard() -> None:
-    p = render_drop_in(
-        {"roles": []},
-        _PEERS_V4,
-        dataplane_backend="wireguard-native",
-        dataplane_peer_cidrs=_PEERS_V4,
-    )
-    assert "udp dport { 51820, 51821 } accept" in p.body
-    assert 51820 in p.expected_udp_ports and 51821 in p.expected_udp_ports
+# ── Bootstrap sentinel retire/keep directive (6443 tighten, #285 1b) ─
 
 
-def test_dataplane_hostgw_or_unknown_opens_nothing() -> None:
-    for backend in ("host-gw", "none", "weird-backend", ""):
-        p = render_drop_in(
-            {"roles": []}, _PEERS_V4, dataplane_backend=backend, dataplane_peer_cidrs=_PEERS_V4
-        )
-        assert "dataplane" not in p.body
-        assert 8472 not in p.expected_udp_ports
+def test_bootstrap_directive_keep_single_node() -> None:
+    # Single-node (cp_member_count default 1) → keep the LAN-wide 6443
+    # bootstrap sentinel.
+    p = render_drop_in({"roles": []}, [], pod_cidrs=["10.42.0.0/16"])
+    assert "# spatium-bootstrap: keep" in p.body
+    assert "# spatium-bootstrap: retire" not in p.body
+
+
+def test_bootstrap_directive_retire_multinode() -> None:
+    # Settled multi-node CP (>= 2) → retire the sentinel; 6443 is then
+    # only the scoped kubeapi rule.
+    p = render_drop_in({"roles": []}, _PEERS_V4, pod_cidrs=["10.42.0.0/16"], cp_member_count=3)
+    assert "# spatium-bootstrap: retire" in p.body
+    assert "# spatium-bootstrap: keep" not in p.body
 
 
 # ── IPv6 family split (the v6 lockout fix) ───────────────────────────
@@ -126,16 +126,12 @@ def test_v6_peers_use_ip6_saddr_and_128() -> None:
         {"roles": []},
         ["192.168.0.10", "2001:db8::10", "2001:db8::11/128"],
         pod_cidrs=["10.42.0.0/16", "2001:cafe:42::/56"],
-        dataplane_backend="vxlan",
-        dataplane_peer_cidrs=["192.168.0.10", "2001:db8::10"],
     )
     # v6 peers render as ip6 saddr with /128, never folded into a v4 set.
     assert "ip6 saddr { 2001:db8::10/128, 2001:db8::11/128 } tcp dport { 2379, 2380, 10250 }" in (
         p.body
     )
     assert "ip saddr { 192.168.0.10/32 } tcp dport { 2379, 2380, 10250 }" in p.body
-    # v6 data-plane on ip6 saddr.
-    assert "ip6 saddr { 2001:db8::10/128 } udp dport 8472 accept" in p.body
     # v6 pod CIDR lands in the v6 6443 set.
     assert "2001:cafe:42::/56" in next(ln for ln in p.body.splitlines() if "kubeapi-v6" in ln)
 
@@ -179,8 +175,6 @@ def test_firewall_extra_appended_last() -> None:
 def test_deterministic() -> None:
     kw = dict(
         pod_cidrs=["10.42.0.0/16"],
-        dataplane_backend="vxlan",
-        dataplane_peer_cidrs=_PEERS_V4,
         cp_member_count=3,
         vip_configured=True,
     )
