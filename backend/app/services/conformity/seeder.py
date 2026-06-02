@@ -196,6 +196,24 @@ _BUILTIN_POLICIES: list[dict[str, object]] = [
         "check_kind": "audit_log_immutable",
         "check_args": {},
     },
+    {
+        "name": "No appliance exposes LAN-wide k3s control-plane ports",
+        "description": (
+            "Network segmentation — no SpatiumDDI appliance node may accept "
+            "the k3s control-plane ports (etcd 2379/2380, kubelet 10250) from "
+            "the whole LAN; #285 scopes them to cluster peers. Fails on a "
+            "node confirmed still on the legacy LAN-wide base; a node the "
+            "control plane can't currently reach reports PASS-stale (never "
+            "connectivity-FAIL, per the control-plane-loss invariant)."
+        ),
+        "framework": "PCI-DSS 4.0",
+        "reference": "1.2.1",
+        "severity": "critical",
+        "target_kind": "platform",
+        "target_filter": {},
+        "check_kind": "no_lanwide_control_plane_ports",
+        "check_args": {"stale_minutes": 30},
+    },
 ]
 
 

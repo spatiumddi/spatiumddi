@@ -44,6 +44,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertRule
+from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.multicast import MulticastGroup
@@ -637,6 +638,91 @@ async def check_no_multicast_collision(
 # ── Catalog (frontend uses to render the policy editor) ──────────────
 
 
+# ── Check: no_lanwide_control_plane_ports (platform-level, #285) ────
+
+
+@register("no_lanwide_control_plane_ports")
+async def check_no_lanwide_control_plane_ports(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """No appliance node exposes the k3s control-plane ports LAN-wide.
+
+    Platform-level (PCI-DSS Req 1 / HIPAA network-segmentation). The
+    appliance base ``/etc/nftables.conf`` historically accepted etcd
+    (2379/2380) + kubelet (10250) from ANY source; #285 cut that so the
+    supervisor's peer-scoped drop-in is authoritative. Each node reports
+    ``base_lanwide_k3s`` (True = still on the legacy LAN-wide base).
+
+    Verdict policy honours non-negotiable #5 — **never connectivity-FAIL**:
+
+    * FAIL only on a CONFIRMED LAN-wide node (``base_lanwide_k3s is True``).
+    * Otherwise PASS. Nodes that are stale (no recent heartbeat, beyond
+      ``args["stale_minutes"]`` — default 30) or unverified
+      (``base_lanwide_k3s is None``) report **PASS-stale** with a
+      diagnostic, rather than failing the compliance claim because the
+      control plane temporarily lost contact.
+    * No reporting appliance node → vacuously PASS.
+    """
+    if target_kind != "platform":
+        return CheckOutcome.not_applicable(
+            f"requires target_kind=platform (got {target_kind})",
+        )
+    stale_minutes = int(args.get("stale_minutes", 30))
+    rows = list(
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    Appliance.deployment_kind == "appliance",
+                    Appliance.base_conf_marker.isnot(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    lanwide = [r for r in rows if r.base_lanwide_k3s is True]
+    if lanwide:
+        return CheckOutcome.fail(
+            f"{len(lanwide)} appliance node(s) still expose LAN-wide k3s "
+            "control-plane ports (etcd 2379/2380, kubelet 10250)",
+            {"lanwide_hosts": sorted(r.hostname for r in lanwide)},
+        )
+    if not rows:
+        return CheckOutcome.passed(
+            "no appliance node has reported a base-conf marker (vacuously compliant)",
+            {"reported": 0},
+        )
+    cutoff = now - timedelta(minutes=stale_minutes)
+
+    def _stale(r: Appliance) -> bool:
+        return r.last_seen_at is None or r.last_seen_at < cutoff
+
+    unknown = [r for r in rows if r.base_lanwide_k3s is None]
+    stale = [r for r in rows if r.base_lanwide_k3s is False and _stale(r)]
+    fresh = [r for r in rows if r.base_lanwide_k3s is False and not _stale(r)]
+    if unknown or stale:
+        return CheckOutcome.passed(
+            f"{len(fresh)} node(s) confirmed hardened; {len(stale)} stale + "
+            f"{len(unknown)} unverified reported PASS-stale (no LAN-wide port confirmed)",
+            {
+                "hardened_fresh": sorted(r.hostname for r in fresh),
+                "stale": sorted(r.hostname for r in stale),
+                "unverified": sorted(r.hostname for r in unknown),
+                "stale_minutes": stale_minutes,
+            },
+        )
+    return CheckOutcome.passed(
+        f"all {len(fresh)} appliance node(s) hardened — no LAN-wide control-plane ports",
+        {"hardened": sorted(r.hostname for r in fresh)},
+    )
+
+
 CHECK_CATALOG: list[dict[str, Any]] = [
     {
         "name": "has_field",
@@ -734,6 +820,20 @@ CHECK_CATALOG: list[dict[str, Any]] = [
         "label": "Multicast group address is unique within its IPSpace",
         "supports": ["multicast_group"],
         "args": [],
+    },
+    {
+        "name": "no_lanwide_control_plane_ports",
+        "label": "No appliance exposes LAN-wide k3s control-plane ports",
+        "supports": ["platform"],
+        "args": [
+            {
+                "name": "stale_minutes",
+                "type": "int",
+                "required": False,
+                "default": 30,
+                "label": "Treat a node's report as stale after N minutes (PASS-stale, never FAIL)",
+            }
+        ],
     },
 ]
 
