@@ -1690,15 +1690,7 @@ async def supervisor_heartbeat(
     # service CIDR) when it's a control-plane variant OR a settled /
     # in-flight / leaving CP member. pod/service CIDR are sent only for
     # those nodes so a plain worker doesn't pointlessly open 6443.
-    runs_apiserver = (
-        row.appliance_variant in ("control-plane", "full-stack", "frontend-core")
-        or row.cluster_role in (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
-        or row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
-        or (
-            row.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
-            and row.cluster_join_state != CLUSTER_JOIN_STATE_LEFT
-        )
-    )
+    runs_apiserver = _runs_apiserver(row)
     firewall_pod_cidrs = _split_cidr_csv(row.pod_cidr) if runs_apiserver else []
     firewall_service_cidrs = _split_cidr_csv(row.service_cidr) if runs_apiserver else []
 
@@ -1822,6 +1814,47 @@ async def supervisor_heartbeat(
         lldp_settings=lldp_block,
         firewall_settings=firewall_block,
     )
+
+
+def _runs_apiserver(row: Appliance) -> bool:
+    """#285 — a node "runs the apiserver" (so 6443 + the pod/service CIDR are
+    in firewall scope) when it's a control-plane variant OR a settled /
+    in-flight / leaving CP member. Shared by the heartbeat render and the
+    firewall effective/preview endpoints so both gate pod/service identically.
+    """
+    return (
+        row.appliance_variant in ("control-plane", "full-stack", "frontend-core")
+        or row.cluster_role in (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+        or row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+        or (
+            row.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
+            and row.cluster_join_state != CLUSTER_JOIN_STATE_LEFT
+        )
+    )
+
+
+async def firewall_render_inputs(db: DB, row: Appliance) -> dict[str, Any]:
+    """The per-node inputs the #285 fleet-firewall merge consumes — reproduced
+    from the heartbeat's own derivation (same ``_build_role_assignment`` /
+    ``_cluster_peer_cidrs`` / ``_committed_cp_count`` / ``_runs_apiserver``
+    helpers) so the effective/preview endpoints render a body BYTE-IDENTICAL
+    to what the heartbeat ships. The heartbeat handler keeps its inline copies
+    (they also feed response telemetry); this is the read-path twin.
+    """
+    role_assignment = await _build_role_assignment(db, row)
+    runs_apiserver = _runs_apiserver(row)
+    cfg_row = (
+        await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    return {
+        "role_assignment": role_assignment.model_dump(),
+        "cluster_peer_cidrs": await _cluster_peer_cidrs(db, row),
+        "pod_cidrs": _split_cidr_csv(row.pod_cidr) if runs_apiserver else [],
+        "service_cidrs": _split_cidr_csv(row.service_cidr) if runs_apiserver else [],
+        "cp_member_count": await _committed_cp_count(db),
+        "vip_configured": bool((cfg_row.control_plane_vip or "") if cfg_row else ""),
+        "firewall_enabled": bool(cfg_row.firewall_enabled) if cfg_row else False,
+    }
 
 
 async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssignment:

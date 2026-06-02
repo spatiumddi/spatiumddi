@@ -30,7 +30,9 @@ extraction; this commit is the CRUD contract.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import json
 import uuid
 from typing import Any
 
@@ -41,9 +43,26 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import user_has_permission
+from app.models.appliance import Appliance
 from app.models.audit import AuditLog
-from app.models.firewall import _POLICY_ROLES, FirewallAlias, FirewallPolicy, FirewallRule
-from app.services.appliance.firewall_merge import reset_policy_cache
+from app.models.firewall import (
+    _POLICY_ROLES,
+    FirewallAlias,
+    FirewallApplyState,
+    FirewallPolicy,
+    FirewallRule,
+)
+from app.services.appliance.firewall_lease import upgrade_in_flight
+from app.services.appliance.firewall_merge import (
+    MergeContext,
+    PolicySet,
+    _Policy,
+    _Rule,
+    compile_firewall_from_policies,
+    load_appliance_policy,
+    load_policy_set,
+    reset_policy_cache,
+)
 
 router = APIRouter()
 
@@ -646,3 +665,282 @@ async def delete_alias(alias_id: uuid.UUID, db: DB, current_user: CurrentUser) -
     await db.execute(delete(FirewallAlias).where(FirewallAlias.id == alias_id))
     await db.commit()
     reset_policy_cache()
+
+
+# ── Effective render + staged preview (read-only) ───────────────────
+#
+# Both re-derive the per-node render inputs the heartbeat uses (via
+# supervisor.firewall_render_inputs) and run the SAME merge, so the body
+# matches what the node would receive. effective works regardless of
+# firewall_enabled (dark-state preview — the frontend shows an "enforcement
+# OFF" banner off the returned flag). preview overlays staged operator rules
+# and diffs. The supervisor import is lazy (load-order + keeps the heavy
+# heartbeat module off this router's import path).
+
+_SECTION_HEADERS: tuple[tuple[str, str], ...] = (
+    ("# ── Management (always open)", "management"),
+    ("# ── Per-role service ports", "role"),
+    ("# ── Control-plane derived", "control_plane"),
+    ("# ── Fleet / appliance overlay", "overlay"),
+    ("# ── Operator override (firewall_extra)", "firewall_extra"),
+)
+
+
+def _layer_breakdown(body: str) -> dict[str, list[str]]:
+    """Bucket the rendered rule lines (non-comment, non-blank) by section."""
+    layers: dict[str, list[str]] = {
+        "header": [],
+        "management": [],
+        "role": [],
+        "control_plane": [],
+        "overlay": [],
+        "firewall_extra": [],
+    }
+    current = "header"
+    for line in body.splitlines():
+        hit = next((key for prefix, key in _SECTION_HEADERS if line.startswith(prefix)), None)
+        if hit:
+            current = hit
+            continue
+        if line.strip() and not line.startswith("#"):
+            layers[current].append(line)
+    return layers
+
+
+def _rulein_to_rule(r: RuleIn) -> _Rule:
+    return _Rule(
+        seq=r.seq,
+        action=r.action,
+        protocol=r.protocol,
+        ports=tuple(r.ports),
+        source_kind=r.source_kind,
+        source_cidrs=tuple(r.source_cidrs),
+        source_alias=r.source_alias,
+        family=r.family,
+        comment=r.comment,
+        render_guard=r.render_guard,
+        enabled=r.enabled,
+    )
+
+
+def _apply_staged(
+    ps: PolicySet,
+    ap: _Policy | None,
+    fleet_rules: list[RuleIn] | None,
+    appliance_rules: list[RuleIn] | None,
+) -> tuple[PolicySet, _Policy | None]:
+    """Overlay staged operator rules onto a copy of the live policy set.
+    A ``None`` list means "leave that layer as-is"; an empty list clears it.
+    """
+    staged = PolicySet(fleet=ps.fleet, roles=ps.roles, aliases=ps.aliases)
+    if fleet_rules is not None:
+        staged.fleet = _Policy("fleet", None, True, tuple(_rulein_to_rule(r) for r in fleet_rules))
+    staged_ap = ap
+    if appliance_rules is not None:
+        staged_ap = _Policy(
+            "appliance", None, True, tuple(_rulein_to_rule(r) for r in appliance_rules)
+        )
+    return staged, staged_ap
+
+
+def _content_lines(body: str) -> list[str]:
+    return [ln for ln in body.splitlines() if ln.strip() and not ln.startswith("#")]
+
+
+def _line_diff(current: str, staged: str) -> tuple[list[str], list[str]]:
+    cur, stg = _content_lines(current), _content_lines(staged)
+    cur_set, stg_set = set(cur), set(stg)
+    return ([ln for ln in stg if ln not in cur_set], [ln for ln in cur if ln not in stg_set])
+
+
+def _rule_nets(r: _Rule, ctx: MergeContext) -> tuple[bool, list[Any]]:
+    """(matches_all, networks) — source_kind='any' matches everything;
+    a derived kind that resolves empty on this node matches nothing here."""
+    if r.source_kind == "any":
+        return True, []
+    v4, v6 = ctx.resolve_source(r)
+    nets: list[Any] = []
+    for c in list(v4) + list(v6):
+        try:
+            nets.append(ipaddress.ip_network(c, strict=False))
+        except ValueError:
+            continue
+    return False, nets
+
+
+def _ports_overlap(a: list[int], b: list[int]) -> bool:
+    sa, sb = set(a), set(b)
+    if not sa and not sb:
+        return True
+    if not sa or not sb:
+        return False
+    return bool(sa & sb)
+
+
+def _nets_overlap(a_all: bool, a: list[Any], b_all: bool, b: list[Any]) -> bool:
+    if a_all or b_all:
+        return True
+    return any(x.version == y.version and x.overlaps(y) for x in a for y in b)
+
+
+def _analyze_overlay(rules: list[RuleIn], ctx: MergeContext) -> list[dict[str, Any]]:
+    """Advisory analysis of the staged operator overlay: accept↔drop conflicts
+    on overlapping (proto, port, source) — deny-wins means the drop takes the
+    overlap — and exact-duplicate redundancy. (Full CIDR-containment shadow
+    analysis is a future refinement.)"""
+    out: list[dict[str, Any]] = []
+    parsed = [(r, _rule_nets(_rulein_to_rule(r), ctx)) for r in rules]
+    for i in range(len(parsed)):
+        ri, (ai_all, ai_nets) = parsed[i]
+        for j in range(i + 1, len(parsed)):
+            rj, (aj_all, aj_nets) = parsed[j]
+            if ri.protocol != rj.protocol or not _ports_overlap(ri.ports, rj.ports):
+                continue
+            if not _nets_overlap(ai_all, ai_nets, aj_all, aj_nets):
+                continue
+            if ri.action != rj.action:
+                out.append(
+                    {
+                        "kind": "conflict",
+                        "detail": (
+                            f"seq {ri.seq} ({ri.action}) and seq {rj.seq} ({rj.action}) overlap on "
+                            f"{ri.protocol} {sorted(set(ri.ports) & set(rj.ports)) or ri.ports}; "
+                            "deny-wins means the drop takes the overlap"
+                        ),
+                        "seqs": [ri.seq, rj.seq],
+                    }
+                )
+            elif (ri.source_kind, sorted(ri.source_cidrs), ri.source_alias) == (
+                rj.source_kind,
+                sorted(rj.source_cidrs),
+                rj.source_alias,
+            ):
+                out.append(
+                    {
+                        "kind": "redundant",
+                        "detail": f"seq {rj.seq} duplicates seq {ri.seq} ({ri.protocol} {ri.ports})",
+                        "seqs": [ri.seq, rj.seq],
+                    }
+                )
+    return out
+
+
+class EffectiveResponse(BaseModel):
+    appliance_id: uuid.UUID
+    hostname: str
+    firewall_enabled: bool
+    config_hash: str
+    firewall_conf: str
+    layers: dict[str, list[str]]
+    rendered_hash: str | None
+    applied_hash: str | None
+    applied_status: str | None
+    base_conf_marker: str | None
+    drift: bool
+
+
+class PreviewRequest(BaseModel):
+    appliance_id: uuid.UUID
+    fleet_rules: list[RuleIn] | None = None
+    appliance_rules: list[RuleIn] | None = None
+
+
+class PreviewWarning(BaseModel):
+    kind: str
+    detail: str
+    seqs: list[int]
+
+
+class PreviewResponse(BaseModel):
+    appliance_id: uuid.UUID
+    added: list[str]
+    removed: list[str]
+    warnings: list[PreviewWarning]
+    upgrade_in_flight: bool
+    staging_id: str
+
+
+def _render_for(inputs: dict[str, Any], ps: PolicySet, ap: _Policy | None) -> str:
+    return compile_firewall_from_policies(
+        inputs["role_assignment"],
+        inputs["cluster_peer_cidrs"],
+        pod_cidrs=inputs["pod_cidrs"],
+        service_cidrs=inputs["service_cidrs"],
+        cp_member_count=inputs["cp_member_count"],
+        vip_configured=inputs["vip_configured"],
+        policy_set=ps,
+        appliance_policy=ap,
+    )
+
+
+@router.get("/appliances/{appliance_id}/effective", response_model=EffectiveResponse)
+async def effective(
+    appliance_id: uuid.UUID, db: DB, current_user: CurrentUser
+) -> EffectiveResponse:
+    _require_read(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Appliance not found")
+    from app.api.v1.appliance.supervisor import firewall_render_inputs
+
+    inputs = await firewall_render_inputs(db, row)
+    ps = await load_policy_set(db)
+    ap = await load_appliance_policy(db, row.id)
+    body = _render_for(inputs, ps, ap)
+    state = await db.get(FirewallApplyState, row.id)
+    return EffectiveResponse(
+        appliance_id=row.id,
+        hostname=row.hostname,
+        firewall_enabled=bool(inputs["firewall_enabled"]),
+        config_hash=hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        firewall_conf=body,
+        layers=_layer_breakdown(body),
+        rendered_hash=getattr(state, "rendered_hash", None),
+        applied_hash=getattr(state, "applied_hash", None),
+        applied_status=getattr(state, "applied_status", None),
+        base_conf_marker=getattr(state, "base_conf_marker", None),
+        drift=bool(state and state.rendered_hash and state.rendered_hash != state.applied_hash),
+    )
+
+
+@router.post("/preview", response_model=PreviewResponse)
+async def preview(body: PreviewRequest, db: DB, current_user: CurrentUser) -> PreviewResponse:
+    _require_read(current_user)
+    row = await db.get(Appliance, body.appliance_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Appliance not found")
+    from app.api.v1.appliance.supervisor import firewall_render_inputs
+
+    inputs = await firewall_render_inputs(db, row)
+    ps = await load_policy_set(db)
+    ap = await load_appliance_policy(db, row.id)
+    ctx = MergeContext.build(
+        inputs["role_assignment"],
+        inputs["cluster_peer_cidrs"],
+        pod_cidrs=inputs["pod_cidrs"],
+        service_cidrs=inputs["service_cidrs"],
+        cp_member_count=inputs["cp_member_count"],
+        vip_configured=inputs["vip_configured"],
+        aliases=ps.aliases,
+    )
+    current_body = _render_for(inputs, ps, ap)
+    staged_ps, staged_ap = _apply_staged(ps, ap, body.fleet_rules, body.appliance_rules)
+    staged_body = _render_for(inputs, staged_ps, staged_ap)
+    added, removed = _line_diff(current_body, staged_body)
+    overlay = list(body.fleet_rules or []) + list(body.appliance_rules or [])
+    staging_input = json.dumps(
+        {
+            "a": str(body.appliance_id),
+            "f": [r.model_dump(mode="json") for r in (body.fleet_rules or [])],
+            "p": [r.model_dump(mode="json") for r in (body.appliance_rules or [])],
+        },
+        sort_keys=True,
+    )
+    return PreviewResponse(
+        appliance_id=row.id,
+        added=added,
+        removed=removed,
+        warnings=[PreviewWarning(**w) for w in _analyze_overlay(overlay, ctx)],
+        upgrade_in_flight=await upgrade_in_flight(db),
+        staging_id=hashlib.sha256(staging_input.encode("utf-8")).hexdigest()[:16],
+    )
