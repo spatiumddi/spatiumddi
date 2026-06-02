@@ -1186,6 +1186,10 @@ class SupervisorHeartbeatResponse(BaseModel):
     # k3s+flannel — field-verified — so no INPUT rule is needed for it.)
     firewall_pod_cidrs: list[str] = Field(default_factory=list)
     firewall_service_cidrs: list[str] = Field(default_factory=list)
+    # #285 Phase 6 — operator Web-UI source restriction. Empty = open. The
+    # supervisor's in-pod render_drop_in scopes 80/443 to these CIDRs (the
+    # base /etc/nftables.conf no longer opens 80/443 LAN-wide).
+    web_ui_allowed_cidrs: list[str] = Field(default_factory=list)
     # #277 — the committed control-plane size (count of settled
     # primary + member nodes, floored at 1). The seed's supervisor
     # patches the spatium-control HelmChart's ``# spatium:cp-size`` lines
@@ -1747,6 +1751,7 @@ async def supervisor_heartbeat(
         vip_configured=bool(metallb_vip),
         firewall_enabled=bool(cfg_row.firewall_enabled) if cfg_row else False,
         appliance_id=row.id,
+        web_ui_allowed_cidrs=(list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []),
     )
     # Persist the rendered hash so 2d's apply-stalled alarm + the Fleet drift
     # chip can compare it against the runner's reported applied_hash. Only
@@ -1803,6 +1808,7 @@ async def supervisor_heartbeat(
         cluster_peer_cidrs=cluster_peer_cidrs,
         firewall_pod_cidrs=firewall_pod_cidrs,
         firewall_service_cidrs=firewall_service_cidrs,
+        web_ui_allowed_cidrs=(list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []),
         control_plane_size=control_plane_size,
         desired_metallb_enabled=metallb_enabled,
         desired_metallb_pool_addresses=metallb_pool,
@@ -1854,6 +1860,7 @@ async def firewall_render_inputs(db: DB, row: Appliance) -> dict[str, Any]:
         "cp_member_count": await _committed_cp_count(db),
         "vip_configured": bool((cfg_row.control_plane_vip or "") if cfg_row else ""),
         "firewall_enabled": bool(cfg_row.firewall_enabled) if cfg_row else False,
+        "web_ui_allowed_cidrs": (list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []),
     }
 
 

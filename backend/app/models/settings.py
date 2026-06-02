@@ -503,6 +503,15 @@ class PlatformSettings(Base):
     firewall_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
+    # #285 Phase 6 — source-scope the Web UI (frontend hostPort 80/443 + the
+    # MetalLB control-plane VIP). Empty = open (today's behaviour). When set,
+    # both firewall renderers emit a peer-scoped 80/443 accept (requires the
+    # base-conf strip of the LAN-wide 80/443) AND the frontend LoadBalancer
+    # Service gets loadBalancerSourceRanges. SSH/22 + console stay in the
+    # un-removable floor, so a bad scope is recoverable, never a brick.
+    web_ui_allowed_cidrs: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
 
     # ── Aggregation candidate snooze (issue #114) ───────────────────
     # Operator-driven hide-list for the IPAM aggregation badge popover.

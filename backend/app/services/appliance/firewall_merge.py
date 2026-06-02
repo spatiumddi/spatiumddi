@@ -470,6 +470,7 @@ def compile_firewall_from_policies(
     appliance_policy: _Policy | None = None,
     mgmt_cidrs: list[Any] | None = None,
     vip_cidrs: list[Any] | None = None,
+    web_ui_allowed_cidrs: list[Any] | None = None,
 ) -> str:
     """Render the drop-in body from the policy model. Fed ``builtin_policy_set``
     + no operator overlay, this is byte-identical to ``compile_firewall_body``.
@@ -503,6 +504,14 @@ def compile_firewall_from_policies(
     lines.append("")
     lines.append("# ── Management (always open) ────────────────────────────────")
     lines.extend(_MGMT_FLOOR)
+    # Web UI (HTTP + HTTPS) — #285 Phase 6. Open by default; source-scoped when
+    # web_ui_allowed_cidrs is set (the base /etc/nftables.conf no longer opens
+    # 80/443). Byte-identical to compile_firewall_body + render_drop_in.
+    if web_ui_allowed_cidrs:
+        web_v4, web_v6 = _split_families(list(web_ui_allowed_cidrs))
+        _emit_family_rule(lines, web_v4, web_v6, "tcp dport { 80, 443 } accept", "web-ui")
+    else:
+        lines.append('tcp dport { 80, 443 } accept comment "web-ui"')
 
     # ── Per-role service ports (STRUCTURAL emit, byte-identical). ──
     # Collect the node's declared roles' "any"-source accept ports; emit one

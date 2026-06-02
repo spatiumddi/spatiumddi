@@ -286,6 +286,7 @@ async def find_firewall_effective(
         vip_configured=inputs["vip_configured"],
         policy_set=ps,
         appliance_policy=ap,
+        web_ui_allowed_cidrs=inputs.get("web_ui_allowed_cidrs") or [],
     )
     state = await db.get(FirewallApplyState, row.id)
     return {
@@ -297,6 +298,48 @@ async def find_firewall_effective(
         "applied_hash": getattr(state, "applied_hash", None),
         "applied_status": getattr(state, "applied_status", None),
         "drift": bool(state and state.rendered_hash and state.rendered_hash != state.applied_hash),
+    }
+
+
+# ── find_web_ui_access (#285 Phase 6) ─────────────────────────────
+
+
+class FindWebUIAccessArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="find_web_ui_access",
+    description=(
+        "Report the appliance Web UI source restriction (#285 Phase 6, superadmin "
+        "only). Returns the allow-list of source CIDRs (empty = open to all) that "
+        "governs both the per-node HTTP/HTTPS door (nftables :80/:443) and the "
+        "MetalLB control-plane VIP (loadBalancerSourceRanges). Use for 'who can "
+        "reach the web UI?' or 'is the dashboard locked down?'. No secrets — just "
+        "the CIDR list and whether it's open."
+    ),
+    args_model=FindWebUIAccessArgs,
+    category="admin",
+    default_enabled=True,
+    module=_MODULE,
+)
+async def find_web_ui_access(
+    db: AsyncSession, user: User, args: FindWebUIAccessArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+
+    cfg = await db.get(PlatformSettings, 1)
+    cidrs = list(cfg.web_ui_allowed_cidrs or []) if cfg else []
+    return {
+        "open": not cidrs,
+        "allowed_cidrs": cidrs,
+        "summary": (
+            "Web UI is open to all source IPs."
+            if not cidrs
+            else f"Web UI is restricted to {len(cidrs)} source range(s): {', '.join(cidrs)}."
+        ),
     }
 
 

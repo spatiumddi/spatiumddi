@@ -184,6 +184,15 @@ frontend:
   # rendered by the appliance chart (charts/spatiumddi-appliance/
   # templates/metallb-pool.yaml). Only used when controlPlaneVIP is set.
   controlPlaneVIPPool: spatium-control-plane
+  # #285 Phase 6 — source-scope the Web UI VIP. List of CIDRs allowed to
+  # reach the LoadBalancer VIP; empty = open to all (the field is omitted
+  # from the Service so MetalLB does not restrict). Only applied when
+  # controlPlaneVIP is set (the VIP Service exists). Driven at runtime from
+  # platform_settings.web_ui_allowed_cidrs via the supervisor's
+  # apply_control_plane_overrides overlay; set it here only for static /
+  # non-supervised deployments. The per-node hostPort :80/:443 door is
+  # scoped separately by the nftables drop-in from the same setting.
+  loadBalancerSourceRanges: []
   # Appliance use (#183 Phase 11) — flip to true to make the frontend
   # pod bind on the node's :80 directly via hostNetwork + hostPort.
   # Pair with ``replicas: 1`` (the single :80 host port is exclusive).

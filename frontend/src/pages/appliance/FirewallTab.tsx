@@ -11,6 +11,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   CheckCircle2,
+  Globe,
   Layers,
   Loader2,
   Lock,
@@ -34,6 +35,7 @@ import {
   type FirewallRuleInput,
   type FirewallScopeKind,
   type FirewallSourceKind,
+  type FirewallWebUIAccess,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -119,6 +121,7 @@ export function FirewallTab() {
       </div>
 
       <EnforcementCard />
+      <WebUIAccessCard />
 
       <div className="flex flex-wrap gap-1 border-b">
         {tabs.map((t) => (
@@ -298,6 +301,220 @@ function EnforcementCard() {
         onClose={() => setConfirm(null)}
       />
     </div>
+  );
+}
+
+// ── Web UI source restriction (Phase 6) ─────────────────────────────
+
+function WebUIAccessCard() {
+  const qc = useQueryClient();
+  const { data: w } = useQuery({
+    queryKey: ["firewall", "web-ui-access"],
+    queryFn: firewallApi.getWebUIAccess,
+  });
+  const [editing, setEditing] = useState(false);
+  if (!w) return null;
+  const excluded = !w.open && !w.caller_covered;
+  return (
+    <div
+      className={cn(
+        "rounded-md border p-3",
+        w.open
+          ? "border-border"
+          : excluded
+            ? "border-rose-500/40 bg-rose-500/5"
+            : "border-sky-500/40 bg-sky-500/5",
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-start gap-2">
+          {w.open ? (
+            <Globe className="mt-0.5 h-5 w-5 text-muted-foreground" />
+          ) : (
+            <Lock className="mt-0.5 h-5 w-5 text-sky-600 dark:text-sky-400" />
+          )}
+          <div>
+            <div className="text-sm font-medium">
+              Web UI access:{" "}
+              {w.open
+                ? "Open to all"
+                : `Restricted to ${w.allowed_cidrs.length} range${
+                    w.allowed_cidrs.length === 1 ? "" : "s"
+                  }`}
+            </div>
+            <div className="text-xs text-muted-foreground">
+              {w.open
+                ? "The Web UI (HTTP/HTTPS) is reachable from any source IP. Restrict it to specific networks to lock it down without an external firewall."
+                : "Only these source ranges reach the Web UI — both each appliance's node IP (nftables :80/:443) and the control-plane VIP (MetalLB)."}{" "}
+              Your IP: <code>{w.caller_ip ?? "unknown"}</code>
+              {excluded && (
+                <span className="font-medium text-rose-600 dark:text-rose-400">
+                  {" "}
+                  — not in the allow-list (you reached this page another way;
+                  SSH on :22 stays open regardless).
+                </span>
+              )}
+            </div>
+            {!w.open && (
+              <div className="mt-2 flex flex-wrap gap-1">
+                {w.allowed_cidrs.map((c) => (
+                  <span
+                    key={c}
+                    className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px]"
+                  >
+                    {c}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="shrink-0">
+          <button
+            type="button"
+            onClick={() => setEditing(true)}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            Edit…
+          </button>
+        </div>
+      </div>
+      {editing && (
+        <WebUIAccessModal
+          current={w}
+          onClose={() => setEditing(false)}
+          onSaved={() => {
+            setEditing(false);
+            qc.invalidateQueries({ queryKey: ["firewall", "web-ui-access"] });
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function parseCidrLines(text: string): string[] {
+  return text
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function WebUIAccessModal({
+  current,
+  onClose,
+  onSaved,
+}: {
+  current: FirewallWebUIAccess;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [text, setText] = useState(current.allowed_cidrs.join("\n"));
+  const [override, setOverride] = useState(false);
+  const save = useMutation({
+    mutationFn: () =>
+      firewallApi.setWebUIAccess({
+        allowed_cidrs: parseCidrLines(text),
+        override_lockout: override,
+      }),
+    onSuccess: onSaved,
+  });
+  const cidrs = parseCidrLines(text);
+  // A 422 from the anti-lockout guard reads "lock you out" — reveal the
+  // override toggle only then, so the operator makes an explicit choice.
+  const lockoutError =
+    save.isError && formatApiError(save.error).includes("lock you out");
+  const addMyIp = () => {
+    if (!current.caller_ip) return;
+    const entry =
+      current.caller_ip + (current.caller_ip.includes(":") ? "/128" : "/32");
+    setText((t) => (t.trim() ? `${t.trim()}\n${entry}` : entry));
+  };
+  return (
+    <Modal title="Web UI source restriction" onClose={onClose}>
+      <div className="space-y-3 text-sm">
+        <p className="text-xs text-muted-foreground">
+          One CIDR (or bare IP) per line — IPv4 and IPv6 both accepted. Leave
+          empty to open the Web UI to everyone. This governs both the per-node
+          HTTP/HTTPS door (nftables) and the control-plane VIP
+          (loadBalancerSourceRanges). SSH on port 22 is never restricted, so a
+          mistake here is always recoverable from the console.
+        </p>
+        <label className="block">
+          <span className="text-xs text-muted-foreground">
+            Allowed source ranges
+          </span>
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            rows={5}
+            placeholder={"192.168.0.0/24\n10.0.0.0/8\n2001:db8::/64"}
+            className="mt-1 w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs"
+          />
+        </label>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={addMyIp}
+            disabled={!current.caller_ip}
+            className="rounded-md border px-2.5 py-1 text-xs hover:bg-accent disabled:opacity-50"
+          >
+            + Add my IP ({current.caller_ip ?? "unknown"})
+          </button>
+          <button
+            type="button"
+            onClick={() => setText("")}
+            className="rounded-md border px-2.5 py-1 text-xs hover:bg-accent"
+          >
+            Open to all (clear)
+          </button>
+        </div>
+        {cidrs.length > 0 && (
+          <p className="text-xs text-muted-foreground">
+            Will restrict the Web UI to {cidrs.length} range
+            {cidrs.length === 1 ? "" : "s"}.
+          </p>
+        )}
+        {lockoutError && (
+          <label className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs">
+            <input
+              type="checkbox"
+              checked={override}
+              onChange={(e) => setOverride(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span>
+              Your current source IP isn't covered by this list — saving would
+              cut off this session's path to the Web UI. Tick to apply anyway
+              (you can still recover over SSH / the console).
+            </span>
+          </label>
+        )}
+        {save.isError && (
+          <p className="text-xs text-destructive">
+            {formatApiError(save.error)}
+          </p>
+        )}
+        <div className="flex justify-end gap-2 pt-1">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={save.isPending || (lockoutError && !override)}
+            onClick={() => save.mutate()}
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50"
+          >
+            {save.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            Save
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 

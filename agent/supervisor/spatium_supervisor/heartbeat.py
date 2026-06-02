@@ -329,6 +329,7 @@ def _maybe_apply_firewall(
     service_cidrs: list[Any] | None = None,
     cp_member_count: int = 1,
     vip_configured: bool = False,
+    web_ui_allowed_cidrs: list[Any] | None = None,
 ) -> None:
     """Render the firewall drop-in + write a trigger file the host
     runner picks up.
@@ -384,6 +385,7 @@ def _maybe_apply_firewall(
         service_cidrs=service_cidrs,
         cp_member_count=cp_member_count,
         vip_configured=vip_configured,
+        web_ui_allowed_cidrs=web_ui_allowed_cidrs,
     )
     body = profile.body
     body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
@@ -708,8 +710,12 @@ def heartbeat_once(
         ml_enabled = bool(body_out.get("desired_metallb_enabled"))
         ml_pool = body_out.get("desired_metallb_pool_addresses") or []
         ml_vip = body_out.get("desired_control_plane_vip") or ""
+        # #285 Phase 6 — source-scope the VIP path too (loadBalancerSourceRanges).
+        web_ui_cidrs = body_out.get("web_ui_allowed_cidrs") or []
 
-        cp_changed, cp_err = k8s_api.apply_control_plane_overrides(cp_size, str(ml_vip))
+        cp_changed, cp_err = k8s_api.apply_control_plane_overrides(
+            cp_size, str(ml_vip), web_ui_allowed_cidrs=list(web_ui_cidrs)
+        )
         if cp_changed:
             log.info(
                 "supervisor.heartbeat.control_plane_overrides_applied",
@@ -806,6 +812,8 @@ def heartbeat_once(
     fw_service_cidrs = body_out.get("firewall_service_cidrs") or []
     fw_cp_member_count = int(body_out.get("control_plane_size") or 1)
     fw_vip_configured = bool(body_out.get("desired_control_plane_vip") or "")
+    # #285 Phase 6 — operator Web-UI source restriction (empty = open).
+    fw_web_ui_cidrs = body_out.get("web_ui_allowed_cidrs") or []
     # #285 Phase 2a — bundle-first / renderer-fallback dispatch. When the
     # control plane has firewall authority (firewall_enabled on → a non-empty
     # ``firewall_settings.config_hash``), pipe its server-rendered body to the
@@ -820,9 +828,20 @@ def heartbeat_once(
             log.info(
                 "supervisor.heartbeat.firewall_trigger_fired", source="control-plane"
             )
-    elif cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs:
+    else:
         # #5 fallback — control plane too old to render, or firewall_enabled
         # still off; render in-pod from the same derived inputs.
+        #
+        # #285 Phase 6 — this branch now fires UNCONDITIONALLY (it used to gate
+        # on ``cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs``).
+        # The base /etc/nftables.conf no longer opens the Web UI (80/443); the
+        # rendered drop-in is now the SOLE source of that accept, so it must be
+        # present on EVERY appliance node — including idle / non-CP nodes that
+        # carry no roles, no peers and no pods. ``_maybe_apply_firewall`` already
+        # self-gates on ``detect_deployment_kind() == "appliance"`` and the host
+        # runner short-circuits on an unchanged body hash, so an unconditional
+        # call is cheap + idempotent. SSH/22 stays in the un-removable base floor,
+        # so even a total drop-in failure leaves the node SSH-recoverable.
         _maybe_apply_firewall(
             role_assignment,
             log,
@@ -831,6 +850,7 @@ def heartbeat_once(
             service_cidrs=fw_service_cidrs,
             cp_member_count=fw_cp_member_count,
             vip_configured=fw_vip_configured,
+            web_ui_allowed_cidrs=fw_web_ui_cidrs,
         )
 
     target = compute_target_env(role_assignment)

@@ -25,6 +25,7 @@ READ_TOOLS = [
     "count_firewall_policies",
     "find_firewall_aliases",
     "find_firewall_effective",
+    "find_web_ui_access",
 ]
 
 
@@ -120,6 +121,24 @@ async def test_find_effective_bad_uuid(db_session: AsyncSession) -> None:
         db_session, u, fw.FindFirewallEffectiveArgs(appliance_id="not-a-uuid")
     )
     assert "error" in res
+
+
+async def test_find_web_ui_access(db_session: AsyncSession) -> None:
+    from app.models.settings import PlatformSettings
+
+    u = await _user(db_session, superadmin=True)
+    # Default (no row) → open.
+    res = await fw.find_web_ui_access(db_session, u, fw.FindWebUIAccessArgs())
+    assert res["open"] is True and res["allowed_cidrs"] == []
+    # Scoped.
+    db_session.add(PlatformSettings(id=1, web_ui_allowed_cidrs=["192.168.0.0/24"]))
+    await db_session.flush()
+    res2 = await fw.find_web_ui_access(db_session, u, fw.FindWebUIAccessArgs())
+    assert res2["open"] is False and res2["allowed_cidrs"] == ["192.168.0.0/24"]
+    # Gated.
+    v = await _user(db_session, superadmin=False)
+    res3 = await fw.find_web_ui_access(db_session, v, fw.FindWebUIAccessArgs())
+    assert "error" in res3 and "superadmin" in res3["error"]
 
 
 async def test_propose_toggle_policy(db_session: AsyncSession) -> None:

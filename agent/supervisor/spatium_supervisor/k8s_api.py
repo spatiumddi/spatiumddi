@@ -515,18 +515,34 @@ def _helmchartconfig_upsert(
 
 
 def apply_control_plane_overrides(
-    cp_size: int, control_plane_vip: str
+    cp_size: int,
+    control_plane_vip: str,
+    web_ui_allowed_cidrs: list[str] | None = None,
 ) -> tuple[bool, str | None]:
     """Durably set the spatium-control overrides: api / frontend / worker
     replicas + CNPG instances + redis sentinel replicas = ``cp_size``,
     plus the frontend control-plane VIP. Written to the spatium-control
-    HelmChartConfig so it survives a k3s restart (#272)."""
+    HelmChartConfig so it survives a k3s restart (#272).
+
+    #285 Phase 6 — ``web_ui_allowed_cidrs`` (empty = open) also lands on the
+    frontend as ``loadBalancerSourceRanges``, so the MetalLB VIP path is
+    source-scoped by the same setting that scopes the per-node hostPort door
+    via nftables. Belt (VIP) + braces (hostPort) from one operator control."""
     if cp_size < 1:
         return False, "cp_size < 1"
     vip = (control_plane_vip or "").strip()
+    # Flow-style JSON list is valid YAML; empty list = open (field omitted by
+    # the chart template). The supervisor already validates these CIDRs at the
+    # control plane, but they arrive here as plain strings — json.dumps keeps
+    # them quoted so a malformed entry can't break the YAML overlay.
+    src_json = json.dumps(
+        [c.strip() for c in (web_ui_allowed_cidrs or []) if c and c.strip()]
+    )
     values = (
         f"api:\n  replicas: {cp_size}\n"
-        f'frontend:\n  replicas: {cp_size}\n  controlPlaneVIP: "{vip}"\n'
+        f"frontend:\n  replicas: {cp_size}\n"
+        f'  controlPlaneVIP: "{vip}"\n'
+        f"  loadBalancerSourceRanges: {src_json}\n"
         f"worker:\n  replicas: {cp_size}\n"
         f"postgresql:\n  cnpg:\n    instances: {cp_size}\n"
         f"redis:\n  sentinel:\n    replicas: {cp_size}\n"

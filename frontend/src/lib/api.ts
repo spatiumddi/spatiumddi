@@ -7466,6 +7466,14 @@ export interface FirewallEnforcement {
   nodes: FirewallEnforcementNode[];
 }
 
+// #285 Phase 6 — Web UI source restriction.
+export interface FirewallWebUIAccess {
+  allowed_cidrs: string[];
+  open: boolean;
+  caller_ip: string | null;
+  caller_covered: boolean;
+}
+
 const _FW = "/appliance/firewall";
 export const firewallApi = {
   listPolicies: (params?: {
@@ -7531,6 +7539,15 @@ export const firewallApi = {
       .then((r) => r.data),
   applyPosture: (preset: "locked" | "balanced" | "open") =>
     api.post<FirewallPolicy>(`${_FW}/posture`, { preset }).then((r) => r.data),
+  getWebUIAccess: () =>
+    api.get<FirewallWebUIAccess>(`${_FW}/web-ui-access`).then((r) => r.data),
+  setWebUIAccess: (body: {
+    allowed_cidrs: string[];
+    override_lockout?: boolean;
+  }) =>
+    api
+      .put<FirewallWebUIAccess>(`${_FW}/web-ui-access`, body)
+      .then((r) => r.data),
 };
 
 // Appliance Web UI certificate management (Phase 4b.1). Mounted at

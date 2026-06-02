@@ -122,6 +122,7 @@ def compile_firewall_body(
     service_cidrs: list[Any] | None = None,
     cp_member_count: int = 1,
     vip_configured: bool = False,
+    web_ui_allowed_cidrs: list[Any] | None = None,
 ) -> str:
     """Byte-identical port of ``firewall_renderer.render_drop_in`` — returns
     just the drop-in body string (the supervisor wraps it in a
@@ -151,6 +152,15 @@ def compile_firewall_body(
     lines.append('icmp type echo-request accept comment "icmpv4 ping"')
     lines.append('icmpv6 type echo-request accept comment "icmpv6 ping"')
     lines.append('iif lo accept comment "loopback"')
+    # Web UI (HTTP + HTTPS) — #285 Phase 6. Open by default; source-scoped
+    # when web_ui_allowed_cidrs is set (the base /etc/nftables.conf no longer
+    # opens 80/443, so this drop-in is authoritative). SSH/22 above stays the
+    # un-removable escape hatch, so a bad Web-UI scope is never a brick.
+    if web_ui_allowed_cidrs:
+        web_v4, web_v6 = _split_families(list(web_ui_allowed_cidrs))
+        _emit_family_rule(lines, web_v4, web_v6, "tcp dport { 80, 443 } accept", "web-ui")
+    else:
+        lines.append('tcp dport { 80, 443 } accept comment "web-ui"')
 
     role_tcp: set[int] = set()
     role_udp: set[int] = set()
@@ -222,6 +232,7 @@ async def firewall_bundle(
     vip_configured: bool,
     firewall_enabled: bool,
     appliance_id: Any = None,
+    web_ui_allowed_cidrs: list[Any] | None = None,
 ) -> dict[str, Any]:
     """The ``firewall_settings`` block shipped on the supervisor heartbeat.
 
@@ -257,6 +268,7 @@ async def firewall_bundle(
         vip_configured=vip_configured,
         policy_set=policy_set,
         appliance_policy=appliance_policy,
+        web_ui_allowed_cidrs=web_ui_allowed_cidrs,
     )
     return {
         "enabled": True,

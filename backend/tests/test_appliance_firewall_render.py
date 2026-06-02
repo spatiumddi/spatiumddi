@@ -69,6 +69,13 @@ _MATRIX: list[dict] = [
         "cp_member_count": 3,
         "vip_configured": False,
     },
+    # #285 Phase 6 — Web-UI source-scoped (v4 only)
+    {"role_assignment": {"roles": []}, "web_ui_allowed_cidrs": ["192.168.0.0/24", "10.0.0.0/8"]},
+    # #285 Phase 6 — Web-UI source-scoped (dual-stack) on a DNS node
+    {
+        "role_assignment": {"roles": ["dns-bind9"]},
+        "web_ui_allowed_cidrs": ["192.168.0.0/24", "2001:db8:f00d::/64"],
+    },
 ]
 
 
@@ -87,6 +94,7 @@ def _call(fn, case: dict):
         service_cidrs=case.get("service_cidrs"),
         cp_member_count=case.get("cp_member_count", 1),
         vip_configured=case.get("vip_configured", False),
+        web_ui_allowed_cidrs=case.get("web_ui_allowed_cidrs"),
     )
 
 
@@ -99,6 +107,7 @@ def _call_merge(case: dict) -> str:
         cp_member_count=case.get("cp_member_count", 1),
         vip_configured=case.get("vip_configured", False),
         policy_set=builtin_policy_set(),
+        web_ui_allowed_cidrs=case.get("web_ui_allowed_cidrs"),
     )
 
 
@@ -212,3 +221,37 @@ async def test_bundle_multinode_retire_directive(db_session) -> None:
     )
     assert "# spatium-bootstrap: keep" in single["firewall_conf"]
     assert "# spatium-bootstrap: retire" in multi["firewall_conf"]
+
+
+def test_web_ui_default_open_all_renderers() -> None:
+    # #285 Phase 6 — with no scope set, EVERY renderer must emit the un-scoped
+    # `tcp dport { 80, 443 } accept` (the base /etc/nftables.conf no longer
+    # opens it, so the default-open behaviour now lives in the drop-in). This
+    # is the anti-lockout floor for a fresh install.
+    sup = _load_supervisor_renderer()
+    case = {"role_assignment": {"roles": []}}
+    expect = 'tcp dport { 80, 443 } accept comment "web-ui"'
+    bodies = [_call(compile_firewall_body, case), _call_merge(case)]
+    if sup is not None:
+        bodies.append(_call(sup.render_drop_in, case).body)
+    for body in bodies:
+        assert expect in body
+        assert "ip saddr" not in body.split('comment "web-ui"')[0].rsplit("\n", 1)[-1]
+
+
+def test_web_ui_scoped_drops_open_accept() -> None:
+    # When scoped, the un-scoped open accept must be GONE (replaced by a
+    # source-matched accept); policy-drop then denies everything else.
+    case = {
+        "role_assignment": {"roles": []},
+        "web_ui_allowed_cidrs": ["192.168.0.0/24", "2001:db8:f00d::/64"],
+    }
+    for body in (_call(compile_firewall_body, case), _call_merge(case)):
+        assert 'tcp dport { 80, 443 } accept comment "web-ui"' not in body
+        assert (
+            'ip saddr { 192.168.0.0/24 } tcp dport { 80, 443 } accept comment "web-ui-v4"' in body
+        )
+        assert (
+            'ip6 saddr { 2001:db8:f00d::/64 } tcp dport { 80, 443 } accept comment "web-ui-v6"'
+            in body
+        )

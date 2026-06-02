@@ -285,6 +285,24 @@ LAN-wide node and reports **PASS-stale** for nodes it can't currently reach
 / `find_firewall_effective` reads + the default-off `propose_toggle_firewall_policy`)
 surface the model to the chat, tagged `module="appliance.firewall"`.
 
+**Web UI source restriction (Phase 6).** A `Web UI access` card on the same tab
+locks the frontend (HTTP/HTTPS) down to specific source ranges without an
+external firewall — `platform_settings.web_ui_allowed_cidrs` (empty = open, the
+shipped default). The value governs **both** Web-UI doors from one control:
+the per-node `:80/:443` accept in the nftables drop-in (every renderer emits an
+un-scoped accept when empty, a family-split `ip saddr { … }` accept when set),
+and the MetalLB control-plane VIP via `loadBalancerSourceRanges` (threaded onto
+the frontend Service through the supervisor's `apply_control_plane_overrides`
+HelmChartConfig overlay). Because the drop-in is now the *sole* source of the
+`80/443` accept (the base `/etc/nftables.conf` no longer opens it), the
+supervisor renders it on **every** appliance heartbeat — including idle / non-CP
+nodes — so the rule is always present. `PUT /appliance/firewall/web-ui-access`
+carries an **anti-lockout guard**: a non-empty set that doesn't cover the
+operator's current source IP is rejected 422 unless `override_lockout=true`
+(the UI surfaces an "Add my IP" button + the override checkbox). SSH on :22
+stays in the un-removable base floor, so a bad scope is always recoverable from
+the console.
+
 ---
 
 ## Post-#170 architecture (2026-05-14, superseded by #183)

@@ -36,13 +36,14 @@ import json
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import user_has_permission
+from app.core.request_meta import client_ip
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
 from app.models.firewall import (
@@ -871,6 +872,7 @@ def _render_for(inputs: dict[str, Any], ps: PolicySet, ap: _Policy | None) -> st
         vip_configured=inputs["vip_configured"],
         policy_set=ps,
         appliance_policy=ap,
+        web_ui_allowed_cidrs=inputs.get("web_ui_allowed_cidrs") or [],
     )
 
 
@@ -1192,3 +1194,144 @@ async def apply_posture(
     await db.commit()
     reset_policy_cache()
     return await _get_policy(db, fleet.id)
+
+
+# ── Web UI source restriction (#285 Phase 6) ────────────────────────
+#
+# Source-scope the appliance Web UI (frontend hostPort 80/443) without an
+# external firewall. Empty list = open (the shipped default). The value
+# rides ``platform_settings.web_ui_allowed_cidrs`` → ``firewall_render_inputs``
+# → every renderer's Web-UI accept (see services/appliance/firewall.py), and
+# also drives ``loadBalancerSourceRanges`` on the MetalLB VIP Service so BOTH
+# the node-IP hostPort door and the VIP door are governed by one setting.
+#
+# ANTI-LOCKOUT: a non-empty set that doesn't cover the operator's CURRENT
+# source IP would brick the very session making the change (the request is
+# arriving through the frontend right now). We reject that 422 unless the
+# operator explicitly passes override_lockout=true. SSH/22 stays in the
+# un-removable base floor regardless, so even an overridden lockout is
+# always recoverable over SSH / the console.
+
+
+def _ip_in_cidrs(ip: str | None, cidrs: list[str]) -> bool:
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for c in cidrs:
+        try:
+            net = ipaddress.ip_network(c, strict=False)
+        except ValueError:
+            continue
+        if addr.version == net.version and addr in net:
+            return True
+    return False
+
+
+class WebUIAccessResponse(BaseModel):
+    allowed_cidrs: list[str]
+    open: bool
+    caller_ip: str | None
+    caller_covered: bool
+
+
+class SetWebUIAccessRequest(BaseModel):
+    allowed_cidrs: list[str] = Field(default_factory=list)
+    override_lockout: bool = False
+
+    @field_validator("allowed_cidrs")
+    @classmethod
+    def _v_cidrs(cls, v: list[str]) -> list[str]:
+        # Validate + canonicalise (dedupe, stable order) so the persisted value
+        # matches the renderers' _split_families canonicalisation and the
+        # config_hash is stable under benign reordering.
+        seen: set[str] = set()
+        out: list[str] = []
+        for c in v:
+            s = (c or "").strip()
+            if not s:
+                continue
+            try:
+                net = ipaddress.ip_network(s, strict=False)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"invalid CIDR {c!r}: {exc}") from exc
+            canon = str(net)
+            if canon not in seen:
+                seen.add(canon)
+                out.append(canon)
+        return out
+
+
+@router.get("/web-ui-access", response_model=WebUIAccessResponse)
+async def get_web_ui_access(
+    request: Request, db: DB, current_user: CurrentUser
+) -> WebUIAccessResponse:
+    _require_read(current_user)
+    cfg = await db.get(PlatformSettings, 1)
+    cidrs = list(cfg.web_ui_allowed_cidrs or []) if cfg else []
+    ip = client_ip(request)
+    return WebUIAccessResponse(
+        allowed_cidrs=cidrs,
+        open=not cidrs,
+        caller_ip=ip,
+        caller_covered=(not cidrs) or _ip_in_cidrs(ip, cidrs),
+    )
+
+
+@router.put("/web-ui-access", response_model=WebUIAccessResponse)
+async def set_web_ui_access(
+    body: SetWebUIAccessRequest, request: Request, db: DB, current_user: CurrentUser
+) -> WebUIAccessResponse:
+    _require_admin(current_user)
+    ip = client_ip(request)
+    if (
+        body.allowed_cidrs
+        and not body.override_lockout
+        and not _ip_in_cidrs(ip, body.allowed_cidrs)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Refusing to restrict the Web UI: your current source IP ({ip or 'unknown'}) "
+                "is not covered by the allow-list, so this would lock you out of the very "
+                "session making the change. Add your IP / network to the list, or pass "
+                "override_lockout=true (SSH on port 22 stays open regardless, so the appliance "
+                "is always recoverable from the console)."
+            ),
+        )
+    cfg = await db.get(PlatformSettings, 1)
+    if cfg is None:
+        cfg = PlatformSettings(id=1)
+        db.add(cfg)
+        await db.flush()
+    old = list(cfg.web_ui_allowed_cidrs or [])
+    if old != body.allowed_cidrs:
+        cfg.web_ui_allowed_cidrs = body.allowed_cidrs
+        db.add(
+            AuditLog(
+                action="update",
+                resource_type="platform_settings",
+                resource_id="1",
+                resource_display="web UI source restriction",
+                user_id=current_user.id,
+                user_display_name=current_user.username,
+                result="success",
+                changed_fields=["web_ui_allowed_cidrs"],
+                old_value={"web_ui_allowed_cidrs": old},
+                new_value={
+                    "web_ui_allowed_cidrs": body.allowed_cidrs,
+                    "override_lockout": body.override_lockout,
+                    "caller_ip": ip,
+                },
+            )
+        )
+    await db.commit()
+    cidrs = list(cfg.web_ui_allowed_cidrs or [])
+    return WebUIAccessResponse(
+        allowed_cidrs=cidrs,
+        open=not cidrs,
+        caller_ip=ip,
+        caller_covered=(not cidrs) or _ip_in_cidrs(ip, cidrs),
+    )

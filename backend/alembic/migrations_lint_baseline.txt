@@ -181,6 +181,7 @@ backend/alembic/versions/b9e4d2a17c83_network_neighbour.py:drop_column:113
 backend/alembic/versions/b9e4d2a17c83_network_neighbour.py:drop_table:111
 backend/alembic/versions/bd4f2a91c7e3_metric_samples.py:drop_table:83
 backend/alembic/versions/bd4f2a91c7e3_metric_samples.py:drop_table:85
+backend/alembic/versions/c1e7f3a90b4d_web_ui_allowed_cidrs.py:drop_column:38
 backend/alembic/versions/c1f4a8b27d09_soft_delete.py:drop_column:100
 backend/alembic/versions/c1f4a8b27d09_soft_delete.py:drop_column:93
 backend/alembic/versions/c1f4a8b27d09_soft_delete.py:drop_column:98

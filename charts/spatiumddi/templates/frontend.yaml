@@ -173,6 +173,16 @@ spec:
   # real client IP, no SNAT hairpin to a hostNetwork endpoint.
   type: LoadBalancer
   externalTrafficPolicy: Local
+  {{- with .Values.frontend.loadBalancerSourceRanges }}
+  # #285 Phase 6 — source-scope the Web UI VIP. Driven from
+  # platform_settings.web_ui_allowed_cidrs via the supervisor's
+  # apply_control_plane_overrides HelmChartConfig overlay; empty = open
+  # (this block is omitted). MetalLB honours loadBalancerSourceRanges, so
+  # this is the VIP-path twin of the per-node nftables 80/443 scope. SSH/22
+  # is untouched, so a bad scope is always recoverable from the console.
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- else }}
   type: {{ .Values.frontend.service.type }}
   {{- end }}
