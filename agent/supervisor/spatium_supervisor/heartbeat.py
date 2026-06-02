@@ -42,7 +42,7 @@ from typing import Any
 import httpx
 import structlog
 
-from . import appliance_state, approval_state, watchdog
+from . import appliance_state, approval_state, firewall_peer_audit, watchdog
 from .cert_auth import build_auth_headers, load_cert, save_cert
 from .config import SupervisorConfig
 from .firewall_renderer import FirewallProfile, render_drop_in
@@ -79,7 +79,9 @@ _ROLE_ENV_FILENAME = "role-compose.env"
 # used by snmp / chrony / slot-upgrade triggers). Writing to this
 # path = "host runner please re-render".
 _NFT_TRIGGER_PATH = Path("/var/lib/spatiumddi-host/release-state/firewall-pending")
-_NFT_APPLIED_HASH_PATH = Path("/var/lib/spatiumddi-host/release-state/firewall-applied-hash")
+_NFT_APPLIED_HASH_PATH = Path(
+    "/var/lib/spatiumddi-host/release-state/firewall-applied-hash"
+)
 
 # #272 — in-cluster control-plane API Service. Every control-plane
 # node runs the api Deployment behind this headless-routable
@@ -289,6 +291,10 @@ _WATCHDOG_INTERVAL_S = 300.0  # 5 minutes
 _last_watchdog_at: float = 0.0
 _cached_role_health: dict[str, Any] = {}
 
+# #285 Phase 5 — throttle for the warn-only etcd/peer-drift cross-check.
+_PEER_DRIFT_INTERVAL_S = 300.0  # 5 minutes
+_last_peer_drift_at: float = 0.0
+
 # #272 Phase 9 — k8s Node names this seed has successfully evicted but
 # the backend hasn't yet confirmed cleared. Reported on each heartbeat
 # request; pruned once the backend drops the name from its evict list.
@@ -351,6 +357,25 @@ def _maybe_apply_firewall(
     """
     if appliance_state.detect_deployment_kind() != "appliance":
         return
+
+    # #285 Phase 5 — warn-only etcd/peer-drift cross-check. Throttled +
+    # best-effort + run BEFORE the unchanged-body short-circuit, so a
+    # membership change the peer set hasn't caught up to is surfaced even when
+    # the local render is stable. Seed-only in practice — a non-seed node's
+    # kubeapi read fails and the helper returns None (no-op).
+    global _last_peer_drift_at
+    if (
+        cluster_peer_cidrs
+        and time.monotonic() - _last_peer_drift_at >= _PEER_DRIFT_INTERVAL_S
+    ):
+        _last_peer_drift_at = time.monotonic()
+        try:
+            firewall_peer_audit.warn_on_peer_drift(
+                [str(c) for c in cluster_peer_cidrs],
+                appliance_state.read_node_ips() or [],
+            )
+        except Exception as exc:  # noqa: BLE001 — warn-only, never break apply
+            log.debug("supervisor.firewall.peer_drift_check_failed", error=str(exc))
 
     profile: FirewallProfile = render_drop_in(
         role_assignment,
@@ -742,7 +767,9 @@ def heartbeat_once(
                 _evicted_pending.add(str(name))
                 log.info("supervisor.heartbeat.node_evicted", node=name)
             else:
-                log.warning("supervisor.heartbeat.node_evict_failed", node=name, error=evict_err)
+                log.warning(
+                    "supervisor.heartbeat.node_evict_failed", node=name, error=evict_err
+                )
         _evicted_pending.intersection_update({str(n) for n in evict_names})
 
     # #170 Wave C2 — render the role-driven compose env. C3 will
@@ -790,7 +817,9 @@ def heartbeat_once(
     fw_settings = body_out.get("firewall_settings")
     if isinstance(fw_settings, dict) and fw_settings.get("config_hash"):
         if appliance_state.maybe_fire_firewall_reload(fw_settings):
-            log.info("supervisor.heartbeat.firewall_trigger_fired", source="control-plane")
+            log.info(
+                "supervisor.heartbeat.firewall_trigger_fired", source="control-plane"
+            )
     elif cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs:
         # #5 fallback — control plane too old to render, or firewall_enabled
         # still off; render in-pod from the same derived inputs.
