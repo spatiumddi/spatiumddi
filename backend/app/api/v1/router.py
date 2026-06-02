@@ -10,6 +10,7 @@ from app.api.v1.ai import router as ai_router
 from app.api.v1.alerts.router import router as alerts_router
 from app.api.v1.api_tokens.router import router as api_tokens_router
 from app.api.v1.appliance import router as appliance_router
+from app.api.v1.appliance.firewall import router as firewall_policy_router
 from app.api.v1.applications import router as applications_router
 from app.api.v1.asns import router as asns_router
 from app.api.v1.audit.router import router as audit_router
@@ -86,6 +87,17 @@ api_v1_router.include_router(trash_router, prefix="/admin", tags=["admin-trash"]
 api_v1_router.include_router(alerts_router, prefix="/alerts", tags=["alerts"])
 api_v1_router.include_router(api_tokens_router, prefix="/api-tokens", tags=["api-tokens"])
 api_v1_router.include_router(appliance_router, prefix="/appliance", tags=["appliance"])
+# #285 Phase 3c — firewall policy CRUD. Separate include (NOT folded into
+# appliance_router) so the require_module gate applies to /appliance/firewall
+# ONLY — the /appliance hub itself stays always-visible (docker/k8s control
+# planes with appliance agents must reach Fleet). This router-level gate is
+# the real #14 enforcement (404 when the module is off).
+api_v1_router.include_router(
+    firewall_policy_router,
+    prefix="/appliance/firewall",
+    tags=["appliance-firewall"],
+    dependencies=[Depends(require_module("appliance.firewall"))],
+)
 api_v1_router.include_router(applications_router, prefix="/applications", tags=["applications"])
 api_v1_router.include_router(
     asns_router,
