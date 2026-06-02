@@ -50,7 +50,9 @@ log = structlog.get_logger(__name__)
 _HOST_ROLE_CONFIG = Path("/etc/spatiumddi-host/role-config")
 _HOST_RELEASE = Path("/etc/spatiumddi-host/appliance-release")
 _HOST_GRUBENV = Path("/boot/efi-host/grub/grubenv")
-_HOST_SLOT_STATE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pending.state")
+_HOST_SLOT_STATE = Path(
+    "/var/lib/spatiumddi-host/release-state/slot-upgrade-pending.state"
+)
 _PROC_CMDLINE = Path("/proc/cmdline")
 _UDEV_DATA = Path("/run/udev/data")
 
@@ -317,7 +319,9 @@ _TZ_APPLIED_HASH_FILE = Path("/var/lib/spatiumddi-host/release-state/tz-hash")
 _SET_NEXT_BOOT_TRIGGER_FILE = Path(
     "/var/lib/spatiumddi-host/release-state/slot-set-next-boot-pending"
 )
-_SET_DEFAULT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-set-default-pending")
+_SET_DEFAULT_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/slot-set-default-pending"
+)
 # Issue #153 — SNMP config rollout. The trigger file carries the
 # rendered snmpd.conf body so the host runner doesn't need to re-
 # render. The hash sidecar lets the agent skip re-firing after an
@@ -361,8 +365,12 @@ _FIREWALL_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/firewall-p
 # written by the PRIMARY's host runner from /var/lib/rancher/k3s/
 # server/token so the supervisor can report it without mounting the
 # k3s server dir.
-_CLUSTER_JOIN_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/cluster-join-pending")
-_CLUSTER_LEAVE_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/cluster-leave-pending")
+_CLUSTER_JOIN_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/cluster-join-pending"
+)
+_CLUSTER_LEAVE_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/cluster-leave-pending"
+)
 # Guardrail confirmation markers (#272). The host-side spatium-cluster-join
 # runner does DESTRUCTIVE k3s surgery (full cluster-identity wipe + rejoin),
 # fired by a systemd .path unit watching these trigger files. To stop a
@@ -372,7 +380,9 @@ _CLUSTER_LEAVE_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/clust
 # the constants in spatium-cluster-join.
 _CLUSTER_JOIN_CONFIRM = "SPATIUMDDI-CLUSTER-JOIN-CONFIRM-V1"
 _CLUSTER_LEAVE_CONFIRM = "SPATIUMDDI-CLUSTER-LEAVE-CONFIRM-V1"
-_CLUSTER_JOIN_STATE_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/cluster-join.state")
+_CLUSTER_JOIN_STATE_SIDECAR = Path(
+    "/var/lib/spatiumddi-host/release-state/cluster-join.state"
+)
 _K3S_JOIN_TOKEN_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/k3s-join-token")
 
 
@@ -672,7 +682,11 @@ def maybe_fire_snmp_reload(bundle_block: object) -> bool:
         # runner) so the agent and host agree on exactly which body
         # was applied — useful when the runner writes the sidecar
         # the agent reads on next bundle to short-circuit re-firing.
-        payload = ("enabled\n" if enabled else "disabled\n") + (config_hash + "\n") + snmpd_conf
+        payload = (
+            ("enabled\n" if enabled else "disabled\n")
+            + (config_hash + "\n")
+            + snmpd_conf
+        )
         tmp = _SNMP_TRIGGER_FILE.with_suffix(".new")
         tmp.write_text(payload, encoding="utf-8")
         tmp.replace(_SNMP_TRIGGER_FILE)
@@ -718,7 +732,9 @@ def maybe_fire_cluster_join(
     try:
         _CLUSTER_JOIN_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _CLUSTER_JOIN_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(f"{_CLUSTER_JOIN_CONFIRM}\n{server_url}\n{join_token}\n", encoding="utf-8")
+        tmp.write_text(
+            f"{_CLUSTER_JOIN_CONFIRM}\n{server_url}\n{join_token}\n", encoding="utf-8"
+        )
         tmp.replace(_CLUSTER_JOIN_TRIGGER_FILE)
         return True
     except OSError:
@@ -1464,7 +1480,9 @@ def read_cluster_cidrs() -> tuple[str | None, str | None, str | None]:
                 if s.startswith("cluster-cidr:"):
                     pod_cidr = s.split(":", 1)[1].strip().strip('"').strip("'") or None
                 elif s.startswith("service-cidr:"):
-                    service_cidr = s.split(":", 1)[1].strip().strip('"').strip("'") or None
+                    service_cidr = (
+                        s.split(":", 1)[1].strip().strip('"').strip("'") or None
+                    )
         except OSError as exc:
             # Drop-in unreadable (perms / mid-write) — fall through with
             # pod/service CIDR as None (the backend leaves those columns
@@ -1486,7 +1504,9 @@ def read_cluster_cidrs() -> tuple[str | None, str | None, str | None]:
         if not path.exists():
             continue
         try:
-            found = _scan_flannel_backend(path.read_text(encoding="utf-8", errors="replace"))
+            found = _scan_flannel_backend(
+                path.read_text(encoding="utf-8", errors="replace")
+            )
         except OSError:
             continue
         if found:
@@ -1517,6 +1537,15 @@ def read_base_conf_marker() -> tuple[str | None, bool | None]:
         raw = _HOST_NFTABLES_CONF.read_bytes()
     except OSError:
         return None, None
+    # An empty / whitespace-only file is the chart's ``hostPath:
+    # FileOrCreate`` touching a placeholder when the host has no real
+    # base /etc/nftables.conf — NOT a hardened base. Treat it as
+    # unavailable (return None,None) so the backend's only-when-not-None
+    # semantics don't persist a misleading "hardened" marker (which would
+    # otherwise let the Phase-4 all-CP-hardened master-enable gate pass on
+    # a node that has no base config at all).
+    if not raw.strip():
+        return None, None
     marker = hashlib.sha256(raw).hexdigest()
     # The legacy LAN-wide accept carries the literal ``comment "k3s-ha"``
     # tag (see appliance/mkosi.extra/etc/nftables.conf). Its presence ⇒
@@ -1542,7 +1571,9 @@ def collect() -> dict[str, object]:
     if current_slot and durable_default:
         is_trial_boot = current_slot != durable_default
 
-    last_state, last_state_at = _last_upgrade_state_from_sidecar() if is_appliance else (None, None)
+    last_state, last_state_at = (
+        _last_upgrade_state_from_sidecar() if is_appliance else (None, None)
+    )
 
     slot_a_version, slot_b_version = read_slot_versions()
     cluster_health = read_cluster_health() if is_appliance else None
@@ -1556,7 +1587,9 @@ def collect() -> dict[str, object]:
     pod_cidr, service_cidr, dataplane_backend = (
         read_cluster_cidrs() if is_appliance else (None, None, None)
     )
-    base_conf_marker, base_lanwide_k3s = read_base_conf_marker() if is_appliance else (None, None)
+    base_conf_marker, base_lanwide_k3s = (
+        read_base_conf_marker() if is_appliance else (None, None)
+    )
 
     return {
         "deployment_kind": deployment_kind,
@@ -1564,7 +1597,9 @@ def collect() -> dict[str, object]:
         # running on. Only meaningful on appliance deploys; None on
         # docker / k8s.
         "appliance_variant": (detect_appliance_variant() if is_appliance else None),
-        "installed_appliance_version": (read_installed_version() if is_appliance else None),
+        "installed_appliance_version": (
+            read_installed_version() if is_appliance else None
+        ),
         "current_slot": current_slot,
         "durable_default": durable_default,
         "slot_a_version": slot_a_version,
@@ -1632,6 +1667,8 @@ def collect() -> dict[str, object]:
         # off-appliance so the backend's "only-when-not-None" upsert never
         # blanks the columns. Surfaces what the runner already writes.
         "firewall_applied_hash": read_firewall_applied_hash() if is_appliance else None,
-        "firewall_applied_status": read_firewall_applied_status() if is_appliance else None,
+        "firewall_applied_status": (
+            read_firewall_applied_status() if is_appliance else None
+        ),
         "firewall_base_marker": read_firewall_base_marker() if is_appliance else None,
     }

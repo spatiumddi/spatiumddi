@@ -61,21 +61,27 @@ async def test_policy_crud_lifecycle(client: AsyncClient, db_session: AsyncSessi
     pid = r.json()["id"]
     assert r.json()["is_builtin"] is False
 
-    assert (await client.get(f"{FW}/policies", headers=h)).status_code == 200
-    assert (await client.get(f"{FW}/policies/{pid}", headers=h)).status_code == 200
+    _r = await client.get(f"{FW}/policies", headers=h)
+    assert _r.status_code == 200
+    _r = await client.get(f"{FW}/policies/{pid}", headers=h)
+    assert _r.status_code == 200
 
     r = await client.patch(f"{FW}/policies/{pid}", headers=h, json={"enabled": False})
     assert r.status_code == 200 and r.json()["enabled"] is False
 
-    assert (await client.delete(f"{FW}/policies/{pid}", headers=h)).status_code == 204
-    assert (await client.get(f"{FW}/policies/{pid}", headers=h)).status_code == 404
+    _r = await client.delete(f"{FW}/policies/{pid}", headers=h)
+    assert _r.status_code == 204
+    _r = await client.get(f"{FW}/policies/{pid}", headers=h)
+    assert _r.status_code == 404
 
 
 async def test_create_bad_scope_rejected(client: AsyncClient, db_session: AsyncSession) -> None:
     _, h = await _user(db_session)
     # fleet must not carry a role
     r = await client.post(
-        f"{FW}/policies", headers=h, json={"name": "x", "scope_kind": "fleet", "scope_role": "dhcp"}
+        f"{FW}/policies",
+        headers=h,
+        json={"name": "x", "scope_kind": "fleet", "scope_role": "dhcp"},
     )
     assert r.status_code == 422
     # role must be a known role token
@@ -90,7 +96,8 @@ async def test_create_bad_scope_rejected(client: AsyncClient, db_session: AsyncS
 async def test_scope_uniqueness_409(client: AsyncClient, db_session: AsyncSession) -> None:
     _, h = await _user(db_session)
     j = {"name": "f1", "scope_kind": "fleet"}
-    assert (await client.post(f"{FW}/policies", headers=h, json=j)).status_code == 201
+    _r = await client.post(f"{FW}/policies", headers=h, json=j)
+    assert _r.status_code == 201
     r = await client.post(f"{FW}/policies", headers=h, json={"name": "f2", "scope_kind": "fleet"})
     assert r.status_code == 409
 
@@ -114,11 +121,11 @@ async def test_builtin_identity_locked(client: AsyncClient, db_session: AsyncSes
     r = await client.patch(f"{FW}/policies/{pid}", headers=h, json={"name": "renamed"})
     assert r.status_code == 400 and "Clone" in r.json()["detail"]
     # mutable field allowed
-    assert (
-        await client.patch(f"{FW}/policies/{pid}", headers=h, json={"enabled": False})
-    ).status_code == 200
+    _r = await client.patch(f"{FW}/policies/{pid}", headers=h, json={"enabled": False})
+    assert _r.status_code == 200
     # delete refused
-    assert (await client.delete(f"{FW}/policies/{pid}", headers=h)).status_code == 400
+    _r = await client.delete(f"{FW}/policies/{pid}", headers=h)
+    assert _r.status_code == 400
 
 
 # ── Rules ────────────────────────────────────────────────────────────
@@ -157,21 +164,19 @@ async def test_rule_crud_and_bulk_replace(client: AsyncClient, db_session: Async
     assert r.status_code == 201, r.text
     rid = r.json()["id"]
     # duplicate seq → 409
-    assert (
-        await client.post(
-            f"{FW}/policies/{pid}/rules",
-            headers=h,
-            json={"seq": 10, "protocol": "tcp", "ports": [53]},
-        )
-    ).status_code == 409
+    _r = await client.post(
+        f"{FW}/policies/{pid}/rules",
+        headers=h,
+        json={"seq": 10, "protocol": "tcp", "ports": [53]},
+    )
+    assert _r.status_code == 409
     # patch
-    assert (
-        await client.patch(
-            f"{FW}/policies/{pid}/rules/{rid}",
-            headers=h,
-            json={"seq": 10, "protocol": "tcp", "ports": [53]},
-        )
-    ).status_code == 200
+    _r = await client.patch(
+        f"{FW}/policies/{pid}/rules/{rid}",
+        headers=h,
+        json={"seq": 10, "protocol": "tcp", "ports": [53]},
+    )
+    assert _r.status_code == 200
     # bulk replace (single audit row)
     r = await client.put(
         f"{FW}/policies/{pid}/rules",
@@ -186,9 +191,8 @@ async def test_rule_crud_and_bulk_replace(client: AsyncClient, db_session: Async
     assert r.status_code == 200 and len(r.json()["rules"]) == 2
     # delete one
     new_rid = r.json()["rules"][0]["id"]
-    assert (
-        await client.delete(f"{FW}/policies/{pid}/rules/{new_rid}", headers=h)
-    ).status_code == 204
+    _r = await client.delete(f"{FW}/policies/{pid}/rules/{new_rid}", headers=h)
+    assert _r.status_code == 204
 
 
 async def test_bulk_replace_dup_seq_rejected(client: AsyncClient, db_session: AsyncSession) -> None:
@@ -232,11 +236,14 @@ async def test_alias_crud_and_family_split(client: AsyncClient, db_session: Asyn
     )
     assert r.status_code == 201, r.text
     aid = r.json()["id"]
-    assert (await client.get(f"{FW}/aliases", headers=h)).json()[0]["name"] == "mgmt"
-    assert (
-        await client.patch(f"{FW}/aliases/{aid}", headers=h, json={"v4_members": ["172.16.0.0/12"]})
-    ).status_code == 200
-    assert (await client.delete(f"{FW}/aliases/{aid}", headers=h)).status_code == 204
+    _r = await client.get(f"{FW}/aliases", headers=h)
+    assert _r.json()[0]["name"] == "mgmt"
+    _r = await client.patch(
+        f"{FW}/aliases/{aid}", headers=h, json={"v4_members": ["172.16.0.0/12"]}
+    )
+    assert _r.status_code == 200
+    _r = await client.delete(f"{FW}/aliases/{aid}", headers=h)
+    assert _r.status_code == 204
 
 
 # ── Audit + event wiring ─────────────────────────────────────────────
@@ -267,7 +274,8 @@ async def test_audit_row_written_and_event_type(
 
 
 async def test_requires_auth(client: AsyncClient) -> None:
-    assert (await client.get(f"{FW}/policies")).status_code == 401
+    _r = await client.get(f"{FW}/policies")
+    assert _r.status_code == 401
 
 
 async def test_non_admin_cannot_write(client: AsyncClient, db_session: AsyncSession) -> None:
@@ -283,6 +291,7 @@ async def test_module_gate_404(client: AsyncClient, db_session: AsyncSession) ->
     await db_session.commit()
     invalidate_cache()
     try:
-        assert (await client.get(f"{FW}/policies", headers=h)).status_code == 404
+        _r = await client.get(f"{FW}/policies", headers=h)
+        assert _r.status_code == 404
     finally:
         invalidate_cache()

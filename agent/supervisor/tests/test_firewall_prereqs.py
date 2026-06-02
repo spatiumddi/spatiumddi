@@ -27,10 +27,13 @@ def _k3s(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_scan_flannel_backend() -> None:
-    assert appliance_state._scan_flannel_backend("flannel-backend: wireguard-native") == (
-        "wireguard-native"
+    assert appliance_state._scan_flannel_backend(
+        "flannel-backend: wireguard-native"
+    ) == ("wireguard-native")
+    assert (
+        appliance_state._scan_flannel_backend('flannel-backend: "host-gw"\n')
+        == "host-gw"
     )
-    assert appliance_state._scan_flannel_backend('flannel-backend: "host-gw"\n') == "host-gw"
     assert appliance_state._scan_flannel_backend("write-kubeconfig-mode: 0644") is None
     assert appliance_state._scan_flannel_backend("") is None
 
@@ -55,7 +58,9 @@ def test_read_cluster_cidrs_dropin(monkeypatch, _k3s, tmp_path) -> None:
     assert backend == "vxlan"  # k3s upstream default when unset
 
 
-def test_read_cluster_cidrs_dualstack_and_explicit_backend(monkeypatch, _k3s, tmp_path) -> None:
+def test_read_cluster_cidrs_dualstack_and_explicit_backend(
+    monkeypatch, _k3s, tmp_path
+) -> None:
     dropin = tmp_path / "spatium-cidrs.yaml"
     dropin.write_text(
         "cluster-cidr: 10.42.0.0/16,2001:cafe:42::/56\n"
@@ -80,7 +85,9 @@ def test_read_cluster_cidrs_missing_dropin_still_defaults_backend(
     # come back None (backend leaves columns alone) but the data-plane
     # backend still resolves to the k3s default.
     monkeypatch.setattr(appliance_state, "_K3S_CIDRS_DROPIN", tmp_path / "absent.yaml")
-    monkeypatch.setattr(appliance_state, "_K3S_MAIN_CONFIG", tmp_path / "absent-config.yaml")
+    monkeypatch.setattr(
+        appliance_state, "_K3S_MAIN_CONFIG", tmp_path / "absent-config.yaml"
+    )
     monkeypatch.setattr(appliance_state, "_K3S_CONFIG_DIR", tmp_path)
     pod, svc, backend = appliance_state.read_cluster_cidrs()
     assert pod is None and svc is None
@@ -115,7 +122,20 @@ def test_read_base_conf_marker_hardened(monkeypatch, _k3s, tmp_path) -> None:
 
 
 def test_read_base_conf_marker_unmounted(monkeypatch, _k3s, tmp_path) -> None:
-    monkeypatch.setattr(appliance_state, "_HOST_NFTABLES_CONF", tmp_path / "absent.conf")
+    monkeypatch.setattr(
+        appliance_state, "_HOST_NFTABLES_CONF", tmp_path / "absent.conf"
+    )
+    assert appliance_state.read_base_conf_marker() == (None, None)
+
+
+def test_read_base_conf_marker_empty_file_is_unavailable(
+    monkeypatch, _k3s, tmp_path
+) -> None:
+    # `hostPath: FileOrCreate` touches an empty placeholder when the host
+    # has no real base conf — must NOT be classed as a hardened base.
+    conf = tmp_path / "nftables.conf"
+    conf.write_text("   \n\n")  # whitespace only
+    monkeypatch.setattr(appliance_state, "_HOST_NFTABLES_CONF", conf)
     assert appliance_state.read_base_conf_marker() == (None, None)
 
 
@@ -147,7 +167,9 @@ def test_read_node_ips_dualstack(monkeypatch, _k3s) -> None:
 def test_read_node_ips_none_when_empty(monkeypatch, _k3s) -> None:
     monkeypatch.setenv("NODE_NAME", "node-1")
     monkeypatch.setattr(
-        k8s_api, "_request", lambda *a, **k: (200, json.dumps({"status": {"addresses": []}}))
+        k8s_api,
+        "_request",
+        lambda *a, **k: (200, json.dumps({"status": {"addresses": []}})),
     )
     assert appliance_state.read_node_ips() is None
 
