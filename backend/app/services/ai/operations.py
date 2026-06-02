@@ -1992,3 +1992,85 @@ register(
         category="admin",
     )
 )
+
+
+# ── toggle_firewall_policy operation (#285 Phase 3e) ──────────────
+
+
+class ToggleFirewallPolicyArgs(BaseModel):
+    """Args for ``toggle_firewall_policy`` — enable/disable a policy."""
+
+    policy_id: str = Field(description="UUID of the firewall policy.")
+    enabled: bool = Field(description="Desired enabled state.")
+
+
+async def _preview_toggle_firewall_policy(
+    db: AsyncSession, user: User, args: ToggleFirewallPolicyArgs
+) -> PreviewResult:
+    from app.models.firewall import FirewallPolicy  # noqa: PLC0415
+
+    try:
+        pid = UUID(args.policy_id)
+    except ValueError:
+        return PreviewResult(ok=False, detail=f"policy_id must be a UUID, got {args.policy_id!r}")
+    p = await db.get(FirewallPolicy, pid)
+    if p is None:
+        return PreviewResult(ok=False, detail=f"No firewall policy with id {args.policy_id}.")
+    if p.enabled == args.enabled:
+        state = "enabled" if args.enabled else "disabled"
+        return PreviewResult(ok=False, detail=f"Policy {p.name!r} is already {state}.")
+    verb = "Enable" if args.enabled else "Disable"
+    if p.scope_kind == "appliance":
+        scope = f"appliance/{p.scope_appliance_id}"  # disambiguate per-appliance overrides
+    elif p.scope_role:
+        scope = f"{p.scope_kind}/{p.scope_role}"
+    else:
+        scope = p.scope_kind
+    text = (
+        f"{verb} firewall policy **{p.name}** (scope {scope}). Takes effect on the "
+        "next supervisor heartbeat — but only renders to a node when the "
+        "firewall_enabled master switch is on."
+    )
+    return PreviewResult(ok=True, detail=text, preview_text=text)
+
+
+async def _apply_toggle_firewall_policy(
+    db: AsyncSession, user: User, args: ToggleFirewallPolicyArgs
+) -> dict[str, Any]:
+    from app.models.audit import AuditLog  # noqa: PLC0415
+    from app.models.firewall import FirewallPolicy  # noqa: PLC0415
+    from app.services.appliance.firewall_merge import reset_policy_cache  # noqa: PLC0415
+
+    p = await db.get(FirewallPolicy, UUID(args.policy_id))
+    if p is None:
+        return {"error": f"No firewall policy with id {args.policy_id}."}
+    p.enabled = args.enabled
+    p.updated_by_id = user.id
+    db.add(
+        AuditLog(
+            action="update",
+            resource_type="firewall_policy",
+            resource_id=str(p.id),
+            resource_display=p.name,
+            user_id=user.id,
+            user_display_name=user.username,
+            result="success",
+            changed_fields=["enabled"],
+            new_value={"enabled": args.enabled},
+        )
+    )
+    await db.commit()
+    reset_policy_cache()
+    return {"policy_id": str(p.id), "name": p.name, "enabled": p.enabled}
+
+
+register(
+    Operation(
+        name="toggle_firewall_policy",
+        description="Enable or disable a fleet-firewall policy.",
+        args_model=ToggleFirewallPolicyArgs,
+        preview=_preview_toggle_firewall_policy,
+        apply=_apply_toggle_firewall_policy,
+        category="admin",
+    )
+)

@@ -226,6 +226,19 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Read-only mirror of public-cloud infrastructure (VPCs / subnets / instance NICs / public + load-balancer IPs) into IPAM. Connect accounts from the Cloud page once enabled. (Cloud DNS is managed separately via the Add DNS server flow.)",
         default_enabled=False,
     ),
+    # Appliance — the declarative fleet-firewall policy surface (#285
+    # Phase 3). Default-enabled for DISCOVERY/STAGING only: turning this
+    # module ON exposes the policy editor + preview but applies NOTHING.
+    # Enforcement is a SEPARATE master switch (platform_settings.
+    # firewall_enabled, default OFF) — flipping the module does not change
+    # any node's firewall. The two gates are intentionally distinct so an
+    # operator authors + previews policy long before arming enforcement.
+    ModuleSpec(
+        id="appliance.firewall",
+        label="Fleet Firewall",
+        group="Appliance",
+        description="Declarative per-role, fleet-wide appliance firewall policy compiled to nftables. DISCOVERY/STAGING only — enforcement is a separate master switch (Settings → firewall_enabled, default OFF). Enabling this module does NOT apply any firewall.",
+    ),
 )
 
 # Map a feature_module id to the ``PlatformSettings`` column whose

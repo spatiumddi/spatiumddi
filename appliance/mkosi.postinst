@@ -53,6 +53,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-lldp-reload.path \
             spatiumddi-tz-reload.path \
             spatium-firewall-reload.path \
+            spatiumddi-firewall-revert.timer \
             spatium-install.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
@@ -247,6 +248,10 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-firewall-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-firewall-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-firewall-reload.service"
+# #285 Phase 2c — firewall test-apply auto-revert timer + runner.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-firewall-revert"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firewall-revert.timer"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firewall-revert.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console.service"

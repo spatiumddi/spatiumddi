@@ -226,6 +226,85 @@ is an open question on #272.
 
 ---
 
+## Fleet firewall — declarative per-role policy (#285)
+
+The per-role `spatium-role.nft` renderer (above) grew into a first-class
+**declarative firewall policy** authored on the control plane and compiled
+server-side into each node's drop-in. It rides the existing heartbeat →
+trigger-file → `spatium-firewall-reload` plane. Full design + risk register:
+[`docs/design/FLEET_FIREWALL.md`](../design/FLEET_FIREWALL.md).
+
+**Dark by default — two independent gates.** Nothing here touches a node until
+*both* are on:
+1. the `appliance.firewall` **feature module** (Settings → Features; the
+   `/appliance/firewall/*` API 404s when off), and
+2. the `platform_settings.firewall_enabled` **enforcement master switch**
+   (default off). While off, the supervisor keeps rendering in-pod (the #5
+   control-plane-loss fallback) and the control-plane render is **byte-identical**
+   to it, so flipping the switch never re-fires a node's trigger.
+
+**Policy model.** Three additive scopes merge per node: a **fleet** singleton
+baseline → **per-role** overlays (`dns-bind9` / `dns-powerdns` / `dhcp` /
+`observer` / `custom` + the merge-internal `control-plane` key, resolved by the
+`is_cp` predicate, not a node label) → a **per-appliance** override. The merge
+is `explode → deny-wins → source-union`; `source_kind` carries derived scopes
+(`cluster_peers` / `pod_cidr` / `service_cidr` / `kubeapi` / `mgmt` / `vip`)
+resolved per-node at render time, so promote/demote re-renders automatically.
+Seeded **builtin** role policies reproduce the Phase-2 hardcoded renderer
+byte-for-byte; operators tune their rules (the floor — ssh/22, ICMP, loopback —
+is un-removable, and no rule may `drop` 22).
+
+**Fleet → Firewall tab.** An **Enforcement** card (turn it on, gated — see
+below) over four sub-tabs: **Policies** (fleet/role/appliance list + rule
+editor), **Aliases** (named CIDR/port sets), **Preview changes** (stage
+fleet-overlay rules → per-node line diff + accept↔drop conflict / redundancy
+warnings, read-only), and **Effective render** (any node's merged drop-in +
+layer breakdown + rendered-vs-applied drift; works while still dark).
+
+**Turning enforcement on (the field-test recipe).** `PUT
+/appliance/firewall/enforcement {enabled:true}` flips the master switch — but
+**refuses** until every reporting appliance node is hardened
+(`base_lanwide_k3s == False`, i.e. off the legacy LAN-wide base
+`/etc/nftables.conf`). A node still on the LAN-wide base would no-op the apply
+(its base `accept` fires first) *and* make the compliance claim false, so the
+gate blocks with a 409 listing the offenders; pass `override_unhardened:true`
+to enable anyway. Disabling is never gated.
+
+**Operator escape hatch.** `firewall_extra` (per-appliance free-text nft,
+appended verbatim, last) is lint-checked on write — a hard 422 only on
+genuinely dangerous patterns (nft-injection chars, unbalanced braces, a `drop`
+on 22); everything else is advisory (`nft -c -f` on the host is the final
+authority), and the lint runs delta-only so pre-existing values are
+grandfathered.
+
+**Compliance + Copilot.** The `no_lanwide_control_plane_ports` conformity check
+(platform-kind, PCI-DSS 1.2.1 / HIPAA segmentation) fails only on a *confirmed*
+LAN-wide node and reports **PASS-stale** for nodes it can't currently reach
+(never connectivity-FAIL, per #5). Five Operator-Copilot MCP tools
+(`find_firewall_policies` / `count_firewall_policies` / `find_firewall_aliases`
+/ `find_firewall_effective` reads + the default-off `propose_toggle_firewall_policy`)
+surface the model to the chat, tagged `module="appliance.firewall"`.
+
+**Web UI source restriction (Phase 6).** A `Web UI access` card on the same tab
+locks the frontend (HTTP/HTTPS) down to specific source ranges without an
+external firewall — `platform_settings.web_ui_allowed_cidrs` (empty = open, the
+shipped default). The value governs **both** Web-UI doors from one control:
+the per-node `:80/:443` accept in the nftables drop-in (every renderer emits an
+un-scoped accept when empty, a family-split `ip saddr { … }` accept when set),
+and the MetalLB control-plane VIP via `loadBalancerSourceRanges` (threaded onto
+the frontend Service through the supervisor's `apply_control_plane_overrides`
+HelmChartConfig overlay). Because the drop-in is now the *sole* source of the
+`80/443` accept (the base `/etc/nftables.conf` no longer opens it), the
+supervisor renders it on **every** appliance heartbeat — including idle / non-CP
+nodes — so the rule is always present. `PUT /appliance/firewall/web-ui-access`
+carries an **anti-lockout guard**: a non-empty set that doesn't cover the
+operator's current source IP is rejected 422 unless `override_lockout=true`
+(the UI surfaces an "Add my IP" button + the override checkbox). SSH on :22
+stays in the un-removable base floor, so a bad scope is always recoverable from
+the console.
+
+---
+
 ## Post-#170 architecture (2026-05-14, superseded by #183)
 
 The architecture below was reshaped end-to-end by [issue #170](https://github.com/spatiumddi/spatiumddi/issues/170). Three threads converged:

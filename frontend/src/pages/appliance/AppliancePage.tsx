@@ -8,17 +8,20 @@ import {
   Network,
   Rocket,
   ScrollText,
+  ShieldAlert,
   ShieldCheck,
   Stamp,
   Wrench,
 } from "lucide-react";
 
 import { applianceApi } from "@/lib/api";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
 import { FleetTab } from "./FleetTab";
 import { CertificatesTab } from "./CertificatesTab";
 import { ClusterUpgradeTab } from "./ClusterUpgradeTab";
 import { ContainersTab } from "./ContainersTab";
+import { FirewallTab } from "./FirewallTab";
 import { LogsTab } from "./LogsTab";
 import { MaintenanceTab } from "./MaintenanceTab";
 import { NetworkTab } from "./NetworkTab";
@@ -42,6 +45,7 @@ import { ReleasesTab } from "./ReleasesTab";
 type Tab =
   | "tls"
   | "fleet"
+  | "firewall"
   | "releases"
   | "containers"
   | "logs"
@@ -55,6 +59,11 @@ interface TabSpec {
   phase: string;
   icon: typeof ShieldCheck;
   summary: string;
+  // #14 — feature-module-gated tab. Hidden (and the underlying router 404s)
+  // when the module is disabled. The /appliance NavItem itself stays
+  // always-visible (docker/k8s control planes need Fleet); module gating
+  // happens at the TAB level here.
+  module?: string;
   // Self-only tabs operate on local host state (TLS cert files, the
   // local docker socket, journalctl, hostname / network config,
   // reboot / shutdown). They only make sense when the control plane
@@ -138,6 +147,19 @@ const TABS: TabSpec[] = [
       "Hostname, DNS resolvers, IPv4/IPv6 mode (DHCP vs static, with the wizard's same form), nftables drop-in editor for /etc/nftables.d/, SSH key upload, proxy config, and a reboot-pending banner.",
   },
   {
+    // #285 Phase 3 — fleet firewall. Gated on the appliance.firewall feature
+    // module (the /appliance/firewall router 404s when off); not selfOnly —
+    // a docker/k8s control plane manages the firewall policy for its
+    // registered appliance agents from here too.
+    key: "firewall",
+    label: "Firewall",
+    phase: "285",
+    icon: ShieldAlert,
+    module: "appliance.firewall",
+    summary:
+      "Declarative per-role / per-appliance nftables policy compiled into each node's drop-in. Edit fleet / role / appliance policies + rules + aliases, and preview any node's effective merged ruleset (dark until the firewall_enabled master switch is on). The seeded builtin role policies reproduce the hardcoded Phase-2 renderer byte-for-byte.",
+  },
+  {
     key: "releases",
     label: "Releases",
     phase: "4c",
@@ -168,15 +190,20 @@ export function AppliancePage() {
   // OS Versions so operators with appliance *agents* (registered
   // against this docker/k8s control plane) can manage them.
   const isApplianceHost = !!info?.appliance_mode;
+  const { enabled: moduleEnabled } = useFeatureModules();
   // Fleet pinned first; every other visible tab sorted alphabetically
-  // by label (case-insensitive). See the comment on TABS above.
-  const visibleTabs = TABS.filter((t) => !t.selfOnly || isApplianceHost).sort(
-    (a, b) => {
-      if (a.key === "fleet") return -1;
-      if (b.key === "fleet") return 1;
-      return a.label.localeCompare(b.label, undefined, { sensitivity: "base" });
-    },
-  );
+  // by label (case-insensitive). See the comment on TABS above. Module-gated
+  // tabs (e.g. Firewall) drop out when their feature module is disabled — the
+  // #14 tab-level gate (the /appliance parent stays always-visible).
+  const visibleTabs = TABS.filter(
+    (t) =>
+      (!t.selfOnly || isApplianceHost) &&
+      (!t.module || moduleEnabled(t.module)),
+  ).sort((a, b) => {
+    if (a.key === "fleet") return -1;
+    if (b.key === "fleet") return 1;
+    return a.label.localeCompare(b.label, undefined, { sensitivity: "base" });
+  });
 
   // Default tab — first self-only tab on appliance hosts (TLS),
   // first universal tab (Releases) otherwise. Keeps the session-stored
@@ -290,6 +317,8 @@ export function AppliancePage() {
             applianceMode={isApplianceHost}
             onNavigateTab={(t) => setTab(t as Tab)}
           />
+        ) : effectiveTab === "firewall" ? (
+          <FirewallTab />
         ) : effectiveTab === "cluster-upgrade" ? (
           <ClusterUpgradeTab />
         ) : effectiveTab === "containers" ? (

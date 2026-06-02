@@ -57,6 +57,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func as sa_func
 from sqlalchemy import or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import is_effective_superadmin, require_permission
@@ -77,6 +78,7 @@ from app.models.appliance import (
     PairingCode,
 )
 from app.models.audit import AuditLog
+from app.models.firewall import FirewallApplyState
 from app.models.settings import PlatformSettings
 from app.services.appliance.ca import (
     ensure_ca,
@@ -84,6 +86,7 @@ from app.services.appliance.ca import (
     sign_supervisor_cert,
     verify_session_token,
 )
+from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
@@ -1028,6 +1031,35 @@ class SupervisorHeartbeatRequest(BaseModel):
     # builds the join URL from the seed's ``node_ip``. None on
     # non-appliance / non-k3s; the handler leaves the column untouched.
     node_ip: str | None = None
+    # Issue #285 Phase 1 — fleet-firewall prerequisites. The (future)
+    # server-side firewall compiler needs these to scope the k3s rules
+    # before the LAN-wide base accept is removed. All None / absent on a
+    # legacy supervisor → the handler leaves the columns alone. Purely
+    # additive telemetry; nothing here changes a live firewall yet.
+    #   node_ips           — every InternalIP (both families) for
+    #                        family-split /32 + /128 peer scoping.
+    #   pod_cidr/service_cidr — operator-chosen k3s CIDRs (#302).
+    #   dataplane_backend  — vxlan / wireguard-native / … (data-plane port).
+    #   base_conf_marker   — sha256 of the live /etc/nftables.conf.
+    #   base_lanwide_k3s   — legacy LAN-wide k3s-ha accept still present?
+    node_ips: list[str] | None = None
+    pod_cidr: str | None = None
+    service_cidr: str | None = None
+    dataplane_backend: str | None = None
+    base_conf_marker: str | None = None
+    base_lanwide_k3s: bool | None = None
+    # Issue #285 Phase 2b — the host runner's firewall apply outcome,
+    # echoed back so the control plane can see drift + drive the apply
+    # alarm. The runner already WRITES these sidecars; nothing read them
+    # back before. None on a legacy runner / non-appliance → the upsert
+    # leaves the column untouched. ``firewall_base_marker`` is the sha256
+    # of the live base /etc/nftables.conf (distinct from the Phase-1
+    # ``base_conf_marker`` telemetry above, which the supervisor reads
+    # directly off the mounted file — this one is what the RUNNER applied
+    # against).
+    firewall_applied_hash: str | None = None
+    firewall_applied_status: str | None = None
+    firewall_base_marker: str | None = None
     # #272 Phase 9 — dead-node replacement. The SEED supervisor reports
     # the hostnames of k8s Nodes it successfully evicted (deleting the
     # Node makes k3s drop the etcd member). The handler clears
@@ -1145,6 +1177,19 @@ class SupervisorHeartbeatResponse(BaseModel):
     # nftables drop-in opening those ports from these peers. Empty on a
     # single-node / non-control-plane appliance.
     cluster_peer_cidrs: list[str] = Field(default_factory=list)
+    # #285 Phase 1 — derived firewall inputs the in-pod renderer uses to
+    # scope the k3s rules. ``firewall_pod_cidrs`` / ``firewall_service_cidrs``
+    # widen the 6443 accept (in-cluster apiserver access traverses INPUT
+    # via the service-IP DNAT with saddr=pod-IP); sent only for nodes that
+    # run the apiserver. (No data-plane / flannel-VXLAN fields: that
+    # inter-node traffic doesn't traverse the host INPUT chain on
+    # k3s+flannel — field-verified — so no INPUT rule is needed for it.)
+    firewall_pod_cidrs: list[str] = Field(default_factory=list)
+    firewall_service_cidrs: list[str] = Field(default_factory=list)
+    # #285 Phase 6 — operator Web-UI source restriction. Empty = open. The
+    # supervisor's in-pod render_drop_in scopes 80/443 to these CIDRs (the
+    # base /etc/nftables.conf no longer opens 80/443 LAN-wide).
+    web_ui_allowed_cidrs: list[str] = Field(default_factory=list)
     # #277 — the committed control-plane size (count of settled
     # primary + member nodes, floored at 1). The seed's supervisor
     # patches the spatium-control HelmChart's ``# spatium:cp-size`` lines
@@ -1183,6 +1228,11 @@ class SupervisorHeartbeatResponse(BaseModel):
     snmp_settings: dict[str, Any] = Field(default_factory=dict)
     ntp_settings: dict[str, Any] = Field(default_factory=dict)
     lldp_settings: dict[str, Any] = Field(default_factory=dict)
+    # #285 Phase 2a — server-side firewall render. ``{enabled, config_hash,
+    # firewall_conf}``; empty config_hash when firewall_enabled is off (the
+    # supervisor then keeps its in-pod fallback render). The supervisor
+    # pipes a non-empty block to the firewall-pending trigger verbatim.
+    firewall_settings: dict[str, Any] = Field(default_factory=dict)
 
 
 def _s(v: object, limit: int = 255) -> str | None:
@@ -1481,6 +1531,45 @@ async def supervisor_heartbeat(
     if body.node_ip is not None:
         row.node_ip = body.node_ip
 
+    # Issue #285 Phase 1 — fleet-firewall prerequisites. "Only update when
+    # not None" so a legacy / pre-#285 supervisor never blanks them.
+    if body.node_ips is not None:
+        row.node_ips = list(body.node_ips)
+    if body.pod_cidr is not None:
+        row.pod_cidr = body.pod_cidr
+    if body.service_cidr is not None:
+        row.service_cidr = body.service_cidr
+    if body.dataplane_backend is not None:
+        row.dataplane_backend = body.dataplane_backend
+    if body.base_conf_marker is not None:
+        row.base_conf_marker = body.base_conf_marker
+    if body.base_lanwide_k3s is not None:
+        row.base_lanwide_k3s = body.base_lanwide_k3s
+
+    # Issue #285 Phase 2b — mirror the host runner's firewall apply outcome
+    # into firewall_apply_state. Upsert (on_conflict_do_update) rather than
+    # get-or-create so overlapping/retried heartbeats from one appliance
+    # can't 500, and a field absent this tick is never clobbered. Only
+    # touch the row when the runner actually reported something.
+    if (
+        body.firewall_applied_hash is not None
+        or body.firewall_applied_status is not None
+        or body.firewall_base_marker is not None
+    ):
+        fw_sets: dict[str, Any] = {}
+        if body.firewall_applied_hash is not None:
+            fw_sets["applied_hash"] = body.firewall_applied_hash
+            fw_sets["last_applied_at"] = datetime.now(UTC)
+        if body.firewall_applied_status is not None:
+            fw_sets["applied_status"] = body.firewall_applied_status
+        if body.firewall_base_marker is not None:
+            fw_sets["base_conf_marker"] = body.firewall_base_marker
+        await db.execute(
+            pg_insert(FirewallApplyState)
+            .values(appliance_id=row.id, **fw_sets)
+            .on_conflict_do_update(index_elements=["appliance_id"], set_=fw_sets)
+        )
+
     # #272 Phase 9 — the seed reports k8s Nodes it evicted (dead-node
     # replacement). Clear the flag + settle those rows to ``left`` so
     # they stop appearing in the seed's evict list on the next tick.
@@ -1600,6 +1689,15 @@ async def supervisor_heartbeat(
     # open its k3s server ports to (empty unless row is a CP node).
     cluster_peer_cidrs = await _cluster_peer_cidrs(db, row)
 
+    # #285 Phase 1 — derived firewall inputs for the in-pod renderer.
+    # A node "runs the apiserver" (so 6443 must accept from the pod /
+    # service CIDR) when it's a control-plane variant OR a settled /
+    # in-flight / leaving CP member. pod/service CIDR are sent only for
+    # those nodes so a plain worker doesn't pointlessly open 6443.
+    runs_apiserver = _runs_apiserver(row)
+    firewall_pod_cidrs = _split_cidr_csv(row.pod_cidr) if runs_apiserver else []
+    firewall_service_cidrs = _split_cidr_csv(row.service_cidr) if runs_apiserver else []
+
     # #277 — committed control-plane size (settled primary + members,
     # floored at 1). The seed supervisor scales CNPG instances +
     # workload replicas to this.
@@ -1637,6 +1735,46 @@ async def supervisor_heartbeat(
         if cfg_row is not None
         else {"enabled": False, "config_hash": "", "lldpd_conf": "", "daemon_args": ""}
     )
+    # #285 Phase 2a — server-side firewall render. Same inputs the in-pod
+    # renderer consumes (byte-identical body). Gated on the firewall_enabled
+    # master switch (default off → disabled-shape block → supervisor keeps
+    # its in-pod fallback). role_assignment is the SupervisorRoleAssignment
+    # built above; pass its dict form so compile_firewall_body reads roles /
+    # firewall_extra / kubeapi_expose_cidrs the same way the supervisor does.
+    firewall_block = await firewall_bundle(
+        db,
+        role_assignment=role_assignment.model_dump(),
+        cluster_peer_cidrs=cluster_peer_cidrs,
+        pod_cidrs=firewall_pod_cidrs,
+        service_cidrs=firewall_service_cidrs,
+        cp_member_count=control_plane_size,
+        vip_configured=bool(metallb_vip),
+        firewall_enabled=bool(cfg_row.firewall_enabled) if cfg_row else False,
+        appliance_id=row.id,
+        web_ui_allowed_cidrs=(list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []),
+    )
+    # Persist the rendered hash so 2d's apply-stalled alarm + the Fleet drift
+    # chip can compare it against the runner's reported applied_hash. Only
+    # when authoritative render is on; a dedicated upsert+commit (the main
+    # handler commit already ran) — skipped entirely in the default-off path.
+    if firewall_block["enabled"]:
+        rendered_at = datetime.now(UTC)
+        await db.execute(
+            pg_insert(FirewallApplyState)
+            .values(
+                appliance_id=row.id,
+                rendered_hash=firewall_block["config_hash"],
+                last_rendered_at=rendered_at,
+            )
+            .on_conflict_do_update(
+                index_elements=["appliance_id"],
+                set_={
+                    "rendered_hash": firewall_block["config_hash"],
+                    "last_rendered_at": rendered_at,
+                },
+            )
+        )
+        await db.commit()
 
     # #272 Phase 9 — dead k8s Nodes the seed should evict. Returned to
     # every CP supervisor but only the control-plane-variant seed acts.
@@ -1668,6 +1806,9 @@ async def supervisor_heartbeat(
         desired_k3s_server_url=row.desired_k3s_server_url,
         desired_k3s_join_token=desired_join_token,
         cluster_peer_cidrs=cluster_peer_cidrs,
+        firewall_pod_cidrs=firewall_pod_cidrs,
+        firewall_service_cidrs=firewall_service_cidrs,
+        web_ui_allowed_cidrs=(list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []),
         control_plane_size=control_plane_size,
         desired_metallb_enabled=metallb_enabled,
         desired_metallb_pool_addresses=metallb_pool,
@@ -1677,7 +1818,50 @@ async def supervisor_heartbeat(
         snmp_settings=snmp_block,
         ntp_settings=ntp_block,
         lldp_settings=lldp_block,
+        firewall_settings=firewall_block,
     )
+
+
+def _runs_apiserver(row: Appliance) -> bool:
+    """#285 — a node "runs the apiserver" (so 6443 + the pod/service CIDR are
+    in firewall scope) when it's a control-plane variant OR a settled /
+    in-flight / leaving CP member. Shared by the heartbeat render and the
+    firewall effective/preview endpoints so both gate pod/service identically.
+    """
+    return (
+        row.appliance_variant in ("control-plane", "full-stack", "frontend-core")
+        or row.cluster_role in (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+        or row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+        or (
+            row.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
+            and row.cluster_join_state != CLUSTER_JOIN_STATE_LEFT
+        )
+    )
+
+
+async def firewall_render_inputs(db: DB, row: Appliance) -> dict[str, Any]:
+    """The per-node inputs the #285 fleet-firewall merge consumes — reproduced
+    from the heartbeat's own derivation (same ``_build_role_assignment`` /
+    ``_cluster_peer_cidrs`` / ``_committed_cp_count`` / ``_runs_apiserver``
+    helpers) so the effective/preview endpoints render a body BYTE-IDENTICAL
+    to what the heartbeat ships. The heartbeat handler keeps its inline copies
+    (they also feed response telemetry); this is the read-path twin.
+    """
+    role_assignment = await _build_role_assignment(db, row)
+    runs_apiserver = _runs_apiserver(row)
+    cfg_row = (
+        await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    return {
+        "role_assignment": role_assignment.model_dump(),
+        "cluster_peer_cidrs": await _cluster_peer_cidrs(db, row),
+        "pod_cidrs": _split_cidr_csv(row.pod_cidr) if runs_apiserver else [],
+        "service_cidrs": _split_cidr_csv(row.service_cidr) if runs_apiserver else [],
+        "cp_member_count": await _committed_cp_count(db),
+        "vip_configured": bool((cfg_row.control_plane_vip or "") if cfg_row else ""),
+        "firewall_enabled": bool(cfg_row.firewall_enabled) if cfg_row else False,
+        "web_ui_allowed_cidrs": (list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []),
+    }
 
 
 async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssignment:
@@ -2711,6 +2895,21 @@ async def update_appliance_roles(
                 )
         row.tags = dict(body.tags)
     if body.firewall_extra is not None:
+        # #285 Phase 3d — lint ONLY the delta (this PATCH carries a new
+        # firewall_extra), so a pre-3d value that predates the grammar is
+        # never retro-rejected. Hard-422 only on genuinely dangerous patterns
+        # (nft-injection chars / unbalanced braces / drop-22); grammar nits
+        # are advisory warnings surfaced in the preview, and `nft -c -f` on
+        # the host is the final syntax authority.
+        from app.services.appliance.firewall_lint import errors, lint_firewall_extra
+
+        fw_errors = errors(lint_firewall_extra(body.firewall_extra))
+        if fw_errors:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "firewall_extra rejected: "
+                + "; ".join(f"line {f.line}: {f.message}" for f in fw_errors),
+            )
         # Empty string is meaningful — operator clearing the extra
         # block. The supervisor renders an empty fragment then; the
         # role-driven mgmt + per-role rules still ship.
@@ -2817,25 +3016,102 @@ async def _committed_cp_count(db: DB) -> int:
     return max(1, int(n))
 
 
+def _split_cidr_csv(value: str | None) -> list[str]:
+    """Split a (possibly comma-joined dual-stack) CIDR field into entries.
+
+    k3s ``cluster-cidr`` / ``service-cidr`` are a single value on a
+    v4-only cluster and a comma-joined pair on a dual-stack cluster
+    (``10.42.0.0/16,2001:cafe:42::/56``). The renderer family-splits the
+    result, so order doesn't matter here.
+    """
+    return [c.strip() for c in (value or "").split(",") if c.strip()]
+
+
+def _node_cidrs(ap: Appliance) -> list[str]:
+    """Every InternalIP of an appliance as a host CIDR — ``/32`` for v4,
+    ``/128`` for v6 (#285 Phase 1).
+
+    Prefers the all-family ``node_ips`` list; falls back to the single
+    ``node_ip`` (as ``/32``) for a pre-#285 supervisor that hasn't
+    reported ``node_ips`` yet. The family split is what lets a v6 peer
+    be scoped by its real ``/128`` rather than a fabricated ``/32``.
+    """
+    ips = list(ap.node_ips or [])
+    if not ips and ap.node_ip:
+        ips = [ap.node_ip]
+    out: list[str] = []
+    for ip in ips:
+        try:
+            addr = ipaddress.ip_address(str(ip).strip())
+        except ValueError:
+            continue
+        out.append(f"{addr}/{128 if addr.version == 6 else 32}")
+    return out
+
+
+async def _firewall_peer_members(db: DB) -> list[Appliance]:
+    """CP members for firewall peer-scoping — like ``_effective_cp_members``
+    but ASYMMETRIC ON LEAVE (#285 Phase 1).
+
+    An in-flight leaver (``desired_cluster_role='none'``) is KEPT in the
+    set until its ``cluster_join_state`` reaches ``left``, so the
+    destructive etcd member-remove can still reach its peers (and they
+    it) during the leave window. Only the next render after ``left``
+    drops it. Mirrors the cert-SAN only-grow safety exactly — the
+    dangerous direction (removing a peer) is delayed until the operation
+    that needs the rule has completed.
+    """
+    rows = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    or_(
+                        Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                        Appliance.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER,
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Keep settled members + in-flight joiners + in-flight leavers; drop
+    # only a leaver that has fully reported ``left`` (its etcd surgery is
+    # done, so it no longer needs — nor should be granted — peer access).
+    return [r for r in rows if r.cluster_join_state != CLUSTER_JOIN_STATE_LEFT]
+
+
 async def _cluster_peer_cidrs(db: DB, row: Appliance) -> list[str]:
-    """``/32`` CIDRs of every OTHER control-plane peer ``row`` must open
-    its k3s server ports to (#272 Phase 7b).
+    """Host CIDRs (``/32`` v4 + ``/128`` v6) of every OTHER control-plane
+    peer ``row`` must open its k3s server ports to (#272 Phase 7b, #285).
 
     Only meaningful when ``row`` is itself a control-plane node — a
-    settled member/primary, or a node mid-promotion
-    (``desired_cluster_role='member'``). In-flight joiners need the peer
-    set too: the seed must open :6443 to the joiner BEFORE it connects,
-    and the joiner must open etcd ports back. Returns an empty list for
-    plain application appliances + single-node installs (no peers).
+    settled member/primary, a node mid-promotion
+    (``desired_cluster_role='member'``), or a node mid-LEAVE that hasn't
+    fully left yet (so the etcd member-remove can complete). In-flight
+    joiners need the peer set too: the seed must open :6443 to the joiner
+    BEFORE it connects, and the joiner must open etcd ports back. Returns
+    an empty list for plain application appliances + single-node installs
+    (no peers).
     """
     is_cp = (
         row.cluster_role in (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
         or row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+        or (
+            row.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
+            and row.cluster_join_state != CLUSTER_JOIN_STATE_LEFT
+        )
     )
     if not is_cp:
         return []
-    members = await _effective_cp_members(db)
-    return sorted(f"{m.node_ip}/32" for m in members if m.id != row.id and m.node_ip)
+    members = await _firewall_peer_members(db)
+    out: list[str] = []
+    for m in members:
+        if m.id == row.id:
+            continue
+        out.extend(_node_cidrs(m))
+    return sorted(set(out))
 
 
 async def _resolve_primary(db: DB, members: list[Appliance]) -> Appliance | None:

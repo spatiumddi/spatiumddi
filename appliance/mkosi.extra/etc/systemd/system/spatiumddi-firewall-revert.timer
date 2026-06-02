@@ -1,0 +1,16 @@
+[Unit]
+Description=Auto-revert un-confirmed SpatiumDDI firewall test-apply (issue #285 Phase 2c)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/285
+# Don't run in the live installer environment.
+ConditionKernelCommandLine=!boot=live
+
+[Timer]
+# Start shortly after boot (so a test-apply armed before a reboot is
+# enforced on the way back up) then poll every 15s. Persistent so a
+# missed window while powered off fires on the next boot.
+OnBootSec=30s
+OnUnitActiveSec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

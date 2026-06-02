@@ -1,0 +1,13 @@
+[Unit]
+Description=Check firewall test-apply deadline + auto-revert (issue #285 Phase 2c)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/285
+# The revert restores the drop-in into the /etc overlay (Phase 8a) and
+# reads its deadline/confirm/.last-good sidecars under /var/lib/spatiumddi
+# (available at local-fs.target).
+After=etc.mount local-fs.target
+Requires=etc.mount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-firewall-revert
+# Driven by spatiumddi-firewall-revert.timer — no [Install].

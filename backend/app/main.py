@@ -293,6 +293,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_cluster_upgrade_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("cluster_upgrade_failed_alert_rule_seed_skipped", reason=str(exc))
+    # Firewall-apply-stalled alert rule — singleton, DISABLED by default
+    # (issue #285 Phase 2d). Fires when a node's control-plane-rendered
+    # firewall ruleset goes un-applied past a grace window. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_firewall_apply_stalled_alert_rule,
+        )
+
+        await seed_firewall_apply_stalled_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("firewall_apply_stalled_alert_rule_seed_skipped", reason=str(exc))
     # Appliance Web UI cert bootstrap (issue #134, Phase 4b.5). On
     # appliance installs without an active row in appliance_certificate,
     # generate a self-signed default + deploy it to /etc/nginx/certs

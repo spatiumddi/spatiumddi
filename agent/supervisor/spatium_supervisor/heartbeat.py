@@ -42,7 +42,7 @@ from typing import Any
 import httpx
 import structlog
 
-from . import appliance_state, approval_state, watchdog
+from . import appliance_state, approval_state, firewall_peer_audit, watchdog
 from .cert_auth import build_auth_headers, load_cert, save_cert
 from .config import SupervisorConfig
 from .firewall_renderer import FirewallProfile, render_drop_in
@@ -79,7 +79,9 @@ _ROLE_ENV_FILENAME = "role-compose.env"
 # used by snmp / chrony / slot-upgrade triggers). Writing to this
 # path = "host runner please re-render".
 _NFT_TRIGGER_PATH = Path("/var/lib/spatiumddi-host/release-state/firewall-pending")
-_NFT_APPLIED_HASH_PATH = Path("/var/lib/spatiumddi-host/release-state/firewall-applied-hash")
+_NFT_APPLIED_HASH_PATH = Path(
+    "/var/lib/spatiumddi-host/release-state/firewall-applied-hash"
+)
 
 # #272 — in-cluster control-plane API Service. Every control-plane
 # node runs the api Deployment behind this headless-routable
@@ -289,6 +291,10 @@ _WATCHDOG_INTERVAL_S = 300.0  # 5 minutes
 _last_watchdog_at: float = 0.0
 _cached_role_health: dict[str, Any] = {}
 
+# #285 Phase 5 — throttle for the warn-only etcd/peer-drift cross-check.
+_PEER_DRIFT_INTERVAL_S = 300.0  # 5 minutes
+_last_peer_drift_at: float = 0.0
+
 # #272 Phase 9 — k8s Node names this seed has successfully evicted but
 # the backend hasn't yet confirmed cleared. Reported on each heartbeat
 # request; pruned once the backend drops the name from its evict list.
@@ -318,6 +324,12 @@ def _maybe_apply_firewall(
     role_assignment: dict[str, Any] | None,
     log: structlog.stdlib.BoundLogger,
     cluster_peer_cidrs: list[Any] | None = None,
+    *,
+    pod_cidrs: list[Any] | None = None,
+    service_cidrs: list[Any] | None = None,
+    cp_member_count: int = 1,
+    vip_configured: bool = False,
+    web_ui_allowed_cidrs: list[Any] | None = None,
 ) -> None:
     """Render the firewall drop-in + write a trigger file the host
     runner picks up.
@@ -347,7 +359,34 @@ def _maybe_apply_firewall(
     if appliance_state.detect_deployment_kind() != "appliance":
         return
 
-    profile: FirewallProfile = render_drop_in(role_assignment, cluster_peer_cidrs)
+    # #285 Phase 5 — warn-only etcd/peer-drift cross-check. Throttled +
+    # best-effort + run BEFORE the unchanged-body short-circuit, so a
+    # membership change the peer set hasn't caught up to is surfaced even when
+    # the local render is stable. Seed-only in practice — a non-seed node's
+    # kubeapi read fails and the helper returns None (no-op).
+    global _last_peer_drift_at
+    if (
+        cluster_peer_cidrs
+        and time.monotonic() - _last_peer_drift_at >= _PEER_DRIFT_INTERVAL_S
+    ):
+        _last_peer_drift_at = time.monotonic()
+        try:
+            firewall_peer_audit.warn_on_peer_drift(
+                [str(c) for c in cluster_peer_cidrs],
+                appliance_state.read_node_ips() or [],
+            )
+        except Exception as exc:  # noqa: BLE001 — warn-only, never break apply
+            log.debug("supervisor.firewall.peer_drift_check_failed", error=str(exc))
+
+    profile: FirewallProfile = render_drop_in(
+        role_assignment,
+        cluster_peer_cidrs,
+        pod_cidrs=pod_cidrs,
+        service_cidrs=service_cidrs,
+        cp_member_count=cp_member_count,
+        vip_configured=vip_configured,
+        web_ui_allowed_cidrs=web_ui_allowed_cidrs,
+    )
     body = profile.body
     body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -671,8 +710,12 @@ def heartbeat_once(
         ml_enabled = bool(body_out.get("desired_metallb_enabled"))
         ml_pool = body_out.get("desired_metallb_pool_addresses") or []
         ml_vip = body_out.get("desired_control_plane_vip") or ""
+        # #285 Phase 6 — source-scope the VIP path too (loadBalancerSourceRanges).
+        web_ui_cidrs = body_out.get("web_ui_allowed_cidrs") or []
 
-        cp_changed, cp_err = k8s_api.apply_control_plane_overrides(cp_size, str(ml_vip))
+        cp_changed, cp_err = k8s_api.apply_control_plane_overrides(
+            cp_size, str(ml_vip), web_ui_allowed_cidrs=list(web_ui_cidrs)
+        )
         if cp_changed:
             log.info(
                 "supervisor.heartbeat.control_plane_overrides_applied",
@@ -730,7 +773,9 @@ def heartbeat_once(
                 _evicted_pending.add(str(name))
                 log.info("supervisor.heartbeat.node_evicted", node=name)
             else:
-                log.warning("supervisor.heartbeat.node_evict_failed", node=name, error=evict_err)
+                log.warning(
+                    "supervisor.heartbeat.node_evict_failed", node=name, error=evict_err
+                )
         _evicted_pending.intersection_update({str(n) for n in evict_names})
 
     # #170 Wave C2 — render the role-driven compose env. C3 will
@@ -758,8 +803,55 @@ def heartbeat_once(
     # ESSENTIAL — apply them whenever the control plane hands us a peer
     # set, regardless of that gate.
     cluster_peer_cidrs = body_out.get("cluster_peer_cidrs") or []
-    if cfg.in_pod_firewall_enabled or cluster_peer_cidrs:
-        _maybe_apply_firewall(role_assignment, log, cluster_peer_cidrs)
+    # #285 Phase 1 — derived firewall inputs the control plane now ships:
+    # pod/service CIDR widen the 6443 accept (in-cluster apiserver access).
+    # cp_member_count + the VIP gate whether MetalLB memberlist (7946) is
+    # opened, and cp_member_count >= 2 drives the bootstrap-sentinel retire
+    # directive the renderer emits.
+    fw_pod_cidrs = body_out.get("firewall_pod_cidrs") or []
+    fw_service_cidrs = body_out.get("firewall_service_cidrs") or []
+    fw_cp_member_count = int(body_out.get("control_plane_size") or 1)
+    fw_vip_configured = bool(body_out.get("desired_control_plane_vip") or "")
+    # #285 Phase 6 — operator Web-UI source restriction (empty = open).
+    fw_web_ui_cidrs = body_out.get("web_ui_allowed_cidrs") or []
+    # #285 Phase 2a — bundle-first / renderer-fallback dispatch. When the
+    # control plane has firewall authority (firewall_enabled on → a non-empty
+    # ``firewall_settings.config_hash``), pipe its server-rendered body to the
+    # host runner. Otherwise (master switch off, or an OLD control plane that
+    # doesn't ship the block) fall back to the in-pod renderer. Both render
+    # the BYTE-IDENTICAL body, so applied state is the same whichever ran —
+    # this is what makes the rolling upgrade (supervisor/control-plane skew in
+    # either direction) safe.
+    fw_settings = body_out.get("firewall_settings")
+    if isinstance(fw_settings, dict) and fw_settings.get("config_hash"):
+        if appliance_state.maybe_fire_firewall_reload(fw_settings):
+            log.info(
+                "supervisor.heartbeat.firewall_trigger_fired", source="control-plane"
+            )
+    else:
+        # #5 fallback — control plane too old to render, or firewall_enabled
+        # still off; render in-pod from the same derived inputs.
+        #
+        # #285 Phase 6 — this branch now fires UNCONDITIONALLY (it used to gate
+        # on ``cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs``).
+        # The base /etc/nftables.conf no longer opens the Web UI (80/443); the
+        # rendered drop-in is now the SOLE source of that accept, so it must be
+        # present on EVERY appliance node — including idle / non-CP nodes that
+        # carry no roles, no peers and no pods. ``_maybe_apply_firewall`` already
+        # self-gates on ``detect_deployment_kind() == "appliance"`` and the host
+        # runner short-circuits on an unchanged body hash, so an unconditional
+        # call is cheap + idempotent. SSH/22 stays in the un-removable base floor,
+        # so even a total drop-in failure leaves the node SSH-recoverable.
+        _maybe_apply_firewall(
+            role_assignment,
+            log,
+            cluster_peer_cidrs,
+            pod_cidrs=fw_pod_cidrs,
+            service_cidrs=fw_service_cidrs,
+            cp_member_count=fw_cp_member_count,
+            vip_configured=fw_vip_configured,
+            web_ui_allowed_cidrs=fw_web_ui_cidrs,
+        )
 
     target = compute_target_env(role_assignment)
     # #170 Wave D follow-up — the role env file carries ONLY role-

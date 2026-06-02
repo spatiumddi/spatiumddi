@@ -1,0 +1,116 @@
+#!/bin/bash
+# spatiumddi-firewall-revert — auto-revert an un-confirmed firewall
+# test-apply (issue #285 Phase 2c).
+#
+# A test-apply (spatium-firewall-reload sees ``__test__`` on line 2 of the
+# trigger) snapshots the current drop-in + sentinel state to .last-good and
+# arms ``firewall-revert-deadline``. This script — driven by the
+# always-running spatiumddi-firewall-revert.timer (~every 15s) — restores
+# .last-good once the deadline passes UNLESS the supervisor has written
+# ``firewall-confirm`` (the control plane's cross-node verdict that the node
+# + its peers are still healthy).
+#
+# Dependency-free bash on purpose: this is the safety net, so it must run
+# even if Python / the supervisor stack is broken.
+#
+# Why revert-on-deadline (and NOT "extend during a control-plane outage"):
+# the node cannot locally distinguish "the control plane is down but I'm
+# perfectly healthy" from "my firewall change broke my own connectivity" —
+# the supervisor loop ticks in both cases, so loop-liveness is not a usable
+# signal. Reverting to .last-good is the strictly-safe direction: .last-good
+# is the pre-test state, which was reachable/confirmed, so a revert can never
+# strand the node. The cost of reverting a genuinely-good change during a
+# rare control-plane-outage overlap is one re-apply — cheap, vs. the risk of
+# guessing wrong and stranding a remote box.
+#
+# Persistence: deadline / confirm / .last-good all live under
+# /var/lib/spatiumddi/release-state (on /var) so a mid-window reboot still
+# reverts on the next post-boot tick; the restore writes the drop-in into
+# the /etc overlay (gated by Requires=etc.mount on the .service).
+
+set -eu
+
+STATE=/var/lib/spatiumddi/release-state
+REVERT_DEADLINE=$STATE/firewall-revert-deadline
+CONFIRM_FILE=$STATE/firewall-confirm
+LAST_GOOD=$STATE/firewall-role.nft.last-good
+LAST_GOOD_SENTINEL=$STATE/firewall-sentinel.last-good
+LOCK=$STATE/firewall.lock
+APPLIED_HASH=$STATE/firewall-applied-hash
+APPLIED_STATUS=$STATE/firewall-applied-status
+DROP_IN=/etc/nftables.d/spatium-role.nft
+SENTINEL=/etc/nftables.d/00-spatium-k3s-bootstrap.nft
+SENTINEL_RETIRED="$SENTINEL.retired"
+NFT_MAIN=/etc/nftables.conf
+
+log() { printf '[spatiumddi-firewall-revert] %s\n' "$*"; }
+
+# Fast path: nothing armed → nothing to do (the common case every 15s).
+[ -r "$REVERT_DEADLINE" ] || exit 0
+
+# Serialise against the supervisor's confirm write (shared lockfile) so a
+# confirm and a revert can't interleave. Skip this tick if we can't take it.
+exec 9>"$LOCK" || exit 0
+flock -n 9 || exit 0
+
+# Re-read under the lock — a confirm/revert may have cleared it meanwhile.
+[ -r "$REVERT_DEADLINE" ] || exit 0
+
+# Confirmed good → clear the window, keep the tested ruleset.
+if [ -e "$CONFIRM_FILE" ]; then
+    rm -f "$REVERT_DEADLINE" "$CONFIRM_FILE"
+    log "test-apply confirmed — keeping the tested ruleset"
+    exit 0
+fi
+
+now=$(date +%s)
+deadline=$(cat "$REVERT_DEADLINE" 2>/dev/null || echo 0)
+case "$deadline" in
+    '' | *[!0-9]*) deadline=0 ;;
+esac
+if [ "$now" -lt "$deadline" ]; then
+    exit 0  # still inside the window — wait for confirm or the deadline
+fi
+
+# Deadline passed, no confirm → revert.
+if [ ! -r "$LAST_GOOD" ]; then
+    # No snapshot to restore — clear the stale window rather than leave a
+    # partial state (shouldn't happen: a test-apply always snapshots first).
+    rm -f "$REVERT_DEADLINE"
+    log "deadline passed but no .last-good snapshot — cleared window, no revert"
+    exit 0
+fi
+
+# Claim the window first so a racing re-arm can't double-fire.
+rm -f "$REVERT_DEADLINE"
+log "test-apply NOT confirmed before deadline — reverting to last-good"
+
+cp -f "$LAST_GOOD" "$DROP_IN"
+# Restore the sentinel state captured at test time (re-opens 6443 if the
+# test had retired it). On a CP node, .last-good contains the scoped
+# etcd/6443 peer rules by construction, so a revert never yields a node
+# with no path to etcd/apiserver.
+sentinel_state=$(cat "$LAST_GOOD_SENTINEL" 2>/dev/null || echo "")
+case "$sentinel_state" in
+    present)
+        if [ ! -f "$SENTINEL" ] && [ -f "$SENTINEL_RETIRED" ]; then
+            mv "$SENTINEL_RETIRED" "$SENTINEL"
+        fi
+        ;;
+    retired)
+        if [ -f "$SENTINEL" ]; then
+            mv "$SENTINEL" "$SENTINEL_RETIRED"
+        fi
+        ;;
+esac
+
+if nft -c -f "$NFT_MAIN" 2>/tmp/nft-revert.err && nft -f "$NFT_MAIN" 2>>/tmp/nft-revert.err; then
+    sha256sum "$DROP_IN" | cut -d' ' -f1 > "$APPLIED_HASH" 2>/dev/null || true
+    printf 'reverted\n' > "$APPLIED_STATUS"
+    log "reverted to last-good ruleset"
+else
+    printf 'error:revert\n' > "$APPLIED_STATUS"
+    log "REVERT FAILED on nft apply — manual intervention needed:"
+    sed 's/^/[spatiumddi-firewall-revert]  /' /tmp/nft-revert.err 2>/dev/null || true
+fi
+rm -f "$LAST_GOOD_SENTINEL"

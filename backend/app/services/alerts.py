@@ -106,6 +106,17 @@ RULE_TYPE_STALE_IP_COUNT = "stale_ip_count"
 # subnet shows low allocated-row utilisation. Issue #339.
 RULE_TYPE_DHCP_POOL_EXHAUSTION = "dhcp_pool_exhaustion"
 
+# Issue #285 Phase 2d — fleet firewall drift. Subject = appliance. Fires
+# when the control-plane-rendered firewall hash (FirewallApplyState.
+# rendered_hash) hasn't been applied by the host runner (applied_hash)
+# past a grace window, AND the node's last apply was a clean ``ok`` — so
+# it's a genuine stall, NOT an apply error (its own ``error:*`` chip) or a
+# deliberate auto-revert (``reverted`` — alarming on those would never
+# resolve since applied_hash != rendered_hash permanently). Distinct from
+# agent-offline: the message cross-references the supervisor's last_seen_at
+# to say whether the supervisor itself is stale or just the host runner.
+RULE_TYPE_FIREWALL_APPLY_STALLED = "firewall.apply_stalled"
+
 RULE_TYPES = frozenset(
     {
         RULE_TYPE_SUBNET_UTILIZATION,
@@ -128,8 +139,18 @@ RULE_TYPES = frozenset(
         RULE_TYPE_K3S_API_CERT_EXPIRING,
         RULE_TYPE_STALE_IP_COUNT,
         RULE_TYPE_DHCP_POOL_EXHAUSTION,
+        RULE_TYPE_FIREWALL_APPLY_STALLED,
     }
 )
+
+# Issue #285 Phase 2d — how long a control-plane-rendered firewall hash may
+# go un-applied (ok-status) before it's "stalled". Comfortably larger than
+# the worst-case render→heartbeat→apply→report round-trip (1-2 heartbeats),
+# so the normal one-tick lag never alarms. Anchored on a ``stalled_since``
+# watermark the matcher stamps on first observation (NOT last_rendered_at,
+# which the server bumps every heartbeat).
+_FIREWALL_STALE_GRACE = timedelta(minutes=3)
+_FIREWALL_APPLY_STALLED_RULE_NAME = "Firewall apply stalled"
 
 # Default stale-IP alert params when the rule doesn't pin them.
 _STALE_IP_DEFAULT_COUNT_THRESHOLD = 10
@@ -916,6 +937,78 @@ async def _matching_k3s_api_cert_expiring_subjects(
     return matches
 
 
+async def _matching_firewall_apply_stalled_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for appliances
+    whose control-plane-rendered firewall ruleset hasn't been applied by the
+    host runner past the grace window (#285 Phase 2d).
+
+    Gates hard on ``applied_status`` so it never false-fires:
+
+    * ``error:*`` → the node's own *applied-error* state (distinct chip), not
+      a stall.
+    * ``reverted`` → a deliberate auto-revert (2c); alarming would never
+      resolve since ``applied_hash != rendered_hash`` permanently.
+    * only an ``ok`` node with a real ``rendered != applied`` mismatch counts.
+
+    The grace is anchored on a ``stalled_since`` watermark the matcher stamps
+    on first observation (and clears on convergence / a non-ok status), so a
+    normal one-heartbeat render→apply lag never alarms and a converged node
+    auto-resolves via ``evaluate_all``'s ``open_by_subject`` diff. The session
+    commit at the end of ``evaluate_all`` persists the watermark mutations.
+    """
+    from app.models.appliance import Appliance  # noqa: PLC0415
+    from app.models.firewall import FirewallApplyState  # noqa: PLC0415
+
+    rows = (
+        await db.execute(
+            select(FirewallApplyState, Appliance)
+            .join(Appliance, Appliance.id == FirewallApplyState.appliance_id)
+            .where(Appliance.revoked_at.is_(None))
+            .where(FirewallApplyState.rendered_hash.is_not(None))
+        )
+    ).all()
+
+    matches: list[tuple[str, str, str, str]] = []
+    for st, a in rows:
+        converged = st.applied_hash == st.rendered_hash
+        if converged or st.applied_status != "ok":
+            # Not stalled (in sync, or an error/reverted state owns its own
+            # signal) — clear the watermark so a later genuine stall starts a
+            # fresh grace clock.
+            if st.stalled_since is not None:
+                st.stalled_since = None
+            continue
+        # ok-status node with a genuine mismatch.
+        if st.stalled_since is None:
+            st.stalled_since = now  # first observation — start the grace clock
+            continue
+        if (now - st.stalled_since) <= _FIREWALL_STALE_GRACE:
+            continue  # still within grace — the normal render→apply lag
+        # Sustained mismatch → fire. Cross-reference the Wave-E watchdog
+        # (last_seen_at) so the operator knows whether the supervisor itself
+        # is wedged or just the host firewall runner is the laggard.
+        seen = a.last_seen_at
+        if seen is not None and (now - seen) > _FIREWALL_STALE_GRACE:
+            cause = f"the supervisor heartbeat is stale (last seen {seen.isoformat()})"
+        else:
+            cause = (
+                "the supervisor is heartbeating but the host firewall runner "
+                "hasn't applied the rendered ruleset"
+            )
+        message = (
+            f"Firewall drift on {a.hostname}: control plane rendered "
+            f"{st.rendered_hash[:12] if st.rendered_hash else 'none'} but the node "
+            f"last applied {st.applied_hash[:12] if st.applied_hash else 'none'} — {cause}. "
+            f"Check `journalctl -u spatium-firewall-reload` on the node."
+        )
+        matches.append((str(a.id), a.hostname, message, rule.severity))
+    return matches
+
+
 async def _evaluate_circuit_status_changed_rule(
     db: AsyncSession,
     rule: AlertRule,
@@ -1465,6 +1558,48 @@ async def seed_audit_chain_alert_rule() -> None:
         await session.commit()
 
 
+async def seed_firewall_apply_stalled_alert_rule() -> None:
+    """Seed the singleton ``firewall.apply_stalled`` rule (issue #285 Phase 2d).
+
+    DISABLED by default — it's only meaningful once an operator has enabled
+    server-side firewall render (``firewall_enabled``); seeding it on signals
+    its existence in the Alerts UI without firing on installs that never opt
+    in. Keyed on ``name`` (one rule per platform); an operator who enables /
+    renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _FIREWALL_APPLY_STALLED_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_FIREWALL_APPLY_STALLED_RULE_NAME,
+                description=(
+                    "Fires when an appliance's control-plane-rendered firewall "
+                    "ruleset hasn't been applied by the host runner past a short "
+                    "grace window, while the node's last apply was a clean 'ok' "
+                    "(i.e. a genuine stall, not an apply error or a deliberate "
+                    "auto-revert). Distinct from agent-offline — the message says "
+                    "whether the supervisor itself is stale or just the host "
+                    "firewall runner. Auto-resolves once the node applies the "
+                    "rendered ruleset. Enable once server-side firewall render is on."
+                ),
+                rule_type=RULE_TYPE_FIREWALL_APPLY_STALLED,
+                severity="warning",
+                enabled=False,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def seed_builtin_compliance_alert_rules() -> None:
     """Insert the three disabled compliance-change rules on first
     boot. Idempotent — only inserts a row when no rule with the same
@@ -1660,6 +1795,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             elif rule.rule_type == RULE_TYPE_K3S_API_CERT_EXPIRING:
                 expiring = await _matching_k3s_api_cert_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
+                subject_type = "appliance"
+            elif rule.rule_type == RULE_TYPE_FIREWALL_APPLY_STALLED:
+                stalled = await _matching_firewall_apply_stalled_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in stalled]
                 subject_type = "appliance"
             elif rule.rule_type == RULE_TYPE_SERVICE_TERM_EXPIRING:
                 expiring = await _matching_service_term_expiring_subjects(db, rule, now)

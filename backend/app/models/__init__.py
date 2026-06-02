@@ -56,6 +56,12 @@ from app.models.docker import DockerHost
 from app.models.domain import Domain
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.models.feature_module import FeatureModule
+from app.models.firewall import (
+    FirewallAlias,
+    FirewallApplyState,
+    FirewallPolicy,
+    FirewallRule,
+)
 from app.models.ipam import (
     CustomFieldDefinition,
     IPAddress,
@@ -210,6 +216,10 @@ __all__ = [
     "ConformityPolicy",
     "ConformityResult",
     "FeatureModule",
+    "FirewallAlias",
+    "FirewallApplyState",
+    "FirewallPolicy",
+    "FirewallRule",
     "InternalError",
     "BackupTarget",
 ]

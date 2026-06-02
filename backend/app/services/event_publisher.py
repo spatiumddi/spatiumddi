@@ -115,6 +115,10 @@ _RESOURCE_NAMESPACE: dict[str, str] = {
     "backup_target": "backup.target",
     # Appliance management (issue #134 Phase 4)
     "appliance_certificate": "appliance.tls",
+    # Fleet firewall (issue #285 Phase 3)
+    "firewall_policy": "firewall.policy",
+    "firewall_rule": "firewall.rule",
+    "firewall_alias": "firewall.alias",
 }
 
 

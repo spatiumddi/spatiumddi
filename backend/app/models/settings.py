@@ -489,6 +489,30 @@ class PlatformSettings(Base):
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
 
+    # ── Fleet firewall master switch (issue #285 Phase 2) ───────────
+    # Gates the NEW server-side-authoritative firewall render (Phase 2a:
+    # the control plane ships a rendered drop-in + hash on the heartbeat
+    # and the supervisor becomes a pipe). Default FALSE so an upgrade is
+    # byte-identical to today — the Phase-1 in-pod renderer keeps running
+    # as the fallback and hardening is an explicit operator opt-in. The
+    # flip-to-true is additionally gated server-side on every CP node
+    # reporting a hardened base-conf marker (no stragglers on the legacy
+    # LAN-wide base) so authoritative render never lights mid-rolling-
+    # upgrade. Does NOT gate the Phase-1 path, which stays on its own
+    # ``cfg.in_pod_firewall_enabled or cluster_peer_cidrs`` gate.
+    firewall_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    # #285 Phase 6 — source-scope the Web UI (frontend hostPort 80/443 + the
+    # MetalLB control-plane VIP). Empty = open (today's behaviour). When set,
+    # both firewall renderers emit a peer-scoped 80/443 accept (requires the
+    # base-conf strip of the LAN-wide 80/443) AND the frontend LoadBalancer
+    # Service gets loadBalancerSourceRanges. SSH/22 + console stay in the
+    # un-removable floor, so a bad scope is recoverable, never a brick.
+    web_ui_allowed_cidrs: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+
     # ── Aggregation candidate snooze (issue #114) ───────────────────
     # Operator-driven hide-list for the IPAM aggregation badge popover.
     # Keys are stable per-candidate hashes derived from the parent

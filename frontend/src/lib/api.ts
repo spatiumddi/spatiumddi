@@ -7357,6 +7357,199 @@ export const applianceApi = {
   getInfo: () => api.get<ApplianceInfo>("/appliance/info").then((r) => r.data),
 };
 
+// ── Fleet firewall (issue #285 Phase 3) ──────────────────────────────
+// Policy/rule/alias CRUD + server-side effective render + staged preview.
+// Gated by the appliance.firewall feature module (router 404s when off) and
+// the firewall_enabled master switch (render stays dark until enforcement).
+export type FirewallScopeKind = "fleet" | "role" | "appliance";
+export type FirewallAction = "accept" | "drop";
+export type FirewallProtocol = "tcp" | "udp" | "icmp" | "icmpv6";
+export type FirewallFamily = "v4" | "v6" | "both";
+export type FirewallSourceKind =
+  | "any"
+  | "cidr"
+  | "alias"
+  | "cluster_peers"
+  | "pod_cidr"
+  | "service_cidr"
+  | "kubeapi"
+  | "mgmt"
+  | "vip";
+
+export interface FirewallRuleInput {
+  seq: number;
+  action: FirewallAction;
+  protocol: FirewallProtocol;
+  ports: number[];
+  source_kind: FirewallSourceKind;
+  source_cidrs: string[];
+  source_alias: string | null;
+  family: FirewallFamily;
+  comment: string | null;
+  render_guard?: Record<string, unknown> | null;
+  enabled: boolean;
+}
+
+export interface FirewallRule extends FirewallRuleInput {
+  id: string;
+  policy_id: string;
+}
+
+export interface FirewallPolicy {
+  id: string;
+  name: string;
+  description: string | null;
+  scope_kind: FirewallScopeKind;
+  scope_role: string | null;
+  scope_appliance_id: string | null;
+  enabled: boolean;
+  is_builtin: boolean;
+  priority: number;
+  rules: FirewallRule[];
+}
+
+export interface FirewallAlias {
+  id: string;
+  name: string;
+  kind: "port" | "cidr";
+  port_members: number[];
+  v4_members: string[];
+  v6_members: string[];
+  description: string | null;
+  is_builtin: boolean;
+}
+
+export interface FirewallEffective {
+  appliance_id: string;
+  hostname: string;
+  firewall_enabled: boolean;
+  config_hash: string;
+  firewall_conf: string;
+  layers: Record<string, string[]>;
+  rendered_hash: string | null;
+  applied_hash: string | null;
+  applied_status: string | null;
+  base_conf_marker: string | null;
+  drift: boolean;
+}
+
+export interface FirewallPreviewWarning {
+  kind: string;
+  detail: string;
+  seqs: number[];
+}
+
+export interface FirewallPreview {
+  appliance_id: string;
+  added: string[];
+  removed: string[];
+  warnings: FirewallPreviewWarning[];
+  upgrade_in_flight: boolean;
+  staging_id: string;
+}
+
+export interface FirewallEnforcementNode {
+  appliance_id: string;
+  hostname: string;
+  hardened: boolean;
+  base_lanwide_k3s: boolean | null;
+  last_seen_at: string | null;
+}
+
+export interface FirewallEnforcement {
+  enabled: boolean;
+  reported_count: number;
+  hardened_count: number;
+  lanwide_count: number;
+  all_hardened: boolean;
+  safe_to_enable: boolean;
+  nodes: FirewallEnforcementNode[];
+}
+
+// #285 Phase 6 — Web UI source restriction.
+export interface FirewallWebUIAccess {
+  allowed_cidrs: string[];
+  open: boolean;
+  caller_ip: string | null;
+  caller_covered: boolean;
+}
+
+const _FW = "/appliance/firewall";
+export const firewallApi = {
+  listPolicies: (params?: {
+    scope_kind?: FirewallScopeKind;
+    scope_role?: string;
+  }) =>
+    api
+      .get<FirewallPolicy[]>(`${_FW}/policies`, { params })
+      .then((r) => r.data),
+  createPolicy: (body: {
+    name: string;
+    description?: string | null;
+    scope_kind: FirewallScopeKind;
+    scope_role?: string | null;
+    scope_appliance_id?: string | null;
+    enabled?: boolean;
+    priority?: number;
+  }) => api.post<FirewallPolicy>(`${_FW}/policies`, body).then((r) => r.data),
+  updatePolicy: (
+    id: string,
+    body: Partial<{
+      name: string;
+      description: string | null;
+      enabled: boolean;
+      priority: number;
+    }>,
+  ) =>
+    api
+      .patch<FirewallPolicy>(`${_FW}/policies/${id}`, body)
+      .then((r) => r.data),
+  deletePolicy: (id: string) =>
+    api.delete(`${_FW}/policies/${id}`).then((r) => r.data),
+  replaceRules: (id: string, rules: FirewallRuleInput[]) =>
+    api
+      .put<FirewallPolicy>(`${_FW}/policies/${id}/rules`, { rules })
+      .then((r) => r.data),
+  listAliases: () =>
+    api.get<FirewallAlias[]>(`${_FW}/aliases`).then((r) => r.data),
+  createAlias: (body: {
+    name: string;
+    kind: "port" | "cidr";
+    port_members?: number[];
+    v4_members?: string[];
+    v6_members?: string[];
+    description?: string | null;
+  }) => api.post<FirewallAlias>(`${_FW}/aliases`, body).then((r) => r.data),
+  deleteAlias: (id: string) =>
+    api.delete(`${_FW}/aliases/${id}`).then((r) => r.data),
+  effective: (applianceId: string) =>
+    api
+      .get<FirewallEffective>(`${_FW}/appliances/${applianceId}/effective`)
+      .then((r) => r.data),
+  preview: (body: {
+    appliance_id: string;
+    fleet_rules?: FirewallRuleInput[];
+    appliance_rules?: FirewallRuleInput[];
+  }) => api.post<FirewallPreview>(`${_FW}/preview`, body).then((r) => r.data),
+  getEnforcement: () =>
+    api.get<FirewallEnforcement>(`${_FW}/enforcement`).then((r) => r.data),
+  setEnforcement: (body: { enabled: boolean; override_unhardened?: boolean }) =>
+    api
+      .put<FirewallEnforcement>(`${_FW}/enforcement`, body)
+      .then((r) => r.data),
+  applyPosture: (preset: "locked" | "balanced" | "open") =>
+    api.post<FirewallPolicy>(`${_FW}/posture`, { preset }).then((r) => r.data),
+  getWebUIAccess: () =>
+    api.get<FirewallWebUIAccess>(`${_FW}/web-ui-access`).then((r) => r.data),
+  setWebUIAccess: (body: {
+    allowed_cidrs: string[];
+    override_lockout?: boolean;
+  }) =>
+    api
+      .put<FirewallWebUIAccess>(`${_FW}/web-ui-access`, body)
+      .then((r) => r.data),
+};
+
 // Appliance Web UI certificate management (Phase 4b.1). Mounted at
 // /api/v1/appliance/tls. Phase 4b.1 ships upload + list + activate +
 // delete; CSR generation lands in 4b.3, Let's Encrypt in 4b.4.
