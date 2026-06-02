@@ -16,15 +16,14 @@ Always-open management rules (regardless of role):
 * Established / related (the master conf's first input rule
   already covers this — we don't restate it).
 
-Data-plane floor (#285 Phase 1 — every pod-running node):
-
-* flannel VXLAN ``udp/8472`` (or wireguard-native ``udp/51820`` +
-  ``udp/51821``) scoped to the cluster node IPs, so cross-node pod
-  networking survives once the LAN-wide base accept is removed. Read
-  from the k3s ``flannel-backend`` setting — never assumed; an
-  unknown / host-gw backend opens nothing (host-gw routes via the
-  FORWARD chain, not INPUT) and is treated as fail-open for the data
-  plane (the base policy / operator handles it).
+No data-plane (flannel/wireguard) INPUT rule is emitted: on k3s+flannel
+that inter-node traffic does not traverse the host ``inet filter`` INPUT
+chain (field-verified on a 3-node appliance — cross-node pods stay
+healthy with no ``8472`` accept), so an INPUT rule for it would be dead
+weight. **Keep it that way** — this body is rendered byte-identically by
+``backend/app/services/appliance/firewall.py:compile_firewall_body`` once
+#285 Phase 2a moves render authority server-side; do not add a one-sided
+data-plane rule here or there (the identity regression test guards it).
 
 Per-role openings:
 

@@ -779,7 +779,21 @@ def heartbeat_once(
     fw_service_cidrs = body_out.get("firewall_service_cidrs") or []
     fw_cp_member_count = int(body_out.get("control_plane_size") or 1)
     fw_vip_configured = bool(body_out.get("desired_control_plane_vip") or "")
-    if cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs:
+    # #285 Phase 2a — bundle-first / renderer-fallback dispatch. When the
+    # control plane has firewall authority (firewall_enabled on → a non-empty
+    # ``firewall_settings.config_hash``), pipe its server-rendered body to the
+    # host runner. Otherwise (master switch off, or an OLD control plane that
+    # doesn't ship the block) fall back to the in-pod renderer. Both render
+    # the BYTE-IDENTICAL body, so applied state is the same whichever ran —
+    # this is what makes the rolling upgrade (supervisor/control-plane skew in
+    # either direction) safe.
+    fw_settings = body_out.get("firewall_settings")
+    if isinstance(fw_settings, dict) and fw_settings.get("config_hash"):
+        if appliance_state.maybe_fire_firewall_reload(fw_settings):
+            log.info("supervisor.heartbeat.firewall_trigger_fired", source="control-plane")
+    elif cfg.in_pod_firewall_enabled or cluster_peer_cidrs or fw_pod_cidrs:
+        # #5 fallback — control plane too old to render, or firewall_enabled
+        # still off; render in-pod from the same derived inputs.
         _maybe_apply_firewall(
             role_assignment,
             log,

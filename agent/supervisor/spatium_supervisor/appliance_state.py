@@ -347,6 +347,11 @@ _FIREWALL_APPLIED_STATUS_SIDECAR = Path(
 _FIREWALL_BASE_MARKER_SIDECAR = Path(
     "/var/lib/spatiumddi-host/release-state/firewall-applied-base-marker"
 )
+# Issue #285 Phase 2a — the firewall-pending trigger the host-side
+# spatium-firewall-reload.path unit watches. Same path heartbeat.py's
+# in-pod fallback writes to; maybe_fire_firewall_reload writes the server-
+# rendered body here when the control plane has firewall authority.
+_FIREWALL_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/firewall-pending")
 
 # #272 Phase 7b — control-plane cluster join/leave. The join trigger
 # carries the seed's kubeapi URL + join token; the host-side runner
@@ -904,6 +909,53 @@ def read_firewall_base_marker() -> str | None:
     against (#285 Phase 2b) — lets the control plane tell a node still on the
     pre-#285 LAN-wide base apart from a hardened one. None when missing."""
     return _read_release_state_line(_FIREWALL_BASE_MARKER_SIDECAR)
+
+
+def maybe_fire_firewall_reload(bundle_block: object) -> bool:
+    """Issue #285 Phase 2a — pipe the control plane's SERVER-rendered firewall
+    drop-in to the host runner.
+
+    When ``firewall_enabled`` is on, the control plane renders the drop-in
+    server-side (``firewall_bundle``) and ships ``{enabled, config_hash,
+    firewall_conf}`` on the heartbeat. The supervisor is now a pipe: compare
+    the bundle's hash to what the host runner last applied (the
+    ``firewall-applied-hash`` sidecar) and, on a difference, write the EXACT
+    Phase-1 2-line trigger (``<hash>\\n<body>``) so the existing
+    spatium-firewall-reload runner consumes it with zero changes. The body
+    carries the ``# spatium-bootstrap:`` directive, so sentinel retire/keep
+    still works.
+
+    Returns True if a trigger was fired. An empty ``config_hash`` means the
+    control plane has no firewall authority (firewall_enabled off / old
+    control plane) → return False so the caller falls back to the in-pod
+    renderer and we never disturb the last-good drop-in (non-negotiable #5).
+    Appliance-only + trigger-presence + hash-short-circuit guards mirror
+    ``maybe_fire_snmp_reload``.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not isinstance(bundle_block, dict):
+        return False
+    config_hash = str(bundle_block.get("config_hash") or "")
+    firewall_conf = str(bundle_block.get("firewall_conf") or "")
+    if not config_hash or not firewall_conf:
+        return False  # no server-side authority → fall back / no-op
+    # Short-circuit against the runner's applied-hash sidecar. A body the
+    # Phase-1 in-pod path already applied short-circuits on upgrade because
+    # the server render is byte-identical → same hash.
+    last_hash = _read_release_state_line(_FIREWALL_APPLIED_HASH_SIDECAR) or ""
+    if config_hash == last_hash:
+        return False
+    if _FIREWALL_TRIGGER_FILE.exists():
+        return False
+    try:
+        _FIREWALL_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _FIREWALL_TRIGGER_FILE.with_suffix(".new")
+        tmp.write_text(f"{config_hash}\n{firewall_conf}", encoding="utf-8")
+        tmp.replace(_FIREWALL_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
 
 
 # ── LLDP neighbour discovery (#347) ──────────────────────────────────

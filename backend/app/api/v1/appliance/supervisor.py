@@ -86,6 +86,7 @@ from app.services.appliance.ca import (
     sign_supervisor_cert,
     verify_session_token,
 )
+from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
@@ -1223,6 +1224,11 @@ class SupervisorHeartbeatResponse(BaseModel):
     snmp_settings: dict[str, Any] = Field(default_factory=dict)
     ntp_settings: dict[str, Any] = Field(default_factory=dict)
     lldp_settings: dict[str, Any] = Field(default_factory=dict)
+    # #285 Phase 2a — server-side firewall render. ``{enabled, config_hash,
+    # firewall_conf}``; empty config_hash when firewall_enabled is off (the
+    # supervisor then keeps its in-pod fallback render). The supervisor
+    # pipes a non-empty block to the firewall-pending trigger verbatim.
+    firewall_settings: dict[str, Any] = Field(default_factory=dict)
 
 
 def _s(v: object, limit: int = 255) -> str | None:
@@ -1733,6 +1739,43 @@ async def supervisor_heartbeat(
         if cfg_row is not None
         else {"enabled": False, "config_hash": "", "lldpd_conf": "", "daemon_args": ""}
     )
+    # #285 Phase 2a — server-side firewall render. Same inputs the in-pod
+    # renderer consumes (byte-identical body). Gated on the firewall_enabled
+    # master switch (default off → disabled-shape block → supervisor keeps
+    # its in-pod fallback). role_assignment is the SupervisorRoleAssignment
+    # built above; pass its dict form so compile_firewall_body reads roles /
+    # firewall_extra / kubeapi_expose_cidrs the same way the supervisor does.
+    firewall_block = firewall_bundle(
+        role_assignment=role_assignment.model_dump(),
+        cluster_peer_cidrs=cluster_peer_cidrs,
+        pod_cidrs=firewall_pod_cidrs,
+        service_cidrs=firewall_service_cidrs,
+        cp_member_count=control_plane_size,
+        vip_configured=bool(metallb_vip),
+        firewall_enabled=bool(cfg_row.firewall_enabled) if cfg_row else False,
+    )
+    # Persist the rendered hash so 2d's apply-stalled alarm + the Fleet drift
+    # chip can compare it against the runner's reported applied_hash. Only
+    # when authoritative render is on; a dedicated upsert+commit (the main
+    # handler commit already ran) — skipped entirely in the default-off path.
+    if firewall_block["enabled"]:
+        rendered_at = datetime.now(UTC)
+        await db.execute(
+            pg_insert(FirewallApplyState)
+            .values(
+                appliance_id=row.id,
+                rendered_hash=firewall_block["config_hash"],
+                last_rendered_at=rendered_at,
+            )
+            .on_conflict_do_update(
+                index_elements=["appliance_id"],
+                set_={
+                    "rendered_hash": firewall_block["config_hash"],
+                    "last_rendered_at": rendered_at,
+                },
+            )
+        )
+        await db.commit()
 
     # #272 Phase 9 — dead k8s Nodes the seed should evict. Returned to
     # every CP supervisor but only the control-plane-variant seed acts.
@@ -1775,6 +1818,7 @@ async def supervisor_heartbeat(
         snmp_settings=snmp_block,
         ntp_settings=ntp_block,
         lldp_settings=lldp_block,
+        firewall_settings=firewall_block,
     )
 
 
