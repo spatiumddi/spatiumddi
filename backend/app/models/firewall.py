@@ -37,7 +37,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
@@ -138,6 +138,20 @@ class FirewallPolicy(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         cascade="all, delete-orphan",
         order_by="FirewallRule.seq",
     )
+
+    @validates("scope_role")
+    def _validate_scope_role(self, _key: str, value: str | None) -> str | None:
+        # Belt-and-braces over the API-layer validator: a non-null scope_role
+        # must be a known policy-role token. NOTE this is the POLICY-role set
+        # (``_POLICY_ROLES``, which INCLUDES the merge-internal ``control-plane``
+        # key) — deliberately NOT the node-label taxonomy, and intentionally a
+        # Python-side ORM validator (no DB CHECK / migration) so the scope_role
+        # column stays free to gain new policy roles without a schema change.
+        # ``None`` is allowed (fleet / appliance scopes); the scope-shape CHECK
+        # enforces the null-vs-set rule per scope_kind.
+        if value is not None and value not in _POLICY_ROLES:
+            raise ValueError(f"scope_role must be one of {_POLICY_ROLES} or None")
+        return value
 
     __table_args__ = (
         # One policy per role token (incl. control-plane).

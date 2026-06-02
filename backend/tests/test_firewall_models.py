@@ -104,6 +104,15 @@ async def test_duplicate_rule_seq_rejected(db_session: AsyncSession) -> None:
     )
 
 
+async def test_scope_role_validator_rejects_unknown(db_session: AsyncSession) -> None:
+    # The @validates("scope_role") guard fires at construction — an unknown
+    # role token (not in _POLICY_ROLES) raises before it ever reaches the DB.
+    with pytest.raises(ValueError, match="scope_role must be one of"):
+        FirewallPolicy(name="x", scope_kind="role", scope_role="bogus-role")
+    # control-plane (the merge-internal key) IS a valid policy role.
+    FirewallPolicy(name="ok", scope_kind="role", scope_role="control-plane")
+
+
 async def test_appliance_scoped_policy_accepted(db_session: AsyncSession) -> None:
     import hashlib
     import os
