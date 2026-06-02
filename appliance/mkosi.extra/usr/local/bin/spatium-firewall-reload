@@ -58,6 +58,22 @@ BASE_MARKER=/var/lib/spatiumddi/release-state/firewall-applied-base-marker
 DROP_IN=/etc/nftables.d/spatium-role.nft
 NFT_MAIN=/etc/nftables.conf
 STAGING=/etc/nftables.d/.spatium-role.nft.new
+# #285 Phase 1b — the baked 6443 bootstrap sentinel the retire/keep block
+# below manages (hoisted here so the Phase-2c test-apply snapshot can read
+# its state too).
+SENTINEL=/etc/nftables.d/00-spatium-k3s-bootstrap.nft
+SENTINEL_RETIRED="$SENTINEL.retired"
+# #285 Phase 2c — test-apply + auto-revert. A test trigger (``__test__`` on
+# line 2) snapshots the current drop-in + sentinel state to .last-good and
+# arms a deadline; the always-running spatiumddi-firewall-revert.timer
+# restores .last-good unless the supervisor writes CONFIRM_FILE (the control
+# plane's cross-node verdict) first. These live under release-state (same
+# filesystem as the deadline/confirm sidecars — avoids /var-vs-/etc-overlay
+# torn views on restore).
+REVERT_DEADLINE=/var/lib/spatiumddi/release-state/firewall-revert-deadline
+CONFIRM_FILE=/var/lib/spatiumddi/release-state/firewall-confirm
+LAST_GOOD=/var/lib/spatiumddi/release-state/firewall-role.nft.last-good
+LAST_GOOD_SENTINEL=/var/lib/spatiumddi/release-state/firewall-sentinel.last-good
 
 log() { printf '[spatium-firewall-reload] %s\n' "$*"; }
 
@@ -78,10 +94,29 @@ if [ -z "$HASH" ]; then
     exit 1
 fi
 
-# Body is everything after line 1. tail -n +2 streams it without
-# reading the whole file into a shell variable.
+# #285 Phase 2c — a test-apply carries ``__test__ revert_seconds=N`` on line
+# 2; its body starts at line 3. A normal apply is the Phase-1 2-line format
+# (body from line 2). An OLD runner that never learned __test__ would treat
+# line 2 as body → nft -c -f fails → the apply is rejected, never
+# mis-applied; the backend only sends __test__ to runners new enough, so
+# this is belt-and-braces.
+LINE2=$(sed -n '2p' "$TRIGGER_FILE")
+TEST_MODE=0
+REVERT_SECONDS=180
+BODY_FROM=2
+case "$LINE2" in
+    __test__*)
+        TEST_MODE=1
+        BODY_FROM=3
+        n=$(printf '%s' "$LINE2" | sed -n 's/.*revert_seconds=\([0-9][0-9]*\).*/\1/p')
+        if [ -n "$n" ]; then REVERT_SECONDS=$n; fi
+        ;;
+esac
+
+# Body is everything from BODY_FROM. tail streams it without reading the
+# whole file into a shell variable.
 mkdir -p "$(dirname "$DROP_IN")"
-tail -n +2 "$TRIGGER_FILE" > "$STAGING"
+tail -n +"$BODY_FROM" "$TRIGGER_FILE" > "$STAGING"
 
 # Atomic rename — load `nft -c -f` will see the live drop-in path
 # resolved via the include glob in /etc/nftables.conf. If the dry-
@@ -93,6 +128,21 @@ if ! nft -c -f "$NFT_MAIN" 2>/tmp/nft-check.err; then
     rm -f "$STAGING"
     write_status "error:dry-run-pre"
     exit 1
+fi
+
+# #285 Phase 2c — snapshot the current (good) drop-in + sentinel state
+# before a test-apply replaces it, so the revert timer can restore BOTH
+# (the sentinel restore is what re-opens 6443 if the test had retired it).
+if [ "$TEST_MODE" = 1 ]; then
+    mkdir -p "$(dirname "$LAST_GOOD")"
+    if [ -f "$DROP_IN" ]; then cp -f "$DROP_IN" "$LAST_GOOD"; else : > "$LAST_GOOD"; fi
+    if [ -f "$SENTINEL" ]; then
+        echo present > "$LAST_GOOD_SENTINEL"
+    elif [ -f "$SENTINEL_RETIRED" ]; then
+        echo retired > "$LAST_GOOD_SENTINEL"
+    else
+        echo absent > "$LAST_GOOD_SENTINEL"
+    fi
 fi
 
 mv "$STAGING" "$DROP_IN"
@@ -117,8 +167,7 @@ fi
 # ever shrinks back to single-node. Both the sentinel and its ``.retired``
 # form live on the /etc overlay, so the move persists across reboots +
 # A/B slot swaps. An absent directive (legacy render) → leave it as-is.
-SENTINEL=/etc/nftables.d/00-spatium-k3s-bootstrap.nft
-SENTINEL_RETIRED="$SENTINEL.retired"
+# (SENTINEL / SENTINEL_RETIRED are defined in the constants block above.)
 sentinel_action=none
 if grep -q '^# spatium-bootstrap: retire' "$DROP_IN"; then
     if [ -f "$SENTINEL" ]; then
@@ -162,5 +211,16 @@ printf '%s\n' "$HASH" > "$APPLIED_HASH"
 # merged master file). An old runner won't write this → control plane sees
 # None → leaves the column untouched (forward-compatible).
 sha256sum "$NFT_MAIN" | cut -d' ' -f1 > "$BASE_MARKER" 2>/dev/null || true
+# #285 Phase 2c — arm / clear the auto-revert deadline. A test-apply arms a
+# deadline the always-running spatiumddi-firewall-revert.timer enforces
+# unless the supervisor writes CONFIRM_FILE first (the control plane's
+# cross-node verdict). A normal apply supersedes any pending test window.
+if [ "$TEST_MODE" = 1 ]; then
+    rm -f "$CONFIRM_FILE"
+    echo "$(( $(date +%s) + REVERT_SECONDS ))" > "$REVERT_DEADLINE"
+    log "test-apply armed: auto-revert in ${REVERT_SECONDS}s unless confirmed"
+else
+    rm -f "$REVERT_DEADLINE" "$CONFIRM_FILE"
+fi
 write_status "ok"
 log "applied drop-in (hash=$HASH)"
