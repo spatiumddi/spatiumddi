@@ -223,4 +223,14 @@ else
     rm -f "$REVERT_DEADLINE" "$CONFIRM_FILE"
 fi
 write_status "ok"
+# #285 — consume the trigger. The supervisor's maybe_fire_firewall_reload
+# guards on ``if firewall-pending exists: return`` (don't clobber unapplied
+# work), so a trigger left in place after a successful apply silently BLOCKS
+# every subsequent firewall change (the applied-hash short-circuit only covers
+# the no-change case). Deleting it here closes that trap: a present trigger now
+# means genuinely-pending work, an absent one means "applied, ready for the
+# next change". The applied-hash sidecar (written above) is the source of truth
+# for what's live; the revert path keys off LAST_GOOD, not this file, so the
+# delete is safe in test mode too.
+rm -f "$TRIGGER_FILE"
 log "applied drop-in (hash=$HASH)"

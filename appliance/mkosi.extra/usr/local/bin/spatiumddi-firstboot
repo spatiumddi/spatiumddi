@@ -248,6 +248,18 @@ if [ -f "$ENV_FILE" ]; then
         CURRENT_APPLIANCE_VERSION="${APPLIANCE_VERSION:-0.1.0}"
         sed -i "s|^APPLIANCE_VERSION=.*|APPLIANCE_VERSION=${CURRENT_APPLIANCE_VERSION}|" "$ENV_FILE"
     fi
+    # ── Every boot: re-derive the first-boot-only identity vars ──────────
+    # APPLIANCE_HOSTNAME_VAL / APPLIANCE_HOST_IPS_VAL are assigned ONLY in the
+    # first-boot .env-generation block above, but referenced unconditionally
+    # in the control-chart HelmChart render below. On every NON-first boot
+    # (crucially, a slot upgrade — .env lives on the persistent /var partition
+    # so the gen block is skipped) they'd be unset and `set -u` aborts the
+    # whole reconcile BEFORE the image-version bump + slot commit ever run —
+    # so new container images never roll and the trial slot never commits.
+    # Re-read from .env (the value the first boot persisted), host as fallback.
+    : "${APPLIANCE_HOSTNAME_VAL:=$(grep '^APPLIANCE_HOSTNAME=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)}"
+    : "${APPLIANCE_HOSTNAME_VAL:=$(hostname 2>/dev/null || echo spatiumddi)}"
+    : "${APPLIANCE_HOST_IPS_VAL:=$(grep '^APPLIANCE_HOST_IPS=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)}"
 fi
 
 # ── Render the bootstrap HelmChart manifest ──────────────────────────────────
