@@ -2888,6 +2888,21 @@ async def update_appliance_roles(
                 )
         row.tags = dict(body.tags)
     if body.firewall_extra is not None:
+        # #285 Phase 3d — lint ONLY the delta (this PATCH carries a new
+        # firewall_extra), so a pre-3d value that predates the grammar is
+        # never retro-rejected. Hard-422 only on genuinely dangerous patterns
+        # (nft-injection chars / unbalanced braces / drop-22); grammar nits
+        # are advisory warnings surfaced in the preview, and `nft -c -f` on
+        # the host is the final syntax authority.
+        from app.services.appliance.firewall_lint import errors, lint_firewall_extra
+
+        fw_errors = errors(lint_firewall_extra(body.firewall_extra))
+        if fw_errors:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "firewall_extra rejected: "
+                + "; ".join(f"line {f.line}: {f.message}" for f in fw_errors),
+            )
         # Empty string is meaningful — operator clearing the extra
         # block. The supervisor renders an empty fragment then; the
         # role-driven mgmt + per-role rules still ship.
