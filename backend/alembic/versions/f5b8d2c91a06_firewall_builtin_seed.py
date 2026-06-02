@@ -130,7 +130,7 @@ def upgrade() -> None:
             sa.text(
                 "INSERT INTO firewall_policy "
                 "(id, name, description, scope_kind, scope_role, enabled, is_builtin, priority, "
-                " created_at, updated_at) "
+                " created_at, modified_at) "
                 "SELECT gen_random_uuid(), :name, NULL, :sk, :sr, :enabled, true, 100, now(), now() "
                 f"WHERE NOT EXISTS (SELECT 1 FROM firewall_policy WHERE {exists_clause})"
             ).bindparams(name=name, sk=scope_kind, sr=scope_role, enabled=enabled)

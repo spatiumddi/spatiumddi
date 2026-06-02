@@ -361,6 +361,12 @@ function PoliciesSection() {
         ))}
       </div>
 
+      {posture.isError && (
+        <p className="text-xs text-destructive">
+          {formatApiError(posture.error)}
+        </p>
+      )}
+
       <div className="flex items-center justify-between">
         <span className="text-xs text-muted-foreground">
           {policies?.length ?? 0} policies

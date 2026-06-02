@@ -104,6 +104,26 @@ async def test_duplicate_rule_seq_rejected(db_session: AsyncSession) -> None:
     )
 
 
+def test_schema_migration_columns_cover_models() -> None:
+    # Regression guard for the modified_at/updated_at drift (#285): conftest
+    # builds the test schema from Base.metadata, so a model↔migration column
+    # mismatch (e.g. TimestampMixin maps `modified_at` but the migration
+    # created `updated_at`) is invisible to every ORM test yet 500s on a real
+    # migration-built DB. Assert every model column name appears in the schema
+    # migration's source.
+    import pathlib
+
+    from app.models.firewall import FirewallAlias, FirewallPolicy, FirewallRule
+
+    src = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "alembic/versions/e4a7c1f08b9d_firewall_policy_schema.py"
+    ).read_text()
+    for model in (FirewallPolicy, FirewallRule, FirewallAlias):
+        for col in model.__table__.columns.keys():
+            assert f'"{col}"' in src, f"{model.__tablename__}.{col} missing from schema migration"
+
+
 async def test_scope_role_validator_rejects_unknown(db_session: AsyncSession) -> None:
     # The @validates("scope_role") guard fires at construction — an unknown
     # role token (not in _POLICY_ROLES) raises before it ever reaches the DB.
