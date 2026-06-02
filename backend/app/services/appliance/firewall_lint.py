@@ -144,7 +144,10 @@ def _lint_line(i: int, line: str, findings: list[LintFinding]) -> None:
             )
         )
         return
-    if line.count("{") != line.count("}"):
+    # Brace-balance on the comment-stripped portion only — nft allows literal
+    # ``{``/``}`` inside a quoted ``comment "…"`` string, so scanning the whole
+    # line would false-reject a valid rule whose comment text contains a brace.
+    if pre.count("{") != pre.count("}"):
         findings.append(LintFinding(i, "error", "unbalanced braces { }"))
         return
 

@@ -59,6 +59,19 @@ def test_unbalanced_braces_is_error() -> None:
     assert any("unbalanced braces" in m for m in errs)
 
 
+def test_braces_inside_comment_not_counted() -> None:
+    # PR #350 review (Copilot): the brace-balance check must run on the
+    # comment-stripped portion — nft allows literal { } inside a quoted
+    # comment, so a balanced rule whose comment text carries a brace must
+    # NOT false-reject as "unbalanced braces".
+    errs, _ = _sev('ip saddr { 10.0.0.0/8 } tcp dport 80 accept comment "burst {only}"')
+    assert not any("unbalanced braces" in m for m in errs)
+    # A genuinely unbalanced comment (single brace) is still fine — the rule
+    # body is balanced and comment text isn't scanned.
+    errs2, _ = _sev('ip saddr { 10.0.0.0/8 } tcp dport 80 accept comment "open {"')
+    assert not any("unbalanced braces" in m for m in errs2)
+
+
 def test_missing_saddr_is_warning() -> None:
     errs, warns = _sev("tcp dport 80 accept")
     assert errs == set()
