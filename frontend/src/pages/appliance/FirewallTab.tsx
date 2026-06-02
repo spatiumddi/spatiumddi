@@ -62,6 +62,28 @@ const SOURCE_KINDS: FirewallSourceKind[] = [
 const PROTOCOLS: FirewallProtocol[] = ["tcp", "udp", "icmp", "icmpv6"];
 const FAMILIES: FirewallFamily[] = ["both", "v4", "v6"];
 
+const POSTURE_PRESETS: {
+  key: "locked" | "balanced" | "open";
+  label: string;
+  blurb: string;
+}[] = [
+  {
+    key: "locked",
+    label: "Locked",
+    blurb: "Builtins + mgmt floor only — nothing extra reachable.",
+  },
+  {
+    key: "balanced",
+    label: "Balanced",
+    blurb: "SNMP + node-exporter from RFC1918 (private networks) only.",
+  },
+  {
+    key: "open",
+    label: "Open",
+    blurb: "SNMP + node-exporter from anywhere (flat, trusted LAN).",
+  },
+];
+
 type SubTab = "policies" | "aliases" | "preview" | "effective";
 
 function scopeLabel(p: FirewallPolicy): string {
@@ -307,9 +329,38 @@ function PoliciesSection() {
       invalidate();
     },
   });
+  const [confirmPreset, setConfirmPreset] = useState<
+    null | "locked" | "balanced" | "open"
+  >(null);
+  const posture = useMutation({
+    mutationFn: (p: "locked" | "balanced" | "open") =>
+      firewallApi.applyPosture(p),
+    onSuccess: () => {
+      setConfirmPreset(null);
+      invalidate();
+    },
+  });
 
   return (
     <div className="space-y-3">
+      <div className="grid gap-2 sm:grid-cols-3">
+        {POSTURE_PRESETS.map((p) => (
+          <div key={p.key} className="rounded-md border p-2.5">
+            <div className="text-sm font-medium">{p.label}</div>
+            <div className="mt-0.5 text-xs text-muted-foreground">
+              {p.blurb}
+            </div>
+            <button
+              type="button"
+              onClick={() => setConfirmPreset(p.key)}
+              className="mt-2 rounded-md border px-2.5 py-1 text-xs hover:bg-accent"
+            >
+              Apply preset
+            </button>
+          </div>
+        ))}
+      </div>
+
       <div className="flex items-center justify-between">
         <span className="text-xs text-muted-foreground">
           {policies?.length ?? 0} policies
@@ -461,6 +512,23 @@ function PoliciesSection() {
         confirmLabel="Delete"
         onConfirm={() => confirmDelete && del.mutate(confirmDelete.id)}
         onClose={() => setConfirmDelete(null)}
+      />
+      <ConfirmModal
+        open={confirmPreset !== null}
+        title={`Apply "${confirmPreset}" posture preset`}
+        loading={posture.isPending}
+        message={
+          <>
+            This replaces the{" "}
+            <span className="font-medium">fleet baseline</span> policy's rules
+            with the <span className="font-medium">{confirmPreset}</span> preset
+            (role + appliance scopes and the builtins are untouched). You can
+            fine-tune the fleet policy afterwards.
+          </>
+        }
+        confirmLabel="Apply preset"
+        onConfirm={() => confirmPreset && posture.mutate(confirmPreset)}
+        onClose={() => setConfirmPreset(null)}
       />
     </div>
   );

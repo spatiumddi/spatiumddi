@@ -1089,3 +1089,106 @@ async def set_enforcement(
         )
     await db.commit()
     return await _enforcement_status(db)
+
+
+# ── Posture presets (#285 Phase 4) ──────────────────────────────────
+#
+# A one-click fleet-baseline posture. A preset replaces the FLEET policy's
+# rules (creating the fleet policy if absent); role + appliance scopes and the
+# builtins are untouched. The knob is how reachable the common management /
+# monitoring services are fleet-wide:
+#   locked   — builtins + mgmt floor only (nothing extra).
+#   balanced — SNMP (161/udp) + node-exporter (9100/tcp) from RFC1918 only.
+#   open     — those same services from anywhere (flat trusted LAN).
+# Operators tune the fleet policy freely afterwards; the preset is a starting
+# point, not a lock.
+_RFC1918 = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+_POSTURE_PRESETS: dict[str, list[dict[str, Any]]] = {
+    "locked": [],
+    "balanced": [
+        {
+            "seq": 10,
+            "protocol": "udp",
+            "ports": [161],
+            "source_kind": "cidr",
+            "source_cidrs": _RFC1918,
+            "comment": "snmp (rfc1918)",
+        },
+        {
+            "seq": 20,
+            "protocol": "tcp",
+            "ports": [9100],
+            "source_kind": "cidr",
+            "source_cidrs": _RFC1918,
+            "comment": "node-exporter (rfc1918)",
+        },
+    ],
+    "open": [
+        {
+            "seq": 10,
+            "protocol": "udp",
+            "ports": [161],
+            "source_kind": "any",
+            "comment": "snmp (any)",
+        },
+        {
+            "seq": 20,
+            "protocol": "tcp",
+            "ports": [9100],
+            "source_kind": "any",
+            "comment": "node-exporter (any)",
+        },
+    ],
+}
+
+
+class ApplyPostureRequest(BaseModel):
+    preset: str
+
+
+@router.post("/posture", response_model=PolicyResponse)
+async def apply_posture(
+    body: ApplyPostureRequest, db: DB, current_user: CurrentUser
+) -> FirewallPolicy:
+    _require_admin(current_user)
+    if body.preset not in _POSTURE_PRESETS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"preset must be one of {sorted(_POSTURE_PRESETS)}",
+        )
+    fleet = (
+        (await db.execute(select(FirewallPolicy).where(FirewallPolicy.scope_kind == "fleet")))
+        .scalars()
+        .first()
+    )
+    if fleet is None:
+        fleet = FirewallPolicy(
+            name="Fleet baseline",
+            scope_kind="fleet",
+            enabled=True,
+            is_builtin=False,
+            updated_by_id=current_user.id,
+        )
+        db.add(fleet)
+        await db.flush()
+    await db.execute(delete(FirewallRule).where(FirewallRule.policy_id == fleet.id))
+    for raw in _POSTURE_PRESETS[body.preset]:
+        rule = RuleIn(**raw)  # validate (no-drop-22, cidr shape, …)
+        db.add(FirewallRule(policy_id=fleet.id, **rule.model_dump()))
+    fleet.updated_by_id = current_user.id
+    db.add(
+        AuditLog(
+            action="update",
+            resource_type="firewall_policy",
+            resource_id=str(fleet.id),
+            resource_display=f"fleet posture → {body.preset}",
+            user_id=current_user.id,
+            user_display_name=current_user.username,
+            result="success",
+            changed_fields=["rules"],
+            new_value={"preset": body.preset, "rule_count": len(_POSTURE_PRESETS[body.preset])},
+        )
+    )
+    await db.commit()
+    reset_policy_cache()
+    return await _get_policy(db, fleet.id)

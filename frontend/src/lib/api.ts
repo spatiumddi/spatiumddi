@@ -7526,6 +7526,8 @@ export const firewallApi = {
     api
       .put<FirewallEnforcement>(`${_FW}/enforcement`, body)
       .then((r) => r.data),
+  applyPosture: (preset: "locked" | "balanced" | "open") =>
+    api.post<FirewallPolicy>(`${_FW}/posture`, { preset }).then((r) => r.data),
 };
 
 // Appliance Web UI certificate management (Phase 4b.1). Mounted at

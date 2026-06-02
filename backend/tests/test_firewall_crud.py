@@ -295,3 +295,39 @@ async def test_module_gate_404(client: AsyncClient, db_session: AsyncSession) ->
         assert _r.status_code == 404
     finally:
         invalidate_cache()
+
+
+# ── Posture presets ──────────────────────────────────────────────────
+
+
+async def test_apply_posture_locked_creates_empty_fleet(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, h = await _user(db_session)
+    r = await client.post(f"{FW}/posture", headers=h, json={"preset": "locked"})
+    assert r.status_code == 200, r.text
+    assert r.json()["scope_kind"] == "fleet" and r.json()["rules"] == []
+
+
+async def test_apply_posture_balanced_then_locked_replaces(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, h = await _user(db_session)
+    r = await client.post(f"{FW}/posture", headers=h, json={"preset": "balanced"})
+    assert r.status_code == 200 and len(r.json()["rules"]) == 2
+    # re-applying locked replaces the fleet rules (not appends)
+    r2 = await client.post(f"{FW}/posture", headers=h, json={"preset": "locked"})
+    assert r2.status_code == 200 and r2.json()["rules"] == []
+    # still a single fleet policy
+    fleets = [
+        p
+        for p in (await client.get(f"{FW}/policies", headers=h)).json()
+        if p["scope_kind"] == "fleet"
+    ]
+    assert len(fleets) == 1
+
+
+async def test_apply_posture_bad_preset(client: AsyncClient, db_session: AsyncSession) -> None:
+    _, h = await _user(db_session)
+    r = await client.post(f"{FW}/posture", headers=h, json={"preset": "nope"})
+    assert r.status_code == 422
