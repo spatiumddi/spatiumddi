@@ -7468,7 +7468,10 @@ export interface FirewallEnforcement {
 
 const _FW = "/appliance/firewall";
 export const firewallApi = {
-  listPolicies: (params?: { scope_kind?: string; scope_role?: string }) =>
+  listPolicies: (params?: {
+    scope_kind?: FirewallScopeKind;
+    scope_role?: string;
+  }) =>
     api
       .get<FirewallPolicy[]>(`${_FW}/policies`, { params })
       .then((r) => r.data),

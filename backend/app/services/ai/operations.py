@@ -2020,7 +2020,12 @@ async def _preview_toggle_firewall_policy(
         state = "enabled" if args.enabled else "disabled"
         return PreviewResult(ok=False, detail=f"Policy {p.name!r} is already {state}.")
     verb = "Enable" if args.enabled else "Disable"
-    scope = p.scope_kind + (f"/{p.scope_role}" if p.scope_role else "")
+    if p.scope_kind == "appliance":
+        scope = f"appliance/{p.scope_appliance_id}"  # disambiguate per-appliance overrides
+    elif p.scope_role:
+        scope = f"{p.scope_kind}/{p.scope_role}"
+    else:
+        scope = p.scope_kind
     text = (
         f"{verb} firewall policy **{p.name}** (scope {scope}). Takes effect on the "
         "next supervisor heartbeat — but only renders to a node when the "
