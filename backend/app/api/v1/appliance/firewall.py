@@ -43,7 +43,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import user_has_permission
-from app.models.appliance import Appliance
+from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
 from app.models.firewall import (
     _POLICY_ROLES,
@@ -52,6 +52,7 @@ from app.models.firewall import (
     FirewallPolicy,
     FirewallRule,
 )
+from app.models.settings import PlatformSettings
 from app.services.appliance.firewall_lease import upgrade_in_flight
 from app.services.appliance.firewall_merge import (
     MergeContext,
@@ -944,3 +945,147 @@ async def preview(body: PreviewRequest, db: DB, current_user: CurrentUser) -> Pr
         upgrade_in_flight=await upgrade_in_flight(db),
         staging_id=hashlib.sha256(staging_input.encode("utf-8")).hexdigest()[:16],
     )
+
+
+# ── Enforcement master switch + all-CP-hardened gate (#285 Phase 4a) ──
+#
+# The keystone that turns the whole (otherwise-dark) feature ON. Flipping
+# `platform_settings.firewall_enabled` is what makes the server-side render
+# authoritative on the fleet — but enabling it while a node still runs the
+# legacy LAN-wide base /etc/nftables.conf would be a no-op on that node
+# (its base accept still fires first) AND a false "hardened" compliance
+# claim. So the gate refuses to ENABLE until every reporting appliance node
+# is hardened (`base_lanwide_k3s == False`), unless the operator explicitly
+# overrides. DISABLING is never gated (always safe to fall back to dark).
+# `base_lanwide_k3s` is None for a node that hasn't reported a usable base
+# marker (incl. the empty-FileOrCreate case) → counted as "unknown", which
+# also blocks the un-overridden enable.
+
+
+class EnforcementNode(BaseModel):
+    appliance_id: uuid.UUID
+    hostname: str
+    hardened: bool
+    base_lanwide_k3s: bool | None
+    last_seen_at: str | None
+
+
+class EnforcementStatus(BaseModel):
+    enabled: bool
+    reported_count: int
+    hardened_count: int
+    lanwide_count: int
+    all_hardened: bool
+    safe_to_enable: bool
+    nodes: list[EnforcementNode]
+
+
+class SetEnforcementRequest(BaseModel):
+    enabled: bool
+    override_unhardened: bool = False
+
+
+async def _enforcement_status(db: DB) -> EnforcementStatus:
+    cfg = await db.get(PlatformSettings, 1)
+    enabled = bool(cfg.firewall_enabled) if cfg else False
+    rows = list(
+        (
+            await db.execute(
+                select(Appliance)
+                .where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    Appliance.deployment_kind == "appliance",
+                    Appliance.base_conf_marker.isnot(None),
+                )
+                .order_by(Appliance.hostname)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    nodes: list[EnforcementNode] = []
+    hardened = lanwide = 0
+    for r in rows:
+        is_hardened = r.base_lanwide_k3s is False
+        if is_hardened:
+            hardened += 1
+        elif r.base_lanwide_k3s is True:
+            lanwide += 1
+        nodes.append(
+            EnforcementNode(
+                appliance_id=r.id,
+                hostname=r.hostname,
+                hardened=is_hardened,
+                base_lanwide_k3s=r.base_lanwide_k3s,
+                last_seen_at=r.last_seen_at.isoformat() if r.last_seen_at else None,
+            )
+        )
+    reported = len(nodes)
+    all_hardened = reported > 0 and hardened == reported
+    return EnforcementStatus(
+        enabled=enabled,
+        reported_count=reported,
+        hardened_count=hardened,
+        lanwide_count=lanwide,
+        all_hardened=all_hardened,
+        safe_to_enable=all_hardened,
+        nodes=nodes,
+    )
+
+
+@router.get("/enforcement", response_model=EnforcementStatus)
+async def get_enforcement(db: DB, current_user: CurrentUser) -> EnforcementStatus:
+    _require_read(current_user)
+    return await _enforcement_status(db)
+
+
+@router.put("/enforcement", response_model=EnforcementStatus)
+async def set_enforcement(
+    body: SetEnforcementRequest, db: DB, current_user: CurrentUser
+) -> EnforcementStatus:
+    _require_admin(current_user)
+    status = await _enforcement_status(db)
+    if body.enabled and not status.all_hardened and not body.override_unhardened:
+        blocked = status.reported_count - status.hardened_count
+        detail = (
+            f"Refusing to enable fleet-firewall enforcement: {blocked} of "
+            f"{status.reported_count} reporting appliance node(s) are not yet hardened "
+            f"({status.lanwide_count} still on the legacy LAN-wide base, "
+            f"{blocked - status.lanwide_count} not reporting a base marker). Wait for the "
+            "hardened slot image to roll out, or pass override_unhardened=true to enable anyway."
+        )
+        if status.reported_count == 0:
+            detail = (
+                "Refusing to enable: no appliance node has reported a base-conf marker yet, "
+                "so the hardened state can't be confirmed. Pass override_unhardened=true to "
+                "enable regardless."
+            )
+        raise HTTPException(status_code=409, detail=detail)
+
+    cfg = await db.get(PlatformSettings, 1)
+    if cfg is None:
+        cfg = PlatformSettings(id=1)
+        db.add(cfg)
+        await db.flush()
+    if cfg.firewall_enabled != body.enabled:
+        cfg.firewall_enabled = body.enabled
+        db.add(
+            AuditLog(
+                action="update",
+                resource_type="platform_settings",
+                resource_id="1",
+                resource_display="firewall enforcement",
+                user_id=current_user.id,
+                user_display_name=current_user.username,
+                result="success",
+                changed_fields=["firewall_enabled"],
+                new_value={
+                    "firewall_enabled": body.enabled,
+                    "override_unhardened": body.override_unhardened,
+                    "hardened_count": status.hardened_count,
+                    "reported_count": status.reported_count,
+                },
+            )
+        )
+    await db.commit()
+    return await _enforcement_status(db)

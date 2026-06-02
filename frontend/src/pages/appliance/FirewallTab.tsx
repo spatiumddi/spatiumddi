@@ -17,6 +17,7 @@ import {
   Plus,
   RefreshCw,
   ShieldAlert,
+  ShieldCheck,
   Tags,
   Trash2,
 } from "lucide-react";
@@ -94,6 +95,8 @@ export function FirewallTab() {
         </div>
       </div>
 
+      <EnforcementCard />
+
       <div className="flex flex-wrap gap-1 border-b">
         {tabs.map((t) => (
           <button
@@ -115,6 +118,161 @@ export function FirewallTab() {
       {sub === "policies" && <PoliciesSection />}
       {sub === "aliases" && <AliasesSection />}
       {sub === "effective" && <EffectiveSection />}
+    </div>
+  );
+}
+
+// ── Enforcement master switch + all-CP-hardened gate (Phase 4a) ──────
+
+function EnforcementCard() {
+  const qc = useQueryClient();
+  const { data: e } = useQuery({
+    queryKey: ["firewall", "enforcement"],
+    queryFn: firewallApi.getEnforcement,
+  });
+  const [confirm, setConfirm] = useState<
+    null | "enable" | "enable-override" | "disable"
+  >(null);
+  const set = useMutation({
+    mutationFn: (b: { enabled: boolean; override_unhardened?: boolean }) =>
+      firewallApi.setEnforcement(b),
+    onSuccess: () => {
+      setConfirm(null);
+      qc.invalidateQueries({ queryKey: ["firewall", "enforcement"] });
+    },
+  });
+  if (!e) return null;
+  const on = e.enabled;
+  const unconfirmed = e.reported_count - e.hardened_count;
+
+  return (
+    <div
+      className={cn(
+        "rounded-md border p-3",
+        on
+          ? "border-emerald-500/40 bg-emerald-500/5"
+          : "border-amber-500/40 bg-amber-500/5",
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-start gap-2">
+          {on ? (
+            <ShieldCheck className="mt-0.5 h-5 w-5 text-emerald-600 dark:text-emerald-400" />
+          ) : (
+            <ShieldAlert className="mt-0.5 h-5 w-5 text-amber-600 dark:text-amber-400" />
+          )}
+          <div>
+            <div className="text-sm font-medium">
+              Enforcement {on ? "ON" : "OFF (dark)"}
+            </div>
+            <div className="text-xs text-muted-foreground">
+              {on
+                ? "The control plane is rendering authoritative firewall drop-ins to the fleet."
+                : "Policies are editable + previewable, but not applied to any node until you enable."}{" "}
+              {e.hardened_count}/{e.reported_count} reporting node(s) hardened
+              {e.lanwide_count > 0 &&
+                `, ${e.lanwide_count} still on the legacy LAN-wide base`}
+              .
+            </div>
+          </div>
+        </div>
+        <div className="shrink-0">
+          {on ? (
+            <button
+              type="button"
+              onClick={() => setConfirm("disable")}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+            >
+              Disable
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() =>
+                setConfirm(e.safe_to_enable ? "enable" : "enable-override")
+              }
+              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            >
+              Enable…
+            </button>
+          )}
+        </div>
+      </div>
+
+      {!on && e.nodes.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1">
+          {e.nodes.map((n) => (
+            <span
+              key={n.appliance_id}
+              className={cn(
+                "rounded px-1.5 py-0.5 text-[11px]",
+                n.hardened
+                  ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
+                  : "bg-rose-500/15 text-rose-600 dark:text-rose-400",
+              )}
+            >
+              {n.hostname}:{" "}
+              {n.hardened
+                ? "hardened"
+                : n.base_lanwide_k3s === true
+                  ? "LAN-wide"
+                  : "unknown"}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {set.isError && (
+        <p className="mt-2 text-xs text-destructive">
+          {formatApiError(set.error)}
+        </p>
+      )}
+
+      <ConfirmModal
+        open={confirm === "enable"}
+        title="Enable firewall enforcement"
+        loading={set.isPending}
+        message={
+          <>
+            All {e.reported_count} reporting node(s) are hardened. Enabling
+            makes the control-plane render authoritative — the next supervisor
+            heartbeat applies each node's policy drop-in.
+          </>
+        }
+        confirmLabel="Enable"
+        onConfirm={() => set.mutate({ enabled: true })}
+        onClose={() => setConfirm(null)}
+      />
+      <ConfirmModal
+        open={confirm === "enable-override"}
+        title="Enable enforcement before all nodes are hardened"
+        tone="destructive"
+        loading={set.isPending}
+        requireCheckboxLabel={`I understand ${unconfirmed} node(s) are not confirmed hardened`}
+        message={
+          <>
+            {unconfirmed} of {e.reported_count} reporting node(s) are not
+            confirmed hardened ({e.lanwide_count} still on the legacy LAN-wide
+            base). On those nodes the base accept still fires first, so enabling
+            is a no-op there until the hardened slot rolls out — and the
+            compliance claim would be inaccurate. Enable anyway?
+          </>
+        }
+        confirmLabel="Enable anyway"
+        onConfirm={() =>
+          set.mutate({ enabled: true, override_unhardened: true })
+        }
+        onClose={() => setConfirm(null)}
+      />
+      <ConfirmModal
+        open={confirm === "disable"}
+        title="Disable firewall enforcement"
+        loading={set.isPending}
+        message="The fleet falls back to the in-pod (dark) render. Always safe — nothing tightens on disable."
+        confirmLabel="Disable"
+        onConfirm={() => set.mutate({ enabled: false })}
+        onClose={() => setConfirm(null)}
+      />
     </div>
   );
 }

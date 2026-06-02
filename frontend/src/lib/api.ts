@@ -7448,6 +7448,24 @@ export interface FirewallPreview {
   staging_id: string;
 }
 
+export interface FirewallEnforcementNode {
+  appliance_id: string;
+  hostname: string;
+  hardened: boolean;
+  base_lanwide_k3s: boolean | null;
+  last_seen_at: string | null;
+}
+
+export interface FirewallEnforcement {
+  enabled: boolean;
+  reported_count: number;
+  hardened_count: number;
+  lanwide_count: number;
+  all_hardened: boolean;
+  safe_to_enable: boolean;
+  nodes: FirewallEnforcementNode[];
+}
+
 const _FW = "/appliance/firewall";
 export const firewallApi = {
   listPolicies: (params?: { scope_kind?: string; scope_role?: string }) =>
@@ -7502,6 +7520,12 @@ export const firewallApi = {
     fleet_rules?: FirewallRuleInput[];
     appliance_rules?: FirewallRuleInput[];
   }) => api.post<FirewallPreview>(`${_FW}/preview`, body).then((r) => r.data),
+  getEnforcement: () =>
+    api.get<FirewallEnforcement>(`${_FW}/enforcement`).then((r) => r.data),
+  setEnforcement: (body: { enabled: boolean; override_unhardened?: boolean }) =>
+    api
+      .put<FirewallEnforcement>(`${_FW}/enforcement`, body)
+      .then((r) => r.data),
 };
 
 // Appliance Web UI certificate management (Phase 4b.1). Mounted at
