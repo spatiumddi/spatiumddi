@@ -211,7 +211,8 @@ def compile_firewall_body(
     return "\n".join(lines) + "\n"
 
 
-def firewall_bundle(
+async def firewall_bundle(
+    db: Any,
     *,
     role_assignment: dict[str, Any],
     cluster_peer_cidrs: list[Any],
@@ -220,22 +221,42 @@ def firewall_bundle(
     cp_member_count: int,
     vip_configured: bool,
     firewall_enabled: bool,
+    appliance_id: Any = None,
 ) -> dict[str, Any]:
     """The ``firewall_settings`` block shipped on the supervisor heartbeat.
 
     Disabled-shape (empty ``config_hash``) when ``firewall_enabled`` is off
     — the supervisor reads the empty hash as "no server authority" and
     keeps its in-pod fallback render. Same key shape as ``snmp_bundle``.
+    The disabled path short-circuits BEFORE any DB read.
+
+    #285 Phase 3b — the body is now compiled from the declarative policy
+    model (``compile_firewall_from_policies``), which SUBSUMES the frozen
+    ``compile_firewall_body`` byte-for-byte when fed the seeded builtins.
+    On an unseeded DB the merge renders from the in-code builtins, so the
+    output is identical either way.
     """
     if not firewall_enabled:
         return {"enabled": False, "config_hash": "", "firewall_conf": ""}
-    body = compile_firewall_body(
+    # Lazy import — firewall_merge imports the shared helpers from THIS module
+    # at load, so importing it at module scope here would be a cycle.
+    from app.services.appliance.firewall_merge import (
+        compile_firewall_from_policies,
+        load_appliance_policy,
+        load_policy_set,
+    )
+
+    policy_set = await load_policy_set(db)
+    appliance_policy = await load_appliance_policy(db, appliance_id)
+    body = compile_firewall_from_policies(
         role_assignment,
         cluster_peer_cidrs,
         pod_cidrs=pod_cidrs,
         service_cidrs=service_cidrs,
         cp_member_count=cp_member_count,
         vip_configured=vip_configured,
+        policy_set=policy_set,
+        appliance_policy=appliance_policy,
     )
     return {
         "enabled": True,

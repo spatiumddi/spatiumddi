@@ -1745,7 +1745,8 @@ async def supervisor_heartbeat(
     # its in-pod fallback). role_assignment is the SupervisorRoleAssignment
     # built above; pass its dict form so compile_firewall_body reads roles /
     # firewall_extra / kubeapi_expose_cidrs the same way the supervisor does.
-    firewall_block = firewall_bundle(
+    firewall_block = await firewall_bundle(
+        db,
         role_assignment=role_assignment.model_dump(),
         cluster_peer_cidrs=cluster_peer_cidrs,
         pod_cidrs=firewall_pod_cidrs,
@@ -1753,6 +1754,7 @@ async def supervisor_heartbeat(
         cp_member_count=control_plane_size,
         vip_configured=bool(metallb_vip),
         firewall_enabled=bool(cfg_row.firewall_enabled) if cfg_row else False,
+        appliance_id=row.id,
     )
     # Persist the rendered hash so 2d's apply-stalled alarm + the Fleet drift
     # chip can compare it against the runner's reported applied_hash. Only

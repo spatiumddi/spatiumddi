@@ -1,12 +1,17 @@
-"""Server-side firewall render (#285 Phase 2a) — pure-function tests.
+"""Server-side firewall render (#285 Phase 2a + 3b) — render-identity tests.
 
-The load-bearing one is ``test_byte_identical_with_supervisor_renderer``:
-``compile_firewall_body`` is a verbatim port of the supervisor's in-pod
-``render_drop_in`` and MUST produce a byte-identical body, else a node's
-drop-in changes hash purely on which renderer ran. These are pure (no DB)
-so they run on the host venv; the identity test loads the supervisor
-renderer standalone via importlib and skips if it isn't on disk (e.g. a
-backend-only container mount).
+The load-bearing contract is the THREE-WAY identity across an input matrix:
+
+    render_drop_in (supervisor in-pod)
+      == compile_firewall_body (frozen 2a port)
+      == compile_firewall_from_policies (3b merge, fed the seeded builtins)
+
+A one-byte divergence re-fires every node's host trigger on the
+firewall_enabled flip (the merge runs when enabled; the in-pod renderer when
+not). The pure-function legs run on the host venv; the supervisor leg loads
+the in-pod renderer standalone via importlib and skips if it isn't on disk.
+The async ``firewall_bundle`` legs use the empty-DB builtin fallback so they
+need no seeding.
 """
 
 from __future__ import annotations
@@ -19,8 +24,13 @@ import sys
 import pytest
 
 from app.services.appliance.firewall import compile_firewall_body, firewall_bundle
+from app.services.appliance.firewall_merge import (
+    builtin_policy_set,
+    compile_firewall_from_policies,
+    reset_policy_cache,
+)
 
-# The full input matrix the byte-identity + smoke tests exercise.
+# The full input matrix the identity + smoke tests exercise.
 _MATRIX: list[dict] = [
     {"role_assignment": {"roles": []}},  # idle
     {"role_assignment": {"roles": ["dns-bind9"]}},
@@ -50,15 +60,29 @@ _MATRIX: list[dict] = [
     },
     # operator firewall_extra
     {"role_assignment": {"roles": ["dhcp"], "firewall_extra": 'udp dport 161 accept comment "x"'}},
+    # Trap 1: junk pod CIDR — is_cp via RAW non-empty, but no valid union.
+    {"role_assignment": {"roles": []}, "pod_cidrs": ["not-a-cidr"]},
+    # multi-node but NO vip → memberlist guard fails (header + peer/api only)
+    {
+        "role_assignment": {"roles": []},
+        "cluster_peer_cidrs": ["192.168.0.5/32"],
+        "cp_member_count": 3,
+        "vip_configured": False,
+    },
 ]
 
 
+@pytest.fixture(autouse=True)
+def _reset_fw_cache():
+    reset_policy_cache()
+    yield
+    reset_policy_cache()
+
+
 def _call(fn, case: dict):
-    ra = case["role_assignment"]
-    peers = case.get("cluster_peer_cidrs")
     return fn(
-        ra,
-        peers,
+        case["role_assignment"],
+        case.get("cluster_peer_cidrs"),
         pod_cidrs=case.get("pod_cidrs"),
         service_cidrs=case.get("service_cidrs"),
         cp_member_count=case.get("cp_member_count", 1),
@@ -66,9 +90,19 @@ def _call(fn, case: dict):
     )
 
 
+def _call_merge(case: dict) -> str:
+    return compile_firewall_from_policies(
+        case["role_assignment"],
+        case.get("cluster_peer_cidrs"),
+        pod_cidrs=case.get("pod_cidrs"),
+        service_cidrs=case.get("service_cidrs"),
+        cp_member_count=case.get("cp_member_count", 1),
+        vip_configured=case.get("vip_configured", False),
+        policy_set=builtin_policy_set(),
+    )
+
+
 def _load_supervisor_renderer():
-    """Load the supervisor's firewall_renderer standalone (no intra-package
-    imports; needs only structlog). Returns None if the file isn't present."""
     path = (
         pathlib.Path(__file__).resolve().parents[2]
         / "agent/supervisor/spatium_supervisor/firewall_renderer.py"
@@ -85,6 +119,18 @@ def _load_supervisor_renderer():
     return mod
 
 
+def test_merge_subsumes_legacy_renderer() -> None:
+    # The 3b merge fed the seeded builtins reproduces the frozen 2a renderer
+    # BYTE-FOR-BYTE across the matrix (the half of the triangle that lives in
+    # this repo without the supervisor file on disk).
+    for case in _MATRIX:
+        legacy = _call(compile_firewall_body, case)
+        merged = _call_merge(case)
+        assert (
+            merged == legacy
+        ), f"merge drift for {case!r}\n--legacy--\n{legacy}\n--merge--\n{merged}"
+
+
 def test_byte_identical_with_supervisor_renderer() -> None:
     sup = _load_supervisor_renderer()
     if sup is None:
@@ -93,21 +139,25 @@ def test_byte_identical_with_supervisor_renderer() -> None:
         backend_body = _call(compile_firewall_body, case)
         supervisor_body = _call(sup.render_drop_in, case).body
         assert backend_body == supervisor_body, f"render drift for {case!r}"
+        # Close the triangle: supervisor == merge too.
+        assert _call_merge(case) == supervisor_body, f"merge≠supervisor for {case!r}"
 
 
-def test_no_dataplane_rule_either_side() -> None:
-    # Neither renderer may emit a flannel/wireguard INPUT rule (#285 — VXLAN
+def test_no_dataplane_rule_any_renderer() -> None:
+    # No renderer may emit a flannel/wireguard INPUT rule (#285 — VXLAN
     # bypasses our chain). Guards against a one-sided data-plane-floor add.
     sup = _load_supervisor_renderer()
     for case in _MATRIX:
-        body = _call(compile_firewall_body, case)
-        assert "8472" not in body and "51820" not in body and "dataplane" not in body
+        for body in (_call(compile_firewall_body, case), _call_merge(case)):
+            assert "8472" not in body and "51820" not in body and "dataplane" not in body
         if sup is not None:
             assert "8472" not in _call(sup.render_drop_in, case).body
 
 
-def test_bundle_disabled_shape() -> None:
-    b = firewall_bundle(
+async def test_bundle_disabled_shape() -> None:
+    # Disabled path short-circuits before any DB read → db can be None.
+    b = await firewall_bundle(
+        None,
         role_assignment={"roles": []},
         cluster_peer_cidrs=[],
         pod_cidrs=[],
@@ -119,8 +169,10 @@ def test_bundle_disabled_shape() -> None:
     assert b == {"enabled": False, "config_hash": "", "firewall_conf": ""}
 
 
-def test_bundle_enabled_shape() -> None:
-    b = firewall_bundle(
+async def test_bundle_enabled_shape(db_session) -> None:
+    # Empty DB → builtin fallback → byte-identical to the legacy render.
+    b = await firewall_bundle(
+        db_session,
         role_assignment={"roles": ["dns-bind9"]},
         cluster_peer_cidrs=[],
         pod_cidrs=[],
@@ -133,12 +185,13 @@ def test_bundle_enabled_shape() -> None:
     assert b["firewall_conf"].startswith("# Auto-generated by spatium-supervisor")
     assert "tcp dport 53 accept" in b["firewall_conf"]
     assert b["config_hash"] == hashlib.sha256(b["firewall_conf"].encode()).hexdigest()
+    legacy = compile_firewall_body({"roles": ["dns-bind9"]}, [])
+    assert b["firewall_conf"] == legacy
 
 
-def test_bundle_multinode_retire_directive() -> None:
-    # cp_member_count >= 2 → the body carries the retire directive that drives
-    # host-side sentinel retirement (Phase 1b).
-    single = firewall_bundle(
+async def test_bundle_multinode_retire_directive(db_session) -> None:
+    single = await firewall_bundle(
+        db_session,
         role_assignment={"roles": []},
         cluster_peer_cidrs=[],
         pod_cidrs=["10.42.0.0/16"],
@@ -147,7 +200,8 @@ def test_bundle_multinode_retire_directive() -> None:
         vip_configured=False,
         firewall_enabled=True,
     )
-    multi = firewall_bundle(
+    multi = await firewall_bundle(
+        db_session,
         role_assignment={"roles": []},
         cluster_peer_cidrs=["192.168.0.2/32"],
         pod_cidrs=["10.42.0.0/16"],
