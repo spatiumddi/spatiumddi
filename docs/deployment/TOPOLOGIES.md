@@ -440,6 +440,47 @@ stateless. A few shape notes:
 
 ---
 
+## Fleet firewall posture across topologies (#285)
+
+The declarative fleet firewall (full operator story in the "Fleet firewall"
+section of [`APPLIANCE.md`](APPLIANCE.md)) applies to the **appliance**
+topologies (1, 2, 3, 7) — Docker-Compose / generic
+K8s control planes (4, 5, 6) manage host firewalling with their own tooling.
+It's dark by default (the `appliance.firewall` module + the `firewall_enabled`
+master switch); when enabled, each node's drop-in is compiled server-side from
+the fleet → role → appliance policy layers:
+
+- **Single VM (1)** — one node carries every role; the merge opens 53 (DNS),
+  67/68 (DHCP), the control-plane ports peer-scoped (here: just itself), and
+  the mgmt floor. The all-CP-hardened enforcement gate trivially passes (one
+  hardened node).
+- **Control plane + separate DNS/DHCP appliances (2, 3)** — the DNS-only and
+  DHCP-only worker appliances open only their role ports + the floor; etcd
+  (2379/2380) + kubelet (10250) never open on a non-CP worker. The control
+  node(s) open the control-plane ports scoped to the cluster-peer CIDR set.
+- **Appliance multi-node CP HA (7)** — every CP member opens etcd/kubelet +
+  MetalLB memberlist (7946) scoped to the *peer* CIDRs (never LAN-wide; the
+  #285 fix), and 6443 to peers ∪ pod ∪ service ∪ kubeapi-expose. The
+  peer-drift cross-check (warn-only) flags a member whose peer entry hasn't
+  propagated, or a left member's stale /32.
+
+### Air-gapped / manual join under enforcement
+
+A *joining* k3s node must reach the seed's apiserver on **6443 before** the
+supervisor can render its own peer-scoped drop-in (a bootstrap chicken-and-egg).
+The appliance keeps 6443 LAN-reachable via a baked sentinel drop-in
+(`/etc/nftables.d/00-spatium-k3s-bootstrap.nft`) for exactly this window — etcd
++ kubelet are *not* LAN-reachable, so the exposure is limited to the
+token+mTLS-guarded apiserver. The sentinel is retired (multi-node, no join
+window) on a later cut; until then it stays baked. So in an air-gapped LAN with
+enforcement on, a new node joins normally — no firewall step is needed on the
+joiner, and the control plane's peer set grows to include it on the next
+heartbeat. Do **not** enable enforcement on a fresh cluster until every CP
+member reports hardened (the enforcement gate blocks this by default; override
+only if you understand a still-LAN-wide node won't actually apply the policy).
+
+---
+
 ## What's NOT supported (yet)
 
 - **Active-active control plane across regions.** The schema isn't
