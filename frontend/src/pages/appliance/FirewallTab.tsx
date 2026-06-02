@@ -6,7 +6,7 @@
 // tab itself is gated in AppliancePage on the appliance.firewall feature
 // module — #14's NavItem clause is satisfied by tab-level gating because the
 // firewall family lives under the always-visible /appliance parent.
-import { useMemo, useState } from "react";
+import { useMemo, useState, type Dispatch, type SetStateAction } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -62,7 +62,7 @@ const SOURCE_KINDS: FirewallSourceKind[] = [
 const PROTOCOLS: FirewallProtocol[] = ["tcp", "udp", "icmp", "icmpv6"];
 const FAMILIES: FirewallFamily[] = ["both", "v4", "v6"];
 
-type SubTab = "policies" | "aliases" | "effective";
+type SubTab = "policies" | "aliases" | "preview" | "effective";
 
 function scopeLabel(p: FirewallPolicy): string {
   if (p.scope_kind === "fleet") return "Fleet";
@@ -78,6 +78,7 @@ export function FirewallTab() {
   const tabs: { key: SubTab; label: string }[] = [
     { key: "policies", label: "Policies" },
     { key: "aliases", label: "Aliases" },
+    { key: "preview", label: "Preview changes" },
     { key: "effective", label: "Effective render" },
   ];
   return (
@@ -117,6 +118,7 @@ export function FirewallTab() {
 
       {sub === "policies" && <PoliciesSection />}
       {sub === "aliases" && <AliasesSection />}
+      {sub === "preview" && <PreviewSection />}
       {sub === "effective" && <EffectiveSection />}
     </div>
   );
@@ -617,6 +619,195 @@ function parseList(s: string): string[] {
     .filter(Boolean);
 }
 
+function emptyRow(seq: number): EditRow {
+  return {
+    seq: String(seq),
+    action: "accept",
+    protocol: "tcp",
+    ports: "",
+    source_kind: "any",
+    source: "",
+    family: "both",
+    comment: "",
+    enabled: true,
+  };
+}
+
+function rowsToRules(rows: EditRow[]): FirewallRuleInput[] {
+  return rows.map((r) => ({
+    seq: Number(r.seq) || 0,
+    action: r.action,
+    protocol: r.protocol,
+    ports: parseList(r.ports)
+      .map((p) => Number(p))
+      .filter((n) => !Number.isNaN(n)),
+    source_kind: r.source_kind,
+    source_cidrs: r.source_kind === "cidr" ? parseList(r.source) : [],
+    source_alias: r.source_kind === "alias" ? r.source.trim() || null : null,
+    family: r.family,
+    comment: r.comment.trim() || null,
+    enabled: r.enabled,
+  }));
+}
+
+// Shared editable rule-rows table — used by the rule editor (bulk-replace a
+// policy) AND the staged-preview tab (what-if fleet overlay rules).
+function RuleRowsEditor({
+  rows,
+  setRows,
+}: {
+  rows: EditRow[];
+  setRows: Dispatch<SetStateAction<EditRow[]>>;
+}) {
+  const update = (i: number, patch: Partial<EditRow>) =>
+    setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  return (
+    <>
+      <div className="max-h-[45vh] overflow-auto rounded-md border">
+        <table className="w-full text-xs">
+          <thead className="sticky top-0 bg-muted/70 text-muted-foreground">
+            <tr>
+              <th className="px-1.5 py-1 text-left">Seq</th>
+              <th className="px-1.5 py-1 text-left">Action</th>
+              <th className="px-1.5 py-1 text-left">Proto</th>
+              <th className="px-1.5 py-1 text-left">Ports</th>
+              <th className="px-1.5 py-1 text-left">Source kind</th>
+              <th className="px-1.5 py-1 text-left">Source (CIDRs / alias)</th>
+              <th className="px-1.5 py-1 text-left">Family</th>
+              <th className="px-1.5 py-1 text-left">Comment</th>
+              <th className="px-1.5 py-1"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr key={i} className="border-t">
+                <td className="px-1 py-1">
+                  <input
+                    value={r.seq}
+                    onChange={(e) => update(i, { seq: e.target.value })}
+                    className="w-12 rounded border bg-background px-1 py-0.5"
+                  />
+                </td>
+                <td className="px-1 py-1">
+                  <select
+                    value={r.action}
+                    onChange={(e) =>
+                      update(i, { action: e.target.value as FirewallAction })
+                    }
+                    className="rounded border bg-background px-1 py-0.5"
+                  >
+                    <option value="accept">accept</option>
+                    <option value="drop">drop</option>
+                  </select>
+                </td>
+                <td className="px-1 py-1">
+                  <select
+                    value={r.protocol}
+                    onChange={(e) =>
+                      update(i, {
+                        protocol: e.target.value as FirewallProtocol,
+                      })
+                    }
+                    className="rounded border bg-background px-1 py-0.5"
+                  >
+                    {PROTOCOLS.map((p) => (
+                      <option key={p} value={p}>
+                        {p}
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <td className="px-1 py-1">
+                  <input
+                    value={r.ports}
+                    onChange={(e) => update(i, { ports: e.target.value })}
+                    placeholder="53, 80"
+                    className="w-20 rounded border bg-background px-1 py-0.5"
+                  />
+                </td>
+                <td className="px-1 py-1">
+                  <select
+                    value={r.source_kind}
+                    onChange={(e) =>
+                      update(i, {
+                        source_kind: e.target.value as FirewallSourceKind,
+                      })
+                    }
+                    className="rounded border bg-background px-1 py-0.5"
+                  >
+                    {SOURCE_KINDS.map((s) => (
+                      <option key={s} value={s}>
+                        {s}
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <td className="px-1 py-1">
+                  <input
+                    value={r.source}
+                    onChange={(e) => update(i, { source: e.target.value })}
+                    disabled={
+                      r.source_kind !== "cidr" && r.source_kind !== "alias"
+                    }
+                    placeholder={
+                      r.source_kind === "alias"
+                        ? "alias-name"
+                        : r.source_kind === "cidr"
+                          ? "10.0.0.0/8"
+                          : "(derived)"
+                    }
+                    className="w-32 rounded border bg-background px-1 py-0.5 disabled:opacity-40"
+                  />
+                </td>
+                <td className="px-1 py-1">
+                  <select
+                    value={r.family}
+                    onChange={(e) =>
+                      update(i, { family: e.target.value as FirewallFamily })
+                    }
+                    className="rounded border bg-background px-1 py-0.5"
+                  >
+                    {FAMILIES.map((f) => (
+                      <option key={f} value={f}>
+                        {f}
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <td className="px-1 py-1">
+                  <input
+                    value={r.comment}
+                    onChange={(e) => update(i, { comment: e.target.value })}
+                    className="w-24 rounded border bg-background px-1 py-0.5"
+                  />
+                </td>
+                <td className="px-1 py-1 text-right">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setRows((rs) => rs.filter((_, j) => j !== i))
+                    }
+                    className="text-destructive hover:opacity-70"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <button
+        type="button"
+        onClick={() => setRows((rs) => [...rs, emptyRow((rs.length + 1) * 10)])}
+        className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs hover:bg-accent"
+      >
+        <Plus className="h-3 w-3" /> Add rule
+      </button>
+    </>
+  );
+}
+
 function RuleEditorModal({
   policy,
   onClose,
@@ -628,44 +819,9 @@ function RuleEditorModal({
 }) {
   const [rows, setRows] = useState<EditRow[]>(policy.rules.map(rowFromRule));
   const save = useMutation({
-    mutationFn: () => {
-      const rules: FirewallRuleInput[] = rows.map((r) => ({
-        seq: Number(r.seq) || 0,
-        action: r.action,
-        protocol: r.protocol,
-        ports: parseList(r.ports)
-          .map((p) => Number(p))
-          .filter((n) => !Number.isNaN(n)),
-        source_kind: r.source_kind,
-        source_cidrs: r.source_kind === "cidr" ? parseList(r.source) : [],
-        source_alias:
-          r.source_kind === "alias" ? r.source.trim() || null : null,
-        family: r.family,
-        comment: r.comment.trim() || null,
-        enabled: r.enabled,
-      }));
-      return firewallApi.replaceRules(policy.id, rules);
-    },
+    mutationFn: () => firewallApi.replaceRules(policy.id, rowsToRules(rows)),
     onSuccess: onSaved,
   });
-
-  const update = (i: number, patch: Partial<EditRow>) =>
-    setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
-  const addRow = () =>
-    setRows((rs) => [
-      ...rs,
-      {
-        seq: String((rs.length + 1) * 10),
-        action: "accept",
-        protocol: "tcp",
-        ports: "",
-        source_kind: "any",
-        source: "",
-        family: "both",
-        comment: "",
-        enabled: true,
-      },
-    ]);
 
   return (
     <Modal title={`Edit rules — ${policy.name}`} onClose={onClose} wide>
@@ -675,149 +831,7 @@ function RuleEditorModal({
           first. A rule may not drop port 22. Builtin policy rules are editable;
           the mgmt floor (ssh / ping / loopback) is always emitted regardless.
         </p>
-        <div className="max-h-[55vh] overflow-auto rounded-md border">
-          <table className="w-full text-xs">
-            <thead className="sticky top-0 bg-muted/70 text-muted-foreground">
-              <tr>
-                <th className="px-1.5 py-1 text-left">Seq</th>
-                <th className="px-1.5 py-1 text-left">Action</th>
-                <th className="px-1.5 py-1 text-left">Proto</th>
-                <th className="px-1.5 py-1 text-left">Ports</th>
-                <th className="px-1.5 py-1 text-left">Source kind</th>
-                <th className="px-1.5 py-1 text-left">
-                  Source (CIDRs / alias)
-                </th>
-                <th className="px-1.5 py-1 text-left">Family</th>
-                <th className="px-1.5 py-1 text-left">Comment</th>
-                <th className="px-1.5 py-1"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r, i) => (
-                <tr key={i} className="border-t">
-                  <td className="px-1 py-1">
-                    <input
-                      value={r.seq}
-                      onChange={(e) => update(i, { seq: e.target.value })}
-                      className="w-12 rounded border bg-background px-1 py-0.5"
-                    />
-                  </td>
-                  <td className="px-1 py-1">
-                    <select
-                      value={r.action}
-                      onChange={(e) =>
-                        update(i, { action: e.target.value as FirewallAction })
-                      }
-                      className="rounded border bg-background px-1 py-0.5"
-                    >
-                      <option value="accept">accept</option>
-                      <option value="drop">drop</option>
-                    </select>
-                  </td>
-                  <td className="px-1 py-1">
-                    <select
-                      value={r.protocol}
-                      onChange={(e) =>
-                        update(i, {
-                          protocol: e.target.value as FirewallProtocol,
-                        })
-                      }
-                      className="rounded border bg-background px-1 py-0.5"
-                    >
-                      {PROTOCOLS.map((p) => (
-                        <option key={p} value={p}>
-                          {p}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
-                  <td className="px-1 py-1">
-                    <input
-                      value={r.ports}
-                      onChange={(e) => update(i, { ports: e.target.value })}
-                      placeholder="53, 80"
-                      className="w-20 rounded border bg-background px-1 py-0.5"
-                    />
-                  </td>
-                  <td className="px-1 py-1">
-                    <select
-                      value={r.source_kind}
-                      onChange={(e) =>
-                        update(i, {
-                          source_kind: e.target.value as FirewallSourceKind,
-                        })
-                      }
-                      className="rounded border bg-background px-1 py-0.5"
-                    >
-                      {SOURCE_KINDS.map((s) => (
-                        <option key={s} value={s}>
-                          {s}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
-                  <td className="px-1 py-1">
-                    <input
-                      value={r.source}
-                      onChange={(e) => update(i, { source: e.target.value })}
-                      disabled={
-                        r.source_kind !== "cidr" && r.source_kind !== "alias"
-                      }
-                      placeholder={
-                        r.source_kind === "alias"
-                          ? "alias-name"
-                          : r.source_kind === "cidr"
-                            ? "10.0.0.0/8"
-                            : "(derived)"
-                      }
-                      className="w-32 rounded border bg-background px-1 py-0.5 disabled:opacity-40"
-                    />
-                  </td>
-                  <td className="px-1 py-1">
-                    <select
-                      value={r.family}
-                      onChange={(e) =>
-                        update(i, { family: e.target.value as FirewallFamily })
-                      }
-                      className="rounded border bg-background px-1 py-0.5"
-                    >
-                      {FAMILIES.map((f) => (
-                        <option key={f} value={f}>
-                          {f}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
-                  <td className="px-1 py-1">
-                    <input
-                      value={r.comment}
-                      onChange={(e) => update(i, { comment: e.target.value })}
-                      className="w-24 rounded border bg-background px-1 py-0.5"
-                    />
-                  </td>
-                  <td className="px-1 py-1 text-right">
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setRows((rs) => rs.filter((_, j) => j !== i))
-                      }
-                      className="text-destructive hover:opacity-70"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <button
-          type="button"
-          onClick={addRow}
-          className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs hover:bg-accent"
-        >
-          <Plus className="h-3 w-3" /> Add rule
-        </button>
+        <RuleRowsEditor rows={rows} setRows={setRows} />
         {save.isError && (
           <p className="text-xs text-destructive">
             {formatApiError(save.error)}
@@ -1163,6 +1177,117 @@ function EffectiveSection() {
             </div>
           </div>
         </>
+      )}
+    </div>
+  );
+}
+
+// ── Staged-preview diff viewer (Phase 4b) ───────────────────────────
+
+function PreviewSection() {
+  const { data: appliances } = useQuery({
+    queryKey: ["appliance", "appliances"],
+    queryFn: applianceApprovalApi.list,
+  });
+  const [applianceId, setApplianceId] = useState("");
+  const [rows, setRows] = useState<EditRow[]>([emptyRow(10)]);
+  const preview = useMutation({
+    mutationFn: () =>
+      firewallApi.preview({
+        appliance_id: applianceId,
+        fleet_rules: rowsToRules(rows),
+      }),
+  });
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground">
+        Stage fleet-overlay rules and preview their effect on a node before
+        saving — the line diff against its current effective render, plus
+        accept↔drop conflict / redundancy warnings. Read-only; nothing is
+        applied or saved.
+      </p>
+      <div className="flex items-center gap-2">
+        <select
+          value={applianceId}
+          onChange={(e) => setApplianceId(e.target.value)}
+          className="rounded-md border bg-background px-2 py-1.5 text-sm"
+        >
+          <option value="">— pick an appliance —</option>
+          {(appliances ?? []).map((a) => (
+            <option key={a.id} value={a.id}>
+              {a.hostname}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          disabled={!applianceId || preview.isPending}
+          onClick={() => preview.mutate()}
+          className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+        >
+          {preview.isPending && (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          )}
+          Preview
+        </button>
+      </div>
+
+      <RuleRowsEditor rows={rows} setRows={setRows} />
+
+      {preview.isError && (
+        <p className="text-xs text-destructive">
+          {formatApiError(preview.error)}
+        </p>
+      )}
+
+      {preview.data && (
+        <div className="space-y-2">
+          {preview.data.upgrade_in_flight && (
+            <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                An OS upgrade is in flight — a firewall apply would be blocked
+                until it completes.
+              </span>
+            </div>
+          )}
+          {preview.data.warnings.length > 0 && (
+            <div className="space-y-1">
+              {preview.data.warnings.map((w, i) => (
+                <div
+                  key={i}
+                  className={cn(
+                    "rounded px-2 py-1 text-xs",
+                    w.kind === "conflict"
+                      ? "bg-amber-500/15 text-amber-700 dark:text-amber-300"
+                      : "bg-muted text-muted-foreground",
+                  )}
+                >
+                  <span className="font-medium">{w.kind}</span> — {w.detail}
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="grid gap-3 lg:grid-cols-2">
+            <div className="rounded-md border">
+              <div className="border-b bg-muted/40 px-2 py-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                + Added ({preview.data.added.length})
+              </div>
+              <pre className="overflow-x-auto px-2 py-1.5 font-mono text-[11px] leading-relaxed">
+                {preview.data.added.join("\n") || "(none)"}
+              </pre>
+            </div>
+            <div className="rounded-md border">
+              <div className="border-b bg-muted/40 px-2 py-1 text-xs font-medium text-rose-600 dark:text-rose-400">
+                − Removed ({preview.data.removed.length})
+              </div>
+              <pre className="overflow-x-auto px-2 py-1.5 font-mono text-[11px] leading-relaxed">
+                {preview.data.removed.join("\n") || "(none)"}
+              </pre>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
