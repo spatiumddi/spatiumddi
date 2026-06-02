@@ -25,6 +25,7 @@ celery_app = Celery(
         "app.tasks.prune_metrics",
         "app.tasks.prune_multicast_memberships",
         "app.tasks.prune_pairing_codes",
+        "app.tasks.firewall_lint_scan",
         "app.tasks.prune_revoked_appliances",
         "app.tasks.trash_purge",
         "app.tasks.ipam_reservation_sweep",
@@ -78,6 +79,7 @@ celery_app.conf.update(
         "app.tasks.prune_metrics.*": {"queue": "default"},
         "app.tasks.prune_multicast_memberships.*": {"queue": "default"},
         "app.tasks.prune_pairing_codes.*": {"queue": "default"},
+        "app.tasks.firewall_lint_scan.*": {"queue": "default"},
         "app.tasks.trash_purge.*": {"queue": "default"},
         "app.tasks.ipam_reservation_sweep.*": {"queue": "ipam"},
         "app.tasks.ipam_discovery.*": {"queue": "ipam"},
@@ -410,6 +412,14 @@ celery_app.conf.update(
         # the rolling-window state of recent codes without a long lag.
         "pairing-codes-prune": {
             "task": "app.tasks.prune_pairing_codes.prune_pairing_codes",
+            "schedule": schedule(run_every=1800.0),
+        },
+        # Every 30 min, advisory-lint every appliance's firewall_extra
+        # (#285 Phase 5). Self-gates on an audit-log marker row so the
+        # body runs exactly once per install; the beat cadence just means
+        # a fresh install scans within 30 min of the worker coming up.
+        "firewall-extra-lint-scan": {
+            "task": "app.tasks.firewall_lint_scan.scan_firewall_extra",
             "schedule": schedule(run_every=1800.0),
         },
         # Hourly sweep of soft-deleted appliance rows past the
