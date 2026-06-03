@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 
 from app.api.deps import DB, CurrentUser
 from app.config import settings
+from app.core.permissions import is_effective_superadmin
 from app.core.security import verify_password
 from app.models.audit import AuditLog
 
@@ -74,7 +75,7 @@ async def reveal_agent_keys(
     surface — anyone who has them can register a rogue agent and
     inject themselves into the agent-config push.
     """
-    if not current_user.is_superadmin:
+    if not is_effective_superadmin(current_user):
         # Audit even the denied attempts — interesting signal.
         db.add(
             AuditLog(

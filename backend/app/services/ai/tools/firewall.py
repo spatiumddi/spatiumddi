@@ -33,6 +33,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
 from app.models.firewall import FirewallAlias, FirewallPolicy
 from app.services.ai import operations
@@ -43,7 +44,7 @@ _MODULE = "appliance.firewall"
 
 
 def _superadmin_gate(user: User) -> dict[str, Any] | None:
-    if not user.is_superadmin:
+    if not is_effective_superadmin(user):
         return {
             "error": (
                 "Fleet firewall management is restricted to superadmin users. "

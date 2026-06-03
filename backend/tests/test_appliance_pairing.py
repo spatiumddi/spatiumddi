@@ -44,6 +44,7 @@ async def _make_user(
         auth_source=auth_source,
         is_superadmin=superadmin,
     )
+    user.groups = []  # mark loaded — is_effective_superadmin walks .groups (#351)
     db.add(user)
     await db.flush()
     token = create_access_token(str(user.id))

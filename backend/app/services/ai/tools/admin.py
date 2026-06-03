@@ -30,6 +30,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.permissions import is_effective_superadmin
 from app.models.auth import Group, Role, User
 from app.services.ai.tools.base import register_tool
 
@@ -47,7 +48,7 @@ def _superadmin_gate(user: User) -> dict[str, Any] | None:
     allowed. Tools wrap their list/dict return as a single-element
     error response so the orchestrator's "tool result" message reads
     as a clear refusal rather than an empty payload."""
-    if not user.is_superadmin:
+    if not is_effective_superadmin(user):
         return {
             "error": (
                 "This tool returns security-sensitive RBAC and login "

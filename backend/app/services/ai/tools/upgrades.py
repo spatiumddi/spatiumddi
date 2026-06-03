@@ -23,13 +23,14 @@ from typing import Any
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
 from app.services.ai.tools.base import register_tool
 from app.services.upgrades import mutex, orchestrator, preflight
 
 
 def _superadmin_gate(user: User) -> dict[str, Any] | None:
-    if not user.is_superadmin:
+    if not is_effective_superadmin(user):
         return {"error": ("Rolling-upgrade preflight is restricted to superadmin users.")}
     return None
 

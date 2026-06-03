@@ -305,3 +305,46 @@ async def test_dns_editor_cannot_touch_ipam(client: AsyncClient, db_session: Asy
     # IPAM: denied
     r = await client.get("/api/v1/ipam/spaces", headers=headers)
     assert r.status_code == 403
+
+
+# ── /auth/me reports EFFECTIVE superadmin (issue #351) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_me_reports_effective_superadmin_for_role_only_user(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An OIDC/LDAP/SAML user mapped to a Superadmin-role group has
+    ``is_superadmin=False`` on the row but the ``{*, *}`` wildcard via the role.
+    ``/auth/me`` must report ``is_superadmin: true`` so the frontend's
+    superadmin gates (Fleet, Pairing, SNMP/NTP/LLDP, Sessions, …) light up —
+    matching what the backend route gates (``is_effective_superadmin``) allow.
+    """
+    user, token = await _persist_user_with_role(
+        db_session,
+        role_name="Superadmin-clone",
+        permissions=[{"action": "*", "resource_type": "*"}],
+        username="oidc-superadmin",
+    )
+    assert user.is_superadmin is False  # the column is NOT set — role only
+    await db_session.commit()
+    r = await client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200, r.text
+    assert r.json()["is_superadmin"] is True
+
+
+@pytest.mark.asyncio
+async def test_me_reports_false_for_plain_user(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # A user with neither the column nor a wildcard role is NOT a superadmin.
+    _, token = await _persist_user_with_role(
+        db_session,
+        role_name="Plain-reader",
+        permissions=[{"action": "read", "resource_type": "subnet"}],
+        username="plain-user",
+    )
+    await db_session.commit()
+    r = await client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200, r.text
+    assert r.json()["is_superadmin"] is False

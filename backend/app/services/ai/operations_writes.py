@@ -39,6 +39,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dhcp._audit import write_audit
+from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
 from app.services.ai.operations import Operation, PreviewResult, register
 
@@ -329,7 +330,7 @@ register(
 
 def _require_superadmin(user: User) -> None:
     """Apply-time guard — raises so a non-superadmin apply is rejected."""
-    if not user.is_superadmin:
+    if not is_effective_superadmin(user):
         raise ValueError("This operation is restricted to superadmin users")
 
 
@@ -337,7 +338,7 @@ def _superadmin_preview_block(user: User) -> PreviewResult | None:
     """Preview-time guard — returns a clean rejection (never raises, so
     ``_propose_via`` surfaces it as proposal_rejected rather than an
     error)."""
-    if not user.is_superadmin:
+    if not is_effective_superadmin(user):
         return PreviewResult(ok=False, detail="This operation is restricted to superadmin users")
     return None
 
