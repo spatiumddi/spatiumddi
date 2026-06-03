@@ -31,6 +31,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
+from app.core.permissions import is_effective_superadmin
 from app.models.ai import AIPrompt
 
 logger = structlog.get_logger(__name__)
@@ -115,7 +116,7 @@ async def list_prompts(current_user: CurrentUser, db: DB) -> list[PromptResponse
     status_code=status.HTTP_201_CREATED,
 )
 async def create_prompt(body: PromptCreate, current_user: CurrentUser, db: DB) -> PromptResponse:
-    if body.is_shared and not current_user.is_superadmin:
+    if body.is_shared and not is_effective_superadmin(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only superadmins can create shared prompts",
@@ -173,12 +174,12 @@ async def update_prompt(
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     is_owner = row.created_by_user_id == current_user.id
-    if not (current_user.is_superadmin or is_owner):
+    if not (is_effective_superadmin(current_user) or is_owner):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     # Operators can't promote a private prompt into the shared bucket
     # without superadmin, since shared prompts go in the curated list.
     if body.is_shared is not None and body.is_shared != row.is_shared:
-        if not current_user.is_superadmin:
+        if not is_effective_superadmin(current_user):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only superadmins can change the shared/private flag",
@@ -205,7 +206,7 @@ async def update_prompt(
     )
     await db.commit()
     await db.refresh(row)
-    return _to_response(row, is_owner=is_owner or current_user.is_superadmin)
+    return _to_response(row, is_owner=is_owner or is_effective_superadmin(current_user))
 
 
 @router.delete("/prompts/{prompt_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -214,7 +215,7 @@ async def delete_prompt(prompt_id: uuid.UUID, current_user: CurrentUser, db: DB)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     is_owner = row.created_by_user_id == current_user.id
-    if not (current_user.is_superadmin or is_owner):
+    if not (is_effective_superadmin(current_user) or is_owner):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     name = row.name
     await db.delete(row)

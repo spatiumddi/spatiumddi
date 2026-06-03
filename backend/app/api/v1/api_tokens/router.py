@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, select
 
 from app.api.deps import DB, CurrentUser
+from app.core.permissions import is_effective_superadmin
 from app.core.security import generate_api_token
 from app.models.audit import AuditLog
 from app.models.auth import APIToken
@@ -139,7 +140,7 @@ def _resolve_expiry(body: ApiTokenCreate) -> datetime | None:
 async def list_tokens(db: DB, current_user: CurrentUser) -> list[APIToken]:
     """List tokens owned by the caller. Superadmin sees everyone's."""
     stmt = select(APIToken).order_by(APIToken.created_at.desc())
-    if not current_user.is_superadmin:
+    if not is_effective_superadmin(current_user):
         stmt = stmt.where(APIToken.user_id == current_user.id)
     return list((await db.execute(stmt)).scalars().all())
 
@@ -277,6 +278,6 @@ async def _require_owned(token_id: uuid.UUID, db: DB, current_user: CurrentUser)
     # Non-superadmins can only see their own tokens. Raising 404 here
     # rather than 403 so we don't leak "this token exists, just not
     # yours".
-    if not current_user.is_superadmin and token.user_id != current_user.id:
+    if not is_effective_superadmin(current_user) and token.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Token not found")
     return token

@@ -42,6 +42,7 @@ from app.core.auth.user_sync import (
 )
 from app.core.auth_throttle import login_rate_limited, mfa_challenge_consume
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.permissions import is_effective_superadmin
 from app.core.request_meta import clean_user_agent
 from app.core.security import (
     create_access_token,
@@ -802,8 +803,26 @@ async def logout(current_user: CurrentUser, db: DB) -> None:
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_me(current_user: CurrentUser) -> User:
-    return current_user
+async def get_me(current_user: CurrentUser) -> UserResponse:
+    # #351 — ``is_superadmin`` here reports the *effective* status (the legacy
+    # column OR a group → Superadmin-role ``{*, *}`` wildcard), NOT the raw
+    # column. OIDC / LDAP / SAML users mapped into a Superadmin-role group have
+    # ``is_superadmin=False`` on the row (the column is only set on the seeded
+    # ``admin`` account + explicit admin-form flags), so reporting the column
+    # locked them out of every frontend superadmin gate (Fleet, Pairing,
+    # SNMP / NTP / LLDP, Sessions, Settings, …) even though the backend route
+    # gates already admit them via ``is_effective_superadmin``. This aligns what
+    # ``/me`` advertises with what those gates actually allow. The literal
+    # column stays available to admins via the users endpoint.
+    return UserResponse(
+        id=current_user.id,
+        username=current_user.username,
+        email=current_user.email,
+        display_name=current_user.display_name,
+        is_superadmin=is_effective_superadmin(current_user),
+        force_password_change=current_user.force_password_change,
+        auth_source=current_user.auth_source,
+    )
 
 
 # ── MFA — TOTP enrolment + management (issue #69) ───────────────────────────

@@ -31,13 +31,14 @@ from sqlalchemy import func as sa_func
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import is_effective_superadmin
 from app.models.appliance import PairingClaim, PairingCode
 from app.models.auth import User
 from app.services.ai.tools.base import register_tool
 
 
 def _superadmin_gate(user: User) -> dict[str, Any] | None:
-    if not user.is_superadmin:
+    if not is_effective_superadmin(user):
         return {
             "error": (
                 "Pairing codes contain agent bootstrap secrets, so this "

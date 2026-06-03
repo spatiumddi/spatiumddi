@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import is_effective_superadmin
 from app.models.appliance import (
     APPLIANCE_STATE_PENDING_APPROVAL,
     Appliance,
@@ -44,7 +45,7 @@ from app.services.ai.tools.proposals import _persist_proposal, _proposal_result
 
 
 def _superadmin_gate(user: User) -> dict[str, Any] | None:
-    if not user.is_superadmin:
+    if not is_effective_superadmin(user):
         return {
             "error": (
                 "Appliance fleet management is restricted to superadmin "

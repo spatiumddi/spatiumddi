@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services.ai.tools.base import register_tool
@@ -38,7 +39,7 @@ def _superadmin_gate(user: User) -> dict[str, Any] | None:
     auth tokens). Mirror the gate at the MCP layer so a non-
     superadmin's chat session can't read it either.
     """
-    if not user.is_superadmin:
+    if not is_effective_superadmin(user):
         return {
             "error": (
                 "Webhook config is restricted to superadmin users. "

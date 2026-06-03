@@ -4441,7 +4441,7 @@ async def reveal_appliance_kubeconfig(
             )
         )
 
-    if not current_user.is_superadmin:
+    if not is_effective_superadmin(current_user):
         _audit_denied("non_superadmin")
         await db.commit()
         await asyncio.sleep(0.1)

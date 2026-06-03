@@ -32,6 +32,7 @@ async def _user(db: AsyncSession, *, superadmin: bool = True, name: str = "ai-wr
         hashed_password=hash_password("x"),
         is_superadmin=superadmin,
     )
+    u.groups = []  # mark loaded — is_effective_superadmin walks .groups (#351)
     db.add(u)
     await db.commit()
     return u

@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
 from app.core.demo_mode import forbid_in_demo_mode
-from app.core.permissions import user_has_permission
+from app.core.permissions import is_effective_superadmin, user_has_permission
 from app.models.audit_forward import AuditForwardTarget
 from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
@@ -1039,7 +1039,7 @@ async def reveal_snmp_community(
             )
         )
 
-    if not current_user.is_superadmin:
+    if not is_effective_superadmin(current_user):
         _audit_denied("non_superadmin")
         await db.commit()
         raise HTTPException(
@@ -1344,7 +1344,7 @@ def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
 
 @router.get("/audit-forward-targets", response_model=list[AuditTargetResponse])
 async def list_audit_targets(current_user: CurrentUser, db: DB) -> list[AuditTargetResponse]:
-    if not current_user.is_superadmin:
+    if not is_effective_superadmin(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     res = await db.execute(select(AuditForwardTarget).order_by(AuditForwardTarget.name))
     return [_target_to_response(t) for t in res.scalars().all()]
@@ -1359,7 +1359,7 @@ async def create_audit_target(
     body: AuditTargetBody, current_user: CurrentUser, db: DB
 ) -> AuditTargetResponse:
     forbid_in_demo_mode("Audit-forward target creation is disabled")
-    if not current_user.is_superadmin:
+    if not is_effective_superadmin(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = AuditForwardTarget()
     _apply_body(row, body)
@@ -1378,7 +1378,7 @@ async def update_audit_target(
     target_id: str, body: AuditTargetBody, current_user: CurrentUser, db: DB
 ) -> AuditTargetResponse:
     forbid_in_demo_mode("Audit-forward target updates are disabled")
-    if not current_user.is_superadmin:
+    if not is_effective_superadmin(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
@@ -1395,7 +1395,7 @@ async def update_audit_target(
 
 @router.delete("/audit-forward-targets/{target_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_audit_target(target_id: str, current_user: CurrentUser, db: DB) -> None:
-    if not current_user.is_superadmin:
+    if not is_effective_superadmin(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
@@ -1412,7 +1412,7 @@ async def test_audit_target(target_id: str, current_user: CurrentUser, db: DB) -
     filter it out in the collector if they want. Doesn't land in
     ``audit_log`` — this is explicit probe traffic, not an audit.
     """
-    if not current_user.is_superadmin:
+    if not is_effective_superadmin(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:

@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import is_effective_superadmin
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.backup import BackupTarget
@@ -49,7 +50,7 @@ def _superadmin_gate(user: User) -> dict[str, Any] | None:
     superadmin; ``None`` when the call is allowed. Mirrors the
     pattern from ``tools/admin.py`` for the RBAC tools.
     """
-    if not user.is_superadmin:
+    if not is_effective_superadmin(user):
         return {
             "error": (
                 "Backup tools expose destination metadata + audit "
