@@ -174,12 +174,15 @@ async def update_prompt(
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     is_owner = row.created_by_user_id == current_user.id
-    if not (is_effective_superadmin(current_user) or is_owner):
+    # Resolve effective-superadmin once — it walks the RBAC group→role graph,
+    # and this handler gates on it three times (#354 review).
+    is_admin = is_effective_superadmin(current_user)
+    if not (is_admin or is_owner):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     # Operators can't promote a private prompt into the shared bucket
     # without superadmin, since shared prompts go in the curated list.
     if body.is_shared is not None and body.is_shared != row.is_shared:
-        if not is_effective_superadmin(current_user):
+        if not is_admin:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only superadmins can change the shared/private flag",
@@ -206,7 +209,7 @@ async def update_prompt(
     )
     await db.commit()
     await db.refresh(row)
-    return _to_response(row, is_owner=is_owner or is_effective_superadmin(current_user))
+    return _to_response(row, is_owner=is_owner or is_admin)
 
 
 @router.delete("/prompts/{prompt_id}", status_code=status.HTTP_204_NO_CONTENT)
