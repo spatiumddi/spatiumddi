@@ -160,6 +160,7 @@ function VerboseBootCard() {
           type="button"
           role="switch"
           aria-checked={verbose}
+          aria-label="Verbose boot console (standard Linux boot)"
           disabled={!isSuperadmin || save.isPending || !settings}
           onClick={() => save.mutate(!verbose)}
           className={cn(

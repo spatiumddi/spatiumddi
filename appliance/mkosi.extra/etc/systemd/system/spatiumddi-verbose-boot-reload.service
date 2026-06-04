@@ -1,10 +1,13 @@
 [Unit]
 Description=Apply pending SpatiumDDI verbose-boot toggle (grubenv spatium_verbose)
-# The runner reads /var/lib/spatiumddi/release-state/verbose-boot-pending
-# (available after local-fs.target) and runs grub-editenv against the grubenv
-# on the ESP (/boot/efi), so the ESP must be mounted first.
-After=local-fs.target boot-efi.mount
-Requires=local-fs.target
+# The runner reads the trigger under /var/lib/spatiumddi/release-state and runs
+# grub-editenv against the grubenv on the ESP (/boot/efi). RequiresMountsFor
+# both PULLS IN and orders-after the mount units covering those paths — robust
+# to the ESP mount-unit's generated name (vs a bare After=boot-efi.mount, which
+# only orders if that unit happens to run). Without /boot/efi mounted the runner
+# can't find grubenv.
+RequiresMountsFor=/boot/efi /var/lib/spatiumddi/release-state
+After=local-fs.target
 
 [Service]
 Type=oneshot
