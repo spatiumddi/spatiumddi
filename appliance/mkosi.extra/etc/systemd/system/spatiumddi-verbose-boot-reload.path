@@ -1,0 +1,14 @@
+[Unit]
+Description=Watch for SpatiumDDI verbose-boot toggle trigger
+# Skip on the live ISO — the installer environment doesn't drive boot
+# verbosity through the SpatiumDDI host-config plane.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# Same atomic-rename trigger pattern the tz / chrony / SNMP units use:
+# the supervisor writes <name>.new then mv → <name>; PathChanged fires
+# once per applied toggle (close-after-write semantics).
+PathChanged=/var/lib/spatiumddi/release-state/verbose-boot-pending
+
+[Install]
+WantedBy=multi-user.target

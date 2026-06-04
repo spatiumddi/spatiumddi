@@ -1219,6 +1219,11 @@ class SupervisorHeartbeatResponse(BaseModel):
     # against the host's current tz on every heartbeat + writes the
     # ``spatium-tz-reload`` trigger file when they differ.
     desired_timezone: str = ""
+    # Verbose-boot console toggle. The supervisor flips a grubenv variable
+    # (spatium_verbose) the grub.cfg menuentries read, so it survives A/B slot
+    # swaps + the /etc overlay and applies on next reboot. Mirrors the
+    # desired_timezone delivery exactly.
+    desired_verbose_boot: bool = False
     # Issue #346 — appliance host-config blocks delivered to the supervisor,
     # which compares each block's ``config_hash`` against its applied sidecar
     # and fires the matching ``spatium-{snmp,chrony,lldp}-reload`` trigger when
@@ -1716,6 +1721,8 @@ async def supervisor_heartbeat(
     metallb_vip = (cfg_row.control_plane_vip or "") if cfg_row else ""
     # Issue #165 — operator-set timezone. Empty string = no override.
     desired_timezone = (cfg_row.timezone or "") if cfg_row else ""
+    # Verbose-boot console toggle (grubenv-driven, applies next reboot).
+    desired_verbose_boot = bool(cfg_row.verbose_boot) if cfg_row else False
     # Issue #346 — host-config blocks for snmp / chrony / lldp. Built from the
     # same ``*_bundle`` helpers the DHCP-agent ConfigBundle uses; the
     # disabled-shape fallback keeps a stable key set when no settings row
@@ -1815,6 +1822,7 @@ async def supervisor_heartbeat(
         desired_control_plane_vip=metallb_vip,
         evict_node_names=evict_names,
         desired_timezone=desired_timezone,
+        desired_verbose_boot=desired_verbose_boot,
         snmp_settings=snmp_block,
         ntp_settings=ntp_block,
         lldp_settings=lldp_block,

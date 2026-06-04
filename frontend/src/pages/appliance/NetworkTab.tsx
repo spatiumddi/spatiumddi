@@ -7,12 +7,15 @@ import {
   Network,
   RefreshCw,
   Server,
+  TerminalSquare,
 } from "lucide-react";
 
 import {
   applianceApprovalApi,
   applianceSystemApi,
+  authApi,
   formatApiError,
+  settingsApi,
   type MetalLBConfig,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -106,7 +109,87 @@ export function NetworkTab() {
       </section>
 
       <MetalLBConfigCard />
+      <VerboseBootCard />
     </div>
+  );
+}
+
+// Verbose-boot console toggle. Off (default) = quiet boot + the Talos-style
+// console dashboard; On = a standard Linux console (kernel messages + systemd
+// [ OK ] lines scroll on boot/reboot/shutdown, and a normal getty login
+// replaces the dashboard). Backed by platform_settings.verbose_boot, which the
+// supervisor flips into the grubenv `spatium_verbose` variable the grub.cfg
+// menuentries read — so it applies on the NEXT reboot. Appliance hosts only
+// (this tab is already selfOnly).
+function VerboseBootCard() {
+  const qc = useQueryClient();
+  const { data: me } = useQuery({
+    queryKey: ["me"],
+    queryFn: authApi.me,
+    staleTime: 60_000,
+  });
+  const { data: settings } = useQuery({
+    queryKey: ["settings"],
+    queryFn: settingsApi.get,
+  });
+  const isSuperadmin = me?.is_superadmin ?? false;
+  const verbose = settings?.verbose_boot ?? false;
+  const save = useMutation({
+    mutationFn: (v: boolean) => settingsApi.update({ verbose_boot: v }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
+  });
+
+  return (
+    <section className="space-y-3 rounded-lg border bg-card p-4 shadow-sm">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="flex items-center gap-2 text-sm font-medium">
+            <TerminalSquare className="h-4 w-4 text-muted-foreground" />
+            Boot console
+          </h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            <strong>Off</strong> (default): quiet boot, then the SpatiumDDI
+            console dashboard. <strong>On</strong>: a standard Linux console —
+            kernel messages and systemd <code>[ OK ]</code> lines scroll during
+            boot / reboot / shutdown, and a normal login prompt replaces the
+            dashboard. Useful for diagnosing boot hangs. Takes effect on the{" "}
+            <strong>next reboot</strong>.
+          </p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={verbose}
+          disabled={!isSuperadmin || save.isPending || !settings}
+          onClick={() => save.mutate(!verbose)}
+          className={cn(
+            "relative mt-0.5 inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-50",
+            verbose ? "bg-primary" : "bg-muted",
+          )}
+        >
+          <span
+            className={cn(
+              "inline-block h-5 w-5 transform rounded-full bg-background shadow transition-transform",
+              verbose ? "translate-x-5" : "translate-x-0.5",
+            )}
+          />
+        </button>
+      </div>
+      {save.isError && (
+        <p className="text-xs text-destructive">{formatApiError(save.error)}</p>
+      )}
+      {save.isSuccess && (
+        <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-400">
+          Saved — applies on the next reboot. Reboot the appliance (Maintenance
+          tab) to switch the boot console now.
+        </p>
+      )}
+      {!isSuperadmin && (
+        <p className="text-xs text-muted-foreground">
+          Changing the boot console is restricted to superadmins.
+        </p>
+      )}
+    </section>
   );
 }
 

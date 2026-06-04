@@ -312,6 +312,15 @@ _SLOT_VERSIONS_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-versions
 # supervisor short-circuits the next heartbeat's trigger write.
 _TZ_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/tz-pending")
 _TZ_APPLIED_HASH_FILE = Path("/var/lib/spatiumddi-host/release-state/tz-hash")
+# Verbose-boot console toggle. The runner flips a grubenv variable
+# (spatium_verbose) the grub.cfg menuentries read; trigger body is a single
+# "1" (standard Linux console) or "0" (quiet boot + dashboard).
+_VERBOSE_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/verbose-boot-pending"
+)
+_VERBOSE_APPLIED_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/verbose-boot-applied"
+)
 # Per-slot boot-control trigger files. Each carries a single line:
 # the target slot name (``slot_a`` / ``slot_b``). The host-side
 # ``spatiumddi-slot-set-next-boot.path`` / ``spatiumddi-slot-set-
@@ -524,6 +533,39 @@ def maybe_fire_timezone(desired_timezone: str | None) -> bool:
         # rename ensures the runner sees the complete trigger file
         # rather than a half-written one.
         tmp.replace(_TZ_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def maybe_fire_verbose_boot(desired_verbose_boot: bool | None) -> bool:
+    """Write the verbose-boot trigger when the operator's desired console
+    verbosity (``platform_settings.verbose_boot``) differs from what the host
+    runner last applied. The runner flips a grubenv variable the grub.cfg
+    menuentries read, so it takes effect on the NEXT reboot.
+
+    Body is a single line: ``1`` (standard Linux console — drop the loglevel
+    cap + systemd.show_status + spatium-console=off) or ``0`` (today's quiet
+    boot + Talos dashboard). Idempotent via the ``verbose-boot-applied``
+    sidecar; a missing sidecar is treated as ``0`` because the installer seeds
+    ``grub-editenv … spatium_verbose=0`` at install time, so the default state
+    is already applied and needs no trigger. Strict appliance-only gate
+    (mirrors ``maybe_fire_timezone`` / ``maybe_fire_reboot``).
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    desired = "1" if desired_verbose_boot else "0"
+    try:
+        applied = _VERBOSE_APPLIED_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        applied = "0"  # install seeds grubenv spatium_verbose=0 — default is live
+    if applied == desired:
+        return False
+    try:
+        _VERBOSE_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _VERBOSE_TRIGGER_FILE.with_suffix(".new")
+        tmp.write_text(desired + "\n", encoding="utf-8")
+        tmp.replace(_VERBOSE_TRIGGER_FILE)
         return True
     except OSError:
         return False

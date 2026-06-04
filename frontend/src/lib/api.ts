@@ -2911,6 +2911,11 @@ export interface PlatformSettings {
   // Issue #165 — operator-set IANA timezone. Empty = no override
   // (host falls back to install-time default).
   timezone: string;
+  /** Appliance verbose-boot console. true = standard Linux console on
+   *  boot/reboot/shutdown (kernel messages + systemd status + getty, no
+   *  dashboard); false (default) = quiet boot + Talos dashboard. Appliance
+   *  hosts only; applies on next reboot (grubenv-driven). */
+  verbose_boot: boolean;
   /** Appliance LLDP (issue #343). No secrets — LLDP advertises public
    *  identity, so read + write shapes match. ``lldp_protocols`` enables
    *  reception of CDP/EDP/FDP/SONMP alongside LLDP. */

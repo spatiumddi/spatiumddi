@@ -52,6 +52,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-chrony-reload.path \
             spatiumddi-lldp-reload.path \
             spatiumddi-tz-reload.path \
+            spatiumddi-verbose-boot-reload.path \
             spatium-firewall-reload.path \
             spatiumddi-firewall-revert.timer \
             spatium-install.service \
@@ -245,6 +246,9 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-lldp-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.service"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-verbose-boot-reload"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-verbose-boot-reload.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-verbose-boot-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-firewall-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-firewall-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-firewall-reload.service"

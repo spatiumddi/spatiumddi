@@ -150,6 +150,10 @@ class SettingsResponse(BaseModel):
     # ── Appliance timezone (issue #165) ───────────────────────────
     # Empty string means "follow install-time default" (no override).
     timezone: str = ""
+    # ── Appliance verbose boot console ────────────────────────────
+    # True = standard Linux console on boot (kernel messages + systemd
+    # status + getty, no dashboard); False = quiet boot + dashboard.
+    verbose_boot: bool = False
     # ── Appliance LLDP (issue #343) ───────────────────────────────
     # No secrets — LLDP advertises public identity, so the read shape
     # mirrors the stored shape directly (like NTP).
@@ -413,6 +417,8 @@ class SettingsUpdate(BaseModel):
     ntp_allow_client_networks: list[str] | None = None
     # ── Appliance timezone (issue #165) ───────────────────────────
     timezone: str | None = None
+    # ── Appliance verbose boot console ────────────────────────────
+    verbose_boot: bool | None = None
     # ── Appliance LLDP (issue #343) ───────────────────────────────
     lldp_enabled: bool | None = None
     lldp_tx_interval: int | None = None

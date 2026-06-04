@@ -653,6 +653,17 @@ def heartbeat_once(
                 desired_timezone=desired_timezone,
             )
 
+    # Verbose-boot console toggle. Always evaluated (it's a definite bool, not
+    # an opt-in override like timezone); maybe_fire_verbose_boot short-circuits
+    # against its applied sidecar so it only writes the grubenv trigger on a
+    # real change. Applies next reboot.
+    desired_verbose_boot = body_out.get("desired_verbose_boot")
+    if appliance_state.maybe_fire_verbose_boot(bool(desired_verbose_boot)):
+        log.info(
+            "supervisor.heartbeat.verbose_boot_trigger_fired",
+            desired_verbose_boot=bool(desired_verbose_boot),
+        )
+
     # Issue #346 — appliance host-config (snmp / chrony / lldp). The control
     # plane ships each rendered block + its config_hash; the maybe_fire_*
     # writers compare against their applied-hash sidecar and fire the matching

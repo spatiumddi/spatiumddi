@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply pending SpatiumDDI verbose-boot toggle (grubenv spatium_verbose)
+# The runner reads /var/lib/spatiumddi/release-state/verbose-boot-pending
+# (available after local-fs.target) and runs grub-editenv against the grubenv
+# on the ESP (/boot/efi), so the ESP must be mounted first.
+After=local-fs.target boot-efi.mount
+Requires=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-verbose-boot-reload
+# No Install section — only invoked by the matching .path unit, never
+# directly enabled at boot.
