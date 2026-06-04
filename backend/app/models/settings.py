@@ -443,6 +443,20 @@ class PlatformSettings(Base):
         String(64), nullable=False, default="", server_default=sa_text("''")
     )
 
+    # ── Appliance verbose boot console (issue: console-and-sidebar) ──
+    # When True, the appliance boots with a STANDARD Linux console: the
+    # kernel ``loglevel=3`` cap is dropped (all kernel messages scroll),
+    # ``systemd.show_status=1`` shows the per-unit ``[ OK ]`` lines, and
+    # ``spatium-console=off`` is passed so a normal getty login replaces
+    # the Talos-style dashboard — i.e. boot/reboot/shutdown look like a
+    # regular Linux box. False (default) keeps today's quiet boot
+    # (``loglevel=3``) + the console dashboard. Flows through the same
+    # heartbeat → grubenv → host-runner plane as timezone / NTP / SNMP;
+    # the kernel cmdline lives in grub.cfg, so it applies on next reboot.
+    verbose_boot: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+
     # ── Appliance LLDP support (issue #343) ─────────────────────────
     # lldpd runs at the Debian host level on every appliance host (same
     # host-config plane as SNMP / chrony) so it can see the host's real

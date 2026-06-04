@@ -1475,6 +1475,24 @@ else
 fi
 if [ -z "\${default}" ]; then set default=slot_a; fi
 
+# Verbose-boot console toggle (grubenv \`spatium_verbose\`, flipped by the
+# Fleet UI → supervisor → spatiumddi-verbose-boot-reload). Loaded by the
+# \`load_env\` above. "1" = standard Linux console: drop the loglevel=3 cap so
+# all kernel messages scroll, add systemd.show_status=1 for the per-unit
+# [ OK ] lines, and pass spatium-console=off so a normal getty login replaces
+# the Talos dashboard. Empty / "0" = today's quiet boot (loglevel=3) + the
+# console dashboard. Unset (old grubenv) falls through to the quiet default —
+# fail-closed, never a brick.
+if [ "\${spatium_verbose}" = "1" ]; then
+    set sp_log=""
+    set sp_systemd="systemd.show_status=1"
+    set sp_console="spatium-console=off"
+else
+    set sp_log="loglevel=3"
+    set sp_systemd=""
+    set sp_console=""
+fi
+
 # Serial console mirror for headless installs.
 serial --unit=0 --speed=115200
 terminal_input  console serial
@@ -1488,7 +1506,7 @@ insmod search_fs_uuid
 menuentry "$SLOT_TITLE_PREFIX (slot A)" --id=slot_a {
     search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
     linux /boot/vmlinuz root=UUID=$ROOT_A_UUID rw \\
-        loglevel=3 audit=0 \\
+        \${sp_log} audit=0 \${sp_systemd} \${sp_console} \\
         console=tty0 console=ttyS0,115200n8
     initrd /boot/initrd.img
 }
@@ -1496,7 +1514,7 @@ menuentry "$SLOT_TITLE_PREFIX (slot A)" --id=slot_a {
 menuentry "$SLOT_TITLE_PREFIX (slot B)" --id=slot_b {
     search --no-floppy --fs-uuid --set=root $ROOT_B_UUID
     linux /boot/vmlinuz root=UUID=$ROOT_B_UUID rw \\
-        loglevel=3 audit=0 \\
+        \${sp_log} audit=0 \${sp_systemd} \${sp_console} \\
         console=tty0 console=ttyS0,115200n8
     initrd /boot/initrd.img
 }
@@ -1525,6 +1543,12 @@ EOF
         # the very first boot lands on slot_a unambiguously. grub-editenv
         # creates the file with the right size (1024 bytes, zero-padded).
         chroot "$MOUNT" /usr/bin/grub-editenv /boot/efi/grub/grubenv set saved_entry=slot_a \
+            >> "$INSTALL_LOG" 2>&1
+        # Seed the verbose-boot toggle OFF (quiet boot + dashboard) so the
+        # menuentry's ${spatium_verbose} conditional resolves to the default
+        # branch from the very first boot. The Fleet UI flips it to 1 later via
+        # spatiumddi-verbose-boot-reload.
+        chroot "$MOUNT" /usr/bin/grub-editenv /boot/efi/grub/grubenv set spatium_verbose=0 \
             >> "$INSTALL_LOG" 2>&1
 
         echo "XXX"; echo "88"; echo "Installing bootloader (BIOS + UEFI to ESP)..."; echo "XXX"

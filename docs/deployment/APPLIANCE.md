@@ -434,6 +434,15 @@ The Talos-style console got a wave of usability fixes:
 - New `Watchdog` header line surfacing the external watchdog state — green `Loop ticking · Ns ago`, yellow `Loop stale · Ns ago`, red `Restart cap hit` when the rate-limit alert trigger is present.
 - Services panel unions whichever supervisor-managed service is either in `docker ps` or listed in `role-compose.env`'s `COMPOSE_PROFILES`, so a crashed / removed container surfaces as `(not running)` rather than disappearing entirely.
 
+### Verbose boot console (standard Linux console)
+
+By default the appliance boots quietly (`loglevel=3` — only kernel errors reach the console) and the Talos-style dashboard claims tty1, so operators see almost no kernel / systemd output during boot / reboot / shutdown. A **Boot console** toggle on **Appliance → Network & Host** switches the box to a *standard Linux console*: it drops the `loglevel=3` cap (all kernel messages scroll), adds `systemd.show_status=1` (the per-unit `[ OK ]` lines), and passes `spatium-console=off` (a normal getty login replaces the dashboard) — i.e. boot looks like a regular Linux server, which is invaluable for diagnosing a boot hang or panic.
+
+- **Mechanism.** Backed by `platform_settings.verbose_boot`; it rides the same host-config plane as timezone / NTP / SNMP (PlatformSettings → supervisor heartbeat `desired_verbose_boot` → `spatiumddi-verbose-boot-reload` host runner). Because the kernel cmdline lives in `grub.cfg` (not a file the running OS re-reads), the runner flips a **grubenv variable** (`spatium_verbose`) that a conditional in the per-slot menuentries reads. grubenv lives on the shared ESP, so the setting **survives A/B slot upgrades + rollbacks + the /etc overlay** verbatim.
+- **Applies on the next reboot** (GRUB only reads the cmdline at boot) — the UI says so and points at the Maintenance-tab reboot.
+- **Default off, opt-in per box.** Doesn't regress the polished quiet-boot experience for appliances that don't want it.
+- **Anti-brick.** Only changes log verbosity + which process owns the TTY — never the slot / root UUID / kernel. A missing or corrupt grubenv makes the menuentry's conditional fail closed to `loglevel=3` (today's behaviour). The always-present GRUB **`(slot A, verbose boot)`** menuentry remains the zero-config one-shot fallback (drops the loglevel cap + `spatium-console=off` for a single boot, selectable from the boot menu with no reinstall).
+
 ### Fleet UI updates
 
 - File rename `frontend/src/pages/appliance/ApprovalsTab.tsx` → `FleetTab.tsx` (component + React-Query keys + URL hash all migrated from `approvals` → `fleet`). The original "Approvals" framing predates the full Fleet management surface that now lives in the tab.

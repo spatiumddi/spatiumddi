@@ -1,0 +1,97 @@
+#!/bin/bash
+# spatiumddi-verbose-boot-reload — host-side verbose-boot toggle runner.
+#
+# The supervisor writes /var/lib/spatiumddi/release-state/verbose-boot-pending
+# whenever the operator's desired console verbosity (platform_settings.
+# verbose_boot) differs from what this runner last applied. File format:
+#
+#   line 1: "1" (standard Linux console) or "0" (quiet boot + dashboard)
+#
+# Apply flow — flip the grubenv variable ``spatium_verbose`` that the installed
+# grub.cfg menuentries read (see spatium-install's grub.cfg heredoc). We do NOT
+# regenerate grub.cfg or reboot — only set the env var the conditional already
+# consumes:
+#   spatium_verbose=1  -> menuentry drops the loglevel=3 cap, adds
+#                         systemd.show_status=1, and passes spatium-console=off
+#                         (normal getty console, no Talos dashboard) — i.e. the
+#                         box boots like a regular Linux server.
+#   spatium_verbose=0  -> today's quiet boot (loglevel=3) + console dashboard.
+#
+# Takes effect on the NEXT REBOOT (GRUB only reads the cmdline at boot). The
+# Fleet UI says so + offers the reboot affordance.
+#
+# Persistence across A/B slot swaps (Phase 8): grubenv lives on the shared ESP
+# (/boot/efi/grub/grubenv), NOT in /etc (which a slot swap resets) and NOT in a
+# file the running kernel re-reads — so the toggle survives slot upgrades +
+# rollbacks verbatim, the same reasoning that puts saved_entry/next_entry there.
+# The release-state sidecars live on /var directly.
+#
+# Anti-brick: only changes log verbosity + which process owns the TTY; never
+# the slot, root UUID, or kernel. A missing/corrupt grubenv makes the
+# menuentry's conditional fail closed to loglevel=3 (today's behaviour). The
+# always-present GRUB debug menuentry remains the zero-config fallback.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/verbose-boot-pending
+APPLIED_SIDECAR=/var/lib/spatiumddi/release-state/verbose-boot-applied
+STATUS_SIDECAR=/var/lib/spatiumddi/release-state/verbose-boot-status
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/verbose-boot-reload.log"
+LOCK=/run/spatiumddi-verbose-boot-reload.lock
+
+mkdir -p "$LOG_DIR" "$(dirname "$APPLIED_SIDECAR")"
+
+log() { printf '%s spatiumddi-verbose-boot-reload: %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG"; }
+
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    log "another instance is running — exiting"
+    exit 0
+fi
+
+if [ ! -f "$TRIGGER" ]; then
+    log "no trigger file — nothing to do"
+    exit 0
+fi
+
+val="$(head -n1 "$TRIGGER" | tr -d '[:space:]')"
+if [ "$val" != "0" ] && [ "$val" != "1" ]; then
+    log "REJECT: trigger value '$val' is not 0 or 1"
+    printf 'state=failed\nreason=invalid_value\nrequested=%s\napplied_at=%s\n' \
+        "$val" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
+    exit 1
+fi
+
+# Locate grubenv. The appliance installs an EFI grub with grubenv on the ESP;
+# fall back to the BIOS paths for completeness. Must match where spatium-install
+# seeds spatium_verbose=0 + where the menuentries load_env from.
+GRUBENV=""
+for cand in /boot/efi/grub/grubenv /boot/grub/grubenv /boot/grub2/grubenv; do
+    if [ -f "$cand" ]; then GRUBENV="$cand"; break; fi
+done
+if [ -z "$GRUBENV" ]; then
+    log "ERROR: no grubenv found (looked in /boot/efi/grub, /boot/grub, /boot/grub2)"
+    printf 'state=failed\nreason=grubenv_not_found\nrequested=%s\napplied_at=%s\n' \
+        "$val" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
+    exit 1
+fi
+
+log "apply: spatium_verbose=$val into $GRUBENV"
+if ! grub-editenv "$GRUBENV" set spatium_verbose="$val" 2>&1 | tee -a "$LOG"; then
+    log "ERROR: grub-editenv failed"
+    printf 'state=failed\nreason=grub_editenv_failed\nrequested=%s\napplied_at=%s\n' \
+        "$val" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
+    exit 1
+fi
+
+# Apply landed. Record it so the supervisor short-circuits the next heartbeat's
+# trigger write, and surface a "reboot to take effect" status for the Fleet UI.
+printf '%s\n' "$val" > "$APPLIED_SIDECAR"
+printf 'state=ok\nrequested=%s\napplied=%s\npending_reboot=1\napplied_at=%s\n' \
+    "$val" "$val" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
+
+# Drop the trigger so the .path unit doesn't re-fire.
+rm -f "$TRIGGER"
+
+log "OK (spatium_verbose=$val — effective on next reboot)"
