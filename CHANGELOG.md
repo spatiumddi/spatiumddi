@@ -20,6 +20,327 @@ the formatter handles the rest.
 
 ---
 
+## 2026.06.04-1 — 2026-06-04
+
+The **roadmap-closure + appliance fleet-firewall** release — the
+largest single cut since the alpha. It clears a long backlog of
+pending feature-roadmap items (Cloud connectors #37, DNS Views
+split-horizon #24, IP discovery #23, BIND9 DNSSEC #49, the DHCP
+configuration importer #129, DHCPv6 modes #52, reverse-DNS
+auto-population #41, the Stale-IP report #45, CGNAT awareness #42)
+and lands the full **#285 fleet firewall** for the appliance —
+six phases that cut the LAN-wide etcd/kubelet exposure, add a
+declarative per-role policy model + merge engine, an operator
+Firewall tab with posture presets and a staged-preview diff
+viewer, an enforcement master switch gated on "all control-plane
+nodes hardened", and source-scopable Web UI access. Same cut wires
+the appliance host-config delivery plane so SNMP / NTP / LLDP
+settings finally apply on a supervisor-based appliance, ships the
+LLDP host-config plane end-to-end (Phases 1–3, including neighbour
+discovery), closes the Operator Copilot MCP write-tool catch-up
+(17 `propose_*` tools, registry 121 → 138), and folds in a broad
+review-sweep of DHCP / DNS / cloud bugs plus a Kea CVE pin. 24 PRs
+since 2026.05.26-1.
+
+### Added
+
+Cloud integration (#37) — AWS / Azure / GCP as a unified "Cloud"
+integration with a per-provider picker:
+
+- **Read-only infra mirror** (`cloud_endpoint` + AWS / Azure / GCP
+  connectors) reconciling VPC → IPBlock, subnet → Subnet, and
+  NIC / public / load-balancer IPs → IPAddress with
+  `cloud_endpoint_id` ownership, `user_modified_at` locks, and
+  prune-on-absence — same read-only-pull shape as the Kubernetes /
+  Docker / Proxmox mirrors. Surfaces on both dashboard surfaces +
+  a `list_cloud_targets` MCP read tool, gated by the
+  `integrations.cloud` feature module.
+- **Cloud DNS driver family** — Cloudflare / Route 53 / Azure DNS /
+  Google Cloud DNS as agentless first-class drivers, plus the
+  token-only tier (DigitalOcean / Hetzner / Linode / Vultr, #327),
+  with import-existing-zones for every provider. All do client-side
+  multi-value RRset disambiguation (match value + priority, not the
+  first row).
+
+DNS Views — end-to-end split-horizon rendering (#24). The storage +
+CRUD + record-form picker already shipped; this wires the render:
+the BIND9 agent now emits one `view "<name>" { match-clients …; }`
+block per view with per-view zone files, `view_id IS NULL` records
+are shared across every view, scoped records render only in their
+view, RPZ / blocklists replicate into each view block (BIND forbids
+top-level zones alongside views), and any record/view change shifts
+the structural etag so the full view-correct re-render fires.
+PowerDNS keeps its existing 422 view gate.
+
+IP discovery — ping / ARP sweep + reconciliation (#23). Opt-in,
+per-subnet scheduled discovery that finds live hosts and folds them
+into IPAM (the producer of the #45 / #41 hygiene loop): unprivileged
+SOCK_DGRAM ICMP with a TCP-connect fallback, `/proc/net/arp` scan
+for ICMP-silent hosts, status=`discovered` rows for live IPs with no
+row (dynamic-pool + network/broadcast skipped, operator-locked rows
+preserved), a three-bucket reconciliation report, on-demand sweep
+endpoint, and a `find_subnet_reconciliation` MCP tool.
+
+BIND9 DNSSEC — inline-signing, policies, DS export, rollover (#49).
+`DNSSECPolicy` (reusable dnssec-policy) + `DNSKey` (public per-zone
+key state — no private-key custody; BIND owns + auto-rotates keys),
+config-driven `dnssec-policy { … }` + per-zone `inline-signing yes;`
+render on both the control-plane and agent BIND9 paths, agent
+post-reload `rndc dnssec -status` + `dnssec-dsfromkey` reporting, a
+DNSSEC Policies page + per-zone key table with a per-key Roll
+button, and `find_zone_dnssec_info` / `list_dnssec_policies` MCP
+tools.
+
+DHCP configuration importer — Kea / Windows DHCP / ISC dhcpd.conf
+(#129). One-shot import-to-evaluate (sister to the DNS
+importer #128) behind one canonical IR + preview → commit
+pipeline: Kea JSON-with-comments upload, Windows live-pull
+(reuses the Path A
+WinRM read driver), and a hand-rolled ISC `dhcpd.conf` tokeniser +
+recursive-descent walker. Every scope binds to a Subnet (link to an
+existing CIDR or auto-create under an operator-chosen space + block);
+per-scope savepoints, skip / overwrite conflict actions, and
+`import_source` + `imported_at` provenance. Gated by the
+`dhcp.import` feature module.
+
+DHCPv6 stateful / stateless / SLAAC mode (#52).
+`DHCPScope.v6_address_mode` + `ra_managed_flag` /
+`ra_other_flag`; the Kea
+driver renders subnet6 by mode (stateful → pools + options +
+reservations, stateless → options only, slaac → bare subnet) and the
+scope modal shows a DHCPv6-mode picker + RA M/O flags on IPv6 scopes.
+
+Reverse-DNS auto-population (#41). A scheduled, platform-opt-in sweep
+that PTR-resolves `hostname IS NULL` rows against configured
+resolvers (bounded concurrency, per-run cap), fills the short label
+into `hostname` and the FQDN into `description` (only when blank),
+and skips integration-owned + lease-mirror rows. Settings → IPAM →
+Reverse DNS form + on-demand Run-now.
+
+Stale-IP report + one-click bulk-deprecate (#45). Over the discovery
+`last_seen_at` signal: which allocated IPs has nothing answered for
+in N days. Paginated report (optional space / block / subnet scope),
+bulk-deprecate selected or all-matching (capped, reversible, stamps
+`user_modified_at`), a `stale_ip_count` alert rule, a
+`find_stale_ips` MCP tool, and a Stale IPs page.
+
+CGNAT (RFC 6598) awareness (#42). An amber "CGNAT" badge on subnet
+detail + a New-Subnet advisory hint when a typed network falls in
+`100.64.0.0/10` (the one reserved IPv4 range overlays actively carve,
+so reaching for it as an on-prem LAN silently overlaps overlay
+routes). `is_cgnat_cidr` classifier + `SubnetResponse.is_cgnat`
+derivation; framing-only, no allocation change.
+
+SVCB / HTTPS (RFC 9460) + DNAME (RFC 6672) record types (#338). Added
+to `VALID_RECORD_TYPES`, gated to `{bind9, powerdns}`; the zone-file
+writer FQDN-normalises DNAME and passes SVCB/HTTPS rdata through; the
+`dns_io` reconcile parser round-trips all three.
+
+DHCP per-pool occupancy + `dhcp_pool_exhaustion` alert (#339).
+Live, control-plane-side occupancy from mirrored `DHCPLease` rows
+(driver-agnostic, no agent change), a new alert rule firing on
+occupancy ≥ threshold OR free < min-free, and a
+`find_dhcp_pool_occupancy` MCP tool.
+
+Functional secondary / stub zones (#336). `DNSZone.masters` (JSONB)
+threaded through the driver dataclass + config bundle so a secondary
+renders `type slave; masters { … };` and a stub `type stub; …` — the
+zone create/update API now 422s a masterless secondary/stub (the
+previously-silent broken state), with named.conf-injection guards on
+each master entry.
+
+Appliance fleet firewall (#285) — declarative per-role firewall
+management for the appliance cluster, landed across Phases 1–6:
+
+- **LAN-wide port cut (Phase 1).** Removed the base
+  `/etc/nftables.conf` `k3s-ha` accept that exposed etcd
+  (2379/2380) + the kubelet (10250) to the whole LAN; the
+  supervisor's peer-scoped drop-in is now the authoritative source
+  for those ports (single-node keeps etcd loopback-only). apiserver
+  6443 stays LAN-reachable behind a baked bootstrap sentinel that
+  auto-retires once the cluster is multi-node, narrowing 6443 to
+  peers ∪ pod ∪ service ∪ operator-allowlisted CIDRs.
+- **Declarative policy model (Phase 3).** `FirewallPolicy` (fleet /
+  per-role / per-appliance scopes) + `FirewallRule` + `FirewallAlias`
+  (family-split v4/v6), behind the `appliance.firewall` feature
+  module. A control-plane merge engine compiles each node's drop-in
+  from the policy model and reproduces the legacy renderer
+  byte-for-byte (three-way render identity across the in-pod,
+  compile-body, and policy-merge paths).
+- **Operator Firewall tab.** Policy / rule / alias editor, posture
+  presets (locked / balanced / open), a staged-preview diff viewer
+  (per-node line diff + accept↔drop conflict / redundancy advisories),
+  an effective-render viewer with a layer breakdown + drift chip, and
+  a `firewall_extra` free-text nft escape hatch with an
+  allowlist-grammar lint (injection / unbalanced-brace / drop-22
+  rejection).
+- **Enforcement master switch (Phase 4a).** `firewall_enabled`
+  (default off) refuses to ENABLE until every reporting appliance
+  node is hardened (base no longer LAN-wide), with an audited
+  override; disabling is never gated.
+- **Source-scopable Web UI (Phase 6).** Restrict the appliance Web
+  UI (frontend :80/:443 + the MetalLB VIP via
+  `loadBalancerSourceRanges`) to operator-chosen source CIDRs from
+  the Firewall tab, with an anti-lockout guard (rejects a scope that
+  doesn't cover the operator's own source IP unless overridden); SSH
+  stays in the un-removable base floor so a bad scope is always
+  recoverable from the console.
+- **Safety + compliance.** A `firewall.apply_stalled` alert (drift
+  between control-plane-rendered and host-applied rulesets), reboot-
+  survivable test-apply auto-revert machinery, an etcd/control-plane
+  peer-drift cross-check (warn-only), a one-time `firewall_extra`
+  advisory-lint sweep, a `no_lanwide_control_plane_ports` conformity
+  check (PCI-DSS 1.2.1 / HIPAA segmentation), and 4 read + 1
+  `propose_*` MCP tools.
+
+LLDP host-config plane (#343 / #347 / #348). Run `lldpd` as a
+host-managed OS package configured from a Fleet → Services → LLDP
+tab, built to exact parity with the SNMP (#153) / NTP (#154) plane
+(`PlatformSettings` → rendered config → ConfigBundle long-poll →
+supervisor trigger-file → host runner; no nftables drop-in — LLDP is
+raw L2 multicast). Phase 2 adds neighbour discovery
+(`ApplianceLldpNeighbour` + `lldpcli show neighbors -f json0` →
+heartbeat → `find_lldp_neighbors` MCP tool); Phase 3 adds MED ELIN
+location + an AgentX→snmpd bridge so LLDP-MIB is queryable via the
+host snmpd.
+
+Operator Copilot MCP write tools (#280 / #304). The deferred
+`propose_*` catch-up — 17 new tools (15 writes + 2 import-preview
+reads) across conformity, webhooks, DNSSEC, multicast, SNMP / NTP,
+and DNS / DHCP import, each an `Operation` (preview + apply) reusing
+the existing service path, default-disabled, module-gated, writing a
+`via="ai_proposal"` audit row. Registry 121 → 138 tools, 11 → 26
+operations.
+
+Sidebar reorg + verbose-boot console (#355). The Core sidebar list
+regroups its grown-in items under lightweight `SubNavLabel`
+sub-headings (IPAM → NAT Mappings / Stale IPs / Subnet Planner;
+DNS → DNS Pools / DNSSEC Policies / Domains) with Dashboard / IPAM /
+DHCP / DNS pinned at the top, and Logs moves to a new top-level
+**Operations** section (zero route / module-gating changes). The
+appliance gains an operator-toggleable **verbose boot console** on
+Appliance → Network & Host — OFF (default) keeps today's quiet boot +
+Talos dashboard; ON drops the `loglevel=3` cap, sets
+`systemd.show_status=1`, and hands tty1 to a normal getty so boot
+looks like a standard Linux server. The toggle flips a `grubenv`
+variable (survives A/B slot swaps + the `/etc` overlay) via the same
+host-config trigger plane; applies on the next reboot, fails closed
+to quiet boot on a corrupt grubenv.
+
+### Changed
+
+- **Appliance host-config delivery wired (#346).** The render +
+  bundle + host-runner halves of the SNMP / NTP / LLDP host-config
+  plane shipped earlier, but the delivery half was unwired under
+  #170 — the supervisor heartbeat never carried the settings and
+  never called the `maybe_fire_*_reload` writers, so none applied on
+  a supervisor-based appliance. The heartbeat now ships
+  `snmp_settings` / `ntp_settings` / `lldp_settings` blocks and the
+  loop fires each reload trigger on change.
+- **Bulk IPAM→DNS sync batched on the create path (#341).** The
+  create/update branch of the bulk sync looped one synchronous WinRM
+  call per record, defeating the 2026.04.19 WinRM-batching fix on the
+  create side. A task-local `_batched_dns_ops` collector now defers +
+  flushes grouped by zone (one batched apply for an agentless Windows
+  DNS primary); wrapped around the sync, bulk-allocate, and bulk-edit
+  loops.
+- **Installer disk floor raised 24 → 32 GiB (#312).** The 24 GiB
+  floor left /var ~7 GiB and the control-plane first boot thrashed
+  the kubelet DiskPressure eviction loop. Raised the global hard
+  floor (so /var gets ~14 GiB) + added a soft control-plane-only
+  sizing warning (below 40 GiB disk / 8 GiB RAM) at role-pick time.
+- **k3s v1.35.4+k3s1 → v1.35.5+k3s1 (#325).** Patch bump (the fetched
+  artifacts are gitignored + re-downloaded at build time).
+- **CNPG operator resource pins (#315).** Gave the CloudNativePG
+  operator `requests`/`limits` (BestEffort → Burstable so it's no
+  longer first in the eviction line on the all-in-one node) +
+  loosened the webhook startup/liveness probes for a slow webhook-TLS
+  bootstrap on a constrained VM.
+- **Dependency bumps** — `axios` 1.15.2 → 1.16.0 (#313), `react-router`
+  6.30.3 → 6.30.4 (#356).
+
+### Fixed
+
+- **OIDC / LDAP / SAML Superadmin role lockout (#351).** A user
+  mapped into a group that grants the built-in Superadmin role has the
+  `*/*` wildcard via RBAC but `User.is_superadmin = False` on the row,
+  so `GET /auth/me` reported the raw column and every frontend
+  superadmin gate (Fleet, Pairing, SNMP/NTP/LLDP, Sessions, Settings)
+  locked them out even though the route-level gates admitted them.
+  `/auth/me` now reports the EFFECTIVE status (column OR `*/*` role),
+  and the same-bug sweep moved ~25 remaining raw-column gates (9 MCP
+  superadmin gates, `operations_writes`, `settings` ×6, `api_tokens`,
+  `ai/prompts` ×5, agent-keys, `supervisor.py`) to
+  `is_effective_superadmin`.
+- **Two slot-upgrade blockers (field-tested on a live 3-node
+  appliance).** firstboot aborted under `set -u` on every non-first
+  boot (a slot upgrade) because `APPLIANCE_HOSTNAME_VAL` /
+  `APPLIANCE_HOST_IPS_VAL` were only assigned inside the first-boot
+  `.env`-gen block but referenced unconditionally — so no A/B slot
+  upgrade ever rolled the control-plane container images. And the
+  firewall host runner never deleted its trigger file, so the
+  supervisor's presence-guard silently blocked every subsequent
+  firewall change. Both fixed (re-derive the vars every boot; `rm` the
+  trigger after a successful apply).
+- **Firewall schema column mismatch (field-test catch).** The
+  firewall migration created `updated_at` but `TimestampMixin` maps
+  `modified_at`, so every `select(FirewallPolicy)` 500'd on a
+  migration-built DB (the test suite missed it — conftest builds from
+  `Base.metadata`). Fixed the migration columns + seed INSERT in place
+  (branch unreleased) + added a static migration-parity guard test.
+- **Setup Wizard cert button deep-link (#314).** The "Manage
+  certificate" CTA navigated to `/appliance` with no tab target,
+  restoring the operator's last-active tab instead of Web UI
+  Certificate; `AppliancePage` now honours a `?tab=<key>` deep-link.
+- **Review-sweep — 10 DHCP / DNS / cloud issues (#342).** Cloudflare
+  (#331) + Route 53 (#334) multi-value RRset disambiguation; per-
+  endpoint session rollback so one bad cloud/proxmox endpoint can't
+  poison the sweep transaction (#333); cloud integration honoured in
+  DEMO_MODE (#335); lease-removal IPAM-mirror lookup scoped to the
+  owning subnet under overlapping ranges (#329); agent lease-events
+  N+1 → 3 bulk loads (#340); Kea HA renders the full 3/5/7-member peer
+  list (#332); DHCPv6 agent renderer emits a real `Dhcp6`/`subnet6`
+  (#330); per-subnet Kea relay-agent addresses (#337).
+
+### Security
+
+- **LAN-wide etcd / kubelet exposure closed (#285).** The headline
+  hardening — etcd (2379/2380) + kubelet (10250) are now peer-scoped,
+  never LAN-wide, on control-plane appliance nodes (see Added).
+- **Kea CVE-2026-3608.** The Kea agent image shipped 2.6.3-r0 (Trivy
+  HIGH); pinned `kea>=2.6.5-r0`.
+- **Config-injection guards.** named.conf-injection guards on
+  secondary/stub `masters` entries (#336), relay-address-family
+  validation on DHCP scopes (#337), and the `firewall_extra`
+  allowlist-grammar lint (nft-injection / shell-metachar rejection,
+  #285 Phase 3d).
+
+### Migrations
+
+Single linear head `a3f1e9c47b20` (17 migrations, all additive on
+`upgrade()`; every `downgrade()` drop is baselined in the migration
+linter):
+
+- `a7e3c1f49d20` — subnet IP-discovery columns (#23).
+- `d7a3f2b9c1e4` — `platform_settings` reverse-DNS columns (#41).
+- `e4c1a8f63b29` — `DHCPScope.v6_address_mode` + RA flags (#52).
+- `f2b6d4a91c37` — BIND9 DNSSEC (`dnssec_policy`, `dns_key`,
+  `dns_zone.dnssec_policy_id`) (#49).
+- `c7f1a3e58b94` — DHCP import provenance columns (#129).
+- `d1e7c4a90fb3` — `cloud_endpoint` + `cloud_endpoint_id` FKs +
+  feature-module seed (#37).
+- `a1c4f7e92b30` — `DHCPScope.relay_addresses` (#337).
+- `c9a1f7e0b234` — `DNSZone.masters` (#336).
+- `a7f3c1e85d20` — `alert_rule.min_free_addresses` (#339).
+- `b8c3f2a9e147` / `c1f4a8e3b29d` — appliance LLDP settings +
+  neighbour table (#343 / #347).
+- `d7e2a4f9c1b3` / `a3f1d9e07c52` / `e4a7c1f08b9d` / `f5b8d2c91a06`
+  — fleet-firewall prereqs, apply-state, policy schema, builtin seed
+  (#285).
+- `c1e7f3a90b4d` — `platform_settings.web_ui_allowed_cidrs` (#285
+  Phase 6).
+- `a3f1e9c47b20` — `platform_settings.verbose_boot` (#355).
+
 ## 2026.05.26-1 — 2026-05-26
 
 The **multi-node rolling upgrade + cold-boot UX + operator-quality**
