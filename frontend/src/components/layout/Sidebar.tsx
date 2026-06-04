@@ -63,19 +63,44 @@ import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
 import logoIcon from "@/assets/logo-icon.svg";
 
+// Core section. The flat list had grown to 11 rows — the four canonical
+// anchors (Dashboard / IPAM / DHCP / DNS) plus seven grown-in sub-features
+// that mixed daily-driver surfaces with mis-filed child resources (e.g.
+// "Domains" routing under /admin). Reorganised (sidebar IA pass): the four
+// anchors stay first + prominent, then the grown-in items group under
+// lightweight ``SubNavLabel`` sub-headings by family — IPAM-family under
+// "IPAM", DNS-family under "DNS" — reusing the same primitive Network +
+// Administration already use. Routes + module-gating are unchanged; only
+// sidebar adjacency moves. (Logs left Core entirely → its own "Operations"
+// section below, since it's cross-cutting telemetry, not an IPAM/DNS child.)
 const baseMainNav = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
   { label: "IPAM", icon: Network, to: "/ipam", end: true },
   { label: "DHCP", icon: Server, to: "/dhcp" },
   { label: "DNS", icon: Globe, to: "/dns", end: true },
-  { label: "DNS Pools", icon: Workflow, to: "/dns/pools" },
-  { label: "DNSSEC Policies", icon: KeyRound, to: "/dns/dnssec-policies" },
-  { label: "Domains", icon: Earth, to: "/admin/domains" },
-  { label: "Logs", icon: ScrollText, to: "/logs" },
+];
+// IPAM-family children (all route under /ipam/*). Alphabetised, matching the
+// Network/Administration sub-group convention.
+const coreIpamNav = [
   { label: "NAT Mappings", icon: Shuffle, to: "/ipam/nat" },
   { label: "Stale IPs", icon: History, to: "/ipam/stale" },
   { label: "Subnet Planner", icon: Workflow, to: "/ipam/plans" },
 ];
+// DNS-family children. "Domains" keeps its /admin/domains route — it's the
+// registrar/expiry/RDAP registry side of a name (linked to dns_zone.domain_id),
+// so it belongs beside DNS in the sidebar even though the route lives under
+// /admin.
+const coreDnsNav = [
+  { label: "DNS Pools", icon: Workflow, to: "/dns/pools" },
+  { label: "DNSSEC Policies", icon: KeyRound, to: "/dns/dnssec-policies" },
+  { label: "Domains", icon: Earth, to: "/admin/domains" },
+];
+// Operations — cross-cutting live telemetry. Logs aggregates DNS query logs,
+// DHCP activity, Windows event log + DHCP audit, so it's not an IPAM/DNS child;
+// it gets its own small top-level section (future home for the pending
+// operational-triage surfaces: PCAP trigger #59, config-drift #61, time-travel
+// #56).
+const operationsNav = [{ label: "Logs", icon: ScrollText, to: "/logs" }];
 
 // Network section — grouped under a collapsible header. As the
 // section grew (4 → 8 items, with #94/#95 still to come), a flat
@@ -573,6 +598,40 @@ export function Sidebar({
             collapsed={effectiveCollapsed}
           >
             {mainNav.map((item) => (
+              <NavItem
+                key={item.to}
+                {...item}
+                collapsed={effectiveCollapsed}
+                onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
+            ))}
+            <SubNavLabel label="IPAM" collapsed={effectiveCollapsed} />
+            {coreIpamNav.map((item) => (
+              <NavItem
+                key={item.to}
+                {...item}
+                collapsed={effectiveCollapsed}
+                onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
+            ))}
+            <SubNavLabel label="DNS" collapsed={effectiveCollapsed} />
+            {coreDnsNav.map((item) => (
+              <NavItem
+                key={item.to}
+                {...item}
+                collapsed={effectiveCollapsed}
+                onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
+            ))}
+          </NavSection>
+
+          <NavSection
+            label="Operations"
+            storageKey="sidebar-section-operations-open"
+            collapsed={effectiveCollapsed}
+            showDivider
+          >
+            {operationsNav.map((item) => (
               <NavItem
                 key={item.to}
                 {...item}
