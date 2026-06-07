@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
+from app.core.agent_wake import collect_wake, dns_group_channel
 from app.models.dns import DNSServer, DNSServerGroup
 from app.services.dns_import import (
     CLOUD_DRIVERS,
@@ -449,6 +450,11 @@ async def bind9_commit(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+    # Wake the target group's parked agent long-polls so the newly
+    # imported zones converge immediately (the wake_publishing
+    # dependency flushes this after commit).
+    collect_wake(dns_group_channel(body.target_group_id))
+
     logger.info(
         "dns_import_bind9_commit",
         target_group_id=str(body.target_group_id),
@@ -599,6 +605,10 @@ async def windows_dns_commit(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+    # Wake the target group's parked agent long-polls so the newly
+    # imported zones converge immediately.
+    collect_wake(dns_group_channel(body.target_group_id))
+
     logger.info(
         "dns_import_windows_dns_commit",
         target_group_id=str(body.target_group_id),
@@ -718,6 +728,9 @@ async def powerdns_commit(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+
+    # #358 — imported zones land under target_group_id; wake its agents.
+    collect_wake(dns_group_channel(body.target_group_id))
 
     logger.info(
         "dns_import_powerdns_commit",
@@ -849,6 +862,9 @@ async def cloud_dns_commit(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+
+    # #358 — imported zones land under target_group_id; wake its agents.
+    collect_wake(dns_group_channel(body.target_group_id))
 
     logger.info(
         "dns_import_cloud_commit",

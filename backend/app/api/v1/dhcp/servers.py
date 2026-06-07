@@ -12,6 +12,7 @@ from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.agent_wake import collect_wake, dhcp_group_channel, dhcp_server_channel
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
 from app.drivers.dhcp import is_agentless, is_read_only
@@ -317,9 +318,22 @@ async def update_server(
     if s is None:
         raise HTTPException(status_code=404, detail="Server not found")
 
+    old_group_id = s.server_group_id
+    old_ha_peer_url = s.ha_peer_url
+
     changes = body.model_dump(exclude_none=True, exclude={"windows_credentials"})
     for k, v in changes.items():
         setattr(s, k, v)
+
+    # Wake the server's own long-poll on any update; if its group
+    # membership or HA listener URL changed, also wake BOTH the old and
+    # new group channels (a peer add/remove/move shifts the group bundle
+    # for every member, not just this server).
+    collect_wake(dhcp_server_channel(s.id))
+    if s.server_group_id != old_group_id or s.ha_peer_url != old_ha_peer_url:
+        for gid in (old_group_id, s.server_group_id):
+            if gid is not None:
+                collect_wake(dhcp_group_channel(gid))
 
     # Credentials handling:
     #   * None → leave alone
@@ -437,6 +451,7 @@ async def sync_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> dict[st
     else:
         op.payload = {"etag": bundle.etag}
         await db.flush()
+    collect_wake(dhcp_server_channel(s.id))
     write_audit(
         db,
         user=user,
@@ -617,6 +632,7 @@ async def approve_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Serv
     if s is None:
         raise HTTPException(status_code=404, detail="Server not found")
     s.agent_approved = True
+    collect_wake(dhcp_server_channel(s.id))
     write_audit(
         db,
         user=user,
@@ -714,6 +730,9 @@ async def resume_server(
     s.maintenance_mode = False
     s.maintenance_started_at = None
     s.maintenance_reason = None
+    # Resuming flips pending-op shipping back on, so wake the long-poll
+    # immediately. (Pause must NOT wake — it only quiets the server.)
+    collect_wake(dhcp_server_channel(s.id))
     write_audit(
         db,
         user=user,

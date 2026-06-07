@@ -13,6 +13,7 @@ from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
+from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import is_effective_superadmin, user_has_permission
 from app.models.audit_forward import AuditForwardTarget
@@ -824,6 +825,14 @@ async def update_settings(
     settings = await _get_or_create(db)
     changes = body.model_dump(exclude_none=True)
 
+    # Whether this update touches any host-config field the appliance
+    # supervisor's ConfigBundle long-poll folds into its ETag (SNMP /
+    # NTP / LLDP). A timezone-only change is deliberately excluded — it
+    # rides a different host-runner trigger, not the wake bus. Computed
+    # from ``changes`` keys before the snmp_* fields below get popped /
+    # rewritten so the detection is order-independent.
+    _host_config_touched = any(field.startswith(("snmp_", "ntp_", "lldp_")) for field in changes)
+
     # fingerbank_api_key needs Fernet encryption + maps to a different
     # column name. Empty string = clear; non-empty = encrypt + store.
     # Pop it out of ``changes`` so the audit log doesn't capture the
@@ -887,6 +896,14 @@ async def update_settings(
 
     await db.commit()
     await db.refresh(settings)
+
+    # The settings router has no request-scoped wake collector, so
+    # publish directly after the commit. Only fire when a host-config
+    # field actually changed so unrelated settings writes don't wake
+    # every DHCP-agent long-poll (which subscribes to HOSTCONFIG_ALL).
+    if _host_config_touched:
+        await publish_wake(HOSTCONFIG_ALL)
+
     logger.info("platform_settings_updated", user=current_user.username, changes=changes)
     return settings
 

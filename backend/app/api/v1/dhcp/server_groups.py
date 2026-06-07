@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPServer, DHCPServerGroup
 
@@ -176,6 +177,9 @@ async def update_group(
     changes = body.model_dump(exclude_none=True)
     for k, v in changes.items():
         setattr(g, k, v)
+    # HA tuning (mode / heartbeat / delays / auto-failover) renders into
+    # every member's bundle, so wake the group channel.
+    collect_wake(dhcp_group_channel(g.id))
     write_audit(
         db,
         user=user,

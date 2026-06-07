@@ -20,6 +20,11 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 
 from app.api.deps import DB
+from app.core.agent_wake import (
+    WAKE_TICK_SECONDS,
+    dns_wake_channels,
+    wake_subscription,
+)
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSKey,
@@ -320,21 +325,33 @@ async def agent_config_longpoll(
         return {"pending_approval": True, "etag": None}
 
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
-    while True:
-        bundle = await build_config_bundle(db, server)
-        etag = bundle["etag"]
-        # Early return if there are pending ops (fast-path per §3)
-        has_pending_ops = bool(bundle.get("pending_record_ops"))
-        if etag != if_none_match or has_pending_ops:
-            server.last_config_etag = etag
-            await db.commit()
-            response.headers["ETag"] = etag
-            return bundle
-        if asyncio.get_running_loop().time() >= deadline:
-            response.status_code = 304
-            response.headers["ETag"] = etag
-            return Response(status_code=304, headers={"ETag": etag})
-        await asyncio.sleep(LONGPOLL_POLL_INTERVAL)
+    # #358 — subscribe to this agent's wake channels BEFORE the first
+    # bundle build so a mutation that commits + publishes during this
+    # request can't land in the gap. A wake collapses the re-poll
+    # latency; with Redis down the subscription degrades to the old
+    # ``LONGPOLL_POLL_INTERVAL`` sleep, so behaviour is unchanged.
+    async with wake_subscription(dns_wake_channels(server)) as wake:
+        while True:
+            # Pick up server-row column changes a wake may be signalling
+            # (group_id, etc.) — build_config_bundle re-queries zones /
+            # records fresh, but server attributes are read off this
+            # cached instance (expire_on_commit=False, no in-loop commit).
+            await db.refresh(server)
+            bundle = await build_config_bundle(db, server)
+            etag = bundle["etag"]
+            # Early return if there are pending ops (fast-path per §3)
+            has_pending_ops = bool(bundle.get("pending_record_ops"))
+            if etag != if_none_match or has_pending_ops:
+                server.last_config_etag = etag
+                await db.commit()
+                response.headers["ETag"] = etag
+                return bundle
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                response.status_code = 304
+                response.headers["ETag"] = etag
+                return Response(status_code=304, headers={"ETag": etag})
+            await wake.wait(min(WAKE_TICK_SECONDS, remaining))
 
 
 @router.post("/heartbeat", response_model=AgentHeartbeatResponseV2)

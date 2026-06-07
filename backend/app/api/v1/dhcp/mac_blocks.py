@@ -23,6 +23,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPMACBlock, DHCPServerGroup
 from app.models.ipam import IPAddress, Subnet
@@ -240,6 +241,7 @@ async def create_mac_block(
         resource_display=body.mac_address,
         new_value=body.model_dump(mode="json"),
     )
+    collect_wake(dhcp_group_channel(group_id))
     await db.commit()
     await db.refresh(block)
     _kick_windows_sync()
@@ -273,6 +275,7 @@ async def update_mac_block(
         changed_fields=list(changes.keys()),
         new_value=body.model_dump(mode="json", exclude_unset=True),
     )
+    collect_wake(dhcp_group_channel(block.group_id))
     await db.commit()
     await db.refresh(block)
     _kick_windows_sync()
@@ -293,6 +296,7 @@ async def delete_mac_block(block_id: uuid.UUID, db: DB, user: SuperAdmin) -> Non
         resource_id=str(block.id),
         resource_display=str(block.mac_address),
     )
+    collect_wake(dhcp_group_channel(block.group_id))
     await db.delete(block)
     await db.commit()
     _kick_windows_sync()

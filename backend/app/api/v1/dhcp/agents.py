@@ -22,6 +22,11 @@ from sqlalchemy import select
 
 from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
+from app.core.agent_wake import (
+    WAKE_TICK_SECONDS,
+    dhcp_wake_channels,
+    wake_subscription,
+)
 from app.models.dhcp import (
     DHCPConfigOp,
     DHCPLease,
@@ -314,195 +319,204 @@ async def agent_config_longpoll(
         return {"pending_approval": True, "etag": None}
 
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
-    while True:
-        bundle = await build_config_bundle(db, server)
-        # Issue #153 — fold the rendered snmpd.conf hash into the ETag
-        # mix below so a Settings → Appliance → SNMP change wakes the
-        # agent's long-poll even when nothing in the DHCP driver
-        # bundle changed.
-        settings_row = await db.get(PlatformSettings, 1)
-        snmp_block = (
-            snmp_bundle(settings_row)
-            if settings_row is not None
-            else {"enabled": False, "config_hash": "", "snmpd_conf": ""}
-        )
-        # Issue #154 — same pattern for chrony / NTP. ntp_bundle
-        # returns a stable dict shape so the etag math below stays
-        # uniform whether settings exist or not.
-        ntp_block = (
-            ntp_bundle(settings_row)
-            if settings_row is not None
-            else {
-                "enabled": False,
-                "allow_clients": False,
-                "config_hash": "",
-                "chrony_conf": "",
-            }
-        )
-        # Issue #343 — same pattern for lldpd. Stable dict shape so the etag
-        # math stays uniform whether settings exist or not.
-        lldp_block = (
-            lldp_bundle(settings_row)
-            if settings_row is not None
-            else {"enabled": False, "config_hash": "", "lldpd_conf": "", "daemon_args": ""}
-        )
-        # Phase 8f-3 — mix the fleet-upgrade intent into the ETag so a
-        # Fleet view change wakes the agent's long-poll even when the
-        # driver-side bundle is unchanged. Deterministic — re-reading
-        # the same DB state yields the same combined ETag.
-        fleet_marker = (
-            f"{server.desired_appliance_version}"
-            f"|{server.desired_slot_image_url}"
-            f"|{int(server.reboot_requested)}"
-            f"|snmp:{int(bool(snmp_block.get('enabled')))}:{snmp_block.get('config_hash', '')}"
-            f"|ntp:{int(bool(ntp_block.get('allow_clients')))}:{ntp_block.get('config_hash', '')}"
-            f"|lldp:{int(bool(lldp_block.get('enabled')))}:{lldp_block.get('config_hash', '')}"
-        )
-        etag = "sha256:" + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
+    async with wake_subscription(dhcp_wake_channels(server)) as wake:
+        # #358 — subscribe before the first bundle build so a committed +
+        # published config change wakes this poll immediately; Redis-down
+        # degrades to the old LONGPOLL_POLL_INTERVAL sleep (see the DNS agent).
+        while True:
+            # Pick up server-row column changes a wake signals (fleet markers,
+            # group, maintenance) — read off this cached instance, since the
+            # bundle re-queries collections but not the server row.
+            await db.refresh(server)
+            bundle = await build_config_bundle(db, server)
+            # Issue #153 — fold the rendered snmpd.conf hash into the ETag
+            # mix below so a Settings → Appliance → SNMP change wakes the
+            # agent's long-poll even when nothing in the DHCP driver
+            # bundle changed.
+            settings_row = await db.get(PlatformSettings, 1)
+            snmp_block = (
+                snmp_bundle(settings_row)
+                if settings_row is not None
+                else {"enabled": False, "config_hash": "", "snmpd_conf": ""}
+            )
+            # Issue #154 — same pattern for chrony / NTP. ntp_bundle
+            # returns a stable dict shape so the etag math below stays
+            # uniform whether settings exist or not.
+            ntp_block = (
+                ntp_bundle(settings_row)
+                if settings_row is not None
+                else {
+                    "enabled": False,
+                    "allow_clients": False,
+                    "config_hash": "",
+                    "chrony_conf": "",
+                }
+            )
+            # Issue #343 — same pattern for lldpd. Stable dict shape so the etag
+            # math stays uniform whether settings exist or not.
+            lldp_block = (
+                lldp_bundle(settings_row)
+                if settings_row is not None
+                else {"enabled": False, "config_hash": "", "lldpd_conf": "", "daemon_args": ""}
+            )
+            # Phase 8f-3 — mix the fleet-upgrade intent into the ETag so a
+            # Fleet view change wakes the agent's long-poll even when the
+            # driver-side bundle is unchanged. Deterministic — re-reading
+            # the same DB state yields the same combined ETag.
+            fleet_marker = (
+                f"{server.desired_appliance_version}"
+                f"|{server.desired_slot_image_url}"
+                f"|{int(server.reboot_requested)}"
+                f"|snmp:{int(bool(snmp_block.get('enabled')))}:{snmp_block.get('config_hash', '')}"
+                f"|ntp:{int(bool(ntp_block.get('allow_clients')))}:{ntp_block.get('config_hash', '')}"
+                f"|lldp:{int(bool(lldp_block.get('enabled')))}:{lldp_block.get('config_hash', '')}"
+            )
+            etag = "sha256:" + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
 
-        # Pending ops fast-path. Issue #182: paused servers don't ship
-        # ops — they accumulate as ``pending`` and dispatch as soon as
-        # the operator resumes.
-        if server.maintenance_mode:
-            pending_ops: list[dict[str, Any]] = []
-        else:
-            ops_res = await db.execute(
-                select(DHCPConfigOp).where(
-                    DHCPConfigOp.server_id == server.id, DHCPConfigOp.status == "pending"
+            # Pending ops fast-path. Issue #182: paused servers don't ship
+            # ops — they accumulate as ``pending`` and dispatch as soon as
+            # the operator resumes.
+            if server.maintenance_mode:
+                pending_ops: list[dict[str, Any]] = []
+            else:
+                ops_res = await db.execute(
+                    select(DHCPConfigOp).where(
+                        DHCPConfigOp.server_id == server.id, DHCPConfigOp.status == "pending"
+                    )
                 )
-            )
-            pending_ops = [
-                {"op_id": str(o.id), "op_type": o.op_type, "payload": o.payload}
-                for o in ops_res.scalars().all()
-            ]
+                pending_ops = [
+                    {"op_id": str(o.id), "op_type": o.op_type, "payload": o.payload}
+                    for o in ops_res.scalars().all()
+                ]
 
-        if etag != if_none_match or pending_ops:
-            logger.info(
-                "dhcp_agent_config_200",
-                server_id=str(server.id),
-                etag=etag,
-                if_none_match=if_none_match,
-                etag_match=(etag == if_none_match),
-                pending_ops=len(pending_ops),
-            )
-            server.config_etag = etag
-            await db.commit()
-            response.headers["ETag"] = etag
-            return {
-                "server_id": str(server.id),
-                "etag": etag,
-                "bundle": {
-                    "server_name": bundle.server_name,
-                    "driver": bundle.driver,
-                    "roles": list(bundle.roles),
-                    "scopes": [
-                        {
-                            "subnet_cidr": s.subnet_cidr,
-                            "lease_time": s.lease_time,
-                            "options": s.options,
-                            # Issue #330 — the agent's render_kea branches on
-                            # these to emit a Dhcp6/subnet6 entry for v6
-                            # scopes. Without them every scope rendered as
-                            # Dhcp4 regardless of family. v6_address_mode
-                            # gates whether the v6 subnet serves pools /
-                            # options (stateful | stateless | slaac).
-                            "address_family": s.address_family,
-                            "v6_address_mode": s.v6_address_mode,
-                            # Issue #337 — relay-agent IPs the agent's
-                            # render_kea emits as ``relay: {"ip-addresses":
-                            # [...]}`` so a centralized Kea matches this
-                            # scope on giaddr for relayed remote subnets.
-                            "relay_addresses": list(s.relay_addresses),
-                            "pools": [
-                                {
-                                    "start_ip": p.start_ip,
-                                    "end_ip": p.end_ip,
-                                    "pool_type": p.pool_type,
-                                }
-                                for p in s.pools
-                            ],
-                            "statics": [
-                                {
-                                    "ip_address": st.ip_address,
-                                    "mac_address": st.mac_address,
-                                    "hostname": st.hostname,
-                                }
-                                for st in s.statics
-                            ],
-                            "ddns_enabled": s.ddns_enabled,
-                        }
-                        for s in bundle.scopes
-                    ],
-                    "client_classes": [
-                        {
-                            "name": c.name,
-                            "match_expression": c.match_expression,
-                            "options": c.options,
-                        }
-                        for c in bundle.client_classes
-                    ],
-                    "mac_blocks": [
-                        {
-                            "mac_address": m.mac_address,
-                            "reason": m.reason,
-                            "description": m.description,
-                        }
-                        for m in bundle.mac_blocks
-                    ],
-                    # Kea HA hook configuration — absent when the
-                    # server isn't part of a failover channel. The
-                    # agent's render_kea.py keys off the presence of
-                    # this ``peers`` list to decide whether to emit
-                    # ``libdhcp_ha.so``.
-                    "failover": (
-                        {
-                            "channel_id": bundle.failover.channel_id,
-                            "channel_name": bundle.failover.channel_name,
-                            "mode": bundle.failover.mode,
-                            "this_server_name": bundle.failover.this_server_name,
-                            "peers": list(bundle.failover.peers),
-                            "heartbeat_delay_ms": bundle.failover.heartbeat_delay_ms,
-                            "max_response_delay_ms": bundle.failover.max_response_delay_ms,
-                            "max_ack_delay_ms": bundle.failover.max_ack_delay_ms,
-                            "max_unacked_clients": bundle.failover.max_unacked_clients,
-                        }
-                        if bundle.failover is not None
-                        else None
-                    ),
-                },
-                "pending_ops": pending_ops,
-                # Phase 8f-3 — fleet upgrade intent the operator set
-                # from the Fleet view. Agent reads desired_*, compares
-                # against its own installed version on next heartbeat /
-                # bundle pickup, and writes the slot-upgrade trigger
-                # if mismatched. Both values None when nothing pending.
-                "fleet_upgrade": {
-                    "desired_appliance_version": server.desired_appliance_version,
-                    "desired_slot_image_url": server.desired_slot_image_url,
-                    # Phase 8f-8 — operator-triggered reboot intent.
-                    # Agent fires the reboot-pending trigger when this
-                    # flips to True; heartbeat handler clears it
-                    # post-reconnect.
-                    "reboot_requested": server.reboot_requested,
-                },
-                # Issue #153 — rendered snmpd.conf body + config hash.
-                # Agent writes the snmp-reload trigger when the hash
-                # differs from its last-rendered config; host-side
-                # spatiumddi-snmp-reload.path picks the file up and
-                # reloads snmpd.
-                "snmp_settings": snmp_block,
-                # Issue #154 — same shape for chrony / NTP. Agent
-                # writes ntp-config-pending on hash change; host-side
-                # spatiumddi-chrony-reload.path applies + reloads.
-                "ntp_settings": ntp_block,
-                # Issue #343 — rendered lldpd config + daemon args. Agent
-                # writes lldp-config-pending on hash change; host-side
-                # spatiumddi-lldp-reload.path applies + reloads lldpd.
-                "lldp_settings": lldp_block,
-            }
-        if asyncio.get_running_loop().time() >= deadline:
-            return Response(status_code=304, headers={"ETag": etag})
-        await asyncio.sleep(LONGPOLL_POLL_INTERVAL)
+            if etag != if_none_match or pending_ops:
+                logger.info(
+                    "dhcp_agent_config_200",
+                    server_id=str(server.id),
+                    etag=etag,
+                    if_none_match=if_none_match,
+                    etag_match=(etag == if_none_match),
+                    pending_ops=len(pending_ops),
+                )
+                server.config_etag = etag
+                await db.commit()
+                response.headers["ETag"] = etag
+                return {
+                    "server_id": str(server.id),
+                    "etag": etag,
+                    "bundle": {
+                        "server_name": bundle.server_name,
+                        "driver": bundle.driver,
+                        "roles": list(bundle.roles),
+                        "scopes": [
+                            {
+                                "subnet_cidr": s.subnet_cidr,
+                                "lease_time": s.lease_time,
+                                "options": s.options,
+                                # Issue #330 — the agent's render_kea branches on
+                                # these to emit a Dhcp6/subnet6 entry for v6
+                                # scopes. Without them every scope rendered as
+                                # Dhcp4 regardless of family. v6_address_mode
+                                # gates whether the v6 subnet serves pools /
+                                # options (stateful | stateless | slaac).
+                                "address_family": s.address_family,
+                                "v6_address_mode": s.v6_address_mode,
+                                # Issue #337 — relay-agent IPs the agent's
+                                # render_kea emits as ``relay: {"ip-addresses":
+                                # [...]}`` so a centralized Kea matches this
+                                # scope on giaddr for relayed remote subnets.
+                                "relay_addresses": list(s.relay_addresses),
+                                "pools": [
+                                    {
+                                        "start_ip": p.start_ip,
+                                        "end_ip": p.end_ip,
+                                        "pool_type": p.pool_type,
+                                    }
+                                    for p in s.pools
+                                ],
+                                "statics": [
+                                    {
+                                        "ip_address": st.ip_address,
+                                        "mac_address": st.mac_address,
+                                        "hostname": st.hostname,
+                                    }
+                                    for st in s.statics
+                                ],
+                                "ddns_enabled": s.ddns_enabled,
+                            }
+                            for s in bundle.scopes
+                        ],
+                        "client_classes": [
+                            {
+                                "name": c.name,
+                                "match_expression": c.match_expression,
+                                "options": c.options,
+                            }
+                            for c in bundle.client_classes
+                        ],
+                        "mac_blocks": [
+                            {
+                                "mac_address": m.mac_address,
+                                "reason": m.reason,
+                                "description": m.description,
+                            }
+                            for m in bundle.mac_blocks
+                        ],
+                        # Kea HA hook configuration — absent when the
+                        # server isn't part of a failover channel. The
+                        # agent's render_kea.py keys off the presence of
+                        # this ``peers`` list to decide whether to emit
+                        # ``libdhcp_ha.so``.
+                        "failover": (
+                            {
+                                "channel_id": bundle.failover.channel_id,
+                                "channel_name": bundle.failover.channel_name,
+                                "mode": bundle.failover.mode,
+                                "this_server_name": bundle.failover.this_server_name,
+                                "peers": list(bundle.failover.peers),
+                                "heartbeat_delay_ms": bundle.failover.heartbeat_delay_ms,
+                                "max_response_delay_ms": bundle.failover.max_response_delay_ms,
+                                "max_ack_delay_ms": bundle.failover.max_ack_delay_ms,
+                                "max_unacked_clients": bundle.failover.max_unacked_clients,
+                            }
+                            if bundle.failover is not None
+                            else None
+                        ),
+                    },
+                    "pending_ops": pending_ops,
+                    # Phase 8f-3 — fleet upgrade intent the operator set
+                    # from the Fleet view. Agent reads desired_*, compares
+                    # against its own installed version on next heartbeat /
+                    # bundle pickup, and writes the slot-upgrade trigger
+                    # if mismatched. Both values None when nothing pending.
+                    "fleet_upgrade": {
+                        "desired_appliance_version": server.desired_appliance_version,
+                        "desired_slot_image_url": server.desired_slot_image_url,
+                        # Phase 8f-8 — operator-triggered reboot intent.
+                        # Agent fires the reboot-pending trigger when this
+                        # flips to True; heartbeat handler clears it
+                        # post-reconnect.
+                        "reboot_requested": server.reboot_requested,
+                    },
+                    # Issue #153 — rendered snmpd.conf body + config hash.
+                    # Agent writes the snmp-reload trigger when the hash
+                    # differs from its last-rendered config; host-side
+                    # spatiumddi-snmp-reload.path picks the file up and
+                    # reloads snmpd.
+                    "snmp_settings": snmp_block,
+                    # Issue #154 — same shape for chrony / NTP. Agent
+                    # writes ntp-config-pending on hash change; host-side
+                    # spatiumddi-chrony-reload.path applies + reloads.
+                    "ntp_settings": ntp_block,
+                    # Issue #343 — rendered lldpd config + daemon args. Agent
+                    # writes lldp-config-pending on hash change; host-side
+                    # spatiumddi-lldp-reload.path applies + reloads lldpd.
+                    "lldp_settings": lldp_block,
+                }
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return Response(status_code=304, headers={"ETag": etag})
+            await wake.wait(min(WAKE_TICK_SECONDS, remaining))
 
 
 @router.post("/heartbeat", response_model=AgentHeartbeatResponse)

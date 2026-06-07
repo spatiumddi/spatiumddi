@@ -30,6 +30,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.core.agent_wake import collect_wake, dns_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.audit import AuditLog
 from app.models.dns import (
@@ -314,6 +315,30 @@ def _to_response(bl: DNSBlockList) -> BlockListResponse:
     )
 
 
+def _blocklist_group_ids(bl: DNSBlockList) -> set[uuid.UUID]:
+    """Server-group ids whose rendered RPZ config a change to ``bl`` affects.
+
+    Union of the blocklist's directly-assigned ``server_groups`` and the
+    groups owning any ``view`` the blocklist is scoped to. Both relationships
+    must already be eager-loaded (``_require_list`` does this via
+    ``selectinload``); ``view.group_id`` is a plain loaded column so reading
+    it triggers no async-lazy relationship load (no MissingGreenlet).
+    """
+    gids: set[uuid.UUID] = {g.id for g in bl.server_groups}
+    gids.update(v.group_id for v in bl.views)
+    return gids
+
+
+def _wake_blocklist_groups(bl: DNSBlockList) -> None:
+    """Stash a DNS-group wake for every group affected by a change to ``bl``.
+
+    Safe no-op when the blocklist is unassigned (e.g. just-created) — no group
+    renders it yet, so there's nothing to wake.
+    """
+    for gid in _blocklist_group_ids(bl):
+        collect_wake(dns_group_channel(gid))
+
+
 def _audit(
     current_user: Any,
     action: str,
@@ -462,6 +487,7 @@ async def subscribe_from_catalog(
                 list_id=str(bl.id),
                 error=str(e),
             )
+    _wake_blocklist_groups(reloaded)
     logger.info(
         "dns_blocklist_subscribed_from_catalog",
         list_id=str(bl.id),
@@ -512,6 +538,7 @@ async def create_blocklist(
     )
     await db.commit()
     reloaded = await _require_list(bl.id, db)
+    _wake_blocklist_groups(reloaded)
     logger.info("dns_blocklist_created", list_id=str(bl.id), name=bl.name)
     return _to_response(reloaded)
 
@@ -542,12 +569,16 @@ async def update_blocklist(
     )
     await db.commit()
     reloaded = await _require_list(list_id, db)
+    _wake_blocklist_groups(reloaded)
     return _to_response(reloaded)
 
 
 @router.delete("/blocklists/{list_id}", status_code=204)
 async def delete_blocklist(list_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> None:
     bl = await _require_list(list_id, db)
+    # Capture affected groups from the eager-loaded assignments BEFORE the
+    # delete (the association rows go away with the cascade).
+    _wake_blocklist_groups(bl)
     db.add(_audit(current_user, "delete", "dns_blocklist", str(bl.id), bl.name))
     await db.delete(bl)
     await db.commit()
@@ -564,6 +595,11 @@ async def update_assignments(
     current_user: SuperAdmin,
 ) -> BlockListResponse:
     bl = await _require_list(list_id, db)
+
+    # Capture the pre-change affected groups so a de-assigned group also
+    # re-renders (drops the blocklist). Read from the eager-loaded relationships
+    # before we reassign them.
+    old_group_ids = _blocklist_group_ids(bl)
 
     changed: list[str] = []
     if body.server_group_ids is not None:
@@ -602,6 +638,9 @@ async def update_assignments(
     )
     await db.commit()
     reloaded = await _require_list(list_id, db)
+    # Wake BOTH the old and new group sets so de-assigned groups re-render too.
+    for gid in old_group_ids | _blocklist_group_ids(reloaded):
+        collect_wake(dns_group_channel(gid))
     return _to_response(reloaded)
 
 
@@ -675,6 +714,7 @@ async def add_entry(
     )
     await db.commit()
     await db.refresh(entry)
+    _wake_blocklist_groups(bl)
     return EntryResponse.model_validate(entry)
 
 
@@ -732,6 +772,8 @@ async def bulk_add_entries(
         )
     )
     await db.commit()
+    if added:
+        _wake_blocklist_groups(bl)
     return BulkAddResponse(added=added, skipped=skipped, total=len(body.domains))
 
 
@@ -791,6 +833,7 @@ async def update_entry(
     )
     await db.commit()
     await db.refresh(entry)
+    _wake_blocklist_groups(bl)
     return EntryResponse.model_validate(entry)
 
 
@@ -823,6 +866,7 @@ async def delete_entry(
     await db.delete(entry)
     bl.entry_count = max(0, bl.entry_count - 1)
     await db.commit()
+    _wake_blocklist_groups(bl)
 
 
 # ── Exceptions ─────────────────────────────────────────────────────────────
@@ -884,6 +928,7 @@ async def add_exception(
     )
     await db.commit()
     await db.refresh(ex)
+    _wake_blocklist_groups(bl)
     return ex
 
 
@@ -937,6 +982,7 @@ async def update_exception(
     )
     await db.commit()
     await db.refresh(ex)
+    _wake_blocklist_groups(bl)
     return ex
 
 
@@ -968,6 +1014,7 @@ async def delete_exception(
     )
     await db.delete(ex)
     await db.commit()
+    _wake_blocklist_groups(bl)
 
 
 # ── Feed refresh ───────────────────────────────────────────────────────────
@@ -1003,6 +1050,11 @@ async def refresh_blocklist(
         )
     )
     await db.commit()
+    # Advisory wake on enqueue. The feed fetch + entry rewrite happens in the
+    # Celery worker (`refresh_blocklist_feed`), which publishes its own wake
+    # after committing the new entries; this just nudges the parked poll so a
+    # no-change refresh still converges promptly.
+    _wake_blocklist_groups(bl)
     return RefreshResponse(list_id=bl.id, task_id=task_id, status="queued")
 
 

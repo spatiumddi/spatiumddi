@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.core.agent_wake import dns_group_channel, publish_wake
 from app.models.audit import AuditLog
 from app.models.ipam import Subnet
 from app.models.settings import PlatformSettings
@@ -44,6 +45,7 @@ async def _run_auto_sync() -> dict[str, Any]:
     from app.api.v1.ipam.router import (
         DnsSyncCommitRequest,  # noqa: PLC0415
         _apply_dns_sync,  # noqa: PLC0415
+        _resolve_effective_dns,  # noqa: PLC0415
     )
     from app.services.dns.sync_check import compute_subnet_dns_drift  # noqa: PLC0415
 
@@ -74,6 +76,10 @@ async def _run_auto_sync() -> dict[str, Any]:
             total_deleted = 0
             errors: list[str] = []
             subnets_touched = 0
+            # Subnets whose records actually changed this run — used after the
+            # commit to wake the parked agent long-polls for the affected DNS
+            # groups (worker process: no request collector, publish directly).
+            touched_subnet_ids: set[Any] = set()
 
             for subnet_id in subnets:
                 try:
@@ -110,6 +116,7 @@ async def _run_auto_sync() -> dict[str, Any]:
                 errors.extend(subnet_errors)
                 if created or updated or deleted:
                     subnets_touched += 1
+                    touched_subnet_ids.add(subnet_id)
 
             ps.dns_auto_sync_last_run_at = now
 
@@ -133,7 +140,21 @@ async def _run_auto_sync() -> dict[str, Any]:
                         },
                     )
                 )
+            # Resolve the DNS groups whose zones received records this run.
+            # Done BEFORE commit (read-only inheritance walk on the live
+            # session) but published AFTER, per the wake contract.
+            wake_group_ids: set[str] = set()
+            for sid in touched_subnet_ids:
+                sn = await db.get(Subnet, sid)
+                if sn is None:
+                    continue
+                group_ids, _, _ = await _resolve_effective_dns(db, sn)
+                wake_group_ids.update(group_ids)
+
             await db.commit()
+
+            for gid in wake_group_ids:
+                await publish_wake(dns_group_channel(gid))
 
             logger.info(
                 "ipam_dns_auto_sync_completed",
