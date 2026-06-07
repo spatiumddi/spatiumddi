@@ -37,6 +37,52 @@ standing up Prometheus / Grafana:
   Copilot `get_redis_stats` tool (superadmin-gated, default-off)
   exposes the same rollup to chat.
 
+  **Heartbeat-gated signals (#358 Phase 1).** The same bus also wakes
+  the **supervisor heartbeat** long-poll: fleet OS/slot upgrade,
+  reboot, role-assignment, and per-appliance host-config (firewall /
+  the shared SNMP/NTP/LLDP/timezone broadcast) changes publish to a
+  per-appliance channel (the `appliance` resource-class), so the
+  supervisor acts in ~0 s instead of waiting up to one heartbeat
+  interval. The supervisor stays HTTP-only — the wake is server-side,
+  behind the heartbeat's opt-in `wait_seconds` long-poll — so remote /
+  Application supervisors that can't reach `sentinel://` are
+  unaffected and no Redis port is exposed to agent nodes. Redis-down
+  degrades the hold to the bounded heartbeat interval (no storm), and
+  a concrete pending command (upgrade / reboot) skips the hold so it
+  is never delayed (non-negotiable #5).
+
+  **Fleet-scale instrumentation + broker threshold (#358 Phase 2).**
+  The wake-bus panel is the capacity signal for whether this
+  Redis-only design still suffices: `total_subscribers` (open
+  long-poll connections ≈ live agents + supervisors) and
+  publishes-by-class (DNS / DHCP / hostconfig / appliance) are the
+  inputs, with Redis `ops-per-sec` on the overview panel as the
+  fan-out cost. The explicit threshold that would justify graduating
+  to a dedicated broker — written down so the call is data-driven,
+  not vibes — is **any of**: (a) sustained **> ~150** concurrent
+  agent/supervisor long-poll subscribers (well past the "dozens" #171
+  sized for); (b) the first **external / WAN-agent** topology (agents
+  reaching the control plane across an untrusted network, where MQTT's
+  retained-message / last-will / QoS / WSS-through-:443 wins start to
+  matter); or (c) a sustained wake publish rate high enough that the
+  per-replica pub/sub fan-out is visible in Redis `ops-per-sec`. Until
+  one is crossed, Redis is the right answer and the work is done.
+
+  **Transport abstraction + escalation path (#358 Phase 3 —
+  deferred, not built).** `publish_wake()` / `wake_subscription()` in
+  `backend/app/core/agent_wake.py` are the transport seam: callers
+  only speak "publish a wake on this channel" / "wait for a wake", and
+  the Redis pub/sub implementation is private to that module. Swapping
+  in **Eclipse Mosquitto** (the escalation documented in #171:
+  single-node StatefulSet behind the control-plane VIP, JWT-as-
+  username auth + Dynamic-Security ACLs rendered from DB via the
+  existing ConfigBundle → trigger-file → host-runner pattern, WSS on
+  :443 for remote agents, MQTT kept a wake/notify channel only with
+  HTTP config-pull + cache authoritative) would therefore be an
+  implementation change inside that one module, not a protocol
+  redesign. It is intentionally **not built** — no broker ships until
+  a Phase-2 threshold is actually crossed.
+
 The native surfaces are intentionally tactical — for long-term
 metrics retention and cross-instance dashboards, fall back to
 Prometheus scraping `/metrics` (see § 6).
