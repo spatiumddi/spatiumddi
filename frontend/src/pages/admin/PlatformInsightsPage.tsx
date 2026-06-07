@@ -756,6 +756,11 @@ function RedisPanel() {
                 ))}
               </tbody>
             </table>
+          ) : wb && !wb.available ? (
+            <p className="text-sm text-amber-600 dark:text-amber-400">
+              Wake-bus metrics unavailable
+              {wb.hint ? `: ${wb.hint}` : " (Redis unreachable)"}.
+            </p>
           ) : (
             <p className="text-sm text-muted-foreground">
               No agents are currently parked on a wake channel.
@@ -796,6 +801,14 @@ function RedisPanel() {
                 ))}
               </tbody>
             </table>
+          ) : keyspace.data && !keyspace.data.available ? (
+            <p className="text-sm text-amber-600 dark:text-amber-400">
+              Keyspace unavailable
+              {keyspace.data.hint
+                ? `: ${keyspace.data.hint}`
+                : " (Redis unreachable)"}
+              .
+            </p>
           ) : (
             <p className="text-sm text-muted-foreground">No keys.</p>
           )}

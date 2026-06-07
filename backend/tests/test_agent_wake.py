@@ -16,7 +16,6 @@ import uuid
 from types import SimpleNamespace
 from typing import Any
 
-import app.core.agent_wake as aw
 from app.core.agent_wake import (
     HOSTCONFIG_ALL,
     WakeResult,
@@ -117,7 +116,7 @@ def _patch_redis(
         assert client is not None
         return client
 
-    monkeypatch.setattr(aw, "make_async_redis", factory)
+    monkeypatch.setattr("app.core.agent_wake.make_async_redis", factory)
 
 
 # ── Channel grammar ─────────────────────────────────────────────────────────────
@@ -187,7 +186,7 @@ async def test_publish_wake_empty_is_noop(monkeypatch: Any) -> None:
     def boom(*a: Any, **k: Any) -> Any:
         raise AssertionError("make_async_redis must not be called for an empty publish")
 
-    monkeypatch.setattr(aw, "make_async_redis", boom)
+    monkeypatch.setattr("app.core.agent_wake.make_async_redis", boom)
     await publish_wake()  # no channels → no connection at all
 
 
@@ -200,7 +199,7 @@ async def test_collecting_wakes_publishes_once_deduped(monkeypatch: Any) -> None
     async def fake_publish(*channels: str) -> None:
         captured.append(channels)
 
-    monkeypatch.setattr(aw, "publish_wake", fake_publish)
+    monkeypatch.setattr("app.core.agent_wake.publish_wake", fake_publish)
     async with collecting_wakes():
         collect_wake("spatium:wake:dns:group:a")
         collect_wake("spatium:wake:dns:group:a")  # dup
@@ -216,7 +215,7 @@ async def test_collecting_wakes_no_publish_when_empty(monkeypatch: Any) -> None:
         nonlocal called
         called = True
 
-    monkeypatch.setattr(aw, "publish_wake", fake_publish)
+    monkeypatch.setattr("app.core.agent_wake.publish_wake", fake_publish)
     async with collecting_wakes():
         pass
     assert called is False
@@ -229,7 +228,7 @@ async def test_collecting_wakes_drops_batch_on_exception(monkeypatch: Any) -> No
         nonlocal called
         called = True
 
-    monkeypatch.setattr(aw, "publish_wake", fake_publish)
+    monkeypatch.setattr("app.core.agent_wake.publish_wake", fake_publish)
     try:
         async with collecting_wakes():
             collect_wake("spatium:wake:dns:group:a")

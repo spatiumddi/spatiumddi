@@ -82,8 +82,10 @@ async def get_redis_stats(
             "role": info.get("role"),
             "uptime_seconds": info.get("uptime_in_seconds"),
             "connected_clients": info.get("connected_clients"),
-            "used_memory_human": info.get("used_memory_human"),
-            "used_memory_peak_human": info.get("used_memory_peak_human"),
+            # Raw byte counters (not the *_human strings) for consistency
+            # with the /admin/redis dashboard shape — the model can format.
+            "used_memory_bytes": info.get("used_memory"),
+            "used_memory_peak_bytes": info.get("used_memory_peak"),
             "instantaneous_ops_per_sec": info.get("instantaneous_ops_per_sec"),
             "keyspace_hits": info.get("keyspace_hits"),
             "keyspace_misses": info.get("keyspace_misses"),
