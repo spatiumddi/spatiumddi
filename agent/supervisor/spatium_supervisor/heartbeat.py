@@ -428,15 +428,21 @@ def heartbeat_once(
     identity: Identity,
     client: httpx.Client,
     log: structlog.stdlib.BoundLogger,
-) -> None:
+) -> bool:
     """One heartbeat round-trip + trigger-file follow-up.
 
     Never raises. Logs every error path so a real outage shows up in
     journalctl without taking down the supervisor process.
     """
     state = appliance_state.collect()
+    # #358 Phase 1b — ask the control plane to long-poll-hold this
+    # heartbeat (Redis-woken) up to the interval so operator commands start
+    # in ~0 s. Old control planes ignore it + return at once; the widened
+    # client timeout below covers the hold.
+    hold_s = max(0, int(cfg.heartbeat_interval_seconds))
     body: dict[str, Any] = {
         "appliance_id": str(appliance_id),
+        "wait_seconds": hold_s,
         "session_token": session_token,
         "capabilities": _capabilities_payload(),
         **state,
@@ -507,13 +513,15 @@ def heartbeat_once(
             log.warning("supervisor.heartbeat.cert_auth_skipped", error=str(exc))
 
     try:
-        resp = client.post(url, json=body, headers=headers, timeout=10.0)
+        resp = client.post(
+            url, json=body, headers=headers, timeout=float(hold_s) + 10.0
+        )
     except httpx.HTTPError as exc:
         # Transient network / DNS / timeout — don't count toward
         # revocation strikes. The control plane is unreachable, not
         # rejecting us; once it comes back the 200 path resumes.
         log.warning("supervisor.heartbeat.failed", error=str(exc))
-        return
+        return False
     if resp.status_code == 403 or resp.status_code == 404:
         # 403 = approval revoked or cert no longer valid for any
         # known appliance row. 404 = appliance row deleted, or the
@@ -559,7 +567,7 @@ def heartbeat_once(
                         "supervisor.heartbeat.revoked_teardown_failed",
                         error=str(exc),
                     )
-        return
+        return False
     if resp.status_code >= 500:
         # 5xx is the control plane crashing mid-flight, not a
         # deliberate rejection — don't count toward revocation.
@@ -567,13 +575,13 @@ def heartbeat_once(
             "supervisor.heartbeat.server_error",
             status_code=resp.status_code,
         )
-        return
+        return False
     if resp.status_code != 200:
         log.warning(
             "supervisor.heartbeat.unexpected_status",
             status_code=resp.status_code,
         )
-        return
+        return False
     # Heartbeat accepted — clear any prior strike counter and stamp
     # ``approved`` if we weren't there yet.
     approval_state.record_success(cfg.state_dir)
@@ -582,7 +590,10 @@ def heartbeat_once(
         body_out = resp.json()
     except ValueError:
         log.warning("supervisor.heartbeat.bad_json")
-        return
+        return False
+    # #358 Phase 1b — True when the control plane long-poll-held this
+    # heartbeat (new server); lets the loop re-arm the hold immediately.
+    held = bool(body_out.get("long_poll"))
 
     # #170 Wave D follow-up — pick up cert + CA chain on the first
     # heartbeat after approval. Subsequent heartbeats include the
@@ -927,7 +938,7 @@ def heartbeat_once(
     if approval_state.read_state(cfg.state_dir) == "revoked":
         log.info("supervisor.heartbeat.lifecycle_skipped_revoked")
         _ = identity
-        return
+        return False
 
     if not env_write_failed and appliance_state.detect_deployment_kind() == "appliance":
         # Phase 10 wave 2 — reconcile node labels every heartbeat
@@ -984,6 +995,8 @@ def heartbeat_once(
     # C2's mTLS upgrade doesn't need to thread it back in. Silence
     # the linter without adding a runtime cost.
     _ = identity
+
+    return held
 
 
 _LIFECYCLE_STATE_FILE = "role-switch-state"

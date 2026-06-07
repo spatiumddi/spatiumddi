@@ -60,7 +60,15 @@ from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser
-from app.core.agent_wake import appliance_channel, publish_wake
+from app.core.agent_wake import (
+    HOSTCONFIG_ALL,
+    WAKE_TICK_SECONDS,
+    WakeResult,
+    appliance_channel,
+    appliance_wake_channels,
+    publish_wake,
+    wake_subscription,
+)
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
@@ -937,6 +945,12 @@ class SupervisorHeartbeatRequest(BaseModel):
 
     appliance_id: uuid.UUID
     session_token: str | None = None
+    # #358 Phase 1b — opt-in heartbeat long-poll. >0 asks the control
+    # plane to hold the response open up to this many seconds (capped
+    # server-side) waiting for a per-appliance wake, so operator commands
+    # start in ~0 s. Omitted/0 by pre-#358 supervisors → return at once
+    # (today's behavior), which keeps the rolling-upgrade skew window safe.
+    wait_seconds: int = 0
     capabilities: SupervisorCapabilities | None = None
     deployment_kind: Literal["appliance", "docker", "k8s", "unknown"] | None = None
     # #272 Phase 1 — installer-role variant read by the supervisor from
@@ -1125,6 +1139,11 @@ class SupervisorHeartbeatResponse(BaseModel):
 
     appliance_id: uuid.UUID
     state: Literal["pending_approval", "approved", "rejected"]
+    # #358 Phase 1b — True when the control plane long-poll-held this
+    # heartbeat (new server honoring wait_seconds). The supervisor uses it
+    # to re-arm the hold immediately instead of double-sleeping the
+    # interval; absent/False from old control planes.
+    long_poll: bool = False
     desired_appliance_version: str | None = None
     desired_slot_image_url: str | None = None
     # Operator's per-slot boot intents. The supervisor writes the
@@ -1314,6 +1333,12 @@ async def _ingest_lldp_neighbours(
     for key, row in by_key.items():
         if key not in desired:
             await db.delete(row)
+
+
+# #358 Phase 1b — server-side cap on how long the heartbeat long-poll holds
+# the connection. Must stay under the supervisor's client timeout
+# (heartbeat_interval + 10 s) so the hold returns before the client gives up.
+_HEARTBEAT_HOLD_CAP_S = 28.0
 
 
 @router.post(
@@ -1657,6 +1682,41 @@ async def supervisor_heartbeat(
 
     await db.commit()
 
+    # #358 Phase 1b — heartbeat long-poll. When the supervisor opts in
+    # (wait_seconds > 0) and there's no concrete pending host command,
+    # hold the response open until a per-appliance wake fires (upgrade /
+    # reboot / role / firewall / host-config) or a bounded timeout — so
+    # operator commands start in ~0 s instead of waiting a full heartbeat.
+    # Fallback-safe by construction: wait_seconds == 0 (old supervisor)
+    # returns immediately as before; a concrete pending command skips the
+    # hold so it's never delayed; and a Redis outage degrades wake.wait to
+    # a bounded sleep (no fast-return storm), with the supervisor's own
+    # interval still delivering everything (non-negotiable #5). The
+    # telemetry commit above already ran, so no DB connection is held
+    # across the wait.
+    long_poll = body.wait_seconds > 0
+    if long_poll:
+        has_pending_command = (
+            row.desired_appliance_version is not None
+            or row.reboot_requested
+            or row.desired_next_boot_slot is not None
+            or row.desired_default_slot is not None
+        )
+        if not has_pending_command:
+            hold_for = min(float(body.wait_seconds), _HEARTBEAT_HOLD_CAP_S)
+            deadline = asyncio.get_running_loop().time() + hold_for
+            async with wake_subscription([*appliance_wake_channels(row), HOSTCONFIG_ALL]) as wake:
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.WAKE:
+                        break
+            # Pick up anything that committed during the hold (role /
+            # firewall / desired-state edits land on other requests) before
+            # building the desired-state response below.
+            await db.refresh(row)
+
     # Resolve assigned role config so the supervisor can bring up
     # service containers. DNS / DHCP group lookups are best-effort —
     # if the operator deleted a group out from under an approved
@@ -1828,6 +1888,7 @@ async def supervisor_heartbeat(
         ntp_settings=ntp_block,
         lldp_settings=lldp_block,
         firewall_settings=firewall_block,
+        long_poll=long_poll,
     )
 
 
