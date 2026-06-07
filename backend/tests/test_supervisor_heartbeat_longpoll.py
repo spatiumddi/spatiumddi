@@ -6,13 +6,19 @@ desired-state change or a bounded timeout, so operator commands
 (upgrade / reboot / role / host-config) start in ~0 s instead of
 waiting a full heartbeat interval.
 
-These cases exercise the new branch deterministically — without a real
-hold or a live Redis — via the two short-circuits:
+``long_poll`` in the response reports whether the control plane actually
+HELD the heartbeat (entered the wake wait), not merely that the
+supervisor opted in — the supervisor keys its re-arm cadence off it:
 * ``wait_seconds`` omitted (pre-#358 supervisor) → immediate return,
   ``long_poll=False`` (byte-for-byte the old behavior).
 * ``wait_seconds`` > 0 but a concrete command is already pending →
-  ``long_poll=True`` and an immediate return (a pending command is
-  never delayed by the hold).
+  immediate return with ``long_poll=False`` (a pending command is never
+  delayed, and the supervisor keeps its normal interval cadence rather
+  than re-arming every floor while the intent persists).
+* ``wait_seconds`` > 0 and idle → the handler holds, then returns
+  ``long_poll=True``. A tiny ``wait_seconds`` keeps the case fast and
+  works whether or not Redis is reachable (the wait degrades to a
+  bounded sleep when it isn't).
 """
 
 from __future__ import annotations
@@ -74,12 +80,13 @@ async def test_heartbeat_long_poll_off_by_default(
     assert r.json()["long_poll"] is False
 
 
-async def test_heartbeat_long_poll_skips_hold_when_command_pending(
+async def test_heartbeat_pending_command_returns_immediately_not_held(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    # wait_seconds>0 sets long_poll=True, but a concrete pending command
-    # (a desired upgrade) short-circuits the hold so the command is never
-    # delayed — the response returns immediately with the desired state.
+    # wait_seconds>0 but a concrete pending command (a desired upgrade)
+    # short-circuits the hold: the response returns immediately with the
+    # desired state AND long_poll=False, so the supervisor does NOT re-arm
+    # on the short floor for the whole duration the upgrade intent persists.
     await _enable(db_session)
     row, token = await _approved_supervisor(db_session)
     row.desired_appliance_version = "2026.06.07-1"
@@ -96,5 +103,28 @@ async def test_heartbeat_long_poll_skips_hold_when_command_pending(
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["long_poll"] is True
+    assert body["long_poll"] is False
     assert body["desired_appliance_version"] == "2026.06.07-1"
+
+
+async def test_heartbeat_holds_when_idle_and_reports_long_poll(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # wait_seconds>0 with nothing pending → the handler actually holds on
+    # the wake wait, then returns long_poll=True. A 1 s wait keeps it fast
+    # and is Redis-agnostic: with Redis up it times out, with Redis down the
+    # wait degrades to a bounded sleep — either way long_poll is True.
+    await _enable(db_session)
+    row, token = await _approved_supervisor(db_session)
+    await db_session.commit()
+
+    r = await client.post(
+        "/api/v1/appliance/supervisor/heartbeat",
+        json={
+            "appliance_id": str(row.id),
+            "session_token": token,
+            "wait_seconds": 1,
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["long_poll"] is True

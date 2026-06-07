@@ -1694,8 +1694,16 @@ async def supervisor_heartbeat(
     # interval still delivering everything (non-negotiable #5). The
     # telemetry commit above already ran, so no DB connection is held
     # across the wait.
-    long_poll = body.wait_seconds > 0
-    if long_poll:
+    #
+    # ``long_poll`` reports whether we ACTUALLY held this heartbeat (entered
+    # the wake wait), NOT merely that the supervisor opted in. A pending
+    # command returns immediately with long_poll=False so the supervisor
+    # keeps its normal interval cadence instead of re-arming every floor for
+    # the whole duration an upgrade/reboot intent persists (the command was
+    # already delivered instantly by the publish_wake on its stamp, and is
+    # re-delivered idempotently on each normal heartbeat).
+    long_poll = False
+    if body.wait_seconds > 0:
         has_pending_command = (
             row.desired_appliance_version is not None
             or row.reboot_requested
@@ -1703,6 +1711,7 @@ async def supervisor_heartbeat(
             or row.desired_default_slot is not None
         )
         if not has_pending_command:
+            long_poll = True
             hold_for = min(float(body.wait_seconds), _HEARTBEAT_HOLD_CAP_S)
             deadline = asyncio.get_running_loop().time() + hold_for
             async with wake_subscription([*appliance_wake_channels(row), HOSTCONFIG_ALL]) as wake:
