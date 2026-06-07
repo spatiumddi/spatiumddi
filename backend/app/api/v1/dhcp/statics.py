@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.ipam import IPAddress, Subnet
@@ -204,6 +205,7 @@ async def create_static(
     db.add(st)
     await db.flush()
     await push_static_change(db, st, action="create")
+    collect_wake(dhcp_group_channel(scope.group_id))
     await _upsert_ipam_for_static(db, scope, st)
     write_audit(
         db,
@@ -241,6 +243,7 @@ async def update_static(
         setattr(st, k, v)
     await db.flush()
     await push_static_change(db, st, action="update", prev_mac=prev_mac)
+    collect_wake(dhcp_group_channel(scope.group_id))
     await _upsert_ipam_for_static(db, scope, st, action="update")
     write_audit(
         db,
@@ -262,6 +265,9 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     st = await db.get(DHCPStaticAssignment, static_id)
     if st is None:
         raise HTTPException(status_code=404, detail="Static assignment not found")
+    scope = await db.get(DHCPScope, st.scope_id)
+    if scope is not None:
+        collect_wake(dhcp_group_channel(scope.group_id))
     await push_static_change(db, st, action="delete")
     await _detach_ipam_for_static(db, st)
     write_audit(

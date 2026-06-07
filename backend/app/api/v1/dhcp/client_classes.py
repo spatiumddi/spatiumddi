@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPClientClass, DHCPServerGroup
 
@@ -83,6 +84,7 @@ async def create_class(
         resource_display=cc.name,
         new_value=body.model_dump(mode="json"),
     )
+    collect_wake(dhcp_group_channel(group_id))
     await db.commit()
     await db.refresh(cc)
     return cc
@@ -108,6 +110,7 @@ async def update_class(
         changed_fields=list(changes.keys()),
         new_value=body.model_dump(mode="json", exclude_none=True),
     )
+    collect_wake(dhcp_group_channel(cc.group_id))
     await db.commit()
     await db.refresh(cc)
     return cc
@@ -126,5 +129,6 @@ async def delete_class(class_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
         resource_id=str(cc.id),
         resource_display=cc.name,
     )
+    collect_wake(dhcp_group_channel(cc.group_id))
     await db.delete(cc)
     await db.commit()

@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.core.agent_wake import collect_wake, dns_group_channel, dns_server_channel
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.permissions import require_any_resource_permission
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
@@ -921,6 +922,7 @@ async def update_group(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group.id))
     await db.commit()
     await db.refresh(group)
     return group
@@ -974,6 +976,7 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group.id))
     await db.delete(group)
     await db.commit()
 
@@ -1068,6 +1071,7 @@ async def create_server(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(server)
     return ServerResponse.from_model(server)
@@ -1171,6 +1175,7 @@ async def update_server(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(server.group_id), dns_server_channel(server.id))
     await db.commit()
     await db.refresh(server)
     return ServerResponse.from_model(server)
@@ -1193,6 +1198,7 @@ async def delete_server(
             result="success",
         )
     )
+    collect_wake(dns_server_channel(server.id), dns_group_channel(server.group_id))
     await db.delete(server)
     await db.commit()
 
@@ -1291,6 +1297,9 @@ async def resume_server(
             result="success",
         )
     )
+    # Resuming re-enables pending-op shipping for this server, so wake it
+    # to pick up anything queued while paused. Pause itself does NOT wake.
+    collect_wake(dns_server_channel(server.id))
     await db.commit()
     await db.refresh(server)
     return ServerResponse.from_model(server)
@@ -1754,9 +1763,11 @@ async def sync_server_from_server(
 ) -> SyncFromServerResponse:
     """Bi-directional sync with a single server. See ``_sync_single_server``."""
     server = await _require_server(group_id, server_id, db)
-    return await _sync_single_server(
+    result = await _sync_single_server(
         db, server, current_user, import_new_zones=import_new_zones, commit=True
     )
+    collect_wake(dns_group_channel(group_id))
+    return result
 
 
 @router.post(
@@ -1834,6 +1845,7 @@ async def sync_group_with_servers(
                 error=str(exc),
             )
 
+    collect_wake(dns_group_channel(group_id))
     await db.commit()
 
     return GroupSyncWithServersResponse(
@@ -1994,6 +2006,7 @@ async def update_options(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.commit()
     reloaded = await _load_options(group_id, db)
     return reloaded  # type: ignore[return-value]
@@ -2022,6 +2035,7 @@ async def add_trust_anchor(
         added_by_user_id=current_user.id,
     )
     db.add(anchor)
+    collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(anchor)
     return anchor
@@ -2040,6 +2054,7 @@ async def delete_trust_anchor(
     anchor = result.scalar_one_or_none()
     if not anchor:
         raise HTTPException(status_code=404, detail="Trust anchor not found")
+    collect_wake(dns_group_channel(group_id))
     await db.delete(anchor)
     await db.commit()
 
@@ -2104,6 +2119,7 @@ async def create_acl(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.commit()
     return await _load_acl(group_id, acl.id, db)  # type: ignore[return-value]
 
@@ -2141,6 +2157,7 @@ async def update_acl(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.commit()
     return await _load_acl(group_id, acl_id, db)  # type: ignore[return-value]
 
@@ -2162,6 +2179,7 @@ async def delete_acl(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.delete(acl)
     await db.commit()
 
@@ -2341,6 +2359,7 @@ async def create_tsig_key(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(key)
     out = TSIGKeyResponse.model_validate(key)
@@ -2398,6 +2417,7 @@ async def update_tsig_key(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(key)
     return TSIGKeyResponse.model_validate(key)
@@ -2428,6 +2448,7 @@ async def rotate_tsig_key(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(key)
     out = TSIGKeyResponse.model_validate(key)
@@ -2454,6 +2475,7 @@ async def delete_tsig_key(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.delete(key)
     await db.commit()
 
@@ -2497,6 +2519,7 @@ async def create_view(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(view)
     return view
@@ -2527,6 +2550,7 @@ async def update_view(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(view)
     return view
@@ -2549,6 +2573,7 @@ async def delete_view(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.delete(view)
     await db.commit()
 
@@ -2613,6 +2638,7 @@ async def create_zone(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(zone)
     return zone
@@ -3101,6 +3127,7 @@ async def update_zone(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(zone)
     return zone
@@ -3233,6 +3260,15 @@ async def update_dnssec_policy(
             result="success",
         )
     )
+    # A DNSSEC policy is shared across zones; wake every group that has a
+    # zone referencing it so its agents re-render with the new params.
+    affected_groups = (
+        await db.execute(
+            select(DNSZone.group_id).distinct().where(DNSZone.dnssec_policy_id == pol.id)
+        )
+    ).scalars()
+    for gid in affected_groups:
+        collect_wake(dns_group_channel(gid))
     await db.commit()
     await db.refresh(pol)
     return pol
@@ -3251,6 +3287,16 @@ async def delete_dnssec_policy(policy_id: uuid.UUID, db: DB, current_user: Super
             select(func.count()).select_from(DNSZone).where(DNSZone.dnssec_policy_id == policy_id)
         )
     ).scalar_one()
+    # Collect affected groups BEFORE the delete — the FK is SET NULL on
+    # delete, so the references won't resolve afterward. Each such group's
+    # zone falls back to the built-in default policy, changing its render.
+    affected_groups = list(
+        (
+            await db.execute(
+                select(DNSZone.group_id).distinct().where(DNSZone.dnssec_policy_id == policy_id)
+            )
+        ).scalars()
+    )
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -3264,6 +3310,8 @@ async def delete_dnssec_policy(policy_id: uuid.UUID, db: DB, current_user: Super
             result="success",
         )
     )
+    for gid in affected_groups:
+        collect_wake(dns_group_channel(gid))
     await db.delete(pol)
     await db.commit()
 
@@ -3516,6 +3564,9 @@ async def delete_zone(
                     result="success",
                 )
             )
+        # Soft-delete stamps deleted_at; the global filter then drops the
+        # zone from the served bundle, so the agents must re-poll.
+        collect_wake(dns_group_channel(group_id))
         await db.commit()
         return
 
@@ -3534,6 +3585,7 @@ async def delete_zone(
             result="success",
         )
     )
+    collect_wake(dns_group_channel(group_id))
     await db.delete(zone)
     await db.commit()
 
@@ -4557,6 +4609,7 @@ async def import_zone_commit(
         )
     )
 
+    collect_wake(dns_group_channel(zone.group_id))
     await db.commit()
 
     logger.info(
@@ -4666,6 +4719,7 @@ async def sync_zone_with_server_endpoint(
                 },
             )
         )
+        collect_wake(dns_group_channel(group_id))
         await db.commit()
     return SyncWithServerResponse(
         server_records=result.pull.server_records,

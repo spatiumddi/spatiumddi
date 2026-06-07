@@ -7,26 +7,31 @@ import {
   Cpu,
   Database,
   HardDrive,
+  MemoryStick,
   Network,
   RefreshCw,
+  Server,
   Sparkles,
+  Zap,
 } from "lucide-react";
 import {
   aiApi,
   conformityApi,
   postgresApi,
   containersApi,
+  redisApi,
   type PostgresOverview,
   type PostgresTableSize,
   type PostgresConnection,
   type PostgresSlowQuery,
   type ContainerStat,
+  type RedisOverview,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Link } from "react-router-dom";
 import { ShieldCheck } from "lucide-react";
 
-type TabKey = "postgres" | "containers" | "conformity" | "copilot";
+type TabKey = "postgres" | "redis" | "containers" | "conformity" | "copilot";
 
 function formatBytes(n: number | null | undefined): string {
   if (n == null) return "—";
@@ -556,6 +561,18 @@ export function PlatformInsightsPage() {
               Postgres
             </button>
             <button
+              onClick={() => setTab("redis")}
+              className={cn(
+                "border-b-2 px-3 py-2 text-sm font-medium -mb-px transition-colors",
+                tab === "redis"
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <Server className="mr-1 inline h-3.5 w-3.5" />
+              Redis
+            </button>
+            <button
               onClick={() => setTab("containers")}
               className={cn(
                 "border-b-2 px-3 py-2 text-sm font-medium -mb-px transition-colors",
@@ -595,9 +612,194 @@ export function PlatformInsightsPage() {
         </div>
 
         {tab === "postgres" && <PostgresPanel />}
+        {tab === "redis" && <RedisPanel />}
         {tab === "containers" && <ContainersPanel />}
         {tab === "conformity" && <ConformityPanel />}
         {tab === "copilot" && <AIUsagePanel />}
+      </div>
+    </div>
+  );
+}
+
+function RedisPanel() {
+  const overview = useQuery({
+    queryKey: ["redis-overview"],
+    queryFn: () => redisApi.overview(),
+    refetchInterval: 15_000,
+  });
+  const keyspace = useQuery({
+    queryKey: ["redis-keyspace"],
+    queryFn: () => redisApi.keyspace(),
+    refetchInterval: 30_000,
+  });
+  const wakeBus = useQuery({
+    queryKey: ["redis-wake-bus"],
+    queryFn: () => redisApi.wakeBus(),
+    refetchInterval: 10_000,
+  });
+
+  const ov: RedisOverview | undefined = overview.data;
+
+  if (ov && !ov.available) {
+    return (
+      <div className="rounded-md border border-amber-400/40 bg-amber-400/5 p-4 text-sm">
+        <div className="flex items-center gap-2 font-medium">
+          <AlertTriangle className="h-4 w-4 text-amber-500" />
+          Redis is unreachable
+        </div>
+        <p className="mt-1 text-muted-foreground">
+          {ov.hint ??
+            "The control plane could not connect to Redis. Agents fall back to the HTTP poll cadence while it's down."}
+        </p>
+      </div>
+    );
+  }
+
+  const hits = ov?.keyspace_hits ?? 0;
+  const misses = ov?.keyspace_misses ?? 0;
+  const hitPct = hits + misses > 0 ? (hits / (hits + misses)) * 100 : null;
+  const fragTone =
+    ov?.mem_fragmentation_ratio != null && ov.mem_fragmentation_ratio >= 1.5
+      ? "warn"
+      : "default";
+
+  const wb = wakeBus.data;
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <StatCard
+          label="Role"
+          value={ov?.role ?? "—"}
+          sub={
+            ov?.sentinel
+              ? `Sentinel HA · ${ov?.connected_replicas ?? 0} replica(s)`
+              : ov?.redis_version
+                ? `v${ov.redis_version}`
+                : undefined
+          }
+          icon={Server}
+        />
+        <StatCard
+          label="Used memory"
+          value={formatBytes(ov?.used_memory_bytes)}
+          sub={`peak ${formatBytes(ov?.used_memory_peak_bytes)}${
+            ov?.mem_fragmentation_ratio != null
+              ? ` · frag ${ov.mem_fragmentation_ratio.toFixed(2)}`
+              : ""
+          }`}
+          icon={MemoryStick}
+          tone={fragTone}
+        />
+        <StatCard
+          label="Connected clients"
+          value={formatNumber(ov?.connected_clients)}
+          sub={`${formatNumber(ov?.instantaneous_ops_per_sec)} ops/sec`}
+          icon={Network}
+        />
+        <StatCard
+          label="Keyspace hit ratio"
+          value={hitPct == null ? "—" : `${hitPct.toFixed(1)}%`}
+          sub={`uptime ${formatDuration(ov?.uptime_seconds)}`}
+          icon={Activity}
+        />
+      </div>
+
+      {/* Config-wake bus (#358) */}
+      <div className="rounded-md border bg-card">
+        <div className="flex items-center justify-between border-b px-4 py-3">
+          <h2 className="flex items-center gap-2 text-sm font-semibold">
+            <Zap className="h-4 w-4" />
+            Agent config-wake bus
+          </h2>
+          <span className="text-xs text-muted-foreground">
+            {wb?.available
+              ? `${wb.total_subscribers} subscriber(s) · ${wb.active_channels.length} channel(s)`
+              : "unavailable"}
+          </span>
+        </div>
+        <div className="p-4">
+          <p className="mb-3 text-xs text-muted-foreground">
+            Redis pub/sub channels that wake parked agent <code>/config</code>{" "}
+            long-polls the instant a change commits. One subscriber per parked
+            agent per channel; publishes are counted by resource class.
+          </p>
+          {wb?.available && Object.keys(wb.published_by_class).length > 0 && (
+            <div className="mb-4 flex flex-wrap gap-2">
+              {Object.entries(wb.published_by_class).map(([cls, n]) => (
+                <span
+                  key={cls}
+                  className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs"
+                >
+                  <span className="font-medium">{cls}</span>
+                  <span className="text-muted-foreground">
+                    {formatNumber(n)} published
+                  </span>
+                </span>
+              ))}
+            </div>
+          )}
+          {wb?.available && wb.active_channels.length > 0 ? (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
+                  <th className="pb-2 font-medium">Channel</th>
+                  <th className="pb-2 text-right font-medium">Subscribers</th>
+                </tr>
+              </thead>
+              <tbody className={zebraBodyCls}>
+                {wb.active_channels.map((c) => (
+                  <tr key={c.channel}>
+                    <td className="py-1.5 font-mono text-xs">{c.channel}</td>
+                    <td className="py-1.5 text-right">{c.subscribers}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              No agents are currently parked on a wake channel.
+            </p>
+          )}
+        </div>
+      </div>
+
+      {/* Keyspace */}
+      <div className="rounded-md border bg-card">
+        <div className="border-b px-4 py-3">
+          <h2 className="flex items-center gap-2 text-sm font-semibold">
+            <Database className="h-4 w-4" />
+            Keyspace
+          </h2>
+        </div>
+        <div className="p-4">
+          {keyspace.data?.dbs && keyspace.data.dbs.length > 0 ? (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
+                  <th className="pb-2 font-medium">DB</th>
+                  <th className="pb-2 text-right font-medium">Keys</th>
+                  <th className="pb-2 text-right font-medium">Volatile</th>
+                </tr>
+              </thead>
+              <tbody className={zebraBodyCls}>
+                {keyspace.data.dbs.map((d) => (
+                  <tr key={d.db}>
+                    <td className="py-1.5 font-mono text-xs">{d.db}</td>
+                    <td className="py-1.5 text-right">
+                      {formatNumber(d.keys)}
+                    </td>
+                    <td className="py-1.5 text-right text-muted-foreground">
+                      {formatNumber(d.expires)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <p className="text-sm text-muted-foreground">No keys.</p>
+          )}
+        </div>
       </div>
     </div>
   );

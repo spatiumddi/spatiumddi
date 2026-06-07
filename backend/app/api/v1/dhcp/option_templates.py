@@ -19,6 +19,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import (
     DHCPOptionTemplate,
@@ -284,6 +285,10 @@ async def apply_template_to_scope(
     else:
         new_options = {**current, **tpl_options}
     scope.options = new_options
+    # Applying a template mutates the scope's rendered options, so wake
+    # the scope's group long-poll. ``group_id`` is a direct column on
+    # DHCPScope (no lazy relationship access).
+    collect_wake(dhcp_group_channel(scope.group_id))
     write_audit(
         db,
         user=user,

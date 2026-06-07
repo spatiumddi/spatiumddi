@@ -26,6 +26,7 @@ from sqlalchemy import delete, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import (
     DHCPPhoneProfile,
@@ -243,6 +244,7 @@ async def create_profile(
             "scope_count": len(body.scope_ids),
         },
     )
+    collect_wake(dhcp_group_channel(group_id))
     await db.commit()
     await db.refresh(prof)
     return await _to_response(db, prof)
@@ -297,6 +299,7 @@ async def update_profile(
         changed_fields=list(payload.keys()),
         new_value=body.model_dump(mode="json", exclude_none=True),
     )
+    collect_wake(dhcp_group_channel(prof.group_id))
     await db.commit()
     await db.refresh(prof)
     return await _to_response(db, prof)
@@ -316,6 +319,7 @@ async def delete_profile(profile_id: uuid.UUID, db: DB, user: SuperAdmin) -> Non
         resource_id=str(prof.id),
         resource_display=prof.name,
     )
+    collect_wake(dhcp_group_channel(prof.group_id))
     await db.delete(prof)
     await db.commit()
 
@@ -358,6 +362,7 @@ async def replace_scope_attachments(
         changed_fields=["scope_attachments"],
         new_value={"scope_count": len(body.scope_ids)},
     )
+    collect_wake(dhcp_group_channel(prof.group_id))
     await db.commit()
     await db.refresh(prof)
     return await _to_response(db, prof)
@@ -425,6 +430,7 @@ async def seed_starter_pack(
             resource_display=f"Starter pack for {grp.name}",
             new_value={"seeded_count": len(out)},
         )
+        collect_wake(dhcp_group_channel(group_id))
         await db.commit()
 
     return [await _to_response(db, p) for p in out]

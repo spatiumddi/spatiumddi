@@ -77,6 +77,7 @@ from sqlalchemy import delete as sql_delete
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.agent_wake import collect_wake, dhcp_server_channel
 from app.drivers.dhcp import is_agentless
 from app.models.dhcp import (
     DHCPConfigOp,
@@ -1282,6 +1283,7 @@ async def _bump_dhcp_bundles_for_subnet(db: AsyncSession, subnet_id: uuid.UUID) 
                     status="pending",
                 )
             )
+        collect_wake(dhcp_server_channel(server.id))
         seen.add(server.id)
     return len(seen)
 

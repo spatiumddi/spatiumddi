@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.core.agent_wake import dns_group_channel, publish_wake
 from app.models.dns import DNSPool
 from app.services.dns.pool_apply import apply_pool_state
 from app.services.dns.pool_healthcheck import apply_check_to_member, run_check
@@ -82,7 +83,17 @@ async def _run_pool_check_async(pool_id_str: str) -> dict[str, Any]:
                 seconds=max(30, int(pool.hc_interval_seconds or 30))
             )
 
+            records_changed = bool(apply_summary.get("created") or apply_summary.get("deleted"))
+            group_id = pool.group_id
+
             await db.commit()
+
+            # Worker process — no request-scoped wake collector, so publish
+            # directly AFTER commit. Only when reconcile actually rendered a
+            # record change (otherwise the bundle ETag is unchanged and a wake
+            # is a wasted no-op rebuild).
+            if records_changed:
+                await publish_wake(dns_group_channel(group_id))
 
             return {
                 "status": "ok",

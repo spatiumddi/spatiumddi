@@ -50,16 +50,19 @@ from app.core.redis_client import make_async_redis
 logger = structlog.get_logger(__name__)
 
 # Belt-and-braces re-poll tick when Redis is healthy: even if some
-# mutation site is not (yet) instrumented to publish a wake, the parked
+# mutation site is not instrumented to publish a wake, the parked
 # long-poll still re-checks the ETag at least this often.
 #
-# Held at 2.0 s — equal to the historical fixed tick — for the initial
-# rollout (#358 Phase 0a): only the DNS record path publishes wakes so
-# far, so every other path must keep its pre-#358 ~2 s convergence (no
-# regression). Once the remaining mutation sites publish wakes
-# (Phase 0b), this rises (e.g. to 12 s) to bank the idle-rebuild saving
-# — by then a missed publisher is the rare exception, not the rule.
-WAKE_TICK_SECONDS = 2.0
+# Now that the config-affecting mutation sites publish wakes (#358
+# Phase 0a record chokepoint + 0b DHCP / DNS-structural / host-config /
+# worker / import / resize publishers), the common case converges via
+# the wake in well under a second, so the idle re-poll can relax from
+# the historical 2 s to 12 s — banking ~6x fewer idle ConfigBundle
+# rebuilds per parked agent. A genuinely missed publisher degrades to
+# <=12 s convergence, never staleness (the ETag compare is the source
+# of truth). Redis-down falls back to LONGPOLL_POLL_INTERVAL_FALLBACK
+# (2 s) — exactly the pre-#358 cadence.
+WAKE_TICK_SECONDS = 12.0
 
 # Cadence the long-poll falls back to when Redis is unavailable — equal
 # to the historical fixed tick so a Redis-down deployment behaves

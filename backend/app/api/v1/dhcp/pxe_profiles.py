@@ -39,6 +39,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import (
     DHCPPXEArchMatch,
@@ -264,6 +265,7 @@ async def create_profile(
             "match_count": len(body.matches),
         },
     )
+    collect_wake(dhcp_group_channel(group_id))
     await db.commit()
     # Re-fetch with matches eager-loaded for response
     res = await db.execute(
@@ -337,6 +339,7 @@ async def update_profile(
         changed_fields=list(payload.keys()) + (["matches"] if matches_input is not None else []),
         new_value=body.model_dump(mode="json", exclude_none=True),
     )
+    collect_wake(dhcp_group_channel(prof.group_id))
     await db.commit()
     res = await db.execute(
         select(DHCPPXEProfile)
@@ -359,5 +362,6 @@ async def delete_profile(profile_id: uuid.UUID, db: DB, user: SuperAdmin) -> Non
         resource_id=str(prof.id),
         resource_display=prof.name,
     )
+    collect_wake(dhcp_group_channel(prof.group_id))
     await db.delete(prof)
     await db.commit()

@@ -53,6 +53,7 @@ import structlog
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.agent_wake import collect_wake, dhcp_server_channel
 from app.drivers.dhcp import is_agentless
 from app.models.dhcp import (
     DHCPConfigOp,
@@ -760,6 +761,7 @@ async def commit_subnet_split(
                         status="pending",
                     )
                 )
+            collect_wake(dhcp_server_channel(server.id))
             dhcp_servers_notified += 1
     await db.flush()
 

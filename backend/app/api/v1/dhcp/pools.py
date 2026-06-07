@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPPool, DHCPScope
 from app.models.ipam import IPAddress
@@ -145,6 +146,7 @@ async def create_pool(
     db.add(pool)
     await db.flush()
     await push_pool_change(db, pool, action="create")
+    collect_wake(dhcp_group_channel(scope.group_id))
     write_audit(
         db,
         user=user,
@@ -184,6 +186,9 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
         setattr(pool, k, v)
     await db.flush()
     await push_pool_change(db, pool, action="update", prev_start=prev_start, prev_end=prev_end)
+    scope = await db.get(DHCPScope, pool.scope_id)
+    if scope is not None:
+        collect_wake(dhcp_group_channel(scope.group_id))
     write_audit(
         db,
         user=user,
@@ -204,6 +209,9 @@ async def delete_pool(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
+    scope = await db.get(DHCPScope, pool.scope_id)
+    if scope is not None:
+        collect_wake(dhcp_group_channel(scope.group_id))
     await push_pool_change(db, pool, action="delete")
     write_audit(
         db,

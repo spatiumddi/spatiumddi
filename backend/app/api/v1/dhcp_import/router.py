@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
+from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.models.dhcp import DHCPServer
 from app.services.dhcp_import import (
     CommitResult,
@@ -323,6 +324,12 @@ async def _run_commit(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    # A commit creates scopes (+ optional subnets) under the target
+    # group — wake that group's parked agent long-polls so the new
+    # config converges immediately (the wake_publishing dependency
+    # flushes this after commit). All three sources (kea / isc /
+    # windows) funnel through here, so this covers them all.
+    collect_wake(dhcp_group_channel(body.target_group_id))
     logger.info(
         "dhcp_import_commit",
         source=source,

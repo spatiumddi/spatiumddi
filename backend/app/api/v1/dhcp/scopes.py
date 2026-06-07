@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPScope, DHCPServerGroup
 from app.models.ipam import Subnet
@@ -389,6 +390,7 @@ async def create_scope(
     # Push to every Windows DHCP member of the group BEFORE commit so a
     # WinRM failure rolls the DB row back.
     await push_scope_upsert(db, scope)
+    collect_wake(dhcp_group_channel(group_id))
     write_audit(
         db,
         user=user,
@@ -442,6 +444,7 @@ async def update_scope(
         setattr(scope, k, v)
     await db.flush()
     await push_scope_upsert(db, scope)
+    collect_wake(dhcp_group_channel(scope.group_id))
     write_audit(
         db,
         user=user,
@@ -475,6 +478,7 @@ async def delete_scope(
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
+    collect_wake(dhcp_group_channel(scope.group_id))
 
     if not permanent:
         batch = await collect_soft_delete_batch(db, scope)

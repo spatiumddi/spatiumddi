@@ -11,9 +11,11 @@ import httpx
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.orm import selectinload
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.core.agent_wake import dns_group_channel, publish_wake
 from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSServer
 from app.services.dns_blocklist import parse_feed
 
@@ -33,7 +35,14 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
     try:
         async with session_factory() as db:
             bl = (
-                await db.execute(select(DNSBlockList).where(DNSBlockList.id == list_id))
+                await db.execute(
+                    select(DNSBlockList)
+                    .where(DNSBlockList.id == list_id)
+                    .options(
+                        selectinload(DNSBlockList.server_groups),
+                        selectinload(DNSBlockList.views),
+                    )
+                )
             ).scalar_one_or_none()
             if bl is None:
                 return {"status": "not_found", "added": 0, "removed": 0}
@@ -112,7 +121,24 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
             bl.last_synced_at = datetime.now(UTC)
             bl.last_sync_status = "success"
             bl.last_sync_error = None
+
+            # Groups whose rendered config folds in this blocklist: groups it's
+            # assigned to directly, plus the owning groups of any views it's
+            # assigned to. Resolved before commit off the eager-loaded
+            # relationships (no lazy access in async); published after.
+            wake_group_ids: set[str] = {str(sg.id) for sg in bl.server_groups}
+            wake_group_ids.update(str(v.group_id) for v in bl.views if v.group_id is not None)
+            feed_changed = bool(to_add or to_remove)
+
             await db.commit()
+
+            # Worker process — no request collector, so publish directly AFTER
+            # commit, and only when the entry set actually changed (otherwise
+            # the effective blocklist is identical and the bundle ETag is
+            # unchanged, making a wake a wasted no-op rebuild).
+            if feed_changed:
+                for gid in wake_group_ids:
+                    await publish_wake(dns_group_channel(gid))
 
             logger.info(
                 "blocklist_feed_refreshed",

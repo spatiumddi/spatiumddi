@@ -9705,6 +9705,67 @@ export const postgresApi = {
       .then((r) => r.data),
 };
 
+// ── Redis insights (#358) ─────────────────────────────────────────────
+export interface RedisReplica {
+  ip: string | null;
+  port: number | null;
+  state: string | null;
+}
+
+export interface RedisOverview {
+  available: boolean;
+  hint?: string | null;
+  sentinel: boolean;
+  redis_version: string | null;
+  role: string | null;
+  uptime_seconds: number | null;
+  connected_clients: number | null;
+  used_memory_bytes: number | null;
+  used_memory_peak_bytes: number | null;
+  mem_fragmentation_ratio: number | null;
+  maxmemory_bytes: number | null;
+  instantaneous_ops_per_sec: number | null;
+  keyspace_hits: number | null;
+  keyspace_misses: number | null;
+  total_commands_processed: number | null;
+  connected_replicas: number | null;
+  replicas: RedisReplica[];
+}
+
+export interface RedisKeyspaceDb {
+  db: string;
+  keys: number;
+  expires: number;
+}
+
+export interface RedisWakeChannel {
+  channel: string;
+  subscribers: number;
+}
+
+export interface RedisWakeBus {
+  available: boolean;
+  hint?: string | null;
+  published_by_class: Record<string, number>;
+  active_channels: RedisWakeChannel[];
+  total_subscribers: number;
+}
+
+export const redisApi = {
+  overview: () =>
+    api.get<RedisOverview>("/admin/redis/overview").then((r) => r.data),
+  keyspace: () =>
+    api
+      .get<{
+        available: boolean;
+        hint?: string | null;
+        dbs: RedisKeyspaceDb[];
+      }>("/admin/redis/keyspace")
+      .then((r) => r.data),
+  wakeBus: () =>
+    api.get<RedisWakeBus>("/admin/redis/wake-bus").then((r) => r.data),
+};
+
 export interface ContainerStat {
   id: string;
   name: string;
