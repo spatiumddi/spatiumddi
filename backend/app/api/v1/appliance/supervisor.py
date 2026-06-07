@@ -60,6 +60,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser
+from app.core.agent_wake import appliance_channel, publish_wake
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
@@ -2953,6 +2954,10 @@ async def update_appliance_roles(
         roles=list(row.assigned_roles or []),
         user=current_user.username,
     )
+    # #358 Phase 1 — wake the supervisor heartbeat long-poll so the new
+    # role/group/firewall assignment applies in ~0 s instead of waiting
+    # for the next heartbeat. Advisory; the heartbeat tick is the fallback.
+    await publish_wake(appliance_channel(row.id))
     return _row_to_schema(row)
 
 
@@ -3886,6 +3891,9 @@ async def schedule_appliance_upgrade(
         desired_version=body.desired_appliance_version,
         user=current_user.username,
     )
+    # #358 Phase 1 — wake the supervisor heartbeat long-poll so the upgrade
+    # trigger fires in ~0 s instead of waiting for the next heartbeat.
+    await publish_wake(appliance_channel(row.id))
     return _row_to_schema(row)
 
 
@@ -3922,6 +3930,8 @@ async def clear_appliance_upgrade(
         )
     )
     await db.commit()
+    # #358 Phase 1 — wake so a mistaken upgrade is dropped promptly.
+    await publish_wake(appliance_channel(row.id))
     return _row_to_schema(row)
 
 
@@ -4130,6 +4140,9 @@ async def schedule_appliance_reboot(
         hostname=row.hostname,
         user=current_user.username,
     )
+    # #358 Phase 1 — wake the supervisor heartbeat long-poll so the reboot
+    # starts in ~0 s instead of waiting up to one heartbeat interval.
+    await publish_wake(appliance_channel(row.id))
     return _row_to_schema(row)
 
 
