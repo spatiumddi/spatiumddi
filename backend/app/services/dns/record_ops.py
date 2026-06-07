@@ -18,6 +18,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.agent_wake import collect_wake, dns_group_channel
 from app.drivers.dns import get_driver, is_agentless
 from app.drivers.dns.base import RecordChange, RecordData
 from app.models.dns import DNSRecordOp, DNSServer, DNSZone
@@ -219,6 +220,11 @@ async def enqueue_record_op(
         if srv.id == primary.id:
             primary_op = row
     await db.flush()
+    # #358 — wake every agent in this group so they re-poll + apply the
+    # queued op immediately instead of waiting for the belt-and-braces
+    # tick. Collected here (no commit yet); the request's
+    # ``wake_publishing`` dependency flushes it after the outer commit.
+    collect_wake(dns_group_channel(zone.group_id))
     return primary_op
 
 

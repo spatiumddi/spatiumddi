@@ -64,6 +64,7 @@ from app.api.v1.version import router as version_router
 from app.api.v1.vlans.router import router as vlans_router
 from app.api.v1.vrfs import router as vrfs_router
 from app.api.v1.webhooks import router as webhooks_router
+from app.core.agent_wake import wake_publishing
 from app.services.feature_modules import require_module
 
 api_v1_router = APIRouter()
@@ -146,7 +147,16 @@ api_v1_router.include_router(
     dependencies=[Depends(require_module("dhcp.import"))],
 )
 api_v1_router.include_router(diagnostics_router, prefix="/diagnostics", tags=["diagnostics"])
-api_v1_router.include_router(dns_router, prefix="/dns", tags=["dns"])
+api_v1_router.include_router(
+    dns_router,
+    prefix="/dns",
+    tags=["dns"],
+    # #358 — publish a Redis wake after any record-mutating handler
+    # commits so parked agent long-polls re-poll immediately. The
+    # agent router (next line) is deliberately NOT wrapped — it holds
+    # the long-poll and never enqueues record ops.
+    dependencies=[Depends(wake_publishing)],
+)
 api_v1_router.include_router(dns_agents_router, prefix="/dns", tags=["dns-agents"])
 api_v1_router.include_router(dns_blocklist_router, prefix="/dns", tags=["dns-blocklists"])
 api_v1_router.include_router(
@@ -155,7 +165,13 @@ api_v1_router.include_router(
     tags=["dns-import"],
     dependencies=[Depends(require_module("dns.import"))],
 )
-api_v1_router.include_router(dns_pool_router, prefix="/dns", tags=["dns-pools"])
+api_v1_router.include_router(
+    dns_pool_router,
+    prefix="/dns",
+    tags=["dns-pools"],
+    # #358 — GSLB pool reconcile calls enqueue_record_op; publish on commit.
+    dependencies=[Depends(wake_publishing)],
+)
 api_v1_router.include_router(dns_tools_router, prefix="/dns", tags=["dns-tools"])
 api_v1_router.include_router(
     docker_router,
@@ -165,7 +181,13 @@ api_v1_router.include_router(
 )
 api_v1_router.include_router(domains_router, tags=["domains"])
 api_v1_router.include_router(groups_router, prefix="/groups", tags=["groups"])
-api_v1_router.include_router(ipam_router, prefix="/ipam", tags=["ipam"])
+api_v1_router.include_router(
+    ipam_router,
+    prefix="/ipam",
+    tags=["ipam"],
+    # #358 — IPAM→DNS auto-sync calls enqueue_record_op; publish on commit.
+    dependencies=[Depends(wake_publishing)],
+)
 api_v1_router.include_router(
     kubernetes_router,
     prefix="/kubernetes",
