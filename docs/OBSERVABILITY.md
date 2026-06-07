@@ -16,10 +16,26 @@ standing up Prometheus / Grafana:
   `dns_metric_sample` / `dhcp_metric_sample` tables.
 - **Platform Insights** (`/admin/platform-insights`) — Postgres
   diagnostics (DB size, cache hit, WAL position, slow queries,
-  table sizes, connection state, longest-running transaction)
-  and per-container CPU / memory / network / IO from the local
-  Docker socket. See
+  table sizes, connection state, longest-running transaction),
+  a **Redis** tab (since `#358`), and per-container CPU / memory /
+  network / IO from the local Docker socket. See
   [SYSTEM_ADMIN § 0](features/SYSTEM_ADMIN.md#0-operator-surfaces-shipped-after-20260416-1).
+
+  The **Redis** tab is superadmin-gated and reads Redis `INFO`
+  (`/admin/redis/overview` — version / role / used + peak memory /
+  fragmentation / connected clients / ops-per-sec / keyspace
+  hit-ratio / connected replicas) plus `/admin/redis/keyspace`. Its
+  headline panel is the **agent config-wake bus**
+  (`/admin/redis/wake-bus`): the Redis pub/sub channels that wake
+  parked agent `/config` long-polls the instant a change commits
+  (#358), showing publishes-by-resource-class and the live
+  subscriber count per channel (one subscriber per parked agent
+  long-poll — so it doubles as a "how many agents are connected
+  right now?" read). Every endpoint degrades to
+  `available: false` + a hint on a Redis error rather than 500ing,
+  so a Redis blip never takes the dashboard down. The Operator
+  Copilot `get_redis_stats` tool (superadmin-gated, default-off)
+  exposes the same rollup to chat.
 
 The native surfaces are intentionally tactical — for long-term
 metrics retention and cross-instance dashboards, fall back to
