@@ -950,7 +950,7 @@ class SupervisorHeartbeatRequest(BaseModel):
     # server-side) waiting for a per-appliance wake, so operator commands
     # start in ~0 s. Omitted/0 by pre-#358 supervisors → return at once
     # (today's behavior), which keeps the rolling-upgrade skew window safe.
-    wait_seconds: int = 0
+    wait_seconds: int = Field(default=0, ge=0)
     capabilities: SupervisorCapabilities | None = None
     deployment_kind: Literal["appliance", "docker", "k8s", "unknown"] | None = None
     # #272 Phase 1 — installer-role variant read by the supervisor from
@@ -1723,8 +1723,17 @@ async def supervisor_heartbeat(
                         break
             # Pick up anything that committed during the hold (role /
             # firewall / desired-state edits land on other requests) before
-            # building the desired-state response below.
-            await db.refresh(row)
+            # building the desired-state response below. Guarded: if the row
+            # was hard-deleted during the hold, refresh raises — serve one
+            # last response from the in-memory row (the next heartbeat
+            # 403/404s cleanly) instead of 500ing.
+            try:
+                await db.refresh(row)
+            except Exception:  # noqa: BLE001
+                logger.info(
+                    "supervisor_heartbeat_refresh_after_hold_failed",
+                    appliance_id=str(row.id),
+                )
 
     # Resolve assigned role config so the supervisor can bring up
     # service containers. DNS / DHCP group lookups are best-effort —
@@ -4093,6 +4102,9 @@ async def schedule_appliance_set_next_boot(
         slot=body.slot,
         user=current_user.username,
     )
+    # #358 Phase 1 — wake the supervisor heartbeat so the slot-boot intent
+    # is picked up in ~0 s instead of waiting for the next heartbeat.
+    await publish_wake(appliance_channel(row.id))
     return _row_to_schema(row)
 
 
@@ -4152,6 +4164,9 @@ async def schedule_appliance_set_default_slot(
         slot=body.slot,
         user=current_user.username,
     )
+    # #358 Phase 1 — wake the supervisor heartbeat so the durable-slot
+    # change is picked up in ~0 s instead of waiting for the next heartbeat.
+    await publish_wake(appliance_channel(row.id))
     return _row_to_schema(row)
 
 

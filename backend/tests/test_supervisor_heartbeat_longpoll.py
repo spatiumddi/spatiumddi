@@ -23,13 +23,16 @@ supervisor opted in — the supervisor keys its re-arm cadence off it:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
+import time
 import uuid
 
-from httpx import AsyncClient
+from httpx import AsyncClient, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.agent_wake import appliance_channel, publish_wake
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.settings import PlatformSettings
 from app.services.appliance.ca import generate_session_token
@@ -128,3 +131,37 @@ async def test_heartbeat_holds_when_idle_and_reports_long_poll(
     )
     assert r.status_code == 200, r.text
     assert r.json()["long_poll"] is True
+
+
+async def test_heartbeat_wake_shortens_the_hold(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # The core feature, end to end: a wake published on the appliance
+    # channel while a heartbeat is held returns it EARLY (the cases above
+    # only exercise the timeout path). Needs a reachable Redis (present in
+    # the dev/test env). wait_seconds=25 vs a ~2 s subscribe delay gives a
+    # wide margin, so "returned well under the cap" reliably means the wake
+    # delivered rather than the hold timing out.
+    await _enable(db_session)
+    row, token = await _approved_supervisor(db_session)
+    await db_session.commit()
+    aid = row.id
+
+    async def _hold() -> Response:
+        return await client.post(
+            "/api/v1/appliance/supervisor/heartbeat",
+            json={"appliance_id": str(aid), "session_token": token, "wait_seconds": 25},
+        )
+
+    t0 = time.monotonic()
+    task = asyncio.create_task(_hold())
+    # Let the handler persist telemetry + subscribe before we wake it — the
+    # wake is edge-triggered, so publishing too early would be missed.
+    await asyncio.sleep(2.0)
+    await publish_wake(appliance_channel(aid))
+    r = await task
+    elapsed = time.monotonic() - t0
+
+    assert r.status_code == 200, r.text
+    assert r.json()["long_poll"] is True
+    assert elapsed < 15.0, f"wake did not shorten the hold (took {elapsed:.1f}s)"
