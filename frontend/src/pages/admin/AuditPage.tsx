@@ -4,6 +4,7 @@ import {
   ClipboardList,
   ChevronLeft,
   ChevronRight,
+  Download,
   ShieldCheck,
   ShieldAlert,
   X,
@@ -158,6 +159,14 @@ export function AuditPage() {
             </p>
           </div>
           <ChainIntegrityBadge />
+          <button
+            onClick={() => auditApi.exportPdf()}
+            title="Download a compliance / change report PDF (last 30 days)"
+            className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            <Download className="h-3.5 w-3.5" />
+            Export PDF
+          </button>
           <span className="text-sm text-muted-foreground">
             {total.toLocaleString()} {total === 1 ? "event" : "events"}
           </span>

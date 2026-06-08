@@ -1,8 +1,8 @@
 """Audit log read endpoints (superadmin or users with `read:audit_log`)."""
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 
@@ -10,6 +10,7 @@ from app.api.deps import DB
 from app.core.permissions import require_permission
 from app.models.audit import AuditLog
 from app.services.audit_chain import verify_chain
+from app.services.audit_report import generate_change_report_pdf
 
 router = APIRouter(dependencies=[Depends(require_permission("read", "audit_log"))])
 
@@ -80,6 +81,37 @@ async def list_audit_log(
     rows = (await db.execute(q)).scalars().all()
 
     return AuditLogPage(total=total, items=list(rows))
+
+
+# ── Compliance / change report PDF (issue #48) ──────────────────────
+
+
+@router.get("/export.pdf")
+async def export_change_report_pdf(
+    db: DB,
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
+) -> Response:
+    """Auditor-facing PDF rollup of every audit-log mutation in a date
+    range, grouped by user / resource type / action, with a SHA-256
+    tamper-evidence trailer. Defaults to the last 30 days. Gated by the
+    router-level ``read:audit_log`` permission."""
+    now = datetime.now(UTC)
+    until = until or now
+    since = since or (until - timedelta(days=30))
+    # Coerce naive client-supplied datetimes to UTC so the comparison
+    # against the timezone-aware ``timestamp`` column is well-defined.
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=UTC)
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=UTC)
+    pdf_bytes = await generate_change_report_pdf(db, since=since, until=until)
+    fname = f"spatiumddi-change-report-{now.strftime('%Y%m%d-%H%M%S')}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 # ── Tamper-evidence verifier (issue #73) ────────────────────────────
