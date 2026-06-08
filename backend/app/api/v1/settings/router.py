@@ -825,13 +825,29 @@ async def update_settings(
     settings = await _get_or_create(db)
     changes = body.model_dump(exclude_none=True)
 
-    # Whether this update touches any host-config field the appliance
-    # supervisor's ConfigBundle long-poll folds into its ETag (SNMP /
-    # NTP / LLDP). A timezone-only change is deliberately excluded — it
-    # rides a different host-runner trigger, not the wake bus. Computed
-    # from ``changes`` keys before the snmp_* fields below get popped /
-    # rewritten so the detection is order-independent.
-    _host_config_touched = any(field.startswith(("snmp_", "ntp_", "lldp_")) for field in changes)
+    # Whether this update touches any host-config field a HOSTCONFIG_ALL
+    # subscriber acts on. The DHCP-agent /config long-poll folds SNMP /
+    # NTP / LLDP into its ETag; the supervisor heartbeat (#358 Phase 1)
+    # ALSO acts on timezone / verbose-boot / firewall-master / MetalLB /
+    # VIP / web-UI-CIDR, so a change to any of those must wake a parked
+    # supervisor too. (A DHCP agent woken by a field it doesn't fold just
+    # re-checks its ETag and 304s — cheap, and these are rare cluster-
+    # config edits.) The set below only matches keys actually present in
+    # this request. Computed from ``changes`` before the snmp_* fields get
+    # popped / rewritten so detection is order-independent.
+    _supervisor_host_config_fields = {
+        "timezone",
+        "verbose_boot",
+        "firewall_enabled",
+        "metallb_enabled",
+        "metallb_pool_addresses",
+        "control_plane_vip",
+        "web_ui_allowed_cidrs",
+    }
+    _host_config_touched = any(
+        field.startswith(("snmp_", "ntp_", "lldp_")) or field in _supervisor_host_config_fields
+        for field in changes
+    )
 
     # fingerbank_api_key needs Fernet encryption + maps to a different
     # column name. Empty string = clear; non-empty = encrypt + store.

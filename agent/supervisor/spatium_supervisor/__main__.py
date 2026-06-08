@@ -360,6 +360,11 @@ def main() -> int:
     # ``touch`` semantics: open + close to update mtime; cheap on a
     # 1-CPU VM and a stuck loop simply stops doing it.
     liveness_path = cfg.state_dir / "last-loop-at"
+    # #358 Phase 1b — floor between heartbeats when the control plane
+    # long-poll-held the previous one. The hold already paced us
+    # (~heartbeat_interval server-side); this only bounds the re-post rate
+    # if a server ever returns held=True fast in a loop.
+    held_rearm_floor_s = 2.0
 
     while not stop:
         try:
@@ -383,12 +388,15 @@ def main() -> int:
         # target even if CONTROL_PLANE_URL was never set; a remote
         # agent only proceeds when its configured URL is present.
         effective_url = _effective_control_plane_url(cfg)
+        # #358 Phase 1b — True when the control plane long-poll-held this
+        # heartbeat (and thus already paced us ~heartbeat_interval).
+        held = False
         if appliance_id is not None and effective_url:
             session_token = load_session_token(cfg.state_dir)
             identity, _ = load_or_generate(cfg.state_dir)
             try:
                 with _build_http_client(skip_tls_verify=skip_tls, log=log) as client:
-                    heartbeat_once(
+                    held = heartbeat_once(
                         cfg=cfg,
                         appliance_id=appliance_id,
                         session_token=session_token,
@@ -411,10 +419,20 @@ def main() -> int:
                 # effective_url is empty here only when this is a
                 # remote agent with no configured CONTROL_PLANE_URL.
             )
-        for _ in range(cfg.heartbeat_interval_seconds):
+        # #358 Phase 1b — when the control plane long-poll-held this
+        # heartbeat it already blocked ~heartbeat_interval server-side, so
+        # re-arm the hold after a short floor instead of sleeping the full
+        # interval again (which would roughly halve hold coverage). Old
+        # control planes / errors (held=False) keep the full interval.
+        sleep_budget = (
+            held_rearm_floor_s if held else float(cfg.heartbeat_interval_seconds)
+        )
+        waited = 0.0
+        while waited < sleep_budget:
             if stop:
                 break
             time.sleep(1)
+            waited += 1.0
 
     log.info("supervisor.stop")
     return 0

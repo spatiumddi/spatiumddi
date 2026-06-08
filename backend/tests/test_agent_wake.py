@@ -19,6 +19,8 @@ from typing import Any
 from app.core.agent_wake import (
     HOSTCONFIG_ALL,
     WakeResult,
+    appliance_channel,
+    appliance_wake_channels,
     collect_wake,
     collecting_wakes,
     dhcp_wake_channels,
@@ -148,6 +150,13 @@ def test_dhcp_channels_omit_group_when_ungrouped() -> None:
 
     ungrouped = dhcp_wake_channels(SimpleNamespace(id=sid, server_group_id=None))
     assert ungrouped == [f"spatium:wake:dhcp:server:{sid}", HOSTCONFIG_ALL]
+
+
+def test_appliance_channel_and_wake_channels() -> None:
+    # #358 Phase 1b — per-appliance channel for the heartbeat-gated signals.
+    aid = uuid.UUID("55555555-5555-5555-5555-555555555555")
+    assert appliance_channel(aid) == f"spatium:wake:appliance:{aid}"
+    assert appliance_wake_channels(SimpleNamespace(id=aid)) == [f"spatium:wake:appliance:{aid}"]
 
 
 # ── publish_wake ─────────────────────────────────────────────────────────────────

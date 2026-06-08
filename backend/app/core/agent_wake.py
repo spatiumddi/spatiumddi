@@ -100,6 +100,17 @@ def dhcp_server_channel(server_id: uuid.UUID | str) -> str:
     return _ch("dhcp", "server", str(server_id))
 
 
+def appliance_channel(appliance_id: uuid.UUID | str) -> str:
+    """Per-appliance channel for the heartbeat-gated supervisor signals
+    (#358 Phase 1): fleet OS/slot upgrade, reboot, role assignment, and
+    host-config (SNMP/NTP/LLDP/firewall/timezone). Published when those
+    desired-state columns are stamped; the supervisor's heartbeat
+    long-poll subscribes so commands start in ~0 s instead of waiting up
+    to one heartbeat interval. Keyed off the existing ``appliance.id``.
+    """
+    return _ch("appliance", str(appliance_id))
+
+
 # Broadcast channel for host-config (SNMP / NTP / LLDP) changes. Only
 # the DHCP agent long-poll folds those into its ETag today, so only it
 # subscribes here.
@@ -123,6 +134,14 @@ def dhcp_wake_channels(server: Any) -> list[str]:
         channels.append(dhcp_group_channel(server.server_group_id))
     channels.append(HOSTCONFIG_ALL)
     return channels
+
+
+def appliance_wake_channels(appliance: Any) -> list[str]:
+    """Channel the supervisor heartbeat long-poll subscribes to (#358
+    Phase 1): just its own appliance row. A wake here means a
+    desired-state column changed and the heartbeat should return now.
+    """
+    return [appliance_channel(appliance.id)]
 
 
 def _metric_class(channel: str) -> str:
