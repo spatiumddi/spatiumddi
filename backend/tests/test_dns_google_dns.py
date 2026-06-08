@@ -650,7 +650,7 @@ def test_capabilities_shape() -> None:
     assert caps["name"] == "google_dns"
     assert caps["agentless"] is True
     assert caps["manages_zones"] is True
-    assert caps["dnssec_online"] is True
+    assert caps["dnssec_online"] is False  # #29 — cloud DNSSEC deferred
     assert caps["views"] is False
     assert caps["rpz"] is False
     assert "A" in caps["record_types"]

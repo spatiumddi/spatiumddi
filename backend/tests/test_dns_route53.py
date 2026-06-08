@@ -766,9 +766,9 @@ def test_capabilities_shape() -> None:
     assert caps["name"] == "route53"
     assert caps["agentless"] is True
     assert caps["manages_zones"] is True
-    assert caps["dnssec_online"] is True
-    assert caps["alias_records"] is True
-    assert "ALIAS" in caps["record_types"]
+    assert caps["dnssec_online"] is False  # #29 — cloud DNSSEC deferred
+    assert caps["alias_records"] is False  # #29 — R53 alias authoring deferred
+    assert "ALIAS" not in caps["record_types"]  # #29 — authoring deferred
     assert caps["views"] is False
     assert caps["rpz"] is False
 

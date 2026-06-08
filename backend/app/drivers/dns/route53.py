@@ -506,8 +506,15 @@ class Route53DNSDriver(CloudDNSDriverBase):
             "manages_zones": True,
             "views": False,
             "rpz": False,
-            "dnssec_online": True,
-            "alias_records": True,
+            # #29 — cloud DNSSEC is a provider zone-toggle (Route 53 needs a
+            # KMS asymmetric key), not the per-record online signing the
+            # dnssec_sign/unsign ops model; gated to powerdns/bind9. Deferred.
+            "dnssec_online": False,
+            # #29 — Route 53 ALIAS targets need an AWS resource + HostedZoneId
+            # the generic ALIAS record type can't express, so authoring is not
+            # supported via this driver yet (existing alias rrsets still read
+            # back). Deferred.
+            "alias_records": False,
             "record_types": [
                 "A",
                 "AAAA",
@@ -519,7 +526,6 @@ class Route53DNSDriver(CloudDNSDriverBase):
                 "CAA",
                 "PTR",
                 "SOA",
-                "ALIAS",
             ],
             "notes": (
                 "Agentless Amazon Route 53 driver. Zone + record CRUD via "

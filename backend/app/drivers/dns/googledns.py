@@ -421,7 +421,9 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
             "manages_zones": True,
             "views": False,
             "rpz": False,
-            "dnssec_online": True,
+            # #29 — Google Cloud DNS DNSSEC is a managed-zone toggle, not the
+            # per-record online signing these ops model; deferred.
+            "dnssec_online": False,
             "record_types": [
                 "A",
                 "AAAA",

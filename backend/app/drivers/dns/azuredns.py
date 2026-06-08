@@ -544,7 +544,9 @@ class AzureDNSDriver(CloudDNSDriverBase):
             "views": False,
             "rpz": False,
             "dnssec_online": False,
-            "alias_records": True,
+            # #29 — Azure DNS alias records target Azure resources and have no
+            # apply path via the generic ALIAS type here; authoring deferred.
+            "alias_records": False,
             "record_types": [
                 "A",
                 "AAAA",
