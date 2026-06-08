@@ -6663,7 +6663,8 @@ export type AlertRuleType =
   | "compliance_change"
   | "voice_lease_count_below"
   | "stale_ip_count"
-  | "dhcp_pool_exhaustion";
+  | "dhcp_pool_exhaustion"
+  | "secret_expiring";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with

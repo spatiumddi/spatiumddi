@@ -40,6 +40,7 @@ const RULE_TYPE_PARAM_DEFAULTS: Partial<
   domain_expiring: { thresholdDays: 30 },
   circuit_term_expiring: { thresholdDays: 30 },
   service_term_expiring: { thresholdDays: 30 },
+  secret_expiring: { thresholdDays: 30 },
 };
 
 function Field({
@@ -132,6 +133,7 @@ function RuleEditorModal({
           ruleType === "domain_expiring" ||
           ruleType === "circuit_term_expiring" ||
           ruleType === "service_term_expiring" ||
+          ruleType === "secret_expiring" ||
           ruleType === "stale_ip_count"
             ? thresholdDays
             : null,
@@ -249,6 +251,11 @@ function RuleEditorModal({
                   Voice VLAN lease count below threshold
                 </option>
               </optgroup>
+              <optgroup label="Security">
+                <option value="secret_expiring">
+                  Secret / certificate expiring
+                </option>
+              </optgroup>
             </select>
           </Field>
         )}
@@ -354,7 +361,8 @@ function RuleEditorModal({
         )}
         {(ruleType === "domain_expiring" ||
           ruleType === "circuit_term_expiring" ||
-          ruleType === "service_term_expiring") && (
+          ruleType === "service_term_expiring" ||
+          ruleType === "secret_expiring") && (
           <Field
             label="Threshold (days)"
             hint="Soft fire at threshold; severity escalates to warning at threshold/4 and critical at threshold/12 (e.g. 30 → 7.5 → 2.5 d)."
