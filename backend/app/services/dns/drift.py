@@ -16,6 +16,7 @@ includes the value.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 
@@ -97,7 +98,8 @@ async def compute_zone_drift(
     report = ZoneDriftReport(
         zone_id=str(zone.id), zone_name=zone.name, db_record_count=len(db_rows)
     )
-    for srv in servers:
+
+    async def _drift_for_server(srv: DNSServer) -> ServerDrift:
         entry = ServerDrift(
             server_id=str(srv.id),
             server_name=srv.name,
@@ -108,8 +110,7 @@ async def compute_zone_drift(
         if not hasattr(driver, "pull_zone_records"):
             entry.status = "unsupported"
             entry.error = f"Driver {srv.driver!r} can't pull live records for drift."
-            report.servers.append(entry)
-            continue
+            return entry
         try:
             on_wire: list[RecordData] = await driver.pull_zone_records(srv, zone.name)
         except Exception as exc:  # noqa: BLE001 — per-server, never fail the whole report
@@ -122,8 +123,7 @@ async def compute_zone_drift(
                 driver=srv.driver,
                 error=str(exc),
             )
-            report.servers.append(entry)
-            continue
+            return entry
 
         wire_by_key = {_key(r, zone.name): r for r in on_wire}
         entry.extra_on_server = [
@@ -133,6 +133,12 @@ async def compute_zone_drift(
             _to_drift_record(r) for k, r in db_by_key.items() if k not in wire_by_key
         ]
         entry.in_sync = len(set(db_by_key) & set(wire_by_key))
-        report.servers.append(entry)
+        return entry
+
+    # Pull every server concurrently — a slow/unreachable host shouldn't add
+    # its full AXFR timeout serially to the request latency. Each coroutine
+    # only touches the driver (network), never the shared AsyncSession, and
+    # isolates its own failures, so gather() is safe. Order is preserved.
+    report.servers = list(await asyncio.gather(*(_drift_for_server(s) for s in servers)))
 
     return report

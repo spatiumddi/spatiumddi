@@ -64,7 +64,7 @@ async def test_inventory_groups_hostvars_and_excludes_placeholders(
             status="allocated",
             role="host",
             hostname="web01",
-            tags=["web", "prod"],
+            tags={"role": "web", "tier": "prod"},
             custom_fields={"env": "prod"},
         )
     )
@@ -94,8 +94,11 @@ async def test_inventory_groups_hostvars_and_excludes_placeholders(
     assert "web01" in inv["space_Prod_Space"]["hosts"]
     assert "web01" in inv["block_Core_Block"]["hosts"]
     assert "web01" in inv["subnet_web_subnet"]["hosts"]
-    assert "web01" in inv["tag_web"]["hosts"]
-    assert "web01" in inv["tag_prod"]["hosts"]
+    # Tags are key+value (a JSONB dict) — grouped by both so distinct
+    # values don't collide and values aren't dropped.
+    assert "web01" in inv["tag_role_web"]["hosts"]
+    assert "web01" in inv["tag_tier_prod"]["hosts"]
+    assert hv["web01"]["spatium_tags"] == {"role": "web", "tier": "prod"}
     assert "web01" in inv["cf_env_prod"]["hosts"]
 
     # Placeholder network row excluded entirely.

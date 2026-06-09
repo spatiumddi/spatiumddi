@@ -94,7 +94,10 @@ async def ansible_inventory(
         block = blocks.get(subnet.block_id) if subnet and subnet.block_id else None
         space_id = (subnet.space_id if subnet else None) or (block.space_id if block else None)
         space = spaces.get(space_id) if space_id else None
-        tags = list(ip.tags or [])
+        # IPAddress.tags is a JSONB dict ({key: value}), not a list — group
+        # by key+value (like custom fields) so distinct values don't collide
+        # into one group and values aren't dropped.
+        tags = dict(ip.tags or {})
         custom = dict(ip.custom_fields or {})
 
         hostvars[name] = {
@@ -121,8 +124,8 @@ async def ansible_inventory(
             groups[_group("block", block.name)]["hosts"].append(name)
         if subnet:
             groups[_group("subnet", subnet.name or str(subnet.network))]["hosts"].append(name)
-        for tag in tags:
-            groups[_group("tag", str(tag))]["hosts"].append(name)
+        for key, value in tags.items():
+            groups[_group("tag", str(key), str(value))]["hosts"].append(name)
         for field, value in custom.items():
             groups[_group("cf", str(field), str(value))]["hosts"].append(name)
 

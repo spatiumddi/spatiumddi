@@ -53,12 +53,12 @@ def _grid(header: list[str], rows: list[list[str]], col_widths: list[float]) -> 
 
 
 def _rows_hash(rows: list[AuditLog]) -> str:
-    """SHA-256 over each row's (seq, timestamp, action, resource) so the
-    trailer is recomputable and tamper-evident — reusing the audit chain's
-    own ``hash`` column when present keeps it cheap and stable."""
+    """SHA-256 over each row's tamper-evidence ``row_hash`` (issue #73's audit
+    chain) so the trailer is itself tamper-evident — falls back to the row id
+    only for rows predating the chain."""
     digest = hashlib.sha256()
     for r in rows:
-        digest.update((getattr(r, "hash", "") or str(r.id)).encode("utf-8"))
+        digest.update((getattr(r, "row_hash", "") or str(r.id)).encode("utf-8"))
         digest.update(b"\x00")
     return digest.hexdigest()
 
