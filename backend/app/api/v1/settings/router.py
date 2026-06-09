@@ -16,6 +16,7 @@ from app.api.deps import DB, CurrentUser
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import is_effective_superadmin, user_has_permission
+from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
@@ -155,6 +156,13 @@ class SettingsResponse(BaseModel):
     # True = standard Linux console on boot (kernel messages + systemd
     # status + getty, no dashboard); False = quiet boot + dashboard.
     verbose_boot: bool = False
+    # ── Maintenance mode (issue #57) ──────────────────────────────
+    # System-wide read-only switch. ``maintenance_started_at`` is
+    # server-managed (stamped on enable / cleared on disable) and so is
+    # read-only here — it has no companion field on SettingsUpdate.
+    maintenance_mode_enabled: bool = False
+    maintenance_message: str = ""
+    maintenance_started_at: datetime | None = None
     # ── Appliance LLDP (issue #343) ───────────────────────────────
     # No secrets — LLDP advertises public identity, so the read shape
     # mirrors the stored shape directly (like NTP).
@@ -420,6 +428,12 @@ class SettingsUpdate(BaseModel):
     timezone: str | None = None
     # ── Appliance verbose boot console ────────────────────────────
     verbose_boot: bool | None = None
+    # ── Maintenance mode (issue #57) ──────────────────────────────
+    # ``maintenance_started_at`` is intentionally NOT settable here —
+    # it's server-stamped in ``update_settings`` when the enable flag
+    # flips, never operator-supplied.
+    maintenance_mode_enabled: bool | None = None
+    maintenance_message: str | None = None
     # ── Appliance LLDP (issue #343) ───────────────────────────────
     lldp_enabled: bool | None = None
     lldp_tx_interval: int | None = None
@@ -514,6 +528,16 @@ class SettingsUpdate(BaseModel):
             ZoneInfo(v)
         except Exception as exc:  # noqa: BLE001 — surface the parse failure
             raise ValueError(f"timezone {v!r} is not a valid IANA tz name: {exc}") from exc
+        return v
+
+    @field_validator("maintenance_message")
+    @classmethod
+    def _validate_maintenance_message(cls, v: str | None) -> str | None:
+        # Mirrors the column width (VARCHAR(500)) — reject overlong banners
+        # at the API boundary with a clean 422 instead of a DB truncation
+        # error. ``None`` (field omitted) is left alone.
+        if v is not None and len(v) > 500:
+            raise ValueError("maintenance_message must be 500 characters or fewer")
         return v
 
     @field_validator("lockout_threshold")
@@ -825,6 +849,14 @@ async def update_settings(
     settings = await _get_or_create(db)
     changes = body.model_dump(exclude_none=True)
 
+    # Maintenance mode (issue #57). Capture the prior enabled state before
+    # the setattr loop mutates it so we can detect an actual flip (and
+    # server-stamp / clear ``maintenance_started_at`` accordingly + write
+    # a dedicated audit row + invalidate the middleware cache). Computed
+    # here so it sees the value as it was BEFORE this request.
+    _maintenance_prev = bool(settings.maintenance_mode_enabled)
+    _maintenance_requested = changes.get("maintenance_mode_enabled")
+
     # Whether this update touches any host-config field a HOSTCONFIG_ALL
     # subscriber acts on. The DHCP-agent /config long-poll folds SNMP /
     # NTP / LLDP into its ETag; the supervisor heartbeat (#358 Phase 1)
@@ -910,8 +942,42 @@ async def update_settings(
     if snmp_users_audit is not None:
         changes["snmp_v3_users"] = snmp_users_audit
 
+    # Maintenance mode flip handling (issue #57). When the enable flag
+    # actually changes state, server-stamp / clear ``maintenance_started_at``
+    # (never operator-supplied) and write a dedicated audit row so the
+    # window is unambiguously bracketed in the audit log.
+    _maintenance_flipped = (
+        _maintenance_requested is not None and bool(_maintenance_requested) != _maintenance_prev
+    )
+    if _maintenance_flipped:
+        now_enabled = bool(_maintenance_requested)
+        settings.maintenance_started_at = datetime.now(UTC) if now_enabled else None
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action=("maintenance_mode.enabled" if now_enabled else "maintenance_mode.disabled"),
+                resource_type="platform_settings",
+                resource_id="maintenance",
+                resource_display="Maintenance mode",
+                result="success",
+                new_value={
+                    "enabled": now_enabled,
+                    "message": settings.maintenance_message or "",
+                },
+            )
+        )
+
     await db.commit()
     await db.refresh(settings)
+
+    # Drop the middleware's process-local cache so the flipping worker
+    # enforces (or lifts) the read-only block on its very next request.
+    if _maintenance_flipped:
+        from app.core import maintenance_mode as _maintenance_mode
+
+        _maintenance_mode.invalidate_cache()
 
     # The settings router has no request-scoped wake collector, so
     # publish directly after the commit. Only fire when a host-config

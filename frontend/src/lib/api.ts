@@ -2978,6 +2978,12 @@ export interface PlatformSettings {
    *  dashboard); false (default) = quiet boot + Talos dashboard. Appliance
    *  hosts only; applies on next reboot (grubenv-driven). */
   verbose_boot: boolean;
+  /** Maintenance mode (issue #57). System-wide read-only switch.
+   *  ``maintenance_started_at`` is server-managed (stamped on enable /
+   *  cleared on disable) and is therefore read-only — not sent on PUT. */
+  maintenance_mode_enabled: boolean;
+  maintenance_message: string;
+  maintenance_started_at: string | null;
   /** Appliance LLDP (issue #343). No secrets — LLDP advertises public
    *  identity, so read + write shapes match. ``lldp_protocols`` enables
    *  reception of CDP/EDP/FDP/SONMP alongside LLDP. */
@@ -8970,6 +8976,11 @@ export interface PlatformHealthResponse {
   status: "ok" | "degraded";
   components: PlatformHealthComponent[];
   demo_mode?: boolean;
+  /** Maintenance mode (issue #57) — bundled into the existing poll so the
+   *  global banner doesn't need a separate request. */
+  maintenance_mode?: boolean;
+  maintenance_message?: string;
+  maintenance_started_at?: string | null;
 }
 
 export const platformHealthApi = {

@@ -457,6 +457,25 @@ class PlatformSettings(Base):
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
 
+    # ── Maintenance mode (issue #57) ────────────────────────────────
+    # System-wide read-only switch. When ``maintenance_mode_enabled`` is
+    # True the API 503s every mutating request (POST/PUT/PATCH/DELETE)
+    # outside the exempt allow-list (auth / settings / health / metrics /
+    # agent endpoints), with an effective-superadmin bypass so an admin
+    # can still flip it back off. ``maintenance_message`` is shown in the
+    # global banner + the 503 body; ``maintenance_started_at`` is
+    # server-stamped on enable and cleared on disable (never operator-set
+    # directly). Default off / empty so existing installs are unaffected.
+    maintenance_mode_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    maintenance_message: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="", server_default=sa_text("''")
+    )
+    maintenance_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # ── Appliance LLDP support (issue #343) ─────────────────────────
     # lldpd runs at the Debian host level on every appliance host (same
     # host-config plane as SNMP / chrony) so it can see the host's real

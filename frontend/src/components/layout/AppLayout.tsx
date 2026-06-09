@@ -4,6 +4,7 @@ import { Sidebar } from "./Sidebar";
 import { Header } from "./Header";
 import { DemoBanner } from "./DemoBanner";
 import { MaintenanceBanner } from "./MaintenanceBanner";
+import { MaintenanceModeBanner } from "./MaintenanceModeBanner";
 import { SetupBanner } from "./SetupBanner";
 import { CopilotButton } from "@/components/copilot/CopilotButton";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
@@ -29,6 +30,7 @@ export function AppLayout() {
         <DemoBanner />
         <SetupBanner />
         <MaintenanceBanner />
+        <MaintenanceModeBanner />
         <Header onMobileMenu={() => setMobileOpen(true)} />
         <main className="flex-1 overflow-auto">
           <Outlet />

@@ -293,6 +293,9 @@ backend/alembic/versions/c9f2a83b04d7_appliance_certificate.py:drop_table:90
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_column:107
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_column:110
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_table:112
+backend/alembic/versions/d1b8f4a92c30_platform_settings_maintenance_mode.py:drop_column:57
+backend/alembic/versions/d1b8f4a92c30_platform_settings_maintenance_mode.py:drop_column:58
+backend/alembic/versions/d1b8f4a92c30_platform_settings_maintenance_mode.py:drop_column:59
 backend/alembic/versions/d1e7c4a90fb3_cloud_integration.py:drop_column:149
 backend/alembic/versions/d1e7c4a90fb3_cloud_integration.py:drop_column:153
 backend/alembic/versions/d1e7c4a90fb3_cloud_integration.py:drop_constraint_fk:152

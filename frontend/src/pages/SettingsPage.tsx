@@ -66,6 +66,7 @@ type SectionId =
   | "password-policy"
   | "account-lockout"
   | "agent-bootstrap-keys"
+  | "maintenance-mode"
   | "session"
   | "subnet-tree"
   | "updates"
@@ -172,6 +173,7 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   // "Reset to defaults" button, so this key just exists for the
   // type-completeness check.
   "agent-bootstrap-keys": [],
+  "maintenance-mode": ["maintenance_mode_enabled", "maintenance_message"],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
   "subnet-tree": ["subnet_tree_default_expanded_depth"],
   updates: ["github_release_check_enabled"],
@@ -698,6 +700,26 @@ const SECTIONS: SectionDef[] = [
       "tls",
       "log",
       "export",
+    ],
+  },
+  {
+    id: "maintenance-mode",
+    title: "Maintenance Mode",
+    group: "Security",
+    description:
+      "System-wide read-only switch (issue #57). When on, every mutating API request (create/update/delete) is rejected with HTTP 503 for everyone except superadmins. Auth, settings, health probes, and agent config-caching endpoints stay reachable so admins can recover and agents keep their last-known-good config. The message shows in a banner across every page and in the 503 body.",
+    keywords: [
+      "maintenance",
+      "read-only",
+      "readonly",
+      "freeze",
+      "lockdown",
+      "downtime",
+      "503",
+      "outage",
+      "window",
+      "migrate",
+      "upgrade",
     ],
   },
   {
@@ -1975,6 +1997,48 @@ export function SettingsPage() {
                     <span className="text-xs text-muted-foreground">min</span>
                   </div>
                 </Field>
+              </>
+            )}
+
+            {activeId === "maintenance-mode" && (
+              <>
+                <Field
+                  label="Maintenance mode"
+                  description="When enabled, the platform goes read-only: all create / update / delete requests are rejected with HTTP 503 for non-superadmins. You can always turn it back off here as a superadmin."
+                >
+                  <Toggle
+                    checked={!!values.maintenance_mode_enabled}
+                    onChange={(v) => set("maintenance_mode_enabled", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                <Field
+                  label="Operator message"
+                  description="Optional. Shown in the read-only banner across every page and in the 503 response body. Max 500 characters."
+                >
+                  <textarea
+                    rows={3}
+                    maxLength={500}
+                    value={values.maintenance_message ?? ""}
+                    onChange={(e) => set("maintenance_message", e.target.value)}
+                    disabled={!isSuperadmin}
+                    placeholder="e.g. Scheduled DB migration in progress — back at 02:00 UTC."
+                    className={cn(inputCls, "w-96 max-w-full")}
+                  />
+                </Field>
+                {values.maintenance_mode_enabled &&
+                  values.maintenance_started_at && (
+                    <Field
+                      label="Active since"
+                      description="When this maintenance window was started (server-stamped)."
+                    >
+                      <span className="text-sm text-muted-foreground">
+                        {new Date(
+                          values.maintenance_started_at,
+                        ).toLocaleString()}
+                      </span>
+                    </Field>
+                  )}
               </>
             )}
 
