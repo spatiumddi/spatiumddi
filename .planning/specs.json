@@ -1,0 +1,738 @@
+[
+  {
+    "issue": 31,
+    "summary": "Add a read-only OPNsense mirror integration cloned from the Proxmox precedent end-to-end. New OPNsenseRouter target model (host/port/verify_tls/ca_bundle_pem + Fernet-encrypted api_key/api_secret, ipam_space_id RESTRICT, optional dns_group_id, mirror flags, sync_interval), an httpx async client hitting the four REST endpoints + ARP, a per-router reconciler that mirrors LAN/VLAN/OPT* interfaces -> Subnets, DHCPv4 leases -> IPAddress status=\"dhcp\", static reservations -> status=\"reserved\", and ARP table -> status=\"opnsense-arp\" (secondary), a 30s beat sweep with per-router interval gating gated on PlatformSettings.integration_opnsense_enabled, full CRUD/test/sync router, and complete shared-file wiring across feature-module gating, both dashboard surfaces (NN #15), MCP tools, sidebar, and routing.",
+    "complexity": "XL",
+    "migration": {
+      "needed": true,
+      "detail": "New Alembic revision (down_revision = current head c7a3e1f90d24), mirror backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py. (1) create_table 'opnsense_router' with columns: id UUID PK, name String(255), description Text default '', enabled Boolean default true, host String(255), port Integer default 443, verify_tls Boolean default true, ca_bundle_pem Text default '', api_key String(255) default '' (the OPNsense key is an identifier, NOT secret \u2014 stored plaintext like proxmox token_id), api_secret_encrypted LargeBinary default ''::bytea (Fernet), ipam_space_id UUID FK ip_space.id ON DELETE RESTRICT NOT NULL, dns_group_id UUID FK dns_server_group.id ON DELETE SET NULL nullable, mirror_dhcp_leases Boolean default true, mirror_static_mappings Boolean default true, mirror_arp Boolean default false (secondary source \u2014 opt-in), sync_interval_seconds Integer default 60, last_synced_at DateTime(tz) nullable, last_sync_error Text nullable, firmware_version String(64) nullable, interface_count Integer nullable, lease_count Integer nullable, created_at/modified_at DateTime(tz) default now(). (2) create unique index ix_opnsense_router_name. (3) For each of ('ip_address','ip_block','subnet'): add column opnsense_router_id UUID FK opnsense_router.id ON DELETE CASCADE nullable + create index ix_{table}_opnsense_router_id. (4) add platform_settings.integration_opnsense_enabled Boolean NOT NULL server_default false. (5) Seed feature_module row id='integrations.opnsense' enabled=false (mirror the INSERT ... ON CONFLICT DO NOTHING pattern in d8b5e4a91f27). downgrade() reverses in inverse order."
+    },
+    "backend_new_files": [
+      "backend/app/models/opnsense.py :: OPNsenseRouter SQLAlchemy model (UUIDPrimaryKeyMixin, TimestampMixin, Base), __tablename__='opnsense_router', columns exactly per migration; mirror backend/app/models/proxmox.py structure and docstring conventions",
+      "backend/app/api/v1/opnsense/__init__.py :: `from app.api.v1.opnsense.router import router` re-export (mirror backend/app/api/v1/proxmox/__init__.py)",
+      "backend/app/api/v1/opnsense/router.py :: CRUD + test-connection + sync endpoints; APIRouter(tags=['opnsense'], dependencies=[Depends(require_resource_permission('opnsense_router'))]); Pydantic RouterBase/Create/Update/Response with field_validator for sync_interval>=30 + CIDR/host; SuperAdmin gate on mutations; forbid_in_demo_mode on create; Fernet encrypt_str on api_secret; _audit writing resource_type='opnsense_router'; mirror backend/app/api/v1/tailscale/router.py + proxmox/router.py",
+      "backend/app/services/opnsense/__init__.py :: package marker (empty, mirror services/proxmox/__init__.py)",
+      "backend/app/services/opnsense/client.py :: OPNsenseClient async httpx context-manager + OPNsenseClientError; HTTP Basic auth (api_key as username, api_secret as password) over https://{host}:{port}; verify_tls + ca_bundle_pem via ssl.create_default_context like ProxmoxClient.__aenter__; methods: get_firmware()/list_vlan_settings (GET /api/interfaces/vlan_settings/get), get_interface_config (GET /api/diagnostics/interface/getInterfaceConfig), search_leases (POST /api/dhcpv4/leases/searchLease), get_reservations (GET /api/dhcpv4/settings/getReservation), get_arp (GET /api/diagnostics/interface/getArp or search_item); normalised dataclasses _OPNInterface/_OPNLease/_OPNReservation/_OPNArpEntry; mirror backend/app/services/proxmox/client.py",
+      "backend/app/services/opnsense/reconcile.py :: reconcile_router(db, router) -> ReconcileSummary; ensure tenant-owned IPBlock+Subnet per LAN/VLAN/OPT* interface CIDR (real LAN semantics \u2014 gateway+broadcast, NO kubernetes_semantics suppression, like Proxmox bridges); compute desired IPAddress rows: leases->status='dhcp' (set auto_from_lease=True for shape parity with Kea), static mappings->status='reserved', ARP->status='opnsense-arp'; claim-pre-existing-operator-rows + sibling-integration ownership guard (skip rows where proxmox_node_id/kubernetes_cluster_id/docker_host_id/tailscale_tenant_id/unifi_controller_id/cloud_endpoint_id is not None), user_modified_at lock, delete/un-claim disappeared rows, _recompute_subnet_utilization, write AuditLog action='opnsense.reconcile' resource_type='opnsense_router'; mirror backend/app/services/proxmox/reconcile.py + tailscale/reconcile.py",
+      "backend/app/tasks/opnsense_sync.py :: sweep_opnsense_routers (30s beat, gate on PlatformSettings.integration_opnsense_enabled, per-router last_synced_at vs sync_interval_seconds gating) + sync_router_now(router_id) for the Sync Now button; mirror backend/app/tasks/tailscale_sync.py exactly",
+      "backend/tests/test_opnsense_client.py :: client parsing/auth/error-status tests (mirror tests/test_proxmox_client.py / test_tailscale_client.py)",
+      "backend/tests/test_opnsense_reconcile.py :: reconciler diff/claim/lock/delete + status-mapping tests (mirror tests/test_proxmox_reconcile.py)"
+    ],
+    "backend_modified_files": [
+      "backend/app/models/__init__.py :: add `from app.models.opnsense import OPNsenseRouter` and add 'OPNsenseRouter' to __all__ (near line 103-107 / 190-193 alongside ProxmoxNode/TailscaleTenant/UnifiController)",
+      "backend/app/models/ipam.py :: add 'opnsense-arp' to IP_STATUSES_INTEGRATION_OWNED frozenset (line ~41-66); add opnsense_router_id Mapped[uuid.UUID|None] FK opnsense_router.id ondelete=CASCADE index=True to IPBlock (~line 225-275), Subnet (~line 600-669), and IPAddress (~line 811+) following the proxmox_node_id pattern",
+      "backend/app/models/settings.py :: add integration_opnsense_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False) next to integration_unifi/cloud_enabled (line ~257-268)",
+      "backend/app/services/feature_modules.py :: append ModuleSpec(id='integrations.opnsense', label='OPNsense', group='Integrations', description='Read-only mirror of OPNsense interfaces + DHCP leases + reservations into IPAM. Connect routers from the OPNsense page once enabled.', default_enabled=False) to MODULES tuple; add 'integrations.opnsense': 'integration_opnsense_enabled' to INTEGRATION_SETTINGS_MIRROR dict",
+      "backend/app/celery_app.py :: add 'app.tasks.opnsense_sync' to include[] list; add task_routes entry 'app.tasks.opnsense_sync.*': {'queue': 'default'}; add beat_schedule entry 'opnsense-sync-sweep': {'task':'app.tasks.opnsense_sync.sweep_opnsense_routers','schedule':schedule(run_every=30.0)}",
+      "backend/app/api/v1/dashboards/integrations.py :: add OPNsenseRouter import; add 'opnsense_router' to _INTEGRATION_RESOURCE_TYPES tuple; query opnsense_targets; add _build_panel(kind='opnsense', label='OPNsense', enabled=getattr(settings,'integration_opnsense_enabled',False), targets=opnsense_targets, display_attr='name') to panels list",
+      "backend/app/services/ai/tools/integrations.py :: add ListOpnsenseTargetsArgs + @register_tool list_opnsense_targets (module='integrations.opnsense', category='integrations') returning id/name/description/host/port/enabled/ipam_space_id/dns_group_id/mirror flags/sync_interval_seconds/last_synced_at/last_sync_error/firmware_version/interface_count/lease_count \u2014 credentials never returned; mirror list_proxmox_targets",
+      "backend/app/core/demo_mode.py :: add 'integrations.opnsense' to DEMO_RESTRICTED_MODULES list (line ~50-52 alongside proxmox/tailscale/unifi)",
+      "backend/app/services/backup/sections.py :: add 'opnsense_router' to the integration table list (line ~254-256)",
+      "backend/app/services/factory_reset/sections.py :: add 'opnsense_router' to the integration table list (line ~201-203)"
+    ],
+    "shared_files": [
+      "backend/app/api/v1/router.py :: `from app.api.v1.opnsense import router as opnsense_router` (with the other imports ~line 24-62) AND api_v1_router.include_router(opnsense_router, prefix='/opnsense', tags=['opnsense'], dependencies=[Depends(require_module('integrations.opnsense'))]) (alongside the proxmox/tailscale/unifi includes ~line 248-281)",
+      "backend/app/services/feature_modules.py :: append integrations.opnsense ModuleSpec to MODULES AND add the 'integrations.opnsense'->'integration_opnsense_enabled' entry to INTEGRATION_SETTINGS_MIRROR",
+      "backend/app/models/settings.py :: add column integration_opnsense_enabled (default False)",
+      "backend/app/celery_app.py :: include 'app.tasks.opnsense_sync' + task_routes + 'opnsense-sync-sweep' beat entry (run_every=30.0)",
+      "backend/app/api/v1/dashboards/integrations.py :: add 'opnsense_router' to _INTEGRATION_RESOURCE_TYPES + an opnsense _build_panel call + select(OPNsenseRouter)",
+      "backend/app/api/v1/settings/router.py :: add integration_opnsense_enabled: bool to SettingsResponse (line ~98-102) and integration_opnsense_enabled: bool | None = None to the settings update model (line ~369-373) so the value round-trips (note: integration_unifi_enabled is currently MISSING from SettingsResponse \u2014 do not copy that omission; the canonical toggle is via /admin/feature-modules which mirrors the column)",
+      "frontend/src/lib/api.ts :: add 'opnsense' to the IntegrationDashboardKind union (line ~7068-7074); add OPNsenseRouter/Create/Update/TestResult interfaces; add opnsenseApi client object (listRouters/createRouter/updateRouter/deleteRouter/testConnection/syncNow at /opnsense/routers) mirroring proxmoxApi (line ~9131)",
+      "frontend/src/pages/DashboardPage.tsx :: import opnsenseApi + OPNsenseRouter type; add opnsenseEnabled = settings?.integration_opnsense_enabled (~line 845); add useQuery opnsense-routers gated on opnsenseEnabled (~line 867); add opnsenseEnabled||... to the IntegrationsPanel render guard (~line 1557) and pass opnsenseEnabled + opnsenseRouters props; in IntegrationsPanel add hasOpnsense to cols[] + add `cols === 7 && 'md:grid-cols-7 md:divide-x md:divide-y-0'` to the grid cn() (CURRENT MAX IS 6 \u2014 must extend); add a {hasOpnsense && (...)} section with IntegrationRow rows (subtitle=`${r.host}:${r.port}`, meta=lease/interface counts); update the empty-state prose string '...Proxmox / Tailscale / UniFi mirrors' to mention OPNsense (~line 3063)",
+      "frontend/src/components/layout/Sidebar.tsx :: add `...(moduleEnabled('integrations.opnsense') ? [{label:'OPNsense', icon: RouterIcon, to:'/opnsense'}] : [])` to the integrationsNav array (~line 522-541); RouterIcon is already imported from lucide-react (line 9)",
+      "frontend/src/App.tsx :: `import { OpnsensePage } from '@/pages/opnsense/OpnsensePage'` (~line 24) + `<Route path=\"opnsense\" element={<OpnsensePage />} />` (~line 148)"
+    ],
+    "endpoints": [
+      "GET /opnsense/routers :: require_module('integrations.opnsense') + require_resource_permission('opnsense_router'); CurrentUser (read)",
+      "POST /opnsense/routers :: SuperAdmin + forbid_in_demo_mode (create)",
+      "PUT /opnsense/routers/{router_id} :: SuperAdmin (update; non-empty api_secret rotates)",
+      "DELETE /opnsense/routers/{router_id} :: SuperAdmin (cascades mirrored IPAM rows via FK)",
+      "POST /opnsense/routers/{router_id}/sync :: SuperAdmin (enqueue sync_router_now, 202)",
+      "POST /opnsense/routers/test :: SuperAdmin (test-connection probe; accepts router_id OR inline creds)",
+      "GET /dashboards/integrations/summary :: existing endpoint \u2014 now returns the opnsense panel (no new route)"
+    ],
+    "feature_module": {
+      "needed": true,
+      "key": "integrations.opnsense",
+      "default_enabled": false,
+      "rationale": "Per NN #14 + the established integrations pattern (kubernetes/docker/proxmox/tailscale/unifi/cloud), every read-only mirror is a default-disabled feature module that gates its router (require_module 404), sidebar entry, MCP tool, and dashboard panel; the matching platform_settings.integration_opnsense_enabled column is kept in lock-step via INTEGRATION_SETTINGS_MIRROR so the celery beat sweep can stop/start without a per-task migration."
+    },
+    "mcp_tools": [
+      "list_opnsense_targets :: find :: default_enabled true :: List configured OPNsense routers SpatiumDDI mirrors into IPAM (id/name/host/enabled/ipam binding/sync state/firmware/interface+lease counts); gated by module='integrations.opnsense' so it disappears in lock-step with the sidebar entry; credentials never returned. Mirrors list_proxmox_targets exactly (NN #13 \u2014 every integration target surface gets a find tool)."
+    ],
+    "frontend_new_files": [
+      "frontend/src/pages/opnsense/OpnsensePage.tsx :: admin page listing routers + add/edit modal (host/port/verify_tls/ca_bundle_pem/api_key/api_secret/ipam_space_id/dns_group_id/mirror flags/sync_interval), Test Connection + Sync Now buttons, last_synced/last_error display; mirror frontend/src/pages/proxmox/ProxmoxPage.tsx structure"
+    ],
+    "frontend_modified_files": [
+      "frontend/src/lib/api.ts :: see shared_files \u2014 IntegrationDashboardKind union + OPNsenseRouter types + opnsenseApi client",
+      "frontend/src/pages/DashboardPage.tsx :: see shared_files \u2014 IntegrationsPanel cols===7 grid extension + hasOpnsense section + query/props + tab empty-state prose",
+      "frontend/src/components/layout/Sidebar.tsx :: see shared_files \u2014 integrationsNav OPNsense entry (RouterIcon)",
+      "frontend/src/App.tsx :: see shared_files \u2014 OpnsensePage import + /opnsense route"
+    ],
+    "precedents": [
+      "backend/app/models/proxmox.py :: closest target-model precedent \u2014 host/port/verify_tls/ca_bundle_pem + encrypted secret + ipam_space_id(RESTRICT)/dns_group_id(SET NULL) + mirror flags + sync state; OPNsenseRouter mirrors this verbatim",
+      "backend/app/services/proxmox/client.py:267-334 :: ProxmoxClient.__aenter__ TLS handling (verify_tls False -> warn log NN#7, ca_bundle_pem -> ssl.create_default_context) + _get error-status mapping \u2014 reuse for OPNsenseClient (OPNsense uses HTTP Basic api_key:api_secret instead of the PVEAPIToken header)",
+      "backend/app/services/proxmox/reconcile.py:482-530 (_apply_blocks_and_subnets) + 695-774 (claim/lock/delete) :: subnet-from-interface mirroring + sibling-integration ownership guard + user_modified_at lock + un-claim-on-disappear \u2014 OPNsense LAN/VLAN interfaces carry real LAN CIDRs so use this (gateway+broadcast) rather than the kubernetes_semantics suppression path",
+      "backend/app/api/v1/dhcp/agents.py:621-781 :: the Kea DHCP-lease IPAM mirror \u2014 status='dhcp' + auto_from_lease=True shape that the issue requires OPNsense DHCPv4 leases to match",
+      "backend/app/services/tailscale/reconcile.py:295-413 (_apply_addresses) :: cleanest desired-vs-current address diff loop + _recompute_subnet_utilization \u2014 structural template for OPNsense _apply_addresses across the three status kinds",
+      "backend/app/tasks/tailscale_sync.py :: exact 30s-sweep + per-target interval-gate + sync_X_now task template",
+      "backend/app/api/v1/tailscale/router.py :: CRUD+test+sync router template (Fernet secret, SuperAdmin gates, _to_response with *_present booleans, _audit)",
+      "backend/app/api/v1/dashboards/integrations.py:85-220 :: _INTEGRATION_RESOURCE_TYPES + _build_panel + per-integration select \u2014 NN #15 backend dashboard surface",
+      "frontend/src/pages/DashboardPage.tsx:1973-2293 :: IntegrationsPanel (note cols max is currently 6 \u2014 must add cols===7) + IntegrationsDashboardTabPanel:3034-3110 (renders panels generically, only the empty-state prose hardcodes integration names) \u2014 NN #15 frontend dashboard surface",
+      "backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py :: migration template (table + 3x FK columns + indexes + platform_settings column); backend/alembic/versions/d8b5e4a91f27_integration_feature_modules.py :: feature_module seed INSERT pattern",
+      "backend/app/api/v1/admin/feature_modules.py:98-124 :: toggle endpoint that writes feature_module + mirrors INTEGRATION_SETTINGS_MIRROR column in one txn \u2014 confirms no extra wiring needed beyond registering the map entry"
+    ],
+    "tests": [
+      "backend/tests/test_opnsense_client.py :: parse VLAN/interface/lease/reservation/ARP payloads; Basic-auth header construction; verify_tls/ca_bundle handling; 401/403/4xx -> OPNsenseClientError messages",
+      "backend/tests/test_opnsense_reconcile.py :: interface CIDR -> Subnet creation (LAN semantics, idempotent); lease -> status='dhcp'/auto_from_lease=True; static mapping -> status='reserved'; ARP -> status='opnsense-arp' (only when mirror_arp=True); claim of operator row stamps opnsense_router_id+user_modified_at; row owned by another integration (proxmox/tailscale/etc) is skipped with a warning; disappeared row with user_modified_at is un-claimed not deleted; AuditLog row written; last_synced_at/last_sync_error persisted on success and failure",
+      "backend/tests/test_sync_sweep_rollback.py (extend existing) :: confirm sweep_opnsense_routers self-skips when integration_opnsense_enabled is False and honours per-router interval gating",
+      "frontend (optional, match repo convention) :: OpnsensePage smoke render if proxmox/tailscale pages have tests"
+    ],
+    "open_questions": [
+      "api_key storage: OPNsense API 'key' is an account identifier (not strictly secret) and 'secret' is the secret \u2014 spec stores api_key plaintext (like proxmox token_id) and api_secret Fernet-encrypted. Confirm the integrator is comfortable with key-plaintext, or encrypt both in one combined Fernet blob if security review prefers.",
+      "Default port: OPNsense web/API is HTTPS on 443 by default (spec uses 443); some operators run the GUI on a custom port. Default 443 chosen \u2014 confirm vs 8443.",
+      "Interface->Subnet selection: getInterfaceConfig returns ALL interfaces (incl. WAN, loopback, GIFs). Spec mirrors LAN/VLAN/OPT* only (per issue) and skips WAN/public/unaddressed \u2014 confirm whether WAN's public IP should also land as a 'reserved' gateway row.",
+      "ARP as IP rows: ARP entries are L2 neighbor sightings, not allocations. Spec uses a dedicated status='opnsense-arp' (added to IP_STATUSES_INTEGRATION_OWNED) gated behind mirror_arp (default off) so it never collides with dhcp/reserved rows \u2014 confirm this status name vs reusing 'discovered'.",
+      "Lease ownership vs Kea: status='dhcp' rows are also produced by the native Kea mirror (auto_from_lease). OPNsense rows are distinguished by opnsense_router_id FK; the dhcp_lease_cleanup sweep keys on auto_from_lease \u2014 confirm setting auto_from_lease=True on OPNsense rows won't cause the Kea expiry sweep to prematurely delete them (the reconciler re-creates each pass, so acceptable, but flag for integrator).",
+      "DHCPv4 only per the issue endpoints \u2014 DHCPv6/Kea-on-OPNsense not in scope for this issue."
+    ]
+  },
+  {
+    "issue": 46,
+    "summary": "Add a first-class nullable `decom_date` (SQLAlchemy `Date`, indexed) to both `Subnet` and `IPAddress`, threaded through the IPAM Pydantic create/update/response schemas. Add a new `decom_expiring` alert rule type that reuses `threshold_days` (NO alerts migration \u2014 same pattern as the just-merged `secret_expiring` #76 and `service_term_expiring`), with a matcher that scans non-soft-deleted subnets whose `decom_date` falls within the window, plus an admin Dashboard widget (client-side aggregation over the already-fetched subnet list, mirroring `DomainsSummaryCard`). The existing `alerts-evaluate` beat task (every 60 s) is the \"generates a 30-day summary feeding alerts\" mechanism \u2014 no new beat entry needed; the issue's \"subnets decom in next 30 days summary\" is the alert events opened by the new rule plus the dashboard widget rollup.",
+    "complexity": "L",
+    "migration": {
+      "needed": true,
+      "detail": "ONE new Alembic migration adds two columns + two indexes: subnet.decom_date (DATE, NULL) with index ix_subnet_decom_date, and ip_address.decom_date (DATE, NULL) with index ix_ip_address_decom_date. Mirror the Date-column precedent in alembic/versions/e1d8c92a4f73_network_service_catalog.py (term_end_date: sa.Column('term_end_date', sa.Date(), nullable=True) + op.create_index('ix_network_service_term_end_date', ...)). NO column for the alert rule itself \u2014 decom_expiring reuses the existing alert_rule.threshold_days, exactly like secret_expiring/service_term_expiring. NO platform_settings column. down_revision: the repo currently has THREE migration heads (c4e7a2f813b9, c7a3e1f90d24, d9a4c3b7e812) because multiple features are in flight; chain from c7a3e1f90d24 (the issue-named head, the subnet_utilization_history migration) and let the integrator resolve the multi-head merge."
+    },
+    "backend_new_files": [
+      "backend/tests/test_alert_decom_expiring.py :: unit test for the new _matching_decom_expiring_subjects matcher, mirroring backend/tests/test_alert_secret_expiring.py"
+    ],
+    "backend_modified_files": [
+      "backend/app/models/ipam.py :: add `decom_date: Mapped[date | None] = mapped_column(Date, nullable=True)` to Subnet (near subnet_role/compliance flags, ~line 595) AND to IPAddress (near reserved_until, ~line 746); add `Date` to the sqlalchemy import block (line 4-14) and ensure `from datetime import date` is importable (file already imports `datetime`); add Index('ix_subnet_decom_date','decom_date') to Subnet.__table_args__ (~line 378) and Index('ix_ip_address_decom_date','decom_date') to IPAddress.__table_args__ (~line 723)",
+      "backend/app/services/alerts.py :: (1) add module constant RULE_TYPE_DECOM_EXPIRING = 'decom_expiring' near the other RULE_TYPE_* constants (~line 127) with a comment; (2) add it to the RULE_TYPES frozenset (~line 152); (3) add async def _matching_decom_expiring_subjects(db, rule, now) -> list[tuple[str,str,str,str]] modeled exactly on _matching_service_term_expiring_subjects (line 1235): cutoff=(now+timedelta(days=threshold_days)).date(), select(Subnet).where(Subnet.deleted_at.is_(None)).where(Subnet.decom_date.is_not(None)).where(Subnet.decom_date<=cutoff), days_to_expiry=(s.decom_date-today).days, sev via _escalate_severity_for_expiring; (4) add an elif branch in evaluate_all (~line 1911, beside RULE_TYPE_SERVICE_TERM_EXPIRING) wiring matches + subject_type='subnet'",
+      "backend/app/api/v1/ipam/router.py :: add `decom_date: date | None = None` to SubnetCreate (~line 1683), SubnetUpdate (~line 1813), SubnetResponse (~line 1958), and to IPAddressCreate (~line 2083), IPAddressUpdate (~line 2133), IPAddressResponse (~line 2165); add `from datetime import date` if not already imported. create_subnet/create IP already use body.model_dump() so the column flows through automatically; update_subnet maps via `changes = body.model_dump(exclude_none=True,...)` \u2014 see open_questions re: clearing decom_date to null",
+      "backend/app/services/ai/tools/ipam.py :: add a new read tool find_subnets_decommissioning (find_* per #13) registered via register_tool(name='find_subnets_decommissioning', module=None, ...) that lists subnets with decom_date within N days (default 30); module=None because IPAM is always-on core (no feature module). Mirror list_subnets (~line 221) shape",
+      "backend/app/api/v1/dashboards/network.py :: OPTIONAL \u2014 if a server-side rollup is preferred over the client-side widget, add a decom_soon count + top-N rows to the Network dashboard summary payload (issue uses 'admin dashboard widget'; client-side aggregation in DashboardPage is the lower-contention default \u2014 see frontend_modified_files)"
+    ],
+    "shared_files": [
+      "backend/app/services/alerts.py :: RULE_TYPES frozenset gets `RULE_TYPE_DECOM_EXPIRING,` added (~line 152); plus new constant + matcher + evaluate_all elif branch (subject_type='subnet')",
+      "frontend/src/lib/api.ts :: extend `export type AlertRuleType` union (~line 6710-6729) with `| \"decom_expiring\"`; add `decom_date?: string | null;` to the `Subnet` interface (~line 487-580, near the compliance flags) and to the IPAddress interface; add `decom_date?: string | null` to the subnet create/update request shapes (ipamApi createSubnet/updateSubnet around lines 1376/1382) and IP create/update shapes",
+      "frontend/src/pages/DashboardPage.tsx :: add a new SubnetDecomCard() summary-card component modeled on DomainsSummaryCard (line 613) \u2014 useQuery over ipamApi.listSubnets() (or reuse the already-fetched `subnets` at line 768), count decom-past-due vs decom-within-30-days with StatusChip tones red/amber/green, Link to /ipam; render it in the Overview grid (~line 1192-1198) alongside AsnSummaryCard/VrfSummaryCard/DomainsSummaryCard and/or the IPAM tab cards block (~line 1212). NOTE: this is the always-on IPAM admin widget, NOT the IntegrationsPanel \u2014 non-negotiable #15 does not apply (decom-date is not an integration mirror)",
+      "frontend/src/pages/admin/AlertsPage.tsx :: add `decom_expiring: { thresholdDays: 30 }` to RULE_TYPE_PARAM_DEFAULTS (~line 33); add `decom_expiring` to the threshold_days submit conditions (~line 132-138) and the threshold_days <input> render gate (~line 362-365); add an <option value=\"decom_expiring\"> under a fitting optgroup (e.g. the Subnet/IPAM group with subnet_utilization, ~line 200-207); extend the list-row threshold-display ternary (~line 674-677) to show `\u2264 ${r.threshold_days ?? 30} d` for decom_expiring",
+      "backend/app/api/v1/ipam/router.py :: SubnetCreate/SubnetUpdate/SubnetResponse + IPAddressCreate/Update/Response all gain decom_date (this file is high-contention; 6 schema sites)"
+    ],
+    "endpoints": [
+      "(no new routes) PATCH /api/v1/ipam/subnets/{id} :: existing require_permission update subnet gate \u2014 now accepts/returns decom_date",
+      "(no new routes) POST /api/v1/ipam/subnets :: existing create gate \u2014 accepts decom_date",
+      "(no new routes) PATCH /api/v1/ipam/addresses/{id} :: existing update gate \u2014 accepts/returns decom_date",
+      "POST /api/v1/alerts/rules :: existing alert-rule admin gate \u2014 rule_type now validates 'decom_expiring' via alert_service.RULE_TYPES (router.py:62 already validates against the frozenset, no router change)"
+    ],
+    "feature_module": {
+      "needed": false,
+      "key": "",
+      "default_enabled": false,
+      "rationale": "decom_date is a column on existing always-on IPAM resources and decom_expiring is one more alert rule type in the always-on alerts framework. No new top-level sidebar section, REST router prefix, or MCP tool cluster is introduced (per #14 the gate is for new top-level resource families). IPAM core and alerts have no feature module today, matching every prior alert-rule addition (secret_expiring, service_term_expiring, voice_lease_count_below all shipped with no module)."
+    },
+    "mcp_tools": [
+      "find_subnets_decommissioning :: find :: default_enabled true :: read-only IPAM list of subnets with decom_date within N days (default 30); no secrets, no writes, no off-prem calls, so default-on per #13; register with module=None (IPAM is always-on core)"
+    ],
+    "frontend_new_files": [],
+    "frontend_modified_files": [
+      "frontend/src/lib/api.ts :: AlertRuleType union + Subnet/IPAddress interfaces + subnet & IP create/update request shapes gain decom_date",
+      "frontend/src/pages/DashboardPage.tsx :: new SubnetDecomCard widget + render in Overview/IPAM grid",
+      "frontend/src/pages/admin/AlertsPage.tsx :: decom_expiring option, threshold_days wiring, defaults, list-row display",
+      "frontend/src/pages/ipam/IPAMPage.tsx :: add a `decom_date` date <input> to the subnet edit form, placed in the compliance/classification block (~line 1300-1346, next to pci_scope/hipaa_scope/internet_facing) or near the General tab status field; thread value+onChange through the form state like the existing pci/hipaa/subnet_role props"
+    ],
+    "precedents": [
+      "backend/app/services/alerts.py:1235 _matching_service_term_expiring_subjects :: closest matcher precedent \u2014 Date-typed column, soft-delete + decom exclusion, .date() cutoff, _escalate_severity_for_expiring, returns 4-tuple with severity override",
+      "backend/app/services/alerts.py:127-153 :: RULE_TYPE_SECRET_EXPIRING constant + RULE_TYPES frozenset addition pattern (rule type with no migration)",
+      "backend/app/services/alerts.py:1903-1914 :: evaluate_all dispatch elif branch shape (matches list-comprehension + subject_type)",
+      "backend/app/models/network_service.py:121-122 + alembic/versions/e1d8c92a4f73_network_service_catalog.py:75,122 :: Date column + index migration precedent (term_end_date)",
+      "frontend/src/pages/DashboardPage.tsx:613 DomainsSummaryCard :: client-side expiring/expired/healthy aggregation widget precedent (30-day window math)",
+      "backend/tests/test_alert_secret_expiring.py :: matcher unit-test precedent",
+      "frontend/src/pages/admin/AlertsPage.tsx:33,132,362,674 :: where each new rule type plugs into the create form + list display"
+    ],
+    "tests": [
+      "backend/tests/test_alert_decom_expiring.py :: rule matches a subnet with decom_date inside threshold_days; excludes far-future decom_date; excludes NULL decom_date; excludes soft-deleted (deleted_at) subnets; severity escalates (threshold/4 warning, threshold/12 critical) via _escalate_severity_for_expiring; past-due decom_date (negative days) yields 'has been decommissioned'/critical message",
+      "backend/tests/test_ipam_subnets (existing or new case) :: POST/PATCH subnet round-trips decom_date; PATCH can set and (verify behavior) clear decom_date; SubnetResponse surfaces it",
+      "backend/tests/ IP-address test :: POST/PATCH ip_address round-trips decom_date (IP update uses exclude_unset so null-clear works)",
+      "backend (alerts router) :: POST /alerts/rules with rule_type='decom_expiring' is accepted (RULE_TYPES validation)"
+    ],
+    "open_questions": [
+      "Multi-head migration: repo has 3 alembic heads (c4e7a2f813b9, c7a3e1f90d24, d9a4c3b7e812) from concurrent features. Spec chains the new migration from c7a3e1f90d24 (issue-named); integrator must reconcile into a single linear head when merging the 9 features.",
+      "Clearing decom_date on a subnet: update_subnet (router.py:4165) uses body.model_dump(exclude_none=True,...), so sending decom_date=null is silently dropped \u2014 same limitation as other nullable subnet fields (customer_id, etc.). Decide whether to add decom_date to an explicit field-set handler (like the dns_fields/dhcp_fields blocks at 4170-4177 that use body.model_fields_set) so operators can un-set a decom date, or accept the existing convention. The IPAddress path (router.py:6210, exclude_unset) already supports null-clear.",
+      "Dashboard surface: 'admin dashboard widget' is implemented as a client-side SubnetDecomCard in DashboardPage (lowest contention, mirrors DomainsSummaryCard). If a server-side rollup is preferred, add a decom_soon panel to dashboards/network.py instead \u2014 confirm which the issue owner wants.",
+      "decom_expiring subject_type='subnet' is shared with subnet_utilization/voice_lease_count_below/stale_ip_count \u2014 confirm AlertEvent dedup keys on (rule_id, subject_id) so a subnet under both a utilization rule and a decom rule latches two distinct events (it does \u2014 separate rule_id), no collision expected.",
+      "IPAddress.decom_date: the issue's beat summary + alert rule operate on subnets only. The IP-level column is added per the issue text ('subnet + ip_address') for parity/custom-field replacement, but no alert rule or widget consumes the IP-level value in this scope \u2014 confirm that is intended (column + API only, no IP-level alerting)."
+    ]
+  },
+  {
+    "issue": 47,
+    "summary": "Add a read-only Top-N reports surface: a new backend reports router (api/v1/reports/) with aggregation endpoints per fixed widget, computed server-side over existing tables (no migration), plus a ReportsPage, a sidebar entry, and find_top_* MCP read tools.",
+    "complexity": "M",
+    "migration": {
+      "needed": false,
+      "detail": "No migration. All four reports derive from existing tables/columns: subnet.utilization_percent + subnet.name/network (top subnets by util); ip_address joined to subnet.customer_id/site_id with customer.name/site.name (top owners by IP count \u2014 NOTE IPAddress itself has NO customer/site/provider FK, only owner_user_id/owner_group_id at ipam.py:754-758; ownership FKs live on Subnet at ipam.py:687/693 and IPBlock at ipam.py:345/351); audit_log group-by (resource_type, resource_id, resource_display) filtered to timestamp >= now-7d (most-modified resources, audit.py:71-75); dns_query_log_entry group-by client_ip ordered by count desc (noisiest DNS clients, logs.py:36-68). The dns_query_log_entry table already has ix_dns_query_log_ts; existing indexes (ix_audit_log_timestamp, ix_subnet_network, ix_ip_address_address) cover the queries adequately for the bounded Top-N use."
+    },
+    "backend_new_files": [
+      "backend/app/api/v1/reports/__init__.py :: APIRouter() that includes the per-report sub-routers, mirroring dashboards/__init__.py:16-27 (single `router` export wired into top-level router.py)",
+      "backend/app/api/v1/reports/router.py :: the four Top-N endpoints + Pydantic response models (TopSubnetRow, TopOwnerRow, TopModifiedResourceRow, TopDNSClientRow and their *Report wrappers with generated_at), each using DB + CurrentUser deps and a per-endpoint require_permission gate; mirror dashboards/network.py + security.py aggregation style (func.count, group_by, order_by(desc(...)).limit(10))"
+    ],
+    "backend_modified_files": [
+      "backend/app/services/ai/tools/reports.py :: NEW file \u2014 register find_top_subnets_by_utilization / find_top_owners_by_ip_count / find_top_modified_resources / find_top_dns_clients read tools via register_tool(...) with module=\"reports.top_n\", category=\"reports\" (mirror services/ai/tools/integrations.py:65-79 register_tool shape)",
+      "backend/app/services/ai/tools/__init__.py :: add `reports` to the side-effect import tuple (currently lines 11-42) so the new tools register on import"
+    ],
+    "shared_files": [
+      "backend/app/api/v1/router.py :: add import `from app.api.v1.reports import router as reports_router` (alongside line 53-ish, alpha order after proxmox/roles) AND include `api_v1_router.include_router(reports_router, prefix=\"/reports\", tags=[\"reports\"], dependencies=[Depends(require_module(\"reports.top_n\"))])` inserted in alpha order (after roles_router line 253, before search_router line 254)",
+      "backend/app/services/feature_modules.py :: append `ModuleSpec(id=\"reports.top_n\", label=\"Top-N Reports\", group=\"Compliance\", description=\"Fixed Top-N dashboard reports (subnet utilization, owner IP counts, most-modified resources, noisiest DNS clients) derived from existing tables.\")` to the MODULES tuple (after line 141 in the Compliance group, or a new bucket; default_enabled omitted = True per #14 discovery argument)",
+      "frontend/src/lib/api.ts :: add `reportsApi` client object + response interfaces (TopSubnetReport, TopOwnerReport, TopModifiedResourceReport, TopDNSClientReport) immediately after dashboardsApi (line 7170), each calling api.get(\"/reports/<name>\").then(r => r.data)",
+      "frontend/src/components/layout/Sidebar.tsx :: add `const reportsNav = [{ label: \"Top-N Reports\", icon: BarChart3, to: \"/reports\", module: \"reports.top_n\" }]` near operationsNav (line 103) and render it as a filterByModule(...)-gated section (mirror the Operations CollapsibleNavSection at lines 627-643); import a BarChart3 icon from lucide-react",
+      "frontend/src/App.tsx :: add `<Route path=\"reports\" element={<ReportsPage />} />` inside the authenticated layout (alongside line 97 dashboard route) and a top import `import { ReportsPage } from \"@/pages/ReportsPage\";`"
+    ],
+    "endpoints": [
+      "GET /api/v1/reports/top-subnets-by-utilization :: require_permission(\"read\", \"subnet\") + router-level require_module(\"reports.top_n\")",
+      "GET /api/v1/reports/top-owners-by-ip-count :: require_permission(\"read\", \"ip_address\")",
+      "GET /api/v1/reports/top-modified-resources :: require_permission(\"read\", \"audit_log\")",
+      "GET /api/v1/reports/top-dns-clients :: require_permission(\"read\", \"dns_query_log\") (confirm exact resource_type string used by the Logs surface for DNS query logs; fall back to require_any_permission((\"read\",\"dns_query_log\"),(\"read\",\"dns_server\")) if dns_query_log is not a registered resource_type)"
+    ],
+    "feature_module": {
+      "needed": true,
+      "key": "reports.top_n",
+      "default_enabled": true,
+      "rationale": "Issue #47 adds a new top-level sidebar section + REST router prefix (/reports) + MCP tool cluster \u2014 exactly the trigger in non-negotiable #14. Default-enabled per #13's discovery argument (read-only, no secrets, no off-prem calls, no blast radius). Gate the router include with require_module(\"reports.top_n\"), tag MCP tools with module=\"reports.top_n\", and carry module:\"reports.top_n\" on the sidebar NavItem. No INTEGRATION_SETTINGS_MIRROR entry (not an integration). Migration to seed a feature_module row is normally required by #14(b), but since default_enabled=True the absence of a row resolves to enabled (feature_modules.py:307), so a seed migration is OPTIONAL here \u2014 flag for integrator: add a seed row only if the install convention requires every module to have an explicit row."
+    },
+    "mcp_tools": [
+      "find_top_subnets_by_utilization :: find :: default_enabled true :: read-only Top-N over subnet.utilization_percent; no secrets, on-prem",
+      "find_top_owners_by_ip_count :: count :: default_enabled true :: aggregates ip_address counts by owning customer/site; on-prem read",
+      "find_top_modified_resources :: find :: default_enabled true :: audit_log group-by over a 7d window; read-only, on-prem (audit data is already exposed via find/list audit tools)",
+      "find_top_dns_clients :: count :: default_enabled true :: dns_query_log_entry group-by client_ip; on-prem read, no secrets"
+    ],
+    "frontend_new_files": [
+      "frontend/src/pages/ReportsPage.tsx :: page with four cards (one per report), each a useQuery against reportsApi.* rendering a ranked table; mirror the panel/card layout + loading/empty states used in DashboardPage.tsx sub-panels (e.g. the top-subnets + activity-feed panels) and the card primitives in components/ui"
+    ],
+    "frontend_modified_files": [
+      "(none beyond the shared files: api.ts, Sidebar.tsx, App.tsx are listed under shared_files)"
+    ],
+    "precedents": [
+      "backend/app/api/v1/dashboards/network.py:134-356 :: canonical server-side rollup endpoint shape (DB+CurrentUser deps, Pydantic row models, _DETAIL_LIMIT=10, generated_at clock)",
+      "backend/app/api/v1/dashboards/security.py:204-261 :: audit_log group-by + windowed (timedelta) aggregation precedent for most-modified-resources and the failed-login group-by pattern",
+      "backend/app/api/v1/dashboards/__init__.py:16-27 :: per-tab sub-router composition pattern to copy for reports/__init__.py",
+      "backend/app/services/ai/tools/integrations.py:40-90 :: register_tool(...) shape with module= gating + narrow read-only output for the find_top_* tools",
+      "backend/app/services/feature_modules.py:60-242 + 136-141 :: MODULES ModuleSpec catalog (Compliance group) \u2014 where to append reports.top_n",
+      "backend/app/api/v1/router.py:253-254 + 100-105 :: include_router with dependencies=[Depends(require_module(...))] enforcement pattern (#14)",
+      "frontend/src/components/layout/Sidebar.tsx:103,124-194,627-643 :: nav array + module-gated CollapsibleNavSection render pattern",
+      "frontend/src/lib/api.ts:7157-7170 :: dashboardsApi client object to mirror for reportsApi"
+    ],
+    "tests": [
+      "backend/tests/api/v1/test_reports.py :: per-endpoint: 200 shape (ranked, capped at 10, ordered desc); top-subnets ordering by utilization_percent; top-owners join math (IPAddress\u2192Subnet.customer_id/site_id counts, IPs in subnets with no owner excluded or bucketed as 'unowned' per resolution of open question); most-modified honours the 7d window boundary; noisiest-dns-clients group-by client_ip count; empty-table \u2192 empty list not error",
+      "backend/tests/api/v1/test_reports.py :: permission gates \u2014 a user lacking read on subnet/ip_address/audit_log/dns_query_log gets 403 per endpoint; require_module off \u2192 whole /reports prefix 404s (mirror feature_modules gate test)",
+      "backend/tests/services/ai/test_reports_tools.py :: each find_top_* tool registered, read-only (writes=False), module=\"reports.top_n\", returns capped ranked rows; tool stripped from effective set when reports.top_n disabled (effective_tool_names with enabled_modules excluding it)"
+    ],
+    "open_questions": [
+      "\"Top 10 owners by IP count\": the issue prompt says owners are the Customer/Site/Provider FKs ON IPAddress, but IPAddress has NO such FKs (ipam.py only has owner_user_id/owner_group_id at 754-758). Ownership FKs (customer_id/site_id) live on Subnet (687/693) and IPBlock (345/351). Resolve: (a) define 'owner' as the Subnet-level customer (join IPAddress\u2192Subnet\u2192Customer) \u2014 recommended, or (b) use IPAddress.owner_user_id/owner_group_id, or (c) report all three owner dimensions. Provider has no IPAM ownership FK at all (only circuits/domains), so 'Provider by IP count' is not derivable without a join through circuits \u2014 likely drop Provider from this report.",
+      "How should IPs in subnets with no customer/site owner be handled in the top-owners report \u2014 excluded entirely, or bucketed as a single 'Unowned' row? (affects whether the Top-10 is meaningful on installs that don't use the ownership module).",
+      "Exact RBAC resource_type string for the DNS query log read gate \u2014 confirm whether the Logs surface registers `dns_query_log`, or whether it gates on `dns_server` / a logs-specific permission; pick the matching one for the top-dns-clients endpoint.",
+      "Sidebar placement: put 'Top-N Reports' in its own new 'Reports' section, or fold it into the existing 'Operations' section (Sidebar.tsx:103) alongside Logs since both are cross-cutting telemetry. Recommend a small dedicated Reports section for discoverability.",
+      "Whether to seed an explicit feature_module row for reports.top_n in a data-only migration \u2014 not strictly required since default_enabled=True resolves to on without a row, but some installs may expect every catalog module to have a seeded row."
+    ]
+  },
+  {
+    "issue": 57,
+    "summary": "Add a global, system-wide read-only \"maintenance mode\" driven by three new PlatformSettings columns (maintenance_mode_enabled / maintenance_message / maintenance_started_at). Enforce via a new Starlette BaseHTTPMiddleware (app.core.maintenance_mode) registered in main.create_app() that 503s every mutating request (POST/PUT/PATCH/DELETE) with a Retry-After header and a structured body \u2014 with a superadmin bypass (decode the bearer in-middleware, check is_effective_superadmin) and an exempt-path allowlist (auth, the settings toggle, agent long-polls/heartbeats). Surface the flag through /health/platform, render a new global top banner (distinct from the existing appliance host-maintenance banner), add a Security-group toggle on SettingsPage, audit the toggle (#4), and register read + write MCP tools (#13).",
+    "complexity": "M",
+    "migration": {
+      "needed": true,
+      "detail": "Add 3 columns to platform_settings (singleton): maintenance_mode_enabled BOOLEAN NOT NULL server_default false; maintenance_message VARCHAR(500) NOT NULL server_default ''; maintenance_started_at TIMESTAMPTZ NULL. One new alembic revision mirroring backend/alembic/versions/a3f1e9c47b20_platform_settings_verbose_boot.py exactly (op.add_column x3 in upgrade, op.drop_column x3 in downgrade). down_revision = current head c7a3e1f90d24 (subnet_utilization_history) \u2014 confirm head at write time via `alembic heads`."
+    },
+    "backend_new_files": [
+      "backend/app/core/maintenance_mode.py :: MaintenanceModeMiddleware (Starlette BaseHTTPMiddleware) + helpers. Holds a process-local short-TTL cache of (enabled, message, started_at) read from platform_settings (mirror the feature_modules.py monotonic + _CACHE_TTL_S=5.0 + invalidate_cache() pattern). dispatch(): if request.method in {POST,PUT,PATCH,DELETE} and path not in EXEMPT_PREFIXES and maintenance enabled -> attempt superadmin bypass (decode bearer via app.core.security.decode_access_token / _resolve_api_token-style lookup; reuse app.api.deps logic minimally, fall back to NO bypass on any decode failure) -> if not effective superadmin return JSONResponse(503, {detail, maintenance: true, message, started_at}, headers={'Retry-After': '120'}). Export is_maintenance_mode(db)/get_maintenance_state(db) + invalidate_cache() for the settings router to call after a toggle. EXEMPT_PREFIXES must include /api/v1/auth (login/refresh/logout), /api/v1/settings (so superadmin can toggle it off \u2014 though superadmin bypass already covers this, keep belt-and-suspenders), /health, /metrics, and agent endpoints that POST heartbeats/long-polls (/api/v1/dns/agents, /api/v1/dhcp/agents, /api/v1/appliance/supervisor) so a maintenance window doesn't break agent config caching (non-negotiable #5).",
+      "backend/app/services/ai/tools/maintenance.py :: two @register_tool entries mirroring backend/app/services/ai/tools/ops.py: maintenance_status (find, read-only, default_enabled True, module=None) returns enabled/message/started_at; set_maintenance_mode (propose/write, writes=True, default_enabled False, module=None) toggles the flag through the same service path + writes AuditLog. Both category='ops'."
+    ],
+    "backend_modified_files": [
+      "backend/app/models/settings.py :: add maintenance_mode_enabled (Boolean, default False, server_default false), maintenance_message (String(500), default ''), maintenance_started_at (DateTime(timezone=True), nullable=True) to PlatformSettings, grouped under a new '\u2500\u2500 Maintenance mode (issue #57) \u2500\u2500' comment block near the other security/session fields.",
+      "backend/app/main.py :: register the new middleware in create_app() (app.add_middleware(MaintenanceModeMiddleware)) \u2014 add it AFTER RequestContextMiddleware so request_id is bound for the 503 log line; document ordering in the existing 'Middleware (outermost first)' comment block (~line 437).",
+      "backend/app/api/v1/settings/router.py :: add maintenance_mode_enabled/maintenance_message/maintenance_started_at to SettingsResponse and the first three (not started_at \u2014 that is server-managed, set automatically) to SettingsUpdate; in update_settings() after commit, when maintenance_mode_enabled flips, stamp/clear maintenance_started_at (set to now() on enable, None on disable), write a dedicated AuditLog row (action 'maintenance_mode.enabled'/'maintenance_mode.disabled', resource_type 'platform_settings', resource_id 'maintenance', new_value {message}) \u2014 the generic logger.info is not an audit row, #4 requires the AuditLog insert \u2014 and call maintenance_mode.invalidate_cache() so the toggling worker sees it instantly. Add a field_validator capping maintenance_message length.",
+      "backend/app/api/health.py :: in platform_health() add maintenance_mode (+ message + started_at) to the returned JSON content dict (~line 416) by reading platform_settings via the existing AsyncSessionLocal block, so the frontend banner has a single poll source like demo_mode.",
+      "backend/app/services/ai/tools/__init__.py :: add side-effect import of the new tools/maintenance.py module so its @register_tool decorators populate REGISTRY (#13)."
+    ],
+    "shared_files": [
+      "backend/app/main.py :: app.add_middleware(MaintenanceModeMiddleware) in create_app(), after RequestContextMiddleware",
+      "backend/app/api/v1/settings/router.py :: extend SettingsResponse + SettingsUpdate with maintenance_mode_enabled/maintenance_message (+ response-only maintenance_started_at); audit + invalidate_cache on toggle",
+      "backend/app/api/health.py :: add maintenance_mode/message/started_at to /health/platform JSON content",
+      "frontend/src/lib/api.ts :: add maintenance_mode_enabled:boolean; maintenance_message:string; maintenance_started_at:string|null to interface PlatformSettings (~line 2858); add maintenance_mode?/maintenance_message?/maintenance_started_at? to interface PlatformHealthResponse (~line 8969); OPTIONAL global 503 handling in the response interceptor (~line 67) to surface a toast on Retry-After 503",
+      "frontend/src/components/layout/AppLayout.tsx :: import + render <MaintenanceModeBanner /> in the banner stack (after DemoBanner/SetupBanner, ~line 31) \u2014 note: NOT the existing MaintenanceBanner which is the appliance host-maintenance banner",
+      "backend/app/services/ai/tools/__init__.py :: side-effect import of app.services.ai.tools.maintenance (#13)",
+      "backend/alembic/versions/<new>_platform_settings_maintenance_mode.py :: down_revision = c7a3e1f90d24 (verify head)"
+    ],
+    "endpoints": [
+      "GET /api/v1/settings :: read (any authenticated user via CurrentUser) \u2014 now also returns maintenance fields",
+      "PUT /api/v1/settings :: write on 'settings' (user_has_permission write/settings; superadmin bypasses) \u2014 now also accepts maintenance_mode_enabled/maintenance_message; this endpoint is exempt from the maintenance write-block so a superadmin can disable the mode",
+      "GET /health/platform :: unauthenticated rollup \u2014 now also returns maintenance_mode/message/started_at (no new endpoint; field added)",
+      "(enforcement, not an endpoint) :: every POST/PUT/PATCH/DELETE under /api/v1 except the EXEMPT_PREFIXES allowlist returns 503 + Retry-After when maintenance is on and caller is not an effective superadmin"
+    ],
+    "feature_module": {
+      "needed": false,
+      "key": "",
+      "default_enabled": false,
+      "rationale": "Maintenance mode is a global operational safety toggle (like demo_mode), not an optional feature surface. It must always be present and reachable so an operator can never be locked out of disabling it; gating it behind a feature_module that could be turned off would be a footgun. Mirror demo_mode's always-on shape, not the feature_modules MODULES catalog."
+    },
+    "mcp_tools": [
+      "maintenance_status :: find :: default_enabled true :: read-only rollup of current maintenance state (enabled/message/started_at) so the copilot can answer 'is the system in maintenance?'",
+      "set_maintenance_mode :: propose :: default_enabled false :: write tool (writes=True) that toggles maintenance mode + writes an AuditLog row; ships disabled-by-default like the other propose-* write tools so operators opt in via Settings -> AI -> Tool Catalog"
+    ],
+    "frontend_new_files": [
+      "frontend/src/components/layout/MaintenanceModeBanner.tsx :: new global banner, mirroring frontend/src/components/layout/DemoBanner.tsx (useQuery on platformHealthApi.get(), staleTime 60s). Renders an amber/red top banner when data.maintenance_mode is true, showing maintenance_message + 'system is read-only'. MUST be a distinct component from the existing appliance-host MaintenanceBanner.tsx (which polls applianceSystemApi.info + version.appliance_mode and is about draining DNS/DHCP traffic, a different concept)."
+    ],
+    "frontend_modified_files": [
+      "frontend/src/lib/api.ts :: extend interface PlatformSettings (maintenance_mode_enabled/maintenance_message/maintenance_started_at) and interface PlatformHealthResponse (maintenance_mode?/maintenance_message?/maintenance_started_at?); optionally add a 503/Retry-After branch in the axios response interceptor to toast 'System is in maintenance mode'.",
+      "frontend/src/components/layout/AppLayout.tsx :: import and render <MaintenanceModeBanner /> in the banner stack.",
+      "frontend/src/pages/SettingsPage.tsx :: add a 'maintenance-mode' SectionId in the Security SectionGroup; add SECTION_FIELDS['maintenance-mode'] = ['maintenance_mode_enabled','maintenance_message']; add the SectionDef to SECTIONS (group 'Security', keywords ['maintenance','read-only','503','change window','freeze']); render a switch + message textarea bound to the existing settings form/mutation. Add 'maintenance_mode_enabled'/'maintenance_message' to the form's editable field set."
+    ],
+    "precedents": [
+      "backend/app/main.py:411 RequestContextMiddleware (BaseHTTPMiddleware shape to copy) and main.py:492-523 the existing 503 + Retry-After JSONResponse for transient DB errors (exact response shape + Retry-After header precedent)",
+      "backend/app/core/demo_mode.py:58-73 is_demo_mode()/forbid_in_demo_mode() (the global-lockdown precedent the issue calls strongest) and health.py:414-422 surfacing demo_mode through /health/platform",
+      "backend/app/services/feature_modules.py:277-313 process-local monotonic short-TTL cache + invalidate_cache() (copy this for the maintenance flag cache so the middleware doesn't hit the DB per request)",
+      "backend/app/api/v1/admin/feature_modules.py:99-123 toggle handler that writes an AuditLog row + busts cache (the #4 audit-on-toggle pattern to mirror in settings router)",
+      "backend/app/api/deps.py:88-159 get_current_user / decode_access_token usage + _resolve_api_token (how to resolve a bearer to a User for the superadmin bypass inside middleware) and core/permissions.py:91-116 is_effective_superadmin",
+      "frontend/src/components/layout/DemoBanner.tsx (global banner mirror) vs frontend/src/components/layout/MaintenanceBanner.tsx (the DIFFERENT appliance-host banner to NOT confuse with)",
+      "backend/app/services/ai/tools/ops.py:46-72 @register_tool usage + base.py:41-77 Tool(writes/default_enabled/module) for the two MCP tools"
+    ],
+    "tests": [
+      "backend/tests/test_maintenance_mode.py :: middleware blocks POST/PUT/PATCH/DELETE with 503 + Retry-After header + structured body when enabled; GET/HEAD always pass; superadmin bearer bypasses (still gets 2xx); non-superadmin with write/settings is blocked on non-settings writes; PUT /settings remains reachable for superadmin to disable; exempt agent heartbeat/auth paths still pass; cache invalidation makes a fresh toggle take effect within the same worker",
+      "backend/tests/test_settings_maintenance.py :: PUT /settings toggling maintenance_mode_enabled stamps maintenance_started_at on enable and clears it on disable; writes an AuditLog row (action maintenance_mode.enabled/disabled, result success); GET /settings + /health/platform expose the fields; message length validator 422s on overlong input",
+      "backend/tests/test_ai_tools_maintenance.py :: maintenance_status returns current state; set_maintenance_mode is writes=True + default_enabled False and writes an audit row when invoked",
+      "frontend: MaintenanceModeBanner renders only when platform-health maintenance_mode is true and shows the message; assert it is independent of appliance_mode"
+    ],
+    "open_questions": [
+      "Superadmin-bypass resolution inside middleware: BaseHTTPMiddleware runs before FastAPI dependency injection, so there is no CurrentUser. Plan resolves the bearer by reusing decode_access_token + a User lookup (and sddi_ API-token path). Confirm the integrator is OK with the middleware opening its own AsyncSessionLocal for the (cached) flag read + the per-request user lookup, OR prefer a different bypass signal (e.g. require the superadmin to pass a header / use a dependency on a shared write-router base). A dependency-based approach would avoid the DB-in-middleware concern but would require touching all 64 routers \u2014 middleware is the lower-collision choice.",
+      "Retry-After value: fixed 120s vs derived from maintenance_started_at / an operator-set ETA. Plan uses a fixed 120 unless the issue owner wants an estimated-end column (would add a 4th platform_settings column).",
+      "Should API-token (sddi_) write requests by a superadmin-owned token also bypass, or should maintenance mode block all token-driven writes regardless of owner (stricter change-freeze semantics)? Plan currently bypasses for effective-superadmin users including their tokens; confirm.",
+      "Exempt-path list completeness: confirm the full set of agent/heartbeat POST endpoints that must stay writable during a window (DNS agents, DHCP agents, supervisor heartbeat) so config-caching (#5) and lease/registration flows are not broken \u2014 needs a grep of agent-facing POST routes at implementation time."
+    ]
+  },
+  {
+    "issue": 58,
+    "summary": "Add a stateless, synchronous /tools network-utilities page that runs ping/traceroute/MTR/dig/whois from the SpatiumDDI server perspective (subprocess), port-test (asyncio TCP/UDP socket), TLS cert check (asyncio ssl + cryptography), DNS-propagation-check (reuse the existing dns_tools multi-resolver helper), and MAC vendor lookup (reuse services/oui.bulk_lookup_vendors). Model it on the existing dns_tools.py synchronous-router pattern (NOT nmap's persisted-scan/SSE model \u2014 these are fast request/response calls, no DB rows, no migration for storage). Gate the whole surface behind a new default-enabled `tools.network` feature module + a new `use_network_tools` permission, and add per-IP Redis rate-limiting mirroring core/auth_throttle.py. v1 is server-perspective only; the chosen-agent perspective is deferred because no agent ad-hoc command-dispatch path exists (DNS/DHCP agents only long-poll config; supervisor subprocess is role-orchestration only).",
+    "complexity": "L",
+    "migration": {
+      "needed": true,
+      "detail": "ONE migration seeding the feature_module row only: INSERT into feature_module (id='tools.network', enabled=true) mirroring backend/alembic/versions/c4f7a1d3e589_feature_module_table.py + the tools.nmap seed pattern. NO results table (tools are stateless request/response \u2014 like dns_tools.py). NO platform_settings column needed (rate-limit budgets are code constants like _LOGIN_RL_MAX in auth_throttle.py; the module toggle is the enable switch). The new permission `use_network_tools` is code-owned via main.py _BUILTIN_ROLES and needs no migration."
+    },
+    "backend_new_files": [
+      "backend/app/api/v1/tools/__init__.py :: package init re-exporting `router` (mirror api/v1/nmap/__init__.py)",
+      "backend/app/api/v1/tools/router.py :: APIRouter with one POST endpoint per tool (/ping /traceroute /mtr /dig /whois /port-test /tls-cert /dns-propagation /mac-vendor), each gated by Depends(require_permission('read','use_network_tools')) and a rate-limit dep; thin handlers delegating to services/nettools",
+      "backend/app/api/v1/tools/schemas.py :: Pydantic request/response models per tool (PingRequest/PingResult, TracerouteResult, MtrResult, DigRequest/DigResult, WhoisResult, PortTestRequest/PortTestResult, TlsCertRequest/TlsCertResult, MacVendorRequest/MacVendorResult) with tight field_validators (target host/IP/CIDR validation mirroring nmap runner._validate_target, port-spec, record_type allowlist from dns_tools)",
+      "backend/app/services/nettools/__init__.py :: package init exporting tool runner functions",
+      "backend/app/services/nettools/runner.py :: async subprocess runners for ping/traceroute/mtr/dig/whois using asyncio.create_subprocess_exec (NEVER shell) + shlex-validated argv + argv allowlist, mirroring services/nmap/runner.py build_argv/_validate_target security model; per-call asyncio timeout (e.g. 30s)",
+      "backend/app/services/nettools/socket_tools.py :: port-test (asyncio.open_connection / DatagramProtocol) + TLS cert check (asyncio ssl.create_default_context with check_hostname off for inspection + cryptography.x509 to parse subject/SAN/issuer/notBefore/notAfter/days_remaining), no subprocess",
+      "backend/app/services/nettools/throttle.py :: Redis per-user/per-IP token-bucket gate copied from core/auth_throttle.py login_rate_limited (fail-open on Redis outage); FastAPI dependency that raises 429 when budget exceeded",
+      "backend/app/services/ai/tools/nettools.py :: MCP tools (network_ping, network_traceroute, network_dig, network_port_test, network_tls_cert, lookup_mac_vendor) registered via register_tool(module='tools.network')"
+    ],
+    "backend_modified_files": [
+      "backend/app/api/v1/router.py :: import + include the new tools router (see shared_files)",
+      "backend/app/services/feature_modules.py :: add ModuleSpec(id='tools.network', ...) to MODULES tuple (see shared_files)",
+      "backend/app/main.py :: add {'action':'admin','resource_type':'use_network_tools'} to the 'Network Editor' _BUILTIN_ROLES perms list (and consider Viewer read) so the seeded role can use the page",
+      "backend/app/services/ai/tools/__init__.py :: import the new nettools MCP module so register_tool decorators run on import (mirror how nmap/whois/vendor modules are imported)",
+      "backend/app/core/permissions.py :: NO code change needed (permission grammar is data-driven); listed only to confirm `use_network_tools` is a free-form resource_type string used in require_permission('read','use_network_tools')"
+    ],
+    "shared_files": [
+      "backend/app/api/v1/router.py :: add `from app.api.v1.tools.router import router as tools_router` in the alphabetised import block (after `tailscale`/before `unifi` region, sort key 't'), and add `api_v1_router.include_router(tools_router, prefix=\"/tools\", tags=[\"tools\"], dependencies=[Depends(require_module(\"tools.network\"))])` in the alphabetised include block. NOTE: prefix collision risk \u2014 `/dns/tools` (dns_tools_router) and `/nmap/scans` already exist; `/tools` is currently unused as an API prefix (the frontend /tools/* routes are client-side only), so `/api/v1/tools` is free.",
+      "backend/app/services/feature_modules.py :: append to MODULES tuple in the `# Tools.` group (next to tools.nmap, ~line 142): ModuleSpec(id=\"tools.network\", label=\"Network tools\", group=\"Tools\", description=\"Built-in ping / traceroute / MTR / dig / whois / port-test / TLS cert / DNS-propagation / MAC-vendor utilities run from the server perspective. Permission-gated + rate-limited.\") \u2014 default_enabled defaults to True (#14 discovery).",
+      "frontend/src/lib/api.ts :: add `export const networkToolsApi = { ping, traceroute, mtr, dig, whois, portTest, tlsCert, dnsPropagation, macVendor }` block with one POST helper per endpoint + matching TS interfaces, modeled on the dnsApi propagation-check helpers (~line 4462) and nmapApi shape. No SSE/streamUrl needed (synchronous).",
+      "frontend/src/components/layout/Sidebar.tsx :: add `{ label: \"Network Tools\", icon: Wrench, to: \"/tools/network\", module: \"tools.network\" }` to the toolsNav array (~line 195, next to CIDR Calculator + Nmap). The Tools NavSection + filterByModule(toolsNav) already exist (~line 694) \u2014 no section wiring needed.",
+      "frontend/src/App.tsx :: add `import { NetworkToolsPage } from \"@/pages/tools/NetworkToolsPage\";` (~line 42) and `<Route path=\"tools/network\" element={<NetworkToolsPage />} />` in the routes block (~line 141, beside tools/nmap + tools/cidr).",
+      "backend/app/services/ai/tools/__init__.py :: add `from app.services.ai.tools import nettools  # noqa: F401` alongside the existing tool-module imports so the new register_tool calls execute at import time."
+    ],
+    "endpoints": [
+      "POST /api/v1/tools/ping :: require_permission('read','use_network_tools') + require_module('tools.network') + rate-limit",
+      "POST /api/v1/tools/traceroute :: require_permission('read','use_network_tools') + module + rate-limit",
+      "POST /api/v1/tools/mtr :: require_permission('read','use_network_tools') + module + rate-limit",
+      "POST /api/v1/tools/dig :: require_permission('read','use_network_tools') + module + rate-limit",
+      "POST /api/v1/tools/whois :: require_permission('read','use_network_tools') + module + rate-limit (outbound RDAP/whois \u2014 see open question on egress)",
+      "POST /api/v1/tools/port-test :: require_permission('read','use_network_tools') + module + rate-limit",
+      "POST /api/v1/tools/tls-cert :: require_permission('read','use_network_tools') + module + rate-limit",
+      "POST /api/v1/tools/dns-propagation :: require_permission('read','use_network_tools') + module + rate-limit (reuses dns_tools propagation helper)",
+      "POST /api/v1/tools/mac-vendor :: require_permission('read','use_network_tools') + module + rate-limit (reuses services/oui.bulk_lookup_vendors)"
+    ],
+    "feature_module": {
+      "needed": true,
+      "key": "tools.network",
+      "default_enabled": true,
+      "rationale": "New top-level sidebar surface + REST router prefix + MCP tool cluster => #14 mandates evaluation. Default-enabled per #13/#14 discovery argument (operators turn off what they don't use); the tools touch the network but only read/probe (no mutations, no secrets), so no blast-radius reason to default off. Mirrors the existing tools.nmap module exactly."
+    },
+    "mcp_tools": [
+      "network_ping :: propose-style read (find) :: default_enabled true :: ICMP/TCP ping from server; read-only probe, on-prem, module=tools.network",
+      "network_traceroute :: find :: default_enabled true :: path trace from server; read-only, on-prem, module=tools.network",
+      "network_dig :: find :: default_enabled true :: DNS lookup against a chosen resolver; read-only, module=tools.network",
+      "network_port_test :: find :: default_enabled true :: single TCP/UDP port reachability check from server; read-only, module=tools.network",
+      "network_tls_cert :: find :: default_enabled true :: fetch + parse a host's TLS cert (subject/SAN/expiry); read-only, module=tools.network",
+      "lookup_mac_vendor :: find :: default_enabled true :: OUI vendor lookup via existing oui_vendor table; purely local DB read, module=tools.network",
+      "network_whois :: find :: default_enabled FALSE :: makes outbound RDAP/whois calls to public servers (off-prem egress) \u2014 mirrors whois.py lookup_whois_* which ship default_enabled=False; operator opts in. module=tools.network"
+    ],
+    "frontend_new_files": [
+      "frontend/src/pages/tools/NetworkToolsPage.tsx :: top-level page with a left tool-picker / tabbed tool selector and a right results panel; each tool is a small form (target/host + tool-specific options) + a result render. Model the right-panel tab UX on NmapToolsPage.tsx (left form, right result panel) but WITHOUT SSE/live streaming \u2014 results are synchronous request/response. Add a (disabled, tooltip 'coming soon') agent-perspective dropdown placeholder per the deferred scope.",
+      "frontend/src/pages/tools/_tools/PingTool.tsx :: ping form + monospace output panel (optional split if NetworkToolsPage gets large)",
+      "frontend/src/pages/tools/_tools/TracerouteTool.tsx :: traceroute/MTR hop-table render",
+      "frontend/src/pages/tools/_tools/DigTool.tsx :: dig form (name + record_type allowlist) + answer render",
+      "frontend/src/pages/tools/_tools/WhoisTool.tsx :: whois/RDAP result render (reuse Domains-page WHOIS panel shape)",
+      "frontend/src/pages/tools/_tools/PortTestTool.tsx :: port-test form + open/closed/filtered badge",
+      "frontend/src/pages/tools/_tools/TlsCertTool.tsx :: TLS cert subject/SAN/issuer/expiry card with days-remaining colouring",
+      "frontend/src/pages/tools/_tools/MacVendorTool.tsx :: MAC input + vendor result"
+    ],
+    "frontend_modified_files": [
+      "frontend/src/components/layout/Sidebar.tsx :: add Network Tools NavItem to toolsNav (see shared_files)",
+      "frontend/src/App.tsx :: add NetworkToolsPage import + /tools/network route (see shared_files)",
+      "frontend/src/lib/api.ts :: add networkToolsApi block + TS interfaces (see shared_files)"
+    ],
+    "precedents": [
+      "backend/app/api/v1/dns_tools.py :: closest precedent \u2014 a synchronous, stateless tools router with prefix='/tools', a router-level permission Depends, asyncio.gather parallel resolver queries, and a propagation-check endpoint that should be REUSED for the DNS-propagation tool (move/share the _query_one + DEFAULT_RESOLVERS helpers)",
+      "backend/app/services/nmap/runner.py:121-243 :: _validate_target / _validate_port_spec / _validate_extra_args / build_argv + create_subprocess_exec security model to mirror for ping/traceroute/mtr/dig/whois argv construction (never shell, shlex-validate, metachar reject, timeout)",
+      "backend/app/services/oui.py:112 :: bulk_lookup_vendors(db, macs) + normalize_mac_key \u2014 REUSE directly for the mac-vendor tool (note it short-circuits to {} when PlatformSettings.oui_lookup_enabled is False \u2014 surface that state to the UI)",
+      "backend/app/core/auth_throttle.py:38 :: login_rate_limited Redis per-IP token pattern (incr + expire, fail-open) \u2014 copy for the per-user/per-IP tools rate limiter; budgets as code constants",
+      "backend/app/services/rdap.py:291 + rdap_ip.py:152 + rdap_asn.py :: lookup_domain/lookup_ip/lookup_asn for the whois tool; also see services/ai/tools/whois.py for the default_enabled=False off-prem-egress MCP pattern to copy",
+      "backend/app/api/v1/router.py:229-234 + services/feature_modules.py:143 + main.py:122 + Sidebar.tsx:197 :: the complete tools.nmap wiring (router include with require_module, ModuleSpec, builtin-role perm, sidebar NavItem with module key) \u2014 replicate exactly for tools.network",
+      "frontend/src/pages/nmap/NmapToolsPage.tsx + frontend/src/lib/api.ts:10358 (nmapApi) :: left-form/right-result-panel + tab UX and api client shape to mirror (drop the SSE streamUrl + history-persistence parts)"
+    ],
+    "tests": [
+      "backend/tests/test_tools_router.py :: each endpoint returns 200 with valid input + structured result; 403 without use_network_tools permission; 404 when tools.network module disabled (require_module); 429 when rate limit exceeded; 422 on bad target/port/record_type validation",
+      "backend/tests/test_nettools_runner.py :: build_argv-style argv validation rejects shell metachars / injection in target + extra options; subprocess timeout path; binary-missing path (ping/mtr not installed) surfaces a clean error not a 500",
+      "backend/tests/test_nettools_socket.py :: port-test open/closed/filtered classification (mock asyncio.open_connection); tls-cert parse of a known cert returns subject/SAN/issuer/expiry/days_remaining; expired-cert + hostname-mismatch handling",
+      "backend/tests/test_tools_mac_vendor.py :: reuse oui fixture; returns vendor for known OUI, empty/None for unknown, short-circuits when oui_lookup_enabled False (mirror existing test_oui_voip_phone.py)",
+      "backend/tests/test_nettools_mcp.py :: registry contains the 7 MCP tools; network_whois has default_enabled=False; all carry module='tools.network'; module disabled strips them from the effective set (filter_to_enabled_tools)"
+    ],
+    "open_questions": [
+      "Permission model: introduce a dedicated `use_network_tools` permission (recommended, granted to Network Editor + optionally Viewer) vs. ride the existing dns_tools pattern of require_any_resource_permission across network resource types. Integrator should confirm the new resource_type string and which builtin roles get it.",
+      "Are ping/traceroute/mtr/whois binaries guaranteed in the API container image? nmap is already documented as needing install (runner.py:462). The Dockerfile (backend image) must add iputils-ping, traceroute, mtr-tiny, dnsutils(dig), whois \u2014 flag this to the deployment owner; otherwise tools return a clean 'binary not found' error like nmap does.",
+      "Rate-limit scope + budget: per-IP (like auth_throttle) vs per-user vs per-(user,tool). Pick a default budget (e.g. 20 calls / 60s / user) and whether whois/dns-propagation (off-prem) get a tighter budget.",
+      "Agent-perspective: confirmed deferred for v1 (no agent ad-hoc command-dispatch path exists \u2014 DNS/DHCP agents only long-poll config bundles; supervisor subprocess is role-orchestration only). A future agent-perspective would need a new command-dispatch channel (likely a Redis/long-poll command queue on the agent) \u2014 out of scope here; the UI should render a disabled 'Run from: <server> | <agent>' selector placeholder.",
+      "Synchronous-but-slow tools (traceroute/MTR can take 20-60s): run inline with a hard asyncio timeout (simplest, matches dns_tools) vs. a short-lived job. Recommend inline + timeout + frontend loading spinner; confirm acceptable request duration under the app's reverse-proxy timeout.",
+      "MTR availability: mtr typically needs raw-socket / CAP_NET_RAW; in a non-root API container it may degrade. Decide whether to ship MTR in v1 or fold it into traceroute (mtr --report) with a documented privilege caveat."
+    ]
+  },
+  {
+    "issue": 65,
+    "summary": "Add a `time_bound_grant` table (group_id, action, resource_type, resource_id, expires_at, granted_by, reason, revoked_at) that is consulted live by `user_has_permission` as an additive union over the static role grants. Live grants are loaded once per request in `app.api.deps` (both the JWT path `get_current_user` and the API-token path `_resolve_api_token`) and stashed on the User object so the synchronous `user_has_permission` can walk them without an async call. A Celery beat sweep (run_every=60s) deactivates rows whose `expires_at` has passed, writing one `audit_log` row per revoked grant attributed to the synthetic `system` user. CRUD lives on the existing `/groups` surface as a sub-router; the Groups admin page gets a per-group \"Time-bound access\" panel plus a create-grant modal with an expiry picker. MCP gets `find_time_bound_grants` (read, default-enabled) and `propose_grant_temporary_access` (write proposal, default-disabled).",
+    "complexity": "L",
+    "migration": {
+      "needed": true,
+      "detail": "New table `time_bound_grant`: id UUID PK (default uuid4); group_id UUID FK -> group.id ON DELETE CASCADE, NOT NULL, indexed; action String(50) NOT NULL; resource_type String(100) NOT NULL; resource_id String(255) NULL (None/empty = whole-type, mirroring Role.permissions resource_id semantics in core/permissions._resource_id_matches); expires_at DateTime(timezone=True) NOT NULL, indexed (the sweep filters on it); revoked_at DateTime(timezone=True) NULL (NULL = live; non-NULL = swept/revoked \u2014 keep the row as an audit breadcrumb rather than hard-delete); reason String(1000) NOT NULL default ''; granted_by_user_id UUID FK -> user.id ON DELETE SET NULL, NULL; created_at/modified_at via TimestampMixin (server_default now()). Composite index ix_time_bound_grant_live on (group_id, revoked_at, expires_at) for the per-request load filter `group_id IN (...) AND revoked_at IS NULL AND expires_at > now()`. Chain `down_revision` off the single alembic head at merge time (currently three open heads \u2014 d6e1a4b9f082 / c5f2a9b18e34 / c7a3e1f90d24; integrator picks whichever is the linear head after the prior 8 features merge). NO platform_settings column change is required \u2014 sweep cadence is fixed at 60s; if an opt-out toggle is wanted, add a `time_bound_grant_sweep_enabled` Boolean to platform_settings, but default behavior needs none."
+    },
+    "backend_new_files": [
+      "backend/app/models/time_bound_grant.py :: SQLAlchemy model `TimeBoundGrant` (UUIDPrimaryKeyMixin + TimestampMixin + Base) with columns above and a `group` relationship; mirrors models/auth.py column style",
+      "backend/app/api/v1/groups/time_bound_grants.py :: APIRouter (mounted under /groups) \u2014 GET list (?group_id filter, ?include_expired), POST create, DELETE revoke-now. Pydantic schemas TimeBoundGrantCreate/Response with action validated against roles.router._VALID_ACTIONS and resource_type non-empty; every mutation writes an audit_log row (action='permission_change') before returning, per non-negotiable #4",
+      "backend/app/services/time_bound_grants.py :: pure helpers \u2014 `load_active_grants_for_groups(db, group_ids) -> list[TimeBoundGrant]` (the per-request query) and `grant_matches(grant, action, resource_type, resource_id)` reusing the _action_matches/_resource_type_matches/_resource_id_matches logic from core/permissions; keeps deps.py thin and is shared by the sweep task",
+      "backend/app/tasks/time_bound_grant_sweep.py :: Celery task `sweep_expired_grants` (name app.tasks.time_bound_grant_sweep.sweep_expired_grants) following tasks/ipam_reservation_sweep.py exactly \u2014 task_session(), select live rows where expires_at < now(), set revoked_at=now(), write one audit_log per row (user_id=None, user_display_name='system', auth_source='system', action='permission_change', new_value={'reason':'time_bound_grant_expired'}), commit; idempotent",
+      "backend/app/services/ai/tools/auth_grants.py :: MCP tool module \u2014 find_time_bound_grants (read, category='admin', default_enabled superadmin-gated like admin.py) and propose_grant_temporary_access (writes=False proposal, default_enabled=False)"
+    ],
+    "backend_modified_files": [
+      "backend/app/core/permissions.py :: extend `user_has_permission` to also walk `getattr(user, '_active_time_bound_grants', [])` after the role loop \u2014 for each grant call the same _action_matches/_resource_type_matches/_resource_id_matches predicates and return True on any match. Pure additive union; static role grants are unchanged. (This is the live-check decision: grants are unioned in, NOT mapped onto a Role row \u2014 expiry just stops the row matching because the sweep sets revoked_at and the per-request load filters it out.)",
+      "backend/app/api/deps.py :: in BOTH user-resolution paths (`get_current_user` after the active-user check ~line 159, and `_resolve_api_token` after the active check ~line 84) load active grants for the user's group ids via services.time_bound_grants.load_active_grants_for_groups and stash on the user object as `user._active_time_bound_grants` (use object.__setattr__-style plain attr; User is a normal mapped class so `user._active_time_bound_grants = [...]` is fine). Belt-and-suspenders: also filter by expires_at>now() at query time so a grant never applies past expiry even before the sweep runs.",
+      "backend/app/celery_app.py :: add beat_schedule entry 'time-bound-grant-sweep' -> {task: 'app.tasks.time_bound_grant_sweep.sweep_expired_grants', schedule: schedule(run_every=60.0)} alongside the existing sweeps (~line 130). Also add task_routes glob 'app.tasks.time_bound_grant_sweep.*': {'queue':'default'} near line 106.",
+      "backend/app/models/__init__.py :: add `from app.models.time_bound_grant import TimeBoundGrant` (after the auth import, line 18) so Base.metadata sees the table for create_all in tests",
+      "backend/app/services/ai/tools/__init__.py :: add `auth_grants` to the side-effect import tuple (line 11) so the two new MCP tools register",
+      "backend/app/services/ai/tools/proposals.py OR operations_writes.py :: register a `grant_temporary_access` Operation (preview+apply) backing propose_grant_temporary_access, following the Tier 5 _propose_via pattern"
+    ],
+    "shared_files": [
+      "backend/app/api/v1/router.py :: the groups include already exists (line 202: `api_v1_router.include_router(groups_router, prefix=\"/groups\", tags=[\"groups\"])`). Either mount the new time-bound-grants router under the same /groups prefix as a SECOND include `api_v1_router.include_router(time_bound_grants_router, prefix=\"/groups\", tags=[\"groups\"])` (add import `from app.api.v1.groups.time_bound_grants import router as time_bound_grants_router`), OR include the sub-router inside groups/router.py. No require_module gate (see feature_module field \u2014 not gated).",
+      "backend/app/services/ai/tools/__init__.py :: add `auth_grants,` to the alphabetised side-effect import tuple",
+      "frontend/src/lib/api.ts :: add `timeBoundGrantsApi` client (list(groupId?)/create/revoke) + interfaces TimeBoundGrant / TimeBoundGrantCreate, placed next to groupsApi (~line 3304)",
+      "backend/app/celery_app.py :: add the 'time-bound-grant-sweep' beat_schedule entry + task_routes glob"
+    ],
+    "endpoints": [
+      "GET /api/v1/groups/time-bound-grants :: read group (require_permission('read','group')) \u2014 list, optional ?group_id + ?include_expired",
+      "POST /api/v1/groups/time-bound-grants :: admin group (require_permission('admin','group')) \u2014 create a grant; writes permission_change audit",
+      "DELETE /api/v1/groups/time-bound-grants/{grant_id} :: admin group (require_permission('admin','group')) \u2014 revoke-now (set revoked_at); writes permission_change audit",
+      "POST /api/v1/mcp (tools/call find_time_bound_grants) :: superadmin-gated inside the tool body like admin.py _superadmin_gate",
+      "POST /api/v1/mcp (tools/call propose_grant_temporary_access) :: proposal preview only; apply path runs through the operator-approval Operation which re-checks admin on group"
+    ],
+    "feature_module": {
+      "needed": false,
+      "key": "",
+      "default_enabled": true,
+      "rationale": "Per non-negotiable #14 this is NOT a new top-level resource family \u2014 it extends the existing Auth/Groups admin surface (no new sidebar section, no new REST prefix; CRUD lives under the already-mounted /groups router, UI is a panel on the existing /admin/groups page). It is a security primitive that must always be evaluable (gating it off must never silently widen access), so it should never be a togglable module. No ModuleSpec, no require_module gate, no module= tag on tools."
+    },
+    "mcp_tools": [
+      "find_time_bound_grants :: find :: default_enabled true :: read-only list of active/expired temporary grants; superadmin-gated inside the tool (mirrors admin.py list_groups) because it exposes RBAC metadata \u2014 no secrets/off-prem so it stays discoverable",
+      "propose_grant_temporary_access :: propose :: default_enabled false :: write proposal that grants a group time-bound access; broad-blast-radius security mutation, so default-disabled per #13 and surfaced as an Approve/Reject card via the existing proposal/apply pattern"
+    ],
+    "frontend_new_files": [
+      "frontend/src/pages/admin/TimeBoundGrantsPanel.tsx :: per-group panel rendering active + expired grants (action / resource_type / resource_id / expires_at countdown / granted_by / reason / revoke button) with a 'Grant temporary access' button",
+      "frontend/src/pages/admin/CreateTimeBoundGrantModal.tsx :: create modal \u2014 action select (read/write/delete/admin/*), resource_type select (the docs/PERMISSIONS.md vocabulary), optional resource_id, expiry picker (datetime-local), reason; follows GroupModal/Modal pattern in GroupsPage.tsx"
+    ],
+    "frontend_modified_files": [
+      "frontend/src/pages/admin/GroupsPage.tsx :: render TimeBoundGrantsPanel for the selected/edited group (e.g. inside an expanded row or the GroupModal), wire useQuery(['time-bound-grants', groupId]) + invalidate on create/revoke",
+      "frontend/src/lib/api.ts :: add timeBoundGrantsApi + TimeBoundGrant/TimeBoundGrantCreate interfaces next to groupsApi"
+    ],
+    "precedents": [
+      "backend/app/tasks/ipam_reservation_sweep.py:37-96 :: exact template for the beat sweep \u2014 task_session(), select-where-expired, mutate, one audit_log per row attributed to user_id=None/'system', idempotent",
+      "backend/app/core/permissions.py:119-150 :: user_has_permission loop + _action_matches/_resource_type_matches/_resource_id_matches (lines 67-88) to reuse for the grant union",
+      "backend/app/api/deps.py:88-159 (get_current_user) + 28-85 (_resolve_api_token) :: the two and only two points where the request User is built \u2014 where grants must be loaded/attached",
+      "backend/app/api/v1/roles/router.py:27,33-55,120-130 :: PermissionEntry validation (_VALID_ACTIONS, _perm_list_to_dicts) to reuse for grant action/resource_type validation",
+      "backend/app/services/ai/tools/admin.py:45-59,159-206 :: _superadmin_gate + list_groups MCP tool shape for find_time_bound_grants",
+      "backend/app/services/ai/tools/proposals.py:175-243 :: Tier 5 _propose_via + default_enabled=False propose_* pattern for propose_grant_temporary_access",
+      "backend/alembic/versions/c7a3e1f90d24_subnet_utilization_history.py :: migration create_table + create_index skeleton",
+      "frontend/src/pages/admin/GroupsPage.tsx:113-274 :: GroupModal/DeleteModal/Modal + useMutation/useQuery patterns for the new panel + modal",
+      "backend/app/celery_app.py:108-160 :: beat_schedule entry shape (run_every=60.0)"
+    ],
+    "tests": [
+      "backend/tests/test_time_bound_grants_permissions.py :: user_has_permission returns True for an action/resource covered only by a live grant; False when the grant is expired (expires_at in past, even before sweep, because the per-request load filters expires_at>now()); False when grant revoked_at set; scoped resource_id grant does not satisfy an unscoped check (mirrors _resource_id_matches rule #4); admin-action grant implies read/write/delete",
+      "backend/tests/test_time_bound_grant_sweep.py :: sweep sets revoked_at on expired rows, leaves live rows untouched, writes exactly one permission_change audit_log per revoked row with user_display_name='system', is idempotent on re-run (no new audit rows)",
+      "backend/tests/test_time_bound_grants_api.py :: POST requires admin on group (403 otherwise) and writes an audit row; GET requires read on group; DELETE revoke-now sets revoked_at + audits; create rejects invalid action / empty resource_type",
+      "backend/tests/test_mcp_time_bound_grants.py :: find_time_bound_grants superadmin-gated (non-superadmin gets error dict); propose_grant_temporary_access default_enabled=False so it is absent from effective_tool_names() defaults",
+      "frontend :: (if FE tests exist) panel renders countdown + revoke; modal posts create and invalidates the query"
+    ],
+    "open_questions": [
+      "Should an expired grant row be soft-revoked (revoked_at set, kept for audit/history \u2014 recommended, lets the panel show 'expired' history) or hard-deleted as the issue text suggests ('deletes/deactivates')? Spec assumes soft-revoke; confirm retention expectation.",
+      "Per-request load adds one SELECT per authenticated request for users in any group with grants. Acceptable given grants are rare; if hot-path latency matters, gate the query behind an EXISTS/short cache. Confirm no caching layer is required for MVP.",
+      "Should there be an opt-out platform_settings.time_bound_grant_sweep_enabled flag (matching reservation_sweep_enabled precedent) or is the sweep always-on? Spec defaults to always-on with no settings column.",
+      "Resource_type vocabulary for the create modal: reuse the full docs/PERMISSIONS.md list as a static FE constant, or fetch a server-provided enumeration? No existing endpoint enumerates resource_types today.",
+      "Should creating a grant also enforce that the granting admin themselves holds the action they are delegating (privilege-escalation guard), or is admin-on-group sufficient? Spec uses admin-on-group only, matching how role permissions are edited today."
+    ]
+  },
+  {
+    "issue": 156,
+    "summary": "Add appliance syslog/journald forwarding (rsyslog) as a host-config plane that is an EXACT sibling of shipped SNMP (#153) + NTP (#154) + LLDP (#343): new platform_settings.syslog_* columns (singleton source of truth) \u2192 a render_rsyslog_conf/syslog_bundle service module \u2192 folded into BOTH the DHCP/DNS ConfigBundle ETag mix AND (the active delivery path) the supervisor heartbeat response \u2192 a maybe_fire_syslog_reload trigger-writer in the supervisor's appliance_state.py \u2192 a host-side spatiumddi-syslog-reload.{path,service} unit + runner with rsyslogd -N1 validation, persisting config across A/B slots. Edit lands on the existing PUT /api/v1/settings (the snmp_/ntp_ precedent flows through the single settings endpoint, NOT a dedicated /settings/snmp route), with the ca_cert_pem TLS secret Fernet-encrypted exactly like snmp_community. Frontend adds a Syslog view to FleetTab's Services nav group plus a Fleet status chip (forwarding/unreachable/disabled) driven by a new appliance.syslog_forwarding heartbeat status column. NO inbound firewall port opens (forwarding is outbound, unlike SNMP/NTP) and NO feature module (follow LLDP's module=None host-config precedent). Per the prompt, the three appliance issues #156/#157/#158 should batch their platform_settings columns into ONE migration and ONE ConfigBundle/heartbeat extension.",
+    "complexity": "L",
+    "migration": {
+      "needed": true,
+      "detail": "Add columns to platform_settings (singleton id=1), down_revision = current head c7a3e1f90d24 (subnet_utilization_history). Mirror b95e2d71f042_appliance_snmp_settings.py shape (op.add_column with server_default so the column-add doesn't disrupt the existing row): syslog_enabled BOOLEAN NOT NULL server_default false; syslog_targets JSONB NOT NULL server_default '[]'::jsonb (list of {host,port,protocol,format,ca_cert_pem}); syslog_filter VARCHAR NOT NULL server_default '' (free-form rsyslog selector/filter expression); syslog_buffer_disk BOOLEAN NOT NULL server_default false (disk-assisted queue on unreachable collector). ALSO add to the appliance table the status column: syslog_forwarding VARCHAR(16) NULL (values forwarding/unreachable/disabled), mirroring appliance.snmpd_running / ntp_sync_state at models/appliance.py:506-507. NOTE for integrator: per the prompt, batch the platform_settings columns for #156+#157+#158 into ONE migration revision and the appliance status columns together; do not chain three separate head migrations that will collide. The ca_cert_pem inside syslog_targets is stored as Fernet ciphertext (URL-safe-base64 string, the form Fernet emits) so the JSONB stays JSON-friendly \u2014 same approach as snmp_v3_users auth_pass_enc."
+    },
+    "backend_new_files": [
+      "backend/app/services/appliance/syslog.py :: render_rsyslog_conf(settings) + syslog_bundle(settings) \u2014 EXACT sibling of services/appliance/ntp.py (render_chrony_conf/ntp_bundle) and snmp.py. Renders a deterministic /etc/rsyslog.d/50-spatium-forward.conf body from syslog_targets (one omfwd action block per target with Target/Port/Protocol; RFC5424/RFC3164/json via the template= directive; TLS via $DefaultNetstreamDriver gtls + the per-target ca_cert_pem written to a referenced .pem path), prepends the syslog_filter selector, and toggles disk-assisted queue (action.resumeRetryCount + queue.type=disk) when syslog_buffer_disk. ca_cert_pem decrypted via app.core.crypto.decrypt_str exactly like snmp._decrypt_or_none. syslog_bundle returns {enabled, config_hash (sha256 of body), rsyslog_conf, ca_certs: {filename: pem}} \u2014 stable dict shape even when disabled so the agent/supervisor hash-compare never KeyErrors.",
+      "backend/alembic/versions/<rev>_appliance_syslog_settings.py :: platform_settings.syslog_* + appliance.syslog_forwarding column-add migration (see migration field; ideally the shared #156/157/158 migration)",
+      "backend/app/services/ai/tools/syslog.py :: find_syslog_settings MCP read tool \u2014 sibling of tools/ntp.py. Returns enabled/targets (host/port/protocol/format, ca_cert REDACTED to ca_cert_set bool)/filter/buffer_disk. Default_enabled=True for discovery (no off-prem call from the read), but REDACT ca_cert_pem. Tag module=None (LLDP host-config precedent at tools/lldp.py:54), NOT a feature module."
+    ],
+    "backend_modified_files": [
+      "backend/app/models/settings.py :: add syslog_enabled/syslog_targets/syslog_filter/syslog_buffer_disk Mapped columns after the LLDP block (~line 503), mirroring the snmp_*/ntp_* column definitions with matching server_default text",
+      "backend/app/models/appliance.py :: add syslog_forwarding: Mapped[str | None] = mapped_column(String(16), nullable=True) right after ntp_sync_state at line 507",
+      "backend/app/api/v1/settings/router.py :: (1) add syslog_* fields to SettingsResponse (~line 136 block) and SettingsUpdate (~line 401 block); (2) extend _redact_secrets (line 176) to redact each target's ca_cert_pem -> ca_cert_set; (3) in update_settings (line 812): add 'syslog_' to the _host_config_touched startswith tuple at line 848 so a syslog edit fires publish_wake(HOSTCONFIG_ALL); add a syslog_targets merge/encrypt block (Fernet-encrypt incoming ca_cert_pem, preserve prior ciphertext when blank) modeled on _merge_snmp_v3_users at line 204; (4) ADD an explicit write_audit(...) call for the syslog change to satisfy non-negotiable #4 \u2014 the existing PUT only logs structlog, so add resource_type='platform_settings', resource_id='syslog'. Add a validation helper for syslog_targets (host non-empty, port 1-65535, protocol in {udp,tcp,tls}, format in {rfc5424,rfc3164,json}, ca_cert_pem required when protocol=tls) mirroring NTPCustomServerUpdate/SNMPV3UserUpdate validators (lines 257-321)",
+      "backend/app/api/v1/appliance/supervisor.py :: (1) import syslog_bundle alongside snmp_bundle/ntp_bundle at lines 99-101; (2) build syslog_block from cfg_row at ~line 1819 with the disabled-shape fallback; (3) add syslog_settings field to SupervisorHeartbeatResponse and pass syslog_settings=syslog_block in the return at ~line 1905; (4) add syslog_forwarding: Literal[...] | None field to SupervisorHeartbeatRequest at ~line 988 and persist it (if body.syslog_forwarding is not None: row.syslog_forwarding = ...) at ~line 1474; (5) add syslog_forwarding to SupervisorAppliancesResponse at ~line 2052 and the row mapping at ~line 2150",
+      "backend/app/api/v1/dhcp/agents.py :: in agent_config_longpoll (~line 336) build syslog_block from settings_row and mix its config_hash into the fleet_marker ETag string at line 366-373; add 'syslog_settings': syslog_block to the bundle dict at ~line 506. Import syslog_bundle at lines 39-41. (Wire-shape/ETag only; the DHCP service container ignores it post-#170 C1 \u2014 the supervisor is the sole trigger producer.)",
+      "backend/app/services/ai/operations_writes.py :: add UpdateSyslogSettingsArgs + _preview_update_syslog_settings + _apply_update_syslog_settings + register(Operation(name='update_syslog_settings', ...)) mirroring _apply_update_snmp_settings at line 1093 (superadmin-gated, Fernet-encrypt ca_cert_pem, write_audit resource_id='syslog', forbid_in_demo_mode)",
+      "backend/app/services/ai/tools/proposals.py :: add propose_update_syslog_settings MCP write tool mirroring propose_update_snmp_settings at line 668 (writes=False i.e. needs Approve, default_enabled=False because ca_cert_pem is a secret AND it configures off-prem log shipping, module=None)"
+    ],
+    "shared_files": [
+      "backend/app/api/v1/appliance/supervisor.py :: SupervisorHeartbeatResponse.syslog_settings field + syslog_block build (~line 1819) + return arg (~line 1905); SupervisorHeartbeatRequest.syslog_forwarding (~line 988) + persist (~line 1474); SupervisorAppliancesResponse.syslog_forwarding (~line 2052) + mapping (~line 2150)",
+      "backend/app/api/v1/dhcp/agents.py :: import syslog_bundle (lines 39-41) + syslog_block in fleet_marker ETag (line 366) + 'syslog_settings' in bundle dict (~line 506)",
+      "backend/app/models/settings.py :: 4 new syslog_* Mapped columns in PlatformSettings (~line 503, after LLDP block)",
+      "backend/app/models/appliance.py :: appliance.syslog_forwarding column (after line 507)",
+      "backend/app/api/v1/settings/router.py :: SettingsResponse + SettingsUpdate syslog_* fields, _redact_secrets ca_cert redaction, update_settings _host_config_touched 'syslog_' prefix + encrypt/merge + write_audit",
+      "frontend/src/lib/api.ts :: PlatformSettings interface syslog_* fields (~line 2973 after lldp block) + SyslogTarget/SyslogProtocol/SyslogFormat types (near SnmpVersion ~line 3005) + ApplianceRow.syslog_forwarding (~line 8218 after ntp_sync_state)",
+      "frontend/src/pages/appliance/FleetTab.tsx :: add {key:'syslog', label:'Syslog', summary:'Fleet-wide rsyslog forwarding.'} to the Services navGroups items (~line 932) + the NavItem key union (~line 900) + setView type + a {view === 'syslog' && (<SyslogTab/>)} render block (~line 1077, mirroring the snmp block) + (if adding the per-row chip) render syslog_forwarding chip on the appliance row",
+      "appliance/mkosi.conf :: add 'rsyslog' to the Packages= list (~line 235, next to lldpd) \u2014 Debian ships rsyslog but confirm it is present in the appliance package set; install service masked/disabled-by-default like snmpd, opt-in via UI",
+      "NOTE: settings router is NOT in router.py include list with require_module \u2014 no router.py edit needed (settings hub is always-visible). NO feature_modules MODULES entry (host-config, module=None like LLDP). NO dashboards/integrations.py edit (#15 is for integration mirrors, not host-config). NO DashboardPage.tsx edit. NO Sidebar/nav edit (syslog lives as a FleetTab sub-view, not a top-level nav)."
+    ],
+    "endpoints": [
+      "GET /api/v1/settings :: existing endpoint; syslog_* fields ride the SettingsResponse (CurrentUser; read gated by the settings read path). Follow the snmp_/ntp_ precedent \u2014 do NOT add a dedicated GET /settings/syslog.",
+      "PUT /api/v1/settings :: existing endpoint; syslog_* fields ride SettingsUpdate. Gated by user_has_permission(current_user,'write','settings') at router.py:819; forbid_in_demo_mode; MUST write_audit (resource_id='syslog') for non-negotiable #4.",
+      "POST /api/v1/appliance/supervisor/heartbeat :: existing; carries syslog_settings down + accepts syslog_forwarding status up (supervisor mTLS / agent JWT auth \u2014 unchanged).",
+      "GET /api/v1/dhcp/agents/config (long-poll) :: existing; syslog_settings folds into ETag (agent JWT auth \u2014 unchanged).",
+      "NOTE: prompt mentions 'GET/PUT /api/v1/settings/syslog' \u2014 FLAG: the actual shipped SNMP/NTP/timezone precedent uses the single combined GET/PUT /api/v1/settings, not per-feature sub-routes. Recommend following the combined-endpoint precedent unless the integrator deliberately diverges."
+    ],
+    "feature_module": {
+      "needed": false,
+      "key": "appliance.syslog",
+      "default_enabled": true,
+      "rationale": "Follow the LLDP precedent (tools/lldp.py:54 uses module=None, commenting 'LLDP is plain host-config (like SNMP/NTP), not a feature module'). Syslog forwarding is host-config that lives as a sub-view inside the always-visible FleetTab, not a new top-level resource family / sidebar section / router prefix, so #14 does not apply. NOTE: the existing snmp.py/ntp.py MCP tools tag module='appliance.snmp'/'appliance.ntp' but those ids are NOT in feature_modules.MODULES (only appliance.firewall is) \u2014 that is a pre-existing dangling-tag inconsistency; do NOT replicate it. Use module=None for syslog tools."
+    },
+    "mcp_tools": [
+      "find_syslog_settings :: find :: default_enabled true :: read the appliance rsyslog forwarding config (targets host/port/protocol/format, filter, disk-buffer) so operators can ask 'where is the appliance shipping logs?'; ca_cert_pem REDACTED to ca_cert_set bool, module=None (host-config like LLDP/NTP)",
+      "propose_update_syslog_settings :: propose :: default_enabled false :: write tool requiring Approve; default OFF because it handles a secret (TLS ca_cert_pem) AND configures off-prem log shipping (both #13 opt-in triggers); superadmin-gated apply via operations_writes update_syslog_settings, module=None"
+    ],
+    "frontend_new_files": [
+      "frontend/src/pages/appliance/SyslogTab.tsx :: thin wrapper (settings + me + version queries) rendering SyslogSection \u2014 EXACT sibling of pages/appliance/NTPTab.tsx",
+      "frontend/src/components/SyslogSection.tsx :: the form (enable toggle, per-target list editor host/port/protocol/format/ca_cert_pem, filter textarea, buffer_disk toggle) with useMutation -> settingsApi.update(patch) and queryClient invalidate(['settings']) \u2014 mirror components/NTPSection.tsx (useMutation pattern at NTPSection.tsx:80-112). ca_cert_pem shown as a 'set/replace' secret field like SNMPSection community."
+    ],
+    "frontend_modified_files": [
+      "frontend/src/lib/api.ts :: PlatformSettings interface syslog_enabled/syslog_targets/syslog_filter/syslog_buffer_disk (~line 2973) + SyslogTarget {host,port,protocol,format,ca_cert_set} / SyslogTargetWrite {...,ca_cert_pem?} / SyslogProtocol = 'udp'|'tcp'|'tls' / SyslogFormat = 'rfc5424'|'rfc3164'|'json' types (~line 3005) + ApplianceRow.syslog_forwarding: string | null (~line 8218)",
+      "frontend/src/pages/appliance/FleetTab.tsx :: add Syslog to the Services navGroups items list (~line 932), extend the NavItem key union + setView type to include 'syslog' (~line 900), add a {view === 'syslog' && (...<SyslogTab/>)} render block (~line 1077, mirroring the snmp/ntp blocks), and render a Fleet status chip on the appliance row reading row.syslog_forwarding (forwarding=green / unreachable=amber-red / disabled=muted) \u2014 note: snmpd_running/ntp_sync_state are NOT yet rendered as per-row chips, so this chip and its color helper are net-new; place it alongside ServiceChipList (~line 1789)"
+    ],
+    "precedents": [
+      "backend/app/services/appliance/ntp.py :: closest sibling for render_rsyslog_conf/syslog_bundle (always-on service, no secrets-in-conf except TLS, allow/port shape) \u2014 mirror render_chrony_conf + ntp_bundle (deterministic body + sha256 config_hash)",
+      "backend/app/services/appliance/snmp.py:188-223 :: Fernet decrypt-or-none for ca_cert_pem (snmp._decrypt_or_none / _decrypt_v3_pass) + the disabled-shape snmp_bundle at line 209",
+      "agent/supervisor/spatium_supervisor/appliance_state.py:679-737 :: maybe_fire_snmp_reload \u2014 exact template for maybe_fire_syslog_reload (appliance-only gate, hash-sidecar idempotency, atomic .new->mv, three-section payload). read_snmpd_running:854 / read_ntp_sync_state:1185 \u2014 template for read_syslog_forwarding status reader",
+      "agent/supervisor/spatium_supervisor/heartbeat.py:678-689 :: where maybe_fire_snmp_reload/maybe_fire_ntp_reload are invoked from body_out \u2014 add maybe_fire_syslog_reload(body_out.get('syslog_settings')); also collect read_syslog_forwarding into the heartbeat body it sends up",
+      "appliance/mkosi.extra/usr/local/bin/spatiumddi-chrony-reload :: closest host-runner template (rsyslogd -N1 validation parallels chronyd -t; systemctl reload rsyslog; NO firewall drop-in needed since forwarding is outbound \u2014 DROP the NFT_DROPIN block that snmp/chrony runners have). Persistence-across-slots note: /etc/rsyslog.d/* + CA .pem -> /var/persist/etc overlay",
+      "appliance/mkosi.extra/etc/systemd/system/spatiumddi-snmp-reload.{path,service} :: template for spatiumddi-syslog-reload.{path,service} (PathChanged=/var/lib/spatiumddi/release-state/syslog-config-pending; ConditionKernelCommandLine=!boot=live; After=etc.mount local-fs.target)",
+      "backend/alembic/versions/b95e2d71f042_appliance_snmp_settings.py :: column-add migration shape (op.add_column loop + server_default, down_revision chaining)",
+      "backend/app/services/ai/operations_writes.py:1093-1125 :: _apply_update_snmp_settings \u2014 exact template for _apply_update_syslog_settings (superadmin, Fernet encrypt secret, write_audit resource_id, forbid_in_demo_mode, commit)",
+      "frontend/src/components/NTPSection.tsx + pages/appliance/NTPTab.tsx :: form + tab wrapper templates",
+      "frontend/src/pages/appliance/FleetTab.tsx:900-950,1077-1089 :: FleetTab Services nav + view render-block pattern"
+    ],
+    "tests": [
+      "backend/tests/test_appliance_host_config_delivery.py :: EXISTS \u2014 extend it. Add: syslog_bundle disabled-shape + enabled render correctness; syslog_settings appears in supervisor heartbeat response; syslog_settings folds into the DHCP /config ETag (changing syslog_targets flips the ETag); ca_cert_pem round-trips encrypted and is redacted in GET /settings",
+      "backend/tests/test_settings_syslog.py (new) :: PUT /api/v1/settings with syslog_targets \u2014 validation (bad port/protocol/format 422, tls without ca_cert 422), Fernet encrypt + redact-on-read (ca_cert_set), audit_log row written (resource_id='syslog'), permission denial without write:settings, demo-mode forbidden",
+      "backend/tests/test_ai_write_operations.py :: EXISTS \u2014 add update_syslog_settings preview/apply (superadmin gate, ca_cert encrypted, audit written) mirroring the existing snmp/ntp cases",
+      "agent/supervisor tests :: maybe_fire_syslog_reload idempotency (same config_hash => no second trigger; trigger-file present => skip; non-appliance => no-op; payload section format); read_syslog_forwarding status sidecar parse (forwarding/unreachable/disabled/None)",
+      "host runner :: a shell/integration test that spatiumddi-syslog-reload runs rsyslogd -N1 on the staged body and aborts on syntax error (mirror the snmp -t / chrony -t validation test if one exists)"
+    ],
+    "open_questions": [
+      "Endpoint shape: the issue text specifies a dedicated GET/PUT /api/v1/settings/syslog, but the shipped SNMP/NTP/timezone host-config all flows through the single combined GET/PUT /api/v1/settings. Confirm whether to follow the combined-endpoint precedent (recommended, lower contention) or genuinely add a sub-route.",
+      "Migration batching: the prompt instructs batching #156/#157/#158 platform_settings columns into ONE migration + ONE ConfigBundle/heartbeat extension. This spec writes the syslog slice standalone; the integrator must coordinate so #157/#158 land their columns in the same revision and extend the same syslog_settings-style heartbeat block rather than three colliding head migrations.",
+      "Fleet chip data source: snmpd_running/ntp_sync_state status columns exist on Appliance but are NOT currently rendered as per-row chips in FleetTab. The 'forwarding/unreachable/disabled' syslog chip is net-new UI; confirm whether to also retrofit chips for snmp/ntp for consistency, or ship the syslog chip alone.",
+      "How does the host runner determine 'unreachable' vs 'forwarding'? rsyslog omfwd doesn't trivially expose per-target reachability; the runner likely needs to parse rsyslog impstats / action suspend state or test-connect. Confirm the exact mechanism the runner uses to write the syslog_forwarding status sidecar (disabled when syslog_enabled=false; forwarding when active + last action not suspended; unreachable when the omfwd action is suspended / queue backing up). This is the least-precedented part \u2014 SNMP/NTP statuses come from snmpd is-active / chronyc tracking, which have no direct rsyslog analogue.",
+      "journald->rsyslog bridge: forwarding journald means rsyslog's imjournal/imuxsock input must be active on the appliance. Confirm whether the appliance base rsyslog config already ingests the journal (Debian default uses imuxsock + imklog; journald forwarding to /run/systemd/journal/syslog may need ForwardToSyslog=yes). The render module may need to emit/assume an input module block, not just omfwd output actions."
+    ]
+  },
+  {
+    "issue": 157,
+    "summary": "Add appliance SSH authorized_keys + sshd hardening as a new host-config block on the platform_settings singleton, mirroring the SNMP (#153) / NTP (#154) / LLDP (#343) precedent exactly: new ssh_* columns + Alembic migration, GET/PUT /api/v1/settings (existing endpoints \u2014 fold ssh_* into SettingsResponse/SettingsUpdate with server-side public-key + lockout-safety validation), a backend renderer service (app/services/appliance/ssh.py) that produces authorized_keys + sshd_config.d/spatiumddi.conf and an ssh_bundle() block folded into BOTH the DHCP-agent ConfigBundle (api/v1/dhcp/agents.py) and the supervisor heartbeat (api/v1/appliance/supervisor.py), a supervisor maybe_fire_ssh_reload() trigger writer + host-side spatiumddi-ssh-reload runner (with its own pre-apply lockout/port safety + nft drop-in for ssh_port/ssh_allowed_source_networks), a shared SSHSection.tsx frontend form, a find_ssh_settings MCP read tool, and an ssh_key_count Fleet chip surfaced via a supervisor status sidecar. SSH is NOT a feature module (host-config under platform_settings, no router prefix), matching SNMP/NTP/LLDP.",
+    "complexity": "L",
+    "migration": {
+      "needed": true,
+      "detail": "New Alembic revision chaining off current head c7a3e1f90d24 (down_revision='c7a3e1f90d24'), mirroring backend/alembic/versions/b95e2d71f042_appliance_snmp_settings.py. Adds columns to platform_settings: ssh_authorized_keys JSONB NOT NULL server_default '[]'::jsonb (list of {name, public_key, comment}); ssh_password_auth_enabled Boolean NOT NULL server_default false; ssh_allow_root_login Boolean NOT NULL server_default false; ssh_port Integer NOT NULL server_default 22; ssh_allowed_source_networks JSONB NOT NULL server_default '[]'::jsonb (CIDR strings). All on the singleton row id=1. No secrets/Fernet (public keys are not sensitive). Use op.add_column per-column like the SNMP migration's _NEW_COLUMNS loop; downgrade drops each."
+    },
+    "backend_new_files": [
+      "backend/app/services/appliance/ssh.py :: render_authorized_keys(settings) + render_sshd_config(settings) (renders /etc/ssh/sshd_config.d/spatiumddi.conf body: Port, PasswordAuthentication, PermitRootLogin, plus AllowUsers/Match scaffolding) + ssh_bundle(settings) returning {enabled, config_hash, authorized_keys, sshd_conf, ssh_port, allowed_source_networks, key_count} \u2014 mirrors app/services/appliance/snmp.py snmp_bundle / app/services/appliance/ntp.py ntp_bundle. Deterministic byte-stable output; config_hash = sha256 over authorized_keys + sshd_conf so the host runner short-circuits. Includes the server-mirrored lockout-safety guard (refuse to render password-auth-off when ssh_authorized_keys is empty) as a reusable validate function imported by the router.",
+      "backend/app/services/ai/tools/ssh.py :: find_ssh_settings MCP read tool, mirrors backend/app/services/ai/tools/snmp.py find_snmp_settings; returns ssh_password_auth_enabled, ssh_allow_root_login, ssh_port, ssh_allowed_source_networks, and key list with name/comment only (public_key fingerprint optional, never a secret). register_tool(name='find_ssh_settings', category='admin', default_enabled=True, module='appliance.ssh'). No propose tool (same rationale as SNMP \u2014 write goes through the form).",
+      "backend/tests/test_appliance_ssh.py :: unit tests for render_authorized_keys/render_sshd_config/ssh_bundle determinism, public-key format validation, and the lockout/privileged-port safety rejections (mirror backend/tests/test_appliance_snmp.py)."
+    ],
+    "backend_modified_files": [
+      "backend/app/models/settings.py :: add the 5 ssh_* mapped_column definitions in a new '# \u2500\u2500 Appliance SSH (issue #157) \u2500\u2500' block after the LLDP block (~line 472+), matching the SNMP/web_ui_allowed_cidrs column style (JSONB default=list, Boolean default=False/sa_text('false'), Integer default=22).",
+      "backend/app/api/v1/settings/router.py :: add ssh_* to SettingsResponse and ssh_* to SettingsUpdate (Optional); add field_validators: _valid_ssh_authorized_keys (each entry validated as a parseable OpenSSH public key via paramiko/cryptography or a strict regex on the type+base64+comment, reject control chars/newlines), _valid_ssh_allowed_source_networks (CIDR canonicalisation reusing the ip_network pattern from snmp_allowed_sources), _valid_ssh_port (1..65535). Add a model_validator-level cross-field LOCKOUT SAFETY check in update_settings (after merge, before commit): if the resulting state has ssh_password_auth_enabled=False AND zero ssh_authorized_keys \u2192 422; if ssh_port is a privileged port (<1024) other than 22 reject (or warn) per issue. Extend _host_config_touched detection so any field.startswith('ssh_') wakes HOSTCONFIG_ALL (line ~848). The PUT already logs to logger.info; confirm/ensure the audit_log row is written for the mutation per NN#4 (settings PUT currently relies on logger.info + changes dict \u2014 match how SNMP fields are audited; ssh keys are public so logging key names is fine, do NOT need redaction).",
+      "backend/app/api/v1/dhcp/agents.py :: import ssh_bundle (next to snmp_bundle/ntp_bundle/lldp_bundle at lines 39-41); build ssh_block from ssh_bundle(settings_row) with disabled-shape fallback (lines ~336-361); fold ssh into the fleet_marker ETag string (line ~370-372: add `|ssh:{config_hash}`); add 'ssh_settings': ssh_block to the returned bundle dict (line ~514).",
+      "backend/app/api/v1/appliance/supervisor.py :: import ssh_bundle (lines 99-101); add ssh_settings: dict field to SupervisorHeartbeatResponse (next to snmp_settings/ntp_settings/lldp_settings at lines 1253-1255); build ssh_block in the heartbeat handler (lines ~1809-1823) with disabled-shape fallback; pass ssh_settings=ssh_block in the SupervisorHeartbeatResponse(...) return (line ~1905-1907). Add ssh_key_count: int|None to the supervisor status-report request model (next to snmpd_running line ~987) and persist to the Appliance row (next to lines 1473-1476); add ssh_key_count to ApplianceRow response (line ~2051) and _row_to_response mapping (line ~2149).",
+      "backend/app/models/appliance.py :: add ssh_key_count Mapped[int|None] = mapped_column(Integer, nullable=True) next to snmpd_running/ntp_sync_state (lines 506-507) \u2014 per-host applied key count reported by the supervisor sidecar for the Fleet chip (requires this column in the same migration as the platform_settings columns, or a second migration \u2014 fold into the #157 migration)."
+    ],
+    "shared_files": [
+      "backend/app/api/v1/dhcp/agents.py :: import ssh_bundle + build ssh_block (disabled fallback) + add `|ssh:{ssh_block.get('config_hash','')}` to fleet_marker ETag + add 'ssh_settings': ssh_block to returned bundle (parallels the snmp/ntp/lldp lines at 336-361, 370-372, 506-514)",
+      "backend/app/api/v1/appliance/supervisor.py :: add `ssh_settings: dict[str,Any] = Field(default_factory=dict)` to SupervisorHeartbeatResponse (after line 1255); build ssh_block (~1823); add `ssh_settings=ssh_block` to the response constructor (~1907); add ssh_key_count to status-report ingest (~1473) + ApplianceRow (~2051) + _row_to_response (~2149)",
+      "backend/app/models/settings.py :: add 5 ssh_* columns in a new '# \u2500\u2500 Appliance SSH (issue #157)' block after the LLDP columns (~line 472)",
+      "backend/app/api/v1/settings/router.py :: add ssh_* to SettingsResponse + SettingsUpdate + validators + lockout-safety reject + extend _host_config_touched to ssh_* prefix (line 848)",
+      "frontend/src/lib/api.ts :: extend PlatformSettings interface (after lldp_snmp_agentx ~line 2993) with ssh_authorized_keys: SshAuthorizedKey[]; ssh_password_auth_enabled: boolean; ssh_allow_root_login: boolean; ssh_port: number; ssh_allowed_source_networks: string[]; add SshAuthorizedKey type {name, public_key, comment}; no new settingsApi method needed (GET/PUT /settings already exist)",
+      "backend/app/services/ai/tools/__init__.py :: register the new ssh tool module if tools are explicitly imported there (mirror how snmp/ntp/lldp tools are registered/imported)",
+      "frontend/src/pages/SettingsPage.tsx :: add a SECTIONS entry (id 'ssh', group 'Appliance', title 'SSH', keywords) that renders <SSHSection> \u2014 mirror the SNMP/NTP/LLDP section entries"
+    ],
+    "endpoints": [
+      "GET /api/v1/settings :: existing endpoint, no new gate \u2014 current_user (any authenticated); ssh_* added to SettingsResponse (public keys, no redaction needed)",
+      "PUT /api/v1/settings :: existing endpoint, gated by user_has_permission(current_user,'write','settings') (superadmin or explicit settings write grant); ssh_* added to SettingsUpdate; 422 on bad public-key format, 422 on lockout-unsafe (disable password auth + zero keys), reject privileged ssh_port; audited per NN#4; wakes HOSTCONFIG_ALL",
+      "POST /api/v1/appliance/supervisor/heartbeat :: existing supervisor-cert-gated endpoint; response now carries ssh_settings block; request now accepts ssh_key_count status report"
+    ],
+    "feature_module": {
+      "needed": false,
+      "key": "appliance.ssh",
+      "default_enabled": true,
+      "rationale": "SSH authorized_keys management is host-config that lives on the platform_settings singleton and is delivered through the existing /api/v1/settings router + the ConfigBundle/heartbeat plane \u2014 it adds NO new top-level sidebar section and NO new REST router prefix (NN#14's trigger conditions). It exactly mirrors SNMP/NTP/LLDP, none of which are feature modules. The MCP tool tags module='appliance.ssh' for consistency with find_snmp_settings (module='appliance.snmp'), but no ModuleSpec is added to MODULES and no require_module gate is applied \u2014 verify find_snmp_settings's module string resolves without a MODULES entry (it currently does), and follow that exact precedent."
+    },
+    "mcp_tools": [
+      "find_ssh_settings :: find :: default_enabled true :: read-only host-config view (password-auth/root-login toggles, port, allowed CIDRs, key names+comments \u2014 public keys are not secrets, no off-prem calls), mirrors find_snmp_settings so admins discover it (NN#13). No propose_* tool \u2014 writes go through the Settings \u2192 Appliance \u2192 SSH form, same rationale as SNMP."
+    ],
+    "frontend_new_files": [
+      "frontend/src/components/SSHSection.tsx :: shared form component mirroring frontend/src/components/SNMPSection.tsx \u2014 props {values: PlatformSettings, isSuperadmin, applianceMode, inputCls}. Renders: authorized-keys list editor ({name, public_key, comment} add/remove rows), password-auth toggle, allow-root-login toggle, port input, allowed-source-networks CIDR list. Client-side mirror of the lockout-safety guard (disable a save / warn when password auth would be off with zero keys); shows server 422s via formatApiError. Uses settingsApi.update.",
+      "frontend/src/pages/appliance/SSHTab.tsx :: thin wrapper around SSHSection (mirror frontend/src/pages/appliance/SNMPTab.tsx) \u2014 fetches authApi.me + settingsApi.get + versionApi.get, renders the SSHSection with applianceMode."
+    ],
+    "frontend_modified_files": [
+      "frontend/src/lib/api.ts :: add SshAuthorizedKey type + 5 ssh_* fields to PlatformSettings interface (after the lldp block ~line 2993)",
+      "frontend/src/pages/SettingsPage.tsx :: add a SECTIONS entry for SSH (group 'Appliance', renders SSHSection) mirroring the SNMP/NTP/LLDP entries; wire the active-section render branch",
+      "frontend/src/pages/appliance/FleetTab.tsx :: add an ssh_key_count capability/service chip in the row chips (mirror the snmpd_running / ntp_sync_state chip rendering around lines 116-133 / 3096-3103) reading ApplianceRow.ssh_key_count"
+    ],
+    "precedents": [
+      "backend/app/services/appliance/snmp.py :: closest renderer+bundle precedent \u2014 render_snmpd_conf + snmp_bundle (config_hash sha256, disabled\u2192empty body, deterministic output); SSH renderer should copy this shape",
+      "backend/app/services/appliance/ntp.py:118-159 :: ntp_bundle carries allow_clients to drive the host nft drop-in (UDP 123) \u2014 SSH must carry ssh_port + allowed_source_networks the same way for its nft drop-in",
+      "agent/supervisor/spatium_supervisor/appliance_state.py:679-738 (maybe_fire_snmp_reload) and 1134-1183 (maybe_fire_ntp_reload) :: trigger-file writer pattern \u2014 appliance-only gate, hash sidecar idempotency, atomic .new\u2192mv, multi-line header payload; add maybe_fire_ssh_reload + _SSH_TRIGGER_FILE/_SSH_HASH_SIDECAR/_SSH_STATUS_SIDECAR + read_ssh_key_count() following these",
+      "appliance/mkosi.extra/usr/local/bin/spatiumddi-snmp-reload :: host-runner precedent \u2014 validate (sshd -t), atomic install of /etc/ssh/sshd_config.d/spatiumddi.conf + ~admin/.ssh/authorized_keys (0600), nft drop-in /etc/nftables.d/50-spatium-ssh.nft for ssh_port, systemctl reload sshd, write hash+status sidecars, .path/.service unit pair; spatiumddi-chrony-reload shows the allow_clients\u2192nft toggle precedent",
+      "appliance/mkosi.extra/etc/systemd/system/spatiumddi-snmp-reload.{path,service} :: copy verbatim for spatiumddi-ssh-reload.{path,service} (PathChanged on the ssh-config-pending trigger; After=etc.mount local-fs.target)",
+      "agent/supervisor/spatium_supervisor/firewall_renderer.py:275 :: CONFLICT \u2014 the firewall drop-in hardcodes `tcp dport 22 accept comment \"ssh\"` in the always-open floor; if ssh_port != 22 the SSH runner's own nft drop-in must open the new port and the floor-22 rule no longer protects access. Note this interaction in the spec (the ssh nft drop-in opens ssh_port scoped to ssh_allowed_source_networks; 22 floor remains for recoverability).",
+      "backend/app/services/ai/tools/snmp.py :: find_snmp_settings \u2014 exact template for find_ssh_settings (no propose tool, module=, default_enabled=True)",
+      "frontend/src/components/SNMPSection.tsx + frontend/src/pages/appliance/SNMPTab.tsx :: frontend form + tab-wrapper template",
+      "backend/app/models/settings.py:526 (web_ui_allowed_cidrs) and :393 (snmp_allowed_sources) :: CIDR-array JSONB column precedent for ssh_allowed_source_networks"
+    ],
+    "tests": [
+      "backend/tests/test_appliance_ssh.py :: render_sshd_config emits correct Port/PasswordAuthentication/PermitRootLogin; render_authorized_keys joins keys with comments; ssh_bundle config_hash deterministic + disabled\u2192empty; public-key validator accepts valid ed25519/rsa keys + rejects garbage/control-chars; lockout-safety raises on password-auth-off + zero keys; privileged-port rejection",
+      "backend/tests/test_settings_ssh_endpoint.py (or extend existing settings test) :: PUT /settings with ssh_* persists; PUT disabling password auth with no keys \u2192 422; PUT with malformed public key \u2192 422; PUT wakes HOSTCONFIG_ALL; audit row written",
+      "backend/tests/ ConfigBundle/heartbeat test :: assert ssh_settings block present in dhcp agent bundle + supervisor heartbeat response and folded into ETag",
+      "agent/supervisor/tests/test_ssh_triggers.py :: maybe_fire_ssh_reload fires once per hash change, idempotent via sidecar, appliance-only gate, refuses unsafe lockout payload (host-side mirror of server guard); mirror agent/supervisor/tests/test_lldp_triggers.py"
+    ],
+    "open_questions": [
+      "Which host user owns authorized_keys: issue says ~admin/.ssh/authorized_keys \u2014 confirm the appliance's admin account name (the firewall_renderer/console wizard may reference a specific user; if there are multiple login users, render needs AllowUsers/Match scaffolding to scope keys). Need the canonical appliance admin username.",
+      "Is ssh_key_count for the Fleet chip per-host (supervisor reports actual applied authorized_keys line count via a status sidecar, like snmpd_running) or global (just len(platform_settings.ssh_authorized_keys))? Spec assumes per-host applied count (mirrors snmpd_running/ntp_sync_state precedent) which proves the keys were actually written; confirm vs. simpler global count.",
+      "Privileged-port handling: issue says 'refuse ssh_port already in use on a privileged port' \u2014 clarify whether the server-side check should reject ANY privileged port (<1024) other than 22, or whether 'already in use' detection is purely a host-runner concern (the host can't know port usage at PUT time). Spec proposes: server rejects <1024 except 22; host runner does the real bind/in-use check + refuses+logs.",
+      "PermitRootLogin granularity: issue gives ssh_allow_root_login bool \u2014 map false\u2192'no' and true\u2192'yes' (or 'prohibit-password' when password auth is off)? Confirm desired sshd directive value for the true case.",
+      "Should the SSH nft drop-in be source-scoped to ssh_allowed_source_networks (CIDR-restricted accept) or open ssh_port unconditionally with sshd's own Match/AllowUsers doing filtering? SNMP opens the port unscoped and lets snmpd filter; chrony opens unscoped and lets chrony 'allow' filter. sshd has no native source-CIDR filter, so the nft drop-in likely MUST be source-scoped here \u2014 confirm this divergence from the SNMP/NTP precedent."
+    ]
+  },
+  {
+    "issue": 158,
+    "summary": "Add appliance DNS-resolver (systemd-resolved) host-config, mirroring the SNMP (#153) / NTP (#154) / LLDP (#343) host-config plane exactly. Add resolver_* columns to the platform_settings singleton, a render_resolved_conf()/resolver_bundle() service that emits an /etc/systemd/resolved.conf.d/spatiumddi.conf drop-in, fold the resolver_settings block into BOTH agent config surfaces (DHCP-agent /config long-poll and supervisor heartbeat), add a supervisor maybe_fire_resolver_reload() trigger writer + a host-side spatiumddi-resolved-reload runner/.path/.service, and ship a Resolver tab under Appliance with DoT + DNSSEC pickers. GET/PUT done via dedicated /settings/resolver endpoints (admin + audited) added inside the existing settings router, plus the resolver fields added to the shared SettingsResponse/SettingsUpdate + PlatformSettings TS type so the full read stays complete.",
+    "complexity": "L",
+    "migration": {
+      "needed": true,
+      "detail": "Add 6 columns to platform_settings (singleton): resolver_mode VARCHAR(16) NOT NULL server_default 'automatic'; resolver_servers JSONB NOT NULL server_default '[]'::jsonb; resolver_fallback_servers JSONB NOT NULL server_default '[]'::jsonb; resolver_search_domains JSONB NOT NULL server_default '[]'::jsonb; resolver_dnssec VARCHAR(16) NOT NULL server_default 'allow-downgrade'; resolver_dns_over_tls VARCHAR(16) NOT NULL server_default 'no'. New alembic revision chaining off the CURRENT head \u2014 note repo has two open heads right now (d6e1a4b9f082 and c7a3e1f90d24); the integrator must chain off whichever is head after the other 8 features merge, or this lands as a batched migration with #156/#157 as the issue recommends (one revision adding all of #156/#157/#158 columns together to avoid a 3-way platform_settings migration collision). Mirror the column-list style of backend/alembic/versions/c87a3f29d108_appliance_ntp_settings.py. Optional (parity, not required for v1): appliance.resolver_status VARCHAR(16) NULL for heartbeat read-back like snmpd_running/ntp_sync_state."
+    },
+    "backend_new_files": [
+      "backend/app/services/appliance/resolver.py :: render_resolved_conf(settings)->str (emits the /etc/systemd/resolved.conf.d/spatiumddi.conf [Resolve] drop-in body; deterministic so the config_hash idempotency check is stable) + resolver_bundle(settings)->dict {enabled, config_hash, resolved_conf} where enabled = (resolver_mode=='override'). Direct port of services/appliance/ntp.py:render_chrony_conf/ntp_bundle. CRITICAL: do NOT emit DNSStubListener in this drop-in \u2014 the appliance already ships /etc/systemd/resolved.conf.d/no-stub-listener.conf with DNSStubListener=no (BIND9 binds host :53); a second file setting it would be redundant/risky. Only emit DNS=, FallbackDNS=, Domains=, DNSSEC=, DNSOverTLS= under [Resolve].",
+      "backend/app/services/ai/tools/resolver.py :: new find_resolver_settings read tool \u2014 direct port of services/ai/tools/ntp.py (no propose/write tool, matching NTP's deliberate choice); register_tool(name='find_resolver_settings', category='admin', default_enabled=True, module='appliance.resolver')",
+      "appliance/mkosi.extra/usr/local/bin/spatiumddi-resolved-reload :: host-side runner (port of spatiumddi-chrony-reload) \u2014 reads /var/lib/spatiumddi/release-state/resolver-config-pending; on enabled marker writes /etc/systemd/resolved.conf.d/spatiumddi.conf + 'systemctl restart systemd-resolved'; on disabled marker REMOVES only spatiumddi.conf (leaves no-stub-listener.conf) + restart; writes resolver-config-hash sidecar; persist drop-in across A/B slots",
+      "appliance/mkosi.extra/etc/systemd/system/spatiumddi-resolved-reload.path :: PathChanged on resolver-config-pending (port of spatiumddi-chrony-reload.path)",
+      "appliance/mkosi.extra/etc/systemd/system/spatiumddi-resolved-reload.service :: oneshot ExecStart=/usr/local/bin/spatiumddi-resolved-reload (port of chrony-reload.service); must also be enabled in appliance/mkosi.postinst alongside the chrony/snmp/lldp .path units"
+    ],
+    "backend_modified_files": [
+      "backend/app/models/settings.py :: add the 6 resolver_* mapped_column definitions in a new '# Appliance DNS resolver (issue #158)' block right after the NTP block (~line 432), matching the NTP/SNMP server_default style (String(16) for resolver_mode/resolver_dnssec/resolver_dns_over_tls, JSONB default=list for the three array columns)",
+      "backend/app/api/v1/settings/router.py :: (1) add resolver_* fields to SettingsResponse (~line 150, after the NTP block) and SettingsUpdate (~line 418); (2) add field_validators: resolver_mode in {'automatic','override'}, resolver_dnssec in {'yes','no','allow-downgrade'}, resolver_dns_over_tls in {'yes','opportunistic','no'}, resolver_servers/resolver_fallback_servers each entry parses via ipaddress.ip_address (reuse the reverse_dns_resolvers validator at line 584), resolver_search_domains non-empty/no-whitespace tokens; (3) add 'resolver_' to the _host_config_touched startswith() tuple at line 848 so a PUT publishes publish_wake(HOSTCONFIG_ALL); (4) add dedicated ResolverSettingsResponse/ResolverSettingsUpdate models + @router.get('/resolver') and @router.put('/resolver') endpoints gated by user_has_permission(current_user,'write','settings') with forbid_in_demo_mode + an explicit AuditLog row action='update' resource_type='platform_settings' resource_id='resolver'",
+      "backend/app/api/v1/dhcp/agents.py :: import resolver_bundle (line ~42 next to snmp_bundle/ntp_bundle/lldp_bundle); build resolver_block with the disabled-shape fallback {enabled:False,config_hash:'',resolved_conf:''} (~line 360); mix into fleet_marker ETag string at line 372 with |resolver:{int(enabled)}:{config_hash}; emit 'resolver_settings': resolver_block in the 200 bundle dict at line 514",
+      "backend/app/api/v1/appliance/supervisor.py :: import resolver_bundle (line ~101); add resolver_settings: dict[str,Any] = Field(default_factory=dict) to SupervisorHeartbeatResponse (~line 1255); build resolver_block with disabled-shape fallback (~line 1822); pass resolver_settings=resolver_block in the SupervisorHeartbeatResponse(...) return (~line 1907)",
+      "backend/app/services/ai/tools/__init__.py :: add 'resolver' to the side-effect import tuple (~line 11, alphabetical near ntp/snmp) so @register_tool runs"
+    ],
+    "shared_files": [
+      "backend/app/models/settings.py :: 6 resolver_* mapped_column defs after NTP block (~line 432)",
+      "backend/app/api/v1/settings/router.py :: resolver_* fields on SettingsResponse + SettingsUpdate, validators, 'resolver_' added to _host_config_touched tuple (line 848), and new /resolver GET+PUT endpoints",
+      "backend/app/api/v1/dhcp/agents.py :: resolver_block fallback + ETag mix (line 372) + 'resolver_settings' in bundle (line 514)",
+      "backend/app/api/v1/appliance/supervisor.py :: resolver_settings field on SupervisorHeartbeatResponse (line 1255) + block build (1822) + return (1907)",
+      "backend/app/services/ai/tools/__init__.py :: add 'resolver' to import tuple",
+      "frontend/src/lib/api.ts :: add resolver_* fields to PlatformSettings interface (~line 2975, after NTP) + export ResolverMode/ResolverDnssec/ResolverDoT union types; settingsApi already has get/update on /settings, optionally add resolver-specific get/update hitting /settings/resolver",
+      "frontend/src/pages/appliance/FleetTab.tsx :: add 'resolver' to the view useSessionState union (line 683) + NavItem key union (line 900) + a navGroups Services item (line 947, after snmp) + a {view==='resolver' && <ResolverTab/>} block (after line 1089) + import ResolverTab",
+      "agent/supervisor/spatium_supervisor/appliance_state.py :: add _RESOLVER_TRIGGER_FILE/_RESOLVER_HASH_SIDECAR/_RESOLVER_STATUS_SIDECAR paths + maybe_fire_resolver_reload(bundle_block) (port of maybe_fire_ntp_reload)",
+      "agent/supervisor/spatium_supervisor/heartbeat.py :: add appliance_state.maybe_fire_resolver_reload(body_out.get('resolver_settings')) call in the #346 host-config block (after line 689)",
+      "appliance/mkosi.postinst :: enable spatiumddi-resolved-reload.path (mirror chrony/snmp/lldp .path enable lines)",
+      "NOTE: backend/app/api/v1/router.py needs NO change \u2014 settings_router already included at /settings (line 262); /settings/resolver lives on that router. NO feature_modules MODULES change. NO dashboards/integrations.py / DashboardPage.tsx change (#15 N/A \u2014 resolver is host-config, not an integration mirror). NO sidebar/nav change (lives under existing Appliance page tabs)."
+    ],
+    "endpoints": [
+      "GET /api/v1/settings/resolver :: any authenticated user (matches GET /settings which is CurrentUser-only); returns full resolver_* shape",
+      "PUT /api/v1/settings/resolver :: user_has_permission(current_user,'write','settings') (superadmin or explicit write/admin grant on 'settings'); forbid_in_demo_mode + explicit AuditLog row; publish_wake(HOSTCONFIG_ALL) after commit when mode/servers change"
+    ],
+    "feature_module": {
+      "needed": false,
+      "key": "",
+      "default_enabled": false,
+      "rationale": "Appliance host-config surfaces (NTP/SNMP/LLDP/timezone) are NOT behind feature_modules \u2014 they are always-available appliance services rendered into a tab under the Appliance page. Resolver mirrors that: no feature_module key. (The only appliance feature_module is appliance.firewall, which gates an entirely separate router; resolver has no equivalent gated router.) Gating is instead via the resolver_mode='automatic' default = inert: render produces no drop-in, runner removes any existing drop-in."
+    },
+    "mcp_tools": [
+      "find_resolver_settings :: find :: default_enabled true :: Surface the singleton platform_settings resolver config (mode, DNS/fallback servers, search domains, DNSSEC, DoT) so the Copilot can answer 'what upstream resolvers does the appliance use / is DoT on?'. No redaction (resolver IPs/domains are not secrets). No propose/write tool for v1 \u2014 matches the deliberate NTP choice in services/ai/tools/ntp.py; the dedicated UI form is the friendly write path."
+    ],
+    "frontend_new_files": [
+      "frontend/src/components/ResolverSection.tsx :: shared form component, direct port of components/NTPSection.tsx \u2014 props {values: PlatformSettings, isSuperadmin, applianceMode, inputCls}; local state + atomic Save via settingsApi.update; mode select (automatic/override); when override: DNS servers + fallback servers + search domains comma/space-split inputs (reuse NTPSection split logic), DNSSEC <select> (yes / no / allow-downgrade), DNSOverTLS <select> (yes / opportunistic / no); reuse the !applianceMode amber warning banner pattern",
+      "frontend/src/pages/appliance/ResolverTab.tsx :: thin wrapper, direct port of pages/appliance/NTPTab.tsx \u2014 me/settings/version queries, header copy ('systemd-resolved drop-in; override replaces upstream resolvers, reverting to automatic removes the drop-in'), renders <ResolverSection/>"
+    ],
+    "frontend_modified_files": [
+      "frontend/src/lib/api.ts :: add resolver_* fields to PlatformSettings interface + ResolverMode='automatic'|'override' / ResolverDnssec='yes'|'no'|'allow-downgrade' / ResolverDoT='yes'|'opportunistic'|'no' union type exports (mirror NtpSourceMode at line 2996)",
+      "frontend/src/pages/appliance/FleetTab.tsx :: import ResolverTab; add 'resolver' to view union (line 683) + NavItem key union (line 900); add {key:'resolver', label:'DNS Resolver', summary:'Fleet-wide systemd-resolved config.'} to the Services navGroups items (after snmp, line 947); add {view==='resolver' && (...<ResolverTab/>)} render block after the snmp block (line 1089)"
+    ],
+    "precedents": [
+      "backend/app/services/appliance/ntp.py :: render_chrony_conf + ntp_bundle \u2014 exact structural template for resolver.py (deterministic body, sha256 config_hash, disabled-shape dict)",
+      "backend/app/services/appliance/snmp.py :: snmp_bundle enabled-gate (body='' when disabled) \u2014 model for resolver_bundle gating on mode=='override'",
+      "backend/app/api/v1/settings/router.py:584 :: validate_resolvers (ipaddress.ip_address per entry) reuse for resolver_servers/resolver_fallback_servers; lines 712-756 NTP validators for enum/CIDR patterns; lines 828-850 _host_config_touched + publish_wake(HOSTCONFIG_ALL)",
+      "agent/supervisor/spatium_supervisor/appliance_state.py:1134 :: maybe_fire_ntp_reload \u2014 exact template for maybe_fire_resolver_reload (appliance-only gate, hash-sidecar short-circuit, atomic .new->rename trigger, multi-line payload header)",
+      "appliance/mkosi.extra/usr/local/bin/spatiumddi-chrony-reload + .path + .service :: exact template for the resolved-reload runner; BUT resolved restarts via 'systemctl restart systemd-resolved' (issue spec) and the override-off path REMOVES the drop-in then restarts (vs NTP always-write)",
+      "appliance/mkosi.extra/etc/systemd/resolved.conf.d/no-stub-listener.conf :: existing drop-in \u2014 new spatiumddi.conf MUST coexist with it and must NOT set DNSStubListener",
+      "frontend/src/components/NTPSection.tsx + pages/appliance/NTPTab.tsx :: exact UI template",
+      "backend/app/services/ai/tools/ntp.py :: find_ntp_settings \u2014 exact template for find_resolver_settings",
+      "frontend/src/pages/appliance/FleetTab.tsx:930-948,1063-1089 :: Services nav + tab render template",
+      "backend/alembic/versions/c87a3f29d108_appliance_ntp_settings.py :: migration column-list template"
+    ],
+    "tests": [
+      "backend/tests/services/appliance/test_resolver.py :: render_resolved_conf \u2014 automatic mode yields disabled-shape (resolver_bundle enabled=False, empty body); override mode renders DNS=/FallbackDNS=/Domains=/DNSSEC=/DNSOverTLS= lines; deterministic (same settings -> identical bytes -> stable config_hash); never emits DNSStubListener; empty servers in override still produces a valid [Resolve] body",
+      "backend/tests/api/test_settings_resolver.py :: GET /settings/resolver returns defaults; PUT as superadmin persists + audits + publishes wake; PUT as non-privileged user 403; invalid resolver_mode/resolver_dnssec/resolver_dns_over_tls -> 422; invalid resolver server IP -> 422; demo-mode -> forbidden; reverting to 'automatic' clears the override intent",
+      "backend/tests/api/test_dhcp_agent_config_resolver.py :: resolver_block present in /config bundle + resolver config_hash change flips the ETag (long-poll wakes)",
+      "backend/tests/api/test_supervisor_heartbeat_resolver.py :: resolver_settings present in heartbeat response with disabled-shape when no settings row",
+      "agent/supervisor/tests/test_resolver_triggers.py :: maybe_fire_resolver_reload writes trigger on hash change, no-ops on matching hash sidecar, no-ops on non-appliance (port of test_lldp_triggers.py / test_cluster_join_triggers.py)"
+    ],
+    "open_questions": [
+      "systemd-resolved restart vs reload: issue says 'systemctl restart systemd-resolved'. A restart briefly drops the host resolver; confirm acceptable (BIND9 in a container is the authoritative :53 and is unaffected; resolved only serves the host's own outbound lookups). If a momentary blip is a concern, 'systemctl reload-or-restart' is safer.",
+      "DNSStubListener interaction: the new drop-in must NOT set DNSStubListener (existing no-stub-listener.conf owns it). Confirm the runner removes ONLY spatiumddi.conf on revert-to-automatic and leaves no-stub-listener.conf intact.",
+      "Per-link vs global override: resolved global DNS= can be overridden by per-link DNS pushed by NetworkManager (dns=systemd-resolved). For an override to actually win, v1 may need to also emit 'Domains=~.' (route-only default domain) so global servers take precedence over per-link DHCP-provided ones \u2014 decide whether to emit it automatically in override mode or just document the caveat.",
+      "Migration batching: issue recommends a single batched platform_settings migration for #156/#157/#158. Integrator must choose one combined revision vs three chained AND first resolve the current two-open-heads state (d6e1a4b9f082 / c7a3e1f90d24).",
+      "Optional heartbeat read-back: add appliance.resolver_status (like snmpd_running/ntp_sync_state) + read_resolver_status() in appliance_state.py and a status pill, or defer for v1 (NTP/SNMP shipped read-backs; resolver could follow up)."
+    ]
+  }
+]
