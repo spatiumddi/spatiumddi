@@ -233,12 +233,17 @@ export function DNSQueryRateCard({
 
 export function DHCPTrafficCard({
   dhcpServers = [],
+  pinnedServerId,
 }: {
   dhcpServers?: DHCPServer[];
+  // #195 — when set (e.g. from the DHCP server detail modal's Stats tab),
+  // the card is scoped to this one server and the server picker is hidden.
+  pinnedServerId?: string;
 }) {
   const [win, setWin] = useState<MetricsWindow>("24h");
   const [serverId, setServerId] = useState<string>(ALL_SERVERS);
-  const scopedId = serverId === ALL_SERVERS ? undefined : serverId;
+  const scopedId =
+    pinnedServerId ?? (serverId === ALL_SERVERS ? undefined : serverId);
   const { data, isLoading } = useQuery({
     queryKey: ["metrics", "dhcp", win, scopedId ?? ""],
     queryFn: () =>
@@ -264,11 +269,13 @@ export function DHCPTrafficCard({
           </h3>
         </div>
         <div className="flex items-center gap-2">
-          <ServerPicker
-            value={serverId}
-            onChange={setServerId}
-            servers={dhcpServers}
-          />
+          {!pinnedServerId && (
+            <ServerPicker
+              value={serverId}
+              onChange={setServerId}
+              servers={dhcpServers}
+            />
+          )}
           <WindowPicker value={win} onChange={setWin} />
         </div>
       </div>

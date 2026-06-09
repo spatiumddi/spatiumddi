@@ -9,6 +9,7 @@ from app.api.v1.admin.redis import router as redis_admin_router
 from app.api.v1.admin.trash import router as trash_router
 from app.api.v1.ai import router as ai_router
 from app.api.v1.alerts.router import router as alerts_router
+from app.api.v1.ansible import router as ansible_router
 from app.api.v1.api_tokens.router import router as api_tokens_router
 from app.api.v1.appliance import router as appliance_router
 from app.api.v1.appliance.firewall import router as firewall_policy_router
@@ -88,6 +89,7 @@ api_v1_router.include_router(postgres_router, prefix="/admin", tags=["admin-post
 api_v1_router.include_router(redis_admin_router, prefix="/admin", tags=["admin-redis"])
 api_v1_router.include_router(trash_router, prefix="/admin", tags=["admin-trash"])
 api_v1_router.include_router(alerts_router, prefix="/alerts", tags=["alerts"])
+api_v1_router.include_router(ansible_router, prefix="/ansible", tags=["ansible"])
 api_v1_router.include_router(api_tokens_router, prefix="/api-tokens", tags=["api-tokens"])
 api_v1_router.include_router(appliance_router, prefix="/appliance", tags=["appliance"])
 # #285 Phase 3c — firewall policy CRUD. Separate include (NOT folded into

@@ -36,6 +36,7 @@ from app.models.ipam import (
     IPSpace,
     Subnet,
     SubnetDomain,
+    SubnetUtilizationHistory,
 )
 from app.models.settings import PlatformSettings
 from app.models.vlans import VLAN
@@ -3715,6 +3716,59 @@ async def get_subnet(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB) ->
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     return subnet
+
+
+class UtilizationHistoryPoint(BaseModel):
+    sampled_at: datetime
+    allocated_ips: int
+    total_ips: int
+    utilization_percent: float
+
+
+@router.get(
+    "/subnets/{subnet_id}/utilization-history",
+    response_model=list[UtilizationHistoryPoint],
+)
+async def get_subnet_utilization_history(
+    subnet_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    days: int = Query(default=90, ge=1, le=365),
+) -> list[UtilizationHistoryPoint]:
+    """Per-subnet IP-utilization over the last ``days`` (#44).
+
+    Daily samples are captured by the ``subnet_utilization_snapshot`` beat
+    task (90-day retention), so this is read-only history — it powers the
+    "% used over time" chart on the subnet detail. Empty until the first
+    nightly snapshot runs.
+    """
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None or subnet.deleted_at is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    since = datetime.now(UTC) - timedelta(days=days)
+    rows = (
+        (
+            await db.execute(
+                select(SubnetUtilizationHistory)
+                .where(SubnetUtilizationHistory.subnet_id == subnet_id)
+                .where(SubnetUtilizationHistory.sampled_at >= since)
+                .order_by(SubnetUtilizationHistory.sampled_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        UtilizationHistoryPoint(
+            sampled_at=r.sampled_at,
+            allocated_ips=r.allocated_ips,
+            total_ips=r.total_ips,
+            utilization_percent=(
+                round(r.allocated_ips / r.total_ips * 100, 2) if r.total_ips > 0 else 0.0
+            ),
+        )
+        for r in rows
+    ]
 
 
 @router.get("/subnets/{subnet_id}/reconciliation")

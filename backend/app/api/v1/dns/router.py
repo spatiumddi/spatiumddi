@@ -2772,6 +2772,86 @@ async def get_zone_server_state(
     )
 
 
+# ── Config-drift report (#61) ───────────────────────────────────────
+
+
+class DriftRecordEntry(BaseModel):
+    name: str
+    record_type: str
+    value: str
+    ttl: int | None = None
+
+
+class ServerDriftEntry(BaseModel):
+    server_id: str
+    server_name: str
+    driver: str
+    status: str  # "ok" | "error" | "unsupported"
+    error: str | None = None
+    in_sync: int
+    drift_count: int
+    extra_on_server: list[DriftRecordEntry]
+    missing_on_server: list[DriftRecordEntry]
+
+
+class ZoneDriftResponse(BaseModel):
+    zone_id: str
+    zone_name: str
+    db_record_count: int
+    servers: list[ServerDriftEntry]
+
+
+@router.get(
+    "/groups/{group_id}/zones/{zone_id}/drift",
+    response_model=ZoneDriftResponse,
+)
+async def get_zone_drift(
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUser
+) -> ZoneDriftResponse:
+    """Per-server record-level config-drift report (#61).
+
+    AXFRs / pulls the live zone from every server in the group and diffs
+    it against the DB source of truth, surfacing per server what's *extra
+    on the server* (manual on-host changes) and *missing on the server*
+    (DB rows not being served). Read-only — never applies. A record whose
+    value changed shows as a missing+extra pair (the identity key includes
+    the value, matching the additive-sync path).
+    """
+    from app.services.dns.drift import compute_zone_drift  # noqa: PLC0415
+
+    zone = await _require_zone(group_id, zone_id, db)
+    report = await compute_zone_drift(db, group_id=group_id, zone=zone)
+    return ZoneDriftResponse(
+        zone_id=report.zone_id,
+        zone_name=report.zone_name,
+        db_record_count=report.db_record_count,
+        servers=[
+            ServerDriftEntry(
+                server_id=s.server_id,
+                server_name=s.server_name,
+                driver=s.driver,
+                status=s.status,
+                error=s.error,
+                in_sync=s.in_sync,
+                drift_count=s.drift_count,
+                extra_on_server=[
+                    DriftRecordEntry(
+                        name=r.name, record_type=r.record_type, value=r.value, ttl=r.ttl
+                    )
+                    for r in s.extra_on_server
+                ],
+                missing_on_server=[
+                    DriftRecordEntry(
+                        name=r.name, record_type=r.record_type, value=r.value, ttl=r.ttl
+                    )
+                    for r in s.missing_on_server
+                ],
+            )
+            for s in report.servers
+        ],
+    )
+
+
 # ── Per-server detail endpoints (powering the Server Detail modal) ──
 
 

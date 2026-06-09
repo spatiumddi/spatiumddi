@@ -1170,3 +1170,28 @@ class IPAMTemplate(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # name_template supports the same {n} / {oct1}–{oct4} tokens as
     # bulk-allocate.
     child_layout: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+
+class SubnetUtilizationHistory(UUIDPrimaryKeyMixin, Base):
+    """Daily snapshot of a subnet's IP utilization (#44).
+
+    One row per subnet per daily sample; powers the 30 / 90-day "% used
+    over time" chart on the subnet detail. Storage piggy-backs on the
+    already-maintained ``Subnet.allocated_ips`` / ``total_ips`` columns —
+    the snapshot beat task just records them. 90-day retention is enforced
+    by that task's prune pass, so the table stays bounded
+    (subnets × ~90 rows).
+    """
+
+    __tablename__ = "subnet_utilization_history"
+
+    subnet_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("subnet.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sampled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    allocated_ips: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_ips: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (Index("ix_subnet_util_hist_subnet_sampled", "subnet_id", "sampled_at"),)

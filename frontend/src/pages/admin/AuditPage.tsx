@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   ClipboardList,
   ChevronLeft,
   ChevronRight,
+  Download,
   ShieldCheck,
   ShieldAlert,
   X,
@@ -115,6 +116,10 @@ export function AuditPage() {
 
   const hasActiveFilter = Object.values(colFilters).some(Boolean);
 
+  const exportPdfMut = useMutation({
+    mutationFn: () => auditApi.exportPdf(),
+  });
+
   const queryParams = {
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
@@ -158,10 +163,26 @@ export function AuditPage() {
             </p>
           </div>
           <ChainIntegrityBadge />
+          <button
+            onClick={() => exportPdfMut.mutate()}
+            disabled={exportPdfMut.isPending}
+            title="Download a compliance / change report PDF (last 30 days)"
+            className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
+          >
+            <Download className="h-3.5 w-3.5" />
+            {exportPdfMut.isPending ? "Exporting…" : "Export PDF"}
+          </button>
           <span className="text-sm text-muted-foreground">
             {total.toLocaleString()} {total === 1 ? "event" : "events"}
           </span>
         </div>
+
+        {exportPdfMut.isError && (
+          <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-400">
+            PDF export failed:{" "}
+            {(exportPdfMut.error as Error)?.message ?? "unknown error"}
+          </div>
+        )}
 
         {/* Table */}
         <div className="overflow-x-auto rounded-lg border">

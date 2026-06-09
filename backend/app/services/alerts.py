@@ -117,6 +117,15 @@ RULE_TYPE_DHCP_POOL_EXHAUSTION = "dhcp_pool_exhaustion"
 # to say whether the supervisor itself is stale or just the host runner.
 RULE_TYPE_FIREWALL_APPLY_STALLED = "firewall.apply_stalled"
 
+# Issue #76 — internal cert / API-token / secret expiry. One rule spans
+# multiple credential tables (supervisor mTLS certs + API tokens with an
+# expiry), so the subject_type is the generic "secret" and the subject_id
+# encodes the source + row id (``appliance_cert:<id>`` / ``api_token:<id>``)
+# to keep each credential's event distinct. Severity escalates like the
+# other ``*_expiring`` rules (threshold/4 → warning, threshold/12 →
+# critical). Catches the "we forgot to rotate" 3am-page failure mode.
+RULE_TYPE_SECRET_EXPIRING = "secret_expiring"
+
 RULE_TYPES = frozenset(
     {
         RULE_TYPE_SUBNET_UTILIZATION,
@@ -140,6 +149,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_STALE_IP_COUNT,
         RULE_TYPE_DHCP_POOL_EXHAUSTION,
         RULE_TYPE_FIREWALL_APPLY_STALLED,
+        RULE_TYPE_SECRET_EXPIRING,
     }
 )
 
@@ -934,6 +944,100 @@ async def _matching_k3s_api_cert_expiring_subjects(
             f"a restart of k3s.service should pick up a refreshed cert."
         )
         matches.append((str(a.id), a.hostname, message, sev))
+    return matches
+
+
+async def _matching_secret_expiring_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for the
+    ``secret_expiring`` rule type (#76). Scans every internal credential
+    that carries an expiry and fires once per credential expiring within
+    ``threshold_days``:
+
+    * **Supervisor mTLS certs** (``appliance.cert_expires_at``) — the
+      internal-CA-signed cert each appliance's supervisor presents on the
+      agent-comms channel. (The k3s API-server cert has its own
+      ``k3s_api_cert_expiring`` rule and is intentionally NOT duplicated.)
+    * **API tokens** (``api_token.expires_at``) — active tokens with an
+      expiry.
+
+    ``subject_id`` is ``appliance_cert:<id>`` / ``api_token:<id>`` so each
+    credential latches its own event; severity escalates per ``threshold/4``
+    (warning) / ``threshold/12`` (critical). TSIG keys and ACME *accounts*
+    carry no expiry of their own (their issued certs do — out of scope), so
+    they contribute no subjects here.
+    """
+    from app.models.appliance import Appliance  # noqa: PLC0415
+    from app.models.auth import APIToken  # noqa: PLC0415
+
+    threshold_days = rule.threshold_days or _DEFAULT_EXPIRING_THRESHOLD_DAYS
+    cutoff = now + timedelta(days=threshold_days)
+    matches: list[tuple[str, str, str, str]] = []
+
+    def _descriptor(days: int) -> str:
+        if days <= 0:
+            return "has expired"
+        if days == 1:
+            return "expires tomorrow"
+        return f"expires in {days} day(s)"
+
+    # 1. Supervisor mTLS certs (internal CA-signed; agent-comms channel).
+    certs = (
+        (
+            await db.execute(
+                select(Appliance)
+                .where(Appliance.revoked_at.is_(None))
+                .where(Appliance.cert_expires_at.is_not(None))
+                .where(Appliance.cert_expires_at <= cutoff)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for a in certs:
+        if a.cert_expires_at is None:
+            continue
+        days = (a.cert_expires_at - now).days
+        sev = _escalate_severity_for_expiring(
+            rule.severity, threshold_days=threshold_days, days_to_expiry=days
+        )
+        message = (
+            f"Supervisor mTLS certificate for appliance {a.hostname} "
+            f"{_descriptor(days)} ({a.cert_expires_at.isoformat()}, threshold "
+            f"{threshold_days} d). Re-key it from the Fleet drilldown."
+        )
+        matches.append((f"appliance_cert:{a.id}", f"{a.hostname} supervisor cert", message, sev))
+
+    # 2. API tokens with an expiry (active only).
+    tokens = (
+        (
+            await db.execute(
+                select(APIToken)
+                .where(APIToken.is_active.is_(True))
+                .where(APIToken.expires_at.is_not(None))
+                .where(APIToken.expires_at <= cutoff)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for t in tokens:
+        if t.expires_at is None:
+            continue
+        days = (t.expires_at - now).days
+        sev = _escalate_severity_for_expiring(
+            rule.severity, threshold_days=threshold_days, days_to_expiry=days
+        )
+        message = (
+            f"API token '{t.name}' ({t.prefix}…) {_descriptor(days)} "
+            f"({t.expires_at.isoformat()}, threshold {threshold_days} d). "
+            f"Rotate it from Settings → API Tokens."
+        )
+        matches.append((f"api_token:{t.id}", f"{t.name} API token", message, sev))
+
     return matches
 
 
@@ -1796,6 +1900,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 expiring = await _matching_k3s_api_cert_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
                 subject_type = "appliance"
+            elif rule.rule_type == RULE_TYPE_SECRET_EXPIRING:
+                expiring = await _matching_secret_expiring_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
+                subject_type = "secret"
             elif rule.rule_type == RULE_TYPE_FIREWALL_APPLY_STALLED:
                 stalled = await _matching_firewall_apply_stalled_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in stalled]

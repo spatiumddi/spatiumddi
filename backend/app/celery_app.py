@@ -30,6 +30,7 @@ celery_app = Celery(
         "app.tasks.trash_purge",
         "app.tasks.ipam_reservation_sweep",
         "app.tasks.ipam_discovery",
+        "app.tasks.subnet_utilization_snapshot",
         "app.tasks.reverse_dns",
         "app.tasks.dhcp_lease_history_prune",
         "app.tasks.update_check",
@@ -77,6 +78,7 @@ celery_app.conf.update(
         "app.tasks.prune_internal_errors.*": {"queue": "default"},
         "app.tasks.prune_logs.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
+        "app.tasks.subnet_utilization_snapshot.*": {"queue": "default"},
         "app.tasks.prune_multicast_memberships.*": {"queue": "default"},
         "app.tasks.prune_pairing_codes.*": {"queue": "default"},
         "app.tasks.firewall_lint_scan.*": {"queue": "default"},
@@ -230,6 +232,12 @@ celery_app.conf.update(
         # pruning more often just burns cycles.
         "metric-samples-prune": {
             "task": "app.tasks.prune_metrics.prune_metric_samples",
+            "schedule": schedule(run_every=24 * 3600.0),
+        },
+        # #44 — daily per-subnet utilization snapshot + 90-day prune,
+        # powering the "% used over time" chart on the subnet detail.
+        "subnet-utilization-snapshot": {
+            "task": "app.tasks.subnet_utilization_snapshot.snapshot_subnet_utilization",
             "schedule": schedule(run_every=24 * 3600.0),
         },
         # Nightly prune of agent-shipped query / activity log entries

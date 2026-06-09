@@ -477,6 +477,13 @@ export const SUBNET_ROLE_LABELS: Record<SubnetRole, string> = {
   guest: "Guest",
 };
 
+export interface SubnetUtilizationPoint {
+  sampled_at: string;
+  allocated_ips: number;
+  total_ips: number;
+  utilization_percent: number;
+}
+
 export interface Subnet {
   id: string;
   space_id: string;
@@ -1377,6 +1384,13 @@ export const ipamApi = {
   }) => api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
   getSubnet: (id: string) =>
     api.get<Subnet>(`/ipam/subnets/${id}`).then((r) => r.data),
+  // Per-subnet utilization history — daily snapshots for the trend chart (#44).
+  getUtilizationHistory: (id: string, days = 90) =>
+    api
+      .get<
+        SubnetUtilizationPoint[]
+      >(`/ipam/subnets/${id}/utilization-history`, { params: { days } })
+      .then((r) => r.data),
   // IP discovery reconciliation report (issue #23).
   getReconciliation: (id: string, staleMinutes?: number) =>
     api
@@ -2227,6 +2241,54 @@ export const auditApi = {
         params: maxRows ? { max_rows: maxRows } : undefined,
       })
       .then((r) => r.data),
+  /** Compliance / change report PDF (#48) — auditor-facing rollup of every
+   *  audit-log mutation in a date range, grouped by user / type / action.
+   *  Defaults to the last 30 days; pass ISO ``since``/``until`` to narrow. */
+  exportPdf: async (params?: {
+    since?: string;
+    until?: string;
+  }): Promise<void> => {
+    let res;
+    try {
+      res = await api.get<Blob>("/audit/export.pdf", {
+        params,
+        responseType: "blob",
+      });
+    } catch (err) {
+      // With responseType: "blob" the error body also arrives as a Blob, so
+      // the usual response.data.detail is unreadable — unwrap it to text
+      // first and re-throw a real Error the caller can show inline.
+      const data = (err as { response?: { data?: unknown } })?.response?.data;
+      if (data instanceof Blob) {
+        const text = await data.text();
+        let detail = text || "PDF export failed";
+        try {
+          detail = JSON.parse(text)?.detail || detail;
+        } catch {
+          // body wasn't JSON — fall back to the raw text
+        }
+        throw new Error(detail);
+      }
+      throw err;
+    }
+    const disp = (res.headers["content-disposition"] as string) || "";
+    const match = disp.match(/filename="?([^";]+)"?/i);
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[-:]/g, "")
+      .replace("T", "-");
+    const filename = match ? match[1] : `spatiumddi-change-report-${ts}.pdf`;
+    const blob = new Blob([res.data as BlobPart], { type: "application/pdf" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
 };
 
 // ── Backup + restore (issue #117 Phase 1a) ────────────────────────────────────
@@ -6663,7 +6725,8 @@ export type AlertRuleType =
   | "compliance_change"
   | "voice_lease_count_below"
   | "stale_ip_count"
-  | "dhcp_pool_exhaustion";
+  | "dhcp_pool_exhaustion"
+  | "secret_expiring";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with

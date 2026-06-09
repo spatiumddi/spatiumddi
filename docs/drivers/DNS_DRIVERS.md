@@ -472,11 +472,11 @@ Each driver's `capabilities()` returns the same dict shape Windows / PowerDNS us
 
 | | Cloudflare | Route 53 | Azure DNS | Google Cloud DNS |
 |---|:---:|:---:|:---:|:---:|
-| `dnssec_online` | ✅ | ✅ | ❌ | ✅ |
-| ALIAS records | apex CNAME auto-flattened | ✅ (`AliasTarget`, null TTL) | ✅ | — |
+| `dnssec_online` | ❌ | ❌ | ❌ | ❌ |
+| ALIAS records | apex CNAME auto-flattened | read-only (`AliasTarget`, null TTL; authoring deferred) | deferred | — |
 | Apex handling | Cloudflare flattens CNAME-at-apex | apex SOA / NS provider-managed | apex SOA Azure-managed (skipped on read) | apex SOA provider-managed |
 
-`azure_dns` is the only cloud driver without online DNSSEC support — its capability dict carries `dnssec_online: False` and the notes call it out. The DNSSEC sign/unsign/rollover operations stay gated server-side by `_DRIVER_GATED_OPERATIONS` as for every other driver.
+**No cloud driver advertises online DNSSEC sign/unsign (#29).** Cloud DNSSEC is a zone-level *provider* toggle — Route 53 needs a KMS asymmetric key, Cloudflare/Google a managed-zone enable — not the per-record online signing the `dnssec_sign`/`unsign` ops model, so every cloud driver's capability dict carries `dnssec_online: False` and the DNSSEC sign/unsign/rollover operations stay gated server-side by `_DRIVER_GATED_OPERATIONS` to PowerDNS / BIND9. Likewise **cloud ALIAS authoring is deferred** — Route 53 / Azure alias targets need a provider resource id the generic `ALIAS` record type can't express (so `alias_records: False` and `ALIAS` is gated to PowerDNS), though existing alias rrsets are still read back. Wiring real cloud DNSSEC (provider enable + DS retrieval) and cloud ALIAS authoring is a #29 follow-up.
 
 ### 4A.4 Provider-specific wrinkles the hooks paper over
 

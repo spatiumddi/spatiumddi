@@ -78,7 +78,7 @@ def test_capabilities_shape() -> None:
     assert caps["name"] == "azure_dns"
     assert caps["agentless"] is True
     assert caps["manages_zones"] is True
-    assert caps["alias_records"] is True
+    assert caps["alias_records"] is False  # #29 — alias authoring deferred
     assert caps["dnssec_online"] is False
     assert "SOA" in caps["record_types"]
     assert "online DNSSEC" in caps["notes"]

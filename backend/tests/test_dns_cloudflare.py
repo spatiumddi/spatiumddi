@@ -537,6 +537,6 @@ def test_capabilities_shape() -> None:
     assert caps["name"] == "cloudflare"
     assert caps["agentless"] is True
     assert caps["manages_zones"] is True
-    assert caps["dnssec_online"] is True
+    assert caps["dnssec_online"] is False  # #29 — cloud DNSSEC deferred
     assert caps["apex_cname"] == "flatten"
     assert "CAA" in caps["record_types"]

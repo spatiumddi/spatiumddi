@@ -126,6 +126,7 @@ import { FreeSpaceBand } from "@/components/ipam/FreeSpaceBand";
 import { PlanAllocationModal } from "@/components/ipam/PlanAllocationModal";
 import { AggregationCandidatesBadge } from "@/components/ipam/AggregationSuggestions";
 import { FreeSpaceTreemap } from "@/components/ipam/FreeSpaceTreemap";
+import { SubnetUtilizationHistory } from "@/components/ipam/SubnetUtilizationHistory";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -3698,7 +3699,7 @@ function SubnetDetail({
   const [scanFromDetail, setScanFromDetail] = useState<IPAddress | null>(null);
   const [showFilters, setShowFilters] = useState(false);
   const [activeSubnetTab, setActiveSubnetTab] = useState<
-    "addresses" | "dhcp" | "aliases" | "nat"
+    "addresses" | "dhcp" | "aliases" | "nat" | "trend"
   >("addresses");
   const [natModalIp, setNatModalIp] = useState<IPAddress | null>(null);
   const [selectedIpIds, setSelectedIpIds] = useState<Set<string>>(new Set());
@@ -4351,6 +4352,18 @@ function SubnetDetail({
           >
             NAT
           </button>
+          <button
+            onClick={() => setActiveSubnetTab("trend")}
+            className={cn(
+              "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
+              activeSubnetTab === "trend"
+                ? "border-primary text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground",
+            )}
+            title="Utilization over time"
+          >
+            Trend
+          </button>
           {activeSubnetTab === "addresses" && selectedIpIds.size > 0 && (
             <div className="ml-auto flex items-center gap-2 py-1">
               <span className="text-xs font-medium text-muted-foreground">
@@ -4398,6 +4411,12 @@ function SubnetDetail({
       {activeSubnetTab === "nat" && (
         <div className="flex-1 overflow-auto">
           <NatSubnetPanel subnetId={subnet.id} />
+        </div>
+      )}
+
+      {activeSubnetTab === "trend" && (
+        <div className="flex-1 overflow-auto p-4">
+          <SubnetUtilizationHistory subnetId={subnet.id} />
         </div>
       )}
 

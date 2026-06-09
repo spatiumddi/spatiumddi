@@ -27,7 +27,13 @@ from app.models.circuit import Circuit
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.domain import Domain
-from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.ipam import (
+    IPAddress,
+    IPBlock,
+    IPSpace,
+    Subnet,
+    SubnetUtilizationHistory,
+)
 from app.models.network import NetworkDevice
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
@@ -368,6 +374,81 @@ async def find_subnet_reconciliation(
         return {"error": "subnet not found", "subnet_id": args.subnet_id}
     stale = max(1, min(args.stale_minutes, 525600))
     return await build_reconciliation_report(db, subnet, stale_minutes=stale)
+
+
+# ── get_subnet_utilization_trend ──────────────────────────────────────
+
+
+class SubnetUtilizationTrendArgs(BaseModel):
+    subnet_id: str = Field(description="Subnet UUID.")
+    days: int = Field(
+        default=90,
+        description="How many days of history to return (1–365, default 90).",
+    )
+
+
+@register_tool(
+    name="get_subnet_utilization_trend",
+    description=(
+        "Daily IP-utilization history for one subnet (issue #44): a "
+        "time-ordered series of allocated / total / percent snapshots plus "
+        "first→last delta. Use when the operator asks 'is X filling up?', "
+        "'how fast is X growing?', or 'what was utilization last month?'. "
+        "Snapshots are recorded nightly and retained 90 days."
+    ),
+    args_model=SubnetUtilizationTrendArgs,
+    category="ipam",
+)
+async def get_subnet_utilization_trend(
+    db: AsyncSession, user: User, args: SubnetUtilizationTrendArgs
+) -> dict[str, Any]:
+    from datetime import UTC, datetime, timedelta
+
+    try:
+        subnet_uuid = uuid.UUID(args.subnet_id)
+    except (ValueError, TypeError):
+        return {"error": "subnet_id must be a UUID", "subnet_id": args.subnet_id}
+    subnet = await db.get(Subnet, subnet_uuid)
+    if subnet is None or subnet.deleted_at is not None:
+        return {"error": "subnet not found", "subnet_id": args.subnet_id}
+    days = max(1, min(args.days, 365))
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+    rows = (
+        (
+            await db.execute(
+                select(SubnetUtilizationHistory)
+                .where(
+                    SubnetUtilizationHistory.subnet_id == subnet_uuid,
+                    SubnetUtilizationHistory.sampled_at >= cutoff,
+                )
+                .order_by(SubnetUtilizationHistory.sampled_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    points = [
+        {
+            "sampled_at": r.sampled_at.isoformat(),
+            "allocated_ips": r.allocated_ips,
+            "total_ips": r.total_ips,
+            "utilization_percent": (
+                round(r.allocated_ips / r.total_ips * 100, 2) if r.total_ips else 0.0
+            ),
+        }
+        for r in rows
+    ]
+    delta = None
+    if len(points) >= 2:
+        delta = round(points[-1]["utilization_percent"] - points[0]["utilization_percent"], 2)
+    return {
+        "subnet_id": str(subnet.id),
+        "network": str(subnet.network),
+        "days": days,
+        "points": points,
+        "current_utilization_percent": float(subnet.utilization_percent or 0.0),
+        "delta_percent_over_window": delta,
+    }
 
 
 # ── find_stale_ips ─────────────────────────────────────────────────────

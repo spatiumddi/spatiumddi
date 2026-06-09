@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
+  BarChart3,
   Copy,
   Cpu,
   FileText,
@@ -13,6 +14,7 @@ import {
   ScrollText,
   Server,
 } from "lucide-react";
+import { DHCPTrafficCard } from "@/components/MetricsCharts";
 import { Modal } from "@/components/ui/modal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import {
@@ -42,7 +44,7 @@ import {
  * Read-only Windows DHCP servers hide the Logs + Config tabs (the
  * driver doesn't push a Kea log pipeline and has no rendered config).
  */
-type Tab = "overview" | "sync" | "events" | "logs" | "config";
+type Tab = "overview" | "sync" | "events" | "logs" | "config" | "stats";
 
 const READ_ONLY_DRIVERS = new Set(["windows_dhcp"]);
 
@@ -166,6 +168,12 @@ export function ServerDetailModal({
                 icon={<FileText className="h-3.5 w-3.5" />}
                 label="Config"
               />
+              <TabButton
+                active={tab === "stats"}
+                onClick={() => setTab("stats")}
+                icon={<BarChart3 className="h-3.5 w-3.5" />}
+                label="Stats"
+              />
             </>
           )}
         </div>
@@ -177,6 +185,17 @@ export function ServerDetailModal({
           {tab === "logs" && !isReadOnly && <LogsTab serverId={server.id} />}
           {tab === "config" && !isReadOnly && (
             <ConfigTab serverId={server.id} />
+          )}
+          {/* #195 — DHCP lease-rate timeseries (DISCOVER/OFFER/REQUEST/ACK/
+              NAK/…), scoped to this server. Reuses the dashboard's
+              DHCPTrafficCard pinned to server.id — symmetric with how the
+              DNS modal's Stats tab reuses metricsApi.dnsTimeseries. Gated on
+              !isReadOnly like Logs/Config (Windows DHCP has no Kea metric
+              stream). */}
+          {tab === "stats" && !isReadOnly && (
+            <div className="p-3">
+              <DHCPTrafficCard pinnedServerId={server.id} />
+            </div>
           )}
         </div>
       </div>
