@@ -24,6 +24,7 @@ import re
 from collections import defaultdict
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 
@@ -31,7 +32,16 @@ from app.api.deps import DB
 from app.core.permissions import require_permission
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 
+logger = structlog.get_logger(__name__)
+
 router = APIRouter()
+
+# The Ansible ``--list`` contract requires the *complete* inventory in one
+# response, so this endpoint deliberately loads every address (capping would
+# silently drop hosts from automation — far worse than the latency). This is
+# the soft size past which we log a heads-up so an operator on a very large
+# install has a breadcrumb if the call gets slow / memory-heavy.
+_LARGE_INVENTORY_WARN = 50_000
 
 # Roles that are placeholder rows (the network / broadcast addresses IPAM
 # auto-creates), not manageable hosts — never emit them as Ansible hosts.
@@ -67,6 +77,12 @@ async def ansible_inventory(
     """Return the full ``--list`` inventory (with ``_meta.hostvars``), or a
     single host's vars when ``?host=`` is supplied."""
     addresses = (await db.execute(select(IPAddress))).scalars().all()
+    if len(addresses) >= _LARGE_INVENTORY_WARN:
+        logger.warning(
+            "ansible.inventory.large",
+            address_count=len(addresses),
+            threshold=_LARGE_INVENTORY_WARN,
+        )
     subnets = {s.id: s for s in (await db.execute(select(Subnet))).scalars().all()}
     blocks = {b.id: b for b in (await db.execute(select(IPBlock))).scalars().all()}
     spaces = {sp.id: sp for sp in (await db.execute(select(IPSpace))).scalars().all()}

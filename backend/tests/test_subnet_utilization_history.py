@@ -101,3 +101,16 @@ async def test_utilization_history_empty(client: AsyncClient, db_session: AsyncS
     )
     assert r.status_code == 200, r.text
     assert r.json() == []
+
+
+async def test_utilization_history_missing_subnet_404(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    token = await _admin_token(db_session)
+    await db_session.commit()
+    r = await client.get(
+        f"/api/v1/ipam/subnets/{uuid.uuid4()}/utilization-history",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    # A missing subnet is distinguishable from "no history yet" (empty list).
+    assert r.status_code == 404, r.text

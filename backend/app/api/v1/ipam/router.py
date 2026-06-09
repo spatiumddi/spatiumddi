@@ -3742,6 +3742,9 @@ async def get_subnet_utilization_history(
     "% used over time" chart on the subnet detail. Empty until the first
     nightly snapshot runs.
     """
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None or subnet.deleted_at is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     since = datetime.now(UTC) - timedelta(days=days)
     rows = (
         (

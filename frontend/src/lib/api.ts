@@ -2248,10 +2248,29 @@ export const auditApi = {
     since?: string;
     until?: string;
   }): Promise<void> => {
-    const res = await api.get<Blob>("/audit/export.pdf", {
-      params,
-      responseType: "blob",
-    });
+    let res;
+    try {
+      res = await api.get<Blob>("/audit/export.pdf", {
+        params,
+        responseType: "blob",
+      });
+    } catch (err) {
+      // With responseType: "blob" the error body also arrives as a Blob, so
+      // the usual response.data.detail is unreadable — unwrap it to text
+      // first and re-throw a real Error the caller can show inline.
+      const data = (err as { response?: { data?: unknown } })?.response?.data;
+      if (data instanceof Blob) {
+        const text = await data.text();
+        let detail = text || "PDF export failed";
+        try {
+          detail = JSON.parse(text)?.detail || detail;
+        } catch {
+          // body wasn't JSON — fall back to the raw text
+        }
+        throw new Error(detail);
+      }
+      throw err;
+    }
     const disp = (res.headers["content-disposition"] as string) || "";
     const match = disp.match(/filename="?([^";]+)"?/i);
     const ts = new Date()
