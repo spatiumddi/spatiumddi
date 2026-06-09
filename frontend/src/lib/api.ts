@@ -477,6 +477,13 @@ export const SUBNET_ROLE_LABELS: Record<SubnetRole, string> = {
   guest: "Guest",
 };
 
+export interface SubnetUtilizationPoint {
+  sampled_at: string;
+  allocated_ips: number;
+  total_ips: number;
+  utilization_percent: number;
+}
+
 export interface Subnet {
   id: string;
   space_id: string;
@@ -1377,6 +1384,13 @@ export const ipamApi = {
   }) => api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
   getSubnet: (id: string) =>
     api.get<Subnet>(`/ipam/subnets/${id}`).then((r) => r.data),
+  // Per-subnet utilization history — daily snapshots for the trend chart (#44).
+  getUtilizationHistory: (id: string, days = 90) =>
+    api
+      .get<
+        SubnetUtilizationPoint[]
+      >(`/ipam/subnets/${id}/utilization-history`, { params: { days } })
+      .then((r) => r.data),
   // IP discovery reconciliation report (issue #23).
   getReconciliation: (id: string, staleMinutes?: number) =>
     api
