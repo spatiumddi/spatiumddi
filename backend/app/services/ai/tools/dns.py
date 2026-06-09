@@ -679,6 +679,62 @@ async def find_zone_dnssec_info(
     }
 
 
+class FindZoneDriftArgs(BaseModel):
+    zone_id: uuid.UUID = Field(
+        description="UUID of the dns_zone to check for per-server config drift.",
+    )
+
+
+@register_tool(
+    name="find_dns_zone_drift",
+    description=(
+        "Per-server config-drift report for one DNS zone (#61): AXFRs / "
+        "pulls the live zone from every server in the zone's group and "
+        "diffs it against the SpatiumDDI DB source of truth. Returns, per "
+        "server, how many records are 'extra on the server' (a manual "
+        "change made directly on the host), 'missing on the server' (DB "
+        "rows the server isn't serving), and in-sync — plus a sample of the "
+        "drifting records. A value change shows as a missing+extra pair. "
+        "Use to answer 'is example.com drifting?' or 'did someone edit "
+        "records directly on the BIND9 host?'. Read-only."
+    ),
+    args_model=FindZoneDriftArgs,
+    category="dns",
+    module="dns",
+)
+async def find_dns_zone_drift(
+    db: AsyncSession, user: User, args: FindZoneDriftArgs
+) -> dict[str, Any]:
+    from app.services.dns.drift import compute_zone_drift  # noqa: PLC0415
+
+    zone = await db.get(DNSZone, args.zone_id)
+    if zone is None:
+        return {"error": "DNS zone not found", "zone_id": str(args.zone_id)}
+    report = await compute_zone_drift(db, group_id=zone.group_id, zone=zone)
+    return {
+        "zone_id": report.zone_id,
+        "name": report.zone_name,
+        "db_record_count": report.db_record_count,
+        "servers": [
+            {
+                "server_name": s.server_name,
+                "driver": s.driver,
+                "status": s.status,
+                "error": s.error,
+                "in_sync": s.in_sync,
+                "drift_count": s.drift_count,
+                "extra_on_server": [
+                    f"{r.name} {r.record_type} {r.value}" for r in s.extra_on_server[:20]
+                ],
+                "missing_on_server": [
+                    f"{r.name} {r.record_type} {r.value}" for r in s.missing_on_server[:20]
+                ],
+            }
+            for s in report.servers
+        ],
+    }
+
+
 class ListDNSSECPoliciesArgs(BaseModel):
     pass
 
