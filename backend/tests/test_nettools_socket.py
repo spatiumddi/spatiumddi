@@ -178,9 +178,15 @@ def test_parse_valid_self_signed() -> None:
         not_after=now + dt.timedelta(days=90),
     )
     parsed = _parse_cert(der, "self.example.com")
-    assert "self.example.com" in parsed["subject"]  # type: ignore[operator]
+    subject = parsed["subject"]
+    san = parsed["san"]
+    # Type-narrow before comparing: parsed is dict[str, object], so a bare
+    # `"host" in parsed["subject"]` reads as a substring check on an unknown
+    # type (and trips CodeQL's URL-substring-sanitization heuristic). subject
+    # is the RFC4514 DN string; san is a list of DNS names — assert exactly.
+    assert isinstance(subject, str) and subject == "CN=self.example.com"
     assert parsed["self_signed"] is True
-    assert "alt.example.com" in parsed["san"]  # type: ignore[operator]
+    assert isinstance(san, list) and "alt.example.com" in san
     assert parsed["expired"] is False
     assert parsed["hostname_matches"] is True
     assert isinstance(parsed["days_remaining"], int) and parsed["days_remaining"] > 80
