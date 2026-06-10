@@ -10719,6 +10719,19 @@ export const nmapApi = {
 // nmap scanner's model, not this one).
 
 /** Uniform subprocess-tool result (ping / traceroute / mtr / dig / whois). */
+// ── reachability-tool run-from target ─────────────────────────────────
+//
+// Optional vantage selector accepted by the five reachability tools
+// (ping / traceroute / dig / port-test / tls-cert). Omitted or
+// ``kind: "server"`` runs inline on the control plane (today's
+// behaviour); ``kind: "appliance"`` dispatches the run from the named
+// Fleet appliance's supervisor. The matching result carries
+// ``ran_from`` ("server" or "appliance:<hostname>").
+export interface NetToolTarget {
+  kind: "server" | "appliance";
+  id: string;
+}
+
 export interface NetToolCommandResult {
   tool: string;
   argv: string[];
@@ -10729,6 +10742,8 @@ export interface NetToolCommandResult {
   stdout: string;
   stderr: string;
   error: string | null;
+  /** Vantage the run executed from — "server" or "appliance:<name>". */
+  ran_from?: string;
 }
 
 export interface NetToolPortTestResult {
@@ -10739,6 +10754,8 @@ export interface NetToolPortTestResult {
   state: string;
   rtt_ms: number | null;
   error: string | null;
+  /** Vantage the run executed from — "server" or "appliance:<name>". */
+  ran_from?: string;
 }
 
 export interface NetToolTlsCertResult {
@@ -10758,6 +10775,8 @@ export interface NetToolTlsCertResult {
   serial: string | null;
   signature_algorithm: string | null;
   error: string | null;
+  /** Vantage the run executed from — "server" or "appliance:<name>". */
+  ran_from?: string;
 }
 
 export interface NetToolMacVendorEntry {
@@ -10771,31 +10790,59 @@ export interface NetToolMacVendorResult {
   entries: NetToolMacVendorEntry[];
 }
 
+// Fold the routing-only ``target`` into a reachability-tool body only
+// when it points at an appliance — a "server" target (or none) is the
+// back-compatible inline run, so we omit the field entirely.
+function withTarget<T extends object>(body: T, target?: NetToolTarget): T {
+  if (target && target.kind === "appliance") {
+    return { ...body, target };
+  }
+  return body;
+}
+
 export const networkToolsApi = {
-  ping: (host: string) =>
-    api.post<NetToolCommandResult>("/tools/ping", { host }).then((r) => r.data),
-  traceroute: (host: string) =>
+  ping: (host: string, target?: NetToolTarget) =>
     api
-      .post<NetToolCommandResult>("/tools/traceroute", { host })
+      .post<NetToolCommandResult>("/tools/ping", withTarget({ host }, target))
+      .then((r) => r.data),
+  traceroute: (host: string, target?: NetToolTarget) =>
+    api
+      .post<NetToolCommandResult>(
+        "/tools/traceroute",
+        withTarget({ host }, target),
+      )
       .then((r) => r.data),
   mtr: (host: string) =>
     api.post<NetToolCommandResult>("/tools/mtr", { host }).then((r) => r.data),
-  dig: (body: { name: string; record_type?: string; server?: string | null }) =>
-    api.post<NetToolCommandResult>("/tools/dig", body).then((r) => r.data),
+  dig: (
+    body: { name: string; record_type?: string; server?: string | null },
+    target?: NetToolTarget,
+  ) =>
+    api
+      .post<NetToolCommandResult>("/tools/dig", withTarget(body, target))
+      .then((r) => r.data),
   whois: (query: string) =>
     api
       .post<NetToolCommandResult>("/tools/whois", { query })
       .then((r) => r.data),
-  portTest: (body: { host: string; port: number; protocol?: string }) =>
+  portTest: (
+    body: { host: string; port: number; protocol?: string },
+    target?: NetToolTarget,
+  ) =>
     api
-      .post<NetToolPortTestResult>("/tools/port-test", body)
+      .post<NetToolPortTestResult>("/tools/port-test", withTarget(body, target))
       .then((r) => r.data),
-  tlsCert: (body: {
-    host: string;
-    port?: number;
-    server_name?: string | null;
-  }) =>
-    api.post<NetToolTlsCertResult>("/tools/tls-cert", body).then((r) => r.data),
+  tlsCert: (
+    body: {
+      host: string;
+      port?: number;
+      server_name?: string | null;
+    },
+    target?: NetToolTarget,
+  ) =>
+    api
+      .post<NetToolTlsCertResult>("/tools/tls-cert", withTarget(body, target))
+      .then((r) => r.data),
   dnsPropagation: (body: {
     name: string;
     record_type?: string;
