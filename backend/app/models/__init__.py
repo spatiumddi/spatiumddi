@@ -92,6 +92,7 @@ from app.models.network import (
 )
 from app.models.network_service import NetworkService, NetworkServiceResource
 from app.models.nmap import NmapScan
+from app.models.opnsense import OPNsenseRouter
 from app.models.oui import OUIVendor
 from app.models.overlay import (
     ApplicationCategory,
@@ -188,6 +189,7 @@ __all__ = [
     "DockerHost",
     "Domain",
     "KubernetesCluster",
+    "OPNsenseRouter",
     "ProxmoxNode",
     "SystemUpgradeRun",
     "TailscaleTenant",

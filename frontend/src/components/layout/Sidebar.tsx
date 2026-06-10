@@ -548,6 +548,9 @@ export function Sidebar({
     ...(moduleEnabled("integrations.docker")
       ? [{ label: "Docker", icon: ContainerIcon, to: "/docker" }]
       : []),
+    ...(moduleEnabled("integrations.opnsense")
+      ? [{ label: "OPNsense", icon: ShieldCheck, to: "/opnsense" }]
+      : []),
     ...(moduleEnabled("integrations.proxmox")
       ? [{ label: "Proxmox", icon: HardDrive, to: "/proxmox" }]
       : []),

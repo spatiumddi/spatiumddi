@@ -49,6 +49,11 @@ IP_STATUSES_INTEGRATION_OWNED: frozenset[str] = frozenset(
         "proxmox-vm",
         "proxmox-lxc",
         "tailscale-node",
+        # OPNsense ARP-table mirror (issue #31). Opt-in secondary source
+        # — a host the firewall has seen on the wire, distinct from a
+        # DHCP lease (status="dhcp") or static reservation
+        # (status="reserved") which the OPNsense reconciler also emits.
+        "opnsense-arp",
         # Cloud integration (issue #37, Part A). cloud-instance = a
         # VM/EC2/GCE NIC private IP; cloud-public = an Elastic/public
         # IP or external address; cloud-lb = a load-balancer frontend
@@ -270,6 +275,15 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     cloud_endpoint_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("cloud_endpoint.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # OPNsense integration provenance (issue #31). Set on wrapper blocks
+    # the OPNsense reconciler creates when no operator block encloses a
+    # firewall interface's CIDR. Cascades on firewall delete.
+    opnsense_router_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("opnsense_router.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )
@@ -676,6 +690,16 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # OPNsense provenance (issue #31). Set on subnets mirrored from a
+    # firewall interface CIDR (LAN / OPT* / VLAN). These are real LANs
+    # — gateway + broadcast apply, unlike a Proxmox plain bridge.
+    # Cascades on firewall delete.
+    opnsense_router_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("opnsense_router.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # Computed / cached. ``total_ips`` is BigInteger because IPv6 subnets can
     # be as large as 2^64 addresses (a /64 — the standard LAN size) which
@@ -867,6 +891,16 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     cloud_endpoint_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("cloud_endpoint.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # OPNsense provenance (issue #31) — set on rows mirrored from a
+    # DHCPv4 lease (status="dhcp"), static reservation
+    # (status="reserved"), or ARP entry (status="opnsense-arp").
+    # Cascades on firewall delete.
+    opnsense_router_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("opnsense_router.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )

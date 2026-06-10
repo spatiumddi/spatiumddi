@@ -242,6 +242,13 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Read-only mirror of public-cloud infrastructure (VPCs / subnets / instance NICs / public + load-balancer IPs) into IPAM. Connect accounts from the Cloud page once enabled. (Cloud DNS is managed separately via the Add DNS server flow.)",
         default_enabled=False,
     ),
+    ModuleSpec(
+        id="integrations.opnsense",
+        label="OPNsense",
+        group="Integrations",
+        description="Read-only mirror of OPNsense interfaces + DHCP leases + reservations into IPAM.",
+        default_enabled=False,
+    ),
     # Appliance — the declarative fleet-firewall policy surface (#285
     # Phase 3). Default-enabled for DISCOVERY/STAGING only: turning this
     # module ON exposes the policy editor + preview but applies NOTHING.
@@ -269,6 +276,7 @@ INTEGRATION_SETTINGS_MIRROR: Final[dict[str, str]] = {
     "integrations.tailscale": "integration_tailscale_enabled",
     "integrations.unifi": "integration_unifi_enabled",
     "integrations.cloud": "integration_cloud_enabled",
+    "integrations.opnsense": "integration_opnsense_enabled",
 }
 
 MODULES_BY_ID: Final[dict[str, ModuleSpec]] = {m.id: m for m in MODULES}

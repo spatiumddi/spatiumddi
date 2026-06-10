@@ -165,6 +165,9 @@ backend/alembic/versions/b5d8a3f12c91_conformity_evaluations.py:drop_table:139
 backend/alembic/versions/b5d9c41e2f80_ai_chat_sessions.py:drop_table:131
 backend/alembic/versions/b5d9c41e2f80_ai_chat_sessions.py:drop_table:135
 backend/alembic/versions/b6f1d4a82c97_api_token_scopes.py:drop_column:49
+backend/alembic/versions/b6f4d2a91c83_opnsense_integration.py:drop_column:121
+backend/alembic/versions/b6f4d2a91c83_opnsense_integration.py:drop_column:124
+backend/alembic/versions/b6f4d2a91c83_opnsense_integration.py:drop_table:126
 backend/alembic/versions/b71d9ae34c50_windows_dhcp_support.py:drop_column:63
 backend/alembic/versions/b71d9ae34c50_windows_dhcp_support.py:drop_column:64
 backend/alembic/versions/b71d9ae34c50_windows_dhcp_support.py:drop_column:65

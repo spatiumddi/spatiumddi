@@ -44,6 +44,7 @@ import {
   kubernetesApi,
   dockerApi,
   proxmoxApi,
+  opnsenseApi,
   cloudApi,
   tailscaleApi,
   unifiApi,
@@ -62,6 +63,7 @@ import {
   type KubernetesCluster,
   type DockerHost,
   type ProxmoxNode,
+  type OPNsenseRouter,
   type CloudEndpoint,
   type TailscaleTenant,
   type UnifiController,
@@ -956,6 +958,7 @@ export function DashboardPage() {
   const kubernetesEnabled = settings?.integration_kubernetes_enabled ?? false;
   const dockerEnabled = settings?.integration_docker_enabled ?? false;
   const proxmoxEnabled = settings?.integration_proxmox_enabled ?? false;
+  const opnsenseEnabled = settings?.integration_opnsense_enabled ?? false;
   const cloudEnabled = settings?.integration_cloud_enabled ?? false;
   const tailscaleEnabled = settings?.integration_tailscale_enabled ?? false;
   const unifiEnabled = settings?.integration_unifi_enabled ?? false;
@@ -981,6 +984,13 @@ export function DashboardPage() {
     queryKey: ["proxmox-nodes"],
     queryFn: proxmoxApi.listNodes,
     enabled: proxmoxEnabled,
+    refetchInterval: 30_000,
+  });
+
+  const { data: opnsenseRouters = [] } = useQuery<OPNsenseRouter[]>({
+    queryKey: ["opnsense-routers"],
+    queryFn: opnsenseApi.listRouters,
+    enabled: opnsenseEnabled,
     refetchInterval: 30_000,
   });
 
@@ -1669,6 +1679,7 @@ export function DashboardPage() {
           (kubernetesEnabled ||
             dockerEnabled ||
             proxmoxEnabled ||
+            opnsenseEnabled ||
             cloudEnabled ||
             tailscaleEnabled ||
             unifiEnabled) && (
@@ -1683,12 +1694,14 @@ export function DashboardPage() {
                 kubernetesEnabled={kubernetesEnabled}
                 dockerEnabled={dockerEnabled}
                 proxmoxEnabled={proxmoxEnabled}
+                opnsenseEnabled={opnsenseEnabled}
                 cloudEnabled={cloudEnabled}
                 tailscaleEnabled={tailscaleEnabled}
                 unifiEnabled={unifiEnabled}
                 clusters={k8sClusters}
                 hosts={dockerHosts}
                 proxmoxNodes={proxmoxNodes}
+                opnsenseRouters={opnsenseRouters}
                 cloudEndpoints={cloudEndpoints}
                 tailscaleTenants={tailscaleTenants}
                 unifiControllers={unifiControllers}
@@ -2088,12 +2101,14 @@ function IntegrationsPanel({
   kubernetesEnabled,
   dockerEnabled,
   proxmoxEnabled,
+  opnsenseEnabled,
   cloudEnabled,
   tailscaleEnabled,
   unifiEnabled,
   clusters,
   hosts,
   proxmoxNodes,
+  opnsenseRouters,
   cloudEndpoints,
   tailscaleTenants,
   unifiControllers,
@@ -2101,12 +2116,14 @@ function IntegrationsPanel({
   kubernetesEnabled: boolean;
   dockerEnabled: boolean;
   proxmoxEnabled: boolean;
+  opnsenseEnabled: boolean;
   cloudEnabled: boolean;
   tailscaleEnabled: boolean;
   unifiEnabled: boolean;
   clusters: KubernetesCluster[];
   hosts: DockerHost[];
   proxmoxNodes: ProxmoxNode[];
+  opnsenseRouters: OPNsenseRouter[];
   cloudEndpoints: CloudEndpoint[];
   tailscaleTenants: TailscaleTenant[];
   unifiControllers: UnifiController[];
@@ -2114,6 +2131,7 @@ function IntegrationsPanel({
   const hasK8s = kubernetesEnabled;
   const hasDocker = dockerEnabled;
   const hasProxmox = proxmoxEnabled;
+  const hasOpnsense = opnsenseEnabled;
   const hasCloud = cloudEnabled;
   const hasTailscale = tailscaleEnabled;
   const hasUnifi = unifiEnabled;
@@ -2121,6 +2139,7 @@ function IntegrationsPanel({
     hasK8s,
     hasDocker,
     hasProxmox,
+    hasOpnsense,
     hasCloud,
     hasTailscale,
     hasUnifi,
@@ -2129,6 +2148,7 @@ function IntegrationsPanel({
     clusters.length +
     hosts.length +
     proxmoxNodes.length +
+    opnsenseRouters.length +
     cloudEndpoints.length +
     tailscaleTenants.length +
     unifiControllers.length;
@@ -2154,6 +2174,7 @@ function IntegrationsPanel({
           cols === 4 && "md:grid-cols-4 md:divide-x md:divide-y-0",
           cols === 5 && "md:grid-cols-5 md:divide-x md:divide-y-0",
           cols === 6 && "md:grid-cols-6 md:divide-x md:divide-y-0",
+          cols === 7 && "md:grid-cols-7 md:divide-x md:divide-y-0",
         )}
       >
         {hasK8s && (
@@ -2265,6 +2286,48 @@ function IntegrationsPanel({
                     lastSyncError={p.last_sync_error}
                     intervalSeconds={p.sync_interval_seconds}
                     enabled={p.enabled}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {hasOpnsense && (
+          <div className="min-w-0">
+            <Link
+              to="/opnsense"
+              className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
+            >
+              <Shield className="h-3 w-3" />
+              OPNsense ({opnsenseRouters.length})
+              <span className="ml-auto text-[10px] text-muted-foreground/70">
+                view all →
+              </span>
+            </Link>
+            {opnsenseRouters.length === 0 ? (
+              <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
+                No firewalls registered.
+              </p>
+            ) : (
+              <div className="divide-y">
+                {opnsenseRouters.map((r) => (
+                  <IntegrationRow
+                    key={r.id}
+                    to={`/opnsense`}
+                    name={r.name}
+                    subtitle={`${r.host}:${r.port}`}
+                    meta={
+                      r.interface_count != null
+                        ? `${r.interface_count} iface${r.interface_count === 1 ? "" : "s"}` +
+                          (r.lease_count != null
+                            ? ` · ${r.lease_count} lease${r.lease_count === 1 ? "" : "s"}`
+                            : "")
+                        : "—"
+                    }
+                    lastSyncedAt={r.last_synced_at}
+                    lastSyncError={r.last_sync_error}
+                    intervalSeconds={r.sync_interval_seconds}
+                    enabled={r.enabled}
                   />
                 ))}
               </div>

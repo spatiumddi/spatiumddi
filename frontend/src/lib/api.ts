@@ -2915,6 +2915,7 @@ export interface PlatformSettings {
   integration_tailscale_enabled: boolean;
   integration_unifi_enabled: boolean;
   integration_cloud_enabled: boolean;
+  integration_opnsense_enabled: boolean;
   /** Domain WHOIS refresh cadence (hours). Beat ticks hourly; the
    *  task itself reads this on every fire so cadence changes take
    *  effect on the next tick without restarting beat. 1–168 h range
@@ -7198,7 +7199,8 @@ export type IntegrationDashboardKind =
   | "proxmox"
   | "tailscale"
   | "unifi"
-  | "cloud";
+  | "cloud"
+  | "opnsense";
 export interface IntegrationsDashboardTargetRow {
   id: string;
   display: string;
@@ -9363,6 +9365,104 @@ export const proxmoxApi = {
   syncNow: (id: string) =>
     api
       .post<{ status: string; task_id: string }>(`/proxmox/nodes/${id}/sync`)
+      .then((r) => r.data),
+};
+
+// ── OPNsense integration (issue #31) ───────────────────────────────
+
+export interface OPNsenseRouter {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  host: string;
+  port: number;
+  verify_tls: boolean;
+  ca_bundle_present: boolean;
+  api_key: string;
+  api_secret_present: boolean;
+  ipam_space_id: string;
+  dns_group_id: string | null;
+  mirror_dhcp_leases: boolean;
+  mirror_static_mappings: boolean;
+  mirror_arp: boolean;
+  sync_interval_seconds: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  firmware_version: string | null;
+  interface_count: number | null;
+  lease_count: number | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface OPNsenseRouterCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  host: string;
+  port?: number;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  api_key: string;
+  api_secret: string;
+  ipam_space_id: string;
+  dns_group_id?: string | null;
+  mirror_dhcp_leases?: boolean;
+  mirror_static_mappings?: boolean;
+  mirror_arp?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface OPNsenseRouterUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  host?: string;
+  port?: number;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  api_key?: string;
+  api_secret?: string;
+  ipam_space_id?: string;
+  dns_group_id?: string | null;
+  mirror_dhcp_leases?: boolean;
+  mirror_static_mappings?: boolean;
+  mirror_arp?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface OPNsenseTestResult {
+  ok: boolean;
+  message: string;
+  firmware_version: string | null;
+}
+
+export const opnsenseApi = {
+  listRouters: () =>
+    api.get<OPNsenseRouter[]>("/opnsense/routers").then((r) => r.data),
+  createRouter: (data: OPNsenseRouterCreate) =>
+    api.post<OPNsenseRouter>("/opnsense/routers", data).then((r) => r.data),
+  updateRouter: (id: string, data: OPNsenseRouterUpdate) =>
+    api
+      .put<OPNsenseRouter>(`/opnsense/routers/${id}`, data)
+      .then((r) => r.data),
+  deleteRouter: (id: string) => api.delete(`/opnsense/routers/${id}`),
+  testConnection: (body: {
+    router_id?: string;
+    host?: string;
+    port?: number;
+    verify_tls?: boolean;
+    ca_bundle_pem?: string;
+    api_key?: string;
+    api_secret?: string;
+  }) =>
+    api
+      .post<OPNsenseTestResult>("/opnsense/routers/test", body)
+      .then((r) => r.data),
+  syncNow: (id: string) =>
+    api
+      .post<{ status: string; task_id: string }>(`/opnsense/routers/${id}/sync`)
       .then((r) => r.data),
 };
 

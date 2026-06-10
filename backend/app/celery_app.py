@@ -37,6 +37,7 @@ celery_app = Celery(
         "app.tasks.kubernetes_sync",
         "app.tasks.docker_sync",
         "app.tasks.proxmox_sync",
+        "app.tasks.opnsense_sync",
         "app.tasks.tailscale_sync",
         "app.tasks.unifi_sync",
         "app.tasks.cloud_sync",
@@ -92,6 +93,7 @@ celery_app.conf.update(
         "app.tasks.kubernetes_sync.*": {"queue": "default"},
         "app.tasks.docker_sync.*": {"queue": "default"},
         "app.tasks.proxmox_sync.*": {"queue": "default"},
+        "app.tasks.opnsense_sync.*": {"queue": "default"},
         "app.tasks.tailscale_sync.*": {"queue": "default"},
         "app.tasks.unifi_sync.*": {"queue": "default"},
         "app.tasks.cloud_sync.*": {"queue": "default"},
@@ -309,6 +311,12 @@ celery_app.conf.update(
         # Gated overall by ``PlatformSettings.integration_proxmox_enabled``.
         "proxmox-sync-sweep": {
             "task": "app.tasks.proxmox_sync.sweep_proxmox_nodes",
+            "schedule": schedule(run_every=30.0),
+        },
+        # OPNsense — same 30 s beat, per-firewall interval gate.
+        # Gated overall by ``PlatformSettings.integration_opnsense_enabled``.
+        "opnsense-sync-sweep": {
+            "task": "app.tasks.opnsense_sync.sweep_opnsense_routers",
             "schedule": schedule(run_every=30.0),
         },
         # Tailscale — same 30 s beat, per-tenant interval gate.

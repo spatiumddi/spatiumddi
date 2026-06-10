@@ -45,6 +45,7 @@ from app.api.v1.metrics import router as metrics_router
 from app.api.v1.multicast import router as multicast_router
 from app.api.v1.network import router as network_router
 from app.api.v1.nmap import router as nmap_router
+from app.api.v1.opnsense import router as opnsense_router
 from app.api.v1.overlays import router as overlays_router
 from app.api.v1.ownership import (
     customers_router,
@@ -239,6 +240,12 @@ api_v1_router.include_router(
     prefix="/nmap",
     tags=["nmap"],
     dependencies=[Depends(require_module("tools.nmap"))],
+)
+api_v1_router.include_router(
+    opnsense_router,
+    prefix="/opnsense",
+    tags=["opnsense"],
+    dependencies=[Depends(require_module("integrations.opnsense"))],
 )
 api_v1_router.include_router(
     overlays_router,

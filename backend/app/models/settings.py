@@ -266,6 +266,9 @@ class PlatformSettings(Base):
     )
     integration_unifi_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     integration_cloud_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    integration_opnsense_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
 
     # Trash retention — high-blast-radius IPAM/DNS/DHCP rows are soft-
     # deleted (``deleted_at`` set) and the nightly purge sweep hard-
