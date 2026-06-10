@@ -27,6 +27,7 @@ from app.api.v1.reports.router import (
     compute_top_owners,
     compute_top_subnets,
 )
+from app.core.permissions import user_has_permission
 from app.models.auth import User
 from app.services.ai.tools.base import register_tool
 
@@ -96,8 +97,22 @@ class FindTopOwnersArgs(BaseModel):
     default_enabled=True,
 )
 async def find_top_owners_by_ip_count(
-    db: AsyncSession, user: User, args: FindTopOwnersArgs  # noqa: ARG001 — read-only
-) -> list[dict[str, Any]]:
+    db: AsyncSession, user: User, args: FindTopOwnersArgs
+) -> list[dict[str, Any]] | dict[str, str]:
+    # The payload is the customer roster (customer_id + customer_name).
+    # ``compute_top_owners`` performs no permission check of its own, so
+    # gate here on ``read:customer`` — the same resource type the
+    # canonical customers surface and the REST endpoint require. A caller
+    # with only ``read:ip_address`` must not read customer names through
+    # this side door.
+    if not user_has_permission(user, "read", "customer"):
+        return {
+            "error": (
+                "This report returns the customer roster (the top IP "
+                "owners) and requires 'read' permission on 'customer'. "
+                "Ask your platform admin to grant it."
+            )
+        }
     rows = await compute_top_owners(db, limit=args.limit)
     return [r.model_dump() for r in rows]
 

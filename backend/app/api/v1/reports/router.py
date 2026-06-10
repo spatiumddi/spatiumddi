@@ -11,7 +11,10 @@ Permission gates (CLAUDE.md non-negotiable #3) are per-endpoint, keyed
 to the dominant resource type each report draws from:
 
 * top-subnets       → ``read`` on ``subnet``
-* top-owners        → ``read`` on ``ip_address`` (the thing we count)
+* top-owners        → ``read`` on ``customer`` (the payload IS the
+  customer roster — customer_id + customer_name for the top owners —
+  so it must gate on the same resource type the canonical customers
+  surface does, not on the ``ip_address`` rows we happen to count)
 * top-modified      → ``read`` on ``audit_log``
 * top-dns-clients   → ``read`` on ``server`` OR ``dns_group`` (the DNS
   query-log surface in the Logs router gates on ``server``; we accept
@@ -24,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import desc, func, select
+from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
@@ -33,6 +36,7 @@ from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, Subnet
 from app.models.logs import DNSQueryLogEntry
 from app.models.ownership import Customer
+from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS
 
 router = APIRouter()
 
@@ -197,16 +201,39 @@ async def compute_top_modified_resources(
 
     Counts create / update / delete mutations per
     ``(resource_type, resource_id)``. ``resource_display`` is taken from
-    the most-recent row for that resource (``max(timestamp)``) so the
-    label reflects the current name even if it was renamed mid-window.
+    the *most-recent* row for that resource (highest ``timestamp``) so
+    the label reflects the current name even if it was renamed
+    mid-window. A correlated subquery selects that latest display per
+    grouped resource — ``func.max(resource_display)`` would instead
+    return the lexicographically-largest string, which is not the same
+    thing the moment a resource is renamed.
     """
     since = datetime.now(UTC) - timedelta(days=window_days)
+    # Correlated subquery: the display string from the newest audit row
+    # for this (resource_type, resource_id). Ordering by timestamp DESC,
+    # seq DESC breaks same-timestamp ties deterministically on the
+    # later-inserted row (``seq`` is a strictly-increasing insertion
+    # sequence, unlike the UUID ``id``).
+    inner = AuditLog.__table__.alias("recent_disp")
+    latest_display = (
+        select(inner.c.resource_display)
+        .where(
+            and_(
+                inner.c.resource_type == AuditLog.resource_type,
+                inner.c.resource_id == AuditLog.resource_id,
+            )
+        )
+        .order_by(desc(inner.c.timestamp), desc(inner.c.seq))
+        .limit(1)
+        .correlate(AuditLog.__table__)
+        .scalar_subquery()
+    )
     stmt = (
         select(
             AuditLog.resource_type.label("resource_type"),
             AuditLog.resource_id.label("resource_id"),
             func.count().label("change_count"),
-            func.max(AuditLog.resource_display).label("resource_display"),
+            latest_display.label("resource_display"),
         )
         .where(AuditLog.timestamp >= since)
         .where(AuditLog.action.in_(("create", "update", "delete")))
@@ -227,17 +254,23 @@ async def compute_top_modified_resources(
 
 
 async def compute_top_dns_clients(db: AsyncSession, *, limit: int = TOP_N) -> list[TopDNSClientRow]:
-    """DNS query-log clients ranked by query volume.
+    """DNS query-log clients ranked by query volume over the last 24 h.
 
-    Groups the parsed BIND9 query-log rows by ``client_ip``. The log
-    table is pruned at 24 h (operator triage retention), so this reads
-    "noisiest clients in the last day". An empty table returns ``[]``.
+    Groups the parsed BIND9 query-log rows by ``client_ip``, bounded to
+    the trailing :data:`prune_logs.DEFAULT_RETENTION_HOURS` (24 h)
+    window. The prune sweep only runs nightly, so between sweeps the
+    table can hold ~48 h of rows — without the time predicate this would
+    over-count *and* full-table-scan past the ``ix_dns_query_log_ts``
+    index. Reusing the retention constant keeps the report window and
+    the prune window aligned. An empty table returns ``[]``.
     """
+    since = datetime.now(UTC) - timedelta(hours=DEFAULT_RETENTION_HOURS)
     stmt = (
         select(
             DNSQueryLogEntry.client_ip.label("client_ip"),
             func.count().label("query_count"),
         )
+        .where(DNSQueryLogEntry.ts >= since)
         .where(DNSQueryLogEntry.client_ip.is_not(None))
         .group_by(DNSQueryLogEntry.client_ip)
         .order_by(desc(func.count()))
@@ -268,7 +301,7 @@ async def top_subnets_by_utilization(db: DB) -> TopSubnetsReport:
 @router.get(
     "/top-owners-by-ip-count",
     response_model=TopOwnersReport,
-    dependencies=[Depends(require_permission("read", "ip_address"))],
+    dependencies=[Depends(require_permission("read", "customer"))],
 )
 async def top_owners_by_ip_count(db: DB) -> TopOwnersReport:
     """Top 10 owners (Customers) by allocated-IP count, with an

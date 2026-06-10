@@ -233,13 +233,20 @@ async def test_top_owners_empty(client: AsyncClient, db_session: AsyncSession) -
 # ── top-modified-resources ───────────────────────────────────────────
 
 
-def _audit(resource_type: str, resource_id: str, *, action: str, ts: datetime) -> AuditLog:
+def _audit(
+    resource_type: str,
+    resource_id: str,
+    *,
+    action: str,
+    ts: datetime,
+    display: str | None = None,
+) -> AuditLog:
     return AuditLog(
         user_display_name="tester",
         action=action,
         resource_type=resource_type,
         resource_id=resource_id,
-        resource_display=f"{resource_type}:{resource_id}",
+        resource_display=display if display is not None else f"{resource_type}:{resource_id}",
         result="success",
         timestamp=ts,
     )
@@ -306,6 +313,49 @@ async def test_top_modified_empty(client: AsyncClient, db_session: AsyncSession)
     assert r.json()["rows"] == []
 
 
+@pytest.mark.asyncio
+async def test_top_modified_uses_latest_display_after_rename(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """resource_display must reflect the MOST-RECENT audit row's display,
+    not the lexicographically-largest. A resource renamed mid-window from
+    a 'larger' string to a 'smaller' one would mislead under func.max()
+    (FIX 3)."""
+    _, h = await _admin(db_session)
+    now = datetime.now(UTC)
+
+    # Resource renamed "zzz-old-name" → "aaa-new-name" within the window.
+    # The new name sorts BEFORE the old one lexicographically, so
+    # func.max() would wrongly return "zzz-old-name". The latest-row
+    # logic must return "aaa-new-name".
+    db_session.add_all(
+        [
+            _audit(
+                "subnet",
+                "R",
+                action="update",
+                ts=now - timedelta(days=2),
+                display="zzz-old-name",
+            ),
+            _audit(
+                "subnet",
+                "R",
+                action="update",
+                ts=now - timedelta(hours=1),
+                display="aaa-new-name",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    r = await client.get(f"{REPORTS}/top-modified-resources", headers=h)
+    assert r.status_code == 200, r.text
+    rows = r.json()["rows"]
+    by_id = {row["resource_id"]: row for row in rows}
+    assert by_id["R"]["change_count"] == 2
+    assert by_id["R"]["resource_display"] == "aaa-new-name"
+
+
 # ── top-dns-clients ──────────────────────────────────────────────────
 
 
@@ -354,6 +404,51 @@ async def test_top_dns_clients_empty(client: AsyncClient, db_session: AsyncSessi
     assert r.json()["rows"] == []
 
 
+@pytest.mark.asyncio
+async def test_top_dns_clients_excludes_rows_older_than_24h(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The query is bounded to the trailing 24 h retention window, so a
+    log row older than that must NOT be counted even while it lingers in
+    the table between nightly prune sweeps (FIX 2)."""
+    _, h = await _admin(db_session)
+    from app.models.dns import DNSServer, DNSServerGroup
+
+    grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}", group_type="internal")
+    db_session.add(grp)
+    await db_session.flush()
+    srv = DNSServer(group_id=grp.id, name="srv", driver="bind9", host="10.0.0.1")
+    db_session.add(srv)
+    await db_session.flush()
+
+    now = datetime.now(UTC)
+    recent = now - timedelta(hours=1)
+    stale = now - timedelta(hours=30)  # past the 24h window
+
+    def _q(client_ip: str, ts: datetime) -> DNSQueryLogEntry:
+        return DNSQueryLogEntry(
+            server_id=srv.id, ts=ts, client_ip=client_ip, qname="x.example.com", qtype="A", raw=""
+        )
+
+    db_session.add_all(
+        [
+            _q("192.0.2.10", recent),
+            _q("192.0.2.10", recent),
+            # Stale row for a different client — must be excluded.
+            _q("192.0.2.99", stale),
+            _q("192.0.2.99", stale),
+            _q("192.0.2.99", stale),
+        ]
+    )
+    await db_session.commit()
+
+    r = await client.get(f"{REPORTS}/top-dns-clients", headers=h)
+    assert r.status_code == 200, r.text
+    by_ip = {row["client_ip"]: row["query_count"] for row in r.json()["rows"]}
+    assert by_ip.get("192.0.2.10") == 2
+    assert "192.0.2.99" not in by_ip  # stale rows beyond 24h excluded
+
+
 # ── Permission gates ─────────────────────────────────────────────────
 
 
@@ -370,14 +465,55 @@ async def test_top_subnets_requires_subnet_read(
 
 
 @pytest.mark.asyncio
-async def test_top_owners_requires_ip_address_read(
+async def test_top_owners_requires_customer_read(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
+    # The payload IS the customer roster, so it gates on read:customer —
+    # NOT read:ip_address. A user with ip_address read but no customer
+    # read must be denied (info-disclosure gap; FIX 1).
     _, h = await _user_with_perms(
-        db_session, [{"action": "read", "resource_type": "subnet"}], name="noip"
+        db_session, [{"action": "read", "resource_type": "ip_address"}], name="noip"
     )
     r = await client.get(f"{REPORTS}/top-owners-by-ip-count", headers=h)
     assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_top_owners_allows_customer_read(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, h = await _user_with_perms(
+        db_session, [{"action": "read", "resource_type": "customer"}], name="custok"
+    )
+    r = await client.get(f"{REPORTS}/top-owners-by-ip-count", headers=h)
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_find_top_owners_tool_refuses_without_customer_read(
+    db_session: AsyncSession,
+) -> None:
+    """The MCP tool reuses compute_top_owners (no built-in customer
+    check), so it must gate on read:customer itself — a caller with
+    only read:ip_address gets an error dict, and a caller with
+    read:customer gets the rows (FIX 1)."""
+    from app.services.ai.tools.reports import (
+        FindTopOwnersArgs,
+        find_top_owners_by_ip_count,
+    )
+
+    user_noperm, _ = await _user_with_perms(
+        db_session, [{"action": "read", "resource_type": "ip_address"}], name="tool-noip"
+    )
+    out = await find_top_owners_by_ip_count(db_session, user_noperm, FindTopOwnersArgs())
+    assert isinstance(out, dict)
+    assert "error" in out
+
+    user_ok, _ = await _user_with_perms(
+        db_session, [{"action": "read", "resource_type": "customer"}], name="tool-custok"
+    )
+    out_ok = await find_top_owners_by_ip_count(db_session, user_ok, FindTopOwnersArgs())
+    assert isinstance(out_ok, list)
 
 
 @pytest.mark.asyncio
