@@ -585,6 +585,21 @@ async def _matching_server_subjects(
 # ── Domain rule evaluators ──────────────────────────────────────────
 
 
+_SEVERITY_ORDER = ("info", "warning", "critical")
+
+
+def _severity_rank(severity: str) -> int:
+    """Ordinal rank for an alert severity: ``info < warning < critical``.
+
+    Unknown / unexpected values rank as ``warning`` (1) — same default
+    the pre-existing escalation helper used. Shared by the expiring-rule
+    escalation helper and the ``evaluate_all`` open-event loop so an
+    already-open ``*_expiring`` event can be bumped up (never down) as
+    its expiry date nears.
+    """
+    return {"info": 0, "warning": 1, "critical": 2}.get(severity, 1)
+
+
 def _escalate_severity_for_expiring(
     base_severity: str,
     *,
@@ -602,10 +617,7 @@ def _escalate_severity_for_expiring(
     domain (or zero — defaults to warning at threshold/4), not three.
     """
 
-    def _rank(s: str) -> int:
-        return {"info": 0, "warning": 1, "critical": 2}.get(s, 1)
-
-    base_rank = _rank(base_severity)
+    base_rank = _severity_rank(base_severity)
     actual_rank = 0  # info at the soft threshold
 
     # Avoid division blowups for absurdly small thresholds. Floor of 1.
@@ -616,7 +628,7 @@ def _escalate_severity_for_expiring(
         actual_rank = 1  # warning
 
     final = max(base_rank, actual_rank)
-    return ("info", "warning", "critical")[final]
+    return _SEVERITY_ORDER[final]
 
 
 async def _matching_domain_expiring_subjects(
@@ -2059,9 +2071,36 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
 
             match_ids = {sid for sid, _, _, _ in matches}
 
-            # Open new events for unseen matches.
+            # Open new events for unseen matches; escalate existing ones.
             for subject_id, display, message, severity_override in matches:
-                if subject_id in open_by_subject:
+                existing = open_by_subject.get(subject_id)
+                if existing is not None:
+                    # Subject is already open. For the *_expiring rule
+                    # family the matcher recomputes a per-row severity
+                    # every tick that climbs info → warning → critical as
+                    # the expiry date nears (issue #46). Bump the open
+                    # event and re-deliver when that severity is *higher*
+                    # than what's already recorded — never downgrade and
+                    # never re-deliver on an unchanged severity (avoids
+                    # 60 s notification spam). Non-escalating rules pass a
+                    # stable severity, so the rank compare never trips and
+                    # they're left untouched.
+                    new_severity = severity_override or rule.severity
+                    if _severity_rank(new_severity) > _severity_rank(existing.severity):
+                        existing.severity = new_severity
+                        existing.message = message
+                        ds, dw, dm = await _deliver(rule, existing, targets)
+                        # OR-in: a channel that delivered on open should
+                        # stay flagged even if a later escalation skips it.
+                        existing.delivered_syslog = existing.delivered_syslog or ds
+                        existing.delivered_webhook = existing.delivered_webhook or dw
+                        existing.delivered_smtp = existing.delivered_smtp or dm
+                        if ds:
+                            delivered_syslog += 1
+                        if dw:
+                            delivered_webhook += 1
+                        if dm:
+                            delivered_smtp += 1
                     continue
                 event = AlertEvent(
                     rule_id=rule.id,
