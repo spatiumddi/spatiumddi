@@ -85,9 +85,12 @@ def render_resolved_conf(settings: PlatformSettings) -> str:
     if servers:
         lines.append("DNS=" + " ".join(servers))
     else:
-        # Override mode with no servers configured is still a valid body —
-        # an empty DNS= line is harmless; document it so an operator who
-        # SSHes in understands the half-configured state.
+        # Override mode with no servers should never reach here — the
+        # settings PUT rejects override + empty servers (it routes all host
+        # DNS to an absent global server list, leaving zero working upstream
+        # resolution). Kept as a defensive marker for any legacy row that
+        # pre-dates that guard, so a curious operator who SSHes in sees why
+        # resolution is broken rather than a silently-empty DNS= line.
         lines.append("# No upstream DNS servers configured — add some in the UI.")
 
     if fallback:

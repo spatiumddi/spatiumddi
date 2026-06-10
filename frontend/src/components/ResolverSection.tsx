@@ -78,6 +78,13 @@ export function ResolverSection({
     dnssec !== values.resolver_dnssec ||
     dot !== values.resolver_dns_over_tls;
 
+  // Override mode routes ALL host DNS to the global DNS= list (Domains=~.),
+  // so an empty server list leaves the host with zero working upstream DNS.
+  // Mirror the server-side guard: require at least one server in override
+  // mode (disable Save + show why) so the operator can't lock the host out.
+  const overrideNeedsServers =
+    mode === "override" && splitList(servers).length === 0;
+
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
 
@@ -151,7 +158,7 @@ export function ResolverSection({
         <>
           <Field
             label="DNS servers"
-            description="Comma- or space-separated resolver IPs (v4 or v6) rendered as systemd-resolved DNS=. A route-only ~. default domain is emitted automatically so these servers win over per-link resolvers. Leaving this empty in override mode is allowed but means no global servers are pinned."
+            description="Comma- or space-separated resolver IPs (v4 or v6) rendered as systemd-resolved DNS=. A route-only ~. default domain is emitted automatically so these servers win over per-link resolvers. At least one server is required in override mode — override routes all host DNS here, so an empty list would leave the host with no working upstream DNS."
           >
             <input
               type="text"
@@ -159,7 +166,11 @@ export function ResolverSection({
               onChange={(e) => setServers(e.target.value)}
               placeholder="1.1.1.1, 9.9.9.9"
               disabled={!isSuperadmin}
-              className={cn(inputCls, "w-96 max-w-full font-mono")}
+              className={cn(
+                inputCls,
+                "w-96 max-w-full font-mono",
+                overrideNeedsServers && "border-destructive",
+              )}
             />
           </Field>
 
@@ -229,7 +240,12 @@ export function ResolverSection({
         <button
           type="button"
           onClick={handleSave}
-          disabled={!isSuperadmin || !dirty || mutation.isPending}
+          disabled={
+            !isSuperadmin ||
+            !dirty ||
+            mutation.isPending ||
+            overrideNeedsServers
+          }
           className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
         >
           {mutation.isPending
@@ -238,6 +254,11 @@ export function ResolverSection({
               ? "Saved!"
               : "Save resolver settings"}
         </button>
+        {overrideNeedsServers && (
+          <span className="text-xs text-destructive">
+            Override mode requires at least one DNS server.
+          </span>
+        )}
         {saveErr && (
           <span className="text-xs text-destructive">
             Failed to save: {saveErr}

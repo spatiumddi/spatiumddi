@@ -757,6 +757,26 @@ class SettingsUpdate(BaseModel):
             out.append(s)
         return out
 
+    @model_validator(mode="after")
+    def _resolver_override_requires_servers(self) -> SettingsUpdate:
+        # CROSS-FIELD guard (#158, mirrors the SSH lockout-safety pattern):
+        # override mode routes ALL host DNS to the global ``DNS=`` server
+        # list (``Domains=~.``), so an override with an empty server list
+        # leaves the appliance host with zero working upstream DNS — and with
+        # DNSOverTLS=yes there's no plaintext fallback either, making it
+        # effectively unrecoverable until corrected. Reject the in-request
+        # case where override is selected AND servers are explicitly cleared.
+        # ``resolver_servers is None`` means "leave the stored list alone";
+        # the merged-state guard in ``update_settings`` catches the case where
+        # the stored list is also empty (it can see the DB row).
+        if (
+            self.resolver_mode == "override"
+            and self.resolver_servers is not None
+            and not self.resolver_servers
+        ):
+            raise ValueError("resolver override mode requires at least one DNS server")
+        return self
+
     @field_validator("ssh_port")
     @classmethod
     def _valid_ssh_port(cls, v: int | None) -> int | None:
@@ -1238,6 +1258,27 @@ class ResolverSettingsUpdate(BaseModel):
             out.append(s)
         return out
 
+    @model_validator(mode="after")
+    def _override_requires_servers(self) -> ResolverSettingsUpdate:
+        # CROSS-FIELD guard (#158, mirrors the SSH lockout-safety pattern):
+        # override mode routes ALL host DNS to the global ``DNS=`` server
+        # list (``Domains=~.``), so an override with an empty server list
+        # leaves the appliance host with zero working upstream DNS — and with
+        # DNSOverTLS=yes there's no plaintext fallback either, making it
+        # effectively unrecoverable until corrected. Reject the in-request
+        # case where override is selected AND servers are explicitly cleared.
+        # ``resolver_servers is None`` means "leave the stored list alone";
+        # the merged-state guard in ``update_resolver_settings`` /
+        # ``update_settings`` catches the case where the stored list is also
+        # empty (it can see the DB row, which this validator can't).
+        if (
+            self.resolver_mode == "override"
+            and self.resolver_servers is not None
+            and not self.resolver_servers
+        ):
+            raise ValueError("resolver override mode requires at least one DNS server")
+        return self
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -1307,6 +1348,26 @@ async def update_settings(
 
     settings = await _get_or_create(db)
     changes = body.model_dump(exclude_none=True)
+
+    # CROSS-FIELD merged-state guard for the DNS resolver (#158). The
+    # model_validator already rejects override + explicitly-empty servers in
+    # the same request; this also catches the case it can't see — override
+    # selected (or already on) while the RESULTING server list is empty (e.g.
+    # servers omitted and the stored list is empty too). Override routes all
+    # host DNS to the global ``DNS=`` list, so an empty list means zero working
+    # upstream DNS. Mirrors the SSH lockout-safety merged-state check below.
+    if "resolver_mode" in changes or "resolver_servers" in changes:
+        _resolver_resulting_mode = changes.get("resolver_mode", settings.resolver_mode)
+        _resolver_resulting_servers = (
+            changes["resolver_servers"]
+            if "resolver_servers" in changes
+            else list(settings.resolver_servers or [])
+        )
+        if _resolver_resulting_mode == "override" and not _resolver_resulting_servers:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="resolver override mode requires at least one DNS server",
+            )
 
     # Maintenance mode is SUPERADMIN-ONLY (issue #57). Flipping it turns the
     # WHOLE platform read-only for everyone except superadmins — a delegated
@@ -1703,6 +1764,24 @@ async def update_resolver_settings(
         # Nothing to do — return the current state without an audit row /
         # wake so a no-op PUT is cheap.
         return ResolverSettingsResponse.model_validate(settings)
+
+    # CROSS-FIELD merged-state guard (#158). The model_validator already
+    # rejects override + explicitly-empty servers in the same request; this
+    # also catches the case it can't see — override selected (or already on)
+    # while the RESULTING server list is empty (e.g. servers omitted and the
+    # stored list is empty too). Override routes all host DNS to the global
+    # ``DNS=`` list, so an empty list means zero working upstream DNS.
+    _resulting_mode = changes.get("resolver_mode", settings.resolver_mode)
+    _resulting_servers = (
+        changes["resolver_servers"]
+        if "resolver_servers" in changes
+        else list(settings.resolver_servers or [])
+    )
+    if _resulting_mode == "override" and not _resulting_servers:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="resolver override mode requires at least one DNS server",
+        )
 
     for field, value in changes.items():
         setattr(settings, field, value)

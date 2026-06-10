@@ -206,6 +206,123 @@ async def test_put_resolver_demo_mode_forbidden(
 
 
 @pytest.mark.asyncio
+async def test_put_resolver_override_empty_servers_422(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    # Override mode with an empty server list routes all host DNS to an absent
+    # global server set — reject it on the dedicated /settings/resolver path.
+    _, token = await _make_user(db_session, username="resemptyded", superadmin=True)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.put(
+        "/api/v1/settings/resolver",
+        headers=headers,
+        json={"resolver_mode": "override", "resolver_servers": []},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_put_resolver_override_no_servers_field_422(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    # Override mode while the stored server list is empty (servers field
+    # omitted entirely) must also 422 — the merged-state guard catches the
+    # case the model_validator can't see.
+    _, token = await _make_user(db_session, username="resnofielded", superadmin=True)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.put(
+        "/api/v1/settings/resolver",
+        headers=headers,
+        json={"resolver_mode": "override"},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_combined_put_resolver_override_empty_servers_422(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    # Same guard on the combined /settings PUT.
+    _, token = await _make_user(db_session, username="resemptycomb", superadmin=True)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.put(
+        "/api/v1/settings",
+        headers=headers,
+        json={"resolver_mode": "override", "resolver_servers": []},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_combined_put_resolver_override_no_servers_field_422(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    # Override on the combined PUT while the stored list is empty (servers
+    # field omitted) → 422 via the merged-state guard.
+    _, token = await _make_user(db_session, username="resnofieldcomb", superadmin=True)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.put(
+        "/api/v1/settings",
+        headers=headers,
+        json={"resolver_mode": "override"},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_put_resolver_override_with_server_succeeds(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    # Override + at least one server is the valid combination — both paths.
+    _, token = await _make_user(db_session, username="resokserver", superadmin=True)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    r1 = await client.put(
+        "/api/v1/settings/resolver",
+        headers=headers,
+        json={"resolver_mode": "override", "resolver_servers": ["1.1.1.1"]},
+    )
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["resolver_servers"] == ["1.1.1.1"]
+    r2 = await client.put(
+        "/api/v1/settings",
+        headers=headers,
+        json={"resolver_mode": "override", "resolver_servers": ["9.9.9.9"]},
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["resolver_servers"] == ["9.9.9.9"]
+
+
+@pytest.mark.asyncio
+async def test_put_resolver_automatic_empty_servers_ok(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    # The guard only applies to override — automatic + empty servers is fine
+    # (the host runner tears the drop-in down and falls back to per-link DNS).
+    _, token = await _make_user(db_session, username="resautoempty", superadmin=True)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    r1 = await client.put(
+        "/api/v1/settings/resolver",
+        headers=headers,
+        json={"resolver_mode": "automatic", "resolver_servers": []},
+    )
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["resolver_mode"] == "automatic"
+    r2 = await client.put(
+        "/api/v1/settings",
+        headers=headers,
+        json={"resolver_mode": "automatic", "resolver_servers": []},
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["resolver_mode"] == "automatic"
+
+
+@pytest.mark.asyncio
 async def test_put_resolver_revert_to_automatic(
     db_session: AsyncSession, client: AsyncClient
 ) -> None:
