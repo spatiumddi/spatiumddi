@@ -7,8 +7,11 @@ from the effective set via ``effective_tool_names``.
 
 from __future__ import annotations
 
+import pytest
+
 from app.services.ai.tools import REGISTRY  # noqa: F401 — triggers registration
 from app.services.ai.tools.base import effective_tool_names
+from app.services.ai.tools.nettools import NetworkDigArgs
 from app.services.feature_modules import all_module_ids
 
 _NETTOOL_NAMES = [
@@ -69,3 +72,31 @@ def test_module_enabled_keeps_default_tools() -> None:
     assert "network_ping" in eff
     assert "lookup_mac_vendor" in eff
     assert "network_whois" not in eff
+
+
+# ── MCP dig args validation (mirrors the REST DigRequest schema) ────
+
+
+def test_network_dig_args_rejects_leading_dash_name() -> None:
+    # The MCP path historically had no ``name`` validator, so ``-froot``
+    # flowed into run_dig → build_dig_argv. dig has no ``--`` terminator,
+    # so a leading-dash name is parsed as a flag (``-f`` batch-mode reads
+    # queries from a filesystem path). The validator now rejects it.
+    with pytest.raises(ValueError):
+        NetworkDigArgs(name="-froot", record_type="A")
+    with pytest.raises(ValueError):
+        NetworkDigArgs(name="bad name with spaces", record_type="A")
+    # valid names still pass
+    assert NetworkDigArgs(name="example.com", record_type="A").name == "example.com"
+    assert NetworkDigArgs(name="_dmarc.example.com").name == "_dmarc.example.com"
+
+
+def test_network_dig_args_rejects_blocked_server() -> None:
+    # @server is SSRF-guarded via the shared denylist.
+    with pytest.raises(ValueError):
+        NetworkDigArgs(name="example.com", server="169.254.169.254")
+    with pytest.raises(ValueError):
+        NetworkDigArgs(name="example.com", server="127.0.0.1")
+    # public + RFC1918 resolvers are allowed
+    assert NetworkDigArgs(name="example.com", server="8.8.8.8").server == "8.8.8.8"
+    assert NetworkDigArgs(name="example.com", server="10.0.0.53").server == "10.0.0.53"

@@ -25,6 +25,14 @@ from app.services.nettools.runner import (
     build_traceroute_argv,
     build_whois_argv,
 )
+from app.services.nettools.schemas import (
+    DigRequest,
+    PortTestRequest,
+    PropagationRequest,
+    TlsCertRequest,
+    assert_target_allowed,
+    is_blocked_target,
+)
 
 # ── argv validation ─────────────────────────────────────────────────
 
@@ -78,6 +86,31 @@ def test_dig_argv_rejects_bad_type_and_name() -> None:
         build_dig_argv("example.com", "EVIL")
     with pytest.raises(NetToolArgError):
         build_dig_argv("bad name with spaces", "A")
+
+
+def test_dig_argv_rejects_leading_dash_name() -> None:
+    # dig has no ``--`` terminator, so a leading-dash name is parsed as a
+    # flag — ``-f`` is batch-mode (reads queries from a filesystem path),
+    # ``-k`` / ``-x`` toggle behaviour. The runner must reject it
+    # regardless of caller (the MCP path had no validator historically).
+    with pytest.raises(NetToolArgError):
+        build_dig_argv("-froot", "A")
+    with pytest.raises(NetToolArgError):
+        build_dig_argv("-k/etc/key", "A")
+    # A leading-dash @server is rejected the same way.
+    with pytest.raises(NetToolArgError):
+        build_dig_argv("example.com", "A", server="-foo")
+
+
+def test_dig_argv_rejects_blocked_server() -> None:
+    # @server steers where the query is sent — block loopback / metadata.
+    with pytest.raises(NetToolArgError):
+        build_dig_argv("example.com", "A", server="169.254.169.254")
+    with pytest.raises(NetToolArgError):
+        build_dig_argv("example.com", "A", server="127.0.0.1")
+    # A public / RFC1918 resolver is fine.
+    assert "@8.8.8.8" in build_dig_argv("example.com", "A", server="8.8.8.8")
+    assert "@10.0.0.53" in build_dig_argv("example.com", "A", server="10.0.0.53")
 
 
 def test_whois_argv_terminates_options() -> None:
@@ -142,3 +175,81 @@ async def test_run_timeout_path() -> None:
     assert res.timed_out is True
     assert res.error is not None and "timeout" in res.error.lower()
     fake.kill.assert_called_once()
+
+
+# ── SSRF denylist (loopback / link-local / cloud-metadata) ──────────
+
+
+@pytest.mark.parametrize(
+    "blocked",
+    [
+        "169.254.169.254",  # cloud instance-metadata IP
+        "127.0.0.1",
+        "127.5.5.5",  # anywhere in 127.0.0.0/8
+        "::1",
+        "fe80::1",
+        "::ffff:127.0.0.1",  # IPv4-mapped loopback
+        "::ffff:169.254.169.254",  # IPv4-mapped metadata
+    ],
+)
+def test_is_blocked_target_blocks_loopback_and_linklocal(blocked: str) -> None:
+    assert is_blocked_target(blocked) is True
+
+
+@pytest.mark.parametrize(
+    "allowed",
+    [
+        "1.1.1.1",  # public
+        "8.8.8.8",  # public
+        "10.0.0.5",  # RFC1918 — internal diagnostics is the point
+        "172.16.0.1",  # RFC1918
+        "192.168.1.1",  # RFC1918
+        "2606:4700:4700::1111",  # public v6
+        "example.com",  # hostname is not an IP literal → not classified
+    ],
+)
+def test_is_blocked_target_allows_public_and_rfc1918(allowed: str) -> None:
+    assert is_blocked_target(allowed) is False
+
+
+def test_assert_target_allowed_raises_on_blocked() -> None:
+    with pytest.raises(ValueError, match="blocked range"):
+        assert_target_allowed("169.254.169.254")
+    with pytest.raises(ValueError, match="blocked range"):
+        assert_target_allowed("127.0.0.1")
+    # public + RFC1918 pass and round-trip the normalised host
+    assert assert_target_allowed("8.8.8.8") == "8.8.8.8"
+    assert assert_target_allowed("10.0.0.5") == "10.0.0.5"
+
+
+def test_port_test_schema_rejects_metadata_and_loopback() -> None:
+    for blocked in ("169.254.169.254", "127.0.0.1"):
+        with pytest.raises(ValueError, match="blocked range"):
+            PortTestRequest(host=blocked, port=80)
+    # public + RFC1918 accepted
+    assert PortTestRequest(host="8.8.8.8", port=53).host == "8.8.8.8"
+    assert PortTestRequest(host="10.0.0.5", port=22).host == "10.0.0.5"
+
+
+def test_tls_cert_schema_rejects_metadata_and_loopback() -> None:
+    for blocked in ("169.254.169.254", "127.0.0.1"):
+        with pytest.raises(ValueError, match="blocked range"):
+            TlsCertRequest(host=blocked)
+    assert TlsCertRequest(host="192.168.1.1").host == "192.168.1.1"
+
+
+def test_dig_schema_rejects_blocked_server_keeps_plain_name() -> None:
+    # @server steers the query target → denylist applies.
+    with pytest.raises(ValueError, match="blocked range"):
+        DigRequest(name="example.com", server="169.254.169.254")
+    # A plain dig name against the default resolver is NOT blocked.
+    assert DigRequest(name="example.com").name == "example.com"
+    # An RFC1918 resolver is allowed (internal DNS).
+    assert DigRequest(name="example.com", server="10.0.0.53").server == "10.0.0.53"
+
+
+def test_propagation_schema_rejects_blocked_resolver() -> None:
+    with pytest.raises(ValueError, match="blocked range"):
+        PropagationRequest(name="example.com", resolvers=["127.0.0.1"])
+    ok = PropagationRequest(name="example.com", resolvers=["8.8.8.8", "10.0.0.53"])
+    assert ok.resolvers == ["8.8.8.8", "10.0.0.53"]

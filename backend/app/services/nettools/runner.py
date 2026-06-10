@@ -29,7 +29,11 @@ from typing import Final
 
 import structlog
 
-from app.services.nettools.schemas import CommandResult, validate_host
+from app.services.nettools.schemas import (
+    CommandResult,
+    assert_target_allowed,
+    validate_host,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -228,6 +232,17 @@ async def run_mtr(host: str, *, cycles: int = 5, max_hops: int = 20) -> CommandR
 
 def build_dig_argv(name: str, record_type: str, server: str | None = None) -> list[str]:
     name = name.strip()
+    # dig has no ``--`` end-of-options terminator, so a ``name`` or
+    # ``@server`` that begins with '-' would be parsed by dig as a flag
+    # (``-f`` batch-mode reads queries from a filesystem path, ``-k``/``-x``
+    # toggle behaviour, etc). Reject leading-dash here unconditionally —
+    # this runner is the documented re-validation point, so it must be
+    # safe regardless of which caller built the inputs (the REST schema
+    # blocks it, but the MCP path historically did not). The _DNS_NAME_RE
+    # match below already forbids spaces; the explicit leading-dash check
+    # is the security guard.
+    if name.startswith("-"):
+        raise NetToolArgError(f"name may not start with '-': {name!r}")
     if not name or not _DNS_NAME_RE.match(name):
         raise NetToolArgError(f"name is not a valid DNS name: {name!r}")
     rtype = record_type.strip().upper()
@@ -244,7 +259,19 @@ def build_dig_argv(name: str, record_type: str, server: str | None = None) -> li
         "+tries=2",
     ]
     if server is not None:
-        srv = validate_host(server)
+        srv = server.strip()
+        if srv.startswith("-"):
+            raise NetToolArgError(f"server may not start with '-': {srv!r}")
+        # SSRF guard — a dig @server that targets loopback / link-local
+        # (incl. the cloud metadata IP) is a defence-in-depth block.
+        # ``assert_target_allowed`` raises a plain ``ValueError``; re-wrap
+        # as ``NetToolArgError`` so the runner's single arg-error type
+        # flows through the REST handler's ``except NetToolArgError`` →
+        # 422 path rather than escaping as an unhandled 500.
+        try:
+            srv = assert_target_allowed(srv)
+        except ValueError as exc:
+            raise NetToolArgError(str(exc)) from exc
         argv.append(f"@{srv}")
     argv.extend([name, rtype])
     return argv

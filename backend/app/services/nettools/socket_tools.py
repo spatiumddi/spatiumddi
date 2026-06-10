@@ -29,7 +29,11 @@ import structlog
 from cryptography import x509
 from cryptography.x509.oid import ExtensionOID, NameOID
 
-from app.services.nettools.schemas import PortTestResult, TlsCertResult
+from app.services.nettools.schemas import (
+    PortTestResult,
+    TlsCertResult,
+    is_blocked_target,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -112,7 +116,24 @@ async def _test_udp(host: str, port: int, timeout: float) -> PortTestResult:
 
 
 async def test_port(host: str, port: int, protocol: str, timeout: float = 5.0) -> PortTestResult:
-    """Classify the reachability of ``host:port``. Server-perspective."""
+    """Classify the reachability of ``host:port``. Server-perspective.
+
+    Defence in depth — re-checks the SSRF denylist here (the REST schema
+    already validates, but MCP callers reach this function directly). A
+    blocked-range IP literal returns a clean ``state="error"`` rather
+    than ever opening the socket.
+    """
+    if is_blocked_target(host):
+        return PortTestResult(
+            host=host,
+            port=port,
+            protocol=protocol if protocol in {"tcp", "udp"} else "tcp",
+            state="error",
+            error=(
+                f"target {host!r} is in a blocked range (loopback / "
+                "link-local / cloud-metadata) and cannot be reached"
+            ),
+        )
     if protocol == "udp":
         return await _test_udp(host, port, timeout)
     return await _test_tcp(host, port, timeout)
@@ -209,6 +230,20 @@ async def inspect_tls_cert(
     reported as data, not enforced.
     """
     sni = server_name or host
+    # Defence in depth — block loopback / link-local / metadata literals
+    # here too, since MCP callers reach this function without the REST
+    # schema validation.
+    if is_blocked_target(host):
+        return TlsCertResult(
+            host=host,
+            port=port,
+            server_name=sni,
+            ok=False,
+            error=(
+                f"target {host!r} is in a blocked range (loopback / "
+                "link-local / cloud-metadata) and cannot be reached"
+            ),
+        )
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE

@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -89,6 +90,49 @@ async def test_udp_closed_on_icmp_unreachable() -> None:
     ):
         res = await _test_port("10.0.0.1", 53, "udp", timeout=0.5)
     assert res.state == "closed"
+
+
+# ── SSRF denylist (loopback / link-local / cloud-metadata) ──────────
+
+
+@pytest.mark.parametrize("blocked", ["169.254.169.254", "127.0.0.1", "::1", "fe80::1"])
+async def test_port_test_rejects_blocked_target_without_opening_socket(blocked: str) -> None:
+    # The socket must never be opened for a blocked literal — patch
+    # open_connection to blow up if it's reached.
+    boom = AsyncMock(side_effect=AssertionError("socket opened for blocked target"))
+    with patch.object(socket_tools.asyncio, "open_connection", boom):
+        res = await _test_port(blocked, 80, "tcp", timeout=0.5)
+    assert res.state == "error"
+    assert res.error is not None and "blocked range" in res.error
+    boom.assert_not_called()
+
+
+@pytest.mark.parametrize("blocked", ["169.254.169.254", "127.0.0.1"])
+async def test_tls_cert_rejects_blocked_target_without_opening_socket(blocked: str) -> None:
+    boom = AsyncMock(side_effect=AssertionError("socket opened for blocked target"))
+    with patch.object(socket_tools.asyncio, "open_connection", boom):
+        res = await socket_tools.inspect_tls_cert(blocked, 443, None, timeout=0.5)
+    assert res.ok is False
+    assert res.error is not None and "blocked range" in res.error
+    boom.assert_not_called()
+
+
+@pytest.mark.parametrize("allowed", ["8.8.8.8", "10.0.0.5", "172.16.0.1", "192.168.1.1"])
+async def test_port_test_accepts_public_and_rfc1918(allowed: str) -> None:
+    # Public + every RFC1918 range must pass the denylist (the socket is
+    # mocked so no packet leaves the box). Internal-network diagnostics
+    # is the legitimate purpose — private ranges must NOT be blocked.
+    writer = MagicMock()
+    writer.close = MagicMock()
+    writer.wait_closed = AsyncMock()
+    with patch.object(
+        socket_tools.asyncio,
+        "open_connection",
+        AsyncMock(return_value=(MagicMock(), writer)),
+    ):
+        res = await _test_port(allowed, 443, "tcp", timeout=0.5)
+    # Reached the real classifier (not the denylist short-circuit).
+    assert res.state == "open"
 
 
 # ── TLS cert parsing ────────────────────────────────────────────────

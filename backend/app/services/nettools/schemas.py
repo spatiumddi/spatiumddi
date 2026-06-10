@@ -80,6 +80,85 @@ def validate_host(value: str) -> str:
     raise ValueError(f"host must be a valid IPv4/IPv6 address or hostname (got {value!r})")
 
 
+# ── SSRF denylist for socket-connecting tools ───────────────────────
+#
+# Tools that *open a socket from the server* (port-test, tls-cert) or
+# steer a resolver / @server parameter (dig @server, DNS propagation)
+# must not be aimable at the host's own loopback or the link-local
+# range — the latter includes the cloud instance-metadata IP
+# (169.254.169.254) that on AWS / Azure / GCP hands out credentials and
+# user-data. We block:
+#
+#   * loopback   — 127.0.0.0/8, ::1
+#   * link-local — 169.254.0.0/16 (covers the metadata IP), fe80::/10
+#
+# We deliberately do NOT block RFC 1918 (10/8, 172.16/12, 192.168/16) or
+# unique-local IPv6 (fc00::/7): diagnosing the *internal* network is the
+# entire point of these tools, so a private-range block would gut the
+# feature. The block is unconditional (no platform setting) since there
+# is never a legitimate diagnostic reason to socket-connect the api
+# container's own loopback or the metadata endpoint through these tools.
+_BLOCKED_NETWORKS: Final[tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]] = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("fe80::/10"),
+)
+
+
+def is_blocked_target(value: str) -> bool:
+    """Return True if ``value`` is an IP literal in a blocked range.
+
+    Only IP literals are classified here. A *hostname* returns False —
+    the caller is responsible for resolving it (see
+    :func:`assert_target_allowed`); we never silently treat an
+    unresolvable name as allowed-because-unclassified at the socket
+    layer, but a plain hostname that DNS later maps into a blocked range
+    is the documented follow-up caveat below.
+    """
+    value = value.strip()
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    # ``ip.ipv4_mapped`` unwraps ::ffff:127.0.0.1 etc so a mapped
+    # loopback / link-local can't sneak past the v4 networks.
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return any(ip in net for net in _BLOCKED_NETWORKS)
+
+
+def assert_target_allowed(value: str) -> str:
+    """Validate ``value`` as a host AND reject blocked-range IP literals.
+
+    Use this (not the bare :func:`validate_host`) for any tool that
+    opens a socket from the server or steers a resolver / @server
+    parameter: port-test, tls-cert, dig ``@server``, DNS-propagation
+    resolvers. A plain ``dig <name>`` against the default resolver does
+    NOT route through here — only the network-reaching parameters do.
+
+    Returns the normalised host on success; raises ``ValueError`` (→ 422
+    for Pydantic callers) on a blocked literal.
+
+    Hostname caveat (follow-up): when ``value`` is a hostname we validate
+    its shape but do not pre-resolve it here, so a name whose A/AAAA
+    record points into a blocked range is not caught at this layer. The
+    socket tools could still reach loopback / metadata via a crafted DNS
+    name. Closing that requires resolving the name with the same address
+    the socket will connect to (getaddrinfo) and re-checking each result;
+    tracked as a follow-up. IP literals — the common SSRF vector — are
+    blocked here unconditionally.
+    """
+    host = validate_host(value)
+    if is_blocked_target(host):
+        raise ValueError(
+            f"target {host!r} is in a blocked range (loopback / link-local / "
+            "cloud-metadata) and cannot be reached by this tool"
+        )
+    return host
+
+
 def validate_host_or_cidr(value: str) -> str:
     """Like :func:`validate_host` but also accepts a CIDR (for traceroute /
     ping where the operator may target a network address). Falls back to
@@ -165,7 +244,9 @@ class DigRequest(BaseModel):
     def _v_server(cls, v: str | None) -> str | None:
         if v is None or not v.strip():
             return None
-        return validate_host(v)
+        # @server steers where dig sends the query — apply the SSRF
+        # denylist so it can't be aimed at loopback / metadata.
+        return assert_target_allowed(v)
 
 
 # ── whois ───────────────────────────────────────────────────────────
@@ -200,7 +281,8 @@ class PortTestRequest(BaseModel):
     @field_validator("host")
     @classmethod
     def _v_host(cls, v: str) -> str:
-        return validate_host(v)
+        # port-test opens a socket from the server → SSRF denylist.
+        return assert_target_allowed(v)
 
     @field_validator("protocol")
     @classmethod
@@ -235,7 +317,8 @@ class TlsCertRequest(BaseModel):
     @field_validator("host")
     @classmethod
     def _v_host(cls, v: str) -> str:
-        return validate_host(v)
+        # tls-cert opens a TLS socket from the server → SSRF denylist.
+        return assert_target_allowed(v)
 
     @field_validator("server_name")
     @classmethod
@@ -299,7 +382,10 @@ class PropagationRequest(BaseModel):
     def _v_resolvers(cls, v: list[str] | None) -> list[str] | None:
         if v is None:
             return None
-        return [validate_host(ip) for ip in v]
+        # Each resolver is a target the server sends DNS queries to →
+        # SSRF denylist so a resolver can't be pointed at loopback /
+        # metadata.
+        return [assert_target_allowed(ip) for ip in v]
 
 
 # ── MAC vendor lookup (reuses services/oui) ─────────────────────────
@@ -336,6 +422,8 @@ __all__ = [
     "TlsCertRequest",
     "TlsCertResult",
     "WhoisRequest",
+    "assert_target_allowed",
+    "is_blocked_target",
     "validate_host",
     "validate_host_or_cidr",
 ]

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
@@ -38,6 +38,7 @@ from app.services.nettools import (
     test_port,
 )
 from app.services.nettools.runner import NetToolArgError
+from app.services.nettools.schemas import DigRequest
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 
 _MODULE = "tools.network"
@@ -137,6 +138,22 @@ class NetworkDigArgs(BaseModel):
         default=None,
         description="Optional resolver IP / hostname to query (@server). Defaults to the server's resolver.",
     )
+
+    # Mirror the REST ``DigRequest`` validators — the MCP path historically
+    # had no ``name`` validator, so a name like ``-froot`` flowed straight
+    # into ``run_dig`` → ``build_dig_argv``. dig has no ``--`` terminator,
+    # so a leading-dash name is parsed as a flag (``-f`` batch-mode reads
+    # queries from a filesystem path). Delegate to the REST schema's
+    # validators so the two surfaces stay in lockstep.
+    @field_validator("name")
+    @classmethod
+    def _v_name(cls, v: str) -> str:
+        return DigRequest._v_name(v)
+
+    @field_validator("server")
+    @classmethod
+    def _v_server(cls, v: str | None) -> str | None:
+        return DigRequest._v_server(v)
 
 
 @register_tool(
