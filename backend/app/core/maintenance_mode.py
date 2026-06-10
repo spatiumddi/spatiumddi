@@ -66,7 +66,15 @@ EXEMPT_PREFIXES: Final[tuple[str, ...]] = (
     "/metrics",
     "/api/v1/dns/agents",
     "/api/v1/dhcp/agents",
+    # Supervisor agent surface — /supervisor/register, /supervisor/poll,
+    # /supervisor/heartbeat, /supervisor/k8s-proxy/* (config-caching +
+    # desired-state delivery, non-negotiable #5).
     "/api/v1/appliance/supervisor",
+    # Local-supervisor self-bootstrap (full-stack / frontend-core appliances
+    # mint their own one-shot pairing code here). Unauthenticated + host-
+    # gated; if a maintenance window 503'd it the appliance's own supervisor
+    # could never register against its control plane (non-negotiable #5).
+    "/api/v1/appliance/self-register-bootstrap",
 )
 
 _API_TOKEN_PREFIX: Final[str] = "sddi_"
@@ -129,11 +137,18 @@ def _is_exempt_path(path: str) -> bool:
     return any(path.startswith(prefix) for prefix in EXEMPT_PREFIXES)
 
 
-async def _bearer_is_effective_superadmin(token: str) -> bool:
+async def _bearer_is_effective_superadmin(token: str, method: str, path: str) -> bool:
     """Best-effort: decode the bearer (JWT or ``sddi_`` API token), look
     up the owning user, and report whether they're an effective
-    superadmin. ANY failure (missing/invalid token, unknown user,
-    inactive, decode error, DB error) yields ``False`` — no bypass.
+    superadmin *and* the bearer is actually allowed to perform this
+    request. ANY failure (missing/invalid token, unknown user, inactive,
+    decode error, revoked/expired session, scope-forbidden, DB error)
+    yields ``False`` — no bypass.
+
+    ``method`` + ``path`` are the request's verb + path so the API-token
+    branch can enforce ``token.scopes`` BEFORE granting a bypass — a
+    read-only-scoped token (even a superadmin's) can never reach a write
+    handler, mirroring ``app.api.deps._resolve_api_token``'s invariant.
 
     Deliberately self-contained: it spins its own session via
     ``AsyncSessionLocal`` rather than reaching for the request-scoped
@@ -147,7 +162,8 @@ async def _bearer_is_effective_superadmin(token: str) -> bool:
     from app.core.permissions import is_effective_superadmin  # noqa: PLC0415
     from app.core.security import decode_access_token, hash_api_token  # noqa: PLC0415
     from app.db import AsyncSessionLocal  # noqa: PLC0415
-    from app.models.auth import APIToken, Group, User  # noqa: PLC0415
+    from app.models.auth import APIToken, Group, User, UserSession  # noqa: PLC0415
+    from app.services.api_token_scopes import scope_matches_request  # noqa: PLC0415
 
     # Eager-load groups → roles so the synchronous ``is_effective_superadmin``
     # → ``user_has_permission`` RBAC walk doesn't trigger an async lazy load
@@ -159,7 +175,7 @@ async def _bearer_is_effective_superadmin(token: str) -> bool:
         async with AsyncSessionLocal() as db:
             if token.startswith(_API_TOKEN_PREFIX):
                 # Mirror deps._resolve_api_token's lookup (minimal slice —
-                # we only need the owning user + active state).
+                # we only need the owning user + active state + scopes).
                 token_hash = hash_api_token(token)
                 api_token = (
                     await db.execute(select(APIToken).where(APIToken.token_hash == token_hash))
@@ -172,6 +188,14 @@ async def _bearer_is_effective_superadmin(token: str) -> bool:
 
                     if api_token.expires_at <= _dt.now(UTC):
                         return False
+                # Scope gate — mirror deps._resolve_api_token's invariant
+                # (deps.py:60-65): a non-empty ``scopes`` list is enforced
+                # BEFORE RBAC, so a read-only-scoped token can never reach
+                # a write handler even when its owner is a superadmin. No
+                # match = no bypass (the request falls through to the 503).
+                scopes = list(api_token.scopes or [])
+                if scopes and not scope_matches_request(scopes, method, path):
+                    return False
                 user = (
                     await db.execute(
                         select(User).where(User.id == api_token.user_id).options(*_user_opts)
@@ -183,6 +207,20 @@ async def _bearer_is_effective_superadmin(token: str) -> bool:
                     user_id = payload["sub"]
                 except (JWTError, KeyError):
                     return False
+                # Session gate — mirror deps.get_current_user (deps.py:130-137).
+                # Tokens minted after the session-viewer landing carry a ``jti``
+                # claim mapping to a ``UserSession`` row; a force-logged-out
+                # superadmin (``revoked``) whose JWT is still unexpired must NOT
+                # bypass maintenance mode. No-jti legacy tokens pass through (same
+                # treatment as the auth dep) — they expire on their own short TTL.
+                jti = payload.get("jti")
+                if jti is not None:
+                    from datetime import UTC  # noqa: PLC0415
+                    from datetime import datetime as _dt
+
+                    session = await db.get(UserSession, jti)
+                    if session is None or session.revoked or session.expires_at <= _dt.now(UTC):
+                        return False
                 user = (
                     await db.execute(select(User).where(User.id == user_id).options(*_user_opts))
                 ).scalar_one_or_none()
@@ -224,7 +262,7 @@ class MaintenanceModeMiddleware(BaseHTTPMiddleware):
         auth_header = request.headers.get("Authorization") or ""
         if auth_header.lower().startswith("bearer "):
             token = auth_header[7:].strip()
-            if token and await _bearer_is_effective_superadmin(token):
+            if token and await _bearer_is_effective_superadmin(token, method, path):
                 return await call_next(request)  # type: ignore[operator,no-any-return]
 
         logger.info(

@@ -14,14 +14,21 @@ Covers:
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import maintenance_mode
-from app.core.security import create_access_token, hash_password
-from app.models.auth import User
+from app.core.security import (
+    create_access_token,
+    generate_api_token,
+    hash_password,
+)
+from app.models.auth import APIToken, User, UserSession
 from app.models.settings import PlatformSettings
 
 
@@ -182,3 +189,124 @@ async def test_cache_invalidation_takes_effect(
     await _set_maintenance(db_session, enabled=True)
     resp = await client.post("/api/v1/ipam/spaces", json={"name": "x"})
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_revoked_session_superadmin_jwt_does_not_bypass(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """FIX 1 — a force-logged-out superadmin (UserSession.revoked) whose JWT is
+    still unexpired must NOT bypass maintenance mode (mirrors the auth dep's
+    session gate). The jti-bearing token is still 503'd."""
+    user, _ = await _make_user(db_session, superadmin=True, username="mmrevoked")
+    # Mint a session row, then revoke it, but keep the (still-unexpired) JWT.
+    jti = uuid.uuid4().hex
+    db_session.add(
+        UserSession(
+            id=jti,
+            user_id=user.id,
+            refresh_token_hash=uuid.uuid4().hex,
+            created_at=datetime.now(UTC),
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            revoked=True,
+        )
+    )
+    await db_session.commit()
+    token = create_access_token(str(user.id), jti=jti)
+    await _set_maintenance(db_session, enabled=True)
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.post("/api/v1/ipam/spaces", headers=headers, json={"name": "nope"})
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["maintenance"] is True
+
+
+@pytest.mark.asyncio
+async def test_live_session_superadmin_jwt_bypasses(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Counterpart to FIX 1 — a superadmin with a LIVE (non-revoked, unexpired)
+    session still bypasses, so the session gate doesn't over-block."""
+    user, _ = await _make_user(db_session, superadmin=True, username="mmlive")
+    jti = uuid.uuid4().hex
+    db_session.add(
+        UserSession(
+            id=jti,
+            user_id=user.id,
+            refresh_token_hash=uuid.uuid4().hex,
+            created_at=datetime.now(UTC),
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            revoked=False,
+        )
+    )
+    await db_session.commit()
+    token = create_access_token(str(user.id), jti=jti)
+    await _set_maintenance(db_session, enabled=True)
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.post("/api/v1/ipam/spaces", headers=headers, json={"name": "mm-live"})
+    assert resp.status_code != 503, resp.text
+
+
+async def _make_api_token(db: AsyncSession, *, user: User, scopes: list[str]) -> str:
+    raw, prefix, token_hash = generate_api_token()
+    db.add(
+        APIToken(
+            name="mm-tok",
+            token_hash=token_hash,
+            prefix=prefix,
+            scope="user",
+            user_id=user.id,
+            created_by_user_id=user.id,
+            scopes=scopes,
+            is_active=True,
+        )
+    )
+    await db.flush()
+    return raw
+
+
+@pytest.mark.asyncio
+async def test_readonly_scoped_superadmin_token_does_not_bypass_write(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """FIX 2 — a superadmin's read-only-scoped ``sddi_`` token must NOT bypass a
+    write during maintenance (mirrors deps._resolve_api_token's scope gate: a
+    read-only token can never reach a write handler)."""
+    user, _ = await _make_user(db_session, superadmin=True, username="mmtokread")
+    raw = await _make_api_token(db_session, user=user, scopes=["read"])
+    await db_session.commit()
+    await _set_maintenance(db_session, enabled=True)
+    headers = {"Authorization": f"Bearer {raw}"}
+    # A write (POST) on a non-exempt path with a read-only token → still 503.
+    resp = await client.post("/api/v1/ipam/spaces", headers=headers, json={"name": "nope"})
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["maintenance"] is True
+
+
+@pytest.mark.asyncio
+async def test_write_scoped_superadmin_token_bypasses(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Counterpart to FIX 2 — a superadmin token scoped ``ipam:write`` DOES
+    bypass a write to an IPAM path, so the scope gate doesn't over-block."""
+    user, _ = await _make_user(db_session, superadmin=True, username="mmtokwrite")
+    raw = await _make_api_token(db_session, user=user, scopes=["ipam:write"])
+    await db_session.commit()
+    await _set_maintenance(db_session, enabled=True)
+    headers = {"Authorization": f"Bearer {raw}"}
+    resp = await client.post("/api/v1/ipam/spaces", headers=headers, json={"name": "mm-tok-write"})
+    assert resp.status_code != 503, resp.text
+
+
+@pytest.mark.asyncio
+async def test_self_register_bootstrap_path_exempt(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """The local-supervisor self-bootstrap POST must clear the maintenance
+    middleware (non-negotiable #5) — it may 403/422 at the handler but must
+    not be 503'd."""
+    await _set_maintenance(db_session, enabled=True)
+    resp = await client.post(
+        "/api/v1/appliance/self-register-bootstrap",
+        json={"appliance_variant": "full-stack"},
+    )
+    assert resp.status_code != 503, resp.text

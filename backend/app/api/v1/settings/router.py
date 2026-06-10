@@ -1303,6 +1303,20 @@ async def update_settings(
     settings = await _get_or_create(db)
     changes = body.model_dump(exclude_none=True)
 
+    # Maintenance mode is SUPERADMIN-ONLY (issue #57). Flipping it turns the
+    # WHOLE platform read-only for everyone except superadmins — a delegated
+    # ``write:settings`` editor must not be able to inflict a platform-wide
+    # DoS. This matches the ``set_maintenance_mode`` MCP tool's superadmin
+    # gate and the banner copy ("blocked for everyone except superadmins").
+    # Either maintenance field in the PUT body requires the stronger gate.
+    if (
+        "maintenance_mode_enabled" in changes or "maintenance_message" in changes
+    ) and not is_effective_superadmin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Maintenance mode can only be changed by a superadmin",
+        )
+
     # Maintenance mode (issue #57). Capture the prior enabled state before
     # the setattr loop mutates it so we can detect an actual flip (and
     # server-stamp / clear ``maintenance_started_at`` accordingly + write
@@ -1310,6 +1324,8 @@ async def update_settings(
     # here so it sees the value as it was BEFORE this request.
     _maintenance_prev = bool(settings.maintenance_mode_enabled)
     _maintenance_requested = changes.get("maintenance_mode_enabled")
+    _maintenance_message_prev = settings.maintenance_message or ""
+    _maintenance_message_requested = changes.get("maintenance_message")
 
     # Whether this update touches any host-config field a HOSTCONFIG_ALL
     # subscriber acts on. The DHCP-agent /config long-poll folds SNMP /
@@ -1574,6 +1590,14 @@ async def update_settings(
     _maintenance_flipped = (
         _maintenance_requested is not None and bool(_maintenance_requested) != _maintenance_prev
     )
+    # A message-only edit (banner reworded while the enable flag stays put)
+    # is still an operator-visible maintenance change and must be audited
+    # (non-negotiable #4) — the flip branch only fired on enable/disable, so
+    # a reword previously slipped through with no ``audit_log`` row.
+    _maintenance_message_changed = (
+        _maintenance_message_requested is not None
+        and (settings.maintenance_message or "") != _maintenance_message_prev
+    )
     if _maintenance_flipped:
         now_enabled = bool(_maintenance_requested)
         settings.maintenance_started_at = datetime.now(UTC) if now_enabled else None
@@ -1593,13 +1617,32 @@ async def update_settings(
                 },
             )
         )
+    elif _maintenance_message_changed:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="maintenance_mode.message_changed",
+                resource_type="platform_settings",
+                resource_id="maintenance",
+                resource_display="Maintenance mode",
+                result="success",
+                new_value={
+                    "enabled": bool(settings.maintenance_mode_enabled),
+                    "message": settings.maintenance_message or "",
+                },
+            )
+        )
 
     await db.commit()
     await db.refresh(settings)
 
     # Drop the middleware's process-local cache so the flipping worker
-    # enforces (or lifts) the read-only block on its very next request.
-    if _maintenance_flipped:
+    # enforces (or lifts) the read-only block on its very next request. A
+    # message-only reword also changes the cached 503 body, so invalidate
+    # for that case too.
+    if _maintenance_flipped or _maintenance_message_changed:
         from app.core import maintenance_mode as _maintenance_mode
 
         _maintenance_mode.invalidate_cache()
