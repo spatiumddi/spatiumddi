@@ -91,6 +91,119 @@ server just re-attaches the running agent to the same group config.
 
 ---
 
+## DHCP server (Kea) doesn't respond to DISCOVER
+
+**Symptom** — A client on the same L2 segment as the Kea server gets no
+lease. Wireshark on the client shows the `DHCPDISCOVER` going out as a
+broadcast, but no `DHCPOFFER` comes back. Static-IP connectivity between
+the client and the server works fine, and the Kea service shows a green
+**`healthy`** chip in the Fleet → Service health panel.
+
+**Key point first** — the `healthy` chip only means the Kea *process is
+up*. It does **not** mean Kea will answer for your client's subnet. There
+are exactly two ways a DISCOVER ends in silence on an otherwise-healthy
+server:
+
+- **(A) The DISCOVER never reaches the Kea socket** — the broadcast is
+  dropped before Kea sees it (host firewall, or the container isn't on
+  the host NIC).
+- **(B) Kea hears it but drops it** — no configured `subnet4` matches the
+  interface the packet arrived on, or the matched subnet has no usable
+  pool. Kea logs this and moves on; nothing goes on the wire.
+
+For a first-time setup, **(B) is by far the most common.**
+
+### Split (A) from (B) in two minutes
+
+Run these on the appliance host (SSH as `admin`, or F1-login at the
+console):
+
+```bash
+# 1. Does the broadcast actually arrive on the host NIC?
+sudo tcpdump -ni any -v 'port 67 or port 68'
+#    …then release/renew DHCP on the client.
+
+# 2. Watch Kea react in real time (k3s appliance):
+sudo k3s kubectl get pods -A | grep kea          # find pod + namespace
+sudo k3s kubectl logs -n <ns> <kea-pod> -f
+#    …on docker-compose installs: docker compose logs -f dhcp-kea
+```
+
+Read the result:
+
+| tcpdump shows DISCOVER | Kea log | Conclusion |
+|---|---|---|
+| yes | logs DISCOVER, no OFFER (often `DHCP4_SUBNET_SELECTION_FAILED` / "no subnet selected") | **(B)** — subnet/scope mismatch. Most common. |
+| yes | logs nothing | **(A)** — firewall is eating it before the socket. |
+| no  | — | The broadcast isn't reaching the appliance VM at all (vSwitch port-group / VLAN). |
+
+### Fixing (B) — scope/subnet mismatch (most common)
+
+Kea selects a subnet for a broadcast (non-relayed) client by matching the
+**receiving interface's own IP** against the configured `subnet4` ranges.
+So if the appliance's NIC on that segment is `192.168.0.x/24` but your
+DHCP scope was created for a different network, Kea silently ignores the
+DISCOVER. Verify, in order:
+
+- Run `ip -4 addr` on the appliance and note its IP on the client-facing
+  interface.
+- In the UI, confirm a **DHCP scope exists whose subnet CIDR contains
+  that address**.
+- The scope is **active** — inactive scopes are dropped from the agent's
+  config bundle entirely.
+- The scope is **IPv4** and has at least one **dynamic pool range** — a
+  scope with no pool has nothing to offer.
+- The scope is attached to the **same DHCP server group** as this Kea
+  server. SpatiumDDI's DHCP model is group-centric (scopes / pools /
+  statics live on the server group); only **active IPv4 scopes attached
+  to that group** render into Kea's `subnet4`. If none qualify, Kea
+  renders `subnet4: []` and answers nobody.
+
+Confirm what Kea actually received by reading the agent's last-rendered
+config (this is the source of truth for what the running Kea is using):
+
+```bash
+# k3s appliance:
+sudo k3s kubectl exec -n <ns> <kea-pod> -- \
+    cat /var/lib/spatium-dhcp-agent/rendered/kea-dhcp4.json | grep -A4 subnet4
+# docker-compose:
+docker compose exec dhcp-kea \
+    cat /var/lib/spatium-dhcp-agent/rendered/kea-dhcp4.json | grep -A4 subnet4
+```
+
+An empty `"subnet4": []` confirms (B): no active IPv4 scope is reaching
+the agent. Activate the scope / attach it to the right group / add a
+pool, then the bundle ETag shifts and the agent re-renders within a
+heartbeat. (The DHCP Activity tab on the **Logs** page surfaces the same
+Kea log lines if you'd rather stay in the UI.)
+
+### Fixing (A) — firewall
+
+Kea uses a plain UDP socket (`dhcp-socket-type: udp`), so it **is**
+subject to the host's nftables INPUT chain. The DHCP role opens UDP
+**67 + 68**; confirm the rules are present (and haven't drifted):
+
+```bash
+sudo nft list chain inet filter input | grep -E 'dport (67|68)'
+```
+
+You should see `udp dport 67 accept` / `udp dport 68 accept`. If they're
+missing, the per-role firewall didn't apply — re-saving the DHCP role
+assignment in **Fleet** re-renders the drop-in.
+
+### Networking sanity check
+
+On the k3s appliance the Kea DaemonSet runs with `hostNetwork: true` so
+it sees broadcasts on the host NIC directly. On docker-compose the DHCP
+container must use **host networking** (`DHCP_NETWORK_MODE=host`, the
+default for supervisor-managed appliances) — a bridged/NAT network will
+not receive the L2 broadcast. If tcpdump on the host shows the DISCOVER
+but `kubectl exec … -- ip addr` / `docker compose exec dhcp-kea ip addr`
+shows the container is *not* on the host's interfaces, the container is
+on the wrong network.
+
+---
+
 ## Resetting the admin password
 
 Documented inline in `CLAUDE.md` under *Development Commands → Reset
