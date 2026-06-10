@@ -2074,3 +2074,151 @@ register(
         category="admin",
     )
 )
+
+
+# ── grant_temporary_access (issue #65) ─────────────────────────────────
+#
+# Attach a temporary, auto-expiring ``{action, resource_type,
+# resource_id?}`` permission to a group. ``user_has_permission`` unions
+# live time-bound grants over the static role grants, so the operator gets
+# the widened access immediately and it auto-revokes at ``expires_at``.
+# Superadmin-gated at apply time — minting permissions is a high-blast-radius
+# write that should never ride a non-superadmin's chat session.
+
+
+class GrantTemporaryAccessArgs(BaseModel):
+    """Args for the ``grant_temporary_access`` operation."""
+
+    group_id: str = Field(description="UUID of the group to grant temporary access to.")
+    action: Literal["read", "write", "delete", "admin", "*"] = Field(
+        description="Permission action. 'admin' implies read/write/delete on the type.",
+    )
+    resource_type: str = Field(
+        description=(
+            "Resource type the grant applies to (e.g. 'subnet', 'dns_zone', "
+            "'dhcp_scope'). '*' matches any type. See docs/PERMISSIONS.md."
+        )
+    )
+    resource_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional UUID to scope the grant to a single instance. Omit for "
+            "the whole resource_type."
+        ),
+    )
+    expires_in_hours: int = Field(
+        default=24,
+        ge=1,
+        le=720,
+        description="How long the grant stays live, in hours (1 – 720; default 24).",
+    )
+    reason: str = Field(
+        default="",
+        description="Why the access is being granted — recorded in the audit log.",
+    )
+
+
+async def _preview_grant_temporary_access(
+    db: AsyncSession, user: User, args: GrantTemporaryAccessArgs
+) -> PreviewResult:
+    from app.core.permissions import is_effective_superadmin  # noqa: PLC0415
+    from app.models.auth import Group  # noqa: PLC0415
+
+    if not is_effective_superadmin(user):
+        return PreviewResult(
+            ok=False,
+            detail=(
+                "Granting temporary access mints RBAC permissions, so it's "
+                "restricted to superadmin users."
+            ),
+        )
+    try:
+        gid = UUID(args.group_id)
+    except (ValueError, AttributeError):
+        return PreviewResult(ok=False, detail=f"Invalid group_id: {args.group_id!r}")
+    group = await db.get(Group, gid)
+    if group is None:
+        return PreviewResult(ok=False, detail=f"No group with id {args.group_id}.")
+    expires = datetime.now(UTC) + timedelta(hours=args.expires_in_hours)
+    scope = f"/{args.resource_id}" if args.resource_id else " (any instance)"
+    preview_text = (
+        f"Grant **{args.action}** on **{args.resource_type}**{scope} "
+        f"to group **{group.name}** until {expires.isoformat()} "
+        f"({args.expires_in_hours}h). Auto-revokes on expiry."
+    )
+    return PreviewResult(ok=True, detail="ready", preview_text=preview_text)
+
+
+async def _apply_grant_temporary_access(
+    db: AsyncSession, user: User, args: GrantTemporaryAccessArgs
+) -> dict[str, Any]:
+    from app.api.v1.dhcp._audit import write_audit  # noqa: PLC0415
+    from app.core.permissions import is_effective_superadmin  # noqa: PLC0415
+    from app.models.auth import Group  # noqa: PLC0415
+    from app.models.time_bound_grant import TimeBoundGrant  # noqa: PLC0415
+
+    if not is_effective_superadmin(user):
+        raise ValueError("Granting temporary access is restricted to superadmin users.")
+    group = await db.get(Group, UUID(args.group_id))
+    if group is None:
+        raise ValueError(f"No group with id {args.group_id}.")
+    resource_id = (args.resource_id or "").strip() or None
+    expires = datetime.now(UTC) + timedelta(hours=args.expires_in_hours)
+    grant = TimeBoundGrant(
+        group_id=group.id,
+        action=args.action,
+        resource_type=args.resource_type,
+        resource_id=resource_id,
+        expires_at=expires,
+        reason=args.reason,
+        granted_by_user_id=user.id,
+    )
+    db.add(grant)
+    await db.flush()
+    write_audit(
+        db,
+        user=user,
+        action="permission_change",
+        resource_type="time_bound_grant",
+        resource_id=str(grant.id),
+        resource_display=(
+            f"Granted {args.action} on {args.resource_type}"
+            f"{('/' + resource_id) if resource_id else ''} to group {group.name}"
+        ),
+        new_value={
+            "group_id": str(group.id),
+            "action": args.action,
+            "resource_type": args.resource_type,
+            "resource_id": resource_id,
+            "expires_at": expires.isoformat(),
+            "reason": args.reason,
+            "via": "ai_proposal",
+        },
+    )
+    await db.commit()
+    await db.refresh(grant)
+    return {
+        "id": str(grant.id),
+        "group_id": str(group.id),
+        "action": args.action,
+        "resource_type": args.resource_type,
+        "resource_id": resource_id,
+        "expires_at": expires.isoformat(),
+    }
+
+
+register(
+    Operation(
+        name="grant_temporary_access",
+        description=(
+            "Grant a group a temporary, auto-expiring RBAC permission "
+            "(issue #65). Superadmin only. Always route via "
+            "propose_grant_temporary_access — the operator clicks Apply to "
+            "mint the grant."
+        ),
+        args_model=GrantTemporaryAccessArgs,
+        preview=_preview_grant_temporary_access,
+        apply=_apply_grant_temporary_access,
+        category="admin",
+    )
+)

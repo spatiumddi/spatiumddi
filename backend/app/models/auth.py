@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     Boolean,
@@ -18,6 +19,9 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+
+if TYPE_CHECKING:
+    from app.models.time_bound_grant import TimeBoundGrant
 
 # Many-to-many: users ↔ groups
 user_group = Table(
@@ -46,6 +50,20 @@ group_role = Table(
 
 class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "user"
+
+    # ``_active_time_bound_grants`` below is a plain per-request attribute,
+    # not a mapped column. ``__allow_unmapped__`` tells SQLAlchemy 2.0's
+    # declarative scanner to leave non-``Mapped[...]`` annotations alone
+    # instead of raising ``ArgumentError`` for them.
+    __allow_unmapped__ = True
+
+    # Per-request cache of live time-bound grants (issue #65), populated by
+    # the auth dependency and consulted by
+    # ``app.core.permissions.user_has_permission``. Defaults to an empty
+    # tuple at the class level so a check on a User loaded outside the auth
+    # dependency (or a detached User in unit tests) reads as "no grants";
+    # the dependency reassigns it to the loaded list per instance.
+    _active_time_bound_grants: "list[TimeBoundGrant]" = []  # noqa: RUF012
 
     username: Mapped[str] = mapped_column(String(150), unique=True, nullable=False, index=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)

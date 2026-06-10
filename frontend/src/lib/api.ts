@@ -3316,6 +3316,51 @@ export const groupsApi = {
   delete: (id: string) => api.delete(`/groups/${id}`),
 };
 
+// ── Time-bound grants (#65) ─────────────────────────────────────────────────
+
+export interface TimeBoundGrant {
+  id: string;
+  group_id: string;
+  action: string;
+  resource_type: string;
+  resource_id?: string | null;
+  expires_at: string;
+  revoked_at?: string | null;
+  reason: string;
+  granted_by_user_id?: string | null;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface TimeBoundGrantCreate {
+  group_id: string;
+  action: string;
+  resource_type: string;
+  resource_id?: string | null;
+  expires_at: string;
+  reason?: string;
+}
+
+export const timeBoundGrantsApi = {
+  list: (groupId?: string, includeExpired?: boolean) => {
+    const params = new URLSearchParams();
+    if (groupId) params.set("group_id", groupId);
+    if (includeExpired) params.set("include_expired", "true");
+    const qs = params.toString();
+    return api
+      .get<TimeBoundGrant[]>(`/groups/time-bound-grants${qs ? `?${qs}` : ""}`)
+      .then((r) => r.data);
+  },
+  create: (body: TimeBoundGrantCreate) =>
+    api
+      .post<TimeBoundGrant>("/groups/time-bound-grants", body)
+      .then((r) => r.data),
+  revoke: (id: string) =>
+    api
+      .delete<TimeBoundGrant>(`/groups/time-bound-grants/${id}`)
+      .then((r) => r.data),
+};
+
 // ── Roles ─────────────────────────────────────────────────────────────────────
 
 export interface PermissionEntry {
