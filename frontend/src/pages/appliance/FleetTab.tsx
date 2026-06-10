@@ -949,7 +949,14 @@ export function FleetTab({
     },
     {
       heading: "Services",
+      // Keep these alphabetical by label so new host-config services slot
+      // in by position rather than append-order.
       items: [
+        {
+          key: "resolver",
+          label: "DNS Resolver",
+          summary: "Fleet-wide systemd-resolved config.",
+        },
         {
           key: "lldp",
           label: "LLDP",
@@ -964,11 +971,6 @@ export function FleetTab({
           key: "snmp",
           label: "SNMP",
           summary: "Fleet-wide snmpd config.",
-        },
-        {
-          key: "resolver",
-          label: "DNS Resolver",
-          summary: "Fleet-wide systemd-resolved config.",
         },
         {
           key: "ssh",
