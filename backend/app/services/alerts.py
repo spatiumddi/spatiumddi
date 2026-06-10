@@ -126,6 +126,14 @@ RULE_TYPE_FIREWALL_APPLY_STALLED = "firewall.apply_stalled"
 # critical). Catches the "we forgot to rotate" 3am-page failure mode.
 RULE_TYPE_SECRET_EXPIRING = "secret_expiring"
 
+# Issue #46 — planned-decommission awareness. Subject = subnet. Fires
+# when a subnet's ``decom_date`` falls within ``threshold_days`` (default
+# 30). Same threshold-escalation shape as the other ``*_expiring`` rules
+# (warning at threshold/4 → critical at threshold/12); a past-due decom
+# date (negative days) is always critical. Catches the "we scheduled this
+# segment for retirement and forgot" failure mode.
+RULE_TYPE_DECOM_EXPIRING = "decom_expiring"
+
 RULE_TYPES = frozenset(
     {
         RULE_TYPE_SUBNET_UTILIZATION,
@@ -150,6 +158,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DHCP_POOL_EXHAUSTION,
         RULE_TYPE_FIREWALL_APPLY_STALLED,
         RULE_TYPE_SECRET_EXPIRING,
+        RULE_TYPE_DECOM_EXPIRING,
     }
 )
 
@@ -1285,6 +1294,61 @@ async def _matching_service_term_expiring_subjects(
     return matches
 
 
+async def _matching_decom_expiring_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for the
+    ``decom_expiring`` rule type (issue #46). Mirrors the
+    ``service_term_expiring`` shape — same severity escalation, same
+    soft-delete exclusion. A past-due decom date (negative days)
+    surfaces a "decommission overdue" message at critical severity.
+    """
+    threshold_days = rule.threshold_days or _DEFAULT_EXPIRING_THRESHOLD_DAYS
+    cutoff = (now + timedelta(days=threshold_days)).date()
+
+    rows = (
+        (
+            await db.execute(
+                select(Subnet)
+                .where(Subnet.deleted_at.is_(None))
+                .where(Subnet.decom_date.is_not(None))
+                .where(Subnet.decom_date <= cutoff)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    matches: list[tuple[str, str, str, str]] = []
+    today = now.date()
+    for s in rows:
+        if s.decom_date is None:
+            continue
+        days_to_expiry = (s.decom_date - today).days
+        sev = _escalate_severity_for_expiring(
+            rule.severity,
+            threshold_days=threshold_days,
+            days_to_expiry=days_to_expiry,
+        )
+        display = s.name or s.network
+        if days_to_expiry < 0:
+            descriptor = f"decommission is {-days_to_expiry} day(s) overdue"
+        elif days_to_expiry == 0:
+            descriptor = "is scheduled for decommission today"
+        elif days_to_expiry == 1:
+            descriptor = "is scheduled for decommission tomorrow"
+        else:
+            descriptor = f"is scheduled for decommission in {days_to_expiry} day(s)"
+        message = (
+            f"Subnet {display} {descriptor} "
+            f"(decom_date {s.decom_date.isoformat()}, threshold {threshold_days} d)"
+        )
+        matches.append((str(s.id), display, message, sev))
+    return matches
+
+
 async def _matching_service_resource_orphaned_subjects(
     db: AsyncSession,
     rule: AlertRule,  # noqa: ARG001 — symmetry with sibling evaluators
@@ -1912,6 +1976,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 expiring = await _matching_service_term_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
                 subject_type = "network_service"
+            elif rule.rule_type == RULE_TYPE_DECOM_EXPIRING:
+                expiring = await _matching_decom_expiring_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
+                subject_type = "subnet"
             elif rule.rule_type == RULE_TYPE_SERVICE_RESOURCE_ORPHANED:
                 orphans = await _matching_service_resource_orphaned_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in orphans]

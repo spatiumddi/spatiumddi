@@ -567,6 +567,10 @@ export interface Subnet {
   pci_scope?: boolean;
   hipaa_scope?: boolean;
   internet_facing?: boolean;
+  // Planned decommission date (issue #46). ISO date (YYYY-MM-DD) or
+  // null when no decom is scheduled. Drives the ``decom_expiring``
+  // alert + the dashboard decom-awareness widget.
+  decom_date?: string | null;
   // Network-role classification (issue #112 phase 2). NULL means
   // unspecified; values are ``data`` / ``voice`` / ``management`` /
   // ``guest``. Drives the IPAM filter chip + VLAN-page voice tag +
@@ -702,6 +706,9 @@ export interface IPAddress {
   /** TTL on a ``status='reserved'`` row. The Celery sweep task flips
    *  the row back to ``available`` after this passes. */
   reserved_until?: string | null;
+  /** Planned decommission date (issue #46). ISO date (YYYY-MM-DD) or
+   *  null when no decom is scheduled. */
+  decom_date?: string | null;
   hostname: string | null;
   fqdn: string | null;
   description: string;
@@ -6732,7 +6739,8 @@ export type AlertRuleType =
   | "voice_lease_count_below"
   | "stale_ip_count"
   | "dhcp_pool_exhaustion"
-  | "secret_expiring";
+  | "secret_expiring"
+  | "decom_expiring";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with

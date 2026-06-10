@@ -6,6 +6,7 @@ import {
   AlertTriangle,
   Ban,
   Boxes,
+  CalendarClock,
   Check,
   ChevronDown,
   ClipboardCheck,
@@ -722,6 +723,118 @@ function DomainsSummaryCard() {
   );
 }
 
+/**
+ * Decom-date awareness (issue #46). Counts subnets whose planned
+ * ``decom_date`` is past-due vs. within 30 days, mirroring the
+ * DomainsSummaryCard shape. Always-on IPAM widget — self-fetches the
+ * subnet list so it works on any dashboard tab that renders it.
+ */
+function SubnetDecomCard() {
+  const { data, isLoading, isError } = useQuery<Subnet[]>({
+    queryKey: ["subnets"],
+    queryFn: () => ipamApi.listSubnets(),
+    staleTime: 30_000,
+  });
+
+  const inner = (() => {
+    if (isLoading) {
+      return (
+        <div className="mt-3 space-y-2">
+          {[1, 2, 3].map((i) => (
+            <div
+              key={i}
+              className="h-4 animate-pulse rounded bg-muted"
+              style={{ width: `${50 + i * 12}%` }}
+            />
+          ))}
+        </div>
+      );
+    }
+    if (isError) {
+      return (
+        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
+          Failed to load subnet data.
+        </p>
+      );
+    }
+    const subnets: Subnet[] = data ?? [];
+    const scheduled = subnets.filter((s) => !!s.decom_date);
+    if (scheduled.length === 0) {
+      return (
+        <div className="mt-3 flex-1 flex flex-col justify-between">
+          <p className="text-xs text-muted-foreground">
+            No subnets scheduled for decommission.
+          </p>
+          <Link
+            to="/ipam"
+            className="mt-2 text-[11px] text-primary hover:underline"
+          >
+            Manage subnets →
+          </Link>
+        </div>
+      );
+    }
+
+    // Compare on the calendar day in local time. decom_date is a plain
+    // ISO date (YYYY-MM-DD) with no time component.
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+    let pastDue = 0;
+    let withinThirty = 0;
+    let later = 0;
+    for (const s of scheduled) {
+      const d = new Date(`${s.decom_date}T00:00:00`).getTime();
+      if (Number.isNaN(d)) continue;
+      const delta = d - today.getTime();
+      if (delta < 0) pastDue += 1;
+      else if (delta <= thirtyDaysMs) withinThirty += 1;
+      else later += 1;
+    }
+
+    return (
+      <div className="mt-3 flex-1 flex flex-col justify-between gap-2">
+        <div className="flex flex-wrap gap-1">
+          {pastDue > 0 && (
+            <StatusChip tone="red" label={`${pastDue} past-due`} />
+          )}
+          {withinThirty > 0 && (
+            <StatusChip tone="amber" label={`${withinThirty} within 30 d`} />
+          )}
+          {pastDue === 0 && withinThirty === 0 && (
+            <StatusChip tone="green" label={`${later} scheduled`} />
+          )}
+        </div>
+        <Link
+          to="/ipam"
+          className="text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          View all →
+        </Link>
+      </div>
+    );
+  })();
+
+  const scheduledCount = (data ?? []).filter((s) => !!s.decom_date).length;
+
+  return (
+    <div className="rounded-lg border bg-card p-4 flex flex-col">
+      <div className="flex items-center justify-between">
+        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          Decommissions
+        </p>
+        <CalendarClock className="h-3.5 w-3.5 text-muted-foreground" />
+      </div>
+      {!isLoading && !isError && scheduledCount > 0 && (
+        <p className="mt-1.5 text-2xl font-bold tabular-nums">
+          {scheduledCount}
+        </p>
+      )}
+      {inner}
+    </div>
+  );
+}
+
 // ── Page ────────────────────────────────────────────────────────────────────
 
 type DashboardTab =
@@ -1190,10 +1303,11 @@ export function DashboardPage() {
 
         {/* ── Network overview cards (Overview tab) ─────────────────── */}
         {tab === "overview" && (
-          <div className="grid gap-3 grid-cols-1 sm:grid-cols-3">
+          <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
             <AsnSummaryCard />
             <VrfSummaryCard />
             <DomainsSummaryCard />
+            <SubnetDecomCard />
           </div>
         )}
 

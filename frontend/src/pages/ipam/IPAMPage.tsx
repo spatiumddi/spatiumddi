@@ -1279,16 +1279,22 @@ function ClassificationSection({
   pciScope,
   hipaaScope,
   internetFacing,
+  decomDate,
   onPciChange,
   onHipaaChange,
   onInternetFacingChange,
+  onDecomDateChange,
 }: {
   pciScope: boolean;
   hipaaScope: boolean;
   internetFacing: boolean;
+  // Planned decommission date (issue #46). Empty string = no scheduled
+  // decom (sent to the API as null on submit).
+  decomDate: string;
   onPciChange: (v: boolean) => void;
   onHipaaChange: (v: boolean) => void;
   onInternetFacingChange: (v: boolean) => void;
+  onDecomDateChange: (v: string) => void;
 }) {
   return (
     <div className="space-y-2">
@@ -1343,6 +1349,32 @@ function ClassificationSection({
             </span>
           </span>
         </label>
+        <div className="space-y-1 pt-1">
+          <label className="flex items-center gap-2 text-xs">
+            <span className="font-medium">Decommission date</span>
+          </label>
+          <div className="flex items-center gap-2">
+            <input
+              type="date"
+              value={decomDate}
+              onChange={(e) => onDecomDateChange(e.target.value)}
+              className="rounded-md border bg-background px-2 py-1 text-xs"
+            />
+            {decomDate && (
+              <button
+                type="button"
+                onClick={() => onDecomDateChange("")}
+                className="text-[11px] text-muted-foreground hover:text-foreground"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Drives the decom-expiring alert + dashboard widget. Leave empty for
+            no scheduled decommission.
+          </p>
+        </div>
       </div>
     </div>
   );
@@ -1934,6 +1966,8 @@ function CreateSubnetModal({
   const [pciScope, setPciScope] = useState(false);
   const [hipaaScope, setHipaaScope] = useState(false);
   const [internetFacing, setInternetFacing] = useState(false);
+  // Planned decommission date (issue #46). Empty string = none.
+  const [decomDate, setDecomDate] = useState("");
   // Network-role (issue #112 phase 2).
   const [subnetRole, setSubnetRole] = useState<SubnetRole | null>(null);
   // Logical ownership (issue #91).
@@ -2042,6 +2076,7 @@ function CreateSubnetModal({
         pci_scope: pciScope,
         hipaa_scope: hipaaScope,
         internet_facing: internetFacing,
+        decom_date: decomDate || null,
         subnet_role: subnetRole,
         customer_id: customerId,
         site_id: siteId,
@@ -2357,9 +2392,11 @@ function CreateSubnetModal({
               pciScope={pciScope}
               hipaaScope={hipaaScope}
               internetFacing={internetFacing}
+              decomDate={decomDate}
               onPciChange={setPciScope}
               onHipaaChange={setHipaaScope}
               onInternetFacingChange={setInternetFacing}
+              onDecomDateChange={setDecomDate}
             />
           </div>
         </div>
@@ -6178,6 +6215,9 @@ function EditSubnetModal({
   const [internetFacing, setInternetFacing] = useState(
     subnet.internet_facing ?? false,
   );
+  // Planned decommission date (issue #46). Empty string = no scheduled
+  // decom; submit sends null so an operator can clear it.
+  const [decomDate, setDecomDate] = useState(subnet.decom_date ?? "");
   // Network-role (issue #112 phase 2).
   const [subnetRole, setSubnetRole] = useState<SubnetRole | null>(
     (subnet.subnet_role ?? null) as SubnetRole | null,
@@ -6295,6 +6335,7 @@ function EditSubnetModal({
         pci_scope: pciScope,
         hipaa_scope: hipaaScope,
         internet_facing: internetFacing,
+        decom_date: decomDate || null,
         subnet_role: subnetRole,
         customer_id: customerId,
         site_id: siteId,
@@ -6649,9 +6690,11 @@ function EditSubnetModal({
               pciScope={pciScope}
               hipaaScope={hipaaScope}
               internetFacing={internetFacing}
+              decomDate={decomDate}
               onPciChange={setPciScope}
               onHipaaChange={setHipaaScope}
               onInternetFacingChange={setInternetFacing}
+              onDecomDateChange={setDecomDate}
             />
           </div>
         </div>
