@@ -44,6 +44,7 @@ from .identity import (
     save_session_token,
 )
 from .log import configure_logging
+from .nettools_proxy import start_nettool_thread
 from .register import RegisterDisabled, RegisterFatal, register
 from .state import ensure_layout
 
@@ -328,6 +329,20 @@ def main() -> int:
         start_proxy_thread(cfg, identity_for_proxy)
     else:
         log.info("supervisor.k8s_proxy.disabled_by_config")
+
+    # dashboard-and-remote-nettools — agent-perspective network-tool
+    # thread. Daemon thread that long-polls the control plane for queued
+    # reachability-tool jobs (ping / traceroute / dig / port-test /
+    # tls-cert) bound for this appliance + runs them against the local
+    # vantage. Self-resilient (no cert / no registration → sleep +
+    # retry; 404 against a pre-feature control plane → longer backoff),
+    # so it's harmless + dormant on any appliance with no nettool work
+    # queued — it just sees empty long-polls. Unlike the k8s-proxy
+    # thread it isn't gated on the k3s runtime: a reachability tool runs
+    # from ANY approved appliance vantage, remote DNS/DHCP agents
+    # included.
+    identity_for_nettool, _ = load_or_generate(cfg.state_dir)
+    start_nettool_thread(cfg, identity_for_nettool)
 
     stop = False
 
