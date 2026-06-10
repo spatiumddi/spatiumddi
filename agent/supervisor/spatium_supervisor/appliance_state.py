@@ -357,6 +357,15 @@ _SYSLOG_TRIGGER_FILE = Path(
 )
 _SYSLOG_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/syslog-config-hash")
 _SYSLOG_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/syslog-status")
+# Issue #157 — SSH authorized_keys + sshd hardening equivalents. Same
+# shape as SNMP / NTP / LLDP / syslog. The trigger carries the rendered
+# authorized_keys + sshd drop-in + source-scope CIDRs (a JSON header
+# line) so the host runner can stage everything; the hash sidecar
+# short-circuits re-firing; the count sidecar carries the per-host
+# applied authorized_keys count the heartbeat ships up.
+_SSH_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/ssh-config-pending")
+_SSH_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ssh-config-hash")
+_SSH_KEY_COUNT_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ssh-key-count")
 # Issue #285 Phase 2b — firewall apply-state sidecars the host-side
 # spatium-firewall-reload runner writes after each apply; echoed on the
 # heartbeat so the control plane can see drift + drive the apply alarm.
@@ -956,6 +965,112 @@ def read_syslog_forwarding() -> str | None:
     if text in ("forwarding", "unreachable", "disabled"):
         return text
     return None
+
+
+def maybe_fire_ssh_reload(bundle_block: object) -> bool:
+    """Issue #157 — write the ssh-config trigger when the control plane's
+    rendered authorized_keys + sshd drop-in hash differs from the last one
+    this agent applied.
+
+    Strict appliance-only gate + hash-sidecar idempotency, mirroring
+    ``maybe_fire_syslog_reload``. The payload is a 5-line header plus the
+    two rendered bodies the host runner stages:
+
+        line 1:   ``enabled`` | ``disabled`` marker
+        line 2:   config_hash (sha256 hex, blank when disabled)
+        line 3:   ssh_port (int)
+        line 4:   JSON list of source-scope CIDRs (``[]`` = open)
+        line 5:   ``1`` if password auth enabled else ``0``
+        line 6:   byte length of the authorized_keys body (so the runner
+                  can split it from the sshd_conf that follows)
+        line 7+:  authorized_keys body, then the sshd_conf body
+                  (concatenated; split at the line-6 byte offset)
+
+    LOCKOUT SAFETY (host-side mirror of the server PUT guard): refuse to
+    write a trigger whose state would leave NO way in — password auth off
+    AND zero authorized keys. The server already rejects this on the PUT,
+    but we mirror it here so a hand-edited / replayed bundle can't brick
+    a box. When we refuse we return False and do NOT write the trigger.
+
+    The host-side ``spatiumddi-ssh-reload`` runner validates the staged
+    sshd config with ``sshd -t``, applies a SOURCE-SCOPED nft drop-in for
+    the ssh port, and reloads sshd. The port-22 accept floor in the
+    firewall renderer always stays open, so a bad port change is never a
+    brick.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not isinstance(bundle_block, dict):
+        return False
+    config_hash = str(bundle_block.get("config_hash") or "")
+    enabled = bool(bundle_block.get("enabled"))
+    authorized_keys = str(bundle_block.get("authorized_keys") or "")
+    sshd_conf = str(bundle_block.get("sshd_conf") or "")
+    ssh_port = int(bundle_block.get("ssh_port") or 22)
+    allowed = bundle_block.get("allowed_source_networks")
+    if not isinstance(allowed, list):
+        allowed = []
+    password_auth = bool(bundle_block.get("password_auth"))
+    key_count = int(bundle_block.get("key_count") or 0)
+
+    # Host-side lockout guard — refuse a payload that would leave no way
+    # in (password auth off + zero keys). Only meaningful when enabled;
+    # the default/disabled state always has password auth on.
+    if enabled and not password_auth and key_count == 0:
+        log.warning(
+            "supervisor.ssh.lockout_refused",
+            reason="password auth off with zero authorized keys",
+        )
+        return False
+
+    last_hash = ""
+    if _SSH_HASH_SIDECAR.exists():
+        try:
+            last_hash = _SSH_HASH_SIDECAR.read_text(encoding="utf-8").strip()
+        except OSError:
+            last_hash = ""
+    if config_hash == last_hash:
+        return False
+    if _SSH_TRIGGER_FILE.exists():
+        return False
+    try:
+        _SSH_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ak_bytes = authorized_keys.encode("utf-8")
+        payload = (
+            ("enabled\n" if enabled else "disabled\n")
+            + (config_hash + "\n")
+            + (str(ssh_port) + "\n")
+            + (json.dumps(allowed) + "\n")
+            + (("1" if password_auth else "0") + "\n")
+            + (str(len(ak_bytes)) + "\n")
+            + authorized_keys
+            + sshd_conf
+        )
+        tmp = _SSH_TRIGGER_FILE.with_suffix(".new")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(_SSH_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def read_ssh_key_count() -> int | None:
+    """Read the per-host applied authorized_keys count from the sidecar the
+    host-side ``spatiumddi-ssh-reload`` runner writes after each apply.
+
+    ``None`` = unknown (sidecar missing / unreadable / non-appliance) so
+    the backend leaves the column alone; an int (incl. 0) is the count the
+    runner actually wrote to ``~admin/.ssh/authorized_keys`` (#157)."""
+    if not _SSH_KEY_COUNT_SIDECAR.exists():
+        return None
+    try:
+        text = _SSH_KEY_COUNT_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
 
 
 def maybe_fire_lldp_reload(bundle_block: object) -> bool:
@@ -1756,6 +1871,10 @@ def collect() -> dict[str, object]:
         # None on non-appliance deploys so the backend leaves the column
         # alone.
         "syslog_forwarding": read_syslog_forwarding() if is_appliance else None,
+        # Issue #157 — per-host applied authorized_keys count from the
+        # host-side runner's count sidecar. None on non-appliance deploys
+        # so the backend leaves the column alone.
+        "ssh_key_count": read_ssh_key_count() if is_appliance else None,
         # Issue #347 — LLDP neighbours discovered by local lldpd. None when
         # not collected (off-appliance / lldpcli error) so the backend leaves
         # the stored set alone; an empty list means "ran, saw none" (wipe).

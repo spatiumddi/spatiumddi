@@ -39,6 +39,7 @@ from app.models.settings import PlatformSettings
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
+from app.services.appliance.ssh import ssh_bundle
 from app.services.appliance.syslog import syslog_bundle
 from app.services.dhcp.agent_token import (
     hash_token,
@@ -367,6 +368,22 @@ async def agent_config_longpoll(
                 if settings_row is not None
                 else {"enabled": False, "config_hash": "", "rsyslog_conf": "", "ca_certs": {}}
             )
+            # Issue #157 — same pattern for SSH. Stable dict shape so the
+            # etag math stays uniform whether settings exist or not.
+            ssh_block = (
+                ssh_bundle(settings_row)
+                if settings_row is not None
+                else {
+                    "enabled": False,
+                    "config_hash": "",
+                    "authorized_keys": "",
+                    "sshd_conf": "",
+                    "ssh_port": 22,
+                    "allowed_source_networks": [],
+                    "password_auth": True,
+                    "key_count": 0,
+                }
+            )
             # Phase 8f-3 — mix the fleet-upgrade intent into the ETag so a
             # Fleet view change wakes the agent's long-poll even when the
             # driver-side bundle is unchanged. Deterministic — re-reading
@@ -380,6 +397,8 @@ async def agent_config_longpoll(
                 f"|lldp:{int(bool(lldp_block.get('enabled')))}:{lldp_block.get('config_hash', '')}"
                 f"|syslog:{int(bool(syslog_block.get('enabled')))}"
                 f":{syslog_block.get('config_hash', '')}"
+                f"|ssh:{int(bool(ssh_block.get('enabled')))}"
+                f":{ssh_block.get('config_hash', '')}"
             )
             etag = "sha256:" + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
 
@@ -528,6 +547,12 @@ async def agent_config_longpoll(
                     # the conf + CA files, validates with rsyslogd -N1, and
                     # restarts rsyslog.
                     "syslog_settings": syslog_block,
+                    # Issue #157 — rendered authorized_keys + sshd drop-in +
+                    # source-scope CIDRs. Agent writes ssh-config-pending on
+                    # hash change; host-side spatiumddi-ssh-reload.path stages
+                    # the files, validates with sshd -t, applies the
+                    # source-scoped nft drop-in, and reloads sshd.
+                    "ssh_settings": ssh_block,
                 }
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:

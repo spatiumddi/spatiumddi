@@ -99,6 +99,7 @@ from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
+from app.services.appliance.ssh import ssh_bundle
 from app.services.appliance.syslog import syslog_bundle
 
 logger = structlog.get_logger(__name__)
@@ -990,6 +991,10 @@ class SupervisorHeartbeatRequest(BaseModel):
     # Issue #156 — best-effort rsyslog-forwarding status. None = not
     # collected (leave the stored column alone); a value persists.
     syslog_forwarding: Literal["forwarding", "unreachable", "disabled"] | None = None
+    # Issue #157 — count of authorized_keys lines the host runner actually
+    # applied to ``~admin/.ssh/authorized_keys``. PER-HOST. None = not
+    # collected (leave the stored column alone); a value (incl. 0) persists.
+    ssh_key_count: int | None = None
     # Issue #347 — LLDP neighbours the local lldpd discovered. ``None`` = not
     # collected (leave the stored set alone); a list (possibly empty) is the
     # authoritative current set the handler upserts + absence-deletes against.
@@ -1261,6 +1266,10 @@ class SupervisorHeartbeatResponse(BaseModel):
     # Same shape the DHCP-agent ConfigBundle ships; disabled-shape block
     # still sent so the supervisor can retract config.
     syslog_settings: dict[str, Any] = Field(default_factory=dict)
+    # Issue #157 — rendered authorized_keys + sshd drop-in + source-scope
+    # CIDRs. Same shape the DHCP-agent ConfigBundle ships; disabled-shape
+    # block still sent so the supervisor can retract managed SSH config.
+    ssh_settings: dict[str, Any] = Field(default_factory=dict)
     # #285 Phase 2a — server-side firewall render. ``{enabled, config_hash,
     # firewall_conf}``; empty config_hash when firewall_enabled is off (the
     # supervisor then keeps its in-pod fallback render). The supervisor
@@ -1484,6 +1493,10 @@ async def supervisor_heartbeat(
         row.ntp_sync_state = body.ntp_sync_state
     if body.syslog_forwarding is not None:
         row.syslog_forwarding = body.syslog_forwarding
+    # Issue #157 — applied authorized_keys count (per-host). None = not
+    # collected (leave the column alone); a value (incl. 0) persists.
+    if body.ssh_key_count is not None:
+        row.ssh_key_count = body.ssh_key_count
     # Issue #347 — ingest the supervisor's local LLDP neighbours (upsert +
     # absence-delete). None = not collected (leave the set alone).
     if body.lldp_neighbours is not None:
@@ -1839,6 +1852,23 @@ async def supervisor_heartbeat(
         if cfg_row is not None
         else {"enabled": False, "config_hash": "", "rsyslog_conf": "", "ca_certs": {}}
     )
+    # Issue #157 — SSH authorized_keys + sshd drop-in. Disabled-shape
+    # fallback keeps a stable key set when no settings row exists yet so
+    # the supervisor's hash compare never KeyErrors.
+    ssh_block = (
+        ssh_bundle(cfg_row)
+        if cfg_row is not None
+        else {
+            "enabled": False,
+            "config_hash": "",
+            "authorized_keys": "",
+            "sshd_conf": "",
+            "ssh_port": 22,
+            "allowed_source_networks": [],
+            "password_auth": True,
+            "key_count": 0,
+        }
+    )
     # #285 Phase 2a — server-side firewall render. Same inputs the in-pod
     # renderer consumes (byte-identical body). Gated on the firewall_enabled
     # master switch (default off → disabled-shape block → supervisor keeps
@@ -1924,6 +1954,7 @@ async def supervisor_heartbeat(
         ntp_settings=ntp_block,
         lldp_settings=lldp_block,
         syslog_settings=syslog_block,
+        ssh_settings=ssh_block,
         firewall_settings=firewall_block,
         long_poll=long_poll,
     )
@@ -2072,6 +2103,9 @@ class ApplianceRow(BaseModel):
     # Issue #156 — best-effort rsyslog-forwarding status surfaced from
     # the appliance row (forwarding / unreachable / disabled).
     syslog_forwarding: str | None
+    # Issue #157 — count of authorized_keys lines the host runner applied
+    # (per-host). None on non-appliance / pre-#157 / never-reported rows.
+    ssh_key_count: int | None
     desired_appliance_version: str | None
     desired_slot_image_url: str | None
     desired_next_boot_slot: str | None
@@ -2171,6 +2205,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         snmpd_running=row.snmpd_running,
         ntp_sync_state=row.ntp_sync_state,
         syslog_forwarding=row.syslog_forwarding,
+        ssh_key_count=row.ssh_key_count,
         desired_appliance_version=row.desired_appliance_version,
         desired_slot_image_url=row.desired_slot_image_url,
         desired_next_boot_slot=row.desired_next_boot_slot,

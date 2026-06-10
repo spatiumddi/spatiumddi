@@ -690,6 +690,9 @@ def heartbeat_once(
     # Issue #156 — rsyslog forwarding config-reload trigger.
     if appliance_state.maybe_fire_syslog_reload(body_out.get("syslog_settings")):
         log.info("supervisor.heartbeat.syslog_trigger_fired")
+    # Issue #157 — SSH authorized_keys + sshd config-reload trigger.
+    if appliance_state.maybe_fire_ssh_reload(body_out.get("ssh_settings")):
+        log.info("supervisor.heartbeat.ssh_trigger_fired")
 
     # #272 Phase 7b — control-plane promote/demote. The host-side runner
     # (spatium-cluster-join) reconfigures k3s + reports back via the

@@ -85,6 +85,13 @@ async def test_heartbeat_delivers_host_config_blocks(
     assert body["syslog_settings"]["enabled"] is False
     assert body["syslog_settings"]["config_hash"] == ""
     assert body["syslog_settings"]["ca_certs"] == {}
+    # Issue #157 — ssh block present with its stable key set; pristine
+    # default → disabled (managed-off), empty hash, password auth on.
+    assert "ssh_settings" in body
+    assert body["ssh_settings"]["enabled"] is False
+    assert body["ssh_settings"]["config_hash"] == ""
+    assert body["ssh_settings"]["password_auth"] is True
+    assert body["ssh_settings"]["key_count"] == 0
 
 
 # ── Issue #156 — syslog bundle + delivery ─────────────────────────────
@@ -160,4 +167,56 @@ async def test_syslog_targets_fold_into_dhcp_config_etag(db_session: AsyncSessio
     hash_before = syslog_bundle(s)["config_hash"]
     s.syslog_targets = [{"host": "b.example", "port": 514, "protocol": "udp", "format": "rfc5424"}]
     hash_after = syslog_bundle(s)["config_hash"]
+    assert hash_before != hash_after
+
+
+# ── Issue #157 — ssh bundle + delivery ────────────────────────────────
+
+
+def _ed25519_key(comment: str = "op@host") -> str:
+    import base64 as _b64
+
+    name = b"ssh-ed25519"
+    key = b"\x00" * 32
+    blob = len(name).to_bytes(4, "big") + name + len(key).to_bytes(4, "big") + key
+    return "ssh-ed25519 " + _b64.b64encode(blob).decode("ascii") + " " + comment
+
+
+async def test_heartbeat_delivers_ssh_block(client: AsyncClient, db_session: AsyncSession) -> None:
+    s = await _settings(db_session)
+    s.ssh_authorized_keys = [{"name": "op", "public_key": _ed25519_key(), "comment": ""}]
+    s.ssh_port = 2222
+    row, token = await _approved_supervisor(db_session)
+    await db_session.commit()
+
+    r = await client.post(
+        "/api/v1/appliance/supervisor/heartbeat",
+        json={"appliance_id": str(row.id), "session_token": token},
+    )
+    assert r.status_code == 200, r.text
+    block = r.json()["ssh_settings"]
+    assert block["enabled"] is True
+    assert block["config_hash"]
+    assert block["ssh_port"] == 2222
+    assert block["key_count"] == 1
+    assert "Port 2222" in block["sshd_conf"]
+
+
+async def test_ssh_keys_fold_into_dhcp_config_etag(db_session: AsyncSession) -> None:
+    """Changing ssh_authorized_keys flips the DHCP /config ETag's ssh
+    marker — the bundle helper is the same one the agent endpoint mixes
+    into the fleet_marker, so the rendered config_hash must move."""
+    from app.services.appliance.ssh import ssh_bundle
+
+    s = PlatformSettings(
+        id=1,
+        ssh_authorized_keys=[{"name": "a", "public_key": _ed25519_key(), "comment": ""}],
+    )
+    hash_before = ssh_bundle(s)["config_hash"]
+    # Add a second key — the rendered authorized_keys body changes.
+    s.ssh_authorized_keys = [
+        {"name": "a", "public_key": _ed25519_key(), "comment": ""},
+        {"name": "b", "public_key": _ed25519_key("two@host"), "comment": ""},
+    ]
+    hash_after = ssh_bundle(s)["config_hash"]
     assert hash_before != hash_after

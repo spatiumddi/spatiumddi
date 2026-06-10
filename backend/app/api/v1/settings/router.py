@@ -21,6 +21,7 @@ from app.models.audit_forward import AuditForwardTarget
 from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
 from app.services import audit_forward as audit_forward_svc
+from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
 
 # SNMP v3 protocol allow-lists. Sticking to the protocols net-snmp's
 # Debian build ships out of the box — DES/AES for priv, MD5/SHA for
@@ -190,6 +191,15 @@ class SettingsResponse(BaseModel):
     syslog_targets: list[dict[str, Any]] = []
     syslog_filter: str = ""
     syslog_buffer_disk: bool = False
+    # ── Appliance SSH (issue #157) ─────────────────────────────────
+    # Public keys are NOT secrets — the authorized-keys list is returned
+    # verbatim (no redaction, unlike the SNMP community / syslog CA PEM).
+    # Each entry is ``{name, public_key, comment}``.
+    ssh_authorized_keys: list[dict[str, Any]] = []
+    ssh_password_auth_enabled: bool = True
+    ssh_allow_root_login: bool = False
+    ssh_port: int = 22
+    ssh_allowed_source_networks: list[str] = []
 
     model_config = {"from_attributes": True}
 
@@ -471,6 +481,43 @@ class SyslogTargetUpdate(BaseModel):
         return self
 
 
+class SshAuthorizedKeyUpdate(BaseModel):
+    """One entry in ``ssh_authorized_keys`` on PUT (#157).
+
+    ``public_key`` is a single OpenSSH public-key line (``<type>
+    <base64-blob> [comment]``); ``name`` is an operator label, ``comment``
+    an optional note. Public keys are NOT secrets — they are stored
+    verbatim (no Fernet). The key is validated strictly so a malformed /
+    multi-line / control-char value can't slip into authorized_keys.
+    """
+
+    name: str = ""
+    public_key: str
+    comment: str = ""
+
+    @field_validator("public_key")
+    @classmethod
+    def _valid_public_key(cls, v: str) -> str:
+        s = v.strip()
+        if not is_valid_public_key(s):
+            raise ValueError(
+                "public_key must be a valid OpenSSH public key "
+                "(e.g. 'ssh-ed25519 AAAA… comment') — type + base64 blob, "
+                "no embedded newlines / control characters"
+            )
+        return s
+
+    @field_validator("name", "comment")
+    @classmethod
+    def _no_control_chars(cls, v: str) -> str:
+        # Names / comments land near the rendered authorized_keys line —
+        # reject control chars (incl. newlines) so they can't break the
+        # file format.
+        if any(ord(c) < 0x20 for c in v):
+            raise ValueError("must not contain control characters")
+        return v.strip()
+
+
 class SettingsUpdate(BaseModel):
     app_title: str | None = None
     app_base_url: str | None = None
@@ -592,6 +639,49 @@ class SettingsUpdate(BaseModel):
     syslog_targets: list[SyslogTargetUpdate] | None = None
     syslog_filter: str | None = None
     syslog_buffer_disk: bool | None = None
+    # ── Appliance SSH (issue #157) ─────────────────────────────────
+    ssh_authorized_keys: list[SshAuthorizedKeyUpdate] | None = None
+    ssh_password_auth_enabled: bool | None = None
+    ssh_allow_root_login: bool | None = None
+    ssh_port: int | None = None
+    ssh_allowed_source_networks: list[str] | None = None
+
+    @field_validator("ssh_port")
+    @classmethod
+    def _valid_ssh_port(cls, v: int | None) -> int | None:
+        if v is None:
+            return None
+        if not (1 <= v <= 65535):
+            raise ValueError("ssh_port must be 1–65535")
+        # Privileged-port floor — reject < 1024 except 22 so an operator
+        # can't park sshd somewhere that needs root-only bind privileges
+        # the runner can't reliably reach. 22 stays the un-removable
+        # default; the host runner does the real bind / in-use check.
+        if v < 1024 and v != 22:
+            raise ValueError(
+                "ssh_port below 1024 is not allowed (except 22) — pick a "
+                "non-privileged port or keep 22"
+            )
+        return v
+
+    @field_validator("ssh_allowed_source_networks")
+    @classmethod
+    def _valid_ssh_sources(cls, v: list[str] | None) -> list[str] | None:
+        # Same CIDR canonicalisation as snmp_allowed_sources — the host
+        # nftables drop-in source-scopes the ssh port to these.
+        if v is None:
+            return None
+        out: list[str] = []
+        for raw in v:
+            s = raw.strip()
+            if not s:
+                continue
+            try:
+                net = ip_network(s, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"invalid CIDR or host: {raw!r} ({exc})") from exc
+            out.append(str(net))
+        return out
 
     @field_validator("syslog_filter")
     @classmethod
@@ -1041,7 +1131,7 @@ async def update_settings(
         "web_ui_allowed_cidrs",
     }
     _host_config_touched = any(
-        field.startswith(("snmp_", "ntp_", "lldp_", "syslog_"))
+        field.startswith(("snmp_", "ntp_", "lldp_", "syslog_", "ssh_"))
         or field in _supervisor_host_config_fields
         for field in changes
     )
@@ -1119,6 +1209,52 @@ async def update_settings(
         settings.syslog_targets = merged_targets
         syslog_targets_audit = [_redact_syslog_target(t) for t in merged_targets]
 
+    # ssh_authorized_keys: atomic replace (no per-entry secret merge — public
+    # keys are not secrets). Normalise the incoming pydantic models into
+    # plain ``{name, public_key, comment}`` dicts so the JSONB column stays
+    # JSON-friendly. CROSS-FIELD lockout-safety guard (#157): compute the
+    # MERGED post-update state (resulting password-auth flag + resulting key
+    # list) and refuse to disable password auth when zero valid keys would
+    # survive — otherwise the operator locks themselves out of every
+    # appliance host. The host runner mirrors this guard defensively.
+    ssh_keys_normalised: list[dict[str, Any]] | None = None
+    if "ssh_authorized_keys" in changes:
+        incoming_keys: list[SshAuthorizedKeyUpdate] = body.ssh_authorized_keys or []
+        ssh_keys_normalised = [
+            {"name": k.name, "public_key": k.public_key, "comment": k.comment}
+            for k in incoming_keys
+        ]
+        changes.pop("ssh_authorized_keys")
+        settings.ssh_authorized_keys = ssh_keys_normalised
+
+    # Resulting (merged) state for the lockout check — read the change if
+    # present, else the value already on the row. Compute regardless of
+    # whether keys / the toggle were in this request, since either one
+    # changing can produce an unsafe combination.
+    _resulting_password_auth = bool(
+        changes.get("ssh_password_auth_enabled", settings.ssh_password_auth_enabled)
+    )
+    _resulting_keys = (
+        ssh_keys_normalised
+        if ssh_keys_normalised is not None
+        else list(settings.ssh_authorized_keys or [])
+    )
+    _ssh_field_in_request = any(f.startswith("ssh_") for f in changes) or (
+        ssh_keys_normalised is not None
+    )
+    if _ssh_field_in_request and not validate_lockout_safe(
+        _resulting_keys, _resulting_password_auth
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Refusing to disable SSH password authentication with no "
+                "authorized keys configured — you would lock yourself out of "
+                "every appliance host. Add at least one valid public key first, "
+                "or keep password authentication enabled."
+            ),
+        )
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
         if field in (
@@ -1134,6 +1270,44 @@ async def update_settings(
         changes["snmp_v3_users"] = snmp_users_audit
     if syslog_targets_audit is not None:
         changes["syslog_targets"] = syslog_targets_audit
+    if ssh_keys_normalised is not None:
+        changes["ssh_authorized_keys"] = ssh_keys_normalised
+
+    # Issue #157 — dedicated audit row for any SSH config change
+    # (non-negotiable #4). SSH access is high-blast-radius (it gates who
+    # can log into every appliance host), so a durable audit entry is
+    # required. Public keys are NOT secrets, so the full key list is
+    # recorded (no redaction). Fires whenever this request touched any
+    # ``ssh_*`` field.
+    if _ssh_field_in_request:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="ssh",
+                resource_display="SSH access",
+                result="success",
+                new_value={
+                    "password_auth_enabled": bool(settings.ssh_password_auth_enabled),
+                    "allow_root_login": bool(settings.ssh_allow_root_login),
+                    "port": int(settings.ssh_port or 22),
+                    "allowed_source_networks": list(settings.ssh_allowed_source_networks or []),
+                    "authorized_keys": [
+                        {
+                            "name": (k.get("name") or "") if isinstance(k, dict) else "",
+                            "comment": (k.get("comment") or "") if isinstance(k, dict) else "",
+                            "public_key": (
+                                (k.get("public_key") or "") if isinstance(k, dict) else ""
+                            ),
+                        }
+                        for k in (settings.ssh_authorized_keys or [])
+                    ],
+                },
+            )
+        )
 
     # Issue #156 — dedicated audit row for any syslog-forwarding change
     # (non-negotiable #4). The generic ``logger.info`` below is not an

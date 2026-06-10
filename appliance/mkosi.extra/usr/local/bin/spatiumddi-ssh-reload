@@ -1,0 +1,304 @@
+#!/bin/bash
+# spatiumddi-ssh-reload — host-side SSH authorized_keys + sshd config-apply
+# runner (issue #157).
+#
+# The supervisor (control plane writes it onto the heartbeat) drops
+# /var/lib/spatiumddi/release-state/ssh-config-pending whenever the
+# rendered authorized_keys / sshd drop-in changes vs. what's been applied
+# here. File format (header is line-based; the JSON CIDR list is parsed
+# with python3 which is always present on the appliance):
+#
+#   line 1:    "enabled" | "disabled"
+#   line 2:    sha256 hex of the combined body (blank when disabled)
+#   line 3:    ssh port (int)
+#   line 4:    JSON list of source-scope CIDRs ("[]" = open unconditionally)
+#   line 5:    "1" if password auth enabled else "0"
+#   line 6:    byte length of the authorized_keys body
+#   line 7+:   authorized_keys body, then the sshd_conf body (concatenated;
+#              split at the line-6 byte offset)
+#
+# Apply flow when enabled:
+#   1. LOCKOUT-SAFETY refuse — password auth off + zero authorized keys →
+#      abort + log, do NOT apply (host-side mirror of the server guard).
+#   2. Stage authorized_keys + sshd drop-in to /tmp.
+#   3. ``sshd -t -f <staged combined>`` config check; abort on fail.
+#   4. Privileged-port in-use check for the configured port.
+#   5. Atomic install:
+#        ~admin/.ssh/authorized_keys   (0600, dir 0700, owned admin)
+#        /etc/ssh/sshd_config.d/spatiumddi.conf  (0644, root)
+#   6. SOURCE-SCOPED nft drop-in /etc/nftables.d/50-spatium-ssh.nft opening
+#      the ssh port to the allowed CIDRs (unscoped if list empty). The
+#      port-22 accept floor lives in the firewall renderer, NOT here, so a
+#      bad port change can't lock the operator out.
+#   7. ``systemctl reload sshd`` (falls back to ssh.service / ssh.socket).
+#   8. Write the hash sidecar + the per-host applied key-count sidecar.
+#
+# Apply flow when disabled (the pristine default: password auth on, no
+# managed keys, default port, root login off):
+#   1. Remove /etc/ssh/sshd_config.d/spatiumddi.conf + the nft drop-in.
+#   2. Truncate the managed authorized_keys to a "managed off" stub.
+#   3. ``systemctl reload sshd``; write hash sidecar (empty) + count 0.
+#
+# Persistence across A/B slot swaps (Phase 8a, issue #138):
+#
+#   /etc/ssh/sshd_config.d/spatiumddi.conf → /var/persist/etc/ssh/...
+#   /etc/nftables.d/50-spatium-ssh.nft     → /var/persist/etc/nftables.d/...
+#   ~admin/.ssh/authorized_keys            → /var/home/admin/.ssh/... (the
+#                                            appliance repoints /home to
+#                                            /var/home so operator user data
+#                                            survives a slot swap verbatim)
+#   /var/lib/spatiumddi/release-state/ssh-config-{hash,pending}
+#   /var/lib/spatiumddi/release-state/ssh-key-count → on /var directly
+#
+# So a slot upgrade / rollback preserves operator SSH config + authorized
+# keys automatically — same overlay-on-/etc + /var-backed-sidecar story as
+# the SNMP / chrony / rsyslog runners. The agent's hash sidecar matches the
+# control plane bundle's config_hash on the first long-poll after reboot and
+# short-circuits the trigger write.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/ssh-config-pending
+HASH_SIDECAR=/var/lib/spatiumddi/release-state/ssh-config-hash
+COUNT_SIDECAR=/var/lib/spatiumddi/release-state/ssh-key-count
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/ssh-reload.log"
+ADMIN_USER=admin
+ADMIN_HOME=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
+ADMIN_HOME=${ADMIN_HOME:-/var/home/admin}
+AK_FILE="$ADMIN_HOME/.ssh/authorized_keys"
+SSHD_DROPIN=/etc/ssh/sshd_config.d/spatiumddi.conf
+# Firewall drop-in — added when SSH is managed, removed when disabled. The
+# port-22 accept floor lives in the firewall renderer, so this only opens
+# the (possibly-non-22) configured port, source-scoped.
+NFT_DROPIN=/etc/nftables.d/50-spatium-ssh.nft
+LOCK=/run/spatiumddi-ssh-reload.lock
+
+mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$(dirname "$NFT_DROPIN")"
+exec >> "$LOG" 2>&1
+echo
+echo "[$(date -Iseconds)] === spatiumddi-ssh-reload fired ==="
+
+if [ ! -f "$TRIGGER" ]; then
+    echo "  no trigger file at $TRIGGER, nothing to do"
+    exit 0
+fi
+
+# Serialise concurrent invocations — the .path unit fires once per write,
+# but operator-driven reapplies + retries could overlap.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "  another reload in progress, deferring"
+    exit 0
+fi
+
+# Reload sshd so the drop-in + authorized_keys changes take effect. Debian
+# names the unit ssh.service (alias sshd.service); try both. authorized_keys
+# is re-read per-connection so a reload isn't strictly required for it, but
+# the sshd drop-in (Port / PasswordAuthentication / PermitRootLogin) does
+# need one.
+reload_sshd() {
+    if systemctl reload ssh.service >/dev/null 2>&1 \
+        || systemctl reload sshd.service >/dev/null 2>&1; then
+        echo "  ✓ sshd reloaded"
+        return 0
+    fi
+    # A reload can fail if the unit isn't loaded as a long-running service
+    # (socket-activated). Restart the socket as a fallback.
+    if systemctl restart ssh.socket >/dev/null 2>&1; then
+        echo "  ✓ ssh.socket restarted"
+        return 0
+    fi
+    echo "  ! sshd reload failed (changes apply on next sshd start)"
+    return 1
+}
+
+# nftables reload so /etc/nftables.d/ drop-in changes take effect. Same
+# best-effort pattern as the SNMP runner.
+nft_reload() {
+    if systemctl reload nftables.service >/dev/null 2>&1; then
+        echo "  ✓ nftables reloaded"
+    else
+        echo "  ! nftables reload failed (ssh port may stay closed until next boot)"
+        systemctl status nftables.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+    fi
+}
+
+MARKER=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
+HASH=$(sed -n '2p' "$TRIGGER" | tr -d '\r\n')
+SSH_PORT=$(sed -n '3p' "$TRIGGER" | tr -d '\r\n')
+CIDR_JSON=$(sed -n '4p' "$TRIGGER")
+PW_AUTH=$(sed -n '5p' "$TRIGGER" | tr -d '\r\n')
+AK_LEN=$(sed -n '6p' "$TRIGGER" | tr -d '\r\n')
+
+echo "  marker:     $MARKER"
+echo "  hash:       ${HASH:-<empty>}"
+echo "  ssh_port:   ${SSH_PORT:-22}"
+echo "  pw_auth:    ${PW_AUTH:-1}"
+echo "  ak_len:     ${AK_LEN:-0}"
+
+fail() {
+    echo "  ✗ $1"
+    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    exit 1
+}
+
+case "$MARKER" in
+    enabled)
+        # The body (line 7+) is authorized_keys ++ sshd_conf. Split at the
+        # AK_LEN byte offset (line 6). Use python3 — always present.
+        BODY_TMP=$(mktemp /tmp/spatium-ssh-body.XXXXXX)
+        AK_TMP=$(mktemp /tmp/spatium-authorized-keys.XXXXXX)
+        SSHD_TMP=$(mktemp /tmp/spatium-sshd.conf.XXXXXX)
+        trap 'rm -f "$BODY_TMP" "$AK_TMP" "$SSHD_TMP"' EXIT
+        tail -n +7 "$TRIGGER" > "$BODY_TMP"
+        if ! python3 - "$BODY_TMP" "$AK_TMP" "$SSHD_TMP" "${AK_LEN:-0}" <<'PYEOF'
+import sys
+
+body_path, ak_path, sshd_path, ak_len = sys.argv[1:5]
+ak_len = int(ak_len)
+with open(body_path, "rb") as fh:
+    data = fh.read()
+ak = data[:ak_len]
+sshd = data[ak_len:]
+with open(ak_path, "wb") as fh:
+    fh.write(ak)
+with open(sshd_path, "wb") as fh:
+    fh.write(sshd)
+PYEOF
+        then
+            fail "failed to split authorized_keys / sshd_conf body"
+        fi
+
+        # LOCKOUT SAFETY (host-side mirror of the server PUT guard). Count
+        # the non-comment, non-blank authorized_keys lines; refuse to apply
+        # password-auth-off with zero keys.
+        KEY_COUNT=$(grep -cvE '^[[:space:]]*(#|$)' "$AK_TMP" || true)
+        KEY_COUNT=${KEY_COUNT:-0}
+        if [ "${PW_AUTH:-1}" = "0" ] && [ "$KEY_COUNT" -eq 0 ]; then
+            fail "LOCKOUT REFUSED — password auth off with zero authorized keys; not applying"
+        fi
+
+        # Build the staged sshd config for the syntax check. sshd -t needs
+        # the MAIN config; -f points it at a file that Includes our drop-in
+        # context. We validate the drop-in directly by feeding the real
+        # /etc/ssh/sshd_config through -t after staging the drop-in into a
+        # temp Include — simplest reliable path is to swap the drop-in in,
+        # test, and roll back on failure. Stage to a temp dir first.
+        STAGE_DIR=$(mktemp -d /tmp/spatium-sshd-stage.XXXXXX)
+        trap 'rm -f "$BODY_TMP" "$AK_TMP" "$SSHD_TMP"; rm -rf "$STAGE_DIR"' EXIT
+        cp "$SSHD_TMP" "$STAGE_DIR/spatiumddi.conf"
+        # sshd -t validates the named config + its Includes. We run it
+        # against a throwaway config that Includes only our staged drop-in
+        # plus the host's HostKey lines so sshd doesn't reject on a missing
+        # key. Pull HostKey directives out of the live config.
+        TEST_CONF=$(mktemp /tmp/spatium-sshd-test.XXXXXX)
+        trap 'rm -f "$BODY_TMP" "$AK_TMP" "$SSHD_TMP" "$TEST_CONF"; rm -rf "$STAGE_DIR"' EXIT
+        grep -iE '^[[:space:]]*HostKey' /etc/ssh/sshd_config > "$TEST_CONF" 2>/dev/null || true
+        cat "$STAGE_DIR/spatiumddi.conf" >> "$TEST_CONF"
+        if ! sshd -t -f "$TEST_CONF" >/tmp/spatium-sshd-validate.log 2>&1; then
+            echo "  ✗ sshd -t failed for staged config:"
+            sed 's/^/      /' /tmp/spatium-sshd-validate.log
+            fail "sshd config validation failed"
+        fi
+        echo "  ✓ sshd -t passed"
+
+        # Privileged-port in-use check. The server already rejects < 1024
+        # except 22; here we additionally confirm the configured port isn't
+        # already bound by a non-sshd listener (which would leave sshd
+        # unable to start). ss is part of iproute2 on the appliance.
+        PORT="${SSH_PORT:-22}"
+        if command -v ss >/dev/null 2>&1; then
+            INUSE=$(ss -ltnH "sport = :$PORT" 2>/dev/null | awk '{print $NF}' | grep -v 'sshd\|ssh' || true)
+            if [ -n "$INUSE" ]; then
+                fail "ssh port $PORT is already in use by another listener: $INUSE"
+            fi
+        fi
+
+        # Atomic install of authorized_keys (owned by admin, 0600, dir 0700).
+        install -d -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0700 "$(dirname "$AK_FILE")"
+        install -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0600 "$AK_TMP" "$AK_FILE"
+        echo "  ✓ authorized_keys installed ($KEY_COUNT key(s))"
+
+        # Atomic install of the sshd drop-in (root, 0644 — no secrets).
+        install -o root -g root -m 0644 "$SSHD_TMP" "$SSHD_DROPIN"
+        echo "  ✓ sshd drop-in installed"
+
+        # SOURCE-SCOPED nft drop-in. sshd has no native source-CIDR filter,
+        # so we scope the configured port at the firewall. Empty CIDR list
+        # = open unconditionally. The port-22 accept floor lives in the
+        # firewall renderer (NOT here), so a bad port change is recoverable.
+        # python3 renders the rule fragment from the JSON CIDR list — same
+        # chain-rule-fragment form the SNMP drop-in uses (the include sits
+        # inside the input chain, so a top-level `add rule` would 422 the
+        # reload).
+        if ! printf '%s' "$CIDR_JSON" | python3 - "$PORT" > "$NFT_DROPIN" <<'PYEOF'
+import json
+import sys
+
+port = int(sys.argv[1])
+try:
+    cidrs = json.load(sys.stdin)
+except Exception:
+    cidrs = []
+if not isinstance(cidrs, list):
+    cidrs = []
+
+print("# Managed by spatiumddi-ssh-reload — do not edit manually.")
+print("# SpatiumDDI manages SSH; this rule opens the configured ssh port,")
+print("# source-scoped to the allowed networks (empty = open). The port-22")
+print("# accept floor lives in the firewall renderer, so a bad port change")
+print("# is recoverable. Removed automatically when SSH management is off.")
+v4 = [c for c in cidrs if isinstance(c, str) and ":" not in c]
+v6 = [c for c in cidrs if isinstance(c, str) and ":" in c]
+if not v4 and not v6:
+    print(f"tcp dport {port} accept comment \"spatium-ssh\"")
+else:
+    if v4:
+        print(f"tcp dport {port} ip saddr {{ {', '.join(v4)} }} accept comment \"spatium-ssh\"")
+    if v6:
+        print(f"tcp dport {port} ip6 saddr {{ {', '.join(v6)} }} accept comment \"spatium-ssh6\"")
+PYEOF
+        then
+            fail "failed to render ssh nft drop-in"
+        fi
+        chmod 0644 "$NFT_DROPIN"
+        nft_reload
+
+        reload_sshd || true
+        echo "$HASH" > "$HASH_SIDECAR"
+        echo "$KEY_COUNT" > "$COUNT_SIDECAR"
+        echo "  ✓ ssh config applied — status: managed, $KEY_COUNT key(s), port $PORT"
+        echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        ;;
+    disabled)
+        # Pristine default — drop the managed sshd drop-in + nft drop-in and
+        # stub the managed authorized_keys. The host's baseline sshd config
+        # takes back over (password auth on, default port).
+        rm -f "$SSHD_DROPIN"
+        if [ -f "$NFT_DROPIN" ]; then
+            rm -f "$NFT_DROPIN"
+            nft_reload
+        fi
+        # Stub authorized_keys so an operator who SSHes in sees the note.
+        if [ -d "$(dirname "$AK_FILE")" ] || install -d -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0700 "$(dirname "$AK_FILE")" 2>/dev/null; then
+            cat > "$AK_FILE" <<'EOF'
+# Managed by SpatiumDDI — SSH key management is currently off.
+# To manage keys, use /appliance → SSH in the SpatiumDDI UI.
+EOF
+            chown "$ADMIN_USER:$ADMIN_USER" "$AK_FILE" 2>/dev/null || true
+            chmod 0600 "$AK_FILE"
+        fi
+        reload_sshd || true
+        : > "$HASH_SIDECAR"
+        echo "0" > "$COUNT_SIDECAR"
+        echo "  ✓ managed ssh config removed, sshd reloaded, status: off"
+        echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        ;;
+    *)
+        fail "unknown marker line: ${MARKER:-<empty>}"
+        ;;
+esac

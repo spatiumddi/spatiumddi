@@ -41,6 +41,7 @@ import { LLDPTab } from "./LLDPTab";
 import { NTPTab } from "./NTPTab";
 import { PairingTab } from "./PairingTab";
 import { SNMPTab } from "./SNMPTab";
+import { SSHTab } from "./SSHTab";
 import { SyslogTab } from "./SyslogTab";
 
 /**
@@ -687,6 +688,7 @@ export function FleetTab({
     | "lldp"
     | "ntp"
     | "snmp"
+    | "ssh"
     | "syslog"
   >("appliance.fleet.section", "appliances");
 
@@ -911,6 +913,7 @@ export function FleetTab({
       | "lldp"
       | "ntp"
       | "snmp"
+      | "ssh"
       | "syslog";
     label: string;
     summary: string;
@@ -958,6 +961,11 @@ export function FleetTab({
           key: "snmp",
           label: "SNMP",
           summary: "Fleet-wide snmpd config.",
+        },
+        {
+          key: "ssh",
+          label: "SSH",
+          summary: "Fleet-wide authorized keys + sshd.",
         },
         {
           key: "syslog",
@@ -1104,6 +1112,22 @@ export function FleetTab({
                 operators opt in here.
               </p>
               <SNMPTab />
+            </div>
+          )}
+
+          {view === "ssh" && (
+            <div>
+              <h2 className="mb-1 text-base font-semibold">SSH access</h2>
+              <p className="mb-4 text-xs text-muted-foreground">
+                Fleet-wide SSH — manage the <code>admin</code> user's authorized
+                keys + sshd hardening (password auth, root login, port) across
+                every appliance host. The rendered <code>authorized_keys</code>{" "}
+                + <code>sshd_config.d/spatiumddi.conf</code> ship through the
+                ConfigBundle long-poll, validated host-side via{" "}
+                <code>sshd -t</code> before activation. Port 22 always stays
+                open in the host firewall as an escape hatch.
+              </p>
+              <SSHTab />
             </div>
           )}
 
@@ -1664,6 +1688,33 @@ function SyslogChip({ row }: { row: ApplianceRow }) {
   );
 }
 
+// Issue #157 — per-host applied authorized_keys count chip, rendered under
+// the service + syslog chips. Only shown when the supervisor has reported a
+// value (null = non-appliance / pre-#157 / never reported → render nothing
+// so the column stays clean). Zero keys is a meaningful state (managed-off
+// or password-auth-only) so it still renders.
+function SshKeyChip({ row }: { row: ApplianceRow }) {
+  const count = row.ssh_key_count;
+  if (count === null || count === undefined) return null;
+  return (
+    <span
+      className={cn(
+        "inline-flex w-fit items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+        count > 0
+          ? "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-400"
+          : "border-muted bg-muted/40 text-muted-foreground",
+      )}
+      title={
+        count > 0
+          ? `${count} SSH authorized key(s) applied on this host`
+          : "No managed SSH authorized keys applied on this host"
+      }
+    >
+      SSH: {count} key{count === 1 ? "" : "s"}
+    </span>
+  );
+}
+
 // #272 Phase 1 — Fleet UI two-table split. One section per bucket
 // (Control plane / Service agents). Pending rows pin to the top of
 // their section, others below. Empty section renders a dashed
@@ -1864,6 +1915,7 @@ function ApplianceTableRow({
         <div className="flex flex-col gap-1">
           <ServiceChipList row={row} />
           <SyslogChip row={row} />
+          <SshKeyChip row={row} />
         </div>
       </td>
       <td className="px-4 py-3">

@@ -3013,6 +3013,26 @@ export interface PlatformSettings {
   syslog_targets: SyslogTarget[];
   syslog_filter: string;
   syslog_buffer_disk: boolean;
+  /** Appliance SSH (issue #157). Public keys are NOT secrets — the
+   *  authorized-keys list is returned verbatim (no redaction). Send the
+   *  full list on update (atomic replace). ``ssh_password_auth_enabled``
+   *  defaults true; disabling it with zero keys is refused server-side
+   *  (lockout safety). ``ssh_port`` < 1024 is rejected except 22. */
+  ssh_authorized_keys: SshAuthorizedKey[];
+  ssh_password_auth_enabled: boolean;
+  ssh_allow_root_login: boolean;
+  ssh_port: number;
+  ssh_allowed_source_networks: string[];
+}
+
+/** One authorized SSH key. ``public_key`` is a single OpenSSH public-key
+ *  line; ``name`` is an operator label, ``comment`` an optional note.
+ *  Public keys are not secrets, so the same shape is used for read +
+ *  write. */
+export interface SshAuthorizedKey {
+  name: string;
+  public_key: string;
+  comment: string;
 }
 
 export type NtpSourceMode = "pool" | "servers" | "mixed";
@@ -8379,6 +8399,10 @@ export interface ApplianceRow {
    *  "forwarding" / "unreachable" / "disabled", or null on
    *  non-appliance / pre-#156 rows. */
   syslog_forwarding: string | null;
+  /** Issue #157 — per-host count of authorized_keys lines the host runner
+   *  actually applied, or null on non-appliance / pre-#157 / never-reported
+   *  rows. */
+  ssh_key_count: number | null;
   desired_appliance_version: string | null;
   desired_slot_image_url: string | null;
   // Operator's per-slot boot intents. Non-null means the Fleet UI

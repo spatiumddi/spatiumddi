@@ -459,6 +459,8 @@ backend/alembic/versions/f1a3b8c52d04_subnet_role.py:drop_column:39
 backend/alembic/versions/f1a8d2c5e413_dns_pull_from_server_settings.py:drop_column:56
 backend/alembic/versions/f1a8d2c5e413_dns_pull_from_server_settings.py:drop_column:57
 backend/alembic/versions/f1a8d2c5e413_dns_pull_from_server_settings.py:drop_column:58
+backend/alembic/versions/f1c4a90b27d6_appliance_ssh_settings.py:drop_column:97
+backend/alembic/versions/f1c4a90b27d6_appliance_ssh_settings.py:drop_column:99
 backend/alembic/versions/f1c8b2a945d3_subnet_ops_ipspace_vrf.py:drop_column:57
 backend/alembic/versions/f1c8b2a945d3_subnet_ops_ipspace_vrf.py:drop_column:58
 backend/alembic/versions/f1c8b2a945d3_subnet_ops_ipspace_vrf.py:drop_column:59

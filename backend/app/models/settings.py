@@ -553,6 +553,44 @@ class PlatformSettings(Base):
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
 
+    # ── Appliance SSH (issue #157) ──────────────────────────────────
+    # sshd runs at the Debian host level on every appliance host (same
+    # host-config plane as SNMP / chrony / lldpd / rsyslog) so operator
+    # SSH access can be managed centrally. The columns here are the
+    # singleton source of truth that every appliance host (local +
+    # remote agents) renders ``~admin/.ssh/authorized_keys`` +
+    # ``/etc/ssh/sshd_config.d/spatiumddi.conf`` from via the same
+    # ConfigBundle → trigger-file pipeline as #153/#154/#343/#156.
+    # ``ssh_authorized_keys`` is a JSONB list of ``{name, public_key,
+    # comment}`` entries — public keys are NOT secrets, so no Fernet
+    # and no redaction (unlike the SNMP community / syslog CA PEM).
+    # ``ssh_password_auth_enabled`` defaults TRUE so existing field
+    # installs do NOT lose password auth on upgrade; flipping it to
+    # false with zero keys is refused (lockout safety) both here on the
+    # PUT and on the host runner. ``ssh_allow_root_login`` → sshd
+    # ``PermitRootLogin yes|no``. ``ssh_port`` → sshd ``Port`` (server
+    # rejects < 1024 except 22). ``ssh_allowed_source_networks`` is a
+    # JSONB list of CIDRs the host nftables drop-in source-scopes the
+    # ssh port to (sshd has no native source filter); empty = open the
+    # port unconditionally, and the un-removable port-22 accept floor
+    # in the firewall renderer always stays so a bad port change can't
+    # brick the box.
+    ssh_authorized_keys: Mapped[list[dict]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    ssh_password_auth_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+    ssh_allow_root_login: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    ssh_port: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=22, server_default=sa_text("22")
+    )
+    ssh_allowed_source_networks: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+
     # ── Fleet firewall master switch (issue #285 Phase 2) ───────────
     # Gates the NEW server-side-authoritative firewall render (Phase 2a:
     # the control plane ships a rendered drop-in + hash on the heartbeat
