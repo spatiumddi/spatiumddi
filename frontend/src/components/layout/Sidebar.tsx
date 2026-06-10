@@ -47,6 +47,7 @@ import {
   History,
   Search,
   Calculator,
+  BarChart3,
   Webhook,
   Workflow,
   Monitor,
@@ -195,6 +196,18 @@ const networkInfrastructureNav = [
 const toolsNav = [
   { label: "CIDR Calculator", icon: Calculator, to: "/tools/cidr" },
   { label: "Nmap", icon: Search, to: "/tools/nmap", module: "tools.nmap" },
+];
+
+// Reports section (issue #47) — fixed Top-N rollups derived from
+// existing tables. Module-gated so operators who don't want the surface
+// can hide it via Settings → Features.
+const reportsNav = [
+  {
+    label: "Top-N Reports",
+    icon: BarChart3,
+    to: "/reports",
+    module: "reports.top_n",
+  },
 ];
 
 const adminIdentityNav = [
@@ -701,6 +714,28 @@ export function Sidebar({
                 showDivider
               >
                 {visibleTools.map((item) => (
+                  <NavItem
+                    key={item.to}
+                    {...item}
+                    collapsed={effectiveCollapsed}
+                    onNavigate={mobileOpen ? onMobileClose : undefined}
+                  />
+                ))}
+              </NavSection>
+            );
+          })()}
+
+          {(() => {
+            const visibleReports = filterByModule(reportsNav);
+            if (visibleReports.length === 0) return null;
+            return (
+              <NavSection
+                label="Reports"
+                storageKey="sidebar-section-reports-open"
+                collapsed={effectiveCollapsed}
+                showDivider
+              >
+                {visibleReports.map((item) => (
                   <NavItem
                     key={item.to}
                     {...item}

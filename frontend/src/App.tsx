@@ -43,6 +43,7 @@ import { CidrCalculatorPage } from "@/pages/tools/CidrCalculatorPage";
 import { SubnetPlannerListPage } from "@/pages/ipam/SubnetPlannerListPage";
 import { SubnetPlannerEditorPage } from "@/pages/ipam/SubnetPlannerEditorPage";
 import { LogsPage } from "@/pages/LogsPage";
+import { ReportsPage } from "@/pages/ReportsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
 import { DNSImportPage } from "@/pages/admin/DNSImportPage";
@@ -143,6 +144,7 @@ export default function App() {
         <Route path="dhcp" element={<DHCPPage />} />
         <Route path="dhcp/groups/:groupId/pxe" element={<PXEProfilesPage />} />
         <Route path="logs" element={<LogsPage />} />
+        <Route path="reports" element={<ReportsPage />} />
         <Route path="kubernetes" element={<KubernetesPage />} />
         <Route path="docker" element={<DockerPage />} />
         <Route path="proxmox" element={<ProxmoxPage />} />

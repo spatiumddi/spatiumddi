@@ -139,6 +139,12 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Compliance",
         description="Declarative compliance checks + PDF export. Auditor / Compliance Editor builtin roles depend on it.",
     ),
+    ModuleSpec(
+        id="reports.top_n",
+        label="Top-N Reports",
+        group="Compliance",
+        description="Fixed Top-N reports (subnet utilization, owner IP counts, most-modified resources, noisiest DNS clients) derived from existing tables.",
+    ),
     # Tools.
     ModuleSpec(
         id="tools.nmap",

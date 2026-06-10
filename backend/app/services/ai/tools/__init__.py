@@ -35,6 +35,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     pairing,
     proposals,
     redis,
+    reports,
     snmp,
     upgrades,
     vendor,

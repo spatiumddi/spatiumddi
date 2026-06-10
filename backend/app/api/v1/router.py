@@ -51,6 +51,7 @@ from app.api.v1.ownership import (
     sites_router,
 )
 from app.api.v1.proxmox import router as proxmox_router
+from app.api.v1.reports import router as reports_router
 from app.api.v1.roles.router import router as roles_router
 from app.api.v1.search.router import router as search_router
 from app.api.v1.services import router as services_router
@@ -249,6 +250,12 @@ api_v1_router.include_router(
     prefix="/proxmox",
     tags=["proxmox"],
     dependencies=[Depends(require_module("integrations.proxmox"))],
+)
+api_v1_router.include_router(
+    reports_router,
+    prefix="/reports",
+    tags=["reports"],
+    dependencies=[Depends(require_module("reports.top_n"))],
 )
 api_v1_router.include_router(roles_router, prefix="/roles", tags=["roles"])
 api_v1_router.include_router(search_router, prefix="/search", tags=["search"])

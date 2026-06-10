@@ -7175,6 +7175,75 @@ export const dashboardsApi = {
       .then((r) => r.data),
 };
 
+// ── Top-N reports (issue #47) ───────────────────────────────────────────────
+
+export interface TopSubnetRow {
+  id: string;
+  name: string;
+  network: string;
+  utilization_percent: number;
+  allocated_ips: number;
+  total_ips: number;
+}
+
+export interface TopOwnerRow {
+  customer_id: string | null;
+  customer_name: string;
+  ip_count: number;
+}
+
+export interface TopModifiedResourceRow {
+  resource_type: string;
+  resource_id: string;
+  resource_display: string;
+  change_count: number;
+}
+
+export interface TopDNSClientRow {
+  client_ip: string;
+  query_count: number;
+}
+
+export interface TopSubnetsReport {
+  generated_at: string;
+  rows: TopSubnetRow[];
+}
+
+export interface TopOwnersReport {
+  generated_at: string;
+  rows: TopOwnerRow[];
+}
+
+export interface TopModifiedResourcesReport {
+  generated_at: string;
+  window_days: number;
+  rows: TopModifiedResourceRow[];
+}
+
+export interface TopDNSClientsReport {
+  generated_at: string;
+  rows: TopDNSClientRow[];
+}
+
+export const reportsApi = {
+  topSubnetsByUtilization: () =>
+    api
+      .get<TopSubnetsReport>("/reports/top-subnets-by-utilization")
+      .then((r) => r.data),
+  topOwnersByIpCount: () =>
+    api
+      .get<TopOwnersReport>("/reports/top-owners-by-ip-count")
+      .then((r) => r.data),
+  topModifiedResources: () =>
+    api
+      .get<TopModifiedResourcesReport>("/reports/top-modified-resources")
+      .then((r) => r.data),
+  topDnsClients: () =>
+    api
+      .get<TopDNSClientsReport>("/reports/top-dns-clients")
+      .then((r) => r.data),
+};
+
 // ── Domain registration (RDAP / WHOIS tracking) ─────────────────────────────
 
 export type DomainWhoisState =
