@@ -10487,6 +10487,104 @@ export const nmapApi = {
   },
 };
 
+// ── Built-in network tools (issue #58) ──────────────────────────────
+//
+// Stateless, synchronous server-perspective utilities. Each call POSTs
+// and returns the result inline (no SSE / persisted rows — that's the
+// nmap scanner's model, not this one).
+
+/** Uniform subprocess-tool result (ping / traceroute / mtr / dig / whois). */
+export interface NetToolCommandResult {
+  tool: string;
+  argv: string[];
+  available: boolean;
+  exit_code: number | null;
+  timed_out: boolean;
+  duration_ms: number | null;
+  stdout: string;
+  stderr: string;
+  error: string | null;
+}
+
+export interface NetToolPortTestResult {
+  host: string;
+  port: number;
+  protocol: string;
+  /** tcp: open|closed|filtered|error · udp: open|filtered|closed|error */
+  state: string;
+  rtt_ms: number | null;
+  error: string | null;
+}
+
+export interface NetToolTlsCertResult {
+  host: string;
+  port: number;
+  server_name: string | null;
+  ok: boolean;
+  subject: string | null;
+  issuer: string | null;
+  san: string[];
+  not_before: string | null;
+  not_after: string | null;
+  days_remaining: number | null;
+  expired: boolean;
+  self_signed: boolean;
+  hostname_matches: boolean | null;
+  serial: string | null;
+  signature_algorithm: string | null;
+  error: string | null;
+}
+
+export interface NetToolMacVendorEntry {
+  mac: string;
+  vendor: string | null;
+  is_voip_phone: boolean;
+}
+
+export interface NetToolMacVendorResult {
+  oui_enabled: boolean;
+  entries: NetToolMacVendorEntry[];
+}
+
+export const networkToolsApi = {
+  ping: (host: string) =>
+    api.post<NetToolCommandResult>("/tools/ping", { host }).then((r) => r.data),
+  traceroute: (host: string) =>
+    api
+      .post<NetToolCommandResult>("/tools/traceroute", { host })
+      .then((r) => r.data),
+  mtr: (host: string) =>
+    api.post<NetToolCommandResult>("/tools/mtr", { host }).then((r) => r.data),
+  dig: (body: { name: string; record_type?: string; server?: string | null }) =>
+    api.post<NetToolCommandResult>("/tools/dig", body).then((r) => r.data),
+  whois: (query: string) =>
+    api
+      .post<NetToolCommandResult>("/tools/whois", { query })
+      .then((r) => r.data),
+  portTest: (body: { host: string; port: number; protocol?: string }) =>
+    api
+      .post<NetToolPortTestResult>("/tools/port-test", body)
+      .then((r) => r.data),
+  tlsCert: (body: {
+    host: string;
+    port?: number;
+    server_name?: string | null;
+  }) =>
+    api.post<NetToolTlsCertResult>("/tools/tls-cert", body).then((r) => r.data),
+  dnsPropagation: (body: {
+    name: string;
+    record_type?: string;
+    resolvers?: string[];
+  }) =>
+    api
+      .post<PropagationCheckResult>("/tools/dns-propagation", body)
+      .then((r) => r.data),
+  macVendor: (macs: string[]) =>
+    api
+      .post<NetToolMacVendorResult>("/tools/mac-vendor", { macs })
+      .then((r) => r.data),
+};
+
 // ── ASN management ──────────────────────────────────────────────────
 
 export type ASNKind = "public" | "private";

@@ -196,6 +196,12 @@ const networkInfrastructureNav = [
 const toolsNav = [
   { label: "CIDR Calculator", icon: Calculator, to: "/tools/cidr" },
   { label: "Nmap", icon: Search, to: "/tools/nmap", module: "tools.nmap" },
+  {
+    label: "Network Tools",
+    icon: Wrench,
+    to: "/tools/network",
+    module: "tools.network",
+  },
 ];
 
 // Reports section (issue #47) — fixed Top-N rollups derived from

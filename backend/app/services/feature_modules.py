@@ -152,6 +152,16 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Tools",
         description="On-demand nmap with live SSE output + history. Subnet/IP scan buttons hide when off.",
     ),
+    ModuleSpec(
+        id="tools.network",
+        label="Network tools",
+        group="Tools",
+        description=(
+            "Built-in ping/traceroute/MTR/dig/whois/port-test/TLS-cert/"
+            "DNS-propagation/MAC-vendor run from the server. "
+            "Permission-gated + rate-limited."
+        ),
+    ),
     # DNS — togglable extras under the Settings → Import surface and
     # the DNS sidebar group. The importer is one-shot (issue #128) —
     # operators upload BIND9 configs / live-pull from Windows DNS or

@@ -25,6 +25,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     lldp,
     maintenance,
     multicast,
+    nettools,
     network,
     network_modeling,
     nmap,

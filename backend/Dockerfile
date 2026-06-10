@@ -44,6 +44,11 @@ WORKDIR /app
 # Runtime system deps: libpq5 for asyncpg, libxmlsec1 for python3-saml,
 # iputils-ping for the DNS pool ICMP health-check (the binary ships
 # with cap_net_raw+ep on Debian, so it works as the non-root app user).
+# traceroute + mtr-tiny + dnsutils (dig) + whois back the built-in
+# network-tools surface (#58); they're invoked via the server-perspective
+# nettools runner. mtr-tiny needs CAP_NET_RAW for ICMP probes — the api
+# container doesn't grant it, so mtr falls back to UDP probes (still a
+# usable report). ping reuses the existing cap_net_raw+ep iputils binary.
 # libcap2-bin gives us setcap so we can grant nmap CAP_NET_RAW —
 # without it ``nmap -O`` (and any SYN scan) bails with
 # "TCP/IP fingerprinting requires root privileges" when invoked by
@@ -69,6 +74,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxmlsec1-openssl \
     nmap \
     iputils-ping \
+    traceroute \
+    mtr-tiny \
+    dnsutils \
+    whois \
     libcap2-bin \
     postgresql-client-16 \
     && setcap cap_net_raw,cap_net_bind_service+eip /usr/bin/nmap \
