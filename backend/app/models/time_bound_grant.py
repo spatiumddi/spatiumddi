@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy import DateTime, ForeignKey, Index, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -33,6 +33,12 @@ if TYPE_CHECKING:
 
 class TimeBoundGrant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "time_bound_grant"
+
+    # Composite index for the per-request "live grants for these groups"
+    # query: filter group_id IN (...) AND revoked_at IS NULL AND
+    # expires_at > now(). Mirrors the index created in migration
+    # d5e9b2c14a07 so autogenerate / ``alembic check`` see no drift.
+    __table_args__ = (Index("ix_time_bound_grant_live", "group_id", "revoked_at", "expires_at"),)
 
     group_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

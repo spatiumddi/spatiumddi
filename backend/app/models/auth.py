@@ -59,11 +59,15 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # Per-request cache of live time-bound grants (issue #65), populated by
     # the auth dependency and consulted by
-    # ``app.core.permissions.user_has_permission``. Defaults to an empty
-    # tuple at the class level so a check on a User loaded outside the auth
-    # dependency (or a detached User in unit tests) reads as "no grants";
-    # the dependency reassigns it to the loaded list per instance.
-    _active_time_bound_grants: "list[TimeBoundGrant]" = []  # noqa: RUF012
+    # ``app.core.permissions.user_has_permission``. The class-level default is
+    # the immutable ``None`` sentinel — NEVER a ``[]`` literal, which a mutable
+    # class attribute would share across every User instance and leak grants
+    # between callers if mutated in place. The dependency assigns a fresh list
+    # per request; the read site treats ``None`` as "no grants"
+    # (``getattr(user, "_active_time_bound_grants", None) or []``), so a User
+    # built outside the auth path (tests, internal construction) reads as empty
+    # and is never polluted by another instance.
+    _active_time_bound_grants: "list[TimeBoundGrant] | None" = None
 
     username: Mapped[str] = mapped_column(String(150), unique=True, nullable=False, index=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)

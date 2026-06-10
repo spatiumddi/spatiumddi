@@ -53,6 +53,50 @@ def _grant(
     return g
 
 
+def _bare_user() -> User:
+    """A User built outside the auth dependency — no ``_active_time_bound_grants``
+    assignment at all, so it falls back to the class-level sentinel."""
+    return User(
+        username=f"u{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@t.io",
+        display_name="Bare",
+        hashed_password="x",
+        is_superadmin=False,
+        is_active=True,
+    )
+
+
+def test_users_do_not_share_grant_state() -> None:
+    """Two distinct User instances must not share grant state.
+
+    The class-level ``_active_time_bound_grants`` default is the immutable
+    ``None`` sentinel (NOT a shared ``[]`` literal), so a User built without
+    a per-request assignment reads as "no grants" and is never polluted by
+    another User's grants — even if that other User's list is mutated in
+    place. Regression guard for the mutable-class-default footgun.
+    """
+    u1 = _bare_user()
+    u1.groups = []
+    u2 = _bare_user()
+    u2.groups = []
+
+    # Neither got a deps-style assignment: both read as empty / denied.
+    assert user_has_permission(u1, "write", "subnet") is False
+    assert user_has_permission(u2, "write", "subnet") is False
+
+    # Give u1 a real list and mutate it in place (the leak vector). u2 must
+    # stay empty — it does not share u1's list.
+    u1._active_time_bound_grants = []
+    u1._active_time_bound_grants.append(_grant(action="write", resource_type="subnet"))
+    assert user_has_permission(u1, "write", "subnet") is True
+    assert user_has_permission(u2, "write", "subnet") is False
+
+    # A third bare User constructed after u1's mutation is also unaffected.
+    u3 = _bare_user()
+    u3.groups = []
+    assert user_has_permission(u3, "write", "subnet") is False
+
+
 def test_live_grant_admits_action_with_no_role() -> None:
     """A user with no role grant gets access purely from a live grant."""
     u = _user()
