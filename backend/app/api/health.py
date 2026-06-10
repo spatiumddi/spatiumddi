@@ -413,11 +413,34 @@ async def platform_health() -> JSONResponse:
     # avoid a separate round-trip on every page load.
     from app.config import settings as _settings
 
+    # Maintenance mode (issue #57) — same rationale: bundle the read-only
+    # banner state into the existing poll instead of a separate request.
+    # Failure to read it never fails the endpoint (it's a UI hint, not a
+    # gate — the middleware is the real enforcement point).
+    maintenance_enabled = False
+    maintenance_message = ""
+    maintenance_started_at: str | None = None
+    try:
+        from app.core import maintenance_mode as _maintenance_mode
+
+        async with AsyncSessionLocal() as session:
+            (
+                maintenance_enabled,
+                maintenance_message,
+                _started,
+            ) = await _maintenance_mode.get_maintenance_state(session)
+        maintenance_started_at = _started.isoformat() if _started else None
+    except Exception:  # noqa: BLE001 — UI hint only
+        pass
+
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content={
             "status": rollup,
             "components": components,
             "demo_mode": bool(_settings.demo_mode),
+            "maintenance_mode": maintenance_enabled,
+            "maintenance_message": maintenance_message,
+            "maintenance_started_at": maintenance_started_at,
         },
     )

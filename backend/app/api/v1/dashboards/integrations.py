@@ -30,6 +30,7 @@ from app.models.audit import AuditLog
 from app.models.cloud import CloudEndpoint
 from app.models.docker import DockerHost
 from app.models.kubernetes import KubernetesCluster
+from app.models.opnsense import OPNsenseRouter
 from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
@@ -89,6 +90,7 @@ _INTEGRATION_RESOURCE_TYPES = (
     "tailscale_tenant",
     "unifi_controller",
     "cloud_endpoint",
+    "opnsense_router",
 )
 
 
@@ -167,6 +169,7 @@ async def integrations_summary(
     tailscale_targets = list((await db.execute(select(TailscaleTenant))).scalars().all())
     unifi_targets = list((await db.execute(select(UnifiController))).scalars().all())
     cloud_targets = list((await db.execute(select(CloudEndpoint))).scalars().all())
+    opnsense_targets = list((await db.execute(select(OPNsenseRouter))).scalars().all())
 
     panels = [
         _build_panel(
@@ -214,6 +217,14 @@ async def integrations_summary(
             label="Cloud (AWS / Azure / GCP)",
             enabled=getattr(settings, "integration_cloud_enabled", False),
             targets=cloud_targets,
+            display_attr="name",
+            now=now,
+        ),
+        _build_panel(
+            kind="opnsense",
+            label="OPNsense",
+            enabled=getattr(settings, "integration_opnsense_enabled", False),
+            targets=opnsense_targets,
             display_attr="name",
             now=now,
         ),

@@ -12,6 +12,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.api.health import router as health_router
 from app.api.v1.router import api_v1_router
 from app.config import settings
+from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.log import configure_logging
 from app.metrics import PrometheusMiddleware, metrics_endpoint
 
@@ -129,6 +130,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         [
             {"action": "admin", "resource_type": "manage_network_devices"},
             {"action": "admin", "resource_type": "manage_nmap_scans"},
+            {"action": "admin", "resource_type": "use_network_tools"},
             {"action": "admin", "resource_type": "manage_asns"},
             {"action": "admin", "resource_type": "vrf"},
             {"action": "admin", "resource_type": "circuit"},
@@ -434,8 +436,19 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Middleware (outermost first)
+    # Middleware (outermost first). Note Starlette wraps in REVERSE add
+    # order: the LAST-added middleware runs outermost. So the request
+    # flows in as CORS → Prometheus → Maintenance → RequestContext, and
+    # the response unwinds the other way.
     app.add_middleware(RequestContextMiddleware)
+
+    # Maintenance mode (issue #57). Added AFTER RequestContextMiddleware so
+    # it sits OUTSIDE it in the add list but — given the reverse wrap —
+    # runs just before RequestContext on the way in; that's fine, the 503
+    # short-circuit doesn't need request_id bound. Mutating requests are
+    # 503'd while maintenance is on (superadmin + exempt-path bypass);
+    # reads + the maintenance-off common case pass through with no DB hit.
+    app.add_middleware(MaintenanceModeMiddleware)
 
     if settings.prometheus_metrics_enabled:
         app.add_middleware(PrometheusMiddleware)

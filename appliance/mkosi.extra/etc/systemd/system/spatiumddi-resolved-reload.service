@@ -1,0 +1,17 @@
+[Unit]
+Description=Apply pending SpatiumDDI systemd-resolved config (issue #158)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/158
+# Defensive — the runner writes to
+# /etc/systemd/resolved.conf.d/spatiumddi.conf, which needs the /etc
+# overlay (Phase 8a, lower=/usr/lib/etc.image, upper=/var/persist/etc)
+# mounted so the write lands on the /var-backed upper layer and persists
+# across A/B slot swaps. The .path unit's trigger file lives under
+# /var/lib/spatiumddi which isn't available until local-fs.target either.
+After=etc.mount local-fs.target
+Requires=etc.mount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-resolved-reload
+# No Install section — only invoked by the matching .path unit, never
+# directly enabled at boot.

@@ -139,12 +139,28 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Compliance",
         description="Declarative compliance checks + PDF export. Auditor / Compliance Editor builtin roles depend on it.",
     ),
+    ModuleSpec(
+        id="reports.top_n",
+        label="Top-N Reports",
+        group="Compliance",
+        description="Fixed Top-N reports (subnet utilization, owner IP counts, most-modified resources, noisiest DNS clients) derived from existing tables.",
+    ),
     # Tools.
     ModuleSpec(
         id="tools.nmap",
         label="Nmap scanning",
         group="Tools",
         description="On-demand nmap with live SSE output + history. Subnet/IP scan buttons hide when off.",
+    ),
+    ModuleSpec(
+        id="tools.network",
+        label="Network tools",
+        group="Tools",
+        description=(
+            "Built-in ping/traceroute/MTR/dig/whois/port-test/TLS-cert/"
+            "DNS-propagation/MAC-vendor run from the server. "
+            "Permission-gated + rate-limited."
+        ),
     ),
     # DNS — togglable extras under the Settings → Import surface and
     # the DNS sidebar group. The importer is one-shot (issue #128) —
@@ -226,6 +242,13 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Read-only mirror of public-cloud infrastructure (VPCs / subnets / instance NICs / public + load-balancer IPs) into IPAM. Connect accounts from the Cloud page once enabled. (Cloud DNS is managed separately via the Add DNS server flow.)",
         default_enabled=False,
     ),
+    ModuleSpec(
+        id="integrations.opnsense",
+        label="OPNsense",
+        group="Integrations",
+        description="Read-only mirror of OPNsense interfaces + DHCP leases + reservations into IPAM.",
+        default_enabled=False,
+    ),
     # Appliance — the declarative fleet-firewall policy surface (#285
     # Phase 3). Default-enabled for DISCOVERY/STAGING only: turning this
     # module ON exposes the policy editor + preview but applies NOTHING.
@@ -253,6 +276,7 @@ INTEGRATION_SETTINGS_MIRROR: Final[dict[str, str]] = {
     "integrations.tailscale": "integration_tailscale_enabled",
     "integrations.unifi": "integration_unifi_enabled",
     "integrations.cloud": "integration_cloud_enabled",
+    "integrations.opnsense": "integration_opnsense_enabled",
 }
 
 MODULES_BY_ID: Final[dict[str, ModuleSpec]] = {m.id: m for m in MODULES}

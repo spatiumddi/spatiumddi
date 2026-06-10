@@ -96,11 +96,15 @@ backend/alembic/versions/a1f4d97c8e25_network_device_poll_igmp.py:drop_column:49
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:83
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:84
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:85
+backend/alembic/versions/a3e7c9d12f80_appliance_resolver_settings.py:drop_column:106
+backend/alembic/versions/a3e7c9d12f80_appliance_resolver_settings.py:drop_column:108
 backend/alembic/versions/a3f1d9e07c52_firewall_apply_state.py:drop_column:66
 backend/alembic/versions/a3f1d9e07c52_firewall_apply_state.py:drop_table:67
 backend/alembic/versions/a3f1e9c47b20_platform_settings_verbose_boot.py:drop_column:37
 backend/alembic/versions/a3f7b2c8d419_add_name_description_to_dhcp_scope.py:drop_column:33
 backend/alembic/versions/a3f7b2c8d419_add_name_description_to_dhcp_scope.py:drop_column:34
+backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:drop_column:38
+backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:drop_column:41
 backend/alembic/versions/a4b8c2d619e7_ai_provider.py:drop_table:92
 backend/alembic/versions/a4d92f61c08b_drop_discovery_scan_settings.py:drop_column:31
 backend/alembic/versions/a4d92f61c08b_drop_discovery_scan_settings.py:drop_column:32
@@ -161,6 +165,9 @@ backend/alembic/versions/b5d8a3f12c91_conformity_evaluations.py:drop_table:139
 backend/alembic/versions/b5d9c41e2f80_ai_chat_sessions.py:drop_table:131
 backend/alembic/versions/b5d9c41e2f80_ai_chat_sessions.py:drop_table:135
 backend/alembic/versions/b6f1d4a82c97_api_token_scopes.py:drop_column:49
+backend/alembic/versions/b6f4d2a91c83_opnsense_integration.py:drop_column:121
+backend/alembic/versions/b6f4d2a91c83_opnsense_integration.py:drop_column:124
+backend/alembic/versions/b6f4d2a91c83_opnsense_integration.py:drop_table:126
 backend/alembic/versions/b71d9ae34c50_windows_dhcp_support.py:drop_column:63
 backend/alembic/versions/b71d9ae34c50_windows_dhcp_support.py:drop_column:64
 backend/alembic/versions/b71d9ae34c50_windows_dhcp_support.py:drop_column:65
@@ -293,6 +300,9 @@ backend/alembic/versions/c9f2a83b04d7_appliance_certificate.py:drop_table:90
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_column:107
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_column:110
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_table:112
+backend/alembic/versions/d1b8f4a92c30_platform_settings_maintenance_mode.py:drop_column:57
+backend/alembic/versions/d1b8f4a92c30_platform_settings_maintenance_mode.py:drop_column:58
+backend/alembic/versions/d1b8f4a92c30_platform_settings_maintenance_mode.py:drop_column:59
 backend/alembic/versions/d1e7c4a90fb3_cloud_integration.py:drop_column:149
 backend/alembic/versions/d1e7c4a90fb3_cloud_integration.py:drop_column:153
 backend/alembic/versions/d1e7c4a90fb3_cloud_integration.py:drop_constraint_fk:152
@@ -321,6 +331,7 @@ backend/alembic/versions/d4f2a86c5b91_device_profiling_phase1.py:drop_constraint
 backend/alembic/versions/d5b8a3f12e64_dhcp_pxe_profiles.py:drop_column:136
 backend/alembic/versions/d5b8a3f12e64_dhcp_pxe_profiles.py:drop_table:140
 backend/alembic/versions/d5b8a3f12e64_dhcp_pxe_profiles.py:drop_table:141
+backend/alembic/versions/d5e9b2c14a07_time_bound_grant.py:drop_table:71
 backend/alembic/versions/d5f1a37c20e9_appliance_node_ip.py:drop_column:35
 backend/alembic/versions/d6a39e84c512_ai_provider_system_prompt_override.py:drop_column:27
 backend/alembic/versions/d6e1a4b9f082_add_dns_auto_sync_settings.py:drop_column:60
@@ -426,6 +437,8 @@ backend/alembic/versions/e6f12b9a3c84_tailscale_phase2_dns.py:drop_column:45
 backend/alembic/versions/e7a2c91d4f60_metallb_control_plane_vip.py:drop_column:66
 backend/alembic/versions/e7a2c91d4f60_metallb_control_plane_vip.py:drop_column:67
 backend/alembic/versions/e7a2c91d4f60_metallb_control_plane_vip.py:drop_column:68
+backend/alembic/versions/e7a3f1c0d294_appliance_syslog_settings.py:drop_column:82
+backend/alembic/versions/e7a3f1c0d294_appliance_syslog_settings.py:drop_column:84
 backend/alembic/versions/e7b3f29a1d6c_proxmox_last_discovery.py:drop_column:38
 backend/alembic/versions/e7b8c4f96a12_dns_zone_domain_fk.py:drop_column:48
 backend/alembic/versions/e7b8c4f96a12_dns_zone_domain_fk.py:drop_constraint_fk:46
@@ -451,6 +464,8 @@ backend/alembic/versions/f1a3b8c52d04_subnet_role.py:drop_column:39
 backend/alembic/versions/f1a8d2c5e413_dns_pull_from_server_settings.py:drop_column:56
 backend/alembic/versions/f1a8d2c5e413_dns_pull_from_server_settings.py:drop_column:57
 backend/alembic/versions/f1a8d2c5e413_dns_pull_from_server_settings.py:drop_column:58
+backend/alembic/versions/f1c4a90b27d6_appliance_ssh_settings.py:drop_column:97
+backend/alembic/versions/f1c4a90b27d6_appliance_ssh_settings.py:drop_column:99
 backend/alembic/versions/f1c8b2a945d3_subnet_ops_ipspace_vrf.py:drop_column:57
 backend/alembic/versions/f1c8b2a945d3_subnet_ops_ipspace_vrf.py:drop_column:58
 backend/alembic/versions/f1c8b2a945d3_subnet_ops_ipspace_vrf.py:drop_column:59

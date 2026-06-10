@@ -1,9 +1,10 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -48,6 +49,11 @@ IP_STATUSES_INTEGRATION_OWNED: frozenset[str] = frozenset(
         "proxmox-vm",
         "proxmox-lxc",
         "tailscale-node",
+        # OPNsense ARP-table mirror (issue #31). Opt-in secondary source
+        # — a host the firewall has seen on the wire, distinct from a
+        # DHCP lease (status="dhcp") or static reservation
+        # (status="reserved") which the OPNsense reconciler also emits.
+        "opnsense-arp",
         # Cloud integration (issue #37, Part A). cloud-instance = a
         # VM/EC2/GCE NIC private IP; cloud-public = an Elastic/public
         # IP or external address; cloud-lb = a load-balancer frontend
@@ -272,6 +278,15 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # OPNsense integration provenance (issue #31). Set on wrapper blocks
+    # the OPNsense reconciler creates when no operator block encloses a
+    # firewall interface's CIDR. Cascades on firewall delete.
+    opnsense_router_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("opnsense_router.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # DNS assignment (propagates to child blocks and subnets unless overridden)
     dns_group_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
@@ -377,6 +392,7 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     __tablename__ = "subnet"
     __table_args__ = (
         Index("ix_subnet_network", "network"),
+        Index("ix_subnet_decom_date", "decom_date"),
         # Subnets cannot overlap within the same IP space (enforced at application layer)
     )
 
@@ -585,6 +601,13 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
 
+    # Planned decommission date (issue #46). NULL = no scheduled decom.
+    # Indexed (``ix_subnet_decom_date``) so the ``decom_expiring`` alert
+    # rule and the admin dashboard widget can scan "decom within N days"
+    # cheaply. Date-only — operators schedule decoms by calendar day,
+    # not to the second.
+    decom_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
     # Network-role classification (issue #112 phase 2). Pure metadata —
     # no behaviour change in the Kea / BIND drivers. Drives the IPAM
     # filter chip, the VLAN page "Voice" tag, the
@@ -667,6 +690,16 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # OPNsense provenance (issue #31). Set on subnets mirrored from a
+    # firewall interface CIDR (LAN / OPT* / VLAN). These are real LANs
+    # — gateway + broadcast apply, unlike a Proxmox plain bridge.
+    # Cascades on firewall delete.
+    opnsense_router_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("opnsense_router.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # Computed / cached. ``total_ips`` is BigInteger because IPv6 subnets can
     # be as large as 2^64 addresses (a /64 — the standard LAN size) which
@@ -722,6 +755,7 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "ip_address"
     __table_args__ = (
         Index("ix_ip_address_address", "address"),
+        Index("ix_ip_address_decom_date", "decom_date"),
         UniqueConstraint("subnet_id", "address", name="uq_ip_address_subnet_address"),
     )
 
@@ -744,6 +778,11 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # The sweep_expired_reservations beat task flips expired rows to
     # 'available' and clears this column.  Null = indefinite reservation.
     reserved_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Planned decommission date (issue #46). NULL = no scheduled decom.
+    # Indexed (``ix_ip_address_decom_date``) for the decom-awareness
+    # reports + alert. Date-only, same rationale as ``Subnet.decom_date``.
+    decom_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     hostname: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     fqdn: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -852,6 +891,16 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     cloud_endpoint_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("cloud_endpoint.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # OPNsense provenance (issue #31) — set on rows mirrored from a
+    # DHCPv4 lease (status="dhcp"), static reservation
+    # (status="reserved"), or ARP entry (status="opnsense-arp").
+    # Cascades on firewall delete.
+    opnsense_router_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("opnsense_router.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )

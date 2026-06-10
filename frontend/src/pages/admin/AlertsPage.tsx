@@ -41,6 +41,7 @@ const RULE_TYPE_PARAM_DEFAULTS: Partial<
   circuit_term_expiring: { thresholdDays: 30 },
   service_term_expiring: { thresholdDays: 30 },
   secret_expiring: { thresholdDays: 30 },
+  decom_expiring: { thresholdDays: 30 },
 };
 
 function Field({
@@ -134,6 +135,7 @@ function RuleEditorModal({
           ruleType === "circuit_term_expiring" ||
           ruleType === "service_term_expiring" ||
           ruleType === "secret_expiring" ||
+          ruleType === "decom_expiring" ||
           ruleType === "stale_ip_count"
             ? thresholdDays
             : null,
@@ -203,6 +205,11 @@ function RuleEditorModal({
                 <option value="server_unreachable">Server unreachable</option>
                 <option value="stale_ip_count">
                   Stale IP count (address-space hygiene)
+                </option>
+              </optgroup>
+              <optgroup label="Subnet / IPAM">
+                <option value="decom_expiring">
+                  Subnet decommission approaching
                 </option>
               </optgroup>
               <optgroup label="Network (ASN / RPKI)">
@@ -362,7 +369,8 @@ function RuleEditorModal({
         {(ruleType === "domain_expiring" ||
           ruleType === "circuit_term_expiring" ||
           ruleType === "service_term_expiring" ||
-          ruleType === "secret_expiring") && (
+          ruleType === "secret_expiring" ||
+          ruleType === "decom_expiring") && (
           <Field
             label="Threshold (days)"
             hint="Soft fire at threshold; severity escalates to warning at threshold/4 and critical at threshold/12 (e.g. 30 → 7.5 → 2.5 d)."
@@ -673,7 +681,9 @@ export function AlertsPage() {
                               ? `type=${r.server_type ?? "any"}`
                               : r.rule_type === "domain_expiring" ||
                                   r.rule_type === "circuit_term_expiring" ||
-                                  r.rule_type === "service_term_expiring"
+                                  r.rule_type === "service_term_expiring" ||
+                                  r.rule_type === "secret_expiring" ||
+                                  r.rule_type === "decom_expiring"
                                 ? `≤ ${r.threshold_days ?? 30} d`
                                 : r.rule_type === "compliance_change"
                                   ? `${r.classification ?? "?"} · ${r.change_scope ?? "any_change"}`

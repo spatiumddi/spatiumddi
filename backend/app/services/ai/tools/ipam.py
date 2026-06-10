@@ -286,6 +286,72 @@ async def list_subnets(
     ]
 
 
+# ── find_subnets_decommissioning ──────────────────────────────────────
+
+
+class FindSubnetsDecommissioningArgs(BaseModel):
+    within_days: int = Field(
+        default=30,
+        ge=0,
+        le=3650,
+        description=(
+            "Look-ahead window in days. Returns subnets whose scheduled "
+            "``decom_date`` falls on or before today + this many days "
+            "(default 30). Past-due decom dates (already overdue) are "
+            "always included."
+        ),
+    )
+    limit: int = Field(default=200, ge=1, le=500)
+
+
+@register_tool(
+    name="find_subnets_decommissioning",
+    description=(
+        "List subnets with a planned decommission date (issue #46) "
+        "falling within the next N days (default 30) — plus any that "
+        "are already past-due. Use this when the operator asks 'what's "
+        "being retired soon?', 'which segments are scheduled for "
+        "decommission?', or to sanity-check the decom_expiring alert. "
+        "Each row carries ``decom_date`` and ``days_until_decom`` "
+        "(negative = overdue)."
+    ),
+    args_model=FindSubnetsDecommissioningArgs,
+    category="ipam",
+    writes=False,
+    default_enabled=True,
+    module=None,
+)
+async def find_subnets_decommissioning(
+    db: AsyncSession, user: User, args: FindSubnetsDecommissioningArgs
+) -> list[dict[str, Any]] | dict[str, Any]:
+    from datetime import UTC, datetime, timedelta
+
+    today = datetime.now(UTC).date()
+    cutoff = today + timedelta(days=args.within_days)
+    stmt = (
+        select(Subnet)
+        .where(Subnet.deleted_at.is_(None))
+        .where(Subnet.decom_date.is_not(None))
+        .where(Subnet.decom_date <= cutoff)
+        .order_by(Subnet.decom_date.asc())
+        .limit(args.limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(s.id),
+            "network": str(s.network),
+            "name": s.name,
+            "space_id": str(s.space_id),
+            "decom_date": s.decom_date.isoformat() if s.decom_date else None,
+            "days_until_decom": (s.decom_date - today).days if s.decom_date else None,
+            "utilization_percent": float(s.utilization_percent or 0.0),
+            "allocated_ips": int(s.allocated_ips or 0),
+        }
+        for s in rows
+    ]
+
+
 # ── get_subnet_summary ────────────────────────────────────────────────
 
 

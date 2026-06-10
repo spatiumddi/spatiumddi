@@ -266,6 +266,9 @@ class PlatformSettings(Base):
     )
     integration_unifi_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     integration_cloud_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    integration_opnsense_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
 
     # Trash retention — high-blast-radius IPAM/DNS/DHCP rows are soft-
     # deleted (``deleted_at`` set) and the nightly purge sweep hard-
@@ -457,6 +460,25 @@ class PlatformSettings(Base):
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
 
+    # ── Maintenance mode (issue #57) ────────────────────────────────
+    # System-wide read-only switch. When ``maintenance_mode_enabled`` is
+    # True the API 503s every mutating request (POST/PUT/PATCH/DELETE)
+    # outside the exempt allow-list (auth / settings / health / metrics /
+    # agent endpoints), with an effective-superadmin bypass so an admin
+    # can still flip it back off. ``maintenance_message`` is shown in the
+    # global banner + the 503 body; ``maintenance_started_at`` is
+    # server-stamped on enable and cleared on disable (never operator-set
+    # directly). Default off / empty so existing installs are unaffected.
+    maintenance_mode_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    maintenance_message: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="", server_default=sa_text("''")
+    )
+    maintenance_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # ── Appliance LLDP support (issue #343) ─────────────────────────
     # lldpd runs at the Debian host level on every appliance host (same
     # host-config plane as SNMP / chrony) so it can see the host's real
@@ -501,6 +523,122 @@ class PlatformSettings(Base):
     )
     lldp_snmp_agentx: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+
+    # ── Appliance syslog forwarding (issue #156) ────────────────────
+    # rsyslog runs at the Debian host level on every appliance host
+    # (same host-config plane as SNMP / chrony / lldpd) so it can ship
+    # both journald + file log sources off-box to a SIEM / collector.
+    # The columns here are the singleton source of truth that every
+    # appliance host (local + remote agents) renders
+    # ``/etc/rsyslog.d/50-spatium-forward.conf`` from via the same
+    # ConfigBundle → trigger-file pipeline as #153/#154/#343. Default-
+    # off so the column add ships nothing off any existing appliance.
+    # ``syslog_targets`` is a JSONB list of ``{host, port, protocol,
+    # format, ca_cert_pem}`` dicts; ``ca_cert_pem`` carries Fernet
+    # ciphertext as the URL-safe-base64 string Fernet emits (only when
+    # ``protocol == 'tls'``) so the JSONB column stays JSON-friendly —
+    # mirroring the SNMP v3-user pass shape. ``syslog_filter`` is an
+    # rsyslog selector (``*.*`` / ``authpriv.*`` / …) prepended to each
+    # ``omfwd`` action; empty = the renderer defaults to ``*.*``.
+    # ``syslog_buffer_disk`` enables a disk-assisted queue so a brief
+    # collector outage doesn't drop logs.
+    syslog_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    syslog_targets: Mapped[list[dict]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    syslog_filter: Mapped[str] = mapped_column(
+        String, nullable=False, default="", server_default=sa_text("''")
+    )
+    syslog_buffer_disk: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+
+    # ── Appliance SSH (issue #157) ──────────────────────────────────
+    # sshd runs at the Debian host level on every appliance host (same
+    # host-config plane as SNMP / chrony / lldpd / rsyslog) so operator
+    # SSH access can be managed centrally. The columns here are the
+    # singleton source of truth that every appliance host (local +
+    # remote agents) renders ``~admin/.ssh/authorized_keys`` +
+    # ``/etc/ssh/sshd_config.d/spatiumddi.conf`` from via the same
+    # ConfigBundle → trigger-file pipeline as #153/#154/#343/#156.
+    # ``ssh_authorized_keys`` is a JSONB list of ``{name, public_key,
+    # comment}`` entries — public keys are NOT secrets, so no Fernet
+    # and no redaction (unlike the SNMP community / syslog CA PEM).
+    # ``ssh_password_auth_enabled`` defaults TRUE so existing field
+    # installs do NOT lose password auth on upgrade; flipping it to
+    # false with zero keys is refused (lockout safety) both here on the
+    # PUT and on the host runner. ``ssh_allow_root_login`` → sshd
+    # ``PermitRootLogin yes|no``. ``ssh_port`` → sshd ``Port`` (server
+    # rejects < 1024 except 22). ``ssh_allowed_source_networks`` is a
+    # JSONB list of CIDRs the host nftables drop-in source-scopes the
+    # ssh port to (sshd has no native source filter); empty = open the
+    # port unconditionally, and the un-removable port-22 accept floor
+    # in the firewall renderer always stays so a bad port change can't
+    # brick the box.
+    ssh_authorized_keys: Mapped[list[dict]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    ssh_password_auth_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+    ssh_allow_root_login: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    ssh_port: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=22, server_default=sa_text("22")
+    )
+    ssh_allowed_source_networks: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+
+    # ── Appliance DNS resolver (issue #158) ─────────────────────────
+    # systemd-resolved runs at the Debian host level on every appliance
+    # host (same host-config plane as SNMP / chrony / lldpd / rsyslog /
+    # sshd). The columns here are the singleton source of truth that every
+    # appliance host (local + remote agents) renders the
+    # ``/etc/systemd/resolved.conf.d/spatiumddi.conf`` drop-in from via the
+    # same ConfigBundle → trigger-file pipeline as #153/#154/#343/#156/#157.
+    #
+    # ``resolver_mode`` selects the behaviour:
+    #   ``automatic`` (default) — leave systemd-resolved to pick upstream
+    #                 DNS from per-link NetworkManager / DHCP. The runner
+    #                 removes the spatiumddi.conf drop-in (leaving the
+    #                 image's no-stub-listener.conf intact, which BIND9
+    #                 relies on to bind host :53).
+    #   ``override``  — pin a global server list (``DNS=``) that wins over
+    #                 the per-link servers. The renderer ALSO emits the
+    #                 route-only ``Domains=~.`` default ahead of any
+    #                 configured search domains so the global ``DNS=``
+    #                 servers actually take precedence over per-link
+    #                 NetworkManager/DHCP-provided resolvers.
+    #
+    # Resolver IPs / domains are NOT secrets (like NTP hostnames / SSH
+    # public keys), so they are stored verbatim — no Fernet, no redaction.
+    # The drop-in NEVER emits ``DNSStubListener`` — the image-shipped
+    # no-stub-listener.conf owns that knob (BIND9 binds host :53).
+    resolver_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="automatic", server_default=sa_text("'automatic'")
+    )
+    resolver_servers: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    resolver_fallback_servers: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    resolver_search_domains: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    resolver_dnssec: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="allow-downgrade",
+        server_default=sa_text("'allow-downgrade'"),
+    )
+    resolver_dns_over_tls: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="no", server_default=sa_text("'no'")
     )
 
     # ── Fleet firewall master switch (issue #285 Phase 2) ───────────

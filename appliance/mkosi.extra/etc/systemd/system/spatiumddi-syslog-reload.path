@@ -1,0 +1,15 @@
+[Unit]
+Description=Watch for SpatiumDDI syslog forwarding config-reload trigger (issue #156)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/156
+# Skip on the live ISO — rsyslog forwarding isn't part of the installer
+# environment.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# PathChanged fires on close-after-write. The supervisor writes this
+# file via an atomic .new → mv rename so the unit only fires once per
+# applied config.
+PathChanged=/var/lib/spatiumddi/release-state/syslog-config-pending
+
+[Install]
+WantedBy=multi-user.target

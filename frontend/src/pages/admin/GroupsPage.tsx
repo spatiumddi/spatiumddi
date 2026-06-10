@@ -13,6 +13,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { TimeBoundGrantsPanel } from "./TimeBoundGrantsPanel";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -225,6 +226,14 @@ function GroupModal({
             {mutation.isPending ? "Saving…" : "Save"}
           </button>
         </div>
+
+        {/* Time-bound grants (#65) — only available once the group exists
+            so a grant has something to attach to. */}
+        {group && (
+          <div className="border-t pt-4">
+            <TimeBoundGrantsPanel groupId={group.id} groupName={group.name} />
+          </div>
+        )}
       </div>
     </Modal>
   );

@@ -22,6 +22,7 @@ import { PXEProfilesPage } from "@/pages/dhcp/PXEProfilesPage";
 import { KubernetesPage } from "@/pages/kubernetes/KubernetesPage";
 import { DockerPage } from "@/pages/docker/DockerPage";
 import { ProxmoxPage } from "@/pages/proxmox/ProxmoxPage";
+import { OpnsensePage } from "@/pages/opnsense/OpnsensePage";
 import { CloudPage } from "@/pages/cloud/CloudPage";
 import { TailscalePage } from "@/pages/tailscale/TailscalePage";
 import { UnifiPage } from "@/pages/unifi/UnifiPage";
@@ -39,10 +40,12 @@ import { ProvidersPage } from "@/pages/network/ProvidersPage";
 import { ServicesPage } from "@/pages/network/ServicesPage";
 import { SitesPage } from "@/pages/network/SitesPage";
 import { NmapToolsPage } from "@/pages/nmap/NmapToolsPage";
+import { NetworkToolsPage } from "@/pages/tools/NetworkToolsPage";
 import { CidrCalculatorPage } from "@/pages/tools/CidrCalculatorPage";
 import { SubnetPlannerListPage } from "@/pages/ipam/SubnetPlannerListPage";
 import { SubnetPlannerEditorPage } from "@/pages/ipam/SubnetPlannerEditorPage";
 import { LogsPage } from "@/pages/LogsPage";
+import { ReportsPage } from "@/pages/ReportsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
 import { DNSImportPage } from "@/pages/admin/DNSImportPage";
@@ -139,13 +142,16 @@ export default function App() {
             redirecting to /network/devices/:id. */}
         <Route path="network/:id" element={<DeviceDetailView />} />
         <Route path="tools/nmap" element={<NmapToolsPage />} />
+        <Route path="tools/network" element={<NetworkToolsPage />} />
         <Route path="tools/cidr" element={<CidrCalculatorPage />} />
         <Route path="dhcp" element={<DHCPPage />} />
         <Route path="dhcp/groups/:groupId/pxe" element={<PXEProfilesPage />} />
         <Route path="logs" element={<LogsPage />} />
+        <Route path="reports" element={<ReportsPage />} />
         <Route path="kubernetes" element={<KubernetesPage />} />
         <Route path="docker" element={<DockerPage />} />
         <Route path="proxmox" element={<ProxmoxPage />} />
+        <Route path="opnsense" element={<OpnsensePage />} />
         <Route path="cloud" element={<CloudPage />} />
         <Route path="tailscale" element={<TailscalePage />} />
         <Route path="unifi" element={<UnifiPage />} />

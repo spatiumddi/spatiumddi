@@ -567,6 +567,10 @@ export interface Subnet {
   pci_scope?: boolean;
   hipaa_scope?: boolean;
   internet_facing?: boolean;
+  // Planned decommission date (issue #46). ISO date (YYYY-MM-DD) or
+  // null when no decom is scheduled. Drives the ``decom_expiring``
+  // alert + the dashboard decom-awareness widget.
+  decom_date?: string | null;
   // Network-role classification (issue #112 phase 2). NULL means
   // unspecified; values are ``data`` / ``voice`` / ``management`` /
   // ``guest``. Drives the IPAM filter chip + VLAN-page voice tag +
@@ -702,6 +706,9 @@ export interface IPAddress {
   /** TTL on a ``status='reserved'`` row. The Celery sweep task flips
    *  the row back to ``available`` after this passes. */
   reserved_until?: string | null;
+  /** Planned decommission date (issue #46). ISO date (YYYY-MM-DD) or
+   *  null when no decom is scheduled. */
+  decom_date?: string | null;
   hostname: string | null;
   fqdn: string | null;
   description: string;
@@ -2908,6 +2915,7 @@ export interface PlatformSettings {
   integration_tailscale_enabled: boolean;
   integration_unifi_enabled: boolean;
   integration_cloud_enabled: boolean;
+  integration_opnsense_enabled: boolean;
   /** Domain WHOIS refresh cadence (hours). Beat ticks hourly; the
    *  task itself reads this on every fire so cadence changes take
    *  effect on the next tick without restarting beat. 1–168 h range
@@ -2978,6 +2986,12 @@ export interface PlatformSettings {
    *  dashboard); false (default) = quiet boot + Talos dashboard. Appliance
    *  hosts only; applies on next reboot (grubenv-driven). */
   verbose_boot: boolean;
+  /** Maintenance mode (issue #57). System-wide read-only switch.
+   *  ``maintenance_started_at`` is server-managed (stamped on enable /
+   *  cleared on disable) and is therefore read-only — not sent on PUT. */
+  maintenance_mode_enabled: boolean;
+  maintenance_message: string;
+  maintenance_started_at: string | null;
   /** Appliance LLDP (issue #343). No secrets — LLDP advertises public
    *  identity, so read + write shapes match. ``lldp_protocols`` enables
    *  reception of CDP/EDP/FDP/SONMP alongside LLDP. */
@@ -2991,9 +3005,77 @@ export interface PlatformSettings {
   lldp_sys_description: string;
   lldp_med_location: Record<string, unknown>;
   lldp_snmp_agentx: boolean;
+  /** Appliance syslog forwarding (issue #156). Per-target ``ca_cert_pem``
+   *  is redacted to a ``ca_cert_set`` boolean on the read shape; on
+   *  update send the full ``SyslogTargetWrite[]`` list with per-target
+   *  ``ca_cert_pem`` semantics (None/omit = leave, "" = clear, non-empty
+   *  = encrypt + replace, keyed by host:port). */
+  syslog_enabled: boolean;
+  syslog_targets: SyslogTarget[];
+  syslog_filter: string;
+  syslog_buffer_disk: boolean;
+  /** Appliance SSH (issue #157). Public keys are NOT secrets — the
+   *  authorized-keys list is returned verbatim (no redaction). Send the
+   *  full list on update (atomic replace). ``ssh_password_auth_enabled``
+   *  defaults true; disabling it with zero keys is refused server-side
+   *  (lockout safety). ``ssh_port`` < 1024 is rejected except 22. */
+  ssh_authorized_keys: SshAuthorizedKey[];
+  ssh_password_auth_enabled: boolean;
+  ssh_allow_root_login: boolean;
+  ssh_port: number;
+  ssh_allowed_source_networks: string[];
+  /** Appliance DNS resolver (issue #158). No secrets — resolver IPs /
+   *  search domains are not sensitive, so read + write shapes match.
+   *  ``automatic`` defers to per-link NetworkManager / DHCP DNS;
+   *  ``override`` pins the global ``resolver_servers`` (which win over
+   *  per-link resolvers via a route-only ``~.`` default domain). The
+   *  rendered drop-in NEVER touches DNSStubListener (BIND9 binds host
+   *  :53). */
+  resolver_mode: ResolverMode;
+  resolver_servers: string[];
+  resolver_fallback_servers: string[];
+  resolver_search_domains: string[];
+  resolver_dnssec: ResolverDnssec;
+  resolver_dns_over_tls: ResolverDoT;
+}
+
+export type ResolverMode = "automatic" | "override";
+export type ResolverDnssec = "yes" | "no" | "allow-downgrade";
+export type ResolverDoT = "yes" | "opportunistic" | "no";
+
+/** One authorized SSH key. ``public_key`` is a single OpenSSH public-key
+ *  line; ``name`` is an operator label, ``comment`` an optional note.
+ *  Public keys are not secrets, so the same shape is used for read +
+ *  write. */
+export interface SshAuthorizedKey {
+  name: string;
+  public_key: string;
+  comment: string;
 }
 
 export type NtpSourceMode = "pool" | "servers" | "mixed";
+export type SyslogProtocol = "udp" | "tcp" | "tls";
+export type SyslogFormat = "rfc5424" | "rfc3164" | "json";
+
+/** Read shape — the server never returns the CA PEM ciphertext. */
+export interface SyslogTarget {
+  host: string;
+  port: number;
+  protocol: SyslogProtocol;
+  format: SyslogFormat;
+  ca_cert_set: boolean;
+}
+
+/** Write shape — ``ca_cert_pem`` is plaintext on the wire (TLS); None /
+ *  omit preserves the existing ciphertext for the same host:port; ""
+ *  clears; required (non-empty) when protocol is "tls". */
+export interface SyslogTargetWrite {
+  host: string;
+  port: number;
+  protocol: SyslogProtocol;
+  format: SyslogFormat;
+  ca_cert_pem?: string | null;
+}
 export type LldpProtocol = "cdp" | "edp" | "fdp" | "sonmp";
 
 export interface NtpCustomServer {
@@ -3301,6 +3383,51 @@ export const groupsApi = {
   update: (id: string, body: InternalGroupUpdate) =>
     api.put<InternalGroup>(`/groups/${id}`, body).then((r) => r.data),
   delete: (id: string) => api.delete(`/groups/${id}`),
+};
+
+// ── Time-bound grants (#65) ─────────────────────────────────────────────────
+
+export interface TimeBoundGrant {
+  id: string;
+  group_id: string;
+  action: string;
+  resource_type: string;
+  resource_id?: string | null;
+  expires_at: string;
+  revoked_at?: string | null;
+  reason: string;
+  granted_by_user_id?: string | null;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface TimeBoundGrantCreate {
+  group_id: string;
+  action: string;
+  resource_type: string;
+  resource_id?: string | null;
+  expires_at: string;
+  reason?: string;
+}
+
+export const timeBoundGrantsApi = {
+  list: (groupId?: string, includeExpired?: boolean) => {
+    const params = new URLSearchParams();
+    if (groupId) params.set("group_id", groupId);
+    if (includeExpired) params.set("include_expired", "true");
+    const qs = params.toString();
+    return api
+      .get<TimeBoundGrant[]>(`/groups/time-bound-grants${qs ? `?${qs}` : ""}`)
+      .then((r) => r.data);
+  },
+  create: (body: TimeBoundGrantCreate) =>
+    api
+      .post<TimeBoundGrant>("/groups/time-bound-grants", body)
+      .then((r) => r.data),
+  revoke: (id: string) =>
+    api
+      .delete<TimeBoundGrant>(`/groups/time-bound-grants/${id}`)
+      .then((r) => r.data),
 };
 
 // ── Roles ─────────────────────────────────────────────────────────────────────
@@ -6726,7 +6853,8 @@ export type AlertRuleType =
   | "voice_lease_count_below"
   | "stale_ip_count"
   | "dhcp_pool_exhaustion"
-  | "secret_expiring";
+  | "secret_expiring"
+  | "decom_expiring";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with
@@ -7071,7 +7199,8 @@ export type IntegrationDashboardKind =
   | "proxmox"
   | "tailscale"
   | "unifi"
-  | "cloud";
+  | "cloud"
+  | "opnsense";
 export interface IntegrationsDashboardTargetRow {
   id: string;
   display: string;
@@ -7166,6 +7295,75 @@ export const dashboardsApi = {
   securitySummary: () =>
     api
       .get<SecurityDashboardSummary>("/dashboards/security/summary")
+      .then((r) => r.data),
+};
+
+// ── Top-N reports (issue #47) ───────────────────────────────────────────────
+
+export interface TopSubnetRow {
+  id: string;
+  name: string;
+  network: string;
+  utilization_percent: number;
+  allocated_ips: number;
+  total_ips: number;
+}
+
+export interface TopOwnerRow {
+  customer_id: string | null;
+  customer_name: string;
+  ip_count: number;
+}
+
+export interface TopModifiedResourceRow {
+  resource_type: string;
+  resource_id: string;
+  resource_display: string;
+  change_count: number;
+}
+
+export interface TopDNSClientRow {
+  client_ip: string;
+  query_count: number;
+}
+
+export interface TopSubnetsReport {
+  generated_at: string;
+  rows: TopSubnetRow[];
+}
+
+export interface TopOwnersReport {
+  generated_at: string;
+  rows: TopOwnerRow[];
+}
+
+export interface TopModifiedResourcesReport {
+  generated_at: string;
+  window_days: number;
+  rows: TopModifiedResourceRow[];
+}
+
+export interface TopDNSClientsReport {
+  generated_at: string;
+  rows: TopDNSClientRow[];
+}
+
+export const reportsApi = {
+  topSubnetsByUtilization: () =>
+    api
+      .get<TopSubnetsReport>("/reports/top-subnets-by-utilization")
+      .then((r) => r.data),
+  topOwnersByIpCount: () =>
+    api
+      .get<TopOwnersReport>("/reports/top-owners-by-ip-count")
+      .then((r) => r.data),
+  topModifiedResources: () =>
+    api
+      .get<TopModifiedResourcesReport>("/reports/top-modified-resources")
+      .then((r) => r.data),
+  topDnsClients: () =>
+    api
+      .get<TopDNSClientsReport>("/reports/top-dns-clients")
       .then((r) => r.data),
 };
 
@@ -8216,6 +8414,18 @@ export interface ApplianceRow {
   last_upgrade_state_at: string | null;
   snmpd_running: boolean | null;
   ntp_sync_state: string | null;
+  /** Issue #156 — best-effort rsyslog forwarding status:
+   *  "forwarding" / "unreachable" / "disabled", or null on
+   *  non-appliance / pre-#156 rows. */
+  syslog_forwarding: string | null;
+  /** Issue #157 — per-host count of authorized_keys lines the host runner
+   *  actually applied, or null on non-appliance / pre-#157 / never-reported
+   *  rows. */
+  ssh_key_count: number | null;
+  /** Issue #158 — per-host systemd-resolved state the supervisor reported:
+   *  "override" / "automatic" / "failed", or null on non-appliance /
+   *  pre-#158 / never-reported rows. */
+  resolver_status: string | null;
   desired_appliance_version: string | null;
   desired_slot_image_url: string | null;
   // Operator's per-slot boot intents. Non-null means the Fleet UI
@@ -8970,6 +9180,11 @@ export interface PlatformHealthResponse {
   status: "ok" | "degraded";
   components: PlatformHealthComponent[];
   demo_mode?: boolean;
+  /** Maintenance mode (issue #57) — bundled into the existing poll so the
+   *  global banner doesn't need a separate request. */
+  maintenance_mode?: boolean;
+  maintenance_message?: string;
+  maintenance_started_at?: string | null;
 }
 
 export const platformHealthApi = {
@@ -9150,6 +9365,104 @@ export const proxmoxApi = {
   syncNow: (id: string) =>
     api
       .post<{ status: string; task_id: string }>(`/proxmox/nodes/${id}/sync`)
+      .then((r) => r.data),
+};
+
+// ── OPNsense integration (issue #31) ───────────────────────────────
+
+export interface OPNsenseRouter {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  host: string;
+  port: number;
+  verify_tls: boolean;
+  ca_bundle_present: boolean;
+  api_key: string;
+  api_secret_present: boolean;
+  ipam_space_id: string;
+  dns_group_id: string | null;
+  mirror_dhcp_leases: boolean;
+  mirror_static_mappings: boolean;
+  mirror_arp: boolean;
+  sync_interval_seconds: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  firmware_version: string | null;
+  interface_count: number | null;
+  lease_count: number | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface OPNsenseRouterCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  host: string;
+  port?: number;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  api_key: string;
+  api_secret: string;
+  ipam_space_id: string;
+  dns_group_id?: string | null;
+  mirror_dhcp_leases?: boolean;
+  mirror_static_mappings?: boolean;
+  mirror_arp?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface OPNsenseRouterUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  host?: string;
+  port?: number;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  api_key?: string;
+  api_secret?: string;
+  ipam_space_id?: string;
+  dns_group_id?: string | null;
+  mirror_dhcp_leases?: boolean;
+  mirror_static_mappings?: boolean;
+  mirror_arp?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface OPNsenseTestResult {
+  ok: boolean;
+  message: string;
+  firmware_version: string | null;
+}
+
+export const opnsenseApi = {
+  listRouters: () =>
+    api.get<OPNsenseRouter[]>("/opnsense/routers").then((r) => r.data),
+  createRouter: (data: OPNsenseRouterCreate) =>
+    api.post<OPNsenseRouter>("/opnsense/routers", data).then((r) => r.data),
+  updateRouter: (id: string, data: OPNsenseRouterUpdate) =>
+    api
+      .put<OPNsenseRouter>(`/opnsense/routers/${id}`, data)
+      .then((r) => r.data),
+  deleteRouter: (id: string) => api.delete(`/opnsense/routers/${id}`),
+  testConnection: (body: {
+    router_id?: string;
+    host?: string;
+    port?: number;
+    verify_tls?: boolean;
+    ca_bundle_pem?: string;
+    api_key?: string;
+    api_secret?: string;
+  }) =>
+    api
+      .post<OPNsenseTestResult>("/opnsense/routers/test", body)
+      .then((r) => r.data),
+  syncNow: (id: string) =>
+    api
+      .post<{ status: string; task_id: string }>(`/opnsense/routers/${id}/sync`)
       .then((r) => r.data),
 };
 
@@ -10397,6 +10710,104 @@ export const nmapApi = {
     const base = API_BASE.replace(/\/$/, "");
     return `${base}/nmap/scans/${id}/stream?token=${encodeURIComponent(token)}`;
   },
+};
+
+// ── Built-in network tools (issue #58) ──────────────────────────────
+//
+// Stateless, synchronous server-perspective utilities. Each call POSTs
+// and returns the result inline (no SSE / persisted rows — that's the
+// nmap scanner's model, not this one).
+
+/** Uniform subprocess-tool result (ping / traceroute / mtr / dig / whois). */
+export interface NetToolCommandResult {
+  tool: string;
+  argv: string[];
+  available: boolean;
+  exit_code: number | null;
+  timed_out: boolean;
+  duration_ms: number | null;
+  stdout: string;
+  stderr: string;
+  error: string | null;
+}
+
+export interface NetToolPortTestResult {
+  host: string;
+  port: number;
+  protocol: string;
+  /** tcp: open|closed|filtered|error · udp: open|filtered|closed|error */
+  state: string;
+  rtt_ms: number | null;
+  error: string | null;
+}
+
+export interface NetToolTlsCertResult {
+  host: string;
+  port: number;
+  server_name: string | null;
+  ok: boolean;
+  subject: string | null;
+  issuer: string | null;
+  san: string[];
+  not_before: string | null;
+  not_after: string | null;
+  days_remaining: number | null;
+  expired: boolean;
+  self_signed: boolean;
+  hostname_matches: boolean | null;
+  serial: string | null;
+  signature_algorithm: string | null;
+  error: string | null;
+}
+
+export interface NetToolMacVendorEntry {
+  mac: string;
+  vendor: string | null;
+  is_voip_phone: boolean;
+}
+
+export interface NetToolMacVendorResult {
+  oui_enabled: boolean;
+  entries: NetToolMacVendorEntry[];
+}
+
+export const networkToolsApi = {
+  ping: (host: string) =>
+    api.post<NetToolCommandResult>("/tools/ping", { host }).then((r) => r.data),
+  traceroute: (host: string) =>
+    api
+      .post<NetToolCommandResult>("/tools/traceroute", { host })
+      .then((r) => r.data),
+  mtr: (host: string) =>
+    api.post<NetToolCommandResult>("/tools/mtr", { host }).then((r) => r.data),
+  dig: (body: { name: string; record_type?: string; server?: string | null }) =>
+    api.post<NetToolCommandResult>("/tools/dig", body).then((r) => r.data),
+  whois: (query: string) =>
+    api
+      .post<NetToolCommandResult>("/tools/whois", { query })
+      .then((r) => r.data),
+  portTest: (body: { host: string; port: number; protocol?: string }) =>
+    api
+      .post<NetToolPortTestResult>("/tools/port-test", body)
+      .then((r) => r.data),
+  tlsCert: (body: {
+    host: string;
+    port?: number;
+    server_name?: string | null;
+  }) =>
+    api.post<NetToolTlsCertResult>("/tools/tls-cert", body).then((r) => r.data),
+  dnsPropagation: (body: {
+    name: string;
+    record_type?: string;
+    resolvers?: string[];
+  }) =>
+    api
+      .post<PropagationCheckResult>("/tools/dns-propagation", body)
+      .then((r) => r.data),
+  macVendor: (macs: string[]) =>
+    api
+      .post<NetToolMacVendorResult>("/tools/mac-vendor", { macs })
+      .then((r) => r.data),
 };
 
 // ── ASN management ──────────────────────────────────────────────────

@@ -92,6 +92,7 @@ from app.models.network import (
 )
 from app.models.network_service import NetworkService, NetworkServiceResource
 from app.models.nmap import NmapScan
+from app.models.opnsense import OPNsenseRouter
 from app.models.oui import OUIVendor
 from app.models.overlay import (
     ApplicationCategory,
@@ -104,6 +105,7 @@ from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
 from app.models.system_upgrade import SystemUpgradeRun
 from app.models.tailscale import TailscaleTenant
+from app.models.time_bound_grant import TimeBoundGrant
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
 from app.models.vrf import VRF
@@ -187,6 +189,7 @@ __all__ = [
     "DockerHost",
     "Domain",
     "KubernetesCluster",
+    "OPNsenseRouter",
     "ProxmoxNode",
     "SystemUpgradeRun",
     "TailscaleTenant",
@@ -222,4 +225,5 @@ __all__ = [
     "FirewallRule",
     "InternalError",
     "BackupTarget",
+    "TimeBoundGrant",
 ]

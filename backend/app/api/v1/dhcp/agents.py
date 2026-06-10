@@ -38,7 +38,10 @@ from app.models.metrics import DHCPMetricSample
 from app.models.settings import PlatformSettings
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.resolver import resolver_bundle
 from app.services.appliance.snmp import snmp_bundle
+from app.services.appliance.ssh import ssh_bundle
+from app.services.appliance.syslog import syslog_bundle
 from app.services.dhcp.agent_token import (
     hash_token,
     mint_agent_token,
@@ -359,6 +362,37 @@ async def agent_config_longpoll(
                 if settings_row is not None
                 else {"enabled": False, "config_hash": "", "lldpd_conf": "", "daemon_args": ""}
             )
+            # Issue #156 — same pattern for rsyslog. Stable dict shape so the
+            # etag math stays uniform whether settings exist or not.
+            syslog_block = (
+                syslog_bundle(settings_row)
+                if settings_row is not None
+                else {"enabled": False, "config_hash": "", "rsyslog_conf": "", "ca_certs": {}}
+            )
+            # Issue #157 — same pattern for SSH. Stable dict shape so the
+            # etag math stays uniform whether settings exist or not.
+            ssh_block = (
+                ssh_bundle(settings_row)
+                if settings_row is not None
+                else {
+                    "enabled": False,
+                    "config_hash": "",
+                    "authorized_keys": "",
+                    "sshd_conf": "",
+                    "ssh_port": 22,
+                    "allowed_source_networks": [],
+                    "password_auth": True,
+                    "key_count": 0,
+                }
+            )
+            # Issue #158 — same pattern for systemd-resolved. Stable dict
+            # shape so the etag math stays uniform whether settings exist
+            # or not.
+            resolver_block = (
+                resolver_bundle(settings_row)
+                if settings_row is not None
+                else {"enabled": False, "config_hash": "", "resolved_conf": ""}
+            )
             # Phase 8f-3 — mix the fleet-upgrade intent into the ETag so a
             # Fleet view change wakes the agent's long-poll even when the
             # driver-side bundle is unchanged. Deterministic — re-reading
@@ -370,6 +404,12 @@ async def agent_config_longpoll(
                 f"|snmp:{int(bool(snmp_block.get('enabled')))}:{snmp_block.get('config_hash', '')}"
                 f"|ntp:{int(bool(ntp_block.get('allow_clients')))}:{ntp_block.get('config_hash', '')}"
                 f"|lldp:{int(bool(lldp_block.get('enabled')))}:{lldp_block.get('config_hash', '')}"
+                f"|syslog:{int(bool(syslog_block.get('enabled')))}"
+                f":{syslog_block.get('config_hash', '')}"
+                f"|ssh:{int(bool(ssh_block.get('enabled')))}"
+                f":{ssh_block.get('config_hash', '')}"
+                f"|resolver:{int(bool(resolver_block.get('enabled')))}"
+                f":{resolver_block.get('config_hash', '')}"
             )
             etag = "sha256:" + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
 
@@ -512,6 +552,24 @@ async def agent_config_longpoll(
                     # writes lldp-config-pending on hash change; host-side
                     # spatiumddi-lldp-reload.path applies + reloads lldpd.
                     "lldp_settings": lldp_block,
+                    # Issue #156 — rendered rsyslog forward config + per-target
+                    # CA PEMs. Agent writes syslog-config-pending on hash
+                    # change; host-side spatiumddi-syslog-reload.path stages
+                    # the conf + CA files, validates with rsyslogd -N1, and
+                    # restarts rsyslog.
+                    "syslog_settings": syslog_block,
+                    # Issue #157 — rendered authorized_keys + sshd drop-in +
+                    # source-scope CIDRs. Agent writes ssh-config-pending on
+                    # hash change; host-side spatiumddi-ssh-reload.path stages
+                    # the files, validates with sshd -t, applies the
+                    # source-scoped nft drop-in, and reloads sshd.
+                    "ssh_settings": ssh_block,
+                    # Issue #158 — rendered systemd-resolved drop-in. Agent
+                    # writes resolver-config-pending on hash change; host-side
+                    # spatiumddi-resolved-reload.path stages the drop-in (or
+                    # removes it on revert-to-automatic) and reloads
+                    # systemd-resolved.
+                    "resolver_settings": resolver_block,
                 }
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:

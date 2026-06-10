@@ -147,6 +147,22 @@ def user_has_permission(
                 if not _resource_id_matches(perm.get("resource_id"), req_rid):
                     continue
                 return True
+
+    # Additive union over any live time-bound grants (issue #65). The auth
+    # dependency stashes the caller's active grants on this attribute after
+    # loading them from ``time_bound_grant`` (filtered to revoked_at IS NULL
+    # AND expires_at > now()). A temporary grant can only widen access — it
+    # never removes a static role grant. The same _action_/_resource_type_/
+    # _resource_id_ predicates apply so a grant evaluates identically to a
+    # role permission with the same triple.
+    for grant in getattr(user, "_active_time_bound_grants", None) or []:
+        if not _action_matches(getattr(grant, "action", ""), action):
+            continue
+        if not _resource_type_matches(getattr(grant, "resource_type", ""), resource_type):
+            continue
+        if not _resource_id_matches(getattr(grant, "resource_id", None), req_rid):
+            continue
+        return True
     return False
 
 

@@ -426,6 +426,7 @@ from app.services.ai.operations_writes import (  # noqa: E402
     UpdateMulticastDomainArgs,
     UpdateNTPSettingsArgs,
     UpdateSNMPSettingsArgs,
+    UpdateSyslogSettingsArgs,
     UpdateWebhookArgs,
 )
 
@@ -702,6 +703,29 @@ async def propose_update_ntp_settings(
     db: AsyncSession, user: User, args: UpdateNTPSettingsArgs
 ) -> dict[str, Any]:
     return await _propose_via(db=db, user=user, operation_name="update_ntp_settings", args=args)
+
+
+@register_tool(
+    name="propose_update_syslog_settings",
+    description=(
+        "Prepare an rsyslog forwarding host-config update. Pass enabled "
+        "+ optional targets (each host/port/protocol (udp/tcp/tls)/format "
+        "(rfc5424/rfc3164/json), with ca_cert_pem for TLS), filter, "
+        "buffer_disk. Superadmin + Approve — TLS targets carry a secret CA "
+        "PEM and the change ships logs off-prem."
+    ),
+    args_model=UpdateSyslogSettingsArgs,
+    writes=False,
+    category="admin",
+    # Default-disabled (NN #13): handles a secret CA PEM + ships logs
+    # off-prem. module=None — plain host-config, not a feature module.
+    default_enabled=False,
+    module=None,
+)
+async def propose_update_syslog_settings(
+    db: AsyncSession, user: User, args: UpdateSyslogSettingsArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="update_syslog_settings", args=args)
 
 
 # ── DNS / DHCP config import — live-pull commit (#128 / #129) ─────────

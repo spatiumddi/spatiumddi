@@ -1,0 +1,159 @@
+#!/bin/bash
+# spatiumddi-resolved-reload — host-side systemd-resolved config-apply
+# runner (issue #158).
+#
+# The supervisor writes
+# /var/lib/spatiumddi/release-state/resolver-config-pending whenever the
+# control plane's rendered resolved.conf drop-in body changes vs. what's
+# been applied here. File format (kept JSON-free for runner simplicity):
+#
+#   line 1:    "enabled" (override mode — write the drop-in) |
+#              "disabled" (automatic mode — remove the drop-in)
+#   line 2:    sha256 hex of the body (blank when disabled)
+#   line 3+:   rendered /etc/systemd/resolved.conf.d/spatiumddi.conf body
+#              (empty when disabled)
+#
+# Apply flow (enabled / override mode):
+#   1. Extract body, write to /tmp staging
+#   2. Atomically install /etc/systemd/resolved.conf.d/spatiumddi.conf
+#   3. ``systemctl reload-or-restart systemd-resolved``
+#   4. Write the status sidecar "override"
+#
+# Apply flow (disabled / automatic mode):
+#   1. Remove ONLY /etc/systemd/resolved.conf.d/spatiumddi.conf
+#      — the image-shipped no-stub-listener.conf is LEFT INTACT (BIND9
+#      binds host :53, which overlaps the 127.0.0.53 stub listener, so
+#      the stub must stay off; that's the no-stub-listener.conf's job,
+#      not ours).
+#   2. ``systemctl reload-or-restart systemd-resolved``
+#   3. Write the status sidecar "automatic"
+#
+# This runner NEVER touches DNSStubListener — the staged drop-in the
+# control plane renders never contains it, and the automatic-mode revert
+# leaves no-stub-listener.conf alone.
+#
+# reload-or-restart is used (not a bare restart) so a config that
+# resolved can hot-reload doesn't bounce the daemon; resolved restarts
+# itself only if a reload isn't sufficient.
+#
+# Persistence across A/B slot swaps (Phase 8a, issue #138):
+#
+#   /etc/systemd/resolved.conf.d/spatiumddi.conf → /var/persist/etc/...
+#   /var/lib/spatiumddi/release-state/resolver-config-{hash,status,pending}
+#                                    → on /var directly
+#
+# Slot upgrades / rollbacks preserve the operator resolver config
+# automatically — same overlay-on-/etc + /var-backed-sidecar story as
+# the SNMP / NTP / syslog / SSH runners.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/resolver-config-pending
+HASH_SIDECAR=/var/lib/spatiumddi/release-state/resolver-config-hash
+STATUS_SIDECAR=/var/lib/spatiumddi/release-state/resolver-status
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/resolved-reload.log"
+# The MANAGED drop-in — the ONLY file this runner ever creates / removes.
+# The sibling no-stub-listener.conf is image-shipped + owned elsewhere.
+ETC_DROPIN=/etc/systemd/resolved.conf.d/spatiumddi.conf
+LOCK=/run/spatiumddi-resolved-reload.lock
+
+mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$(dirname "$ETC_DROPIN")"
+exec >> "$LOG" 2>&1
+echo
+echo "[$(date -Iseconds)] === spatiumddi-resolved-reload fired ==="
+
+
+resolved_reload() {
+    # reload-or-restart: resolved hot-reloads if it can, restarts only if
+    # the change needs it. Either way /etc/resolv.conf is re-derived.
+    if systemctl reload-or-restart systemd-resolved.service >/dev/null 2>&1; then
+        echo "  ✓ systemd-resolved reloaded/restarted"
+        return 0
+    fi
+    echo "  ✗ systemd-resolved reload-or-restart failed"
+    systemctl status systemd-resolved.service --no-pager 2>&1 \
+        | sed 's/^/      /' | head -10 || true
+    return 1
+}
+
+
+if [ ! -f "$TRIGGER" ]; then
+    echo "  no trigger file at $TRIGGER, nothing to do"
+    exit 0
+fi
+
+# Serialise concurrent invocations.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "  another reload in progress, deferring"
+    exit 0
+fi
+
+MARKER=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
+HASH=$(sed -n '2p' "$TRIGGER" | tr -d '\r\n')
+TMP_BODY=$(mktemp /tmp/spatium-resolved.conf.XXXXXX)
+trap 'rm -f "$TMP_BODY"' EXIT
+tail -n +3 "$TRIGGER" > "$TMP_BODY"
+
+echo "  marker:    $MARKER"
+echo "  hash:      ${HASH:-<empty>}"
+echo "  body size: $(wc -c < "$TMP_BODY") bytes"
+
+case "$MARKER" in
+    enabled)
+        # Override mode — install the managed drop-in. Defensive guard:
+        # never write a body that smuggles a DNSStubListener directive
+        # (the control plane never emits it, but a hand-edited / replayed
+        # bundle could). Refuse rather than fight no-stub-listener.conf.
+        if grep -qi 'DNSStubListener' "$TMP_BODY"; then
+            echo "  ✗ staged drop-in contains DNSStubListener — refusing"
+            echo "failed" > "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        # Owner root, mode 0644 — no secrets (resolver IPs / domains are
+        # operator-visible anyway), so world-readable is fine.
+        install -o root -g root -m 0644 "$TMP_BODY" "$ETC_DROPIN"
+        echo "  ✓ wrote $ETC_DROPIN"
+        if resolved_reload; then
+            echo "override" > "$STATUS_SIDECAR"
+        else
+            echo "failed" > "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        ;;
+    disabled)
+        # Automatic mode — remove ONLY the managed drop-in. The
+        # image-shipped no-stub-listener.conf is intentionally untouched.
+        if [ -f "$ETC_DROPIN" ]; then
+            rm -f "$ETC_DROPIN"
+            echo "  ✓ removed $ETC_DROPIN (revert to automatic)"
+        else
+            echo "  (no managed drop-in present — already automatic)"
+        fi
+        if resolved_reload; then
+            echo "automatic" > "$STATUS_SIDECAR"
+        else
+            echo "failed" > "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        ;;
+    *)
+        echo "  ✗ unknown marker line: ${MARKER:-<empty>}"
+        echo "failed" > "$STATUS_SIDECAR"
+        echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+        mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+        exit 1
+        ;;
+esac
+
+echo "$HASH" > "$HASH_SIDECAR"
+echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+echo "  ✓ done — resolver state: $(cat "$STATUS_SIDECAR")"

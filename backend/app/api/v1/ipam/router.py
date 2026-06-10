@@ -7,7 +7,7 @@ import ipaddress
 import re
 import string
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
 
 import structlog
@@ -1678,6 +1678,8 @@ class SubnetCreate(BaseModel):
     pci_scope: bool = False
     hipaa_scope: bool = False
     internet_facing: bool = False
+    # Planned decommission date (issue #46). Null = no scheduled decom.
+    decom_date: date | None = None
     # Network-role classification (issue #112 phase 2). Pure metadata
     # — null means unspecified.
     subnet_role: str | None = None
@@ -1810,6 +1812,9 @@ class SubnetUpdate(BaseModel):
     pci_scope: bool | None = None
     hipaa_scope: bool | None = None
     internet_facing: bool | None = None
+    # Planned decommission date (issue #46). Explicit null clears it —
+    # handled through the model_fields_set block in ``update_subnet``.
+    decom_date: date | None = None
     subnet_role: str | None = None
     customer_id: uuid.UUID | None = None
     site_id: uuid.UUID | None = None
@@ -1955,6 +1960,7 @@ class SubnetResponse(BaseModel):
     pci_scope: bool = False
     hipaa_scope: bool = False
     internet_facing: bool = False
+    decom_date: date | None = None
     subnet_role: str | None = None
     customer_id: uuid.UUID | None = None
     site_id: uuid.UUID | None = None
@@ -2081,6 +2087,8 @@ class IPAddressCreate(BaseModel):
     # When set, the ``sweep_expired_reservations`` Celery beat task
     # flips the row back to ``available`` after the timestamp passes.
     reserved_until: datetime | None = None
+    # Planned decommission date (issue #46). Null = no scheduled decom.
+    decom_date: date | None = None
     # When False (default), the server returns 409 if the pending assignment
     # collides with another IP's FQDN or MAC. Clients re-submit with True
     # after the user confirms the warning.
@@ -2131,6 +2139,9 @@ class IPAddressUpdate(BaseModel):
     extra_zone_ids: list[str] | None = None
     role: str | None = None
     reserved_until: datetime | None = None
+    # Planned decommission date (issue #46). Explicit null clears it —
+    # the update path uses exclude_unset so null-clear works directly.
+    decom_date: date | None = None
     # See IPAddressCreate.force.
     force: bool = False
 
@@ -2163,6 +2174,7 @@ class IPAddressResponse(BaseModel):
     status: str
     role: str | None = None
     reserved_until: datetime | None = None
+    decom_date: date | None = None
     hostname: str | None
     fqdn: str | None
     mac_address: str | None
@@ -4161,6 +4173,11 @@ async def update_subnet(
         "dns_inherit_settings",
         "dhcp_server_group_id",
         "dhcp_inherit_settings",
+        # decom_date is nullable and operators must be able to CLEAR it
+        # (set to null). model_dump(exclude_none=True) silently drops a
+        # null, so handle it explicitly through the model_fields_set
+        # block below — same pattern as the DNS / DHCP fields.
+        "decom_date",
     }
     changes = body.model_dump(exclude_none=True, exclude=exclude_fields)
     changes_for_audit = body.model_dump(mode="json", exclude_none=True, exclude=exclude_fields)
@@ -4176,6 +4193,14 @@ async def update_subnet(
         val = getattr(body, field)
         setattr(subnet, field, val)
         changes_for_audit[field] = str(val) if isinstance(val, uuid.UUID) else val
+
+    # Planned decommission date (issue #46). Explicitly applied (not via
+    # the exclude_none dump) so an operator CAN clear it back to null.
+    if "decom_date" in body.model_fields_set:
+        subnet.decom_date = body.decom_date
+        changes_for_audit["decom_date"] = (
+            body.decom_date.isoformat() if body.decom_date is not None else None
+        )
 
     # Handle add/remove of auto-created network/broadcast/gateway records.
     # Kubernetes-semantics subnets (pod / service CIDRs) are routed

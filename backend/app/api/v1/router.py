@@ -37,6 +37,7 @@ from app.api.v1.dns_tools import router as dns_tools_router
 from app.api.v1.docker import router as docker_router
 from app.api.v1.domains import router as domains_router
 from app.api.v1.groups.router import router as groups_router
+from app.api.v1.groups.time_bound_grants import router as time_bound_grants_router
 from app.api.v1.ipam.router import router as ipam_router
 from app.api.v1.kubernetes import router as kubernetes_router
 from app.api.v1.logs import logs_router
@@ -44,6 +45,7 @@ from app.api.v1.metrics import router as metrics_router
 from app.api.v1.multicast import router as multicast_router
 from app.api.v1.network import router as network_router
 from app.api.v1.nmap import router as nmap_router
+from app.api.v1.opnsense import router as opnsense_router
 from app.api.v1.overlays import router as overlays_router
 from app.api.v1.ownership import (
     customers_router,
@@ -51,6 +53,7 @@ from app.api.v1.ownership import (
     sites_router,
 )
 from app.api.v1.proxmox import router as proxmox_router
+from app.api.v1.reports import router as reports_router
 from app.api.v1.roles.router import router as roles_router
 from app.api.v1.search.router import router as search_router
 from app.api.v1.services import router as services_router
@@ -59,6 +62,7 @@ from app.api.v1.settings.router import router as settings_router
 from app.api.v1.system import router as system_router
 from app.api.v1.tags import router as tags_router
 from app.api.v1.tailscale import router as tailscale_router
+from app.api.v1.tools import router as tools_router
 from app.api.v1.unifi import router as unifi_router
 from app.api.v1.upgrades import router as upgrades_router
 from app.api.v1.users.router import router as users_router
@@ -199,6 +203,11 @@ api_v1_router.include_router(
     dependencies=[Depends(require_module("integrations.docker"))],
 )
 api_v1_router.include_router(domains_router, tags=["domains"])
+# Mount the time-bound-grant routes BEFORE the groups router: the groups
+# router carries a ``GET /{group_id}`` that would otherwise shadow
+# ``/groups/time-bound-grants`` (the literal path would be parsed as a UUID
+# path param and 422). Registering the static-prefix router first wins.
+api_v1_router.include_router(time_bound_grants_router, prefix="/groups", tags=["time-bound-grants"])
 api_v1_router.include_router(groups_router, prefix="/groups", tags=["groups"])
 api_v1_router.include_router(
     ipam_router,
@@ -233,6 +242,12 @@ api_v1_router.include_router(
     dependencies=[Depends(require_module("tools.nmap"))],
 )
 api_v1_router.include_router(
+    opnsense_router,
+    prefix="/opnsense",
+    tags=["opnsense"],
+    dependencies=[Depends(require_module("integrations.opnsense"))],
+)
+api_v1_router.include_router(
     overlays_router,
     prefix="/overlays",
     tags=["overlays"],
@@ -249,6 +264,12 @@ api_v1_router.include_router(
     prefix="/proxmox",
     tags=["proxmox"],
     dependencies=[Depends(require_module("integrations.proxmox"))],
+)
+api_v1_router.include_router(
+    reports_router,
+    prefix="/reports",
+    tags=["reports"],
+    dependencies=[Depends(require_module("reports.top_n"))],
 )
 api_v1_router.include_router(roles_router, prefix="/roles", tags=["roles"])
 api_v1_router.include_router(search_router, prefix="/search", tags=["search"])
@@ -273,6 +294,12 @@ api_v1_router.include_router(
     prefix="/tailscale",
     tags=["tailscale"],
     dependencies=[Depends(require_module("integrations.tailscale"))],
+)
+api_v1_router.include_router(
+    tools_router,
+    prefix="/tools",
+    tags=["tools"],
+    dependencies=[Depends(require_module("tools.network"))],
 )
 api_v1_router.include_router(
     unifi_router,

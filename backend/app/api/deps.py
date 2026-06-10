@@ -82,6 +82,7 @@ async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> Us
     # 500 the request — we commit on the caller's session so if the
     # caller rolls back, the timestamp rolls with it (acceptable).
     token.last_used_at = now
+    await _load_time_bound_grants(db, user)
     return user
 
 
@@ -156,7 +157,29 @@ async def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled"
         )
 
+    await _load_time_bound_grants(db, user)
     return user
+
+
+async def _load_time_bound_grants(db: AsyncSession, user: User) -> None:
+    """Stash the caller's live time-bound grants (issue #65) on the User so
+    ``app.core.permissions.user_has_permission`` can union them over the
+    static role grants. Best-effort — a failure here must never block an
+    otherwise-authenticated request, so we log and leave the empty default.
+
+    Lazy import: ``app.services.time_bound_grants`` pulls in
+    ``app.core.permissions`` which imports ``CurrentUser`` / ``get_db`` from
+    this module at top level, so an eager import would close the circular
+    graph at uvicorn startup.
+    """
+    from app.services.time_bound_grants import load_active_grants_for_groups
+
+    try:
+        group_ids = [g.id for g in user.groups]
+        user._active_time_bound_grants = await load_active_grants_for_groups(db, group_ids)
+    except Exception as exc:  # noqa: BLE001 — grant load must not break auth
+        logger.warning("time_bound_grant_load_failed", error=str(exc))
+        user._active_time_bound_grants = []
 
 
 def require_superadmin(current_user: Annotated[User, Depends(get_current_user)]) -> User:

@@ -1,0 +1,15 @@
+[Unit]
+Description=Watch for SpatiumDDI systemd-resolved config-reload trigger (issue #158)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/158
+# Skip on the live ISO — resolver override isn't part of the installer
+# environment.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# PathChanged fires on close-after-write. The supervisor writes this
+# file via an atomic .new → mv rename so the unit only fires once per
+# applied config.
+PathChanged=/var/lib/spatiumddi/release-state/resolver-config-pending
+
+[Install]
+WantedBy=multi-user.target

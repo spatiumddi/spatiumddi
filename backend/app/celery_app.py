@@ -37,6 +37,7 @@ celery_app = Celery(
         "app.tasks.kubernetes_sync",
         "app.tasks.docker_sync",
         "app.tasks.proxmox_sync",
+        "app.tasks.opnsense_sync",
         "app.tasks.tailscale_sync",
         "app.tasks.unifi_sync",
         "app.tasks.cloud_sync",
@@ -51,6 +52,7 @@ celery_app = Celery(
         "app.tasks.ai_digest",
         "app.tasks.audit_chain_verify",
         "app.tasks.upgrade_orchestrator",
+        "app.tasks.time_bound_grant_sweep",
     ],
 )
 
@@ -91,6 +93,7 @@ celery_app.conf.update(
         "app.tasks.kubernetes_sync.*": {"queue": "default"},
         "app.tasks.docker_sync.*": {"queue": "default"},
         "app.tasks.proxmox_sync.*": {"queue": "default"},
+        "app.tasks.opnsense_sync.*": {"queue": "default"},
         "app.tasks.tailscale_sync.*": {"queue": "default"},
         "app.tasks.unifi_sync.*": {"queue": "default"},
         "app.tasks.cloud_sync.*": {"queue": "default"},
@@ -104,6 +107,7 @@ celery_app.conf.update(
         "app.tasks.domain_whois_refresh.*": {"queue": "default"},
         "app.tasks.ai_digest.*": {"queue": "default"},
         "app.tasks.audit_chain_verify.*": {"queue": "default"},
+        "app.tasks.time_bound_grant_sweep.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60 s, mark DNS agents as ``unreachable`` if their
@@ -309,6 +313,12 @@ celery_app.conf.update(
             "task": "app.tasks.proxmox_sync.sweep_proxmox_nodes",
             "schedule": schedule(run_every=30.0),
         },
+        # OPNsense — same 30 s beat, per-firewall interval gate.
+        # Gated overall by ``PlatformSettings.integration_opnsense_enabled``.
+        "opnsense-sync-sweep": {
+            "task": "app.tasks.opnsense_sync.sweep_opnsense_routers",
+            "schedule": schedule(run_every=30.0),
+        },
         # Tailscale — same 30 s beat, per-tenant interval gate.
         # Gated overall by ``PlatformSettings.integration_tailscale_enabled``.
         "tailscale-sync-sweep": {
@@ -446,6 +456,17 @@ celery_app.conf.update(
         # next tick.
         "backup-target-sweep": {
             "task": "app.tasks.backup_sweep.sweep_backup_targets",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Every 60 s, soft-revoke time-bound RBAC grants whose
+        # ``expires_at`` has passed (issue #65). Always-on — there is no
+        # opt-out setting; the per-row ``expires_at`` is the only knob.
+        # Enforcement is already immediate via the ``expires_at > now()``
+        # filter at request time, so this sweep is the durable bookkeeping
+        # layer (sets ``revoked_at`` + writes one permission_change audit
+        # row per expired grant).
+        "time-bound-grant-sweep": {
+            "task": "app.tasks.time_bound_grant_sweep.sweep_expired_grants",
             "schedule": schedule(run_every=60.0),
         },
     },

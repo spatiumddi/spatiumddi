@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     Boolean,
@@ -18,6 +19,9 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+
+if TYPE_CHECKING:
+    from app.models.time_bound_grant import TimeBoundGrant
 
 # Many-to-many: users ↔ groups
 user_group = Table(
@@ -46,6 +50,24 @@ group_role = Table(
 
 class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "user"
+
+    # ``_active_time_bound_grants`` below is a plain per-request attribute,
+    # not a mapped column. ``__allow_unmapped__`` tells SQLAlchemy 2.0's
+    # declarative scanner to leave non-``Mapped[...]`` annotations alone
+    # instead of raising ``ArgumentError`` for them.
+    __allow_unmapped__ = True
+
+    # Per-request cache of live time-bound grants (issue #65), populated by
+    # the auth dependency and consulted by
+    # ``app.core.permissions.user_has_permission``. The class-level default is
+    # the immutable ``None`` sentinel — NEVER a ``[]`` literal, which a mutable
+    # class attribute would share across every User instance and leak grants
+    # between callers if mutated in place. The dependency assigns a fresh list
+    # per request; the read site treats ``None`` as "no grants"
+    # (``getattr(user, "_active_time_bound_grants", None) or []``), so a User
+    # built outside the auth path (tests, internal construction) reads as empty
+    # and is never polluted by another instance.
+    _active_time_bound_grants: "list[TimeBoundGrant] | None" = None
 
     username: Mapped[str] = mapped_column(String(150), unique=True, nullable=False, index=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)

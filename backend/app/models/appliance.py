@@ -505,6 +505,32 @@ class Appliance(Base):
     )
     snmpd_running: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     ntp_sync_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Issue #156 — best-effort rsyslog-forwarding status the supervisor
+    # reports from ``systemctl is-active rsyslog`` + config-applied
+    # state. ``forwarding`` (rsyslog active + config applied) /
+    # ``unreachable`` (enabled but the rsyslog unit failed/inactive) /
+    # ``disabled`` (off). NULL on non-appliance / pre-#156 rows; the
+    # heartbeat handler only overwrites when the supervisor sends a
+    # non-None value. Fine-grained per-target omfwd reachability is
+    # deferred — this is a daemon-level health signal, not a
+    # destination-level probe.
+    syslog_forwarding: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Issue #157 — best-effort count of authorized_keys lines the
+    # supervisor's host runner actually applied to ``~admin/.ssh/
+    # authorized_keys``. PER-HOST (not a global len() of the settings
+    # list), like ``snmpd_running`` — surfaces in the Fleet view so an
+    # operator can confirm a key push actually landed on each box. NULL
+    # on non-appliance / pre-#157 rows; the heartbeat handler only
+    # overwrites when the supervisor sends a non-None value.
+    ssh_key_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Issue #158 — best-effort systemd-resolved state the supervisor
+    # reports after applying the resolver config. ``override`` (the
+    # spatiumddi.conf drop-in is applied) / ``automatic`` (no drop-in —
+    # per-link NetworkManager/DHCP DNS) / ``failed`` (apply error). NULL
+    # on non-appliance / pre-#158 rows; the heartbeat handler only
+    # overwrites when the supervisor sends a non-None value. Per-host,
+    # like ``ssh_key_count`` / ``syslog_forwarding``.
+    resolver_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # Operator-driven desired state. Set via the fleet UI / API;
     # supervisor's heartbeat poll picks them up + writes the matching

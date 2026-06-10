@@ -34,7 +34,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,6 +42,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
 from app.services.ai.operations import Operation, PreviewResult, register
+from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
 
 # Re-declared here (tiny) rather than imported from the routers, so this
 # module doesn't drag the whole router import graph in at load time.
@@ -1056,6 +1057,8 @@ register(
 
 _SNMP_VERSIONS = frozenset({"v2c", "v3"})
 _NTP_SOURCE_MODES = frozenset({"pool", "servers", "mixed"})
+_SYSLOG_PROTOCOLS = frozenset({"udp", "tcp", "tls"})
+_SYSLOG_FORMATS = frozenset({"rfc5424", "rfc3164", "json"})
 
 
 class UpdateSNMPSettingsArgs(BaseModel):
@@ -1199,6 +1202,159 @@ register(
         args_model=UpdateNTPSettingsArgs,
         preview=_preview_update_ntp_settings,
         apply=_apply_update_ntp_settings,
+        category="admin",
+    )
+)
+
+
+class SyslogTargetArg(BaseModel):
+    host: str
+    port: int = 514
+    protocol: str = Field(default="udp", description="udp / tcp / tls.")
+    format: str = Field(default="rfc5424", description="rfc5424 / rfc3164 / json.")
+    ca_cert_pem: str | None = Field(
+        default=None,
+        description="CA PEM for TLS targets (stored Fernet-encrypted). Required when protocol=tls.",
+    )
+
+    @field_validator("host")
+    @classmethod
+    def _valid_host(cls, v: str) -> str:
+        # Strict charset shared with the REST PUT path — the host is
+        # interpolated into a quoted RainerScript ``target="..."`` param
+        # in the root-owned rsyslog config, so a value with a double-
+        # quote / backslash / whitespace / control char must be rejected
+        # before it can inject action params.
+        return validate_syslog_host(v)
+
+
+class UpdateSyslogSettingsArgs(BaseModel):
+    enabled: bool
+    targets: list[SyslogTargetArg] | None = Field(
+        default=None, description="Full replacement list of forward destinations."
+    )
+    filter: str | None = Field(default=None, description="rsyslog selector, e.g. '*.*'.")
+    buffer_disk: bool | None = None
+
+    @field_validator("filter")
+    @classmethod
+    def _valid_filter(cls, v: str | None) -> str | None:
+        # Same selector-charset validation the REST PUT applies — the
+        # filter is rendered straight into the root-owned conf body, so a
+        # newline / directive char would inject without this guard.
+        return validate_syslog_filter(v)
+
+
+def _validate_syslog_targets(targets: list[SyslogTargetArg]) -> str | None:
+    """Return an operator-facing error string, or None when valid.
+
+    Note the strict host charset is enforced by ``SyslogTargetArg``'s
+    field validator (shared with the REST path) before this ever runs;
+    here we re-assert non-emptiness defensively + cover the port /
+    protocol / format / TLS-CA rules that aren't field-level."""
+    for t in targets:
+        try:
+            validate_syslog_host(t.host)
+        except ValueError as exc:
+            return str(exc)
+        if not (1 <= t.port <= 65535):
+            return f"port {t.port} out of range (1-65535)"
+        if t.protocol not in _SYSLOG_PROTOCOLS:
+            return f"protocol must be one of {sorted(_SYSLOG_PROTOCOLS)}"
+        if t.format not in _SYSLOG_FORMATS:
+            return f"format must be one of {sorted(_SYSLOG_FORMATS)}"
+        if t.protocol == "tls" and not (t.ca_cert_pem or "").strip():
+            return f"target {t.host}:{t.port} uses TLS but has no ca_cert_pem"
+    return None
+
+
+async def _preview_update_syslog_settings(
+    db: AsyncSession, user: User, args: UpdateSyslogSettingsArgs
+) -> PreviewResult:
+    if (block := _superadmin_preview_block(user)) is not None:
+        return block
+    if args.targets is not None and (err := _validate_syslog_targets(args.targets)) is not None:
+        return PreviewResult(ok=False, detail=err)
+    bits = [f"enabled={args.enabled}"]
+    if args.targets is not None:
+        bits.append(
+            "targets=[" + ", ".join(f"{t.host}:{t.port}/{t.protocol}" for t in args.targets) + "]"
+        )
+    if args.filter is not None:
+        bits.append(f"filter={args.filter!r}")
+    if args.buffer_disk is not None:
+        bits.append(f"buffer_disk={args.buffer_disk}")
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text="Update syslog forwarding: " + ", ".join(bits),
+    )
+
+
+async def _apply_update_syslog_settings(
+    db: AsyncSession, user: User, args: UpdateSyslogSettingsArgs
+) -> dict[str, Any]:
+    _require_superadmin(user)
+    if args.targets is not None and (err := _validate_syslog_targets(args.targets)) is not None:
+        raise ValueError(err)
+    from app.api.v1.settings.router import _get_or_create  # noqa: PLC0415
+    from app.core.crypto import encrypt_str  # noqa: PLC0415
+    from app.core.demo_mode import forbid_in_demo_mode  # noqa: PLC0415
+
+    forbid_in_demo_mode("Platform settings updates are disabled")
+    settings = await _get_or_create(db)
+    settings.syslog_enabled = args.enabled
+    if args.targets is not None:
+        # Encrypt each TLS target's CA PEM at rest (URL-safe-base64 string
+        # so the JSONB column stays JSON-friendly). Non-TLS targets carry
+        # no CA. Full-replacement semantics — the chat can't do the
+        # leave-alone merge the REST PUT does, so the model must supply
+        # the complete list including any CA PEM it wants kept.
+        new_targets: list[dict[str, Any]] = []
+        for t in args.targets:
+            ca_enc = (
+                encrypt_str(t.ca_cert_pem).decode("ascii")
+                if t.protocol == "tls" and t.ca_cert_pem
+                else None
+            )
+            new_targets.append(
+                {
+                    "host": t.host,
+                    "port": t.port,
+                    "protocol": t.protocol,
+                    "format": t.format,
+                    "ca_cert_pem": ca_enc,
+                }
+            )
+        settings.syslog_targets = new_targets
+    if args.filter is not None:
+        settings.syslog_filter = args.filter
+    if args.buffer_disk is not None:
+        settings.syslog_buffer_disk = args.buffer_disk
+    write_audit(
+        db,
+        user=user,
+        action="update",
+        resource_type="platform_settings",
+        resource_id="syslog",
+        resource_display="Syslog forwarding",
+        new_value={
+            "via": "ai_proposal",
+            "enabled": args.enabled,
+            "target_count": len(args.targets) if args.targets is not None else None,
+        },
+    )
+    await db.commit()
+    return {"syslog_enabled": args.enabled}
+
+
+register(
+    Operation(
+        name="update_syslog_settings",
+        description="Update appliance rsyslog forwarding host config (superadmin).",
+        args_model=UpdateSyslogSettingsArgs,
+        preview=_preview_update_syslog_settings,
+        apply=_apply_update_syslog_settings,
         category="admin",
     )
 )

@@ -51,6 +51,9 @@ for unit in chrony.service ssh.service \
             spatiumddi-snmp-reload.path \
             spatiumddi-chrony-reload.path \
             spatiumddi-lldp-reload.path \
+            spatiumddi-syslog-reload.path \
+            spatiumddi-ssh-reload.path \
+            spatiumddi-resolved-reload.path \
             spatiumddi-tz-reload.path \
             spatiumddi-verbose-boot-reload.path \
             spatium-firewall-reload.path \
@@ -246,6 +249,15 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-lldp-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.service"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-syslog-reload"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-syslog-reload.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-syslog-reload.service"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-ssh-reload"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-ssh-reload.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-ssh-reload.service"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-resolved-reload"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-resolved-reload.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-resolved-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-verbose-boot-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-verbose-boot-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-verbose-boot-reload.service"

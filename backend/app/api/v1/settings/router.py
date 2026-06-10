@@ -16,10 +16,13 @@ from app.api.deps import DB, CurrentUser
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import is_effective_superadmin, user_has_permission
+from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
 from app.services import audit_forward as audit_forward_svc
+from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
+from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
 
 # SNMP v3 protocol allow-lists. Sticking to the protocols net-snmp's
 # Debian build ships out of the box — DES/AES for priv, MD5/SHA for
@@ -39,6 +42,21 @@ _SNMP_PRIV_PROTOCOLS: set[str] = {"none", "DES", "AES"}
 #   ``mixed``   — use both (operator wants internal primary +
 #                 public pool as a fallback).
 _NTP_SOURCE_MODES: set[str] = {"pool", "servers", "mixed"}
+
+# Issue #156 — rsyslog forward-target validation. ``udp`` / ``tcp`` are
+# plaintext; ``tls`` uses rsyslog's gtls stream driver + requires a CA
+# PEM. Wire formats map to rsyslog templates in services/appliance/syslog.py.
+_SYSLOG_PROTOCOLS: set[str] = {"udp", "tcp", "tls"}
+_SYSLOG_FORMATS: set[str] = {"rfc5424", "rfc3164", "json"}
+
+# Issue #158 — systemd-resolved drop-in validation.
+#   resolver_mode       — ``automatic`` (per-link DHCP / NetworkManager DNS)
+#                         vs ``override`` (pinned global DNS= server list).
+#   resolver_dnssec     — systemd-resolved ``DNSSEC=`` values.
+#   resolver_dns_over_tls — systemd-resolved ``DNSOverTLS=`` values.
+_RESOLVER_MODES: set[str] = {"automatic", "override"}
+_RESOLVER_DNSSEC: set[str] = {"yes", "no", "allow-downgrade"}
+_RESOLVER_DOT: set[str] = {"yes", "opportunistic", "no"}
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -100,6 +118,7 @@ class SettingsResponse(BaseModel):
     integration_proxmox_enabled: bool
     integration_tailscale_enabled: bool
     integration_cloud_enabled: bool
+    integration_opnsense_enabled: bool
     domain_whois_interval_hours: int
     # Device profiling — fingerbank API key. Boolean reflects whether
     # an encrypted key is stored; the plaintext is never returned.
@@ -155,6 +174,13 @@ class SettingsResponse(BaseModel):
     # True = standard Linux console on boot (kernel messages + systemd
     # status + getty, no dashboard); False = quiet boot + dashboard.
     verbose_boot: bool = False
+    # ── Maintenance mode (issue #57) ──────────────────────────────
+    # System-wide read-only switch. ``maintenance_started_at`` is
+    # server-managed (stamped on enable / cleared on disable) and so is
+    # read-only here — it has no companion field on SettingsUpdate.
+    maintenance_mode_enabled: bool = False
+    maintenance_message: str = ""
+    maintenance_started_at: datetime | None = None
     # ── Appliance LLDP (issue #343) ───────────────────────────────
     # No secrets — LLDP advertises public identity, so the read shape
     # mirrors the stored shape directly (like NTP).
@@ -168,6 +194,33 @@ class SettingsResponse(BaseModel):
     lldp_sys_description: str = ""
     lldp_med_location: dict[str, Any] = {}
     lldp_snmp_agentx: bool = False
+    # ── Appliance syslog forwarding (issue #156) ──────────────────
+    # Per-target ``ca_cert_pem`` ciphertext is folded into a per-entry
+    # ``ca_cert_set`` boolean by the model validator below — the wire
+    # never carries the CA PEM bytes (mirrors the SNMP community).
+    syslog_enabled: bool = False
+    syslog_targets: list[dict[str, Any]] = []
+    syslog_filter: str = ""
+    syslog_buffer_disk: bool = False
+    # ── Appliance SSH (issue #157) ─────────────────────────────────
+    # Public keys are NOT secrets — the authorized-keys list is returned
+    # verbatim (no redaction, unlike the SNMP community / syslog CA PEM).
+    # Each entry is ``{name, public_key, comment}``.
+    ssh_authorized_keys: list[dict[str, Any]] = []
+    ssh_password_auth_enabled: bool = True
+    ssh_allow_root_login: bool = False
+    ssh_port: int = 22
+    ssh_allowed_source_networks: list[str] = []
+    # ── Appliance DNS resolver (issue #158) ───────────────────────
+    # No secrets — resolver IPs / search domains are not sensitive, so
+    # the read shape mirrors the stored shape directly (like NTP / SSH
+    # public keys).
+    resolver_mode: str = "automatic"
+    resolver_servers: list[str] = []
+    resolver_fallback_servers: list[str] = []
+    resolver_search_domains: list[str] = []
+    resolver_dnssec: str = "allow-downgrade"
+    resolver_dns_over_tls: str = "no"
 
     model_config = {"from_attributes": True}
 
@@ -186,6 +239,10 @@ class SettingsResponse(BaseModel):
             cols["snmp_community_set"] = bool(cols.pop("snmp_community_encrypted", None))
             raw_users = cols.get("snmp_v3_users") or []
             cols["snmp_v3_users"] = [_redact_v3_user(u) for u in raw_users]
+            # Issue #156 — fold each syslog target's CA PEM ciphertext into
+            # a ``ca_cert_set`` boolean so the wire never carries the PEM.
+            raw_targets = cols.get("syslog_targets") or []
+            cols["syslog_targets"] = [_redact_syslog_target(t) for t in raw_targets]
             return cols
         return data
 
@@ -199,6 +256,74 @@ def _redact_v3_user(u: dict[str, Any]) -> dict[str, Any]:
         "priv_protocol": u.get("priv_protocol") or "none",
         "priv_pass_set": bool(u.get("priv_pass_enc")),
     }
+
+
+def _redact_syslog_target(t: Any) -> dict[str, Any]:
+    """Strip the CA PEM ciphertext from a stored syslog-target dict for
+    the response shape — the operator only needs to know whether a CA
+    is configured (``ca_cert_set``), never the PEM bytes (#156).
+
+    Guards against a non-dict entry (e.g. a malformed JSONB row) so
+    ``GET /settings`` never 500s — a bad entry coerces to an empty,
+    clearly-default target rather than raising ``AttributeError``."""
+    if not isinstance(t, dict):
+        return {
+            "host": "",
+            "port": 514,
+            "protocol": "udp",
+            "format": "rfc5424",
+            "ca_cert_set": False,
+        }
+    return {
+        "host": t.get("host", ""),
+        "port": int(t.get("port") or 514),
+        "protocol": t.get("protocol") or "udp",
+        "format": t.get("format") or "rfc5424",
+        "ca_cert_set": bool(t.get("ca_cert_pem")),
+    }
+
+
+def _merge_syslog_targets(
+    existing: list[dict[str, Any]], incoming: list[SyslogTargetUpdate]
+) -> list[dict[str, Any]]:
+    """Atomic replace + per-target CA-PEM merge keyed on ``(host, port)``.
+
+    ``incoming`` is the full new list — targets not present are dropped.
+    For each entry, ``ca_cert_pem`` of ``None`` preserves the existing
+    ciphertext for the same ``(host, port)`` key; ``""`` clears; anything
+    else is encrypted fresh. Mirrors ``_merge_snmp_v3_users`` so an
+    operator editing a target's format doesn't have to re-paste its CA
+    PEM. Encrypted bytes are stored as the URL-safe-base64 string Fernet
+    emits so the JSONB column stays JSON-friendly.
+    """
+    from app.core.crypto import encrypt_str
+
+    by_key = {(t.get("host"), int(t.get("port") or 514)): t for t in existing}
+    out: list[dict[str, Any]] = []
+    for entry in incoming:
+        prior = by_key.get((entry.host, entry.port), {})
+        if entry.protocol == "tls":
+            submitted = entry.ca_cert_pem
+            prior_enc = prior.get("ca_cert_pem")
+            if submitted is None:
+                ca_enc = prior_enc if isinstance(prior_enc, str) and prior_enc else None
+            elif submitted == "":
+                ca_enc = None
+            else:
+                ca_enc = encrypt_str(submitted).decode("ascii")
+        else:
+            # Non-TLS targets carry no CA — drop any prior ciphertext.
+            ca_enc = None
+        out.append(
+            {
+                "host": entry.host,
+                "port": entry.port,
+                "protocol": entry.protocol,
+                "format": entry.format,
+                "ca_cert_pem": ca_enc,
+            }
+        )
+    return out
 
 
 def _merge_snmp_v3_users(
@@ -325,6 +450,106 @@ class NTPCustomServerUpdate(BaseModel):
         return s
 
 
+class SyslogTargetUpdate(BaseModel):
+    """One entry in ``syslog_targets`` on PUT (#156).
+
+    ``host`` is the collector hostname / IP; ``port`` 1–65535;
+    ``protocol`` one of ``udp`` / ``tcp`` / ``tls``; ``format`` one of
+    ``rfc5424`` / ``rfc3164`` / ``json``. ``ca_cert_pem`` is REQUIRED
+    when ``protocol == 'tls'`` and ignored otherwise; its merge
+    semantics mirror the SNMP v3 pass / SMTP password shape:
+
+    * ``None`` — leave the existing ciphertext alone (matched by
+      ``(host, port)`` against the stored list).
+    * ``""`` — clear any existing ciphertext.
+    * non-empty string — encrypt and replace.
+    """
+
+    host: str
+    port: int = 514
+    protocol: str = "udp"
+    format: str = "rfc5424"
+    ca_cert_pem: str | None = None
+
+    @field_validator("host")
+    @classmethod
+    def _syslog_host_nonempty(cls, v: str) -> str:
+        # Strict charset shared with the AI proposal path — the host is
+        # interpolated into a quoted RainerScript action param, so reject
+        # quotes / backslashes / whitespace / control chars, not just
+        # empty values.
+        return validate_syslog_host(v)
+
+    @field_validator("port")
+    @classmethod
+    def _syslog_port_range(cls, v: int) -> int:
+        if not (1 <= v <= 65535):
+            raise ValueError("port must be 1–65535")
+        return v
+
+    @field_validator("protocol")
+    @classmethod
+    def _syslog_protocol(cls, v: str) -> str:
+        if v not in _SYSLOG_PROTOCOLS:
+            raise ValueError(f"protocol must be one of {sorted(_SYSLOG_PROTOCOLS)}")
+        return v
+
+    @field_validator("format")
+    @classmethod
+    def _syslog_format(cls, v: str) -> str:
+        if v not in _SYSLOG_FORMATS:
+            raise ValueError(f"format must be one of {sorted(_SYSLOG_FORMATS)}")
+        return v
+
+    @model_validator(mode="after")
+    def _tls_requires_ca(self) -> SyslogTargetUpdate:
+        # A TLS target needs a CA to validate the collector's cert. The
+        # PEM may be supplied now (non-empty string) OR already stored —
+        # but ``""`` (explicit clear) on a TLS target leaves it with no
+        # CA, which can't validate, so reject that here. ``None`` is OK:
+        # it means "keep the existing CA", which the merge resolves.
+        if self.protocol == "tls" and self.ca_cert_pem == "":
+            raise ValueError("ca_cert_pem is required when protocol is 'tls'")
+        return self
+
+
+class SshAuthorizedKeyUpdate(BaseModel):
+    """One entry in ``ssh_authorized_keys`` on PUT (#157).
+
+    ``public_key`` is a single OpenSSH public-key line (``<type>
+    <base64-blob> [comment]``); ``name`` is an operator label, ``comment``
+    an optional note. Public keys are NOT secrets — they are stored
+    verbatim (no Fernet). The key is validated strictly so a malformed /
+    multi-line / control-char value can't slip into authorized_keys.
+    """
+
+    name: str = ""
+    public_key: str
+    comment: str = ""
+
+    @field_validator("public_key")
+    @classmethod
+    def _valid_public_key(cls, v: str) -> str:
+        s = v.strip()
+        if not is_valid_public_key(s):
+            raise ValueError(
+                "public_key must be a valid OpenSSH public key "
+                "(e.g. 'ssh-ed25519 AAAA… comment') — type + base64 blob, "
+                "no embedded newlines / control characters"
+            )
+        return s
+
+    @field_validator("name", "comment")
+    @classmethod
+    def _no_control_chars(cls, v: str) -> str:
+        # Names / comments land near the rendered authorized_keys line —
+        # reject control chars (incl. newlines) so they can't break the
+        # file format.
+        if any(ord(c) < 0x20 for c in v):
+            raise ValueError("must not contain control characters")
+        return v.strip()
+
+
 class SettingsUpdate(BaseModel):
     app_title: str | None = None
     app_base_url: str | None = None
@@ -371,6 +596,7 @@ class SettingsUpdate(BaseModel):
     integration_proxmox_enabled: bool | None = None
     integration_tailscale_enabled: bool | None = None
     integration_cloud_enabled: bool | None = None
+    integration_opnsense_enabled: bool | None = None
     domain_whois_interval_hours: int | None = None
     # Device profiling — fingerbank API key. Plaintext on the wire
     # (TLS-protected); empty string clears the stored value. Omit the
@@ -420,6 +646,12 @@ class SettingsUpdate(BaseModel):
     timezone: str | None = None
     # ── Appliance verbose boot console ────────────────────────────
     verbose_boot: bool | None = None
+    # ── Maintenance mode (issue #57) ──────────────────────────────
+    # ``maintenance_started_at`` is intentionally NOT settable here —
+    # it's server-stamped in ``update_settings`` when the enable flag
+    # flips, never operator-supplied.
+    maintenance_mode_enabled: bool | None = None
+    maintenance_message: str | None = None
     # ── Appliance LLDP (issue #343) ───────────────────────────────
     lldp_enabled: bool | None = None
     lldp_tx_interval: int | None = None
@@ -431,6 +663,166 @@ class SettingsUpdate(BaseModel):
     lldp_sys_description: str | None = None
     lldp_med_location: dict[str, Any] | None = None
     lldp_snmp_agentx: bool | None = None
+    # ── Appliance syslog forwarding (issue #156) ──────────────────
+    syslog_enabled: bool | None = None
+    # When provided, this list is the new full set — targets not in the
+    # incoming list are removed. Per-target CA-PEM merge semantics see
+    # ``SyslogTargetUpdate`` docstring (None = leave, "" = clear,
+    # non-empty = encrypt + replace).
+    syslog_targets: list[SyslogTargetUpdate] | None = None
+    syslog_filter: str | None = None
+    syslog_buffer_disk: bool | None = None
+    # ── Appliance SSH (issue #157) ─────────────────────────────────
+    ssh_authorized_keys: list[SshAuthorizedKeyUpdate] | None = None
+    ssh_password_auth_enabled: bool | None = None
+    ssh_allow_root_login: bool | None = None
+    ssh_port: int | None = None
+    ssh_allowed_source_networks: list[str] | None = None
+    # ── Appliance DNS resolver (issue #158) ───────────────────────
+    resolver_mode: str | None = None
+    resolver_servers: list[str] | None = None
+    resolver_fallback_servers: list[str] | None = None
+    resolver_search_domains: list[str] | None = None
+    resolver_dnssec: str | None = None
+    resolver_dns_over_tls: str | None = None
+
+    @field_validator("resolver_mode")
+    @classmethod
+    def _valid_resolver_mode(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _RESOLVER_MODES:
+            raise ValueError(f"resolver_mode must be one of {sorted(_RESOLVER_MODES)}")
+        return v
+
+    @field_validator("resolver_dnssec")
+    @classmethod
+    def _valid_resolver_dnssec(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _RESOLVER_DNSSEC:
+            raise ValueError(f"resolver_dnssec must be one of {sorted(_RESOLVER_DNSSEC)}")
+        return v
+
+    @field_validator("resolver_dns_over_tls")
+    @classmethod
+    def _valid_resolver_dot(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _RESOLVER_DOT:
+            raise ValueError(f"resolver_dns_over_tls must be one of {sorted(_RESOLVER_DOT)}")
+        return v
+
+    @field_validator("resolver_servers", "resolver_fallback_servers")
+    @classmethod
+    def _valid_resolver_servers(cls, v: list[str] | None) -> list[str] | None:
+        # Each entry must parse as a bare IP address — systemd-resolved's
+        # ``DNS=`` / ``FallbackDNS=`` take resolver IPs (v4 or v6), not
+        # hostnames. Reuse the same shape as the reverse_dns_resolvers
+        # validator below. Strip whitespace + drop empties.
+        if v is None:
+            return None
+        import ipaddress  # noqa: PLC0415
+
+        cleaned: list[str] = []
+        for entry in v:
+            host = (entry or "").strip()
+            if not host:
+                continue
+            try:
+                ipaddress.ip_address(host)
+            except ValueError as exc:
+                raise ValueError(f"invalid resolver IP: {entry!r}") from exc
+            cleaned.append(host)
+        return cleaned
+
+    @field_validator("resolver_search_domains")
+    @classmethod
+    def _valid_resolver_search(cls, v: list[str] | None) -> list[str] | None:
+        # Search domains are rendered straight into the ``Domains=`` line, so
+        # reject embedded whitespace / control chars (a smuggled space would
+        # split one domain into two; a newline would break out of the line).
+        # Strip + drop empties.
+        if v is None:
+            return None
+        out: list[str] = []
+        for raw in v:
+            s = (raw or "").strip()
+            if not s:
+                continue
+            if any(c.isspace() for c in s) or any(ord(c) < 0x20 for c in s):
+                raise ValueError(
+                    f"search domain may not contain whitespace / control chars: {raw!r}"
+                )
+            out.append(s)
+        return out
+
+    @model_validator(mode="after")
+    def _resolver_override_requires_servers(self) -> SettingsUpdate:
+        # CROSS-FIELD guard (#158, mirrors the SSH lockout-safety pattern):
+        # override mode routes ALL host DNS to the global ``DNS=`` server
+        # list (``Domains=~.``), so an override with an empty server list
+        # leaves the appliance host with zero working upstream DNS — and with
+        # DNSOverTLS=yes there's no plaintext fallback either, making it
+        # effectively unrecoverable until corrected. Reject the in-request
+        # case where override is selected AND servers are explicitly cleared.
+        # ``resolver_servers is None`` means "leave the stored list alone";
+        # the merged-state guard in ``update_settings`` catches the case where
+        # the stored list is also empty (it can see the DB row).
+        if (
+            self.resolver_mode == "override"
+            and self.resolver_servers is not None
+            and not self.resolver_servers
+        ):
+            raise ValueError("resolver override mode requires at least one DNS server")
+        return self
+
+    @field_validator("ssh_port")
+    @classmethod
+    def _valid_ssh_port(cls, v: int | None) -> int | None:
+        if v is None:
+            return None
+        if not (1 <= v <= 65535):
+            raise ValueError("ssh_port must be 1–65535")
+        # Privileged-port floor — reject < 1024 except 22 so an operator
+        # can't park sshd somewhere that needs root-only bind privileges
+        # the runner can't reliably reach. 22 stays the un-removable
+        # default; the host runner does the real bind / in-use check.
+        if v < 1024 and v != 22:
+            raise ValueError(
+                "ssh_port below 1024 is not allowed (except 22) — pick a "
+                "non-privileged port or keep 22"
+            )
+        return v
+
+    @field_validator("ssh_allowed_source_networks")
+    @classmethod
+    def _valid_ssh_sources(cls, v: list[str] | None) -> list[str] | None:
+        # Same CIDR canonicalisation as snmp_allowed_sources — the host
+        # nftables drop-in source-scopes the ssh port to these.
+        if v is None:
+            return None
+        out: list[str] = []
+        for raw in v:
+            s = raw.strip()
+            if not s:
+                continue
+            try:
+                net = ip_network(s, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"invalid CIDR or host: {raw!r} ({exc})") from exc
+            out.append(str(net))
+        return out
+
+    @field_validator("syslog_filter")
+    @classmethod
+    def _valid_syslog_filter(cls, v: str | None) -> str | None:
+        # rsyslog selector — ``facility.severity`` tokens, comma-joined,
+        # plus ``*`` wildcards and the ``!`` / ``=`` / ``;`` modifiers.
+        # Rendered straight into the conf body, so reject control chars /
+        # newlines / quotes to keep config injection out. Empty = the
+        # renderer defaults to ``*.*``. Shared with the AI proposal path.
+        return validate_syslog_filter(v)
 
     @field_validator("lldp_tx_interval")
     @classmethod
@@ -514,6 +906,16 @@ class SettingsUpdate(BaseModel):
             ZoneInfo(v)
         except Exception as exc:  # noqa: BLE001 — surface the parse failure
             raise ValueError(f"timezone {v!r} is not a valid IANA tz name: {exc}") from exc
+        return v
+
+    @field_validator("maintenance_message")
+    @classmethod
+    def _validate_maintenance_message(cls, v: str | None) -> str | None:
+        # Mirrors the column width (VARCHAR(500)) — reject overlong banners
+        # at the API boundary with a clean 422 instead of a DB truncation
+        # error. ``None`` (field omitted) is left alone.
+        if v is not None and len(v) > 500:
+            raise ValueError("maintenance_message must be 500 characters or fewer")
         return v
 
     @field_validator("lockout_threshold")
@@ -756,6 +1158,128 @@ class SettingsUpdate(BaseModel):
         return out
 
 
+# ── Dedicated resolver schema (issue #158) ──────────────────────────────────────
+
+
+class ResolverSettingsResponse(BaseModel):
+    """Focused read shape for ``GET /settings/resolver`` (issue #158).
+
+    A scoped slice of the combined ``SettingsResponse`` so the Appliance →
+    DNS Resolver form (and the ``find_resolver_settings`` MCP read) can fetch
+    just the resolver config without the rest of the platform-settings blob.
+    No secrets — resolver IPs / domains are not sensitive.
+    """
+
+    resolver_mode: str
+    resolver_servers: list[str]
+    resolver_fallback_servers: list[str]
+    resolver_search_domains: list[str]
+    resolver_dnssec: str
+    resolver_dns_over_tls: str
+
+    model_config = {"from_attributes": True}
+
+
+class ResolverSettingsUpdate(BaseModel):
+    """Focused write shape for ``PUT /settings/resolver`` (issue #158).
+
+    Same field-level validation as the matching ``resolver_*`` fields on
+    ``SettingsUpdate`` (mode / dnssec / dot enums + IP / search-domain
+    hygiene). ``None`` leaves the existing value alone.
+    """
+
+    resolver_mode: str | None = None
+    resolver_servers: list[str] | None = None
+    resolver_fallback_servers: list[str] | None = None
+    resolver_search_domains: list[str] | None = None
+    resolver_dnssec: str | None = None
+    resolver_dns_over_tls: str | None = None
+
+    @field_validator("resolver_mode")
+    @classmethod
+    def _valid_mode(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _RESOLVER_MODES:
+            raise ValueError(f"resolver_mode must be one of {sorted(_RESOLVER_MODES)}")
+        return v
+
+    @field_validator("resolver_dnssec")
+    @classmethod
+    def _valid_dnssec(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _RESOLVER_DNSSEC:
+            raise ValueError(f"resolver_dnssec must be one of {sorted(_RESOLVER_DNSSEC)}")
+        return v
+
+    @field_validator("resolver_dns_over_tls")
+    @classmethod
+    def _valid_dot(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _RESOLVER_DOT:
+            raise ValueError(f"resolver_dns_over_tls must be one of {sorted(_RESOLVER_DOT)}")
+        return v
+
+    @field_validator("resolver_servers", "resolver_fallback_servers")
+    @classmethod
+    def _valid_servers(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        import ipaddress  # noqa: PLC0415
+
+        cleaned: list[str] = []
+        for entry in v:
+            host = (entry or "").strip()
+            if not host:
+                continue
+            try:
+                ipaddress.ip_address(host)
+            except ValueError as exc:
+                raise ValueError(f"invalid resolver IP: {entry!r}") from exc
+            cleaned.append(host)
+        return cleaned
+
+    @field_validator("resolver_search_domains")
+    @classmethod
+    def _valid_search(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        out: list[str] = []
+        for raw in v:
+            s = (raw or "").strip()
+            if not s:
+                continue
+            if any(c.isspace() for c in s) or any(ord(c) < 0x20 for c in s):
+                raise ValueError(
+                    f"search domain may not contain whitespace / control chars: {raw!r}"
+                )
+            out.append(s)
+        return out
+
+    @model_validator(mode="after")
+    def _override_requires_servers(self) -> ResolverSettingsUpdate:
+        # CROSS-FIELD guard (#158, mirrors the SSH lockout-safety pattern):
+        # override mode routes ALL host DNS to the global ``DNS=`` server
+        # list (``Domains=~.``), so an override with an empty server list
+        # leaves the appliance host with zero working upstream DNS — and with
+        # DNSOverTLS=yes there's no plaintext fallback either, making it
+        # effectively unrecoverable until corrected. Reject the in-request
+        # case where override is selected AND servers are explicitly cleared.
+        # ``resolver_servers is None`` means "leave the stored list alone";
+        # the merged-state guard in ``update_resolver_settings`` /
+        # ``update_settings`` catches the case where the stored list is also
+        # empty (it can see the DB row, which this validator can't).
+        if (
+            self.resolver_mode == "override"
+            and self.resolver_servers is not None
+            and not self.resolver_servers
+        ):
+            raise ValueError("resolver override mode requires at least one DNS server")
+        return self
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
@@ -825,6 +1349,50 @@ async def update_settings(
     settings = await _get_or_create(db)
     changes = body.model_dump(exclude_none=True)
 
+    # CROSS-FIELD merged-state guard for the DNS resolver (#158). The
+    # model_validator already rejects override + explicitly-empty servers in
+    # the same request; this also catches the case it can't see — override
+    # selected (or already on) while the RESULTING server list is empty (e.g.
+    # servers omitted and the stored list is empty too). Override routes all
+    # host DNS to the global ``DNS=`` list, so an empty list means zero working
+    # upstream DNS. Mirrors the SSH lockout-safety merged-state check below.
+    if "resolver_mode" in changes or "resolver_servers" in changes:
+        _resolver_resulting_mode = changes.get("resolver_mode", settings.resolver_mode)
+        _resolver_resulting_servers = (
+            changes["resolver_servers"]
+            if "resolver_servers" in changes
+            else list(settings.resolver_servers or [])
+        )
+        if _resolver_resulting_mode == "override" and not _resolver_resulting_servers:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="resolver override mode requires at least one DNS server",
+            )
+
+    # Maintenance mode is SUPERADMIN-ONLY (issue #57). Flipping it turns the
+    # WHOLE platform read-only for everyone except superadmins — a delegated
+    # ``write:settings`` editor must not be able to inflict a platform-wide
+    # DoS. This matches the ``set_maintenance_mode`` MCP tool's superadmin
+    # gate and the banner copy ("blocked for everyone except superadmins").
+    # Either maintenance field in the PUT body requires the stronger gate.
+    if (
+        "maintenance_mode_enabled" in changes or "maintenance_message" in changes
+    ) and not is_effective_superadmin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Maintenance mode can only be changed by a superadmin",
+        )
+
+    # Maintenance mode (issue #57). Capture the prior enabled state before
+    # the setattr loop mutates it so we can detect an actual flip (and
+    # server-stamp / clear ``maintenance_started_at`` accordingly + write
+    # a dedicated audit row + invalidate the middleware cache). Computed
+    # here so it sees the value as it was BEFORE this request.
+    _maintenance_prev = bool(settings.maintenance_mode_enabled)
+    _maintenance_requested = changes.get("maintenance_mode_enabled")
+    _maintenance_message_prev = settings.maintenance_message or ""
+    _maintenance_message_requested = changes.get("maintenance_message")
+
     # Whether this update touches any host-config field a HOSTCONFIG_ALL
     # subscriber acts on. The DHCP-agent /config long-poll folds SNMP /
     # NTP / LLDP into its ETag; the supervisor heartbeat (#358 Phase 1)
@@ -845,7 +1413,8 @@ async def update_settings(
         "web_ui_allowed_cidrs",
     }
     _host_config_touched = any(
-        field.startswith(("snmp_", "ntp_", "lldp_")) or field in _supervisor_host_config_fields
+        field.startswith(("snmp_", "ntp_", "lldp_", "syslog_", "ssh_", "resolver_"))
+        or field in _supervisor_host_config_fields
         for field in changes
     )
 
@@ -896,6 +1465,78 @@ async def update_settings(
         # losing every encrypted pass.
         snmp_users_audit = [_redact_v3_user(u) for u in merged]
 
+    # syslog_targets: same atomic-replace + per-target CA-PEM merge as
+    # SNMP v3 users (#156). Match by ``(host, port)`` so editing one
+    # target's format doesn't drop another's CA PEM. A TLS target with
+    # no CA (neither submitted now nor stored prior) is rejected so the
+    # operator's PUT is the error site, not a downstream rsyslog reload.
+    syslog_targets_audit: list[dict[str, Any]] | None = None
+    if "syslog_targets" in changes:
+        incoming_targets: list[SyslogTargetUpdate] = body.syslog_targets or []
+        existing_targets = list(settings.syslog_targets or [])
+        merged_targets = _merge_syslog_targets(existing_targets, incoming_targets)
+        for tgt in merged_targets:
+            if tgt["protocol"] == "tls" and not tgt.get("ca_cert_pem"):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        f"syslog target {tgt['host']}:{tgt['port']} uses TLS but has "
+                        "no CA certificate configured — paste a CA PEM for it."
+                    ),
+                )
+        # Drop the raw incoming list out of ``changes`` so the generic
+        # setattr loop doesn't clobber the merged form; the model
+        # attribute is set directly here.
+        changes.pop("syslog_targets")
+        settings.syslog_targets = merged_targets
+        syslog_targets_audit = [_redact_syslog_target(t) for t in merged_targets]
+
+    # ssh_authorized_keys: atomic replace (no per-entry secret merge — public
+    # keys are not secrets). Normalise the incoming pydantic models into
+    # plain ``{name, public_key, comment}`` dicts so the JSONB column stays
+    # JSON-friendly. CROSS-FIELD lockout-safety guard (#157): compute the
+    # MERGED post-update state (resulting password-auth flag + resulting key
+    # list) and refuse to disable password auth when zero valid keys would
+    # survive — otherwise the operator locks themselves out of every
+    # appliance host. The host runner mirrors this guard defensively.
+    ssh_keys_normalised: list[dict[str, Any]] | None = None
+    if "ssh_authorized_keys" in changes:
+        incoming_keys: list[SshAuthorizedKeyUpdate] = body.ssh_authorized_keys or []
+        ssh_keys_normalised = [
+            {"name": k.name, "public_key": k.public_key, "comment": k.comment}
+            for k in incoming_keys
+        ]
+        changes.pop("ssh_authorized_keys")
+        settings.ssh_authorized_keys = ssh_keys_normalised
+
+    # Resulting (merged) state for the lockout check — read the change if
+    # present, else the value already on the row. Compute regardless of
+    # whether keys / the toggle were in this request, since either one
+    # changing can produce an unsafe combination.
+    _resulting_password_auth = bool(
+        changes.get("ssh_password_auth_enabled", settings.ssh_password_auth_enabled)
+    )
+    _resulting_keys = (
+        ssh_keys_normalised
+        if ssh_keys_normalised is not None
+        else list(settings.ssh_authorized_keys or [])
+    )
+    _ssh_field_in_request = any(f.startswith("ssh_") for f in changes) or (
+        ssh_keys_normalised is not None
+    )
+    if _ssh_field_in_request and not validate_lockout_safe(
+        _resulting_keys, _resulting_password_auth
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Refusing to disable SSH password authentication with no "
+                "authorized keys configured — you would lock yourself out of "
+                "every appliance host. Add at least one valid public key first, "
+                "or keep password authentication enabled."
+            ),
+        )
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
         if field in (
@@ -909,9 +1550,168 @@ async def update_settings(
 
     if snmp_users_audit is not None:
         changes["snmp_v3_users"] = snmp_users_audit
+    if syslog_targets_audit is not None:
+        changes["syslog_targets"] = syslog_targets_audit
+    if ssh_keys_normalised is not None:
+        changes["ssh_authorized_keys"] = ssh_keys_normalised
+
+    # Issue #157 — dedicated audit row for any SSH config change
+    # (non-negotiable #4). SSH access is high-blast-radius (it gates who
+    # can log into every appliance host), so a durable audit entry is
+    # required. Public keys are NOT secrets, so the full key list is
+    # recorded (no redaction). Fires whenever this request touched any
+    # ``ssh_*`` field.
+    if _ssh_field_in_request:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="ssh",
+                resource_display="SSH access",
+                result="success",
+                new_value={
+                    "password_auth_enabled": bool(settings.ssh_password_auth_enabled),
+                    "allow_root_login": bool(settings.ssh_allow_root_login),
+                    "port": int(settings.ssh_port or 22),
+                    "allowed_source_networks": list(settings.ssh_allowed_source_networks or []),
+                    "authorized_keys": [
+                        {
+                            "name": (k.get("name") or "") if isinstance(k, dict) else "",
+                            "comment": (k.get("comment") or "") if isinstance(k, dict) else "",
+                            "public_key": (
+                                (k.get("public_key") or "") if isinstance(k, dict) else ""
+                            ),
+                        }
+                        for k in (settings.ssh_authorized_keys or [])
+                    ],
+                },
+            )
+        )
+
+    # Issue #158 — dedicated audit row for any DNS-resolver change
+    # (non-negotiable #4). Resolver config steers where every appliance
+    # host sends its DNS lookups (and BIND9 binds host :53 on top), so a
+    # durable audit entry is warranted. Resolver IPs / domains are not
+    # secrets, so the full shape is recorded (no redaction). Fires
+    # whenever this request touched any ``resolver_*`` field. Computed off
+    # ``changes`` which still carries the resolver keys (they go through
+    # the generic setattr loop, no special pop like ssh/syslog).
+    _resolver_touched = any(f.startswith("resolver_") for f in changes)
+    if _resolver_touched:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="resolver",
+                resource_display="DNS resolver",
+                result="success",
+                new_value={
+                    "mode": settings.resolver_mode,
+                    "servers": list(settings.resolver_servers or []),
+                    "fallback_servers": list(settings.resolver_fallback_servers or []),
+                    "search_domains": list(settings.resolver_search_domains or []),
+                    "dnssec": settings.resolver_dnssec,
+                    "dns_over_tls": settings.resolver_dns_over_tls,
+                },
+            )
+        )
+
+    # Issue #156 — dedicated audit row for any syslog-forwarding change
+    # (non-negotiable #4). The generic ``logger.info`` below is not an
+    # ``audit_log`` row; syslog forwarding ships logs off-box + carries a
+    # secret CA PEM, so a durable, redacted audit entry is required. Fires
+    # whenever this request touched any ``syslog_*`` field (the targets
+    # list shows only the redacted shape — no CA PEM bytes).
+    _syslog_touched = any(f.startswith("syslog_") for f in changes)
+    if _syslog_touched:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="syslog",
+                resource_display="Syslog forwarding",
+                result="success",
+                new_value={
+                    "enabled": bool(settings.syslog_enabled),
+                    "targets": [_redact_syslog_target(t) for t in (settings.syslog_targets or [])],
+                    "filter": settings.syslog_filter or "",
+                    "buffer_disk": bool(settings.syslog_buffer_disk),
+                },
+            )
+        )
+
+    # Maintenance mode flip handling (issue #57). When the enable flag
+    # actually changes state, server-stamp / clear ``maintenance_started_at``
+    # (never operator-supplied) and write a dedicated audit row so the
+    # window is unambiguously bracketed in the audit log.
+    _maintenance_flipped = (
+        _maintenance_requested is not None and bool(_maintenance_requested) != _maintenance_prev
+    )
+    # A message-only edit (banner reworded while the enable flag stays put)
+    # is still an operator-visible maintenance change and must be audited
+    # (non-negotiable #4) — the flip branch only fired on enable/disable, so
+    # a reword previously slipped through with no ``audit_log`` row.
+    _maintenance_message_changed = (
+        _maintenance_message_requested is not None
+        and (settings.maintenance_message or "") != _maintenance_message_prev
+    )
+    if _maintenance_flipped:
+        now_enabled = bool(_maintenance_requested)
+        settings.maintenance_started_at = datetime.now(UTC) if now_enabled else None
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action=("maintenance_mode.enabled" if now_enabled else "maintenance_mode.disabled"),
+                resource_type="platform_settings",
+                resource_id="maintenance",
+                resource_display="Maintenance mode",
+                result="success",
+                new_value={
+                    "enabled": now_enabled,
+                    "message": settings.maintenance_message or "",
+                },
+            )
+        )
+    elif _maintenance_message_changed:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="maintenance_mode.message_changed",
+                resource_type="platform_settings",
+                resource_id="maintenance",
+                resource_display="Maintenance mode",
+                result="success",
+                new_value={
+                    "enabled": bool(settings.maintenance_mode_enabled),
+                    "message": settings.maintenance_message or "",
+                },
+            )
+        )
 
     await db.commit()
     await db.refresh(settings)
+
+    # Drop the middleware's process-local cache so the flipping worker
+    # enforces (or lifts) the read-only block on its very next request. A
+    # message-only reword also changes the cached 503 body, so invalidate
+    # for that case too.
+    if _maintenance_flipped or _maintenance_message_changed:
+        from app.core import maintenance_mode as _maintenance_mode
+
+        _maintenance_mode.invalidate_cache()
 
     # The settings router has no request-scoped wake collector, so
     # publish directly after the commit. Only fire when a host-config
@@ -922,6 +1722,102 @@ async def update_settings(
 
     logger.info("platform_settings_updated", user=current_user.username, changes=changes)
     return settings
+
+
+# ── Dedicated resolver endpoints (issue #158) ───────────────────────────────────
+
+
+@router.get("/resolver", response_model=ResolverSettingsResponse)
+async def get_resolver_settings(current_user: CurrentUser, db: DB) -> ResolverSettingsResponse:
+    """Scoped read of just the appliance DNS-resolver config (issue #158).
+
+    A focused slice of ``GET /settings`` for the Appliance → DNS Resolver
+    form. The combined read is still complete (resolver_* live on
+    ``SettingsResponse`` too); this endpoint exists per the spec so the form
+    can fetch just its own state.
+    """
+    settings = await _get_or_create(db)
+    return ResolverSettingsResponse.model_validate(settings)
+
+
+@router.put("/resolver", response_model=ResolverSettingsResponse)
+async def update_resolver_settings(
+    body: ResolverSettingsUpdate, current_user: CurrentUser, db: DB
+) -> ResolverSettingsResponse:
+    """Scoped write of just the appliance DNS-resolver config (issue #158).
+
+    Same guardrails as the combined PUT: demo-mode block, ``write`` on
+    ``settings`` permission gate, a dedicated audit row (``resource_id=
+    'resolver'``), and a HOSTCONFIG_ALL wake so parked supervisor / DHCP-agent
+    long-polls pick the change up. Only the resolver_* columns are touched.
+    """
+    forbid_in_demo_mode("Platform settings updates are disabled")
+    if not user_has_permission(current_user, "write", "settings"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: need 'write' on 'settings'",
+        )
+
+    settings = await _get_or_create(db)
+    changes = body.model_dump(exclude_none=True)
+    if not changes:
+        # Nothing to do — return the current state without an audit row /
+        # wake so a no-op PUT is cheap.
+        return ResolverSettingsResponse.model_validate(settings)
+
+    # CROSS-FIELD merged-state guard (#158). The model_validator already
+    # rejects override + explicitly-empty servers in the same request; this
+    # also catches the case it can't see — override selected (or already on)
+    # while the RESULTING server list is empty (e.g. servers omitted and the
+    # stored list is empty too). Override routes all host DNS to the global
+    # ``DNS=`` list, so an empty list means zero working upstream DNS.
+    _resulting_mode = changes.get("resolver_mode", settings.resolver_mode)
+    _resulting_servers = (
+        changes["resolver_servers"]
+        if "resolver_servers" in changes
+        else list(settings.resolver_servers or [])
+    )
+    if _resulting_mode == "override" and not _resulting_servers:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="resolver override mode requires at least one DNS server",
+        )
+
+    for field, value in changes.items():
+        setattr(settings, field, value)
+
+    # Dedicated audit row (non-negotiable #4) — resolver config steers every
+    # appliance host's DNS lookups. Resolver IPs / domains are not secrets,
+    # so the full shape is recorded.
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="update",
+            resource_type="platform_settings",
+            resource_id="resolver",
+            resource_display="DNS resolver",
+            result="success",
+            new_value={
+                "mode": settings.resolver_mode,
+                "servers": list(settings.resolver_servers or []),
+                "fallback_servers": list(settings.resolver_fallback_servers or []),
+                "search_domains": list(settings.resolver_search_domains or []),
+                "dnssec": settings.resolver_dnssec,
+                "dns_over_tls": settings.resolver_dns_over_tls,
+            },
+        )
+    )
+
+    await db.commit()
+    await db.refresh(settings)
+
+    # Wake parked supervisor / DHCP-agent long-polls (HOSTCONFIG_ALL).
+    await publish_wake(HOSTCONFIG_ALL)
+
+    logger.info("resolver_settings_updated", user=current_user.username, changes=list(changes))
+    return ResolverSettingsResponse.model_validate(settings)
 
 
 class ReverseDnsRunResponse(BaseModel):

@@ -31,6 +31,7 @@ from app.models.auth import User
 from app.models.cloud import CloudEndpoint
 from app.models.docker import DockerHost
 from app.models.kubernetes import KubernetesCluster
+from app.models.opnsense import OPNsenseRouter
 from app.models.proxmox import ProxmoxNode
 from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
@@ -447,3 +448,64 @@ async def list_cloud_targets(
         }
         for r in rows
     ]
+
+
+# ── list_opnsense_targets ─────────────────────────────────────────────
+
+
+class ListOPNsenseTargetsArgs(BaseModel):
+    search: str | None = _common_target_args()["search"]
+    enabled: bool | None = _common_target_args()["enabled"]
+    limit: int = _common_target_args()["limit"]
+
+
+@register_tool(
+    name="list_opnsense_targets",
+    module="integrations.opnsense",
+    description=(
+        "List configured OPNsense firewalls that SpatiumDDI mirrors "
+        "into IPAM. Each row carries id, name, description, endpoint, "
+        "enabled flag, ipam_space_id, sync_interval_seconds, "
+        "last_synced_at, firmware_version, interface_count, and "
+        "lease_count. Use for 'which OPNsense firewalls are configured?' "
+        "or 'is OPNsense syncing?'. API keys/secrets never appear."
+    ),
+    args_model=ListOPNsenseTargetsArgs,
+    category="integrations",
+)
+async def list_opnsense_targets(
+    db: AsyncSession, user: User, args: ListOPNsenseTargetsArgs
+) -> list[dict[str, Any]]:
+    stmt = select(OPNsenseRouter)
+    if args.search:
+        like = f"%{args.search.lower()}%"
+        stmt = stmt.where(
+            or_(
+                func.lower(OPNsenseRouter.name).like(like),
+                func.lower(OPNsenseRouter.description).like(like),
+                func.lower(OPNsenseRouter.host).like(like),
+            )
+        )
+    if args.enabled is not None:
+        stmt = stmt.where(OPNsenseRouter.enabled.is_(args.enabled))
+    stmt = stmt.order_by(OPNsenseRouter.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "id": str(r.id),
+                "name": r.name,
+                "description": r.description or "",
+                "enabled": r.enabled,
+                "endpoint": f"https://{r.host}:{r.port}",
+                "ipam_space_id": str(r.ipam_space_id),
+                "sync_interval_seconds": r.sync_interval_seconds,
+                "last_synced_at": r.last_synced_at.isoformat() if r.last_synced_at else None,
+                "last_sync_error": r.last_sync_error,
+                "firmware_version": r.firmware_version,
+                "interface_count": r.interface_count,
+                "lease_count": r.lease_count,
+            }
+        )
+    return out
