@@ -34,7 +34,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,6 +42,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
 from app.services.ai.operations import Operation, PreviewResult, register
+from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
 
 # Re-declared here (tiny) rather than imported from the routers, so this
 # module doesn't drag the whole router import graph in at load time.
@@ -1216,6 +1217,16 @@ class SyslogTargetArg(BaseModel):
         description="CA PEM for TLS targets (stored Fernet-encrypted). Required when protocol=tls.",
     )
 
+    @field_validator("host")
+    @classmethod
+    def _valid_host(cls, v: str) -> str:
+        # Strict charset shared with the REST PUT path — the host is
+        # interpolated into a quoted RainerScript ``target="..."`` param
+        # in the root-owned rsyslog config, so a value with a double-
+        # quote / backslash / whitespace / control char must be rejected
+        # before it can inject action params.
+        return validate_syslog_host(v)
+
 
 class UpdateSyslogSettingsArgs(BaseModel):
     enabled: bool
@@ -1225,12 +1236,27 @@ class UpdateSyslogSettingsArgs(BaseModel):
     filter: str | None = Field(default=None, description="rsyslog selector, e.g. '*.*'.")
     buffer_disk: bool | None = None
 
+    @field_validator("filter")
+    @classmethod
+    def _valid_filter(cls, v: str | None) -> str | None:
+        # Same selector-charset validation the REST PUT applies — the
+        # filter is rendered straight into the root-owned conf body, so a
+        # newline / directive char would inject without this guard.
+        return validate_syslog_filter(v)
+
 
 def _validate_syslog_targets(targets: list[SyslogTargetArg]) -> str | None:
-    """Return an operator-facing error string, or None when valid."""
+    """Return an operator-facing error string, or None when valid.
+
+    Note the strict host charset is enforced by ``SyslogTargetArg``'s
+    field validator (shared with the REST path) before this ever runs;
+    here we re-assert non-emptiness defensively + cover the port /
+    protocol / format / TLS-CA rules that aren't field-level."""
     for t in targets:
-        if not (t.host or "").strip():
-            return "every target needs a host"
+        try:
+            validate_syslog_host(t.host)
+        except ValueError as exc:
+            return str(exc)
         if not (1 <= t.port <= 65535):
             return f"port {t.port} out of range (1-65535)"
         if t.protocol not in _SYSLOG_PROTOCOLS:

@@ -22,6 +22,7 @@ from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
 from app.services import audit_forward as audit_forward_svc
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
+from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
 
 # SNMP v3 protocol allow-lists. Sticking to the protocols net-snmp's
 # Debian build ships out of the box — DES/AES for priv, MD5/SHA for
@@ -257,10 +258,22 @@ def _redact_v3_user(u: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _redact_syslog_target(t: dict[str, Any]) -> dict[str, Any]:
+def _redact_syslog_target(t: Any) -> dict[str, Any]:
     """Strip the CA PEM ciphertext from a stored syslog-target dict for
     the response shape — the operator only needs to know whether a CA
-    is configured (``ca_cert_set``), never the PEM bytes (#156)."""
+    is configured (``ca_cert_set``), never the PEM bytes (#156).
+
+    Guards against a non-dict entry (e.g. a malformed JSONB row) so
+    ``GET /settings`` never 500s — a bad entry coerces to an empty,
+    clearly-default target rather than raising ``AttributeError``."""
+    if not isinstance(t, dict):
+        return {
+            "host": "",
+            "port": 514,
+            "protocol": "udp",
+            "format": "rfc5424",
+            "ca_cert_set": False,
+        }
     return {
         "host": t.get("host", ""),
         "port": int(t.get("port") or 514),
@@ -461,12 +474,11 @@ class SyslogTargetUpdate(BaseModel):
     @field_validator("host")
     @classmethod
     def _syslog_host_nonempty(cls, v: str) -> str:
-        s = v.strip()
-        if not s:
-            raise ValueError("host may not be empty")
-        if any(c.isspace() for c in s):
-            raise ValueError("host may not contain whitespace")
-        return s
+        # Strict charset shared with the AI proposal path — the host is
+        # interpolated into a quoted RainerScript action param, so reject
+        # quotes / backslashes / whitespace / control chars, not just
+        # empty values.
+        return validate_syslog_host(v)
 
     @field_validator("port")
     @classmethod
@@ -789,15 +801,8 @@ class SettingsUpdate(BaseModel):
         # plus ``*`` wildcards and the ``!`` / ``=`` / ``;`` modifiers.
         # Rendered straight into the conf body, so reject control chars /
         # newlines / quotes to keep config injection out. Empty = the
-        # renderer defaults to ``*.*``.
-        if v is None:
-            return None
-        v = v.strip()
-        if v and not re.fullmatch(r"[A-Za-z0-9_*.,;:=!\- ]+", v):
-            raise ValueError(
-                "syslog_filter may only contain letters, digits, and * . , ; : = ! - _ space"
-            )
-        return v
+        # renderer defaults to ``*.*``. Shared with the AI proposal path.
+        return validate_syslog_filter(v)
 
     @field_validator("lldp_tx_interval")
     @classmethod

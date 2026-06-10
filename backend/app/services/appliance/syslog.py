@@ -39,10 +39,75 @@ Design notes:
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from typing import Any
 
 from app.core.crypto import decrypt_str
 from app.models.settings import PlatformSettings
+
+# Strict host charset shared by BOTH write paths (REST PUT +
+# AI proposal) and re-checked defensively at render time. The host is
+# interpolated into a quoted RainerScript ``target="..."`` action param,
+# so anything outside a hostname / IP-literal character class (quotes,
+# backslashes, whitespace, control chars) could break out of the string
+# and inject action params into the root-owned rsyslog config. Allow
+# only the characters that appear in DNS hostnames + IPv4/IPv6 literals:
+# letters, digits, dot, colon (IPv6), hyphen, underscore. No ``[]``
+# brackets — rsyslog's omfwd ``target`` takes a bare IPv6 literal.
+_SYSLOG_HOST_RE = re.compile(r"\A[A-Za-z0-9.:_-]+\Z")
+
+# rsyslog selector charset — ``facility.severity`` tokens, comma-joined,
+# plus ``*`` wildcards and the ``!`` / ``=`` / ``;`` / ``:`` modifiers.
+# Rendered straight into the conf body, so reject control chars /
+# newlines / quotes to keep config injection out. Shared by the REST PUT
+# validator + the AI proposal path.
+_SYSLOG_FILTER_RE = re.compile(r"[A-Za-z0-9_*.,;:=!\- ]+")
+
+
+def validate_syslog_host(host: str) -> str:
+    """Validate + normalise a syslog forward-target host.
+
+    Returns the stripped host when valid; raises ``ValueError`` with an
+    operator-facing message otherwise. Shared by the REST PUT validator
+    (``SyslogTargetUpdate``) and the AI proposal validator
+    (``SyslogTargetArg`` / ``_validate_syslog_targets``) so both write
+    paths enforce identical rules — the host lands in a quoted
+    RainerScript action param in the root-owned rsyslog config, so a
+    value with a double-quote / backslash / whitespace / control char
+    must never reach the renderer.
+    """
+    s = (host or "").strip()
+    if not s:
+        raise ValueError("host may not be empty")
+    if not _SYSLOG_HOST_RE.fullmatch(s):
+        raise ValueError(
+            "host may only contain letters, digits, and . : - _ "
+            "(hostname or IP literal); no quotes, backslashes, "
+            "whitespace, or control characters"
+        )
+    return s
+
+
+def validate_syslog_filter(value: str | None) -> str | None:
+    """Validate + normalise an rsyslog selector string.
+
+    ``None`` passes through unchanged (means "leave as-is" on the REST
+    PUT). A stripped non-empty value must match the selector charset or
+    ``ValueError`` is raised. Shared by the REST PUT
+    (``_valid_syslog_filter``) + the AI proposal path so a filter with a
+    newline / directive char can't inject into the root-owned conf via
+    either write surface.
+    """
+    if value is None:
+        return None
+    v = value.strip()
+    if v and not _SYSLOG_FILTER_RE.fullmatch(v):
+        raise ValueError(
+            "syslog_filter may only contain letters, digits, and * . , ; : = ! - _ space"
+        )
+    return v
+
 
 # rsyslog severity-mapping for the RFC5424 / RFC3164 framing. The
 # operator picks the wire format per-target; we translate to the
@@ -144,6 +209,18 @@ def render_rsyslog_conf(settings: PlatformSettings) -> str:
         host = (raw.get("host") or "").strip()
         if not host:
             continue
+        # Belt-and-suspenders: both write paths validate the host, but
+        # never trust a stored value — a host that fails the strict
+        # charset (e.g. an embedded quote / backslash from a malformed
+        # JSONB row) would break out of the quoted ``target="..."`` param
+        # and inject action params into this root-owned config, so drop it.
+        if not _SYSLOG_HOST_RE.fullmatch(host):
+            lines.append(
+                f"# Target {index}: dropped — host {host!r} contains "
+                "characters invalid for an rsyslog forward target."
+            )
+            lines.append("")
+            continue
         port = int(raw.get("port") or 514)
         protocol = (raw.get("protocol") or "udp").strip().lower()
         fmt = (raw.get("format") or "rfc5424").strip().lower()
@@ -206,8 +283,16 @@ def syslog_bundle(settings: PlatformSettings) -> dict[str, Any]:
     ``maybe_fire_syslog_reload``) reads the same keys without a KeyError:
 
       * ``enabled`` — the master toggle.
-      * ``config_hash`` — sha256 of the rendered body (empty string when
+      * ``config_hash`` — sha256 of the rendered body PLUS a
+        deterministic digest of ``ca_certs`` (empty string when
         disabled, so an enabled→disabled flip still shifts the hash).
+        The CA material is folded in because a TLS target references its
+        CA by a deterministic *path* (``StreamDriverCAFile``) that never
+        changes when the PEM is rotated — so a same-host/port/protocol/
+        format CA swap leaves the rendered body byte-identical. Without
+        hashing the PEM bytes the supervisor's ``maybe_fire`` trigger
+        would never fire and the appliance would keep validating against
+        the OLD CA forever (#156 review).
       * ``rsyslog_conf`` — the rendered body, written verbatim by the
         host runner (empty when disabled).
       * ``ca_certs`` — ``{filename: pem}`` of every TLS target's
@@ -216,7 +301,6 @@ def syslog_bundle(settings: PlatformSettings) -> dict[str, Any]:
     """
     enabled = bool(settings.syslog_enabled)
     body = render_rsyslog_conf(settings) if enabled else ""
-    config_hash = hashlib.sha256(body.encode("utf-8")).hexdigest() if body else ""
     ca_certs: dict[str, str] = {}
     if enabled:
         for index, raw in enumerate(list(settings.syslog_targets or [])):
@@ -227,6 +311,15 @@ def syslog_bundle(settings: PlatformSettings) -> dict[str, Any]:
             pem = _decrypt_or_none(raw.get("ca_cert_pem"))
             if pem:
                 ca_certs[_ca_filename(index)] = pem
+    if body:
+        # Fold the CA material into the hash so rotating a CA (same
+        # host/port/protocol/format, new PEM) shifts config_hash and the
+        # supervisor trigger fires. ``sort_keys=True`` keeps the digest
+        # deterministic regardless of dict insertion order.
+        ca_digest = json.dumps(ca_certs, sort_keys=True)
+        config_hash = hashlib.sha256((body + "\n" + ca_digest).encode("utf-8")).hexdigest()
+    else:
+        config_hash = ""
     return {
         "enabled": enabled,
         "config_hash": config_hash,

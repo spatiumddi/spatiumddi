@@ -176,6 +176,71 @@ async def test_syslog_targets_fold_into_dhcp_config_etag(db_session: AsyncSessio
     assert hash_before != hash_after
 
 
+async def test_ca_rotation_changes_config_hash() -> None:
+    """Rotating a TLS target's CA PEM (same host/port/protocol/format,
+    new PEM) MUST shift config_hash so the supervisor trigger fires —
+    the CA is referenced by a deterministic path so the rendered body is
+    byte-identical, and only folding the PEM bytes into the hash makes
+    the rotation observable (#156 review FIX 1)."""
+    from app.core.crypto import encrypt_str
+    from app.services.appliance.syslog import syslog_bundle
+
+    pem_old = "-----BEGIN CERTIFICATE-----\nOLDOLDOLD\n-----END CERTIFICATE-----\n"
+    pem_new = "-----BEGIN CERTIFICATE-----\nNEWNEWNEW\n-----END CERTIFICATE-----\n"
+
+    def _settings_with(pem: str) -> PlatformSettings:
+        return PlatformSettings(
+            id=1,
+            syslog_enabled=True,
+            syslog_targets=[
+                {
+                    "host": "siem.example",
+                    "port": 6514,
+                    "protocol": "tls",
+                    "format": "rfc5424",
+                    "ca_cert_pem": encrypt_str(pem).decode("ascii"),
+                }
+            ],
+            syslog_filter="*.*",
+        )
+
+    before = syslog_bundle(_settings_with(pem_old))
+    after = syslog_bundle(_settings_with(pem_new))
+
+    # The rendered body is identical (CA referenced by path), but the
+    # hash must differ because the staged CA PEM changed.
+    assert before["rsyslog_conf"] == after["rsyslog_conf"]
+    assert before["config_hash"] != after["config_hash"]
+    # The decrypted PEM is what actually got staged for the host runner.
+    assert list(after["ca_certs"].values()) == [pem_new]
+
+
+async def test_render_drops_target_with_injection_host() -> None:
+    """Belt-and-suspenders: even if a malformed JSONB row carries a host
+    with an embedded quote (which both write paths now reject), the
+    renderer must NOT emit it as a ``target="..."`` action — it drops it
+    with an inline comment instead (#156 review FIX 2)."""
+    from app.services.appliance.syslog import render_rsyslog_conf
+
+    s = PlatformSettings(
+        id=1,
+        syslog_enabled=True,
+        syslog_targets=[
+            {"host": 'a"b', "port": 514, "protocol": "udp", "format": "rfc5424"},
+            {"host": "good.example", "port": 514, "protocol": "udp", "format": "rfc5424"},
+        ],
+        syslog_filter="*.*",
+    )
+    body = render_rsyslog_conf(s)
+    # The bad host never reaches a target= action line — the only place
+    # it may appear is the inline "dropped" comment (host repr).
+    assert 'target="a"b"' not in body
+    assert not any(line.lstrip().startswith('target="a"b"') for line in body.splitlines())
+    assert "dropped" in body
+    # The good host still renders as a real action.
+    assert 'target="good.example"' in body
+
+
 # ── Issue #157 — ssh bundle + delivery ────────────────────────────────
 
 

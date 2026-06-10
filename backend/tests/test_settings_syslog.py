@@ -249,3 +249,79 @@ async def test_demo_mode_forbidden(
         json={"syslog_enabled": True, "syslog_targets": [_VALID_TARGET]},
     )
     assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_host_with_quote_rejected(db_session: AsyncSession, client: AsyncClient) -> None:
+    """A host with an embedded double-quote breaks out of the quoted
+    rsyslog ``target="..."`` action param — the strict charset validator
+    must 422 it (#156 review FIX 2)."""
+    _, token = await _make_user(db_session, username="sysinject1", superadmin=True)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.put(
+        "/api/v1/settings",
+        headers=headers,
+        json={
+            "syslog_enabled": True,
+            "syslog_targets": [{**_VALID_TARGET, "host": 'a"b'}],
+        },
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_host_with_backslash_rejected(db_session: AsyncSession, client: AsyncClient) -> None:
+    _, token = await _make_user(db_session, username="sysinject2", superadmin=True)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.put(
+        "/api/v1/settings",
+        headers=headers,
+        json={
+            "syslog_enabled": True,
+            "syslog_targets": [{**_VALID_TARGET, "host": "a\\b"}],
+        },
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_filter_with_newline_rejected(db_session: AsyncSession, client: AsyncClient) -> None:
+    """The selector is rendered straight into the root-owned conf — a
+    newline / directive char must 422 on the REST path too."""
+    _, token = await _make_user(db_session, username="sysfilter1", superadmin=True)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.put(
+        "/api/v1/settings",
+        headers=headers,
+        json={"syslog_enabled": True, "syslog_filter": "*.*\naction(...)"},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_get_settings_with_non_dict_target_does_not_500(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """A malformed (non-dict) entry in syslog_targets JSONB must not 500
+    GET /settings — _redact_syslog_target coerces it to a default shape
+    instead of raising AttributeError (#156 review FIX 4)."""
+    _, token = await _make_user(db_session, username="sysmalformed1", superadmin=True)
+    settings = await db_session.get(PlatformSettings, 1)
+    if settings is None:
+        settings = PlatformSettings(id=1)
+        db_session.add(settings)
+    settings.syslog_enabled = True
+    # A non-dict entry alongside a normal one — e.g. corrupt JSONB.
+    settings.syslog_targets = ["not-a-dict", dict(_VALID_TARGET)]
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.get("/api/v1/settings", headers=headers)
+    assert resp.status_code == 200, resp.text
+    targets = resp.json()["syslog_targets"]
+    assert len(targets) == 2
+    # The bad entry coerced to a clearly-default target.
+    assert targets[0]["host"] == ""
+    assert targets[1]["host"] == _VALID_TARGET["host"]
