@@ -206,13 +206,25 @@ PYEOF
 
         # Privileged-port in-use check. The server already rejects < 1024
         # except 22; here we additionally confirm the configured port isn't
-        # already bound by a non-sshd listener (which would leave sshd
-        # unable to start). ss is part of iproute2 on the appliance.
+        # already bound by a NON-sshd listener (which would leave sshd unable
+        # to start). ss is part of iproute2 on the appliance.
+        #
+        # We inspect the PROCESS column (-p) — without it ss prints the PEER
+        # address as the last field (0.0.0.0:* / [::]:*), so an $NF / grep
+        # filter never matches "ssh" and the guard fires against sshd's OWN
+        # listening socket. An sshd-owned socket on the configured port is
+        # always expected (operator is keeping or re-applying the same port),
+        # so we filter sshd/ssh out and only fail on a genuinely foreign
+        # listener.
         PORT="${SSH_PORT:-22}"
         if command -v ss >/dev/null 2>&1; then
-            INUSE=$(ss -ltnH "sport = :$PORT" 2>/dev/null | awk '{print $NF}' | grep -v 'sshd\|ssh' || true)
+            INUSE=$(ss -ltnpH "sport = :$PORT" 2>/dev/null \
+                | grep -oP 'users:\(\("\K[^"]+' \
+                | grep -vE '^sshd?$' \
+                | sort -u \
+                || true)
             if [ -n "$INUSE" ]; then
-                fail "ssh port $PORT is already in use by another listener: $INUSE"
+                fail "ssh port $PORT is already in use by another listener: $(echo "$INUSE" | tr '\n' ' ')"
             fi
         fi
 
