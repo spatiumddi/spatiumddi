@@ -38,6 +38,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     proposals,
     redis,
     reports,
+    resolver,
     snmp,
     ssh,
     syslog,

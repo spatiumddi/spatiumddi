@@ -98,6 +98,7 @@ from app.services.appliance.ca import (
 from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.resolver import resolver_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.appliance.ssh import ssh_bundle
 from app.services.appliance.syslog import syslog_bundle
@@ -995,6 +996,11 @@ class SupervisorHeartbeatRequest(BaseModel):
     # applied to ``~admin/.ssh/authorized_keys``. PER-HOST. None = not
     # collected (leave the stored column alone); a value (incl. 0) persists.
     ssh_key_count: int | None = None
+    # Issue #158 — systemd-resolved state the host runner reports after
+    # applying the resolver config. None = not collected (leave the stored
+    # column alone); a value persists. ``override`` = spatiumddi.conf
+    # drop-in applied; ``automatic`` = no drop-in; ``failed`` = apply error.
+    resolver_status: Literal["override", "automatic", "failed"] | None = None
     # Issue #347 — LLDP neighbours the local lldpd discovered. ``None`` = not
     # collected (leave the stored set alone); a list (possibly empty) is the
     # authoritative current set the handler upserts + absence-deletes against.
@@ -1270,6 +1276,11 @@ class SupervisorHeartbeatResponse(BaseModel):
     # CIDRs. Same shape the DHCP-agent ConfigBundle ships; disabled-shape
     # block still sent so the supervisor can retract managed SSH config.
     ssh_settings: dict[str, Any] = Field(default_factory=dict)
+    # Issue #158 — rendered systemd-resolved drop-in. Same shape the
+    # DHCP-agent ConfigBundle ships; disabled-shape block (automatic mode)
+    # still sent so the supervisor can retract the managed drop-in (revert
+    # to per-link DHCP / NetworkManager DNS).
+    resolver_settings: dict[str, Any] = Field(default_factory=dict)
     # #285 Phase 2a — server-side firewall render. ``{enabled, config_hash,
     # firewall_conf}``; empty config_hash when firewall_enabled is off (the
     # supervisor then keeps its in-pod fallback render). The supervisor
@@ -1497,6 +1508,10 @@ async def supervisor_heartbeat(
     # collected (leave the column alone); a value (incl. 0) persists.
     if body.ssh_key_count is not None:
         row.ssh_key_count = body.ssh_key_count
+    # Issue #158 — applied systemd-resolved state (per-host). None = not
+    # collected (leave the column alone); a value persists.
+    if body.resolver_status is not None:
+        row.resolver_status = body.resolver_status
     # Issue #347 — ingest the supervisor's local LLDP neighbours (upsert +
     # absence-delete). None = not collected (leave the set alone).
     if body.lldp_neighbours is not None:
@@ -1869,6 +1884,14 @@ async def supervisor_heartbeat(
             "key_count": 0,
         }
     )
+    # Issue #158 — systemd-resolved drop-in. Disabled-shape fallback
+    # (automatic mode) keeps a stable key set when no settings row exists
+    # yet so the supervisor's hash compare never KeyErrors.
+    resolver_block = (
+        resolver_bundle(cfg_row)
+        if cfg_row is not None
+        else {"enabled": False, "config_hash": "", "resolved_conf": ""}
+    )
     # #285 Phase 2a — server-side firewall render. Same inputs the in-pod
     # renderer consumes (byte-identical body). Gated on the firewall_enabled
     # master switch (default off → disabled-shape block → supervisor keeps
@@ -1955,6 +1978,7 @@ async def supervisor_heartbeat(
         lldp_settings=lldp_block,
         syslog_settings=syslog_block,
         ssh_settings=ssh_block,
+        resolver_settings=resolver_block,
         firewall_settings=firewall_block,
         long_poll=long_poll,
     )
@@ -2106,6 +2130,10 @@ class ApplianceRow(BaseModel):
     # Issue #157 — count of authorized_keys lines the host runner applied
     # (per-host). None on non-appliance / pre-#157 / never-reported rows.
     ssh_key_count: int | None
+    # Issue #158 — systemd-resolved state the host runner reported
+    # (override / automatic / failed). None on non-appliance / pre-#158 /
+    # never-reported rows.
+    resolver_status: str | None
     desired_appliance_version: str | None
     desired_slot_image_url: str | None
     desired_next_boot_slot: str | None
@@ -2206,6 +2234,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         ntp_sync_state=row.ntp_sync_state,
         syslog_forwarding=row.syslog_forwarding,
         ssh_key_count=row.ssh_key_count,
+        resolver_status=row.resolver_status,
         desired_appliance_version=row.desired_appliance_version,
         desired_slot_image_url=row.desired_slot_image_url,
         desired_next_boot_slot=row.desired_next_boot_slot,

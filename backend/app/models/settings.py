@@ -591,6 +591,53 @@ class PlatformSettings(Base):
         JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
     )
 
+    # ── Appliance DNS resolver (issue #158) ─────────────────────────
+    # systemd-resolved runs at the Debian host level on every appliance
+    # host (same host-config plane as SNMP / chrony / lldpd / rsyslog /
+    # sshd). The columns here are the singleton source of truth that every
+    # appliance host (local + remote agents) renders the
+    # ``/etc/systemd/resolved.conf.d/spatiumddi.conf`` drop-in from via the
+    # same ConfigBundle → trigger-file pipeline as #153/#154/#343/#156/#157.
+    #
+    # ``resolver_mode`` selects the behaviour:
+    #   ``automatic`` (default) — leave systemd-resolved to pick upstream
+    #                 DNS from per-link NetworkManager / DHCP. The runner
+    #                 removes the spatiumddi.conf drop-in (leaving the
+    #                 image's no-stub-listener.conf intact, which BIND9
+    #                 relies on to bind host :53).
+    #   ``override``  — pin a global server list (``DNS=``) that wins over
+    #                 the per-link servers. The renderer ALSO emits the
+    #                 route-only ``Domains=~.`` default ahead of any
+    #                 configured search domains so the global ``DNS=``
+    #                 servers actually take precedence over per-link
+    #                 NetworkManager/DHCP-provided resolvers.
+    #
+    # Resolver IPs / domains are NOT secrets (like NTP hostnames / SSH
+    # public keys), so they are stored verbatim — no Fernet, no redaction.
+    # The drop-in NEVER emits ``DNSStubListener`` — the image-shipped
+    # no-stub-listener.conf owns that knob (BIND9 binds host :53).
+    resolver_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="automatic", server_default=sa_text("'automatic'")
+    )
+    resolver_servers: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    resolver_fallback_servers: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    resolver_search_domains: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    resolver_dnssec: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="allow-downgrade",
+        server_default=sa_text("'allow-downgrade'"),
+    )
+    resolver_dns_over_tls: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="no", server_default=sa_text("'no'")
+    )
+
     # ── Fleet firewall master switch (issue #285 Phase 2) ───────────
     # Gates the NEW server-side-authoritative firewall render (Phase 2a:
     # the control plane ships a rendered drop-in + hash on the heartbeat

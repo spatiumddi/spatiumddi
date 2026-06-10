@@ -523,6 +523,14 @@ class Appliance(Base):
     # on non-appliance / pre-#157 rows; the heartbeat handler only
     # overwrites when the supervisor sends a non-None value.
     ssh_key_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Issue #158 — best-effort systemd-resolved state the supervisor
+    # reports after applying the resolver config. ``override`` (the
+    # spatiumddi.conf drop-in is applied) / ``automatic`` (no drop-in —
+    # per-link NetworkManager/DHCP DNS) / ``failed`` (apply error). NULL
+    # on non-appliance / pre-#158 rows; the heartbeat handler only
+    # overwrites when the supervisor sends a non-None value. Per-host,
+    # like ``ssh_key_count`` / ``syslog_forwarding``.
+    resolver_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # Operator-driven desired state. Set via the fleet UI / API;
     # supervisor's heartbeat poll picks them up + writes the matching

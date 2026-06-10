@@ -92,6 +92,12 @@ async def test_heartbeat_delivers_host_config_blocks(
     assert body["ssh_settings"]["config_hash"] == ""
     assert body["ssh_settings"]["password_auth"] is True
     assert body["ssh_settings"]["key_count"] == 0
+    # Issue #158 — resolver block present with its stable key set; default
+    # automatic mode → disabled, empty hash, empty body.
+    assert "resolver_settings" in body
+    assert body["resolver_settings"]["enabled"] is False
+    assert body["resolver_settings"]["config_hash"] == ""
+    assert body["resolver_settings"]["resolved_conf"] == ""
 
 
 # ── Issue #156 — syslog bundle + delivery ─────────────────────────────
@@ -219,4 +225,44 @@ async def test_ssh_keys_fold_into_dhcp_config_etag(db_session: AsyncSession) -> 
         {"name": "b", "public_key": _ed25519_key("two@host"), "comment": ""},
     ]
     hash_after = ssh_bundle(s)["config_hash"]
+    assert hash_before != hash_after
+
+
+# ── Issue #158 — resolver bundle + delivery ───────────────────────────
+
+
+async def test_heartbeat_delivers_resolver_block(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    s = await _settings(db_session)
+    s.resolver_mode = "override"
+    s.resolver_servers = ["1.1.1.1", "9.9.9.9"]
+    s.resolver_search_domains = ["corp.example.com"]
+    row, token = await _approved_supervisor(db_session)
+    await db_session.commit()
+
+    r = await client.post(
+        "/api/v1/appliance/supervisor/heartbeat",
+        json={"appliance_id": str(row.id), "session_token": token},
+    )
+    assert r.status_code == 200, r.text
+    block = r.json()["resolver_settings"]
+    assert block["enabled"] is True
+    assert block["config_hash"]
+    assert "DNS=1.1.1.1 9.9.9.9" in block["resolved_conf"]
+    assert "Domains=~. corp.example.com" in block["resolved_conf"]
+    # Never the stub listener.
+    assert "DNSStubListener" not in block["resolved_conf"]
+
+
+async def test_resolver_servers_fold_into_dhcp_config_etag(db_session: AsyncSession) -> None:
+    """Changing resolver_servers flips the DHCP /config ETag's resolver
+    marker — the bundle helper is the same one the agent endpoint mixes
+    into the fleet_marker, so the rendered config_hash must move."""
+    from app.services.appliance.resolver import resolver_bundle
+
+    s = PlatformSettings(id=1, resolver_mode="override", resolver_servers=["1.1.1.1"])
+    hash_before = resolver_bundle(s)["config_hash"]
+    s.resolver_servers = ["9.9.9.9"]
+    hash_after = resolver_bundle(s)["config_hash"]
     assert hash_before != hash_after

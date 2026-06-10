@@ -48,6 +48,15 @@ _NTP_SOURCE_MODES: set[str] = {"pool", "servers", "mixed"}
 _SYSLOG_PROTOCOLS: set[str] = {"udp", "tcp", "tls"}
 _SYSLOG_FORMATS: set[str] = {"rfc5424", "rfc3164", "json"}
 
+# Issue #158 — systemd-resolved drop-in validation.
+#   resolver_mode       — ``automatic`` (per-link DHCP / NetworkManager DNS)
+#                         vs ``override`` (pinned global DNS= server list).
+#   resolver_dnssec     — systemd-resolved ``DNSSEC=`` values.
+#   resolver_dns_over_tls — systemd-resolved ``DNSOverTLS=`` values.
+_RESOLVER_MODES: set[str] = {"automatic", "override"}
+_RESOLVER_DNSSEC: set[str] = {"yes", "no", "allow-downgrade"}
+_RESOLVER_DOT: set[str] = {"yes", "opportunistic", "no"}
+
 logger = structlog.get_logger(__name__)
 router = APIRouter()
 
@@ -200,6 +209,16 @@ class SettingsResponse(BaseModel):
     ssh_allow_root_login: bool = False
     ssh_port: int = 22
     ssh_allowed_source_networks: list[str] = []
+    # ── Appliance DNS resolver (issue #158) ───────────────────────
+    # No secrets — resolver IPs / search domains are not sensitive, so
+    # the read shape mirrors the stored shape directly (like NTP / SSH
+    # public keys).
+    resolver_mode: str = "automatic"
+    resolver_servers: list[str] = []
+    resolver_fallback_servers: list[str] = []
+    resolver_search_domains: list[str] = []
+    resolver_dnssec: str = "allow-downgrade"
+    resolver_dns_over_tls: str = "no"
 
     model_config = {"from_attributes": True}
 
@@ -645,6 +664,84 @@ class SettingsUpdate(BaseModel):
     ssh_allow_root_login: bool | None = None
     ssh_port: int | None = None
     ssh_allowed_source_networks: list[str] | None = None
+    # ── Appliance DNS resolver (issue #158) ───────────────────────
+    resolver_mode: str | None = None
+    resolver_servers: list[str] | None = None
+    resolver_fallback_servers: list[str] | None = None
+    resolver_search_domains: list[str] | None = None
+    resolver_dnssec: str | None = None
+    resolver_dns_over_tls: str | None = None
+
+    @field_validator("resolver_mode")
+    @classmethod
+    def _valid_resolver_mode(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _RESOLVER_MODES:
+            raise ValueError(f"resolver_mode must be one of {sorted(_RESOLVER_MODES)}")
+        return v
+
+    @field_validator("resolver_dnssec")
+    @classmethod
+    def _valid_resolver_dnssec(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _RESOLVER_DNSSEC:
+            raise ValueError(f"resolver_dnssec must be one of {sorted(_RESOLVER_DNSSEC)}")
+        return v
+
+    @field_validator("resolver_dns_over_tls")
+    @classmethod
+    def _valid_resolver_dot(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _RESOLVER_DOT:
+            raise ValueError(f"resolver_dns_over_tls must be one of {sorted(_RESOLVER_DOT)}")
+        return v
+
+    @field_validator("resolver_servers", "resolver_fallback_servers")
+    @classmethod
+    def _valid_resolver_servers(cls, v: list[str] | None) -> list[str] | None:
+        # Each entry must parse as a bare IP address — systemd-resolved's
+        # ``DNS=`` / ``FallbackDNS=`` take resolver IPs (v4 or v6), not
+        # hostnames. Reuse the same shape as the reverse_dns_resolvers
+        # validator below. Strip whitespace + drop empties.
+        if v is None:
+            return None
+        import ipaddress  # noqa: PLC0415
+
+        cleaned: list[str] = []
+        for entry in v:
+            host = (entry or "").strip()
+            if not host:
+                continue
+            try:
+                ipaddress.ip_address(host)
+            except ValueError as exc:
+                raise ValueError(f"invalid resolver IP: {entry!r}") from exc
+            cleaned.append(host)
+        return cleaned
+
+    @field_validator("resolver_search_domains")
+    @classmethod
+    def _valid_resolver_search(cls, v: list[str] | None) -> list[str] | None:
+        # Search domains are rendered straight into the ``Domains=`` line, so
+        # reject embedded whitespace / control chars (a smuggled space would
+        # split one domain into two; a newline would break out of the line).
+        # Strip + drop empties.
+        if v is None:
+            return None
+        out: list[str] = []
+        for raw in v:
+            s = (raw or "").strip()
+            if not s:
+                continue
+            if any(c.isspace() for c in s) or any(ord(c) < 0x20 for c in s):
+                raise ValueError(
+                    f"search domain may not contain whitespace / control chars: {raw!r}"
+                )
+            out.append(s)
+        return out
 
     @field_validator("ssh_port")
     @classmethod
@@ -1034,6 +1131,107 @@ class SettingsUpdate(BaseModel):
         return out
 
 
+# ── Dedicated resolver schema (issue #158) ──────────────────────────────────────
+
+
+class ResolverSettingsResponse(BaseModel):
+    """Focused read shape for ``GET /settings/resolver`` (issue #158).
+
+    A scoped slice of the combined ``SettingsResponse`` so the Appliance →
+    DNS Resolver form (and the ``find_resolver_settings`` MCP read) can fetch
+    just the resolver config without the rest of the platform-settings blob.
+    No secrets — resolver IPs / domains are not sensitive.
+    """
+
+    resolver_mode: str
+    resolver_servers: list[str]
+    resolver_fallback_servers: list[str]
+    resolver_search_domains: list[str]
+    resolver_dnssec: str
+    resolver_dns_over_tls: str
+
+    model_config = {"from_attributes": True}
+
+
+class ResolverSettingsUpdate(BaseModel):
+    """Focused write shape for ``PUT /settings/resolver`` (issue #158).
+
+    Same field-level validation as the matching ``resolver_*`` fields on
+    ``SettingsUpdate`` (mode / dnssec / dot enums + IP / search-domain
+    hygiene). ``None`` leaves the existing value alone.
+    """
+
+    resolver_mode: str | None = None
+    resolver_servers: list[str] | None = None
+    resolver_fallback_servers: list[str] | None = None
+    resolver_search_domains: list[str] | None = None
+    resolver_dnssec: str | None = None
+    resolver_dns_over_tls: str | None = None
+
+    @field_validator("resolver_mode")
+    @classmethod
+    def _valid_mode(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _RESOLVER_MODES:
+            raise ValueError(f"resolver_mode must be one of {sorted(_RESOLVER_MODES)}")
+        return v
+
+    @field_validator("resolver_dnssec")
+    @classmethod
+    def _valid_dnssec(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _RESOLVER_DNSSEC:
+            raise ValueError(f"resolver_dnssec must be one of {sorted(_RESOLVER_DNSSEC)}")
+        return v
+
+    @field_validator("resolver_dns_over_tls")
+    @classmethod
+    def _valid_dot(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _RESOLVER_DOT:
+            raise ValueError(f"resolver_dns_over_tls must be one of {sorted(_RESOLVER_DOT)}")
+        return v
+
+    @field_validator("resolver_servers", "resolver_fallback_servers")
+    @classmethod
+    def _valid_servers(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        import ipaddress  # noqa: PLC0415
+
+        cleaned: list[str] = []
+        for entry in v:
+            host = (entry or "").strip()
+            if not host:
+                continue
+            try:
+                ipaddress.ip_address(host)
+            except ValueError as exc:
+                raise ValueError(f"invalid resolver IP: {entry!r}") from exc
+            cleaned.append(host)
+        return cleaned
+
+    @field_validator("resolver_search_domains")
+    @classmethod
+    def _valid_search(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        out: list[str] = []
+        for raw in v:
+            s = (raw or "").strip()
+            if not s:
+                continue
+            if any(c.isspace() for c in s) or any(ord(c) < 0x20 for c in s):
+                raise ValueError(
+                    f"search domain may not contain whitespace / control chars: {raw!r}"
+                )
+            out.append(s)
+        return out
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
@@ -1131,7 +1329,7 @@ async def update_settings(
         "web_ui_allowed_cidrs",
     }
     _host_config_touched = any(
-        field.startswith(("snmp_", "ntp_", "lldp_", "syslog_", "ssh_"))
+        field.startswith(("snmp_", "ntp_", "lldp_", "syslog_", "ssh_", "resolver_"))
         or field in _supervisor_host_config_fields
         for field in changes
     )
@@ -1309,6 +1507,37 @@ async def update_settings(
             )
         )
 
+    # Issue #158 — dedicated audit row for any DNS-resolver change
+    # (non-negotiable #4). Resolver config steers where every appliance
+    # host sends its DNS lookups (and BIND9 binds host :53 on top), so a
+    # durable audit entry is warranted. Resolver IPs / domains are not
+    # secrets, so the full shape is recorded (no redaction). Fires
+    # whenever this request touched any ``resolver_*`` field. Computed off
+    # ``changes`` which still carries the resolver keys (they go through
+    # the generic setattr loop, no special pop like ssh/syslog).
+    _resolver_touched = any(f.startswith("resolver_") for f in changes)
+    if _resolver_touched:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="resolver",
+                resource_display="DNS resolver",
+                result="success",
+                new_value={
+                    "mode": settings.resolver_mode,
+                    "servers": list(settings.resolver_servers or []),
+                    "fallback_servers": list(settings.resolver_fallback_servers or []),
+                    "search_domains": list(settings.resolver_search_domains or []),
+                    "dnssec": settings.resolver_dnssec,
+                    "dns_over_tls": settings.resolver_dns_over_tls,
+                },
+            )
+        )
+
     # Issue #156 — dedicated audit row for any syslog-forwarding change
     # (non-negotiable #4). The generic ``logger.info`` below is not an
     # ``audit_log`` row; syslog forwarding ships logs off-box + carries a
@@ -1382,6 +1611,84 @@ async def update_settings(
 
     logger.info("platform_settings_updated", user=current_user.username, changes=changes)
     return settings
+
+
+# ── Dedicated resolver endpoints (issue #158) ───────────────────────────────────
+
+
+@router.get("/resolver", response_model=ResolverSettingsResponse)
+async def get_resolver_settings(current_user: CurrentUser, db: DB) -> ResolverSettingsResponse:
+    """Scoped read of just the appliance DNS-resolver config (issue #158).
+
+    A focused slice of ``GET /settings`` for the Appliance → DNS Resolver
+    form. The combined read is still complete (resolver_* live on
+    ``SettingsResponse`` too); this endpoint exists per the spec so the form
+    can fetch just its own state.
+    """
+    settings = await _get_or_create(db)
+    return ResolverSettingsResponse.model_validate(settings)
+
+
+@router.put("/resolver", response_model=ResolverSettingsResponse)
+async def update_resolver_settings(
+    body: ResolverSettingsUpdate, current_user: CurrentUser, db: DB
+) -> ResolverSettingsResponse:
+    """Scoped write of just the appliance DNS-resolver config (issue #158).
+
+    Same guardrails as the combined PUT: demo-mode block, ``write`` on
+    ``settings`` permission gate, a dedicated audit row (``resource_id=
+    'resolver'``), and a HOSTCONFIG_ALL wake so parked supervisor / DHCP-agent
+    long-polls pick the change up. Only the resolver_* columns are touched.
+    """
+    forbid_in_demo_mode("Platform settings updates are disabled")
+    if not user_has_permission(current_user, "write", "settings"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: need 'write' on 'settings'",
+        )
+
+    settings = await _get_or_create(db)
+    changes = body.model_dump(exclude_none=True)
+    if not changes:
+        # Nothing to do — return the current state without an audit row /
+        # wake so a no-op PUT is cheap.
+        return ResolverSettingsResponse.model_validate(settings)
+
+    for field, value in changes.items():
+        setattr(settings, field, value)
+
+    # Dedicated audit row (non-negotiable #4) — resolver config steers every
+    # appliance host's DNS lookups. Resolver IPs / domains are not secrets,
+    # so the full shape is recorded.
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="update",
+            resource_type="platform_settings",
+            resource_id="resolver",
+            resource_display="DNS resolver",
+            result="success",
+            new_value={
+                "mode": settings.resolver_mode,
+                "servers": list(settings.resolver_servers or []),
+                "fallback_servers": list(settings.resolver_fallback_servers or []),
+                "search_domains": list(settings.resolver_search_domains or []),
+                "dnssec": settings.resolver_dnssec,
+                "dns_over_tls": settings.resolver_dns_over_tls,
+            },
+        )
+    )
+
+    await db.commit()
+    await db.refresh(settings)
+
+    # Wake parked supervisor / DHCP-agent long-polls (HOSTCONFIG_ALL).
+    await publish_wake(HOSTCONFIG_ALL)
+
+    logger.info("resolver_settings_updated", user=current_user.username, changes=list(changes))
+    return ResolverSettingsResponse.model_validate(settings)
 
 
 class ReverseDnsRunResponse(BaseModel):

@@ -3023,7 +3023,24 @@ export interface PlatformSettings {
   ssh_allow_root_login: boolean;
   ssh_port: number;
   ssh_allowed_source_networks: string[];
+  /** Appliance DNS resolver (issue #158). No secrets — resolver IPs /
+   *  search domains are not sensitive, so read + write shapes match.
+   *  ``automatic`` defers to per-link NetworkManager / DHCP DNS;
+   *  ``override`` pins the global ``resolver_servers`` (which win over
+   *  per-link resolvers via a route-only ``~.`` default domain). The
+   *  rendered drop-in NEVER touches DNSStubListener (BIND9 binds host
+   *  :53). */
+  resolver_mode: ResolverMode;
+  resolver_servers: string[];
+  resolver_fallback_servers: string[];
+  resolver_search_domains: string[];
+  resolver_dnssec: ResolverDnssec;
+  resolver_dns_over_tls: ResolverDoT;
 }
+
+export type ResolverMode = "automatic" | "override";
+export type ResolverDnssec = "yes" | "no" | "allow-downgrade";
+export type ResolverDoT = "yes" | "opportunistic" | "no";
 
 /** One authorized SSH key. ``public_key`` is a single OpenSSH public-key
  *  line; ``name`` is an operator label, ``comment`` an optional note.
@@ -8403,6 +8420,10 @@ export interface ApplianceRow {
    *  actually applied, or null on non-appliance / pre-#157 / never-reported
    *  rows. */
   ssh_key_count: number | null;
+  /** Issue #158 — per-host systemd-resolved state the supervisor reported:
+   *  "override" / "automatic" / "failed", or null on non-appliance /
+   *  pre-#158 / never-reported rows. */
+  resolver_status: string | null;
   desired_appliance_version: string | null;
   desired_slot_image_url: string | null;
   // Operator's per-slot boot intents. Non-null means the Fleet UI

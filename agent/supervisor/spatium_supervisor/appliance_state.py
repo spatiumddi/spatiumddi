@@ -366,6 +366,21 @@ _SYSLOG_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/syslog-sta
 _SSH_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/ssh-config-pending")
 _SSH_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ssh-config-hash")
 _SSH_KEY_COUNT_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ssh-key-count")
+# Issue #158 — systemd-resolved equivalents. Same shape as SNMP / NTP /
+# LLDP / syslog / SSH. The trigger carries the rendered resolved.conf
+# drop-in body (a 2-line header) so the host runner can stage it (or
+# remove it on revert-to-automatic); the hash sidecar short-circuits
+# re-firing; the status sidecar carries the best-effort ``override`` /
+# ``automatic`` / ``failed`` verdict the heartbeat ships up.
+_RESOLVER_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/resolver-config-pending"
+)
+_RESOLVER_HASH_SIDECAR = Path(
+    "/var/lib/spatiumddi-host/release-state/resolver-config-hash"
+)
+_RESOLVER_STATUS_SIDECAR = Path(
+    "/var/lib/spatiumddi-host/release-state/resolver-status"
+)
 # Issue #285 Phase 2b — firewall apply-state sidecars the host-side
 # spatium-firewall-reload runner writes after each apply; echoed on the
 # heartbeat so the control plane can see drift + drive the apply alarm.
@@ -1071,6 +1086,77 @@ def read_ssh_key_count() -> int | None:
         return int(text)
     except ValueError:
         return None
+
+
+def maybe_fire_resolver_reload(bundle_block: object) -> bool:
+    """Issue #158 — write the resolver-config trigger when the control
+    plane's rendered systemd-resolved drop-in hash differs from the last
+    one this agent applied.
+
+    Strict appliance-only gate + hash-sidecar idempotency, mirroring
+    ``maybe_fire_syslog_reload``. The payload is a 2-line header plus the
+    rendered drop-in body the host runner stages:
+
+        line 1:   ``enabled`` | ``disabled`` marker
+        line 2:   config_hash (sha256 hex, blank when disabled/automatic)
+        line 3+:  rendered /etc/systemd/resolved.conf.d/spatiumddi.conf body
+                  (empty when disabled — the runner then REMOVES the drop-in)
+
+    ``enabled`` (override mode) → the runner writes the drop-in + reloads
+    systemd-resolved. ``disabled`` (automatic mode) → the runner removes
+    ONLY spatiumddi.conf (leaving the image-shipped no-stub-listener.conf
+    intact, which BIND9 relies on to bind host :53) + reloads. The drop-in
+    NEVER carries ``DNSStubListener``.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not isinstance(bundle_block, dict):
+        return False
+    config_hash = str(bundle_block.get("config_hash") or "")
+    resolved_conf = str(bundle_block.get("resolved_conf") or "")
+    enabled = bool(bundle_block.get("enabled"))
+    last_hash = ""
+    if _RESOLVER_HASH_SIDECAR.exists():
+        try:
+            last_hash = _RESOLVER_HASH_SIDECAR.read_text(encoding="utf-8").strip()
+        except OSError:
+            last_hash = ""
+    if config_hash == last_hash:
+        return False
+    if _RESOLVER_TRIGGER_FILE.exists():
+        return False
+    try:
+        _RESOLVER_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = (
+            ("enabled\n" if enabled else "disabled\n")
+            + (config_hash + "\n")
+            + resolved_conf
+        )
+        tmp = _RESOLVER_TRIGGER_FILE.with_suffix(".new")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(_RESOLVER_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def read_resolver_status() -> str | None:
+    """Read systemd-resolved's last-reported state from the sidecar the
+    host-side ``spatiumddi-resolved-reload`` runner writes after each apply.
+
+    One of ``override`` (the spatiumddi.conf drop-in is applied) /
+    ``automatic`` (no drop-in — per-link DHCP/NetworkManager DNS) /
+    ``failed`` (apply error), or ``None`` on docker / k8s (no sidecar
+    mounted) so the backend leaves the column alone (#158)."""
+    if not _RESOLVER_STATUS_SIDECAR.exists():
+        return None
+    try:
+        text = _RESOLVER_STATUS_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if text in ("override", "automatic", "failed"):
+        return text
+    return None
 
 
 def maybe_fire_lldp_reload(bundle_block: object) -> bool:
@@ -1875,6 +1961,10 @@ def collect() -> dict[str, object]:
         # host-side runner's count sidecar. None on non-appliance deploys
         # so the backend leaves the column alone.
         "ssh_key_count": read_ssh_key_count() if is_appliance else None,
+        # Issue #158 — systemd-resolved state from the host-side runner's
+        # status sidecar (override / automatic / failed). None on
+        # non-appliance deploys so the backend leaves the column alone.
+        "resolver_status": read_resolver_status() if is_appliance else None,
         # Issue #347 — LLDP neighbours discovered by local lldpd. None when
         # not collected (off-appliance / lldpcli error) so the backend leaves
         # the stored set alone; an empty list means "ran, saw none" (wipe).
