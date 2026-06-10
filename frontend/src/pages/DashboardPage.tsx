@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Children, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueries, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
@@ -84,6 +84,7 @@ import {
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
 
 /**
@@ -224,8 +225,8 @@ function SubnetHeatmap({ subnets }: { subnets: Subnet[] }) {
 
   return (
     <div className="rounded-lg border bg-card">
-      <div className="flex items-center justify-between border-b px-4 py-2.5">
-        <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2.5">
+        <div className="flex min-w-0 items-center gap-2">
           <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
           <h3 className="text-xs font-semibold uppercase tracking-wider">
             Subnet Utilization
@@ -234,7 +235,7 @@ function SubnetHeatmap({ subnets }: { subnets: Subnet[] }) {
             / {subnets.length} subnet{subnets.length === 1 ? "" : "s"}
           </span>
         </div>
-        <div className="flex items-center gap-3 text-[11px]">
+        <div className="flex flex-wrap items-center gap-3 text-[11px]">
           <div className="flex items-center gap-1">
             <span className="inline-block h-2.5 w-2.5 rounded-sm bg-muted/60" />
             <span className="text-muted-foreground">0%</span>
@@ -360,6 +361,21 @@ function humanTime(ts: string): string {
   return d.toLocaleDateString();
 }
 
+// Future-facing companion to ``humanTime`` — ``humanTime`` is a
+// past-only "N ago" formatter that collapses every future timestamp to
+// "just now". Use this for expiry dates (e.g. RPKI ROA ``valid_to``)
+// that are by definition in the future.
+function futureTime(ts: string): string {
+  const d = new Date(ts);
+  const diff = Math.floor((d.getTime() - Date.now()) / 1000);
+  if (diff <= 0) return "expired";
+  if (diff < 3600) return `in ${Math.max(1, Math.floor(diff / 60))}m`;
+  if (diff < 86400) return `in ${Math.floor(diff / 3600)}h`;
+  const days = Math.floor(diff / 86400);
+  if (days <= 90) return `in ${days}d`;
+  return d.toLocaleDateString();
+}
+
 // ── Status chip ─────────────────────────────────────────────────────────────
 
 function StatusChip({
@@ -392,11 +408,20 @@ function StatusChip({
 // ── ASN Summary card ─────────────────────────────────────────────────────────
 
 function AsnSummaryCard() {
+  const { enabled, ready } = useFeatureModules();
+  // Gate on ``ready`` so the query waits for the real module state (``enabled``
+  // is optimistically true while loading → a one-shot 404 on hard load).
+  const moduleOn = ready && enabled("network.asn");
   const { data, isLoading, isError } = useQuery({
     queryKey: ["asns-summary"],
     queryFn: () => asnsApi.list({ limit: 200 }),
     staleTime: 30_000,
+    enabled: moduleOn,
   });
+
+  // When the ASN module is off the gated endpoint 404s — render
+  // nothing (the 4-up grid just collapses) instead of a red error card.
+  if (!moduleOn) return null;
 
   const inner = (() => {
     if (isLoading) {
@@ -523,6 +548,8 @@ function AsnSummaryCard() {
 // ── VRF Summary card ─────────────────────────────────────────────────────────
 
 function VrfSummaryCard() {
+  const { enabled, ready } = useFeatureModules();
+  const moduleOn = ready && enabled("network.vrf");
   const {
     data: vrfs = [],
     isLoading,
@@ -531,7 +558,12 @@ function VrfSummaryCard() {
     queryKey: ["vrfs-summary"],
     queryFn: () => vrfsApi.list(),
     staleTime: 30_000,
+    enabled: moduleOn,
   });
+
+  // When the VRF module is off the gated endpoint 404s — render
+  // nothing (the 4-up grid just collapses) instead of a red error card.
+  if (!moduleOn) return null;
 
   const inner = (() => {
     if (isLoading) {
@@ -863,6 +895,19 @@ const _PERSISTED_TABS: ReadonlySet<DashboardTab> = new Set([
 
 export function DashboardPage() {
   const qc = useQueryClient();
+  const { enabled } = useFeatureModules();
+
+  // Per-tab feature-module gate — keep in lock-step with the tab-bar
+  // array's ``module`` fields below. A tab whose module is off is hidden
+  // and must never be the active tab (its panel would 404).
+  const _TAB_MODULES: Partial<Record<DashboardTab, string>> = {
+    conformity: "compliance.conformity",
+  };
+  const tabVisible = (key: DashboardTab): boolean => {
+    const mod = _TAB_MODULES[key];
+    return !mod || enabled(mod);
+  };
+
   const [tab, setTab] = useState<DashboardTab>(() => {
     const saved = localStorage.getItem("dashboard-tab");
     if (saved && _PERSISTED_TABS.has(saved as DashboardTab)) {
@@ -874,6 +919,17 @@ export function DashboardPage() {
     setTab(next);
     localStorage.setItem("dashboard-tab", next);
   }
+
+  // If the persisted tab points at a now-hidden (module-disabled) tab,
+  // fall back to Overview so we don't render a panel against a 404'd
+  // endpoint.
+  useEffect(() => {
+    if (!tabVisible(tab)) {
+      setTab("overview");
+      localStorage.setItem("dashboard-tab", "overview");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, enabled]);
 
   // IPAM
   const { data: spaces } = useQuery({
@@ -1176,8 +1232,8 @@ export function DashboardPage() {
             feed + platform health; the per-subsystem tabs surface the
             subsystem-scoped panels (charts, server lists, integration
             status) without overcrowding the home view. */}
-        <div className="border-b">
-          <div className="flex gap-1">
+        <div className="border-b overflow-x-auto">
+          <div className="flex gap-1 min-w-max whitespace-nowrap">
             {(
               [
                 { key: "overview", label: "Overview", Icon: Activity },
@@ -1191,25 +1247,28 @@ export function DashboardPage() {
                   key: "conformity",
                   label: "Conformity",
                   Icon: ClipboardCheck,
+                  module: "compliance.conformity",
                 },
                 { key: "security", label: "Security", Icon: Lock },
               ] as const
-            ).map(({ key, label, Icon }) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => selectTab(key)}
-                className={cn(
-                  "inline-flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm font-medium -mb-px transition-colors",
-                  tab === key
-                    ? "border-primary text-foreground"
-                    : "border-transparent text-muted-foreground hover:text-foreground",
-                )}
-              >
-                <Icon className="h-3.5 w-3.5" />
-                {label}
-              </button>
-            ))}
+            )
+              .filter((t) => !("module" in t) || enabled(t.module))
+              .map(({ key, label, Icon }) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => selectTab(key)}
+                  className={cn(
+                    "inline-flex shrink-0 items-center gap-1.5 border-b-2 px-3 py-2 text-sm font-medium -mb-px transition-colors",
+                    tab === key
+                      ? "border-primary text-foreground"
+                      : "border-transparent text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <Icon className="h-3.5 w-3.5" />
+                  {label}
+                </button>
+              ))}
           </div>
         </div>
 
@@ -1432,35 +1491,39 @@ export function DashboardPage() {
                   Showing {topSubnets.length} of {subnets?.length ?? 0}
                 </span>
               </div>
-              <div className="divide-y">
-                {topSubnets.length === 0 ? (
-                  <div className="px-4 py-8 text-center text-xs text-muted-foreground">
-                    No subnets have allocated IPs yet.
-                  </div>
-                ) : (
-                  topSubnets.map((subnet) => (
-                    <Link
-                      key={subnet.id}
-                      to={`/ipam?subnet=${subnet.id}`}
-                      className="flex items-center gap-4 px-4 py-2.5 transition-colors hover:bg-accent/40"
-                    >
-                      <span className="w-32 flex-shrink-0 font-mono text-xs">
-                        {subnet.network}
-                      </span>
-                      <span className="w-32 truncate text-xs text-muted-foreground">
-                        {subnet.name || (
-                          <span className="text-muted-foreground/40">—</span>
-                        )}
-                      </span>
-                      <div className="flex-1">
-                        <UtilizationBar percent={subnet.utilization_percent} />
-                      </div>
-                      <span className="w-20 text-right text-[11px] tabular-nums text-muted-foreground">
-                        {subnet.allocated_ips} / {subnet.total_ips}
-                      </span>
-                    </Link>
-                  ))
-                )}
+              <div className="overflow-x-auto">
+                <div className="min-w-[480px] divide-y">
+                  {topSubnets.length === 0 ? (
+                    <div className="px-4 py-8 text-center text-xs text-muted-foreground">
+                      No subnets have allocated IPs yet.
+                    </div>
+                  ) : (
+                    topSubnets.map((subnet) => (
+                      <Link
+                        key={subnet.id}
+                        to={`/ipam?subnet=${subnet.id}`}
+                        className="flex items-center gap-4 px-4 py-2.5 transition-colors hover:bg-accent/40"
+                      >
+                        <span className="w-32 flex-shrink-0 font-mono text-xs">
+                          {subnet.network}
+                        </span>
+                        <span className="w-32 truncate text-xs text-muted-foreground">
+                          {subnet.name || (
+                            <span className="text-muted-foreground/40">—</span>
+                          )}
+                        </span>
+                        <div className="flex-1">
+                          <UtilizationBar
+                            percent={subnet.utilization_percent}
+                          />
+                        </div>
+                        <span className="w-20 text-right text-[11px] tabular-nums text-muted-foreground">
+                          {subnet.allocated_ips} / {subnet.total_ips}
+                        </span>
+                      </Link>
+                    ))
+                  )}
+                </div>
               </div>
             </div>
 
@@ -1483,38 +1546,40 @@ export function DashboardPage() {
                   view all →
                 </Link>
               </div>
-              <div className="divide-y">
-                {!recent || recent.items.length === 0 ? (
-                  <div className="px-4 py-8 text-center text-xs text-muted-foreground">
-                    No recent activity. Try creating a subnet or a DNS record.
-                  </div>
-                ) : (
-                  recent.items.slice(0, 12).map((entry) => (
-                    <div
-                      key={entry.id}
-                      className="flex items-center gap-3 px-4 py-2 text-[11px]"
-                    >
-                      <span className="w-14 flex-shrink-0 tabular-nums text-muted-foreground">
-                        {humanTime(entry.timestamp)}
-                      </span>
-                      <span className="w-36 flex-shrink-0 min-w-0">
-                        <ActionBadge
-                          action={entry.action}
-                          result={entry.result}
-                        />
-                      </span>
-                      <span className="w-20 flex-shrink-0 truncate text-muted-foreground">
-                        {entry.resource_type.replace(/_/g, " ")}
-                      </span>
-                      <span className="flex-1 truncate font-mono">
-                        {entry.resource_display}
-                      </span>
-                      <span className="w-20 flex-shrink-0 truncate text-right text-muted-foreground">
-                        {entry.user_display_name}
-                      </span>
+              <div className="overflow-x-auto">
+                <div className="min-w-[440px] divide-y">
+                  {!recent || recent.items.length === 0 ? (
+                    <div className="px-4 py-8 text-center text-xs text-muted-foreground">
+                      No recent activity. Try creating a subnet or a DNS record.
                     </div>
-                  ))
-                )}
+                  ) : (
+                    recent.items.slice(0, 12).map((entry) => (
+                      <div
+                        key={entry.id}
+                        className="flex items-center gap-3 px-4 py-2 text-[11px]"
+                      >
+                        <span className="w-14 flex-shrink-0 tabular-nums text-muted-foreground">
+                          {humanTime(entry.timestamp)}
+                        </span>
+                        <span className="w-36 flex-shrink-0 min-w-0">
+                          <ActionBadge
+                            action={entry.action}
+                            result={entry.result}
+                          />
+                        </span>
+                        <span className="w-20 flex-shrink-0 truncate text-muted-foreground">
+                          {entry.resource_type.replace(/_/g, " ")}
+                        </span>
+                        <span className="flex-1 truncate font-mono">
+                          {entry.resource_display}
+                        </span>
+                        <span className="w-20 flex-shrink-0 truncate text-right text-muted-foreground">
+                          {entry.user_display_name}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -1582,22 +1647,24 @@ export function DashboardPage() {
                 </span>
               </div>
             </div>
-            <div className="divide-y">
-              {allDnsServers.map((s) => {
-                const group = dnsGroups.find((g) => g.id === s.group_id);
-                return (
-                  <ServerRow
-                    key={s.id}
-                    name={s.name}
-                    host={`${s.host}:${s.port}`}
-                    driver={s.driver}
-                    status={s.status}
-                    groupName={group?.name ?? "—"}
-                    lastSeen={s.last_health_check_at}
-                    isEnabled={s.is_enabled !== false}
-                  />
-                );
-              })}
+            <div className="overflow-x-auto">
+              <div className="min-w-[520px] divide-y">
+                {allDnsServers.map((s) => {
+                  const group = dnsGroups.find((g) => g.id === s.group_id);
+                  return (
+                    <ServerRow
+                      key={s.id}
+                      name={s.name}
+                      host={`${s.host}:${s.port}`}
+                      driver={s.driver}
+                      status={s.status}
+                      groupName={group?.name ?? "—"}
+                      lastSeen={s.last_health_check_at}
+                      isEnabled={s.is_enabled !== false}
+                    />
+                  );
+                })}
+              </div>
             </div>
           </div>
         )}
@@ -1628,25 +1695,27 @@ export function DashboardPage() {
                 </span>
               </div>
             </div>
-            <div className="divide-y">
-              {dhcpServers.map((s) => {
-                const group = dhcpGroups.find(
-                  (g) => g.id === s.server_group_id,
-                );
-                return (
-                  <ServerRow
-                    key={s.id}
-                    name={s.name}
-                    host={`${s.host}:${s.port}`}
-                    driver={s.driver}
-                    status={
-                      !s.agent_approved ? "pending" : (s.status ?? "unknown")
-                    }
-                    groupName={group?.name ?? "ungrouped"}
-                    lastSeen={s.last_health_check_at}
-                  />
-                );
-              })}
+            <div className="overflow-x-auto">
+              <div className="min-w-[520px] divide-y">
+                {dhcpServers.map((s) => {
+                  const group = dhcpGroups.find(
+                    (g) => g.id === s.server_group_id,
+                  );
+                  return (
+                    <ServerRow
+                      key={s.id}
+                      name={s.name}
+                      host={`${s.host}:${s.port}`}
+                      driver={s.driver}
+                      status={
+                        !s.agent_approved ? "pending" : (s.status ?? "unknown")
+                      }
+                      groupName={group?.name ?? "ungrouped"}
+                      lastSeen={s.last_health_check_at}
+                    />
+                  );
+                })}
+              </div>
             </div>
             {haGroups.length > 0 && (
               <>
@@ -1709,7 +1778,7 @@ export function DashboardPage() {
             </div>
           )}
 
-        {/* ── Compliance tab ────────────────────────────────────────── */}
+        {/* ── Network tab ───────────────────────────────────────────── */}
         {tab === "network" && <NetworkPanel />}
 
         {tab === "integrations" && <IntegrationsDashboardTabPanel />}
@@ -2194,20 +2263,24 @@ function IntegrationsPanel({
                 No clusters registered.
               </p>
             ) : (
-              <div className="divide-y">
-                {clusters.map((c) => (
-                  <IntegrationRow
-                    key={c.id}
-                    to={`/kubernetes`}
-                    name={c.name}
-                    subtitle={c.api_server_url}
-                    meta={c.node_count != null ? `${c.node_count} nodes` : "—"}
-                    lastSyncedAt={c.last_synced_at}
-                    lastSyncError={c.last_sync_error}
-                    intervalSeconds={c.sync_interval_seconds}
-                    enabled={c.enabled}
-                  />
-                ))}
+              <div className="overflow-x-auto">
+                <div className="min-w-[520px] divide-y">
+                  {clusters.map((c) => (
+                    <IntegrationRow
+                      key={c.id}
+                      to={`/kubernetes`}
+                      name={c.name}
+                      subtitle={c.api_server_url}
+                      meta={
+                        c.node_count != null ? `${c.node_count} nodes` : "—"
+                      }
+                      lastSyncedAt={c.last_synced_at}
+                      lastSyncError={c.last_sync_error}
+                      intervalSeconds={c.sync_interval_seconds}
+                      enabled={c.enabled}
+                    />
+                  ))}
+                </div>
               </div>
             )}
           </div>
@@ -2229,24 +2302,26 @@ function IntegrationsPanel({
                 No hosts registered.
               </p>
             ) : (
-              <div className="divide-y">
-                {hosts.map((h) => (
-                  <IntegrationRow
-                    key={h.id}
-                    to={`/docker`}
-                    name={h.name}
-                    subtitle={h.endpoint}
-                    meta={
-                      h.container_count != null
-                        ? `${h.container_count} containers`
-                        : "—"
-                    }
-                    lastSyncedAt={h.last_synced_at}
-                    lastSyncError={h.last_sync_error}
-                    intervalSeconds={h.sync_interval_seconds}
-                    enabled={h.enabled}
-                  />
-                ))}
+              <div className="overflow-x-auto">
+                <div className="min-w-[520px] divide-y">
+                  {hosts.map((h) => (
+                    <IntegrationRow
+                      key={h.id}
+                      to={`/docker`}
+                      name={h.name}
+                      subtitle={h.endpoint}
+                      meta={
+                        h.container_count != null
+                          ? `${h.container_count} containers`
+                          : "—"
+                      }
+                      lastSyncedAt={h.last_synced_at}
+                      lastSyncError={h.last_sync_error}
+                      intervalSeconds={h.sync_interval_seconds}
+                      enabled={h.enabled}
+                    />
+                  ))}
+                </div>
               </div>
             )}
           </div>
@@ -2268,26 +2343,28 @@ function IntegrationsPanel({
                 No endpoints registered.
               </p>
             ) : (
-              <div className="divide-y">
-                {proxmoxNodes.map((p) => (
-                  <IntegrationRow
-                    key={p.id}
-                    to={`/proxmox`}
-                    name={p.name}
-                    subtitle={`${p.host}:${p.port}`}
-                    meta={
-                      p.cluster_name
-                        ? `${p.cluster_name} (${p.node_count ?? "?"})`
-                        : p.node_count != null
-                          ? `${p.node_count} node${p.node_count === 1 ? "" : "s"}`
-                          : "—"
-                    }
-                    lastSyncedAt={p.last_synced_at}
-                    lastSyncError={p.last_sync_error}
-                    intervalSeconds={p.sync_interval_seconds}
-                    enabled={p.enabled}
-                  />
-                ))}
+              <div className="overflow-x-auto">
+                <div className="min-w-[520px] divide-y">
+                  {proxmoxNodes.map((p) => (
+                    <IntegrationRow
+                      key={p.id}
+                      to={`/proxmox`}
+                      name={p.name}
+                      subtitle={`${p.host}:${p.port}`}
+                      meta={
+                        p.cluster_name
+                          ? `${p.cluster_name} (${p.node_count ?? "?"})`
+                          : p.node_count != null
+                            ? `${p.node_count} node${p.node_count === 1 ? "" : "s"}`
+                            : "—"
+                      }
+                      lastSyncedAt={p.last_synced_at}
+                      lastSyncError={p.last_sync_error}
+                      intervalSeconds={p.sync_interval_seconds}
+                      enabled={p.enabled}
+                    />
+                  ))}
+                </div>
               </div>
             )}
           </div>
@@ -2309,27 +2386,29 @@ function IntegrationsPanel({
                 No firewalls registered.
               </p>
             ) : (
-              <div className="divide-y">
-                {opnsenseRouters.map((r) => (
-                  <IntegrationRow
-                    key={r.id}
-                    to={`/opnsense`}
-                    name={r.name}
-                    subtitle={`${r.host}:${r.port}`}
-                    meta={
-                      r.interface_count != null
-                        ? `${r.interface_count} iface${r.interface_count === 1 ? "" : "s"}` +
-                          (r.lease_count != null
-                            ? ` · ${r.lease_count} lease${r.lease_count === 1 ? "" : "s"}`
-                            : "")
-                        : "—"
-                    }
-                    lastSyncedAt={r.last_synced_at}
-                    lastSyncError={r.last_sync_error}
-                    intervalSeconds={r.sync_interval_seconds}
-                    enabled={r.enabled}
-                  />
-                ))}
+              <div className="overflow-x-auto">
+                <div className="min-w-[520px] divide-y">
+                  {opnsenseRouters.map((r) => (
+                    <IntegrationRow
+                      key={r.id}
+                      to={`/opnsense`}
+                      name={r.name}
+                      subtitle={`${r.host}:${r.port}`}
+                      meta={
+                        r.interface_count != null
+                          ? `${r.interface_count} iface${r.interface_count === 1 ? "" : "s"}` +
+                            (r.lease_count != null
+                              ? ` · ${r.lease_count} lease${r.lease_count === 1 ? "" : "s"}`
+                              : "")
+                          : "—"
+                      }
+                      lastSyncedAt={r.last_synced_at}
+                      lastSyncError={r.last_sync_error}
+                      intervalSeconds={r.sync_interval_seconds}
+                      enabled={r.enabled}
+                    />
+                  ))}
+                </div>
               </div>
             )}
           </div>
@@ -2351,30 +2430,32 @@ function IntegrationsPanel({
                 No accounts registered.
               </p>
             ) : (
-              <div className="divide-y">
-                {cloudEndpoints.map((ep) => (
-                  <IntegrationRow
-                    key={ep.id}
-                    to={`/cloud`}
-                    name={ep.name}
-                    subtitle={
-                      ep.provider_account_id
-                        ? `${ep.provider} · ${ep.provider_account_id}`
-                        : ep.provider
-                    }
-                    meta={
-                      ep.network_count != null || ep.instance_count != null
-                        ? `${ep.network_count ?? 0} net${
-                            ep.network_count === 1 ? "" : "s"
-                          } · ${ep.instance_count ?? 0} inst`
-                        : "—"
-                    }
-                    lastSyncedAt={ep.last_synced_at}
-                    lastSyncError={ep.last_sync_error}
-                    intervalSeconds={ep.sync_interval_seconds}
-                    enabled={ep.enabled}
-                  />
-                ))}
+              <div className="overflow-x-auto">
+                <div className="min-w-[520px] divide-y">
+                  {cloudEndpoints.map((ep) => (
+                    <IntegrationRow
+                      key={ep.id}
+                      to={`/cloud`}
+                      name={ep.name}
+                      subtitle={
+                        ep.provider_account_id
+                          ? `${ep.provider} · ${ep.provider_account_id}`
+                          : ep.provider
+                      }
+                      meta={
+                        ep.network_count != null || ep.instance_count != null
+                          ? `${ep.network_count ?? 0} net${
+                              ep.network_count === 1 ? "" : "s"
+                            } · ${ep.instance_count ?? 0} inst`
+                          : "—"
+                      }
+                      lastSyncedAt={ep.last_synced_at}
+                      lastSyncError={ep.last_sync_error}
+                      intervalSeconds={ep.sync_interval_seconds}
+                      enabled={ep.enabled}
+                    />
+                  ))}
+                </div>
               </div>
             )}
           </div>
@@ -2396,24 +2477,26 @@ function IntegrationsPanel({
                 No tenants registered.
               </p>
             ) : (
-              <div className="divide-y">
-                {tailscaleTenants.map((t) => (
-                  <IntegrationRow
-                    key={t.id}
-                    to={`/tailscale`}
-                    name={t.name}
-                    subtitle={t.tailnet_domain ?? `tailnet ${t.tailnet}`}
-                    meta={
-                      t.device_count != null
-                        ? `${t.device_count} device${t.device_count === 1 ? "" : "s"}`
-                        : "—"
-                    }
-                    lastSyncedAt={t.last_synced_at}
-                    lastSyncError={t.last_sync_error}
-                    intervalSeconds={t.sync_interval_seconds}
-                    enabled={t.enabled}
-                  />
-                ))}
+              <div className="overflow-x-auto">
+                <div className="min-w-[520px] divide-y">
+                  {tailscaleTenants.map((t) => (
+                    <IntegrationRow
+                      key={t.id}
+                      to={`/tailscale`}
+                      name={t.name}
+                      subtitle={t.tailnet_domain ?? `tailnet ${t.tailnet}`}
+                      meta={
+                        t.device_count != null
+                          ? `${t.device_count} device${t.device_count === 1 ? "" : "s"}`
+                          : "—"
+                      }
+                      lastSyncedAt={t.last_synced_at}
+                      lastSyncError={t.last_sync_error}
+                      intervalSeconds={t.sync_interval_seconds}
+                      enabled={t.enabled}
+                    />
+                  ))}
+                </div>
               </div>
             )}
           </div>
@@ -2435,31 +2518,33 @@ function IntegrationsPanel({
                 No controllers registered.
               </p>
             ) : (
-              <div className="divide-y">
-                {unifiControllers.map((c) => (
-                  <IntegrationRow
-                    key={c.id}
-                    to={`/unifi/${c.id}`}
-                    name={c.name}
-                    subtitle={
-                      c.mode === "cloud"
-                        ? `cloud · ${c.cloud_host_id ? c.cloud_host_id.slice(0, 8) + "…" : "?"}`
-                        : `${c.host ?? "?"}:${c.port}`
-                    }
-                    meta={
-                      c.site_count != null
-                        ? `${c.site_count} site${c.site_count === 1 ? "" : "s"}` +
-                          (c.network_count != null
-                            ? ` · ${c.network_count} net${c.network_count === 1 ? "" : "s"}`
-                            : "")
-                        : "—"
-                    }
-                    lastSyncedAt={c.last_synced_at}
-                    lastSyncError={c.last_sync_error}
-                    intervalSeconds={c.sync_interval_seconds}
-                    enabled={c.enabled}
-                  />
-                ))}
+              <div className="overflow-x-auto">
+                <div className="min-w-[520px] divide-y">
+                  {unifiControllers.map((c) => (
+                    <IntegrationRow
+                      key={c.id}
+                      to={`/unifi/${c.id}`}
+                      name={c.name}
+                      subtitle={
+                        c.mode === "cloud"
+                          ? `cloud · ${c.cloud_host_id ? c.cloud_host_id.slice(0, 8) + "…" : "?"}`
+                          : `${c.host ?? "?"}:${c.port}`
+                      }
+                      meta={
+                        c.site_count != null
+                          ? `${c.site_count} site${c.site_count === 1 ? "" : "s"}` +
+                            (c.network_count != null
+                              ? ` · ${c.network_count} net${c.network_count === 1 ? "" : "s"}`
+                              : "")
+                          : "—"
+                      }
+                      lastSyncedAt={c.last_synced_at}
+                      lastSyncError={c.last_sync_error}
+                      intervalSeconds={c.sync_interval_seconds}
+                      enabled={c.enabled}
+                    />
+                  ))}
+                </div>
               </div>
             )}
           </div>
@@ -2748,16 +2833,50 @@ function ComplianceKpi({
 // The companion Compliance tab covers the static + reactive picture
 // (classification roll-up + audit-log change events).
 function ConformityPanel() {
+  const { enabled, ready } = useFeatureModules();
+  const moduleEnabled = enabled("compliance.conformity");
+  // Gate queries on ``ready`` so they wait for the real module state; show the
+  // "disabled" empty state only once we KNOW it's off (not while still loading).
+  const moduleOn = ready && moduleEnabled;
+  const [pdfError, setPdfError] = useState<string | null>(null);
+  const [pdfBusy, setPdfBusy] = useState(false);
   const summaryQ = useQuery<ConformitySummary>({
     queryKey: ["conformity-summary"],
     queryFn: () => conformityApi.summary(),
     refetchInterval: 60_000,
+    enabled: moduleOn,
   });
   const failingQ = useQuery<ConformityResult[]>({
     queryKey: ["conformity-results", "fail-recent"],
     queryFn: () => conformityApi.listResults({ status: "fail", limit: 20 }),
     refetchInterval: 60_000,
+    enabled: moduleOn,
   });
+
+  async function handleExportPdf() {
+    setPdfError(null);
+    setPdfBusy(true);
+    try {
+      await conformityApi.exportPdf();
+    } catch (err) {
+      setPdfError(
+        err instanceof Error ? err.message : "Failed to generate audit PDF.",
+      );
+    } finally {
+      setPdfBusy(false);
+    }
+  }
+
+  // When the Conformity module is off the /conformity/* endpoints 404 —
+  // show a muted empty state instead of a wall of red error cards. Only once
+  // ready (known-off), so we don't flash this during the module-load window.
+  if (ready && !moduleEnabled) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-sm text-muted-foreground">
+        Conformity module is disabled — enable it in Settings → Features.
+      </div>
+    );
+  }
 
   const summary = summaryQ.data;
   const totalEvaluated = summary
@@ -2840,21 +2959,29 @@ function ConformityPanel() {
           Auditor PDF export covers every framework + policy + resource with the
           latest result, plus a SHA-256 integrity hash.
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => conformityApi.exportPdf()}
-            className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent"
-          >
-            <FileDown className="h-3.5 w-3.5" />
-            Generate audit PDF
-          </button>
-          <Link
-            to="/admin/conformity"
-            className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent"
-          >
-            Manage policies →
-          </Link>
+        <div className="flex flex-col items-end gap-1">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleExportPdf}
+              disabled={pdfBusy}
+              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <FileDown className="h-3.5 w-3.5" />
+              {pdfBusy ? "Generating…" : "Generate audit PDF"}
+            </button>
+            <Link
+              to="/admin/conformity"
+              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+            >
+              Manage policies →
+            </Link>
+          </div>
+          {pdfError && (
+            <p className="text-[11px] text-red-600 dark:text-red-400">
+              {pdfError}
+            </p>
+          )}
         </div>
       </div>
 
@@ -3079,8 +3206,11 @@ function NetworkPanel() {
                   AS{row.asn_number ?? "?"} {row.prefix}
                   {row.max_length != null ? `-${row.max_length}` : ""}
                 </span>
-                <span className="text-[10px] text-muted-foreground tabular-nums">
-                  {row.valid_to ? humanTime(row.valid_to) : "—"}
+                <span
+                  className="text-[10px] text-muted-foreground tabular-nums"
+                  title={row.valid_to ?? undefined}
+                >
+                  {row.valid_to ? futureTime(row.valid_to) : "—"}
                 </span>
               </div>
             </Link>
@@ -3237,7 +3367,8 @@ function IntegrationsDashboardTabPanel() {
           >
             Features → Integrations
           </Link>{" "}
-          to wire up Kubernetes / Docker / Proxmox / Tailscale / UniFi mirrors.
+          to wire up Kubernetes / Docker / Proxmox / OPNsense / Cloud /
+          Tailscale / UniFi mirrors.
         </p>
       </div>
     );
@@ -3532,7 +3663,7 @@ function SecurityPanel() {
         </DashboardListCard>
         <DashboardListCard
           title={`Failed logins past ${data.failed_login_window_hours} h`}
-          emptyHint="No failed logins in the last 24 h."
+          emptyHint={`No failed logins in the last ${data.failed_login_window_hours} h.`}
         >
           {data.failed_login_top_sources.map((row, i) => (
             <div
@@ -3602,9 +3733,11 @@ function DashboardListCard({
   emptyHint: string;
   children: React.ReactNode;
 }) {
-  const childArray = (Array.isArray(children) ? children : [children]).filter(
-    Boolean,
-  );
+  // ``React.Children.toArray`` flattens nested arrays (a card fed two
+  // separate ``.map()`` lists arrives as ``[arrayA, arrayB]``) and drops
+  // ``null`` / ``false`` / empty children, so an empty card correctly
+  // shows its ``emptyHint`` instead of rendering two empty <li>s.
+  const childArray = Children.toArray(children).filter(Boolean);
   return (
     <div className="rounded-lg border bg-card">
       <div className="flex items-center justify-between border-b px-4 py-2.5">

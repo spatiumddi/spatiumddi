@@ -138,6 +138,20 @@ export function DNSQueryRateCard({
     servfail: perSecond(p.servfail, data?.bucket_seconds ?? 60),
   }));
 
+  // The API returns one zero-filled sample per bucket even when no
+  // agent has reported, so ``points.length`` is non-zero on a fresh
+  // install. Fall through to the empty state unless something is
+  // actually plotted — an all-zero series renders a degenerate flat
+  // line that reads as a bug.
+  const hasData = points.some(
+    (p) =>
+      (p.queries || 0) +
+        (p.noerror || 0) +
+        (p.nxdomain || 0) +
+        (p.servfail || 0) >
+      0,
+  );
+
   return (
     <div className="rounded-lg border bg-card">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2.5">
@@ -161,7 +175,7 @@ export function DNSQueryRateCard({
           <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
             Loading…
           </div>
-        ) : points.length === 0 ? (
+        ) : !hasData ? (
           <div className="flex h-full flex-col items-center justify-center gap-1 text-center text-xs text-muted-foreground">
             <span>No query data yet.</span>
             <span className="text-[11px]">
@@ -259,6 +273,16 @@ export function DHCPTrafficCard({
     nak: perSecond(p.nak, data?.bucket_seconds ?? 60),
   }));
 
+  // The API returns one zero-filled sample per bucket even when no
+  // agent has reported, so ``points.length`` is non-zero on a fresh
+  // install. Fall through to the empty state unless something is
+  // actually plotted — an all-zero series renders a degenerate flat
+  // plot that reads as a bug.
+  const hasData = points.some(
+    (p) =>
+      (p.discover || 0) + (p.request || 0) + (p.ack || 0) + (p.nak || 0) > 0,
+  );
+
   return (
     <div className="rounded-lg border bg-card">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2.5">
@@ -284,7 +308,7 @@ export function DHCPTrafficCard({
           <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
             Loading…
           </div>
-        ) : points.length === 0 ? (
+        ) : !hasData ? (
           <div className="flex h-full flex-col items-center justify-center gap-1 text-center text-xs text-muted-foreground">
             <span>No DHCP traffic yet.</span>
             <span className="text-[11px]">

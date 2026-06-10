@@ -32,9 +32,17 @@ export function useFeatureModules() {
     return enabledSet.has(id);
   }
 
+  // ``ready`` is true once the module set has actually loaded. Gate DATA
+  // queries that hit feature-module-gated endpoints on ``ready && enabled(id)``:
+  // ``enabled`` optimistically returns true while loading (so the sidebar
+  // doesn't blink), which would otherwise fire a gated query once on a hard
+  // page load and 404 before the real module state is known.
+  const ready = !!query.data;
+
   return {
     modules,
     enabled,
+    ready,
     isLoading: query.isLoading,
     isError: query.isError,
     refetch: query.refetch,
