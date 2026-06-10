@@ -3004,9 +3004,40 @@ export interface PlatformSettings {
   lldp_sys_description: string;
   lldp_med_location: Record<string, unknown>;
   lldp_snmp_agentx: boolean;
+  /** Appliance syslog forwarding (issue #156). Per-target ``ca_cert_pem``
+   *  is redacted to a ``ca_cert_set`` boolean on the read shape; on
+   *  update send the full ``SyslogTargetWrite[]`` list with per-target
+   *  ``ca_cert_pem`` semantics (None/omit = leave, "" = clear, non-empty
+   *  = encrypt + replace, keyed by host:port). */
+  syslog_enabled: boolean;
+  syslog_targets: SyslogTarget[];
+  syslog_filter: string;
+  syslog_buffer_disk: boolean;
 }
 
 export type NtpSourceMode = "pool" | "servers" | "mixed";
+export type SyslogProtocol = "udp" | "tcp" | "tls";
+export type SyslogFormat = "rfc5424" | "rfc3164" | "json";
+
+/** Read shape — the server never returns the CA PEM ciphertext. */
+export interface SyslogTarget {
+  host: string;
+  port: number;
+  protocol: SyslogProtocol;
+  format: SyslogFormat;
+  ca_cert_set: boolean;
+}
+
+/** Write shape — ``ca_cert_pem`` is plaintext on the wire (TLS); None /
+ *  omit preserves the existing ciphertext for the same host:port; ""
+ *  clears; required (non-empty) when protocol is "tls". */
+export interface SyslogTargetWrite {
+  host: string;
+  port: number;
+  protocol: SyslogProtocol;
+  format: SyslogFormat;
+  ca_cert_pem?: string | null;
+}
 export type LldpProtocol = "cdp" | "edp" | "fdp" | "sonmp";
 
 export interface NtpCustomServer {
@@ -8344,6 +8375,10 @@ export interface ApplianceRow {
   last_upgrade_state_at: string | null;
   snmpd_running: boolean | null;
   ntp_sync_state: string | null;
+  /** Issue #156 — best-effort rsyslog forwarding status:
+   *  "forwarding" / "unreachable" / "disabled", or null on
+   *  non-appliance / pre-#156 rows. */
+  syslog_forwarding: string | null;
   desired_appliance_version: string | null;
   desired_slot_image_url: string | null;
   // Operator's per-slot boot intents. Non-null means the Fleet UI

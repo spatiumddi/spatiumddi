@@ -41,6 +41,12 @@ _SNMP_PRIV_PROTOCOLS: set[str] = {"none", "DES", "AES"}
 #                 public pool as a fallback).
 _NTP_SOURCE_MODES: set[str] = {"pool", "servers", "mixed"}
 
+# Issue #156 — rsyslog forward-target validation. ``udp`` / ``tcp`` are
+# plaintext; ``tls`` uses rsyslog's gtls stream driver + requires a CA
+# PEM. Wire formats map to rsyslog templates in services/appliance/syslog.py.
+_SYSLOG_PROTOCOLS: set[str] = {"udp", "tcp", "tls"}
+_SYSLOG_FORMATS: set[str] = {"rfc5424", "rfc3164", "json"}
+
 logger = structlog.get_logger(__name__)
 router = APIRouter()
 
@@ -176,6 +182,14 @@ class SettingsResponse(BaseModel):
     lldp_sys_description: str = ""
     lldp_med_location: dict[str, Any] = {}
     lldp_snmp_agentx: bool = False
+    # ── Appliance syslog forwarding (issue #156) ──────────────────
+    # Per-target ``ca_cert_pem`` ciphertext is folded into a per-entry
+    # ``ca_cert_set`` boolean by the model validator below — the wire
+    # never carries the CA PEM bytes (mirrors the SNMP community).
+    syslog_enabled: bool = False
+    syslog_targets: list[dict[str, Any]] = []
+    syslog_filter: str = ""
+    syslog_buffer_disk: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -194,6 +208,10 @@ class SettingsResponse(BaseModel):
             cols["snmp_community_set"] = bool(cols.pop("snmp_community_encrypted", None))
             raw_users = cols.get("snmp_v3_users") or []
             cols["snmp_v3_users"] = [_redact_v3_user(u) for u in raw_users]
+            # Issue #156 — fold each syslog target's CA PEM ciphertext into
+            # a ``ca_cert_set`` boolean so the wire never carries the PEM.
+            raw_targets = cols.get("syslog_targets") or []
+            cols["syslog_targets"] = [_redact_syslog_target(t) for t in raw_targets]
             return cols
         return data
 
@@ -207,6 +225,62 @@ def _redact_v3_user(u: dict[str, Any]) -> dict[str, Any]:
         "priv_protocol": u.get("priv_protocol") or "none",
         "priv_pass_set": bool(u.get("priv_pass_enc")),
     }
+
+
+def _redact_syslog_target(t: dict[str, Any]) -> dict[str, Any]:
+    """Strip the CA PEM ciphertext from a stored syslog-target dict for
+    the response shape — the operator only needs to know whether a CA
+    is configured (``ca_cert_set``), never the PEM bytes (#156)."""
+    return {
+        "host": t.get("host", ""),
+        "port": int(t.get("port") or 514),
+        "protocol": t.get("protocol") or "udp",
+        "format": t.get("format") or "rfc5424",
+        "ca_cert_set": bool(t.get("ca_cert_pem")),
+    }
+
+
+def _merge_syslog_targets(
+    existing: list[dict[str, Any]], incoming: list[SyslogTargetUpdate]
+) -> list[dict[str, Any]]:
+    """Atomic replace + per-target CA-PEM merge keyed on ``(host, port)``.
+
+    ``incoming`` is the full new list — targets not present are dropped.
+    For each entry, ``ca_cert_pem`` of ``None`` preserves the existing
+    ciphertext for the same ``(host, port)`` key; ``""`` clears; anything
+    else is encrypted fresh. Mirrors ``_merge_snmp_v3_users`` so an
+    operator editing a target's format doesn't have to re-paste its CA
+    PEM. Encrypted bytes are stored as the URL-safe-base64 string Fernet
+    emits so the JSONB column stays JSON-friendly.
+    """
+    from app.core.crypto import encrypt_str
+
+    by_key = {(t.get("host"), int(t.get("port") or 514)): t for t in existing}
+    out: list[dict[str, Any]] = []
+    for entry in incoming:
+        prior = by_key.get((entry.host, entry.port), {})
+        if entry.protocol == "tls":
+            submitted = entry.ca_cert_pem
+            prior_enc = prior.get("ca_cert_pem")
+            if submitted is None:
+                ca_enc = prior_enc if isinstance(prior_enc, str) and prior_enc else None
+            elif submitted == "":
+                ca_enc = None
+            else:
+                ca_enc = encrypt_str(submitted).decode("ascii")
+        else:
+            # Non-TLS targets carry no CA — drop any prior ciphertext.
+            ca_enc = None
+        out.append(
+            {
+                "host": entry.host,
+                "port": entry.port,
+                "protocol": entry.protocol,
+                "format": entry.format,
+                "ca_cert_pem": ca_enc,
+            }
+        )
+    return out
 
 
 def _merge_snmp_v3_users(
@@ -333,6 +407,70 @@ class NTPCustomServerUpdate(BaseModel):
         return s
 
 
+class SyslogTargetUpdate(BaseModel):
+    """One entry in ``syslog_targets`` on PUT (#156).
+
+    ``host`` is the collector hostname / IP; ``port`` 1–65535;
+    ``protocol`` one of ``udp`` / ``tcp`` / ``tls``; ``format`` one of
+    ``rfc5424`` / ``rfc3164`` / ``json``. ``ca_cert_pem`` is REQUIRED
+    when ``protocol == 'tls'`` and ignored otherwise; its merge
+    semantics mirror the SNMP v3 pass / SMTP password shape:
+
+    * ``None`` — leave the existing ciphertext alone (matched by
+      ``(host, port)`` against the stored list).
+    * ``""`` — clear any existing ciphertext.
+    * non-empty string — encrypt and replace.
+    """
+
+    host: str
+    port: int = 514
+    protocol: str = "udp"
+    format: str = "rfc5424"
+    ca_cert_pem: str | None = None
+
+    @field_validator("host")
+    @classmethod
+    def _syslog_host_nonempty(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("host may not be empty")
+        if any(c.isspace() for c in s):
+            raise ValueError("host may not contain whitespace")
+        return s
+
+    @field_validator("port")
+    @classmethod
+    def _syslog_port_range(cls, v: int) -> int:
+        if not (1 <= v <= 65535):
+            raise ValueError("port must be 1–65535")
+        return v
+
+    @field_validator("protocol")
+    @classmethod
+    def _syslog_protocol(cls, v: str) -> str:
+        if v not in _SYSLOG_PROTOCOLS:
+            raise ValueError(f"protocol must be one of {sorted(_SYSLOG_PROTOCOLS)}")
+        return v
+
+    @field_validator("format")
+    @classmethod
+    def _syslog_format(cls, v: str) -> str:
+        if v not in _SYSLOG_FORMATS:
+            raise ValueError(f"format must be one of {sorted(_SYSLOG_FORMATS)}")
+        return v
+
+    @model_validator(mode="after")
+    def _tls_requires_ca(self) -> SyslogTargetUpdate:
+        # A TLS target needs a CA to validate the collector's cert. The
+        # PEM may be supplied now (non-empty string) OR already stored —
+        # but ``""`` (explicit clear) on a TLS target leaves it with no
+        # CA, which can't validate, so reject that here. ``None`` is OK:
+        # it means "keep the existing CA", which the merge resolves.
+        if self.protocol == "tls" and self.ca_cert_pem == "":
+            raise ValueError("ca_cert_pem is required when protocol is 'tls'")
+        return self
+
+
 class SettingsUpdate(BaseModel):
     app_title: str | None = None
     app_base_url: str | None = None
@@ -445,6 +583,32 @@ class SettingsUpdate(BaseModel):
     lldp_sys_description: str | None = None
     lldp_med_location: dict[str, Any] | None = None
     lldp_snmp_agentx: bool | None = None
+    # ── Appliance syslog forwarding (issue #156) ──────────────────
+    syslog_enabled: bool | None = None
+    # When provided, this list is the new full set — targets not in the
+    # incoming list are removed. Per-target CA-PEM merge semantics see
+    # ``SyslogTargetUpdate`` docstring (None = leave, "" = clear,
+    # non-empty = encrypt + replace).
+    syslog_targets: list[SyslogTargetUpdate] | None = None
+    syslog_filter: str | None = None
+    syslog_buffer_disk: bool | None = None
+
+    @field_validator("syslog_filter")
+    @classmethod
+    def _valid_syslog_filter(cls, v: str | None) -> str | None:
+        # rsyslog selector — ``facility.severity`` tokens, comma-joined,
+        # plus ``*`` wildcards and the ``!`` / ``=`` / ``;`` modifiers.
+        # Rendered straight into the conf body, so reject control chars /
+        # newlines / quotes to keep config injection out. Empty = the
+        # renderer defaults to ``*.*``.
+        if v is None:
+            return None
+        v = v.strip()
+        if v and not re.fullmatch(r"[A-Za-z0-9_*.,;:=!\- ]+", v):
+            raise ValueError(
+                "syslog_filter may only contain letters, digits, and * . , ; : = ! - _ space"
+            )
+        return v
 
     @field_validator("lldp_tx_interval")
     @classmethod
@@ -877,7 +1041,8 @@ async def update_settings(
         "web_ui_allowed_cidrs",
     }
     _host_config_touched = any(
-        field.startswith(("snmp_", "ntp_", "lldp_")) or field in _supervisor_host_config_fields
+        field.startswith(("snmp_", "ntp_", "lldp_", "syslog_"))
+        or field in _supervisor_host_config_fields
         for field in changes
     )
 
@@ -928,6 +1093,32 @@ async def update_settings(
         # losing every encrypted pass.
         snmp_users_audit = [_redact_v3_user(u) for u in merged]
 
+    # syslog_targets: same atomic-replace + per-target CA-PEM merge as
+    # SNMP v3 users (#156). Match by ``(host, port)`` so editing one
+    # target's format doesn't drop another's CA PEM. A TLS target with
+    # no CA (neither submitted now nor stored prior) is rejected so the
+    # operator's PUT is the error site, not a downstream rsyslog reload.
+    syslog_targets_audit: list[dict[str, Any]] | None = None
+    if "syslog_targets" in changes:
+        incoming_targets: list[SyslogTargetUpdate] = body.syslog_targets or []
+        existing_targets = list(settings.syslog_targets or [])
+        merged_targets = _merge_syslog_targets(existing_targets, incoming_targets)
+        for tgt in merged_targets:
+            if tgt["protocol"] == "tls" and not tgt.get("ca_cert_pem"):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        f"syslog target {tgt['host']}:{tgt['port']} uses TLS but has "
+                        "no CA certificate configured — paste a CA PEM for it."
+                    ),
+                )
+        # Drop the raw incoming list out of ``changes`` so the generic
+        # setattr loop doesn't clobber the merged form; the model
+        # attribute is set directly here.
+        changes.pop("syslog_targets")
+        settings.syslog_targets = merged_targets
+        syslog_targets_audit = [_redact_syslog_target(t) for t in merged_targets]
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
         if field in (
@@ -941,6 +1132,35 @@ async def update_settings(
 
     if snmp_users_audit is not None:
         changes["snmp_v3_users"] = snmp_users_audit
+    if syslog_targets_audit is not None:
+        changes["syslog_targets"] = syslog_targets_audit
+
+    # Issue #156 — dedicated audit row for any syslog-forwarding change
+    # (non-negotiable #4). The generic ``logger.info`` below is not an
+    # ``audit_log`` row; syslog forwarding ships logs off-box + carries a
+    # secret CA PEM, so a durable, redacted audit entry is required. Fires
+    # whenever this request touched any ``syslog_*`` field (the targets
+    # list shows only the redacted shape — no CA PEM bytes).
+    _syslog_touched = any(f.startswith("syslog_") for f in changes)
+    if _syslog_touched:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="syslog",
+                resource_display="Syslog forwarding",
+                result="success",
+                new_value={
+                    "enabled": bool(settings.syslog_enabled),
+                    "targets": [_redact_syslog_target(t) for t in (settings.syslog_targets or [])],
+                    "filter": settings.syslog_filter or "",
+                    "buffer_disk": bool(settings.syslog_buffer_disk),
+                },
+            )
+        )
 
     # Maintenance mode flip handling (issue #57). When the enable flag
     # actually changes state, server-stamp / clear ``maintenance_started_at``

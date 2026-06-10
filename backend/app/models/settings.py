@@ -522,6 +522,37 @@ class PlatformSettings(Base):
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
 
+    # ── Appliance syslog forwarding (issue #156) ────────────────────
+    # rsyslog runs at the Debian host level on every appliance host
+    # (same host-config plane as SNMP / chrony / lldpd) so it can ship
+    # both journald + file log sources off-box to a SIEM / collector.
+    # The columns here are the singleton source of truth that every
+    # appliance host (local + remote agents) renders
+    # ``/etc/rsyslog.d/50-spatium-forward.conf`` from via the same
+    # ConfigBundle → trigger-file pipeline as #153/#154/#343. Default-
+    # off so the column add ships nothing off any existing appliance.
+    # ``syslog_targets`` is a JSONB list of ``{host, port, protocol,
+    # format, ca_cert_pem}`` dicts; ``ca_cert_pem`` carries Fernet
+    # ciphertext as the URL-safe-base64 string Fernet emits (only when
+    # ``protocol == 'tls'``) so the JSONB column stays JSON-friendly —
+    # mirroring the SNMP v3-user pass shape. ``syslog_filter`` is an
+    # rsyslog selector (``*.*`` / ``authpriv.*`` / …) prepended to each
+    # ``omfwd`` action; empty = the renderer defaults to ``*.*``.
+    # ``syslog_buffer_disk`` enables a disk-assisted queue so a brief
+    # collector outage doesn't drop logs.
+    syslog_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    syslog_targets: Mapped[list[dict]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    syslog_filter: Mapped[str] = mapped_column(
+        String, nullable=False, default="", server_default=sa_text("''")
+    )
+    syslog_buffer_disk: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+
     # ── Fleet firewall master switch (issue #285 Phase 2) ───────────
     # Gates the NEW server-side-authoritative firewall render (Phase 2a:
     # the control plane ships a rendered drop-in + hash on the heartbeat

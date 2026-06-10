@@ -80,3 +80,84 @@ async def test_heartbeat_delivers_host_config_blocks(
     assert body["snmp_settings"]["config_hash"] == ""
     # NTP block carries its stable keys too.
     assert "config_hash" in body["ntp_settings"]
+    # Issue #156 — syslog block present with its stable key set; off → empty.
+    assert "syslog_settings" in body
+    assert body["syslog_settings"]["enabled"] is False
+    assert body["syslog_settings"]["config_hash"] == ""
+    assert body["syslog_settings"]["ca_certs"] == {}
+
+
+# ── Issue #156 — syslog bundle + delivery ─────────────────────────────
+
+
+async def test_syslog_bundle_disabled_and_enabled_shapes() -> None:
+    """syslog_bundle returns a STABLE dict shape disabled (empty body /
+    hash) and a rendered body + hash when enabled."""
+    from app.services.appliance.syslog import syslog_bundle
+
+    off = PlatformSettings(id=1, syslog_enabled=False, syslog_targets=[])
+    block = syslog_bundle(off)
+    assert block == {
+        "enabled": False,
+        "config_hash": "",
+        "rsyslog_conf": "",
+        "ca_certs": {},
+    }
+
+    on = PlatformSettings(
+        id=1,
+        syslog_enabled=True,
+        syslog_targets=[
+            {"host": "collector.example", "port": 514, "protocol": "udp", "format": "rfc5424"}
+        ],
+        syslog_filter="*.*",
+        syslog_buffer_disk=False,
+    )
+    block = syslog_bundle(on)
+    assert block["enabled"] is True
+    assert block["config_hash"]  # non-empty when enabled
+    assert 'target="collector.example"' in block["rsyslog_conf"]
+    # journald is forwarded — imjournal input block must be present.
+    assert 'module(load="imjournal"' in block["rsyslog_conf"]
+    assert block["ca_certs"] == {}
+
+
+async def test_heartbeat_delivers_syslog_block(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    s = await _settings(db_session)
+    s.syslog_enabled = True
+    s.syslog_targets = [
+        {"host": "siem.example", "port": 6514, "protocol": "tcp", "format": "rfc5424"}
+    ]
+    s.syslog_filter = "*.*"
+    row, token = await _approved_supervisor(db_session)
+    await db_session.commit()
+
+    r = await client.post(
+        "/api/v1/appliance/supervisor/heartbeat",
+        json={"appliance_id": str(row.id), "session_token": token},
+    )
+    assert r.status_code == 200, r.text
+    block = r.json()["syslog_settings"]
+    assert block["enabled"] is True
+    assert block["config_hash"]
+    assert 'target="siem.example"' in block["rsyslog_conf"]
+
+
+async def test_syslog_targets_fold_into_dhcp_config_etag(db_session: AsyncSession) -> None:
+    """Changing syslog_targets flips the DHCP /config ETag's syslog
+    marker — the bundle helper is the same one the agent endpoint mixes
+    into the fleet_marker, so the rendered config_hash must move."""
+    from app.services.appliance.syslog import syslog_bundle
+
+    s = PlatformSettings(
+        id=1,
+        syslog_enabled=True,
+        syslog_targets=[{"host": "a.example", "port": 514, "protocol": "udp", "format": "rfc5424"}],
+        syslog_filter="*.*",
+    )
+    hash_before = syslog_bundle(s)["config_hash"]
+    s.syslog_targets = [{"host": "b.example", "port": 514, "protocol": "udp", "format": "rfc5424"}]
+    hash_after = syslog_bundle(s)["config_hash"]
+    assert hash_before != hash_after

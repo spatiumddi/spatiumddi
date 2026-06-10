@@ -505,6 +505,16 @@ class Appliance(Base):
     )
     snmpd_running: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     ntp_sync_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Issue #156 — best-effort rsyslog-forwarding status the supervisor
+    # reports from ``systemctl is-active rsyslog`` + config-applied
+    # state. ``forwarding`` (rsyslog active + config applied) /
+    # ``unreachable`` (enabled but the rsyslog unit failed/inactive) /
+    # ``disabled`` (off). NULL on non-appliance / pre-#156 rows; the
+    # heartbeat handler only overwrites when the supervisor sends a
+    # non-None value. Fine-grained per-target omfwd reachability is
+    # deferred — this is a daemon-level health signal, not a
+    # destination-level probe.
+    syslog_forwarding: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # Operator-driven desired state. Set via the fleet UI / API;
     # supervisor's heartbeat poll picks them up + writes the matching

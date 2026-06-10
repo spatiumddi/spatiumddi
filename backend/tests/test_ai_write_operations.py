@@ -245,6 +245,83 @@ async def test_update_ntp_settings_validation_and_apply(db_session: AsyncSession
     assert settings.ntp_allow_clients is True
 
 
+@pytest.mark.asyncio
+async def test_update_syslog_settings_preview_apply(db_session: AsyncSession) -> None:
+    from app.api.v1.settings.router import _get_or_create
+    from app.core.crypto import decrypt_str
+    from app.services.ai.operations_writes import (
+        SyslogTargetArg,
+        UpdateSyslogSettingsArgs,
+    )
+
+    user = await _user(db_session)
+    op = get_operation("update_syslog_settings")
+    assert op is not None
+
+    # A TLS target with no CA fails preview.
+    bad = await op.preview(
+        db_session,
+        user,
+        UpdateSyslogSettingsArgs(
+            enabled=True,
+            targets=[SyslogTargetArg(host="x", port=6514, protocol="tls")],
+        ),
+    )
+    assert bad.ok is False
+
+    # Happy path — UDP target + a TLS target carrying a CA PEM.
+    pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+    args = UpdateSyslogSettingsArgs(
+        enabled=True,
+        targets=[
+            SyslogTargetArg(host="a.example", port=514, protocol="udp", format="rfc5424"),
+            SyslogTargetArg(
+                host="b.example", port=6514, protocol="tls", format="json", ca_cert_pem=pem
+            ),
+        ],
+        filter="*.*",
+    )
+    preview = await op.preview(db_session, user, args)
+    assert preview.ok, preview.detail
+    await op.apply(db_session, user, args)
+
+    settings = await _get_or_create(db_session)
+    assert settings.syslog_enabled is True
+    assert len(settings.syslog_targets) == 2
+    # The TLS target's CA PEM is stored encrypted, never plaintext.
+    tls_target = next(t for t in settings.syslog_targets if t["protocol"] == "tls")
+    assert tls_target["ca_cert_pem"] is not None
+    assert pem not in tls_target["ca_cert_pem"]
+    assert decrypt_str(tls_target["ca_cert_pem"].encode("ascii")) == pem
+
+    # Audit row written with resource_id='syslog'.
+    rows = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.resource_type == "platform_settings",
+                    AuditLog.resource_id == "syslog",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].new_value["via"] == "ai_proposal"
+
+
+@pytest.mark.asyncio
+async def test_update_syslog_settings_requires_superadmin(db_session: AsyncSession) -> None:
+    from app.services.ai.operations_writes import UpdateSyslogSettingsArgs
+
+    user = await _user(db_session, superadmin=False)
+    op = get_operation("update_syslog_settings")
+    assert op is not None
+    block = await op.preview(db_session, user, UpdateSyslogSettingsArgs(enabled=True))
+    assert block.ok is False
+
+
 # ── DNSSEC + import (hermetic rejection paths) ────────────────────────
 
 

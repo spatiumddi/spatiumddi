@@ -41,6 +41,7 @@ import { LLDPTab } from "./LLDPTab";
 import { NTPTab } from "./NTPTab";
 import { PairingTab } from "./PairingTab";
 import { SNMPTab } from "./SNMPTab";
+import { SyslogTab } from "./SyslogTab";
 
 /**
  * Appliance → Fleet tab (#170 Wave D1; supersedes Wave B3 "Approvals").
@@ -680,7 +681,13 @@ export function FleetTab({
   // persists the operator's pick so a refresh inside the same tab
   // lands them back on the same section.
   const [view, setView] = useSessionState<
-    "appliances" | "pairing" | "slot-images" | "lldp" | "ntp" | "snmp"
+    | "appliances"
+    | "pairing"
+    | "slot-images"
+    | "lldp"
+    | "ntp"
+    | "snmp"
+    | "syslog"
   >("appliance.fleet.section", "appliances");
 
   const [drilldown, setDrilldown] = useState<ApplianceRow | null>(null);
@@ -897,7 +904,14 @@ export function FleetTab({
   // host-OS surfaces (#155-#166 — APT proxy, syslog forwarder, SSH
   // authorized_keys, etc.) drop into Services without restructuring.
   type NavItem = {
-    key: "appliances" | "pairing" | "slot-images" | "lldp" | "ntp" | "snmp";
+    key:
+      | "appliances"
+      | "pairing"
+      | "slot-images"
+      | "lldp"
+      | "ntp"
+      | "snmp"
+      | "syslog";
     label: string;
     summary: string;
     badge?: string | number;
@@ -944,6 +958,11 @@ export function FleetTab({
           key: "snmp",
           label: "SNMP",
           summary: "Fleet-wide snmpd config.",
+        },
+        {
+          key: "syslog",
+          label: "Syslog",
+          summary: "Fleet-wide log forwarding.",
         },
       ],
     },
@@ -1085,6 +1104,23 @@ export function FleetTab({
                 operators opt in here.
               </p>
               <SNMPTab />
+            </div>
+          )}
+
+          {view === "syslog" && (
+            <div>
+              <h2 className="mb-1 text-base font-semibold">
+                Syslog forwarding (rsyslog)
+              </h2>
+              <p className="mb-4 text-xs text-muted-foreground">
+                Fleet-wide rsyslog forwarding — ship journald + file log sources
+                off-box to a SIEM / collector over UDP / TCP / TLS. The rendered{" "}
+                <code>50-spatium-forward.conf</code> ships through the
+                ConfigBundle long-poll to every appliance host, validated
+                host-side before activation. Disabled by default; forwarding is
+                outbound only (no inbound port opened).
+              </p>
+              <SyslogTab />
             </div>
           )}
 
@@ -1589,6 +1625,45 @@ function ServiceChipList({ row }: { row: ApplianceRow }) {
   );
 }
 
+// Issue #156 — best-effort syslog-forwarding status chip rendered under
+// the per-role service chips. Only shown when the supervisor has
+// reported a value (``forwarding`` green / ``unreachable`` amber-red /
+// ``disabled`` muted); a null status (non-appliance / pre-#156 / never
+// reported) renders nothing so the column stays clean.
+function SyslogChip({ row }: { row: ApplianceRow }) {
+  const status = row.syslog_forwarding;
+  if (!status) return null;
+  const style =
+    status === "forwarding"
+      ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+      : status === "unreachable"
+        ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+        : "border-muted bg-muted/40 text-muted-foreground";
+  const label =
+    status === "forwarding"
+      ? "Syslog: forwarding"
+      : status === "unreachable"
+        ? "Syslog: unreachable"
+        : "Syslog: off";
+  return (
+    <span
+      className={cn(
+        "inline-flex w-fit items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+        style,
+      )}
+      title={
+        status === "forwarding"
+          ? "rsyslog is active + the forward config is applied"
+          : status === "unreachable"
+            ? "Forwarding enabled but the rsyslog unit failed / is inactive"
+            : "Syslog forwarding is disabled"
+      }
+    >
+      {label}
+    </span>
+  );
+}
+
 // #272 Phase 1 — Fleet UI two-table split. One section per bucket
 // (Control plane / Service agents). Pending rows pin to the top of
 // their section, others below. Empty section renders a dashed
@@ -1786,7 +1861,10 @@ function ApplianceTableRow({
         </span>
       </td>
       <td className="px-4 py-3">
-        <ServiceChipList row={row} />
+        <div className="flex flex-col gap-1">
+          <ServiceChipList row={row} />
+          <SyslogChip row={row} />
+        </div>
       </td>
       <td className="px-4 py-3">
         <div className="flex flex-wrap gap-1">

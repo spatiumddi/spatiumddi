@@ -99,6 +99,7 @@ from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
+from app.services.appliance.syslog import syslog_bundle
 
 logger = structlog.get_logger(__name__)
 
@@ -986,6 +987,9 @@ class SupervisorHeartbeatRequest(BaseModel):
     last_upgrade_state_at: datetime | None = None
     snmpd_running: bool | None = None
     ntp_sync_state: Literal["synchronized", "unsynchronized", "unknown"] | None = None
+    # Issue #156 — best-effort rsyslog-forwarding status. None = not
+    # collected (leave the stored column alone); a value persists.
+    syslog_forwarding: Literal["forwarding", "unreachable", "disabled"] | None = None
     # Issue #347 — LLDP neighbours the local lldpd discovered. ``None`` = not
     # collected (leave the stored set alone); a list (possibly empty) is the
     # authoritative current set the handler upserts + absence-deletes against.
@@ -1253,6 +1257,10 @@ class SupervisorHeartbeatResponse(BaseModel):
     snmp_settings: dict[str, Any] = Field(default_factory=dict)
     ntp_settings: dict[str, Any] = Field(default_factory=dict)
     lldp_settings: dict[str, Any] = Field(default_factory=dict)
+    # Issue #156 — rendered rsyslog forward config + per-target CA PEMs.
+    # Same shape the DHCP-agent ConfigBundle ships; disabled-shape block
+    # still sent so the supervisor can retract config.
+    syslog_settings: dict[str, Any] = Field(default_factory=dict)
     # #285 Phase 2a — server-side firewall render. ``{enabled, config_hash,
     # firewall_conf}``; empty config_hash when firewall_enabled is off (the
     # supervisor then keeps its in-pod fallback render). The supervisor
@@ -1474,6 +1482,8 @@ async def supervisor_heartbeat(
         row.snmpd_running = body.snmpd_running
     if body.ntp_sync_state is not None:
         row.ntp_sync_state = body.ntp_sync_state
+    if body.syslog_forwarding is not None:
+        row.syslog_forwarding = body.syslog_forwarding
     # Issue #347 — ingest the supervisor's local LLDP neighbours (upsert +
     # absence-delete). None = not collected (leave the set alone).
     if body.lldp_neighbours is not None:
@@ -1821,6 +1831,14 @@ async def supervisor_heartbeat(
         if cfg_row is not None
         else {"enabled": False, "config_hash": "", "lldpd_conf": "", "daemon_args": ""}
     )
+    # Issue #156 — rsyslog forward config. Disabled-shape fallback keeps
+    # a stable key set when no settings row exists yet so the supervisor's
+    # hash compare never KeyErrors.
+    syslog_block = (
+        syslog_bundle(cfg_row)
+        if cfg_row is not None
+        else {"enabled": False, "config_hash": "", "rsyslog_conf": "", "ca_certs": {}}
+    )
     # #285 Phase 2a — server-side firewall render. Same inputs the in-pod
     # renderer consumes (byte-identical body). Gated on the firewall_enabled
     # master switch (default off → disabled-shape block → supervisor keeps
@@ -1905,6 +1923,7 @@ async def supervisor_heartbeat(
         snmp_settings=snmp_block,
         ntp_settings=ntp_block,
         lldp_settings=lldp_block,
+        syslog_settings=syslog_block,
         firewall_settings=firewall_block,
         long_poll=long_poll,
     )
@@ -2050,6 +2069,9 @@ class ApplianceRow(BaseModel):
     last_upgrade_state_at: datetime | None
     snmpd_running: bool | None
     ntp_sync_state: str | None
+    # Issue #156 — best-effort rsyslog-forwarding status surfaced from
+    # the appliance row (forwarding / unreachable / disabled).
+    syslog_forwarding: str | None
     desired_appliance_version: str | None
     desired_slot_image_url: str | None
     desired_next_boot_slot: str | None
@@ -2148,6 +2170,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         last_upgrade_state_at=row.last_upgrade_state_at,
         snmpd_running=row.snmpd_running,
         ntp_sync_state=row.ntp_sync_state,
+        syslog_forwarding=row.syslog_forwarding,
         desired_appliance_version=row.desired_appliance_version,
         desired_slot_image_url=row.desired_slot_image_url,
         desired_next_boot_slot=row.desired_next_boot_slot,

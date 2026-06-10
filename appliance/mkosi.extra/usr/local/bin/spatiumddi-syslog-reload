@@ -1,0 +1,211 @@
+#!/bin/bash
+# spatiumddi-syslog-reload — host-side rsyslog forwarding config-apply
+# runner (issue #156).
+#
+# The supervisor (control plane writes it onto the heartbeat) drops
+# /var/lib/spatiumddi/release-state/syslog-config-pending whenever the
+# rendered rsyslog forward config changes vs. what's been applied here.
+# File format (kept JSON-light — only the CA blob is JSON, parsed with
+# python3 which is always present on the appliance):
+#
+#   line 1:    "enabled" | "disabled"
+#   line 2:    sha256 hex of the body (blank when disabled)
+#   line 3:    JSON object {"<ca-file-path>": "<pem>", ...} ("{}" when none)
+#   line 4+:   rendered /etc/rsyslog.d/50-spatium-forward.conf body
+#
+# Apply flow when enabled:
+#   1. Extract body → /tmp staging; stage each CA PEM to its path
+#   2. ``rsyslogd -N1 -f <combined>`` config check; abort on fail
+#   3. Atomically swap /etc/rsyslog.d/50-spatium-forward.conf + CA files
+#   4. ``systemctl restart rsyslog``
+#   5. Verify it's up; write the hash + status sidecar ("forwarding")
+#
+# Apply flow when disabled:
+#   1. Remove /etc/rsyslog.d/50-spatium-forward.conf + staged CA files
+#   2. ``systemctl restart rsyslog`` (drop the forward actions)
+#   3. Write the hash sidecar (empty) + status sidecar ("disabled")
+#
+# NO nftables drop-in — syslog forwarding is OUTBOUND only, so the
+# appliance opens nothing inbound (contrast the SNMP UDP 161 / NTP-serve
+# UDP 123 runners).
+#
+# Status sidecar values the supervisor heartbeat ships up (issue #156):
+#   forwarding  — rsyslog active after apply + forward config in place
+#   unreachable — enabled, but rsyslog failed/inactive after restart
+#   disabled    — forwarding off
+#
+# Persistence across A/B slot swaps (Phase 8a, issue #138):
+#
+#   /etc/rsyslog.d/50-spatium-forward.conf
+#                                   → /var/persist/etc/rsyslog.d/...
+#   /etc/rsyslog.d/spatium-ca/*.pem → /var/persist/etc/rsyslog.d/...
+#   /var/lib/spatiumddi/release-state/syslog-config-{hash,status,pending}
+#                                   → on /var directly
+#
+# So a slot upgrade / rollback preserves operator forward config + CA
+# trust automatically — same overlay-on-/etc + /var-backed-sidecar
+# story as the SNMP / chrony runners. The agent's hash sidecar matches
+# the control plane bundle's config_hash on the first long-poll after
+# reboot and short-circuits the trigger write.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/syslog-config-pending
+HASH_SIDECAR=/var/lib/spatiumddi/release-state/syslog-config-hash
+STATUS_SIDECAR=/var/lib/spatiumddi/release-state/syslog-status
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/syslog-reload.log"
+ETC_CONF=/etc/rsyslog.d/50-spatium-forward.conf
+CA_DIR=/etc/rsyslog.d/spatium-ca
+LOCK=/run/spatiumddi-syslog-reload.lock
+
+mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$CA_DIR"
+exec >> "$LOG" 2>&1
+echo
+echo "[$(date -Iseconds)] === spatiumddi-syslog-reload fired ==="
+
+if [ ! -f "$TRIGGER" ]; then
+    echo "  no trigger file at $TRIGGER, nothing to do"
+    exit 0
+fi
+
+# Serialise concurrent invocations — the .path unit fires once per
+# write, but operator-driven reapplies + retries could overlap.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "  another reload in progress, deferring"
+    exit 0
+fi
+
+# Remove every previously-staged CA file so a target that dropped TLS
+# (or got removed) doesn't leave a dangling PEM behind. Re-staged below
+# from the trigger's CA blob when still needed.
+clear_ca_dir() {
+    rm -f "$CA_DIR"/*.pem 2>/dev/null || true
+}
+
+# Restart rsyslog + capture the post-apply daemon state into the status
+# sidecar. ``forwarding`` when active, ``unreachable`` when not.
+restart_and_status() {
+    if systemctl restart rsyslog.service >/dev/null 2>&1; then
+        echo "  ✓ rsyslog restarted"
+    else
+        echo "  ✗ rsyslog restart failed"
+        systemctl status rsyslog.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+    fi
+    sleep 1
+    if systemctl is-active --quiet rsyslog.service; then
+        echo "forwarding" > "$STATUS_SIDECAR"
+        echo "  ✓ rsyslog active — status: forwarding"
+        return 0
+    fi
+    echo "unreachable" > "$STATUS_SIDECAR"
+    echo "  ✗ rsyslog not active after restart — status: unreachable"
+    return 1
+}
+
+MARKER=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
+HASH=$(sed -n '2p' "$TRIGGER" | tr -d '\r\n')
+CA_JSON=$(sed -n '3p' "$TRIGGER")
+TMP_BODY=$(mktemp /tmp/spatium-rsyslog.conf.XXXXXX)
+trap 'rm -f "$TMP_BODY"' EXIT
+tail -n +4 "$TRIGGER" > "$TMP_BODY"
+
+echo "  marker:    $MARKER"
+echo "  hash:      ${HASH:-<empty>}"
+echo "  body size: $(wc -c < "$TMP_BODY") bytes"
+
+case "$MARKER" in
+    enabled)
+        if ! command -v rsyslogd >/dev/null 2>&1; then
+            echo "  ✗ rsyslogd binary not found — is rsyslog installed?"
+            echo "unreachable" > "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+
+        # Stage CA PEMs from the JSON blob (line 3). python3 is always
+        # present on the appliance; this writes each {path: pem} entry to
+        # its file with mode 0644 (public material — the CA cert, not a
+        # private key). Clear stale files first.
+        clear_ca_dir
+        if [ -n "$CA_JSON" ] && [ "$CA_JSON" != "{}" ]; then
+            if ! printf '%s' "$CA_JSON" | python3 - "$CA_DIR" <<'PYEOF'
+import json
+import os
+import sys
+
+ca_dir = sys.argv[1]
+data = json.load(sys.stdin)
+for path, pem in data.items():
+    # Only honour paths inside the managed CA dir — defence against a
+    # malformed/hostile blob trying to write elsewhere.
+    norm = os.path.normpath(path)
+    if not norm.startswith(ca_dir + os.sep):
+        continue
+    os.makedirs(os.path.dirname(norm), exist_ok=True)
+    fd = os.open(norm, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(pem if pem.endswith("\n") else pem + "\n")
+print("staged", len(data), "CA file(s)")
+PYEOF
+            then
+                echo "  ✗ failed to stage CA PEMs from trigger blob"
+                echo "unreachable" > "$STATUS_SIDECAR"
+                echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+                mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+                exit 1
+            fi
+        fi
+
+        # Validate the staged config with rsyslog's own checker.
+        # ``-N1`` runs config verification and exits; ``-f`` points it
+        # at the staged body. We can't validate the body in total
+        # isolation (it references the global rsyslog includes), so we
+        # check the staged file directly — a syntax error in the forward
+        # actions still surfaces here before we swap it live.
+        if ! rsyslogd -N1 -f "$TMP_BODY" >/tmp/spatium-rsyslog-validate.log 2>&1; then
+            echo "  ✗ rsyslogd -N1 failed for staged config:"
+            sed 's/^/      /' /tmp/spatium-rsyslog-validate.log
+            echo "unreachable" > "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        echo "  ✓ rsyslogd -N1 passed"
+
+        # Atomic swap. Owner root, group root, mode 0644 — the conf has
+        # no secrets (CA PEMs are public + live in their own files;
+        # forward host/port are operator-visible anyway).
+        install -o root -g root -m 0644 "$TMP_BODY" "$ETC_CONF"
+
+        if restart_and_status; then
+            echo "$HASH" > "$HASH_SIDECAR"
+            echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        else
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        ;;
+    disabled)
+        # Drop the forward config + staged CA files, then restart so the
+        # forward actions go away.
+        rm -f "$ETC_CONF"
+        clear_ca_dir
+        systemctl restart rsyslog.service >/dev/null 2>&1 || true
+        echo "disabled" > "$STATUS_SIDECAR"
+        : > "$HASH_SIDECAR"
+        echo "  ✓ forward config removed, rsyslog restarted, status: disabled"
+        echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        ;;
+    *)
+        echo "  ✗ unknown marker line: ${MARKER:-<empty>}"
+        echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+        mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+        exit 1
+        ;;
+esac

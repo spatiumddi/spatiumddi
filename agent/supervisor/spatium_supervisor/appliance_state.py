@@ -346,6 +346,17 @@ _NTP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-status")
 _LLDP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/lldp-config-pending")
 _LLDP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/lldp-config-hash")
 _LLDP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/lldp-status")
+# Issue #156 — rsyslog forwarding equivalents. Same shape as SNMP / NTP /
+# LLDP. The trigger carries the rendered conf body + per-target CA PEMs
+# (one JSON header line) so the host runner can stage everything; the
+# hash sidecar short-circuits re-firing; the status sidecar carries the
+# best-effort ``forwarding`` / ``unreachable`` / ``disabled`` verdict the
+# heartbeat ships up.
+_SYSLOG_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/syslog-config-pending"
+)
+_SYSLOG_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/syslog-config-hash")
+_SYSLOG_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/syslog-status")
 # Issue #285 Phase 2b — firewall apply-state sidecars the host-side
 # spatium-firewall-reload runner writes after each apply; echoed on the
 # heartbeat so the control plane can see drift + drive the apply alarm.
@@ -866,6 +877,84 @@ def read_snmpd_running() -> bool | None:
         return True
     if text == "stopped":
         return False
+    return None
+
+
+def maybe_fire_syslog_reload(bundle_block: object) -> bool:
+    """Issue #156 — write the syslog-config trigger when the control
+    plane's rendered rsyslog.conf hash differs from the last one this
+    agent applied.
+
+    Strict appliance-only gate + hash-sidecar idempotency, mirroring
+    ``maybe_fire_snmp_reload``. The payload is three sections plus a
+    JSON CA blob (rsyslog forwarding can carry per-target CA PEMs the
+    host runner stages alongside the conf):
+
+        line 1:   ``enabled`` | ``disabled`` marker
+        line 2:   config_hash (sha256 hex, blank when disabled)
+        line 3:   JSON object of ``{ca_filename: pem}`` (``{}`` when none)
+        line 4+:  rendered /etc/rsyslog.d/50-spatium-forward.conf body
+
+    Forwarding is OUTBOUND only, so — unlike SNMP / NTP-serve — there is
+    no firewall drop-in; the host runner just stages the conf + CA files,
+    validates with ``rsyslogd -N1``, and restarts rsyslog.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not isinstance(bundle_block, dict):
+        return False
+    config_hash = str(bundle_block.get("config_hash") or "")
+    rsyslog_conf = str(bundle_block.get("rsyslog_conf") or "")
+    enabled = bool(bundle_block.get("enabled"))
+    ca_certs = bundle_block.get("ca_certs")
+    if not isinstance(ca_certs, dict):
+        ca_certs = {}
+    last_hash = ""
+    if _SYSLOG_HASH_SIDECAR.exists():
+        try:
+            last_hash = _SYSLOG_HASH_SIDECAR.read_text(encoding="utf-8").strip()
+        except OSError:
+            last_hash = ""
+    if config_hash == last_hash:
+        return False
+    if _SYSLOG_TRIGGER_FILE.exists():
+        return False
+    try:
+        _SYSLOG_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = (
+            ("enabled\n" if enabled else "disabled\n")
+            + (config_hash + "\n")
+            + (json.dumps(ca_certs) + "\n")
+            + rsyslog_conf
+        )
+        tmp = _SYSLOG_TRIGGER_FILE.with_suffix(".new")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(_SYSLOG_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def read_syslog_forwarding() -> str | None:
+    """Read rsyslog's last-reported forwarding status from the sidecar
+    the host-side runner writes after each apply. One of ``forwarding``
+    (rsyslog active + config applied) / ``unreachable`` (enabled but the
+    rsyslog unit failed/inactive) / ``disabled`` (off), or ``None`` on
+    docker / k8s (no sidecar mounted) so the backend leaves the column
+    alone.
+
+    Fine-grained per-target omfwd reachability is deferred — this is a
+    daemon-level health signal derived from ``systemctl is-active
+    rsyslog`` + the config-applied state, not a per-destination probe.
+    """
+    if not _SYSLOG_STATUS_SIDECAR.exists():
+        return None
+    try:
+        text = _SYSLOG_STATUS_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if text in ("forwarding", "unreachable", "disabled"):
+        return text
     return None
 
 
@@ -1662,6 +1751,11 @@ def collect() -> dict[str, object]:
         # Issue #343 — lldpd running state from the host-side runner's
         # status sidecar. None on non-appliance deploys.
         "lldpd_running": read_lldpd_running() if is_appliance else None,
+        # Issue #156 — rsyslog forwarding status from the host-side
+        # runner's status sidecar (forwarding / unreachable / disabled).
+        # None on non-appliance deploys so the backend leaves the column
+        # alone.
+        "syslog_forwarding": read_syslog_forwarding() if is_appliance else None,
         # Issue #347 — LLDP neighbours discovered by local lldpd. None when
         # not collected (off-appliance / lldpcli error) so the backend leaves
         # the stored set alone; an empty list means "ran, saw none" (wipe).
