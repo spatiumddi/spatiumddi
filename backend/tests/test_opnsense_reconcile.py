@@ -413,6 +413,268 @@ async def test_vlan_label_in_subnet_description(db_session: AsyncSession) -> Non
 
 
 @pytest.mark.asyncio
+async def test_disappeared_subnet_with_operator_ip_is_unclaimed_not_deleted(
+    db_session: AsyncSession,
+) -> None:
+    """When an interface disappears upstream but its router-owned subnet
+    still holds an operator IP (opnsense_router_id IS NULL), the subnet
+    must be un-claimed (handed back to manual management), NOT deleted —
+    because IPAddress → Subnet is ON DELETE CASCADE with no soft-delete,
+    so a blind delete would sweep the operator row too."""
+    space = await _make_space(db_session)
+    router = await _make_router(db_session, space)
+    await db_session.commit()
+
+    # First pass: the firewall has a LAN interface → router-owned subnet.
+    iface = [_iface("lan", "igb1", "10.0.0.1", "10.0.0.0/24")]
+    with _patch_client(_FakeClient(interfaces=iface)):
+        await reconcile_router(db_session, router)
+
+    sub = (
+        await db_session.execute(select(Subnet).where(Subnet.opnsense_router_id == router.id))
+    ).scalar_one()
+    sub_id = sub.id
+
+    # Operator drops an unclaimed (operator-owned) IP into that subnet.
+    op_ip = IPAddress(
+        subnet_id=sub_id,
+        address="10.0.0.200",
+        status="allocated",
+        hostname="operator-host",
+    )
+    db_session.add(op_ip)
+    await db_session.commit()
+    # NB: the UUID primary key is a Python-side ``default=uuid.uuid4``
+    # column default, so it is only assigned at flush/commit time — NOT
+    # at construction. Capturing ``op_ip.id`` before the commit above
+    # would record ``None`` and a later ``db_session.get(IPAddress, None)``
+    # would (silently) return ``None`` regardless of the real DB state.
+    op_ip_id = op_ip.id
+    sub_block_id = sub.block_id
+
+    # Second pass: the interface is gone upstream (no interfaces at all).
+    with _patch_client(_FakeClient(interfaces=[])):
+        summary = await reconcile_router(db_session, router)
+    assert summary.ok, summary.error
+
+    # Drop every cached ORM identity so the assertions below read the
+    # true post-reconcile DB row state rather than an in-memory object
+    # the test mutated/created earlier (the session uses
+    # ``expire_on_commit=False``, so committed objects stay un-expired in
+    # the identity map and ``db_session.get`` would hand them back
+    # without re-querying — masking a cascade delete at the DB level).
+    db_session.expire_all()
+
+    # Subnet survives — un-claimed, not deleted.
+    assert summary.subnets_deleted == 0
+    surviving = await db_session.get(Subnet, sub_id)
+    assert surviving is not None
+    assert surviving.opnsense_router_id is None  # handed back to manual mgmt
+
+    # Its enclosing block survives too — un-claiming a subnet must never
+    # cascade-delete the block the operator IP still hangs off of.
+    surviving_block = await db_session.get(IPBlock, sub_block_id)
+    assert surviving_block is not None
+
+    # Operator IP survives the cascade that a blind delete would trigger.
+    surviving_ip = await db_session.get(IPAddress, op_ip_id)
+    assert surviving_ip is not None
+    assert surviving_ip.opnsense_router_id is None
+
+
+@pytest.mark.asyncio
+async def test_disappeared_subnet_with_no_foreign_children_is_deleted(
+    db_session: AsyncSession,
+) -> None:
+    """Control case for the un-claim guard: a router-owned subnet with no
+    surviving non-OPNsense children IS hard-deleted when its interface
+    disappears upstream."""
+    space = await _make_space(db_session)
+    router = await _make_router(db_session, space)
+    await db_session.commit()
+
+    iface = [_iface("lan", "igb1", "10.0.0.1", "10.0.0.0/24")]
+    with _patch_client(_FakeClient(interfaces=iface)):
+        await reconcile_router(db_session, router)
+    assert (
+        await db_session.execute(select(Subnet).where(Subnet.opnsense_router_id == router.id))
+    ).scalar_one_or_none() is not None
+
+    with _patch_client(_FakeClient(interfaces=[])):
+        summary = await reconcile_router(db_session, router)
+    assert summary.ok, summary.error
+    assert summary.subnets_deleted >= 1
+    assert (
+        await db_session.execute(select(Subnet).where(Subnet.opnsense_router_id == router.id))
+    ).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_transient_client_error_aborts_without_deleting_mirror_rows(
+    db_session: AsyncSession,
+) -> None:
+    """A transient client error (5xx / timeout — surfaced as an
+    OPNsenseClientError raised from a list method) must abort the
+    reconcile with last_sync_error set, NOT diff against an empty desired
+    set and mass-delete the existing mirror rows."""
+    from app.services.opnsense.client import OPNsenseClientError  # noqa: PLC0415
+
+    space = await _make_space(db_session)
+    router = await _make_router(db_session, space)
+    await db_session.commit()
+
+    # First pass: establish a mirrored lease row.
+    iface = [_iface("lan", "igb1", "10.0.0.1", "10.0.0.0/24")]
+    with _patch_client(
+        _FakeClient(
+            interfaces=iface,
+            leases=[_OPNLease(address="10.0.0.50", mac=None, hostname="x", state="active")],
+        )
+    ):
+        await reconcile_router(db_session, router)
+    assert (
+        await db_session.execute(select(IPAddress).where(IPAddress.address == "10.0.0.50"))
+    ).scalar_one_or_none() is not None
+
+    # Second pass: list_leases raises a transient error (no 404 status →
+    # the client would re-raise rather than swallow-to-empty).
+    class _RaisingClient(_FakeClient):
+        async def list_leases(self):
+            raise OPNsenseClientError("HTTP 503 — service unavailable", status_code=503)
+
+    with _patch_client(_RaisingClient(interfaces=iface)):
+        summary = await reconcile_router(db_session, router)
+
+    # Reconcile aborted — error recorded, nothing deleted.
+    assert not summary.ok
+    assert summary.error is not None
+    assert summary.addresses_deleted == 0
+    await db_session.refresh(router)
+    assert router.last_sync_error is not None
+
+    # The mirrored row survived the transient blip.
+    assert (
+        await db_session.execute(select(IPAddress).where(IPAddress.address == "10.0.0.50"))
+    ).scalar_one_or_none() is not None
+
+
+@pytest.mark.asyncio
+async def test_list_leases_swallows_404_but_reraises_5xx(db_session: AsyncSession) -> None:
+    """The client distinguishes a genuine 404 (endpoint absent → empty
+    table) from a transient 5xx (re-raise)."""
+    import httpx  # noqa: PLC0415
+
+    from app.services.opnsense.client import OPNsenseClient, OPNsenseClientError  # noqa: PLC0415
+
+    # 404 → empty list (DHCP service not enabled / endpoint absent).
+    def _handler_404(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "not found"})
+
+    client = OPNsenseClient(host="fw.test", port=443, api_key="k", api_secret="s", verify_tls=False)
+    client._client = httpx.AsyncClient(
+        base_url="https://fw.test:443", transport=httpx.MockTransport(_handler_404)
+    )
+    try:
+        assert await client.list_leases() == []
+    finally:
+        await client._client.aclose()
+
+    # 5xx → re-raise so the reconciler aborts.
+    def _handler_503(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream busy")
+
+    client2 = OPNsenseClient(
+        host="fw.test", port=443, api_key="k", api_secret="s", verify_tls=False
+    )
+    client2._client = httpx.AsyncClient(
+        base_url="https://fw.test:443", transport=httpx.MockTransport(_handler_503)
+    )
+    try:
+        with pytest.raises(OPNsenseClientError) as exc_info:
+            await client2.list_leases()
+        assert exc_info.value.status_code == 503
+    finally:
+        await client2._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_same_address_in_another_space_does_not_block_own_space_row(
+    db_session: AsyncSession,
+) -> None:
+    """Phase-1 existence/claim must be scoped to the firewall's IPAM
+    space. The same IP existing in a DIFFERENT space (owned by another
+    integration) must NOT make the firewall skip creating its legitimate
+    row in its own space."""
+    space = await _make_space(db_session)
+    router = await _make_router(db_session, space)
+
+    # A foreign space with a row at the same address, owned by Proxmox.
+    other_space = await _make_space(db_session)
+    other_block = IPBlock(space_id=other_space.id, network="10.0.0.0/24", name="other-block")
+    db_session.add(other_block)
+    await db_session.flush()
+    other_subnet = Subnet(
+        space_id=other_space.id,
+        block_id=other_block.id,
+        network="10.0.0.0/24",
+        name="other-subnet",
+        total_ips=254,
+    )
+    db_session.add(other_subnet)
+    await db_session.flush()
+
+    from app.models.proxmox import ProxmoxNode  # noqa: PLC0415
+
+    pnode = ProxmoxNode(
+        name=f"pve-{uuid.uuid4().hex[:6]}",
+        host="pve.test",
+        token_id="root@pam!x",
+        ipam_space_id=other_space.id,
+    )
+    db_session.add(pnode)
+    await db_session.flush()
+    foreign_ip = IPAddress(
+        subnet_id=other_subnet.id,
+        address="10.0.0.50",
+        status="proxmox-vm",
+        hostname="pve-guest",
+        proxmox_node_id=pnode.id,
+    )
+    db_session.add(foreign_ip)
+    await db_session.commit()
+
+    fake = _FakeClient(
+        interfaces=[_iface("lan", "igb1", "10.0.0.1", "10.0.0.0/24")],
+        leases=[_OPNLease(address="10.0.0.50", mac=None, hostname="dhcp-name", state="active")],
+    )
+    with _patch_client(fake):
+        summary = await reconcile_router(db_session, router)
+    assert summary.ok, summary.error
+
+    # The firewall's own-space row was created (not skipped by the
+    # foreign-space match).
+    own_rows = (
+        (
+            await db_session.execute(
+                select(IPAddress)
+                .join(Subnet, IPAddress.subnet_id == Subnet.id)
+                .where(Subnet.space_id == space.id)
+                .where(IPAddress.address == "10.0.0.50")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(own_rows) == 1
+    assert own_rows[0].opnsense_router_id == router.id
+
+    # The foreign-space row is untouched.
+    await db_session.refresh(foreign_ip)
+    assert foreign_ip.opnsense_router_id is None
+    assert foreign_ip.proxmox_node_id == pnode.id
+
+
+@pytest.mark.asyncio
 async def test_no_api_secret_records_error(db_session: AsyncSession) -> None:
     space = await _make_space(db_session)
     router = OPNsenseRouter(

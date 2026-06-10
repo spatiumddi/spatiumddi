@@ -360,12 +360,31 @@ async def _apply_blocks_and_subnets(
     desired_map = {d.network: d for d in desired_subnets}
     used_wrapper_cidrs: set[str] = set()
 
-    # Delete router-owned subnets that disappeared upstream.
+    # Delete router-owned subnets that disappeared upstream — but only
+    # when no non-OPNsense IPAddress rows still live in them. IPAddress
+    # → Subnet is ON DELETE CASCADE with no soft-delete, so a blind
+    # delete here would also sweep operator-created rows and the rows
+    # _apply_addresses deliberately un-claimed (opnsense_router_id=None).
+    # If any such survivor exists we un-claim the subnet (leave it as a
+    # manually-managed entry) instead, mirroring the wrapper-block guard
+    # below and the address-level un-claim in _apply_addresses.
     for net_str, row in current_subnets.items():
         if net_str in desired_map:
             continue
-        await db.delete(row)
-        summary.subnets_deleted += 1
+        surviving_foreign = await db.scalar(
+            select(func.count())
+            .select_from(IPAddress)
+            .where(IPAddress.subnet_id == row.id)
+            .where(IPAddress.opnsense_router_id.is_(None))
+        )
+        if surviving_foreign:
+            # Operator / other-owned addresses still depend on this
+            # subnet — don't cascade-delete them. Hand the subnet back.
+            row.opnsense_router_id = None
+            summary.subnets_updated += 1
+        else:
+            await db.delete(row)
+            summary.subnets_deleted += 1
 
     for net_str, d in desired_map.items():
         # Operator subnet at this exact CIDR wins — reused untouched.
@@ -486,8 +505,22 @@ async def _apply_addresses(
     unclaimable: set[str] = set()
     desired_addrs = list(desired_map.keys())
     if desired_addrs:
+        # Scope the existence lookup to THIS firewall's IPAM space. An IP
+        # can legitimately exist in another space owned by a different
+        # integration; without the space filter the create-guard would
+        # match that foreign-space row and silently skip the firewall's
+        # legitimate row in its own space (and Phase 1 could stamp the FK
+        # onto a foreign-space row). Join through Subnet → space_id keeps
+        # both the claim and the unclaimable guard inside our space.
         existing = (
-            (await db.execute(select(IPAddress).where(IPAddress.address.in_(desired_addrs))))
+            (
+                await db.execute(
+                    select(IPAddress)
+                    .join(Subnet, IPAddress.subnet_id == Subnet.id)
+                    .where(Subnet.space_id == router.ipam_space_id)
+                    .where(IPAddress.address.in_(desired_addrs))
+                )
+            )
             .scalars()
             .all()
         )

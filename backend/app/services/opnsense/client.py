@@ -45,7 +45,18 @@ class OPNsenseClientError(Exception):
 
     The message carries the HTTP status + path + first 200 bytes of the
     response body so operator-facing error messages are useful.
+
+    ``status_code`` is the HTTP status when the failure was a response
+    (``401`` / ``403`` / ``5xx`` / …) and ``None`` for transport-level
+    failures (timeout / connection refused / non-JSON body). Callers use
+    it to tell a genuine "endpoint absent" 404 (safe to treat as an empty
+    table) apart from a transient 5xx / timeout (must abort the reconcile
+    rather than diff against an empty desired set — see #5).
     """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass
@@ -218,13 +229,21 @@ class OPNsenseClient:
         try:
             resp = await self._client.request(method, path, json=json)
         except httpx.HTTPError as exc:
+            # Transport-level failure (timeout / connection refused) — no
+            # HTTP status, so status_code stays None and the caller treats
+            # it as transient (abort, don't diff against empty).
             raise OPNsenseClientError(f"{path}: {exc}") from exc
         if resp.status_code == 401:
-            raise OPNsenseClientError(f"{path}: HTTP 401 — API key/secret invalid")
+            raise OPNsenseClientError(f"{path}: HTTP 401 — API key/secret invalid", status_code=401)
         if resp.status_code == 403:
-            raise OPNsenseClientError(f"{path}: HTTP 403 — API user lacks privilege for this path")
+            raise OPNsenseClientError(
+                f"{path}: HTTP 403 — API user lacks privilege for this path", status_code=403
+            )
         if resp.status_code >= 400:
-            raise OPNsenseClientError(f"{path}: HTTP {resp.status_code} {resp.text[:200]}")
+            raise OPNsenseClientError(
+                f"{path}: HTTP {resp.status_code} {resp.text[:200]}",
+                status_code=resp.status_code,
+            )
         try:
             return resp.json()
         except ValueError as exc:
@@ -340,8 +359,11 @@ class OPNsenseClient:
         """DHCPv4 leases via the ``searchLease`` POST endpoint.
 
         The POST body asks for a large page so we get the full table in
-        one call. Returns an empty list on 404 (DHCP service not
-        enabled) rather than failing the whole reconcile.
+        one call. Returns an empty list only on 404 (DHCP service not
+        enabled / endpoint absent). A 5xx / timeout / other failure is
+        re-raised so the reconciler aborts instead of mistaking a
+        transient error for an empty lease table and mass-deleting every
+        mirrored row (#5).
         """
         try:
             body = await self._post(
@@ -349,8 +371,10 @@ class OPNsenseClient:
                 json={"current": 1, "rowCount": 5000, "searchPhrase": ""},
             )
         except OPNsenseClientError as exc:
-            logger.debug("opnsense_leases_unavailable", error=str(exc))
-            return []
+            if exc.status_code == 404:
+                logger.debug("opnsense_leases_unavailable", error=str(exc))
+                return []
+            raise
         out: list[_OPNLease] = []
         for r in _unwrap_rows(body):
             addr = str(r.get("address") or r.get("ip") or "").strip()
@@ -373,12 +397,18 @@ class OPNsenseClient:
         ``getReservation`` returns the ISC ``dhcpd`` config tree on
         older firmware (``{"dhcpd": {"<iface>": {"staticmap": {...}}}}``)
         and a ``rows[]`` wrapper on newer ones. We flatten both shapes.
+
+        Returns an empty list only on 404 (endpoint absent); a transient
+        5xx / timeout is re-raised so the reconciler doesn't diff against
+        an empty desired set and delete every mirrored reservation (#5).
         """
         try:
             body = await self._get("/api/dhcpv4/settings/getReservation")
         except OPNsenseClientError as exc:
-            logger.debug("opnsense_reservations_unavailable", error=str(exc))
-            return []
+            if exc.status_code == 404:
+                logger.debug("opnsense_reservations_unavailable", error=str(exc))
+                return []
+            raise
         rows: list[dict[str, Any]] = []
         if isinstance(body, dict) and "dhcpd" in body and isinstance(body["dhcpd"], dict):
             # ISC tree shape: dhcpd → <iface> → staticmap → {uuid|idx: {...}}
@@ -410,13 +440,20 @@ class OPNsenseClient:
 
     async def list_arp(self) -> list[_OPNArpEntry]:
         """ARP table — secondary population, only fetched when the
-        operator opts in. Empty list on failure.
+        operator opts in.
+
+        Returns an empty list only on 404 (endpoint absent); a transient
+        5xx / timeout is re-raised so the reconciler aborts rather than
+        mistaking a transient error for an empty ARP table and deleting
+        every mirrored ARP row (#5).
         """
         try:
             body = await self._get("/api/diagnostics/interface/getArp")
         except OPNsenseClientError as exc:
-            logger.debug("opnsense_arp_unavailable", error=str(exc))
-            return []
+            if exc.status_code == 404:
+                logger.debug("opnsense_arp_unavailable", error=str(exc))
+                return []
+            raise
         out: list[_OPNArpEntry] = []
         for r in _unwrap_rows(body):
             addr = str(r.get("ip") or r.get("address") or "").strip()
