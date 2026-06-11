@@ -3136,13 +3136,17 @@ function ApplianceRoleAssignmentSection({
     row.firewall_extra,
   ]);
 
+  // Use the SAME canonical keys the rest of the app invalidates on group
+  // create/edit (["dns-groups"] / ["dhcp-groups"]) — the old tuple keys
+  // ["dns","groups"] / ["dhcp","groups"] never matched those invalidations,
+  // so a freshly-created group didn't appear here until a full reload (#367).
   const dnsGroupsQuery = useQuery({
-    queryKey: ["dns", "groups"],
+    queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
     staleTime: 60_000,
   });
   const dhcpGroupsQuery = useQuery({
-    queryKey: ["dhcp", "groups"],
+    queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
     staleTime: 60_000,
   });
@@ -3157,6 +3161,11 @@ function ApplianceRoleAssignmentSection({
       }),
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+      // Belt-and-braces (#367): refresh the group pickers after a role
+      // assign so a group created moments earlier is guaranteed current,
+      // regardless of the 60s staleTime above.
+      qc.invalidateQueries({ queryKey: ["dns-groups"] });
+      qc.invalidateQueries({ queryKey: ["dhcp-groups"] });
       setSavedAt(Date.now());
       onSaved(updated);
     },
