@@ -247,7 +247,10 @@ def _pd_pool_v6(p: dict[str, Any]) -> dict[str, Any] | None:
             out["excluded-prefix"] = str(ex.network_address)
             out["excluded-prefix-len"] = ex.prefixlen
         except ValueError:
-            pass
+            # Malformed excluded-prefix: render the pd-pool without it rather
+            # than dropping the pool. The control plane validates it on create/
+            # update, so this is defensive against an unexpected wire value.
+            _log.warning("dhcp_pd_excluded_prefix_invalid", value=excluded)
     if p.get("class_restriction"):
         out["client-class"] = p["class_restriction"]
     return out

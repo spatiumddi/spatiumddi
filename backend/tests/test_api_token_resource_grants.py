@@ -248,17 +248,19 @@ async def test_subnet_token_cannot_mutate_other_subnet(
     await db_session.commit()
     hdr = {"Authorization": f"Bearer {raw}"}
 
-    # PUT other subnet → 403; PUT own subnet → 200.
-    assert (
-        await client.put(f"/api/v1/ipam/subnets/{sub_b.id}", headers=hdr, json={"description": "x"})
-    ).status_code == 403
-    assert (
-        await client.put(
-            f"/api/v1/ipam/subnets/{sub_a.id}", headers=hdr, json={"description": "ok"}
-        )
-    ).status_code == 200
+    # PUT other subnet → 403; PUT own subnet → 200. (Assign first so the HTTP
+    # call isn't a side-effect inside an assert.)
+    r_other = await client.put(
+        f"/api/v1/ipam/subnets/{sub_b.id}", headers=hdr, json={"description": "x"}
+    )
+    assert r_other.status_code == 403
+    r_own = await client.put(
+        f"/api/v1/ipam/subnets/{sub_a.id}", headers=hdr, json={"description": "ok"}
+    )
+    assert r_own.status_code == 200
     # DELETE other subnet → 403.
-    assert (await client.delete(f"/api/v1/ipam/subnets/{sub_b.id}", headers=hdr)).status_code == 403
+    r_del = await client.delete(f"/api/v1/ipam/subnets/{sub_b.id}", headers=hdr)
+    assert r_del.status_code == 403
 
 
 @pytest.mark.asyncio

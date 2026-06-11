@@ -156,7 +156,11 @@ def _render_pd_pool(pool: PoolDef) -> dict[str, Any] | None:
             d["excluded-prefix"] = str(ex.network_address)
             d["excluded-prefix-len"] = ex.prefixlen
         except ValueError:
-            pass
+            # Malformed excluded-prefix: render the pd-pool without it rather
+            # than dropping the whole pool. The create/update API validates the
+            # excluded-prefix (services pools._validate_pd), so this is purely
+            # defensive against legacy/hand-edited rows.
+            logger.warning("kea_pd_excluded_prefix_invalid", value=pool.excluded_prefix)
     if pool.class_restriction:
         d["client-class"] = pool.class_restriction
     return d
