@@ -19,6 +19,7 @@ import structlog
 from .bootstrap import ensure_token
 from .config import AgentConfig
 from .dhcp_fingerprint import DhcpFingerprintShipper
+from .rogue_probe import RogueProbeShipper
 from .ha_status import HAStatusPoller
 from .heartbeat import HeartbeatClient
 from .leases import LeaseWatcher
@@ -68,6 +69,15 @@ def run(cfg: AgentConfig) -> int:
         fingerprint_shipper = DhcpFingerprintShipper(cfg, token_ref)
         log.info("dhcp_fingerprint_enabled")
 
+    # Active rogue-DHCP probe (issue #370) — opt-in for the same CAP_NET_RAW +
+    # scapy reasons as fingerprinting. Broadcasts a DISCOVER on an interval and
+    # ships observed OFFERs so the control plane can flag unknown responders.
+    rogue_probe_enabled = os.environ.get("DHCP_ROGUE_PROBE_ENABLED", "0") == "1"
+    rogue_probe: RogueProbeShipper | None = None
+    if rogue_probe_enabled:
+        rogue_probe = RogueProbeShipper(cfg, token_ref)
+        log.info("dhcp_rogue_probe_enabled")
+
     threads = [
         threading.Thread(target=syncer.run, name="sync", daemon=True),
         threading.Thread(target=heartbeat.run, name="heartbeat", daemon=True),
@@ -84,6 +94,10 @@ def run(cfg: AgentConfig) -> int:
                 name="dhcp-fingerprint",
                 daemon=True,
             )
+        )
+    if rogue_probe is not None:
+        threads.append(
+            threading.Thread(target=rogue_probe.run, name="rogue-probe", daemon=True)
         )
     for t in threads:
         t.start()

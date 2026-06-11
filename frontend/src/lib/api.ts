@@ -6205,6 +6205,21 @@ export const dhcpApi = {
   deletePool: (_scopeId: string, poolId: string) =>
     api.delete(`/dhcp/pools/${poolId}`),
 
+  // Rogue-DHCP observed responders (#370).
+  listResponders: (groupId: string, classification?: string) =>
+    api
+      .get<DHCPObservedResponder[]>(`/dhcp/groups/${groupId}/responders`, {
+        params: classification ? { classification } : undefined,
+      })
+      .then((r) => r.data),
+  acknowledgeResponder: (groupId: string, responderId: string, note = "") =>
+    api
+      .post<DHCPObservedResponder>(
+        `/dhcp/groups/${groupId}/responders/${responderId}/acknowledge`,
+        { note },
+      )
+      .then((r) => r.data),
+
   listStatics: (scopeId: string, params?: { tag?: string[] }) =>
     api
       .get<DHCPStaticAssignment[]>(`/dhcp/scopes/${scopeId}/statics`, {
@@ -6398,6 +6413,20 @@ export interface DHCPStaticAssignment {
   ip_address_id: string | null;
   created_at: string;
   modified_at: string;
+}
+
+/** A DHCP server observed answering on a managed segment (#370). */
+export interface DHCPObservedResponder {
+  id: string;
+  group_id: string;
+  server_identifier: string;
+  source_ip: string;
+  source_mac: string | null;
+  giaddr: string | null;
+  offered_ip: string | null;
+  classification: string; // "expected" | "acknowledged" | "rogue"
+  first_seen_at: string;
+  last_seen_at: string;
 }
 
 export interface DHCPClientClass {

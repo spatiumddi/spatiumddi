@@ -326,6 +326,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_ip_hygiene_alert_rules()
     except Exception as exc:  # noqa: BLE001
         logger.debug("ip_hygiene_alert_rule_seed_skipped", reason=str(exc))
+    # Rogue DHCP server alert rule — singleton, DISABLED by default (issue
+    # #370). Fires only on segments running the agent's active DHCP probe.
+    try:
+        from app.services.alerts import seed_rogue_dhcp_alert_rule  # noqa: PLC0415
+
+        await seed_rogue_dhcp_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("rogue_dhcp_alert_rule_seed_skipped", reason=str(exc))
     # Appliance Web UI cert bootstrap (issue #134, Phase 4b.5). On
     # appliance installs without an active row in appliance_certificate,
     # generate a self-signed default + deploy it to /etc/nginx/certs

@@ -41,7 +41,13 @@ from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN, ASNRpkiRoa
 from app.models.audit import AuditLog
 from app.models.circuit import Circuit
-from app.models.dhcp import DHCPLease, DHCPPool, DHCPScope, DHCPServer
+from app.models.dhcp import (
+    DHCPLease,
+    DHCPObservedResponder,
+    DHCPPool,
+    DHCPScope,
+    DHCPServer,
+)
 from app.models.dns import DNSServer, DNSZone
 from app.models.domain import Domain
 from app.models.ipam import IPAddress, IPBlock, IpMacHistory, Subnet
@@ -169,6 +175,14 @@ RULE_TYPE_IP_FREE_BUT_RESPONDING = "ip_free_but_responding"
 RULE_TYPE_STALE_RESERVATION = "stale_reservation"
 RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE = "unknown_mac_in_static_range"
 
+# Rogue DHCP server detection — issue #370. Subject = dhcp_responder. Fires on
+# dhcp_observed_responder rows classified ``rogue`` (a DHCP server answering on
+# a managed segment that isn't a known group member and isn't allowlisted),
+# observed within ``threshold_days`` (default 1). The agent's active probe is
+# opt-in, so this only has data on segments running the probe.
+RULE_TYPE_ROGUE_DHCP = "rogue_dhcp"
+_ROGUE_DHCP_RECENCY_DAYS = 1
+
 RULE_TYPES = frozenset(
     {
         RULE_TYPE_SUBNET_UTILIZATION,
@@ -199,6 +213,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_IP_FREE_BUT_RESPONDING,
         RULE_TYPE_STALE_RESERVATION,
         RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE,
+        RULE_TYPE_ROGUE_DHCP,
     }
 )
 
@@ -615,6 +630,42 @@ async def _matching_unknown_mac_in_static_range_subjects(
             f"{obs_at.isoformat()} — possible squatter or a device that moved."
         )
         matches.append((str(ip_id), str(ip_row.address), message))
+    return matches
+
+
+async def _matching_rogue_dhcp_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """dhcp_observed_responder rows classified ``rogue`` + seen within the
+    recency window (issue #370). Auto-resolves once a responder stops being
+    seen as rogue (operator allowlists it → reclassified, or it goes away)."""
+    days = rule.threshold_days if rule.threshold_days is not None else _ROGUE_DHCP_RECENCY_DAYS
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, days))
+    rows = (
+        (
+            await db.execute(
+                select(DHCPObservedResponder).where(
+                    DHCPObservedResponder.classification == "rogue",
+                    DHCPObservedResponder.last_seen_at >= cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str]] = []
+    for r in rows:
+        display = f"{r.source_ip} (server-id {r.server_identifier})"
+        offered = f", offered {r.offered_ip}" if r.offered_ip else ""
+        message = (
+            f"Unrecognised DHCP server answering on a managed segment: "
+            f"source {r.source_ip}, server-id {r.server_identifier}"
+            f"{f', MAC {r.source_mac}' if r.source_mac else ''}{offered}. "
+            f"Not a known group member or allowlisted — investigate a rogue / "
+            f"misconfigured DHCP server, or acknowledge it if expected."
+        )
+        matches.append((str(r.id), display, message))
     return matches
 
 
@@ -2211,6 +2262,46 @@ async def seed_ip_hygiene_alert_rules() -> None:
         await session.commit()
 
 
+async def seed_rogue_dhcp_alert_rule() -> None:
+    """Seed the singleton ``rogue_dhcp`` rule (issue #370), DISABLED by default.
+
+    Meaningful only once an operator turns on the agent's active DHCP probe
+    (``DHCP_ROGUE_PROBE_ENABLED=1``); seeding it off makes it discoverable in
+    the Alerts UI without firing on installs that never opt in. Keyed on
+    ``rule_type`` — an operator who enables / renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_ROGUE_DHCP)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name="Rogue DHCP server",
+                description=(
+                    "Fires when the DHCP agent's active probe sees an OFFER from "
+                    "a DHCP server that isn't a known group member and isn't on "
+                    "the responder allowlist — a rogue or misconfigured DHCP "
+                    "server on the segment. Auto-resolves when the responder "
+                    "stops appearing or is acknowledged. Enable once the probe "
+                    "(DHCP_ROGUE_PROBE_ENABLED) is on."
+                ),
+                rule_type=RULE_TYPE_ROGUE_DHCP,
+                threshold_days=_ROGUE_DHCP_RECENCY_DAYS,
+                severity="warning",
+                enabled=False,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def seed_builtin_compliance_alert_rules() -> None:
     """Insert the three disabled compliance-change rules on first
     boot. Idempotent — only inserts a row when no rule with the same
@@ -2395,6 +2486,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_unknown_mac_in_static_range_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "ip_address"
+            elif rule.rule_type == RULE_TYPE_ROGUE_DHCP:
+                base = await _matching_rogue_dhcp_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "dhcp_responder"
             elif rule.rule_type == RULE_TYPE_SERVER_UNREACHABLE:
                 base = await _matching_server_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]

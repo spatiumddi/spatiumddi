@@ -161,6 +161,20 @@ class DHCPFingerprintBatch(BaseModel):
     fingerprints: list[DHCPFingerprintEntry]
 
 
+class DHCPOfferEntry(BaseModel):
+    """One OFFER the agent's rogue-DHCP probe observed (issue #370)."""
+
+    server_identifier: str
+    source_ip: str
+    source_mac: str | None = None
+    giaddr: str | None = None
+    offered_ip: str | None = None
+
+
+class DHCPOfferBatch(BaseModel):
+    offers: list[DHCPOfferEntry]
+
+
 # ── Auth ────────────────────────────────────────────────────────────────────
 
 
@@ -1091,3 +1105,35 @@ async def agent_dhcp_fingerprints(
         "dropped": dropped,
         "enqueued": len(enqueue_macs),
     }
+
+
+@router.post("/dhcp-offers")
+async def agent_dhcp_offers(
+    body: DHCPOfferBatch,
+    db: DB,
+    auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, int]:
+    """Ingest observed DHCP OFFERs from the agent's rogue-detection probe (#370).
+
+    The agent broadcasts a DISCOVER and ships every OFFER it gets back; we
+    classify each responder against the group's known DHCP servers + the
+    operator allowlist and upsert a ``dhcp_observed_responder`` row. The
+    ``rogue_dhcp`` alert fires on rows that classify ``rogue``. Capped at 200
+    offers per request. No audit row — observations are high-volume telemetry.
+    """
+    from app.services.dhcp.rogue_detection import ObservedOffer, record_offers
+
+    server, _ = auth
+    capped = body.offers[:200]
+    offers = [
+        ObservedOffer(
+            server_identifier=o.server_identifier,
+            source_ip=o.source_ip,
+            source_mac=o.source_mac,
+            giaddr=o.giaddr,
+            offered_ip=o.offered_ip,
+        )
+        for o in capped
+    ]
+    counts = await record_offers(db, server, offers)
+    return counts

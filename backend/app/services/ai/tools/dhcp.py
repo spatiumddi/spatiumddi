@@ -736,3 +736,59 @@ async def find_dhcp_pool_occupancy(
         )
     out.sort(key=lambda r: r["occupancy_percent"], reverse=True)
     return out[: args.limit]
+
+
+# ── find_dhcp_responders (issue #370) ─────────────────────────────────
+
+
+class FindDHCPRespondersArgs(BaseModel):
+    group_id: str | None = Field(
+        default=None, description="Filter to one DHCP server group by UUID."
+    )
+    classification: str | None = Field(
+        default=None,
+        description="Filter by classification: expected / acknowledged / rogue.",
+    )
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+@register_tool(
+    name="find_dhcp_responders",
+    description=(
+        "List DHCP servers the active rogue-detection probe has observed "
+        "answering on managed segments (issue #370). Each row carries the "
+        "source IP / MAC, server-identifier, offered IP, classification "
+        "(expected = a known group member, acknowledged = operator-allowlisted, "
+        "rogue = unknown responder), and last-seen time. Filter "
+        "classification='rogue' to answer 'is there a rogue DHCP server on my "
+        "network?'. Read-only; only has data on segments running the probe."
+    ),
+    args_model=FindDHCPRespondersArgs,
+    category="dhcp",
+)
+async def find_dhcp_responders(
+    db: AsyncSession, user: User, args: FindDHCPRespondersArgs
+) -> list[dict[str, Any]]:
+    from app.models.dhcp import DHCPObservedResponder  # noqa: PLC0415
+
+    stmt = select(DHCPObservedResponder)
+    if args.group_id:
+        stmt = stmt.where(DHCPObservedResponder.group_id == args.group_id)
+    if args.classification:
+        stmt = stmt.where(DHCPObservedResponder.classification == args.classification.lower())
+    stmt = stmt.order_by(DHCPObservedResponder.last_seen_at.desc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(r.id),
+            "group_id": str(r.group_id),
+            "server_identifier": r.server_identifier,
+            "source_ip": str(r.source_ip),
+            "source_mac": str(r.source_mac) if r.source_mac else None,
+            "giaddr": str(r.giaddr) if r.giaddr else None,
+            "offered_ip": str(r.offered_ip) if r.offered_ip else None,
+            "classification": r.classification,
+            "last_seen_at": r.last_seen_at.isoformat() if r.last_seen_at else None,
+        }
+        for r in rows
+    ]

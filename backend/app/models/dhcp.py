@@ -886,6 +886,76 @@ class DHCPPhoneProfileScope(Base):
     )
 
 
+class DHCPObservedResponder(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A DHCP server observed answering on a managed segment (issue #370).
+
+    The agent's active probe broadcasts a DISCOVER and records every OFFER it
+    gets back; the control plane upserts one row per (group, server-id,
+    source-ip) and classifies it. ``classification`` ∈
+    ``expected`` (source matches a known DHCPServer in the group) /
+    ``acknowledged`` (operator allowlisted it) / ``rogue`` (unknown responder
+    — the alert fires on these).
+    """
+
+    __tablename__ = "dhcp_observed_responder"
+    __table_args__ = (
+        UniqueConstraint(
+            "group_id", "server_identifier", "source_ip", name="uq_dhcp_responder_id_ip"
+        ),
+        Index("ix_dhcp_observed_responder_group", "group_id"),
+        Index("ix_dhcp_observed_responder_last_seen", "last_seen_at"),
+    )
+
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    reported_by_server_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    server_identifier: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_ip: Mapped[str] = mapped_column(INET, nullable=False)
+    source_mac: Mapped[str | None] = mapped_column(MACADDR, nullable=True)
+    giaddr: Mapped[str | None] = mapped_column(INET, nullable=True)
+    offered_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
+    # expected | acknowledged | rogue
+    classification: Mapped[str] = mapped_column(String(16), nullable=False, default="rogue")
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=sa_text("now()")
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=sa_text("now()")
+    )
+
+
+class DHCPResponderAllowlist(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """An operator-acknowledged DHCP responder (issue #370).
+
+    Suppresses the rogue classification for a known-but-external DHCP server
+    (e.g. a corporate edge router). A responder matches when its
+    ``server_identifier`` OR ``source_ip`` equals an allowlist entry in the
+    same group.
+    """
+
+    __tablename__ = "dhcp_responder_allowlist"
+    __table_args__ = (Index("ix_dhcp_responder_allowlist_group", "group_id"),)
+
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    server_identifier: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
+    note: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+
+
 __all__ = [
     "DHCPServerGroup",
     "DHCPServer",
@@ -903,4 +973,6 @@ __all__ = [
     "DHCPConfigOp",
     "DHCPRecordOp",
     "DHCPLeaseHistory",
+    "DHCPObservedResponder",
+    "DHCPResponderAllowlist",
 ]
