@@ -20,6 +20,415 @@ the formatter handles the rest.
 
 ---
 
+## 2026.06.11-1 — 2026-06-11
+
+The **roadmap-batch + control-plane-HA-finish** release. Three
+roadmap batches (#361 / #362 / #375) clear ~22 backlog issues:
+global maintenance mode (#57), a built-in network-tools page (#58),
+top-N reports (#47), decom-date awareness (#46), per-subnet
+utilization history (#44), time-bound permissions (#65),
+resource-scoped API tokens (#374), an Ansible dynamic-inventory
+endpoint (#67), an internal-cert / token `secret_expiring` alert
+(#76), a compliance / change-report PDF (#48), DHCPv6 prefix
+delegation + DUID reservations (#368), rogue-DHCP-server detection
+(#370), DNS query-anomaly alerting (#371), IP-reconciliation
+hygiene alerts (#369), fingerbank device-class on the lease list
+(#373), atomic next-available-subnet allocation (#372), an OPNsense
+read-only mirror (#31), and the appliance host-OS config plane
+(syslog #156 / SSH #157 / DNS resolver #158). Finishes
+control-plane HA (#272) — data-plane resolver VIPs (DNS :53 +
+DHCP-relay :67 behind MetalLB) and a guided etcd snapshot-restore —
+and lands the #199 upgrade-image GitHub import plus the
+slot-image → upgrade-image rename. Closes the #358 agent
+config-wake arc (Redis pub/sub wake for the agent + supervisor
+long-polls, so a committed change reaches a parked box in under a
+second). Plus a dashboard-audit sweep (#364), a DHCP socket-mode
+fix for directly-attached clients (#365 / #366), and an OpenSSL
+CVE pin. Operator Copilot registry 148 → 180. 11 PRs since
+2026.06.04-1.
+
+### Added
+
+Control-plane HA — finished (#272). The remaining HA code lands;
+live multi-node VM testing (promote → restore → VIP claim) stays
+the gate to formally close the issue.
+
+- **Phase 10 — data-plane resolver VIPs.** New
+  `platform_settings.dns_vip` (:53) drops BIND9 / PowerDNS off
+  `hostNetwork` behind a MetalLB L2 LoadBalancer, and
+  `dhcp_relay_vip` (:67) fronts the Kea relay → server unicast
+  forward (Kea keeps `hostNetwork` for broadcast). The MetalLB
+  endpoint carries both with VIP-in-pool + distinct-VIP
+  validation; the seed upserts the `spatiumddi-appliance`
+  HelmChartConfig (`dns.useMetalLBVIP` / `dns.vip` /
+  `dhcpKea.relayVIP`) — the same reboot-safe overlay as the
+  control-plane VIP. Fleet → Network & Host → MetalLB → Advanced
+  gains the two pickers.
+- **Phase 9b — guided etcd snapshot restore.** The seed reports
+  its `k3s etcd-snapshot list` (read from the `ETCDSnapshotFile`
+  CRs over the kubeapi — no host `k3s` binary needed) on heartbeat
+  into `appliance.etcd_snapshots`. Fleet → Control plane grows an
+  etcd-snapshots card; Restore is gated behind a typed-hostname
+  confirm on top of superadmin, stamps `desired_restore_snapshot`,
+  and fires the host-side `spatium-cluster-restore` runner
+  (`k3s server --cluster-reset --cluster-reset-restore-path=…`).
+  Single-node cluster-reset — other members are orphaned and
+  re-paired via Replace; disaster recovery only, local snapshots
+  only (S3 restore deferred).
+- **Schema-head divergence panel** on Platform Insights → Postgres
+  (follow-up A) — `GET /postgres/schema-health` surfaces
+  schema-behind state during cold boot / mid-rolling-upgrade
+  without a 502 guess.
+
+Appliance upgrade images — pick from GitHub Releases (#199). For
+appliances with internet access the control plane imports the
+upgrade image straight from a release instead of the operator
+downloading + re-uploading it:
+`GET /api/v1/appliance/upgrade-images/available` lists releases
+carrying the `spatiumddi-appliance-slot-*-amd64.raw.xz` + `.sha256`
+sidecar (returns `github_reachable` for UI auto-detect);
+`POST …/upgrade-images/import-from-github` fetches the sidecar,
+short-circuits on a hash already held (idempotent), then streams +
+sha256-verifies the `.raw.xz` through the same storage path the
+upload flow uses. Fleet → Upgrade images grows a Pick from GitHub
+Releases / Upload (air-gap) toggle that auto-defaults to GitHub
+when reachable, else upload.
+
+Agent config-wake — Redis pub/sub (#358), end-to-end. The agent
+`/config` long-poll and the supervisor heartbeat long-poll now
+wake on a Redis pub/sub bus published to after each config commit,
+so a committed change reaches a parked agent / supervisor in under
+a second instead of waiting out the interval — while the
+ETag / desired-state compare stays the source of truth and the
+loops degrade to a bounded poll when Redis is down (never the sole
+delivery path, per non-negotiable #5).
+
+- `backend/app/core/agent_wake.py` adds `publish_wake`
+  (fire-and-forget; swallows every Redis error so an outage can't
+  500 a CRUD write) and `wake_subscription` (subscribes before the
+  first bundle build to close the register race). Reuses the
+  Sentinel-aware Redis client so it follows failover; every api
+  replica subscribes, so a wake on any replica / Celery worker
+  reaches whichever replica holds the poll.
+- **Supervisor heartbeat long-poll wake** —
+  `SupervisorHeartbeatRequest` gains an opt-in `wait_seconds`;
+  when set with no concrete command pending, the handler holds on
+  the appliance + `HOSTCONFIG_ALL` wake channels up to 28 s. The
+  supervisor stays HTTP-only (the Redis wake lives server-side), so
+  remote / Application supervisors that can't reach the
+  cluster-internal `sentinel://` Redis still benefit. Fleet OS /
+  reboot / role / firewall changes `publish_wake` after commit, so
+  they start in ~0 s.
+- **Redis dashboard** — a superadmin-gated, degrade-friendly Redis
+  tab in Platform Insights (role / memory / clients / hit-ratio
+  cards + a config-wake-bus panel showing publishes-by-class +
+  parked subscribers per channel + keyspace), backed by
+  `GET /redis/{overview,keyspace,wake-bus}` (never 500s) and a new
+  `get_redis_stats` MCP read tool.
+
+Appliance host-OS config plane (#156 / #157 / #158) — siblings of
+the SNMP / NTP / LLDP host-config plane, same
+PlatformSettings → ConfigBundle / heartbeat → host-runner pattern,
+default-off, surfaced under Fleet → Services:
+
+- **Syslog / rsyslog forwarding (#156)** — `syslog_targets`
+  (host / port / protocol / format + Fernet-encrypted CA PEM),
+  Fleet chip, MCP. Strict host / filter validators on both the
+  REST and AI paths.
+- **SSH authorized_keys + sshd hardening (#157)** —
+  keys / password-auth / root-login / port / source-CIDRs, with
+  lockout-safety guards in both the server + host runner and a
+  source-scoped nftables drop-in.
+- **DNS resolver override (#158)** — a systemd-resolved drop-in
+  (override only; never touches `DNSStubListener`; `Domains=~.`),
+  rejected (422) if override mode is set with no servers.
+
+Global maintenance mode (#57). Middleware 503s mutating requests
+during a change window (`Retry-After`, superadmin bypass,
+agent / auth / health exempt per non-negotiable #5);
+PlatformSettings-driven, audited, with a global banner, a Settings
+toggle, and `maintenance_status` / `set_maintenance_mode` MCP
+tools.
+
+Built-in network tools page (#58). A `/tools` page —
+ping / traceroute / mtr / dig / whois (sandboxed argv),
+port-test / TLS-cert (sockets), DNS-propagation, MAC-vendor —
+permission-gated + Redis rate-limited, with 7 MCP tools. Network
+tools can also run from a selected Fleet appliance's vantage (the
+"Run from" selector) reusing the supervisor poll/reply-over-
+outbound channel — NAT-friendly, no inbound holes, server-rebuilt
+argv (never a shell string).
+
+Top-N reports (#47). A `/reports` surface — top subnets by
+utilization, owners by IP count, most-modified resources (via
+`audit_log`), noisiest DNS clients — feature-module-gated with 4
+MCP read tools.
+
+Decom-date awareness (#46). First-class `decom_date` on subnet +
+IP, a `decom_expiring` alert rule (severity escalation reused from
+the other `*_expiring` rules), a dashboard widget, and a
+`find_subnets_decommissioning` MCP tool.
+
+Per-subnet utilization history (#44). A daily beat task snapshots
+each subnet's allocated / total IP counts (pruned > 90 d); a Trend
+tab on the subnet detail renders a 30 / 90-day % used line chart;
+`get_subnet_utilization_trend` MCP tool reports the series +
+first → last delta.
+
+Time-bound permissions (#65). A `time_bound_grant` table —
+auto-expiring additive RBAC grants ({action, resource_type,
+resource_id?} to a group until `expires_at`) consulted live by
+`user_has_permission`, soft-revoked by a 60 s beat sweep (never
+hard-deleted), with per-group UI + MCP.
+
+Resource-scoped API tokens (#374). `api_token.resource_grants`
+binds a token to a specific subnet or DNS zone in the RBAC grammar
+(building on #74's coarse scopes) — the binding only narrows the
+owner, never widens, so a leaked CI / Terraform secret can't touch
+anything else. Create-time validation checks shape, resource
+existence, and can't-grant-more-than-yourself; the tokens page
+gains a resource picker.
+
+Ansible dynamic-inventory endpoint (#67). `GET /api/v1/ansible/
+inventory` returns standard Ansible dynamic-inventory JSON built
+from IPAM — hosts grouped by space / block / subnet / tag /
+custom-field, with `_meta.hostvars`. Read-only; point Ansible at
+it with a read-scoped API token.
+
+OPNsense read-only mirror (#31). A first-class read-only pull
+integration cloned end-to-end from the Proxmox mirror (model,
+client, reconciler, beat sweep, CRUD / test / sync, both dashboard
+surfaces per non-negotiable #15, sidebar, page, `list_opnsense_
+targets` MCP tool), gated by the `integrations.opnsense` feature
+module.
+
+Compliance / change-report PDF (#48). `GET /api/v1/audit/
+export.pdf` renders an auditor-facing PDF of every `audit_log`
+mutation in a date range, grouped by user / resource / action,
+with a per-row SHA-256 tamper-evidence trailer over the
+audit-chain hash. Export PDF button on the Audit Log page.
+
+`secret_expiring` alert rule (#76). One rule that fires per
+internal credential expiring within `threshold_days` — supervisor
+mTLS certs (`appliance.cert_expires_at`) + API tokens
+(`api_token.expires_at`) — with the standard
+warning / critical escalation.
+
+DHCPv6 prefix delegation + DUID reservations (#368).
+`DHCPPool.pool_type='pd'` (`pd_prefix` / `delegated_length` /
+`excluded_prefix`) renders a Kea `pd-pools` entry inside `subnet6`
+on stateful v6 subnets (RFC 6603 excluded-prefix); `DHCPStatic
+Assignment.duid` keys v6 reservations on DUID with
+`host-reservation-identifiers ['duid','hw-address']`. Pool + static
+forms gain the IA_PD type / DUID field on v6 scopes.
+
+Rogue DHCP server detection (#370). An opt-in agent probe thread
+broadcasts a spoofed-MAC DISCOVER (never a REQUEST — no lease
+consumed), collects OFFERs, and ships responders; the backend
+classifies each against the group's known servers + an operator
+allowlist into expected / acknowledged / rogue, with a
+disabled-by-default `rogue_dhcp` alert rule, a Responders tab +
+Acknowledge action, and a `find_dhcp_responders` MCP tool.
+
+Fingerbank device class on the lease list (#373). The leases
+endpoint returns device class / name / manufacturer / score per
+lease via a single batch join, with an optional `?device_class=`
+filter, a Device column + filter on the leases tab, and the fields
+surfaced on `find_dhcp_leases`.
+
+DHCP per-group socket mode (#365 / #366). `DHCPServerGroup.dhcp_
+socket_mode` — `direct` → Kea raw / AF_PACKET sockets (default;
+hears broadcast DISCOVERs from directly-attached clients that have
+no IP yet) / `relay` → udp (relay-only opt-out), delivered through
+the ConfigBundle long-poll + folded into the ETag, with a "Client
+reachability" toggle on the server-group modal.
+
+Atomic next-available-subnet allocation (#372).
+`POST /ipam/blocks/{id}/allocate-subnet` carves the lowest free
+child CIDR of a requested prefix (or a chosen free in-block CIDR)
+in one block-locked transaction — the subnet analog of the
+next-available-IP allocate — delegating to `create_subnet` so
+placeholders, templates, and DDNS inheritance match. New
+`propose_allocate_subnet` MCP write tool; the AddSubnet "Find by
+size" flow now allocates through it.
+
+IP-reconciliation hygiene alerts (#369). Three alert rule types
+(disabled by default) over the `last_seen_at` liveness signal —
+`ip_free_but_responding`, `stale_reservation`, and
+`unknown_mac_in_static_range` (a squat) — with the ping / ARP
+sweep + SNMP ARP cross-reference now logging observed MACs into
+`ip_mac_history` (operator-set MAC never overwritten), and a
+`find_ip_hygiene_findings` MCP tool.
+
+DNS query-anomaly alerts + per-view analytics (#371). Two alert
+rule types over the per-server rcode deltas agents already report —
+`dns_nxdomain_spike` (NXDOMAIN ratio over a 15-min window, catches
+DGA beacons) and `dns_query_rate_spike` — plus a "By view" card in
+the Logs analytics strip (split-horizon servers) and a
+`find_dns_query_stats` MCP tool.
+
+DNS config-drift report backend (#61, partial). `GET …/zones/{id}/
+drift` AXFRs the live zone from every server in the group and diffs
+it against the DB — extra-on-server (manual host change) /
+missing-on-server / in-sync, per server, read-only — with a
+`find_dns_zone_drift` MCP tool. UI deferred.
+
+DHCP server-detail Stats tab (#195, partial). The 6th tab on the
+DHCP server detail modal renders the per-server lease-rate
+timeseries, reusing the dashboard DHCP traffic card scoped to one
+server.
+
+### Changed
+
+- **Operator-facing rename "slot image" → "upgrade image" (#199).**
+  Model `ApplianceSlotImage` → `ApplianceUpgradeImage` (+
+  data-preserving table rename); module `slot_images.py` →
+  `upgrade_images.py`; endpoints `/slot-images/*` →
+  `/upgrade-images/*`; Pydantic schemas, audit actions, logger
+  events, UI strings, and the frontend client follow. The
+  lower-level A/B `dd` mechanism stays named "slot" deliberately
+  (the `slot-image-mirror` PVC, `services/appliance/slot.py`, the
+  `/var/lib/spatiumddi/slot-images` store + env + volume, the
+  `desired_slot_image_url` columns / wire fields, the slot
+  download-token HMAC, and the `spatiumddi-appliance-slot-*.raw.xz`
+  release asset name — pure plumbing, not operator-facing).
+- Config-mutating DNS / DHCP / IPAM / host-config endpoints (and
+  the `dns_pool_healthcheck` / `ipam_dns_sync` / blocklist-refresh
+  Celery workers) now `publish_wake` after commit so parked agents
+  converge in ~0 s; the belt-and-braces idle tick
+  (`WAKE_TICK_SECONDS`) is raised 2 s → 12 s since the wake carries
+  the common case (#358).
+- `find_control_plane_vip` MCP tool widened to also report the
+  DNS + DHCP-relay data-plane VIPs (#272 Phase 10).
+- `make appliance-baked-iso` now refuses local source images older
+  than 24 h unless `--allow-stale-images` / `ALLOW_STALE_IMAGES=1`
+  is passed, so a stale local bake can't silently ship into the ISO
+  (#272 follow-up B); `appliance-bake-images` threads a
+  `BAKE_FLAGS` knob.
+- DHCP socket-mode default flips upgraded installs from the old
+  hard-coded `udp` render to `direct` / raw via the migration's
+  `server_default` — every existing group starts answering
+  directly-attached clients with no operator action (#366).
+- `NET_RAW` granted on all Kea services in the docker-compose files
+  (the appliance DaemonSet already had it) so raw socket mode works
+  (#366); the supervisor + backend images gain
+  iputils / traceroute / mtr / dig / whois for the network-tools
+  surface (#58 / #364).
+- Fleet → Services nav items alphabetized
+  (DNS Resolver / LLDP / NTP / SNMP / SSH / Syslog), with a
+  keep-sorted note (#363). Dashboard tab bar + heatmap / server /
+  integration lists get isolated horizontal scroll + `min-w`
+  wrappers on mobile (#364).
+- Cloud DNS drivers (Route 53 / Cloudflare / Google / Azure) no
+  longer advertise `dnssec_online` / `alias_records` capabilities
+  the server-side gates already 422 — so the UI stops offering
+  cloud DNSSEC sign / ALIAS authoring that then failed (#29,
+  partial; real cloud DNSSEC + ALIAS remain a scoped follow-up).
+
+### Fixed
+
+- Dashboard feature-gated queries fired before the module set
+  loaded → a one-shot 404 console-spam + scary red cards on hard
+  load; `useFeatureModules` now exposes a `ready` flag and the
+  AI / ASN / VRF / Conformity surfaces gate on `ready && enabled`,
+  with the Conformity tab filtered out when its module is off
+  (#364).
+- Dashboard widgets: all-zero DHCP / DNS series render the empty
+  state instead of a degenerate plot; RPKI "expiring soon" shows
+  "just now" not a future "in N d"; the Orphan-services card's
+  empty hint shows; the Proxmox panel used a non-existent
+  `hostname` column (blank rows) → `name`; UniFi was unreachable
+  on the dashboard (missing `integration_unifi_enabled` in the
+  settings schemas) (#364).
+- #368 was dead on the real agent path — the agent `/config` wire
+  payload hand-builds pool / static dicts and dropped the new
+  PD / DUID fields, so they never reached `render_kea`; the v6
+  pool-overlap check crashed on an IPv4-only `_ip_int`; the agent
+  `render_kea` socket-type fallback flipped `udp` → `raw` so a
+  control-plane-less render still hears direct clients (#366).
+- #374 token binding escaped on every subnet handler not yet
+  guarded (a subnet-scoped token could update / delete / resize /
+  bulk-edit across any subnet) — `_enforce_subnet_token_scope`
+  added to all of them, bulk handlers skipping out-of-scope IPs
+  per row.
+- #362 adversarial self-review (33-agent pass, 19 confirmed
+  findings, all fixed): the SSH-reload port-in-use guard matched
+  sshd's own socket and aborted every apply on real hardware;
+  maintenance superadmin-bypass skipped the session check (a
+  force-logged-out superadmin still bypassed) + ignored token
+  scopes; the syslog `config_hash` excluded the CA PEM so CA
+  rotation never propagated; OPNsense delete CASCADE-wiped operator
+  IP rows on a disappeared interface (now un-claims); the
+  `*_expiring` alerts never escalated an already-open event.
+- Fleet role-assignment + Subnet-planner group pickers read the
+  tuple query keys `['dns','groups']` while group CRUD invalidates
+  the hyphenated `['dns-groups']` — React Query matches by prefix,
+  so a freshly-created group only appeared after a full reload;
+  switched both to the canonical hyphenated keys (#367).
+
+### Security
+
+- Bumped OpenSSL (libcrypto3 / libssl3) to `>= 3.5.7-r0` across the
+  Kea / BIND9 / PowerDNS agent images to clear CVE-2026-45447
+  (HIGH) surfaced by Trivy (#366).
+- Resource-scoped API tokens (#374) limit the blast radius of a
+  leaked token — a token bound to one subnet / DNS zone is
+  intersected with the owner's RBAC and can only ever narrow it;
+  `is_effective_superadmin` is token-aware so a resource-scoped
+  admin token is never treated as superadmin.
+- Rogue DHCP server detection (#370) surfaces an unauthorized DHCP
+  server answering on a managed segment.
+- #362 security sweep: `dig` leading-dash option-injection
+  (local-file read) closed at the runner + MCP; an SSRF denylist
+  (loopback / link-local / `169.254.169.254`) on the socket tools +
+  `@server` / resolvers (RFC1918 still allowed); strict rsyslog
+  `target` / filter validators on both REST + AI paths; the
+  maintenance toggle is superadmin-only and an `sddi_` scoped token
+  can no longer bypass it; top-owners now requires `read:customer`,
+  not just `read:ip_address`.
+
+### Migrations
+
+Single linear head `c3f7a1d9b486`. Fourteen migrations, all
+additive (new columns / tables) except the one `rename_table`,
+parented off the 2026.06.04-1 head `a3f1e9c47b20`:
+
+- `c7a3e1f90d24` — `subnet_utilization_history` table (#44).
+- `d1b8f4a92c30` — `platform_settings` maintenance-mode columns
+  (#57).
+- `a3f7c1e92b48` — `decom_date` on subnet + ip_address (#46).
+- `d5e9b2c14a07` — `time_bound_grant` table (#65).
+- `e7a3f1c0d294` — appliance syslog-forwarding settings (#156).
+- `f1c4a90b27d6` — appliance SSH settings (#157).
+- `a3e7c9d12f80` — appliance DNS-resolver settings (#158).
+- `b6f4d2a91c83` — `opnsense_firewall` table + IPAM provenance FKs
+  + `integrations.opnsense` feature module (#31).
+- `f3b9c1d6a274` — `dhcp_server_group.dhcp_socket_mode`
+  (server_default `direct`, backfills every row) (#365 / #366).
+- `c3f1a7e09d52` — `api_token.resource_grants` JSONB (#374).
+- `d5b2e8a14c93` — DHCPv6 PD columns on `dhcp_pool` + `duid` on
+  `dhcp_static_assignment` (#368).
+- `e7a3c0d519f4` — `dhcp_observed_responder` +
+  `dhcp_responder_allowlist` for rogue-DHCP detection (#370).
+- `f1a4c7b2e9d6` — `platform_settings.dns_vip` / `dhcp_relay_vip` +
+  `appliance.etcd_snapshots` / `desired_restore_snapshot` /
+  `restore_state` / `restore_reason` (#272 Phase 9b / 10).
+- `c3f7a1d9b486` — data-preserving `rename_table`
+  `appliance_slot_image` → `appliance_upgrade_image` (#199); the
+  rename is baselined in `migrations_lint_baseline.txt` for the
+  #296 expand/contract linter (transient superadmin-only table;
+  the rolling-upgrade orchestrator runs migrate after the pod
+  rollout completes).
+
+### Deprecated
+
+- Legacy `/api/v1/appliance/slot-images/*` paths are kept for one
+  release cut as `308` permanent redirects to `/upgrade-images/*`
+  so bookmarks / scripts don't hard-break (#199). `308` (not
+  `301`) preserves the request method + body, so the air-gap
+  upload + delete shims keep working. Update scripts to the new
+  paths — the shim is scheduled for removal next cut.
+
 ## 2026.06.04-1 — 2026-06-04
 
 The **roadmap-closure + appliance fleet-firewall** release — the
