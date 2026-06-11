@@ -1429,7 +1429,9 @@ export const ipamApi = {
   // over availableSubnets()-then-createSubnet() for the "Find by size" flow.
   allocateSubnet: (
     blockId: string,
-    data: { prefix_len: number } & Partial<Subnet> & { template_id?: string | null },
+    data: { prefix_len: number } & Partial<Subnet> & {
+        template_id?: string | null;
+      },
   ) =>
     api
       .post<Subnet>(`/ipam/blocks/${blockId}/allocate-subnet`, data)

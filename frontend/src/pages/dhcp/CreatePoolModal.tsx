@@ -133,9 +133,7 @@ export function CreatePoolModal({
               <option value="dynamic">Dynamic</option>
               <option value="excluded">Excluded</option>
               <option value="reserved">Reserved</option>
-              {isV6 && (
-                <option value="pd">Prefix delegation (IA_PD)</option>
-              )}
+              {isV6 && <option value="pd">Prefix delegation (IA_PD)</option>}
             </select>
           </Field>
           {isPd && (

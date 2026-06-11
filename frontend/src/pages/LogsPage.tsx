@@ -1251,7 +1251,8 @@ function DNSQueryAnalyticsStrip({
   // Per-view card only renders for split-horizon servers (≥1 view seen) so
   // single-view setups keep the tidy 3-card strip (#371).
   const views = analytics?.top_views ?? [];
-  const cols = views.length > 0 ? "md:grid-cols-2 lg:grid-cols-4" : "md:grid-cols-3";
+  const cols =
+    views.length > 0 ? "md:grid-cols-2 lg:grid-cols-4" : "md:grid-cols-3";
 
   return (
     <div className="border-b bg-muted/10 px-6 py-2">

@@ -525,9 +525,7 @@ function GroupDetailView({
         {isKea && tab === "phone-profiles" && (
           <PhoneProfilesTab groupId={group.id} />
         )}
-        {isKea && tab === "responders" && (
-          <RespondersTab groupId={group.id} />
-        )}
+        {isKea && tab === "responders" && <RespondersTab groupId={group.id} />}
       </div>
     </div>
   );
@@ -556,10 +554,10 @@ function RespondersTab({ groupId }: { groupId: string }) {
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
-        DHCP servers seen answering on this group's segments by the active
-        probe (enable <code>DHCP_ROGUE_PROBE_ENABLED=1</code> on the agent).
-        Unknown responders classify <span className="text-rose-600">rogue</span>{" "}
-        and fire the Rogue DHCP alert — acknowledge a known-but-external one to
+        DHCP servers seen answering on this group's segments by the active probe
+        (enable <code>DHCP_ROGUE_PROBE_ENABLED=1</code> on the agent). Unknown
+        responders classify <span className="text-rose-600">rogue</span> and
+        fire the Rogue DHCP alert — acknowledge a known-but-external one to
         allowlist it.
       </p>
       <div className="rounded-lg border overflow-auto">
@@ -1705,7 +1703,9 @@ function LeasesTab({ server }: { server: DHCPServer }) {
   // Distinct fingerbank device classes present in the current result set —
   // drives the device-class filter (#373), same client-side style as state/subnet.
   const deviceClasses = Array.from(
-    new Set(allLeases.map((l) => l.device_class).filter((c): c is string => !!c)),
+    new Set(
+      allLeases.map((l) => l.device_class).filter((c): c is string => !!c),
+    ),
   ).sort();
   const leases = allLeases.filter((l) => {
     if (state && l.state !== state) return false;
