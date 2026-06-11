@@ -110,10 +110,10 @@ async def test_allocate_skips_preexisting_subnet(
 
 @pytest.mark.asyncio
 async def test_allocate_409_when_full(client: AsyncClient, db_session: AsyncSession) -> None:
-    """A /30 block holds exactly one /30 — the second carve 409s."""
+    """A /29 block holds exactly two /30s — the third carve 409s."""
     _, token = await _make_admin(db_session)
     space = await _make_space(db_session)
-    block = await _make_block(db_session, space, "10.52.0.0/30")
+    block = await _make_block(db_session, space, "10.52.0.0/29")
 
     r1 = await client.post(
         f"/api/v1/ipam/blocks/{block.id}/allocate-subnet",
@@ -128,7 +128,16 @@ async def test_allocate_409_when_full(client: AsyncClient, db_session: AsyncSess
         headers=_auth(token),
         json={"prefix_len": 30},
     )
-    assert r2.status_code == 409, r2.text
+    assert r2.status_code == 201, r2.text
+    assert r2.json()["network"] == "10.52.0.4/30"
+
+    # Block now full of /30s → third 409s.
+    r3 = await client.post(
+        f"/api/v1/ipam/blocks/{block.id}/allocate-subnet",
+        headers=_auth(token),
+        json={"prefix_len": 30},
+    )
+    assert r3.status_code == 409, r3.text
 
 
 @pytest.mark.asyncio
