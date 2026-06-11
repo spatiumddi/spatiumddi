@@ -112,7 +112,9 @@ export function CreateServerGroupModal({
           <select
             className={inputCls}
             value={socketMode}
-            onChange={(e) => setSocketMode(e.target.value as "direct" | "relay")}
+            onChange={(e) =>
+              setSocketMode(e.target.value as "direct" | "relay")
+            }
           >
             <option value="direct">
               Directly attached / mixed (raw sockets) — recommended
