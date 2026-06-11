@@ -4266,15 +4266,15 @@ async def schedule_appliance_upgrade(
     # from the same network it reaches the control plane on; the
     # request's base_url is the operator-facing scheme + host the
     # frontend is already using.
-    from app.models.appliance import ApplianceSlotImage  # noqa: PLC0415
+    from app.models.appliance import ApplianceUpgradeImage  # noqa: PLC0415
 
     resolved_url: str
     if body.slot_image_id is not None:
-        image = await db.get(ApplianceSlotImage, body.slot_image_id)
+        image = await db.get(ApplianceUpgradeImage, body.slot_image_id)
         if image is None:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"Slot image {body.slot_image_id} not found.",
+                f"Upgrade image {body.slot_image_id} not found.",
             )
         # ``request.base_url`` ends with ``/`` and carries the scheme
         # + host the frontend reached us on (X-Forwarded-Host /
@@ -4290,14 +4290,14 @@ async def schedule_appliance_upgrade(
         # session and no mTLS material. The token is HMAC'd against
         # the image_id + SECRET_KEY, so a leaked URL can't be replayed
         # against a different image.
-        from app.api.v1.appliance.slot_images import (  # noqa: PLC0415
+        from app.api.v1.appliance.upgrade_images import (  # noqa: PLC0415
             slot_image_download_token,
         )
 
         token = slot_image_download_token(image.id)
         resolved_url = (
             f"{str(request.base_url).rstrip('/')}"
-            f"/api/v1/appliance/slot-images/{image.id}/raw.xz?t={token}"
+            f"/api/v1/appliance/upgrade-images/{image.id}/raw.xz?t={token}"
         )
     else:
         assert body.desired_slot_image_url is not None

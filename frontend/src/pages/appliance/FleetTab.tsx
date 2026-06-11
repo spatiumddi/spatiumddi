@@ -4,6 +4,7 @@ import {
   AlertCircle,
   Ban,
   CheckCircle2,
+  DownloadCloud,
   FileText,
   HardDrive,
   KeyRound,
@@ -22,15 +23,15 @@ import {
 
 import {
   applianceApprovalApi,
-  applianceSlotImagesApi,
+  applianceUpgradeImagesApi,
   authApi,
   dhcpApi,
   dnsApi,
   type ApplianceRow,
   type ApplianceState,
   type ControlPlaneReplaceResult,
-  type SlotImage,
   type SupervisorCapabilities,
+  type UpgradeImage,
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
@@ -686,7 +687,7 @@ export function FleetTab({
   const [view, setView] = useSessionState<
     | "appliances"
     | "pairing"
-    | "slot-images"
+    | "upgrade-images"
     | "lldp"
     | "ntp"
     | "resolver"
@@ -912,7 +913,7 @@ export function FleetTab({
     key:
       | "appliances"
       | "pairing"
-      | "slot-images"
+      | "upgrade-images"
       | "lldp"
       | "ntp"
       | "resolver"
@@ -942,9 +943,9 @@ export function FleetTab({
           summary: "Mint codes for new appliances.",
         },
         {
-          key: "slot-images",
+          key: "upgrade-images",
           label: "Upgrade images",
-          summary: "Air-gap .raw.xz upload + browse.",
+          summary: "GitHub import or air-gap .raw.xz upload.",
         },
       ],
     },
@@ -1035,7 +1036,7 @@ export function FleetTab({
       <main className="flex-1 overflow-y-auto">
         {/* The appliances list is a wide multi-column table — let it use
             the full pane width (like the IPAM table) instead of the
-            max-w-5xl cap the narrower config forms (pairing / slot-images
+            max-w-5xl cap the narrower config forms (pairing / upgrade-images
             / NTP / SNMP) read better at. */}
         <div
           className={cn(
@@ -1057,7 +1058,7 @@ export function FleetTab({
             </div>
           )}
 
-          {view === "slot-images" && (
+          {view === "upgrade-images" && (
             <div>
               <div className="mb-1 flex items-center justify-between gap-2">
                 <h2 className="text-base font-semibold">Upgrade images</h2>
@@ -1065,7 +1066,7 @@ export function FleetTab({
                   type="button"
                   onClick={() =>
                     qc.invalidateQueries({
-                      queryKey: ["appliance", "slot-images"],
+                      queryKey: ["appliance", "upgrade-images"],
                     })
                   }
                   title="Refresh the upgrade images list"
@@ -1076,12 +1077,14 @@ export function FleetTab({
                 </button>
               </div>
               <p className="mb-4 text-xs text-muted-foreground">
-                Air-gap support — upload <code>.raw.xz</code> upgrade images for
-                offline appliance upgrades. The supervisor downloads through the
-                control plane via an authenticated internal URL once an OS
-                upgrade points at the uploaded row.
+                Stage an appliance OS upgrade image. Connected installs can
+                import directly from a GitHub release; air-gapped installs
+                upload the <code>.raw.xz</code> out-of-band. Either way the
+                supervisor downloads through the control plane via an
+                authenticated internal URL once an OS upgrade points at the
+                stored row.
               </p>
-              <SlotImageManager />
+              <UpgradeImageManager />
             </div>
           )}
 
@@ -3648,11 +3651,11 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
     row.deployment_kind === "appliance" || row.deployment_kind === null;
   const upgradeInFlight = row.desired_appliance_version !== null;
 
-  // Uploaded slot images — fetched only when the operator picks the
+  // Staged upgrade images — fetched only when the operator picks the
   // ``uploaded`` source, so non-air-gapped flows skip the round trip.
   const uploadedQuery = useQuery({
-    queryKey: ["appliance", "slot-images"],
-    queryFn: applianceSlotImagesApi.list,
+    queryKey: ["appliance", "upgrade-images"],
+    queryFn: applianceUpgradeImagesApi.list,
     staleTime: 30_000,
     enabled: isApplianceHost,
   });
@@ -3964,9 +3967,12 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
   );
 }
 
-// ── SlotImageManager (#170 follow-up) ───────────────────────────
+// ── UpgradeImageManager (#170 follow-up; GitHub import + air-gap
+// upload — #199) ──────────────────────────────────────────────────
 
-function SlotImageManager() {
+type UpgradeSourceMode = "github" | "upload";
+
+function UpgradeImageManager() {
   const qc = useQueryClient();
   const [file, setFile] = useState<File | null>(null);
   const [sha256, setSha256] = useState("");
@@ -3976,20 +3982,42 @@ function SlotImageManager() {
     loaded: number;
     total: number;
   } | null>(null);
-  // Slot images are heavy (typically ~700 MiB raw.xz) and a misclick
+  // GitHub-import picker state.
+  const [selectedTag, setSelectedTag] = useState("");
+  // ``null`` = auto-detect once the ``available`` query resolves:
+  // GitHub if reachable + has matching releases, else air-gap upload.
+  const [mode, setMode] = useState<UpgradeSourceMode | null>(null);
+  // Upgrade images are heavy (typically ~700 MiB raw.xz) and a misclick
   // wipes the only on-server copy of an air-gap-cached release — gate
   // the delete behind a typed-confirm modal.
-  const [deleteTarget, setDeleteTarget] = useState<SlotImage | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<UpgradeImage | null>(null);
 
   const imagesQuery = useQuery({
-    queryKey: ["appliance", "slot-images"],
-    queryFn: applianceSlotImagesApi.list,
+    queryKey: ["appliance", "upgrade-images"],
+    queryFn: applianceUpgradeImagesApi.list,
     staleTime: 30_000,
   });
 
+  // Connected-install picker source. Empty / unreachable ⇒ the UI
+  // auto-defaults to the air-gap upload tab.
+  const availableQuery = useQuery({
+    queryKey: ["appliance", "upgrade-images", "available"],
+    queryFn: applianceUpgradeImagesApi.listAvailable,
+    staleTime: 60_000,
+  });
+  const available = availableQuery.data?.available ?? [];
+  const githubReachable = availableQuery.data?.github_reachable ?? false;
+  const effectiveMode: UpgradeSourceMode =
+    mode ?? (githubReachable && available.length > 0 ? "github" : "upload");
+
+  // Default-select the newest available tag once the list lands.
+  useEffect(() => {
+    if (!selectedTag && available.length > 0) setSelectedTag(available[0].tag);
+  }, [available, selectedTag]);
+
   const upload = useMutation({
     mutationFn: () =>
-      applianceSlotImagesApi.upload(
+      applianceUpgradeImagesApi.upload(
         file!,
         sha256.trim().toLowerCase(),
         applianceVersion.trim(),
@@ -3997,7 +4025,7 @@ function SlotImageManager() {
         (loaded, total) => setProgress({ loaded, total }),
       ),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["appliance", "slot-images"] });
+      qc.invalidateQueries({ queryKey: ["appliance", "upgrade-images"] });
       setFile(null);
       setSha256("");
       setApplianceVersion("");
@@ -4007,10 +4035,17 @@ function SlotImageManager() {
     onError: () => setProgress(null),
   });
 
-  const remove = useMutation({
-    mutationFn: (id: string) => applianceSlotImagesApi.remove(id),
+  const importGithub = useMutation({
+    mutationFn: () => applianceUpgradeImagesApi.importFromGithub(selectedTag),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["appliance", "slot-images"] });
+      qc.invalidateQueries({ queryKey: ["appliance", "upgrade-images"] });
+    },
+  });
+
+  const remove = useMutation({
+    mutationFn: (id: string) => applianceUpgradeImagesApi.remove(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "upgrade-images"] });
       setDeleteTarget(null);
     },
   });
@@ -4018,90 +4053,188 @@ function SlotImageManager() {
   return (
     <div className="space-y-3 text-xs">
       <p className="text-muted-foreground">
-        Air-gapped appliances can&apos;t reach the GitHub release page. Download
-        the <code>.raw.xz</code> + its <code>.sha256</code> sidecar to a
-        workstation, then upload here. The backend verifies the SHA-256 on the
-        received bytes; the appliance downloads through the control plane via an
-        authenticated internal URL when an OS upgrade is scheduled.
+        Connected installs import the upgrade image straight from a GitHub
+        release — the control plane downloads + verifies it for you. Air-gapped
+        installs download the <code>.raw.xz</code> + its <code>.sha256</code>{" "}
+        sidecar out-of-band and upload it here. Either way the backend verifies
+        the SHA-256 before storing, and the appliance pulls through the control
+        plane via an authenticated internal URL when an OS upgrade is scheduled.
       </p>
 
-      <div className="rounded-md border p-3">
-        <div className="grid gap-2 sm:grid-cols-2">
-          <div>
-            <label className="text-muted-foreground">.raw.xz file</label>
-            <input
-              type="file"
-              accept=".xz,.raw.xz,application/octet-stream"
-              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-              className="mt-1 block w-full text-xs"
-            />
-            {file && (
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                {file.name} · {(file.size / (1024 * 1024)).toFixed(1)} MiB
-              </p>
-            )}
-          </div>
-          <div>
-            <label className="text-muted-foreground">Appliance version</label>
-            <input
-              value={applianceVersion}
-              onChange={(e) => setApplianceVersion(e.target.value)}
-              placeholder="e.g. 2026.06.01-1"
-              className="mt-1 w-full rounded-md border bg-background px-2 py-1"
-            />
-          </div>
-          <div className="sm:col-span-2">
-            <label className="text-muted-foreground">SHA-256 (hex)</label>
-            <input
-              value={sha256}
-              onChange={(e) => setSha256(e.target.value)}
-              placeholder="paste from the .sha256 sidecar (64 lowercase hex chars)"
-              className="mt-1 w-full rounded-md border bg-background px-2 py-1 font-mono"
-            />
-          </div>
-          <div className="sm:col-span-2">
-            <label className="text-muted-foreground">Notes (optional)</label>
-            <input
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              placeholder="e.g. RC1 — verified by ops on 2026-06-01"
-              className="mt-1 w-full rounded-md border bg-background px-2 py-1"
-            />
-          </div>
-        </div>
-        <div className="mt-3 flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => upload.mutate()}
-            disabled={
-              !file ||
-              sha256.trim().length !== 64 ||
-              !applianceVersion.trim() ||
-              upload.isPending
-            }
-            className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {upload.isPending ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Upload className="h-3.5 w-3.5" />
-            )}
-            Upload
-          </button>
-          {progress && progress.total > 0 && (
-            <span className="text-[11px] text-muted-foreground">
-              {((progress.loaded / progress.total) * 100).toFixed(0)}% ·{" "}
-              {(progress.loaded / (1024 * 1024)).toFixed(1)} /{" "}
-              {(progress.total / (1024 * 1024)).toFixed(1)} MiB
-            </span>
+      {/* Source toggle — auto-defaults to GitHub when reachable. */}
+      <div className="inline-flex rounded-md border p-0.5">
+        <button
+          type="button"
+          onClick={() => setMode("github")}
+          className={cn(
+            "rounded px-3 py-1",
+            effectiveMode === "github"
+              ? "bg-primary/10 font-medium text-primary"
+              : "text-muted-foreground hover:bg-muted",
           )}
-          {upload.error && (
-            <span className="text-rose-700 dark:text-rose-300">
-              {formatApiError(upload.error)}
-            </span>
+        >
+          Pick from GitHub Releases
+        </button>
+        <button
+          type="button"
+          onClick={() => setMode("upload")}
+          className={cn(
+            "rounded px-3 py-1",
+            effectiveMode === "upload"
+              ? "bg-primary/10 font-medium text-primary"
+              : "text-muted-foreground hover:bg-muted",
           )}
-        </div>
+        >
+          Upload (air-gap)
+        </button>
       </div>
+
+      {effectiveMode === "github" ? (
+        <div className="rounded-md border p-3">
+          {availableQuery.isLoading ? (
+            <div className="flex items-center gap-2 text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Checking GitHub
+              releases…
+            </div>
+          ) : !githubReachable ? (
+            <p className="text-muted-foreground">
+              GitHub isn&apos;t reachable from the control plane. Use the{" "}
+              <strong>Upload (air-gap)</strong> tab instead.
+            </p>
+          ) : available.length === 0 ? (
+            <p className="text-muted-foreground">
+              No recent GitHub release carries an importable appliance upgrade
+              image yet.
+            </p>
+          ) : (
+            <div className="space-y-3">
+              <div>
+                <label className="text-muted-foreground">Release</label>
+                <select
+                  value={selectedTag}
+                  onChange={(e) => setSelectedTag(e.target.value)}
+                  className="mt-1 w-full rounded-md border bg-background px-2 py-1"
+                >
+                  {available.map((r) => (
+                    <option key={r.tag} value={r.tag}>
+                      {r.tag}
+                      {r.is_prerelease ? " (pre-release)" : ""}
+                      {r.is_installed ? " · installed" : ""}
+                      {r.size_bytes
+                        ? ` · ${(r.size_bytes / (1024 * 1024)).toFixed(0)} MiB`
+                        : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => importGithub.mutate()}
+                  disabled={!selectedTag || importGithub.isPending}
+                  className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {importGithub.isPending ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <DownloadCloud className="h-3.5 w-3.5" />
+                  )}
+                  Import
+                </button>
+                {importGithub.isPending && (
+                  <span className="text-[11px] text-muted-foreground">
+                    Downloading + verifying on the control plane — this can take
+                    a few minutes for a ~700 MiB image.
+                  </span>
+                )}
+                {importGithub.error && (
+                  <span className="text-rose-700 dark:text-rose-300">
+                    {formatApiError(importGithub.error)}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="rounded-md border p-3">
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div>
+              <label className="text-muted-foreground">.raw.xz file</label>
+              <input
+                type="file"
+                accept=".xz,.raw.xz,application/octet-stream"
+                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+                className="mt-1 block w-full text-xs"
+              />
+              {file && (
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  {file.name} · {(file.size / (1024 * 1024)).toFixed(1)} MiB
+                </p>
+              )}
+            </div>
+            <div>
+              <label className="text-muted-foreground">Appliance version</label>
+              <input
+                value={applianceVersion}
+                onChange={(e) => setApplianceVersion(e.target.value)}
+                placeholder="e.g. 2026.06.01-1"
+                className="mt-1 w-full rounded-md border bg-background px-2 py-1"
+              />
+            </div>
+            <div className="sm:col-span-2">
+              <label className="text-muted-foreground">SHA-256 (hex)</label>
+              <input
+                value={sha256}
+                onChange={(e) => setSha256(e.target.value)}
+                placeholder="paste from the .sha256 sidecar (64 lowercase hex chars)"
+                className="mt-1 w-full rounded-md border bg-background px-2 py-1 font-mono"
+              />
+            </div>
+            <div className="sm:col-span-2">
+              <label className="text-muted-foreground">Notes (optional)</label>
+              <input
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="e.g. RC1 — verified by ops on 2026-06-01"
+                className="mt-1 w-full rounded-md border bg-background px-2 py-1"
+              />
+            </div>
+          </div>
+          <div className="mt-3 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => upload.mutate()}
+              disabled={
+                !file ||
+                sha256.trim().length !== 64 ||
+                !applianceVersion.trim() ||
+                upload.isPending
+              }
+              className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {upload.isPending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Upload className="h-3.5 w-3.5" />
+              )}
+              Upload
+            </button>
+            {progress && progress.total > 0 && (
+              <span className="text-[11px] text-muted-foreground">
+                {((progress.loaded / progress.total) * 100).toFixed(0)}% ·{" "}
+                {(progress.loaded / (1024 * 1024)).toFixed(1)} /{" "}
+                {(progress.total / (1024 * 1024)).toFixed(1)} MiB
+              </span>
+            )}
+            {upload.error && (
+              <span className="text-rose-700 dark:text-rose-300">
+                {formatApiError(upload.error)}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
 
       {imagesQuery.isLoading ? (
         <div className="flex items-center gap-2 text-muted-foreground">
@@ -4122,7 +4255,7 @@ function SlotImageManager() {
             </tr>
           </thead>
           <tbody className="divide-y">
-            {(imagesQuery.data ?? []).map((img: SlotImage) => (
+            {(imagesQuery.data ?? []).map((img: UpgradeImage) => (
               <tr key={img.id}>
                 <td className="px-2 py-1">
                   <div className="font-medium">{img.filename}</div>
@@ -4163,11 +4296,11 @@ function SlotImageManager() {
           message={
             <>
               <p className="text-sm">
-                Delete the uploaded <code>.raw.xz</code> for{" "}
+                Delete the staged <code>.raw.xz</code> for{" "}
                 <strong>{deleteTarget.appliance_version}</strong>? The on-server
-                copy is removed and any in-flight slot upgrade pointing at it
-                will fail with a 404 on the next fetch. Re-uploading is
-                operator-effort — typically a few hundred MiB.
+                copy is removed and any in-flight OS upgrade pointing at it will
+                fail with a 404 on the next fetch. Re-staging it (upload or
+                GitHub import) is operator-effort — typically a few hundred MiB.
               </p>
               {deleteTarget.notes && (
                 <p className="mt-2 text-xs text-muted-foreground">

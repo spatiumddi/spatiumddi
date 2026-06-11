@@ -121,8 +121,8 @@ class PlanRequest(BaseModel):
       appliance can reach github.com (or a private mirror) directly.
 
     * **Uploaded image** (``slot_image_id``) — an
-      ``appliance_slot_image`` row id from
-      ``POST /api/v1/appliance/slot-images`` (the air-gap upload
+      ``appliance_upgrade_image`` row id from
+      ``POST /api/v1/appliance/upgrade-images`` (the air-gap upload
       endpoint). The control plane composes the authenticated internal
       URL on plan-acceptance, so every per-node runner pulls bytes
       through the same control-plane → mirror path the per-box flow
@@ -152,10 +152,10 @@ class PlanRequest(BaseModel):
     slot_image_id: uuid.UUID | None = Field(
         default=None,
         description=(
-            "ID of an uploaded slot image (``appliance_slot_image`` row "
-            "from ``POST /api/v1/appliance/slot-images``). The control "
-            "plane composes the authenticated download URL on plan + "
-            "every node pulls bytes through it. Air-gap-friendly. "
+            "ID of an uploaded upgrade image (``appliance_upgrade_image`` "
+            "row from ``POST /api/v1/appliance/upgrade-images``). The "
+            "control plane composes the authenticated download URL on "
+            "plan + every node pulls bytes through it. Air-gap-friendly. "
             "Mutually exclusive with ``slot_image_url``."
         ),
     )
@@ -209,7 +209,7 @@ class PlanRequest(BaseModel):
                 "Pass exactly one of ``slot_image_url`` or ``slot_image_id`` — "
                 "got both, or neither. URL is for online environments that "
                 "fetch directly; ID is for air-gap fleets that upload "
-                "through ``POST /api/v1/appliance/slot-images`` first."
+                "through ``POST /api/v1/appliance/upgrade-images`` first."
             )
         return self
 
@@ -329,28 +329,28 @@ async def _resolve_slot_image_url(
     * ``slot_image_url`` → returned verbatim (operator-provided
       external URL).
     * ``slot_image_id`` → composed as
-      ``{request.base_url}/api/v1/appliance/slot-images/{id}/raw.xz
+      ``{request.base_url}/api/v1/appliance/upgrade-images/{id}/raw.xz
       ?t={hmac}`` where the HMAC comes from
       ``slot_image_download_token``.
     """
     if body.slot_image_url is not None:
         return body.slot_image_url
     assert body.slot_image_id is not None  # ruled out by model_validator
-    from app.api.v1.appliance.slot_images import (  # noqa: PLC0415
+    from app.api.v1.appliance.upgrade_images import (  # noqa: PLC0415
         slot_image_download_token,
     )
-    from app.models.appliance import ApplianceSlotImage  # noqa: PLC0415
+    from app.models.appliance import ApplianceUpgradeImage  # noqa: PLC0415
 
-    image = await db.get(ApplianceSlotImage, body.slot_image_id)
+    image = await db.get(ApplianceUpgradeImage, body.slot_image_id)
     if image is None:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
-            f"Slot image {body.slot_image_id} not found.",
+            f"Upgrade image {body.slot_image_id} not found.",
         )
     token = slot_image_download_token(image.id)
     return (
         f"{str(request.base_url).rstrip('/')}"
-        f"/api/v1/appliance/slot-images/{image.id}/raw.xz?t={token}"
+        f"/api/v1/appliance/upgrade-images/{image.id}/raw.xz?t={token}"
     )
 
 

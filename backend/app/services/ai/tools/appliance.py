@@ -37,6 +37,7 @@ from app.core.permissions import is_effective_superadmin
 from app.models.appliance import (
     APPLIANCE_STATE_PENDING_APPROVAL,
     Appliance,
+    ApplianceUpgradeImage,
 )
 from app.models.auth import User
 from app.services.ai import operations
@@ -505,6 +506,111 @@ async def find_etcd_snapshots(
     }
 
 
+# ── find_upgrade_images ────────────────────────────────────────────
+
+
+class FindUpgradeImagesArgs(BaseModel):
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+@register_tool(
+    name="find_upgrade_images",
+    description=(
+        "List appliance upgrade images stored on the control plane "
+        "(superadmin only, #199). These are the ``.raw.xz`` artifacts an "
+        "operator uploaded (air-gap) or imported from a GitHub release — "
+        "the pool a fleet / per-box OS upgrade can point at. Each row "
+        "carries filename / appliance_version / size / a short SHA-256 / "
+        "upload time / notes. Use to answer 'which upgrade images do we "
+        "have staged?' or 'is 2026.06.01-1 already uploaded?'. Read-only "
+        "— upload / import / delete happen in Fleet → Upgrade images."
+    ),
+    args_model=FindUpgradeImagesArgs,
+    category="admin",
+    default_enabled=True,
+    module="appliance.fleet",
+)
+async def find_upgrade_images(
+    db: AsyncSession, user: User, args: FindUpgradeImagesArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+    rows = list(
+        (
+            await db.execute(
+                select(ApplianceUpgradeImage)
+                .order_by(ApplianceUpgradeImage.uploaded_at.desc())
+                .limit(args.limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "images": [
+            {
+                "id": str(r.id),
+                "filename": r.filename,
+                "appliance_version": r.appliance_version,
+                "size_bytes": r.size_bytes,
+                "sha256_short": (r.sha256[:12] + "…" + r.sha256[-6:]) if r.sha256 else None,
+                "uploaded_at": r.uploaded_at.isoformat(),
+                "notes": r.notes,
+            }
+            for r in rows
+        ],
+        "count": len(rows),
+    }
+
+
+# ── find_available_upgrade_images ──────────────────────────────────
+
+
+class FindAvailableUpgradeImagesArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="find_available_upgrade_images",
+    description=(
+        "List GitHub releases that carry an importable appliance upgrade "
+        "image (superadmin only, #199). Returns each release tag + name + "
+        "prerelease/installed flags + the image size, plus whether GitHub "
+        "was reachable at all. Use to answer 'what upgrade images can I "
+        "import?' before pointing the operator at Fleet → Upgrade images "
+        "to do the import. Read-only — and it makes an outbound call to "
+        "github.com, so it's opt-in (disabled by default)."
+    ),
+    args_model=FindAvailableUpgradeImagesArgs,
+    category="admin",
+    default_enabled=False,
+    module="appliance.fleet",
+)
+async def find_available_upgrade_images(
+    db: AsyncSession, user: User, args: FindAvailableUpgradeImagesArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+    from app.services.appliance import releases as releases_service  # noqa: PLC0415
+
+    reachable, rows = await releases_service.list_available_upgrade_images()
+    return {
+        "github_reachable": reachable,
+        "available": [
+            {
+                "tag": r.tag,
+                "name": r.name,
+                "is_prerelease": r.is_prerelease,
+                "is_installed": r.is_installed,
+                "size_bytes": r.size_bytes,
+                "published_at": r.published_at.isoformat(),
+            }
+            for r in rows
+        ],
+        "count": len(rows),
+    }
+
+
 # ── propose_approve_appliance ──────────────────────────────────────
 
 
@@ -634,6 +740,8 @@ async def propose_assign_role(
 __all__ = [
     "find_pending_appliances",
     "find_appliance_fleet",
+    "find_upgrade_images",
+    "find_available_upgrade_images",
     "propose_approve_appliance",
     "propose_assign_role",
 ]

@@ -1027,16 +1027,22 @@ cluster** under coordination from one driver pod. Lives in
 `/appliance` → **Rolling Upgrade** tab; runs against the local
 control-plane cluster itself, not the registered agent fleet.
 
-**Two source modes for the slot image:**
+**Two source modes for the upgrade image:**
 
-1. **Uploaded image** (air-gap). Operator uploads the `.raw.xz` +
-   sha256 sidecar once in **Fleet → Slot images**. The image is
-   stored on the in-cluster mirror PVC (`slot-image-mirror`
-   Deployment + PVC, gated behind `slotImageMirror.enabled`). On the
-   Rolling Upgrade tab the operator picks it from the dropdown — the
-   control plane composes an authenticated download URL with an HMAC
-   token, every per-node host runner pulls bytes through the same
-   control-plane → mirror pipe. No node ever talks to github.com.
+1. **Uploaded / imported image** (staged). Operator stages the image
+   once in **Fleet → Upgrade images** (#199 renamed this from "Slot
+   images"). Two ways to populate the pool: **upload** the `.raw.xz` +
+   its sha256 sidecar out-of-band (air-gap), or — on a connected
+   install — **import from GitHub** straight from the release-asset
+   picker, where the control plane downloads + sha256-verifies the
+   image for you (no out-of-band round trip). Either way the bytes are
+   stored on the in-cluster mirror PVC (`slot-image-mirror` Deployment +
+   PVC, gated behind `slotImageMirror.enabled` — the mirror infra keeps
+   the historical name). On the Rolling Upgrade tab the operator picks
+   it from the dropdown — the control plane composes an authenticated
+   download URL with an HMAC token, every per-node host runner pulls
+   bytes through the same control-plane → mirror pipe. No node ever
+   talks to github.com.
 2. **URL** (connected install). Operator pastes the GitHub release
    asset URL — same `https://github.com/.../spatiumddi-appliance-
    slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches
@@ -1044,8 +1050,19 @@ control-plane cluster itself, not the registered agent fleet.
 
 The tab's source toggle defaults to **Uploaded** when at least one
 image is on file; otherwise falls back to **URL**. The empty-state
-copy on the Uploaded picker points back to **Fleet → Slot images**
+copy on the Uploaded picker points back to **Fleet → Upgrade images**
 so a first-time operator never gets stuck looking for the upload.
+
+> **Naming (#199).** The operator-facing artifact is an *upgrade
+> image*; the REST surface is `/api/v1/appliance/upgrade-images/*` and
+> the model/table are `ApplianceUpgradeImage` / `appliance_upgrade_image`.
+> The legacy `/api/v1/appliance/slot-images/*` paths stay alive for one
+> release cut as `308` redirects, then get dropped. "Slot" is retained
+> only for the lower-level A/B dd mechanism (the `slot-image-mirror`
+> PVC, the `desired_slot_image_url` desired-state columns, the
+> `/var/lib/spatiumddi/slot-images` on-disk store, `spatium-upgrade-slot`,
+> `make appliance-slot-image`, and the `spatiumddi-appliance-slot-*.raw.xz`
+> release asset name) — that's pure plumbing, not operator-facing.
 
 **Flow (operator-facing):**
 
@@ -1092,9 +1109,10 @@ so a first-time operator never gets stuck looking for the upload.
 
 3. In the SpatiumDDI UI (control-plane node, any operator browser
    that can reach the cluster):
-     a. Fleet → Slot images → Upload .raw.xz + paste the SHA-256 +
+     a. Fleet → Upgrade images → Upload .raw.xz + paste the SHA-256 +
         type the CalVer tag → Upload. Bytes stream through the api
-        to the mirror PVC.
+        to the mirror PVC. (Connected installs can skip steps 1-2 and
+        use the "Pick from GitHub Releases" tab here instead.)
      b. Rolling Upgrade → type 2026.06.01-1 → leave source as
         "Uploaded" → pick the just-uploaded image from the dropdown
         → Run preflight → review → Plan → Start.

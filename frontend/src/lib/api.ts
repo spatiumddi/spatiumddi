@@ -8305,15 +8305,17 @@ export interface ClusterUpgradePlanResponse {
   preflight: PreflightPlanRow[];
 }
 
-// Two source modes for the slot image — exactly one must be set.
+// Two source modes for the upgrade image — exactly one must be set.
 // ``slot_image_url`` is the connected / online path (operator pastes
 // an HTTPS URL like a GitHub release asset). ``slot_image_id`` is the
-// air-gap path: operator first uploads the .raw.xz via
-// ``applianceSlotImagesApi.upload`` (in the Fleet → Slot images
-// panel), then references the returned id here. The control plane
-// composes the authenticated internal URL server-side so every node's
-// host runner pulls bytes through the same control-plane → mirror
-// pipe as the per-box upgrade flow.
+// staged-image path: operator first uploads or imports the .raw.xz via
+// ``applianceUpgradeImagesApi`` (in the Fleet → Upgrade images panel),
+// then references the returned id here. (The request field names keep
+// the ``slot_image_*`` form — they feed the lower-level slot mechanism;
+// #199 renamed the operator-facing surface, not the wire fields.) The
+// control plane composes the authenticated internal URL server-side so
+// every node's host runner pulls bytes through the same control-plane →
+// mirror pipe as the per-box upgrade flow.
 export interface ClusterUpgradePlanRequest {
   target_version: string;
   slot_image_url?: string;
@@ -8853,13 +8855,18 @@ export const applianceApprovalApi = {
       .then((r) => r.data),
 };
 
-// ── Slot image uploads (#170 follow-up) ────────────────────────────
-// Air-gapped operators upload the .raw.xz directly to the control
-// plane; the backend stores it on a local volume + serves it back
+// ── Upgrade images (#170 follow-up; renamed slot-images → upgrade-
+// images in #199) ──────────────────────────────────────────────────
+// Two ways to stage an OS upgrade image on the control plane:
+//   * Upload (air-gap) — operators upload the .raw.xz directly.
+//   * Import from GitHub (connected) — the control plane downloads +
+//     sha256-verifies a release asset on the operator's behalf.
+// Either way the backend stores it on a local volume + serves it back
 // under an authenticated internal URL. The supervisor's existing
 // heartbeat → trigger-file → host runner pipeline picks it up
-// unchanged via the appliance row's ``desired_slot_image_url``.
-export interface SlotImage {
+// unchanged via the appliance row's ``desired_slot_image_url`` (the
+// lower-level slot mechanism keeps the "slot" name).
+export interface UpgradeImage {
   id: string;
   filename: string;
   size_bytes: number;
@@ -8870,11 +8877,43 @@ export interface SlotImage {
   notes: string | null;
 }
 
-export const applianceSlotImagesApi = {
+// A GitHub release carrying an importable appliance upgrade image.
+export interface AvailableUpgradeImage {
+  tag: string;
+  name: string;
+  published_at: string;
+  body: string;
+  html_url: string;
+  is_prerelease: boolean;
+  is_installed: boolean;
+  image_asset_url: string;
+  checksum_asset_url: string;
+  size_bytes: number | null;
+}
+
+export interface AvailableUpgradeImages {
+  github_reachable: boolean;
+  available: AvailableUpgradeImage[];
+}
+
+export const applianceUpgradeImagesApi = {
   list: () =>
     api
-      .get<{ images: SlotImage[] }>("/appliance/slot-images")
+      .get<{ images: UpgradeImage[] }>("/appliance/upgrade-images")
       .then((r) => r.data.images),
+  // Connected-install picker source — releases with an importable
+  // upgrade-image asset + its .sha256 sidecar.
+  listAvailable: () =>
+    api
+      .get<AvailableUpgradeImages>("/appliance/upgrade-images/available")
+      .then((r) => r.data),
+  // Control plane downloads + verifies + stores the release asset.
+  importFromGithub: (release_tag: string) =>
+    api
+      .post<UpgradeImage>("/appliance/upgrade-images/import-from-github", {
+        release_tag,
+      })
+      .then((r) => r.data),
   upload: (
     file: File,
     sha256: string,
@@ -8888,7 +8927,7 @@ export const applianceSlotImagesApi = {
     fd.append("appliance_version", appliance_version);
     if (notes) fd.append("notes", notes);
     return api
-      .post<SlotImage>("/appliance/slot-images", fd, {
+      .post<UpgradeImage>("/appliance/upgrade-images", fd, {
         // Axios picks the right multipart boundary automatically
         // when the body is a FormData; explicit Content-Type would
         // strip the boundary.
@@ -8900,7 +8939,7 @@ export const applianceSlotImagesApi = {
       .then((r) => r.data);
   },
   remove: (id: string) =>
-    api.delete<void>(`/appliance/slot-images/${id}`).then((r) => r.data),
+    api.delete<void>(`/appliance/upgrade-images/${id}`).then((r) => r.data),
 };
 
 // ── Appliance: container management (Phase 4d) ─────────────────────
