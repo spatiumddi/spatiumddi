@@ -312,6 +312,9 @@ function MetalLBConfigCard() {
   const [enabled, setEnabled] = useState(false);
   const [poolText, setPoolText] = useState("");
   const [vip, setVip] = useState("");
+  // #272 Phase 10 — data-plane resolver VIPs (optional; live in Advanced).
+  const [dnsVip, setDnsVip] = useState("");
+  const [dhcpRelayVip, setDhcpRelayVip] = useState("");
   const [dirty, setDirty] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
@@ -323,15 +326,19 @@ function MetalLBConfigCard() {
       const pool = data.pool_addresses ?? [];
       setPoolText(pool.join("\n"));
       setVip(data.control_plane_vip ?? "");
+      setDnsVip(data.dns_vip ?? "");
+      setDhcpRelayVip(data.dhcp_relay_vip ?? "");
       // Auto-reveal the Advanced pool field when the saved pool is a
       // real range (not just the auto-derived <vip>/32) so editing an
-      // existing custom pool isn't hidden behind the disclosure.
+      // existing custom pool isn't hidden behind the disclosure. A
+      // data-plane VIP also lives in Advanced, so reveal for those too.
       const autoPool = data.control_plane_vip
         ? [`${data.control_plane_vip}/32`, `${data.control_plane_vip}/128`]
         : [];
       const isCustom =
         pool.length > 1 || (pool.length === 1 && !autoPool.includes(pool[0]));
-      if (isCustom) setShowAdvanced(true);
+      if (isCustom || data.dns_vip || data.dhcp_relay_vip)
+        setShowAdvanced(true);
     }
   }, [data, dirty]);
 
@@ -372,6 +379,11 @@ function MetalLBConfigCard() {
       // range is only sent when Advanced is open.
       pool_addresses: showAdvanced ? poolAddresses : [],
       control_plane_vip: vip.trim(),
+      // Data-plane VIPs are sent unconditionally (no auto-derive); the
+      // seeded value carries through even if Advanced is collapsed, so a
+      // pool-only edit can't silently drop a configured resolver VIP.
+      dns_vip: dnsVip.trim(),
+      dhcp_relay_vip: dhcpRelayVip.trim(),
     });
   };
 
@@ -417,7 +429,9 @@ function MetalLBConfigCard() {
           one address regardless of which control-plane node is up (multi-node
           HA). Just enter the VIP — a matching <code>/32</code> pool is created
           for you. Applied across the cluster by the seed within ~60&nbsp;s; the
-          served certificate auto-adds the VIP to its SANs.
+          served certificate auto-adds the VIP to its SANs. Open{" "}
+          <strong>Advanced</strong> to widen the pool and add data-plane
+          resolver VIPs (DNS&nbsp;:53 / DHCP relay&nbsp;:67).
         </p>
 
         {/* Live status — only meaningful once enabled. */}
@@ -490,25 +504,71 @@ function MetalLBConfigCard() {
                 {showAdvanced ? "▾" : "▸"} Advanced — custom address pool
               </button>
               {showAdvanced && (
-                <div className="flex flex-col gap-1">
-                  <textarea
-                    value={poolText}
-                    onChange={(e) => {
-                      setPoolText(e.target.value);
-                      setDirty(true);
-                    }}
-                    rows={2}
-                    placeholder={
-                      "192.168.0.240/29\n192.168.0.240-192.168.0.247"
-                    }
-                    className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
-                  />
-                  <span className="text-[11px] text-muted-foreground">
-                    One CIDR or range per line. Leave blank to auto-create a{" "}
-                    <code>/32</code> from the VIP. Provide a range only for
-                    headroom, data-plane VIPs, or BGP. The VIP must fall inside
-                    the pool.
-                  </span>
+                <div className="flex flex-col gap-3">
+                  <div className="flex flex-col gap-1">
+                    <textarea
+                      value={poolText}
+                      onChange={(e) => {
+                        setPoolText(e.target.value);
+                        setDirty(true);
+                      }}
+                      rows={2}
+                      placeholder={
+                        "192.168.0.240/29\n192.168.0.240-192.168.0.247"
+                      }
+                      className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
+                    />
+                    <span className="text-[11px] text-muted-foreground">
+                      One CIDR or range per line. Leave blank to auto-create a{" "}
+                      <code>/32</code> from the VIP. Provide a range only for
+                      headroom, data-plane VIPs, or BGP. Every VIP must fall
+                      inside the pool.
+                    </span>
+                  </div>
+
+                  {/* #272 Phase 10 — data-plane resolver VIPs. Optional;
+                    need a pool wide enough to hold them alongside the
+                    control-plane VIP. Empty = the hostNetwork data plane. */}
+                  <div className="flex flex-col gap-1">
+                    <span className="text-xs font-medium text-muted-foreground">
+                      DNS resolver VIP (:53) — optional
+                    </span>
+                    <input
+                      value={dnsVip}
+                      onChange={(e) => {
+                        setDnsVip(e.target.value);
+                        setDirty(true);
+                      }}
+                      placeholder="192.168.0.241"
+                      className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
+                    />
+                    <span className="text-[11px] text-muted-foreground">
+                      One floating IP for BIND9 / PowerDNS so clients use a
+                      single resolver address that follows whichever node is up
+                      (the resolver Pods drop <code>hostNetwork</code> behind an
+                      L2 LoadBalancer). Must differ from the control-plane VIP.
+                    </span>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <span className="text-xs font-medium text-muted-foreground">
+                      DHCP relay VIP (:67) — optional
+                    </span>
+                    <input
+                      value={dhcpRelayVip}
+                      onChange={(e) => {
+                        setDhcpRelayVip(e.target.value);
+                        setDirty(true);
+                      }}
+                      placeholder="192.168.0.242"
+                      className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
+                    />
+                    <span className="text-[11px] text-muted-foreground">
+                      Stabilises a DHCP relay's <code>forward-to</code> target
+                      so it outlives a single Kea node. Kea keeps{" "}
+                      <code>hostNetwork</code>:67 for direct-attached broadcast
+                      — this VIP only fronts the relay→server unicast forward.
+                    </span>
+                  </div>
                 </div>
               )}
             </div>

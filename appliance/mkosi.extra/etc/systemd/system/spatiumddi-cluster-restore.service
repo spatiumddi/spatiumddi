@@ -1,0 +1,9 @@
+[Unit]
+Description=Restore etcd from a snapshot — single-node cluster-reset (#272 Phase 9b)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/272
+# k3s --cluster-reset surgery; the runner stops/starts k3s itself.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatium-cluster-restore
+# No Install section — only invoked by the matching .path unit.

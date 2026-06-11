@@ -8089,6 +8089,11 @@ export interface MetalLBConfig {
   enabled: boolean;
   pool_addresses: string[];
   control_plane_vip: string;
+  // #272 Phase 10 — optional data-plane resolver VIPs (same pool).
+  // Empty = the hostNetwork data plane (no VIP). dns_vip fronts
+  // bind9/powerdns :53; dhcp_relay_vip fronts the Kea relay→server :67.
+  dns_vip?: string;
+  dhcp_relay_vip?: string;
   // #272 — live readiness from the GET (best-effort; absent/zero when
   // kubeapi is unreachable). Not sent on PUT.
   controller_ready?: boolean;
@@ -8101,6 +8106,25 @@ export interface ControlPlaneReplaceResult {
   evicted: ApplianceRow;
   pairing_code: string;
   pairing_expires_at: string;
+}
+
+// #272 Phase 9b — etcd snapshot inventory + guided restore.
+export interface EtcdSnapshotRow {
+  name: string;
+  location: string;
+  node_name: string;
+  size: number | null;
+  created_at: string | null;
+}
+export interface EtcdSnapshots {
+  available: boolean;
+  seed_id: string | null;
+  seed_hostname: string | null;
+  reported_at: string | null;
+  snapshots: EtcdSnapshotRow[];
+  desired_restore_snapshot: string | null;
+  restore_state: string | null;
+  restore_reason: string | null;
 }
 
 export const applianceFleetApi = {
@@ -8694,6 +8718,21 @@ export const applianceApprovalApi = {
   setMetalLBConfig: (body: MetalLBConfig) =>
     api
       .put<MetalLBConfig>("/appliance/fleet/control-plane/metallb", body)
+      .then((r) => r.data),
+  // #272 Phase 9b — etcd snapshot inventory + guided restore. The seed
+  // reports its local snapshots on heartbeat; restore stamps the seed
+  // row (superadmin + typed-hostname confirm) and the host runner does a
+  // destructive single-node cluster-reset.
+  listEtcdSnapshots: () =>
+    api
+      .get<EtcdSnapshots>("/appliance/fleet/control-plane/etcd-snapshots")
+      .then((r) => r.data),
+  restoreEtcdSnapshot: (snapshot_name: string, confirm_hostname: string) =>
+    api
+      .post<EtcdSnapshots>("/appliance/fleet/control-plane/restore", {
+        snapshot_name,
+        confirm_hostname,
+      })
       .then((r) => r.data),
   // #170 Wave D1 — OS slot upgrade + reboot affordances on the
   // Fleet drilldown. Appliance-only deployments; the API surfaces a
@@ -10152,7 +10191,20 @@ export const postgresApi = {
         params: { limit },
       })
       .then((r) => r.data),
+  // #272 follow-up — alembic schema-head divergence (cold-boot / rolling
+  // upgrade visibility; the readiness probe gates on the same check).
+  schemaHealth: () =>
+    api
+      .get<PostgresSchemaHealth>("/admin/postgres/schema-health")
+      .then((r) => r.data),
 };
+
+export interface PostgresSchemaHealth {
+  status: "ok" | "behind" | "error";
+  expected_head: string | null;
+  db_revision: string | null;
+  detail: string;
+}
 
 // ── Redis insights (#358) ─────────────────────────────────────────────
 export interface RedisReplica {

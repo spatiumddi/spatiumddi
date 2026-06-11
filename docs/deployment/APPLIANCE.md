@@ -177,6 +177,19 @@ state on its heartbeat:
   `frontend.controlPlaneVIP` rides the `spatium-control` override above.
   The VIP also auto-threads into the api's `APPLIANCE_EXTRA_CERT_SANS` so
   the served cert validates on it.
+- **Data-plane VIPs (Phase 10).** Two optional resolver VIPs share the
+  same pool: `dns_vip` (one floating :53 the bind9/powerdns DaemonSets
+  drop `hostNetwork` to sit behind, an L2 LoadBalancer Service) and
+  `dhcp_relay_vip` (an additional :67 LoadBalancer fronting the Kea
+  relay→server unicast forward — Kea keeps `hostNetwork` for
+  direct-attached broadcast). Both live on the same `platform_settings`
+  singleton + the `…/control-plane/metallb` endpoint; the seed upserts
+  the `spatiumddi-appliance` HelmChartConfig (`dns.useMetalLBVIP` /
+  `dns.vip` / `dhcpKea.relayVIP`) via
+  `k8s_api.apply_dataplane_vip_overrides()`. Each must fall in the pool
+  and differ from the control-plane VIP + each other; empty = the
+  hostNetwork data plane (the single-node default). Configured under
+  Network & Host → MetalLB → **Advanced**.
 - **Cert SAN reconcile (Phase 7c).** A periodic loop in the api lifespan
   (`reconcile_cluster_cert_sans`, advisory-locked across the api
   replicas, appliance-mode only) grows the self-signed cert as members
@@ -215,6 +228,35 @@ agents have no in-cluster DNS to resolve that name, so they keep using
 their configured `CONTROL_PLANE_URL` — which should be the **VIP** on an
 HA cluster (see `_effective_control_plane_url` in the supervisor's
 `heartbeat.py`).
+
+### Guided etcd restore (Phase 9b)
+
+`/appliance → Fleet → Control plane` carries an **etcd snapshots**
+disaster-recovery card. The seed reports its local
+`k3s etcd-snapshot list` on every heartbeat — read from the
+`ETCDSnapshotFile` CRs over the kubeapi (no host `k3s` binary needed),
+stored on the seed's `appliance.etcd_snapshots` column — so the card
+lists recoverable snapshots (name / node / size / created) without an
+operator SSH. k3s takes one every 6 h and retains 8 (baked into the k3s
+config).
+
+A **Restore…** action stamps `appliance.desired_restore_snapshot` on the
+seed after a typed-hostname confirm (on top of the superadmin gate). The
+seed supervisor reads it on the next heartbeat and fires the host-side
+`spatium-cluster-restore` trigger (guarded by the
+`SPATIUMDDI-CLUSTER-RESTORE-CONFIRM-V1` marker, mirroring join/leave); the
+runner stops k3s, runs `k3s server --cluster-reset
+--cluster-reset-restore-path=<local snapshot>`, restarts, and writes a
+`.state` sidecar the supervisor reports back (`restoring` → `done` /
+`failed`). The backend clears the desired snapshot once it lands `done`.
+
+⚠️ **A restore is a single-node cluster-reset** — etcd collapses to one
+member from the snapshot, and every *other* control-plane node is
+orphaned and must be re-paired via the **Replace** flow afterward.
+Disaster recovery only, never routine; only local snapshots are
+restorable in v1 (S3 restore is a follow-up). The read-only
+`find_etcd_snapshots` MCP tool surfaces the inventory to the Operator
+Copilot (restore itself is UI-only).
 
 ### Storage note
 

@@ -54,7 +54,7 @@ from cryptography.hazmat.primitives.serialization import (
     load_der_public_key,
 )
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import func as sa_func
 from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -1096,6 +1096,16 @@ class SupervisorHeartbeatRequest(BaseModel):
     # ``evict_requested`` + settles those rows to ``left``. Empty on
     # every non-seed heartbeat + when there's nothing to evict.
     evicted_node_names: list[str] = Field(default_factory=list)
+    # #272 Phase 9b — etcd snapshot inventory + restore progress. The
+    # SEED reports its local ``k3s etcd-snapshot list`` so the Fleet tab
+    # can show recoverable snapshots; ``restore_state`` /
+    # ``restore_reason`` mirror the host runner's ``.state`` sidecar
+    # while a guided restore is in flight. All "only update when not
+    # None / non-empty-on-seed" so a member heartbeat never blanks the
+    # seed's inventory. None = no report this tick (leave the row as-is).
+    etcd_snapshots: list[dict[str, Any]] | None = None
+    restore_state: str | None = None
+    restore_reason: str | None = None
 
 
 class SupervisorRoleAssignment(BaseModel):
@@ -1241,6 +1251,12 @@ class SupervisorHeartbeatResponse(BaseModel):
     desired_metallb_enabled: bool = False
     desired_metallb_pool_addresses: list[str] = Field(default_factory=list)
     desired_control_plane_vip: str = ""
+    # #272 Phase 10 — data-plane resolver VIPs. Acted on only by the seed:
+    # it patches ``dns.useMetalLBVIP`` / ``dns.vip`` / ``dhcpKea.relayVIP``
+    # on the spatiumddi-appliance HelmChartConfig overlay. Empty = the
+    # hostNetwork data plane (single-node default).
+    desired_dns_vip: str = ""
+    desired_dhcp_relay_vip: str = ""
     # #272 Phase 9 — dead-node replacement. Hostnames of k8s Nodes the
     # SEED should evict (delete the Node → k3s removes the etcd member).
     # Populated from rows flagged ``evict_requested``; only the
@@ -1600,6 +1616,13 @@ async def supervisor_heartbeat(
     if body.node_ip is not None:
         row.node_ip = body.node_ip
 
+    # #272 Phase 9b — etcd snapshot inventory (seed-reported). "Only
+    # update when not None" so a member / pre-9b supervisor never blanks
+    # the seed's list. Cap the stored list defensively (the runner already
+    # sorts newest-first; a runaway snapshot dir shouldn't bloat the row).
+    if body.etcd_snapshots is not None:
+        row.etcd_snapshots = list(body.etcd_snapshots)[:200]
+
     # Issue #285 Phase 1 — fleet-firewall prerequisites. "Only update when
     # not None" so a legacy / pre-#285 supervisor never blanks them.
     if body.node_ips is not None:
@@ -1680,6 +1703,22 @@ async def supervisor_heartbeat(
     ):
         row.cluster_role = None
         row.desired_cluster_role = None
+
+    # #272 Phase 9b — guided etcd restore. Persist the runner-reported
+    # progress, and auto-clear the desired snapshot once it lands ``done``
+    # (so a converged restore stops re-firing the trigger). A ``failed``
+    # restore keeps ``desired_restore_snapshot`` set so the operator sees
+    # the failure on the row and can retry / pick another snapshot.
+    if body.restore_state is not None:
+        row.restore_state = body.restore_state
+        row.restore_reason = body.restore_reason
+    if row.desired_restore_snapshot is not None and row.restore_state == "done":
+        logger.info(
+            "control_plane_restore_done",
+            appliance_id=str(row.id),
+            snapshot=row.desired_restore_snapshot,
+        )
+        row.desired_restore_snapshot = None
 
     # Auto-clear desired_appliance_version once installed matches +
     # the upgrade landed cleanly. Same shape as #138 Phase 8f-4's
@@ -1836,6 +1875,9 @@ async def supervisor_heartbeat(
     metallb_enabled = bool(cfg_row.metallb_enabled) if cfg_row else False
     metallb_pool = list(cfg_row.metallb_pool_addresses or []) if cfg_row else []
     metallb_vip = (cfg_row.control_plane_vip or "") if cfg_row else ""
+    # #272 Phase 10 — data-plane resolver VIPs (only the seed acts).
+    dns_vip = (cfg_row.dns_vip or "") if cfg_row else ""
+    dhcp_relay_vip = (cfg_row.dhcp_relay_vip or "") if cfg_row else ""
     # Issue #165 — operator-set timezone. Empty string = no override.
     desired_timezone = (cfg_row.timezone or "") if cfg_row else ""
     # Verbose-boot console toggle (grubenv-driven, applies next reboot).
@@ -1970,6 +2012,8 @@ async def supervisor_heartbeat(
         desired_metallb_enabled=metallb_enabled,
         desired_metallb_pool_addresses=metallb_pool,
         desired_control_plane_vip=metallb_vip,
+        desired_dns_vip=dns_vip,
+        desired_dhcp_relay_vip=dhcp_relay_vip,
         evict_node_names=evict_names,
         desired_timezone=desired_timezone,
         desired_verbose_boot=desired_verbose_boot,
@@ -3647,6 +3691,205 @@ async def replace_control_plane_member(
     )
 
 
+# ── Admin: etcd snapshot list + guided restore (#272 Phase 9b) ───────
+
+
+class EtcdSnapshotRow(BaseModel):
+    """One recoverable etcd snapshot, mapped from a k3s
+    ``ETCDSnapshotFile`` CR. All fields tolerant of a partial wire shape
+    (a future k3s schema change shouldn't 500 the panel)."""
+
+    name: str = ""
+    location: str = ""
+    node_name: str = ""
+    size: int | None = None
+    created_at: str | None = None
+
+
+class EtcdSnapshotsResponse(BaseModel):
+    """Cluster etcd snapshot inventory + in-flight restore state.
+
+    ``available`` is False on a docker / k8s control plane (no appliance
+    seed row) — the Fleet panel then shows a "not an appliance" note
+    instead of an empty table that reads as broken.
+    """
+
+    available: bool = False
+    seed_id: uuid.UUID | None = None
+    seed_hostname: str | None = None
+    reported_at: datetime | None = None
+    snapshots: list[EtcdSnapshotRow] = Field(default_factory=list)
+    # In-flight guided restore (#272 Phase 9b).
+    desired_restore_snapshot: str | None = None
+    restore_state: str | None = None
+    restore_reason: str | None = None
+
+
+class ClusterRestoreRequest(BaseModel):
+    """POST body for a guided etcd restore. ``confirm_hostname`` must
+    match the seed's hostname exactly — a typed-confirmation guardrail
+    on top of the superadmin gate, because the restore is a single-node
+    cluster-reset (every other control-plane node is orphaned)."""
+
+    snapshot_name: str
+    confirm_hostname: str
+
+
+async def _find_seed_row(db: DB) -> Appliance | None:
+    """Resolve the etcd seed appliance row — the control-plane node that
+    holds the snapshots + drives a guided restore.
+
+    Multi-node: the row with ``cluster_role == 'primary'``. Single-node
+    (pre-promote, cluster_role still NULL): the lone control-plane-variant
+    appliance. None on a docker / k8s control plane (no appliance rows)."""
+    primary = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    Appliance.cluster_role == CLUSTER_ROLE_PRIMARY,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if primary is not None:
+        return primary
+    return (
+        (
+            await db.execute(
+                select(Appliance)
+                .where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    Appliance.appliance_variant.in_(tuple(_SELF_BOOTSTRAP_VARIANTS)),
+                    Appliance.last_seen_at.is_not(None),
+                )
+                .order_by(Appliance.created_at.asc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+def _etcd_snapshots_response(seed: Appliance | None) -> EtcdSnapshotsResponse:
+    if seed is None:
+        return EtcdSnapshotsResponse(available=False)
+    rows: list[EtcdSnapshotRow] = []
+    for s in seed.etcd_snapshots or []:
+        if isinstance(s, dict):
+            rows.append(EtcdSnapshotRow(**s))
+    return EtcdSnapshotsResponse(
+        available=True,
+        seed_id=seed.id,
+        seed_hostname=seed.hostname,
+        reported_at=seed.last_seen_at,
+        snapshots=rows,
+        desired_restore_snapshot=seed.desired_restore_snapshot,
+        restore_state=seed.restore_state,
+        restore_reason=seed.restore_reason,
+    )
+
+
+@router.get(
+    "/fleet/control-plane/etcd-snapshots",
+    response_model=EtcdSnapshotsResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="List recoverable etcd snapshots from the cluster seed (superadmin)",
+)
+async def list_etcd_snapshots(
+    current_user: CurrentUser,
+    db: DB,
+) -> EtcdSnapshotsResponse:
+    """Read the seed's reported ``k3s etcd-snapshot list`` + any in-flight
+    restore state. Read-only — the seed reports its local snapshots on
+    every heartbeat, so this is just the last-reported inventory."""
+    _require_superadmin(current_user)
+    return _etcd_snapshots_response(await _find_seed_row(db))
+
+
+@router.post(
+    "/fleet/control-plane/restore",
+    response_model=EtcdSnapshotsResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Guided etcd restore — stamp the seed to cluster-reset-restore (superadmin)",
+)
+async def restore_etcd_snapshot(
+    body: ClusterRestoreRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> EtcdSnapshotsResponse:
+    """Stamp the seed row to perform a guided etcd restore.
+
+    ⚠️ DESTRUCTIVE — single-node cluster-reset. The seed supervisor reads
+    ``desired_restore_snapshot`` on its next heartbeat and fires the
+    host-side ``spatium-cluster-restore`` trigger (guarded by a confirm
+    marker): k3s stops, resets etcd to a 1-member cluster from the
+    snapshot, and restarts. Every OTHER control-plane node is orphaned
+    and must be re-paired (Replace flow). Disaster recovery only.
+
+    Guardrails: superadmin + the snapshot must exist in the seed's
+    last-reported inventory + ``confirm_hostname`` must match the seed's
+    hostname exactly. Refuses a second restore while one is in flight."""
+    _require_superadmin(current_user)
+    seed = await _find_seed_row(db)
+    if seed is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "No appliance control-plane seed found — etcd restore is appliance-only "
+            "(a docker / k8s control plane manages its own database).",
+        )
+    if (body.confirm_hostname or "").strip() != (seed.hostname or ""):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Type the seed hostname ({seed.hostname!r}) exactly to confirm this "
+            "destructive cluster-reset restore.",
+        )
+    known = {
+        s.get("name")
+        for s in (seed.etcd_snapshots or [])
+        if isinstance(s, dict) and s.get("name")
+    }
+    if body.snapshot_name not in known:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Snapshot {body.snapshot_name!r} is not in the seed's reported inventory.",
+        )
+    if seed.desired_restore_snapshot is not None and seed.restore_state != "failed":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"A restore is already in flight ({seed.desired_restore_snapshot!r}, "
+            f"state={seed.restore_state or 'pending'}). Wait for it to settle.",
+        )
+    seed.desired_restore_snapshot = body.snapshot_name
+    seed.restore_state = None
+    seed.restore_reason = None
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.control_plane_etcd_restore_requested",
+            resource_type="appliance",
+            resource_id=str(seed.id),
+            resource_display=seed.hostname,
+            result="success",
+            new_value={"snapshot_name": body.snapshot_name},
+        )
+    )
+    await db.commit()
+    await db.refresh(seed)
+    logger.warning(
+        "control_plane_etcd_restore_requested",
+        appliance_id=str(seed.id),
+        hostname=seed.hostname,
+        snapshot=body.snapshot_name,
+        user=current_user.username,
+    )
+    return _etcd_snapshots_response(seed)
+
+
 # ── Admin: MetalLB control-plane VIP (#272 Phase 7c) ─────────────
 
 
@@ -3694,6 +3937,11 @@ class MetalLBConfigResponse(BaseModel):
     enabled: bool = False
     pool_addresses: list[str] = Field(default_factory=list)
     control_plane_vip: str = ""
+    # #272 Phase 10 — data-plane resolver VIPs (same pool). Empty = the
+    # hostNetwork data plane (no VIP). ``dns_vip`` fronts bind9/powerdns
+    # :53; ``dhcp_relay_vip`` fronts the Kea relay→server :67 forward.
+    dns_vip: str = ""
+    dhcp_relay_vip: str = ""
     # #272 — live readiness, best-effort from the spatium-namespace pod
     # list (reuses the api's existing pod-read RBAC). All zero/false when
     # kubeapi is unreachable (docker/k8s control plane) or MetalLB is off.
@@ -3749,6 +3997,8 @@ def _metallb_response(row: PlatformSettings) -> MetalLBConfigResponse:
         enabled=row.metallb_enabled,
         pool_addresses=list(row.metallb_pool_addresses or []),
         control_plane_vip=row.control_plane_vip or "",
+        dns_vip=row.dns_vip or "",
+        dhcp_relay_vip=row.dhcp_relay_vip or "",
         controller_ready=controller_ready,
         speakers_ready=speakers_ready,
         speakers_total=speakers_total,
@@ -3767,6 +4017,9 @@ class MetalLBConfigUpdate(BaseModel):
     enabled: bool = False
     pool_addresses: list[str] = Field(default_factory=list)
     control_plane_vip: str = ""
+    # #272 Phase 10 — data-plane resolver VIPs (optional; same pool).
+    dns_vip: str = ""
+    dhcp_relay_vip: str = ""
 
     @field_validator("pool_addresses")
     @classmethod
@@ -3783,16 +4036,16 @@ class MetalLBConfigUpdate(BaseModel):
             out.append(s)
         return out
 
-    @field_validator("control_plane_vip")
+    @field_validator("control_plane_vip", "dns_vip", "dhcp_relay_vip")
     @classmethod
-    def _valid_vip(cls, v: str) -> str:
+    def _valid_vip(cls, v: str, info: ValidationInfo) -> str:
         s = v.strip()
         if not s:
             return ""
         try:
             ipaddress.ip_address(s)
         except ValueError as exc:
-            raise ValueError(f"control_plane_vip must be a single IP: {exc}") from exc
+            raise ValueError(f"{info.field_name} must be a single IP: {exc}") from exc
         return s
 
     @model_validator(mode="after")
@@ -3812,10 +4065,26 @@ class MetalLBConfigUpdate(BaseModel):
             if not self.pool_addresses:
                 prefix = 32 if ipaddress.ip_address(self.control_plane_vip).version == 4 else 128
                 self.pool_addresses = [f"{self.control_plane_vip}/{prefix}"]
-        if self.control_plane_vip and self.pool_addresses:
-            if not _vip_in_pool(self.control_plane_vip, self.pool_addresses):
+        # #272 Phase 10 — data-plane VIPs require MetalLB on (no VIP path
+        # exists without it) and can't reuse the control-plane VIP or each
+        # other — MetalLB hands a given address to exactly one Service, so
+        # two services sharing one VIP would leave one perpetually Pending.
+        dp_vips = {"DNS resolver VIP": self.dns_vip, "DHCP relay VIP": self.dhcp_relay_vip}
+        for label, vip in dp_vips.items():
+            if vip and not self.enabled:
+                raise ValueError(f"{label} requires MetalLB to be enabled")
+        if self.dns_vip and self.dns_vip == self.control_plane_vip:
+            raise ValueError("DNS resolver VIP must differ from the control-plane VIP")
+        if self.dhcp_relay_vip and self.dhcp_relay_vip == self.control_plane_vip:
+            raise ValueError("DHCP relay VIP must differ from the control-plane VIP")
+        if self.dns_vip and self.dns_vip == self.dhcp_relay_vip:
+            raise ValueError("DNS resolver VIP and DHCP relay VIP must differ")
+        # Every configured VIP must fall inside the pool.
+        for label, vip in {"control-plane VIP": self.control_plane_vip, **dp_vips}.items():
+            if vip and self.pool_addresses and not _vip_in_pool(vip, self.pool_addresses):
                 raise ValueError(
-                    f"control-plane VIP {self.control_plane_vip} is not inside the " "address pool"
+                    f"{label} {vip} is not inside the address pool "
+                    "(widen metallb_pool_addresses to include every VIP)"
                 )
         return self
 
@@ -3872,14 +4141,20 @@ async def put_metallb_config(
         "enabled": row.metallb_enabled,
         "pool_addresses": list(row.metallb_pool_addresses or []),
         "control_plane_vip": row.control_plane_vip or "",
+        "dns_vip": row.dns_vip or "",
+        "dhcp_relay_vip": row.dhcp_relay_vip or "",
     }
     row.metallb_enabled = body.enabled
     row.metallb_pool_addresses = body.pool_addresses
     row.control_plane_vip = body.control_plane_vip
+    row.dns_vip = body.dns_vip
+    row.dhcp_relay_vip = body.dhcp_relay_vip
     new = {
         "enabled": body.enabled,
         "pool_addresses": body.pool_addresses,
         "control_plane_vip": body.control_plane_vip,
+        "dns_vip": body.dns_vip,
+        "dhcp_relay_vip": body.dhcp_relay_vip,
     }
     db.add(
         AuditLog(

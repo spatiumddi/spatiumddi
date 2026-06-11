@@ -468,6 +468,12 @@ backend/alembic/versions/ee86cea94cf5_appliance_role_assignment.py:drop_column:1
 backend/alembic/versions/ee86cea94cf5_appliance_role_assignment.py:drop_column:104
 backend/alembic/versions/ee86cea94cf5_appliance_role_assignment.py:drop_column:105
 backend/alembic/versions/f1a3b8c52d04_subnet_role.py:drop_column:39
+backend/alembic/versions/f1a4c7b2e9d6_cp_ha_dataplane_vip_etcd_restore.py:drop_column:71
+backend/alembic/versions/f1a4c7b2e9d6_cp_ha_dataplane_vip_etcd_restore.py:drop_column:72
+backend/alembic/versions/f1a4c7b2e9d6_cp_ha_dataplane_vip_etcd_restore.py:drop_column:73
+backend/alembic/versions/f1a4c7b2e9d6_cp_ha_dataplane_vip_etcd_restore.py:drop_column:74
+backend/alembic/versions/f1a4c7b2e9d6_cp_ha_dataplane_vip_etcd_restore.py:drop_column:75
+backend/alembic/versions/f1a4c7b2e9d6_cp_ha_dataplane_vip_etcd_restore.py:drop_column:76
 backend/alembic/versions/f1a8d2c5e413_dns_pull_from_server_settings.py:drop_column:56
 backend/alembic/versions/f1a8d2c5e413_dns_pull_from_server_settings.py:drop_column:57
 backend/alembic/versions/f1a8d2c5e413_dns_pull_from_server_settings.py:drop_column:58

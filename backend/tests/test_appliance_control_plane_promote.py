@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from httpx import AsyncClient
@@ -443,4 +444,229 @@ async def test_metallb_non_superadmin_refused(
     token = await _admin(db_session, superadmin=False, username="plainuser")
     await db_session.commit()
     resp = await client.get(_METALLB_URL, headers=_hdr(token))
+    assert resp.status_code == 403
+
+
+# ── data-plane resolver VIPs (Phase 10) ──────────────────────────────
+
+
+async def test_dataplane_vips_put_and_get(db_session: AsyncSession, client: AsyncClient) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": True,
+            "pool_addresses": ["192.168.0.240/29"],
+            "control_plane_vip": "192.168.0.241",
+            "dns_vip": "192.168.0.242",
+            "dhcp_relay_vip": "192.168.0.243",
+        },
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["dns_vip"] == "192.168.0.242"
+    assert body["dhcp_relay_vip"] == "192.168.0.243"
+    got = (await client.get(_METALLB_URL, headers=_hdr(token))).json()
+    assert got["dns_vip"] == "192.168.0.242"
+    assert got["dhcp_relay_vip"] == "192.168.0.243"
+
+
+async def test_dataplane_vip_outside_pool_refused(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": True,
+            "pool_addresses": ["192.168.0.240/29"],
+            "control_plane_vip": "192.168.0.241",
+            "dns_vip": "10.0.0.9",
+        },
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 422
+    assert "not inside" in resp.text
+
+
+async def test_dataplane_vip_requires_metallb_enabled(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": False,
+            "pool_addresses": [],
+            "control_plane_vip": "",
+            "dns_vip": "192.168.0.242",
+        },
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 422
+    assert "requires MetalLB" in resp.text
+
+
+async def test_dataplane_vip_must_differ_from_control_plane(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": True,
+            "pool_addresses": ["192.168.0.240/29"],
+            "control_plane_vip": "192.168.0.241",
+            "dns_vip": "192.168.0.241",
+        },
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 422
+    assert "differ from the control-plane VIP" in resp.text
+
+
+async def test_dataplane_dns_and_dhcp_vips_must_differ(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": True,
+            "pool_addresses": ["192.168.0.240/29"],
+            "control_plane_vip": "192.168.0.241",
+            "dns_vip": "192.168.0.242",
+            "dhcp_relay_vip": "192.168.0.242",
+        },
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 422
+    assert "must differ" in resp.text
+
+
+# ── etcd snapshots + guided restore (Phase 9b) ───────────────────────
+
+_SNAP_URL = "/api/v1/appliance/fleet/control-plane/etcd-snapshots"
+_RESTORE_URL = "/api/v1/appliance/fleet/control-plane/restore"
+
+
+async def test_etcd_snapshots_unavailable_without_seed(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.get(_SNAP_URL, headers=_hdr(token))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["available"] is False
+
+
+async def test_etcd_snapshots_lists_seed_inventory(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session)
+    seed = await _seed(db_session)
+    seed.last_seen_at = datetime.now(UTC)
+    seed.etcd_snapshots = [
+        {
+            "name": "on-demand-seed-1700000000",
+            "location": "file:///var/lib/rancher/k3s/server/db/snapshots/on-demand-seed-1700000000",
+            "node_name": "seed",
+            "size": 1234567,
+            "created_at": "2026-06-10T00:00:00Z",
+        }
+    ]
+    await db_session.commit()
+    resp = await client.get(_SNAP_URL, headers=_hdr(token))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["available"] is True
+    assert body["seed_hostname"] == "seed"
+    assert len(body["snapshots"]) == 1
+    assert body["snapshots"][0]["name"] == "on-demand-seed-1700000000"
+
+
+async def test_restore_stamps_desired_snapshot(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session)
+    seed = await _seed(db_session)
+    seed.etcd_snapshots = [{"name": "snap-A", "node_name": "seed"}]
+    await db_session.commit()
+    resp = await client.post(
+        _RESTORE_URL,
+        json={"snapshot_name": "snap-A", "confirm_hostname": "seed"},
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(seed)
+    assert seed.desired_restore_snapshot == "snap-A"
+
+
+async def test_restore_wrong_hostname_refused(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session)
+    seed = await _seed(db_session)
+    seed.etcd_snapshots = [{"name": "snap-A", "node_name": "seed"}]
+    await db_session.commit()
+    resp = await client.post(
+        _RESTORE_URL,
+        json={"snapshot_name": "snap-A", "confirm_hostname": "wrong"},
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 422
+    assert "hostname" in resp.text
+    await db_session.refresh(seed)
+    assert seed.desired_restore_snapshot is None
+
+
+async def test_restore_unknown_snapshot_refused(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session)
+    seed = await _seed(db_session)
+    seed.etcd_snapshots = [{"name": "snap-A", "node_name": "seed"}]
+    await db_session.commit()
+    resp = await client.post(
+        _RESTORE_URL,
+        json={"snapshot_name": "does-not-exist", "confirm_hostname": "seed"},
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 422
+    assert "inventory" in resp.text
+
+
+async def test_restore_in_flight_conflict(db_session: AsyncSession, client: AsyncClient) -> None:
+    token = await _admin(db_session)
+    seed = await _seed(db_session)
+    seed.etcd_snapshots = [{"name": "snap-A", "node_name": "seed"}]
+    seed.desired_restore_snapshot = "snap-A"
+    seed.restore_state = "restoring"
+    await db_session.commit()
+    resp = await client.post(
+        _RESTORE_URL,
+        json={"snapshot_name": "snap-A", "confirm_hostname": "seed"},
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 409
+    assert "already in flight" in resp.text
+
+
+async def test_restore_non_superadmin_refused(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session, superadmin=False, username="plain2")
+    await _seed(db_session)
+    await db_session.commit()
+    resp = await client.post(
+        _RESTORE_URL,
+        json={"snapshot_name": "snap-A", "confirm_hostname": "seed"},
+        headers=_hdr(token),
+    )
     assert resp.status_code == 403

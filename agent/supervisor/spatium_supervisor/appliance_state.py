@@ -429,6 +429,21 @@ _CLUSTER_JOIN_STATE_SIDECAR = Path(
 )
 _K3S_JOIN_TOKEN_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/k3s-join-token")
 
+# #272 Phase 9b — guided etcd restore. Same trigger-file + confirm-marker
+# shape as join/leave, but for the MOST destructive cluster op: a
+# single-node cluster-reset that restores etcd from a snapshot. The
+# host-side spatium-cluster-restore runner refuses any trigger whose
+# first line isn't this exact marker. The payload is two lines: the
+# marker then the snapshot name. The runner writes the same .state sidecar
+# shape (``state\treason``) the supervisor reports back.
+_CLUSTER_RESTORE_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/cluster-restore-pending"
+)
+_CLUSTER_RESTORE_CONFIRM = "SPATIUMDDI-CLUSTER-RESTORE-CONFIRM-V1"
+_CLUSTER_RESTORE_STATE_SIDECAR = Path(
+    "/var/lib/spatiumddi-host/release-state/cluster-restore.state"
+)
+
 
 def maybe_fire_fleet_upgrade(
     desired_version: str | None,
@@ -858,6 +873,60 @@ def read_cluster_join_state() -> tuple[str | None, str | None]:
         return None, None
     try:
         raw = _CLUSTER_JOIN_STATE_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None, None
+    if not raw:
+        return None, None
+    state, _, reason = raw.partition("\t")
+    return (state or None), (reason or None)
+
+
+def maybe_fire_cluster_restore(desired_restore_snapshot: str | None) -> bool:
+    """Write the cluster-restore trigger when the control plane asks this
+    seed to restore etcd from a snapshot (#272 Phase 9b).
+
+    ⚠️ The MOST destructive trigger: the host runner stops k3s and runs
+    ``k3s server --cluster-reset --cluster-reset-restore-path=…``, which
+    collapses the cluster to a 1-member etcd and orphans every other
+    control-plane node. The backend already gates this hard (superadmin +
+    typed-hostname confirm + snapshot-in-inventory); here we re-assert the
+    appliance-only gate and stamp the ``_CLUSTER_RESTORE_CONFIRM`` marker
+    so a stray file can't fire a cluster reset.
+
+    Payload is two lines: the marker then the snapshot name. Idempotent
+    via trigger-file presence — once written we don't stack until the host
+    runner consumes it (rename to ``.done`` / ``.failed``)."""
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not desired_restore_snapshot:
+        return False
+    if _CLUSTER_RESTORE_TRIGGER_FILE.exists():
+        return False
+    try:
+        _CLUSTER_RESTORE_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CLUSTER_RESTORE_TRIGGER_FILE.with_suffix(".new")
+        tmp.write_text(
+            f"{_CLUSTER_RESTORE_CONFIRM}\n{desired_restore_snapshot}\n", encoding="utf-8"
+        )
+        tmp.replace(_CLUSTER_RESTORE_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def read_cluster_restore_state() -> tuple[str | None, str | None]:
+    """Return ``(restore_state, restore_reason)`` from the ``.state``
+    sidecar the host restore runner writes (``state\\treason``).
+
+    Appliance-only; ``(None, None)`` when the sidecar is missing so the
+    backend's "only update when not None" semantics leave the columns
+    alone on nodes that have never run a restore."""
+    if detect_deployment_kind() != "appliance":
+        return None, None
+    if not _CLUSTER_RESTORE_STATE_SIDECAR.exists():
+        return None, None
+    try:
+        raw = _CLUSTER_RESTORE_STATE_SIDECAR.read_text(encoding="utf-8").strip()
     except OSError:
         return None, None
     if not raw:

@@ -430,6 +430,47 @@ def delete_helmchart(
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+def list_etcd_snapshots() -> list[dict[str, Any]]:
+    """List recoverable etcd snapshots from the k3s ``ETCDSnapshotFile``
+    cluster-scoped CRs (#272 Phase 9b).
+
+    k3s ≥ 1.26 materialises one ``etcdsnapshotfile.k3s.cattle.io`` object
+    per on-disk (and S3) snapshot — the same source ``k3s etcd-snapshot
+    list`` reads — so the supervisor reads them over the kubeapi it
+    already talks to, with NO host ``k3s`` binary or etcd access needed.
+
+    Returns ``[{name, location, node_name, size, created_at}]`` sorted
+    newest-first, or ``[]`` on any error (older k3s without the CRD, a
+    kubeapi blip, or a non-seed node whose read 403s)."""
+    path = "/apis/k3s.cattle.io/v1/etcdsnapshotfiles"
+    try:
+        status, resp = _request("GET", path)
+    except RuntimeError:
+        return []
+    if status != 200:
+        return []
+    try:
+        items = (json.loads(resp) or {}).get("items") or []
+    except (json.JSONDecodeError, ValueError):
+        return []
+    out: list[dict[str, Any]] = []
+    for it in items:
+        spec = it.get("spec") or {}
+        st = it.get("status") or {}
+        out.append(
+            {
+                "name": spec.get("snapshotName") or (it.get("metadata") or {}).get("name") or "",
+                "location": spec.get("location") or "",
+                "node_name": spec.get("nodeName") or "",
+                "size": st.get("size"),
+                "created_at": st.get("creationTime"),
+            }
+        )
+    # Newest-first by created_at (ISO 8601 sorts lexically); blanks last.
+    out.sort(key=lambda s: s.get("created_at") or "", reverse=True)
+    return out
+
+
 def delete_node(name: str) -> tuple[bool, str | None]:
     """Delete a k8s Node. On k3s, deleting a server Node object makes
     the cluster drop its etcd member — so this is how a dead
@@ -567,6 +608,35 @@ def apply_metallb_overrides(
         f"  ipPool:\n    addresses: {pool_json}\n"
     )
     return _helmchartconfig_upsert("spatium-metallb", values)
+
+
+def apply_dataplane_vip_overrides(
+    *, dns_vip: str, dhcp_relay_vip: str
+) -> tuple[bool, str | None]:
+    """Durably set the data-plane resolver VIPs (#272 Phase 10) on the
+    spatiumddi-appliance HelmChartConfig.
+
+    ``dns_vip`` (non-empty) flips the bind9 / powerdns DaemonSets OFF
+    hostNetwork and behind a single L2 LoadBalancer Service at the VIP
+    (``dns.useMetalLBVIP`` + ``dns.vip``); empty keeps hostNetwork :53.
+    ``dhcp_relay_vip`` adds the relay→server LoadBalancer Service on :67
+    (``dhcpKea.relayVIP``) without touching Kea's hostNetwork broadcast
+    path; empty renders no relay Service.
+
+    Written to the HelmChartConfig (not the HelmChart CR) so it survives
+    a k3s restart's manifest re-apply, exactly like the cp-size + VIP
+    overrides. helm-controller merges it on top of the role-assignment
+    values the supervisor PATCHes onto the same-named HelmChart, so this
+    overlay only carries the VIP keys and never fights for ownership of
+    the per-role ``enabled`` flags. Idempotent — only writes on change."""
+    dns_vip = (dns_vip or "").strip()
+    relay_vip = (dhcp_relay_vip or "").strip()
+    values = (
+        f"dns:\n  useMetalLBVIP: {'true' if dns_vip else 'false'}\n"
+        f'  vip: "{dns_vip}"\n'
+        f'dhcpKea:\n  relayVIP: "{relay_vip}"\n'
+    )
+    return _helmchartconfig_upsert("spatiumddi-appliance", values)
 
 
 def patch_node_labels(

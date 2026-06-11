@@ -30,6 +30,20 @@ VERSION_FILE="$APPLIANCE_DIR/mkosi.extra/usr/lib/spatiumddi/spatiumddi-version"
 SPATIUMDDI_VERSION="${SPATIUMDDI_VERSION:-dev}"
 BAKE_SOURCE="${BAKE_SOURCE:-local}"  # local (docker :dev) | ghcr (pull from ghcr.io)
 
+# #272 follow-up — stale-source-image guard. A local bake saves whatever
+# ``make build`` last produced; if the operator edited code but forgot to
+# rebuild, the ISO silently ships stale images. Refuse when any SpatiumDDI
+# source image is older than STALE_MAX_AGE_S unless explicitly allowed.
+# ghcr pulls are always fresh, so this only applies to BAKE_SOURCE=local.
+ALLOW_STALE_IMAGES="${ALLOW_STALE_IMAGES:-0}"
+STALE_MAX_AGE_S="${STALE_MAX_AGE_S:-86400}"  # 24h
+for arg in "$@"; do
+    case "$arg" in
+        --allow-stale-images) ALLOW_STALE_IMAGES=1 ;;
+        *) echo "WARN: ignoring unknown arg '$arg'" >&2 ;;
+    esac
+done
+
 # SpatiumDDI service images. Tagged with SPATIUMDDI_VERSION so the
 # chart's ``image: ghcr.io/spatiumddi/<name>:${SPATIUMDDI_VERSION}``
 # reference resolves locally without a pull.
@@ -186,6 +200,35 @@ resolve_source_tag() {
             ;;
     esac
 }
+
+# Stale-source-image pre-scan (local only). Fails BEFORE baking anything
+# so the operator fixes it in one rebuild rather than discovering a stale
+# image after a 10-minute ISO build. Missing images aren't flagged here —
+# the main loop's inspect handles those with a more specific error.
+image_age_seconds() {
+    local created created_epoch
+    created="$(docker image inspect "$1" --format '{{.Created}}' 2>/dev/null)" || return 1
+    created_epoch="$(date -d "$created" +%s 2>/dev/null)" || return 1
+    echo $(( $(date +%s) - created_epoch ))
+}
+if [ "$BAKE_SOURCE" = "local" ] && [ "$ALLOW_STALE_IMAGES" != "1" ]; then
+    stale=()
+    for repo in "${IMAGES[@]}"; do
+        src="$(resolve_source_tag "$repo")"
+        docker image inspect "$src" >/dev/null 2>&1 || continue
+        age="$(image_age_seconds "$src")" || continue
+        if [ "$age" -gt "$STALE_MAX_AGE_S" ]; then
+            stale+=("$src ($(( age / 3600 ))h old)")
+        fi
+    done
+    if [ "${#stale[@]}" -gt 0 ]; then
+        echo "ERROR: stale local source image(s) older than $(( STALE_MAX_AGE_S / 3600 ))h:" >&2
+        for s in "${stale[@]}"; do echo "         $s" >&2; done
+        echo "       Rebuild with 'make build' (+ 'make build-supervisor'), or bake them" >&2
+        echo "       as-is with --allow-stale-images (or ALLOW_STALE_IMAGES=1)." >&2
+        exit 4
+    fi
+fi
 
 for repo in "${IMAGES[@]}"; do
     short="$(basename "$repo")"

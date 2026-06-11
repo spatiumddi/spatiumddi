@@ -376,8 +376,12 @@ appliance-bake-control-chart:
 appliance-bake-metallb-chart:
 	@CHART_NAME=spatiumddi-metallb bash $(APPLIANCE_DIR)/scripts/bake-chart.sh
 
+# BAKE_FLAGS lets an operator pass --allow-stale-images to bypass the
+# >24h stale-source-image guard (#272 follow-up): make appliance-baked-iso
+# BAKE_FLAGS=--allow-stale-images  (or ALLOW_STALE_IMAGES=1, which the
+# script also honours from the environment).
 appliance-bake-images: build-supervisor
-	@bash $(APPLIANCE_DIR)/scripts/bake-images.sh
+	@bash $(APPLIANCE_DIR)/scripts/bake-images.sh $(BAKE_FLAGS)
 
 # Convenience for fast laptop iteration on appliance-level changes
 # (installer, firstboot, console dashboard, partition layout,
