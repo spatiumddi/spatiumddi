@@ -83,7 +83,7 @@ async def test_subnet_token_in_scope_allow_out_of_scope_deny(
     r_ok = await client.post(
         f"/api/v1/ipam/subnets/{sub_x.id}/addresses",
         headers=hdr,
-        json={"address": "10.30.1.10", "status": "allocated"},
+        json={"address": "10.30.1.10", "status": "allocated", "hostname": "in-scope"},
     )
     assert r_ok.status_code == 201, r_ok.text
 
@@ -92,7 +92,7 @@ async def test_subnet_token_in_scope_allow_out_of_scope_deny(
     r_deny = await client.post(
         f"/api/v1/ipam/subnets/{sub_y.id}/addresses",
         headers=hdr,
-        json={"address": "10.30.2.10", "status": "allocated"},
+        json={"address": "10.30.2.10", "status": "allocated", "hostname": "out-of-scope"},
     )
     assert r_deny.status_code == 403, r_deny.text
 
