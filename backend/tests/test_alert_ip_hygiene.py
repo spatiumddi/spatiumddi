@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertRule
-from app.models.ipam import IpMacHistory, IPAddress, IPBlock, IPSpace, Subnet
+from app.models.ipam import IPAddress, IPBlock, IpMacHistory, IPSpace, Subnet
 from app.services.alerts import (
     RULE_TYPE_IP_FREE_BUT_RESPONDING,
     RULE_TYPE_STALE_RESERVATION,
