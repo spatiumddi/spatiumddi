@@ -3847,9 +3847,7 @@ async def restore_etcd_snapshot(
             "destructive cluster-reset restore.",
         )
     known = {
-        s.get("name")
-        for s in (seed.etcd_snapshots or [])
-        if isinstance(s, dict) and s.get("name")
+        s.get("name") for s in (seed.etcd_snapshots or []) if isinstance(s, dict) and s.get("name")
     }
     if body.snapshot_name not in known:
         raise HTTPException(

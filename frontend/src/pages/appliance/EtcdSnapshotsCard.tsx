@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  applianceFleetApi,
+  applianceApprovalApi,
   formatApiError,
   type EtcdSnapshotRow,
 } from "@/lib/api";
@@ -39,7 +39,7 @@ export function EtcdSnapshotsCard() {
   const qc = useQueryClient();
   const { data, isLoading } = useQuery({
     queryKey: ["appliance", "etcd-snapshots"],
-    queryFn: applianceFleetApi.listEtcdSnapshots,
+    queryFn: applianceApprovalApi.listEtcdSnapshots,
     staleTime: 20_000,
     // Poll faster while a restore is in flight so the state banner tracks
     // the host runner; idle otherwise.
@@ -57,7 +57,7 @@ export function EtcdSnapshotsCard() {
 
   const restore = useMutation({
     mutationFn: ({ name, hostname }: { name: string; hostname: string }) =>
-      applianceFleetApi.restoreEtcdSnapshot(name, hostname),
+      applianceApprovalApi.restoreEtcdSnapshot(name, hostname),
     onSuccess: (res) => {
       qc.setQueryData(["appliance", "etcd-snapshots"], res);
       setRestoreTarget(null);
