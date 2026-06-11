@@ -214,6 +214,8 @@ async def _run(
             proc.kill()
             await proc.wait()
         except ProcessLookupError:
+            # The process already exited between the timeout and the kill —
+            # nothing left to reap.
             pass
         duration_ms = (time.perf_counter() - started) * 1000.0
         log.info("supervisor.nettool.timeout", tool=tool, timeout_s=timeout_seconds)

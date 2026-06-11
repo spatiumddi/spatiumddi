@@ -41,7 +41,12 @@ FROM alpine:3.22 AS runtime
 # installed — they stay server-only (mtr needs CAP_NET_RAW + is covered
 # by ping/traceroute; whois hits off-prem infra with no per-vantage
 # meaning), so the control plane never dispatches them to an appliance.
-RUN apk add --no-cache \
+# ``apk upgrade --no-cache`` runs BEFORE ``apk add`` so the base image's
+# packages (openssl / libcrypto3 / libssl3, …) are pulled forward to their
+# fixed versions — keeps the Trivy HIGH/CRITICAL gate clean. Same pattern as
+# the DNS/DHCP agent images (agent/{dns,dhcp}/images/*/Dockerfile).
+RUN apk upgrade --no-cache \
+ && apk add --no-cache \
       tini su-exec \
       python3 py3-pip \
       nftables libcap \

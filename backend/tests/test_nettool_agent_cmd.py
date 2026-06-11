@@ -43,7 +43,7 @@ async def test_enqueue_pop_deliver_roundtrip() -> None:
     outcome = await agent_cmd.enqueue_command(
         appliance_id, "ping", {"host": "1.1.1.1"}, ready=True, timeout=5.0
     )
-    await sup
+    await asyncio.gather(sup)  # drain the helper task + surface any error
     assert outcome.error is None
     assert outcome.result is not None
     assert outcome.result["available"] is True
@@ -96,7 +96,7 @@ async def test_pop_skips_cancelled() -> None:
     outcome = await agent_cmd.enqueue_command(
         appliance_id, "ping", {"host": "9.9.9.9"}, ready=True, timeout=3.0
     )
-    await sup
+    await asyncio.gather(sup)  # drain the helper task + surface any error
     assert outcome.result == {"ok": True}
 
 
