@@ -49,10 +49,30 @@ def upgrade() -> None:
             nullable=False,
             server_default="rogue",
         ),
-        sa.Column("first_seen_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
-        sa.Column("last_seen_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
-        sa.Column("modified_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
+        sa.Column(
+            "first_seen_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "last_seen_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "modified_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
         sa.UniqueConstraint(
             "group_id", "server_identifier", "source_ip", name="uq_dhcp_responder_id_ip"
         ),
@@ -80,8 +100,18 @@ def upgrade() -> None:
             sa.ForeignKey("user.id", ondelete="SET NULL"),
             nullable=True,
         ),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
-        sa.Column("modified_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "modified_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
     )
     op.create_index("ix_dhcp_responder_allowlist_group", "dhcp_responder_allowlist", ["group_id"])
 

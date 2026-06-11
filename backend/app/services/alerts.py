@@ -221,6 +221,10 @@ RULE_TYPES = frozenset(
 _FREE_RESPONDING_RECENCY_DAYS = 1
 _STALE_RESERVATION_DAYS = 90
 _SQUAT_RECENCY_DAYS = 7
+# Defensive cap on per-IP hygiene events opened per tick — a badly-misconfigured
+# discovery run shouldn't open thousands of AlertEvents in one 60 s pass. The
+# matcher logs when it truncates (no silent cap).
+_IP_HYGIENE_MAX_EVENTS = 500
 
 # DNS query-anomaly evaluation window + defaults (issue #371). 15 min spans
 # ~15 one-minute buckets / 3 five-minute buckets — long enough to smooth a
@@ -534,16 +538,20 @@ async def _matching_ip_free_but_responding_subjects(
     rows = (
         (
             await db.execute(
-                select(IPAddress).where(
+                select(IPAddress)
+                .where(
                     IPAddress.status == "available",
                     IPAddress.last_seen_at.is_not(None),
                     IPAddress.last_seen_at >= cutoff,
                 )
+                .limit(_IP_HYGIENE_MAX_EVENTS)
             )
         )
         .scalars()
         .all()
     )
+    if len(rows) >= _IP_HYGIENE_MAX_EVENTS:
+        logger.warning("ip_free_but_responding_truncated", cap=_IP_HYGIENE_MAX_EVENTS)
     matches: list[tuple[str, str, str]] = []
     for r in rows:
         via = f" via {r.last_seen_method}" if r.last_seen_method else ""
@@ -568,16 +576,20 @@ async def _matching_stale_reservation_subjects(
     rows = (
         (
             await db.execute(
-                select(IPAddress).where(
+                select(IPAddress)
+                .where(
                     IPAddress.status.in_(("reserved", "static_dhcp")),
                     IPAddress.last_seen_at.is_not(None),
                     IPAddress.last_seen_at < cutoff,
                 )
+                .limit(_IP_HYGIENE_MAX_EVENTS)
             )
         )
         .scalars()
         .all()
     )
+    if len(rows) >= _IP_HYGIENE_MAX_EVENTS:
+        logger.warning("stale_reservation_truncated", cap=_IP_HYGIENE_MAX_EVENTS)
     matches: list[tuple[str, str, str]] = []
     for r in rows:
         label = str(r.address) + (f" ({r.hostname})" if r.hostname else "")
@@ -614,6 +626,7 @@ async def _matching_unknown_mac_in_static_range_subjects(
                 IpMacHistory.mac_address != IPAddress.mac_address,
                 IpMacHistory.last_seen >= cutoff,
             )
+            .limit(_IP_HYGIENE_MAX_EVENTS)
         )
     ).all()
     # One event per IP — keep the most-recent offending observation if several.

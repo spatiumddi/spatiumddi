@@ -495,6 +495,14 @@ async def agent_config_longpoll(
                                         "start_ip": p.start_ip,
                                         "end_ip": p.end_ip,
                                         "pool_type": p.pool_type,
+                                        # DHCPv6 prefix delegation (#368) — the
+                                        # agent's render_kea reads these for
+                                        # pool_type == "pd". Null for v4 / range
+                                        # pools.
+                                        "pd_prefix": p.pd_prefix,
+                                        "delegated_length": p.delegated_length,
+                                        "excluded_prefix": p.excluded_prefix,
+                                        "class_restriction": p.class_restriction,
                                     }
                                     for p in s.pools
                                 ],
@@ -503,6 +511,9 @@ async def agent_config_longpoll(
                                         "ip_address": st.ip_address,
                                         "mac_address": st.mac_address,
                                         "hostname": st.hostname,
+                                        # DHCPv6 DUID (#368) — keys the v6
+                                        # reservation instead of the MAC.
+                                        "duid": st.duid,
                                     }
                                     for st in s.statics
                                 ],

@@ -116,6 +116,8 @@ def run(cfg: AgentConfig) -> int:
         log_shipper.stop()
         if fingerprint_shipper is not None:
             fingerprint_shipper.stop()
+        if rogue_probe is not None:
+            rogue_probe.stop()
 
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)

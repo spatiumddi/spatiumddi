@@ -226,3 +226,105 @@ async def test_create_token_bad_resource_type_422(
     )
     # Shape validator rejects unsupported resource_type at the schema layer.
     assert r.status_code == 422, r.text
+
+
+@pytest.mark.asyncio
+async def test_subnet_token_cannot_mutate_other_subnet(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A token bound to subnet A can edit/delete A but 403s on subnet B
+    (regression for the update/delete/resize escape found in review)."""
+    owner, _ = await _make_user(db_session, superadmin=True)
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    sub_a = await _make_subnet(db_session, space, "10.40.1.0/24")
+    sub_b = await _make_subnet(db_session, space, "10.40.2.0/24")
+    raw = await _make_token(
+        db_session,
+        owner,
+        [{"action": "admin", "resource_type": "subnet", "resource_id": str(sub_a.id)}],
+    )
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {raw}"}
+
+    # PUT other subnet → 403; PUT own subnet → 200.
+    assert (
+        await client.put(f"/api/v1/ipam/subnets/{sub_b.id}", headers=hdr, json={"description": "x"})
+    ).status_code == 403
+    assert (
+        await client.put(
+            f"/api/v1/ipam/subnets/{sub_a.id}", headers=hdr, json={"description": "ok"}
+        )
+    ).status_code == 200
+    # DELETE other subnet → 403.
+    assert (await client.delete(f"/api/v1/ipam/subnets/{sub_b.id}", headers=hdr)).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_write_scoped_token_can_read_own_subnet(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A write-only grant implies read on the bound resource (#374 review #6)."""
+    owner, _ = await _make_user(db_session, superadmin=True)
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    sub = await _make_subnet(db_session, space, "10.41.1.0/24")
+    raw = await _make_token(
+        db_session,
+        owner,
+        [{"action": "write", "resource_type": "subnet", "resource_id": str(sub.id)}],
+    )
+    await db_session.commit()
+    r = await client.get(
+        f"/api/v1/ipam/subnets/{sub.id}", headers={"Authorization": f"Bearer {raw}"}
+    )
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_subnet_token_bulk_delete_skips_other_subnet(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Bulk-delete only touches IPs in the token's bound subnet (review #2)."""
+    owner, _ = await _make_user(db_session, superadmin=True)
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    sub_a = await _make_subnet(db_session, space, "10.42.1.0/24")
+    sub_b = await _make_subnet(db_session, space, "10.42.2.0/24")
+    # Superadmin session creates one IP in each subnet.
+    _, admin_token = await _make_user(db_session, superadmin=True)
+    await db_session.commit()
+    admin_hdr = {"Authorization": f"Bearer {admin_token}"}
+    ra = await client.post(
+        f"/api/v1/ipam/subnets/{sub_a.id}/addresses",
+        headers=admin_hdr,
+        json={"address": "10.42.1.10", "status": "allocated", "hostname": "a"},
+    )
+    rb = await client.post(
+        f"/api/v1/ipam/subnets/{sub_b.id}/addresses",
+        headers=admin_hdr,
+        json={"address": "10.42.2.10", "status": "allocated", "hostname": "b"},
+    )
+    assert ra.status_code == 201 and rb.status_code == 201
+    ip_a, ip_b = ra.json()["id"], rb.json()["id"]
+
+    # bulk-delete is a POST → maps to the 'write' action, so the token needs a
+    # write/admin grant (a bare 'delete' grant wouldn't clear the coarse gate).
+    raw = await _make_token(
+        db_session,
+        owner,
+        [{"action": "admin", "resource_type": "subnet", "resource_id": str(sub_a.id)}],
+    )
+    await db_session.commit()
+    resp = await client.post(
+        "/api/v1/ipam/addresses/bulk-delete",
+        headers={"Authorization": f"Bearer {raw}"},
+        json={"ip_ids": [ip_a, ip_b], "permanent": True},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # ip_b (other subnet) is skipped, not deleted.
+    assert ip_b in body.get("skipped", [])

@@ -115,9 +115,18 @@ def _token_grants_allow(
     * **Scoped check** (``req_rid`` set — a per-row gate): a grant must match
       action + resource_type + resource_id (grant resource_id None/``*`` = any
       instance of that type, else exact match).
+
+    Write implies read for token grants: a token granted ``write`` / ``delete``
+    on a resource can also ``read`` it (you can't sensibly mutate what you can't
+    read), so a ``write``-only resource token isn't locked out of GET-ing its
+    own bound resource.
     """
     for g in grants:
-        if not _action_matches(g.get("action", ""), action):
+        g_action = g.get("action", "")
+        action_ok = _action_matches(g_action, action) or (
+            action == "read" and g_action in ("write", "delete")
+        )
+        if not action_ok:
             continue
         if not _resource_type_matches(g.get("resource_type", ""), resource_type):
             continue

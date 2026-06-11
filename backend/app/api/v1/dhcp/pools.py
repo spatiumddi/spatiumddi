@@ -89,24 +89,28 @@ class PoolResponse(BaseModel):
 
 
 def _ip_int(ip_str: str) -> int:
-    return int(ipaddress.IPv4Address(ip_str))
+    # Family-agnostic so a v6 (address or pd) pool in the scope doesn't blow up
+    # the overlap scan with an IPv4Address ValueError (#368).
+    return int(ipaddress.ip_address(ip_str))
 
 
-def _validate_pd(body: PoolCreate) -> tuple[ipaddress.IPv6Network, str]:
+def _validate_pd(
+    pd_prefix: str | None, delegated_length: int | None, excluded_prefix: str | None
+) -> tuple[ipaddress.IPv6Network, str]:
     """Validate a DHCPv6 prefix-delegation pool (issue #368). Returns the
-    parsed prefix network. 422 on any malformed input."""
-    if not body.pd_prefix or not body.delegated_length:
+    parsed prefix network. 422 on any malformed input. Shared by create + update."""
+    if not pd_prefix or not delegated_length:
         raise HTTPException(
             status_code=422,
             detail="pd pools require pd_prefix and delegated_length",
         )
     try:
-        net = ipaddress.ip_network(body.pd_prefix, strict=False)
+        net = ipaddress.ip_network(pd_prefix, strict=False)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=f"invalid pd_prefix: {exc}") from exc
     if not isinstance(net, ipaddress.IPv6Network):
         raise HTTPException(status_code=422, detail="pd_prefix must be an IPv6 prefix")
-    dl = int(body.delegated_length)
+    dl = int(delegated_length)
     if dl < net.prefixlen or dl > 128:
         raise HTTPException(
             status_code=422,
@@ -115,15 +119,26 @@ def _validate_pd(body: PoolCreate) -> tuple[ipaddress.IPv6Network, str]:
                 f"{net.prefixlen} and 128"
             ),
         )
-    if body.excluded_prefix:
+    if excluded_prefix:
         try:
-            ex = ipaddress.ip_network(body.excluded_prefix, strict=False)
+            ex = ipaddress.ip_network(excluded_prefix, strict=False)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=f"invalid excluded_prefix: {exc}") from exc
         if not isinstance(ex, ipaddress.IPv6Network) or not ex.subnet_of(net):
             raise HTTPException(
                 status_code=422,
                 detail="excluded_prefix must be an IPv6 sub-prefix of pd_prefix",
+            )
+        # RFC 6603: the excluded prefix is carved out of each delegated prefix,
+        # so it must be strictly longer than the delegated length — Kea rejects
+        # the config otherwise (#368 review).
+        if ex.prefixlen <= dl:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"excluded_prefix length {ex.prefixlen} must be greater than "
+                    f"delegated_length {dl}"
+                ),
             )
     return net, str(net.network_address)
 
@@ -142,6 +157,11 @@ async def _check_pool_overlap(
     res = await db.execute(select(DHCPPool).where(DHCPPool.scope_id == scope_id))
     for p in res.scalars().all():
         if exclude_id and p.id == exclude_id:
+            continue
+        # pd pools (#368) carry a prefix network address in start/end_ip as a
+        # NOT-NULL placeholder, not an address range — they never overlap an
+        # address pool, so skip them (also avoids comparing across families).
+        if p.pool_type == "pd":
             continue
         ps, pe = _ip_int(str(p.start_ip)), _ip_int(str(p.end_ip))
         if new_start <= pe and new_end >= ps:
@@ -194,7 +214,7 @@ async def create_pool(
         # DHCPv6 prefix-delegation pool (issue #368). No v4 range / overlap
         # logic — validate the prefix + delegated length, then store the
         # prefix network address in start_ip/end_ip (NOT NULL placeholders).
-        net, _start = _validate_pd(body)
+        net, _start = _validate_pd(body.pd_prefix, body.delegated_length, body.excluded_prefix)
         values = body.model_dump()
         values["start_ip"] = str(net.network_address)
         values["end_ip"] = str(net.network_address)
@@ -253,7 +273,19 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
     prev_end = str(pool.end_ip)
     new_start = body.start_ip or prev_start
     new_end = body.end_ip or prev_end
-    if body.start_ip or body.end_ip:
+    effective_type = body.pool_type if body.pool_type is not None else pool.pool_type
+    if effective_type == "pd":
+        # Re-validate the (merged) pd fields so a bad edit can't silently make a
+        # working pd pool unrenderable (#368). Re-sync start/end placeholders to
+        # the (possibly new) prefix network address.
+        net, net_addr = _validate_pd(
+            body.pd_prefix if body.pd_prefix is not None else pool.pd_prefix,
+            body.delegated_length if body.delegated_length is not None else pool.delegated_length,
+            body.excluded_prefix if body.excluded_prefix is not None else pool.excluded_prefix,
+        )
+        pool.start_ip = net_addr  # type: ignore[assignment]
+        pool.end_ip = net_addr  # type: ignore[assignment]
+    elif body.start_ip or body.end_ip:
         overlap = await _check_pool_overlap(
             db, pool.scope_id, new_start, new_end, exclude_id=pool.id
         )

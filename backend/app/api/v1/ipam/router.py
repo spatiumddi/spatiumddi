@@ -3021,6 +3021,14 @@ async def get_available_subnets(
         {"sid": str(block.space_id), "net": str(block.network)},
     )
     existing = [ipaddress.ip_network(str(row[0]), strict=False) for row in result.fetchall()]
+    # Also exclude direct child blocks so this preview agrees with what
+    # POST /blocks/{id}/allocate-subnet actually carves (#372 review) — that
+    # endpoint subtracts child blocks too, so without this the preview could
+    # show a candidate the carve then skips.
+    child_blocks = await db.execute(
+        select(IPBlock.network).where(IPBlock.parent_block_id == block.id)
+    )
+    existing += [ipaddress.ip_network(str(n), strict=False) for (n,) in child_blocks.all()]
 
     available: list[str] = []
     scanned = 0
@@ -3947,6 +3955,7 @@ async def trigger_subnet_discovery(subnet_id: uuid.UUID, current_user: CurrentUs
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
 
     queued = True
     try:
@@ -4226,6 +4235,7 @@ async def update_subnet(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
 
     old_block_id = subnet.block_id
 
@@ -4426,6 +4436,7 @@ async def delete_subnet(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
 
     if not permanent:
         # Soft-delete: cascade-stamp the subnet + its scopes. Non-emptiness
@@ -4708,6 +4719,7 @@ async def resize_subnet_preview(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
     preview = await preview_subnet_resize(
         db,
         subnet,
@@ -4755,6 +4767,7 @@ async def resize_subnet_commit(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
 
     old_snapshot = {
         "network": str(subnet.network),
@@ -6201,6 +6214,7 @@ async def get_address(address_id: uuid.UUID, current_user: CurrentUser, db: DB) 
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+    _enforce_subnet_token_scope(current_user, ip.subnet_id)
     return ip
 
 
@@ -6242,6 +6256,7 @@ async def list_mac_history(
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+    _enforce_subnet_token_scope(current_user, ip.subnet_id)
 
     rows = list(
         (
@@ -6458,6 +6473,7 @@ async def list_aliases(address_id: uuid.UUID, current_user: CurrentUser, db: DB)
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
+    _enforce_subnet_token_scope(current_user, ip.subnet_id)
     # Aliases are auto-generated records linked to this IP that aren't the
     # primary forward A (which is stored separately on ip.dns_record_id).
     res = await db.execute(
@@ -6623,6 +6639,7 @@ async def profile_address(
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+    _enforce_subnet_token_scope(current_user, ip.subnet_id)
 
     from app.services.profiling.auto_profile import enqueue_now
 
@@ -6823,6 +6840,7 @@ async def purge_orphans(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
     if not body.ip_ids:
         return {"purged": 0}
     res = await db.execute(
@@ -7361,6 +7379,7 @@ async def preview_next_ip(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
     if subnet.kind == "multicast":
         # No "next available" semantics for multicast — addresses
         # are operator-named stream identities, not endpoint slots.
@@ -8013,6 +8032,11 @@ async def bulk_delete_addresses(
         if not body.permanent and ip.status == "orphan":
             skipped.append(ip.id)
             continue
+        # Resource-scoped token (#374): skip IPs outside the token's bound
+        # subnet so a subnet-scoped token can't bulk-delete across subnets.
+        if not token_scope_allows(current_user, "subnet", ip.subnet_id):
+            skipped.append(ip.id)
+            continue
         subnet = await db.get(Subnet, ip.subnet_id)
         if subnet is not None:
             try:
@@ -8199,6 +8223,11 @@ async def bulk_edit_addresses(
             # edit here would be overwritten on the next pull. The UI already
             # blocks these from being selected; this is defence-in-depth.
             if ip.auto_from_lease:
+                skipped.append(ip.id)
+                continue
+            # Resource-scoped token (#374): a subnet-scoped token can't bulk-edit
+            # IPs outside its bound subnet.
+            if not token_scope_allows(current_user, "subnet", ip.subnet_id):
                 skipped.append(ip.id)
                 continue
 

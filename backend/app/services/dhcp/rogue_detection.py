@@ -31,7 +31,14 @@ class ObservedOffer:
 
 async def _known_responder_keys(db: AsyncSession, group_id: uuid.UUID) -> set[str]:
     """The set of IPs / identifiers that count as an *expected* responder for a
-    group — the configured ``host`` and the last-seen IP of every member."""
+    group — the configured ``host`` and the last-seen IP of every member.
+
+    ``host`` may be a hostname rather than an IP; ``last_seen_ip`` is the
+    reliable key and is populated on the member's first heartbeat (within ~60s
+    of the agent starting). So a member whose ``host`` is a hostname and which
+    hasn't heartbeated yet could briefly mis-classify its own OFFER as rogue —
+    self-heals on the next heartbeat, and the operator can acknowledge meanwhile.
+    """
     members = (
         (await db.execute(select(DHCPServer).where(DHCPServer.server_group_id == group_id)))
         .scalars()
