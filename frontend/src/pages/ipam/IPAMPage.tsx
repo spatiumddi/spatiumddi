@@ -2030,14 +2030,17 @@ function CreateSubnetModal({
     if (!blockId && blocks?.length === 1) setBlockId(blocks[0].id);
   }, [blocks, blockId]);
 
-  // Size mode carves the lowest free CIDR atomically server-side (#372) — the
-  // operator no longer picks a specific candidate (that would mismatch what the
-  // race-safe endpoint actually allocates). Track the lowest free one for
-  // submit-gating + as a best-effort preview (the server re-picks under a block
-  // lock at submit, so a concurrent carve may shift it).
+  // Size mode (#372): the operator picks a candidate from the free list and the
+  // atomic endpoint allocates that exact CIDR (validated free under a block
+  // lock; a concurrent claim 409s). Default to the lowest free one, but keep a
+  // still-valid operator pick across refetches — only reset when the current
+  // selection drops out of the list (e.g. prefix change or it got taken).
   useEffect(() => {
-    if (subnetMode === "size") setSelectedNet(availableNets[0] ?? "");
-  }, [subnetMode, availableNets]);
+    if (subnetMode !== "size") return;
+    if (!selectedNet || !availableNets.includes(selectedNet)) {
+      setSelectedNet(availableNets[0] ?? "");
+    }
+  }, [subnetMode, availableNets, selectedNet]);
 
   // When switching to size mode, clear manually typed network
   function switchMode(m: "manual" | "size") {
@@ -2096,6 +2099,9 @@ function CreateSubnetModal({
       return subnetMode === "size"
         ? ipamApi.allocateSubnet(blockId, {
             prefix_len: parseInt(prefixLen, 10),
+            // The operator-picked CIDR; the endpoint allocates this exact one
+            // (or the lowest free if somehow empty).
+            network: selectedNet || undefined,
             ...common,
           })
         : ipamApi.createSubnet({
@@ -2222,28 +2228,30 @@ function CreateSubnetModal({
             ) : (
               <div>
                 <p className="text-xs text-muted-foreground mb-1">
-                  Free /{prefixLen} subnets (the lowest is allocated atomically
-                  on submit):
+                  Free /{prefixLen} subnets (click to choose; allocated
+                  atomically on submit):
                 </p>
                 <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto">
-                  {availableNets.map((net: string, i: number) => (
-                    <span
+                  {availableNets.map((net: string) => (
+                    <button
                       key={net}
+                      type="button"
+                      onClick={() => setSelectedNet(net)}
                       className={cn(
-                        "font-mono rounded border px-2 py-0.5 text-xs",
-                        i === 0
+                        "font-mono rounded border px-2 py-0.5 text-xs transition-colors",
+                        selectedNet === net
                           ? "bg-primary text-primary-foreground border-primary"
-                          : "bg-background text-muted-foreground",
+                          : "bg-background hover:border-primary/50",
                       )}
                     >
                       {net}
-                    </span>
+                    </button>
                   ))}
                 </div>
-                {availableNets[0] && (
+                {selectedNet && (
                   <p className="text-xs text-emerald-600 dark:text-emerald-400 mt-1">
                     Will allocate:{" "}
-                    <span className="font-mono">{availableNets[0]}</span>
+                    <span className="font-mono">{selectedNet}</span>
                   </p>
                 )}
               </div>

@@ -213,3 +213,60 @@ async def test_allocate_404_unknown_block(client: AsyncClient, db_session: Async
         json={"prefix_len": 24},
     )
     assert r.status_code == 404, r.text
+
+
+@pytest.mark.asyncio
+async def test_allocate_specific_network_picked(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Passing an explicit free CIDR allocates that exact one (#372 — the
+    'Find by size' picker is clickable, not lowest-only)."""
+    _, token = await _make_admin(db_session)
+    space = await _make_space(db_session)
+    block = await _make_block(db_session, space, "10.55.0.0/16")
+
+    r = await client.post(
+        f"/api/v1/ipam/blocks/{block.id}/allocate-subnet",
+        headers=_auth(token),
+        json={"prefix_len": 24, "network": "10.55.7.0/24"},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["network"] == "10.55.7.0/24"  # not the lowest (.0.0)
+
+
+@pytest.mark.asyncio
+async def test_allocate_specific_network_taken_409(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    space = await _make_space(db_session)
+    block = await _make_block(db_session, space, "10.56.0.0/16")
+    # First claim 10.56.7.0/24, then a second pick of the same → 409.
+    r1 = await client.post(
+        f"/api/v1/ipam/blocks/{block.id}/allocate-subnet",
+        headers=_auth(token),
+        json={"prefix_len": 24, "network": "10.56.7.0/24"},
+    )
+    assert r1.status_code == 201, r1.text
+    r2 = await client.post(
+        f"/api/v1/ipam/blocks/{block.id}/allocate-subnet",
+        headers=_auth(token),
+        json={"prefix_len": 24, "network": "10.56.7.0/24"},
+    )
+    assert r2.status_code == 409, r2.text
+
+
+@pytest.mark.asyncio
+async def test_allocate_specific_network_out_of_block_422(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    space = await _make_space(db_session)
+    block = await _make_block(db_session, space, "10.57.0.0/16")
+    # A /24 outside the block.
+    r = await client.post(
+        f"/api/v1/ipam/blocks/{block.id}/allocate-subnet",
+        headers=_auth(token),
+        json={"prefix_len": 24, "network": "10.99.7.0/24"},
+    )
+    assert r.status_code == 422, r.text

@@ -3782,17 +3782,24 @@ class SubnetAllocate(SubnetCreate):
 async def allocate_subnet(
     block_id: uuid.UUID, body: SubnetAllocate, current_user: CurrentUser, db: DB
 ) -> Subnet:
-    """Atomically carve the lowest free child CIDR of ``prefix_len`` and create it (#372).
+    """Atomically carve a free child CIDR of ``prefix_len`` and create it (#372).
 
     The automation-facing analog of ``POST /subnets/{id}/next`` for IPs: a
     single locked call picks a free CIDR and persists the subnet (full
     ``create_subnet`` side effects — placeholder rows, kind detection, template
     pre-fill, DNS/DHCP inheritance, audit row). Concurrency-safe — the parent
-    block row is locked ``FOR UPDATE`` so two simultaneous carves serialize and
-    return two different adjacent CIDRs instead of racing on read-then-create.
+    block row is locked ``FOR UPDATE``.
 
-    Returns ``409`` when no free CIDR of that size remains, ``422`` for an
-    invalid ``prefix_len`` (≤ the block's own prefix, or > the family max).
+    If the caller passes a specific ``network`` (the operator clicked a
+    candidate in the "Find by size" picker), that exact CIDR is allocated after
+    validating it's a free, in-block, ``prefix_len``-sized child — a concurrent
+    claim of the same CIDR yields a clean ``409``. With no ``network`` the
+    lowest free CIDR of ``prefix_len`` is carved (the Terraform / automation
+    default).
+
+    Returns ``409`` when the chosen / lowest CIDR isn't free, ``422`` for an
+    invalid ``prefix_len`` (≤ the block's own prefix, or > the family max) or a
+    ``network`` that isn't an in-block, correctly-sized child.
     """
     # Lock the parent block row so concurrent allocate-subnet calls on the
     # same block serialize: the second waits until the first commits, then
@@ -3830,19 +3837,52 @@ async def allocate_subnet(
     )
     child_subnets = await db.execute(select(Subnet.network).where(Subnet.block_id == block.id))
     occupied = [str(n) for (n,) in child_blocks.all()] + [str(n) for (n,) in child_subnets.all()]
-    free = _compute_free_cidrs(str(block.network), occupied, max_results=100_000)
+    occupied_nets = [ipaddress.ip_network(o, strict=False) for o in occupied]
 
     chosen: ipaddress.IPv4Network | ipaddress.IPv6Network | None = None
-    for fr in free:
-        fnet = ipaddress.ip_network(fr["network"], strict=False)
-        if fnet.prefixlen <= body.prefix_len:
-            chosen = next(fnet.subnets(new_prefix=body.prefix_len))
-            break
-    if chosen is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(f"No free /{body.prefix_len} subnet available in block {block.network}"),
-        )
+    if body.network:
+        # Operator picked a specific candidate (the "Find by size" list is
+        # clickable). Validate it's an in-block, correctly-sized, free child;
+        # the block lock + create_subnet's overlap re-check make a concurrent
+        # claim of the same CIDR a clean 409.
+        try:
+            picked = ipaddress.ip_network(body.network, strict=False)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"invalid network: {exc}",
+            ) from exc
+        if picked.version != block_net.version or not picked.subnet_of(block_net):  # type: ignore[arg-type]
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{picked} is not within block {block.network}",
+            )
+        if picked.prefixlen != body.prefix_len:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{picked} is not a /{body.prefix_len}",
+            )
+        if any(picked.overlaps(o) for o in occupied_nets):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"{picked} is already allocated or overlaps an existing block/subnet",
+            )
+        chosen = picked
+    else:
+        # No specific pick — carve the lowest free CIDR. _compute_free_cidrs
+        # returns maximal aligned free CIDRs sorted by address, so the first
+        # one large enough to hold a /prefix_len yields the globally-lowest.
+        free = _compute_free_cidrs(str(block.network), occupied, max_results=100_000)
+        for fr in free:
+            fnet = ipaddress.ip_network(fr["network"], strict=False)
+            if fnet.prefixlen <= body.prefix_len:
+                chosen = next(fnet.subnets(new_prefix=body.prefix_len))
+                break
+        if chosen is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(f"No free /{body.prefix_len} subnet available in block {block.network}"),
+            )
 
     # Delegate to create_subnet for the full side-effect set + the overlap
     # re-check inside this still-open transaction (the block row lock is held
