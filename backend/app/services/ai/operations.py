@@ -36,7 +36,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
-from app.models.ipam import IPAddress, Subnet
+from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.services.nmap import NmapArgError, build_argv
 
 # Per-proposal TTL. 30 minutes is a generous window for a thoughtful
@@ -436,6 +436,150 @@ register(
         preview=_preview_run_nmap_scan,
         apply=_apply_run_nmap_scan,
         category="network",
+    )
+)
+
+
+# ── allocate_subnet operation (issue #372) ─────────────────────────────
+#
+# The carve-and-create counterpart to create_ip_address — picks the
+# lowest free child CIDR of the requested prefix from a block and
+# creates the subnet atomically. Unblocks the previously-deferred
+# create_subnet AI write (no operator-supplied CIDR to get wrong; the
+# free-space scan picks it). Apply delegates to the IPAM router's
+# allocate_subnet handler so all create_subnet side effects + the audit
+# row + the block row-lock are reused verbatim.
+
+
+class AllocateSubnetArgs(BaseModel):
+    """Args for the ``allocate_subnet`` operation."""
+
+    block_id: str = Field(description="UUID of the parent IP block to carve the subnet from")
+    prefix_len: int = Field(
+        ge=1,
+        le=128,
+        description="Prefix length of the subnet to carve (e.g. 24 for a /24, 64 for a v6 /64)",
+    )
+    name: str = Field(default="", description="Optional name for the new subnet")
+    description: str = Field(default="", description="Optional free-form description")
+    template_id: str | None = Field(
+        default=None, description="Optional IPAM template UUID to stamp onto the new subnet"
+    )
+
+
+def _carve_candidate(
+    block: IPBlock, prefix_len: int, occupied: list[str]
+) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    """Pick the lowest free child CIDR of ``prefix_len`` (read-only).
+
+    Shared by preview + the router endpoint's logic. ``_compute_free_cidrs``
+    returns maximal aligned free CIDRs sorted by address, so the first one
+    large enough to hold a /prefix_len yields the globally-lowest free CIDR.
+    """
+    from app.api.v1.ipam.router import _compute_free_cidrs  # local import — avoid cycle
+
+    free = _compute_free_cidrs(str(block.network), occupied, max_results=100_000)
+    for fr in free:
+        fnet = ipaddress.ip_network(fr["network"], strict=False)
+        if fnet.prefixlen <= prefix_len:
+            return next(fnet.subnets(new_prefix=prefix_len))
+    return None
+
+
+async def _preview_allocate_subnet(
+    db: AsyncSession, user: User, args: AllocateSubnetArgs
+) -> PreviewResult:
+    block = await db.get(IPBlock, args.block_id)
+    if block is None:
+        return PreviewResult(ok=False, detail=f"Block {args.block_id} not found")
+
+    block_net = ipaddress.ip_network(str(block.network), strict=False)
+    family_max = 32 if block_net.version == 4 else 128
+    if args.prefix_len > family_max:
+        return PreviewResult(
+            ok=False,
+            detail=(
+                f"prefix_len {args.prefix_len} exceeds max {family_max} for "
+                f"IPv{block_net.version} block {block.network}"
+            ),
+        )
+    if args.prefix_len <= block_net.prefixlen:
+        return PreviewResult(
+            ok=False,
+            detail=(
+                f"prefix_len {args.prefix_len} must be greater than block "
+                f"prefix length {block_net.prefixlen}"
+            ),
+        )
+
+    child_blocks = (
+        await db.execute(select(IPBlock.network).where(IPBlock.parent_block_id == block.id))
+    ).all()
+    child_subnets = (
+        await db.execute(select(Subnet.network).where(Subnet.block_id == block.id))
+    ).all()
+    occupied = [str(n) for (n,) in child_blocks] + [str(n) for (n,) in child_subnets]
+    chosen = _carve_candidate(block, args.prefix_len, occupied)
+    if chosen is None:
+        return PreviewResult(
+            ok=False,
+            detail=f"No free /{args.prefix_len} subnet available in block {block.network}",
+        )
+
+    parts = [
+        f"Carve `{chosen}` (a /{args.prefix_len}) from block {block.network}",
+    ]
+    if args.name:
+        parts.append(f"name={args.name}")
+    parts.append(
+        "this is the lowest free CIDR now; the actual allocation is re-checked "
+        "under a block lock at apply, so a concurrent carve may shift it"
+    )
+    return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts))
+
+
+async def _apply_allocate_subnet(
+    db: AsyncSession, user: User, args: AllocateSubnetArgs
+) -> dict[str, Any]:
+    """Delegate to the IPAM router's atomic allocate-subnet handler.
+
+    Reuses the block row-lock + full create_subnet side effects + audit
+    row, so the AI apply path is identical to the REST/Terraform path.
+    """
+    from app.api.v1.ipam.router import (  # local import — avoid cycle
+        SubnetAllocate,
+        allocate_subnet,
+    )
+
+    alloc = SubnetAllocate(
+        prefix_len=args.prefix_len,
+        name=args.name or "",
+        description=args.description or "",
+        template_id=UUID(args.template_id) if args.template_id else None,
+    )
+    subnet = await allocate_subnet(UUID(args.block_id), alloc, user, db)
+    return {
+        "id": str(subnet.id),
+        "network": str(subnet.network),
+        "name": subnet.name,
+        "block_id": args.block_id,
+    }
+
+
+register(
+    Operation(
+        name="allocate_subnet",
+        description=(
+            "Carve the next free child subnet of a given prefix length out "
+            "of an IP block and create it atomically. Use this when the "
+            "operator asks to 'allocate a /24 from block X' or 'give me a "
+            "free /26'. Always go through propose_allocate_subnet — never "
+            "call this directly without an explicit operator approval step."
+        ),
+        args_model=AllocateSubnetArgs,
+        preview=_preview_allocate_subnet,
+        apply=_apply_allocate_subnet,
+        category="ipam",
     )
 )
 

@@ -3722,6 +3722,111 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     return subnet
 
 
+class SubnetAllocate(SubnetCreate):
+    """Body for the atomic carve-and-create endpoint (#372).
+
+    Inherits every optional create field + validator from ``SubnetCreate`` so
+    a carve composes with IPAM templates, DNS/DHCP inheritance, custom fields,
+    etc. ``network`` / ``space_id`` / ``block_id`` are computed by the handler
+    (the network from the free-space scan, the other two from the path block),
+    so they are optional here and ignored if sent.
+    """
+
+    prefix_len: int = Field(
+        ...,
+        ge=1,
+        le=128,
+        description="Prefix length of the subnet to carve — /1-/32 for IPv4 blocks, /1-/128 for IPv6",
+    )
+    network: str = ""
+    space_id: uuid.UUID | None = None  # type: ignore[assignment]
+    block_id: uuid.UUID | None = None  # type: ignore[assignment]
+
+
+@router.post(
+    "/blocks/{block_id}/allocate-subnet",
+    response_model=SubnetResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def allocate_subnet(
+    block_id: uuid.UUID, body: SubnetAllocate, current_user: CurrentUser, db: DB
+) -> Subnet:
+    """Atomically carve the lowest free child CIDR of ``prefix_len`` and create it (#372).
+
+    The automation-facing analog of ``POST /subnets/{id}/next`` for IPs: a
+    single locked call picks a free CIDR and persists the subnet (full
+    ``create_subnet`` side effects — placeholder rows, kind detection, template
+    pre-fill, DNS/DHCP inheritance, audit row). Concurrency-safe — the parent
+    block row is locked ``FOR UPDATE`` so two simultaneous carves serialize and
+    return two different adjacent CIDRs instead of racing on read-then-create.
+
+    Returns ``409`` when no free CIDR of that size remains, ``422`` for an
+    invalid ``prefix_len`` (≤ the block's own prefix, or > the family max).
+    """
+    # Lock the parent block row so concurrent allocate-subnet calls on the
+    # same block serialize: the second waits until the first commits, then
+    # recomputes free space and picks the next free CIDR.
+    locked = await db.execute(select(IPBlock).where(IPBlock.id == block_id).with_for_update())
+    block = locked.scalar_one_or_none()
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+
+    block_net = ipaddress.ip_network(str(block.network), strict=False)
+    family_max = 32 if block_net.version == 4 else 128
+    if body.prefix_len > family_max:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"prefix_len {body.prefix_len} exceeds max {family_max} for "
+                f"IPv{block_net.version} block"
+            ),
+        )
+    if body.prefix_len <= block_net.prefixlen:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"prefix_len {body.prefix_len} must be greater than block "
+                f"prefix length {block_net.prefixlen}"
+            ),
+        )
+
+    # Free space = block minus its direct child blocks and direct child
+    # subnets (same accounting as GET /blocks/{id}/free-space). _compute_free_cidrs
+    # returns maximal aligned free CIDRs sorted by address, so the first one
+    # large enough to hold a /prefix_len yields the globally-lowest free CIDR.
+    child_blocks = await db.execute(
+        select(IPBlock.network).where(IPBlock.parent_block_id == block.id)
+    )
+    child_subnets = await db.execute(select(Subnet.network).where(Subnet.block_id == block.id))
+    occupied = [str(n) for (n,) in child_blocks.all()] + [str(n) for (n,) in child_subnets.all()]
+    free = _compute_free_cidrs(str(block.network), occupied, max_results=100_000)
+
+    chosen: ipaddress.IPv4Network | ipaddress.IPv6Network | None = None
+    for fr in free:
+        fnet = ipaddress.ip_network(fr["network"], strict=False)
+        if fnet.prefixlen <= body.prefix_len:
+            chosen = next(fnet.subnets(new_prefix=body.prefix_len))
+            break
+    if chosen is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(f"No free /{body.prefix_len} subnet available in block {block.network}"),
+        )
+
+    # Delegate to create_subnet for the full side-effect set + the overlap
+    # re-check inside this still-open transaction (the block row lock is held
+    # through create_subnet's commit, which releases it).
+    create_body = SubnetCreate(
+        **{
+            **body.model_dump(exclude={"prefix_len"}),
+            "network": str(chosen),
+            "space_id": block.space_id,
+            "block_id": block_id,
+        }
+    )
+    return await create_subnet(create_body, current_user, db)
+
+
 @router.get("/subnets/{subnet_id}", response_model=SubnetResponse)
 async def get_subnet(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Subnet:
     subnet = await db.get(Subnet, subnet_id)

@@ -2030,6 +2030,15 @@ function CreateSubnetModal({
     if (!blockId && blocks?.length === 1) setBlockId(blocks[0].id);
   }, [blocks, blockId]);
 
+  // Size mode carves the lowest free CIDR atomically server-side (#372) — the
+  // operator no longer picks a specific candidate (that would mismatch what the
+  // race-safe endpoint actually allocates). Track the lowest free one for
+  // submit-gating + as a best-effort preview (the server re-picks under a block
+  // lock at submit, so a concurrent carve may shift it).
+  useEffect(() => {
+    if (subnetMode === "size") setSelectedNet(availableNets[0] ?? "");
+  }, [subnetMode, availableNets]);
+
   // When switching to size mode, clear manually typed network
   function switchMode(m: "manual" | "size") {
     setSubnetMode(m);
@@ -2042,11 +2051,13 @@ function CreateSubnetModal({
   const effectiveNetwork = subnetMode === "manual" ? network : selectedNet;
 
   const mutation = useMutation({
-    mutationFn: () =>
-      ipamApi.createSubnet({
-        space_id: spaceId,
-        block_id: blockId,
-        network: effectiveNetwork,
+    mutationFn: () => {
+      // "Find by size" carves atomically server-side (#372) — one locked
+      // call picks the lowest free CIDR + creates it, so two concurrent
+      // operators can't pick the same network. Manual mode posts the typed
+      // CIDR. The optional-field payload is identical either way; size mode
+      // sends prefix_len instead of network.
+      const common = {
         name: name || undefined,
         gateway: gateway || undefined,
         vlan_ref_id: vlanRefId ?? undefined,
@@ -2081,7 +2092,19 @@ function CreateSubnetModal({
         customer_id: customerId,
         site_id: siteId,
         ...(templateId ? { template_id: templateId } : {}),
-      }),
+      };
+      return subnetMode === "size"
+        ? ipamApi.allocateSubnet(blockId, {
+            prefix_len: parseInt(prefixLen, 10),
+            ...common,
+          })
+        : ipamApi.createSubnet({
+            space_id: spaceId,
+            block_id: blockId,
+            network: effectiveNetwork,
+            ...common,
+          });
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", spaceId] });
       qc.invalidateQueries({ queryKey: ["spaces"] });
@@ -2199,28 +2222,28 @@ function CreateSubnetModal({
             ) : (
               <div>
                 <p className="text-xs text-muted-foreground mb-1">
-                  Available /{prefixLen} subnets (click to select):
+                  Free /{prefixLen} subnets (the lowest is allocated atomically
+                  on submit):
                 </p>
                 <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto">
-                  {availableNets.map((net: string) => (
-                    <button
+                  {availableNets.map((net: string, i: number) => (
+                    <span
                       key={net}
-                      type="button"
-                      onClick={() => setSelectedNet(net)}
                       className={cn(
-                        "font-mono rounded border px-2 py-0.5 text-xs transition-colors",
-                        selectedNet === net
+                        "font-mono rounded border px-2 py-0.5 text-xs",
+                        i === 0
                           ? "bg-primary text-primary-foreground border-primary"
-                          : "bg-background hover:border-primary/50",
+                          : "bg-background text-muted-foreground",
                       )}
                     >
                       {net}
-                    </button>
+                    </span>
                   ))}
                 </div>
-                {selectedNet && (
+                {availableNets[0] && (
                   <p className="text-xs text-emerald-600 dark:text-emerald-400 mt-1">
-                    Selected: <span className="font-mono">{selectedNet}</span>
+                    Will allocate:{" "}
+                    <span className="font-mono">{availableNets[0]}</span>
                   </p>
                 )}
               </div>

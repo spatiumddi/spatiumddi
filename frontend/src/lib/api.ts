@@ -1424,6 +1424,16 @@ export const ipamApi = {
       .then((r) => r.data),
   createSubnet: (data: Partial<Subnet> & { template_id?: string | null }) =>
     api.post<Subnet>("/ipam/subnets", data).then((r) => r.data),
+  // Atomic carve-and-create (#372): pick the lowest free child CIDR of
+  // ``prefix_len`` and create it in one locked call. Race-safe — preferred
+  // over availableSubnets()-then-createSubnet() for the "Find by size" flow.
+  allocateSubnet: (
+    blockId: string,
+    data: { prefix_len: number } & Partial<Subnet> & { template_id?: string | null },
+  ) =>
+    api
+      .post<Subnet>(`/ipam/blocks/${blockId}/allocate-subnet`, data)
+      .then((r) => r.data),
   updateSubnet: (
     id: string,
     data: Partial<Subnet> & { manage_auto_addresses?: boolean },
