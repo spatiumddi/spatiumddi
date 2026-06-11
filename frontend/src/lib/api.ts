@@ -6682,6 +6682,8 @@ export interface DNSQueryLogRequest {
   q?: string | null;
   qtype?: string | null;
   client_ip?: string | null;
+  // Exact-match view filter (#371) — seeded by the per-view analytics card.
+  view?: string | null;
   max_events?: number;
 }
 
@@ -6742,6 +6744,8 @@ export interface DNSQueryAnalyticsResponse {
   top_qnames: DNSQueryAnalyticsRow[];
   top_clients: DNSQueryAnalyticsRow[];
   qtype_distribution: DNSQueryAnalyticsRow[];
+  // Per-view query split (#371). Empty for single-view servers.
+  top_views?: DNSQueryAnalyticsRow[];
 }
 
 export const logsApi = {

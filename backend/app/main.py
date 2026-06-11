@@ -306,6 +306,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_firewall_apply_stalled_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("firewall_apply_stalled_alert_rule_seed_skipped", reason=str(exc))
+    # DNS query-anomaly alert rules — NXDOMAIN-spike + query-rate-spike,
+    # singletons, DISABLED by default (issue #371). Discoverable in the
+    # Alerts UI; fire only on agent-based BIND9 installs with metric data.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dns_query_anomaly_alert_rules,
+        )
+
+        await seed_dns_query_anomaly_alert_rules()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_query_anomaly_alert_rule_seed_skipped", reason=str(exc))
     # Appliance Web UI cert bootstrap (issue #134, Phase 4b.5). On
     # appliance installs without an active row in appliance_certificate,
     # generate a self-signed default + deploy it to /etc/nginx/certs

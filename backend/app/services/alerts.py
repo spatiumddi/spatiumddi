@@ -45,6 +45,7 @@ from app.models.dhcp import DHCPLease, DHCPPool, DHCPScope, DHCPServer
 from app.models.dns import DNSServer, DNSZone
 from app.models.domain import Domain
 from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.models.metrics import DNSMetricSample
 from app.models.network_service import NetworkService, NetworkServiceResource
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Site
@@ -134,6 +135,25 @@ RULE_TYPE_SECRET_EXPIRING = "secret_expiring"
 # segment for retirement and forgot" failure mode.
 RULE_TYPE_DECOM_EXPIRING = "decom_expiring"
 
+# DNS query-behaviour anomalies — issue #371. Subject = dns_server. Evaluated
+# on the 60 s tick against the per-server ``dns_metric_sample`` rcode deltas
+# the agents already report (no new collection). Both reuse the generic
+# AlertRule int columns instead of a bespoke window column:
+#   * ``dns_nxdomain_spike`` — fires when, over the trailing window, a server's
+#     NXDOMAIN ratio (nxdomain ÷ queries_total) reaches ``threshold_percent``
+#     AND the absolute NXDOMAIN count reaches ``min_free_addresses`` (the
+#     low-traffic guard, so a server answering 3 queries / 2 NXDOMAIN doesn't
+#     page). Catches DGA beacons / broken-client search-domain storms.
+#   * ``dns_query_rate_spike`` — fires when the trailing window's query total
+#     exceeds the prior equal-length window by ``threshold_percent`` AND clears
+#     the ``min_free_addresses`` absolute floor (so tiny servers don't page on
+#     a 3→9 query "300% spike"). A cold prior window counts as a spike once the
+#     floor is cleared.
+# The window itself is a fixed module constant (not operator-tunable in v1) —
+# same approach as the firewall / transition rules' fixed grace windows.
+RULE_TYPE_DNS_NXDOMAIN_SPIKE = "dns_nxdomain_spike"
+RULE_TYPE_DNS_QUERY_RATE_SPIKE = "dns_query_rate_spike"
+
 RULE_TYPES = frozenset(
     {
         RULE_TYPE_SUBNET_UTILIZATION,
@@ -159,8 +179,19 @@ RULE_TYPES = frozenset(
         RULE_TYPE_FIREWALL_APPLY_STALLED,
         RULE_TYPE_SECRET_EXPIRING,
         RULE_TYPE_DECOM_EXPIRING,
+        RULE_TYPE_DNS_NXDOMAIN_SPIKE,
+        RULE_TYPE_DNS_QUERY_RATE_SPIKE,
     }
 )
+
+# DNS query-anomaly evaluation window + defaults (issue #371). 15 min spans
+# ~15 one-minute buckets / 3 five-minute buckets — long enough to smooth a
+# single noisy bucket, short enough to page within a quarter hour.
+_DNS_ANOMALY_WINDOW = timedelta(minutes=15)
+_DNS_NXDOMAIN_RATIO_DEFAULT = 40  # % of queries that are NXDOMAIN
+_DNS_NXDOMAIN_MIN_COUNT_DEFAULT = 200  # absolute NXDOMAIN floor over the window
+_DNS_QUERY_RATE_SPIKE_PCT_DEFAULT = 200  # current ≥ prior × (1 + 200%) = ×3
+_DNS_QUERY_RATE_MIN_DEFAULT = 1000  # absolute query floor over the window
 
 # Issue #285 Phase 2d — how long a control-plane-rendered firewall hash may
 # go un-applied (ok-status) before it's "stalled". Comfortably larger than
@@ -451,6 +482,132 @@ async def _matching_stale_ip_count_subjects(
             f"deprecation from the Stale-IP report"
         )
         matches.append((str(s.id), display, message))
+    return matches
+
+
+async def _dns_server_names(db: AsyncSession, server_ids: list[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Resolve DNS server ids → display names in one query (issue #371)."""
+    if not server_ids:
+        return {}
+    rows = (
+        await db.execute(select(DNSServer.id, DNSServer.name).where(DNSServer.id.in_(server_ids)))
+    ).all()
+    return {row[0]: row[1] for row in rows}
+
+
+async def _matching_dns_nxdomain_spike_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """DNS servers whose trailing-window NXDOMAIN ratio + count cross the rule
+    thresholds (issue #371). Reads the per-server ``dns_metric_sample`` deltas
+    the agents already report; no new collection.
+    """
+    ratio_threshold = (
+        rule.threshold_percent
+        if rule.threshold_percent is not None
+        else _DNS_NXDOMAIN_RATIO_DEFAULT
+    )
+    min_count = (
+        rule.min_free_addresses
+        if rule.min_free_addresses is not None
+        else _DNS_NXDOMAIN_MIN_COUNT_DEFAULT
+    )
+    since = datetime.now(UTC) - _DNS_ANOMALY_WINDOW
+    rows = (
+        await db.execute(
+            select(
+                DNSMetricSample.server_id,
+                func.sum(DNSMetricSample.queries_total).label("q"),
+                func.sum(DNSMetricSample.nxdomain).label("nx"),
+            )
+            .where(DNSMetricSample.bucket_at >= since)
+            .group_by(DNSMetricSample.server_id)
+        )
+    ).all()
+    if not rows:
+        return []
+    names = await _dns_server_names(db, [r.server_id for r in rows])
+    win_min = int(_DNS_ANOMALY_WINDOW.total_seconds() // 60)
+    matches: list[tuple[str, str, str]] = []
+    for r in rows:
+        q = int(r.q or 0)
+        nx = int(r.nx or 0)
+        if nx < min_count or q <= 0:
+            continue
+        ratio = nx / q * 100
+        if ratio < ratio_threshold:
+            continue
+        name = names.get(r.server_id) or str(r.server_id)
+        message = (
+            f"DNS server {name} — {nx} NXDOMAIN responses ({ratio:.0f}% of {q} "
+            f"queries) in the last {win_min} min (threshold {ratio_threshold}% / "
+            f"floor {min_count}). Possible DGA beacon, broken client, or "
+            f"mistyped-search-domain storm."
+        )
+        matches.append((str(r.server_id), name, message))
+    return matches
+
+
+async def _matching_dns_query_rate_spike_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """DNS servers whose trailing-window query total spikes vs the prior
+    equal-length window (issue #371)."""
+    pct = (
+        rule.threshold_percent
+        if rule.threshold_percent is not None
+        else _DNS_QUERY_RATE_SPIKE_PCT_DEFAULT
+    )
+    floor = (
+        rule.min_free_addresses
+        if rule.min_free_addresses is not None
+        else _DNS_QUERY_RATE_MIN_DEFAULT
+    )
+    now = datetime.now(UTC)
+    cur_since = now - _DNS_ANOMALY_WINDOW
+    prev_since = now - 2 * _DNS_ANOMALY_WINDOW
+
+    async def _sums(lower: datetime, upper: datetime | None) -> dict[uuid.UUID, int]:
+        stmt = select(
+            DNSMetricSample.server_id,
+            func.sum(DNSMetricSample.queries_total),
+        ).where(DNSMetricSample.bucket_at >= lower)
+        if upper is not None:
+            stmt = stmt.where(DNSMetricSample.bucket_at < upper)
+        stmt = stmt.group_by(DNSMetricSample.server_id)
+        return {sid: int(q or 0) for sid, q in (await db.execute(stmt)).all()}
+
+    cur = await _sums(cur_since, None)
+    if not cur:
+        return []
+    prev = await _sums(prev_since, cur_since)
+    names = await _dns_server_names(db, list(cur.keys()))
+    win_min = int(_DNS_ANOMALY_WINDOW.total_seconds() // 60)
+    matches: list[tuple[str, str, str]] = []
+    for sid, q_cur in cur.items():
+        if q_cur < floor:
+            continue
+        q_prev = prev.get(sid, 0)
+        # A cold prior window: any current ≥ floor is a spike. Otherwise the
+        # current window must exceed the prior by pct%.
+        threshold_val = q_prev * (1 + pct / 100) if q_prev > 0 else float(floor)
+        if q_cur < threshold_val:
+            continue
+        name = names.get(sid) or str(sid)
+        if q_prev > 0:
+            message = (
+                f"DNS server {name} — query-rate spike: {q_cur} queries in the "
+                f"last {win_min} min vs {q_prev} in the prior {win_min} min "
+                f"(+{(q_cur / q_prev - 1) * 100:.0f}%, threshold +{pct}%)."
+            )
+        else:
+            message = (
+                f"DNS server {name} — {q_cur} queries in the last {win_min} min "
+                f"from a cold prior window (floor {floor})."
+            )
+        matches.append((str(sid), name, message))
     return matches
 
 
@@ -1780,6 +1937,78 @@ async def seed_firewall_apply_stalled_alert_rule() -> None:
         await session.commit()
 
 
+_DNS_NXDOMAIN_SPIKE_RULE_NAME = "DNS NXDOMAIN spike"
+_DNS_QUERY_RATE_SPIKE_RULE_NAME = "DNS query-rate spike"
+
+
+async def seed_dns_query_anomaly_alert_rules() -> None:
+    """Seed the two DNS query-anomaly rules (issue #371), DISABLED by default.
+
+    Like the firewall-stalled rule, these are seeded off so their existence is
+    discoverable in the Alerts UI without firing on installs that don't run
+    agent-based BIND9 (and therefore have no ``dns_metric_sample`` data). Keyed
+    on ``rule_type`` so an operator who enables / renames either is never
+    overridden by a later boot.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    seeds = [
+        {
+            "name": _DNS_NXDOMAIN_SPIKE_RULE_NAME,
+            "rule_type": RULE_TYPE_DNS_NXDOMAIN_SPIKE,
+            "description": (
+                "Fires when a DNS server's NXDOMAIN responses reach "
+                f"threshold_percent% of total queries (default "
+                f"{_DNS_NXDOMAIN_RATIO_DEFAULT}%) AND the absolute NXDOMAIN "
+                f"count clears min_free_addresses (default "
+                f"{_DNS_NXDOMAIN_MIN_COUNT_DEFAULT}, the low-traffic guard) "
+                "over a 15-minute window. Catches DGA malware beacons, broken "
+                "clients, and mistyped-search-domain storms. Auto-resolves when "
+                "the ratio falls back under threshold."
+            ),
+            "threshold_percent": _DNS_NXDOMAIN_RATIO_DEFAULT,
+            "min_free_addresses": _DNS_NXDOMAIN_MIN_COUNT_DEFAULT,
+        },
+        {
+            "name": _DNS_QUERY_RATE_SPIKE_RULE_NAME,
+            "rule_type": RULE_TYPE_DNS_QUERY_RATE_SPIKE,
+            "description": (
+                "Fires when a DNS server's query total over the last 15 minutes "
+                "exceeds the prior 15-minute window by threshold_percent% "
+                f"(default {_DNS_QUERY_RATE_SPIKE_PCT_DEFAULT}% = ×3) AND clears "
+                f"the min_free_addresses absolute floor (default "
+                f"{_DNS_QUERY_RATE_MIN_DEFAULT}, so tiny servers don't page on a "
+                "3→9 'spike'). Auto-resolves when the rate settles."
+            ),
+            "threshold_percent": _DNS_QUERY_RATE_SPIKE_PCT_DEFAULT,
+            "min_free_addresses": _DNS_QUERY_RATE_MIN_DEFAULT,
+        },
+    ]
+    async with AsyncSessionLocal() as session:
+        for seed in seeds:
+            existing = await session.scalar(
+                select(AlertRule).where(AlertRule.rule_type == seed["rule_type"])
+            )
+            if existing is not None:
+                continue
+            session.add(
+                AlertRule(
+                    name=seed["name"],
+                    description=seed["description"],
+                    rule_type=seed["rule_type"],
+                    threshold_percent=seed["threshold_percent"],
+                    min_free_addresses=seed["min_free_addresses"],
+                    severity="warning",
+                    enabled=False,
+                    notify_syslog=True,
+                    notify_webhook=True,
+                    notify_smtp=False,
+                )
+            )
+        await session.commit()
+
+
 async def seed_builtin_compliance_alert_rules() -> None:
     """Insert the three disabled compliance-change rules on first
     boot. Idempotent — only inserts a row when no rule with the same
@@ -1944,6 +2173,14 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_dhcp_pool_exhaustion_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "dhcp_pool"
+            elif rule.rule_type == RULE_TYPE_DNS_NXDOMAIN_SPIKE:
+                base = await _matching_dns_nxdomain_spike_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "dns_server"
+            elif rule.rule_type == RULE_TYPE_DNS_QUERY_RATE_SPIKE:
+                base = await _matching_dns_query_rate_spike_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "dns_server"
             elif rule.rule_type == RULE_TYPE_SERVER_UNREACHABLE:
                 base = await _matching_server_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]

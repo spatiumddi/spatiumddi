@@ -777,6 +777,89 @@ async def list_dnssec_policies(
     }
 
 
+class FindDNSQueryStatsArgs(BaseModel):
+    server_id: str | None = Field(
+        default=None,
+        description="Filter to one DNS server UUID. Omit for every server.",
+    )
+    window_minutes: int = Field(
+        default=15,
+        ge=1,
+        le=1440,
+        description="Trailing window to summarise (default 15 min, max 24 h).",
+    )
+
+
+@register_tool(
+    name="find_dns_query_stats",
+    description=(
+        "Per-server DNS query stats over a trailing window from "
+        "dns_metric_sample (the same rcode counters the NXDOMAIN-spike / "
+        "query-rate-spike alerts use): total queries, NOERROR / NXDOMAIN / "
+        "SERVFAIL counts, and the NXDOMAIN ratio %. Use to answer 'is any "
+        "DNS server spiking?', 'what's the NXDOMAIN rate right now?', or to "
+        "triage a query-anomaly alert. Read-only; empty for servers with no "
+        "metric samples (non-agent / no traffic)."
+    ),
+    args_model=FindDNSQueryStatsArgs,
+    category="dns",
+    module="dns",
+)
+async def find_dns_query_stats(
+    db: AsyncSession, user: User, args: FindDNSQueryStatsArgs
+) -> list[dict[str, Any]]:
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.models.metrics import DNSMetricSample  # noqa: PLC0415
+
+    since = datetime.now(UTC) - timedelta(minutes=args.window_minutes)
+    stmt = (
+        select(
+            DNSMetricSample.server_id,
+            func.sum(DNSMetricSample.queries_total).label("q"),
+            func.sum(DNSMetricSample.noerror).label("ne"),
+            func.sum(DNSMetricSample.nxdomain).label("nx"),
+            func.sum(DNSMetricSample.servfail).label("sf"),
+        )
+        .where(DNSMetricSample.bucket_at >= since)
+        .group_by(DNSMetricSample.server_id)
+    )
+    if args.server_id:
+        stmt = stmt.where(DNSMetricSample.server_id == args.server_id)
+    rows = (await db.execute(stmt)).all()
+    if not rows:
+        return []
+    names = {
+        sid: name
+        for sid, name in (
+            await db.execute(
+                select(DNSServer.id, DNSServer.name).where(
+                    DNSServer.id.in_([r.server_id for r in rows])
+                )
+            )
+        ).all()
+    }
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        q = int(r.q or 0)
+        nx = int(r.nx or 0)
+        out.append(
+            {
+                "server_id": str(r.server_id),
+                "server_name": names.get(r.server_id),
+                "window_minutes": args.window_minutes,
+                "queries_total": q,
+                "noerror": int(r.ne or 0),
+                "nxdomain": nx,
+                "servfail": int(r.sf or 0),
+                "nxdomain_ratio_pct": round(nx / q * 100, 1) if q > 0 else 0.0,
+            }
+        )
+    out.sort(key=lambda d: d["nxdomain_ratio_pct"], reverse=True)
+    return out
+
+
 # Silence false-positive on lifted imports — Python pulls them in at
 # module load, but the linters want at-least-one referent in module
 # scope.

@@ -1042,6 +1042,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   const [q, setQ] = useState("");
   const [qtype, setQtype] = useState<string>("");
   const [clientIp, setClientIp] = useState<string>("");
+  const [view, setView] = useState<string>("");
 
   useEffect(() => {
     if (sources.length === 0) {
@@ -1065,6 +1066,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
       q,
       qtype,
       clientIp,
+      view,
     ],
     queryFn: () =>
       logsApi.dnsQueries({
@@ -1074,6 +1076,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         q: q.trim() || null,
         qtype: qtype.trim() || null,
         client_ip: clientIp.trim() || null,
+        view: view.trim() || null,
       }),
     enabled,
     staleTime: 5_000,
@@ -1159,13 +1162,14 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         <MaxEventsPicker value={maxEvents} onChange={setMaxEvents} />
         <FilterSearch value={q} onChange={setQ} />
         <div className="ml-auto flex items-center gap-2">
-          {(q || qtype || clientIp || since) && (
+          {(q || qtype || clientIp || view || since) && (
             <button
               type="button"
               onClick={() => {
                 setQ("");
                 setQtype("");
                 setClientIp("");
+                setView("");
                 setSince("");
               }}
               title="Clear all filters"
@@ -1188,6 +1192,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         onPickQname={(name) => setQ(name)}
         onPickClient={(ip) => setClientIp(ip)}
         onPickQtype={(t) => setQtype(t)}
+        onPickView={(v) => setView(v)}
       />
 
       {dnsQueriesQuery.isError && <QueryErrorBanner query={dnsQueriesQuery} />}
@@ -1232,15 +1237,21 @@ function DNSQueryAnalyticsStrip({
   onPickQname,
   onPickClient,
   onPickQtype,
+  onPickView,
 }: {
   analytics: import("@/lib/api").DNSQueryAnalyticsResponse | null;
   loading: boolean;
   onPickQname: (name: string) => void;
   onPickClient: (ip: string) => void;
   onPickQtype: (t: string) => void;
+  onPickView: (v: string) => void;
 }) {
   if (!analytics && !loading) return null;
   const total = analytics?.total_queries ?? 0;
+  // Per-view card only renders for split-horizon servers (≥1 view seen) so
+  // single-view setups keep the tidy 3-card strip (#371).
+  const views = analytics?.top_views ?? [];
+  const cols = views.length > 0 ? "md:grid-cols-2 lg:grid-cols-4" : "md:grid-cols-3";
 
   return (
     <div className="border-b bg-muted/10 px-6 py-2">
@@ -1252,7 +1263,7 @@ function DNSQueryAnalyticsStrip({
             : `${total.toLocaleString()} queries in window`}
         </span>
       </div>
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+      <div className={cn("grid grid-cols-1 gap-3", cols)}>
         <AnalyticsCard
           title="Top names"
           rows={analytics?.top_qnames ?? []}
@@ -1274,6 +1285,15 @@ function DNSQueryAnalyticsStrip({
           onPick={onPickQtype}
           emptyHint="No qtype data."
         />
+        {views.length > 0 && (
+          <AnalyticsCard
+            title="By view"
+            rows={views}
+            total={total}
+            onPick={onPickView}
+            emptyHint="No view data."
+          />
+        )}
       </div>
     </div>
   );
