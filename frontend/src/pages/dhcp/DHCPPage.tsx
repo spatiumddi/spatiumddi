@@ -1580,6 +1580,7 @@ function OptionTemplatesTab({ groupId }: { groupId: string }) {
 function LeasesTab({ server }: { server: DHCPServer }) {
   const [state, setState] = useState<string>("");
   const [subnetId, setSubnetId] = useState<string>("");
+  const [deviceClass, setDeviceClass] = useState<string>("");
   const limit = 500;
 
   const { data: subnets = [] } = useQuery({
@@ -1593,9 +1594,15 @@ function LeasesTab({ server }: { server: DHCPServer }) {
   });
 
   const allLeases = data ?? [];
+  // Distinct fingerbank device classes present in the current result set —
+  // drives the device-class filter (#373), same client-side style as state/subnet.
+  const deviceClasses = Array.from(
+    new Set(allLeases.map((l) => l.device_class).filter((c): c is string => !!c)),
+  ).sort();
   const leases = allLeases.filter((l) => {
     if (state && l.state !== state) return false;
     if (subnetId && l.scope_id !== subnetId) return false;
+    if (deviceClass && l.device_class !== deviceClass) return false;
     return true;
   });
 
@@ -1625,6 +1632,21 @@ function LeasesTab({ server }: { server: DHCPServer }) {
             </option>
           ))}
         </select>
+        {deviceClasses.length > 0 && (
+          <select
+            className="rounded-md border bg-background px-2 py-1 text-xs"
+            value={deviceClass}
+            onChange={(e) => setDeviceClass(e.target.value)}
+            title="Filter by fingerbank device class"
+          >
+            <option value="">All device classes</option>
+            {deviceClasses.map((c) => (
+              <option key={c} value={c}>
+                {c}
+              </option>
+            ))}
+          </select>
+        )}
         <button
           onClick={() => refetch()}
           className="ml-auto flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
@@ -1641,6 +1663,7 @@ function LeasesTab({ server }: { server: DHCPServer }) {
               <th className="px-3 py-2 text-left font-medium">IP</th>
               <th className="px-3 py-2 text-left font-medium">MAC</th>
               <th className="px-3 py-2 text-left font-medium">Hostname</th>
+              <th className="px-3 py-2 text-left font-medium">Device</th>
               <th className="px-3 py-2 text-left font-medium">State</th>
               <th className="px-3 py-2 text-left font-medium">Expires</th>
               <th className="px-3 py-2 text-left font-medium">Last Seen</th>
@@ -1650,7 +1673,7 @@ function LeasesTab({ server }: { server: DHCPServer }) {
             {leases.length === 0 && (
               <tr>
                 <td
-                  colSpan={6}
+                  colSpan={7}
                   className="p-6 text-center text-sm text-muted-foreground"
                 >
                   {isFetching ? "Loading…" : "No leases."}
@@ -1686,6 +1709,32 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                       )}
                     </td>
                     <td className="px-3 py-1.5">{l.hostname || "—"}</td>
+                    <td className="px-3 py-1.5 text-xs">
+                      {l.device_class ? (
+                        <span
+                          title={
+                            [
+                              l.device_name,
+                              l.device_manufacturer,
+                              l.fingerbank_score != null
+                                ? `score ${l.fingerbank_score}`
+                                : null,
+                            ]
+                              .filter(Boolean)
+                              .join(" · ") || undefined
+                          }
+                        >
+                          {l.device_class}
+                          {l.device_name && (
+                            <span className="block text-[11px] text-muted-foreground">
+                              {l.device_name}
+                            </span>
+                          )}
+                        </span>
+                      ) : (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </td>
                     <td className="px-3 py-1.5">
                       <span
                         className={cn(

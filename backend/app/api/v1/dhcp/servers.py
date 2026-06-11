@@ -22,6 +22,7 @@ from app.drivers.dhcp.registry import get_driver
 from app.drivers.dhcp.windows import test_winrm_credentials
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPServer
+from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.pull_leases import pull_leases_from_server
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
@@ -201,6 +202,13 @@ class LeaseResponse(BaseModel):
     # ``True`` when the vendor matches the curated VoIP-phone list
     # (issue #112 phase 3). Drives a Phone icon in the lease table.
     is_voip_phone: bool = False
+    # Fingerbank passive-fingerprinting device classification for this MAC
+    # (issue #373), joined from ``dhcp_fingerprint`` when a fingerprint exists.
+    # All ``None`` when fingerprinting is off / unconfigured / not-yet-looked-up.
+    device_class: str | None = None
+    device_name: str | None = None
+    device_manufacturer: str | None = None
+    fingerbank_score: int | None = None
 
     model_config = {"from_attributes": True}
 
@@ -949,24 +957,54 @@ async def get_server_rendered_config(
 
 @router.get("/{server_id}/leases", response_model=list[LeaseResponse])
 async def list_leases(
-    server_id: uuid.UUID, db: DB, _: CurrentUser, limit: int = 500
+    server_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    limit: int = 500,
+    device_class: str | None = None,
 ) -> list[DHCPLease]:
+    """List leases, enriched with OUI vendor + fingerbank device class (#373).
+
+    ``device_class`` filters server-side to leases whose joined fingerbank
+    classification matches (so the ``limit`` applies to matching rows). When
+    fingerprinting is off / unconfigured the device fields are simply blank.
+    """
     s = await db.get(DHCPServer, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="Server not found")
-    res = await db.execute(
-        select(DHCPLease)
-        .where(DHCPLease.server_id == server_id)
-        .order_by(DHCPLease.last_seen_at.desc())
-        .limit(min(limit, 5000))
-    )
-    rows = list(res.scalars().all())
+    q = select(DHCPLease).where(DHCPLease.server_id == server_id)
+    if device_class:
+        # Inner-join the fingerprint table so the limit lands on matching rows.
+        q = q.join(DHCPFingerprint, DHCPFingerprint.mac_address == DHCPLease.mac_address).where(
+            DHCPFingerprint.fingerbank_device_class == device_class
+        )
+    q = q.order_by(DHCPLease.last_seen_at.desc()).limit(min(limit, 5000))
+    rows = list((await db.execute(q)).scalars().all())
+
     vendors = await bulk_lookup_vendors(
         db, [str(lease.mac_address) if lease.mac_address else None for lease in rows]
     )
+    # Batch-fetch fingerprints for the result MACs (one query, mirroring the
+    # OUI bulk-lookup pattern) and key by normalized MAC so the device class /
+    # name / manufacturer / score join into each lease without a per-row query.
+    macs = [str(lease.mac_address) for lease in rows if lease.mac_address]
+    fps: dict[str, DHCPFingerprint] = {}
+    if macs:
+        fp_rows = (
+            await db.execute(select(DHCPFingerprint).where(DHCPFingerprint.mac_address.in_(macs)))
+        ).scalars()
+        for fp in fp_rows:
+            fps[normalize_mac_key(str(fp.mac_address))] = fp
     for lease in rows:
         key = normalize_mac_key(str(lease.mac_address)) if lease.mac_address else None
         vendor = vendors.get(key) if key else None
         lease.vendor = vendor  # type: ignore[attr-defined]
         lease.is_voip_phone = is_voip_phone_vendor(vendor)  # type: ignore[attr-defined]
+        fp = fps.get(key) if key else None
+        lease.device_class = fp.fingerbank_device_class if fp else None  # type: ignore[attr-defined]
+        lease.device_name = fp.fingerbank_device_name if fp else None  # type: ignore[attr-defined]
+        lease.device_manufacturer = (  # type: ignore[attr-defined]
+            fp.fingerbank_manufacturer if fp else None
+        )
+        lease.fingerbank_score = fp.fingerbank_score if fp else None  # type: ignore[attr-defined]
     return rows

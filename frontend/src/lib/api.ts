@@ -6495,6 +6495,13 @@ export interface DHCPLease {
   // Issue #112 phase 3 — flag from the curated VoIP-phone vendor list.
   // Drives a Phone icon next to the lease's MAC in the lease table.
   is_voip_phone?: boolean;
+  // Fingerbank passive-fingerprinting device classification (#373), joined
+  // from dhcp_fingerprint by MAC. All null/undefined when no fingerprint
+  // exists (fingerprinting off / unconfigured / not-yet-looked-up).
+  device_class?: string | null;
+  device_name?: string | null;
+  device_manufacturer?: string | null;
+  fingerbank_score?: number | null;
 }
 
 export interface PublicAuthProvider {
