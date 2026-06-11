@@ -831,24 +831,33 @@ class ApplianceCA(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-class ApplianceSlotImage(Base):
-    """Slot image (.raw.xz) uploaded by an operator for an air-gapped
-    appliance upgrade (#170 follow-up).
+class ApplianceUpgradeImage(Base):
+    """Upgrade image (.raw.xz) an operator makes available for an
+    air-gapped appliance OS upgrade (#170 follow-up; renamed from
+    ``ApplianceSlotImage`` / ``appliance_slot_image`` in #199 — the
+    operator-facing concept is an "upgrade image", while "slot" stays
+    the name of the lower-level A/B dd mechanism the bytes land on).
 
-    Bytes live on disk under ``/var/lib/spatiumddi/slot-images/{id}.raw.xz``;
-    this row carries metadata + SHA-256 verification + audit linkage.
-    The supervisor downloads via the internal authenticated URL
-    ``GET /api/v1/appliance/slot-images/{id}/raw.xz`` once an operator
+    The image arrives one of two ways: uploaded out-of-band by the
+    operator (air-gap), or imported by the control plane from a GitHub
+    release (connected installs — #199). Either way the bytes live on
+    disk under ``/var/lib/spatiumddi/slot-images/{id}.raw.xz`` (the
+    on-disk path keeps the historical ``slot-images`` name — it's pure
+    storage plumbing, not operator-facing). This row carries metadata +
+    SHA-256 verification + audit linkage. The supervisor downloads via
+    the internal authenticated URL
+    ``GET /api/v1/appliance/upgrade-images/{id}/raw.xz`` once an operator
     schedules an upgrade pointing at this row.
 
-    SHA-256 is computed server-side on the uploaded byte stream + verified
-    against the operator-supplied value before the row commits — mismatches
-    raise 422 and the partial file is deleted from disk. The hash also acts
-    as a uniqueness anchor (UNIQUE index) so a duplicate upload short-
-    circuits to the existing row rather than wasting disk.
+    SHA-256 is computed server-side on the uploaded/imported byte stream
+    + verified against the expected value before the row commits —
+    mismatches raise 422 and the partial file is deleted from disk. The
+    hash also acts as a uniqueness anchor (UNIQUE index) so a duplicate
+    upload/import short-circuits to the existing row rather than wasting
+    disk.
     """
 
-    __tablename__ = "appliance_slot_image"
+    __tablename__ = "appliance_upgrade_image"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filename: Mapped[str] = mapped_column(String(255), nullable=False)

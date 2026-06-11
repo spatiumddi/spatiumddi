@@ -754,11 +754,11 @@ def build_slot_image_url(*, request_base_url: str, image_id: uuid.UUID) -> str:
     works. The Phase D orchestrator will call this when scheduling
     each node's apply.
     """
-    from app.api.v1.appliance.slot_images import slot_image_download_token  # noqa: PLC0415
+    from app.api.v1.appliance.upgrade_images import slot_image_download_token  # noqa: PLC0415
 
     token = slot_image_download_token(image_id)
     base = request_base_url.rstrip("/")
-    return f"{base}/api/v1/appliance/slot-images/{image_id}/raw.xz?t={token}"
+    return f"{base}/api/v1/appliance/upgrade-images/{image_id}/raw.xz?t={token}"
 
 
 __all__ = [

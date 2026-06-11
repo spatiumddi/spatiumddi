@@ -28,10 +28,10 @@ from app.api.v1.appliance.pairing import router as pairing_router
 from app.api.v1.appliance.releases import router as releases_router
 from app.api.v1.appliance.slot import router as slot_router
 from app.api.v1.appliance.slot_image_mirror import router as slot_image_mirror_router
-from app.api.v1.appliance.slot_images import router as slot_images_router
 from app.api.v1.appliance.supervisor import router as supervisor_router
 from app.api.v1.appliance.system import router as system_router
 from app.api.v1.appliance.tls import router as tls_router
+from app.api.v1.appliance.upgrade_images import router as upgrade_images_router
 from app.config import settings
 from app.core.permissions import require_permission
 
@@ -43,10 +43,12 @@ router = APIRouter()
 router.include_router(tls_router, prefix="/tls")
 router.include_router(releases_router, prefix="/releases")
 router.include_router(slot_router, prefix="/slot-upgrade")
-# Slot-image upload for air-gapped fleets — routes already include
-# the ``/slot-images`` prefix in their decorators, so no nested
-# prefix here (matches the supervisor + pairing routers' shape).
-router.include_router(slot_images_router)
+# Upgrade-image management (#199 — renamed from slot-images): upload /
+# import-from-github / list / download / delete. Routes already include
+# the ``/upgrade-images`` prefix in their decorators (plus the legacy
+# ``/slot-images`` 308-redirect shims), so no nested prefix here
+# (matches the supervisor + pairing routers' shape).
+router.include_router(upgrade_images_router)
 # #296 Phase B — slot-image-mirror internal byte-op endpoints (PUT /
 # GET / DELETE under /internal/slot-images/{id}) ONLY register on
 # the mirror Deployment. The main api Deployment leaves the

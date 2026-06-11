@@ -582,7 +582,7 @@ def test_build_slot_image_url_format(monkeypatch: pytest.MonkeyPatch) -> None:
         request_base_url="https://fleet.example.com/", image_id=image_id
     )
     assert url.startswith(
-        f"https://fleet.example.com/api/v1/appliance/slot-images/{image_id}/raw.xz?t="
+        f"https://fleet.example.com/api/v1/appliance/upgrade-images/{image_id}/raw.xz?t="
     )
     # Token is 64-char hex.
     token = url.split("?t=")[1]

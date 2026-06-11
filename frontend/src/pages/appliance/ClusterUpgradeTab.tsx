@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 
 import {
-  applianceSlotImagesApi,
+  applianceUpgradeImagesApi,
   clusterUpgradesApi,
   formatApiError,
   type ClusterUpgradeFailureCategory,
@@ -24,8 +24,8 @@ import {
   type PreflightCheck,
   type PreflightLevel,
   type PreflightReport,
-  type SlotImage,
   type SystemUpgradeRun,
+  type UpgradeImage,
 } from "@/lib/api";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { cn } from "@/lib/utils";
@@ -97,7 +97,7 @@ const CATEGORY_HINTS: Record<ClusterUpgradeFailureCategory, string> = {
   node_unreachable_after_apply:
     "Check supervisor heartbeat + appliance last_upgrade_state. If unreachable, evict + re-pair (#272 Ph9).",
   supervisor_reported_failed:
-    "Slot apply failed on the node. Check spatium-upgrade-slot.log; the slot image may be corrupt.",
+    "Slot apply failed on the node. Check spatium-upgrade-slot.log; the upgrade image may be corrupt.",
   node_did_not_rejoin:
     "Node rebooted but didn't rejoin etcd / DaemonSet pods. Consider evict + re-pair (#272 Ph9).",
   chart_bump_failed:
@@ -205,41 +205,41 @@ function LeasePill({ lease }: { lease: ReturnType<typeof useQuery>["data"] }) {
 
 // ── Plan form ────────────────────────────────────────────────────────
 
-// Slot-image source mode for the rolling upgrade. Air-gap operators
-// upload through Fleet → Slot images then pick from the dropdown
-// here ("uploaded"); connected installs paste a GitHub release URL
-// ("url"). Default is decided dynamically: "uploaded" if at least one
-// image is on file, else "url" — so the dropdown becomes invisible
-// to operators who don't use it.
-type SlotImageSource = "uploaded" | "url";
+// Upgrade-image source mode for the rolling upgrade. Operators stage
+// an image through Fleet → Upgrade images (upload or GitHub import)
+// then pick from the dropdown here ("uploaded"); connected installs
+// can instead paste a GitHub release URL ("url"). Default is decided
+// dynamically: "uploaded" if at least one image is on file, else "url"
+// — so the dropdown becomes invisible to operators who don't use it.
+type UpgradeImageSource = "uploaded" | "url";
 
 function PlanFormPanel() {
   const qc = useQueryClient();
   const [targetVersion, setTargetVersion] = useState("");
   const [slotImageUrl, setSlotImageUrl] = useState("");
   const [slotImageId, setSlotImageId] = useState<string>("");
-  // ``null`` means "use the smart default once the slot-images query
+  // ``null`` means "use the smart default once the upgrade-images query
   // resolves"; once the operator explicitly picks one we honour it.
-  const [sourceMode, setSourceMode] = useState<SlotImageSource | null>(null);
+  const [sourceMode, setSourceMode] = useState<UpgradeImageSource | null>(null);
   const [cnpgClusterName, setCnpgClusterName] = useState("");
   const [preflightTarget, setPreflightTarget] = useState<string | null>(null);
   const [planError, setPlanError] = useState<string | null>(null);
 
   const slotImagesQuery = useQuery({
-    queryKey: ["appliance", "slot-images"],
-    queryFn: applianceSlotImagesApi.list,
-    // Slot images change rarely (operator uploads on a fresh release)
-    // — 30 s is plenty of staleness for this picker. Same cadence the
-    // FleetTab SlotImagesPanel uses so the two surfaces don't race
-    // each other in cache.
+    queryKey: ["appliance", "upgrade-images"],
+    queryFn: applianceUpgradeImagesApi.list,
+    // Upgrade images change rarely (operator stages one on a fresh
+    // release) — 30 s is plenty of staleness for this picker. Same
+    // cadence + cache key the FleetTab UpgradeImageManager uses so the
+    // two surfaces don't race each other in cache.
     staleTime: 30_000,
   });
-  const slotImages: SlotImage[] = slotImagesQuery.data ?? [];
+  const slotImages: UpgradeImage[] = slotImagesQuery.data ?? [];
 
   // Resolve the effective source mode. If the operator hasn't picked
   // explicitly, default to "uploaded" iff at least one image is on
-  // file — air-gap operators land directly on the dropdown they need.
-  const effectiveSource: SlotImageSource =
+  // file — operators land directly on the dropdown they need.
+  const effectiveSource: UpgradeImageSource =
     sourceMode ?? (slotImages.length > 0 ? "uploaded" : "url");
 
   // Preflight runs on-demand — operator types a target then clicks
@@ -323,7 +323,7 @@ function PlanFormPanel() {
         <div className="flex flex-col gap-1">
           <div className="flex items-center justify-between gap-2">
             <span className="text-xs font-medium text-muted-foreground">
-              Slot image source
+              Upgrade image source
             </span>
             {/* Air-gap-friendly + online: two radio chips. Selection
                 survives until the operator changes it; the default
@@ -358,12 +358,13 @@ function PlanFormPanel() {
           </div>
           {effectiveSource === "uploaded" ? (
             slotImages.length === 0 ? (
-              // Empty-state copy — point to Fleet → Slot images. Air-gap
-              // workflow is unambiguous: upload there, come back here.
+              // Empty-state copy — point to Fleet → Upgrade images.
+              // Workflow is unambiguous: stage there, come back here.
               <div className="rounded-md border border-dashed bg-muted/30 px-2 py-1.5 text-xs text-muted-foreground">
-                No uploaded slot images yet. Upload <code>.raw.xz</code> in{" "}
-                <strong>Fleet → Slot images</strong>, then return here. Or
-                switch to <strong>URL</strong> for an online install.
+                No staged upgrade images yet. Upload or import a{" "}
+                <code>.raw.xz</code> in <strong>Fleet → Upgrade images</strong>,
+                then return here. Or switch to <strong>URL</strong> for an
+                online install.
               </div>
             ) : (
               <select
