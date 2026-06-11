@@ -542,7 +542,14 @@ def render(
     dhcp4: dict[str, Any] = {
         "interfaces-config": {
             "interfaces": list(interfaces),
-            "dhcp-socket-type": server.get("dhcp_socket_type", "udp"),
+            # Issue #365 — default to ``raw`` (AF_PACKET) so Kea hears
+            # broadcast DISCOVERs from directly-attached clients. The
+            # control plane sends the resolved value (``raw`` for group
+            # socket_mode "direct", ``udp`` for "relay"); the ``raw``
+            # fallback only applies to bundles from an older control plane
+            # that predates the ``server`` block. ``raw`` needs CAP_NET_RAW
+            # (granted on the appliance DaemonSet + compose Kea services).
+            "dhcp-socket-type": server.get("dhcp_socket_type", "raw"),
         },
         "control-socket": {
             "socket-type": "unix",

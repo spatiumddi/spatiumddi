@@ -33,12 +33,32 @@ DHCPServer
 DHCPServerGroup
   id, name, description
   mode: enum(standalone, hot-standby, load-balancing)
+  dhcp_socket_mode: enum(direct, relay)   -- Kea dhcp-socket-type selector
   heartbeat_delay_ms, max_response_delay_ms, max_ack_delay_ms, max_unacked_clients
   auto_failover: bool
   servers: [DHCPServer]          -- 2 Kea members = HA pair
   scopes: [DHCPScope]            -- rendered on every member
   client_classes: [DHCPClientClass]
 ```
+
+**Client reachability (`dhcp_socket_mode`, issue #365).** Kea's
+`dhcp-socket-type` is a *per-daemon* setting — it can't vary per subnet —
+so it lives on the group and applies to every member Kea. Two values,
+surfaced in the create/edit modal as **Client reachability**:
+
+| Mode | Renders | Use when |
+|---|---|---|
+| `direct` *(default)* | `dhcp-socket-type: raw` | The server is on the same L2 as its clients. Raw (AF_PACKET) sockets receive broadcast `DHCPDISCOVER`s from clients that have no IP yet **and** relayed traffic — the superset, and Kea's own default. Needs `CAP_NET_RAW` (granted on the appliance DaemonSet + the shipped compose Kea services). |
+| `relay` | `dhcp-socket-type: udp` | Kea sits exclusively behind a DHCP relay (`ip helper-address` / `dhcrelay`), or the runtime can't grant raw-socket capability. UDP datagram sockets cannot receive direct L2 broadcasts. |
+
+The value flows to every deploy path (k8s / compose / appliance) through
+the ConfigBundle long-poll and is folded into the bundle ETag, so a
+change re-renders the running Kea within a heartbeat. It is distinct from
+`network_mode` (host vs bridged), which controls the *container's* network
+namespace on supervisor-managed appliances — a directly-attached server
+typically wants `network_mode: host` **and** `dhcp_socket_mode: direct`.
+See [TROUBLESHOOTING.md](../TROUBLESHOOTING.md#dhcp-server-kea-doesnt-respond-to-discover)
+for the "no DHCPOFFER" diagnosis flow.
 
 ---
 

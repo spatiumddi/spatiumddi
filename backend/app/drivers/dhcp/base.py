@@ -225,6 +225,12 @@ class ConfigBundle:
     # agent's Kea renderer injects ``libdhcp_ha.so`` + the ``high-
     # availability`` config block when this is present.
     failover: FailoverConfig | None = None
+    # Issue #365 — Kea ``dhcp-socket-type`` for the Dhcp4 daemon, derived
+    # from ``DHCPServerGroup.dhcp_socket_mode`` (``direct`` → ``raw``,
+    # ``relay`` → ``udp``). Defaults to ``raw`` so a bundle built without a
+    # group (or by an older control plane) still serves directly-attached
+    # clients. v6 is unaffected — DHCPv6 has no socket-type concept.
+    dhcp_socket_type: str = "raw"
 
     def compute_etag(self) -> str:
         """Compute a stable SHA-256 of the bundle contents (excluding etag/timestamp)."""
@@ -240,6 +246,7 @@ class ConfigBundle:
             "pxe_classes": [asdict(p) for p in self.pxe_classes],
             "phone_classes": [asdict(c) for c in self.phone_classes],
             "failover": asdict(self.failover) if self.failover else None,
+            "dhcp_socket_type": self.dhcp_socket_type,
         }
         blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         return "sha256:" + hashlib.sha256(blob).hexdigest()

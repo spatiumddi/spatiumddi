@@ -268,7 +268,13 @@ class KeaDriver(DHCPDriver):
         if v4_scopes or not v6_scopes:
             out["Dhcp4"] = {
                 "valid-lifetime": bundle.options.lease_time,
-                "interfaces-config": {"interfaces": ["*"]},
+                # Issue #365 — ``raw`` (group socket_mode "direct") receives
+                # broadcast DISCOVERs from directly-attached clients; ``udp``
+                # is relay-only. v6 below has no socket-type concept.
+                "interfaces-config": {
+                    "interfaces": ["*"],
+                    "dhcp-socket-type": bundle.dhcp_socket_type,
+                },
                 "lease-database": {
                     "type": "memfile",
                     "persist": True,

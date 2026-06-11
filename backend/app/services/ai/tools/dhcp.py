@@ -196,7 +196,9 @@ class ListServerGroupsArgs(BaseModel):
     description=(
         "List DHCP server groups (logical bundles of Kea servers, "
         "with HA implicit when the group has ≥ 2 members). Each "
-        "summary includes name, member count, and DDNS toggle."
+        "summary includes name, member count, DDNS toggle, and "
+        "dhcp_socket_mode ('direct' = raw sockets that hear broadcast "
+        "DISCOVERs from on-LAN clients; 'relay' = udp, relay-only)."
     ),
     args_model=ListServerGroupsArgs,
     category="dhcp",
@@ -219,6 +221,10 @@ async def list_dhcp_server_groups(
                 "id": str(g.id),
                 "name": g.name,
                 "ddns_enabled": g.ddns_enabled,
+                # #365 — "direct" (raw sockets, hears broadcast DISCOVERs) or
+                # "relay" (udp sockets, relay-only). Helps the copilot answer
+                # "why isn't this DHCP server replying to direct clients?".
+                "dhcp_socket_mode": g.dhcp_socket_mode,
                 "member_count": int(member_count or 0),
             }
         )

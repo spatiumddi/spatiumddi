@@ -29,12 +29,17 @@ router = APIRouter(
 )
 
 VALID_MODES = {"standalone", "load-balancing", "hot-standby"}
+# Issue #365 — Kea dhcp-socket-type selector. "direct" → raw sockets
+# (receives broadcast DISCOVERs from directly-attached clients), "relay"
+# → udp sockets (relay-only).
+VALID_SOCKET_MODES = {"direct", "relay"}
 
 
 class GroupCreate(BaseModel):
     name: str
     description: str = ""
     mode: str = "hot-standby"
+    dhcp_socket_mode: str = "direct"
     heartbeat_delay_ms: int = 10000
     max_response_delay_ms: int = 60000
     max_ack_delay_ms: int = 10000
@@ -48,11 +53,19 @@ class GroupCreate(BaseModel):
             raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
         return v
 
+    @field_validator("dhcp_socket_mode")
+    @classmethod
+    def _sm(cls, v: str) -> str:
+        if v not in VALID_SOCKET_MODES:
+            raise ValueError(f"dhcp_socket_mode must be one of {sorted(VALID_SOCKET_MODES)}")
+        return v
+
 
 class GroupUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     mode: str | None = None
+    dhcp_socket_mode: str | None = None
     heartbeat_delay_ms: int | None = None
     max_response_delay_ms: int | None = None
     max_ack_delay_ms: int | None = None
@@ -64,6 +77,13 @@ class GroupUpdate(BaseModel):
     def _m(cls, v: str | None) -> str | None:
         if v is not None and v not in VALID_MODES:
             raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
+        return v
+
+    @field_validator("dhcp_socket_mode")
+    @classmethod
+    def _sm(cls, v: str | None) -> str | None:
+        if v is not None and v not in VALID_SOCKET_MODES:
+            raise ValueError(f"dhcp_socket_mode must be one of {sorted(VALID_SOCKET_MODES)}")
         return v
 
 
@@ -83,6 +103,7 @@ class GroupResponse(BaseModel):
     name: str
     description: str
     mode: str
+    dhcp_socket_mode: str
     heartbeat_delay_ms: int
     max_response_delay_ms: int
     max_ack_delay_ms: int
@@ -107,6 +128,7 @@ def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
         name=g.name,
         description=g.description,
         mode=g.mode,
+        dhcp_socket_mode=g.dhcp_socket_mode,
         heartbeat_delay_ms=g.heartbeat_delay_ms,
         max_response_delay_ms=g.max_response_delay_ms,
         max_ack_delay_ms=g.max_ack_delay_ms,
@@ -177,8 +199,9 @@ async def update_group(
     changes = body.model_dump(exclude_none=True)
     for k, v in changes.items():
         setattr(g, k, v)
-    # HA tuning (mode / heartbeat / delays / auto-failover) renders into
-    # every member's bundle, so wake the group channel.
+    # HA tuning (mode / heartbeat / delays / auto-failover) and the Kea
+    # socket mode (#365) all render into every member's bundle, so wake the
+    # group channel — the bundle ETag shifts and agents re-render promptly.
     collect_wake(dhcp_group_channel(g.id))
     write_audit(
         db,

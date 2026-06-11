@@ -26,6 +26,11 @@ FROM alpine:3.22 AS runtime
 # ``cache-from: type=gha`` on the build workflow) is otherwise
 # perfectly happy to serve a 30-day-old ``apk add`` layer that
 # Trivy will then flag.
+#
+# ``libcrypto3``/``libssl3`` pinned ``>=3.5.7-r0`` for CVE-2026-45447
+# (HIGH, OpenSSL — alpine 3.22 base ships 3.5.6-r0, fixed in 3.5.7-r0):
+# the explicit lower bound installs the patched openssl libs AND busts
+# the ``cache-from`` layer so a stale apk add can't reintroduce 3.5.6-r0.
 RUN apk upgrade --no-cache \
  && apk add --no-cache \
       bind bind-tools \
@@ -33,6 +38,7 @@ RUN apk upgrade --no-cache \
       python3 py3-pip \
       libcap \
       ca-certificates tzdata \
+      'libcrypto3>=3.5.7-r0' 'libssl3>=3.5.7-r0' \
  && setcap cap_net_bind_service=+ep /usr/sbin/named \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \

@@ -348,11 +348,15 @@ services:
     depends_on:
       api:
         condition: service_started
-    # Kea runs as non-root and needs to bind UDP/67. No NET_RAW/NET_ADMIN —
-    # this server accepts relayed DHCP (unicast from relay agents), it does
-    # NOT need to listen for L2 broadcasts on the host LAN.
+    # Kea binds UDP/67 (NET_BIND_SERVICE) and, by default, uses raw
+    # AF_PACKET sockets (NET_RAW, #365) so it hears broadcast DISCOVERs
+    # from directly-attached clients on the host LAN. A relay-only group
+    # (socket mode "relay" → udp sockets) doesn't use raw sockets, but
+    # granting NET_RAW is harmless. Pair with `network_mode: host` (or a
+    # macvlan) so the broadcasts actually reach the container.
     cap_add:
       - NET_BIND_SERVICE
+      - NET_RAW
 
   # ── DHCP agent (secondary, HA peer) ───────────────────────────────────
   # Only starts with `--profile dhcp-ha`. Pair dhcp-kea + dhcp-kea-2 in
@@ -398,6 +402,7 @@ services:
         condition: service_started
     cap_add:
       - NET_BIND_SERVICE
+      - NET_RAW  # #365 — raw sockets for direct-attached DHCP (see dhcp-kea)
 
 
 networks:

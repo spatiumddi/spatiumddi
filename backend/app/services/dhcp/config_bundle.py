@@ -258,6 +258,12 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
     phone_classes = await _assemble_phone_classes(db, scope_rows)
 
     failover = await _resolve_failover(db, server, group)
+    # Issue #365 — Kea socket type. ``direct`` (default) → ``raw`` sockets
+    # so Kea hears broadcast DISCOVERs from directly-attached clients;
+    # ``relay`` → ``udp`` for relay-only deployments. Groupless servers
+    # render an empty bundle anyway, but default them to ``raw`` too.
+    socket_mode = getattr(group, "dhcp_socket_mode", "direct") if group else "direct"
+    dhcp_socket_type = "udp" if socket_mode == "relay" else "raw"
     bundle = ConfigBundle(
         server_id=str(server.id),
         server_name=server.name,
@@ -271,6 +277,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         phone_classes=phone_classes,
         generated_at=datetime.now(UTC),
         failover=failover,
+        dhcp_socket_type=dhcp_socket_type,
     )
     bundle.etag = bundle.compute_etag()
     return bundle

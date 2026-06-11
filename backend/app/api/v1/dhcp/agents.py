@@ -448,6 +448,16 @@ async def agent_config_longpoll(
                         "server_name": bundle.server_name,
                         "driver": bundle.driver,
                         "roles": list(bundle.roles),
+                        # Issue #365 — server-wide Kea interfaces-config. The
+                        # agent's render_kea reads ``dhcp_socket_type`` here;
+                        # ``raw`` (from group socket_mode "direct") lets Kea
+                        # receive broadcast DISCOVERs from directly-attached
+                        # clients, ``udp`` is relay-only. Folded into the
+                        # bundle ETag so a mode change wakes the long-poll.
+                        "server": {
+                            "interfaces": ["*"],
+                            "dhcp_socket_type": bundle.dhcp_socket_type,
+                        },
                         "scopes": [
                             {
                                 "subnet_cidr": s.subnet_cidr,

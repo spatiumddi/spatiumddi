@@ -71,6 +71,26 @@ class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         String(16), nullable=False, default="host", server_default="host"
     )
 
+    # Issue #365 — Kea ``dhcp-socket-type`` (inside ``interfaces-config``).
+    # Distinct from ``network_mode`` above: that's the *container* network
+    # namespace; this is how the Kea daemon reads packets off the wire. It
+    # is a per-daemon setting (cannot vary per subnet), so it lives on the
+    # group and applies to every member Kea.
+    #   * ``direct`` → ``raw`` (AF_PACKET). Receives broadcast DISCOVERs
+    #     from directly-attached clients that have no IP yet *and* relayed
+    #     traffic — the superset, and Kea's own default. Needs CAP_NET_RAW
+    #     (granted on the appliance DaemonSet + the compose Kea services).
+    #   * ``relay`` → ``udp`` (datagram). Relay-only; cannot receive direct
+    #     L2 broadcasts. Pick only when Kea sits exclusively behind a DHCP
+    #     relay, or the runtime can't grant raw-socket capability.
+    # Delivered to every deploy path (k8s/compose/appliance) via the
+    # ConfigBundle long-poll — not the supervisor role assignment — so the
+    # agent renders ``interfaces-config`` from it and the ETag shifts on
+    # change.
+    dhcp_socket_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="direct", server_default="direct"
+    )
+
     # Kea HA hook tuning — rendered into libdhcp_ha.so config when the
     # group is an HA pair. Defaults mirror Kea's documented recommendations.
     heartbeat_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
