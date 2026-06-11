@@ -44,7 +44,7 @@ from app.models.circuit import Circuit
 from app.models.dhcp import DHCPLease, DHCPPool, DHCPScope, DHCPServer
 from app.models.dns import DNSServer, DNSZone
 from app.models.domain import Domain
-from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.models.ipam import IPAddress, IPBlock, IpMacHistory, Subnet
 from app.models.metrics import DNSMetricSample
 from app.models.network_service import NetworkService, NetworkServiceResource
 from app.models.overlay import OverlayNetwork
@@ -154,6 +154,21 @@ RULE_TYPE_DECOM_EXPIRING = "decom_expiring"
 RULE_TYPE_DNS_NXDOMAIN_SPIKE = "dns_nxdomain_spike"
 RULE_TYPE_DNS_QUERY_RATE_SPIKE = "dns_query_rate_spike"
 
+# Active IP reconciliation hygiene alerts — issue #369. Subject = ip_address.
+# Reuse the on-the-wire liveness signal (IPAddress.last_seen_at) the discovery
+# sweep + SNMP poll already write + the ip_mac_history observation log; no new
+# collectors. The window for each is ``threshold_days`` (reused).
+#   * ip_free_but_responding — an 'available' row that answered within the last
+#     threshold_days (default 1). "IPAM says free, host is up."
+#   * stale_reservation — a 'reserved'/'static_dhcp' row last seen > threshold_days
+#     ago (default 90). The gap stale_ip_count deliberately leaves (allocated-only).
+#   * unknown_mac_in_static_range — a 'reserved'/'static_dhcp' row whose
+#     ip_mac_history holds a recently-observed (≤ threshold_days, default 7) MAC
+#     differing from the recorded one — a squat.
+RULE_TYPE_IP_FREE_BUT_RESPONDING = "ip_free_but_responding"
+RULE_TYPE_STALE_RESERVATION = "stale_reservation"
+RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE = "unknown_mac_in_static_range"
+
 RULE_TYPES = frozenset(
     {
         RULE_TYPE_SUBNET_UTILIZATION,
@@ -181,8 +196,16 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DECOM_EXPIRING,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
         RULE_TYPE_DNS_QUERY_RATE_SPIKE,
+        RULE_TYPE_IP_FREE_BUT_RESPONDING,
+        RULE_TYPE_STALE_RESERVATION,
+        RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE,
     }
 )
+
+# IP-hygiene window defaults (issue #369), each reused as ``threshold_days``.
+_FREE_RESPONDING_RECENCY_DAYS = 1
+_STALE_RESERVATION_DAYS = 90
+_SQUAT_RECENCY_DAYS = 7
 
 # DNS query-anomaly evaluation window + defaults (issue #371). 15 min spans
 # ~15 one-minute buckets / 3 five-minute buckets — long enough to smooth a
@@ -482,6 +505,116 @@ async def _matching_stale_ip_count_subjects(
             f"deprecation from the Stale-IP report"
         )
         matches.append((str(s.id), display, message))
+    return matches
+
+
+async def _matching_ip_free_but_responding_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """``available`` IPs that answered on the wire within the recency window
+    (issue #369, case 1) — "IPAM says free, host is up"."""
+    days = rule.threshold_days if rule.threshold_days is not None else _FREE_RESPONDING_RECENCY_DAYS
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, days))
+    rows = (
+        (
+            await db.execute(
+                select(IPAddress).where(
+                    IPAddress.status == "available",
+                    IPAddress.last_seen_at.is_not(None),
+                    IPAddress.last_seen_at >= cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str]] = []
+    for r in rows:
+        via = f" via {r.last_seen_method}" if r.last_seen_method else ""
+        message = (
+            f"IP {r.address} is marked 'available' but answered on the wire{via} "
+            f"at {r.last_seen_at.isoformat() if r.last_seen_at else '?'} (within "
+            f"{days}d) — reclaim it as allocated/discovered or investigate the host."
+        )
+        matches.append((str(r.id), str(r.address), message))
+    return matches
+
+
+async def _matching_stale_reservation_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """``reserved`` / ``static_dhcp`` IPs not seen within ``threshold_days``
+    (issue #369, case 2). The gap ``stale_ip_count`` leaves (allocated-only).
+    High-confidence: requires the row to have been seen at least once."""
+    days = rule.threshold_days if rule.threshold_days is not None else _STALE_RESERVATION_DAYS
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, days))
+    rows = (
+        (
+            await db.execute(
+                select(IPAddress).where(
+                    IPAddress.status.in_(("reserved", "static_dhcp")),
+                    IPAddress.last_seen_at.is_not(None),
+                    IPAddress.last_seen_at < cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str]] = []
+    for r in rows:
+        label = str(r.address) + (f" ({r.hostname})" if r.hostname else "")
+        message = (
+            f"{r.status} IP {label} hasn't been seen on the wire since "
+            f"{r.last_seen_at.isoformat() if r.last_seen_at else '?'} (> {days}d) — "
+            f"verify the host still exists or release the reservation."
+        )
+        matches.append((str(r.id), str(r.address), message))
+    return matches
+
+
+async def _matching_unknown_mac_in_static_range_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """``reserved`` / ``static_dhcp`` IPs whose ip_mac_history holds a recently
+    observed MAC differing from the recorded one (issue #369, case 3) — a squat.
+
+    The discovery sweep + SNMP poll log every observed MAC into ip_mac_history
+    (see services.ipam.discovery.record_mac_observation); operator-set
+    ``mac_address`` is never overwritten, so a differing recent history row is
+    a genuine "someone else is answering on this IP" signal.
+    """
+    days = rule.threshold_days if rule.threshold_days is not None else _SQUAT_RECENCY_DAYS
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, days))
+    rows = (
+        await db.execute(
+            select(IPAddress, IpMacHistory.mac_address, IpMacHistory.last_seen)
+            .join(IpMacHistory, IpMacHistory.ip_address_id == IPAddress.id)
+            .where(
+                IPAddress.status.in_(("reserved", "static_dhcp")),
+                IPAddress.mac_address.is_not(None),
+                IpMacHistory.mac_address != IPAddress.mac_address,
+                IpMacHistory.last_seen >= cutoff,
+            )
+        )
+    ).all()
+    # One event per IP — keep the most-recent offending observation if several.
+    by_ip: dict[uuid.UUID, tuple[IPAddress, str, datetime]] = {}
+    for ip_row, obs_mac, obs_at in rows:
+        prev = by_ip.get(ip_row.id)
+        if prev is None or obs_at > prev[2]:
+            by_ip[ip_row.id] = (ip_row, str(obs_mac), obs_at)
+    matches: list[tuple[str, str, str]] = []
+    for ip_id, (ip_row, obs_mac, obs_at) in by_ip.items():
+        message = (
+            f"IP {ip_row.address} ({ip_row.status}) is recorded with MAC "
+            f"{ip_row.mac_address} but a different MAC {obs_mac} answered at "
+            f"{obs_at.isoformat()} — possible squatter or a device that moved."
+        )
+        matches.append((str(ip_id), str(ip_row.address), message))
     return matches
 
 
@@ -2009,6 +2142,75 @@ async def seed_dns_query_anomaly_alert_rules() -> None:
         await session.commit()
 
 
+async def seed_ip_hygiene_alert_rules() -> None:
+    """Seed the three IP-reconciliation hygiene rules (issue #369), DISABLED by
+    default so installs that don't run discovery aren't suddenly paged. Keyed on
+    ``rule_type`` — an operator who enables / renames one is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    seeds = [
+        {
+            "name": "IP free but responding",
+            "rule_type": RULE_TYPE_IP_FREE_BUT_RESPONDING,
+            "description": (
+                "Fires on an IP marked 'available' that answered on the wire "
+                f"within threshold_days (default {_FREE_RESPONDING_RECENCY_DAYS}) "
+                "— IPAM thinks it's free but a host is using it. Reclaim it or "
+                "investigate. Needs subnet discovery (ping/ARP sweep or SNMP)."
+            ),
+            "threshold_days": _FREE_RESPONDING_RECENCY_DAYS,
+            "severity": "warning",
+        },
+        {
+            "name": "Stale reservation",
+            "rule_type": RULE_TYPE_STALE_RESERVATION,
+            "description": (
+                "Fires on a reserved / static_dhcp IP not seen on the wire for "
+                f"more than threshold_days (default {_STALE_RESERVATION_DAYS}). "
+                "The reservation-aware companion to the stale-IP alert (which is "
+                "allocated-only). Verify the host or release the reservation."
+            ),
+            "threshold_days": _STALE_RESERVATION_DAYS,
+            "severity": "info",
+        },
+        {
+            "name": "Unknown MAC in static range",
+            "rule_type": RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE,
+            "description": (
+                "Fires when a reserved / static_dhcp IP is answered by a MAC that "
+                "differs from the one recorded on the row, observed within "
+                f"threshold_days (default {_SQUAT_RECENCY_DAYS}) — a squatter or a "
+                "device that moved. Needs subnet discovery (ping/ARP or SNMP)."
+            ),
+            "threshold_days": _SQUAT_RECENCY_DAYS,
+            "severity": "warning",
+        },
+    ]
+    async with AsyncSessionLocal() as session:
+        for seed in seeds:
+            existing = await session.scalar(
+                select(AlertRule).where(AlertRule.rule_type == seed["rule_type"])
+            )
+            if existing is not None:
+                continue
+            session.add(
+                AlertRule(
+                    name=seed["name"],
+                    description=seed["description"],
+                    rule_type=seed["rule_type"],
+                    threshold_days=seed["threshold_days"],
+                    severity=seed["severity"],
+                    enabled=False,
+                    notify_syslog=True,
+                    notify_webhook=True,
+                    notify_smtp=False,
+                )
+            )
+        await session.commit()
+
+
 async def seed_builtin_compliance_alert_rules() -> None:
     """Insert the three disabled compliance-change rules on first
     boot. Idempotent — only inserts a row when no rule with the same
@@ -2181,6 +2383,18 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_dns_query_rate_spike_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "dns_server"
+            elif rule.rule_type == RULE_TYPE_IP_FREE_BUT_RESPONDING:
+                base = await _matching_ip_free_but_responding_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "ip_address"
+            elif rule.rule_type == RULE_TYPE_STALE_RESERVATION:
+                base = await _matching_stale_reservation_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "ip_address"
+            elif rule.rule_type == RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE:
+                base = await _matching_unknown_mac_in_static_range_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "ip_address"
             elif rule.rule_type == RULE_TYPE_SERVER_UNREACHABLE:
                 base = await _matching_server_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]

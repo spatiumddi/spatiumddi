@@ -914,3 +914,86 @@ async def count_ipam_resources(
         "ip_addresses": int(ip_count or 0),
         "ip_addresses_by_status": {row[0]: int(row[1]) for row in by_status_rows},
     }
+
+
+class FindIPHygieneFindingsArgs(BaseModel):
+    free_responding_days: int = Field(
+        default=1,
+        ge=1,
+        le=365,
+        description="Recency window for 'free but responding' (answered within N days).",
+    )
+    stale_reservation_days: int = Field(
+        default=90,
+        ge=1,
+        le=3650,
+        description="Staleness window for reservations not seen in N days.",
+    )
+    squat_days: int = Field(
+        default=7,
+        ge=1,
+        le=365,
+        description="Recency window for an observed MAC differing from the recorded one.",
+    )
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+@register_tool(
+    name="find_ip_hygiene_findings",
+    description=(
+        "Fleet-wide IPAM hygiene findings (issue #369), in three buckets: "
+        "'free_but_responding' (IPs marked available that answered on the "
+        "wire), 'stale_reservations' (reserved/static IPs not seen in N "
+        "days), and 'unknown_mac_in_static_range' (an IP answered by a MAC "
+        "differing from the recorded one — a squat). Mirrors the IP-hygiene "
+        "alert rules but on demand. Use to answer 'any IP hygiene issues?', "
+        "'is anything squatting in my static ranges?', or 'which reservations "
+        "are dead?'. Read-only; depends on subnet discovery (ping/ARP/SNMP)."
+    ),
+    args_model=FindIPHygieneFindingsArgs,
+    category="ipam",
+)
+async def find_ip_hygiene_findings(
+    db: AsyncSession, user: User, args: FindIPHygieneFindingsArgs
+) -> dict[str, Any]:
+    # Reuse the alert matchers so the on-demand view and the alert rules can't
+    # drift. Pass transient (unsaved) AlertRule objects purely as a threshold
+    # carrier — the matchers only read ``threshold_days``.
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+    from app.services.alerts import (  # noqa: PLC0415
+        RULE_TYPE_IP_FREE_BUT_RESPONDING,
+        RULE_TYPE_STALE_RESERVATION,
+        RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE,
+        _matching_ip_free_but_responding_subjects,
+        _matching_stale_reservation_subjects,
+        _matching_unknown_mac_in_static_range_subjects,
+    )
+
+    def _rule(rule_type: str, days: int) -> AlertRule:
+        return AlertRule(name="adhoc", rule_type=rule_type, severity="info", threshold_days=days)
+
+    free = await _matching_ip_free_but_responding_subjects(
+        db, _rule(RULE_TYPE_IP_FREE_BUT_RESPONDING, args.free_responding_days)
+    )
+    stale = await _matching_stale_reservation_subjects(
+        db, _rule(RULE_TYPE_STALE_RESERVATION, args.stale_reservation_days)
+    )
+    squat = await _matching_unknown_mac_in_static_range_subjects(
+        db, _rule(RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE, args.squat_days)
+    )
+
+    def _fmt(rows: list[tuple[str, str, str]]) -> list[dict[str, str]]:
+        return [
+            {"ip_id": sid, "address": disp, "detail": msg} for sid, disp, msg in rows[: args.limit]
+        ]
+
+    return {
+        "free_but_responding": _fmt(free),
+        "stale_reservations": _fmt(stale),
+        "unknown_mac_in_static_range": _fmt(squat),
+        "counts": {
+            "free_but_responding": len(free),
+            "stale_reservations": len(stale),
+            "unknown_mac_in_static_range": len(squat),
+        },
+    }

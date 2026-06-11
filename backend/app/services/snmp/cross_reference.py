@@ -100,6 +100,15 @@ async def cross_reference_arp(
             existing.last_seen_method = "snmp"
             if existing.mac_address is None and arp.mac_address:
                 existing.mac_address = arp.mac_address
+            # Log the observed MAC so the unknown-MAC-in-static-range hygiene
+            # alert (#369) can compare recorded vs observed — without
+            # overwriting operator-set mac_address above.
+            if arp.mac_address:
+                from app.services.ipam.discovery import (  # noqa: PLC0415
+                    record_mac_observation,
+                )
+
+                await record_mac_observation(db, existing.id, arp.mac_address)
             counts["updated"] += 1
             continue
 

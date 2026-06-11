@@ -36,11 +36,12 @@ import ipaddress
 import os
 import socket
 import struct
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPPool, DHCPScope
@@ -360,6 +361,11 @@ async def reconcile_subnet(db: AsyncSession, subnet: Subnet, sweep: SweepResult)
             if ip in sweep.arp and row.mac_address is None:
                 row.mac_address = sweep.arp[ip]
                 counts["arp_enriched"] += 1
+            # Always log the observed MAC to ip_mac_history so the
+            # unknown-MAC-in-static-range hygiene alert (#369) can compare
+            # the operator-recorded MAC against what actually answered.
+            if ip in sweep.arp:
+                await record_mac_observation(db, row.id, sweep.arp[ip])
             counts["updated"] += 1
             continue
 
@@ -388,6 +394,32 @@ async def reconcile_subnet(db: AsyncSession, subnet: Subnet, sweep: SweepResult)
 
 
 # ── Reconciliation report (read side) ───────────────────────────────
+
+
+async def record_mac_observation(
+    db: AsyncSession, ip_id: uuid.UUID, mac_address: str | None
+) -> None:
+    """Upsert an observed ``(ip_id, mac)`` into ``ip_mac_history`` (issue #369).
+
+    Called from the ping/ARP sweep + SNMP ARP cross-reference for EVERY MAC
+    observed on the wire — not just when the IPAddress row's canonical
+    ``mac_address`` is empty. That's what lets the ``unknown_mac_in_static_range``
+    hygiene alert compare the operator-recorded MAC against what's actually
+    answering: a differing recent history row is a squat. Mirrors the router's
+    ``_record_mac_history`` upsert (kept separate to avoid a router→service
+    import cycle). No-op on a missing MAC.
+    """
+    if not mac_address:
+        return
+    await db.execute(
+        text("""
+            INSERT INTO ip_mac_history (id, ip_address_id, mac_address, first_seen, last_seen)
+            VALUES (gen_random_uuid(), :ip_id, CAST(:mac AS macaddr), now(), now())
+            ON CONFLICT (ip_address_id, mac_address)
+            DO UPDATE SET last_seen = now()
+            """),
+        {"ip_id": str(ip_id), "mac": mac_address},
+    )
 
 
 async def build_reconciliation_report(

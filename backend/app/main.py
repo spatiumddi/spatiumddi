@@ -317,6 +317,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dns_query_anomaly_alert_rules()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dns_query_anomaly_alert_rule_seed_skipped", reason=str(exc))
+    # IP-reconciliation hygiene alert rules — free-but-responding /
+    # stale-reservation / unknown-MAC-in-static-range, DISABLED by default
+    # (issue #369). Fire only on installs running subnet discovery.
+    try:
+        from app.services.alerts import seed_ip_hygiene_alert_rules  # noqa: PLC0415
+
+        await seed_ip_hygiene_alert_rules()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("ip_hygiene_alert_rule_seed_skipped", reason=str(exc))
     # Appliance Web UI cert bootstrap (issue #134, Phase 4b.5). On
     # appliance installs without an active row in appliance_certificate,
     # generate a self-signed default + deploy it to /etc/nginx/certs
