@@ -202,12 +202,14 @@ def _reservation_v6(res: dict[str, Any]) -> dict[str, Any]:
     address_family="ipv6")`` in the backend driver.
     """
     out: dict[str, Any] = {}
-    if "hw_address" in res or "mac" in res:
-        out["hw-address"] = res.get("hw_address") or res.get("mac")
-    if "client_id" in res:
-        out["client-id"] = res["client_id"]
-    if "duid" in res:
+    # DHCPv6 clients are identified by DUID (issue #368): when a duid is set we
+    # key the reservation on it and drop hw-address, mirroring the backend
+    # driver. Otherwise fall back to hw-address (matched via the subnet's
+    # host-reservation-identifiers).
+    if res.get("duid"):
         out["duid"] = res["duid"]
+    elif "hw_address" in res or "mac" in res:
+        out["hw-address"] = res.get("hw_address") or res.get("mac")
     addr = res.get("ip_address") or res.get("ip")
     if addr:
         out["ip-addresses"] = [addr]
@@ -216,6 +218,38 @@ def _reservation_v6(res: dict[str, Any]) -> dict[str, Any]:
     opts = _options_from_mapping_v6(res.get("options"))
     if opts:
         out["option-data"] = opts
+    return out
+
+
+def _pd_pool_v6(p: dict[str, Any]) -> dict[str, Any] | None:
+    """Render a DHCPv6 prefix-delegation pool dict (issue #368).
+
+    Mirrors the backend driver's ``_render_pd_pool``. Returns ``None`` on a
+    malformed row so one bad pool can't fail the whole render.
+    """
+    pd_prefix = p.get("pd_prefix")
+    delegated = p.get("delegated_length")
+    if not pd_prefix or not delegated:
+        return None
+    try:
+        net = ipaddress.ip_network(pd_prefix, strict=False)
+    except ValueError:
+        return None
+    out: dict[str, Any] = {
+        "prefix": str(net.network_address),
+        "prefix-len": net.prefixlen,
+        "delegated-len": int(delegated),
+    }
+    excluded = p.get("excluded_prefix")
+    if excluded:
+        try:
+            ex = ipaddress.ip_network(excluded, strict=False)
+            out["excluded-prefix"] = str(ex.network_address)
+            out["excluded-prefix-len"] = ex.prefixlen
+        except ValueError:
+            pass
+    if p.get("class_restriction"):
+        out["client-class"] = p["class_restriction"]
     return out
 
 
@@ -254,6 +288,16 @@ def _scope_to_subnet6(scope: dict[str, Any]) -> dict[str, Any]:
         ]
         if dyn:
             out["pools"] = [{"pool": f"{p['start_ip']} - {p['end_ip']}"} for p in dyn]
+        # Prefix-delegation pools (issue #368) — drop malformed rows.
+        pd = [
+            p
+            for p in (scope.get("pools") or [])
+            if (p.get("pool_type") or "dynamic") == "pd"
+        ]
+        if pd:
+            rendered_pd = [r for r in (_pd_pool_v6(p) for p in pd) if r is not None]
+            if rendered_pd:
+                out["pd-pools"] = rendered_pd
     if serve_options:
         opts = _options_from_mapping_v6(scope.get("options"))
         if opts:
@@ -266,8 +310,8 @@ def _scope_to_subnet6(scope: dict[str, Any]) -> dict[str, Any]:
                 {
                     "ip_address": s["ip_address"],
                     "hw_address": s["mac_address"],
+                    "duid": s.get("duid"),
                     "hostname": s.get("hostname") or "",
-                    "client_id": s.get("client_id"),
                     "options": s.get("options_override"),
                 }
             )
@@ -685,6 +729,9 @@ def render(
     v6_interfaces = list(interfaces) if v6_scopes else []
     dhcp6: dict[str, Any] = {
         "interfaces-config": {"interfaces": v6_interfaces},
+        # Match host reservations on DUID (v6-native, issue #368) then
+        # hw-address. Mirrors the backend Dhcp6 block.
+        "host-reservation-identifiers": ["duid", "hw-address"],
         "control-socket": {
             "socket-type": "unix",
             "socket-name": ctrl6,

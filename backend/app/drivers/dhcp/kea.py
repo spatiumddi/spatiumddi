@@ -12,6 +12,7 @@ for *shape* (valid JSON) and *auditing*, not daemon transport.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 from typing import Any
 
@@ -130,17 +131,47 @@ def _render_pool(pool: PoolDef, *, address_family: str = "ipv4") -> dict[str, An
     return d
 
 
+def _render_pd_pool(pool: PoolDef) -> dict[str, Any] | None:
+    """Render a DHCPv6 prefix-delegation pool (issue #368).
+
+    Kea's ``pd-pools`` entry is ``{"prefix", "prefix-len", "delegated-len"}``
+    plus an optional RFC 6603 ``excluded-prefix`` / ``excluded-prefix-len``.
+    Returns ``None`` (skipped) when the pool is malformed so one bad row can't
+    fail the whole render.
+    """
+    if not pool.pd_prefix or not pool.delegated_length:
+        return None
+    try:
+        net = ipaddress.ip_network(pool.pd_prefix, strict=False)
+    except ValueError:
+        return None
+    d: dict[str, Any] = {
+        "prefix": str(net.network_address),
+        "prefix-len": net.prefixlen,
+        "delegated-len": int(pool.delegated_length),
+    }
+    if pool.excluded_prefix:
+        try:
+            ex = ipaddress.ip_network(pool.excluded_prefix, strict=False)
+            d["excluded-prefix"] = str(ex.network_address)
+            d["excluded-prefix-len"] = ex.prefixlen
+        except ValueError:
+            pass
+    if pool.class_restriction:
+        d["client-class"] = pool.class_restriction
+    return d
+
+
 def _render_reservation(s: StaticAssignmentDef, *, address_family: str = "ipv4") -> dict[str, Any]:
-    # Dhcp6 reservations use ``ip-addresses`` (plural, list) and don't
-    # accept ``hw-address`` as the match key by default — ``duid`` /
-    # ``hw-address`` is configured per-subnet in real deployments. Emit
-    # the minimum viable v6 shape and let the agent / operator layer on
-    # ``host-reservation-identifiers`` via server options.
+    # Dhcp6 reservations use ``ip-addresses`` (plural, list). DHCPv6 clients are
+    # identified by DUID, so when a ``duid`` is set we key the reservation on it
+    # (issue #368); otherwise we fall back to ``hw-address`` (Kea can match it
+    # via the subnet's ``host-reservation-identifiers``).
     if address_family == "ipv6":
-        r: dict[str, Any] = {
-            "hw-address": s.mac_address,
-            "ip-addresses": [s.ip_address],
-        }
+        if s.duid:
+            r: dict[str, Any] = {"duid": s.duid, "ip-addresses": [s.ip_address]}
+        else:
+            r = {"hw-address": s.mac_address, "ip-addresses": [s.ip_address]}
     else:
         r = {
             "hw-address": s.mac_address,
@@ -148,7 +179,7 @@ def _render_reservation(s: StaticAssignmentDef, *, address_family: str = "ipv4")
         }
     if s.hostname:
         r["hostname"] = s.hostname
-    if s.client_id:
+    if s.client_id and address_family != "ipv6":
         r["client-id"] = s.client_id
     if s.options_override:
         r["option-data"] = _render_option_data(s.options_override, address_family=address_family)
@@ -171,6 +202,13 @@ def _render_scope(scope: ScopeDef) -> dict[str, Any]:
         serve_options = True
 
     dynamic_pools = [p for p in scope.pools if p.pool_type == "dynamic"] if serve_addresses else []
+    # DHCPv6 prefix delegation (issue #368) — pd-pools render only on a
+    # stateful v6 subnet6. v4 / stateless / slaac never carry them.
+    pd_pools = (
+        [p for p in scope.pools if p.pool_type == "pd"]
+        if (serve_addresses and af == "ipv6")
+        else []
+    )
     out: dict[str, Any] = {
         # Kea names the CIDR field "subnet" and the pool list "pools" in
         # both Dhcp4 and Dhcp6 modes.
@@ -197,6 +235,12 @@ def _render_scope(scope: ScopeDef) -> dict[str, Any]:
     # Dhcp4 (``subnet4``) and Dhcp6 (``subnet6``) blocks.
     if scope.relay_addresses:
         out["relay"] = {"ip-addresses": list(scope.relay_addresses)}
+    # Prefix-delegation pools (issue #368) — drop malformed rows rather than
+    # failing the whole render.
+    if pd_pools:
+        rendered_pd = [r for r in (_render_pd_pool(p) for p in pd_pools) if r is not None]
+        if rendered_pd:
+            out["pd-pools"] = rendered_pd
     return out
 
 
@@ -296,6 +340,10 @@ class KeaDriver(DHCPDriver):
             out["Dhcp6"] = {
                 "valid-lifetime": bundle.options.lease_time,
                 "interfaces-config": {"interfaces": ["*"]},
+                # Match host reservations on DUID (the v6-native identifier,
+                # issue #368) and hw-address (when the operator only knows the
+                # MAC). Order = match precedence.
+                "host-reservation-identifiers": ["duid", "hw-address"],
                 "lease-database": {
                     "type": "memfile",
                     "persist": True,

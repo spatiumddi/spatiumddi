@@ -6363,10 +6363,14 @@ export interface DHCPPool {
   name: string;
   start_ip: string;
   end_ip: string;
-  pool_type: string; // "dynamic" | "excluded" | "reserved"
+  pool_type: string; // "dynamic" | "excluded" | "reserved" | "pd"
   class_restriction: string | null;
   lease_time_override: number | null;
   options_override: Record<string, unknown> | null;
+  // DHCPv6 prefix delegation (#368) — only set for pool_type === "pd".
+  pd_prefix?: string | null;
+  delegated_length?: number | null;
+  excluded_prefix?: string | null;
   // Populated by create/update only: IPs already allocated inside this
   // range, so the modal can surface a confirmation before overwriting.
   existing_ips_in_range?:
@@ -6388,6 +6392,8 @@ export interface DHCPStaticAssignment {
   hostname: string;
   description: string;
   client_id: string | null;
+  // DHCPv6 DUID (#368) — keys the reservation on a v6 scope.
+  duid?: string | null;
   options_override: Record<string, unknown> | null;
   ip_address_id: string | null;
   created_at: string;

@@ -24,6 +24,16 @@ export function CreatePoolModal({
   const [leaseOverride, setLeaseOverride] = useState(
     pool?.lease_time_override != null ? String(pool.lease_time_override) : "",
   );
+  // DHCPv6 prefix delegation (#368) — only offered on v6 scopes.
+  const isV6 = scope.address_family === "ipv6";
+  const isPd = poolType === "pd";
+  const [pdPrefix, setPdPrefix] = useState(pool?.pd_prefix ?? "");
+  const [delegatedLength, setDelegatedLength] = useState(
+    pool?.delegated_length != null ? String(pool.delegated_length) : "",
+  );
+  const [excludedPrefix, setExcludedPrefix] = useState(
+    pool?.excluded_prefix ?? "",
+  );
   const [error, setError] = useState("");
   const [existingWarning, setExistingWarning] = useState<
     { address: string; status: string; hostname: string }[] | null
@@ -40,14 +50,27 @@ export function CreatePoolModal({
 
   const mut = useMutation({
     mutationFn: () => {
-      const data: Partial<DHCPPool> = {
-        name,
-        start_ip: startIp,
-        end_ip: endIp,
-        pool_type: poolType,
-        class_restriction: classRestriction || null,
-        lease_time_override: leaseOverride ? parseInt(leaseOverride, 10) : null,
-      };
+      const data: Partial<DHCPPool> = isPd
+        ? {
+            name,
+            pool_type: "pd",
+            pd_prefix: pdPrefix,
+            delegated_length: delegatedLength
+              ? parseInt(delegatedLength, 10)
+              : null,
+            excluded_prefix: excludedPrefix || null,
+            class_restriction: classRestriction || null,
+          }
+        : {
+            name,
+            start_ip: startIp,
+            end_ip: endIp,
+            pool_type: poolType,
+            class_restriction: classRestriction || null,
+            lease_time_override: leaseOverride
+              ? parseInt(leaseOverride, 10)
+              : null,
+          };
       return editing
         ? dhcpApi.updatePool(scope.id, pool!.id, data)
         : dhcpApi.createPool(scope.id, data);
@@ -81,22 +104,26 @@ export function CreatePoolModal({
           />
         </Field>
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Start IP">
-            <input
-              className={inputCls}
-              value={startIp}
-              onChange={(e) => setStartIp(e.target.value)}
-              required
-            />
-          </Field>
-          <Field label="End IP">
-            <input
-              className={inputCls}
-              value={endIp}
-              onChange={(e) => setEndIp(e.target.value)}
-              required
-            />
-          </Field>
+          {!isPd && (
+            <>
+              <Field label="Start IP">
+                <input
+                  className={inputCls}
+                  value={startIp}
+                  onChange={(e) => setStartIp(e.target.value)}
+                  required={!isPd}
+                />
+              </Field>
+              <Field label="End IP">
+                <input
+                  className={inputCls}
+                  value={endIp}
+                  onChange={(e) => setEndIp(e.target.value)}
+                  required={!isPd}
+                />
+              </Field>
+            </>
+          )}
           <Field label="Type">
             <select
               className={inputCls}
@@ -106,16 +133,52 @@ export function CreatePoolModal({
               <option value="dynamic">Dynamic</option>
               <option value="excluded">Excluded</option>
               <option value="reserved">Reserved</option>
+              {isV6 && (
+                <option value="pd">Prefix delegation (IA_PD)</option>
+              )}
             </select>
           </Field>
-          <Field label="Lease Time Override (sec)">
-            <input
-              type="number"
-              className={inputCls}
-              value={leaseOverride}
-              onChange={(e) => setLeaseOverride(e.target.value)}
-            />
-          </Field>
+          {isPd && (
+            <>
+              <Field label="Delegatable prefix (CIDR)">
+                <input
+                  className={inputCls}
+                  value={pdPrefix}
+                  onChange={(e) => setPdPrefix(e.target.value)}
+                  placeholder="2001:db8:1::/56"
+                  required={isPd}
+                />
+              </Field>
+              <Field label="Delegated length">
+                <input
+                  type="number"
+                  className={inputCls}
+                  value={delegatedLength}
+                  onChange={(e) => setDelegatedLength(e.target.value)}
+                  placeholder="64"
+                  required={isPd}
+                />
+              </Field>
+              <Field label="Excluded prefix (optional CIDR)">
+                <input
+                  className={inputCls}
+                  value={excludedPrefix}
+                  onChange={(e) => setExcludedPrefix(e.target.value)}
+                  placeholder="2001:db8:1:1::/64"
+                />
+              </Field>
+            </>
+          )}
+          {!isPd && (
+            <Field label="Lease Time Override (sec)">
+              <input
+                type="number"
+                className={inputCls}
+                value={leaseOverride}
+                onChange={(e) => setLeaseOverride(e.target.value)}
+              />
+            </Field>
+          )}
           <Field label="Restrict to Client Class">
             <select
               className={inputCls}

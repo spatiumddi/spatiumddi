@@ -21,6 +21,9 @@ export function CreateStaticAssignmentModal({
     staticAssignment?.description ?? "",
   );
   const [clientId, setClientId] = useState(staticAssignment?.client_id ?? "");
+  // DHCPv6 DUID (#368) — keys the reservation on a v6 scope.
+  const isV6 = scope.address_family === "ipv6";
+  const [duid, setDuid] = useState(staticAssignment?.duid ?? "");
   const [error, setError] = useState("");
 
   const { data: pools = [] } = useQuery({
@@ -40,6 +43,7 @@ export function CreateStaticAssignmentModal({
         hostname,
         description,
         client_id: clientId || null,
+        duid: isV6 ? duid || null : null,
       };
       return editing
         ? dhcpApi.updateStatic(scope.id, staticAssignment!.id, data)
@@ -120,6 +124,19 @@ export function CreateStaticAssignmentModal({
               onChange={(e) => setClientId(e.target.value)}
             />
           </Field>
+          {isV6 && (
+            <Field
+              label="DUID"
+              hint="DHCPv6 identifier — keys the reservation instead of the MAC"
+            >
+              <input
+                className={`${inputCls} font-mono`}
+                value={duid}
+                onChange={(e) => setDuid(e.target.value)}
+                placeholder="00:03:00:01:aa:bb:cc:dd:ee:ff"
+              />
+            </Field>
+          )}
         </div>
         <Field label="Description">
           <input

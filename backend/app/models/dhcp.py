@@ -416,11 +416,24 @@ class DHCPPool(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     start_ip: Mapped[str] = mapped_column(INET, nullable=False)
     end_ip: Mapped[str] = mapped_column(INET, nullable=False)
-    # pool_type: dynamic | excluded | reserved
+    # pool_type: dynamic | excluded | reserved | pd
+    # ``pd`` is a DHCPv6 prefix-delegation pool (issue #368). For ``pd`` pools
+    # start_ip/end_ip are set to the prefix's network address (NOT NULL
+    # placeholders, unused by the renderer); the delegated prefix is described
+    # by the three columns below instead.
     pool_type: Mapped[str] = mapped_column(String(20), nullable=False, default="dynamic")
     class_restriction: Mapped[str | None] = mapped_column(String(255), nullable=True)
     lease_time_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
     options_override: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    # DHCPv6 prefix delegation (issue #368), only for pool_type == "pd".
+    # ``pd_prefix`` is the delegatable prefix as a CIDR (e.g. "2001:db8:1::/56");
+    # ``delegated_length`` is the size of each delegated prefix (e.g. 64, ≥ the
+    # pd_prefix length); ``excluded_prefix`` optionally carves a sub-prefix out
+    # of every delegation (RFC 6603) as a CIDR.
+    pd_prefix: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    delegated_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    excluded_prefix: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Provenance — set by the DHCP configuration importer (issue #129).
     import_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
@@ -448,6 +461,10 @@ class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     ip_address: Mapped[str] = mapped_column(INET, nullable=False)
     mac_address: Mapped[str] = mapped_column(MACADDR, nullable=False)
     client_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # DHCPv6 DUID identifier (issue #368). When set on a v6 scope's
+    # reservation, the Kea driver keys the host reservation on ``duid``
+    # instead of ``hw-address`` (DHCPv6 clients are identified by DUID).
+    duid: Mapped[str | None] = mapped_column(String(255), nullable=True)
     hostname: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     options_override: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

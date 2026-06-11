@@ -45,11 +45,18 @@ class PoolDef:
 
     start_ip: str
     end_ip: str
-    pool_type: str = "dynamic"  # dynamic | excluded | reserved
+    pool_type: str = "dynamic"  # dynamic | excluded | reserved | pd
     name: str = ""
     class_restriction: str | None = None
     lease_time_override: int | None = None
     options_override: dict[str, Any] | None = None
+    # DHCPv6 prefix delegation (issue #368) — only for pool_type == "pd".
+    # ``pd_prefix`` is the delegatable prefix CIDR, ``delegated_length`` the
+    # per-client delegated prefix size, ``excluded_prefix`` an optional
+    # RFC 6603 excluded sub-prefix.
+    pd_prefix: str | None = None
+    delegated_length: int | None = None
+    excluded_prefix: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +68,9 @@ class StaticAssignmentDef:
     hostname: str = ""
     client_id: str | None = None
     options_override: dict[str, Any] | None = None
+    # DHCPv6 DUID (issue #368) — when set on a v6 scope the Kea driver keys
+    # the reservation on ``duid`` instead of ``hw-address``.
+    duid: str | None = None
 
 
 @dataclass(frozen=True)

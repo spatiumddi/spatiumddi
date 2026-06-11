@@ -271,7 +271,7 @@ class ListDHCPPoolsArgs(BaseModel):
     scope_id: str | None = Field(default=None, description="Filter to one DHCP scope by UUID.")
     pool_type: str | None = Field(
         default=None,
-        description="Filter by pool_type: dynamic / excluded / reserved.",
+        description="Filter by pool_type: dynamic / excluded / reserved / pd (v6 prefix delegation).",
     )
     limit: int = Field(default=100, ge=1, le=500)
 
@@ -312,6 +312,11 @@ async def list_dhcp_pools(
             "class_restriction": p.class_restriction,
             "lease_time_override": p.lease_time_override,
             "options_override": p.options_override,
+            # DHCPv6 prefix delegation (issue #368) — populated only on
+            # pool_type == "pd" pools.
+            "pd_prefix": getattr(p, "pd_prefix", None),
+            "delegated_length": getattr(p, "delegated_length", None),
+            "excluded_prefix": getattr(p, "excluded_prefix", None),
         }
         for p in rows
     ]
@@ -367,6 +372,7 @@ async def list_dhcp_statics(
             "ip_address": str(s.ip_address),
             "mac_address": str(s.mac_address),
             "client_id": s.client_id,
+            "duid": getattr(s, "duid", None),
             "hostname": s.hostname,
             "description": s.description,
             "options_override": s.options_override,

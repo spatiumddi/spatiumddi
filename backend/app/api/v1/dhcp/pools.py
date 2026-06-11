@@ -22,17 +22,25 @@ from app.services.dhcp.windows_writethrough import push_pool_change
 
 router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_pool"))])
 
-VALID_POOL_TYPES = {"dynamic", "excluded", "reserved"}
+# ``pd`` = DHCPv6 prefix-delegation pool (issue #368). For a pd pool the
+# start_ip/end_ip range is ignored — the delegation is described by
+# pd_prefix / delegated_length / excluded_prefix instead.
+VALID_POOL_TYPES = {"dynamic", "excluded", "reserved", "pd"}
 
 
 class PoolCreate(BaseModel):
     name: str = ""
-    start_ip: str
-    end_ip: str
+    # Optional for pd pools (derived from pd_prefix); required for v4 ranges.
+    start_ip: str | None = None
+    end_ip: str | None = None
     pool_type: str = "dynamic"
     class_restriction: str | None = None
     lease_time_override: int | None = None
     options_override: dict[str, Any] | None = None
+    # DHCPv6 prefix delegation (issue #368) — only for pool_type == "pd".
+    pd_prefix: str | None = None
+    delegated_length: int | None = None
+    excluded_prefix: str | None = None
 
     @field_validator("pool_type")
     @classmethod
@@ -50,6 +58,9 @@ class PoolUpdate(BaseModel):
     class_restriction: str | None = None
     lease_time_override: int | None = None
     options_override: dict[str, Any] | None = None
+    pd_prefix: str | None = None
+    delegated_length: int | None = None
+    excluded_prefix: str | None = None
 
 
 class PoolResponse(BaseModel):
@@ -62,6 +73,9 @@ class PoolResponse(BaseModel):
     class_restriction: str | None
     lease_time_override: int | None
     options_override: dict[str, Any] | None
+    pd_prefix: str | None = None
+    delegated_length: int | None = None
+    excluded_prefix: str | None = None
     existing_ips_in_range: list[dict[str, str]] | None = None
     created_at: datetime
     modified_at: datetime
@@ -76,6 +90,42 @@ class PoolResponse(BaseModel):
 
 def _ip_int(ip_str: str) -> int:
     return int(ipaddress.IPv4Address(ip_str))
+
+
+def _validate_pd(body: PoolCreate) -> tuple[ipaddress.IPv6Network, str]:
+    """Validate a DHCPv6 prefix-delegation pool (issue #368). Returns the
+    parsed prefix network. 422 on any malformed input."""
+    if not body.pd_prefix or not body.delegated_length:
+        raise HTTPException(
+            status_code=422,
+            detail="pd pools require pd_prefix and delegated_length",
+        )
+    try:
+        net = ipaddress.ip_network(body.pd_prefix, strict=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"invalid pd_prefix: {exc}") from exc
+    if not isinstance(net, ipaddress.IPv6Network):
+        raise HTTPException(status_code=422, detail="pd_prefix must be an IPv6 prefix")
+    dl = int(body.delegated_length)
+    if dl < net.prefixlen or dl > 128:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"delegated_length {dl} must be between the pd_prefix length "
+                f"{net.prefixlen} and 128"
+            ),
+        )
+    if body.excluded_prefix:
+        try:
+            ex = ipaddress.ip_network(body.excluded_prefix, strict=False)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"invalid excluded_prefix: {exc}") from exc
+        if not isinstance(ex, ipaddress.IPv6Network) or not ex.subnet_of(net):
+            raise HTTPException(
+                status_code=422,
+                detail="excluded_prefix must be an IPv6 sub-prefix of pd_prefix",
+            )
+    return net, str(net.network_address)
 
 
 async def _check_pool_overlap(
@@ -139,6 +189,34 @@ async def create_pool(
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
+
+    if body.pool_type == "pd":
+        # DHCPv6 prefix-delegation pool (issue #368). No v4 range / overlap
+        # logic — validate the prefix + delegated length, then store the
+        # prefix network address in start_ip/end_ip (NOT NULL placeholders).
+        net, _start = _validate_pd(body)
+        values = body.model_dump()
+        values["start_ip"] = str(net.network_address)
+        values["end_ip"] = str(net.network_address)
+        pool = DHCPPool(scope_id=scope_id, **values)
+        db.add(pool)
+        await db.flush()
+        collect_wake(dhcp_group_channel(scope.group_id))
+        write_audit(
+            db,
+            user=user,
+            action="create",
+            resource_type="dhcp_pool",
+            resource_id=str(pool.id),
+            resource_display=f"pd {body.pd_prefix} /{body.delegated_length}",
+            new_value=body.model_dump(mode="json"),
+        )
+        await db.commit()
+        await db.refresh(pool)
+        return PoolResponse.model_validate(pool, from_attributes=True)
+
+    if not body.start_ip or not body.end_ip:
+        raise HTTPException(status_code=422, detail="start_ip and end_ip are required")
     overlap = await _check_pool_overlap(db, scope_id, body.start_ip, body.end_ip)
     if overlap:
         raise HTTPException(status_code=409, detail=overlap)
