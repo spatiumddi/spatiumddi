@@ -117,6 +117,7 @@ class SettingsResponse(BaseModel):
     integration_docker_enabled: bool
     integration_proxmox_enabled: bool
     integration_tailscale_enabled: bool
+    integration_unifi_enabled: bool
     integration_cloud_enabled: bool
     integration_opnsense_enabled: bool
     domain_whois_interval_hours: int
@@ -595,6 +596,7 @@ class SettingsUpdate(BaseModel):
     integration_docker_enabled: bool | None = None
     integration_proxmox_enabled: bool | None = None
     integration_tailscale_enabled: bool | None = None
+    integration_unifi_enabled: bool | None = None
     integration_cloud_enabled: bool | None = None
     integration_opnsense_enabled: bool | None = None
     domain_whois_interval_hours: int | None = None

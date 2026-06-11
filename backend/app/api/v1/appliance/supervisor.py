@@ -4453,6 +4453,131 @@ async def k8s_proxy_reply(
     return {"delivered": "true" if delivered else "stale"}
 
 
+# ── Agent-perspective network tools (dashboard-and-remote-nettools) ──
+#
+# Generalizes the k8s-proxy poll/reply pattern above to carry an
+# *already-validated* nettool job instead of a raw kubeapi request. The
+# control plane enqueues a reachability tool (ping / traceroute / dig /
+# port-test / tls-cert) bound for this appliance via
+# ``app.services.appliance.agent_cmd``; the supervisor long-polls here,
+# runs the tool against its local vantage, and POSTs the structured
+# result back. Cert-authed exactly like the k8s-proxy channel.
+#
+# The supervisor-agent side that consumes these endpoints (the poll
+# thread + the local nettool runner) is a separate follow-up; this
+# lands only the backend surface.
+
+
+class NetToolPollResponse(BaseModel):
+    """Long-poll result for the supervisor's nettool channel.
+
+    ``request_id`` + ``tool`` are empty when the poll timed out without
+    a queued command — the supervisor handles that as "no work, poll
+    again". Otherwise the supervisor maps ``tool`` + ``params`` to its
+    local nettool runner (re-validating every field) and posts the
+    result back via ``/supervisor/nettool/reply/{request_id}``.
+
+    ``params`` is the server-validated structured request — NEVER a raw
+    shell string or a pre-joined argv. The supervisor rebuilds the argv
+    from these fields with the same allowlist validators the control
+    plane uses.
+    """
+
+    request_id: str
+    tool: str
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class NetToolReplyRequest(BaseModel):
+    """Supervisor-sent reply after running the dispatched tool locally.
+
+    ``result`` is the JSON body of the matching nettool result model
+    (CommandResult / PortTestResult / TlsCertResult). ``error`` is set
+    instead when the supervisor couldn't run the tool at all (unknown
+    tool / local validation failure) so the control plane surfaces a
+    clean message rather than a malformed body.
+    """
+
+    request_id: str
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+
+@router.post(
+    "/supervisor/nettool/poll",
+    response_model=NetToolPollResponse,
+    summary="Long-poll for the next queued network-tool command",
+)
+async def nettool_poll(request: Request, db: DB) -> NetToolPollResponse:
+    """Supervisor-only endpoint. The supervisor's nettool poll thread
+    holds an outbound long-poll here; when an operator dispatches a
+    reachability tool bound for this appliance, the poll returns
+    immediately. Otherwise it times out after 30 s and the supervisor
+    re-issues.
+
+    Cert auth required — anonymous callers can't intercept queued
+    commands. The queue is keyed by appliance_id, so a misbehaving cert
+    only ever sees its own queue.
+    """
+    from app.services.appliance import agent_cmd as _cmd  # noqa: PLC0415
+
+    appliance = await _require_cert_auth(request, db)
+    queued = await _cmd.pop_command(appliance.id, timeout=30.0)
+    if queued is None:
+        # No command within the timeout — empty shape so the supervisor
+        # loop just re-polls. 200 (not 204) so the supervisor doesn't
+        # special-case "no body".
+        return NetToolPollResponse(request_id="", tool="", params={})
+    return NetToolPollResponse(
+        request_id=queued.request_id,
+        tool=queued.tool,
+        params=queued.params,
+    )
+
+
+@router.post(
+    "/supervisor/nettool/reply/{request_id}",
+    summary="Return a network-tool result to the awaiting operator action",
+)
+async def nettool_reply(
+    request_id: str,
+    body: NetToolReplyRequest,
+    request: Request,
+    db: DB,
+) -> dict[str, str]:
+    """Supervisor-only endpoint. Once the supervisor has run the
+    dispatched tool against its local vantage, it POSTs the structured
+    result here. The backend's in-memory future map matches the
+    request_id + resolves the operator action's pending future.
+
+    Returns 200 either way — late replies (operator already timed out +
+    the future was evicted) are logged + discarded server-side so the
+    supervisor's loop stays simple.
+    """
+    from app.services.appliance import agent_cmd as _cmd  # noqa: PLC0415
+
+    appliance = await _require_cert_auth(request, db)
+    if body.request_id != request_id:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "request_id path/body mismatch",
+        )
+    result = _cmd.NetToolResult(
+        request_id=request_id,
+        result=body.result,
+        error=body.error,
+    )
+    delivered = _cmd.deliver_result(result)
+    logger.info(
+        "appliance.nettool.reply",
+        appliance_id=str(appliance.id),
+        request_id=request_id,
+        has_error=body.error is not None,
+        delivered=delivered,
+    )
+    return {"delivered": "true" if delivered else "stale"}
+
+
 class ApplianceRestartDeploymentRequest(BaseModel):
     """Operator-driven Deployment / DaemonSet rollout-restart.
 

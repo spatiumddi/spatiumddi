@@ -193,7 +193,10 @@ async def integrations_summary(
             label="Proxmox VE",
             enabled=getattr(settings, "integration_proxmox_enabled", False),
             targets=proxmox_targets,
-            display_attr="hostname",
+            # ProxmoxNode has `name`/`host`, not `hostname` — use `name` so the
+            # Integrations dashboard shows the same node label as the IPAM panel
+            # (display_attr="hostname" silently resolved to "" for every node).
+            display_attr="name",
             now=now,
         ),
         _build_panel(

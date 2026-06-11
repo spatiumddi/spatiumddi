@@ -26,16 +26,46 @@ FROM alpine:3.22 AS runtime
 # ``nftables`` stays — the supervisor renders nft drop-ins under
 # ``/etc/nftables.d/`` and exec()s ``nft -f`` to apply (firewall
 # allowlist for the kubeapi-direct CIDRs, role-driven ports).
-RUN apk add --no-cache \
+# dashboard-and-remote-nettools — reachability-tool binaries for the
+# agent-perspective network tools (ping / traceroute / dig). The
+# supervisor's nettool poll thread runs these against the appliance's
+# local vantage when an operator dispatches a tool from the Tools page.
+#   * iputils    — provides the REAL iputils ``ping``. The argv builder
+#                  uses iputils flags (``-n`` numeric, ``-w`` deadline);
+#                  BusyBox's built-in ping lacks ``-n`` and treats
+#                  ``-w`` differently, so iputils MUST override it.
+#   * traceroute — standalone traceroute (BusyBox's lacks the flags).
+#   * bind-tools — provides ``dig`` (Alpine's BIND utils package).
+# port-test + tls-cert are pure-Python (asyncio sockets + ssl +
+# cryptography) and need no binary. mtr + whois are intentionally NOT
+# installed — they stay server-only (mtr needs CAP_NET_RAW + is covered
+# by ping/traceroute; whois hits off-prem infra with no per-vantage
+# meaning), so the control plane never dispatches them to an appliance.
+# ``apk upgrade --no-cache`` runs BEFORE ``apk add`` so the base image's
+# packages (openssl / libcrypto3 / libssl3, …) are pulled forward to their
+# fixed versions — keeps the Trivy HIGH/CRITICAL gate clean. Same pattern as
+# the DNS/DHCP agent images (agent/{dns,dhcp}/images/*/Dockerfile).
+RUN apk upgrade --no-cache \
+ && apk add --no-cache \
       tini su-exec \
       python3 py3-pip \
       nftables libcap \
       ca-certificates tzdata \
+      iputils traceroute bind-tools \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
  && mkdir -p /var/lib/spatium-supervisor \
  && chown -R spatium:spatium /var/lib/spatium-supervisor \
- && setcap cap_net_admin+eip /usr/sbin/nft
+ && setcap cap_net_admin+eip /usr/sbin/nft \
+ && setcap cap_net_raw+ep /usr/bin/traceroute
+# dashboard-and-remote-nettools — traceroute needs a raw socket but
+# Alpine ships it NON-setuid, so the unprivileged ``spatium`` user the
+# entrypoint drops to can't open one without a file cap. ``ping`` is
+# already setuid-root in the iputils package so it needs no setcap.
+# The pod runs privileged (supervisor.yaml securityContext) so
+# CAP_NET_RAW is in the bounding set; the file cap promotes it into the
+# non-root process's effective set. Same pattern as the nft setcap
+# above + the api image's setcap on nmap.
 # ``libcap`` ships ``setcap``; the file cap on /usr/sbin/nft lets the
 # unprivileged ``spatium`` user (issue #170 design) actually exercise
 # the CAP_NET_ADMIN the compose entry requests. Without the file

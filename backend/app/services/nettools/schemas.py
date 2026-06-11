@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Final
+import uuid
+from typing import Final, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -173,6 +174,34 @@ def validate_host_or_cidr(value: str) -> str:
     return validate_host(value)
 
 
+# ── tool vantage target (agent-perspective dispatch) ────────────────
+#
+# The optional ``target`` on a reachability request selects WHERE the
+# tool runs. ``kind="server"`` (the default when ``target`` is omitted)
+# is today's behaviour — the api container runs the tool inline.
+# ``kind="appliance"`` dispatches the (server-re-validated) job to a
+# supervisor-managed Fleet appliance over the existing outbound poll
+# channel and labels the result ``ran_from="appliance:<name>"``.
+#
+# The ``Literal`` already lists ``dns_agent`` / ``dhcp_agent`` so the
+# wire shape is forward-compatible: the DNS / DHCP service-container
+# vantage is a deferred follow-up (the router rejects those kinds until
+# their dispatch path lands), but a client serialising one today won't
+# fail validation. Only ``server`` + ``appliance`` are wired in this PR.
+
+
+class NetToolTarget(BaseModel):
+    """Where to run a reachability tool from.
+
+    ``id`` identifies the appliance (or, later, the DNS/DHCP agent) row
+    when ``kind != "server"``; it's ignored — and may be omitted — for
+    ``kind="server"``.
+    """
+
+    kind: Literal["server", "appliance", "dns_agent", "dhcp_agent"] = "server"
+    id: uuid.UUID | None = None
+
+
 # ── ping / traceroute / mtr ─────────────────────────────────────────
 
 
@@ -180,6 +209,9 @@ class HostRequest(BaseModel):
     """Shared single-host request shape for ping / traceroute / mtr."""
 
     host: str = Field(min_length=1, max_length=253)
+    # Optional run-from vantage. None ⇒ run on the api container (server),
+    # i.e. exactly today's behaviour. See NetToolTarget above.
+    target: NetToolTarget | None = None
 
     @field_validator("host")
     @classmethod
@@ -201,6 +233,11 @@ class CommandResult(BaseModel):
     stdout: str = ""
     stderr: str = ""
     error: str | None = None
+    # Which vantage produced this result. "server" for the api-container
+    # run (the default / back-compatible path); "appliance:<name>" when a
+    # Fleet appliance ran it. The router stamps this after dispatch so the
+    # UI can label the vantage without re-deriving it.
+    ran_from: str = "server"
 
 
 # ── dig ─────────────────────────────────────────────────────────────
@@ -212,6 +249,8 @@ class DigRequest(BaseModel):
     # Optional resolver to query (``@server``). When null dig uses the
     # server's /etc/resolv.conf.
     server: str | None = Field(default=None, max_length=253)
+    # Optional run-from vantage. None ⇒ server. See NetToolTarget.
+    target: NetToolTarget | None = None
 
     @field_validator("name")
     @classmethod
@@ -277,6 +316,8 @@ class PortTestRequest(BaseModel):
     port: int = Field(ge=1, le=65535)
     protocol: str = Field(default="tcp")
     timeout_seconds: float = Field(default=5.0, ge=0.5, le=15.0)
+    # Optional run-from vantage. None ⇒ server. See NetToolTarget.
+    target: NetToolTarget | None = None
 
     @field_validator("host")
     @classmethod
@@ -302,6 +343,8 @@ class PortTestResult(BaseModel):
     state: str
     rtt_ms: float | None = None
     error: str | None = None
+    # See CommandResult.ran_from. "server" default → back-compatible.
+    ran_from: str = "server"
 
 
 # ── TLS certificate inspection ──────────────────────────────────────
@@ -313,6 +356,8 @@ class TlsCertRequest(BaseModel):
     # Optional SNI override; defaults to ``host`` when null.
     server_name: str | None = Field(default=None, max_length=253)
     timeout_seconds: float = Field(default=8.0, ge=0.5, le=15.0)
+    # Optional run-from vantage. None ⇒ server. See NetToolTarget.
+    target: NetToolTarget | None = None
 
     @field_validator("host")
     @classmethod
@@ -345,6 +390,8 @@ class TlsCertResult(BaseModel):
     serial: str | None = None
     signature_algorithm: str | None = None
     error: str | None = None
+    # See CommandResult.ran_from. "server" default → back-compatible.
+    ran_from: str = "server"
 
 
 # ── DNS propagation (reuses the dns_tools helper) ───────────────────
@@ -416,6 +463,7 @@ __all__ = [
     "MacVendorEntry",
     "MacVendorRequest",
     "MacVendorResult",
+    "NetToolTarget",
     "PortTestRequest",
     "PortTestResult",
     "PropagationRequest",

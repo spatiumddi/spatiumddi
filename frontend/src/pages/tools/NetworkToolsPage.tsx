@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
   Award,
@@ -13,11 +14,14 @@ import {
   Wrench,
 } from "lucide-react";
 import {
+  type ApplianceRow,
   type NetToolCommandResult,
   type NetToolMacVendorResult,
   type NetToolPortTestResult,
+  type NetToolTarget,
   type NetToolTlsCertResult,
   type PropagationCheckResult,
+  applianceApprovalApi,
   networkToolsApi,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -43,6 +47,9 @@ interface ToolDef {
   blurb: string;
   /** off-prem tools carry a tighter rate-limit budget on the server */
   offPrem?: boolean;
+  /** the five reachability tools can run from a remote Fleet appliance's
+   *  vantage; everything else is control-plane-server-only. */
+  reachability?: boolean;
 }
 
 const TOOLS: ToolDef[] = [
@@ -51,12 +58,14 @@ const TOOLS: ToolDef[] = [
     label: "Ping",
     icon: Activity,
     blurb: "4 ICMP echoes — reachability + round-trip latency.",
+    reachability: true,
   },
   {
     id: "traceroute",
     label: "Traceroute",
     icon: Route,
     blurb: "Per-hop path to a host (max 20 hops).",
+    reachability: true,
   },
   {
     id: "mtr",
@@ -69,18 +78,21 @@ const TOOLS: ToolDef[] = [
     label: "Dig",
     icon: Search,
     blurb: "DNS query against a record type / resolver.",
+    reachability: true,
   },
   {
     id: "port-test",
     label: "Port test",
     icon: Plug,
     blurb: "TCP / UDP reachability — open / closed / filtered.",
+    reachability: true,
   },
   {
     id: "tls-cert",
     label: "TLS certificate",
     icon: ShieldCheck,
     blurb: "Inspect the cert a host presents — expiry, SAN, issuer.",
+    reachability: true,
   },
   {
     id: "dns-propagation",
@@ -138,11 +150,76 @@ function apiError(e: unknown): string {
   return "Request failed";
 }
 
+/** Map an axios error into operator-friendly copy. When a run was
+ *  dispatched to a Fleet appliance, the supervisor path surfaces its
+ *  own status codes (503 offline / 504 timeout / 502 supervisor error
+ *  / 400 not-allowed / 404 unknown) — translate those to plain English
+ *  and fall back to the normal detail-string handling otherwise. */
+function toolError(e: unknown, ranRemote: boolean): string {
+  const status = (e as { response?: { status?: number } })?.response?.status;
+  if (ranRemote) {
+    if (status === 503) return "Appliance is offline";
+    if (status === 504) return "Timed out waiting for the appliance";
+    if (status === 502) return "Appliance error";
+    if (status === 404) return "Appliance not found";
+    if (status === 400) return apiError(e); // tool-not-allowed reason
+  }
+  return apiError(e);
+}
+
+// ── run-from target ───────────────────────────────────────────────────
+//
+// Mirror the backend's reachability gate (``agent_cmd.appliance_ready``):
+// an appliance is offerable as a run-from target only when it's
+// ``approved`` AND has heartbeated within the staleness window.
+const APPLIANCE_ONLINE_STALE_MS = 90_000;
+
+function applianceOnline(a: ApplianceRow): boolean {
+  if (a.state !== "approved") return false;
+  if (!a.last_seen_at) return false;
+  const seen = Date.parse(a.last_seen_at);
+  if (Number.isNaN(seen)) return false;
+  return Date.now() - seen <= APPLIANCE_ONLINE_STALE_MS;
+}
+
+/** ``undefined`` = run on the control-plane server (back-compat). */
+function buildTarget(selection: string): NetToolTarget | undefined {
+  if (selection === "server") return undefined;
+  return { kind: "appliance", id: selection };
+}
+
 // ── page ──────────────────────────────────────────────────────────────
 
 export function NetworkToolsPage() {
   const [active, setActive] = useState<ToolId>("ping");
+  // ``"server"`` or an appliance id. Default = server (back-compat).
+  const [runFrom, setRunFrom] = useState("server");
   const tool = TOOLS.find((t) => t.id === active)!;
+
+  // Fleet appliances we can dispatch reachability tools to. Cheap +
+  // shared list endpoint; refetch on a short cadence so the online set
+  // tracks heartbeats while the page is open.
+  const { data: appliances } = useQuery({
+    queryKey: ["appliance-approval-list"],
+    queryFn: () => applianceApprovalApi.list(),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+
+  const onlineAppliances = useMemo(
+    () => (appliances ?? []).filter(applianceOnline),
+    [appliances],
+  );
+
+  // If the picked appliance fell offline (or the list changed), fall
+  // back to the server so we never dispatch to a stale target.
+  const selectionValid =
+    runFrom === "server" || onlineAppliances.some((a) => a.id === runFrom);
+  const effectiveRunFrom = selectionValid ? runFrom : "server";
+
+  // Only the reachability tools accept a remote vantage; everything
+  // else is server-only, so they ignore ``effectiveRunFrom`` entirely.
+  const target = tool.reachability ? buildTarget(effectiveRunFrom) : undefined;
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -153,15 +230,22 @@ export function NetworkToolsPage() {
         </div>
         <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
           Stateless ping / traceroute / MTR / dig / whois / port-test / TLS-cert
-          / DNS-propagation / MAC-vendor utilities run from the SpatiumDDI
-          server perspective. Rate-limited per user.
+          / DNS-propagation / MAC-vendor utilities. Reachability tools can run
+          from the control-plane server or a Fleet appliance's vantage;
+          rate-limited per user.
         </p>
       </div>
 
       <div className="flex flex-1 overflow-hidden">
         {/* Left tool picker */}
         <div className="w-60 shrink-0 overflow-auto border-r bg-card/40 p-2">
-          <RunFromSelector />
+          {tool.reachability && (
+            <RunFromSelector
+              value={effectiveRunFrom}
+              onChange={setRunFrom}
+              appliances={onlineAppliances}
+            />
+          )}
           <div className="mt-2 space-y-1">
             {TOOLS.map((t) => {
               const Icon = t.icon;
@@ -202,7 +286,7 @@ export function NetworkToolsPage() {
         {/* Right form + result */}
         <div className="flex-1 overflow-auto p-6">
           <div className="mx-auto max-w-3xl">
-            <ToolPanel key={active} tool={tool} />
+            <ToolPanel key={active} tool={tool} target={target} />
           </div>
         </div>
       </div>
@@ -210,29 +294,49 @@ export function NetworkToolsPage() {
   );
 }
 
-/** Deferred agent-perspective work (#58 follow-up). Render a disabled
- *  selector placeholder so the surface telegraphs the future capability. */
-function RunFromSelector() {
+/** Live run-from selector for the reachability tools — "Server" plus
+ *  every online Fleet appliance. With zero online appliances it still
+ *  offers "Server" and notes that nothing's reachable. */
+function RunFromSelector({
+  value,
+  onChange,
+  appliances,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  appliances: ApplianceRow[];
+}) {
   return (
-    <div className="rounded-md border border-dashed border-border bg-muted/30 p-2">
+    <div className="rounded-md border border-border bg-muted/30 p-2">
       <label className={labelCls}>Run from</label>
       <select
-        disabled
-        className={cn(inputCls, "cursor-not-allowed opacity-60")}
-        title="Agent-perspective runs are coming soon"
+        className={inputCls}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
       >
-        <option>Server</option>
-        <option>Agent… (coming soon)</option>
+        <option value="server">Server (control plane)</option>
+        {appliances.map((a) => (
+          <option key={a.id} value={a.id}>
+            {a.hostname}
+          </option>
+        ))}
       </select>
       <p className="mt-1 text-[10px] leading-tight text-muted-foreground/70">
-        Runs execute from the control-plane server. Per-agent perspective is
-        coming soon.
+        {appliances.length === 0
+          ? "Runs execute from the control-plane server — no appliances online."
+          : "Pick the control plane or a Fleet appliance's vantage point."}
       </p>
     </div>
   );
 }
 
-function ToolPanel({ tool }: { tool: ToolDef }) {
+function ToolPanel({
+  tool,
+  target,
+}: {
+  tool: ToolDef;
+  target?: NetToolTarget;
+}) {
   const Icon = tool.icon;
   return (
     <div className="space-y-4">
@@ -240,13 +344,15 @@ function ToolPanel({ tool }: { tool: ToolDef }) {
         <Icon className="h-5 w-5 text-muted-foreground" />
         <h2 className="text-base font-semibold">{tool.label}</h2>
       </div>
-      {tool.id === "ping" && <CommandTool kind="ping" />}
-      {tool.id === "traceroute" && <CommandTool kind="traceroute" />}
+      {tool.id === "ping" && <CommandTool kind="ping" target={target} />}
+      {tool.id === "traceroute" && (
+        <CommandTool kind="traceroute" target={target} />
+      )}
       {tool.id === "mtr" && <CommandTool kind="mtr" />}
-      {tool.id === "dig" && <DigTool />}
+      {tool.id === "dig" && <DigTool target={target} />}
       {tool.id === "whois" && <WhoisTool />}
-      {tool.id === "port-test" && <PortTestTool />}
-      {tool.id === "tls-cert" && <TlsCertTool />}
+      {tool.id === "port-test" && <PortTestTool target={target} />}
+      {tool.id === "tls-cert" && <TlsCertTool target={target} />}
       {tool.id === "dns-propagation" && <PropagationTool />}
       {tool.id === "mac-vendor" && <MacVendorTool />}
     </div>
@@ -260,6 +366,16 @@ function ErrorBanner({ msg }: { msg: string }) {
     <p className="rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
       {msg}
     </p>
+  );
+}
+
+/** Tiny provenance chip — "ran from: server" / "ran from: appliance:host". */
+function RanFrom({ value }: { value?: string }) {
+  if (!value) return null;
+  return (
+    <span className="inline-flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+      ran from: <span className="font-mono">{value}</span>
+    </span>
   );
 }
 
@@ -302,11 +418,19 @@ function CommandOutput({ res }: { res: NetToolCommandResult }) {
 
 // ── ping / traceroute / mtr ───────────────────────────────────────────
 
-function CommandTool({ kind }: { kind: "ping" | "traceroute" | "mtr" }) {
+function CommandTool({
+  kind,
+  target,
+}: {
+  kind: "ping" | "traceroute" | "mtr";
+  target?: NetToolTarget;
+}) {
   const [host, setHost] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [res, setRes] = useState<NetToolCommandResult | null>(null);
+
+  const ranRemote = target?.kind === "appliance";
 
   const run = async () => {
     if (!host.trim()) {
@@ -314,17 +438,18 @@ function CommandTool({ kind }: { kind: "ping" | "traceroute" | "mtr" }) {
       return;
     }
     setErr(null);
+    setRes(null);
     setBusy(true);
     try {
-      const fn =
+      const out =
         kind === "ping"
-          ? networkToolsApi.ping
+          ? await networkToolsApi.ping(host.trim(), target)
           : kind === "traceroute"
-            ? networkToolsApi.traceroute
-            : networkToolsApi.mtr;
-      setRes(await fn(host.trim()));
+            ? await networkToolsApi.traceroute(host.trim(), target)
+            : await networkToolsApi.mtr(host.trim());
+      setRes(out);
     } catch (e) {
-      setErr(apiError(e));
+      setErr(toolError(e, ranRemote));
     } finally {
       setBusy(false);
     }
@@ -345,14 +470,19 @@ function CommandTool({ kind }: { kind: "ping" | "traceroute" | "mtr" }) {
       </div>
       {err && <ErrorBanner msg={err} />}
       <RunButton busy={busy} onClick={run} label={host || "host"} />
-      {res && <CommandOutput res={res} />}
+      {res && (
+        <div className="space-y-2">
+          <RanFrom value={res.ran_from} />
+          <CommandOutput res={res} />
+        </div>
+      )}
     </div>
   );
 }
 
 // ── dig ───────────────────────────────────────────────────────────────
 
-function DigTool() {
+function DigTool({ target }: { target?: NetToolTarget }) {
   const [name, setName] = useState("");
   const [recordType, setRecordType] = useState("A");
   const [server, setServer] = useState("");
@@ -360,23 +490,29 @@ function DigTool() {
   const [err, setErr] = useState<string | null>(null);
   const [res, setRes] = useState<NetToolCommandResult | null>(null);
 
+  const ranRemote = target?.kind === "appliance";
+
   const run = async () => {
     if (!name.trim()) {
       setErr("Name is required");
       return;
     }
     setErr(null);
+    setRes(null);
     setBusy(true);
     try {
       setRes(
-        await networkToolsApi.dig({
-          name: name.trim(),
-          record_type: recordType,
-          server: server.trim() || null,
-        }),
+        await networkToolsApi.dig(
+          {
+            name: name.trim(),
+            record_type: recordType,
+            server: server.trim() || null,
+          },
+          target,
+        ),
       );
     } catch (e) {
-      setErr(apiError(e));
+      setErr(toolError(e, ranRemote));
     } finally {
       setBusy(false);
     }
@@ -422,7 +558,12 @@ function DigTool() {
       </div>
       {err && <ErrorBanner msg={err} />}
       <RunButton busy={busy} onClick={run} label="dig" />
-      {res && <CommandOutput res={res} />}
+      {res && (
+        <div className="space-y-2">
+          <RanFrom value={res.ran_from} />
+          <CommandOutput res={res} />
+        </div>
+      )}
     </div>
   );
 }
@@ -476,13 +617,15 @@ function WhoisTool() {
 
 // ── port test ─────────────────────────────────────────────────────────
 
-function PortTestTool() {
+function PortTestTool({ target }: { target?: NetToolTarget }) {
   const [host, setHost] = useState("");
   const [port, setPort] = useState("443");
   const [protocol, setProtocol] = useState<"tcp" | "udp">("tcp");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [res, setRes] = useState<NetToolPortTestResult | null>(null);
+
+  const ranRemote = target?.kind === "appliance";
 
   const run = async () => {
     const p = Number(port);
@@ -495,17 +638,21 @@ function PortTestTool() {
       return;
     }
     setErr(null);
+    setRes(null);
     setBusy(true);
     try {
       setRes(
-        await networkToolsApi.portTest({
-          host: host.trim(),
-          port: p,
-          protocol,
-        }),
+        await networkToolsApi.portTest(
+          {
+            host: host.trim(),
+            port: p,
+            protocol,
+          },
+          target,
+        ),
       );
     } catch (e) {
-      setErr(apiError(e));
+      setErr(toolError(e, ranRemote));
     } finally {
       setBusy(false);
     }
@@ -571,6 +718,11 @@ function PortTestTool() {
       <RunButton busy={busy} onClick={run} label="port" />
       {res && (
         <div className="space-y-2 rounded-md border bg-card p-3 text-sm">
+          {res.ran_from && (
+            <div>
+              <RanFrom value={res.ran_from} />
+            </div>
+          )}
           <div className="flex items-center gap-2">
             <span className="font-mono">
               {res.host}:{res.port}/{res.protocol}
@@ -600,13 +752,15 @@ function PortTestTool() {
 
 // ── TLS cert ──────────────────────────────────────────────────────────
 
-function TlsCertTool() {
+function TlsCertTool({ target }: { target?: NetToolTarget }) {
   const [host, setHost] = useState("");
   const [port, setPort] = useState("443");
   const [serverName, setServerName] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [res, setRes] = useState<NetToolTlsCertResult | null>(null);
+
+  const ranRemote = target?.kind === "appliance";
 
   const run = async () => {
     const p = Number(port);
@@ -619,17 +773,21 @@ function TlsCertTool() {
       return;
     }
     setErr(null);
+    setRes(null);
     setBusy(true);
     try {
       setRes(
-        await networkToolsApi.tlsCert({
-          host: host.trim(),
-          port: p,
-          server_name: serverName.trim() || null,
-        }),
+        await networkToolsApi.tlsCert(
+          {
+            host: host.trim(),
+            port: p,
+            server_name: serverName.trim() || null,
+          },
+          target,
+        ),
       );
     } catch (e) {
-      setErr(apiError(e));
+      setErr(toolError(e, ranRemote));
     } finally {
       setBusy(false);
     }
@@ -669,7 +827,12 @@ function TlsCertTool() {
       </div>
       {err && <ErrorBanner msg={err} />}
       <RunButton busy={busy} onClick={run} label="cert" />
-      {res && <TlsCertCard res={res} />}
+      {res && (
+        <div className="space-y-2">
+          <RanFrom value={res.ran_from} />
+          <TlsCertCard res={res} />
+        </div>
+      )}
     </div>
   );
 }
