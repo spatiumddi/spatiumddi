@@ -231,13 +231,14 @@ class FindControlPlaneVipArgs(BaseModel):
 @register_tool(
     name="find_control_plane_vip",
     description=(
-        "Read the cluster-wide MetalLB control-plane VIP config "
-        "(superadmin only, #272 Phase 7c). Returns whether MetalLB is "
-        "enabled, the L2 address pool, and the floating VIP that fronts "
-        "the Web UI across control-plane nodes. Read-only — changing the "
-        "VIP is a high-blast-radius operation (it can sever Web UI / "
-        "agent reachability) and is done in Fleet → Control plane, not "
-        "via the Copilot."
+        "Read the cluster-wide MetalLB VIP config (superadmin only, "
+        "#272). Returns whether MetalLB is enabled, the L2 address pool, "
+        "the floating control-plane VIP that fronts the Web UI across "
+        "control-plane nodes, and the data-plane resolver VIPs (DNS :53 "
+        "and DHCP relay :67, #272 Phase 10). Read-only — changing a VIP "
+        "is a high-blast-radius operation (it can sever Web UI / agent / "
+        "resolver reachability) and is done in Fleet → Control plane, "
+        "not via the Copilot."
     ),
     args_model=FindControlPlaneVipArgs,
     category="admin",
@@ -255,11 +256,19 @@ async def find_control_plane_vip(
         await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
     ).scalar_one_or_none()
     if row is None:
-        return {"enabled": False, "pool_addresses": [], "control_plane_vip": ""}
+        return {
+            "enabled": False,
+            "pool_addresses": [],
+            "control_plane_vip": "",
+            "dns_vip": "",
+            "dhcp_relay_vip": "",
+        }
     return {
         "enabled": bool(row.metallb_enabled),
         "pool_addresses": list(row.metallb_pool_addresses or []),
         "control_plane_vip": row.control_plane_vip or "",
+        "dns_vip": row.dns_vip or "",
+        "dhcp_relay_vip": row.dhcp_relay_vip or "",
     }
 
 
@@ -412,6 +421,87 @@ async def find_cluster_health(
             "tolerates_node_loss": max(0, (member_count - 1) // 2),
         },
         "nodes": nodes,
+    }
+
+
+# ── find_etcd_snapshots ────────────────────────────────────────────
+
+
+class FindEtcdSnapshotsArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="find_etcd_snapshots",
+    description=(
+        "List recoverable etcd snapshots reported by the appliance "
+        "control-plane seed (superadmin only, #272 Phase 9b). Returns "
+        "each snapshot's name / node / size / creation time, plus any "
+        "in-flight restore state. Use to answer 'what etcd snapshots can "
+        "we recover from?' or 'is a restore running?'. Read-only — a "
+        "restore is a destructive single-node cluster-reset and is done "
+        "in Fleet → Control plane, never via the Copilot."
+    ),
+    args_model=FindEtcdSnapshotsArgs,
+    category="admin",
+    default_enabled=True,
+    module="appliance.cluster",
+)
+async def find_etcd_snapshots(
+    db: AsyncSession, user: User, args: FindEtcdSnapshotsArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+    from app.models.appliance import (  # noqa: PLC0415
+        APPLIANCE_STATE_APPROVED,
+        CLUSTER_ROLE_PRIMARY,
+    )
+
+    # Resolve the seed: prefer the etcd primary, else the lone
+    # control-plane-variant appliance (single-node, pre-promote).
+    seed = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    Appliance.cluster_role == CLUSTER_ROLE_PRIMARY,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if seed is None:
+        seed = (
+            (
+                await db.execute(
+                    select(Appliance)
+                    .where(
+                        Appliance.state == APPLIANCE_STATE_APPROVED,
+                        Appliance.appliance_variant.in_(
+                            ("control-plane", "full-stack", "frontend-core")
+                        ),
+                        Appliance.last_seen_at.is_not(None),
+                    )
+                    .order_by(Appliance.created_at.asc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+    if seed is None:
+        return {
+            "available": False,
+            "snapshots": [],
+            "note": "No appliance control-plane seed found (docker / k8s control plane).",
+        }
+    return {
+        "available": True,
+        "seed_hostname": seed.hostname,
+        "snapshots": list(seed.etcd_snapshots or []),
+        "desired_restore_snapshot": seed.desired_restore_snapshot,
+        "restore_state": seed.restore_state,
+        "restore_reason": seed.restore_reason,
     }
 
 

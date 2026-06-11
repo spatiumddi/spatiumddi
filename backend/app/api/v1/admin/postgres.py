@@ -181,6 +181,73 @@ async def postgres_overview(db: DB, _: SuperAdmin) -> OverviewResponse:
     )
 
 
+class SchemaHealthResponse(BaseModel):
+    """Alembic schema-head divergence (#272 follow-up).
+
+    ``status`` is ``ok`` (DB at the head this image expects),
+    ``behind`` (a migration is pending — the migrate Job hasn't run the
+    new head yet, the real-world failure mode on a cold multi-node boot
+    or a bundled image that's behind), or ``error`` (couldn't read the
+    head / alembic_version). The readiness probe already gates pod
+    membership on this; surfacing it here gives operators a non-502 way
+    to see *why* a fresh install or rolling upgrade is mid-converge."""
+
+    status: str  # "ok" | "behind" | "error"
+    expected_head: str | None = None
+    db_revision: str | None = None
+    detail: str
+
+
+@router.get("/postgres/schema-health", response_model=SchemaHealthResponse)
+async def postgres_schema_health(db: DB, _: SuperAdmin) -> SchemaHealthResponse:
+    """Compare the DB's ``alembic_version`` against the alembic head this
+    api image bundles. Reuses the readiness probe's cached head reader so
+    there's a single source of truth for "is the schema where this image
+    expects it?". Cheap — the head is read+cached once, then it's one
+    ``SELECT version_num``."""
+    from app.api.health import _expected_alembic_head  # noqa: PLC0415
+
+    expected, head_err = _expected_alembic_head()
+    if head_err is not None:
+        return SchemaHealthResponse(
+            status="error", expected_head=None, db_revision=None, detail=head_err
+        )
+    try:
+        row = (await db.execute(text("SELECT version_num FROM alembic_version"))).first()
+    except Exception as exc:  # noqa: BLE001 — surface, never 500 the panel
+        return SchemaHealthResponse(
+            status="error",
+            expected_head=expected,
+            db_revision=None,
+            detail=f"could not read alembic_version: {exc}",
+        )
+    actual = str(row[0]) if row else None
+    if actual is None:
+        return SchemaHealthResponse(
+            status="error",
+            expected_head=expected,
+            db_revision=None,
+            detail="alembic_version table is empty (migrations never ran)",
+        )
+    if actual != expected:
+        return SchemaHealthResponse(
+            status="behind",
+            expected_head=expected,
+            db_revision=actual,
+            detail=(
+                f"DB schema is at {actual}; this api image expects {expected}. "
+                "A migration is pending — the migrate Job should advance it "
+                "(cold-boot / mid-rolling-upgrade window)."
+            ),
+        )
+    return SchemaHealthResponse(
+        status="ok",
+        expected_head=expected,
+        db_revision=actual,
+        detail=f"Schema at head {expected}.",
+    )
+
+
 @router.get("/postgres/tables", response_model=TableSizesResponse)
 async def postgres_table_sizes(
     db: DB,

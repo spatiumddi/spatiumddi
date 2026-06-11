@@ -46,6 +46,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-reboot-agent.path \
             spatiumddi-cluster-join.path \
             spatiumddi-cluster-leave.path \
+            spatiumddi-cluster-restore.path \
             spatiumddi-publish-k3s-token.service \
             k3s.service \
             spatiumddi-snmp-reload.path \
@@ -286,6 +287,10 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-cluster-join.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-cluster-join.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-cluster-leave.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-cluster-leave.service"
+# #272 Phase 9b — guided etcd-restore host runner (single-node cluster-reset).
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-cluster-restore"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-cluster-restore.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-cluster-restore.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-publish-k3s-token.service"
 
 # Issue #276 — spatium-etc-render runs in the sysinit phase (it must

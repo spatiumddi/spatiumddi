@@ -724,3 +724,29 @@ class PlatformSettings(Base):
     control_plane_vip: Mapped[str] = mapped_column(
         String(64), nullable=False, default="", server_default=sa_text("''")
     )
+
+    # ── Data-plane resolver VIPs (issue #272 Phase 10) ──────────────
+    # Same cluster-wide singleton + same MetalLB pool as the control-
+    # plane VIP. Both default empty = the single-node hostNetwork data
+    # plane (no VIP), and both require ``metallb_enabled`` + a value
+    # inside ``metallb_pool_addresses`` that differs from every other
+    # VIP. The seed supervisor applies them on heartbeat (same desired-
+    # state path as ``control_plane_vip``): it writes ``dns.useMetalLBVIP``
+    # / ``dns.vip`` / ``dhcpKea.relayVIP`` onto the spatiumddi-appliance
+    # HelmChartConfig overlay, and helm-controller flips the resolver
+    # Pods off hostNetwork behind an L2 LoadBalancer Service.
+    #
+    # ``dns_vip`` — one floating :53 resolver IP that follows whichever
+    # node is up (bind9 / powerdns drop hostNetwork and sit behind the
+    # LoadBalancer Service). Empty = each node answers on its own IP.
+    #
+    # ``dhcp_relay_vip`` — fronts the relay→server unicast forward on
+    # :67 so a DHCP relay's ``forward-to`` target outlives a single Kea
+    # node. Kea KEEPS hostNetwork:67 for direct-attached broadcast reach
+    # — this VIP does NOT replace client-facing :67. Empty = no relay VIP.
+    dns_vip: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=sa_text("''")
+    )
+    dhcp_relay_vip: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=sa_text("''")
+    )

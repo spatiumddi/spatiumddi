@@ -485,6 +485,22 @@ def heartbeat_once(
                 log.warning("supervisor.watchdog.crashed", error=str(exc))
         if _cached_role_health:
             body["role_health"] = _cached_role_health
+
+        # #272 Phase 9b — report the seed's etcd snapshot inventory (read
+        # from the k3s ETCDSnapshotFile CRs over the kubeapi, no host k3s
+        # binary needed) so Fleet can show recoverable snapshots without an
+        # operator SSH. Seed-only: the kubeapi read on a non-control-plane
+        # node 403s / returns [] (the helper swallows it). Plus the
+        # guided-restore .state sidecar, so the backend can settle the
+        # desired snapshot once the runner reports ``done``.
+        if appliance_state.detect_appliance_variant() == "control-plane":
+            from . import k8s_api  # noqa: PLC0415
+
+            body["etcd_snapshots"] = k8s_api.list_etcd_snapshots()
+        restore_state, restore_reason = appliance_state.read_cluster_restore_state()
+        if restore_state is not None:
+            body["restore_state"] = restore_state
+            body["restore_reason"] = restore_reason
     url_path = "/api/v1/appliance/supervisor/heartbeat"
     # #272 — cluster members POST to the in-cluster api Service; remote
     # agents to their configured CONTROL_PLANE_URL. See
@@ -716,6 +732,19 @@ def heartbeat_once(
         if appliance_state.maybe_fire_cluster_leave(desired_cluster_role):
             log.info("supervisor.heartbeat.cluster_leave_trigger_fired")
 
+    # #272 Phase 9b — guided etcd restore. The backend stamps
+    # ``desired_restore_snapshot`` only on the seed row (after a superadmin
+    # + typed-hostname confirm), so this fires only on the seed. The
+    # host-side spatium-cluster-restore runner does the destructive
+    # cluster-reset; collect() ships the .state sidecar back so the backend
+    # clears the desired-state once it lands ``done``.
+    restore_snapshot = body_out.get("desired_restore_snapshot")
+    if appliance_state.maybe_fire_cluster_restore(restore_snapshot):  # type: ignore[arg-type]
+        log.warning(
+            "supervisor.heartbeat.cluster_restore_trigger_fired",
+            snapshot=restore_snapshot,
+        )
+
     # #277 — scale the CNPG postgres cluster + control-plane workload
     # replicas to the committed member count. Only the SEED acts (the
     # spatium-control HelmChart lives there; on members the GET 404s and
@@ -788,6 +817,24 @@ def heartbeat_once(
             )
         elif bs_err:
             log.warning("supervisor.heartbeat.metallb_overrides_failed", error=bs_err)
+
+        # #272 Phase 10 — data-plane resolver VIPs. Patches
+        # dns.useMetalLBVIP / dns.vip / dhcpKea.relayVIP onto the
+        # spatiumddi-appliance HelmChartConfig (a no-op merge until the
+        # chart exists, i.e. until a DNS/DHCP role is assigned somewhere).
+        dns_vip = body_out.get("desired_dns_vip") or ""
+        relay_vip = body_out.get("desired_dhcp_relay_vip") or ""
+        dp_changed, dp_err = k8s_api.apply_dataplane_vip_overrides(
+            dns_vip=str(dns_vip), dhcp_relay_vip=str(relay_vip)
+        )
+        if dp_changed:
+            log.info(
+                "supervisor.heartbeat.dataplane_vip_overrides_applied",
+                dns_vip=dns_vip,
+                dhcp_relay_vip=relay_vip,
+            )
+        elif dp_err:
+            log.warning("supervisor.heartbeat.dataplane_vip_overrides_failed", error=dp_err)
 
         # #272 Phase 9 — dead-node replacement. The seed deletes each k8s
         # Node the backend flagged for eviction (deleting the Node makes

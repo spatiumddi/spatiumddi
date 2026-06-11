@@ -769,6 +769,33 @@ class Appliance(Base):
         Boolean, nullable=False, default=False, server_default=sa.text("false")
     )
 
+    # ── #272 Phase 9b — etcd snapshot inventory + guided restore ─────
+    # The SEED (primary) reports its local ``k3s etcd-snapshot list`` on
+    # every heartbeat so the Fleet tab can show recoverable snapshots
+    # without an operator SSH. Each entry:
+    #   {"name", "location", "size" (bytes, int|null), "created_at" (ISO)}.
+    # Populated only on the primary row; member / application rows stay [].
+    etcd_snapshots: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa.text("'[]'::jsonb")
+    )
+    # The snapshot the operator asked to restore (its ``name`` from the
+    # inventory). Stamped by ``POST …/control-plane/restore`` on the seed
+    # row; the seed supervisor reads it on heartbeat and fires the
+    # destructive host-side ``spatium-cluster-restore`` trigger (guarded
+    # by a confirm marker). NULL except while a restore is in flight; the
+    # heartbeat handler clears it once the runner reports ``done``.
+    #
+    # ⚠️ A restore is a single-node cluster-reset: k3s collapses to a
+    # 1-member etcd from the snapshot and every OTHER control-plane node
+    # is orphaned and must be re-paired (Replace flow). Disaster recovery
+    # only — never a routine op.
+    desired_restore_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Supervisor-reported progress of the in-flight restore:
+    # ``restoring`` | ``done`` | ``failed`` | NULL (idle), read from the
+    # host runner's ``.state`` sidecar (mirrors ``cluster_join_state``).
+    restore_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    restore_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

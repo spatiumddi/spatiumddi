@@ -1,0 +1,179 @@
+#!/bin/bash
+# spatium-cluster-restore — host-side k3s etcd restore runner
+# (#272 Phase 9b).
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │ ⚠️  THE MOST DESTRUCTIVE host runner. It runs                     │
+# │ ``k3s server --cluster-reset --cluster-reset-restore-path=…``,   │
+# │ which COLLAPSES the cluster to a single-member etcd restored     │
+# │ from the snapshot. Every OTHER control-plane node is ORPHANED    │
+# │ (it still references the old etcd cluster) and must be re-paired  │
+# │ via the Fleet Replace flow afterwards. Disaster recovery only —  │
+# │ never a routine operation. UNVALIDATED on a multi-node cluster;  │
+# │ shake out on throwaway VMs before trusting it in the field.      │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# Flow (mirrors spatium-cluster-join):
+#   1. Operator picks a snapshot in Fleet → Control plane and confirms
+#      (superadmin + typed seed hostname) → backend stamps
+#      desired_restore_snapshot on the seed row.
+#   2. The seed supervisor's heartbeat picks it up + writes the trigger
+#      file via its release-state bind mount:
+#        /var/lib/spatiumddi/release-state/cluster-restore-pending
+#        (2 lines: confirm marker, snapshot name)
+#   3. The spatiumddi-cluster-restore.path unit notices the file + runs
+#      this script as root.
+#   4. This script reset-restores etcd, writes the cluster-restore.state
+#      sidecar (state<TAB>reason) the supervisor reads back + reports,
+#      and renames the trigger to .done / .failed so the .path unit
+#      doesn't re-fire.
+#
+# k3s restore model: with k3s stopped, ``k3s server --cluster-reset
+# --cluster-reset-restore-path=<file>`` rebuilds etcd as a fresh
+# 1-member cluster from the snapshot and exits; a normal
+# ``systemctl start k3s`` then brings the restored single-node cluster
+# up. We only restore from a LOCAL snapshot file (S3 restore is a
+# follow-up); a snapshot whose file isn't on this node is refused.
+
+set -uo pipefail
+
+RELEASE_STATE=/var/lib/spatiumddi/release-state
+TRIGGER="$RELEASE_STATE/cluster-restore-pending"
+STATE="$RELEASE_STATE/cluster-restore.state"
+
+# Guardrail confirmation marker. This script is fired by a systemd .path
+# unit watching the trigger file — so a stray / leftover / hand-touched
+# file could otherwise reset the cluster by accident. The supervisor
+# stamps this magic first line into every trigger it writes; we refuse
+# to act on any trigger whose first line isn't an exact match. Must stay
+# byte-identical to _CLUSTER_RESTORE_CONFIRM in the supervisor's
+# appliance_state.py.
+RESTORE_CONFIRM="SPATIUMDDI-CLUSTER-RESTORE-CONFIRM-V1"
+
+K3S_SERVER_DIR=/var/lib/rancher/k3s/server
+SNAP_DIR="$K3S_SERVER_DIR/db/snapshots"
+
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/cluster-restore.log"
+READY_TIMEOUT=240  # seconds to wait for the node to report Ready
+
+mkdir -p "$LOG_DIR" "$RELEASE_STATE"
+
+log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" | tee -a "$LOG"; }
+
+# State sidecar the supervisor reads (state<TAB>reason). Keep the
+# vocabulary in lock-step with the supervisor's appliance_state.py +
+# the backend's restore_state handling: restoring | done | failed.
+write_state() { printf '%s\t%s\n' "$1" "${2:-}" > "$STATE"; }
+
+# Reap orphaned containerd-shims + reset the systemd start counter before
+# a (re)start — identical rationale to spatium-cluster-join's helper
+# (k3s stop leaves shims behind; rapid restarts trip StartLimitBurst).
+clean_k3s_runtime() {
+    systemctl reset-failed k3s 2>/dev/null || true
+    pkill -9 -f 'containerd-shim' 2>/dev/null || true
+    pkill -9 -f 'k3s/data' 2>/dev/null || true
+    awk '$2 ~ "/var/lib/kubelet/pods|/run/k3s|/var/lib/rancher/k3s" {print $2}' /proc/mounts \
+        | sort -r | while read -r m; do umount "$m" 2>/dev/null || true; done
+}
+
+require_appliance() {
+    if [ ! -f /etc/spatiumddi/role-config ]; then
+        log "not a SpatiumDDI appliance (no role-config) — refusing"
+        exit 0
+    fi
+    if ! command -v k3s >/dev/null 2>&1; then
+        log "k3s not installed — refusing"
+        exit 0
+    fi
+}
+
+wait_ready() {
+    local deadline=$(( $(date +%s) + READY_TIMEOUT )) node
+    node="$(hostname)"
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if k3s kubectl get node "$node" \
+                -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' \
+                2>/dev/null | grep -q True; then
+            return 0
+        fi
+        sleep 5
+    done
+    return 1
+}
+
+do_restore() {
+    if [ ! -f "$TRIGGER" ]; then
+        log "restore invoked without a trigger file — nothing to do"
+        exit 0
+    fi
+    local confirm snapshot
+    confirm="$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')"
+    snapshot="$(sed -n '2p' "$TRIGGER" | tr -d '\r\n')"
+
+    # Guardrail — refuse anything not stamped by the supervisor.
+    if [ "$confirm" != "$RESTORE_CONFIRM" ]; then
+        log "restore trigger missing confirmation marker (got: '${confirm:-<empty>}') — refusing, not touching k3s"
+        mv -f "$TRIGGER" "${TRIGGER}.rejected.$(date +%s)" || true
+        exit 0
+    fi
+
+    # Sanitise the snapshot name: a bare filename only, no path traversal.
+    # The supervisor sources it from the ETCDSnapshotFile CR, but this is
+    # the file we feed to a root k3s invocation — defend in depth.
+    if [ -z "$snapshot" ] || printf '%s' "$snapshot" | grep -q '[/]'; then
+        log "invalid snapshot name ('${snapshot:-<empty>}') — refusing"
+        write_state failed "invalid snapshot name"
+        mv -f "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" || true
+        exit 1
+    fi
+
+    local snap_path="$SNAP_DIR/$snapshot"
+    if [ ! -f "$snap_path" ]; then
+        log "snapshot file not found locally: $snap_path (S3 restore unsupported in v1)"
+        write_state failed "snapshot not found on this node: $snapshot"
+        mv -f "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" || true
+        exit 1
+    fi
+
+    log "RESTORE: resetting cluster to single-node etcd from $snapshot"
+    write_state restoring "$snapshot"
+
+    systemctl stop k3s || true
+    clean_k3s_runtime
+
+    # One-shot reset-restore. k3s rebuilds etcd as a 1-member cluster from
+    # the snapshot and EXITS (it is NOT the long-running server here); a
+    # normal ``systemctl start k3s`` afterwards brings the restored cluster
+    # up. We capture its output to the log for forensics.
+    if k3s server \
+            --cluster-reset \
+            --cluster-reset-restore-path="$snap_path" >>"$LOG" 2>&1; then
+        log "cluster-reset-restore completed — restarting k3s"
+    else
+        log "cluster-reset-restore FAILED — see $LOG; attempting to restart k3s as-is"
+        clean_k3s_runtime
+        systemctl start k3s || true
+        write_state failed "k3s --cluster-reset-restore failed; cluster left as-is"
+        mv -f "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" || true
+        exit 1
+    fi
+
+    clean_k3s_runtime
+    if systemctl start k3s && wait_ready; then
+        log "RESTORE ok — single-node cluster is Ready on the restored snapshot."
+        log "NOTE: other control-plane members are now orphaned — re-pair them via Fleet → Replace."
+        write_state done "$snapshot"
+        mv -f "$TRIGGER" "${TRIGGER}.done.$(date +%s)" || true
+        exit 0
+    fi
+
+    log "RESTORE: k3s did not come Ready after restore — manual recovery needed"
+    write_state failed "k3s not Ready after restore"
+    mv -f "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" || true
+    exit 1
+}
+
+require_appliance
+do_restore

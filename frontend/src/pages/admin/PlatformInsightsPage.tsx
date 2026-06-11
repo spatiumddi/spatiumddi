@@ -115,6 +115,14 @@ function PostgresPanel() {
     queryFn: () => postgresApi.slowQueries(20),
     refetchInterval: 60_000,
   });
+  // #272 follow-up — alembic schema-head divergence (cold-boot / rolling
+  // upgrade visibility). Polls a touch faster than the rest so a pending
+  // migration clears from the banner soon after the migrate Job runs.
+  const schema = useQuery({
+    queryKey: ["pg-schema-health"],
+    queryFn: () => postgresApi.schemaHealth(),
+    refetchInterval: 15_000,
+  });
 
   const ov: PostgresOverview | undefined = overview.data;
 
@@ -162,6 +170,57 @@ function PostgresPanel() {
           icon={HardDrive}
         />
       </div>
+
+      {/* #272 follow-up — alembic schema-head divergence. Compact OK row;
+        prominent banner when behind / errored (the actionable cases). */}
+      {schema.data &&
+        (schema.data.status === "ok" ? (
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <ShieldCheck className="h-3.5 w-3.5 text-emerald-500" />
+            Schema at alembic head{" "}
+            <span className="font-mono">{schema.data.expected_head}</span>.
+          </div>
+        ) : (
+          <div
+            className={cn(
+              "rounded-md border p-3",
+              schema.data.status === "behind"
+                ? "border-amber-500/40 bg-amber-500/5"
+                : "border-rose-500/40 bg-rose-500/5",
+            )}
+          >
+            <div
+              className={cn(
+                "flex items-center gap-2 text-sm font-medium",
+                schema.data.status === "behind"
+                  ? "text-amber-800 dark:text-amber-300"
+                  : "text-rose-800 dark:text-rose-300",
+              )}
+            >
+              <AlertTriangle className="h-4 w-4" />
+              {schema.data.status === "behind"
+                ? "Database schema is behind this image"
+                : "Schema-head check failed"}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {schema.data.detail}
+            </p>
+            <div className="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-xs">
+              <div>
+                <span className="text-muted-foreground">Image expects</span>{" "}
+                <span className="font-mono">
+                  {schema.data.expected_head ?? "—"}
+                </span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">DB revision</span>{" "}
+                <span className="font-mono">
+                  {schema.data.db_revision ?? "—"}
+                </span>
+              </div>
+            </div>
+          </div>
+        ))}
 
       {ov?.longest_transaction && (
         <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3">

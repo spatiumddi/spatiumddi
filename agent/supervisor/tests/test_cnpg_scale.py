@@ -83,3 +83,36 @@ def test_rejects_sub_one_size(monkeypatch) -> None:
     assert changed is False
     assert err == "instances < 1"
     assert not rec.calls  # guard short-circuits before any kubeapi call
+
+
+# ── #272 Phase 10 — data-plane VIP overrides (HelmChartConfig render) ──
+
+
+def test_dataplane_vip_overrides_render(monkeypatch) -> None:
+    # No existing HelmChartConfig (404) → create POST carrying the values.
+    rec = _Recorder(404, "")
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    changed, err = k8s_api.apply_dataplane_vip_overrides(
+        dns_vip="192.168.0.242", dhcp_relay_vip="192.168.0.243"
+    )
+
+    assert (changed, err) == (True, None)
+    body = next(json.loads(b) for m, _, b in rec.calls if m == "POST" and b)
+    vals = body["spec"]["valuesContent"]
+    assert "useMetalLBVIP: true" in vals
+    assert 'vip: "192.168.0.242"' in vals
+    assert 'relayVIP: "192.168.0.243"' in vals
+
+
+def test_dataplane_vip_overrides_empty_disables(monkeypatch) -> None:
+    rec = _Recorder(404, "")
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    k8s_api.apply_dataplane_vip_overrides(dns_vip="", dhcp_relay_vip="")
+
+    body = next(json.loads(b) for m, _, b in rec.calls if m == "POST" and b)
+    vals = body["spec"]["valuesContent"]
+    assert "useMetalLBVIP: false" in vals
+    assert 'vip: ""' in vals
+    assert 'relayVIP: ""' in vals
