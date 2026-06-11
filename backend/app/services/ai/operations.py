@@ -479,11 +479,13 @@ def _carve_candidate(
     from app.api.v1.ipam.router import _compute_free_cidrs  # local import — avoid cycle
 
     free = _compute_free_cidrs(str(block.network), occupied, max_results=100_000)
+    chosen: ipaddress.IPv4Network | ipaddress.IPv6Network | None = None
     for fr in free:
         fnet = ipaddress.ip_network(fr["network"], strict=False)
         if fnet.prefixlen <= prefix_len:
-            return next(fnet.subnets(new_prefix=prefix_len))
-    return None
+            chosen = next(fnet.subnets(new_prefix=prefix_len))
+            break
+    return chosen
 
 
 async def _preview_allocate_subnet(
