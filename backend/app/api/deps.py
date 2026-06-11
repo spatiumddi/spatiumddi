@@ -83,6 +83,9 @@ async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> Us
     # caller rolls back, the timestamp rolls with it (acceptable).
     token.last_used_at = now
     await _load_time_bound_grants(db, user)
+    # Stash this token's resource grants (issue #374) so the permission layer
+    # can intersect them with the owner's RBAC. Empty/None = unrestricted.
+    user._api_token_resource_grants = list(token.resource_grants or [])
     return user
 
 

@@ -204,6 +204,9 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 class_restriction=p.class_restriction,
                 lease_time_override=p.lease_time_override,
                 options_override=p.options_override or None,
+                pd_prefix=getattr(p, "pd_prefix", None),
+                delegated_length=getattr(p, "delegated_length", None),
+                excluded_prefix=getattr(p, "excluded_prefix", None),
             )
             for p in sc.pools
         )
@@ -214,6 +217,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 hostname=s.hostname or "",
                 client_id=s.client_id,
                 options_override=s.options_override or None,
+                duid=getattr(s, "duid", None),
             )
             for s in sc.statics
         )

@@ -24,6 +24,7 @@ from app.models.auth import User
 from app.services.ai import operations
 from app.services.ai.operations import (
     AllocateMulticastGroupsArgs,
+    AllocateSubnetArgs,
     ArchiveSessionArgs,
     CreateAlertRuleArgs,
     CreateDHCPStaticArgs,
@@ -122,6 +123,47 @@ async def propose_create_ip_address(
         db,
         user=user,
         operation="create_ip_address",
+        args=args.model_dump(),
+        preview_text=preview.preview_text,
+    )
+    return _proposal_result(proposal, preview_text=preview.preview_text)
+
+
+# ── propose_allocate_subnet ───────────────────────────────────────────
+
+
+@register_tool(
+    name="propose_allocate_subnet",
+    description=(
+        "Prepare a proposal to carve the next free child subnet of a "
+        "given prefix length out of an IP block (e.g. 'allocate a /24 "
+        "from block X'). The operator must explicitly click Apply for "
+        "the subnet to be created. Returns a kind='proposal' payload — "
+        "surface the previewed CIDR to the operator and wait for their "
+        "decision. Never call this twice for the same request without "
+        "operator instruction."
+    ),
+    args_model=AllocateSubnetArgs,
+    writes=False,  # The propose tool itself is read-only; apply is the write.
+    category="ipam",
+)
+async def propose_allocate_subnet(
+    db: AsyncSession, user: User, args: AllocateSubnetArgs
+) -> dict[str, Any]:
+    op = operations.get_operation("allocate_subnet")
+    if op is None:
+        return {"error": "Operation 'allocate_subnet' is not registered"}
+    preview = await op.preview(db, user, args)
+    if not preview.ok:
+        return {
+            "kind": "proposal_rejected",
+            "operation": "allocate_subnet",
+            "detail": preview.detail,
+        }
+    proposal = await _persist_proposal(
+        db,
+        user=user,
+        operation="allocate_subnet",
         args=args.model_dump(),
         preview_text=preview.preview_text,
     )

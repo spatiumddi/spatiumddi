@@ -19,7 +19,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
-from app.core.permissions import require_any_resource_permission
+from app.core.permissions import require_any_resource_permission, token_scope_allows
 from app.drivers.dhcp import is_agentless
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignment
@@ -548,6 +548,20 @@ async def _record_mac_history(db: AsyncSession, ip_id: uuid.UUID, mac_address: s
             """),
         {"ip_id": str(ip_id), "mac": mac_address},
     )
+
+
+def _enforce_subnet_token_scope(user: Any, subnet_id: uuid.UUID) -> None:
+    """403 when a resource-scoped API token (#374) isn't bound to this subnet.
+
+    No-op for sessions / unscoped tokens (``token_scope_allows`` returns True),
+    so normal callers are unaffected — only a subnet-bound token is constrained
+    to its subnet for IP create / edit / delete / next-IP / list operations.
+    """
+    if not token_scope_allows(user, "subnet", subnet_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API token is not scoped to this subnet",
+        )
 
 
 # ── DHCP pool awareness ───────────────────────────────────────────────────────
@@ -3007,6 +3021,14 @@ async def get_available_subnets(
         {"sid": str(block.space_id), "net": str(block.network)},
     )
     existing = [ipaddress.ip_network(str(row[0]), strict=False) for row in result.fetchall()]
+    # Also exclude direct child blocks so this preview agrees with what
+    # POST /blocks/{id}/allocate-subnet actually carves (#372 review) — that
+    # endpoint subtracts child blocks too, so without this the preview could
+    # show a candidate the carve then skips.
+    child_blocks = await db.execute(
+        select(IPBlock.network).where(IPBlock.parent_block_id == block.id)
+    )
+    existing += [ipaddress.ip_network(str(n), strict=False) for (n,) in child_blocks.all()]
 
     available: list[str] = []
     scanned = 0
@@ -3529,6 +3551,15 @@ async def list_subnets(
 
 @router.post("/subnets", response_model=SubnetResponse, status_code=status.HTTP_201_CREATED)
 async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -> Subnet:
+    # A token bound to a specific subnet (#374) manages addresses *within* that
+    # subnet — it cannot mint new subnets. token_scope_allows(..., None) is True
+    # for sessions / unscoped tokens / subnet-wildcard tokens, False only for an
+    # instance-bound subnet token.
+    if not token_scope_allows(current_user, "subnet", None):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API token is bound to a specific subnet and cannot create new subnets",
+        )
     if await db.get(IPSpace, body.space_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
@@ -3722,11 +3753,157 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     return subnet
 
 
+class SubnetAllocate(SubnetCreate):
+    """Body for the atomic carve-and-create endpoint (#372).
+
+    Inherits every optional create field + validator from ``SubnetCreate`` so
+    a carve composes with IPAM templates, DNS/DHCP inheritance, custom fields,
+    etc. ``network`` / ``space_id`` / ``block_id`` are computed by the handler
+    (the network from the free-space scan, the other two from the path block),
+    so they are optional here and ignored if sent.
+    """
+
+    prefix_len: int = Field(
+        ...,
+        ge=1,
+        le=128,
+        description="Prefix length of the subnet to carve — /1-/32 for IPv4 blocks, /1-/128 for IPv6",
+    )
+    network: str = ""
+    space_id: uuid.UUID | None = None  # type: ignore[assignment]
+    block_id: uuid.UUID | None = None  # type: ignore[assignment]
+
+
+@router.post(
+    "/blocks/{block_id}/allocate-subnet",
+    response_model=SubnetResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def allocate_subnet(
+    block_id: uuid.UUID, body: SubnetAllocate, current_user: CurrentUser, db: DB
+) -> Subnet:
+    """Atomically carve a free child CIDR of ``prefix_len`` and create it (#372).
+
+    The automation-facing analog of ``POST /subnets/{id}/next`` for IPs: a
+    single locked call picks a free CIDR and persists the subnet (full
+    ``create_subnet`` side effects — placeholder rows, kind detection, template
+    pre-fill, DNS/DHCP inheritance, audit row). Concurrency-safe — the parent
+    block row is locked ``FOR UPDATE``.
+
+    If the caller passes a specific ``network`` (the operator clicked a
+    candidate in the "Find by size" picker), that exact CIDR is allocated after
+    validating it's a free, in-block, ``prefix_len``-sized child — a concurrent
+    claim of the same CIDR yields a clean ``409``. With no ``network`` the
+    lowest free CIDR of ``prefix_len`` is carved (the Terraform / automation
+    default).
+
+    Returns ``409`` when the chosen / lowest CIDR isn't free, ``422`` for an
+    invalid ``prefix_len`` (≤ the block's own prefix, or > the family max) or a
+    ``network`` that isn't an in-block, correctly-sized child.
+    """
+    # Lock the parent block row so concurrent allocate-subnet calls on the
+    # same block serialize: the second waits until the first commits, then
+    # recomputes free space and picks the next free CIDR.
+    locked = await db.execute(select(IPBlock).where(IPBlock.id == block_id).with_for_update())
+    block = locked.scalar_one_or_none()
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+
+    block_net = ipaddress.ip_network(str(block.network), strict=False)
+    family_max = 32 if block_net.version == 4 else 128
+    if body.prefix_len > family_max:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"prefix_len {body.prefix_len} exceeds max {family_max} for "
+                f"IPv{block_net.version} block"
+            ),
+        )
+    if body.prefix_len <= block_net.prefixlen:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"prefix_len {body.prefix_len} must be greater than block "
+                f"prefix length {block_net.prefixlen}"
+            ),
+        )
+
+    # Free space = block minus its direct child blocks and direct child
+    # subnets (same accounting as GET /blocks/{id}/free-space). _compute_free_cidrs
+    # returns maximal aligned free CIDRs sorted by address, so the first one
+    # large enough to hold a /prefix_len yields the globally-lowest free CIDR.
+    child_blocks = await db.execute(
+        select(IPBlock.network).where(IPBlock.parent_block_id == block.id)
+    )
+    child_subnets = await db.execute(select(Subnet.network).where(Subnet.block_id == block.id))
+    occupied = [str(n) for (n,) in child_blocks.all()] + [str(n) for (n,) in child_subnets.all()]
+    occupied_nets = [ipaddress.ip_network(o, strict=False) for o in occupied]
+
+    chosen: ipaddress.IPv4Network | ipaddress.IPv6Network | None = None
+    if body.network:
+        # Operator picked a specific candidate (the "Find by size" list is
+        # clickable). Validate it's an in-block, correctly-sized, free child;
+        # the block lock + create_subnet's overlap re-check make a concurrent
+        # claim of the same CIDR a clean 409.
+        try:
+            picked = ipaddress.ip_network(body.network, strict=False)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"invalid network: {exc}",
+            ) from exc
+        if picked.version != block_net.version or not picked.subnet_of(block_net):  # type: ignore[arg-type]
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{picked} is not within block {block.network}",
+            )
+        if picked.prefixlen != body.prefix_len:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{picked} is not a /{body.prefix_len}",
+            )
+        if any(picked.overlaps(o) for o in occupied_nets):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"{picked} is already allocated or overlaps an existing block/subnet",
+            )
+        chosen = picked
+    else:
+        # No specific pick — carve the lowest free CIDR. _compute_free_cidrs
+        # returns maximal aligned free CIDRs sorted by address, so the first
+        # one large enough to hold a /prefix_len yields the globally-lowest.
+        free = _compute_free_cidrs(str(block.network), occupied, max_results=100_000)
+        for fr in free:
+            fnet = ipaddress.ip_network(fr["network"], strict=False)
+            if fnet.prefixlen <= body.prefix_len:
+                chosen = next(fnet.subnets(new_prefix=body.prefix_len))
+                break
+        if chosen is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(f"No free /{body.prefix_len} subnet available in block {block.network}"),
+            )
+
+    # Delegate to create_subnet for the full side-effect set + the overlap
+    # re-check inside this still-open transaction (the block row lock is held
+    # through create_subnet's commit, which releases it).
+    create_body = SubnetCreate(
+        **{
+            **body.model_dump(exclude={"prefix_len"}),
+            "network": str(chosen),
+            "space_id": block.space_id,
+            "block_id": block_id,
+        }
+    )
+    return await create_subnet(create_body, current_user, db)
+
+
 @router.get("/subnets/{subnet_id}", response_model=SubnetResponse)
 async def get_subnet(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Subnet:
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
     return subnet
 
 
@@ -3818,6 +3995,7 @@ async def trigger_subnet_discovery(subnet_id: uuid.UUID, current_user: CurrentUs
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
 
     queued = True
     try:
@@ -4097,6 +4275,7 @@ async def update_subnet(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
 
     old_block_id = subnet.block_id
 
@@ -4297,6 +4476,7 @@ async def delete_subnet(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
 
     if not permanent:
         # Soft-delete: cascade-stamp the subnet + its scopes. Non-emptiness
@@ -4579,6 +4759,7 @@ async def resize_subnet_preview(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
     preview = await preview_subnet_resize(
         db,
         subnet,
@@ -4626,6 +4807,7 @@ async def resize_subnet_commit(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
 
     old_snapshot = {
         "network": str(subnet.network),
@@ -5902,6 +6084,7 @@ async def list_addresses(
 ) -> list[IPAddress]:
     if await db.get(Subnet, subnet_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
 
     query = (
         select(IPAddress)
@@ -5938,6 +6121,7 @@ async def create_address(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
 
     # Multicast subnets don't allocate per-IP endpoint rows. Use the
     # multicast group registry under ``/multicast/groups`` instead —
@@ -6070,6 +6254,7 @@ async def get_address(address_id: uuid.UUID, current_user: CurrentUser, db: DB) 
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+    _enforce_subnet_token_scope(current_user, ip.subnet_id)
     return ip
 
 
@@ -6111,6 +6296,7 @@ async def list_mac_history(
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+    _enforce_subnet_token_scope(current_user, ip.subnet_id)
 
     rows = list(
         (
@@ -6153,6 +6339,7 @@ async def update_address(
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+    _enforce_subnet_token_scope(current_user, ip.subnet_id)
 
     # Dynamic-lease mirrors are owned by the DHCP server, not IPAM. Any edit
     # here would be overwritten on the next pull cycle, so refuse outright —
@@ -6326,6 +6513,7 @@ async def list_aliases(address_id: uuid.UUID, current_user: CurrentUser, db: DB)
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
+    _enforce_subnet_token_scope(current_user, ip.subnet_id)
     # Aliases are auto-generated records linked to this IP that aren't the
     # primary forward A (which is stored separately on ip.dns_record_id).
     res = await db.execute(
@@ -6491,6 +6679,7 @@ async def profile_address(
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+    _enforce_subnet_token_scope(current_user, ip.subnet_id)
 
     from app.services.profiling.auto_profile import enqueue_now
 
@@ -6591,6 +6780,7 @@ async def delete_address(
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+    _enforce_subnet_token_scope(current_user, ip.subnet_id)
 
     # Dynamic-lease mirrors are owned by the DHCP server. Deleting one here
     # would just get recreated on the next pull cycle — block it so the user
@@ -6690,6 +6880,7 @@ async def purge_orphans(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
     if not body.ip_ids:
         return {"purged": 0}
     res = await db.execute(
@@ -7228,6 +7419,7 @@ async def preview_next_ip(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
     if subnet.kind == "multicast":
         # No "next available" semantics for multicast — addresses
         # are operator-named stream identities, not endpoint slots.
@@ -7261,6 +7453,7 @@ async def allocate_next_ip(
     subnet = result.unique().scalar_one_or_none()
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
     if subnet.kind == "multicast":
         raise HTTPException(
             status_code=422,
@@ -7879,6 +8072,11 @@ async def bulk_delete_addresses(
         if not body.permanent and ip.status == "orphan":
             skipped.append(ip.id)
             continue
+        # Resource-scoped token (#374): skip IPs outside the token's bound
+        # subnet so a subnet-scoped token can't bulk-delete across subnets.
+        if not token_scope_allows(current_user, "subnet", ip.subnet_id):
+            skipped.append(ip.id)
+            continue
         subnet = await db.get(Subnet, ip.subnet_id)
         if subnet is not None:
             try:
@@ -8065,6 +8263,11 @@ async def bulk_edit_addresses(
             # edit here would be overwritten on the next pull. The UI already
             # blocks these from being selected; this is defence-in-depth.
             if ip.auto_from_lease:
+                skipped.append(ip.id)
+                continue
+            # Resource-scoped token (#374): a subnet-scoped token can't bulk-edit
+            # IPs outside its bound subnet.
+            if not token_scope_allows(current_user, "subnet", ip.subnet_id):
                 skipped.append(ip.id)
                 continue
 

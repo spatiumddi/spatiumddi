@@ -131,8 +131,49 @@ def validate_scopes(scopes: list[str]) -> list[str]:
     return out
 
 
+# Per-token resource-grant vocabulary (issue #374). Only the resource types
+# whose handlers actually enforce token binding are accepted — minting a
+# block-scoped token that isn't enforced would give a false sense of security.
+TOKEN_GRANT_RESOURCE_TYPES: frozenset[str] = frozenset({"subnet", "dns_zone"})
+TOKEN_GRANT_ACTIONS: frozenset[str] = frozenset({"read", "write", "delete", "admin", "*"})
+
+
+def validate_resource_grant_shape(grants: list[dict]) -> list[dict]:
+    """Shape-validate per-token resource grants (issue #374).
+
+    Pure validation — no DB. Each entry must be
+    ``{action, resource_type, resource_id}`` with a known action + an
+    enforced resource_type + a non-empty resource_id. The create handler does
+    the DB-existence + "issuing user must hold this grant" checks on top.
+    """
+    out: list[dict] = []
+    for g in grants:
+        if not isinstance(g, dict):
+            raise ValueError("each resource grant must be an object")
+        action = g.get("action")
+        rtype = g.get("resource_type")
+        rid = g.get("resource_id")
+        if action not in TOKEN_GRANT_ACTIONS:
+            raise ValueError(
+                f"grant action {action!r} invalid; allowed: "
+                f"{', '.join(sorted(TOKEN_GRANT_ACTIONS))}"
+            )
+        if rtype not in TOKEN_GRANT_RESOURCE_TYPES:
+            raise ValueError(
+                f"grant resource_type {rtype!r} invalid; allowed: "
+                f"{', '.join(sorted(TOKEN_GRANT_RESOURCE_TYPES))}"
+            )
+        if not rid or not str(rid).strip():
+            raise ValueError("grant resource_id is required (token must bind to an instance)")
+        out.append({"action": action, "resource_type": rtype, "resource_id": str(rid)})
+    return out
+
+
 __all__ = [
+    "TOKEN_GRANT_ACTIONS",
+    "TOKEN_GRANT_RESOURCE_TYPES",
     "TOKEN_SCOPE_VOCABULARY",
     "scope_matches_request",
+    "validate_resource_grant_shape",
     "validate_scopes",
 ]

@@ -1424,6 +1424,18 @@ export const ipamApi = {
       .then((r) => r.data),
   createSubnet: (data: Partial<Subnet> & { template_id?: string | null }) =>
     api.post<Subnet>("/ipam/subnets", data).then((r) => r.data),
+  // Atomic carve-and-create (#372): pick the lowest free child CIDR of
+  // ``prefix_len`` and create it in one locked call. Race-safe — preferred
+  // over availableSubnets()-then-createSubnet() for the "Find by size" flow.
+  allocateSubnet: (
+    blockId: string,
+    data: { prefix_len: number } & Partial<Subnet> & {
+        template_id?: string | null;
+      },
+  ) =>
+    api
+      .post<Subnet>(`/ipam/blocks/${blockId}/allocate-subnet`, data)
+      .then((r) => r.data),
   updateSubnet: (
     id: string,
     data: Partial<Subnet> & { manage_auto_addresses?: boolean },
@@ -6195,6 +6207,21 @@ export const dhcpApi = {
   deletePool: (_scopeId: string, poolId: string) =>
     api.delete(`/dhcp/pools/${poolId}`),
 
+  // Rogue-DHCP observed responders (#370).
+  listResponders: (groupId: string, classification?: string) =>
+    api
+      .get<DHCPObservedResponder[]>(`/dhcp/groups/${groupId}/responders`, {
+        params: classification ? { classification } : undefined,
+      })
+      .then((r) => r.data),
+  acknowledgeResponder: (groupId: string, responderId: string, note = "") =>
+    api
+      .post<DHCPObservedResponder>(
+        `/dhcp/groups/${groupId}/responders/${responderId}/acknowledge`,
+        { note },
+      )
+      .then((r) => r.data),
+
   listStatics: (scopeId: string, params?: { tag?: string[] }) =>
     api
       .get<DHCPStaticAssignment[]>(`/dhcp/scopes/${scopeId}/statics`, {
@@ -6353,10 +6380,14 @@ export interface DHCPPool {
   name: string;
   start_ip: string;
   end_ip: string;
-  pool_type: string; // "dynamic" | "excluded" | "reserved"
+  pool_type: string; // "dynamic" | "excluded" | "reserved" | "pd"
   class_restriction: string | null;
   lease_time_override: number | null;
   options_override: Record<string, unknown> | null;
+  // DHCPv6 prefix delegation (#368) — only set for pool_type === "pd".
+  pd_prefix?: string | null;
+  delegated_length?: number | null;
+  excluded_prefix?: string | null;
   // Populated by create/update only: IPs already allocated inside this
   // range, so the modal can surface a confirmation before overwriting.
   existing_ips_in_range?:
@@ -6378,10 +6409,26 @@ export interface DHCPStaticAssignment {
   hostname: string;
   description: string;
   client_id: string | null;
+  // DHCPv6 DUID (#368) — keys the reservation on a v6 scope.
+  duid?: string | null;
   options_override: Record<string, unknown> | null;
   ip_address_id: string | null;
   created_at: string;
   modified_at: string;
+}
+
+/** A DHCP server observed answering on a managed segment (#370). */
+export interface DHCPObservedResponder {
+  id: string;
+  group_id: string;
+  server_identifier: string;
+  source_ip: string;
+  source_mac: string | null;
+  giaddr: string | null;
+  offered_ip: string | null;
+  classification: string; // "expected" | "acknowledged" | "rogue"
+  first_seen_at: string;
+  last_seen_at: string;
 }
 
 export interface DHCPClientClass {
@@ -6485,6 +6532,13 @@ export interface DHCPLease {
   // Issue #112 phase 3 — flag from the curated VoIP-phone vendor list.
   // Drives a Phone icon next to the lease's MAC in the lease table.
   is_voip_phone?: boolean;
+  // Fingerbank passive-fingerprinting device classification (#373), joined
+  // from dhcp_fingerprint by MAC. All null/undefined when no fingerprint
+  // exists (fingerprinting off / unconfigured / not-yet-looked-up).
+  device_class?: string | null;
+  device_name?: string | null;
+  device_manufacturer?: string | null;
+  fingerbank_score?: number | null;
 }
 
 export interface PublicAuthProvider {
@@ -6665,6 +6719,8 @@ export interface DNSQueryLogRequest {
   q?: string | null;
   qtype?: string | null;
   client_ip?: string | null;
+  // Exact-match view filter (#371) — seeded by the per-view analytics card.
+  view?: string | null;
   max_events?: number;
 }
 
@@ -6725,6 +6781,8 @@ export interface DNSQueryAnalyticsResponse {
   top_qnames: DNSQueryAnalyticsRow[];
   top_clients: DNSQueryAnalyticsRow[];
   qtype_distribution: DNSQueryAnalyticsRow[];
+  // Per-view query split (#371). Empty for single-view servers.
+  top_views?: DNSQueryAnalyticsRow[];
 }
 
 export const logsApi = {
@@ -6796,6 +6854,13 @@ export const API_TOKEN_SCOPES: {
   },
 ];
 
+/** Per-token resource binding (#374). resource_type ∈ {subnet, dns_zone}. */
+export interface ApiTokenResourceGrant {
+  action: string;
+  resource_type: string;
+  resource_id: string;
+}
+
 export interface ApiToken {
   id: string;
   name: string;
@@ -6803,6 +6868,7 @@ export interface ApiToken {
   prefix: string;
   scope: string;
   scopes: ApiTokenScope[];
+  resource_grants?: ApiTokenResourceGrant[];
   user_id: string | null;
   expires_at: string | null;
   last_used_at: string | null;
@@ -6815,6 +6881,7 @@ export interface ApiTokenCreate {
   description?: string;
   expires_in_days?: number | null;
   scopes?: ApiTokenScope[];
+  resource_grants?: ApiTokenResourceGrant[];
 }
 
 /** Response from POST — contains the raw token ONCE. */

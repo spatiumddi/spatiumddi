@@ -481,6 +481,9 @@ class DNSQueryLogRequest(BaseModel):
     q: str | None = None
     qtype: str | None = None
     client_ip: str | None = None
+    # Exact-match view filter (#371) — seeded by clicking a per-view
+    # analytics card so split-horizon operators can drill into one view.
+    view: str | None = None
     max_events: int = Field(default=200, ge=1, le=1000)
 
 
@@ -520,6 +523,8 @@ async def query_dns_queries(body: DNSQueryLogRequest, db: DB) -> DNSQueryLogResp
         stmt = stmt.where(DNSQueryLogEntry.qtype == body.qtype.upper())
     if body.client_ip:
         stmt = stmt.where(DNSQueryLogEntry.client_ip == body.client_ip)
+    if body.view:
+        stmt = stmt.where(DNSQueryLogEntry.view == body.view)
     if body.q:
         like = f"%{body.q.lower()}%"
         # ILIKE on qname (most common search) and a fallback on raw —
@@ -578,6 +583,9 @@ class DNSQueryAnalyticsResponse(BaseModel):
     top_qnames: list[DNSQueryAnalyticsRow]
     top_clients: list[DNSQueryAnalyticsRow]
     qtype_distribution: list[DNSQueryAnalyticsRow]
+    # Per-view query split (issue #371) — empty for single-view servers; useful
+    # for split-horizon operators to see "which view is taking the load".
+    top_views: list[DNSQueryAnalyticsRow]
 
 
 @router.post("/dns-queries/analytics", response_model=DNSQueryAnalyticsResponse)
@@ -629,6 +637,8 @@ async def query_dns_analytics(body: DNSQueryAnalyticsRequest, db: DB) -> DNSQuer
     # Distribution returns *every* qtype seen, not just top-N — operators
     # want a complete pie of A vs AAAA vs CNAME etc.
     qtype_distribution = await _topn(DNSQueryLogEntry.qtype, 25)
+    # Per-view split (issue #371) — every view seen (small cardinality).
+    top_views = await _topn(DNSQueryLogEntry.view, 25)
 
     return DNSQueryAnalyticsResponse(
         server_id=server.id,
@@ -638,6 +648,7 @@ async def query_dns_analytics(body: DNSQueryAnalyticsRequest, db: DB) -> DNSQuer
         top_qnames=top_qnames,
         top_clients=top_clients,
         qtype_distribution=qtype_distribution,
+        top_views=top_views,
     )
 
 

@@ -31,6 +31,9 @@ class StaticCreate(BaseModel):
     hostname: str = ""
     description: str = ""
     client_id: str | None = None
+    # DHCPv6 DUID (issue #368) — on a v6 scope the reservation is keyed on
+    # this instead of the MAC. The MAC stays required at the model level.
+    duid: str | None = None
     options_override: dict[str, Any] | None = None
     ip_address_id: uuid.UUID | None = None
     tags: dict[str, Any] = Field(default_factory=dict)
@@ -42,6 +45,7 @@ class StaticUpdate(BaseModel):
     hostname: str | None = None
     description: str | None = None
     client_id: str | None = None
+    duid: str | None = None
     options_override: dict[str, Any] | None = None
     ip_address_id: uuid.UUID | None = None
     tags: dict[str, Any] | None = None
@@ -55,6 +59,7 @@ class StaticResponse(BaseModel):
     hostname: str
     description: str
     client_id: str | None
+    duid: str | None = None
     options_override: dict[str, Any] | None
     ip_address_id: uuid.UUID | None
     tags: dict[str, Any] = Field(default_factory=dict)

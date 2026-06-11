@@ -306,6 +306,34 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_firewall_apply_stalled_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("firewall_apply_stalled_alert_rule_seed_skipped", reason=str(exc))
+    # DNS query-anomaly alert rules — NXDOMAIN-spike + query-rate-spike,
+    # singletons, DISABLED by default (issue #371). Discoverable in the
+    # Alerts UI; fire only on agent-based BIND9 installs with metric data.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dns_query_anomaly_alert_rules,
+        )
+
+        await seed_dns_query_anomaly_alert_rules()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_query_anomaly_alert_rule_seed_skipped", reason=str(exc))
+    # IP-reconciliation hygiene alert rules — free-but-responding /
+    # stale-reservation / unknown-MAC-in-static-range, DISABLED by default
+    # (issue #369). Fire only on installs running subnet discovery.
+    try:
+        from app.services.alerts import seed_ip_hygiene_alert_rules  # noqa: PLC0415
+
+        await seed_ip_hygiene_alert_rules()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("ip_hygiene_alert_rule_seed_skipped", reason=str(exc))
+    # Rogue DHCP server alert rule — singleton, DISABLED by default (issue
+    # #370). Fires only on segments running the agent's active DHCP probe.
+    try:
+        from app.services.alerts import seed_rogue_dhcp_alert_rule  # noqa: PLC0415
+
+        await seed_rogue_dhcp_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("rogue_dhcp_alert_rule_seed_skipped", reason=str(exc))
     # Appliance Web UI cert bootstrap (issue #134, Phase 4b.5). On
     # appliance installs without an active row in appliance_certificate,
     # generate a self-signed default + deploy it to /etc/nginx/certs

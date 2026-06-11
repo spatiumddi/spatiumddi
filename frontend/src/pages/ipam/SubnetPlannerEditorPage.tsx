@@ -610,13 +610,15 @@ function PropertiesPanel({
   readOnly: boolean;
   onChange: (patch: Partial<PlanNode>) => void;
 }) {
+  // Canonical group keys (#367) — match the rest of the app so create/edit
+  // invalidations refresh these pickers without a full reload.
   const { data: dnsGroups = [] } = useQuery({
-    queryKey: ["dns", "groups"],
+    queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
     staleTime: 5 * 60 * 1000,
   });
   const { data: dhcpGroups = [] } = useQuery({
-    queryKey: ["dhcp", "groups"],
+    queryKey: ["dhcp-groups"],
     queryFn: () => dhcpApi.listGroups(),
     staleTime: 5 * 60 * 1000,
   });

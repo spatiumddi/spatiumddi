@@ -32,11 +32,13 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, select
 
 from app.api.deps import DB, CurrentUser
-from app.core.permissions import is_effective_superadmin
+from app.core.permissions import is_effective_superadmin, user_has_permission
 from app.core.security import generate_api_token
 from app.models.audit import AuditLog
 from app.models.auth import APIToken
-from app.services.api_token_scopes import validate_scopes
+from app.models.dns import DNSZone
+from app.models.ipam import Subnet
+from app.services.api_token_scopes import validate_resource_grant_shape, validate_scopes
 
 router = APIRouter()
 
@@ -56,6 +58,16 @@ class ApiTokenCreate(BaseModel):
     # Coarse-grained scope vocabulary — see issue #74 +
     # ``app.services.api_token_scopes``. Empty = no restriction.
     scopes: list[str] = Field(default_factory=list)
+    # Per-token resource binding (issue #374). Each entry is
+    # ``{action, resource_type, resource_id}``; resource_type ∈ {subnet,
+    # dns_zone}. Empty = no resource restriction. Validated against the
+    # issuing user's RBAC + resource existence in the create handler.
+    resource_grants: list[dict] = Field(default_factory=list)
+
+    @field_validator("resource_grants")
+    @classmethod
+    def _validate_grant_shape(cls, v: list[dict]) -> list[dict]:
+        return validate_resource_grant_shape(v)
 
     @field_validator("expires_in_days")
     @classmethod
@@ -80,6 +92,7 @@ class ApiTokenResponse(BaseModel):
     prefix: str
     scope: str
     scopes: list[str] = Field(default_factory=list)
+    resource_grants: list[dict] = Field(default_factory=list)
     user_id: uuid.UUID | None
     expires_at: datetime | None
     last_used_at: datetime | None
@@ -87,6 +100,12 @@ class ApiTokenResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @field_validator("resource_grants", mode="before")
+    @classmethod
+    def _grants_default(cls, v: object) -> list[dict]:
+        # The column is nullable; surface NULL as an empty list on the wire.
+        return v if isinstance(v, list) else []
 
 
 class ApiTokenCreateResponse(ApiTokenResponse):
@@ -119,6 +138,40 @@ class ApiTokenUpdate(BaseModel):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+
+_GRANT_RESOURCE_MODELS = {"subnet": Subnet, "dns_zone": DNSZone}
+
+
+async def _validate_resource_grants(db: DB, current_user: CurrentUser, grants: list[dict]) -> None:
+    """Issue #374 create-time checks beyond the shape validator: every grant's
+    ``resource_id`` must exist, and the issuing user must already hold the
+    grant (you cannot mint a token more powerful than yourself). Raises 422 /
+    403 respectively.
+    """
+    import uuid as _uuid  # noqa: PLC0415
+
+    for g in grants:
+        rtype = g["resource_type"]
+        rid = g["resource_id"]
+        model = _GRANT_RESOURCE_MODELS[rtype]
+        try:
+            obj = await db.get(model, _uuid.UUID(str(rid)))
+        except (ValueError, AttributeError):
+            obj = None
+        if obj is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{rtype} {rid} not found",
+            )
+        if not user_has_permission(current_user, g["action"], rtype, rid):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"You don't hold '{g['action']}' on {rtype} {rid}; a token "
+                    "cannot grant more than its creator."
+                ),
+            )
 
 
 def _resolve_expiry(body: ApiTokenCreate) -> datetime | None:
@@ -158,6 +211,8 @@ async def create_token(
     # entropy to be useful to an attacker.
     display_prefix = raw[:10]
     expires_at = _resolve_expiry(body)
+    # Resource grants (#374): existence + "can't exceed yourself" checks.
+    await _validate_resource_grants(db, current_user, body.resource_grants)
     token = APIToken(
         name=body.name,
         description=body.description,
@@ -165,6 +220,7 @@ async def create_token(
         prefix=display_prefix,
         scope="user",
         scopes=body.scopes,
+        resource_grants=body.resource_grants or None,
         user_id=current_user.id,
         created_by_user_id=current_user.id,
         expires_at=expires_at,
@@ -186,6 +242,7 @@ async def create_token(
                 "prefix": display_prefix,
                 "expires_at": expires_at.isoformat() if expires_at else None,
                 "scopes": body.scopes,
+                "resource_grants": body.resource_grants,
             },
         )
     )
@@ -198,6 +255,7 @@ async def create_token(
         "prefix": token.prefix,
         "scope": token.scope,
         "scopes": token.scopes,
+        "resource_grants": token.resource_grants or [],
         "user_id": token.user_id,
         "expires_at": token.expires_at,
         "last_used_at": token.last_used_at,

@@ -4,8 +4,11 @@ import { Copy, Eye, EyeOff, Plus, Power, PowerOff, Trash2 } from "lucide-react";
 import {
   apiTokensApi,
   API_TOKEN_SCOPES,
+  dnsApi,
+  ipamApi,
   type ApiToken,
   type ApiTokenCreated,
+  type ApiTokenResourceGrant,
   type ApiTokenScope,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
@@ -53,7 +56,43 @@ function CreateTokenModal({
   const [expiryMode, setExpiryMode] = useState<"days" | "never">("days");
   const [days, setDays] = useState<number>(90);
   const [scopes, setScopes] = useState<ApiTokenScope[]>([]);
+  // Optional per-token resource binding (#374): bind to one subnet or DNS zone.
+  const [bindType, setBindType] = useState<"none" | "subnet" | "dns_zone">(
+    "none",
+  );
+  const [bindAction, setBindAction] = useState<"read" | "write" | "admin">(
+    "write",
+  );
+  const [bindGroupId, setBindGroupId] = useState("");
+  const [bindResourceId, setBindResourceId] = useState("");
   const [error, setError] = useState<string | null>(null);
+
+  const subnetsQ = useQuery({
+    queryKey: ["subnets"],
+    queryFn: () => ipamApi.listSubnets(),
+    enabled: bindType === "subnet",
+  });
+  const dnsGroupsQ = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: dnsApi.listGroups,
+    enabled: bindType === "dns_zone",
+  });
+  const zonesQ = useQuery({
+    queryKey: ["dns-zones", bindGroupId],
+    queryFn: () => dnsApi.listZones(bindGroupId),
+    enabled: bindType === "dns_zone" && !!bindGroupId,
+  });
+
+  const resourceGrants: ApiTokenResourceGrant[] =
+    bindType !== "none" && bindResourceId
+      ? [
+          {
+            action: bindAction,
+            resource_type: bindType,
+            resource_id: bindResourceId,
+          },
+        ]
+      : [];
 
   const mut = useMutation({
     mutationFn: () =>
@@ -62,6 +101,7 @@ function CreateTokenModal({
         description,
         expires_in_days: expiryMode === "never" ? null : days,
         scopes,
+        resource_grants: resourceGrants,
       }),
     onSuccess: (token) => {
       qc.invalidateQueries({ queryKey: ["api-tokens"] });
@@ -172,6 +212,87 @@ function CreateTokenModal({
                 </span>
               </label>
             ))}
+          </div>
+        </Field>
+        <Field
+          label="Bind to a resource (optional)"
+          hint="Restrict this token to a single subnet or DNS zone — a leaked CI secret can't touch anything else. The binding can never exceed your own permissions."
+        >
+          <div className="space-y-1.5">
+            <select
+              className={inputCls}
+              value={bindType}
+              onChange={(e) => {
+                setBindType(e.target.value as "none" | "subnet" | "dns_zone");
+                setBindResourceId("");
+                setBindGroupId("");
+              }}
+            >
+              <option value="none">No resource binding</option>
+              <option value="subnet">Subnet</option>
+              <option value="dns_zone">DNS zone</option>
+            </select>
+            {bindType !== "none" && (
+              <select
+                className={inputCls}
+                value={bindAction}
+                onChange={(e) =>
+                  setBindAction(e.target.value as "read" | "write" | "admin")
+                }
+              >
+                <option value="read">read</option>
+                <option value="write">write</option>
+                <option value="admin">admin</option>
+              </select>
+            )}
+            {bindType === "subnet" && (
+              <select
+                className={inputCls}
+                value={bindResourceId}
+                onChange={(e) => setBindResourceId(e.target.value)}
+              >
+                <option value="">Select a subnet…</option>
+                {(subnetsQ.data ?? []).map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.network}
+                    {s.name ? ` — ${s.name}` : ""}
+                  </option>
+                ))}
+              </select>
+            )}
+            {bindType === "dns_zone" && (
+              <>
+                <select
+                  className={inputCls}
+                  value={bindGroupId}
+                  onChange={(e) => {
+                    setBindGroupId(e.target.value);
+                    setBindResourceId("");
+                  }}
+                >
+                  <option value="">Select a DNS group…</option>
+                  {(dnsGroupsQ.data ?? []).map((g) => (
+                    <option key={g.id} value={g.id}>
+                      {g.name}
+                    </option>
+                  ))}
+                </select>
+                {bindGroupId && (
+                  <select
+                    className={inputCls}
+                    value={bindResourceId}
+                    onChange={(e) => setBindResourceId(e.target.value)}
+                  >
+                    <option value="">Select a zone…</option>
+                    {(zonesQ.data ?? []).map((z) => (
+                      <option key={z.id} value={z.id}>
+                        {z.name}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </>
+            )}
           </div>
         </Field>
         {error && (
@@ -373,6 +494,19 @@ export function ApiTokensPage() {
                     <td className="px-3 py-2 font-mono text-xs">{t.prefix}…</td>
                     <td className="px-3 py-2">
                       <ScopeChips scopes={t.scopes} />
+                      {t.resource_grants && t.resource_grants.length > 0 && (
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {t.resource_grants.map((g, i) => (
+                            <span
+                              key={i}
+                              className="rounded bg-violet-100 px-1.5 py-0.5 text-[10px] font-medium text-violet-700 dark:bg-violet-900/30 dark:text-violet-300"
+                              title={`Bound to ${g.resource_type} ${g.resource_id} (${g.action})`}
+                            >
+                              {g.action}:{g.resource_type}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </td>
                     <td className="px-3 py-2 text-xs">
                       {t.expires_at ? (

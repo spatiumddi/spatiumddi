@@ -333,7 +333,8 @@ type GroupTab =
   | "classes"
   | "option-templates"
   | "mac-blocks"
-  | "phone-profiles";
+  | "phone-profiles"
+  | "responders";
 
 function GroupDetailView({
   group,
@@ -489,6 +490,12 @@ function GroupDetailView({
             >
               Phone Profiles
             </TabButton>
+            <TabButton
+              active={tab === "responders"}
+              onClick={() => setTab("responders")}
+            >
+              Responders
+            </TabButton>
           </div>
         </div>
       )}
@@ -518,6 +525,105 @@ function GroupDetailView({
         {isKea && tab === "phone-profiles" && (
           <PhoneProfilesTab groupId={group.id} />
         )}
+        {isKea && tab === "responders" && <RespondersTab groupId={group.id} />}
+      </div>
+    </div>
+  );
+}
+
+// Rogue-DHCP observed responders (#370). Lists DHCP servers the active probe
+// saw answering on this group's segments + lets the operator acknowledge a
+// known-but-external one (allowlists it so the rogue alert auto-resolves).
+function RespondersTab({ groupId }: { groupId: string }) {
+  const qc = useQueryClient();
+  const { data: responders = [], isFetching } = useQuery({
+    queryKey: ["dhcp-responders", groupId],
+    queryFn: () => dhcpApi.listResponders(groupId),
+  });
+  const ack = useMutation({
+    mutationFn: (id: string) => dhcpApi.acknowledgeResponder(groupId, id),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["dhcp-responders", groupId] }),
+  });
+  const badge = (c: string) =>
+    c === "rogue"
+      ? "bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300"
+      : c === "acknowledged"
+        ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300"
+        : "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300";
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground">
+        DHCP servers seen answering on this group's segments by the active probe
+        (enable <code>DHCP_ROGUE_PROBE_ENABLED=1</code> on the agent). Unknown
+        responders classify <span className="text-rose-600">rogue</span> and
+        fire the Rogue DHCP alert — acknowledge a known-but-external one to
+        allowlist it.
+      </p>
+      <div className="rounded-lg border overflow-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b bg-muted/30 text-xs">
+              <th className="px-3 py-2 text-left font-medium">Source IP</th>
+              <th className="px-3 py-2 text-left font-medium">Server ID</th>
+              <th className="px-3 py-2 text-left font-medium">MAC</th>
+              <th className="px-3 py-2 text-left font-medium">Offered</th>
+              <th className="px-3 py-2 text-left font-medium">Class</th>
+              <th className="px-3 py-2 text-left font-medium">Last seen</th>
+              <th className="px-3 py-2 text-right font-medium">Actions</th>
+            </tr>
+          </thead>
+          <tbody className={zebraBodyCls}>
+            {responders.length === 0 && (
+              <tr>
+                <td
+                  colSpan={7}
+                  className="p-6 text-center text-sm text-muted-foreground"
+                >
+                  {isFetching ? "Loading…" : "No responders observed."}
+                </td>
+              </tr>
+            )}
+            {responders.map((r) => (
+              <tr key={r.id} className="border-b last:border-0">
+                <td className="px-3 py-1.5 font-mono text-xs">{r.source_ip}</td>
+                <td className="px-3 py-1.5 font-mono text-xs">
+                  {r.server_identifier}
+                </td>
+                <td className="px-3 py-1.5 font-mono text-xs">
+                  {r.source_mac || "—"}
+                </td>
+                <td className="px-3 py-1.5 font-mono text-xs">
+                  {r.offered_ip || "—"}
+                </td>
+                <td className="px-3 py-1.5">
+                  <span
+                    className={cn(
+                      "rounded-full px-2 py-0.5 text-xs",
+                      badge(r.classification),
+                    )}
+                  >
+                    {r.classification}
+                  </span>
+                </td>
+                <td className="px-3 py-1.5 text-xs text-muted-foreground">
+                  {new Date(r.last_seen_at).toLocaleString()}
+                </td>
+                <td className="px-3 py-1.5 text-right">
+                  {r.classification === "rogue" && (
+                    <button
+                      onClick={() => ack.mutate(r.id)}
+                      disabled={ack.isPending}
+                      className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                    >
+                      Acknowledge
+                    </button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </div>
   );
@@ -1580,6 +1686,7 @@ function OptionTemplatesTab({ groupId }: { groupId: string }) {
 function LeasesTab({ server }: { server: DHCPServer }) {
   const [state, setState] = useState<string>("");
   const [subnetId, setSubnetId] = useState<string>("");
+  const [deviceClass, setDeviceClass] = useState<string>("");
   const limit = 500;
 
   const { data: subnets = [] } = useQuery({
@@ -1593,9 +1700,17 @@ function LeasesTab({ server }: { server: DHCPServer }) {
   });
 
   const allLeases = data ?? [];
+  // Distinct fingerbank device classes present in the current result set —
+  // drives the device-class filter (#373), same client-side style as state/subnet.
+  const deviceClasses = Array.from(
+    new Set(
+      allLeases.map((l) => l.device_class).filter((c): c is string => !!c),
+    ),
+  ).sort();
   const leases = allLeases.filter((l) => {
     if (state && l.state !== state) return false;
     if (subnetId && l.scope_id !== subnetId) return false;
+    if (deviceClass && l.device_class !== deviceClass) return false;
     return true;
   });
 
@@ -1625,6 +1740,21 @@ function LeasesTab({ server }: { server: DHCPServer }) {
             </option>
           ))}
         </select>
+        {deviceClasses.length > 0 && (
+          <select
+            className="rounded-md border bg-background px-2 py-1 text-xs"
+            value={deviceClass}
+            onChange={(e) => setDeviceClass(e.target.value)}
+            title="Filter by fingerbank device class"
+          >
+            <option value="">All device classes</option>
+            {deviceClasses.map((c) => (
+              <option key={c} value={c}>
+                {c}
+              </option>
+            ))}
+          </select>
+        )}
         <button
           onClick={() => refetch()}
           className="ml-auto flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
@@ -1641,6 +1771,7 @@ function LeasesTab({ server }: { server: DHCPServer }) {
               <th className="px-3 py-2 text-left font-medium">IP</th>
               <th className="px-3 py-2 text-left font-medium">MAC</th>
               <th className="px-3 py-2 text-left font-medium">Hostname</th>
+              <th className="px-3 py-2 text-left font-medium">Device</th>
               <th className="px-3 py-2 text-left font-medium">State</th>
               <th className="px-3 py-2 text-left font-medium">Expires</th>
               <th className="px-3 py-2 text-left font-medium">Last Seen</th>
@@ -1650,7 +1781,7 @@ function LeasesTab({ server }: { server: DHCPServer }) {
             {leases.length === 0 && (
               <tr>
                 <td
-                  colSpan={6}
+                  colSpan={7}
                   className="p-6 text-center text-sm text-muted-foreground"
                 >
                   {isFetching ? "Loading…" : "No leases."}
@@ -1686,6 +1817,32 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                       )}
                     </td>
                     <td className="px-3 py-1.5">{l.hostname || "—"}</td>
+                    <td className="px-3 py-1.5 text-xs">
+                      {l.device_class ? (
+                        <span
+                          title={
+                            [
+                              l.device_name,
+                              l.device_manufacturer,
+                              l.fingerbank_score != null
+                                ? `score ${l.fingerbank_score}`
+                                : null,
+                            ]
+                              .filter(Boolean)
+                              .join(" · ") || undefined
+                          }
+                        >
+                          {l.device_class}
+                          {l.device_name && (
+                            <span className="block text-[11px] text-muted-foreground">
+                              {l.device_name}
+                            </span>
+                          )}
+                        </span>
+                      ) : (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </td>
                     <td className="px-3 py-1.5">
                       <span
                         className={cn(

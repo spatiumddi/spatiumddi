@@ -20,7 +20,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel, dns_server_channel
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
-from app.core.permissions import require_any_resource_permission
+from app.core.permissions import require_any_resource_permission, token_scope_allows
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import CLOUD_DNS_DRIVERS, is_agentless
 from app.drivers.dns.windows import test_winrm_credentials
@@ -4094,6 +4094,7 @@ async def list_records(
     tag: list[str] = Query(default_factory=list),
 ) -> list[DNSRecord]:
     await _require_zone(group_id, zone_id, db)
+    _enforce_zone_token_scope(_, zone_id)
     stmt = (
         select(DNSRecord)
         .where(DNSRecord.zone_id == zone_id)
@@ -4117,6 +4118,7 @@ async def create_record(
     current_user: CurrentUser,
 ) -> DNSRecord:
     zone = await _require_zone(group_id, zone_id, db)
+    _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
     await _check_driver_gated_record_type(body.record_type, group_id, db)
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
@@ -4175,6 +4177,7 @@ async def update_record(
     current_user: CurrentUser,
 ) -> DNSRecord:
     record = await _require_record(group_id, zone_id, record_id, db)
+    _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "edit")
     zone = await db.get(DNSZone, record.zone_id)
     changes = body.model_dump(exclude_none=True)
@@ -4237,6 +4240,7 @@ async def delete_record(
     window won't see a serial bump round trip first.
     """
     record = await _require_record(group_id, zone_id, record_id, db)
+    _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "delete")
 
     if not permanent:
@@ -4869,6 +4873,20 @@ async def _require_view(group_id: uuid.UUID, view_id: uuid.UUID, db: DB) -> DNSV
     if not view:
         raise HTTPException(status_code=404, detail="View not found")
     return view
+
+
+def _enforce_zone_token_scope(user: Any, zone_id: uuid.UUID) -> None:
+    """403 when a resource-scoped API token (#374) isn't bound to this DNS zone.
+
+    No-op for sessions / unscoped tokens — only a zone-bound token is
+    constrained, so record list / create / edit / delete in any other zone
+    403s while its own zone works.
+    """
+    if not token_scope_allows(user, "dns_zone", zone_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API token is not scoped to this DNS zone",
+        )
 
 
 async def _require_zone(group_id: uuid.UUID, zone_id: uuid.UUID, db: DB) -> DNSZone:

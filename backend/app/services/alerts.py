@@ -41,10 +41,17 @@ from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN, ASNRpkiRoa
 from app.models.audit import AuditLog
 from app.models.circuit import Circuit
-from app.models.dhcp import DHCPLease, DHCPPool, DHCPScope, DHCPServer
+from app.models.dhcp import (
+    DHCPLease,
+    DHCPObservedResponder,
+    DHCPPool,
+    DHCPScope,
+    DHCPServer,
+)
 from app.models.dns import DNSServer, DNSZone
 from app.models.domain import Domain
-from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.models.ipam import IPAddress, IPBlock, IpMacHistory, Subnet
+from app.models.metrics import DNSMetricSample
 from app.models.network_service import NetworkService, NetworkServiceResource
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Site
@@ -134,6 +141,48 @@ RULE_TYPE_SECRET_EXPIRING = "secret_expiring"
 # segment for retirement and forgot" failure mode.
 RULE_TYPE_DECOM_EXPIRING = "decom_expiring"
 
+# DNS query-behaviour anomalies — issue #371. Subject = dns_server. Evaluated
+# on the 60 s tick against the per-server ``dns_metric_sample`` rcode deltas
+# the agents already report (no new collection). Both reuse the generic
+# AlertRule int columns instead of a bespoke window column:
+#   * ``dns_nxdomain_spike`` — fires when, over the trailing window, a server's
+#     NXDOMAIN ratio (nxdomain ÷ queries_total) reaches ``threshold_percent``
+#     AND the absolute NXDOMAIN count reaches ``min_free_addresses`` (the
+#     low-traffic guard, so a server answering 3 queries / 2 NXDOMAIN doesn't
+#     page). Catches DGA beacons / broken-client search-domain storms.
+#   * ``dns_query_rate_spike`` — fires when the trailing window's query total
+#     exceeds the prior equal-length window by ``threshold_percent`` AND clears
+#     the ``min_free_addresses`` absolute floor (so tiny servers don't page on
+#     a 3→9 query "300% spike"). A cold prior window counts as a spike once the
+#     floor is cleared.
+# The window itself is a fixed module constant (not operator-tunable in v1) —
+# same approach as the firewall / transition rules' fixed grace windows.
+RULE_TYPE_DNS_NXDOMAIN_SPIKE = "dns_nxdomain_spike"
+RULE_TYPE_DNS_QUERY_RATE_SPIKE = "dns_query_rate_spike"
+
+# Active IP reconciliation hygiene alerts — issue #369. Subject = ip_address.
+# Reuse the on-the-wire liveness signal (IPAddress.last_seen_at) the discovery
+# sweep + SNMP poll already write + the ip_mac_history observation log; no new
+# collectors. The window for each is ``threshold_days`` (reused).
+#   * ip_free_but_responding — an 'available' row that answered within the last
+#     threshold_days (default 1). "IPAM says free, host is up."
+#   * stale_reservation — a 'reserved'/'static_dhcp' row last seen > threshold_days
+#     ago (default 90). The gap stale_ip_count deliberately leaves (allocated-only).
+#   * unknown_mac_in_static_range — a 'reserved'/'static_dhcp' row whose
+#     ip_mac_history holds a recently-observed (≤ threshold_days, default 7) MAC
+#     differing from the recorded one — a squat.
+RULE_TYPE_IP_FREE_BUT_RESPONDING = "ip_free_but_responding"
+RULE_TYPE_STALE_RESERVATION = "stale_reservation"
+RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE = "unknown_mac_in_static_range"
+
+# Rogue DHCP server detection — issue #370. Subject = dhcp_responder. Fires on
+# dhcp_observed_responder rows classified ``rogue`` (a DHCP server answering on
+# a managed segment that isn't a known group member and isn't allowlisted),
+# observed within ``threshold_days`` (default 1). The agent's active probe is
+# opt-in, so this only has data on segments running the probe.
+RULE_TYPE_ROGUE_DHCP = "rogue_dhcp"
+_ROGUE_DHCP_RECENCY_DAYS = 1
+
 RULE_TYPES = frozenset(
     {
         RULE_TYPE_SUBNET_UTILIZATION,
@@ -159,8 +208,32 @@ RULE_TYPES = frozenset(
         RULE_TYPE_FIREWALL_APPLY_STALLED,
         RULE_TYPE_SECRET_EXPIRING,
         RULE_TYPE_DECOM_EXPIRING,
+        RULE_TYPE_DNS_NXDOMAIN_SPIKE,
+        RULE_TYPE_DNS_QUERY_RATE_SPIKE,
+        RULE_TYPE_IP_FREE_BUT_RESPONDING,
+        RULE_TYPE_STALE_RESERVATION,
+        RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE,
+        RULE_TYPE_ROGUE_DHCP,
     }
 )
+
+# IP-hygiene window defaults (issue #369), each reused as ``threshold_days``.
+_FREE_RESPONDING_RECENCY_DAYS = 1
+_STALE_RESERVATION_DAYS = 90
+_SQUAT_RECENCY_DAYS = 7
+# Defensive cap on per-IP hygiene events opened per tick — a badly-misconfigured
+# discovery run shouldn't open thousands of AlertEvents in one 60 s pass. The
+# matcher logs when it truncates (no silent cap).
+_IP_HYGIENE_MAX_EVENTS = 500
+
+# DNS query-anomaly evaluation window + defaults (issue #371). 15 min spans
+# ~15 one-minute buckets / 3 five-minute buckets — long enough to smooth a
+# single noisy bucket, short enough to page within a quarter hour.
+_DNS_ANOMALY_WINDOW = timedelta(minutes=15)
+_DNS_NXDOMAIN_RATIO_DEFAULT = 40  # % of queries that are NXDOMAIN
+_DNS_NXDOMAIN_MIN_COUNT_DEFAULT = 200  # absolute NXDOMAIN floor over the window
+_DNS_QUERY_RATE_SPIKE_PCT_DEFAULT = 200  # current ≥ prior × (1 + 200%) = ×3
+_DNS_QUERY_RATE_MIN_DEFAULT = 1000  # absolute query floor over the window
 
 # Issue #285 Phase 2d — how long a control-plane-rendered firewall hash may
 # go un-applied (ok-status) before it's "stalled". Comfortably larger than
@@ -451,6 +524,287 @@ async def _matching_stale_ip_count_subjects(
             f"deprecation from the Stale-IP report"
         )
         matches.append((str(s.id), display, message))
+    return matches
+
+
+async def _matching_ip_free_but_responding_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """``available`` IPs that answered on the wire within the recency window
+    (issue #369, case 1) — "IPAM says free, host is up"."""
+    days = rule.threshold_days if rule.threshold_days is not None else _FREE_RESPONDING_RECENCY_DAYS
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, days))
+    rows = (
+        (
+            await db.execute(
+                select(IPAddress)
+                .where(
+                    IPAddress.status == "available",
+                    IPAddress.last_seen_at.is_not(None),
+                    IPAddress.last_seen_at >= cutoff,
+                )
+                .limit(_IP_HYGIENE_MAX_EVENTS)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(rows) >= _IP_HYGIENE_MAX_EVENTS:
+        logger.warning("ip_free_but_responding_truncated", cap=_IP_HYGIENE_MAX_EVENTS)
+    matches: list[tuple[str, str, str]] = []
+    for r in rows:
+        via = f" via {r.last_seen_method}" if r.last_seen_method else ""
+        message = (
+            f"IP {r.address} is marked 'available' but answered on the wire{via} "
+            f"at {r.last_seen_at.isoformat() if r.last_seen_at else '?'} (within "
+            f"{days}d) — reclaim it as allocated/discovered or investigate the host."
+        )
+        matches.append((str(r.id), str(r.address), message))
+    return matches
+
+
+async def _matching_stale_reservation_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """``reserved`` / ``static_dhcp`` IPs not seen within ``threshold_days``
+    (issue #369, case 2). The gap ``stale_ip_count`` leaves (allocated-only).
+    High-confidence: requires the row to have been seen at least once."""
+    days = rule.threshold_days if rule.threshold_days is not None else _STALE_RESERVATION_DAYS
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, days))
+    rows = (
+        (
+            await db.execute(
+                select(IPAddress)
+                .where(
+                    IPAddress.status.in_(("reserved", "static_dhcp")),
+                    IPAddress.last_seen_at.is_not(None),
+                    IPAddress.last_seen_at < cutoff,
+                )
+                .limit(_IP_HYGIENE_MAX_EVENTS)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(rows) >= _IP_HYGIENE_MAX_EVENTS:
+        logger.warning("stale_reservation_truncated", cap=_IP_HYGIENE_MAX_EVENTS)
+    matches: list[tuple[str, str, str]] = []
+    for r in rows:
+        label = str(r.address) + (f" ({r.hostname})" if r.hostname else "")
+        message = (
+            f"{r.status} IP {label} hasn't been seen on the wire since "
+            f"{r.last_seen_at.isoformat() if r.last_seen_at else '?'} (> {days}d) — "
+            f"verify the host still exists or release the reservation."
+        )
+        matches.append((str(r.id), str(r.address), message))
+    return matches
+
+
+async def _matching_unknown_mac_in_static_range_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """``reserved`` / ``static_dhcp`` IPs whose ip_mac_history holds a recently
+    observed MAC differing from the recorded one (issue #369, case 3) — a squat.
+
+    The discovery sweep + SNMP poll log every observed MAC into ip_mac_history
+    (see services.ipam.discovery.record_mac_observation); operator-set
+    ``mac_address`` is never overwritten, so a differing recent history row is
+    a genuine "someone else is answering on this IP" signal.
+    """
+    days = rule.threshold_days if rule.threshold_days is not None else _SQUAT_RECENCY_DAYS
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, days))
+    rows = (
+        await db.execute(
+            select(IPAddress, IpMacHistory.mac_address, IpMacHistory.last_seen)
+            .join(IpMacHistory, IpMacHistory.ip_address_id == IPAddress.id)
+            .where(
+                IPAddress.status.in_(("reserved", "static_dhcp")),
+                IPAddress.mac_address.is_not(None),
+                IpMacHistory.mac_address != IPAddress.mac_address,
+                IpMacHistory.last_seen >= cutoff,
+            )
+            .limit(_IP_HYGIENE_MAX_EVENTS)
+        )
+    ).all()
+    # One event per IP — keep the most-recent offending observation if several.
+    by_ip: dict[uuid.UUID, tuple[IPAddress, str, datetime]] = {}
+    for ip_row, obs_mac, obs_at in rows:
+        prev = by_ip.get(ip_row.id)
+        if prev is None or obs_at > prev[2]:
+            by_ip[ip_row.id] = (ip_row, str(obs_mac), obs_at)
+    matches: list[tuple[str, str, str]] = []
+    for ip_id, (ip_row, obs_mac, obs_at) in by_ip.items():
+        message = (
+            f"IP {ip_row.address} ({ip_row.status}) is recorded with MAC "
+            f"{ip_row.mac_address} but a different MAC {obs_mac} answered at "
+            f"{obs_at.isoformat()} — possible squatter or a device that moved."
+        )
+        matches.append((str(ip_id), str(ip_row.address), message))
+    return matches
+
+
+async def _matching_rogue_dhcp_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """dhcp_observed_responder rows classified ``rogue`` + seen within the
+    recency window (issue #370). Auto-resolves once a responder stops being
+    seen as rogue (operator allowlists it → reclassified, or it goes away)."""
+    days = rule.threshold_days if rule.threshold_days is not None else _ROGUE_DHCP_RECENCY_DAYS
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, days))
+    rows = (
+        (
+            await db.execute(
+                select(DHCPObservedResponder).where(
+                    DHCPObservedResponder.classification == "rogue",
+                    DHCPObservedResponder.last_seen_at >= cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str]] = []
+    for r in rows:
+        display = f"{r.source_ip} (server-id {r.server_identifier})"
+        offered = f", offered {r.offered_ip}" if r.offered_ip else ""
+        message = (
+            f"Unrecognised DHCP server answering on a managed segment: "
+            f"source {r.source_ip}, server-id {r.server_identifier}"
+            f"{f', MAC {r.source_mac}' if r.source_mac else ''}{offered}. "
+            f"Not a known group member or allowlisted — investigate a rogue / "
+            f"misconfigured DHCP server, or acknowledge it if expected."
+        )
+        matches.append((str(r.id), display, message))
+    return matches
+
+
+async def _dns_server_names(db: AsyncSession, server_ids: list[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Resolve DNS server ids → display names in one query (issue #371)."""
+    if not server_ids:
+        return {}
+    rows = (
+        await db.execute(select(DNSServer.id, DNSServer.name).where(DNSServer.id.in_(server_ids)))
+    ).all()
+    return {row[0]: row[1] for row in rows}
+
+
+async def _matching_dns_nxdomain_spike_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """DNS servers whose trailing-window NXDOMAIN ratio + count cross the rule
+    thresholds (issue #371). Reads the per-server ``dns_metric_sample`` deltas
+    the agents already report; no new collection.
+    """
+    ratio_threshold = (
+        rule.threshold_percent
+        if rule.threshold_percent is not None
+        else _DNS_NXDOMAIN_RATIO_DEFAULT
+    )
+    min_count = (
+        rule.min_free_addresses
+        if rule.min_free_addresses is not None
+        else _DNS_NXDOMAIN_MIN_COUNT_DEFAULT
+    )
+    since = datetime.now(UTC) - _DNS_ANOMALY_WINDOW
+    rows = (
+        await db.execute(
+            select(
+                DNSMetricSample.server_id,
+                func.sum(DNSMetricSample.queries_total).label("q"),
+                func.sum(DNSMetricSample.nxdomain).label("nx"),
+            )
+            .where(DNSMetricSample.bucket_at >= since)
+            .group_by(DNSMetricSample.server_id)
+        )
+    ).all()
+    if not rows:
+        return []
+    names = await _dns_server_names(db, [r.server_id for r in rows])
+    win_min = int(_DNS_ANOMALY_WINDOW.total_seconds() // 60)
+    matches: list[tuple[str, str, str]] = []
+    for r in rows:
+        q = int(r.q or 0)
+        nx = int(r.nx or 0)
+        if nx < min_count or q <= 0:
+            continue
+        ratio = nx / q * 100
+        if ratio < ratio_threshold:
+            continue
+        name = names.get(r.server_id) or str(r.server_id)
+        message = (
+            f"DNS server {name} — {nx} NXDOMAIN responses ({ratio:.0f}% of {q} "
+            f"queries) in the last {win_min} min (threshold {ratio_threshold}% / "
+            f"floor {min_count}). Possible DGA beacon, broken client, or "
+            f"mistyped-search-domain storm."
+        )
+        matches.append((str(r.server_id), name, message))
+    return matches
+
+
+async def _matching_dns_query_rate_spike_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """DNS servers whose trailing-window query total spikes vs the prior
+    equal-length window (issue #371)."""
+    pct = (
+        rule.threshold_percent
+        if rule.threshold_percent is not None
+        else _DNS_QUERY_RATE_SPIKE_PCT_DEFAULT
+    )
+    floor = (
+        rule.min_free_addresses
+        if rule.min_free_addresses is not None
+        else _DNS_QUERY_RATE_MIN_DEFAULT
+    )
+    now = datetime.now(UTC)
+    cur_since = now - _DNS_ANOMALY_WINDOW
+    prev_since = now - 2 * _DNS_ANOMALY_WINDOW
+
+    async def _sums(lower: datetime, upper: datetime | None) -> dict[uuid.UUID, int]:
+        stmt = select(
+            DNSMetricSample.server_id,
+            func.sum(DNSMetricSample.queries_total),
+        ).where(DNSMetricSample.bucket_at >= lower)
+        if upper is not None:
+            stmt = stmt.where(DNSMetricSample.bucket_at < upper)
+        stmt = stmt.group_by(DNSMetricSample.server_id)
+        return {sid: int(q or 0) for sid, q in (await db.execute(stmt)).all()}
+
+    cur = await _sums(cur_since, None)
+    if not cur:
+        return []
+    prev = await _sums(prev_since, cur_since)
+    names = await _dns_server_names(db, list(cur.keys()))
+    win_min = int(_DNS_ANOMALY_WINDOW.total_seconds() // 60)
+    matches: list[tuple[str, str, str]] = []
+    for sid, q_cur in cur.items():
+        if q_cur < floor:
+            continue
+        q_prev = prev.get(sid, 0)
+        # A cold prior window: any current ≥ floor is a spike. Otherwise the
+        # current window must exceed the prior by pct%.
+        threshold_val = q_prev * (1 + pct / 100) if q_prev > 0 else float(floor)
+        if q_cur < threshold_val:
+            continue
+        name = names.get(sid) or str(sid)
+        if q_prev > 0:
+            message = (
+                f"DNS server {name} — query-rate spike: {q_cur} queries in the "
+                f"last {win_min} min vs {q_prev} in the prior {win_min} min "
+                f"(+{(q_cur / q_prev - 1) * 100:.0f}%, threshold +{pct}%)."
+            )
+        else:
+            message = (
+                f"DNS server {name} — {q_cur} queries in the last {win_min} min "
+                f"from a cold prior window (floor {floor})."
+            )
+        matches.append((str(sid), name, message))
     return matches
 
 
@@ -1780,6 +2134,187 @@ async def seed_firewall_apply_stalled_alert_rule() -> None:
         await session.commit()
 
 
+_DNS_NXDOMAIN_SPIKE_RULE_NAME = "DNS NXDOMAIN spike"
+_DNS_QUERY_RATE_SPIKE_RULE_NAME = "DNS query-rate spike"
+
+
+async def seed_dns_query_anomaly_alert_rules() -> None:
+    """Seed the two DNS query-anomaly rules (issue #371), DISABLED by default.
+
+    Like the firewall-stalled rule, these are seeded off so their existence is
+    discoverable in the Alerts UI without firing on installs that don't run
+    agent-based BIND9 (and therefore have no ``dns_metric_sample`` data). Keyed
+    on ``rule_type`` so an operator who enables / renames either is never
+    overridden by a later boot.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    seeds = [
+        {
+            "name": _DNS_NXDOMAIN_SPIKE_RULE_NAME,
+            "rule_type": RULE_TYPE_DNS_NXDOMAIN_SPIKE,
+            "description": (
+                "Fires when a DNS server's NXDOMAIN responses reach "
+                f"threshold_percent% of total queries (default "
+                f"{_DNS_NXDOMAIN_RATIO_DEFAULT}%) AND the absolute NXDOMAIN "
+                f"count clears min_free_addresses (default "
+                f"{_DNS_NXDOMAIN_MIN_COUNT_DEFAULT}, the low-traffic guard) "
+                "over a 15-minute window. Catches DGA malware beacons, broken "
+                "clients, and mistyped-search-domain storms. Auto-resolves when "
+                "the ratio falls back under threshold."
+            ),
+            "threshold_percent": _DNS_NXDOMAIN_RATIO_DEFAULT,
+            "min_free_addresses": _DNS_NXDOMAIN_MIN_COUNT_DEFAULT,
+        },
+        {
+            "name": _DNS_QUERY_RATE_SPIKE_RULE_NAME,
+            "rule_type": RULE_TYPE_DNS_QUERY_RATE_SPIKE,
+            "description": (
+                "Fires when a DNS server's query total over the last 15 minutes "
+                "exceeds the prior 15-minute window by threshold_percent% "
+                f"(default {_DNS_QUERY_RATE_SPIKE_PCT_DEFAULT}% = ×3) AND clears "
+                f"the min_free_addresses absolute floor (default "
+                f"{_DNS_QUERY_RATE_MIN_DEFAULT}, so tiny servers don't page on a "
+                "3→9 'spike'). Auto-resolves when the rate settles."
+            ),
+            "threshold_percent": _DNS_QUERY_RATE_SPIKE_PCT_DEFAULT,
+            "min_free_addresses": _DNS_QUERY_RATE_MIN_DEFAULT,
+        },
+    ]
+    async with AsyncSessionLocal() as session:
+        for seed in seeds:
+            existing = await session.scalar(
+                select(AlertRule).where(AlertRule.rule_type == seed["rule_type"])
+            )
+            if existing is not None:
+                continue
+            session.add(
+                AlertRule(
+                    name=seed["name"],
+                    description=seed["description"],
+                    rule_type=seed["rule_type"],
+                    threshold_percent=seed["threshold_percent"],
+                    min_free_addresses=seed["min_free_addresses"],
+                    severity="warning",
+                    enabled=False,
+                    notify_syslog=True,
+                    notify_webhook=True,
+                    notify_smtp=False,
+                )
+            )
+        await session.commit()
+
+
+async def seed_ip_hygiene_alert_rules() -> None:
+    """Seed the three IP-reconciliation hygiene rules (issue #369), DISABLED by
+    default so installs that don't run discovery aren't suddenly paged. Keyed on
+    ``rule_type`` — an operator who enables / renames one is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    seeds = [
+        {
+            "name": "IP free but responding",
+            "rule_type": RULE_TYPE_IP_FREE_BUT_RESPONDING,
+            "description": (
+                "Fires on an IP marked 'available' that answered on the wire "
+                f"within threshold_days (default {_FREE_RESPONDING_RECENCY_DAYS}) "
+                "— IPAM thinks it's free but a host is using it. Reclaim it or "
+                "investigate. Needs subnet discovery (ping/ARP sweep or SNMP)."
+            ),
+            "threshold_days": _FREE_RESPONDING_RECENCY_DAYS,
+            "severity": "warning",
+        },
+        {
+            "name": "Stale reservation",
+            "rule_type": RULE_TYPE_STALE_RESERVATION,
+            "description": (
+                "Fires on a reserved / static_dhcp IP not seen on the wire for "
+                f"more than threshold_days (default {_STALE_RESERVATION_DAYS}). "
+                "The reservation-aware companion to the stale-IP alert (which is "
+                "allocated-only). Verify the host or release the reservation."
+            ),
+            "threshold_days": _STALE_RESERVATION_DAYS,
+            "severity": "info",
+        },
+        {
+            "name": "Unknown MAC in static range",
+            "rule_type": RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE,
+            "description": (
+                "Fires when a reserved / static_dhcp IP is answered by a MAC that "
+                "differs from the one recorded on the row, observed within "
+                f"threshold_days (default {_SQUAT_RECENCY_DAYS}) — a squatter or a "
+                "device that moved. Needs subnet discovery (ping/ARP or SNMP)."
+            ),
+            "threshold_days": _SQUAT_RECENCY_DAYS,
+            "severity": "warning",
+        },
+    ]
+    async with AsyncSessionLocal() as session:
+        for seed in seeds:
+            existing = await session.scalar(
+                select(AlertRule).where(AlertRule.rule_type == seed["rule_type"])
+            )
+            if existing is not None:
+                continue
+            session.add(
+                AlertRule(
+                    name=seed["name"],
+                    description=seed["description"],
+                    rule_type=seed["rule_type"],
+                    threshold_days=seed["threshold_days"],
+                    severity=seed["severity"],
+                    enabled=False,
+                    notify_syslog=True,
+                    notify_webhook=True,
+                    notify_smtp=False,
+                )
+            )
+        await session.commit()
+
+
+async def seed_rogue_dhcp_alert_rule() -> None:
+    """Seed the singleton ``rogue_dhcp`` rule (issue #370), DISABLED by default.
+
+    Meaningful only once an operator turns on the agent's active DHCP probe
+    (``DHCP_ROGUE_PROBE_ENABLED=1``); seeding it off makes it discoverable in
+    the Alerts UI without firing on installs that never opt in. Keyed on
+    ``rule_type`` — an operator who enables / renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_ROGUE_DHCP)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name="Rogue DHCP server",
+                description=(
+                    "Fires when the DHCP agent's active probe sees an OFFER from "
+                    "a DHCP server that isn't a known group member and isn't on "
+                    "the responder allowlist — a rogue or misconfigured DHCP "
+                    "server on the segment. Auto-resolves when the responder "
+                    "stops appearing or is acknowledged. Enable once the probe "
+                    "(DHCP_ROGUE_PROBE_ENABLED) is on."
+                ),
+                rule_type=RULE_TYPE_ROGUE_DHCP,
+                threshold_days=_ROGUE_DHCP_RECENCY_DAYS,
+                severity="warning",
+                enabled=False,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def seed_builtin_compliance_alert_rules() -> None:
     """Insert the three disabled compliance-change rules on first
     boot. Idempotent — only inserts a row when no rule with the same
@@ -1944,6 +2479,30 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_dhcp_pool_exhaustion_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "dhcp_pool"
+            elif rule.rule_type == RULE_TYPE_DNS_NXDOMAIN_SPIKE:
+                base = await _matching_dns_nxdomain_spike_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "dns_server"
+            elif rule.rule_type == RULE_TYPE_DNS_QUERY_RATE_SPIKE:
+                base = await _matching_dns_query_rate_spike_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "dns_server"
+            elif rule.rule_type == RULE_TYPE_IP_FREE_BUT_RESPONDING:
+                base = await _matching_ip_free_but_responding_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "ip_address"
+            elif rule.rule_type == RULE_TYPE_STALE_RESERVATION:
+                base = await _matching_stale_reservation_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "ip_address"
+            elif rule.rule_type == RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE:
+                base = await _matching_unknown_mac_in_static_range_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "ip_address"
+            elif rule.rule_type == RULE_TYPE_ROGUE_DHCP:
+                base = await _matching_rogue_dhcp_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "dhcp_responder"
             elif rule.rule_type == RULE_TYPE_SERVER_UNREACHABLE:
                 base = await _matching_server_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]

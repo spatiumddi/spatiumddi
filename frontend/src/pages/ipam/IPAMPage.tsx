@@ -2030,6 +2030,18 @@ function CreateSubnetModal({
     if (!blockId && blocks?.length === 1) setBlockId(blocks[0].id);
   }, [blocks, blockId]);
 
+  // Size mode (#372): the operator picks a candidate from the free list and the
+  // atomic endpoint allocates that exact CIDR (validated free under a block
+  // lock; a concurrent claim 409s). Default to the lowest free one, but keep a
+  // still-valid operator pick across refetches — only reset when the current
+  // selection drops out of the list (e.g. prefix change or it got taken).
+  useEffect(() => {
+    if (subnetMode !== "size") return;
+    if (!selectedNet || !availableNets.includes(selectedNet)) {
+      setSelectedNet(availableNets[0] ?? "");
+    }
+  }, [subnetMode, availableNets, selectedNet]);
+
   // When switching to size mode, clear manually typed network
   function switchMode(m: "manual" | "size") {
     setSubnetMode(m);
@@ -2042,11 +2054,13 @@ function CreateSubnetModal({
   const effectiveNetwork = subnetMode === "manual" ? network : selectedNet;
 
   const mutation = useMutation({
-    mutationFn: () =>
-      ipamApi.createSubnet({
-        space_id: spaceId,
-        block_id: blockId,
-        network: effectiveNetwork,
+    mutationFn: () => {
+      // "Find by size" carves atomically server-side (#372) — one locked
+      // call picks the lowest free CIDR + creates it, so two concurrent
+      // operators can't pick the same network. Manual mode posts the typed
+      // CIDR. The optional-field payload is identical either way; size mode
+      // sends prefix_len instead of network.
+      const common = {
         name: name || undefined,
         gateway: gateway || undefined,
         vlan_ref_id: vlanRefId ?? undefined,
@@ -2081,7 +2095,22 @@ function CreateSubnetModal({
         customer_id: customerId,
         site_id: siteId,
         ...(templateId ? { template_id: templateId } : {}),
-      }),
+      };
+      return subnetMode === "size"
+        ? ipamApi.allocateSubnet(blockId, {
+            prefix_len: parseInt(prefixLen, 10),
+            // The operator-picked CIDR; the endpoint allocates this exact one
+            // (or the lowest free if somehow empty).
+            network: selectedNet || undefined,
+            ...common,
+          })
+        : ipamApi.createSubnet({
+            space_id: spaceId,
+            block_id: blockId,
+            network: effectiveNetwork,
+            ...common,
+          });
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", spaceId] });
       qc.invalidateQueries({ queryKey: ["spaces"] });
@@ -2199,7 +2228,8 @@ function CreateSubnetModal({
             ) : (
               <div>
                 <p className="text-xs text-muted-foreground mb-1">
-                  Available /{prefixLen} subnets (click to select):
+                  Free /{prefixLen} subnets (click to choose; allocated
+                  atomically on submit):
                 </p>
                 <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto">
                   {availableNets.map((net: string) => (
@@ -2220,7 +2250,8 @@ function CreateSubnetModal({
                 </div>
                 {selectedNet && (
                   <p className="text-xs text-emerald-600 dark:text-emerald-400 mt-1">
-                    Selected: <span className="font-mono">{selectedNet}</span>
+                    Will allocate:{" "}
+                    <span className="font-mono">{selectedNet}</span>
                   </p>
                 )}
               </div>

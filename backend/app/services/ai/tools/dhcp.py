@@ -24,6 +24,7 @@ from app.models.dhcp import (
     DHCPServerGroup,
     DHCPStaticAssignment,
 )
+from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.services.ai.tools.base import register_tool
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 
@@ -128,6 +129,15 @@ class FindDHCPLeasesArgs(BaseModel):
         default=None,
         description="Filter by lease state (active, expired, declined, released).",
     )
+    device_class: str | None = Field(
+        default=None,
+        description=(
+            "Filter by fingerbank device class (passive DHCP fingerprinting), "
+            "e.g. 'Phone, Tablet or Wearable', 'Operating System', 'Hardware "
+            "Manufacturer'. Only leases whose MAC has a matching fingerprint "
+            "are returned."
+        ),
+    )
     limit: int = Field(default=100, ge=1, le=500)
 
 
@@ -135,10 +145,11 @@ class FindDHCPLeasesArgs(BaseModel):
     name="find_dhcp_leases",
     description=(
         "Find DHCP leases. Filterable by server, scope, MAC, IP, "
-        "hostname substring, or state. Returns lease metadata "
-        "(IP / MAC / hostname / state / starts_at / ends_at). Use "
+        "hostname substring, state, or fingerbank device class. Returns "
+        "lease metadata (IP / MAC / mac_vendor / device_class / "
+        "device_name / hostname / state / starts_at / ends_at). Use "
         "for questions like 'what's the lease for MAC X?', 'what's "
-        "leased on subnet Y?', or 'find every lease for hostname Z'."
+        "leased on subnet Y?', or 'show me the phones on this network'."
     ),
     args_model=FindDHCPLeasesArgs,
     category="dhcp",
@@ -162,13 +173,28 @@ async def find_dhcp_leases(
         stmt = stmt.where(func.lower(DHCPLease.hostname).like(like))
     if args.state:
         stmt = stmt.where(DHCPLease.state == args.state)
+    if args.device_class:
+        stmt = stmt.join(
+            DHCPFingerprint, DHCPFingerprint.mac_address == DHCPLease.mac_address
+        ).where(DHCPFingerprint.fingerbank_device_class == args.device_class)
     stmt = stmt.order_by(DHCPLease.ends_at.desc()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
     vendors = await bulk_lookup_vendors(db, [str(le.mac_address) for le in rows])
+    # Batch-fetch fingerprints for the result MACs (one query) so each lease
+    # can report its fingerbank device class/name without a per-row lookup.
+    macs = [str(le.mac_address) for le in rows if le.mac_address]
+    fps: dict[str, DHCPFingerprint] = {}
+    if macs:
+        fp_rows = (
+            await db.execute(select(DHCPFingerprint).where(DHCPFingerprint.mac_address.in_(macs)))
+        ).scalars()
+        for fp in fp_rows:
+            fps[normalize_mac_key(str(fp.mac_address))] = fp
     out: list[dict[str, Any]] = []
     for le in rows:
         mac_key = normalize_mac_key(str(le.mac_address))
         vendor = vendors.get(mac_key) if mac_key else None
+        fp = fps.get(mac_key) if mac_key else None
         out.append(
             {
                 "id": str(le.id),
@@ -178,6 +204,10 @@ async def find_dhcp_leases(
                 "mac_address": str(le.mac_address),
                 "mac_vendor": vendor,
                 "is_voip_phone": is_voip_phone_vendor(vendor),
+                "device_class": fp.fingerbank_device_class if fp else None,
+                "device_name": fp.fingerbank_device_name if fp else None,
+                "device_manufacturer": fp.fingerbank_manufacturer if fp else None,
+                "fingerbank_score": fp.fingerbank_score if fp else None,
                 "hostname": le.hostname,
                 "state": le.state,
                 "starts_at": le.starts_at.isoformat() if le.starts_at else None,
@@ -241,7 +271,7 @@ class ListDHCPPoolsArgs(BaseModel):
     scope_id: str | None = Field(default=None, description="Filter to one DHCP scope by UUID.")
     pool_type: str | None = Field(
         default=None,
-        description="Filter by pool_type: dynamic / excluded / reserved.",
+        description="Filter by pool_type: dynamic / excluded / reserved / pd (v6 prefix delegation).",
     )
     limit: int = Field(default=100, ge=1, le=500)
 
@@ -282,6 +312,11 @@ async def list_dhcp_pools(
             "class_restriction": p.class_restriction,
             "lease_time_override": p.lease_time_override,
             "options_override": p.options_override,
+            # DHCPv6 prefix delegation (issue #368) — populated only on
+            # pool_type == "pd" pools.
+            "pd_prefix": getattr(p, "pd_prefix", None),
+            "delegated_length": getattr(p, "delegated_length", None),
+            "excluded_prefix": getattr(p, "excluded_prefix", None),
         }
         for p in rows
     ]
@@ -337,6 +372,7 @@ async def list_dhcp_statics(
             "ip_address": str(s.ip_address),
             "mac_address": str(s.mac_address),
             "client_id": s.client_id,
+            "duid": getattr(s, "duid", None),
             "hostname": s.hostname,
             "description": s.description,
             "options_override": s.options_override,
@@ -700,3 +736,59 @@ async def find_dhcp_pool_occupancy(
         )
     out.sort(key=lambda r: r["occupancy_percent"], reverse=True)
     return out[: args.limit]
+
+
+# ── find_dhcp_responders (issue #370) ─────────────────────────────────
+
+
+class FindDHCPRespondersArgs(BaseModel):
+    group_id: str | None = Field(
+        default=None, description="Filter to one DHCP server group by UUID."
+    )
+    classification: str | None = Field(
+        default=None,
+        description="Filter by classification: expected / acknowledged / rogue.",
+    )
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+@register_tool(
+    name="find_dhcp_responders",
+    description=(
+        "List DHCP servers the active rogue-detection probe has observed "
+        "answering on managed segments (issue #370). Each row carries the "
+        "source IP / MAC, server-identifier, offered IP, classification "
+        "(expected = a known group member, acknowledged = operator-allowlisted, "
+        "rogue = unknown responder), and last-seen time. Filter "
+        "classification='rogue' to answer 'is there a rogue DHCP server on my "
+        "network?'. Read-only; only has data on segments running the probe."
+    ),
+    args_model=FindDHCPRespondersArgs,
+    category="dhcp",
+)
+async def find_dhcp_responders(
+    db: AsyncSession, user: User, args: FindDHCPRespondersArgs
+) -> list[dict[str, Any]]:
+    from app.models.dhcp import DHCPObservedResponder  # noqa: PLC0415
+
+    stmt = select(DHCPObservedResponder)
+    if args.group_id:
+        stmt = stmt.where(DHCPObservedResponder.group_id == args.group_id)
+    if args.classification:
+        stmt = stmt.where(DHCPObservedResponder.classification == args.classification.lower())
+    stmt = stmt.order_by(DHCPObservedResponder.last_seen_at.desc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(r.id),
+            "group_id": str(r.group_id),
+            "server_identifier": r.server_identifier,
+            "source_ip": str(r.source_ip),
+            "source_mac": str(r.source_mac) if r.source_mac else None,
+            "giaddr": str(r.giaddr) if r.giaddr else None,
+            "offered_ip": str(r.offered_ip) if r.offered_ip else None,
+            "classification": r.classification,
+            "last_seen_at": r.last_seen_at.isoformat() if r.last_seen_at else None,
+        }
+        for r in rows
+    ]

@@ -11,6 +11,7 @@ from app.api.v1.dhcp.option_templates import router as option_templates_router
 from app.api.v1.dhcp.phone_profiles import router as phone_profiles_router
 from app.api.v1.dhcp.pools import router as pools_router
 from app.api.v1.dhcp.pxe_profiles import router as pxe_profiles_router
+from app.api.v1.dhcp.responders import router as responders_router
 from app.api.v1.dhcp.scopes import router as scopes_router
 from app.api.v1.dhcp.server_groups import router as server_groups_router
 from app.api.v1.dhcp.servers import router as servers_router
@@ -31,6 +32,7 @@ router.include_router(mac_blocks_router)
 router.include_router(option_codes_router)
 router.include_router(option_templates_router)
 router.include_router(voip_options_router)
+router.include_router(responders_router)
 router.include_router(agents_router)
 
 __all__ = ["router"]
