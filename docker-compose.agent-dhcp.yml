@@ -81,8 +81,13 @@ services:
       - "${DHCP_HA_HOST_PORT:-8001}:8000/tcp"
       # Optional operator-facing kea-ctrl-agent REST.
       # - "8544:8544/tcp"
+    # NET_BIND_SERVICE binds UDP/67; NET_RAW (#365) lets Kea use raw
+    # AF_PACKET sockets — the default "direct" socket mode. For a
+    # directly-attached LAN switch this to `network_mode: host`; the
+    # bridged default here only sees relayed/port-mapped traffic.
     cap_add:
       - NET_BIND_SERVICE
+      - NET_RAW
 
   # ── DHCP agent (secondary, HA peer) ───────────────────────────────
   # Enable with: ``--profile dhcp-ha``.
@@ -111,6 +116,7 @@ services:
       - "${DHCP_HA_HOST_PORT_2:-8002}:8000/tcp"
     cap_add:
       - NET_BIND_SERVICE
+      - NET_RAW  # #365 — raw sockets for direct-attached DHCP (see dhcp-kea)
 
 networks:
   spatiumddi-agent:

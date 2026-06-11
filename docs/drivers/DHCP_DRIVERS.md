@@ -120,6 +120,7 @@ The HTTP envelope returned by `GET /api/v1/dhcp/agents/config` is:
     "server_name": "…",
     "driver": "kea",
     "roles": [...],
+    "server": { "interfaces": ["*"], "dhcp_socket_type": "raw" },
     "scopes": [
       {
         "subnet_cidr": "10.0.0.0/24",
@@ -138,6 +139,8 @@ The HTTP envelope returned by `GET /api/v1/dhcp/agents/config` is:
 ```
 
 Shipped 2026.04.21-2: `render_kea.py:_scope_to_subnet` maps each wire scope to a Kea `subnet4` entry — `subnet_cidr` → `subnet`, `pools[start_ip,end_ip,pool_type]` → `{"pool": "start - end"}` (only `dynamic` pools are emitted; `excluded` / `reserved` are IPAM bookkeeping and must **not** become Kea lease pools), `statics[ip_address,mac_address,hostname]` → `reservations[ip-address,hw-address,hostname]`. Client-class `match_expression` → Kea `test`. Subnet `id` is derived deterministically from the CIDR via truncated SHA-256, so a config reload never orphans active leases by renumbering subnets.
+
+**Socket type (issue #365).** The `server.dhcp_socket_type` field drives `Dhcp4.interfaces-config.dhcp-socket-type`. It is derived from the server group's `dhcp_socket_mode` in `services/dhcp/config_bundle.py` (`direct` → `raw`, `relay` → `udp`) and is part of `ConfigBundle.compute_etag()`, so flipping the mode shifts the ETag and the agent re-renders on its next long-poll. The default is `raw` (AF_PACKET) so Kea hears broadcast `DHCPDISCOVER`s from directly-attached clients; the agent's `render_kea.py` also falls back to `raw` when an older control plane omits the `server` block. `raw` needs `CAP_NET_RAW` (appliance DaemonSet + shipped compose Kea services grant it). DHCPv6 has no socket-type concept — the field applies to `Dhcp4` only.
 
 ### HA coordination
 

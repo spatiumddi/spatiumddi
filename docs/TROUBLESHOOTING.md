@@ -134,7 +134,7 @@ Read the result:
 | tcpdump shows DISCOVER | Kea log | Conclusion |
 |---|---|---|
 | yes | logs DISCOVER, no OFFER (often `DHCP4_SUBNET_SELECTION_FAILED` / "no subnet selected") | **(B)** — subnet/scope mismatch. Most common. |
-| yes | logs nothing | **(A)** — firewall is eating it before the socket. |
+| yes | logs nothing | **(A)** — the packet reaches the host but not the Kea socket: the group is in **Relay-only (udp)** socket mode, or the firewall is dropping it. |
 | no  | — | The broadcast isn't reaching the appliance VM at all (vSwitch port-group / VLAN). |
 
 ### Fixing (B) — scope/subnet mismatch (most common)
@@ -177,11 +177,45 @@ pool, then the bundle ETag shifts and the agent re-renders within a
 heartbeat. (The DHCP Activity tab on the **Logs** page surfaces the same
 Kea log lines if you'd rather stay in the UI.)
 
-### Fixing (A) — firewall
+### Fixing (A) — packet reaches the host but not Kea
 
-Kea uses a plain UDP socket (`dhcp-socket-type: udp`), so it **is**
-subject to the host's nftables INPUT chain. The DHCP role opens UDP
-**67 + 68**; confirm the rules are present (and haven't drifted):
+Two causes; check the socket mode first.
+
+**Socket mode (#365).** A directly-attached client can only be heard when
+Kea's Dhcp4 daemon uses **raw** (AF_PACKET) sockets — UDP sockets are
+relay-only and silently miss the broadcast. The DHCP **server group**
+carries a *Client reachability* setting that controls this:
+
+- **Directly attached / mixed** → `dhcp-socket-type: raw` (the default
+  since #365). Hears broadcast DISCOVERs *and* relayed traffic.
+- **Relay-only** → `dhcp-socket-type: udp`. Cannot receive direct L2
+  broadcasts.
+
+If the server is on the same LAN as its clients, the group must be
+**Directly attached** (DHCP → the server group → Edit → *Client
+reachability*). Confirm what's actually rendered:
+
+```bash
+# k3s appliance:
+sudo k3s kubectl exec -n <ns> <kea-pod> -- \
+    cat /var/lib/spatium-dhcp-agent/rendered/kea-dhcp4.json | grep socket-type
+# docker-compose:
+docker compose exec dhcp-kea \
+    cat /var/lib/spatium-dhcp-agent/rendered/kea-dhcp4.json | grep socket-type
+```
+
+`"dhcp-socket-type": "udp"` on a direct-attached LAN is the problem —
+switch the group to *Directly attached*; the agent re-renders within a
+heartbeat. (Raw sockets need the `NET_RAW` capability, which the
+appliance DaemonSet and the shipped compose files grant.)
+
+> Installs predating #365 hardcoded `udp` and had no knob — that was the
+> original bug. Upgraded installs default to `direct` (raw), so this is
+> only a live cause if the group was deliberately set to Relay-only.
+
+**Firewall.** UDP sockets are also subject to the host's nftables INPUT
+chain (raw sockets bypass it). The DHCP role opens UDP **67 + 68**;
+confirm the rules are present (and haven't drifted):
 
 ```bash
 sudo nft list chain inet filter input | grep -E 'dport (67|68)'

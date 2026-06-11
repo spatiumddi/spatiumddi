@@ -5745,6 +5745,11 @@ export interface DHCPServerGroup {
   // unicast deployments). Surfaces in the role-assignment UI on
   // the Approvals tab so the operator knows what they're picking.
   network_mode?: string;
+  // #365 — Kea dhcp-socket-type selector. "direct" → raw sockets (hears
+  // broadcast DISCOVERs from directly-attached clients; the default),
+  // "relay" → udp sockets (relay-only). Per-daemon, so it lives on the
+  // group and applies to every member Kea.
+  dhcp_socket_mode?: "direct" | "relay";
   heartbeat_delay_ms: number;
   max_response_delay_ms: number;
   max_ack_delay_ms: number;
@@ -5763,6 +5768,7 @@ export interface DHCPServerGroupCreate {
   name: string;
   description?: string;
   mode?: "standalone" | "hot-standby" | "load-balancing";
+  dhcp_socket_mode?: "direct" | "relay";
   heartbeat_delay_ms?: number;
   max_response_delay_ms?: number;
   max_ack_delay_ms?: number;

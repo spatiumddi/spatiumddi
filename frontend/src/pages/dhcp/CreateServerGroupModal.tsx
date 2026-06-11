@@ -30,6 +30,9 @@ export function CreateServerGroupModal({
   const [autoFailover, setAutoFailover] = useState(
     group?.auto_failover ?? true,
   );
+  const [socketMode, setSocketMode] = useState<"direct" | "relay">(
+    group?.dhcp_socket_mode ?? "direct",
+  );
   const [error, setError] = useState("");
 
   const isHA = mode === "hot-standby" || mode === "load-balancing";
@@ -40,6 +43,7 @@ export function CreateServerGroupModal({
         name,
         description,
         mode: mode as "standalone" | "hot-standby" | "load-balancing",
+        dhcp_socket_mode: socketMode,
         heartbeat_delay_ms: parseInt(heartbeat, 10) || 10000,
         max_response_delay_ms: parseInt(maxResponse, 10) || 60000,
         max_ack_delay_ms: parseInt(maxAck, 10) || 10000,
@@ -98,6 +102,22 @@ export function CreateServerGroupModal({
               Hot Standby (one active, one passive)
             </option>
             <option value="load-balancing">Load Balancing (both active)</option>
+          </select>
+        </Field>
+
+        <Field
+          label="Client reachability"
+          hint="How Kea receives client traffic. Directly attached uses raw sockets, so Kea hears broadcast DISCOVERs from clients on the same LAN (and also serves relayed clients) — the right choice for an all-in-one / on-LAN server. Relay-only uses UDP sockets; pick it only when every client reaches Kea through a DHCP relay, or the host can't grant raw-socket capability."
+        >
+          <select
+            className={inputCls}
+            value={socketMode}
+            onChange={(e) => setSocketMode(e.target.value as "direct" | "relay")}
+          >
+            <option value="direct">
+              Directly attached / mixed (raw sockets) — recommended
+            </option>
+            <option value="relay">Relay-only (UDP sockets)</option>
           </select>
         </Field>
 
