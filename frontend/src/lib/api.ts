@@ -6817,6 +6817,13 @@ export const API_TOKEN_SCOPES: {
   },
 ];
 
+/** Per-token resource binding (#374). resource_type ∈ {subnet, dns_zone}. */
+export interface ApiTokenResourceGrant {
+  action: string;
+  resource_type: string;
+  resource_id: string;
+}
+
 export interface ApiToken {
   id: string;
   name: string;
@@ -6824,6 +6831,7 @@ export interface ApiToken {
   prefix: string;
   scope: string;
   scopes: ApiTokenScope[];
+  resource_grants?: ApiTokenResourceGrant[];
   user_id: string | null;
   expires_at: string | null;
   last_used_at: string | null;
@@ -6836,6 +6844,7 @@ export interface ApiTokenCreate {
   description?: string;
   expires_in_days?: number | null;
   scopes?: ApiTokenScope[];
+  resource_grants?: ApiTokenResourceGrant[];
 }
 
 /** Response from POST — contains the raw token ONCE. */

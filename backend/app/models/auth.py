@@ -252,6 +252,17 @@ class APIToken(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         JSONB, nullable=False, default=list, server_default="[]"
     )
 
+    # Per-token resource-instance binding (issue #74 follow-up #374). A list of
+    # ``{action, resource_type, resource_id}`` grants in the same grammar as
+    # Role.permissions. Empty/None = no resource restriction (current
+    # behaviour). Non-empty = the token can only ever NARROW its owner: the
+    # effective permission for a request is the INTERSECTION of the owner's
+    # RBAC and these grants. Validated at create time to be a subset of what
+    # the issuing user holds (you can't mint a token more powerful than
+    # yourself). Enforced in app.core.permissions.user_has_permission +
+    # token_scope_allows.
+    resource_grants: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
+
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

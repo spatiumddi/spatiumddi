@@ -19,7 +19,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
-from app.core.permissions import require_any_resource_permission
+from app.core.permissions import require_any_resource_permission, token_scope_allows
 from app.drivers.dhcp import is_agentless
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignment
@@ -548,6 +548,20 @@ async def _record_mac_history(db: AsyncSession, ip_id: uuid.UUID, mac_address: s
             """),
         {"ip_id": str(ip_id), "mac": mac_address},
     )
+
+
+def _enforce_subnet_token_scope(user: Any, subnet_id: uuid.UUID) -> None:
+    """403 when a resource-scoped API token (#374) isn't bound to this subnet.
+
+    No-op for sessions / unscoped tokens (``token_scope_allows`` returns True),
+    so normal callers are unaffected — only a subnet-bound token is constrained
+    to its subnet for IP create / edit / delete / next-IP / list operations.
+    """
+    if not token_scope_allows(user, "subnet", subnet_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API token is not scoped to this subnet",
+        )
 
 
 # ── DHCP pool awareness ───────────────────────────────────────────────────────
@@ -3529,6 +3543,15 @@ async def list_subnets(
 
 @router.post("/subnets", response_model=SubnetResponse, status_code=status.HTTP_201_CREATED)
 async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -> Subnet:
+    # A token bound to a specific subnet (#374) manages addresses *within* that
+    # subnet — it cannot mint new subnets. token_scope_allows(..., None) is True
+    # for sessions / unscoped tokens / subnet-wildcard tokens, False only for an
+    # instance-bound subnet token.
+    if not token_scope_allows(current_user, "subnet", None):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API token is bound to a specific subnet and cannot create new subnets",
+        )
     if await db.get(IPSpace, body.space_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
@@ -3832,6 +3855,7 @@ async def get_subnet(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB) ->
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
     return subnet
 
 
@@ -6007,6 +6031,7 @@ async def list_addresses(
 ) -> list[IPAddress]:
     if await db.get(Subnet, subnet_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
 
     query = (
         select(IPAddress)
@@ -6043,6 +6068,7 @@ async def create_address(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
 
     # Multicast subnets don't allocate per-IP endpoint rows. Use the
     # multicast group registry under ``/multicast/groups`` instead —
@@ -6258,6 +6284,7 @@ async def update_address(
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+    _enforce_subnet_token_scope(current_user, ip.subnet_id)
 
     # Dynamic-lease mirrors are owned by the DHCP server, not IPAM. Any edit
     # here would be overwritten on the next pull cycle, so refuse outright —
@@ -6696,6 +6723,7 @@ async def delete_address(
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+    _enforce_subnet_token_scope(current_user, ip.subnet_id)
 
     # Dynamic-lease mirrors are owned by the DHCP server. Deleting one here
     # would just get recreated on the next pull cycle — block it so the user
@@ -7366,6 +7394,7 @@ async def allocate_next_ip(
     subnet = result.unique().scalar_one_or_none()
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
     if subnet.kind == "multicast":
         raise HTTPException(
             status_code=422,

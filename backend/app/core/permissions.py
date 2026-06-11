@@ -88,6 +88,70 @@ def _resource_id_matches(granted: str | None, requested: str | None) -> bool:
     return str(granted) == str(requested)
 
 
+def _token_grants_for(user: User) -> list[dict]:
+    """Active API-token resource grants stashed on the user by the auth dep
+    (issue #374). Empty for session/JWT requests and for tokens without a
+    resource binding — those are unrestricted (only their coarse ``scopes``
+    + the owner's RBAC apply)."""
+    grants = getattr(user, "_api_token_resource_grants", None) or []
+    return [g for g in grants if isinstance(g, dict)]
+
+
+def _token_grants_allow(
+    grants: list[dict], action: str, resource_type: str, req_rid: str | None
+) -> bool:
+    """Intersection rule for a resource-scoped token (issue #374).
+
+    A token can only ever NARROW its owner. ``user_has_permission`` calls this
+    only after the owner's RBAC already allowed the request, so this purely
+    decides whether the *token* also permits it:
+
+    * **Coarse check** (``req_rid is None`` — the router-level method gate):
+      pass if any grant covers (action, resource_type) regardless of the
+      grant's own resource_id. This lets a subnet-scoped token through the
+      coarse gate so the request reaches the handler, where the per-row
+      ``token_scope_allows`` enforces the specific instance. A wildcard grant
+      (``*``/``*``) always passes.
+    * **Scoped check** (``req_rid`` set — a per-row gate): a grant must match
+      action + resource_type + resource_id (grant resource_id None/``*`` = any
+      instance of that type, else exact match).
+    """
+    for g in grants:
+        if not _action_matches(g.get("action", ""), action):
+            continue
+        if not _resource_type_matches(g.get("resource_type", ""), resource_type):
+            continue
+        if req_rid is None:
+            return True
+        if _resource_id_matches(g.get("resource_id"), req_rid):
+            return True
+    return False
+
+
+def token_scope_allows(user: User, resource_type: str, resource_id: str | UUID | None) -> bool:
+    """Per-row token-binding gate for handlers (issue #374).
+
+    Returns ``True`` for any request whose credential carries NO resource
+    grants (sessions, plain tokens) — so normal callers are completely
+    unaffected. For a resource-scoped token, returns ``True`` only when a
+    grant covers (resource_type, resource_id). Call this inside a handler
+    once the target resource is known, e.g.::
+
+        if not token_scope_allows(user, "subnet", subnet.id):
+            raise HTTPException(403, "API token is not scoped to this subnet")
+    """
+    grants = _token_grants_for(user)
+    if not grants:
+        return True
+    req_rid = str(resource_id) if resource_id is not None else None
+    for g in grants:
+        if not _resource_type_matches(g.get("resource_type", ""), resource_type):
+            continue
+        if _resource_id_matches(g.get("resource_id"), req_rid):
+            return True
+    return False
+
+
 def is_effective_superadmin(user: User) -> bool:
     """Whether the user is a superadmin for gate-style checks.
 
@@ -111,7 +175,11 @@ def is_effective_superadmin(user: User) -> bool:
     operator might need during incident triage. Per-permission checks
     still gate on ``user.is_active``.
     """
-    if getattr(user, "is_superadmin", False):
+    # A resource-scoped token (issue #374) is never a superadmin, even when
+    # owned by the seeded ``admin`` — skip the legacy-flag shortcut so the
+    # wildcard intersection in user_has_permission decides (a non-wildcard
+    # token grant won't match ``*``/``*`` and correctly fails the gate).
+    if getattr(user, "is_superadmin", False) and not _token_grants_for(user):
         return True
     return user_has_permission(user, "*", "*")
 
@@ -130,10 +198,28 @@ def user_has_permission(
     """
     if not user.is_active:
         return False
-    if user.is_superadmin:
-        return True
 
     req_rid = str(resource_id) if resource_id is not None else None
+
+    # Resolve the owner's RBAC verdict first (issue #374 intersection: a token
+    # can only narrow, so the owner must allow before the token is consulted).
+    rbac_allowed = _user_rbac_allows(user, action, resource_type, req_rid)
+    if not rbac_allowed:
+        return False
+
+    # Token narrowing (#374): when the active credential is a resource-scoped
+    # token, the request must ALSO be covered by its grants — intersection.
+    token_grants = _token_grants_for(user)
+    if token_grants and not _token_grants_allow(token_grants, action, resource_type, req_rid):
+        return False
+    return True
+
+
+def _user_rbac_allows(user: User, action: str, resource_type: str, req_rid: str | None) -> bool:
+    """The owning user's static-role + time-bound-grant verdict (no token
+    narrowing — that's layered on in :func:`user_has_permission`)."""
+    if user.is_superadmin:
+        return True
 
     for group in user.groups:
         for role in group.roles:
@@ -354,5 +440,6 @@ __all__ = [
     "require_any_resource_permission",
     "require_permission",
     "require_resource_permission",
+    "token_scope_allows",
     "user_has_permission",
 ]
