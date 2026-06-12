@@ -20,7 +20,7 @@ the formatter handles the rest.
 
 ---
 
-## 2026.06.11-2 — 2026-06-11
+## 2026.06.12-1 — 2026-06-12
 
 Hotfix for **directly-attached DHCP dead on 2026.06.11-1** (#383).
 The prior release switched Kea's default socket mode to `raw`
