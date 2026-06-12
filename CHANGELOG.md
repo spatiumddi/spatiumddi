@@ -22,27 +22,73 @@ the formatter handles the rest.
 
 ## 2026.06.12-2 — 2026-06-12
 
-Appliance **host-config reliability** — closes the silent NTP
-crash-loop (#387) and the always-empty Fleet etcd-snapshot list
-(#389). On a field appliance the GUI-configured NTP settings had
-**never** applied: the host-side `spatiumddi-chrony-reload` runner
-validated the staged config with `chronyd -t -f <file>`, but `-t`
-is chrony's *timeout* flag (it takes a numeric argument), so chrony
-parsed `-f` as the timeout value and died with `Fatal error :
-Invalid argument -f` on every apply. Because each host-config
-runner only writes its applied-hash sidecar on SUCCESS, the
-supervisor re-derived "desired ≠ applied → fire the trigger" every
-~30 s heartbeat and re-fired forever — accumulating **2374**
-`ntp-config-pending.failed.<ts>` sidecars (and a parallel 2021
-`slot-set-next-boot-pending.done` from the same re-fire shape) with
-nothing surfaced in the UI. This release fixes the chrony flag and
-generalises #386's slot-upgrade fire-once/backoff/prune pattern to
-every hash-keyed host-config runner so none of them can silently
-loop again, and surfaces a stuck apply honestly in the Fleet
-drilldown. Builds on the slot-upgrade guard shipped in #386.
+Appliance **upgrade + host-config reliability** — three appliance
+fixes, all field-validated on a single-node appliance.
+
+**#386 — single-appliance OS upgrade now works end-to-end.** Applying
+an imported / uploaded OS slot-image (the #199 flow) had failed every
+time, retried silently forever, and showed nothing useful in the
+Fleet UI: the download hit the appliance's own self-signed web cert,
+a failed apply re-fired every ~30 s with no backoff (and the
+failed→ready auto-heal masked it), and the drilldown showed only a
+coarse state chip. Fixed across four parts — verify-by-hash +
+relax-TLS-for-the-self-served-URL download, a fire-once /
+honest-failure / sidecar-prune guard, a live per-phase progress
+stepper, and a persistent upgrade-image store.
+
+**#387 — host-config runners crash-loop silently.** The
+GUI-configured NTP settings had **never** applied: the
+`spatiumddi-chrony-reload` runner validated the staged config with
+`chronyd -t -f <file>`, but `-t` is chrony's *timeout* flag (it takes
+a numeric argument), so chrony parsed `-f` as the value and died with
+`Fatal error : Invalid argument -f` on every apply. Since each
+host-config runner only writes its applied-hash sidecar on SUCCESS,
+the supervisor re-derived "desired ≠ applied → fire" every ~30 s
+heartbeat and re-fired forever — **2374** `ntp-config-pending.failed`
+sidecars on the test box (plus 2021 `slot-set-next-boot-pending.done`
+from the same shape). #387 fixes the chrony flag and generalises
+#386's fire-once / backoff / prune pattern to every hash-keyed
+host-config runner (snmp / ntp / lldp / syslog / ssh / resolver /
+firewall / timezone), so none of them can silently loop again, and
+surfaces a stuck apply honestly in the Fleet drilldown.
+
+**#389 — Fleet etcd-snapshot inventory always empty** — the
+supervisor lists the k3s `ETCDSnapshotFile` CRs over the kubeapi, but
+its ServiceAccount lacked the read grant, so the list reported empty
+every heartbeat even though k3s was taking snapshots on schedule.
 
 ### Fixed
 
+* **#386 — OS slot-upgrade download failed on self-signed TLS.** The
+  scheduler points `desired_slot_image_url` at the appliance's OWN
+  control plane (`https://<self>/api/v1/appliance/upgrade-images/<id>/raw.xz`),
+  behind the self-signed web cert; the host runner's bare
+  `urllib.urlopen` verifies TLS by default → `CERTIFICATE_VERIFY_FAILED`,
+  so the apply never even downloaded. The scheduler now stamps the
+  image's stored sha256 + a `tls_insecure` flag; the runner verifies
+  the bytes against the hash (the real integrity guarantee) and skips
+  cert-verify ONLY for the self-served URL. External public-CA URLs
+  stay fully verified, and insecure-TLS is refused host-side unless an
+  expected hash is present.
+* **#386 — upgrade re-fired silently forever + hid the failure.** A
+  failed apply renamed the trigger away but left `desired_version`
+  set, so the supervisor re-fired every ~30 s heartbeat with no
+  backoff (flooding `.failed.<ts>` sidecars), and the failed→ready
+  auto-heal then read "ready" mid-failure. Now a per-apply nonce
+  fragment on the URL makes each schedule a distinct desired-state,
+  the supervisor fires exactly once per distinct URL (fire-once
+  marker), a cleared/cancelled upgrade resets the marker + heals a
+  stale `failed`, failures are reported honestly, and old sidecars are
+  pruned. (This is the slot-upgrade guard #387 then generalised to the
+  other host-config runners.)
+* **#386 — imported upgrade-image bytes vanished on api restart.**
+  Uploaded / GitHub-imported `.raw.xz` lived in the api's ephemeral
+  container layer, so on any api restart the DB row survived but the
+  bytes 404'd (`Upgrade image bytes missing on disk`) and a scheduled
+  upgrade failed at download. Added a persistent `slot-images`
+  hostPath mount on the api (single-node; the #296 slot-image mirror
+  PVC already covers multi-node, so the mount is gated off when the
+  mirror is enabled).
 * **#387 — NTP config never applied on the appliance.** The chrony
   config-apply runner's syntax check used `chronyd -t -f <file>`;
   `-t` is the *timeout* option (numeric arg), not a "test config"
@@ -76,6 +122,15 @@ drilldown. Builds on the slot-upgrade guard shipped in #386.
 
 ### Added
 
+* **#386 — live OS-upgrade status in the Fleet UI.** The host runner
+  now emits structured per-phase progress (queued → downloading[+%] →
+  verifying → writing → bootloader → arming → reboot-pending) to a
+  sidecar the supervisor ships on every heartbeat, alongside a tail of
+  `slot-upgrade.log`. The appliance drilldown renders a live status
+  stepper with the download percentage, an expandable log, a failure
+  card with the reason, and a reboot-to-finish CTA — replacing the
+  coarse single state chip. (The supervisor gains a read-only
+  `/var/log/spatiumddi` mount to ship the log tail.)
 * **#387 — host-config apply health in the Fleet UI.** The
   supervisor heartbeat ships `host_config_health` — per-plane
   `{state, attempts, at}` for any host-config runner whose desired
@@ -88,8 +143,11 @@ drilldown. Builds on the slot-upgrade guard shipped in #386.
 
 ### Migrations
 
-* `f4a1c9e7b2d8` — adds `appliance.host_config_health` (JSONB, not
-  null, default `{}`).
+* `e1c4a9d27b63` (#386) — adds `appliance.desired_slot_image_sha256`,
+  `desired_slot_image_tls_insecure`, `last_upgrade_log_tail`,
+  `last_upgrade_progress`.
+* `f4a1c9e7b2d8` (#387) — adds `appliance.host_config_health` (JSONB,
+  not null, default `{}`).
 
 ---
 
