@@ -20,6 +20,7 @@ import {
   postgresApi,
   containersApi,
   redisApi,
+  versionApi,
   type PostgresOverview,
   type PostgresTableSize,
   type PostgresConnection,
@@ -426,6 +427,8 @@ function PostgresPanel() {
 }
 
 function ContainersPanel() {
+  const version = useQuery({ queryKey: ["version"], queryFn: versionApi.get });
+  const isAppliance = !!version.data?.appliance_mode;
   const [prefix, setPrefix] = useState("spatiumddi-");
   const [includeStopped, setIncludeStopped] = useState(false);
   const stats = useQuery({
@@ -433,7 +436,35 @@ function ContainersPanel() {
     queryFn: () =>
       containersApi.stats({ prefix, include_stopped: includeStopped }),
     refetchInterval: 5_000,
+    // No operator-facing Docker socket on the k3s appliance — don't poll it;
+    // we point at Appliance → Pods instead (below).
+    enabled: !isAppliance,
   });
+
+  // On a k3s appliance the control-plane workloads run as Kubernetes pods,
+  // not Docker containers, so this docker-stats view is empty/irrelevant.
+  // Send the operator to the Appliance → Pods surface (live logs + restart).
+  if (isAppliance) {
+    return (
+      <div className="rounded border border-blue-500/40 bg-blue-500/5 p-4">
+        <div className="flex items-center gap-2 text-sm font-medium text-blue-800 dark:text-blue-300">
+          <Box className="h-4 w-4" />
+          This appliance runs on k3s
+        </div>
+        <p className="mt-2 text-xs text-muted-foreground">
+          Control-plane workloads run as Kubernetes pods, not Docker containers.
+          View and manage them — with restart and live log streaming — under{" "}
+          <Link
+            to="/appliance?tab=containers"
+            className="font-medium text-primary hover:underline"
+          >
+            Appliance → Pods
+          </Link>
+          .
+        </p>
+      </div>
+    );
+  }
 
   if (stats.data && !stats.data.available) {
     return (
