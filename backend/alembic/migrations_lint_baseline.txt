@@ -380,6 +380,10 @@ backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:357
 backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:359
 backend/alembic/versions/d9e4c12a7f85_aggregation_snooze.py:drop_column:39
 backend/alembic/versions/d9f3b21e8c54_wan_circuits.py:drop_table:187
+backend/alembic/versions/e1c4a9d27b63_appliance_upgrade_download_monitoring.py:drop_column:61
+backend/alembic/versions/e1c4a9d27b63_appliance_upgrade_download_monitoring.py:drop_column:62
+backend/alembic/versions/e1c4a9d27b63_appliance_upgrade_download_monitoring.py:drop_column:63
+backend/alembic/versions/e1c4a9d27b63_appliance_upgrade_download_monitoring.py:drop_column:64
 backend/alembic/versions/e1d8c92a4f73_network_service_catalog.py:drop_table:182
 backend/alembic/versions/e1d8c92a4f73_network_service_catalog.py:drop_table:190
 backend/alembic/versions/e1f2a3b4c5d6_subnet_ddns_fields.py:drop_column:63

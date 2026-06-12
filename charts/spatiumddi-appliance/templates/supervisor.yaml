@@ -96,6 +96,14 @@ spec:
             - name: nftables-conf
               mountPath: /etc/nftables-host.conf
               readOnly: true
+            # Issue #386 Part C — host slot-upgrade.log, read-only, so the
+            # heartbeat can ship a tail to the Fleet drilldown for full
+            # upgrade status (download → verify → write → bootloader).
+            # The structured progress sidecar lives in release-state
+            # (already mounted); this adds the raw log for detail.
+            - name: slot-upgrade-log
+              mountPath: /var/log/spatiumddi-host
+              readOnly: true
       volumes:
         - name: etc-spatiumddi-host
           hostPath:
@@ -125,6 +133,12 @@ spec:
           hostPath:
             path: /etc/rancher/k3s
             type: Directory
+        - name: slot-upgrade-log
+          hostPath:
+            path: /var/log/spatiumddi
+            # DirectoryOrCreate so a node that hasn't run an upgrade yet
+            # (no log dir) can never block the supervisor from scheduling.
+            type: DirectoryOrCreate
         - name: nftables-conf
           hostPath:
             path: {{ .Values.supervisor.hostMounts.nftablesConf }}

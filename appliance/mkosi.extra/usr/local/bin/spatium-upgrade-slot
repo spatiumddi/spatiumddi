@@ -28,9 +28,11 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -157,13 +159,74 @@ def cmd_status(_args) -> int:
     return 0
 
 
-def fetch_to(src: str, dst: Path) -> None:
-    """Stream-copy from URL or local file path into dst."""
+# Issue #386 Part C — structured per-phase progress for the Fleet UI.
+# The host wrapper (spatiumddi-slot-upgrade) owns the terminal steps
+# (queued / arming / reboot-pending / failed); this script writes the
+# in-apply steps (downloading + pct, verifying, writing, bootloader).
+# The supervisor reads this sidecar (it lives in release-state, which is
+# bind-mounted into the supervisor) and ships it on the heartbeat.
+_PROGRESS_FILE = Path("/var/lib/spatiumddi/release-state/slot-upgrade.progress")
+
+
+def _write_progress(step: str, pct: int | None = None, detail: str = "") -> None:
+    """Atomically write the progress sidecar. Best-effort — never let a
+    progress-write failure abort the upgrade itself."""
+    try:
+        _PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(
+            {
+                "step": step,
+                "pct": pct,
+                "detail": detail,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        tmp = _PROGRESS_FILE.with_name(_PROGRESS_FILE.name + ".new")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(_PROGRESS_FILE)
+    except OSError:
+        pass
+
+
+def fetch_to(src: str, dst: Path, *, insecure: bool = False, report: bool = False) -> None:
+    """Stream-copy from URL or local file path into dst.
+
+    ``insecure`` (#386 Part A) skips TLS cert-verification — used ONLY
+    for the appliance's own self-served upgrade-image URL behind its
+    self-signed web cert, and only when the caller will verify the bytes
+    against an expected sha256. ``report`` (#386 Part C) emits download
+    percentage into the progress sidecar from the Content-Length header.
+    """
     dst.parent.mkdir(parents=True, exist_ok=True)
     if src.startswith(("http://", "https://")):
+        ctx: ssl.SSLContext | None = None
+        if insecure and src.startswith("https://"):
+            print("  (TLS cert verification disabled for this self-served fetch)")
+            ctx = ssl._create_unverified_context()
         print(f"  fetching {src}")
-        with urllib.request.urlopen(src) as r, open(dst, "wb") as f:
-            shutil.copyfileobj(r, f, length=1024 * 1024)
+        with urllib.request.urlopen(src, context=ctx) as r, open(dst, "wb") as f:
+            total = 0
+            try:
+                total = int(r.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            done = 0
+            last_pct = -5
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if report and total > 0:
+                    pct = int(done * 100 / total)
+                    if pct - last_pct >= 2 or pct >= 100:
+                        last_pct = pct
+                        _write_progress(
+                            "downloading",
+                            pct,
+                            f"{done // (1024 * 1024)} / {total // (1024 * 1024)} MB",
+                        )
     else:
         srcpath = Path(src)
         if not srcpath.exists():
@@ -202,28 +265,50 @@ def cmd_apply(args) -> int:
     # /var/persist/etc/ssh, hostname stamp into the new slot's
     # /etc.image) are no longer needed and have been removed.
 
+    # Issue #386 Part A — relaxing TLS verification is only safe when we
+    # also verify the downloaded bytes against an expected hash. Refuse
+    # ``--insecure`` without one rather than fetch an unauthenticated,
+    # unverified image onto a block device.
+    insecure = getattr(args, "insecure", False)
+    expected_sha256 = (getattr(args, "expected_sha256", None) or "").strip().lower()
+    if insecure and not (expected_sha256 or args.checksum):
+        print(
+            "ERROR: --insecure requires --expected-sha256 or --checksum "
+            "(bytes must be verified when TLS verification is off)",
+            file=sys.stderr,
+        )
+        return 2
+
     workdir = Path("/var/lib/spatiumddi/slot-staging")
     workdir.mkdir(parents=True, exist_ok=True)
     staged = workdir / "slot.raw.xz"
 
     # Fetch.
-    fetch_to(args.image, staged)
+    _write_progress("downloading", 0, f"fetching {args.image}")
+    fetch_to(args.image, staged, insecure=insecure, report=True)
 
-    # Verify SHA256 if a sidecar checksum file is present (URL only).
-    if args.checksum:
-        sha_path = workdir / "slot.sha256"
-        fetch_to(args.checksum, sha_path)
-        expected = sha_path.read_text().strip().split()[0]
+    # Verify SHA256 against an expected literal (#386 — passed by the
+    # control plane for self-served images, no second fetch) or a sidecar
+    # checksum file (legacy / external URLs).
+    if expected_sha256 or args.checksum:
+        _write_progress("verifying", None, "verifying sha256")
+        if not expected_sha256:
+            sha_path = workdir / "slot.sha256"
+            fetch_to(args.checksum, sha_path, insecure=insecure)
+            expected_sha256 = sha_path.read_text().strip().split()[0].lower()
         actual = sha256_file(staged)
-        if expected.lower() != actual.lower():
-            print(f"ERROR: checksum mismatch (expected {expected}, got {actual})",
-                  file=sys.stderr)
+        if expected_sha256 != actual.lower():
+            print(
+                f"ERROR: checksum mismatch (expected {expected_sha256}, got {actual})",
+                file=sys.stderr,
+            )
             return 3
         print(f"  checksum OK: {actual}")
 
     # Decompress + dd directly into the inactive partition. xz can
     # stream-decompress so we don't need disk space for an intermediate
     # uncompressed file.
+    _write_progress("writing", None, f"writing image to {inactive['partlabel']}")
     print(f"  writing → {target_dev}")
     xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
                           stdout=subprocess.PIPE)
@@ -235,6 +320,7 @@ def cmd_apply(args) -> int:
         print("ERROR: xz exited non-zero", file=sys.stderr)
         return 4
 
+    _write_progress("bootloader", None, "updating bootloader + slot versions")
     print("  flushing kernel buffers + re-reading filesystem metadata…")
     subprocess.run(["partprobe", "/dev/" + os.path.basename(target_dev).rstrip("0123456789p")],
                    check=False)
@@ -709,6 +795,20 @@ def main() -> int:
     apply_p = sub.add_parser("apply", help="write a slot image to the inactive slot")
     apply_p.add_argument("image", help="URL or local file path to a slot .raw.xz image")
     apply_p.add_argument("--checksum", help="URL or path to a SHA-256 sidecar file")
+    # Issue #386 Part A.
+    apply_p.add_argument(
+        "--expected-sha256",
+        dest="expected_sha256",
+        help="expected SHA-256 hex of the image (verify against this literal — no "
+        "second fetch). Takes precedence over --checksum.",
+    )
+    apply_p.add_argument(
+        "--insecure",
+        action="store_true",
+        help="skip TLS cert verification for an https:// fetch (self-served upgrade "
+        "image behind the appliance's self-signed cert). Requires --expected-sha256 "
+        "or --checksum so the bytes are still verified.",
+    )
 
     nxt = sub.add_parser("set-next-boot",
                          help="set the next boot to a slot ONCE (grub-reboot — auto-reverts on failure)")
