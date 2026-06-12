@@ -114,13 +114,34 @@ export function NetworkTab() {
   );
 }
 
-// Verbose-boot console toggle. Off (default) = quiet boot + the Talos-style
-// console dashboard; On = a standard Linux console (kernel messages + systemd
-// [ OK ] lines scroll on boot/reboot/shutdown, and a normal getty login
-// replaces the dashboard). Backed by platform_settings.verbose_boot, which the
-// supervisor flips into the grubenv `spatium_verbose` variable the grub.cfg
+// Console-mode selector (#393). Picks what the appliance's physical / serial
+// console shows: the Talos dashboard, verbose boot output then the dashboard,
+// or a plain text login. Backed by platform_settings.console_mode, which the
+// supervisor maps to the grubenv `spatium_verbose` value the grub.cfg
 // menuentries read — so it applies on the NEXT reboot. Appliance hosts only
 // (this tab is already selfOnly).
+const CONSOLE_MODES: {
+  value: "dashboard" | "verbose_dashboard" | "text_console";
+  label: string;
+  desc: string;
+}[] = [
+  {
+    value: "dashboard",
+    label: "Dashboard (default)",
+    desc: "Quiet boot, then the SpatiumDDI console dashboard on screen.",
+  },
+  {
+    value: "verbose_dashboard",
+    label: "Verbose boot, then dashboard",
+    desc: "Kernel + systemd [ OK ] lines scroll during boot, then the dashboard takes over the console.",
+  },
+  {
+    value: "text_console",
+    label: "Plain text console",
+    desc: "Verbose boot + a standard Linux login prompt, no dashboard. Best for diagnosing boot hangs or working at the console directly.",
+  },
+];
+
 function VerboseBootCard() {
   const qc = useQueryClient();
   const { data: me } = useQuery({
@@ -133,48 +154,60 @@ function VerboseBootCard() {
     queryFn: settingsApi.get,
   });
   const isSuperadmin = me?.is_superadmin ?? false;
-  const verbose = settings?.verbose_boot ?? false;
+  const mode = settings?.console_mode ?? "dashboard";
   const save = useMutation({
-    mutationFn: (v: boolean) => settingsApi.update({ verbose_boot: v }),
+    mutationFn: (v: "dashboard" | "verbose_dashboard" | "text_console") =>
+      settingsApi.update({ console_mode: v }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
   });
 
   return (
     <section className="space-y-3 rounded-lg border bg-card p-4 shadow-sm">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h3 className="flex items-center gap-2 text-sm font-medium">
-            <TerminalSquare className="h-4 w-4 text-muted-foreground" />
-            Boot console
-          </h3>
-          <p className="mt-1 text-xs text-muted-foreground">
-            <strong>Off</strong> (default): quiet boot, then the SpatiumDDI
-            console dashboard. <strong>On</strong>: a standard Linux console —
-            kernel messages and systemd <code>[ OK ]</code> lines scroll during
-            boot / reboot / shutdown, and a normal login prompt replaces the
-            dashboard. Useful for diagnosing boot hangs. Takes effect on the{" "}
-            <strong>next reboot</strong>.
-          </p>
-        </div>
-        <button
-          type="button"
-          role="switch"
-          aria-checked={verbose}
-          aria-label="Verbose boot console (standard Linux boot)"
-          disabled={!isSuperadmin || save.isPending || !settings}
-          onClick={() => save.mutate(!verbose)}
-          className={cn(
-            "relative mt-0.5 inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-50",
-            verbose ? "bg-primary" : "bg-muted",
-          )}
-        >
-          <span
-            className={cn(
-              "inline-block h-5 w-5 transform rounded-full bg-background shadow transition-transform",
-              verbose ? "translate-x-5" : "translate-x-0.5",
-            )}
-          />
-        </button>
+      <div>
+        <h3 className="flex items-center gap-2 text-sm font-medium">
+          <TerminalSquare className="h-4 w-4 text-muted-foreground" />
+          Boot console
+        </h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          What the appliance&apos;s physical / serial console shows. Takes
+          effect on the <strong>next reboot</strong>.
+        </p>
+      </div>
+      <div className="space-y-2">
+        {CONSOLE_MODES.map((opt) => {
+          const active = mode === opt.value;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              role="radio"
+              aria-checked={active}
+              disabled={!isSuperadmin || save.isPending || !settings}
+              onClick={() => save.mutate(opt.value)}
+              className={cn(
+                "flex w-full items-start gap-3 rounded-md border p-2.5 text-left transition-colors disabled:opacity-50",
+                active
+                  ? "border-primary bg-primary/5"
+                  : "border-border hover:bg-muted/50",
+              )}
+            >
+              <span
+                className={cn(
+                  "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border",
+                  active ? "border-primary" : "border-muted-foreground/40",
+                )}
+              >
+                {active && <span className="h-2 w-2 rounded-full bg-primary" />}
+              </span>
+              <span className="min-w-0">
+                <span className="block text-sm font-medium">{opt.label}</span>
+                <span className="block text-xs text-muted-foreground">
+                  {opt.desc}
+                </span>
+              </span>
+            </button>
+          );
+        })}
       </div>
       {save.isError && (
         <p className="text-xs text-destructive">{formatApiError(save.error)}</p>
@@ -182,7 +215,7 @@ function VerboseBootCard() {
       {save.isSuccess && (
         <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-400">
           Saved — applies on the next reboot. Reboot the appliance (Maintenance
-          tab) to switch the boot console now.
+          tab) to switch the console now.
         </p>
       )}
       {!isSuperadmin && (

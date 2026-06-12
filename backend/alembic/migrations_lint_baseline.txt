@@ -118,6 +118,8 @@ backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:91
 backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:92
 backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:93
 backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:94
+backend/alembic/versions/a7c3e9f1b405_console_mode.py:drop_column:48
+backend/alembic/versions/a7c3e9f1b405_console_mode.py:drop_column:65
 backend/alembic/versions/a7e3c1f49d20_subnet_ip_discovery.py:drop_column:54
 backend/alembic/versions/a7e3c1f49d20_subnet_ip_discovery.py:drop_column:55
 backend/alembic/versions/a7e3c1f49d20_subnet_ip_discovery.py:drop_column:56

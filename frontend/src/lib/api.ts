@@ -2993,11 +2993,12 @@ export interface PlatformSettings {
   // Issue #165 — operator-set IANA timezone. Empty = no override
   // (host falls back to install-time default).
   timezone: string;
-  /** Appliance verbose-boot console. true = standard Linux console on
-   *  boot/reboot/shutdown (kernel messages + systemd status + getty, no
-   *  dashboard); false (default) = quiet boot + Talos dashboard. Appliance
-   *  hosts only; applies on next reboot (grubenv-driven). */
-  verbose_boot: boolean;
+  /** Appliance console mode (#393): "dashboard" (default) = quiet boot +
+   *  the Talos console dashboard; "verbose_dashboard" = verbose kernel /
+   *  systemd boot output, then the dashboard takes over; "text_console" =
+   *  verbose boot + a plain getty login (no dashboard). Appliance hosts only;
+   *  applies on the next reboot (grubenv-driven). */
+  console_mode: "dashboard" | "verbose_dashboard" | "text_console";
   /** Maintenance mode (issue #57). System-wide read-only switch.
    *  ``maintenance_started_at`` is server-managed (stamped on enable /
    *  cleared on disable) and is therefore read-only — not sent on PUT. */

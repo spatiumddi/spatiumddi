@@ -1475,18 +1475,27 @@ else
 fi
 if [ -z "\${default}" ]; then set default=slot_a; fi
 
-# Verbose-boot console toggle (grubenv \`spatium_verbose\`, flipped by the
-# Fleet UI → supervisor → spatiumddi-verbose-boot-reload). Loaded by the
-# \`load_env\` above. "1" = standard Linux console: drop the loglevel=3 cap so
-# all kernel messages scroll, add systemd.show_status=1 for the per-unit
-# [ OK ] lines, and pass spatium-console=off so a normal getty login replaces
-# the Talos dashboard. Empty / "0" = today's quiet boot (loglevel=3) + the
-# console dashboard. Unset (old grubenv) falls through to the quiet default —
+# Console-mode toggle (#393) — grubenv \`spatium_verbose\`, flipped by the
+# Fleet UI → supervisor → spatiumddi-verbose-boot-reload, loaded by \`load_env\`
+# above. The supervisor maps platform_settings.console_mode → this numeric:
+#   "1" text_console      — drop the loglevel=3 cap so all kernel messages
+#                           scroll, add systemd.show_status=1 for the per-unit
+#                           [ OK ] lines, and pass spatium-console=off so a
+#                           normal getty LOGIN replaces the Talos dashboard
+#                           (regular Linux server console).
+#   "2" verbose_dashboard — same verbose boot output, but NO spatium-console=off
+#                           so the dashboard still claims tty1 after boot.
+#   "0"/empty dashboard   — today's quiet boot (loglevel=3) + the dashboard.
+# Unset / unknown (old grubenv) falls through to the quiet dashboard default —
 # fail-closed, never a brick.
 if [ "\${spatium_verbose}" = "1" ]; then
     set sp_log=""
     set sp_systemd="systemd.show_status=1"
     set sp_console="spatium-console=off"
+elif [ "\${spatium_verbose}" = "2" ]; then
+    set sp_log=""
+    set sp_systemd="systemd.show_status=1"
+    set sp_console=""
 else
     set sp_log="loglevel=3"
     set sp_systemd=""

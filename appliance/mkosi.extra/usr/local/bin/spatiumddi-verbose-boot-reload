@@ -2,20 +2,24 @@
 # spatiumddi-verbose-boot-reload — host-side verbose-boot toggle runner.
 #
 # The supervisor writes /var/lib/spatiumddi/release-state/verbose-boot-pending
-# whenever the operator's desired console verbosity (platform_settings.
-# verbose_boot) differs from what this runner last applied. File format:
+# whenever the operator's desired console mode (platform_settings.console_mode,
+# #393) differs from what this runner last applied. File format:
 #
-#   line 1: "1" (standard Linux console) or "0" (quiet boot + dashboard)
+#   line 1: "0" | "1" | "2" — the grubenv spatium_verbose value (the supervisor
+#           maps console_mode → this numeric: dashboard→0 / text_console→1 /
+#           verbose_dashboard→2)
 #
 # Apply flow — flip the grubenv variable ``spatium_verbose`` that the installed
 # grub.cfg menuentries read (see spatium-install's grub.cfg heredoc). We do NOT
 # regenerate grub.cfg or reboot — only set the env var the conditional already
 # consumes:
-#   spatium_verbose=1  -> menuentry drops the loglevel=3 cap, adds
-#                         systemd.show_status=1, and passes spatium-console=off
-#                         (normal getty console, no Talos dashboard) — i.e. the
-#                         box boots like a regular Linux server.
-#   spatium_verbose=0  -> today's quiet boot (loglevel=3) + console dashboard.
+#   spatium_verbose=0  -> quiet boot (loglevel=3) + the Talos console dashboard.
+#   spatium_verbose=1  -> drops the loglevel=3 cap, adds systemd.show_status=1,
+#                         and passes spatium-console=off so a normal getty LOGIN
+#                         replaces the dashboard (regular Linux server console).
+#   spatium_verbose=2  -> verbose boot output (no loglevel cap +
+#                         systemd.show_status=1) but the dashboard still claims
+#                         tty1 after boot (no spatium-console=off).
 #
 # Takes effect on the NEXT REBOOT (GRUB only reads the cmdline at boot). The
 # Fleet UI says so + offers the reboot affordance.
@@ -56,12 +60,18 @@ if [ ! -f "$TRIGGER" ]; then
 fi
 
 val="$(head -n1 "$TRIGGER" | tr -d '[:space:]')"
-if [ "$val" != "0" ] && [ "$val" != "1" ]; then
-    log "REJECT: trigger value '$val' is not 0 or 1"
-    printf 'state=failed\nreason=invalid_value\nrequested=%s\napplied_at=%s\n' \
-        "$val" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
-    exit 1
-fi
+# #393 — 0 = dashboard (quiet boot + dashboard), 1 = text_console
+# (verbose boot + plain getty login, no dashboard), 2 = verbose_dashboard
+# (verbose boot output, then the dashboard claims tty1).
+case "$val" in
+    0 | 1 | 2) ;;
+    *)
+        log "REJECT: trigger value '$val' is not 0, 1 or 2"
+        printf 'state=failed\nreason=invalid_value\nrequested=%s\napplied_at=%s\n' \
+            "$val" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
+        exit 1
+        ;;
+esac
 
 # Locate grubenv. The appliance installs an EFI grub with grubenv on the ESP;
 # fall back to the BIOS paths for completeness. Must match where spatium-install
