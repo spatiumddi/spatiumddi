@@ -185,6 +185,8 @@ def _write_progress(step: str, pct: int | None = None, detail: str = "") -> None
         tmp.write_text(payload, encoding="utf-8")
         tmp.replace(_PROGRESS_FILE)
     except OSError:
+        # Progress reporting is cosmetic — a write failure must never
+        # abort the slot apply itself, so swallow it.
         pass
 
 

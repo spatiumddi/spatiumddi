@@ -529,6 +529,8 @@ def maybe_fire_fleet_upgrade(
         if _FIRED_URL_MARKER.read_text(encoding="utf-8").strip() == desired_url_str:
             return False
     except OSError:
+        # No marker yet / unreadable → treat as not-yet-fired and fall
+        # through to write the trigger. Never fatal.
         pass
     if _TRIGGER_FILE.exists():
         return False
@@ -556,6 +558,9 @@ def maybe_fire_fleet_upgrade(
         try:
             _FIRED_URL_MARKER.write_text(desired_url_str + "\n", encoding="utf-8")
         except OSError:
+            # Best-effort fire-once bookkeeping — a failed marker write at
+            # worst costs one extra re-fire next heartbeat, never a crash,
+            # so don't abort the (already-written) trigger.
             pass
         _prune_failed_sidecars()
         return True
@@ -575,6 +580,8 @@ def clear_fleet_upgrade_marker() -> None:
     try:
         _FIRED_URL_MARKER.unlink(missing_ok=True)
     except OSError:
+        # Best-effort cleanup — a stale marker only risks suppressing one
+        # re-fire of an identical URL; not worth failing the loop.
         pass
     if _TRIGGER_FILE.exists():
         return
@@ -586,6 +593,8 @@ def clear_fleet_upgrade_marker() -> None:
                     f"ready {datetime.now(UTC).isoformat()}\n", encoding="utf-8"
                 )
     except OSError:
+        # Best-effort heal — if the state sidecar can't be read/rewritten
+        # the chip just keeps its last value; the next apply overwrites it.
         pass
 
 
@@ -602,6 +611,8 @@ def _prune_failed_sidecars(keep: int = 5) -> None:
             for path in stale[:-keep]:
                 path.unlink(missing_ok=True)
     except OSError:
+        # Best-effort housekeeping — leftover sidecars are cosmetic; a
+        # prune failure must never block the upgrade trigger.
         pass
 
 
