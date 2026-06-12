@@ -386,6 +386,9 @@ def _unlink(path: str) -> None:
     try:
         os.unlink(path)
     except OSError:
+        # Best-effort cleanup of the candidate .new file — it may already be
+        # gone or unremovable; a failed unlink here is non-fatal (we never
+        # swapped it in, so the live grub.cfg + .bak are untouched regardless).
         pass
 
 
