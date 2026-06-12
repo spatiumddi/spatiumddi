@@ -20,7 +20,17 @@ ConditionKernelCommandLine=!spatium-console=off
 # in the meantime.
 After=systemd-user-sessions.service getty-pre.target
 Before=getty.target
-Conflicts=getty@tty1.service
+# #393 — NO Conflicts=getty@tty1.service. Conflicts= is registered at
+# unit-load time and leaks: even though this unit's
+# ConditionKernelCommandLine=!spatium-console=off makes it inactive in
+# the text_console mode, the recorded conflict still drops getty@tty1
+# from the boot transaction (ConflictedBy), so the operator who picked
+# the plain-console mode was left with NO login at all. The dashboard and
+# getty@tty1 are now mutually exclusive purely by their opposite
+# spatium-console=off conditions (getty's gate is in
+# getty@tty1.service.d/spatium-console-gate.conf), which needs no
+# Conflicts. The ExecStartPre `systemctl stop getty@tty1` below stays as
+# belt-and-braces for the rare case getty somehow raced up first.
 
 [Service]
 # `idle` defers ExecStart until pending jobs settle — same trick
