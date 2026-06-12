@@ -1292,3 +1292,189 @@ re-confirm + audit row).
 | Air-gapped site with the key saved out-of-band | Bootstrap key |
 | Cloud-init / unattended installs | ``BOOTSTRAP_PAIRING_CODE`` env (cloud-init) or the key |
 | Pairing code expired between generation and install | Bootstrap key, or generate a new code |
+
+---
+
+## 11. Host migration framework (#395)
+
+### The gap it closes
+
+`grub.cfg` lives on the shared ESP and is written once — at install time
+— by `spatium-install`'s heredoc. `spatium-upgrade-slot apply` only does
+surgical regex patches inside existing menuentry blocks (UUID re-stamp +
+version-label re-stamp). This meant a change to the `grub.cfg`
+**structure** — for example, `#393`'s `spatium_verbose=2`
+(`verbose_dashboard`) three-way conditional — could not reach an already-
+installed box via slot upgrade. Only a full reinstall would pick it up.
+
+The host migration framework closes that gap. On every boot,
+`spatiumddi-firstboot` calls the reconcile orchestrator **before** the
+health-commit step. The orchestrator compares the booted slot's baked
+`host_template_version` to a `/var` stamp and, if the slot is newer (or a
+previous patch attempt failed), runs every outstanding numbered patch in
+order. Patch `001-grub-render.sh` invokes `spatium-grub-render`, which
+re-renders the full `grub.cfg` deterministically from live data and
+atomically swaps it onto the ESP.
+
+### Components
+
+#### `spatium-grub-render` (single source of truth for `grub.cfg`)
+
+A standalone Python 3 script, run as root on the host, that emits the
+complete `grub.cfg` deterministically. Three modes:
+
+| Mode | Invocation | Use |
+|---|---|---|
+| **LIVE** | `spatium-grub-render` | Reconcile + `spatium-upgrade-slot apply` on the running host. Discovers `root_a`/`root_b` UUIDs via the same `lsblk -J` PARTLABEL walk `spatium-upgrade-slot` uses; reads per-slot versions from `slot-versions.json`. |
+| **INSTALL** | `spatium-grub-render --install-root MOUNT --root-a-uuid U --root-b-uuid U --version-label V` | Called by `spatium-install` in place of the old heredoc. One source of truth for both install-time and post-upgrade renders. |
+| **DRY-RUN** | `spatium-grub-render --print --root-a-uuid U --root-b-uuid U [--ver-a V] [--ver-b V]` | Prints the rendered config to stdout; no write, no `grub-script-check`, no partition discovery. Used by unit tests + golden-diff. |
+
+Safety swap (LIVE + INSTALL modes):
+
+1. Candidate written to `grub.cfg.new`.
+2. `grub-script-check grub.cfg.new` — if this fails, `.new` is deleted
+   and the existing `grub.cfg` + `.bak` are left untouched. Non-zero
+   return propagates to the orchestrator.
+3. Prior `grub.cfg` is `cp`'d to `grub.cfg.bak` (plain copy — FAT32 has
+   no hardlinks; a power-cut mid-copy still leaves the original complete).
+4. `os.replace(.new → grub.cfg)` — atomic rename within the ESP.
+
+**`grubenv` is never touched.** `saved_entry`, `next_entry`, and
+`spatium_verbose` survive every re-render verbatim; `grub.cfg` only
+*reads* them via `load_env`.
+
+The rendered output includes the `spatium_verbose` 0/1/2 three-way
+conditional (#393 gap closure):
+
+- `0` / unset — quiet boot (`loglevel=3`) + Talos console dashboard
+  (today's default)
+- `1` — standard Linux console: full kernel log + `systemd.show_status=1`;
+  Talos dashboard replaced by normal `getty@tty1`
+  (`spatium-console=off`)
+- `2` — verbose_dashboard (#393): full kernel log + systemd status but
+  **keeps** the Talos console dashboard (no `spatium-console=off`)
+
+#### `spatium-host-migrate` (reconcile orchestrator)
+
+A `#!/bin/sh` script invoked by `spatiumddi-firstboot` **before**
+`commit_slot_if_healthy`. Version-gated: reads the baked
+`host_template_version` from the slot rootfs
+(`/usr/lib/spatiumddi/host-template-version`) and the last-applied
+version from `/var` (`/var/lib/spatiumddi/release-state/host-template-version`).
+
+Behaviour:
+
+- If the slot version is newer (or any patch is not yet marked `ok` in
+  the ledger), runs every unapplied `NNN-*.sh` patch in lexical order.
+- On full success, stamps the applied-version file so the next boot skips
+  the loop.
+- On any patch failure: stops at the failing patch, records `ok=false` +
+  increments `fail_count` in the ledger, leaves the version stamp
+  **unchanged** (self-heal retry on next boot), and returns non-zero.
+- A non-zero return causes `spatiumddi-firstboot` to `exit 1` **before**
+  `commit_slot_if_healthy` — so a trial boot's slot is **not** committed
+  durable and the next reboot auto-reverts to the previous (working) slot.
+
+#### Numbered patch registry
+
+```
+/usr/lib/spatiumddi/            # on the slot rootfs (replaced on slot upgrade)
+├── host-template-version       # single line, e.g. "1"; bump when adding a patch
+└── host-patches/
+    └── 001-grub-render.sh      # idempotent; exec's spatium-grub-render
+```
+
+Patch contract:
+
+- **Filename**: `NNN-<slug>.sh` (zero-padded number prefix) — lexical
+  sort drives apply order.
+- **Exit 0** = applied successfully; **non-zero** = failure.
+- **Idempotent** — safe to run twice (the orchestrator only runs patches
+  not yet marked `ok`, but a patch must still no-op cleanly if re-run).
+- **Self-contained** — may call host binaries; must not assume any
+  container is up.
+
+#### `/var` ledger
+
+```
+/var/lib/spatiumddi/release-state/   # persistent /var — survives slot swaps
+├── slot-versions.json               # EXISTING — per-slot versions
+├── host-template-version            # NEW — last-applied template version
+└── host-patches-applied.json        # NEW — applied-patch ledger
+```
+
+`host-patches-applied.json` shape:
+
+```json
+{
+  "last_reconcile_at": "2026-06-12T15:40:02+00:00",
+  "last_reconcile_ok": true,
+  "template_version_applied": "1",
+  "patches": {
+    "001-grub-render": {
+      "applied_at": "2026-06-12T15:40:02+00:00",
+      "ok": true,
+      "fail_count": 0
+    }
+  }
+}
+```
+
+On a failed patch `ok: false` and `fail_count` > 0 are recorded; the
+`template_version_applied` top-level key is omitted (so the next boot
+retries).
+
+### Every-boot version-gated reconcile + boot safety
+
+The reconcile fires on **every** boot (not gated on k3s readyz), so it
+retries after a transient failure (e.g. ESP momentarily busy,
+`grub-script-check` missing on an older slot). The version gate keeps
+steady-state cost to one integer compare plus one `cat` — negligible.
+
+The safety sequence, in boot order:
+
+1. `sync-versions` refreshes `slot-versions.json` (so the renderer reads
+   current per-slot labels).
+2. `spatium-host-migrate` runs unapplied patches:
+   - `001-grub-render.sh` → `spatium-grub-render`:
+     discover live UUIDs → render full `grub.cfg` → `grub-script-check`
+     → atomic swap → update `.bak`.
+   - Ledger updated per patch.
+3. **On success**: version stamp written. Execution continues to the
+   readiness wait and `commit_slot_if_healthy`.
+4. **On failure**: `spatiumddi-firstboot` exits 1. `commit_slot_if_healthy`
+   never runs. `grubenv`'s `saved_entry` is unchanged → next reboot
+   reverts to the previous durable slot (with its old, working `grub.cfg`).
+   The `.bak` file on the ESP is the secondary safety net: the prior
+   `grub.cfg` is intact even if the failed render left `.new` half-written
+   (`.new` is cleaned up by `write_atomic` on `grub-script-check`
+   rejection).
+
+### Fleet UI surface (`host_migration_health`)
+
+The supervisor's heartbeat reads the `/var` ledger at
+`/var/lib/spatiumddi-host/release-state/host-patches-applied.json` (via
+the existing read-only bind mount) and reports a thin rollup to the
+control plane as `host_migration_health` on the `Appliance` row. Shape
+mirrors `host_config_health` (#387): only **failing** patches appear;
+all-applied → `{}` (clears any stale entry). The Fleet tab's per-appliance
+drilldown shows the rollup when any patch is failing.
+
+### Operator / developer workflow for future patches
+
+To ship a future install-time or ESP fix (e.g. adding a new GRUB module,
+changing the serial-console baud rate, adding a new `menuentry` variant):
+
+1. Add `/usr/lib/spatiumddi/host-patches/NNN-<slug>.sh` (idempotent,
+   `exit 0` on success).
+2. Bump `/usr/lib/spatiumddi/host-template-version` by one integer.
+3. Add the corresponding `chmod 0755` lines to `appliance/mkosi.postinst`.
+4. Rebuild the slot image (`make appliance-slot-image` or the full ISO).
+
+On the next slot upgrade + reboot cycle, `spatiumddi-firstboot` detects
+the bumped version, runs the new patch, updates the ledger, and (on
+success) commits the slot durable. **No reinstall required.**
+
+If the patch calls `spatium-grub-render`, it inherits all the renderer's
+safety guarantees: `grub-script-check` before swap, `.bak` preservation,
+atomic rename, and the boot-revert on failure.

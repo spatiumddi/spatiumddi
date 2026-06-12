@@ -1,0 +1,253 @@
+#!/bin/sh
+# spatium-host-migrate — version-gated host-patch reconcile (#395).
+#
+# Invoked by spatiumddi-firstboot BEFORE the health-commit step. Returns
+# non-zero on any patch failure so firstboot blocks commit_slot_if_healthy.
+#
+# Design:
+#   * Every-boot, version-gated: reads the baked host-template-version from
+#     the slot rootfs and the last-applied version from /var. When they
+#     differ, every not-yet-applied patch is run. When they are equal, only
+#     patches not yet marked ok in the ledger are retried (covers a patch
+#     that failed last boot and left the version stamp unbumped — self-heal).
+#   * Patch contract: /usr/lib/spatiumddi/host-patches/NNN-<slug>.sh, exit 0
+#     = success, non-zero = failure. Applied in lexical (numeric) order.
+#     Patches must be idempotent.
+#   * Ledger: /var/lib/spatiumddi/release-state/host-patches-applied.json —
+#     atomic JSON write (python3 .new → os.replace), same convention as
+#     slot-versions.json. Survives slot swaps on the persistent /var.
+#   * On full success: stamps /var/lib/spatiumddi/release-state/
+#     host-template-version with the baked version (next boot skips the loop).
+#   * On any patch failure: stops at the failing patch, records ok=false +
+#     increments fail_count + error in the ledger, leaves the /var version
+#     stamp unchanged so next boot retries, returns 1.
+#
+# Log target: /var/log/spatiumddi/firstboot.log (shared with firstboot).
+
+set -eu
+
+# Paths default to the production locations but accept env overrides so the
+# script is unit-testable (point it at a tmp tree) and debuggable from a
+# rescue shell. The defaults below are the real appliance paths — overriding
+# is a dev/test/recovery affordance, never used in the firstboot call.
+PATCH_DIR=${SPATIUM_HOST_PATCH_DIR:-/usr/lib/spatiumddi/host-patches}
+BAKED_VER_FILE=${SPATIUM_HOST_TEMPLATE_VERSION_FILE:-/usr/lib/spatiumddi/host-template-version}
+STATE_DIR=${SPATIUM_HOST_STATE_DIR:-/var/lib/spatiumddi/release-state}
+APPLIED_VER_FILE="$STATE_DIR/host-template-version"
+LEDGER="$STATE_DIR/host-patches-applied.json"
+LOG=${SPATIUM_HOST_MIGRATE_LOG:-/var/log/spatiumddi/firstboot.log}
+ROLE_CONFIG=${SPATIUM_HOST_ROLE_CONFIG:-/etc/spatiumddi/role-config}
+
+# ── Appliance-only gate ───────────────────────────────────────────────────────
+# Mirror sync-versions guard in firstboot: only run on appliance nodes that
+# have the role-config sidecar (not on docker/k8s control planes).
+if [ ! -e "$ROLE_CONFIG" ]; then
+    exit 0
+fi
+if [ ! -d "$PATCH_DIR" ]; then
+    exit 0
+fi
+
+# ── State dir ─────────────────────────────────────────────────────────────────
+# firstboot already mkdir -p's this with chmod 1777, but we guard here too
+# so the script can be run standalone in recovery (e.g. from a rescue shell).
+mkdir -p "$STATE_DIR"
+
+# ── Timestamp helper ──────────────────────────────────────────────────────────
+now_iso() {
+    date -Iseconds 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%S+00:00"
+}
+
+# ── Ledger helpers (python3 inline) ──────────────────────────────────────────
+#
+# The ledger JSON shape (mirrors slot-versions.json conventions):
+# {
+#   "last_reconcile_at": "<iso>",
+#   "last_reconcile_ok": true | false,
+#   "template_version_applied": "<ver>",
+#   "patches": {
+#     "<id>": {
+#       "applied_at": "<iso>",
+#       "ok": true | false,
+#       "fail_count": 0,
+#       "error": "<string>"          # only on failure
+#     }
+#   }
+# }
+#
+# ledger_ok ID — exit 0 if patch ID is marked ok in the ledger, else 1.
+ledger_ok() {
+    local id="$1"
+    python3 - "$LEDGER" "$id" <<'PY'
+import sys, json, pathlib
+ledger_path, patch_id = sys.argv[1], sys.argv[2]
+try:
+    data = json.loads(pathlib.Path(ledger_path).read_text(encoding="utf-8"))
+    patch_info = data.get("patches", {}).get(patch_id, {})
+    sys.exit(0 if patch_info.get("ok") is True else 1)
+except (OSError, ValueError):
+    sys.exit(1)
+PY
+}
+
+# ledger_patch_ok ID AT — record a successful patch run.
+ledger_patch_ok() {
+    local id="$1"
+    local at="$2"
+    python3 - "$LEDGER" "$id" "$at" <<'PY'
+import sys, json, os, pathlib
+ledger_path_str, patch_id, applied_at = sys.argv[1], sys.argv[2], sys.argv[3]
+ledger_path = pathlib.Path(ledger_path_str)
+try:
+    data = json.loads(ledger_path.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    data = {}
+if "patches" not in data or not isinstance(data["patches"], dict):
+    data["patches"] = {}
+existing = data["patches"].get(patch_id, {}) if isinstance(data["patches"].get(patch_id), dict) else {}
+data["patches"][patch_id] = {
+    "applied_at": applied_at,
+    "ok": True,
+    "fail_count": 0,
+}
+# Preserve error key omission on success (clean record).
+text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+tmp = ledger_path_str + ".new"
+pathlib.Path(tmp).write_text(text, encoding="utf-8")
+os.replace(tmp, ledger_path_str)
+PY
+}
+
+# ledger_patch_fail ID AT ERROR — record a failed patch run, incrementing fail_count.
+ledger_patch_fail() {
+    local id="$1"
+    local at="$2"
+    local error="$3"
+    python3 - "$LEDGER" "$id" "$at" "$error" <<'PY'
+import sys, json, os, pathlib
+ledger_path_str, patch_id, applied_at, error = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+ledger_path = pathlib.Path(ledger_path_str)
+try:
+    data = json.loads(ledger_path.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    data = {}
+if "patches" not in data or not isinstance(data["patches"], dict):
+    data["patches"] = {}
+existing = data["patches"].get(patch_id)
+old_fail_count = 0
+if isinstance(existing, dict):
+    old_fail_count = int(existing.get("fail_count") or 0)
+data["patches"][patch_id] = {
+    "applied_at": applied_at,
+    "ok": False,
+    "fail_count": old_fail_count + 1,
+    "error": error,
+}
+text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+tmp = ledger_path_str + ".new"
+pathlib.Path(tmp).write_text(text, encoding="utf-8")
+os.replace(tmp, ledger_path_str)
+PY
+}
+
+# ledger_finalize OK AT BAKED_VER — write the top-level reconcile result.
+# Writes last_reconcile_at, last_reconcile_ok, and (on success) template_version_applied.
+# Preserves existing patches entries.
+ledger_finalize() {
+    local ok="$1"      # "true" or "false"
+    local at="$2"
+    local baked_ver="$3"
+    python3 - "$LEDGER" "$ok" "$at" "$baked_ver" <<'PY'
+import sys, json, os, pathlib
+ledger_path_str, ok_str, reconcile_at, baked_ver = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+ledger_path = pathlib.Path(ledger_path_str)
+try:
+    data = json.loads(ledger_path.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    data = {}
+ok_bool = (ok_str == "true")
+data["last_reconcile_at"] = reconcile_at
+data["last_reconcile_ok"] = ok_bool
+if ok_bool and baked_ver:
+    data["template_version_applied"] = baked_ver
+if "patches" not in data or not isinstance(data["patches"], dict):
+    data["patches"] = {}
+text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+tmp = ledger_path_str + ".new"
+pathlib.Path(tmp).write_text(text, encoding="utf-8")
+os.replace(tmp, ledger_path_str)
+PY
+}
+
+# ── Version resolution ────────────────────────────────────────────────────────
+baked_ver=$(cat "$BAKED_VER_FILE" 2>/dev/null | tr -d '[:space:]' || echo "0")
+applied_ver=$(cat "$APPLIED_VER_FILE" 2>/dev/null | tr -d '[:space:]' || echo "0")
+
+echo "host-migrate: baked_ver=$baked_ver applied_ver=$applied_ver" >> "$LOG"
+
+# ── Patch loop ────────────────────────────────────────────────────────────────
+# The version compare is an optimisation: if versions match AND the ledger
+# shows all patches are ok, we can exit early. However, we always check
+# per-patch ledger state — so a patch that failed last boot is retried even
+# when baked_ver == applied_ver (because its ledger entry is not ok).
+#
+# Iteration order: lexical sort of NNN-*.sh filenames ensures numeric order.
+
+all_ok=1
+ran_any=0
+
+for patch in $(ls -1 "$PATCH_DIR"/[0-9]*.sh 2>/dev/null | sort); do
+    id=$(basename "$patch" .sh)
+
+    # Check if this patch is already recorded as ok in the ledger.
+    if ledger_ok "$id"; then
+        # Already applied successfully. Only skip if the baked version hasn't
+        # changed — if it has, we let new patches run but leave already-ok
+        # ones alone (they are idempotent, but skipping saves work).
+        continue
+    fi
+
+    # Patch needs to run.
+    echo "host-migrate: applying $id" | tee -a "$LOG"
+    ran_any=1
+    patch_at=$(now_iso)
+
+    # Run the patch, capturing its exit code.
+    set +e
+    sh "$patch" >> "$LOG" 2>&1
+    patch_rc=$?
+    set -e
+
+    if [ "$patch_rc" -eq 0 ]; then
+        echo "host-migrate: $id OK" >> "$LOG"
+        ledger_patch_ok "$id" "$patch_at"
+    else
+        echo "host-migrate: PATCH $id FAILED (rc=$patch_rc)" | tee -a "$LOG" >&2
+        ledger_patch_fail "$id" "$patch_at" "exit $patch_rc"
+        all_ok=0
+        break  # Stop at first failure — patches are ordered dependencies.
+    fi
+done
+
+# ── Finalise ──────────────────────────────────────────────────────────────────
+reconcile_at=$(now_iso)
+
+if [ "$all_ok" -eq 1 ]; then
+    # Stamp the applied version ONLY on full success → next boot skips work
+    # (unless a new patch is added, in which case baked_ver > applied_ver and
+    # the new patch will run while already-ok patches are skipped by the ledger
+    # check above).
+    printf '%s\n' "$baked_ver" > "$APPLIED_VER_FILE"
+    ledger_finalize "true" "$reconcile_at" "$baked_ver"
+    if [ "$ran_any" -eq 1 ]; then
+        echo "host-migrate: reconcile complete (template_version=$baked_ver)" >> "$LOG"
+    else
+        echo "host-migrate: nothing to do (template_version=$baked_ver already applied)" >> "$LOG"
+    fi
+    exit 0
+else
+    # Leave APPLIED_VER_FILE unchanged so the next boot retries the failed patch.
+    ledger_finalize "false" "$reconcile_at" ""
+    echo "host-migrate: reconcile FAILED — slot commit will be blocked" | tee -a "$LOG" >&2
+    exit 1
+fi

@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""spatium-grub-render — single source of truth for the appliance grub.cfg (#395).
+
+The A/B grub.cfg lives on the ESP and is SHARED between both slots. It used
+to be generated only by the install-time heredoc in spatium-install, and
+spatium-upgrade-slot apply only did surgical regex patches (UUID + label)
+inside the existing menuentry blocks. That meant a change to the grub.cfg
+*structure* (e.g. #393's `spatium_verbose=2` / verbose_dashboard branch)
+could never reach an installed box — only a reinstall would pick it up.
+
+This renderer closes that gap. It emits the FULL grub.cfg deterministically
+from live data, so a new slot's first-boot reconcile (spatium-host-migrate →
+001-grub-render.sh) can re-render the ESP grub.cfg with whatever structure
+the new slot ships. It is the same renderer spatium-install calls, so there
+is one source of truth for the menu.
+
+Run as root on the host. Three modes:
+
+  spatium-grub-render
+      LIVE mode (reconcile + spatium-upgrade-slot apply). Discovers the
+      root_a/root_b filesystem UUIDs via the same `lsblk -J` PARTLABEL walk
+      spatium-upgrade-slot uses, reads per-slot versions from
+      slot-versions.json, renders the full grub.cfg to /boot/efi/grub/grub.cfg
+      via the atomic safety swap below.
+
+  spatium-grub-render --install-root MOUNT --root-a-uuid U --root-b-uuid U \
+                      --version-label V
+      INSTALL mode (spatium-install). Renders into MOUNT/boot/efi/grub/grub.cfg
+      using the UUIDs the installer just mkfs'd. Both slots are titled V
+      (root_B is an rsync clone of root_A at install). No live lsblk — the
+      partitions aren't the running root yet.
+
+  spatium-grub-render --print --root-a-uuid U --root-b-uuid U \
+                      [--ver-a V] [--ver-b V]
+      DRY-RUN. Prints the rendered grub.cfg to stdout. No write, no
+      grub-script-check, no UUID discovery (uses the passed UUIDs). For unit
+      tests + golden-diff.
+
+GUARD RAILS (LIVE + INSTALL modes):
+  1. The candidate is written to grub.cfg.new, then `grub-script-check`'d
+     BEFORE it can become live. A candidate that fails the check is deleted;
+     the live grub.cfg + .bak are left byte-unchanged; we return non-zero.
+  2. The prior grub.cfg is `cp`'d to grub.cfg.bak (FAT32 has no hardlinks —
+     plain copy, not rename) before the swap, so a power-cut mid-swap still
+     leaves either the old grub.cfg or the old .bak complete.
+  3. `os.replace(.new → grub.cfg)` is atomic within the ESP filesystem.
+
+INVARIANT — grubenv is NEVER touched. This renderer does not call
+grub-editenv / grub-reboot / grub-set-default. The grubenv variables
+(saved_entry / next_entry / spatium_verbose) survive every re-render
+verbatim; grub.cfg only *reads* them via `load_env`. The install-time
+grubenv seeds stay in spatium-install, not here.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+# ESP path (live mode). grub.cfg + grubenv live on the ESP, shared between
+# both slots, mounted at /boot/efi on the installed system (matches
+# spatium-upgrade-slot's GRUB_BOOT_DIR).
+GRUB_CFG = "/boot/efi/grub/grub.cfg"
+
+# Per-slot version sidecar written by `spatium-upgrade-slot sync-versions`
+# (and on every boot by spatiumddi-firstboot). Shape: {"slot_a": ver,
+# "slot_b": ver}. The renderer reads it for the menuentry titles — NOT
+# /etc/spatiumddi/appliance-release, which only reports the *active* slot.
+SLOT_VERSIONS = "/var/lib/spatiumddi/release-state/slot-versions.json"
+
+# GPT partition names set by `sgdisk -c4:root_A -c5:root_B` in spatium-install
+# (distinct from the ext4 filesystem labels). Same set spatium-upgrade-slot
+# filters on.
+SLOT_PARTLABELS = {"root_a", "root_b"}
+
+# Version sentinels that mean "no real version" → render a bare title with
+# no version chunk. Mirrors slot_version_label()/_read_active_appliance_version()
+# in spatium-upgrade-slot, which return these for an empty/staging/unreadable
+# slot.
+_VERSION_SENTINELS = {"", "unknown", "unstamped", "unreadable"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live discovery (LIVE mode only)
+# ─────────────────────────────────────────────────────────────────────────────
+def discover_live_uuids() -> dict[str, str]:
+    """Discover the root_a/root_b filesystem UUIDs from live partitions.
+
+    EXACT reuse of spatium-upgrade-slot's find_slot_partitions() lsblk
+    PARTLABEL walk. We run natively on the host (not in a container), so
+    lsblk has device-inode access and PARTLABEL/UUID come back populated —
+    the /run/udev parse the api/supervisor containers use is NOT needed here.
+
+    Returns {"root_a": <uuid>, "root_b": <uuid>} (only entries with a
+    non-empty UUID are included).
+    """
+    try:
+        out = subprocess.run(
+            ["lsblk", "-J", "-o", "NAME,PATH,UUID,PARTLABEL,LABEL,PARTTYPE,FSTYPE"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return {}
+
+    uuids: dict[str, str] = {}
+
+    def walk(node: dict) -> None:
+        partlabel = (node.get("partlabel") or "").lower()
+        if partlabel in SLOT_PARTLABELS:
+            uuid = node.get("uuid") or ""
+            if uuid:
+                uuids[partlabel] = uuid
+        for child in node.get("children") or []:
+            walk(child)
+
+    for top in data.get("blockdevices") or []:
+        walk(top)
+    return uuids
+
+
+def per_slot_versions() -> dict[str, str]:
+    """Read slot-versions.json → {"slot_a": ver, "slot_b": ver}.
+
+    On any error (missing file, bad JSON, wrong shape) → {}; callers degrade
+    to a bare "SpatiumDDI Appliance" title.
+    """
+    try:
+        data = json.loads(Path(SLOT_VERSIONS).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for slot in ("slot_a", "slot_b"):
+        val = data.get(slot)
+        if isinstance(val, str):
+            out[slot] = val
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pure rendering (exercised deterministically by --print)
+# ─────────────────────────────────────────────────────────────────────────────
+def _title(version: str | None, suffix: str) -> str:
+    """Compose a menuentry title.
+
+    `SpatiumDDI Appliance <version> <suffix>` when version is real, else
+    `SpatiumDDI Appliance <suffix>`. <suffix> is e.g. "(slot A)".
+    """
+    base = "SpatiumDDI Appliance"
+    if version and version.strip() not in _VERSION_SENTINELS:
+        base = f"{base} {version}"
+    return f"{base} {suffix}"
+
+
+def render_verbose_block() -> str:
+    """The spatium_verbose conditional — THE #393 GAP CLOSURE.
+
+    The install-time heredoc today is binary (`= "1"` / else). The renderer
+    emits the 0/1/2 three-way so an installed box, after a slot upgrade,
+    gains the #393 `verbose_dashboard` (=2) branch with no reinstall:
+
+      0 / unset → quiet boot (loglevel=3) + Talos console dashboard (default)
+      1         → standard Linux console: full kernel log + systemd status,
+                  getty replaces the dashboard (spatium-console=off)
+      2         → verbose_dashboard: full kernel log + systemd status, but
+                  the Talos console dashboard is KEPT (no spatium-console=off)
+
+    Emitted as literal grub syntax (sets the sp_log / sp_systemd / sp_console
+    grub variables the slot_a / slot_b menuentries expand on their cmdline).
+    """
+    return (
+        '# Verbose-boot console toggle (grubenv `spatium_verbose`, flipped by the\n'
+        "# Fleet UI → supervisor → spatiumddi-verbose-boot-reload). Loaded by the\n"
+        '# `load_env` above. "1" = standard Linux console: drop the loglevel=3 cap so\n'
+        "# all kernel messages scroll, add systemd.show_status=1 for the per-unit\n"
+        "# [ OK ] lines, and pass spatium-console=off so a normal getty login replaces\n"
+        '# the Talos dashboard. "2" = verbose_dashboard (#393): same full kernel log +\n'
+        "# systemd status, but KEEP the Talos console dashboard (no spatium-console=off).\n"
+        '# Empty / "0" = today\'s quiet boot (loglevel=3) + the console dashboard. Unset\n'
+        "# (old grubenv) falls through to the quiet default — fail-closed, never a brick.\n"
+        'if [ "${spatium_verbose}" = "1" ]; then\n'
+        '    set sp_log=""\n'
+        '    set sp_systemd="systemd.show_status=1"\n'
+        '    set sp_console="spatium-console=off"\n'
+        'elif [ "${spatium_verbose}" = "2" ]; then\n'
+        '    set sp_log=""\n'
+        '    set sp_systemd="systemd.show_status=1"\n'
+        '    set sp_console=""\n'
+        "else\n"
+        '    set sp_log="loglevel=3"\n'
+        '    set sp_systemd=""\n'
+        '    set sp_console=""\n'
+        "fi"
+    )
+
+
+def render_text(uuid_a: str, uuid_b: str,
+                ver_a: str | None, ver_b: str | None) -> str:
+    """Render the full grub.cfg text.
+
+    Pure function of its inputs (the --print mode exercises this directly so
+    unit tests can subprocess it deterministically). Reproduces the
+    spatium-install heredoc verbatim EXCEPT the spatium_verbose conditional,
+    which becomes the 0/1/2 three-way (see render_verbose_block).
+
+    All grub variables (${next_entry} ${saved_entry} ${spatium_verbose}
+    ${sp_log} ${sp_systemd} ${sp_console}) are emitted as LITERAL grub syntax
+    — in the heredoc they are `\\${...}`-escaped; here we just write the plain
+    strings (there is no shell to fight). UUIDs + version-label titles are
+    substituted. The four menuentries are emitted in order: --id=slot_a,
+    --id=slot_b, --id=slot_a_verbose, --id=rescue.
+    """
+    title_a = _title(ver_a, "(slot A)")
+    title_b = _title(ver_b, "(slot B)")
+    title_a_verbose = _title(ver_a, "(slot A, verbose boot)")
+    title_rescue = _title(ver_a, "(rescue / single-user)")
+
+    lines = [
+        "# SpatiumDDI A/B boot config (Phase 8c, issue #138).",
+        "# Default boot is whichever slot grubenv's saved_entry points at; on",
+        "# first install that's slot_a. grub-reboot <slot> from spatium-upgrade-",
+        "# slot sets it for ONE BOOT only (auto-reverts on next boot — that's",
+        "# the safety net for failed upgrades).",
+        "set timeout=3",
+        "load_env",
+        "",
+        "# Phase 8c boot counting:",
+        "#   * next_entry → one-shot, set by `grub-reboot <slot>`. We honor it",
+        "#     once, clear it (so the next-but-one boot reverts), then boot.",
+        "#     If the chosen slot panics or fails /health/live, it's already",
+        "#     cleared from grubenv → operator falls back to saved_entry on",
+        "#     the next reboot. This is the rollback safety net.",
+        "#   * saved_entry → durable default. Set by `grub-set-default <slot>`",
+        "#     either manually (spatium-upgrade-slot rollback) or by",
+        "#     spatiumddi-firstboot.service after a trial slot proves healthy.",
+        'if [ "${next_entry}" ]; then',
+        '    set default="${next_entry}"',
+        "    set next_entry=",
+        "    save_env next_entry",
+        "else",
+        '    set default="${saved_entry}"',
+        "fi",
+        'if [ -z "${default}" ]; then set default=slot_a; fi',
+        "",
+        render_verbose_block(),
+        "",
+        "# Serial console mirror for headless installs.",
+        "serial --unit=0 --speed=115200",
+        "terminal_input  console serial",
+        "terminal_output console serial",
+        "",
+        "insmod part_gpt",
+        "insmod ext2",
+        "insmod ext4",
+        "insmod search_fs_uuid",
+        "",
+        f'menuentry "{title_a}" --id=slot_a {{',
+        f"    search --no-floppy --fs-uuid --set=root {uuid_a}",
+        f"    linux /boot/vmlinuz root=UUID={uuid_a} rw \\",
+        "        ${sp_log} audit=0 ${sp_systemd} ${sp_console} \\",
+        "        console=tty0 console=ttyS0,115200n8",
+        "    initrd /boot/initrd.img",
+        "}",
+        "",
+        f'menuentry "{title_b}" --id=slot_b {{',
+        f"    search --no-floppy --fs-uuid --set=root {uuid_b}",
+        f"    linux /boot/vmlinuz root=UUID={uuid_b} rw \\",
+        "        ${sp_log} audit=0 ${sp_systemd} ${sp_console} \\",
+        "        console=tty0 console=ttyS0,115200n8",
+        "    initrd /boot/initrd.img",
+        "}",
+        "",
+        f'menuentry "{title_a_verbose}" --id=slot_a_verbose {{',
+        "    # Drops loglevel + audit too. Use when you need to capture every",
+        "    # kernel message for a bug report. Also passes spatium-console=off",
+        "    # so getty@tty1 wins tty1 (no dashboard overpainting the log).",
+        f"    search --no-floppy --fs-uuid --set=root {uuid_a}",
+        f"    linux /boot/vmlinuz root=UUID={uuid_a} rw \\",
+        "        spatium-console=off \\",
+        "        console=tty0 console=ttyS0,115200n8",
+        "    initrd /boot/initrd.img",
+        "}",
+        "",
+        f'menuentry "{title_rescue}" --id=rescue {{',
+        "    # Boots slot_a into rescue.target — single-user, root shell only,",
+        "    # no k3s, no getty@tty1.",
+        f"    search --no-floppy --fs-uuid --set=root {uuid_a}",
+        f"    linux /boot/vmlinuz root=UUID={uuid_a} rw \\",
+        "        console=tty0 console=ttyS0,115200n8 systemd.unit=rescue.target",
+        "    initrd /boot/initrd.img",
+        "}",
+    ]
+    # Heredoc body ends with `}\n` before EOF → the file ends with a single
+    # trailing newline after the closing brace.
+    return "\n".join(lines) + "\n"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Atomic safety swap (LIVE + INSTALL modes)
+# ─────────────────────────────────────────────────────────────────────────────
+def write_atomic(cfg_path: str, text: str) -> int:
+    """Write `text` to `cfg_path` through the boot-critical safety swap.
+
+      1. Write the candidate to <cfg>.new (0644 on FAT32 via mount opts).
+      2. grub-script-check <cfg>.new — FAIL → rm .new, keep live cfg + .bak,
+         return non-zero (2).
+      3. If the live cfg exists, cp it → <cfg>.bak (last-known-good).
+      4. os.replace(.new → cfg) — atomic rename within the ESP filesystem.
+
+    grubenv is never touched. Returns 0 on success, 2 on grub-script-check
+    rejection, 1 on any I/O failure.
+    """
+    new = cfg_path + ".new"
+    bak = cfg_path + ".bak"
+    try:
+        Path(new).write_text(text, encoding="utf-8")
+    except OSError as exc:
+        print(f"ERROR: couldn't write {new}: {exc}", file=sys.stderr)
+        return 1
+
+    # GUARD RAIL 1 — syntax-check the CANDIDATE before it can become live.
+    # grub-script-check is a syntax-only parse (no module load), so it
+    # validates structure without the ESP being the live boot dir.
+    try:
+        rc = subprocess.run(
+            ["grub-script-check", new],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        # grub-script-check absent is itself a failure: we must not ship an
+        # unchecked grub.cfg onto the shared ESP. Keep the live cfg + .bak.
+        _unlink(new)
+        print(
+            "ERROR: grub-script-check not found on PATH; refusing to swap an "
+            "unchecked grub.cfg (keeping existing grub.cfg + .bak intact)",
+            file=sys.stderr,
+        )
+        return 2
+    if rc.returncode != 0:
+        _unlink(new)
+        detail = (rc.stderr or rc.stdout or "").strip()
+        print(
+            "ERROR: grub-script-check rejected the rendered grub.cfg; keeping "
+            "existing grub.cfg + .bak intact"
+            + (f" ({detail})" if detail else ""),
+            file=sys.stderr,
+        )
+        return 2
+
+    # GUARD RAIL 2 — keep last-known-good before the swap. Plain copy (FAT32
+    # has no hardlinks); a power-cut mid-copy still leaves the old grub.cfg
+    # complete (the swap hasn't happened yet).
+    if os.path.exists(cfg_path):
+        try:
+            shutil.copyfile(cfg_path, bak)
+        except OSError as exc:
+            # Non-fatal for the swap itself, but loud: without a .bak the
+            # safety net for the *next* render is gone. Still proceed —
+            # the candidate passed grub-script-check.
+            print(f"WARN: couldn't refresh {bak}: {exc}", file=sys.stderr)
+
+    try:
+        os.replace(new, cfg_path)
+    except OSError as exc:
+        print(f"ERROR: couldn't swap {new} → {cfg_path}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="spatium-grub-render",
+        description="Render the appliance A/B grub.cfg (single source of truth). "
+        "grubenv is never touched.",
+    )
+    p.add_argument(
+        "--install-root",
+        metavar="MOUNT",
+        help="INSTALL mode: render into MOUNT/boot/efi/grub/grub.cfg using the "
+        "supplied UUIDs (no live lsblk). Requires --root-a-uuid, --root-b-uuid, "
+        "--version-label.",
+    )
+    p.add_argument(
+        "--print",
+        action="store_true",
+        dest="print_only",
+        help="DRY-RUN: print the rendered grub.cfg to stdout (no write, no "
+        "grub-script-check, no UUID discovery). Requires --root-a-uuid, "
+        "--root-b-uuid.",
+    )
+    p.add_argument("--root-a-uuid", help="slot A filesystem UUID")
+    p.add_argument("--root-b-uuid", help="slot B filesystem UUID")
+    p.add_argument(
+        "--version-label",
+        help="INSTALL mode: version string for BOTH slot titles (root_B is an "
+        "rsync clone of root_A at install).",
+    )
+    p.add_argument("--ver-a", help="DRY-RUN: slot A version label")
+    p.add_argument("--ver-b", help="DRY-RUN: slot B version label")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+
+    # DRY-RUN — pure render to stdout, no discovery, no write, no check.
+    if args.print_only:
+        if not args.root_a_uuid or not args.root_b_uuid:
+            print(
+                "ERROR: --print requires --root-a-uuid and --root-b-uuid",
+                file=sys.stderr,
+            )
+            return 2
+        sys.stdout.write(
+            render_text(args.root_a_uuid, args.root_b_uuid, args.ver_a, args.ver_b)
+        )
+        return 0
+
+    # INSTALL mode — render into a freshly-installed rootfs at MOUNT using the
+    # UUIDs the installer just mkfs'd. Both slots titled --version-label.
+    if args.install_root:
+        if not args.root_a_uuid or not args.root_b_uuid:
+            print(
+                "ERROR: --install-root requires --root-a-uuid and --root-b-uuid",
+                file=sys.stderr,
+            )
+            return 2
+        cfg = os.path.join(args.install_root, "boot/efi/grub/grub.cfg")
+        os.makedirs(os.path.dirname(cfg), exist_ok=True)
+        text = render_text(
+            args.root_a_uuid,
+            args.root_b_uuid,
+            args.version_label,
+            args.version_label,
+        )
+        return write_atomic(cfg, text)
+
+    # LIVE mode — reconcile + spatium-upgrade-slot apply on the running host.
+    uuids = discover_live_uuids()
+    if "root_a" not in uuids or "root_b" not in uuids:
+        print(
+            "ERROR: couldn't resolve both slot UUIDs via lsblk PARTLABEL "
+            "(root_a/root_b) — is this an appliance install?",
+            file=sys.stderr,
+        )
+        return 3
+    vers = per_slot_versions()
+    text = render_text(
+        uuids["root_a"],
+        uuids["root_b"],
+        vers.get("slot_a"),
+        vers.get("slot_b"),
+    )
+    return write_atomic(GRUB_CFG, text)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

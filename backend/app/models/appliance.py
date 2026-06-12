@@ -679,6 +679,21 @@ class Appliance(Base):
         server_default="{}",
     )
 
+    # #395 — host-migration reconcile health from the supervisor's read
+    # of the ``host-patches-applied.json`` ledger. ``{<patch-id>:
+    # {state, attempts, at, error?}}`` where only patches whose ``ok``
+    # field is False appear; an all-applied (or pre-#395) box reports
+    # ``{}``. ``state`` is always ``"failing"`` (patches are run-once-
+    # per-boot — no continuous retry loop). Empty dict clears stale
+    # entries once the reconcile succeeds; ``None`` (pre-#395 supervisor)
+    # leaves the column untouched.
+    host_migration_health: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+
     # Issue #183 Phase 4 — local k3s cluster health summary, supplied
     # by the supervisor on every heartbeat. Shape:
     # ``{"kubeapi_ready": bool, "nodes_total": int, "nodes_ready":

@@ -1448,106 +1448,19 @@ EOF
             SLOT_TITLE_PREFIX="SpatiumDDI Appliance $APPLIANCE_VERSION_LABEL"
         fi
         mkdir -p "$MOUNT/boot/efi/grub"
-        cat > "$MOUNT/boot/efi/grub/grub.cfg" <<EOF
-# SpatiumDDI A/B boot config (Phase 8c, issue #138).
-# Default boot is whichever slot grubenv's saved_entry points at; on
-# first install that's slot_a. grub-reboot <slot> from spatium-upgrade-
-# slot sets it for ONE BOOT only (auto-reverts on next boot — that's
-# the safety net for failed upgrades).
-set timeout=3
-load_env
-
-# Phase 8c boot counting:
-#   * next_entry → one-shot, set by \`grub-reboot <slot>\`. We honor it
-#     once, clear it (so the next-but-one boot reverts), then boot.
-#     If the chosen slot panics or fails /health/live, it's already
-#     cleared from grubenv → operator falls back to saved_entry on
-#     the next reboot. This is the rollback safety net.
-#   * saved_entry → durable default. Set by \`grub-set-default <slot>\`
-#     either manually (spatium-upgrade-slot rollback) or by
-#     spatiumddi-firstboot.service after a trial slot proves healthy.
-if [ "\${next_entry}" ]; then
-    set default="\${next_entry}"
-    set next_entry=
-    save_env next_entry
-else
-    set default="\${saved_entry}"
-fi
-if [ -z "\${default}" ]; then set default=slot_a; fi
-
-# Console-mode toggle (#393) — grubenv \`spatium_verbose\`, flipped by the
-# Fleet UI → supervisor → spatiumddi-verbose-boot-reload, loaded by \`load_env\`
-# above. The supervisor maps platform_settings.console_mode → this numeric:
-#   "1" text_console      — drop the loglevel=3 cap so all kernel messages
-#                           scroll, add systemd.show_status=1 for the per-unit
-#                           [ OK ] lines, and pass spatium-console=off so a
-#                           normal getty LOGIN replaces the Talos dashboard
-#                           (regular Linux server console).
-#   "2" verbose_dashboard — same verbose boot output, but NO spatium-console=off
-#                           so the dashboard still claims tty1 after boot.
-#   "0"/empty dashboard   — today's quiet boot (loglevel=3) + the dashboard.
-# Unset / unknown (old grubenv) falls through to the quiet dashboard default —
-# fail-closed, never a brick.
-if [ "\${spatium_verbose}" = "1" ]; then
-    set sp_log=""
-    set sp_systemd="systemd.show_status=1"
-    set sp_console="spatium-console=off"
-elif [ "\${spatium_verbose}" = "2" ]; then
-    set sp_log=""
-    set sp_systemd="systemd.show_status=1"
-    set sp_console=""
-else
-    set sp_log="loglevel=3"
-    set sp_systemd=""
-    set sp_console=""
-fi
-
-# Serial console mirror for headless installs.
-serial --unit=0 --speed=115200
-terminal_input  console serial
-terminal_output console serial
-
-insmod part_gpt
-insmod ext2
-insmod ext4
-insmod search_fs_uuid
-
-menuentry "$SLOT_TITLE_PREFIX (slot A)" --id=slot_a {
-    search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
-    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID rw \\
-        \${sp_log} audit=0 \${sp_systemd} \${sp_console} \\
-        console=tty0 console=ttyS0,115200n8
-    initrd /boot/initrd.img
-}
-
-menuentry "$SLOT_TITLE_PREFIX (slot B)" --id=slot_b {
-    search --no-floppy --fs-uuid --set=root $ROOT_B_UUID
-    linux /boot/vmlinuz root=UUID=$ROOT_B_UUID rw \\
-        \${sp_log} audit=0 \${sp_systemd} \${sp_console} \\
-        console=tty0 console=ttyS0,115200n8
-    initrd /boot/initrd.img
-}
-
-menuentry "$SLOT_TITLE_PREFIX (slot A, verbose boot)" --id=slot_a_verbose {
-    # Drops loglevel + audit too. Use when you need to capture every
-    # kernel message for a bug report. Also passes spatium-console=off
-    # so getty@tty1 wins tty1 (no dashboard overpainting the log).
-    search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
-    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID rw \\
-        spatium-console=off \\
-        console=tty0 console=ttyS0,115200n8
-    initrd /boot/initrd.img
-}
-
-menuentry "$SLOT_TITLE_PREFIX (rescue / single-user)" --id=rescue {
-    # Boots slot_a into rescue.target — single-user, root shell only,
-    # no k3s, no getty@tty1.
-    search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
-    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID rw \\
-        console=tty0 console=ttyS0,115200n8 systemd.unit=rescue.target
-    initrd /boot/initrd.img
-}
-EOF
+        # #395 — grub.cfg is now rendered by spatium-grub-render (one source of
+        # truth for the menu, shared with the firstboot reconcile and
+        # spatium-upgrade-slot apply). The renderer runs in a chroot so it uses
+        # the rootfs's own grub-script-check for syntax validation. Both UUIDs
+        # come from the freshly-formatted partitions (blkid'd above); the version
+        # label seeds both slot titles (root_B is an rsync clone of root_A at
+        # install, so both slots have the same version at this point).
+        chroot "$MOUNT" /usr/local/bin/spatium-grub-render \
+            --install-root / \
+            --root-a-uuid "$ROOT_A_UUID" \
+            --root-b-uuid "$ROOT_B_UUID" \
+            --version-label "$APPLIANCE_VERSION_LABEL" \
+            >> "$INSTALL_LOG" 2>&1
         # Seed grubenv with default + saved_entry pointing at slot_a so
         # the very first boot lands on slot_a unambiguously. grub-editenv
         # creates the file with the right size (1024 bytes, zero-padded).

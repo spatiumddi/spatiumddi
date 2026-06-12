@@ -2267,6 +2267,11 @@ function ApplianceDrilldownModal({
             <ApplianceHostConfigHealthSection row={row} />
           )}
 
+        {row.state === "approved" &&
+          Object.keys(row.host_migration_health ?? {}).length > 0 && (
+            <ApplianceHostMigrationSection row={row} />
+          )}
+
         {row.state === "approved" && (
           <ApplianceClusterHealthSection row={row} />
         )}
@@ -2579,6 +2584,95 @@ function ApplianceHostConfigHealthSection({ row }: { row: ApplianceRow }) {
                 <tr key={plane}>
                   <td className="px-3 py-1.5">
                     {HOSTCFG_PLANE_LABELS[plane] ?? plane}
+                  </td>
+                  <td className="px-3 py-1.5">
+                    <span
+                      className={cn(
+                        "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+                        failing
+                          ? "bg-rose-500/15 text-rose-700 border-rose-500/40 dark:text-rose-300"
+                          : "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
+                      )}
+                    >
+                      <Icon
+                        className={cn(
+                          "h-2.5 w-2.5",
+                          !failing && "animate-spin",
+                        )}
+                      />
+                      {h.state}
+                    </span>
+                  </td>
+                  <td className="px-3 py-1.5 text-muted-foreground">
+                    {h.attempts}
+                  </td>
+                  <td
+                    className="px-3 py-1.5 text-muted-foreground"
+                    title={h.at ?? undefined}
+                  >
+                    {h.at ? formatRelativeSince(h.at) : "—"}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// #395 — host-migration reconcile health. Renders only when at least
+// one numbered host-patch (e.g. 001-grub-render) failed to apply on
+// the most recent firstboot reconcile. A healthy appliance reports an
+// empty ``host_migration_health`` dict so this section quietly hides.
+// Unlike ``ApplianceHostConfigHealthSection`` (continuous bounded-retry
+// fire-guard), host-migration patches are run-once-per-boot — the
+// state is always ``failing``; the next reboot automatically retries.
+const HOST_MIGRATION_PATCH_LABELS: Record<string, string> = {
+  "001-grub-render": "grub.cfg re-render",
+  reconcile: "Host-migration reconcile",
+};
+
+function ApplianceHostMigrationSection({ row }: { row: ApplianceRow }) {
+  const entries = Object.entries(row.host_migration_health ?? {});
+  entries.sort(([a], [b]) => a.localeCompare(b));
+  const anyFailing = entries.some(([, h]) => h.state === "failing");
+  return (
+    <div className="border-t pt-4">
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        Host-migration health
+      </h3>
+      <p
+        className={cn(
+          "mt-1 text-xs",
+          anyFailing
+            ? "text-rose-700 dark:text-rose-300"
+            : "text-amber-700 dark:text-amber-400",
+        )}
+      >
+        {anyFailing
+          ? "A host-migration patch failed on this appliance — the slot was not committed durable. The next reboot will retry. Check /var/log/spatiumddi/firstboot.log for the cause."
+          : "A host-migration patch is still being applied (retrying)."}
+      </p>
+      <div className="mt-2 overflow-hidden rounded-md border">
+        <table className="w-full text-xs">
+          <thead className="bg-muted/40 text-[10px] uppercase tracking-wide text-muted-foreground">
+            <tr>
+              <th className="px-3 py-1.5 text-left font-medium">Patch</th>
+              <th className="px-3 py-1.5 text-left font-medium">State</th>
+              <th className="px-3 py-1.5 text-left font-medium">Attempts</th>
+              <th className="px-3 py-1.5 text-left font-medium">Last try</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y">
+            {entries.map(([patch, h]) => {
+              const failing = h.state === "failing";
+              const Icon = failing ? AlertCircle : Loader2;
+              return (
+                <tr key={patch}>
+                  <td className="px-3 py-1.5">
+                    {HOST_MIGRATION_PATCH_LABELS[patch] ?? patch}
                   </td>
                   <td className="px-3 py-1.5">
                     <span
