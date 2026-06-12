@@ -32,6 +32,12 @@ FROM alpine:3.22 AS runtime
 # live on the binary as a file cap to survive the privilege drop. Same
 # fix as named + pdns_server in the DNS image family.
 #
+# ``setpriv`` (util-linux) is added for the python agent's launch: the
+# opt-in scapy rogue-DHCP probe + fingerprint sniffer need CAP_NET_RAW,
+# but a python interpreter can't carry a file cap, so the entrypoint
+# raises NET_RAW into the *ambient* set via setpriv (survives the
+# setuid + execve into ``spatium``). See entrypoint.sh (#383).
+#
 # ``kea>=2.6.5-r0`` ships the CVE-2026-3608 (HIGH) fix that Trivy flags
 # in 2.6.3-r0; the explicit ``>=`` lower-bound both pulls the patched
 # package AND busts the BuildKit ``cache-from`` layer so a stale
@@ -55,7 +61,7 @@ RUN apk upgrade --no-cache \
  && apk add --no-cache \
       'kea>=2.6.5-r0' kea-dhcp4 kea-dhcp6 kea-ctrl-agent kea-admin \
       kea-hook-lease-cmds kea-hook-ha \
-      tini su-exec \
+      tini su-exec setpriv \
       python3 py3-pip libpcap \
       libcap \
       ca-certificates tzdata \

@@ -165,7 +165,16 @@ _term() {
 }
 trap _term TERM INT
 
-su-exec spatium:spatium spatium-dhcp-agent &
+# The python agent runs the opt-in scapy rogue-DHCP probe (#370) +
+# passive fingerprint sniffer, which need CAP_NET_RAW to open
+# AF_PACKET sockets. ``su-exec``'s setuid clears the container's
+# NET_RAW on the 0→non-root privilege drop, and a python interpreter
+# can't carry a file capability the way kea-dhcp4/6 do — so use
+# ``setpriv`` to raise NET_RAW into the *ambient* set, which survives
+# setuid + execve into the unprivileged ``spatium`` user (#383).
+setpriv --reuid spatium --regid spatium --init-groups \
+        --inh-caps +net_raw --ambient-caps +net_raw \
+        spatium-dhcp-agent &
 AGENT_PID=$!
 
 # wait -n is a bash-ism; busybox ash accepts it too as of 1.30+
