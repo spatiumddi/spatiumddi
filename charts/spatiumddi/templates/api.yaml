@@ -118,6 +118,18 @@ spec:
             - name: spatiumddi-host-etc
               mountPath: /etc/spatiumddi-host
               readOnly: true
+            {{- if not .Values.slotImageMirror.enabled }}
+            # #386 — uploaded / GitHub-imported upgrade-image bytes. Without
+            # a persistent mount these live in the api's ephemeral container
+            # layer and vanish on every api restart: the DB row survives but
+            # the bytes 404 ("Upgrade image bytes missing on disk — re-upload
+            # required"), so a scheduled upgrade fails on download. The
+            # multi-node slot-image mirror (#296) holds these on its own PVC
+            # and the api proxies byte ops there, so this single-node hostPath
+            # only applies when the mirror is off. api WRITES here.
+            - name: slot-images
+              mountPath: /var/lib/spatiumddi/slot-images
+            {{- end }}
           {{- end }}
       {{- if .Values.api.applianceHostMounts.enabled }}
       volumes:
@@ -133,6 +145,14 @@ spec:
           hostPath:
             path: {{ .Values.api.applianceHostMounts.hostEtcDir }}
             type: DirectoryOrCreate
+        {{- if not .Values.slotImageMirror.enabled }}
+        # #386 — persist upgrade-image bytes across api restarts (single
+        # node; the mirror's PVC handles the multi-node case).
+        - name: slot-images
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.slotImagesDir }}
+            type: DirectoryOrCreate
+        {{- end }}
       {{- end }}
       {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.api.nodeSelector) .) | nindent 6 }}
       {{- with .Values.api.tolerations }}
