@@ -20,6 +20,45 @@ the formatter handles the rest.
 
 ---
 
+## 2026.06.11-2 — 2026-06-11
+
+Hotfix for **directly-attached DHCP dead on 2026.06.11-1** (#383).
+The prior release switched Kea's default socket mode to `raw`
+(AF_PACKET) so it hears directly-attached broadcast DISCOVERs
+(#365 / #366), but the Kea binaries only carried the
+`cap_net_bind_service` file capability — not `cap_net_raw`. The
+container's `NET_RAW` (from `securityContext.capabilities.add`)
+only sets the bounding set and is dropped when the entrypoint
+`su-exec`s to the unprivileged `spatium` user, so `kea-dhcp4`
+failed to open the raw LPF socket (`DHCPSRV_OPEN_SOCKET_FAIL` /
+`DHCPSRV_NO_SOCKETS_OPEN`) and served no leases on any
+non-relayed network. The same missing-capability gap left the
+opt-in scapy rogue-DHCP probe (#370) and passive fingerprint
+sniffer with zero effective caps. Image-only change — no schema,
+no API, no frontend.
+
+### Fixed
+
+- **Kea raw sockets under `su-exec` (#383).** The Kea image now
+  grants `cap_net_raw` alongside `cap_net_bind_service` as a
+  *file* capability on `/usr/sbin/kea-dhcp4` + `/usr/sbin/kea-dhcp6`
+  (`setcap cap_net_bind_service,cap_net_raw=+ep`). File caps
+  survive the `su-exec` 0→non-root privilege drop, where the
+  container-level bounding-set capability does not — so the raw
+  AF_PACKET/LPF socket opens and Kea serves leases on
+  directly-attached networks again. Same fix shape as `named` /
+  `pdns_server` in the DNS image family.
+- **Python agent rogue-probe / fingerprint sniffer caps (#383).**
+  The entrypoint now launches `spatium-dhcp-agent` via util-linux
+  `setpriv --reuid spatium --regid spatium --init-groups
+  --inh-caps +net_raw --ambient-caps +net_raw` so `CAP_NET_RAW`
+  lands in the *ambient* set — which survives setuid + execve into
+  the unprivileged user (a Python interpreter can't carry a file
+  cap the way the Kea binaries can). The opt-in rogue-DHCP probe
+  (`DHCP_ROGUE_PROBE_ENABLED=1`) and passive fingerprint sniffer
+  (`DHCP_FINGERPRINT_ENABLED=1`) can now bind their scapy
+  AF_PACKET sockets.
+
 ## 2026.06.11-1 — 2026-06-11
 
 The **roadmap-batch + control-plane-HA-finish** release. Three

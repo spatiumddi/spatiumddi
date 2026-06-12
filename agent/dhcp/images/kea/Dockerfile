@@ -19,13 +19,24 @@ FROM alpine:3.22 AS runtime
 # for the sniffer to bind the socket — see docs/deployment/DOCKER.md.
 #
 # ``libcap`` brings in ``setcap`` so we can grant ``kea-dhcp4`` /
-# ``kea-dhcp6`` the CAP_NET_BIND_SERVICE file capability — without it,
-# the unprivileged ``spatium`` user the entrypoint drops to can't bind
-# UDP/67 (the DHCPv4 server port) or UDP/547 (the DHCPv6 server port).
-# Compose-side ``cap_add: NET_BIND_SERVICE`` only sets the container
-# bounding set; for a non-root process to actually use the cap, the
-# binary needs file caps. Same fix as named + pdns_server in the DNS
-# image family.
+# ``kea-dhcp6`` the CAP_NET_BIND_SERVICE + CAP_NET_RAW file capabilities.
+# NET_BIND_SERVICE: bind UDP/67 (DHCPv4) + UDP/547 (DHCPv6) as the
+# unprivileged ``spatium`` user the entrypoint drops to. NET_RAW: open
+# the AF_PACKET/LPF raw socket for ``dhcp-socket-type: raw`` (the
+# #365/#366 default — required to hear directly-attached broadcast
+# DISCOVERs); without it kea-dhcp4 fails with "Failed to create raw LPF
+# socket" on the real NIC and serves no leases (#383). Crucially:
+# container-level ``cap_add`` / ``securityContext.capabilities.add:
+# [NET_RAW]`` only sets the bounding set — it's DROPPED when the
+# entrypoint ``su-exec``s to the non-root user, so the capability has to
+# live on the binary as a file cap to survive the privilege drop. Same
+# fix as named + pdns_server in the DNS image family.
+#
+# ``setpriv`` (util-linux) is added for the python agent's launch: the
+# opt-in scapy rogue-DHCP probe + fingerprint sniffer need CAP_NET_RAW,
+# but a python interpreter can't carry a file cap, so the entrypoint
+# raises NET_RAW into the *ambient* set via setpriv (survives the
+# setuid + execve into ``spatium``). See entrypoint.sh (#383).
 #
 # ``kea>=2.6.5-r0`` ships the CVE-2026-3608 (HIGH) fix that Trivy flags
 # in 2.6.3-r0; the explicit ``>=`` lower-bound both pulls the patched
@@ -50,13 +61,13 @@ RUN apk upgrade --no-cache \
  && apk add --no-cache \
       'kea>=2.6.5-r0' kea-dhcp4 kea-dhcp6 kea-ctrl-agent kea-admin \
       kea-hook-lease-cmds kea-hook-ha \
-      tini su-exec \
+      tini su-exec setpriv \
       python3 py3-pip libpcap \
       libcap \
       ca-certificates tzdata \
       'libcrypto3>=3.5.7-r0' 'libssl3>=3.5.7-r0' \
- && setcap cap_net_bind_service=+ep /usr/sbin/kea-dhcp4 \
- && setcap cap_net_bind_service=+ep /usr/sbin/kea-dhcp6 \
+ && setcap cap_net_bind_service,cap_net_raw=+ep /usr/sbin/kea-dhcp4 \
+ && setcap cap_net_bind_service,cap_net_raw=+ep /usr/sbin/kea-dhcp6 \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
  && mkdir -p /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea \
