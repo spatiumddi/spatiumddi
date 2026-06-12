@@ -49,9 +49,7 @@ async def _approved_supervisor(db: AsyncSession) -> tuple[Appliance, str]:
     return row, token
 
 
-async def _hb(
-    client: AsyncClient, row: Appliance, token: str, **fields: object
-) -> None:
+async def _hb(client: AsyncClient, row: Appliance, token: str, **fields: object) -> None:
     r = await client.post(
         "/api/v1/appliance/supervisor/heartbeat",
         json={"appliance_id": str(row.id), "session_token": token, **fields},
@@ -88,9 +86,7 @@ async def test_empty_dict_clears_stale_entries(
     assert refreshed.host_config_health == {}
 
 
-async def test_omitted_field_left_untouched(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_omitted_field_left_untouched(client: AsyncClient, db_session: AsyncSession) -> None:
     row, token = await _approved_supervisor(db_session)
     await db_session.commit()
 
