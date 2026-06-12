@@ -2262,6 +2262,11 @@ function ApplianceDrilldownModal({
             <ApplianceRoleHealthSection row={row} />
           )}
 
+        {row.state === "approved" &&
+          Object.keys(row.host_config_health ?? {}).length > 0 && (
+            <ApplianceHostConfigHealthSection row={row} />
+          )}
+
         {row.state === "approved" && (
           <ApplianceClusterHealthSection row={row} />
         )}
@@ -2505,6 +2510,102 @@ function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
                   </td>
                   <td className="px-3 py-1.5 font-mono text-muted-foreground">
                     {h.container_id ?? "—"}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// #387 — per-plane host-config apply health. Renders only when at
+// least one host-config plane (ntp / snmp / lldp / syslog / ssh /
+// resolver / firewall / timezone) has a desired config that isn't
+// applied — i.e. the supervisor's bounded-retry guard is backing off a
+// stuck apply. A healthy appliance reports an empty dict, so this
+// section quietly hides. Before #387 these stuck applies looped
+// silently (the NTP runner failed every ~30 s, flooding thousands of
+// .failed sidecars) with nothing surfaced in the UI.
+const HOSTCFG_PLANE_LABELS: Record<string, string> = {
+  ntp: "NTP (chrony)",
+  snmp: "SNMP",
+  lldp: "LLDP",
+  syslog: "Syslog forwarding",
+  ssh: "SSH keys / sshd",
+  resolver: "DNS resolver",
+  firewall: "Firewall",
+  timezone: "Timezone",
+};
+
+function ApplianceHostConfigHealthSection({ row }: { row: ApplianceRow }) {
+  const entries = Object.entries(row.host_config_health ?? {});
+  entries.sort(([a], [b]) => a.localeCompare(b));
+  const anyFailing = entries.some(([, h]) => h.state === "failing");
+  return (
+    <div className="border-t pt-4">
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        Host-config apply health
+      </h3>
+      <p
+        className={cn(
+          "mt-1 text-xs",
+          anyFailing
+            ? "text-rose-700 dark:text-rose-300"
+            : "text-amber-700 dark:text-amber-400",
+        )}
+      >
+        {anyFailing
+          ? "A host-config change keeps failing to apply on this appliance — the supervisor is retrying with backoff. Check the host runner log (e.g. /var/log/spatiumddi/chrony-reload.log) for the cause."
+          : "A host-config change is still being applied (retrying)."}
+      </p>
+      <div className="mt-2 overflow-hidden rounded-md border">
+        <table className="w-full text-xs">
+          <thead className="bg-muted/40 text-[10px] uppercase tracking-wide text-muted-foreground">
+            <tr>
+              <th className="px-3 py-1.5 text-left font-medium">Config</th>
+              <th className="px-3 py-1.5 text-left font-medium">State</th>
+              <th className="px-3 py-1.5 text-left font-medium">Attempts</th>
+              <th className="px-3 py-1.5 text-left font-medium">Last try</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y">
+            {entries.map(([plane, h]) => {
+              const failing = h.state === "failing";
+              const Icon = failing ? AlertCircle : Loader2;
+              return (
+                <tr key={plane}>
+                  <td className="px-3 py-1.5">
+                    {HOSTCFG_PLANE_LABELS[plane] ?? plane}
+                  </td>
+                  <td className="px-3 py-1.5">
+                    <span
+                      className={cn(
+                        "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+                        failing
+                          ? "bg-rose-500/15 text-rose-700 border-rose-500/40 dark:text-rose-300"
+                          : "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
+                      )}
+                    >
+                      <Icon
+                        className={cn(
+                          "h-2.5 w-2.5",
+                          !failing && "animate-spin",
+                        )}
+                      />
+                      {h.state}
+                    </span>
+                  </td>
+                  <td className="px-3 py-1.5 text-muted-foreground">
+                    {h.attempts}
+                  </td>
+                  <td
+                    className="px-3 py-1.5 text-muted-foreground"
+                    title={h.at ?? undefined}
+                  >
+                    {h.at ? formatRelativeSince(h.at) : "—"}
                   </td>
                 </tr>
               );

@@ -617,7 +617,9 @@ async def supervisor_register(
     # force a fresh registration they delete the row in the fleet UI,
     # which causes the supervisor to clear its identity + claim a new
     # pairing code on next boot.
-    existing_stmt = select(Appliance).where(Appliance.public_key_fingerprint == pubkey_fingerprint)
+    existing_stmt = select(Appliance).where(
+        Appliance.public_key_fingerprint == pubkey_fingerprint
+    )
     existing = (await db.execute(existing_stmt)).scalar_one_or_none()
     if existing is not None:
         # Idempotent re-register. Touch last_seen_at so the heartbeat
@@ -703,7 +705,9 @@ async def supervisor_register(
                 resource_type="pairing_code",
                 resource_id=str(code_row.id) if code_row is not None else "unknown",
                 resource_display=(
-                    "supervisor pairing code" if code_row is not None else "unknown pairing code"
+                    "supervisor pairing code"
+                    if code_row is not None
+                    else "unknown pairing code"
                 ),
                 result="forbidden",
                 new_value={
@@ -748,7 +752,9 @@ async def supervisor_register(
     # operator to open the role-picker.
     initial_assigned_roles: list[str] = []
     if body.appliance_variant is not None:
-        initial_assigned_roles = list(_REGISTER_VARIANT_FIXED_ROLES.get(body.appliance_variant, []))
+        initial_assigned_roles = list(
+            _REGISTER_VARIANT_FIXED_ROLES.get(body.appliance_variant, [])
+        )
     appliance_row = Appliance(
         id=appliance_id,
         hostname=body.hostname,
@@ -895,7 +901,9 @@ async def supervisor_poll(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
 
     row = await db.get(Appliance, body.appliance_id)
-    valid = row is not None and verify_session_token(body.session_token, row.session_token_hash)
+    valid = row is not None and verify_session_token(
+        body.session_token, row.session_token_hash
+    )
     if not valid:
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
@@ -1035,6 +1043,12 @@ class SupervisorHeartbeatRequest(BaseModel):
     # None / omitted = supervisor didn't run the watchdog this tick
     # (typical on docker / k8s deployments or before the first probe).
     role_health: dict[str, dict[str, Any]] | None = None
+    # #387 — per-plane host-config apply health from the supervisor's
+    # bounded-retry fire-guard. ``{<plane>: {state, attempts, at}}`` for
+    # the hash-keyed runners (snmp / ntp / lldp / syslog / ssh /
+    # resolver / firewall / timezone). Empty dict = all applied / healthy
+    # (clears stale entries); None / omitted = pre-#387 supervisor.
+    host_config_health: dict[str, dict[str, Any]] | None = None
     # Issue #183 Phase 4 — local k3s cluster health summary. Shape:
     # ``{"kubeapi_ready": bool, "nodes_total": int, "nodes_ready":
     # int, "pods_total": int, "pods_by_phase": {<phase>: count}}``.
@@ -1220,7 +1234,9 @@ class SupervisorHeartbeatResponse(BaseModel):
     # uses this to bring up dns-bind9 / dns-powerdns / dhcp-kea
     # service containers via docker compose. Empty roles list = idle
     # (approved but no service running).
-    role_assignment: SupervisorRoleAssignment = Field(default_factory=SupervisorRoleAssignment)
+    role_assignment: SupervisorRoleAssignment = Field(
+        default_factory=SupervisorRoleAssignment
+    )
     # #272 Phase 7 — control-plane promote/demote desired state.
     # ``desired_cluster_role`` = "member" → join the seed via
     # ``desired_k3s_server_url`` + ``desired_k3s_join_token``; "none" →
@@ -1364,7 +1380,9 @@ async def _ingest_lldp_neighbours(
         .scalars()
         .all()
     )
-    by_key = {(e.local_iface, e.remote_chassis_id, e.remote_port_id): e for e in existing}
+    by_key = {
+        (e.local_iface, e.remote_chassis_id, e.remote_port_id): e for e in existing
+    }
     now = datetime.now(UTC)
 
     for key, n in desired.items():
@@ -1485,7 +1503,9 @@ async def supervisor_heartbeat(
         )
         if not valid:
             await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "Invalid appliance or session."
+            )
 
     assert row is not None
     # Issue #170 Wave E follow-up — reject heartbeats from soft-deleted
@@ -1578,6 +1598,13 @@ async def supervisor_heartbeat(
         # supervisor's ``since`` timestamp is the canonical "first
         # observed in this status" anchor across heartbeats.
         row.role_health = dict(body.role_health)
+    if body.host_config_health is not None:
+        # #387 — supervisor's per-plane host-config apply health.
+        # Overwrite verbatim every tick: empty dict clears stale stuck-
+        # apply entries once a plane converges; a non-empty dict means
+        # at least one plane's desired config isn't applied (the guard
+        # is backing it off), which the Fleet UI surfaces as a banner.
+        row.host_config_health = dict(body.host_config_health)
     if body.cluster_health is not None:
         # Issue #183 Phase 4 — supervisor's local-k3s health summary.
         # Same overwrite-verbatim shape as role_health. Empty dict
@@ -1706,7 +1733,9 @@ async def supervisor_heartbeat(
         for ev in evicted:
             ev.evict_requested = False
             ev.cluster_join_state = CLUSTER_JOIN_STATE_LEFT
-            logger.info("control_plane_node_evicted", hostname=ev.hostname, by=str(row.id))
+            logger.info(
+                "control_plane_node_evicted", hostname=ev.hostname, by=str(row.id)
+            )
 
     # Auto-clear the promote desired-state once the join landed: the
     # supervisor reports ``ready`` → the node IS a member now, so settle
@@ -1762,13 +1791,19 @@ async def supervisor_heartbeat(
     # the requested slot as ``current_slot`` — the operator's intent
     # was "boot into this slot next", and we got there. ``durable_
     # default`` is irrelevant here (next-boot is one-shot by design).
-    if row.desired_next_boot_slot is not None and row.current_slot == row.desired_next_boot_slot:
+    if (
+        row.desired_next_boot_slot is not None
+        and row.current_slot == row.desired_next_boot_slot
+    ):
         row.desired_next_boot_slot = None
 
     # Auto-clear desired_default_slot once the supervisor reports the
     # requested slot as ``durable_default`` — grub-set-default landed
     # and survives subsequent reboots.
-    if row.desired_default_slot is not None and row.durable_default == row.desired_default_slot:
+    if (
+        row.desired_default_slot is not None
+        and row.durable_default == row.desired_default_slot
+    ):
         row.desired_default_slot = None
 
     # Auto-clear reboot_requested 15 s after the stamp — by that
@@ -1818,12 +1853,17 @@ async def supervisor_heartbeat(
             long_poll = True
             hold_for = min(float(body.wait_seconds), _HEARTBEAT_HOLD_CAP_S)
             deadline = asyncio.get_running_loop().time() + hold_for
-            async with wake_subscription([*appliance_wake_channels(row), HOSTCONFIG_ALL]) as wake:
+            async with wake_subscription(
+                [*appliance_wake_channels(row), HOSTCONFIG_ALL]
+            ) as wake:
                 while True:
                     remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:
                         break
-                    if await wake.wait(min(WAKE_TICK_SECONDS, remaining)) == WakeResult.WAKE:
+                    if (
+                        await wake.wait(min(WAKE_TICK_SECONDS, remaining))
+                        == WakeResult.WAKE
+                    ):
                         break
             # Pick up anything that committed during the hold (role /
             # firewall / desired-state edits land on other requests) before
@@ -1983,7 +2023,9 @@ async def supervisor_heartbeat(
         vip_configured=bool(metallb_vip),
         firewall_enabled=bool(cfg_row.firewall_enabled) if cfg_row else False,
         appliance_id=row.id,
-        web_ui_allowed_cidrs=(list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []),
+        web_ui_allowed_cidrs=(
+            list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []
+        ),
     )
     # Persist the rendered hash so 2d's apply-stalled alarm + the Fleet drift
     # chip can compare it against the runner's reported applied_hash. Only
@@ -2042,7 +2084,9 @@ async def supervisor_heartbeat(
         cluster_peer_cidrs=cluster_peer_cidrs,
         firewall_pod_cidrs=firewall_pod_cidrs,
         firewall_service_cidrs=firewall_service_cidrs,
-        web_ui_allowed_cidrs=(list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []),
+        web_ui_allowed_cidrs=(
+            list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []
+        ),
         control_plane_size=control_plane_size,
         desired_metallb_enabled=metallb_enabled,
         desired_metallb_pool_addresses=metallb_pool,
@@ -2101,7 +2145,9 @@ async def firewall_render_inputs(db: DB, row: Appliance) -> dict[str, Any]:
         "cp_member_count": await _committed_cp_count(db),
         "vip_configured": bool((cfg_row.control_plane_vip or "") if cfg_row else ""),
         "firewall_enabled": bool(cfg_row.firewall_enabled) if cfg_row else False,
-        "web_ui_allowed_cidrs": (list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []),
+        "web_ui_allowed_cidrs": (
+            list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []
+        ),
     }
 
 
@@ -2115,7 +2161,9 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
     from app.models.dns import DNSServerGroup
 
     assigned_roles = list(row.assigned_roles or [])
-    dns_role_assigned = "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
+    dns_role_assigned = (
+        "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
+    )
     dhcp_role_assigned = "dhcp" in assigned_roles
 
     dns_engine: str | None = None
@@ -2249,6 +2297,11 @@ class ApplianceRow(BaseModel):
     # ``dhcp-kea``); values carry ``{role, status, since,
     # container_id}``.
     role_health: dict[str, dict[str, Any]]
+    # #387 — per-plane host-config apply health (snmp / ntp / lldp /
+    # syslog / ssh / resolver / firewall / timezone). ``{<plane>:
+    # {state, attempts, at}}``; only planes with an unapplied desired
+    # config appear. Empty when all healthy.
+    host_config_health: dict[str, dict[str, Any]]
     # Issue #183 Phase 4 — local k3s cluster health summary.
     cluster_health: dict[str, Any]
     # Issue #183 Phase 5 — installed k3s version (plain text, public).
@@ -2344,6 +2397,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         role_switch_state=row.role_switch_state,
         role_switch_reason=row.role_switch_reason,
         role_health=dict(row.role_health or {}),
+        host_config_health=dict(row.host_config_health or {}),
         cluster_health=dict(row.cluster_health or {}),
         k3s_version=row.k3s_version,
         kubeconfig_set=row.kubeconfig_encrypted is not None,
@@ -2367,7 +2421,9 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
 async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     _require_superadmin(current_user)
     rows = (
-        (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc()))).scalars().all()
+        (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc())))
+        .scalars()
+        .all()
     )
     return ApplianceList(appliances=[_row_to_schema(r) for r in rows])
 
@@ -2378,7 +2434,9 @@ async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Fetch a single appliance (superadmin)",
 )
-async def get_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> ApplianceRow:
+async def get_appliance(
+    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> ApplianceRow:
     _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
@@ -2503,7 +2561,9 @@ async def approve_appliance(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Reject a pending appliance (deletes the row, superadmin)",
 )
-async def reject_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def reject_appliance(
+    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> None:
     """Reject = DELETE the row. Supervisor's next poll gets 403 +
     falls back to bootstrapping. Distinct from delete (next endpoint)
     only in the audit verb — operationally identical."""
@@ -2636,7 +2696,9 @@ async def _find_appliance_dependents(
 
     return ApplianceDependents(
         dns=[
-            ApplianceDependentServer(kind="dns", id=r.id, name=r.name, host=r.host, status=r.status)
+            ApplianceDependentServer(
+                kind="dns", id=r.id, name=r.name, host=r.host, status=r.status
+            )
             for r in dns_rows
         ],
         dhcp=[
@@ -2746,8 +2808,12 @@ async def delete_appliance(
                     Appliance.id != row.id,
                     Appliance.state != APPLIANCE_STATE_REVOKED,
                     or_(
-                        Appliance.appliance_variant.in_(tuple(_SELF_BOOTSTRAP_VARIANTS)),
-                        Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                        Appliance.appliance_variant.in_(
+                            tuple(_SELF_BOOTSTRAP_VARIANTS)
+                        ),
+                        Appliance.cluster_role.in_(
+                            (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+                        ),
                     ),
                 )
             )
@@ -3197,10 +3263,14 @@ async def update_appliance_roles(
             new_value={
                 "roles": list(row.assigned_roles or []),
                 "dns_group_id": (
-                    str(row.assigned_dns_group_id) if row.assigned_dns_group_id else None
+                    str(row.assigned_dns_group_id)
+                    if row.assigned_dns_group_id
+                    else None
                 ),
                 "dhcp_group_id": (
-                    str(row.assigned_dhcp_group_id) if row.assigned_dhcp_group_id else None
+                    str(row.assigned_dhcp_group_id)
+                    if row.assigned_dhcp_group_id
+                    else None
                 ),
                 "tags": dict(row.tags or {}),
             },
@@ -3252,7 +3322,9 @@ async def _effective_cp_members(db: DB) -> list[Appliance]:
                 select(Appliance).where(
                     Appliance.state == APPLIANCE_STATE_APPROVED,
                     or_(
-                        Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                        Appliance.cluster_role.in_(
+                            (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+                        ),
                         Appliance.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER,
                     ),
                 )
@@ -3340,7 +3412,9 @@ async def _firewall_peer_members(db: DB) -> list[Appliance]:
                 select(Appliance).where(
                     Appliance.state == APPLIANCE_STATE_APPROVED,
                     or_(
-                        Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                        Appliance.cluster_role.in_(
+                            (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+                        ),
                         Appliance.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER,
                     ),
                 )
@@ -3466,7 +3540,9 @@ async def promote_control_plane(
         seen.add(aid)
         row = await db.get(Appliance, aid)
         if row is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Appliance {aid} not found.")
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, f"Appliance {aid} not found."
+            )
         if row.id == primary.id:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -3477,7 +3553,10 @@ async def promote_control_plane(
                 status.HTTP_409_CONFLICT,
                 f"Appliance {row.hostname!r} is in state {row.state!r}; approve it first.",
             )
-        if row.cluster_role is not None or row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER:
+        if (
+            row.cluster_role is not None
+            or row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+        ):
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 f"Appliance {row.hostname!r} is already a control-plane member (or joining).",
@@ -3573,7 +3652,9 @@ async def demote_control_plane(
         seen.add(aid)
         row = await db.get(Appliance, aid)
         if row is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Appliance {aid} not found.")
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, f"Appliance {aid} not found."
+            )
         if row.cluster_role == CLUSTER_ROLE_PRIMARY:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -3671,7 +3752,9 @@ async def replace_control_plane_member(
 
     row = await db.get(Appliance, appliance_id)
     if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Appliance {appliance_id} not found.")
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"Appliance {appliance_id} not found."
+        )
     if row.cluster_role == CLUSTER_ROLE_PRIMARY:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -3900,7 +3983,9 @@ async def restore_etcd_snapshot(
             "destructive cluster-reset restore.",
         )
     known = {
-        s.get("name") for s in (seed.etcd_snapshots or []) if isinstance(s, dict) and s.get("name")
+        s.get("name")
+        for s in (seed.etcd_snapshots or [])
+        if isinstance(s, dict) and s.get("name")
     }
     if body.snapshot_name not in known:
         raise HTTPException(
@@ -4017,7 +4102,9 @@ def _metallb_pod_status() -> tuple[bool, int, int]:
 
     def _ready(pod: dict[str, Any]) -> bool:
         conds = (pod.get("status") or {}).get("conditions") or []
-        return any(c.get("type") == "Ready" and c.get("status") == "True" for c in conds)
+        return any(
+            c.get("type") == "Ready" and c.get("status") == "True" for c in conds
+        )
 
     try:
         # #272 / #286 — MetalLB lives in its own metallb-system namespace
@@ -4103,7 +4190,9 @@ class MetalLBConfigUpdate(BaseModel):
     def _cross_field(self) -> MetalLBConfigUpdate:
         if self.enabled:
             if not self.control_plane_vip:
-                raise ValueError("a control-plane VIP is required when MetalLB is enabled")
+                raise ValueError(
+                    "a control-plane VIP is required when MetalLB is enabled"
+                )
             # #272 — auto-derive a single-address pool from the VIP when
             # no explicit pool is given. This is the common case: the
             # operator just wants one floating IP for the Web UI and
@@ -4114,7 +4203,11 @@ class MetalLBConfigUpdate(BaseModel):
             # supply one explicitly, and the VIP-in-pool check below
             # applies to it.
             if not self.pool_addresses:
-                prefix = 32 if ipaddress.ip_address(self.control_plane_vip).version == 4 else 128
+                prefix = (
+                    32
+                    if ipaddress.ip_address(self.control_plane_vip).version == 4
+                    else 128
+                )
                 self.pool_addresses = [f"{self.control_plane_vip}/{prefix}"]
         # #272 Phase 10 — data-plane VIPs require MetalLB on (no VIP path
         # exists without it) and can't reuse the control-plane VIP or each
@@ -4138,7 +4231,11 @@ class MetalLBConfigUpdate(BaseModel):
             "control-plane VIP": self.control_plane_vip,
             **dp_vips,
         }.items():
-            if vip and self.pool_addresses and not _vip_in_pool(vip, self.pool_addresses):
+            if (
+                vip
+                and self.pool_addresses
+                and not _vip_in_pool(vip, self.pool_addresses)
+            ):
                 raise ValueError(
                     f"{label} {vip} is not inside the address pool "
                     "(widen metallb_pool_addresses to include every VIP)"
@@ -4403,7 +4500,9 @@ async def schedule_appliance_upgrade(
             new_value={
                 "desired_appliance_version": body.desired_appliance_version,
                 "desired_slot_image_url": resolved_url,
-                "slot_image_id": (str(body.slot_image_id) if body.slot_image_id else None),
+                "slot_image_id": (
+                    str(body.slot_image_id) if body.slot_image_id else None
+                ),
             },
         )
     )
@@ -4720,7 +4819,9 @@ async def _require_cert_auth(request: Request, db: DB) -> Appliance:
         principal = await authenticate_cert(request, db)
     except CertAuthFailed as exc:
         logger.warning("appliance.k8s_proxy.cert_auth_failed", reason=exc.reason)
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance client cert.") from exc
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Invalid appliance client cert."
+        ) from exc
     if principal is None:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -4759,7 +4860,9 @@ async def k8s_proxy_poll(request: Request, db: DB) -> K8sProxyPollResponse:
         # No request within the timeout — return an empty shape so
         # the supervisor loop just re-polls. 200 (not 204) so the
         # supervisor doesn't have to special-case "no body".
-        return K8sProxyPollResponse(request_id="", method="", path="", headers={}, body_b64="")
+        return K8sProxyPollResponse(
+            request_id="", method="", path="", headers={}, body_b64=""
+        )
     return K8sProxyPollResponse(
         request_id=queued.request_id,
         method=queued.method,
@@ -4987,13 +5090,18 @@ async def k8s_rollout_restart(
     # Strategic-merge patch that bumps the pod template's
     # ``restartedAt`` annotation. Standard kubectl rollout-restart
     # shape — same JSON kubectl sends.
-    api_path = f"/apis/apps/v1/namespaces/{body.namespace}/" f"{body.kind.lower()}s/{body.name}"
+    api_path = (
+        f"/apis/apps/v1/namespaces/{body.namespace}/"
+        f"{body.kind.lower()}s/{body.name}"
+    )
     patch_body = {
         "spec": {
             "template": {
                 "metadata": {
                     "annotations": {
-                        "kubectl.kubernetes.io/restartedAt": datetime.now(UTC).isoformat()
+                        "kubectl.kubernetes.io/restartedAt": datetime.now(
+                            UTC
+                        ).isoformat()
                     }
                 }
             }
@@ -5154,7 +5262,9 @@ async def reveal_appliance_kubeconfig(
         # Clean "nothing to reveal" — supervisor hasn't shipped a
         # kubeconfig yet (legacy compose / pre-Phase-5 / k3s not
         # started). Surface as a friendly state, not an error.
-        return RevealKubeconfigResponse(configured=False, kubeconfig=None, hostname=row.hostname)
+        return RevealKubeconfigResponse(
+            configured=False, kubeconfig=None, hostname=row.hostname
+        )
 
     try:
         plaintext = decrypt_str(row.kubeconfig_encrypted)
@@ -5186,7 +5296,9 @@ async def reveal_appliance_kubeconfig(
         hostname=row.hostname,
         user=current_user.username,
     )
-    return RevealKubeconfigResponse(configured=True, kubeconfig=plaintext, hostname=row.hostname)
+    return RevealKubeconfigResponse(
+        configured=True, kubeconfig=plaintext, hostname=row.hostname
+    )
 
 
 # ── Issue #183 Phase 6 — kubeapi-expose CIDR editor ──
@@ -5365,7 +5477,9 @@ async def k8s_list_pods(
         spec = item.get("spec") or {}
         st = item.get("status") or {}
         container_statuses = st.get("containerStatuses") or []
-        ready = bool(container_statuses) and all(cs.get("ready") for cs in container_statuses)
+        ready = bool(container_statuses) and all(
+            cs.get("ready") for cs in container_statuses
+        )
         pods.append(
             K8sPodSummary(
                 name=meta.get("name") or "",
@@ -5373,7 +5487,9 @@ async def k8s_list_pods(
                 phase=st.get("phase") or "Unknown",
                 ready=ready,
                 containers=[
-                    c.get("name") or "" for c in (spec.get("containers") or []) if c.get("name")
+                    c.get("name") or ""
+                    for c in (spec.get("containers") or [])
+                    if c.get("name")
                 ],
                 labels=dict(meta.get("labels") or {}),
             )

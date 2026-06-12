@@ -510,6 +510,7 @@ backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:139
 backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:140
 backend/alembic/versions/f3b8d24a1c70_appliance_evict_requested.py:drop_column:39
 backend/alembic/versions/f3b9c1d6a274_dhcp_group_socket_mode.py:drop_column:49
+backend/alembic/versions/f4a1c9e7b2d8_appliance_host_config_health.py:drop_column:43
 backend/alembic/versions/f4a6c8b2e571_bgp_communities.py:drop_table:83
 backend/alembic/versions/f4a9c1b2d6e7_dns_zone_color.py:drop_column:33
 backend/alembic/versions/f4e1d2a09b75_lease_history_and_nat.py:drop_column:171

@@ -598,22 +598,228 @@ def clear_fleet_upgrade_marker() -> None:
         pass
 
 
-def _prune_failed_sidecars(keep: int = 5) -> None:
-    """#386 Part B — keep only the most recent ``.failed.<ts>`` /
-    ``.done.<ts>`` / ``.invalid.<ts>`` slot-upgrade sidecars so churn
-    (or a pre-#386 re-fire loop) doesn't accumulate hundreds of files
-    in release-state. Sidecar suffixes are unix timestamps, so a
-    lexicographic sort is chronological."""
+def _prune_host_config_sidecars(trigger_file: Path, keep: int = 5) -> None:
+    """(#387) Keep only the newest ``.failed.<ts>`` / ``.done.<ts>`` /
+    ``.invalid.<ts>`` sidecars for ONE trigger family, so a (pre-fix)
+    re-fire loop or normal churn can't accumulate thousands of files in
+    release-state (2374 ntp + 2021 set-next-boot observed on ddi1, #387).
+    Sidecar suffixes are unix timestamps, so a lexicographic sort is
+    chronological. Generalises the slot-upgrade-only #386 pruner."""
     try:
-        parent = _TRIGGER_FILE.parent
+        parent = trigger_file.parent
         for suffix in ("failed", "done", "invalid"):
-            stale = sorted(parent.glob(f"{_TRIGGER_FILE.name}.{suffix}.*"))
+            stale = sorted(parent.glob(f"{trigger_file.name}.{suffix}.*"))
             for path in stale[:-keep]:
                 path.unlink(missing_ok=True)
     except OSError:
         # Best-effort housekeeping — leftover sidecars are cosmetic; a
-        # prune failure must never block the upgrade trigger.
+        # prune failure must never block a trigger write.
         pass
+
+
+def _prune_failed_sidecars(keep: int = 5) -> None:
+    """#386 — slot-upgrade sidecar prune. Thin wrapper over the
+    generalised #387 pruner, kept as a named entry point for
+    ``maybe_fire_fleet_upgrade``."""
+    _prune_host_config_sidecars(_TRIGGER_FILE, keep)
+
+
+# ── #387 — shared bounded-retry fire-guard for the hash-keyed host-
+#    config runners (snmp / ntp / lldp / syslog / ssh / resolver /
+#    firewall / timezone) ──────────────────────────────────────────────
+#
+# Each runner applies a control-plane-rendered config and writes its
+# applied-hash sidecar ONLY on success. The naive fire test — "desired
+# config_hash != applied_hash → write the trigger" — therefore re-fires
+# the SAME desired-state every heartbeat whenever an apply persistently
+# fails (the sidecar never advances), flooding ``<trigger>.failed.<ts>``
+# sidecars (2374 observed on ddi1 for a single bad chrony flag, #387) and
+# never surfacing the failure.
+#
+# The guard caps the RATE of re-fires per distinct config_hash with
+# exponential backoff (a fresh hash — operator pushed new config —
+# resets the budget). A stuck apply retries at a decreasing cadence
+# (60 s → 120 s → … → 15 min ceiling) instead of every ~30 s tick, and
+# NEVER permanently gives up, so a fixed runner (e.g. the #387 chrony
+# flag fix) auto-recovers on the next backoff window with no operator
+# action. ``read_host_config_health()`` surfaces the per-plane
+# stuck/failing state on the heartbeat for the Fleet UI.
+
+_HOSTCFG_BACKOFF_BASE_S = 60.0
+_HOSTCFG_BACKOFF_MAX_S = 900.0  # 15-min ceiling between retries of a stuck apply
+_HOSTCFG_FAILING_ATTEMPTS = 3  # at/after this many fires of one hash → "failing"
+
+# (plane name, trigger file, applied-hash sidecar). The per-plane
+# fire-state sidecar is derived as ``<trigger>.fire-state`` so there's
+# one source of truth and no extra path consts to keep in sync.
+_HOST_CONFIG_PLANES: list[tuple[str, Path, Path]] = [
+    ("snmp", _SNMP_TRIGGER_FILE, _SNMP_HASH_SIDECAR),
+    ("ntp", _NTP_TRIGGER_FILE, _NTP_HASH_SIDECAR),
+    ("lldp", _LLDP_TRIGGER_FILE, _LLDP_HASH_SIDECAR),
+    ("syslog", _SYSLOG_TRIGGER_FILE, _SYSLOG_HASH_SIDECAR),
+    ("ssh", _SSH_TRIGGER_FILE, _SSH_HASH_SIDECAR),
+    ("resolver", _RESOLVER_TRIGGER_FILE, _RESOLVER_HASH_SIDECAR),
+    ("firewall", _FIREWALL_TRIGGER_FILE, _FIREWALL_APPLIED_HASH_SIDECAR),
+    ("timezone", _TZ_TRIGGER_FILE, _TZ_APPLIED_HASH_FILE),
+]
+
+
+def _fire_state_path(trigger_file: Path) -> Path:
+    return trigger_file.with_name(trigger_file.name + ".fire-state")
+
+
+def _read_fire_state(fire_state_file: Path) -> tuple[str, int, datetime | None]:
+    """Read ``<hash>\\t<attempts>\\t<iso>`` → (hash, attempts, when).
+    Missing / malformed → ``("", 0, None)``."""
+    try:
+        text = fire_state_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "", 0, None
+    parts = text.split("\t")
+    if not parts or not parts[0]:
+        return "", 0, None
+    try:
+        attempts = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        attempts = 0
+    when: datetime | None = None
+    if len(parts) > 2:
+        try:
+            when = datetime.fromisoformat(parts[2])
+        except ValueError:
+            when = None
+    return parts[0], attempts, when
+
+
+def _write_fire_state(
+    fire_state_file: Path, config_hash: str, attempts: int, when: datetime
+) -> None:
+    try:
+        tmp = fire_state_file.with_suffix(".new")
+        tmp.write_text(
+            f"{config_hash}\t{attempts}\t{when.isoformat()}\n", encoding="utf-8"
+        )
+        tmp.replace(fire_state_file)
+    except OSError:
+        # Best-effort bookkeeping — a failed fire-state write at worst
+        # costs the backoff its memory for one tick; never fatal.
+        pass
+
+
+def _hostcfg_backoff_seconds(attempts: int) -> float:
+    # ``attempts`` = number of prior fires for this hash (>= 1).
+    expo = _HOSTCFG_BACKOFF_BASE_S * (2 ** max(0, attempts - 1))
+    return min(expo, _HOSTCFG_BACKOFF_MAX_S)
+
+
+def _hostcfg_should_fire(
+    fire_state_file: Path, config_hash: str, *, now: datetime | None = None
+) -> tuple[bool, int]:
+    """(#387) Decide whether to (re-)fire a hash-keyed host-config
+    trigger, applying per-hash exponential backoff. Returns
+    ``(should_fire, attempt_to_record)``. The caller has already
+    confirmed ``config_hash != applied_hash`` and that the trigger file
+    is absent — so reaching here with the SAME hash means the prior
+    attempt has not succeeded yet (failed, or still mid-apply)."""
+    now = now or datetime.now(UTC)
+    prev_hash, attempts, last_at = _read_fire_state(fire_state_file)
+    if config_hash != prev_hash:
+        return True, 1  # fresh desired-state → reset budget, fire now
+    if last_at is not None and (
+        now - last_at
+    ).total_seconds() < _hostcfg_backoff_seconds(attempts):
+        return False, attempts  # still inside the backoff window
+    return True, attempts + 1
+
+
+def _fire_host_config(
+    trigger_file: Path,
+    applied_hash_sidecar: Path,
+    config_hash: str,
+    payload: str,
+) -> bool:
+    """(#387) Shared write path for the hash-keyed host-config runners.
+
+    Replaces the per-function "compare hash → check trigger presence →
+    write trigger" boilerplate AND adds the bounded-retry guard + the
+    per-plane sidecar prune in one place. Returns True iff a trigger was
+    written. The caller owns the appliance-only gate + payload assembly
+    (+ any plane-specific guard, e.g. the SSH lockout refusal)."""
+    applied_hash = _read_release_state_line(applied_hash_sidecar) or ""
+    if config_hash == applied_hash:
+        return False  # already applied — idempotent no-op
+    if trigger_file.exists():
+        return False  # path unit hasn't consumed the last trigger — don't stack
+    fire_state = _fire_state_path(trigger_file)
+    now = datetime.now(UTC)
+    should_fire, attempt = _hostcfg_should_fire(fire_state, config_hash, now=now)
+    if not should_fire:
+        return False  # backing off a stuck apply (#387) — no silent flood
+    try:
+        trigger_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = trigger_file.with_suffix(".new")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(trigger_file)
+    except OSError:
+        return False
+    _write_fire_state(fire_state, config_hash, attempt, now)
+    _prune_host_config_sidecars(trigger_file)
+    return True
+
+
+def read_host_config_health() -> dict[str, dict[str, object]]:
+    """(#387) Per-plane apply health for the hash-keyed host-config
+    runners, surfaced on the heartbeat so the Fleet UI shows a stuck
+    apply honestly instead of leaving the operator with a silent re-fire
+    loop. Only planes whose last-fired config has NOT been applied are
+    reported::
+
+        {"ntp": {"state": "failing", "attempts": 7, "at": "<iso>"}, ...}
+
+    ``state`` is ``failing`` once the same hash has been fired
+    ``_HOSTCFG_FAILING_ATTEMPTS`` times (apply keeps failing), else
+    ``retrying``. A plane whose applied-hash matches its last-fired hash
+    (success) — or that was never fired — is omitted, so a healthy box
+    reports ``{}`` (which clears any stale server-side entry)."""
+    out: dict[str, dict[str, object]] = {}
+    for name, trigger, applied_sidecar in _HOST_CONFIG_PLANES:
+        fhash, attempts, when = _read_fire_state(_fire_state_path(trigger))
+        if not fhash:
+            continue  # never fired → nothing to report
+        applied = _read_release_state_line(applied_sidecar) or ""
+        if applied == fhash:
+            continue  # last-fired config is applied → healthy, omit
+        out[name] = {
+            "state": (
+                "failing" if attempts >= _HOSTCFG_FAILING_ATTEMPTS else "retrying"
+            ),
+            "attempts": attempts,
+            "at": when.isoformat() if when else None,
+        }
+    return out
+
+
+# Trigger families whose host runners rename the consumed trigger to a
+# timestamped ``.done`` / ``.failed`` / ``.invalid`` sidecar. The
+# collect() sweep prunes each every heartbeat so the existing ddi1
+# backlog (2374 ntp + 2021 set-next-boot) is culled on the first
+# post-upgrade heartbeat regardless of whether anything fires this tick.
+# Globbing a family that never timestamp-renames is a harmless no-op.
+_PRUNABLE_TRIGGERS: list[Path] = [
+    _TRIGGER_FILE,
+    _SET_NEXT_BOOT_TRIGGER_FILE,
+    _SET_DEFAULT_TRIGGER_FILE,
+    _VERBOSE_TRIGGER_FILE,
+    _REBOOT_TRIGGER_FILE,
+] + [trigger for _name, trigger, _applied in _HOST_CONFIG_PLANES]
+
+
+def prune_all_trigger_sidecars(keep: int = 5) -> None:
+    """(#387) Sweep every known trigger family's stale timestamped
+    sidecars. Called once per ``collect()`` so a pre-fix backlog is
+    bounded immediately on upgrade, independent of any fire this tick."""
+    for trigger in _PRUNABLE_TRIGGERS:
+        _prune_host_config_sidecars(trigger, keep)
 
 
 def _read_slot_upgrade_log_tail(lines: int = 40, max_chars: int = 8000) -> str:
@@ -695,26 +901,14 @@ def maybe_fire_timezone(desired_timezone: str | None) -> bool:
     if not desired_timezone or not desired_timezone.strip():
         return False
     desired = desired_timezone.strip()
-    # Read the applied-hash sidecar (single-line IANA name) the host
-    # runner writes after a successful apply.
-    try:
-        applied = _TZ_APPLIED_HASH_FILE.read_text(encoding="utf-8").strip()
-    except OSError:
-        applied = ""
-    if applied == desired:
-        return False
-    try:
-        _TZ_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _TZ_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(desired + "\n", encoding="utf-8")
-        # Atomic rename — the .path unit watches PathChanged which
-        # fires on close-after-write of the final path, so the
-        # rename ensures the runner sees the complete trigger file
-        # rather than a half-written one.
-        tmp.replace(_TZ_TRIGGER_FILE)
-        return True
-    except OSError:
-        return False
+    # #387 — fire through the shared bounded-retry guard. The "applied
+    # IANA name" sidecar plays the role of the applied-hash, and the
+    # desired IANA name plays the config_hash, so a tz the host runner
+    # can't apply (e.g. a name ``timedatectl`` rejects) backs off
+    # instead of re-firing every heartbeat. Payload = the IANA name.
+    return _fire_host_config(
+        _TZ_TRIGGER_FILE, _TZ_APPLIED_HASH_FILE, desired, desired + "\n"
+    )
 
 
 def maybe_fire_verbose_boot(desired_verbose_boot: bool | None) -> bool:
@@ -883,37 +1077,24 @@ def maybe_fire_snmp_reload(bundle_block: object) -> bool:
     # disable trigger if the agent previously applied a non-empty
     # config (sidecar present and non-empty) — otherwise this is the
     # default "never configured" state and there's nothing to undo.
-    last_hash = ""
-    if _SNMP_HASH_SIDECAR.exists():
-        try:
-            last_hash = _SNMP_HASH_SIDECAR.read_text(encoding="utf-8").strip()
-        except OSError:
-            last_hash = ""
-    if config_hash == last_hash:
-        return False
-    if _SNMP_TRIGGER_FILE.exists():
-        return False
-    try:
-        _SNMP_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # Three-section payload the host runner reads:
-        #   line 1:    ``enabled`` | ``disabled`` marker
-        #   line 2:    config_hash (sha256 hex, blank when disabled)
-        #   line 3+:   rendered snmpd.conf body (already ends with \n)
-        # The hash is on the wire (rather than recomputed by the
-        # runner) so the agent and host agree on exactly which body
-        # was applied — useful when the runner writes the sidecar
-        # the agent reads on next bundle to short-circuit re-firing.
-        payload = (
-            ("enabled\n" if enabled else "disabled\n")
-            + (config_hash + "\n")
-            + snmpd_conf
-        )
-        tmp = _SNMP_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(_SNMP_TRIGGER_FILE)
-        return True
-    except OSError:
-        return False
+    # Three-section payload the host runner reads:
+    #   line 1:   ``enabled`` | ``disabled`` marker
+    #   line 2:   config_hash (sha256 hex, blank when disabled)
+    #   line 3+:  rendered snmpd.conf body (already ends with \n)
+    # The hash is on the wire (rather than recomputed by the runner) so
+    # the agent and host agree on exactly which body was applied. An
+    # empty config_hash (SNMP disabled) only fires a disable trigger if
+    # a non-empty config was previously applied — handled by the
+    # ``config_hash == applied_hash`` short-circuit inside the guard.
+    payload = (
+        ("enabled\n" if enabled else "disabled\n") + (config_hash + "\n") + snmpd_conf
+    )
+    # #387 — fire through the shared bounded-retry guard so a
+    # persistently-failing apply backs off instead of re-firing every
+    # heartbeat (which flooded thousands of .failed sidecars).
+    return _fire_host_config(
+        _SNMP_TRIGGER_FILE, _SNMP_HASH_SIDECAR, config_hash, payload
+    )
 
 
 # ── #272 Phase 7b — control-plane cluster join/leave ────────────────
@@ -1132,30 +1313,16 @@ def maybe_fire_syslog_reload(bundle_block: object) -> bool:
     ca_certs = bundle_block.get("ca_certs")
     if not isinstance(ca_certs, dict):
         ca_certs = {}
-    last_hash = ""
-    if _SYSLOG_HASH_SIDECAR.exists():
-        try:
-            last_hash = _SYSLOG_HASH_SIDECAR.read_text(encoding="utf-8").strip()
-        except OSError:
-            last_hash = ""
-    if config_hash == last_hash:
-        return False
-    if _SYSLOG_TRIGGER_FILE.exists():
-        return False
-    try:
-        _SYSLOG_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = (
-            ("enabled\n" if enabled else "disabled\n")
-            + (config_hash + "\n")
-            + (json.dumps(ca_certs) + "\n")
-            + rsyslog_conf
-        )
-        tmp = _SYSLOG_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(_SYSLOG_TRIGGER_FILE)
-        return True
-    except OSError:
-        return False
+    payload = (
+        ("enabled\n" if enabled else "disabled\n")
+        + (config_hash + "\n")
+        + (json.dumps(ca_certs) + "\n")
+        + rsyslog_conf
+    )
+    # #387 — shared bounded-retry guard (see maybe_fire_snmp_reload).
+    return _fire_host_config(
+        _SYSLOG_TRIGGER_FILE, _SYSLOG_HASH_SIDECAR, config_hash, payload
+    )
 
 
 def read_syslog_forwarding() -> str | None:
@@ -1237,35 +1404,19 @@ def maybe_fire_ssh_reload(bundle_block: object) -> bool:
         )
         return False
 
-    last_hash = ""
-    if _SSH_HASH_SIDECAR.exists():
-        try:
-            last_hash = _SSH_HASH_SIDECAR.read_text(encoding="utf-8").strip()
-        except OSError:
-            last_hash = ""
-    if config_hash == last_hash:
-        return False
-    if _SSH_TRIGGER_FILE.exists():
-        return False
-    try:
-        _SSH_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ak_bytes = authorized_keys.encode("utf-8")
-        payload = (
-            ("enabled\n" if enabled else "disabled\n")
-            + (config_hash + "\n")
-            + (str(ssh_port) + "\n")
-            + (json.dumps(allowed) + "\n")
-            + (("1" if password_auth else "0") + "\n")
-            + (str(len(ak_bytes)) + "\n")
-            + authorized_keys
-            + sshd_conf
-        )
-        tmp = _SSH_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(_SSH_TRIGGER_FILE)
-        return True
-    except OSError:
-        return False
+    ak_bytes = authorized_keys.encode("utf-8")
+    payload = (
+        ("enabled\n" if enabled else "disabled\n")
+        + (config_hash + "\n")
+        + (str(ssh_port) + "\n")
+        + (json.dumps(allowed) + "\n")
+        + (("1" if password_auth else "0") + "\n")
+        + (str(len(ak_bytes)) + "\n")
+        + authorized_keys
+        + sshd_conf
+    )
+    # #387 — shared bounded-retry guard (see maybe_fire_snmp_reload).
+    return _fire_host_config(_SSH_TRIGGER_FILE, _SSH_HASH_SIDECAR, config_hash, payload)
 
 
 def read_ssh_key_count() -> int | None:
@@ -1314,29 +1465,15 @@ def maybe_fire_resolver_reload(bundle_block: object) -> bool:
     config_hash = str(bundle_block.get("config_hash") or "")
     resolved_conf = str(bundle_block.get("resolved_conf") or "")
     enabled = bool(bundle_block.get("enabled"))
-    last_hash = ""
-    if _RESOLVER_HASH_SIDECAR.exists():
-        try:
-            last_hash = _RESOLVER_HASH_SIDECAR.read_text(encoding="utf-8").strip()
-        except OSError:
-            last_hash = ""
-    if config_hash == last_hash:
-        return False
-    if _RESOLVER_TRIGGER_FILE.exists():
-        return False
-    try:
-        _RESOLVER_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = (
-            ("enabled\n" if enabled else "disabled\n")
-            + (config_hash + "\n")
-            + resolved_conf
-        )
-        tmp = _RESOLVER_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(_RESOLVER_TRIGGER_FILE)
-        return True
-    except OSError:
-        return False
+    payload = (
+        ("enabled\n" if enabled else "disabled\n")
+        + (config_hash + "\n")
+        + resolved_conf
+    )
+    # #387 — shared bounded-retry guard (see maybe_fire_snmp_reload).
+    return _fire_host_config(
+        _RESOLVER_TRIGGER_FILE, _RESOLVER_HASH_SIDECAR, config_hash, payload
+    )
 
 
 def read_resolver_status() -> str | None:
@@ -1380,30 +1517,16 @@ def maybe_fire_lldp_reload(bundle_block: object) -> bool:
     lldpd_conf = str(bundle_block.get("lldpd_conf") or "")
     daemon_args = str(bundle_block.get("daemon_args") or "")
     enabled = bool(bundle_block.get("enabled"))
-    last_hash = ""
-    if _LLDP_HASH_SIDECAR.exists():
-        try:
-            last_hash = _LLDP_HASH_SIDECAR.read_text(encoding="utf-8").strip()
-        except OSError:
-            last_hash = ""
-    if config_hash == last_hash:
-        return False
-    if _LLDP_TRIGGER_FILE.exists():
-        return False
-    try:
-        _LLDP_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = (
-            ("enabled\n" if enabled else "disabled\n")
-            + (config_hash + "\n")
-            + (daemon_args + "\n")
-            + lldpd_conf
-        )
-        tmp = _LLDP_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(_LLDP_TRIGGER_FILE)
-        return True
-    except OSError:
-        return False
+    payload = (
+        ("enabled\n" if enabled else "disabled\n")
+        + (config_hash + "\n")
+        + (daemon_args + "\n")
+        + lldpd_conf
+    )
+    # #387 — shared bounded-retry guard (see maybe_fire_snmp_reload).
+    return _fire_host_config(
+        _LLDP_TRIGGER_FILE, _LLDP_HASH_SIDECAR, config_hash, payload
+    )
 
 
 def read_lldpd_running() -> bool | None:
@@ -1487,22 +1610,17 @@ def maybe_fire_firewall_reload(bundle_block: object) -> bool:
     firewall_conf = str(bundle_block.get("firewall_conf") or "")
     if not config_hash or not firewall_conf:
         return False  # no server-side authority → fall back / no-op
-    # Short-circuit against the runner's applied-hash sidecar. A body the
-    # Phase-1 in-pod path already applied short-circuits on upgrade because
-    # the server render is byte-identical → same hash.
-    last_hash = _read_release_state_line(_FIREWALL_APPLIED_HASH_SIDECAR) or ""
-    if config_hash == last_hash:
-        return False
-    if _FIREWALL_TRIGGER_FILE.exists():
-        return False
-    try:
-        _FIREWALL_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _FIREWALL_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(f"{config_hash}\n{firewall_conf}", encoding="utf-8")
-        tmp.replace(_FIREWALL_TRIGGER_FILE)
-        return True
-    except OSError:
-        return False
+    # #387 — shared bounded-retry guard. The short-circuit against the
+    # runner's applied-hash sidecar (a body the Phase-1 in-pod path
+    # already applied → byte-identical server render → same hash) now
+    # lives inside _fire_host_config, along with backoff on a stuck apply
+    # (see maybe_fire_snmp_reload).
+    return _fire_host_config(
+        _FIREWALL_TRIGGER_FILE,
+        _FIREWALL_APPLIED_HASH_SIDECAR,
+        config_hash,
+        f"{config_hash}\n{firewall_conf}",
+    )
 
 
 # ── LLDP neighbour discovery (#347) ──────────────────────────────────
@@ -1636,39 +1754,25 @@ def maybe_fire_ntp_reload(bundle_block: object) -> bool:
     config_hash = str(bundle_block.get("config_hash") or "")
     chrony_conf = str(bundle_block.get("chrony_conf") or "")
     allow_clients = bool(bundle_block.get("allow_clients"))
-    last_hash = ""
-    if _NTP_HASH_SIDECAR.exists():
-        try:
-            last_hash = _NTP_HASH_SIDECAR.read_text(encoding="utf-8").strip()
-        except OSError:
-            last_hash = ""
-    if config_hash == last_hash:
-        return False
-    if _NTP_TRIGGER_FILE.exists():
-        return False
-    try:
-        _NTP_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # Four-line header:
-        #   line 1: marker — ``enabled`` is always the case for
-        #           chrony (it's always running on the appliance);
-        #           kept for shape-parity with the SNMP runner.
-        #   line 2: ``allow_clients`` — ``true`` / ``false`` so the
-        #           runner knows whether to open the UDP 123 nft
-        #           drop-in.
-        #   line 3: config_hash (sha256 hex)
-        #   line 4+: rendered chrony.conf body
-        payload = (
-            "enabled\n"
-            + ("true\n" if allow_clients else "false\n")
-            + (config_hash + "\n")
-            + chrony_conf
-        )
-        tmp = _NTP_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(_NTP_TRIGGER_FILE)
-        return True
-    except OSError:
-        return False
+    # Four-line header:
+    #   line 1:  marker — ``enabled`` is always the case for chrony
+    #            (it's always running on the appliance); kept for
+    #            shape-parity with the SNMP runner.
+    #   line 2:  ``allow_clients`` — ``true`` / ``false`` so the runner
+    #            knows whether to open the UDP 123 nft drop-in.
+    #   line 3:  config_hash (sha256 hex)
+    #   line 4+: rendered chrony.conf body
+    payload = (
+        "enabled\n"
+        + ("true\n" if allow_clients else "false\n")
+        + (config_hash + "\n")
+        + chrony_conf
+    )
+    # #387 — shared bounded-retry guard. Before this, the bad
+    # ``chronyd -t -f`` validate flag made every apply fail, and the
+    # naive re-fire flooded 2374 .failed sidecars on ddi1. The guard
+    # backs off a stuck apply; the chrony runner fix makes it succeed.
+    return _fire_host_config(_NTP_TRIGGER_FILE, _NTP_HASH_SIDECAR, config_hash, payload)
 
 
 def read_ntp_sync_state() -> str | None:
@@ -2096,6 +2200,13 @@ def collect() -> dict[str, object]:
     deployment_kind = detect_deployment_kind()
     is_appliance = deployment_kind == "appliance"
 
+    # #387 — cull any stale timestamped trigger sidecars every tick so a
+    # pre-fix backlog (2374 ntp + 2021 set-next-boot observed on ddi1)
+    # is bounded on the first post-upgrade heartbeat, independent of
+    # whether any trigger fires this tick. Cheap (a handful of globs).
+    if is_appliance:
+        prune_all_trigger_sidecars()
+
     current_slot = _current_slot_from_cmdline() if is_appliance else None
     durable_default = _durable_default_from_grubenv() if is_appliance else None
     is_trial_boot: bool | None = None
@@ -2165,6 +2276,13 @@ def collect() -> dict[str, object]:
         # reference / stratum >= 16; ``unknown`` = chronyc unreadable
         # (transient at boot). None on non-appliance deploys.
         "ntp_sync_state": read_ntp_sync_state() if is_appliance else None,
+        # #387 — per-plane host-config apply health (snmp / ntp / lldp /
+        # syslog / ssh / resolver / firewall / timezone). Surfaces a
+        # stuck apply (the bounded-retry guard is backing it off) so the
+        # Fleet UI shows it honestly instead of a silent re-fire loop.
+        # ``{}`` when every plane is applied / unconfigured — clears any
+        # stale server-side entry; None off-appliance leaves it untouched.
+        "host_config_health": read_host_config_health() if is_appliance else None,
         # Issue #343 — lldpd running state from the host-side runner's
         # status sidecar. None on non-appliance deploys.
         "lldpd_running": read_lldpd_running() if is_appliance else None,

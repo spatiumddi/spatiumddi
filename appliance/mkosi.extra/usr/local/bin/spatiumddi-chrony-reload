@@ -16,7 +16,7 @@
 #
 # Apply flow:
 #   1. Extract body, write to /tmp staging
-#   2. ``chronyd -t -f <tmp>`` — chrony's syntax check; abort on fail
+#   2. ``chronyd -p -f <tmp>`` — chrony's syntax check; abort on fail
 #   3. Atomically swap /etc/chrony/chrony.conf
 #   4. ``systemctl reload chrony`` (in-place re-read of conf)
 #   5. Manage /etc/nftables.d/50-spatium-ntp.nft per allow_clients
@@ -128,16 +128,21 @@ if [ "$MARKER" != "enabled" ]; then
 fi
 
 # Syntax-check the staged config against chrony's own parser.
-# ``chronyd -t -f <file>`` reads the config + exits 0 / non-0 on
-# parse success / failure without touching the running daemon.
+# ``chronyd -p -f <file>`` parses the config, prints it, and exits
+# 0 / non-0 on parse success / failure WITHOUT detaching or touching
+# the running daemon. NB: ``-t`` is chrony's *timeout* flag (it takes
+# a numeric argument), NOT a "test" flag — ``chronyd -t -f <file>``
+# parses ``-f`` as the timeout value and dies with "Fatal error :
+# Invalid argument -f", which is why every NTP apply silently failed
+# on the appliance before #387.
 if ! command -v chronyd >/dev/null 2>&1; then
     echo "  ✗ chronyd binary not found — is chrony installed?"
     echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
     mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
     exit 1
 fi
-if ! chronyd -t -f "$TMP_BODY" >/tmp/spatium-chrony-validate.log 2>&1; then
-    echo "  ✗ chronyd -t failed for staged config:"
+if ! chronyd -p -f "$TMP_BODY" >/tmp/spatium-chrony-validate.log 2>&1; then
+    echo "  ✗ chronyd -p failed for staged config:"
     sed 's/^/      /' /tmp/spatium-chrony-validate.log
     echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
     mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
