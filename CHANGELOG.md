@@ -20,6 +20,79 @@ the formatter handles the rest.
 
 ---
 
+## 2026.06.12-2 — 2026-06-12
+
+Appliance **host-config reliability** — closes the silent NTP
+crash-loop (#387) and the always-empty Fleet etcd-snapshot list
+(#389). On a field appliance the GUI-configured NTP settings had
+**never** applied: the host-side `spatiumddi-chrony-reload` runner
+validated the staged config with `chronyd -t -f <file>`, but `-t`
+is chrony's *timeout* flag (it takes a numeric argument), so chrony
+parsed `-f` as the timeout value and died with `Fatal error :
+Invalid argument -f` on every apply. Because each host-config
+runner only writes its applied-hash sidecar on SUCCESS, the
+supervisor re-derived "desired ≠ applied → fire the trigger" every
+~30 s heartbeat and re-fired forever — accumulating **2374**
+`ntp-config-pending.failed.<ts>` sidecars (and a parallel 2021
+`slot-set-next-boot-pending.done` from the same re-fire shape) with
+nothing surfaced in the UI. This release fixes the chrony flag and
+generalises #386's slot-upgrade fire-once/backoff/prune pattern to
+every hash-keyed host-config runner so none of them can silently
+loop again, and surfaces a stuck apply honestly in the Fleet
+drilldown. Builds on the slot-upgrade guard shipped in #386.
+
+### Fixed
+
+* **#387 — NTP config never applied on the appliance.** The chrony
+  config-apply runner's syntax check used `chronyd -t -f <file>`;
+  `-t` is the *timeout* option (numeric arg), not a "test config"
+  flag, so the check died with `Fatal error : Invalid argument -f`
+  and every operator-pushed NTP change silently failed to apply
+  (chrony kept running on the image-baked pool config, so time sync
+  itself was unaffected — only GUI NTP changes were dropped). Now
+  uses `chronyd -p -f <file>` (parse-and-print, exits 0/non-0
+  without touching the running daemon), with a comment documenting
+  the `-t` vs `-p` trap so it isn't reintroduced.
+* **#387 — host-config runners crash-loop silently.** A shared
+  bounded-retry fire-guard now gates every hash-keyed host-config
+  runner (snmp / ntp / lldp / syslog / ssh / resolver / firewall /
+  timezone): a persistently-failing apply re-fires with exponential
+  backoff (60 s → … → 15 min ceiling) per distinct config hash
+  instead of every heartbeat, a fresh config hash resets the budget,
+  and the guard never permanently gives up so a fixed runner
+  auto-recovers. Stale timestamped trigger sidecars
+  (`.failed` / `.done` / `.invalid.<ts>`) are pruned to the newest
+  5 per family on every heartbeat, which culls the existing ddi1
+  backlog on the first post-upgrade tick.
+* **#389 — Fleet etcd-snapshot inventory always empty.** The
+  supervisor reports recoverable snapshots by listing the k3s
+  `ETCDSnapshotFile` CRs over the kubeapi, but its ServiceAccount
+  lacked a `k3s.cattle.io/etcdsnapshotfiles` read grant, so the
+  `GET` 403'd and the list reported empty every heartbeat even
+  though k3s was taking snapshots on schedule. Added the read-only
+  rule to the supervisor's `spatium-supervisor-nodes` ClusterRole;
+  `list_etcd_snapshots()` now logs a warning on a 403 (was a silent
+  empty list) so a future RBAC gap is self-diagnosing.
+
+### Added
+
+* **#387 — host-config apply health in the Fleet UI.** The
+  supervisor heartbeat ships `host_config_health` — per-plane
+  `{state, attempts, at}` for any host-config runner whose desired
+  config isn't applied yet (`retrying` while transient, `failing`
+  once the apply keeps failing) — persisted to the new
+  `appliance.host_config_health` column and rendered as a
+  "Host-config apply health" table in the appliance drilldown, so a
+  stuck apply is visible instead of looping invisibly. An
+  all-healthy appliance reports `{}` and the section stays hidden.
+
+### Migrations
+
+* `f4a1c9e7b2d8` — adds `appliance.host_config_health` (JSONB, not
+  null, default `{}`).
+
+---
+
 ## 2026.06.12-1 — 2026-06-12
 
 Hotfix for **directly-attached DHCP dead on 2026.06.11-1** (#383).

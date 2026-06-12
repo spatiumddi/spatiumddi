@@ -448,6 +448,18 @@ def list_etcd_snapshots() -> list[dict[str, Any]]:
     except RuntimeError:
         return []
     if status != 200:
+        # #389 — a 403 here is the common cause of an empty Fleet → etcd
+        # snapshots list: the supervisor ServiceAccount needs a
+        # ``k3s.cattle.io/etcdsnapshotfiles`` read grant
+        # (supervisor-rbac.yaml). Log it so a missing grant is
+        # self-diagnosing instead of an invisible empty list. A 404
+        # (older k3s without the CRD) is benign → debug, not warning.
+        emit = log.warning if status == 403 else log.debug
+        emit(
+            "supervisor.k8s_api.list_etcd_snapshots_status",
+            status=status,
+            body=resp[:200],
+        )
         return []
     try:
         items = (json.loads(resp) or {}).get("items") or []
@@ -459,7 +471,9 @@ def list_etcd_snapshots() -> list[dict[str, Any]]:
         st = it.get("status") or {}
         out.append(
             {
-                "name": spec.get("snapshotName") or (it.get("metadata") or {}).get("name") or "",
+                "name": spec.get("snapshotName")
+                or (it.get("metadata") or {}).get("name")
+                or "",
                 "location": spec.get("location") or "",
                 "node_name": spec.get("nodeName") or "",
                 "size": st.get("size"),

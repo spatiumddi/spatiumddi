@@ -159,6 +159,18 @@ rules:
     # k8s_api.patch_node_labels and a fallback strategic-merge if we
     # ever switch.
     verbs: ["get", "list", "watch", "patch", "update"]
+    # #389 — read-only on the k3s ETCDSnapshotFile CRs so the
+    # heartbeat's ``list_etcd_snapshots()`` can populate the Fleet →
+    # etcd snapshots inventory. Without this grant the
+    # ``GET /apis/k3s.cattle.io/v1/etcdsnapshotfiles`` 403s and the
+    # list reports empty every heartbeat even though k3s is taking
+    # snapshots on schedule. Cluster-scoped because the CRs are;
+    # read-only because snapshot create / delete / restore go through
+    # the host ``k3s`` binary + the cluster-restore trigger plane, not
+    # the kubeapi.
+  - apiGroups: ["k3s.cattle.io"]
+    resources: ["etcdsnapshotfiles"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

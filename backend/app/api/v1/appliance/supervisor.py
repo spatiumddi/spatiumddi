@@ -1035,6 +1035,12 @@ class SupervisorHeartbeatRequest(BaseModel):
     # None / omitted = supervisor didn't run the watchdog this tick
     # (typical on docker / k8s deployments or before the first probe).
     role_health: dict[str, dict[str, Any]] | None = None
+    # #387 — per-plane host-config apply health from the supervisor's
+    # bounded-retry fire-guard. ``{<plane>: {state, attempts, at}}`` for
+    # the hash-keyed runners (snmp / ntp / lldp / syslog / ssh /
+    # resolver / firewall / timezone). Empty dict = all applied / healthy
+    # (clears stale entries); None / omitted = pre-#387 supervisor.
+    host_config_health: dict[str, dict[str, Any]] | None = None
     # Issue #183 Phase 4 — local k3s cluster health summary. Shape:
     # ``{"kubeapi_ready": bool, "nodes_total": int, "nodes_ready":
     # int, "pods_total": int, "pods_by_phase": {<phase>: count}}``.
@@ -1578,6 +1584,13 @@ async def supervisor_heartbeat(
         # supervisor's ``since`` timestamp is the canonical "first
         # observed in this status" anchor across heartbeats.
         row.role_health = dict(body.role_health)
+    if body.host_config_health is not None:
+        # #387 — supervisor's per-plane host-config apply health.
+        # Overwrite verbatim every tick: empty dict clears stale stuck-
+        # apply entries once a plane converges; a non-empty dict means
+        # at least one plane's desired config isn't applied (the guard
+        # is backing it off), which the Fleet UI surfaces as a banner.
+        row.host_config_health = dict(body.host_config_health)
     if body.cluster_health is not None:
         # Issue #183 Phase 4 — supervisor's local-k3s health summary.
         # Same overwrite-verbatim shape as role_health. Empty dict
@@ -2249,6 +2262,11 @@ class ApplianceRow(BaseModel):
     # ``dhcp-kea``); values carry ``{role, status, since,
     # container_id}``.
     role_health: dict[str, dict[str, Any]]
+    # #387 — per-plane host-config apply health (snmp / ntp / lldp /
+    # syslog / ssh / resolver / firewall / timezone). ``{<plane>:
+    # {state, attempts, at}}``; only planes with an unapplied desired
+    # config appear. Empty when all healthy.
+    host_config_health: dict[str, dict[str, Any]]
     # Issue #183 Phase 4 — local k3s cluster health summary.
     cluster_health: dict[str, Any]
     # Issue #183 Phase 5 — installed k3s version (plain text, public).
@@ -2344,6 +2362,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         role_switch_state=row.role_switch_state,
         role_switch_reason=row.role_switch_reason,
         role_health=dict(row.role_health or {}),
+        host_config_health=dict(row.host_config_health or {}),
         cluster_health=dict(row.cluster_health or {}),
         k3s_version=row.k3s_version,
         kubeconfig_set=row.kubeconfig_encrypted is not None,

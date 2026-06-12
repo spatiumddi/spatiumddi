@@ -663,6 +663,22 @@ class Appliance(Base):
         server_default="{}",
     )
 
+    # #387 — per-plane host-config apply health from the supervisor's
+    # bounded-retry fire-guard. ``{<plane>: {state, attempts, at}}`` for
+    # the hash-keyed host-config runners (snmp / ntp / lldp / syslog /
+    # ssh / resolver / firewall / timezone), keyed by plane name; only
+    # planes whose desired config is NOT yet applied appear. ``state`` is
+    # ``retrying`` (transient) or ``failing`` (apply keeps failing).
+    # Empty dict when every plane is applied — the Fleet drilldown shows
+    # an amber/red banner only when non-empty, so a stuck apply is
+    # visible instead of looping silently (the pre-#387 NTP bug).
+    host_config_health: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+
     # Issue #183 Phase 4 — local k3s cluster health summary, supplied
     # by the supervisor on every heartbeat. Shape:
     # ``{"kubeapi_ready": bool, "nodes_total": int, "nodes_ready":

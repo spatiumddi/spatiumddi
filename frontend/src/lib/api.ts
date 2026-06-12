@@ -8601,6 +8601,20 @@ export interface ApplianceRow {
       container_id: string | null;
     }
   >;
+  // #387 — per-plane host-config apply health from the supervisor's
+  // bounded-retry fire-guard. Keyed by plane name (``ntp`` / ``snmp`` /
+  // ``lldp`` / ``syslog`` / ``ssh`` / ``resolver`` / ``firewall`` /
+  // ``timezone``); only planes whose desired config isn't applied appear,
+  // so an all-healthy appliance reports ``{}``. ``failing`` = the apply
+  // keeps failing (the guard is backing it off); ``retrying`` = transient.
+  host_config_health: Record<
+    string,
+    {
+      state: "retrying" | "failing";
+      attempts: number;
+      at: string | null;
+    }
+  >;
   // Issue #183 Phase 4 — local k3s cluster health summary, supplied
   // by the supervisor on every heartbeat. Empty object on legacy
   // compose appliances or pre-#183 supervisors.
