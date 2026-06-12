@@ -148,7 +148,7 @@ if ! chronyd -p -f "$TMP_BODY" >/tmp/spatium-chrony-validate.log 2>&1; then
     mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
     exit 1
 fi
-echo "  ✓ chronyd -t passed"
+echo "  ✓ chronyd -p passed"
 
 # Atomic swap. Owner root, group root, mode 0644 — chrony reads as
 # root + the file has no secrets (server hostnames are operator-
