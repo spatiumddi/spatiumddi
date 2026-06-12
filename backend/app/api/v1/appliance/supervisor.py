@@ -987,6 +987,16 @@ class SupervisorHeartbeatRequest(BaseModel):
     is_trial_boot: bool | None = None
     last_upgrade_state: Literal["ready", "in-flight", "done", "failed"] | None = None
     last_upgrade_state_at: datetime | None = None
+    # Issue #386 Part C — tail of the host ``slot-upgrade.log`` so the
+    # Fleet drilldown can show what an in-flight / failed apply is doing.
+    # The supervisor ships the last lines while state is in-flight/failed
+    # and ``""`` once ready/done (clears a stale tail); None on
+    # non-appliance so the handler leaves the column alone.
+    last_upgrade_log_tail: str | None = None
+    # Issue #386 Part C — structured per-phase progress (step / pct /
+    # detail / at) so the Fleet UI renders a real status stepper. ``{}``
+    # once no longer in-flight (clear); None on non-appliance.
+    last_upgrade_progress: dict[str, Any] | None = None
     snmpd_running: bool | None = None
     ntp_sync_state: Literal["synchronized", "unsynchronized", "unknown"] | None = None
     # Issue #156 — best-effort rsyslog-forwarding status. None = not
@@ -1171,6 +1181,14 @@ class SupervisorHeartbeatResponse(BaseModel):
     long_poll: bool = False
     desired_appliance_version: str | None = None
     desired_slot_image_url: str | None = None
+    # Issue #386 Part A — integrity + transport hints the host-side
+    # ``spatium-upgrade-slot`` runner uses for the fetch. ``sha256`` is
+    # the image's stored hash (the runner verifies bytes against it);
+    # ``tls_insecure`` allows skipping cert-verify for the appliance's
+    # OWN self-served URL only — honoured host-side ONLY when a sha256
+    # is also present. External (public-CA) URLs leave both unset.
+    desired_slot_image_sha256: str | None = None
+    desired_slot_image_tls_insecure: bool = False
     # Operator's per-slot boot intents. The supervisor writes the
     # matching trigger file when non-null + the current state doesn't
     # already satisfy the request. Both auto-clear in the heartbeat
@@ -1514,6 +1532,13 @@ async def supervisor_heartbeat(
         row.last_upgrade_state = body.last_upgrade_state
     if body.last_upgrade_state_at is not None:
         row.last_upgrade_state_at = body.last_upgrade_state_at
+    # #386 Part C — empty string is a meaningful value here ("no
+    # in-flight upgrade, clear any stale tail"), so persist on
+    # ``is not None`` rather than truthiness.
+    if body.last_upgrade_log_tail is not None:
+        row.last_upgrade_log_tail = body.last_upgrade_log_tail or None
+    if body.last_upgrade_progress is not None:
+        row.last_upgrade_progress = body.last_upgrade_progress or None
     if body.snmpd_running is not None:
         row.snmpd_running = body.snmpd_running
     if body.ntp_sync_state is not None:
@@ -1730,6 +1755,8 @@ async def supervisor_heartbeat(
     ):
         row.desired_appliance_version = None
         row.desired_slot_image_url = None
+        row.desired_slot_image_sha256 = None
+        row.desired_slot_image_tls_insecure = False
 
     # Auto-clear desired_next_boot_slot once the supervisor reports
     # the requested slot as ``current_slot`` — the operator's intent
@@ -1843,7 +1870,8 @@ async def supervisor_heartbeat(
             desired_join_token = decrypt_str(row.desired_k3s_join_token_encrypted)
         except Exception:  # noqa: BLE001
             logger.warning(
-                "supervisor_heartbeat_join_token_decrypt_failed", appliance_id=str(row.id)
+                "supervisor_heartbeat_join_token_decrypt_failed",
+                appliance_id=str(row.id),
             )
 
     # #272 Phase 7b — the cross-node firewall peer set this node must
@@ -1894,7 +1922,12 @@ async def supervisor_heartbeat(
     ntp_block = (
         ntp_bundle(cfg_row)
         if cfg_row is not None
-        else {"enabled": False, "allow_clients": False, "config_hash": "", "chrony_conf": ""}
+        else {
+            "enabled": False,
+            "allow_clients": False,
+            "config_hash": "",
+            "chrony_conf": "",
+        }
     )
     lldp_block = (
         lldp_bundle(cfg_row)
@@ -1994,6 +2027,8 @@ async def supervisor_heartbeat(
         state=row.state,  # type: ignore[arg-type]
         desired_appliance_version=row.desired_appliance_version,
         desired_slot_image_url=row.desired_slot_image_url,
+        desired_slot_image_sha256=row.desired_slot_image_sha256,
+        desired_slot_image_tls_insecure=row.desired_slot_image_tls_insecure,
         desired_next_boot_slot=row.desired_next_boot_slot,  # type: ignore[arg-type]
         desired_default_slot=row.desired_default_slot,  # type: ignore[arg-type]
         reboot_requested=row.reboot_requested,
@@ -2166,6 +2201,12 @@ class ApplianceRow(BaseModel):
     is_trial_boot: bool
     last_upgrade_state: str | None
     last_upgrade_state_at: datetime | None
+    # Issue #386 Part C — tail of the host slot-upgrade.log + structured
+    # per-phase progress while an apply is in-flight / failed, so the
+    # Fleet drilldown shows a real status stepper + the failure reason
+    # instead of just the coarse state chip.
+    last_upgrade_log_tail: str | None
+    last_upgrade_progress: dict[str, Any] | None
     snmpd_running: bool | None
     ntp_sync_state: str | None
     # Issue #156 — best-effort rsyslog-forwarding status surfaced from
@@ -2180,6 +2221,11 @@ class ApplianceRow(BaseModel):
     resolver_status: str | None
     desired_appliance_version: str | None
     desired_slot_image_url: str | None
+    # #386 Part A — integrity + transport hints surfaced for the UI /
+    # debugging (not secret). sha256 the host verifies the bytes against;
+    # tls_insecure is true only for the appliance's own self-served URL.
+    desired_slot_image_sha256: str | None
+    desired_slot_image_tls_insecure: bool
     desired_next_boot_slot: str | None
     desired_default_slot: str | None
     reboot_requested: bool
@@ -2274,6 +2320,8 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         is_trial_boot=row.is_trial_boot,
         last_upgrade_state=row.last_upgrade_state,
         last_upgrade_state_at=row.last_upgrade_state_at,
+        last_upgrade_log_tail=row.last_upgrade_log_tail,
+        last_upgrade_progress=row.last_upgrade_progress,
         snmpd_running=row.snmpd_running,
         ntp_sync_state=row.ntp_sync_state,
         syslog_forwarding=row.syslog_forwarding,
@@ -2281,6 +2329,8 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         resolver_status=row.resolver_status,
         desired_appliance_version=row.desired_appliance_version,
         desired_slot_image_url=row.desired_slot_image_url,
+        desired_slot_image_sha256=row.desired_slot_image_sha256,
+        desired_slot_image_tls_insecure=row.desired_slot_image_tls_insecure,
         desired_next_boot_slot=row.desired_next_boot_slot,
         desired_default_slot=row.desired_default_slot,
         reboot_requested=row.reboot_requested,
@@ -3673,7 +3723,10 @@ async def replace_control_plane_member(
             resource_id=str(row.id),
             resource_display=row.hostname,
             result="success",
-            new_value={"pairing_code_id": str(pc_id), "pairing_expires_at": expires_at.isoformat()},
+            new_value={
+                "pairing_code_id": str(pc_id),
+                "pairing_expires_at": expires_at.isoformat(),
+            },
         )
     )
     await db.commit()
@@ -4067,7 +4120,10 @@ class MetalLBConfigUpdate(BaseModel):
         # exists without it) and can't reuse the control-plane VIP or each
         # other — MetalLB hands a given address to exactly one Service, so
         # two services sharing one VIP would leave one perpetually Pending.
-        dp_vips = {"DNS resolver VIP": self.dns_vip, "DHCP relay VIP": self.dhcp_relay_vip}
+        dp_vips = {
+            "DNS resolver VIP": self.dns_vip,
+            "DHCP relay VIP": self.dhcp_relay_vip,
+        }
         for label, vip in dp_vips.items():
             if vip and not self.enabled:
                 raise ValueError(f"{label} requires MetalLB to be enabled")
@@ -4078,7 +4134,10 @@ class MetalLBConfigUpdate(BaseModel):
         if self.dns_vip and self.dns_vip == self.dhcp_relay_vip:
             raise ValueError("DNS resolver VIP and DHCP relay VIP must differ")
         # Every configured VIP must fall inside the pool.
-        for label, vip in {"control-plane VIP": self.control_plane_vip, **dp_vips}.items():
+        for label, vip in {
+            "control-plane VIP": self.control_plane_vip,
+            **dp_vips,
+        }.items():
             if vip and self.pool_addresses and not _vip_in_pool(vip, self.pool_addresses):
                 raise ValueError(
                     f"{label} {vip} is not inside the address pool "
@@ -4269,6 +4328,12 @@ async def schedule_appliance_upgrade(
     from app.models.appliance import ApplianceUpgradeImage  # noqa: PLC0415
 
     resolved_url: str
+    # Issue #386 Part A — integrity + transport hints stamped alongside
+    # the URL. For an internal (self-served) image we know the sha256 and
+    # that the URL points at our own self-signed cert; for an external
+    # operator-pasted URL we trust public-CA TLS and have no hash.
+    image_sha256: str | None = None
+    tls_insecure = False
     if body.slot_image_id is not None:
         image = await db.get(ApplianceUpgradeImage, body.slot_image_id)
         if image is None:
@@ -4299,12 +4364,32 @@ async def schedule_appliance_upgrade(
             f"{str(request.base_url).rstrip('/')}"
             f"/api/v1/appliance/upgrade-images/{image.id}/raw.xz?t={token}"
         )
+        # The image is served by our OWN control plane behind the
+        # self-signed web cert, so the host runner's bare urllib fetch
+        # would fail TLS verify (#386). Hand it the stored sha256 to
+        # verify bytes against + flag the self-served URL so it skips
+        # cert-verify for this fetch only.
+        image_sha256 = image.sha256
+        tls_insecure = True
     else:
         assert body.desired_slot_image_url is not None
         resolved_url = body.desired_slot_image_url
 
+    # Issue #386 Part B — append a per-apply nonce as a URL *fragment* so
+    # each schedule yields a distinct ``desired_slot_image_url``. The
+    # supervisor fires the slot-upgrade trigger exactly once per distinct
+    # URL (no silent re-fire loop on a failed apply); a fresh apply of the
+    # same image re-fires because the fragment differs. Fragments are
+    # client-side only — the host runner strips it before fetching and
+    # HTTP never sends it — so it's safe to graft onto any URL, including
+    # query-signed ones.
+    nonce = uuid.uuid4().hex[:12]
+    resolved_url = f"{resolved_url}#a={nonce}"
+
     row.desired_appliance_version = body.desired_appliance_version
     row.desired_slot_image_url = resolved_url
+    row.desired_slot_image_sha256 = image_sha256
+    row.desired_slot_image_tls_insecure = tls_insecure
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -4356,6 +4441,8 @@ async def clear_appliance_upgrade(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
     row.desired_appliance_version = None
     row.desired_slot_image_url = None
+    row.desired_slot_image_sha256 = None
+    row.desired_slot_image_tls_insecure = False
     db.add(
         AuditLog(
             user_id=current_user.id,

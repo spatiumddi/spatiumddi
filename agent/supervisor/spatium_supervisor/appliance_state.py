@@ -253,17 +253,16 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     runner maintains. Returns (state, when) or (None, None) when no
     upgrade has ever run on this agent.
 
-    Auto-heals stale ``failed`` states: the host runner renames the
-    pending trigger to ``.failed.<ts>`` once it finishes, so the
-    presence of the un-suffixed trigger file is the marker of an
-    in-flight apply. If state == failed AND the un-suffixed trigger
-    isn't present, the failure has already been recorded + processed
-    — by definition the operator has had time to observe it (typical
-    heartbeat cadence is 30 s) so the Fleet view's State pill
-    shouldn't stick on ``failed`` forever. Flip back to ``ready`` so
-    the agent's heartbeat naturally clears the chip on the control
-    plane within one cycle. The ``.failed.<ts>`` sidecar file still
-    exists on disk for forensic / audit lookup.
+    Reports ``failed`` honestly (#386). The earlier behaviour flipped a
+    stale ``failed`` back to ``ready`` the instant the trigger was
+    renamed to ``.failed.<ts>`` — which made a failing upgrade read as
+    ``ready`` on the Fleet chip within one heartbeat, hiding the failure
+    (and, paired with the silent re-fire loop, hiding it forever). A
+    failure now sticks until the operator clears or re-applies: the
+    backend's success auto-clear nulls ``desired_*`` once installed
+    matches, and ``clear_fleet_upgrade_marker`` resets a stale ``failed``
+    to ``ready`` when the control plane reports no upgrade desired (the
+    Cancel button / a cleared attempt).
 
     Fresh appliances that have never run an upgrade have no .state
     file at all — return ``ready`` rather than ``None`` so the Fleet
@@ -282,11 +281,6 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     state = parts[0] if parts else None
     if state not in ("ready", "in-flight", "done", "failed"):
         return None, None
-    # Stale-failed auto-heal — only when no apply is currently in
-    # flight (trigger file is the "in-flight" marker; rename to
-    # .failed.<ts> on finish).
-    if state == "failed" and not _TRIGGER_FILE.exists():
-        return "ready", None
     stamp = None
     if len(parts) > 1:
         try:
@@ -298,6 +292,27 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
 
 _TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pending")
 _REBOOT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/reboot-pending")
+# Issue #386 Part B — fire-once marker. Records the last
+# ``desired_slot_image_url`` the supervisor wrote a trigger for, so a
+# failed apply (which renames the trigger to ``.failed.<ts>`` and would
+# otherwise look "no trigger present → fire again") isn't silently
+# re-fired every heartbeat. We re-fire only when the desired URL
+# differs — the backend appends a per-apply nonce fragment, so a fresh
+# "Apply" of the same image re-triggers while a stuck failure does not.
+_FIRED_URL_MARKER = Path(
+    "/var/lib/spatiumddi-host/release-state/slot-upgrade-fired-url"
+)
+# Issue #386 Part C — host slot-upgrade log, mounted read-only into the
+# supervisor (charts/spatiumddi-appliance/templates/supervisor.yaml) so
+# the heartbeat can ship a tail to the Fleet drilldown while an apply is
+# in-flight / failed.
+_SLOT_UPGRADE_LOG = Path("/var/log/spatiumddi-host/slot-upgrade.log")
+# Issue #386 Part C — structured per-phase progress the host runner
+# writes (step / pct / detail / at). Lives in release-state (already
+# mounted into the supervisor), so it works without the log mount.
+_SLOT_UPGRADE_PROGRESS = Path(
+    "/var/lib/spatiumddi-host/release-state/slot-upgrade.progress"
+)
 # Per-slot installed-version sidecar maintained by ``spatium-upgrade-
 # slot sync-versions`` (called by spatiumddi-firstboot at every boot
 # + at the end of every apply). Shape: ``{"slot_a": "<version>",
@@ -448,66 +463,180 @@ _CLUSTER_RESTORE_STATE_SIDECAR = Path(
 def maybe_fire_fleet_upgrade(
     desired_version: str | None,
     desired_url: str | None,
+    desired_sha256: str | None = None,
+    desired_tls_insecure: bool = False,
 ) -> bool:
     """Phase 8f-4 — write the slot-upgrade trigger when the control
     plane's desired version doesn't match what's installed.
 
     Returns True if a trigger was fired (caller should log it), False
-    otherwise. Idempotent — multiple long-poll cycles with the same
-    desired_version produce one trigger, not many: we check whether
-    the trigger file already exists (the host-side path unit hasn't
-    picked it up yet) before writing a fresh one. We also skip when
-    the desired version equals what's already installed.
+    otherwise.
+
+    **Fire-once (#386 Part B).** A failed apply renames the trigger to
+    ``.failed.<ts>``, so the old "trigger file absent → fire" guard
+    re-fired the SAME desired-state every heartbeat — a silent
+    crash-loop that flooded ``.failed.*`` sidecars and never surfaced.
+    We now record the fired ``desired_slot_image_url`` (which carries a
+    per-apply nonce fragment) in ``_FIRED_URL_MARKER`` and skip when it
+    already matches: a stuck failure does NOT re-fire; a fresh Apply
+    (new nonce → different URL) does.
+
+    **Download hints (#386 Part A).** ``desired_sha256`` is written into
+    the trigger so the host runner verifies the bytes against it;
+    ``desired_tls_insecure`` adds an ``insecure-tls`` marker so the
+    runner skips cert-verify for the appliance's OWN self-served URL —
+    but ONLY when a sha256 is also present (verified bytes are the real
+    integrity guarantee).
 
     Conditions for firing:
       - Not running on an appliance (no /etc/spatiumddi-host) → skip.
-      - desired_version is None / empty → skip.
+      - desired_version / desired_url is None / empty → skip.
       - desired_version equals installed_appliance_version → skip.
+      - URL already fired (marker match) → skip (no re-fire loop).
       - Trigger file already present → skip (path unit hasn't picked
         it up yet; don't stack).
-      - desired_url is missing → skip (nothing to apply).
     """
     if detect_deployment_kind() != "appliance":
         return False
     if not desired_version or not desired_url:
         return False
-    # Issue #242 — only accept ``https://`` (preferred) or ``file://``
-    # (sneakernet / air-gap). Reject ``http://`` so a misconfigured
-    # control plane can't downgrade the OS-image fetch to cleartext
-    # over the WAN; reject unknown / unscheme'd URLs entirely so a
-    # tampered payload can't slip past as a relative path the host
-    # runner would resolve.
     desired_url_str = str(desired_url).strip()
     if not desired_url_str:
         return False
+    # Strip the #386 fire-once nonce fragment before any scheme / fetch
+    # work — URL fragments are client-side only and must never reach the
+    # host runner's ``urllib`` fetch. The UNSTRIPPED URL is the
+    # fire-once key (so a new nonce re-fires); the stripped URL is what
+    # the runner downloads.
+    fetch_url = desired_url_str.split("#", 1)[0]
+    # Issue #242 — only accept ``https://`` (preferred) or ``file://``
+    # (sneakernet / air-gap). Reject ``http://`` so a misconfigured
+    # control plane can't downgrade the OS-image fetch to cleartext
+    # over the WAN; reject unknown / unscheme'd URLs entirely.
     allowed_schemes = ("https://", "file://")
-    if not any(desired_url_str.lower().startswith(s) for s in allowed_schemes):
+    if not any(fetch_url.lower().startswith(s) for s in allowed_schemes):
         log.warning(
             "supervisor.appliance_state.rejected_upgrade_url_scheme",
-            url_prefix=desired_url_str.split("://", 1)[0][:32],
+            url_prefix=fetch_url.split("://", 1)[0][:32],
         )
         return False
     installed = read_installed_version()
     if installed and installed == desired_version:
         return False
+    # Fire-once: skip if we already wrote a trigger for this exact
+    # desired-state (same URL incl. nonce).
+    try:
+        if _FIRED_URL_MARKER.read_text(encoding="utf-8").strip() == desired_url_str:
+            return False
+    except OSError:
+        # No marker yet / unreadable → treat as not-yet-fired and fall
+        # through to write the trigger. Never fatal.
+        pass
     if _TRIGGER_FILE.exists():
         return False
+    # Only relax TLS when we also have a hash to verify the bytes.
+    insecure = bool(desired_tls_insecure) and bool(desired_sha256)
     # The trigger file's parent should already exist on the appliance
     # (firstboot creates /var/lib/spatiumddi/release-state). Bail
-    # silently if it doesn't — host setup is broken; the operator
-    # will see "upgrade requested but agent couldn't write trigger"
-    # in the audit log on the control plane side once the heartbeat
-    # comes back without a state change.
+    # silently if it doesn't — host setup is broken; the control plane
+    # sees the heartbeat come back without a state change.
     try:
         _TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Trigger format the host runner parses: line 1 = image URL (or
+        # path, fragment stripped); optional ``sha256=<hex>`` +
+        # ``insecure-tls`` marker lines. Legacy two-line (line 2 = bare
+        # checksum URL) is still accepted by the runner for the
+        # self-panel apply path.
+        lines = [fetch_url]
+        if desired_sha256:
+            lines.append(f"sha256={desired_sha256.strip().lower()}")
+        if insecure:
+            lines.append("insecure-tls")
         tmp = _TRIGGER_FILE.with_suffix(".new")
-        # Two-line format the host runner expects (Phase 8b-3 contract):
-        # line 1 = image URL (or path), line 2 = optional checksum URL.
-        tmp.write_text(desired_url + "\n", encoding="utf-8")
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
         tmp.replace(_TRIGGER_FILE)
+        try:
+            _FIRED_URL_MARKER.write_text(desired_url_str + "\n", encoding="utf-8")
+        except OSError:
+            # Best-effort fire-once bookkeeping — a failed marker write at
+            # worst costs one extra re-fire next heartbeat, never a crash,
+            # so don't abort the (already-written) trigger.
+            pass
+        _prune_failed_sidecars()
         return True
     except OSError:
         return False
+
+
+def clear_fleet_upgrade_marker() -> None:
+    """#386 Part B — the control plane reports no upgrade desired
+    (cleared via the Cancel button, or never set). Drop the fire-once
+    marker so a future Apply of the same URL re-fires, and reset a stale
+    ``failed`` state back to ``ready`` so a cancelled failure stops
+    sticking on the Fleet chip. No-op off-appliance, and never touches
+    an in-flight apply (trigger file present)."""
+    if detect_deployment_kind() != "appliance":
+        return
+    try:
+        _FIRED_URL_MARKER.unlink(missing_ok=True)
+    except OSError:
+        # Best-effort cleanup — a stale marker only risks suppressing one
+        # re-fire of an identical URL; not worth failing the loop.
+        pass
+    if _TRIGGER_FILE.exists():
+        return
+    try:
+        if _HOST_SLOT_STATE.exists():
+            parts = _HOST_SLOT_STATE.read_text(encoding="utf-8").split(maxsplit=1)
+            if parts and parts[0] == "failed":
+                _HOST_SLOT_STATE.write_text(
+                    f"ready {datetime.now(UTC).isoformat()}\n", encoding="utf-8"
+                )
+    except OSError:
+        # Best-effort heal — if the state sidecar can't be read/rewritten
+        # the chip just keeps its last value; the next apply overwrites it.
+        pass
+
+
+def _prune_failed_sidecars(keep: int = 5) -> None:
+    """#386 Part B — keep only the most recent ``.failed.<ts>`` /
+    ``.done.<ts>`` / ``.invalid.<ts>`` slot-upgrade sidecars so churn
+    (or a pre-#386 re-fire loop) doesn't accumulate hundreds of files
+    in release-state. Sidecar suffixes are unix timestamps, so a
+    lexicographic sort is chronological."""
+    try:
+        parent = _TRIGGER_FILE.parent
+        for suffix in ("failed", "done", "invalid"):
+            stale = sorted(parent.glob(f"{_TRIGGER_FILE.name}.{suffix}.*"))
+            for path in stale[:-keep]:
+                path.unlink(missing_ok=True)
+    except OSError:
+        # Best-effort housekeeping — leftover sidecars are cosmetic; a
+        # prune failure must never block the upgrade trigger.
+        pass
+
+
+def _read_slot_upgrade_log_tail(lines: int = 40, max_chars: int = 8000) -> str:
+    """#386 Part C — last ``lines`` of the host slot-upgrade.log, capped
+    at ``max_chars``. Empty string when the log is unreadable / absent
+    (e.g. the log dir isn't mounted into the supervisor)."""
+    try:
+        text = _SLOT_UPGRADE_LOG.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    tail = "\n".join(text.splitlines()[-lines:])
+    return tail[-max_chars:] if len(tail) > max_chars else tail
+
+
+def _read_slot_upgrade_progress() -> dict[str, object] | None:
+    """#386 Part C — structured per-phase progress the host runner
+    writes to the progress sidecar (step / pct / detail / at). None when
+    absent / unreadable / malformed."""
+    try:
+        data = json.loads(_SLOT_UPGRADE_PROGRESS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def maybe_fire_reboot(reboot_requested: bool) -> bool:
@@ -906,7 +1035,8 @@ def maybe_fire_cluster_restore(desired_restore_snapshot: str | None) -> bool:
         _CLUSTER_RESTORE_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _CLUSTER_RESTORE_TRIGGER_FILE.with_suffix(".new")
         tmp.write_text(
-            f"{_CLUSTER_RESTORE_CONFIRM}\n{desired_restore_snapshot}\n", encoding="utf-8"
+            f"{_CLUSTER_RESTORE_CONFIRM}\n{desired_restore_snapshot}\n",
+            encoding="utf-8",
         )
         tmp.replace(_CLUSTER_RESTORE_TRIGGER_FILE)
         return True
@@ -1975,6 +2105,20 @@ def collect() -> dict[str, object]:
     last_state, last_state_at = (
         _last_upgrade_state_from_sidecar() if is_appliance else (None, None)
     )
+    # #386 Part C — ship the log tail + structured progress while an
+    # upgrade is in-flight / failed / awaiting-reboot (done). For idle
+    # appliances ship empty so a stale tail/progress is cleared; None
+    # off-appliance so the backend leaves the columns alone.
+    _show_progress = is_appliance and last_state in ("in-flight", "failed", "done")
+    if not is_appliance:
+        last_upgrade_log_tail = None
+        last_upgrade_progress: dict[str, object] | None = None
+    elif _show_progress:
+        last_upgrade_log_tail = _read_slot_upgrade_log_tail()
+        last_upgrade_progress = _read_slot_upgrade_progress() or {}
+    else:
+        last_upgrade_log_tail = ""
+        last_upgrade_progress = {}
 
     slot_a_version, slot_b_version = read_slot_versions()
     cluster_health = read_cluster_health() if is_appliance else None
@@ -2008,6 +2152,9 @@ def collect() -> dict[str, object]:
         "is_trial_boot": is_trial_boot,
         "last_upgrade_state": last_state,
         "last_upgrade_state_at": last_state_at.isoformat() if last_state_at else None,
+        # #386 Part C — full upgrade status for the Fleet UI.
+        "last_upgrade_log_tail": last_upgrade_log_tail,
+        "last_upgrade_progress": last_upgrade_progress,
         # Issue #153 — surfaces in the Fleet view next to deployment
         # kind so operators see at a glance which appliances actually
         # have snmpd running. None on non-appliance deploys.

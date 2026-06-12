@@ -630,16 +630,29 @@ def heartbeat_once(
 
     desired_version = body_out.get("desired_appliance_version")
     desired_url = body_out.get("desired_slot_image_url")
+    desired_sha256 = body_out.get("desired_slot_image_sha256")
+    desired_tls_insecure = bool(body_out.get("desired_slot_image_tls_insecure"))
     desired_next_boot_slot = body_out.get("desired_next_boot_slot")
     desired_default_slot = body_out.get("desired_default_slot")
     reboot_requested = bool(body_out.get("reboot_requested"))
 
     if desired_version and desired_url:
-        if appliance_state.maybe_fire_fleet_upgrade(desired_version, desired_url):
+        if appliance_state.maybe_fire_fleet_upgrade(
+            desired_version,
+            desired_url,
+            desired_sha256,  # type: ignore[arg-type]
+            desired_tls_insecure,
+        ):
             log.info(
                 "supervisor.heartbeat.upgrade_trigger_fired",
                 desired_version=desired_version,
             )
+    else:
+        # #386 Part B — no upgrade desired (cleared via Cancel, or never
+        # set). Drop the fire-once marker so a future Apply re-fires, and
+        # heal a stale ``failed`` state so a cancelled attempt stops
+        # sticking on the Fleet chip.
+        appliance_state.clear_fleet_upgrade_marker()
     # Per-slot boot intents. Both compare against the freshly-collected
     # local state (snapshotted at the top of this function) so a
     # supervisor that just rebooted into the requested slot doesn't
@@ -834,7 +847,9 @@ def heartbeat_once(
                 dhcp_relay_vip=relay_vip,
             )
         elif dp_err:
-            log.warning("supervisor.heartbeat.dataplane_vip_overrides_failed", error=dp_err)
+            log.warning(
+                "supervisor.heartbeat.dataplane_vip_overrides_failed", error=dp_err
+            )
 
         # #272 Phase 9 — dead-node replacement. The seed deletes each k8s
         # Node the backend flagged for eviction (deleting the Node makes

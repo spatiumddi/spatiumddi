@@ -29,6 +29,7 @@ import {
   dnsApi,
   type ApplianceRow,
   type ApplianceState,
+  type ApplianceUpgradeStep,
   type ControlPlaneReplaceResult,
   type SupervisorCapabilities,
   type UpgradeImage,
@@ -3639,6 +3640,226 @@ function ApplianceSlotCard({
   );
 }
 
+// #386 Part C — the ordered phases a slot upgrade walks through, for the
+// Fleet drilldown's status stepper. ``done`` / ``failed`` are terminal
+// states carried on ``last_upgrade_state``, not stepper rows.
+const UPGRADE_STEPS: { key: ApplianceUpgradeStep; label: string }[] = [
+  { key: "queued", label: "Queued" },
+  { key: "downloading", label: "Downloading image" },
+  { key: "verifying", label: "Verifying checksum" },
+  { key: "writing", label: "Writing to inactive slot" },
+  { key: "bootloader", label: "Updating bootloader" },
+  { key: "arming", label: "Arming next-boot" },
+  { key: "reboot-pending", label: "Reboot to boot the new slot" },
+];
+
+function UpgradeLogTail({ text }: { text: string }) {
+  return (
+    <details className="mt-2">
+      <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">
+        <FileText className="mr-1 inline h-3 w-3" />
+        Show upgrade log
+      </summary>
+      <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-muted/60 p-2 font-mono text-[10px] leading-tight">
+        {text}
+      </pre>
+    </details>
+  );
+}
+
+/**
+ * #386 Part C — full upgrade status for the Fleet drilldown. Driven by
+ * the supervisor-shipped ``last_upgrade_progress`` (per-phase step + %)
+ * + ``last_upgrade_log_tail`` + ``last_upgrade_state``. Renders three
+ * shapes: a red failure card (with the reason + log), a live stepper
+ * while an apply is downloading / writing / etc., and a green
+ * "staged — reboot to finish" card once next-boot is armed.
+ */
+function UpgradeStatusPanel({
+  row,
+  onCancel,
+  cancelPending,
+  onReboot,
+}: {
+  row: ApplianceRow;
+  onCancel: () => void;
+  cancelPending: boolean;
+  onReboot: () => void;
+}) {
+  const progress = row.last_upgrade_progress;
+  const state = row.last_upgrade_state;
+  const failed = state === "failed" || progress?.step === "failed";
+  const target = row.desired_appliance_version;
+
+  if (failed) {
+    return (
+      <div className="mt-3 rounded-md border border-rose-500/40 bg-rose-500/5 p-3 text-xs">
+        <div className="flex items-center gap-2">
+          <AlertCircle className="h-3.5 w-3.5 text-rose-600 dark:text-rose-400" />
+          <span className="font-medium">Upgrade failed</span>
+          {target && (
+            <code className="ml-auto rounded bg-muted px-1.5 py-0.5 text-[10px]">
+              → {target}
+            </code>
+          )}
+        </div>
+        <p className="mt-1 text-rose-700 dark:text-rose-300">
+          {progress?.detail || "The slot apply failed."} See the log for the
+          cause, fix it, then re-apply.
+        </p>
+        {row.last_upgrade_log_tail && (
+          <UpgradeLogTail text={row.last_upgrade_log_tail} />
+        )}
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={cancelPending}
+          className="mt-2 inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:opacity-50"
+        >
+          {cancelPending ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <XCircle className="h-3 w-3" />
+          )}
+          Clear failed upgrade
+        </button>
+      </div>
+    );
+  }
+
+  const rebootPending = progress?.step === "reboot-pending" || state === "done";
+  // Where are we? -1 = desired set but no progress reported yet (the
+  // supervisor hasn't fired the trigger). Otherwise the index of the
+  // current phase in UPGRADE_STEPS.
+  const stepIndex = progress
+    ? UPGRADE_STEPS.findIndex((s) => s.key === progress.step)
+    : -1;
+
+  return (
+    <div
+      className={cn(
+        "mt-3 rounded-md border p-3 text-xs",
+        rebootPending
+          ? "border-emerald-500/40 bg-emerald-500/5"
+          : "border-amber-500/40 bg-amber-500/5",
+      )}
+    >
+      <div className="flex items-center gap-2">
+        {rebootPending ? (
+          <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+        ) : (
+          <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-600 dark:text-amber-400" />
+        )}
+        <span className="font-medium">
+          {rebootPending
+            ? "Upgrade staged — reboot to finish"
+            : stepIndex === -1
+              ? "Upgrade pending"
+              : "Upgrade in progress"}
+        </span>
+        {target && (
+          <code className="ml-auto rounded bg-muted px-1.5 py-0.5 text-[10px]">
+            → {target}
+          </code>
+        )}
+      </div>
+
+      {stepIndex === -1 && (
+        <p className="mt-1 text-muted-foreground">
+          Supervisor will fire the slot-upgrade trigger on its next heartbeat (≤
+          30 s).
+        </p>
+      )}
+
+      <ol className="mt-2 space-y-1">
+        {UPGRADE_STEPS.map((s, i) => {
+          const done =
+            i < stepIndex || (rebootPending && s.key !== "reboot-pending");
+          const active = !rebootPending && i === stepIndex;
+          const rebootCta = rebootPending && s.key === "reboot-pending";
+          return (
+            <li key={s.key} className="flex items-center gap-2">
+              {done ? (
+                <CheckCircle2 className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
+              ) : active ? (
+                <Loader2 className="h-3 w-3 animate-spin text-amber-600 dark:text-amber-400" />
+              ) : rebootCta ? (
+                <Power className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
+              ) : (
+                <span className="inline-block h-3 w-3 rounded-full border border-muted-foreground/40" />
+              )}
+              <span
+                className={cn(
+                  done || rebootCta
+                    ? "text-foreground"
+                    : active
+                      ? "font-medium text-foreground"
+                      : "text-muted-foreground",
+                )}
+              >
+                {s.label}
+              </span>
+              {active && progress?.pct != null && (
+                <span className="ml-auto tabular-nums text-muted-foreground">
+                  {progress.pct}%
+                </span>
+              )}
+            </li>
+          );
+        })}
+      </ol>
+
+      {progress?.detail && !rebootPending && (
+        <p
+          className="mt-2 truncate text-muted-foreground"
+          title={progress.detail}
+        >
+          {progress.detail}
+        </p>
+      )}
+      {progress?.step === "downloading" && progress.pct != null && (
+        <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+          <div
+            className="h-full bg-amber-500 transition-all"
+            style={{ width: `${Math.min(100, Math.max(0, progress.pct))}%` }}
+          />
+        </div>
+      )}
+
+      {row.last_upgrade_log_tail && (
+        <UpgradeLogTail text={row.last_upgrade_log_tail} />
+      )}
+
+      <div className="mt-2 flex flex-wrap gap-2">
+        {rebootPending && (
+          <button
+            type="button"
+            onClick={onReboot}
+            className="inline-flex items-center gap-1 rounded-md border border-emerald-500/50 bg-emerald-500/10 px-2 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-300"
+          >
+            <Power className="h-3 w-3" /> Reboot to boot new slot
+          </button>
+        )}
+        {target && (
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={cancelPending}
+            className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:opacity-50"
+          >
+            {cancelPending ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <XCircle className="h-3 w-3" />
+            )}
+            Cancel pending upgrade
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
   const qc = useQueryClient();
   const [sourceKind, setSourceKind] = useState<"url" | "uploaded">("uploaded");
@@ -3650,6 +3871,13 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
   const isApplianceHost =
     row.deployment_kind === "appliance" || row.deployment_kind === null;
   const upgradeInFlight = row.desired_appliance_version !== null;
+  // #386 Part C — show the full status panel whenever there's upgrade
+  // activity: a pending/in-flight desired version, or a terminal
+  // in-flight/failed state the supervisor is still reporting.
+  const showUpgradeStatus =
+    upgradeInFlight ||
+    row.last_upgrade_state === "in-flight" ||
+    row.last_upgrade_state === "failed";
 
   // Staged upgrade images — fetched only when the operator picks the
   // ``uploaded`` source, so non-air-gapped flows skip the round trip.
@@ -3780,31 +4008,13 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
           appliance OS. Use the docker compose / helm upgrade flow for{" "}
           <code>{row.deployment_kind}</code> deployments.
         </p>
-      ) : upgradeInFlight ? (
-        <div className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
-          <div className="flex items-center gap-2">
-            <Upload className="h-3.5 w-3.5 text-amber-700 dark:text-amber-300" />
-            <span className="font-medium">Upgrade pending</span>
-          </div>
-          <p className="mt-1 text-muted-foreground">
-            Target version <code>{row.desired_appliance_version}</code>.
-            Supervisor will fire the slot-upgrade trigger on its next heartbeat
-            (≤ 30 s).
-          </p>
-          <button
-            type="button"
-            onClick={() => clearUpgrade.mutate()}
-            disabled={clearUpgrade.isPending}
-            className="mt-2 inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:opacity-50"
-          >
-            {clearUpgrade.isPending ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <XCircle className="h-3 w-3" />
-            )}
-            Cancel pending upgrade
-          </button>
-        </div>
+      ) : showUpgradeStatus ? (
+        <UpgradeStatusPanel
+          row={row}
+          onCancel={() => clearUpgrade.mutate()}
+          cancelPending={clearUpgrade.isPending}
+          onReboot={() => setRebootConfirm(true)}
+        />
       ) : (
         <div className="mt-3 space-y-2">
           {/* Source picker — uploaded image (air-gap-friendly) vs

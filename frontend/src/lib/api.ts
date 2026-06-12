@@ -8471,6 +8471,29 @@ export interface SupervisorCapabilities {
   [k: string]: unknown;
 }
 
+// #386 Part C — structured per-phase progress the host slot-upgrade
+// runner emits, surfaced on the appliance row so the Fleet drilldown
+// can render a real step-by-step status instead of just a coarse chip.
+export type ApplianceUpgradeStep =
+  | "queued"
+  | "downloading"
+  | "verifying"
+  | "writing"
+  | "bootloader"
+  | "arming"
+  | "reboot-pending"
+  | "done"
+  | "failed";
+
+export interface ApplianceUpgradeProgress {
+  step: ApplianceUpgradeStep | string;
+  /** 0–100 during download; null for steps without a measurable %. */
+  pct: number | null;
+  detail: string;
+  /** ISO-8601 timestamp the step was entered. */
+  at: string;
+}
+
 export interface ApplianceRow {
   id: string;
   hostname: string;
@@ -8511,6 +8534,11 @@ export interface ApplianceRow {
   is_trial_boot: boolean;
   last_upgrade_state: string | null;
   last_upgrade_state_at: string | null;
+  // #386 Part C — full upgrade status: tail of the host slot-upgrade.log
+  // + structured per-phase progress, shipped by the supervisor while an
+  // apply is in-flight / failed / awaiting-reboot.
+  last_upgrade_log_tail: string | null;
+  last_upgrade_progress: ApplianceUpgradeProgress | null;
   snmpd_running: boolean | null;
   ntp_sync_state: string | null;
   /** Issue #156 — best-effort rsyslog forwarding status:
@@ -8527,6 +8555,11 @@ export interface ApplianceRow {
   resolver_status: string | null;
   desired_appliance_version: string | null;
   desired_slot_image_url: string | null;
+  // #386 Part A — integrity + transport hints (not secret). sha256 the
+  // host verifies the image bytes against; tls_insecure is true only for
+  // the appliance's own self-served URL.
+  desired_slot_image_sha256: string | null;
+  desired_slot_image_tls_insecure: boolean;
   // Operator's per-slot boot intents. Non-null means the Fleet UI
   // has asked the appliance to switch boot slots; the supervisor's
   // next heartbeat picks the field up + writes a host-side trigger.

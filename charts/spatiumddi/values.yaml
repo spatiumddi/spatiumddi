@@ -115,6 +115,12 @@ api:
     releaseStateDir: /var/lib/spatiumddi/release-state
     hostLogDir: /var/log/spatiumddi
     hostEtcDir: /etc/spatiumddi
+    # #386 — host dir backing the api's upgrade-image store
+    # (SPATIUM_SLOT_IMAGE_DIR, default /var/lib/spatiumddi/slot-images).
+    # Persists uploaded / GitHub-imported images across api restarts so
+    # they don't 404 with "bytes missing on disk" on the next upgrade.
+    # Only mounted when the multi-node slot-image mirror is off.
+    slotImagesDir: /var/lib/spatiumddi/slot-images
 
 # ── Slot-image mirror (#296 Phase B) ────────────────────────────────────────
 # A single-replica Deployment + node-pinned local-path PVC + ClusterIP

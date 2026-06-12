@@ -503,6 +503,23 @@ class Appliance(Base):
     last_upgrade_state_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Issue #386 Part C — tail of the host-side ``slot-upgrade.log`` the
+    # supervisor ships while a slot apply is in-flight or has failed, so
+    # the Fleet drilldown can show what the upgrade is actually doing
+    # (download → decompress → dd → grub-patch) and the failure reason —
+    # previously only the coarse ``last_upgrade_state`` chip was visible,
+    # which made a failing upgrade indistinguishable from a pending one.
+    # The supervisor ships ``""`` once state is ready/done so a stale tail
+    # doesn't linger; NULL on non-appliance / never-reported rows.
+    last_upgrade_log_tail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Issue #386 Part C — structured per-phase progress the host runner
+    # emits so the Fleet UI can render a real step-by-step status (not
+    # just a log dump): ``{"step": "downloading"|"verifying"|"writing"|
+    # "bootloader"|"arming"|"reboot-pending"|"done"|"failed",
+    # "pct": <int|null>, "detail": "<human line>", "at": "<iso8601>"}``.
+    # NULL on non-appliance / never-reported rows; the supervisor ships
+    # ``{}`` once an upgrade is no longer in-flight to clear it.
+    last_upgrade_progress: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     snmpd_running: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     ntp_sync_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Issue #156 — best-effort rsyslog-forwarding status the supervisor
@@ -539,6 +556,21 @@ class Appliance(Base):
     # arrives post-reboot.
     desired_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     desired_slot_image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Issue #386 Part A — integrity + transport hints for the host-side
+    # ``spatium-upgrade-slot`` runner. When the scheduler points
+    # ``desired_slot_image_url`` at the appliance's OWN control-plane API
+    # (an imported/uploaded upgrade image served behind the self-signed
+    # web cert), the runner's bare ``urllib.urlopen`` fails TLS verify and
+    # the upgrade never applies. We stamp the image's stored sha256 here +
+    # set ``tls_insecure`` so the runner verifies bytes against the hash
+    # (the real integrity guarantee) and skips cert-verify ONLY for that
+    # self-served URL. External (public-CA) URLs leave both NULL/false and
+    # stay fully verified. ``tls_insecure`` is refused host-side unless an
+    # expected sha256 is present.
+    desired_slot_image_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    desired_slot_image_tls_insecure: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.text("false")
+    )
     reboot_requested: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa.text("false")
     )

@@ -1,27 +1,38 @@
 #!/bin/bash
 # spatiumddi-slot-upgrade — host-side slot-image upgrade runner
-# (Phase 8b-3, issue #138).
+# (Phase 8b-3, issue #138; extended in #386).
 #
-# The api container writes /var/lib/spatiumddi/release-state/
-# slot-upgrade-pending with one line: either a URL or a local file
-# path to a slot .raw.xz image. Optionally a second line carries
-# the SHA-256 checksum URL or path.
+# The supervisor (or api container) writes /var/lib/spatiumddi/
+# release-state/slot-upgrade-pending. Format:
+#   line 1: URL or absolute path to slot .raw.xz (any #fragment is
+#           stripped — #386 fire-once nonce, client-side only)
+#   then any of these directive lines (order-independent):
+#     sha256=<hex>   — expected image hash; verified with no 2nd fetch
+#     insecure-tls   — skip TLS cert-verify for the https:// fetch
+#                      (self-served image behind the appliance's
+#                      self-signed cert); only honoured WITH a hash
+#     checksum=<src> — URL/path to a .sha256 sidecar (legacy / external)
+#   A bare URL/path on line 2 is still accepted as a legacy checksum src.
 #
 # Then `spatiumddi-slot-upgrade.path` notices the file and runs this
 # script as root. It:
-#   1. Reads the trigger file
-#   2. Invokes /usr/local/bin/spatium-upgrade-slot apply <url>
-#      [--checksum <url>]
+#   1. Reads + parses the trigger file
+#   2. Invokes /usr/local/bin/spatium-upgrade-slot apply <url> [flags]
 #   3. On success, invokes spatium-upgrade-slot set-next-boot
-#   4. Renames the trigger to .done or .failed so the .path unit
-#      doesn't re-fire on the next watch
+#   4. Renames the trigger to .done / .failed so the .path unit doesn't
+#      re-fire on the next watch
 #
-# The api / UI then polls /api/v1/appliance/slot-upgrade/status to
-# show progress + result (parses /var/log/spatiumddi/slot-upgrade.log).
+# Throughout, it maintains two sidecars the supervisor ships on its
+# heartbeat so the Fleet UI shows full status (#386 Part C):
+#   slot-upgrade-pending.state  — coarse state (in-flight/done/failed)
+#   slot-upgrade.progress       — structured {step,pct,detail,at}; this
+#       wrapper owns the terminal steps, spatium-upgrade-slot writes the
+#       in-apply steps (downloading/verifying/writing/bootloader).
 
 set -euo pipefail
 
 TRIGGER=/var/lib/spatiumddi/release-state/slot-upgrade-pending
+PROGRESS=/var/lib/spatiumddi/release-state/slot-upgrade.progress
 LOG_DIR=/var/log/spatiumddi
 LOG="$LOG_DIR/slot-upgrade.log"
 
@@ -30,16 +41,49 @@ exec >> "$LOG" 2>&1
 echo
 echo "[$(date -Iseconds)] === spatiumddi-slot-upgrade fired ==="
 
+# Structured progress for the Fleet UI. Best-effort — never abort the
+# upgrade on a progress-write hiccup.
+write_progress() {  # $1 = step, $2 = human detail
+    local detail
+    detail=$(printf '%s' "${2:-}" | tr -d '"\\\r\n')
+    printf '{"step":"%s","pct":null,"detail":"%s","at":"%s"}' \
+        "$1" "$detail" "$(date -Iseconds)" > "${PROGRESS}.new" 2>/dev/null \
+        && mv "${PROGRESS}.new" "$PROGRESS" 2>/dev/null || true
+}
+
+fail() {  # $1 = human reason
+    echo
+    echo "  ✗ $1"
+    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    write_progress "failed" "$1"
+    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
+    exit 1
+}
+
 if [ ! -f "$TRIGGER" ]; then
     echo "  no trigger file at $TRIGGER, nothing to do"
     exit 0
 fi
 
-# Trigger file format:
-#   line 1: URL or absolute path to slot .raw.xz
-#   line 2 (optional): URL or absolute path to .sha256 sidecar
+# Line 1 = image source, fragment stripped.
 IMAGE_SRC=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
-CHECKSUM_SRC=$(sed -n '2p' "$TRIGGER" | tr -d '\r\n' || true)
+IMAGE_SRC=${IMAGE_SRC%%#*}
+
+# Remaining lines = directives (#386) or a legacy bare checksum URL.
+EXPECTED_SHA256=
+INSECURE=
+CHECKSUM_SRC=
+while IFS= read -r line; do
+    line=$(printf '%s' "$line" | tr -d '\r\n')
+    [ -z "$line" ] && continue
+    case "$line" in
+        sha256=*)              EXPECTED_SHA256=${line#sha256=} ;;
+        insecure-tls)          INSECURE=1 ;;
+        checksum=*)            CHECKSUM_SRC=${line#checksum=} ;;
+        https://*|http://*|/*) CHECKSUM_SRC=$line ;;   # legacy bare line 2
+        *) echo "  WARN: ignoring unrecognised trigger line: $line" ;;
+    esac
+done < <(tail -n +2 "$TRIGGER")
 
 if [ -z "$IMAGE_SRC" ]; then
     echo "  ERROR: trigger file empty, aborting"
@@ -47,8 +91,8 @@ if [ -z "$IMAGE_SRC" ]; then
     exit 1
 fi
 
-# Reject anything that doesn't look like a URL or absolute path —
-# basic guard against shell metachars.
+# Reject anything that doesn't look like a URL or absolute path — basic
+# guard against shell metachars.
 case "$IMAGE_SRC" in
     https://*|http://*|/*)  ;;
     *)
@@ -67,43 +111,47 @@ if [ -n "$CHECKSUM_SRC" ]; then
             ;;
     esac
 fi
+if [ -n "$EXPECTED_SHA256" ]; then
+    case "$EXPECTED_SHA256" in
+        *[!0-9a-fA-F]*)
+            echo "  ERROR: sha256 directive is not hex: $EXPECTED_SHA256"
+            mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+            exit 1
+            ;;
+    esac
+fi
 
 echo "  image:    $IMAGE_SRC"
-if [ -n "$CHECKSUM_SRC" ]; then
-    echo "  checksum: $CHECKSUM_SRC"
-fi
+[ -n "$EXPECTED_SHA256" ] && echo "  sha256:   $EXPECTED_SHA256"
+[ -n "$CHECKSUM_SRC" ] && echo "  checksum: $CHECKSUM_SRC"
+[ -n "$INSECURE" ] && echo "  insecure-tls: yes (self-served URL; bytes verified by hash)"
 echo
 
-# Mark trigger as in-flight so the UI can show "applying" state.
-# We don't rename it (the .path unit fires on close-after-write,
-# not on every read) but we do touch a sibling marker.
+# Mark trigger as in-flight so the UI can show "applying" state. We
+# don't rename it (the .path unit fires on close-after-write, not on
+# every read) but we do touch a sibling marker + progress.
 echo "in-flight $(date -Iseconds)" > "${TRIGGER}.state"
+write_progress "queued" "starting slot upgrade"
 
 APPLY_ARGS=("apply" "$IMAGE_SRC")
-if [ -n "$CHECKSUM_SRC" ]; then
-    APPLY_ARGS+=("--checksum" "$CHECKSUM_SRC")
-fi
+[ -n "$EXPECTED_SHA256" ] && APPLY_ARGS+=("--expected-sha256" "$EXPECTED_SHA256")
+[ -n "$CHECKSUM_SRC" ] && APPLY_ARGS+=("--checksum" "$CHECKSUM_SRC")
+[ -n "$INSECURE" ] && APPLY_ARGS+=("--insecure")
 
 echo "  → /usr/local/bin/spatium-upgrade-slot ${APPLY_ARGS[*]}"
 if /usr/local/bin/spatium-upgrade-slot "${APPLY_ARGS[@]}"; then
     echo
     echo "  apply succeeded — calling set-next-boot"
+    write_progress "arming" "arming next-boot"
     if /usr/local/bin/spatium-upgrade-slot set-next-boot; then
         echo
         echo "  ✓ next-boot armed. Operator needs to reboot to switch slots."
         echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+        write_progress "reboot-pending" "upgrade staged — reboot to boot the new slot"
         mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
     else
-        echo
-        echo "  ✗ set-next-boot failed (image is written but next-boot not armed)"
-        echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-        mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
-        exit 1
+        fail "set-next-boot failed (image is written but next-boot not armed)"
     fi
 else
-    echo
-    echo "  ✗ apply failed — inactive slot may be partially written"
-    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
-    exit 1
+    fail "apply failed — see slot-upgrade.log for the cause (download / verify / write)"
 fi
