@@ -459,6 +459,14 @@ _CLUSTER_RESTORE_STATE_SIDECAR = Path(
     "/var/lib/spatiumddi-host/release-state/cluster-restore.state"
 )
 
+# #395 — host-migration reconcile ledger. Written by spatium-host-migrate
+# on every reconcile (success or failure). The supervisor reads it via the
+# existing read-only /var/lib/spatiumddi-host/release-state bind mount and
+# surfaces failing patches on the heartbeat for the Fleet UI.
+_HOST_PATCHES_LEDGER = Path(
+    "/var/lib/spatiumddi-host/release-state/host-patches-applied.json"
+)
+
 
 def maybe_fire_fleet_upgrade(
     desired_version: str | None,
@@ -795,6 +803,70 @@ def read_host_config_health() -> dict[str, dict[str, object]]:
             ),
             "attempts": attempts,
             "at": when.isoformat() if when else None,
+        }
+    return out
+
+
+def read_host_migration_health() -> dict[str, dict[str, object]]:
+    """(#395) Thin host-migration reconcile rollup, surfaced on the
+    heartbeat so the Fleet UI shows a failing patch honestly.
+
+    Reads the per-patch JSON ledger written by ``spatium-host-migrate``
+    at ``/var/lib/spatiumddi-host/release-state/host-patches-applied.json``
+    and emits an entry for every patch whose ``ok`` field is ``False``::
+
+        {"001-grub-render": {"state": "failing", "at": "<iso>", "error": "…"}}
+
+    A healthy appliance (all patches applied) returns ``{}`` — which
+    clears any stale server-side entry, mirroring ``read_host_config_health()``.
+    If the ledger is absent (e.g. the box has never booted a #395 slot)
+    there is nothing to report, so ``{}`` is returned rather than surfacing
+    a spurious failure. ``None`` is never returned; the ``collect()`` caller
+    guards with ``if is_appliance else None``.
+
+    Unlike ``host_config_health`` (which uses a continuous bounded-retry
+    fire-guard with exponential backoff), host-migration patches are run
+    once per boot. They only ever report ``"failing"`` — the next boot
+    automatically retries, so there is no ``"retrying"`` transient state.
+    The ``state`` value is still in the same ``"retrying" | "failing"``
+    union so the Fleet UI chip colours require no extension."""
+    try:
+        data = json.loads(_HOST_PATCHES_LEDGER.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}  # no ledger yet → nothing to report
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict[str, object]] = {}
+    patches = data.get("patches", {})
+    if not isinstance(patches, dict):
+        return {}
+    for pid, info in sorted(patches.items()):
+        if not isinstance(info, dict):
+            continue
+        if info.get("ok") is False:
+            try:
+                attempts = int(info.get("fail_count") or 1)
+            except (TypeError, ValueError):
+                attempts = 1
+            out[pid] = {
+                "state": "failing",
+                # Real consecutive-boot fail count from the ledger (a box
+                # left durable on a slot whose patch keeps failing grows
+                # this every boot); floored at 1 so a freshly-failed patch
+                # never reports 0.
+                "attempts": max(attempts, 1),
+                "at": info.get("applied_at"),
+                "error": info.get("error"),
+            }
+    # If the overall reconcile failed but no individual patch is flagged
+    # (e.g. the version-stamp write failed after all patches succeeded),
+    # surface a synthetic "reconcile" entry so the operator isn't told
+    # everything is fine when it isn't.
+    if data.get("last_reconcile_ok") is False and not out:
+        out["reconcile"] = {
+            "state": "failing",
+            "attempts": 1,
+            "at": data.get("last_reconcile_at"),
         }
     return out
 
@@ -2296,6 +2368,13 @@ def collect() -> dict[str, object]:
         # ``{}`` when every plane is applied / unconfigured — clears any
         # stale server-side entry; None off-appliance leaves it untouched.
         "host_config_health": read_host_config_health() if is_appliance else None,
+        # #395 — host-migration reconcile health. Surfaces patches whose
+        # ``ok`` field in the ``host-patches-applied.json`` ledger is
+        # False so the Fleet UI shows a failed grub.cfg re-render (or any
+        # future numbered patch) honestly. ``{}`` when all patches are
+        # applied — clears any stale server-side entry; None off-appliance
+        # leaves the column untouched.
+        "host_migration_health": read_host_migration_health() if is_appliance else None,
         # Issue #343 — lldpd running state from the host-side runner's
         # status sidecar. None on non-appliance deploys.
         "lldpd_running": read_lldpd_running() if is_appliance else None,

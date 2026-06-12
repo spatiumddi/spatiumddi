@@ -825,6 +825,24 @@ if [ -x /usr/local/bin/spatium-upgrade-slot ] && [ -e /etc/spatiumddi/role-confi
         echo "WARN: sync-versions failed — OS Image card will show 'unknown' for slot versions"
 fi
 
+# ── #395 host-migration reconcile ────────────────────────────────────────────
+# MUST run before the readyz wait so a failed grub render blocks the slot
+# commit. The current boot already loaded via grub (we're here), so a bad
+# render only risks the NEXT boot — covered by .bak + the health-gate.
+# sync-versions ran just above, so slot-versions.json is fresh for the
+# renderer's per-slot labels.
+if [ -x /usr/local/bin/spatium-host-migrate ]; then
+    if ! /usr/local/bin/spatium-host-migrate; then
+        echo "ERROR: host-migration reconcile failed — NOT committing this slot." >&2
+        echo "       grub.cfg + .bak are intact; next reboot reverts (A/B one-shot)." >&2
+        # Do NOT place_deferred / commit. Mirror the not-ready tail: still
+        # release any deferred control manifest so the control plane comes up,
+        # then exit non-zero so commit_slot_if_healthy never runs.
+        mv -f "${CONTROL_MANIFEST}.deferred" "$CONTROL_MANIFEST" 2>/dev/null || true
+        exit 1
+    fi
+fi
+
 # ── Readiness wait + slot commit ─────────────────────────────────────────────
 # Phase 8c — commit the active slot as the durable default after a
 # successful trial boot. spatium-upgrade-slot set-next-boot writes a

@@ -8616,6 +8616,21 @@ export interface ApplianceRow {
       at: string | null;
     }
   >;
+  // #395 — host-migration reconcile health. Keyed by patch id (e.g.
+  // ``001-grub-render`` / ``reconcile``); only patches whose ``ok``
+  // field is ``false`` in the ledger appear, so an all-applied appliance
+  // reports ``{}``. ``state`` is always ``"failing"`` (run-once-per-boot
+  // — no continuous retry loop). The ``error`` field carries the exit-
+  // code or error string from the patch runner when available.
+  host_migration_health: Record<
+    string,
+    {
+      state: "retrying" | "failing";
+      attempts: number;
+      at: string | null;
+      error?: string;
+    }
+  >;
   // Issue #183 Phase 4 — local k3s cluster health summary, supplied
   // by the supervisor on every heartbeat. Empty object on legacy
   // compose appliances or pre-#183 supervisors.

@@ -1041,6 +1041,12 @@ class SupervisorHeartbeatRequest(BaseModel):
     # resolver / firewall / timezone). Empty dict = all applied / healthy
     # (clears stale entries); None / omitted = pre-#387 supervisor.
     host_config_health: dict[str, dict[str, Any]] | None = None
+    # #395 — host-migration reconcile health from the supervisor's read
+    # of the ``host-patches-applied.json`` ledger. ``{<patch-id>:
+    # {state, attempts, at, error?}}``; only patches with ``ok: false``
+    # appear. Empty dict = all patches applied (clears stale entries);
+    # None / omitted = pre-#395 supervisor (leave the column alone).
+    host_migration_health: dict[str, dict[str, Any]] | None = None
     # Issue #183 Phase 4 — local k3s cluster health summary. Shape:
     # ``{"kubeapi_ready": bool, "nodes_total": int, "nodes_ready":
     # int, "pods_total": int, "pods_by_phase": {<phase>: count}}``.
@@ -1592,6 +1598,14 @@ async def supervisor_heartbeat(
         # at least one plane's desired config isn't applied (the guard
         # is backing it off), which the Fleet UI surfaces as a banner.
         row.host_config_health = dict(body.host_config_health)
+    if body.host_migration_health is not None:
+        # #395 — supervisor's host-migration reconcile health. Overwrite
+        # verbatim every tick: empty dict clears stale failing-patch
+        # entries once the reconcile succeeds; a non-empty dict means at
+        # least one numbered patch's grub/ESP change didn't apply (e.g.
+        # grub-script-check rejected the rendered grub.cfg), surfaced as
+        # a banner in the Fleet drilldown.
+        row.host_migration_health = dict(body.host_migration_health)
     if body.cluster_health is not None:
         # Issue #183 Phase 4 — supervisor's local-k3s health summary.
         # Same overwrite-verbatim shape as role_health. Empty dict
@@ -2268,6 +2282,11 @@ class ApplianceRow(BaseModel):
     # {state, attempts, at}}``; only planes with an unapplied desired
     # config appear. Empty when all healthy.
     host_config_health: dict[str, dict[str, Any]]
+    # #395 — host-migration reconcile health (numbered host-patches,
+    # e.g. ``001-grub-render``). ``{<patch-id>: {state, attempts, at,
+    # error?}}``; only patches with ``ok: false`` in the ledger appear.
+    # Empty when all patches are applied / pre-#395 box.
+    host_migration_health: dict[str, dict[str, Any]]
     # Issue #183 Phase 4 — local k3s cluster health summary.
     cluster_health: dict[str, Any]
     # Issue #183 Phase 5 — installed k3s version (plain text, public).
@@ -2364,6 +2383,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         role_switch_reason=row.role_switch_reason,
         role_health=dict(row.role_health or {}),
         host_config_health=dict(row.host_config_health or {}),
+        host_migration_health=dict(row.host_migration_health or {}),
         cluster_health=dict(row.cluster_health or {}),
         k3s_version=row.k3s_version,
         kubeconfig_set=row.kubeconfig_encrypted is not None,

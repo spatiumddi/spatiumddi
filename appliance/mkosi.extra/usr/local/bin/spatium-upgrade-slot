@@ -344,23 +344,39 @@ def cmd_apply(args) -> int:
     # call doesn't return the stale baked-in value.
     subprocess.run(["udevadm", "trigger", "--settle", target_dev], check=False)
 
-    # Re-read the partition's now-unique UUID + patch grub.cfg's
-    # slot_<x> menuentry to point at it. PARTLABEL is preserved because
+    # Re-read the partition's now-unique UUID. PARTLABEL is preserved because
     # it lives in the GPT header, not the filesystem.
     new_uuid = _blkid_uuid(target_dev)
     if new_uuid:
-        _patch_grub_cfg_slot_uuid(inactive["partlabel"], new_uuid)
         # Refresh our cached view so set-next-boot reflects the new UUID.
         inactive["uuid"] = new_uuid
 
-    # Read the freshly-written slot's APPLIANCE_VERSION so we can both
-    # patch the grub.cfg menu label + update the sidecar that drives
-    # the OS Image card's per-slot version display. Both operations
-    # are best-effort — apply succeeded regardless of label/sidecar.
+    # Read the freshly-written slot's APPLIANCE_VERSION for the sidecar +
+    # the grub.cfg title. Both are best-effort — apply succeeded regardless.
     new_version = slot_version_label(inactive)
-    if new_version and new_version not in ("unstamped", "unreadable", "unknown"):
-        _patch_grub_cfg_slot_label(inactive["partlabel"], new_version)
+
+    # Sync the sidecar FIRST so the renderer reads correct per-slot labels
+    # when it re-renders grub.cfg below. (Previously sync_slot_versions was
+    # called last; it must now precede the render — #395.)
     sync_slot_versions()
+
+    # #395 — prefer the full renderer (one source of truth; can ship grub
+    # STRUCTURE changes such as #393's spatium_verbose=2 branch, not just
+    # UUID/label). Fall back to the surgical patches if the renderer is
+    # missing or returns non-zero (pre-#395 ESP, or a render-path bug)
+    # so apply never leaves grub.cfg unstamped.
+    rendered = False
+    try:
+        rc = subprocess.run(["spatium-grub-render"], check=False).returncode
+        rendered = (rc == 0)
+    except FileNotFoundError:
+        rendered = False
+    if not rendered:
+        print("  spatium-grub-render unavailable/failed — using surgical patches as fallback")
+        if new_uuid:
+            _patch_grub_cfg_slot_uuid(inactive["partlabel"], new_uuid)
+        if new_version and new_version not in ("unstamped", "unreadable", "unknown"):
+            _patch_grub_cfg_slot_label(inactive["partlabel"], new_version)
 
     # Hostname continuity across the slot swap is handled by the STATE
     # partition + spatium-etc-render (#276): render sets the kernel
