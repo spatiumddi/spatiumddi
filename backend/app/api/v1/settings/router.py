@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from ipaddress import ip_network
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from fastapi import APIRouter, HTTPException, status
@@ -171,10 +171,11 @@ class SettingsResponse(BaseModel):
     # ── Appliance timezone (issue #165) ───────────────────────────
     # Empty string means "follow install-time default" (no override).
     timezone: str = ""
-    # ── Appliance verbose boot console ────────────────────────────
-    # True = standard Linux console on boot (kernel messages + systemd
-    # status + getty, no dashboard); False = quiet boot + dashboard.
-    verbose_boot: bool = False
+    # ── Appliance console mode (#393) ─────────────────────────────
+    # ``dashboard`` (default) = quiet boot + Talos dashboard;
+    # ``verbose_dashboard`` = verbose boot output then dashboard;
+    # ``text_console`` = verbose boot + plain getty login (no dashboard).
+    console_mode: str = "dashboard"
     # ── Maintenance mode (issue #57) ──────────────────────────────
     # System-wide read-only switch. ``maintenance_started_at`` is
     # server-managed (stamped on enable / cleared on disable) and so is
@@ -646,8 +647,8 @@ class SettingsUpdate(BaseModel):
     ntp_allow_client_networks: list[str] | None = None
     # ── Appliance timezone (issue #165) ───────────────────────────
     timezone: str | None = None
-    # ── Appliance verbose boot console ────────────────────────────
-    verbose_boot: bool | None = None
+    # ── Appliance console mode (#393) ─────────────────────────────
+    console_mode: Literal["dashboard", "verbose_dashboard", "text_console"] | None = None
     # ── Maintenance mode (issue #57) ──────────────────────────────
     # ``maintenance_started_at`` is intentionally NOT settable here —
     # it's server-stamped in ``update_settings`` when the enable flag
@@ -1407,7 +1408,7 @@ async def update_settings(
     # popped / rewritten so detection is order-independent.
     _supervisor_host_config_fields = {
         "timezone",
-        "verbose_boot",
+        "console_mode",
         "firewall_enabled",
         "metallb_enabled",
         "metallb_pool_addresses",

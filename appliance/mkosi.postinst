@@ -19,15 +19,16 @@ set -eu
 # for cloud-init-local / cloud-init / cloud-config / cloud-final.
 mkdir -p "$BUILDROOT/etc/systemd/system/multi-user.target.wants"
 
-# NOTE on tty1: we deliberately do NOT force-enable getty@tty1.service
-# here anymore. Phase 4h ships spatium-console.service which claims
-# tty1 on the installed system (Conflicts=getty@tty1.service +
-# ConditionKernelCommandLine gates that match getty's drop-in). For
-# the installer and live ISO modes the existing spatium-install /
-# spatium-live-banner units own tty1 — both still gate themselves via
-# kernel cmdline. Operators who want stock getty back can pass
-# `spatium-console=off` on the kernel cmdline or
-# `systemctl disable spatium-console.service && systemctl enable getty@tty1.service`.
+# NOTE on tty1 (#393): getty@tty1.service IS enabled (getty.target.wants
+# symlink below), but a drop-in (getty@tty1.service.d/spatium-console-gate.conf)
+# gates it on ConditionKernelCommandLine=spatium-console=off — the exact
+# mirror of spatium-console.service's !spatium-console=off gate. So the two
+# are mutually exclusive: in dashboard / verbose_dashboard console mode the
+# dashboard owns tty1 (getty's condition fails); in text_console mode the
+# dashboard's condition fails and getty@tty1 runs → a real login. Pre-#393
+# getty@tty1 was NOT enabled, so picking the plain-console mode left tty1 with
+# no login at all. Install + live ISO modes still gate themselves via
+# spatium-mode= so only the wizard/banner owns tty1 there.
 #
 # Alt+F2..F6 still spawn getty on demand via systemd-logind's NAutoVTs
 # (Debian default = 6), so the operator always has a shell escape hatch
@@ -82,6 +83,15 @@ for unit in chrony.service ssh.service \
     fi
     ln -sfn "$src" "$BUILDROOT/etc/systemd/system/multi-user.target.wants/$unit"
 done
+
+# #393 — enable getty@tty1 into getty.target.wants (its [Install] is
+# WantedBy=getty.target, NOT multi-user.target, so the loop above can't do it).
+# The spatium-console-gate.conf drop-in gates it on spatium-console=off, so it
+# only actually starts in the text_console mode; in dashboard /
+# verbose_dashboard mode its condition fails and the dashboard owns tty1.
+mkdir -p "$BUILDROOT/etc/systemd/system/getty.target.wants"
+ln -sfn /lib/systemd/system/getty@.service \
+    "$BUILDROOT/etc/systemd/system/getty.target.wants/getty@tty1.service"
 
 # Issue #153 — snmpd is installed but NOT auto-started. The Debian
 # net-snmp package's postinst symlinks snmpd.service into

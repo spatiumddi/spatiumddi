@@ -62,10 +62,20 @@ charts_json=$($KUBECTL --request-timeout=10s get helmchart -A -o json 2>/dev/nul
 # Walk each item, pull (namespace, name, conditions). We use python3
 # because jq isn't guaranteed (it's in the slot image but the runner
 # stays dep-free in case a future slot trims it).
-python3 - <<PY
-import json, sys, subprocess, time
+#
+# #394 — pass the kubectl JSON via an env var, NOT shell-interpolated
+# into the heredoc (``'''$charts_json'''``): a HelmChart's
+# ``spec.valuesContent`` can carry a literal control char that Python's
+# default strict json.loads rejects ("Invalid control character"),
+# crashing the whole recovery runner on every boot — and interpolating
+# ~280 KB of operator-influenced data straight into the Python source
+# is fragile besides (JSON containing ``'''`` would break the literal).
+# ``strict=False`` tolerates the control char (we only read the CRs to
+# find Failed conditions, so lossy value bytes don't matter).
+CHARTS_JSON="$charts_json" python3 - <<PY
+import json, os, subprocess, time
 
-data = json.loads('''$charts_json''')
+data = json.loads(os.environ["CHARTS_JSON"], strict=False)
 now = int(time.time())
 
 def kubectl(*args):

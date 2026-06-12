@@ -446,18 +446,24 @@ class PlatformSettings(Base):
         String(64), nullable=False, default="", server_default=sa_text("''")
     )
 
-    # ── Appliance verbose boot console (issue: console-and-sidebar) ──
-    # When True, the appliance boots with a STANDARD Linux console: the
-    # kernel ``loglevel=3`` cap is dropped (all kernel messages scroll),
-    # ``systemd.show_status=1`` shows the per-unit ``[ OK ]`` lines, and
-    # ``spatium-console=off`` is passed so a normal getty login replaces
-    # the Talos-style dashboard — i.e. boot/reboot/shutdown look like a
-    # regular Linux box. False (default) keeps today's quiet boot
-    # (``loglevel=3``) + the console dashboard. Flows through the same
-    # heartbeat → grubenv → host-runner plane as timezone / NTP / SNMP;
-    # the kernel cmdline lives in grub.cfg, so it applies on next reboot.
-    verbose_boot: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    # ── Appliance console mode (#393) ──────────────────────────────
+    # How the appliance's physical/serial console behaves, one of:
+    #   ``dashboard``         (default) — quiet boot (``loglevel=3``) +
+    #                         the Talos-style console dashboard on tty1.
+    #   ``verbose_dashboard`` — show kernel + systemd boot output during
+    #                         boot, THEN the dashboard takes over tty1.
+    #   ``text_console``      — verbose boot + a plain getty LOGIN on
+    #                         tty1 (no dashboard), i.e. a regular Linux
+    #                         box (``spatium-console=off``).
+    # The supervisor maps this to the grubenv ``spatium_verbose`` value
+    # the grub.cfg menuentries read (dashboard→0 / text_console→1 /
+    # verbose_dashboard→2); applies on the next reboot. Flows through
+    # the same heartbeat → grubenv → host-runner plane as timezone /
+    # NTP / SNMP. Replaces the pre-#393 boolean ``verbose_boot`` (which
+    # mapped True→text_console, False→dashboard — backfilled in the
+    # migration).
+    console_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="dashboard", server_default="dashboard"
     )
 
     # ── Maintenance mode (issue #57) ────────────────────────────────

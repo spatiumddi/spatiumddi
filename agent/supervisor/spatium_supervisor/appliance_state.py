@@ -911,23 +911,36 @@ def maybe_fire_timezone(desired_timezone: str | None) -> bool:
     )
 
 
-def maybe_fire_verbose_boot(desired_verbose_boot: bool | None) -> bool:
-    """Write the verbose-boot trigger when the operator's desired console
-    verbosity (``platform_settings.verbose_boot``) differs from what the host
-    runner last applied. The runner flips a grubenv variable the grub.cfg
-    menuentries read, so it takes effect on the NEXT reboot.
+# #393 — console_mode → grubenv ``spatium_verbose`` numeric. Keeping
+# dashboard=0 + text_console=1 preserves the pre-#393 grubenv meaning,
+# so an old grubenv (or an unknown mode → ``"0"`` fallback) still
+# resolves to the safe dashboard default in grub.cfg (fail-closed).
+_CONSOLE_MODE_TO_GRUBENV = {
+    "dashboard": "0",
+    "text_console": "1",
+    "verbose_dashboard": "2",
+}
 
-    Body is a single line: ``1`` (standard Linux console — drop the loglevel
-    cap + systemd.show_status + spatium-console=off) or ``0`` (today's quiet
-    boot + Talos dashboard). Idempotent via the ``verbose-boot-applied``
-    sidecar; a missing sidecar is treated as ``0`` because the installer seeds
-    ``grub-editenv … spatium_verbose=0`` at install time, so the default state
-    is already applied and needs no trigger. Strict appliance-only gate
-    (mirrors ``maybe_fire_timezone`` / ``maybe_fire_reboot``).
+
+def maybe_fire_console_mode(desired_console_mode: str | None) -> bool:
+    """(#393) Write the verbose-boot trigger when the operator's desired
+    console mode (``platform_settings.console_mode``) differs from what the
+    host runner last applied. The runner flips the grubenv ``spatium_verbose``
+    variable the grub.cfg menuentries read, so it takes effect on the NEXT
+    reboot.
+
+    Maps the mode to the grubenv numeric the runner + grub.cfg understand:
+    ``dashboard``→0 (quiet boot + dashboard), ``text_console``→1 (verbose boot
+    + a plain getty login, no dashboard), ``verbose_dashboard``→2 (verbose
+    boot output, then the dashboard). An unknown / missing mode falls back to
+    ``0`` (dashboard) — fail-closed. Idempotent via the
+    ``verbose-boot-applied`` sidecar; a missing sidecar is treated as ``0``
+    (the installer seeds ``grub-editenv … spatium_verbose=0``). Strict
+    appliance-only gate (mirrors ``maybe_fire_timezone`` / ``maybe_fire_reboot``).
     """
     if detect_deployment_kind() != "appliance":
         return False
-    desired = "1" if desired_verbose_boot else "0"
+    desired = _CONSOLE_MODE_TO_GRUBENV.get(desired_console_mode or "dashboard", "0")
     try:
         applied = _VERBOSE_APPLIED_FILE.read_text(encoding="utf-8").strip()
     except OSError:

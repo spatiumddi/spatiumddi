@@ -14,10 +14,15 @@ ConditionPathExists=/dev/%I
 # dashboard during boot, when they can't yet ssh in.
 After=systemd-user-sessions.service getty-pre.target
 Before=getty.target
-# Replace the serial-getty systemd-getty-generator auto-spawns from
-# the kernel cmdline `console=ttyS0,115200n8`. Same Conflicts pattern
-# as the tty1 unit.
-Conflicts=serial-getty@%i.service
+# #393 — NO Conflicts=serial-getty@%i.service. Same fix + reasoning as
+# spatium-console.service: a load-time Conflicts= leaks (ConflictedBy)
+# and drops serial-getty from the boot transaction even when this unit
+# stays inactive in text_console mode, leaving a serial-only box with no
+# login. The dashboard and serial-getty are now mutually exclusive purely
+# by their opposite spatium-console=off conditions (serial-getty's gate is
+# in serial-getty@ttyS0.service.d/spatium-console-gate.conf). The
+# ExecStartPre `systemctl stop serial-getty@%i` below stays as
+# belt-and-braces.
 
 [Service]
 Type=idle
