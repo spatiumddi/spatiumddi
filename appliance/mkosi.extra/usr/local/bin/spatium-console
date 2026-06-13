@@ -2673,6 +2673,49 @@ def render_footer(message: str = "", role: str = "control-plane") -> Text:
     return t
 
 
+def render_pod_summary(ps_rows: list[dict], height: int) -> Panel:
+    """Pod rollup by phase + namespace with bar-fills — a glanceable
+    'what's running and where' block (inspired by the gpu-talos console),
+    rendered in the otherwise-wasted space beside the log. Counts ALL pods
+    (incl. completed Jobs) so the totals match ``kubectl get pods -A``."""
+    total = len(ps_rows)
+    running = sum(1 for r in ps_rows if (r.get("K8sState") or "") == "Running")
+    succeeded = sum(1 for r in ps_rows if (r.get("K8sState") or "") == "Succeeded")
+    other = total - running - succeeded
+    ns_counts: dict[str, int] = {}
+    for r in ps_rows:
+        ns = r.get("Namespace") or "?"
+        ns_counts[ns] = ns_counts.get(ns, 0) + 1
+
+    head = Text()
+    head.append(f"{total} pods", style="bold")
+    if running:
+        head.append("  ")
+        head.append(f"{running} Running", style="bold green")
+    if succeeded:
+        head.append("  ")
+        head.append(f"{succeeded} Done", style="dim")
+    if other:
+        head.append("  ")
+        head.append(f"{other} other", style="bold yellow")
+
+    tbl = Table.grid(padding=(0, 1))
+    tbl.add_column(justify="left", no_wrap=True)
+    tbl.add_column(justify="right", no_wrap=True)
+    tbl.add_column(justify="left", no_wrap=True)
+    maxc = max(ns_counts.values()) if ns_counts else 1
+    cap = max(height - 4, 1)  # leave room for the header rows + borders
+    for ns, c in sorted(ns_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:cap]:
+        tbl.add_row(
+            Text(ns[:18], style="cyan"),
+            Text(str(c), style="bold"),
+            Text(_bar_gauge(c, maxc, width=12), style="bold cyan"),
+        )
+    body = Group(head, Text("by namespace", style="dim"), tbl)
+    return Panel(body, box=SQUARE, border_style="cyan",
+                 title="[bold]Pod summary[/bold]", title_align="left")
+
+
 def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # Compact sizing — feedback was that the dashboard occupied too
     # many rows. Each panel claims exactly content + 2 border rows;
@@ -2777,7 +2820,17 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
         fixed = HEADER_ROWS + SVC_ROWS + FOOTER_ROWS
     layout["body"]["services"].update(render_services(state.role, state.ps_rows))
     log_height = max(state.term_size[1] - fixed, 4)
-    layout["body"]["log"].update(render_log(state.tail, log_height))
+    # Split the bottom band into [ log | Pod summary ] — fills the wasted
+    # space beside the (mostly k3s-noise) log with a pod rollup, gpu-talos
+    # style. Both panes share log_height (it's a horizontal split).
+    layout["body"]["log"].split_row(
+        Layout(name="logpane", ratio=2),
+        Layout(name="summary", ratio=1),
+    )
+    layout["body"]["log"]["logpane"].update(render_log(state.tail, log_height))
+    layout["body"]["log"]["summary"].update(
+        render_pod_summary(state.ps_rows, log_height)
+    )
     layout["footer"].update(render_footer(state.status_message, state.role))
     return layout
 
