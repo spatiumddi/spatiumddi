@@ -7803,6 +7803,8 @@ export interface FirewallEnforcementNode {
 
 export interface FirewallEnforcement {
   enabled: boolean;
+  /** #404 — opt-in firewall drop-logging master switch. */
+  logging_enabled: boolean;
   reported_count: number;
   hardened_count: number;
   lanwide_count: number;
@@ -7881,6 +7883,11 @@ export const firewallApi = {
   setEnforcement: (body: { enabled: boolean; override_unhardened?: boolean }) =>
     api
       .put<FirewallEnforcement>(`${_FW}/enforcement`, body)
+      .then((r) => r.data),
+  // #404 — opt-in firewall drop-logging toggle (independent of enforcement).
+  setLogging: (enabled: boolean) =>
+    api
+      .put<FirewallEnforcement>(`${_FW}/logging`, { enabled })
       .then((r) => r.data),
   applyPosture: (preset: "locked" | "balanced" | "open") =>
     api.post<FirewallPolicy>(`${_FW}/posture`, { preset }).then((r) => r.data),
@@ -11278,7 +11285,32 @@ export const networkToolsApi = {
     api
       .post<NetToolMacVendorResult>("/tools/mac-vendor", { macs })
       .then((r) => r.data),
+  // #404 — tail an appliance's nftables drop logs. Always appliance-targeted
+  // (the api can't read host kernel logs); poll with the returned cursor.
+  firewallLogs: (
+    body: { since_seq?: number; limit?: number },
+    target: NetToolTarget,
+  ) =>
+    api
+      .post<FirewallLogsResult>("/tools/firewall-logs", { ...body, target })
+      .then((r) => r.data),
 };
+
+// #404 — firewall drop-log line + result (Firewall → Logs viewer).
+export interface FirewallLogLine {
+  seq: number;
+  ts_us: number;
+  text: string;
+}
+
+export interface FirewallLogsResult {
+  available: boolean;
+  lines: FirewallLogLine[];
+  cursor: number;
+  error: string | null;
+  /** Vantage the run executed from — "appliance:<name>". */
+  ran_from?: string;
+}
 
 // ── ASN management ──────────────────────────────────────────────────
 

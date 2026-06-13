@@ -974,6 +974,9 @@ class EnforcementNode(BaseModel):
 
 class EnforcementStatus(BaseModel):
     enabled: bool
+    # #404 — opt-in firewall logging master switch (independent of the
+    # enforcement gate; logging is harmless so it has no hardened-node guard).
+    logging_enabled: bool = False
     reported_count: int
     hardened_count: int
     lanwide_count: int
@@ -987,9 +990,14 @@ class SetEnforcementRequest(BaseModel):
     override_unhardened: bool = False
 
 
+class SetFirewallLoggingRequest(BaseModel):
+    enabled: bool
+
+
 async def _enforcement_status(db: DB) -> EnforcementStatus:
     cfg = await db.get(PlatformSettings, 1)
     enabled = bool(cfg.firewall_enabled) if cfg else False
+    logging_enabled = bool(cfg.firewall_logging_enabled) if cfg else False
     rows = list(
         (
             await db.execute(
@@ -1026,6 +1034,7 @@ async def _enforcement_status(db: DB) -> EnforcementStatus:
     all_hardened = reported > 0 and hardened == reported
     return EnforcementStatus(
         enabled=enabled,
+        logging_enabled=logging_enabled,
         reported_count=reported,
         hardened_count=hardened,
         lanwide_count=lanwide,
@@ -1087,6 +1096,40 @@ async def set_enforcement(
                     "hardened_count": status.hardened_count,
                     "reported_count": status.reported_count,
                 },
+            )
+        )
+    await db.commit()
+    return await _enforcement_status(db)
+
+
+@router.put("/logging", response_model=EnforcementStatus)
+async def set_logging(
+    body: SetFirewallLoggingRequest, db: DB, current_user: CurrentUser
+) -> EnforcementStatus:
+    """#404 — toggle opt-in firewall drop-logging. Independent of the
+    enforcement master switch + hardened gate (logging is harmless): it just
+    makes the rendered nft drop-in carry a rate-limited catch-all log rule, so
+    the Firewall → Logs viewer has something to tail. Takes effect on the next
+    supervisor heartbeat render (only matters while firewall_enabled is on)."""
+    _require_admin(current_user)
+    cfg = await db.get(PlatformSettings, 1)
+    if cfg is None:
+        cfg = PlatformSettings(id=1)
+        db.add(cfg)
+        await db.flush()
+    if cfg.firewall_logging_enabled != body.enabled:
+        cfg.firewall_logging_enabled = body.enabled
+        db.add(
+            AuditLog(
+                action="update",
+                resource_type="platform_settings",
+                resource_id="1",
+                resource_display="firewall logging",
+                user_id=current_user.id,
+                user_display_name=current_user.username,
+                result="success",
+                changed_fields=["firewall_logging_enabled"],
+                new_value={"firewall_logging_enabled": body.enabled},
             )
         )
     await db.commit()

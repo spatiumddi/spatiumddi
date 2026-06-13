@@ -456,9 +456,44 @@ class MacVendorResult(BaseModel):
     entries: list[MacVendorEntry]
 
 
+# ── firewall logs (appliance-diagnostic, #404) ──────────────────────
+#
+# Not a reachability probe: it serves the supervisor's kmsg-tailed
+# nftables drop-log buffer. The api container can't read host kernel
+# logs, so this ALWAYS runs from an appliance vantage (the router rejects
+# a server target). ``since_seq`` is the incremental cursor.
+
+
+class FirewallLogsRequest(BaseModel):
+    target: NetToolTarget | None = None
+    since_seq: int = Field(default=0, ge=0)
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+class FirewallLogLine(BaseModel):
+    seq: int
+    ts_us: int
+    text: str
+
+
+class FirewallLogsResult(BaseModel):
+    # False when the supervisor couldn't open /dev/kmsg.
+    available: bool = False
+    lines: list[FirewallLogLine] = []
+    # Newest kernel sequence seen — pass back as ``since_seq`` to poll for
+    # just-arrived lines.
+    cursor: int = 0
+    error: str | None = None
+    # See CommandResult.ran_from — stamped "appliance:<name>" after dispatch.
+    ran_from: str = "server"
+
+
 __all__ = [
     "CommandResult",
     "DigRequest",
+    "FirewallLogLine",
+    "FirewallLogsRequest",
+    "FirewallLogsResult",
     "HostRequest",
     "MacVendorEntry",
     "MacVendorRequest",

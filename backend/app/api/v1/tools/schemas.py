@@ -11,6 +11,9 @@ from __future__ import annotations
 from app.services.nettools.schemas import (
     CommandResult,
     DigRequest,
+    FirewallLogLine,
+    FirewallLogsRequest,
+    FirewallLogsResult,
     HostRequest,
     MacVendorEntry,
     MacVendorRequest,
@@ -29,6 +32,9 @@ from app.services.nettools.schemas import (
 __all__ = [
     "CommandResult",
     "DigRequest",
+    "FirewallLogLine",
+    "FirewallLogsRequest",
+    "FirewallLogsResult",
     "HostRequest",
     "MacVendorEntry",
     "MacVendorRequest",

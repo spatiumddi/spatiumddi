@@ -6,7 +6,6 @@ import {
   ChevronRight,
   Download,
   ExternalLink,
-  Info,
   RefreshCw,
 } from "lucide-react";
 
@@ -40,12 +39,8 @@ const FULL_CARDS = 3;
  */
 export function ReleasesTab({
   applianceMode = false,
-  onNavigateTab,
 }: {
   applianceMode?: boolean;
-  // Lets the appliance-mode banner deep-link to the Fleet tab where OS
-  // slot upgrades actually live.
-  onNavigateTab?: (tab: string) => void;
 }) {
   const { data, isLoading, error } = useQuery({
     queryKey: ["appliance", "releases"],
@@ -75,35 +70,10 @@ export function ReleasesTab({
         </div>
       </div>
 
-      {/* #294 — on the appliance, OS upgrades are NOT applied from here;
-          they go through the A/B slot image flow on the Fleet tab. This
-          list is read-only. */}
-      {applianceMode && (
-        <div className="rounded-md border border-sky-500/40 bg-sky-500/10 p-3">
-          <div className="flex items-start gap-2 text-xs">
-            <Info className="mt-0.5 h-4 w-4 shrink-0 text-sky-600 dark:text-sky-400" />
-            <div className="flex-1">
-              <p className="font-medium text-sky-700 dark:text-sky-300">
-                This list is informational
-              </p>
-              <p className="mt-0.5 text-sky-700/80 dark:text-sky-300/80">
-                OS upgrades on the appliance are applied as atomic A/B slot
-                images from the Fleet tab — not from here.
-              </p>
-              {onNavigateTab && (
-                <button
-                  type="button"
-                  onClick={() => onNavigateTab("fleet")}
-                  className="mt-1.5 inline-flex items-center gap-1 rounded-md border border-sky-500/50 bg-background px-2 py-1 text-xs font-medium text-sky-700 hover:bg-sky-500/10 dark:text-sky-300"
-                >
-                  Go to Fleet → OS upgrades
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
+      {/* #404 — Releases now live alongside the Rolling Upgrade orchestrator
+          in the Fleet sidebar, so the old "go to Fleet for OS upgrades"
+          banner is gone; on the appliance this catalog stays read-only
+          (upgrades are driven by the orchestrator above / OS Versions). */}
       {error && (
         <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
           Failed to load releases: {formatApiError(error)}

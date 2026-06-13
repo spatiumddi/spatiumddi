@@ -6,17 +6,26 @@
 // tab itself is gated in AppliancePage on the appliance.firewall feature
 // module — #14's NavItem clause is satisfied by tab-level gating because the
 // firewall family lives under the always-visible /appliance parent.
-import { useMemo, useState, type Dispatch, type SetStateAction } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   CheckCircle2,
+  Eye,
   Globe,
   Layers,
   Loader2,
   Lock,
   Plus,
   RefreshCw,
+  ScrollText,
   ShieldAlert,
   ShieldCheck,
   Tags,
@@ -27,6 +36,8 @@ import {
   applianceApprovalApi,
   firewallApi,
   formatApiError,
+  networkToolsApi,
+  type FirewallLogLine,
   type FirewallAction,
   type FirewallEffective,
   type FirewallFamily,
@@ -86,7 +97,50 @@ const POSTURE_PRESETS: {
   },
 ];
 
-type SubTab = "policies" | "aliases" | "preview" | "effective";
+type FirewallSection =
+  | "policies"
+  | "aliases"
+  | "preview"
+  | "effective"
+  | "logs";
+
+const FW_SECTIONS: {
+  key: FirewallSection;
+  label: string;
+  icon: typeof ShieldAlert;
+  hint: string;
+}[] = [
+  {
+    key: "policies",
+    label: "Policies",
+    icon: ShieldAlert,
+    hint: "Fleet / role / appliance rules",
+  },
+  {
+    key: "aliases",
+    label: "Aliases",
+    icon: Tags,
+    hint: "Named CIDR / port sets",
+  },
+  {
+    key: "preview",
+    label: "Preview changes",
+    icon: Eye,
+    hint: "Stage & diff before save",
+  },
+  {
+    key: "effective",
+    label: "Effective render",
+    icon: Layers,
+    hint: "Per-node merged ruleset",
+  },
+  {
+    key: "logs",
+    label: "Logs",
+    icon: ScrollText,
+    hint: "Realtime nft drop log",
+  },
+];
 
 function scopeLabel(p: FirewallPolicy): string {
   if (p.scope_kind === "fleet") return "Fleet";
@@ -95,16 +149,10 @@ function scopeLabel(p: FirewallPolicy): string {
 }
 
 export function FirewallTab() {
-  const [sub, setSub] = useSessionState<SubTab>(
-    "appliance.firewall.subtab",
+  const [section, setSection] = useSessionState<FirewallSection>(
+    "appliance.firewall.section",
     "policies",
   );
-  const tabs: { key: SubTab; label: string }[] = [
-    { key: "policies", label: "Policies" },
-    { key: "aliases", label: "Aliases" },
-    { key: "preview", label: "Preview changes" },
-    { key: "effective", label: "Effective render" },
-  ];
   return (
     <div className="space-y-4">
       <div className="flex items-start gap-2">
@@ -115,36 +163,264 @@ export function FirewallTab() {
             Declarative per-role / per-appliance nftables policy. Edits stay
             dark until the <code>firewall_enabled</code> master switch is on AND
             the next supervisor heartbeat renders — preview any node's effective
-            ruleset below before you flip enforcement on.
+            ruleset before you flip enforcement on.
           </p>
         </div>
       </div>
 
-      <EnforcementCard />
-      <WebUIAccessCard />
+      {/* #404 — left sub-nav (Cluster-style) replacing the old top sub-tabs.
+          Enforcement + Web-UI-access cards moved into the Policies section
+          (they were confusing full-width bars up here). */}
+      <div className="flex gap-6">
+        <nav className="w-48 shrink-0 space-y-1">
+          <div className="mb-2 flex items-center gap-1.5 px-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+            <ShieldAlert className="h-3.5 w-3.5" />
+            Firewall
+          </div>
+          {FW_SECTIONS.map((s) => {
+            const Icon = s.icon;
+            const active = section === s.key;
+            return (
+              <button
+                key={s.key}
+                type="button"
+                onClick={() => setSection(s.key)}
+                className={cn(
+                  "flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1.5 text-left",
+                  active
+                    ? "bg-accent text-foreground"
+                    : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+                )}
+              >
+                <span className="flex items-center gap-1.5 text-sm">
+                  <Icon className="h-3.5 w-3.5" />
+                  {s.label}
+                </span>
+                <span className="pl-5 text-[11px] text-muted-foreground">
+                  {s.hint}
+                </span>
+              </button>
+            );
+          })}
+        </nav>
 
-      <div className="flex flex-wrap gap-1 border-b">
-        {tabs.map((t) => (
-          <button
-            key={t.key}
-            type="button"
-            onClick={() => setSub(t.key)}
-            className={cn(
-              "-mb-px border-b-2 px-3 py-1.5 text-sm",
-              sub === t.key
-                ? "border-primary text-foreground"
-                : "border-transparent text-muted-foreground hover:text-foreground",
-            )}
-          >
-            {t.label}
-          </button>
-        ))}
+        <div className="min-w-0 flex-1">
+          {section === "policies" && <PoliciesSection />}
+          {section === "aliases" && <AliasesSection />}
+          {section === "preview" && <PreviewSection />}
+          {section === "effective" && <EffectiveSection />}
+          {section === "logs" && <FirewallLogsSection />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// #404 Phase 2 — realtime nftables firewall-log viewer.
+//
+// nft rules don't log by default, so logging is an opt-in toggle: when on, the
+// renderer adds a rate-limited catch-all `log prefix "spatium-fw: "` before the
+// chain's policy drop. The api pod can't read host kernel logs, so the
+// supervisor tails /dev/kmsg and serves the lines over the nettool proxy —
+// which routes per-appliance, so any appliance in the fleet is selectable. We
+// poll ~2s with a since-cursor for a near-realtime tail.
+function recentlySeen(iso: string | null | undefined): boolean {
+  if (!iso) return false;
+  const t = new Date(iso).getTime();
+  return Number.isFinite(t) && Date.now() - t < 120_000;
+}
+
+function FirewallLogsSection() {
+  const qc = useQueryClient();
+  const { data: enf } = useQuery({
+    queryKey: ["firewall", "enforcement"],
+    queryFn: firewallApi.getEnforcement,
+  });
+  const setLogging = useMutation({
+    mutationFn: firewallApi.setLogging,
+    onSuccess: (d) => qc.setQueryData(["firewall", "enforcement"], d),
+  });
+
+  const { data: appliances } = useQuery({
+    queryKey: ["appliance", "fleet", "fw-logs"],
+    queryFn: applianceApprovalApi.list,
+    refetchInterval: 30_000,
+  });
+  const online = useMemo(
+    () =>
+      (appliances ?? []).filter(
+        (a) =>
+          a.state === "approved" &&
+          a.deployment_kind === "appliance" &&
+          recentlySeen(a.last_seen_at),
+      ),
+    [appliances],
+  );
+
+  const [selected, setSelected] = useState<string>("");
+  useEffect(() => {
+    if (!selected && online.length) setSelected(online[0].id);
+  }, [online, selected]);
+
+  const [lines, setLines] = useState<FirewallLogLine[]>([]);
+  const [paused, setPaused] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const cursorRef = useRef(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Reset the buffer when the target appliance changes.
+  useEffect(() => {
+    setLines([]);
+    cursorRef.current = 0;
+    setErr(null);
+  }, [selected]);
+
+  // Poll the appliance's firewall_logs nettool for new lines (~2s).
+  useEffect(() => {
+    if (!selected || paused) return;
+    let stop = false;
+    const tick = async () => {
+      try {
+        const res = await networkToolsApi.firewallLogs(
+          { since_seq: cursorRef.current, limit: 500 },
+          { kind: "appliance", id: selected },
+        );
+        if (stop) return;
+        setErr(
+          res.available ? null : "kernel log not readable on this appliance",
+        );
+        if (res.cursor) cursorRef.current = res.cursor;
+        if (res.lines.length) {
+          setLines((prev) => {
+            const next = [...prev, ...res.lines];
+            return next.length > 2000 ? next.slice(next.length - 2000) : next;
+          });
+        }
+      } catch (e) {
+        if (!stop) setErr(formatApiError(e));
+      }
+    };
+    void tick();
+    const h = setInterval(tick, 2000);
+    return () => {
+      stop = true;
+      clearInterval(h);
+    };
+  }, [selected, paused]);
+
+  // Auto-scroll to the bottom as lines arrive (unless paused).
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && !paused) el.scrollTop = el.scrollHeight;
+  }, [lines, paused]);
+
+  const loggingOn = !!enf?.logging_enabled;
+  const enforcementOff = enf ? !enf.enabled : false;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h3 className="flex items-center gap-2 text-sm font-semibold">
+            <ScrollText className="h-4 w-4 text-muted-foreground" />
+            Firewall logs
+          </h3>
+          <p className="mt-1 max-w-xl text-xs text-muted-foreground">
+            Live tail of nftables drop events (prefix <code>spatium-fw:</code>)
+            for troubleshooting "why is this blocked?". Logging is opt-in; the
+            supervisor streams its host kernel log here, so you can watch any
+            appliance in the fleet.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => setLogging.mutate(!loggingOn)}
+          disabled={setLogging.isPending}
+          className={cn(
+            "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm",
+            loggingOn
+              ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+              : "bg-background hover:bg-accent",
+          )}
+        >
+          {setLogging.isPending && (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          )}
+          Logging: {loggingOn ? "On" : "Off"}
+        </button>
       </div>
 
-      {sub === "policies" && <PoliciesSection />}
-      {sub === "aliases" && <AliasesSection />}
-      {sub === "preview" && <PreviewSection />}
-      {sub === "effective" && <EffectiveSection />}
+      {loggingOn && enforcementOff && (
+        <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-400">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          Logging is on, but firewall enforcement is off — no packets are being
+          dropped, so there's nothing to log yet. Turn on enforcement from the
+          Policies section.
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="text-xs text-muted-foreground">Appliance</label>
+        <select
+          value={selected}
+          onChange={(e) => setSelected(e.target.value)}
+          className="rounded-md border bg-background px-2 py-1 text-sm"
+        >
+          {online.length === 0 && (
+            <option value="">No online appliances</option>
+          )}
+          {online.map((a) => (
+            <option key={a.id} value={a.id}>
+              {a.hostname}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          onClick={() => setPaused((p) => !p)}
+          className="rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
+        >
+          {paused ? "Resume" : "Pause"}
+        </button>
+        <button
+          type="button"
+          onClick={() => setLines([])}
+          className="rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
+        >
+          Clear
+        </button>
+        <span className="ml-auto text-[11px] text-muted-foreground">
+          {lines.length} line{lines.length === 1 ? "" : "s"}
+          {!paused && selected ? " · live" : ""}
+        </span>
+      </div>
+
+      {err && (
+        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
+          {err}
+        </div>
+      )}
+
+      <div
+        ref={scrollRef}
+        className="h-[28rem] overflow-auto rounded-md border bg-muted/30 px-3 py-2 font-mono text-[11px] leading-tight"
+      >
+        {lines.length === 0 ? (
+          <span className="text-muted-foreground">
+            {selected
+              ? loggingOn
+                ? "Waiting for dropped packets…"
+                : "Enable logging above, then reproduce the blocked connection."
+              : "Select an appliance to tail its firewall log."}
+          </span>
+        ) : (
+          lines.map((l) => (
+            <div key={l.seq} className="whitespace-pre-wrap break-all">
+              {l.text}
+            </div>
+          ))
+        )}
+      </div>
     </div>
   );
 }
@@ -560,6 +836,13 @@ function PoliciesSection() {
 
   return (
     <div className="space-y-3">
+      {/* #404 — firewall master controls (enforcement + Web UI access),
+          nested here with the policies they govern instead of as full-width
+          bars above the whole tab. Two columns so they stay compact. */}
+      <div className="grid gap-3 xl:grid-cols-2">
+        <EnforcementCard />
+        <WebUIAccessCard />
+      </div>
       <div className="grid gap-2 sm:grid-cols-3">
         {POSTURE_PRESETS.map((p) => (
           <div key={p.key} className="rounded-md border p-2.5">
