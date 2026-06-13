@@ -24,6 +24,7 @@ import {
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { ReauthFields } from "@/components/ReauthFields";
 import { cn } from "@/lib/utils";
 
 /**
@@ -711,11 +712,17 @@ function RevealModal({
   onClose: () => void;
 }) {
   const [password, setPassword] = useState("");
+  const [totp, setTotp] = useState("");
   const [revealed, setRevealed] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
   const mutation = useMutation({
-    mutationFn: () => appliancePairingApi.reveal(row.id, password),
+    mutationFn: () =>
+      appliancePairingApi.reveal(
+        row.id,
+        password || undefined,
+        totp || undefined,
+      ),
     onSuccess: (body) => setRevealed(body.code),
   });
 
@@ -767,19 +774,16 @@ function RevealModal({
           className="flex flex-col gap-3"
         >
           <p className="text-xs text-muted-foreground">
-            Re-display the cleartext of this persistent code. Requires
-            confirming your current password (local-auth only).
+            Re-display the cleartext of this persistent code. Re-confirm with
+            your password (local accounts) or an authenticator code (SSO).
           </p>
-          <label className="flex flex-col gap-1 text-sm">
-            <span className="text-xs font-medium">Current password</span>
-            <input
-              type="password"
-              className={inputCls}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              autoFocus
-            />
-          </label>
+          <ReauthFields
+            password={password}
+            onPassword={setPassword}
+            totp={totp}
+            onTotp={setTotp}
+            autoFocus
+          />
           {mutation.error && (
             <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
               {formatApiError(mutation.error)}
@@ -795,7 +799,7 @@ function RevealModal({
             </button>
             <button
               type="submit"
-              disabled={mutation.isPending || password.length === 0}
+              disabled={mutation.isPending || (!password && !totp)}
               className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-60"
             >
               {mutation.isPending && (

@@ -37,6 +37,7 @@ import {
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { ReauthFields } from "@/components/ReauthFields";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
 import { LLDPTab } from "./LLDPTab";
@@ -3258,10 +3259,15 @@ function RevealKubeconfigModal({
   onClose: () => void;
 }) {
   const [password, setPassword] = useState("");
+  const [totp, setTotp] = useState("");
   const [shown, setShown] = useState<string | null>(null);
   const reveal = useMutation({
     mutationFn: () =>
-      applianceApprovalApi.revealKubeconfig(appliance.id, password),
+      applianceApprovalApi.revealKubeconfig(
+        appliance.id,
+        password || undefined,
+        totp || undefined,
+      ),
     onSuccess: (data) => {
       setShown(data.kubeconfig ?? "");
     },
@@ -3283,20 +3289,20 @@ function RevealKubeconfigModal({
     >
       <div className="space-y-3 text-sm">
         <p className="text-xs text-muted-foreground">
-          Re-confirm your password to reveal the admin kubeconfig the supervisor
-          shipped for this appliance. The reveal is audit-logged and
-          local-auth-only. The downloaded file works against the appliance from
-          its current network; for cross-network use, edit the{" "}
-          <code>server:</code> line to a reachable address.
+          Re-confirm to reveal the admin kubeconfig the supervisor shipped for
+          this appliance — with your password (local accounts) or an
+          authenticator code (SSO). The reveal is audit-logged. The downloaded
+          file works against the appliance from its current network; for
+          cross-network use, edit the <code>server:</code> line to a reachable
+          address.
         </p>
         {!shown && (
           <>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="Your password"
-              className="w-full rounded-md border bg-background px-2 py-1 text-sm"
+            <ReauthFields
+              password={password}
+              onPassword={setPassword}
+              totp={totp}
+              onTotp={setTotp}
               autoFocus
             />
             <div className="flex items-center justify-end gap-2">
@@ -3310,7 +3316,9 @@ function RevealKubeconfigModal({
               <button
                 type="button"
                 onClick={() => reveal.mutate()}
-                disabled={!password.trim() || reveal.isPending}
+                disabled={
+                  (!password.trim() && !totp.trim()) || reveal.isPending
+                }
                 className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {reveal.isPending ? (
