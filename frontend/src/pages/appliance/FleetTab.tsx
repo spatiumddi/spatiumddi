@@ -672,8 +672,22 @@ export function FleetTab({
     queryFn: applianceApprovalApi.list,
     refetchInterval: (query) => {
       const rows = query.state.data ?? [];
-      const hasPending = rows.some((r) => r.state === "pending_approval");
-      return hasPending ? 2_000 : 15_000;
+      // #410 — also fast-poll while any appliance has an upgrade or
+      // reboot in flight, so the drilldown's UpgradeStatusPanel shows
+      // download progress within ~2 s instead of the 15 s idle cadence.
+      // A terminal ``failed`` upgrade is excluded from the desired-version
+      // arm so a stale failure doesn't pin every superadmin's browser at
+      // 2 s until it's cleared (it still fast-polls while actually
+      // in-flight, and a reboot is caught by reboot_requested).
+      const busy = rows.some(
+        (r) =>
+          r.state === "pending_approval" ||
+          (r.desired_appliance_version !== null &&
+            r.last_upgrade_state !== "failed") ||
+          r.last_upgrade_state === "in-flight" ||
+          r.reboot_requested === true,
+      );
+      return busy ? 2_000 : 15_000;
     },
     enabled: isSuperadmin,
   });
@@ -1439,7 +1453,12 @@ export function FleetTab({
 
       {drilldown && (
         <ApplianceDrilldownModal
-          row={drilldown}
+          // #410 — render the freshly-polled row (matched by id) rather
+          // than the frozen open-time snapshot, so live upgrade progress
+          // shipped via the supervisor heartbeat updates the drilldown
+          // without a hard page reload. Falls back to the snapshot if the
+          // row briefly drops out of the list (e.g. mid-refetch).
+          row={data?.find((r) => r.id === drilldown.id) ?? drilldown}
           onClose={() => setDrilldown(null)}
           onApprove={() => approve.mutate(drilldown.id)}
           approving={approve.isPending}
