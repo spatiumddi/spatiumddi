@@ -1691,6 +1691,33 @@ def _bar_gauge(value: float, vmax: float, width: int = _GAUGE_WIDTH) -> str:
     return "".join(cells[:width])
 
 
+def _heat_bar(value: float, vmax: float, width: int = 10) -> Text:
+    """Bar gauge whose FILLED cells are coloured green→yellow→red by their
+    position along the bar (btop-style heat), so it changes colour
+    incrementally as it fills — not a single solid colour that only flips
+    at a threshold. Empty cells are a dim ░ track. Font-safe (█ ▒ ░)."""
+    t = Text()
+    if vmax <= 0:
+        t.append("░" * width, style="dim")
+        return t
+    units = max(0.0, min(value / vmax, 1.0)) * width
+    full = int(units)
+    for i in range(width):
+        pos = (i + 1) / width  # this cell's fraction along the bar
+        if i < full:
+            ch = "█"
+        elif i == full and (units - full) >= 0.34:
+            ch = "▒"
+        else:
+            ch = "░"
+        if ch == "░":
+            t.append(ch, style="dim")
+        else:
+            color = "red" if pos >= 0.8 else "yellow" if pos >= 0.5 else "green"
+            t.append(ch, style=f"bold {color}")
+    return t
+
+
 def overall_verdict(
     state: "DashboardState",
     k3s_state: tuple[str, str] | None = None,
@@ -2010,21 +2037,24 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     cpu_style = _vital_style(cpu, 80, 95)
     vitals.append("   CPU ", style="dim")
     vitals.append(f"{cpu:3.0f}%", style=cpu_style)
-    vitals.append(" " + _bar_gauge(cpu, 100.0), style=cpu_style)
+    vitals.append(" ")
+    vitals.append_text(_heat_bar(cpu, 100.0))
     ram_style = _vital_style(state.ram_percent, 85, 95)
     vitals.append("   RAM ", style="dim")
     vitals.append(
         f"{state.ram_used_gib:.1f}/{state.ram_total_gib:.1f} GiB ({state.ram_percent:3.0f}%)",
         style=ram_style,
     )
-    vitals.append(" " + _bar_gauge(state.ram_percent, 100.0), style=ram_style)
+    vitals.append(" ")
+    vitals.append_text(_heat_bar(state.ram_percent, 100.0))
     vitals.append("   Load ", style="dim")
     load_1m = state.load_avg[0] if state.load_avg else 0.0
     load_style = _vital_style(load_1m / ncpu * 100 if ncpu else 0.0, 100, 200)
     vitals.append(load, style=load_style)
     vitals.append(f" ({ncpu} cpu)", style="dim")
     # Load gauge scaled 0..ncpu (a full bar = every core busy).
-    vitals.append(" " + _bar_gauge(load_1m, float(ncpu)), style=load_style)
+    vitals.append(" ")
+    vitals.append_text(_heat_bar(load_1m, float(ncpu)))
     if state.disks:
         vitals.append("   Disk ", style="dim")
         # Split the disk string so EACH mount colours on its own % —
