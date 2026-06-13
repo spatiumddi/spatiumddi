@@ -1903,6 +1903,46 @@ def _pod_sort_priority(row: dict) -> int:
         except ValueError:
             pass
     return 3
+
+
+# P2.1 — above this many visible pods the Pods panel auto-filters to
+# "problems + this node" so a big multi-node cluster doesn't bury a
+# crash-looping pod under dozens of healthy ones (F3 still lists all).
+_POD_FILTER_THRESHOLD = 20
+
+
+def _filtered_pods(state: "DashboardState") -> tuple[list[dict], str]:
+    """(rows, mode_label) for the Pods panel. At/under the threshold: all
+    visible pods + empty label. Above it: keep only problem pods
+    (sort-priority ≤ 2 — broken / pending / not-ready) plus every pod on the
+    LOCAL node, and label the panel so the operator knows it's filtered."""
+    vis = visible_pods(state.ps_rows)
+    if len(vis) <= _POD_FILTER_THRESHOLD:
+        return vis, ""
+    local = os.uname().nodename
+    kept = [
+        r for r in vis
+        if _pod_sort_priority(r) <= 2 or r.get("Node") == local
+    ]
+    return kept, "filtered: problems + this node"
+
+
+def _quorum_verdict(state: "DashboardState") -> tuple[str, str] | None:
+    """Multi-node etcd quorum status (label, style) for the Cluster KPI box
+    + Nodes-panel title, or None on a single-node box (quorum is trivial and
+    must never show QUORUM LOST — P2.1 field test). Driven by etcd
+    has_leader; falls back to a Ready-node majority when state.etcd is empty
+    (sqlite backend / pre-first-fetch)."""
+    nodes = state.nodes
+    if len(nodes) <= 1:
+        return None
+    hl = state.etcd.get("has_leader")
+    if hl is not None:
+        return ("QUORUM OK", "green") if hl == 1 else ("QUORUM LOST", "bold red")
+    ready = sum(1 for n in nodes if n.get("ready") == "True")
+    return ("QUORUM OK", "green") if ready * 2 > len(nodes) else ("QUORUM LOST", "bold red")
+
+
 # Disk %-used that escalates the verdict — ``/var`` filling wedges etcd
 # + CNPG, so this is the tightest band.
 _DISK_CRIT_PCT = 90.0
@@ -2296,6 +2336,7 @@ def render_services(
     ps_rows: list[dict],
     cap: int | None = None,
     overflow: int = 0,
+    filter_label: str = "",
 ) -> Panel:
     """Render the Pods panel — every pod on the local k3s cluster
     with status + node + ports (the image column was dropped — on an
@@ -2419,6 +2460,10 @@ def render_services(
         )
     else:
         pods_title = f"[bold]Pods[/bold] · {ready_count} Ready"
+    # P2.1 — flag the auto-filter so the operator knows the panel isn't the
+    # full pod list (F3 lists everything).
+    if filter_label:
+        pods_title += f" [dim]· {filter_label}[/dim]"
 
     if not sorted_rows:
         tbl.add_row(
@@ -2530,6 +2575,8 @@ def render_nodes(
     pods: list[dict] | None = None,
     cap: int | None = None,
     overflow: int = 0,
+    quorum: tuple[str, str] | None = None,
+    local_pct: tuple = (None, None, None),
 ) -> Panel:
     """Render the cluster Nodes panel (#272) — one row per k3s node:
     Ready / roles / pod count / health / capacity / age / IP / version.
@@ -2577,6 +2624,8 @@ def render_nodes(
         Text("VERSION", style=header_style),
     )
     ready_total = sum(1 for n in nodes if n.get("ready") == "True")
+    local_name = os.uname().nodename
+    lcpu, lmem, _lfs = local_pct
     # Phase 2 (§3c) — clamp to ``cap`` data rows; the overflow count goes in
     # the panel SUBTITLE (bottom border), not a table row (same column-squeeze
     # reason as the Pods panel), so it's full-width + never clipped and spends
@@ -2597,14 +2646,24 @@ def render_nodes(
             glyph, gstyle, rtxt, rstyle = "●", "yellow", "Unknown", "yellow"
         cond = n.get("conditions") or "ok"
         cond_style = "dim" if cond == "ok" else "bold yellow"
+        # P2.1 — the LOCAL node shows LIVE usage% (kubelet); remote nodes
+        # show the capacity string until cluster-wide stats land (INC 9).
+        nm = n.get("name") or ""
+        if nm == local_name and lcpu is not None and lmem is not None:
+            cm_cell = Text()
+            cm_cell.append(f"{lcpu:.0f}%", style=_vital_style(lcpu, 80, 90))
+            cm_cell.append("/", style="dim")
+            cm_cell.append(f"{lmem:.0f}%", style=_vital_style(lmem, 80, 90))
+        else:
+            cm_cell = Text(n.get("capacity") or "—", style="dim")
         tbl.add_row(
             Text(glyph, style=gstyle),
-            Text(n.get("name") or "", style="bold"),
+            Text(nm, style="bold"),
             Text(rtxt, style=rstyle),
             Text(n.get("roles") or "<none>", style="dim"),
-            Text(str(pod_counts.get(n.get("name") or "", 0)), style="dim"),
+            Text(str(pod_counts.get(nm, 0)), style="dim"),
             Text(cond, style=cond_style),
-            Text(n.get("capacity") or "—", style="dim"),
+            cm_cell,
             Text(_format_pod_age(n.get("created") or ""), style="dim"),
             Text(n.get("internal_ip") or "—", style="dim"),
             Text(n.get("version") or "", style="dim"),
@@ -2614,8 +2673,15 @@ def render_nodes(
         f"[dim]… +{overflow} more nodes[/dim]" if overflow > 0 else None
     )
     title = f"[bold]Cluster[/bold] · {ready_total}/{len(nodes)} Ready"
+    # P2.1 — quorum chip in the title; QUORUM LOST turns the magenta border red.
+    nodes_border = "magenta"
+    if quorum is not None:
+        qlabel, qstyle = quorum
+        title += f" · [{qstyle}]{qlabel}[/{qstyle}]"
+        if "LOST" in qlabel:
+            nodes_border = "red"
     return Panel(
-        tbl, box=SQUARE, border_style="magenta",
+        tbl, box=SQUARE, border_style=nodes_border,
         title=title, title_align="left",
         subtitle=nodes_subtitle, subtitle_align="right",
     )
@@ -3200,6 +3266,15 @@ def render_kpi_cluster(state: "DashboardState") -> Panel:
     row1 = Text()
     row1.append(f"{ready}/{total} Ready" if total else "no nodes",
                 style="bold green" if all_ready else "bold yellow")
+    # P2.1 — multi-node quorum chip inline on the readiness row; QUORUM LOST
+    # forces the box border red (it outranks not-all-ready amber).
+    quorum = _quorum_verdict(state)
+    if quorum is not None:
+        qlabel, qstyle = quorum
+        row1.append("  ")
+        row1.append(qlabel, style=qstyle)
+        if "LOST" in qlabel:
+            border = "bold red"
 
     row2 = Text()
     row2.append("k3s ", style="dim")
@@ -3507,11 +3582,11 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
         remainder = max(rows - header_rows - footer_rows, _MIN_MAIN + _MIN_LOG)
         main_h = max(remainder // 2, _MIN_MAIN)
         max_pod_rows = max(main_h - 3, 1)  # -3 = top border + col-header + bottom border
-        shown = visible_pods(state.ps_rows)
-        pods_overflow = max(len(shown) - max_pod_rows, 0)
+        pod_rows, pod_filter = _filtered_pods(state)
+        pods_overflow = max(len(pod_rows) - max_pod_rows, 0)
         layout["main"].update(
-            render_services(state.role, state.ps_rows,
-                            cap=max_pod_rows, overflow=pods_overflow)
+            render_services(state.role, pod_rows, cap=max_pod_rows,
+                            overflow=pods_overflow, filter_label=pod_filter)
         )
         log_h = max(remainder - main_h, _MIN_LOG)
         layout["log"].update(render_log(state.tail, log_h))
@@ -3550,18 +3625,20 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     main_h = max(remainder * 2 // 3, _MIN_MAIN)
     log_h = max(remainder - main_h, _MIN_LOG)
     max_pod_rows = max(main_h - 3, 1)
-    shown = visible_pods(state.ps_rows)
-    pods_overflow = max(len(shown) - max_pod_rows, 0)
+    pod_rows, pod_filter = _filtered_pods(state)
+    pods_overflow = max(len(pod_rows) - max_pod_rows, 0)
 
     if show_nodes:
         layout["nodes"].update(
             render_nodes(state.nodes, state.ps_rows,
-                         cap=nodes_cap, overflow=nodes_overflow)
+                         cap=nodes_cap, overflow=nodes_overflow,
+                         quorum=_quorum_verdict(state),
+                         local_pct=(state.node_cpu_pct, state.node_mem_pct, state.node_fs_pct))
         )
 
     layout["main"]["pods"].update(
-        render_services(state.role, state.ps_rows,
-                        cap=max_pod_rows, overflow=pods_overflow)
+        render_services(state.role, pod_rows, cap=max_pod_rows,
+                        overflow=pods_overflow, filter_label=pod_filter)
     )
     layout["main"]["top"].update(render_top_pods(state, main_h))
 
