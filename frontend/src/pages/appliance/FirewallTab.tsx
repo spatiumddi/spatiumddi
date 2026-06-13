@@ -168,10 +168,9 @@ export function FirewallTab() {
         </div>
       </div>
 
-      <EnforcementCard />
-      <WebUIAccessCard />
-
-      {/* #404 — left sub-nav (Cluster-style) replacing the old top sub-tabs. */}
+      {/* #404 — left sub-nav (Cluster-style) replacing the old top sub-tabs.
+          Enforcement + Web-UI-access cards moved into the Policies section
+          (they were confusing full-width bars up here). */}
       <div className="flex gap-6">
         <nav className="w-48 shrink-0 space-y-1">
           <div className="mb-2 flex items-center gap-1.5 px-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -837,6 +836,13 @@ function PoliciesSection() {
 
   return (
     <div className="space-y-3">
+      {/* #404 — firewall master controls (enforcement + Web UI access),
+          nested here with the policies they govern instead of as full-width
+          bars above the whole tab. Two columns so they stay compact. */}
+      <div className="grid gap-3 xl:grid-cols-2">
+        <EnforcementCard />
+        <WebUIAccessCard />
+      </div>
       <div className="grid gap-2 sm:grid-cols-3">
         {POSTURE_PRESETS.map((p) => (
           <div key={p.key} className="rounded-md border p-2.5">
