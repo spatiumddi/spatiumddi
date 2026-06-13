@@ -2717,6 +2717,47 @@ def upgrade_status() -> tuple[str, str] | None:
     return None
 
 
+# P1.6 — slot-upgrade step → ordinal, for the "step N/5" progress label.
+# The host-side spatium-upgrade-slot runner writes a step name into
+# ``slot-upgrade.progress``; map the known names to a 1-based ordinal.
+_SLOT_STEPS = {
+    "download": 1, "downloading": 1,
+    "verify": 2, "checksum": 2, "verifying": 2,
+    "writing": 3, "dd": 3,
+    "uuid": 4, "grub": 4,
+    "sync": 5, "sync-versions": 5, "finalize": 5,
+}
+_SLOT_STEP_COUNT = 5
+
+
+def read_slot_upgrade_progress() -> dict:
+    """P1.6 — slot-upgrade progress from ``slot-upgrade.progress`` JSON
+    (``{"step": "writing", "pct": 62, "at": <unix ts>}``). {} when the file
+    is absent / unreadable / malformed. Pure file read; safe on the data
+    tier (NEVER the render path)."""
+    try:
+        raw = (_RELEASE_STATE_DIR / "slot-upgrade.progress").read_text(encoding="utf-8")
+        out = json.loads(raw)
+        return out if isinstance(out, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def active_slot_upgrade() -> dict | None:
+    """P1.6 — the progress dict IFF a slot apply is actively in flight: the
+    progress file exists and its ``at`` timestamp is fresh (<5 min). Returns
+    None when there's no file or it's stale — a crashed / finished apply
+    leaves a stale file behind, and we must not show a permanent
+    "Upgrading…" on a box that's actually idle."""
+    p = read_slot_upgrade_progress()
+    at = p.get("at")
+    if not p or not isinstance(at, (int, float)):
+        return None
+    if time.time() - float(at) > 300:
+        return None
+    return p
+
+
 def k3s_status() -> tuple[str, str] | None:
     """Issue #183 Phase 1 — derive a (label, style) tuple for the
     console's 'k3s' row, or ``None`` when k3s isn't baked into this
@@ -3112,7 +3153,16 @@ def _kpi_box(
     """A KPI stat box clamped to EXACTLY 3 body rows (+2 border = 5), so
     every box in the ribbon is the same height regardless of content and
     the grid row never ragged-aligns."""
-    rows = list(body_rows)[:3]
+    rows = []
+    for r in list(body_rows)[:3]:
+        # Force no-wrap + ellipsis so an over-long row can never wrap to a
+        # second line and push the box past its fixed 3-body-row height
+        # (which would clip the KPI Layout band). Narrow columns ellipsize
+        # gracefully instead.
+        if isinstance(r, Text):
+            r.no_wrap = True
+            r.overflow = "ellipsis"
+        rows.append(r)
     while len(rows) < 3:
         rows.append(Text(""))
     return Panel(
@@ -3283,9 +3333,31 @@ def render_kpi_slot(state: "DashboardState") -> Panel:
     rows = [slot_row("A", ver_a), slot_row("B", ver_b)]
 
     border = "green"
+    prog = active_slot_upgrade()
     ustatus = upgrade_status() if state.role in ("appliance", "application") else None
     nxt = state.slot_next_entry
-    if reboot_pending():
+    if prog is not None:
+        # P1.6 — a slot apply is dd'ing right now. Show which slot, the
+        # step ordinal, and a live % bar (dropped when pct is absent, e.g.
+        # a bootloader/sync step with no byte count). The target is the
+        # inactive slot.
+        target = "B" if cur == "A" else "A"
+        step = str(prog.get("step", "")).lower()
+        step_n = _SLOT_STEPS.get(step)
+        pct = prog.get("pct")
+        t = Text(no_wrap=True, overflow="ellipsis")
+        t.append(f"Upgrading {target}", style="bold bright_yellow")
+        if step_n:
+            t.append(f" · {step_n}/{_SLOT_STEP_COUNT}", style="dim")
+        if isinstance(pct, (int, float)):
+            t.append(" ")
+            t.append_text(_heat_bar(float(pct), 100.0, 8))
+            t.append(f" {int(pct)}%", style="dim")
+        elif step:
+            t.append(f" · {step}", style="dim")
+        rows.append(t)
+        border = "yellow"
+    elif reboot_pending():
         rows.append(Text("REBOOT pending — F5", style="bold bright_yellow"))
         border = "yellow"
     elif ustatus is not None:
