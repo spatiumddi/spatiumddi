@@ -20,6 +20,165 @@ the formatter handles the rest.
 
 ---
 
+## 2026.06.13-1 — 2026-06-13
+
+The **appliance console + security-hardening** release. Six PRs: a
+Talos-style operations cockpit and a live Cluster dashboard for the
+appliance console / UI, a 3-mode console selector that fixes a
+no-login regression, an in-place host-migration framework so
+install-time / ESP changes reach already-installed boxes on a slot
+upgrade, a firewall navigation refresh with a realtime
+dropped-packet log viewer, and a full internal auth-bypass /
+privilege-boundary review (#400) that remediates 1 critical, 3
+high, and 12 medium / low findings with ~55 regression tests.
+
+**#400 — auth-bypass / privilege-boundary review (#401).** The
+headline security item. **C1 (critical):** the supervisor
+`/heartbeat` endpoint was unauthenticated, so anyone who could
+reach the control plane could register a fake appliance and pull a
+signed supervisor cert → k3s cluster-admin; it now requires the
+supervisor session token. **C2–C4 (high):** AI-apply re-checks the
+caller's RBAC at apply time (not only at propose), the `dns_zone`
+token path no longer trusts a caller-supplied zone id (IDOR), and
+role / group edits are capped by the editor's own permission
+ceiling so an admin can't grant beyond what they themselves hold.
+Plus 12 medium / low hardening items spanning sessions, the
+force-password-change gate, response info-leak trimming,
+CORS / TrustedHost tightening, an SSRF guard on outbound-fetch
+surfaces, and frontend token-handling + security-header fixes.
+
+**Appliance console & Cluster UI.** The serial / VGA console gains
+a Talos-style operations cockpit (#398) and the web UI gains a
+consolidated **Cluster** tab with a live SSE-fed Overview dashboard
+(#402) — both grounded in kubelet stats + node / pod listings since
+there is no Prometheus on the appliance. A new firewall navigation
+layout adds a realtime nftables dropped-packet log viewer that
+works across remote appliances too (#404).
+
+### Security
+
+* **C1 (critical) — unauthenticated supervisor heartbeat → k3s
+  cluster-admin (#400).** The `/api/v1/appliance/supervisor/heartbeat`
+  endpoint accepted any caller, so anyone able to reach the control
+  plane could impersonate a supervisor, get approved, and receive a
+  signed supervisor certificate that grants k3s cluster-admin. The
+  endpoint now requires the supervisor session token (regression
+  test in `test_supervisor_heartbeat_authz.py`).
+* **C2 (high) — AI-apply skipped the apply-time RBAC re-check.** A
+  `propose_*` plan that passed the proposer's permissions could be
+  applied by a caller who no longer (or never) held them; apply now
+  re-validates the caller's RBAC against the concrete mutation.
+* **C3 (high) — `dns_zone` token-scope IDOR.** The DNS token path
+  trusted a caller-supplied zone id instead of deriving scope from
+  the authenticated token, letting a scoped token act outside its
+  zone. Scope is now resolved server-side.
+* **C4 (high) — role / group edits could exceed the editor's
+  ceiling.** Role and group mutations are now bounded by the
+  editing user's own effective permissions, so an admin cannot
+  grant a permission they do not themselves hold.
+* **12 medium / low hardening items.** Session fixation + idle
+  timeout, the force-password-change gate, response info-leak
+  trimming, CORS / TrustedHost allow-list tightening, a new SSRF
+  guard (`backend/app/core/ssrf.py`) on outbound-fetch surfaces, and
+  frontend token-handling + security-header fixes. ~55 regression
+  tests across `test_fix_c*` / `test_fix_m*` / `test_fix_l*`.
+
+### Added
+
+* **#398 — Talos-style operations cockpit on the appliance
+  console.** Replaces the prior console with a 6-box KPI ribbon
+  (Cluster / etcd / Postgres / API / Platform / Slot) fed by
+  concurrent 5 s-tier collectors, an F7 Health drill-down with
+  guarded recovery actions, multi-node quorum + auto pod-filter +
+  cluster-wide Top-pods + a MetalLB speaker check, font-safe glyphs,
+  content-sized panels, and level-token log colouring. Field-tested
+  on ddi1 at ~2.5 % CPU.
+* **#402 — live Cluster Overview dashboard.** The Overview section
+  of the new Cluster tab streams cluster health over SSE (2 s) into
+  a KPI ribbon, a Recharts CPU / memory hero chart, animated
+  per-node radial gauges, a workload-health panel, and a top-pods
+  leaderboard — all from kubelet stats + node / pod listings (no
+  Prometheus on the appliance). Per-node disk shows the host's real
+  partition list (supervisor-reported, with a kubelet `/var`
+  fallback). Needs a `nodes/proxy [get]` RBAC grant and a read-only
+  host-root mount on the supervisor, both shipped in the charts.
+* **#404 — realtime nftables firewall-log viewer.** An opt-in global
+  toggle appends a rate-limited `log` rule to the rendered input
+  policy; the supervisor tails `/dev/kmsg` for `spatium-fw:` drops
+  into a ring buffer, surfaced through a new `firewall_logs` nettool
+  so the Firewall tab streams dropped / rejected packets live —
+  including for remote appliances via the per-appliance nettool
+  proxy. Ships a `kernel.dmesg_restrict=0` sysctl drop-in so the
+  unprivileged supervisor can read the kernel ring buffer.
+* **#395 — in-place host-migration framework.** A/B slot upgrades
+  replace the rootfs but not the install-time, shared-ESP
+  `grub.cfg`, so menu-structure or kernel-cmdline changes (such as
+  #393's verbose branch) previously required a full reinstall to
+  reach an installed box. New `spatium-grub-render` (idempotent,
+  single source of truth for grub.cfg, shared by the install + live
+  paths) and `spatium-host-migrate` (version-gated, every-boot
+  reconcile of numbered idempotent host-patches run before the
+  health-commit, so a failed render blocks the slot commit and the
+  A/B one-shot reverts) close that gap; failures surface as
+  `host_migration_health` in the Fleet UI.
+
+### Changed
+
+* **#393 — 3-mode console selector replaces the verbose-boot
+  toggle.** The old binary toggle conflated boot verbosity with the
+  post-boot console (dashboard vs. plain login) and couldn't express
+  "verbose boot, then dashboard". `console_mode` ∈ {`dashboard`
+  (default), `verbose_dashboard`, `text_console`} maps to the
+  grubenv `spatium_verbose` 0 / 2 / 1 the grub menuentries read
+  (keeping dashboard = 0 + text_console = 1 so old grubenv values
+  still resolve fail-closed); the NetworkTab toggle becomes a
+  3-option radio.
+* **#402 — Cluster tab consolidation.** The standalone Pods tab and
+  the etcd-snapshots section fold into a single **Cluster** tab
+  (Overview / Pods / etcd left sub-nav) — named "Cluster" rather
+  than "Kubernetes" for operator clarity.
+* **#404 — Firewall + Fleet navigation refresh.** The Firewall tab's
+  top sub-tabs become a left sub-nav (Policies / Aliases / Preview /
+  Effective / Logs), with the Enforcement + Web-UI-access cards
+  nested compactly inside Policies; Rolling Upgrade, Releases (folded
+  into Rolling Upgrade), and Web UI Certificate move into the Fleet
+  sidebar, with legacy `?tab=` deep-links remapped.
+
+### Fixed
+
+* **#394 — helm-stuck-recover crashed on every boot.**
+  `spatiumddi-helm-stuck-recover` (the #183 Phase 9 safety net) died
+  with `JSONDecodeError: Invalid control character` because it
+  shell-interpolated kubectl JSON into a Python heredoc parsed in
+  strict mode, so a genuinely wedged HelmChart would never
+  auto-clear. Now passes the JSON via an env var and parses with
+  `strict=False`.
+* **#393 — `text_console` mode left the appliance with no console
+  login.** `spatium-console.service` still declared
+  `Conflicts=getty@tty1.service`, which is registered at unit-load
+  time, so even with the dashboard correctly inactive in
+  `text_console` mode the recorded conflict dropped `getty@tty1`
+  from the boot transaction — bare kernel text, no prompt. Removed
+  the `Conflicts=` (dashboard and getty are already mutually
+  exclusive via opposite `spatium-console=off` conditions);
+  field-validated end-to-end on slot B.
+* **#404 — dead Platform Insights → Containers link.** The Platform
+  Insights card linked to the removed `?tab=containers`; it now
+  points at `Cluster → Pods`.
+
+### Migrations
+
+* `a7c3e9f1b405` (#393) — adds `platform_settings.console_mode`,
+  backfills it from the old `verbose_boot` flag (`True` →
+  `text_console`), then drops `verbose_boot`.
+* `b3e7d1f9a204` (#395) — adds `appliance.host_migration_health`
+  (JSONB, not null, default `{}`).
+* `c5f1a2b3d4e6` (#404) — adds
+  `platform_settings.firewall_logging_enabled` (bool, default
+  `false`).
+
+---
+
 ## 2026.06.12-2 — 2026-06-12
 
 Appliance **upgrade + host-config reliability** — three appliance

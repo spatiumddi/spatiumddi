@@ -84,13 +84,13 @@ The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB
 
 The `/appliance` section in the SpatiumDDI UI talks to k3s directly via the api pod's mounted ServiceAccount:
 
-- **Pods tab** (`/appliance/containers` API surface, renamed Containers → Pods in the UI). Lists every pod in the spatium namespace via kubeapi `GET /api/v1/namespaces/spatium/pods`. Restart = `DELETE` the pod (owning Deployment / DaemonSet recreates it). Logs = SSE wrapping kubeapi's `?follow=true` pod-log endpoint.
+- **Cluster tab** (#402 — folds the former Containers/Pods tab + the etcd-snapshots section into one tab via a left sub-nav, named *Cluster* rather than *Kubernetes* for operator clarity). Three sub-sections: **Overview** — a live SSE-fed (2 s) health dashboard (KPI ribbon, CPU / memory hero chart, per-node radial gauges with the host's real partition list, workload-health panel, top-pods leaderboard) built from kubeapi node / pod listings + per-node kubelet `stats/summary` (there is no Prometheus on the appliance); **Pods** — lists every pod in the spatium namespace via kubeapi `GET /api/v1/namespaces/spatium/pods`, restart = `DELETE` the pod (owning Deployment / DaemonSet recreates it), logs = SSE wrapping kubeapi's `?follow=true` pod-log endpoint; **etcd** — the recoverable `ETCDSnapshotFile` inventory.
 - **TLS cert manager**. Patches the `spatium-appliance-tls` Secret in place via `kubectl patch secret`. Bumps a checksum annotation on the frontend Deployment to trigger a rollout (k8s doesn't auto-roll on Secret changes — the annotation acts as the trigger).
 - **Logs & Diagnostics → Self-test**. Five-check battery: external DNS resolution, kubeapi reachability via the ServiceAccount, every spatium pod's health (Running + healthy / Succeeded Jobs OK), informational DHCP + DNS role presence (OK when not assigned).
 - **Diagnostic bundle**. Per-pod log tails (last 500 lines via kubeapi) + host logs + system info + redacted env, zipped for support tickets.
 - **OS Versions**. Atomic A/B slot upgrades — same machinery as pre-#183 (Phase 8); the slot raw.xz carries a complete rootfs with k3s + baked images + chart tarballs. A slot upgrade is also an effective container upgrade because images are baked. For an upgrade scheduled from an imported/uploaded image (#199), the download is **verified by the stored sha256** (the integrity guarantee), which lets the host runner relax TLS cert-verify *only* for the appliance's own self-served URL behind the self-signed web cert — external public-CA URLs stay fully verified (#386). The Fleet drilldown shows a **live per-phase progress stepper** (download % → verify → write → bootloader → reboot-pending) with an expandable `slot-upgrade.log` tail and an honest failure card, and a stuck apply re-fires once per distinct desired-state rather than looping (#386). Uploaded/imported image bytes are persisted on a host-path mount so they survive an api restart (#386).
 
-The api pod's ServiceAccount is namespace-scoped with minimal RBAC: pods + pods/log read, the specific `spatium-appliance-tls` Secret patch, and the frontend Deployment annotation patch. Nothing cluster-wide, nothing destructive.
+The api pod's ServiceAccount keeps minimal RBAC: namespace-scoped pods + pods/log read, the specific `spatium-appliance-tls` Secret patch, and the frontend Deployment annotation patch. The only cluster-scoped grant is **read-only** `nodes` + `nodes/proxy [get]` (added in #402) so the Cluster Overview dashboard can read per-node kubelet stats. Nothing destructive.
 
 ### From-zero operator flow
 
@@ -296,12 +296,28 @@ Seeded **builtin** role policies reproduce the Phase-2 hardcoded renderer
 byte-for-byte; operators tune their rules (the floor — ssh/22, ICMP, loopback —
 is un-removable, and no rule may `drop` 22).
 
-**Fleet → Firewall tab.** An **Enforcement** card (turn it on, gated — see
-below) over four sub-tabs: **Policies** (fleet/role/appliance list + rule
-editor), **Aliases** (named CIDR/port sets), **Preview changes** (stage
-fleet-overlay rules → per-node line diff + accept↔drop conflict / redundancy
-warnings, read-only), and **Effective render** (any node's merged drop-in +
-layer breakdown + rendered-vs-applied drift; works while still dark).
+**Fleet → Firewall tab.** A **left sub-nav** (#404 — was top sub-tabs) over
+five sections: **Policies** (fleet/role/appliance list + rule editor, with the
+**Enforcement** + **Web-UI-access** cards nested compactly at the top rather
+than as full-width bars), **Aliases** (named CIDR/port sets), **Preview
+changes** (stage fleet-overlay rules → per-node line diff + accept↔drop conflict
+/ redundancy warnings, read-only), **Effective render** (any node's merged
+drop-in + layer breakdown + rendered-vs-applied drift; works while still dark),
+and **Logs** (realtime dropped-packet viewer — see below).
+
+**Realtime firewall logs (#404).** An opt-in
+`platform_settings.firewall_logging_enabled` toggle (off by default; `PUT
+/appliance/firewall/logging`, migration `c5f1a2b3d4e6`) appends a rate-limited
+`log prefix "spatium-fw: "` rule to the rendered input chain just before the
+`policy drop`, so dropped / rejected packets are logged to the kernel ring
+buffer. The supervisor tails `/dev/kmsg` for `spatium-fw:` lines into a ring
+buffer (`kmsg_reader.py`), exposed through a new `firewall_logs` nettool; the
+**Logs** section streams them live (2 s poll) and — because it routes through
+the per-appliance nettool proxy — works for **remote** appliances too, not just
+the local control plane. Needs `kernel.dmesg_restrict=0` (a baked sysctl
+drop-in ships it) so the unprivileged supervisor can read the ring buffer; the
+rule is folded into the body before the bundle hash, so toggling it re-fires
+each node's `spatium-firewall-reload`.
 
 **Turning enforcement on (the field-test recipe).** `PUT
 /appliance/firewall/enforcement {enabled:true}` flips the master switch — but
@@ -476,14 +492,18 @@ The Talos-style console got a wave of usability fixes:
 - New `Watchdog` header line surfacing the external watchdog state — green `Loop ticking · Ns ago`, yellow `Loop stale · Ns ago`, red `Restart cap hit` when the rate-limit alert trigger is present.
 - Services panel unions whichever supervisor-managed service is either in `docker ps` or listed in `role-compose.env`'s `COMPOSE_PROFILES`, so a crashed / removed container surfaces as `(not running)` rather than disappearing entirely.
 
-### Verbose boot console (standard Linux console)
+### Console mode (dashboard / verbose dashboard / text login)
 
-By default the appliance boots quietly (`loglevel=3` — only kernel errors reach the console) and the Talos-style dashboard claims tty1, so operators see almost no kernel / systemd output during boot / reboot / shutdown. A **Boot console** toggle on **Appliance → Network & Host** switches the box to a *standard Linux console*: it drops the `loglevel=3` cap (all kernel messages scroll), adds `systemd.show_status=1` (the per-unit `[ OK ]` lines), and passes `spatium-console=off` (a normal getty login replaces the dashboard) — i.e. boot looks like a regular Linux server, which is invaluable for diagnosing a boot hang or panic.
+By default the appliance boots quietly (`loglevel=3` — only kernel errors reach the console) and the Talos-style cockpit claims tty1, so operators see almost no kernel / systemd output during boot. A **Boot console** selector on **Appliance → Network & Host** (#393 — replacing the old binary verbose-boot toggle, which conflated boot verbosity with the post-boot console and couldn't express "verbose boot, then dashboard") picks one of three modes:
 
-- **Mechanism.** Backed by `platform_settings.verbose_boot`; it rides the same host-config plane as timezone / NTP / SNMP (PlatformSettings → supervisor heartbeat `desired_verbose_boot` → `spatiumddi-verbose-boot-reload` host runner). Because the kernel cmdline lives in `grub.cfg` (not a file the running OS re-reads), the runner flips a **grubenv variable** (`spatium_verbose`) that a conditional in the per-slot menuentries reads. grubenv lives on the shared ESP, so the setting **survives A/B slot upgrades + rollbacks + the /etc overlay** verbatim.
+- **`dashboard`** (default) — quiet boot, then the cockpit on tty1.
+- **`verbose_dashboard`** — full kernel + `systemd.show_status=1` boot output (invaluable for diagnosing a boot hang / panic), *then* the cockpit. This is the combination the old toggle couldn't reach.
+- **`text_console`** — verbose boot, then a standard getty login (`spatium-console=off`) instead of the cockpit — boot looks like a regular Linux server end-to-end.
+
+- **Mechanism.** Backed by `platform_settings.console_mode` (Literal-validated to the three values; migration `a7c3e9f1b405` adds it, backfills from the old `verbose_boot` flag — `True` → `text_console` — then drops `verbose_boot`). It rides the same host-config plane as timezone / NTP / SNMP (PlatformSettings → supervisor heartbeat `console_mode` → `maybe_fire_console_mode` → host runner). Because the kernel cmdline lives in `grub.cfg` (not a file the running OS re-reads), the runner flips a **grubenv variable** (`spatium_verbose`) that a `0` / `1` / `2` conditional in the per-slot menuentries reads (rendered by #395's `spatium-grub-render`). The mode → grubenv map keeps `dashboard = 0` + `text_console = 1` so pre-#393 grubenv values still resolve fail-closed; `verbose_dashboard = 2` is the new branch. grubenv lives on the shared ESP, so the setting **survives A/B slot upgrades + rollbacks + the /etc overlay** verbatim.
 - **Applies on the next reboot** (GRUB only reads the cmdline at boot) — the UI says so and points at the Maintenance-tab reboot.
-- **Default off, opt-in per box.** Doesn't regress the polished quiet-boot experience for appliances that don't want it.
-- **Anti-brick.** Only changes log verbosity + which process owns the TTY — never the slot / root UUID / kernel. A missing or corrupt grubenv makes the menuentry's conditional fail closed to `loglevel=3` (today's behaviour). The always-present GRUB **`(slot A, verbose boot)`** menuentry remains the zero-config one-shot fallback (drops the loglevel cap + `spatium-console=off` for a single boot, selectable from the boot menu with no reinstall).
+- **`text_console` gets a real login.** `getty@tty1` is gated on `spatium-console=off` (the mirror of the dashboard's gate) and enabled into `getty.target.wants`, so the dashboard and getty are mutually exclusive by their opposite conditions and `text_console` lands a standard agetty login. (A unit-load-time `Conflicts=getty` leak that left `text_console` with *no* login was fixed in #393 / #394 — see CHANGELOG.)
+- **Anti-brick.** Only changes log verbosity + which process owns the TTY — never the slot / root UUID / kernel. A missing or corrupt grubenv makes the menuentry's conditional fail closed to `loglevel=3` + the dashboard. The always-present GRUB verbose-boot menuentry remains the zero-config one-shot fallback (drops the loglevel cap for a single boot, selectable from the boot menu with no reinstall).
 
 ### Fleet UI updates
 

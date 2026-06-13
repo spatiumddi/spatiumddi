@@ -116,6 +116,13 @@ on inactive.
    satisfy an unscoped check (one passed without `resource_id`). This prevents
    "I have write on *this one* subnet" from accidentally granting "write on
    subnets in general".
+5. **Privilege ceiling on role / group edits (#400 C4).** When a non-superadmin
+   creates or edits a role's permission set (or assigns roles to a group), every
+   permission they add must be one they *themselves* effectively hold —
+   `user_has_permission(editor, entry)` must pass for each entry in the new set.
+   This stops, say, an IPAM editor from minting a `{*, *}` role and assigning it
+   to their own group to escalate. Superadmins (either path in the section
+   above) are exempt by rule 1.
 
 ## Built-in roles (seeded on first start)
 
