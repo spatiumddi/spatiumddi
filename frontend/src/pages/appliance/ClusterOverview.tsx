@@ -423,14 +423,30 @@ function NodeCard({ node }: { node: ClusterNodeVitals }) {
           sub={`${fmtBytes(node.memory_working_set_bytes)} / ${fmtBytes(node.memory_capacity_bytes)}`}
         />
         <div className="min-w-0 flex-1 space-y-2 text-[11px]">
-          <div>
+          <div
+            title={
+              "Kubelet node filesystem — container images, pod volumes, and " +
+              "ephemeral storage on the appliance's /var data partition. This " +
+              "is the disk-pressure signal the kubelet evicts on. The OS slot " +
+              "partitions (root A/B) and the ESP are managed separately and " +
+              "aren't shown here."
+            }
+          >
             <div className="flex justify-between text-muted-foreground">
               <span className="flex items-center gap-1">
                 <HardDrive className="h-3 w-3" /> Disk
+                <span className="rounded bg-muted px-1 text-[9px] font-medium uppercase tracking-wide">
+                  node /var
+                </span>
               </span>
               <span className="tabular-nums">
                 {fmtBytes(node.fs_used_bytes)} /{" "}
                 {fmtBytes(node.fs_capacity_bytes)}
+                {diskPct != null && (
+                  <span className="ml-1 text-foreground">
+                    · {Math.round(diskPct)}%
+                  </span>
+                )}
               </span>
             </div>
             <div className="mt-1">
