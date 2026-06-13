@@ -52,10 +52,17 @@ spec:
           image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dnsPowerdns.image.repository) }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           env:
-            # #292 — in-cluster API Service over HTTP; see dns-bind9.yaml
-            # (the external URL's self-signed cert fails agent registration).
+            # #292 / #409 — in-cluster API Service over HTTP by default;
+            # prefer the supervisor-supplied external controlPlaneUrl when
+            # set (Application appliance with its own k3s — no in-cluster
+            # control Service), skipping TLS verify on that self-signed
+            # path. See dns-bind9.yaml for the full rationale.
             - name: CONTROL_PLANE_URL
-              value: {{ .Values.dnsPowerdns.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
+              value: {{ .Values.dnsPowerdns.controlPlaneUrl | default .Values.dnsPowerdns.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
+            {{- if .Values.dnsPowerdns.controlPlaneUrl }}
+            - name: SPATIUM_INSECURE_SKIP_TLS_VERIFY
+              value: "1"
+            {{- end }}
             - name: DNS_AGENT_KEY
               value: {{ .Values.dnsPowerdns.agentKey | quote }}
             - name: AGENT_GROUP

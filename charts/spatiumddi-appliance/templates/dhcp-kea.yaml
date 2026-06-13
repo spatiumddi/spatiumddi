@@ -68,14 +68,17 @@ spec:
             # Kea entrypoint env contract (agent/dhcp/images/kea/
             # entrypoint.sh): SPATIUM_API_URL + SPATIUM_AGENT_KEY +
             # AGENT_GROUP.
-            # #292 — co-located DaemonSet agent reaches the control plane
-            # via the in-cluster API Service over plain HTTP. The external
-            # operator-facing URL (dhcpKea.controlPlaneUrl) carries the
-            # appliance's self-signed cert, which the agent can't verify
-            # → registration fails with CERTIFICATE_VERIFY_FAILED. See
-            # dns-bind9.yaml for the full rationale.
+            # #292 / #409 — in-cluster API Service over HTTP by default;
+            # prefer the supervisor-supplied external controlPlaneUrl when
+            # set (Application appliance with its own k3s — no in-cluster
+            # control Service), skipping TLS verify on that self-signed
+            # path. See dns-bind9.yaml for the full rationale.
             - name: SPATIUM_API_URL
-              value: {{ .Values.dhcpKea.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
+              value: {{ .Values.dhcpKea.controlPlaneUrl | default .Values.dhcpKea.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
+            {{- if .Values.dhcpKea.controlPlaneUrl }}
+            - name: SPATIUM_INSECURE_SKIP_TLS_VERIFY
+              value: "1"
+            {{- end }}
             - name: SPATIUM_AGENT_KEY
               value: {{ .Values.dhcpKea.agentKey | quote }}
             - name: AGENT_GROUP

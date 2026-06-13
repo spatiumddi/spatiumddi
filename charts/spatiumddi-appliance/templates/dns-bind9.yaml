@@ -73,17 +73,26 @@ spec:
           image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dnsBind9.image.repository) }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           env:
-            # #292 — co-located DaemonSet agents reach the control plane
-            # via the in-cluster API Service over plain HTTP. The external
-            # operator-facing URL (dnsBind9.controlPlaneUrl) carries the
-            # appliance's self-signed cert, which the agent can't verify
-            # → registration fails with CERTIFICATE_VERIFY_FAILED. Intra-
-            # cluster traffic needs no TLS, so point at the api Service
-            # directly (same repoint as the #272 supervisor heartbeat).
-            # ``inClusterApiUrl`` overrides the default if a deployment
-            # uses a non-standard control-release name/namespace.
+            # #292 — a co-located DaemonSet agent (control-plane / full-
+            # stack appliance) reaches the control plane via the in-cluster
+            # API Service over plain HTTP; intra-cluster traffic needs no
+            # TLS, so the in-cluster Service is the default.
+            # #409 — but an Application appliance is its OWN single-node k3s
+            # with no in-cluster control Service, so when the supervisor
+            # supplies the external operator-facing URL it must be used.
+            # Precedence: controlPlaneUrl (external; set by the supervisor
+            # only on off-cluster Application appliances) → inClusterApiUrl
+            # (override for non-standard control-release name/ns) → the in-
+            # cluster api Service default. The external URL carries the
+            # appliance's self-signed cert, so the TLS-skip env below is
+            # emitted on that path (same TOFU model as the supervisor pod —
+            # the pairing code + mTLS client cert are the real auth).
             - name: CONTROL_PLANE_URL
-              value: {{ .Values.dnsBind9.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
+              value: {{ .Values.dnsBind9.controlPlaneUrl | default .Values.dnsBind9.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
+            {{- if .Values.dnsBind9.controlPlaneUrl }}
+            - name: SPATIUM_INSECURE_SKIP_TLS_VERIFY
+              value: "1"
+            {{- end }}
             - name: DNS_AGENT_KEY
               value: {{ .Values.dnsBind9.agentKey | quote }}
             - name: AGENT_GROUP
