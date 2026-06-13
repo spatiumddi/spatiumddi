@@ -1345,6 +1345,65 @@ def _compact_journal_line(line: str) -> str:
     return f"{date} {ts}  {unit}  {rest}"
 
 
+class AppLogTail(threading.Thread):
+    """Tail the SpatiumDDI app pods (api / worker / beat / frontend) into
+    the SAME deque as JournalTail, so the live-log pane shows real platform
+    activity — requests, Celery tasks, DNS/DHCP — not just filtered k3s
+    noise. Streams via ``kubectl logs -f`` (apiserver proxy, no extra deps);
+    drops health-probe spam; compacts the ``[pod/.../container]`` prefix to
+    the bare component name."""
+
+    _SELECTOR = "app.kubernetes.io/instance=spatium-control"
+    _PROBE_RE = re.compile(r"/health/(ready|live)|/healthz|kube-probe")
+    _PREFIX_RE = re.compile(r"^\[pod/\S*?spatiumddi-([a-z0-9]+)-\S*?\]\s*")
+
+    def __init__(self, sink: "deque[str]"):
+        super().__init__(daemon=True)
+        self.lines = sink
+        self._stop = threading.Event()
+        self._proc: subprocess.Popen | None = None
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except (ProcessLookupError, OSError):
+                pass
+
+    def run(self) -> None:
+        env = {**os.environ, "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"}
+        while not self._stop.is_set():
+            argv = [
+                "/usr/local/bin/k3s", "kubectl", "logs",
+                "-n", "spatium", "--all-containers", "--prefix",
+                "--since", "15s", "--tail", "4",
+                "--max-log-requests", "12", "-f", "-l", self._SELECTOR,
+            ]
+            try:
+                self._proc = subprocess.Popen(
+                    argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, bufsize=1, env=env,
+                )
+            except (FileNotFoundError, OSError):
+                return  # no k3s / kubectl — app log simply absent
+            assert self._proc.stdout is not None
+            for line in self._proc.stdout:
+                if self._stop.is_set():
+                    break
+                line = line.rstrip("\n")
+                if not line or self._PROBE_RE.search(line):
+                    continue
+                comp = self._PREFIX_RE.match(line)
+                if comp:
+                    line = f"{comp.group(1):<9} {line[comp.end():]}"
+                self.lines.append("app  " + line[:240])
+            self._proc = None
+            if self._stop.is_set():
+                return
+            time.sleep(2)
+
+
 class JournalTail(threading.Thread):
     """Tail journalctl into a deque so the renderer can read recent
     lines without blocking on subprocess I/O each refresh."""
@@ -2653,6 +2712,19 @@ def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple
     return ("Bootstrapping…", "bold yellow")
 
 
+def _log_line_style(line: str) -> str:
+    """Colour a log line by severity for the live-log pane: red on an
+    error/failure marker, yellow on a warning, dim otherwise."""
+    low = line.lower()
+    if ("error" in low or "fail" in low or "fatal" in low or "panic" in low
+            or "refused" in low or "traceback" in low or " 500 " in line
+            or " 503 " in line):
+        return "red"
+    if "warn" in low:
+        return "yellow"
+    return "dim"
+
+
 def render_log(tail: JournalTail, height: int) -> Panel:
     # Take the last `height-2` lines (room for borders). On a fresh
     # boot the deque can be empty for a few seconds — render a
@@ -2661,7 +2733,7 @@ def render_log(tail: JournalTail, height: int) -> Panel:
         body: Group | Text = Text("(waiting for log output…)", style="dim italic")
     else:
         body = Group(*(
-            Text(line, style="dim", overflow="ellipsis", no_wrap=True)
+            Text(line, style=_log_line_style(line), overflow="ellipsis", no_wrap=True)
             for line in list(tail.lines)[-(max(height - 2, 1)):]
         ))
     # P0.10 — honest title: this pane tails the k3s system journal (the
@@ -2669,7 +2741,7 @@ def render_log(tail: JournalTail, height: int) -> Panel:
     # The "· k3s system" suffix stops the operator from expecting app
     # events until the P1 app-log tail lands.
     return Panel(body, box=SQUARE, border_style="cyan",
-                 title="[bold]Live log[/bold] · k3s system", title_align="left")
+                 title="[bold]Live log[/bold] · k3s + app", title_align="left")
 
 
 def render_footer(message: str = "", role: str = "control-plane") -> Text:
@@ -3610,6 +3682,8 @@ def main() -> int:
 
     tail = JournalTail(JOURNAL_UNITS)
     tail.start()
+    app_tail = AppLogTail(tail.lines)
+    app_tail.start()
 
     # Prime psutil's CPU sampler so the first frame doesn't show 0.0% —
     # cpu_percent(None) returns the delta since the last call; the
