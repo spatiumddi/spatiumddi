@@ -1643,16 +1643,23 @@ class KeyReader(threading.Thread):
 # ── rendering ────────────────────────────────────────────────────────
 
 
+# Glyph discipline: the appliance console font (Lat15-Terminus12x6, 256
+# glyphs) has ● U+25CF and ■ U+25A0 but NOT ✓ U+2713 / ◐ U+25D0 / ○ U+25CB
+# (those rendered as the missing-glyph diamond on the real VGA console — the
+# same class of bug as the eighth-block sparklines). So state is carried by
+# COLOUR on two font-safe shapes: ● = a live/active dot (green ok / yellow
+# transitional / red bad), ■ = a terminal/stopped block (red exited / dim
+# inactive). The state TEXT beside the glyph disambiguates completed-vs-running.
 HEALTH_STYLES = {
     "healthy":    ("●", "bold green"),
     "running":    ("●", "bold green"),
-    "completed":  ("✓", "bold green"),   # one-shot exit 0 (e.g. migrate)
-    "starting":   ("◐", "bold yellow"),
+    "completed":  ("●", "bold green"),   # was ✓ (absent) — one-shot exit 0 (migrate)
+    "starting":   ("●", "bold yellow"),  # was ◐ (absent)
     "unhealthy":  ("●", "bold red"),
-    "restarting": ("◐", "bold yellow"),
-    "exited":     ("○", "bold red"),
-    "created":    ("○", "dim"),
-    "missing":    ("○", "dim"),
+    "restarting": ("●", "bold yellow"),  # was ◐ (absent)
+    "exited":     ("■", "bold red"),     # was ○ (absent); ■ reads as "stopped"
+    "created":    ("■", "dim"),          # was ○ (absent)
+    "missing":    ("■", "dim"),          # was ○ (absent)
     "unknown":    ("?", "dim"),
 }
 
@@ -2597,7 +2604,7 @@ def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple
       plane has rejected our heartbeats long enough that the
       supervisor flipped to the revoked state (issue #170 Wave E
       follow-up). Takes precedence over cert.pem so a stale-cert
-      "Approved ✓" can't mislead the operator after a server-side
+      "Approved ●" can't mislead the operator after a server-side
       deletion.
     * ``identity/appliance_id`` — created when the supervisor's
       pairing-code claim succeeds.
@@ -2625,7 +2632,7 @@ def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple
         return ("Approval revoked — re-pair from /appliance/pairing", "bold red")
 
     if cert_file.exists() and cert_file.stat().st_size > 0:
-        return ("Approved ✓", "bold green")
+        return ("Approved ●", "bold green")
     if appliance_id_file.exists() and appliance_id_file.stat().st_size > 0:
         return ("Awaiting approval", "bold yellow")
     # No appliance_id yet — supervisor either hasn't claimed the
@@ -2835,6 +2842,248 @@ def render_top_pods(state: "DashboardState", height: int) -> Panel:
                  title="[bold]Top pods[/bold] · CPU / mem", title_align="left")
 
 
+# ── Phase 2 KPI ribbon (§4) ────────────────────────────────────────────
+# A row of fixed-height (3 body + 2 border = 5) stat boxes placed in the
+# ``kpi`` Layout. Every box reads state.* ONLY (the few file-stats here —
+# slot_info() process-cached, reboot_pending()/upgrade_status() stat the
+# release-state dir — already rode the PHASE-1 header render path, so this
+# is no regression). Each box is rendered through ``_kpi_safe`` so a single
+# malformed value degrades to a dim "n/a" box rather than blanking the frame.
+
+
+def _slot_letter(s: str) -> str:
+    """``slot_a`` → ``A``, ``slot_b`` → ``B``; pass anything else through
+    so a future ``slot_c`` doesn't render empty. (Was an inline helper in
+    the PHASE-1 header; hoisted to module scope for the Slot KPI box.)"""
+    if s.startswith("slot_") and len(s) > 5:
+        return s[5:].upper()
+    return s
+
+
+def _kpi_box(
+    title: str,
+    body_rows: list,
+    border_style: str,
+    subtitle: str | None = None,
+) -> Panel:
+    """A KPI stat box clamped to EXACTLY 3 body rows (+2 border = 5), so
+    every box in the ribbon is the same height regardless of content and
+    the grid row never ragged-aligns."""
+    rows = list(body_rows)[:3]
+    while len(rows) < 3:
+        rows.append(Text(""))
+    return Panel(
+        Group(*rows), box=SQUARE, border_style=border_style,
+        title=title, title_align="left", subtitle=subtitle, padding=(0, 1),
+    )
+
+
+def _kpi_na(title: str) -> Panel:
+    """Dim ``n/a`` box — the placeholder for collectors not yet populated
+    (etcd/pg/api/platform until INC 3/4) and the try/except fallback."""
+    return _kpi_box(title, [Text("n/a", style="dim")], "cyan")
+
+
+def _kpi_safe(fn, state: "DashboardState", title: str) -> Panel:
+    try:
+        return fn(state)
+    except Exception:
+        return _kpi_na(title)
+
+
+def render_kpi_cluster(state: "DashboardState") -> Panel:
+    """Cluster box — node readiness · k3s version · node-CPU heat bar.
+
+    Restores the k3s + node-health visibility removed from the header in
+    INC 1. The node-CPU bar shows ``n/a`` until INC 4 lands the kubelet
+    ``.node`` parse. Border: green all-ready / amber not-all-ready (red
+    QUORUM-LOST arrives with the etcd gate in INC 3)."""
+    nodes = state.nodes
+    ready = sum(1 for n in nodes if n.get("ready") == "True")
+    total = len(nodes)
+    all_ready = total > 0 and ready == total
+    border = "green" if all_ready else ("yellow" if total else "red")
+
+    row1 = Text()
+    row1.append(f"{ready}/{total} Ready" if total else "no nodes",
+                style="bold green" if all_ready else "bold yellow")
+
+    row2 = Text()
+    row2.append("k3s ", style="dim")
+    if state.k3s_state is not None:
+        klabel, kstyle = state.k3s_state
+        row2.append(klabel, style=kstyle)
+    elif nodes and nodes[0].get("version"):
+        row2.append(nodes[0]["version"], style="dim")
+    else:
+        row2.append("—", style="dim")
+
+    row3 = Text()
+    row3.append("node ", style="dim")
+    if state.node_cpu_pct is None:
+        row3.append("n/a", style="dim")
+    else:
+        row3.append_text(_heat_bar(state.node_cpu_pct, 100.0, 5))
+        row3.append(f" {state.node_cpu_pct:.0f}%", style="dim")
+
+    return _kpi_box("[bold]Cluster[/bold]", [row1, row2, row3], border)
+
+
+def render_kpi_etcd(state: "DashboardState") -> Panel:
+    """etcd box — placeholder until INC 3 lands fetch_etcd_health()."""
+    if not state.etcd:
+        return _kpi_na("[bold]etcd[/bold]")
+    e = state.etcd
+    has_leader = e.get("has_leader", 0) == 1
+    prop_fail = int(e.get("proposals_failed", 0) or 0)
+    db = float(e.get("db_in_use", 0) or 0)
+    border = "green" if (has_leader and prop_fail == 0) else "bold red"
+    row1 = Text()
+    row1.append("leader ", style="dim")
+    row1.append("●", style="green") if has_leader else row1.append("NO LEADER", style="bold red")
+    row2 = Text()
+    row2.append(f"{_human_bytes(db)}/2G ", style="dim")
+    row2.append_text(_heat_bar(db, 2 * 2**30, 6))
+    row3 = Text()
+    row3.append("prop-fail ", style="dim")
+    row3.append(str(prop_fail), style="green" if prop_fail == 0 else "bold red")
+    return _kpi_box("[bold]etcd[/bold]", [row1, row2, row3], border)
+
+
+def render_kpi_pg(state: "DashboardState") -> Panel:
+    """Postgres box — placeholder until INC 4 lands fetch_cnpg_metrics()."""
+    if not state.cnpg:
+        return _kpi_na("[bold]Postgres[/bold]")
+    c = state.cnpg
+    waiting = int(c.get("backends_waiting", 0) or 0)
+    conns = int(c.get("backends", 0) or 0)
+    size = float(c.get("db_size", 0) or 0)
+    role = "replica" if c.get("in_recovery") else "primary"
+    border = "green" if waiting == 0 else "yellow"
+    row1 = Text(role, style="bold")
+    row2 = Text()
+    row2.append(f"{conns} conn  ", style="dim")
+    row2.append(f"{waiting} wait", style="dim" if waiting == 0 else "bold yellow")
+    row3 = Text(_human_bytes(size), style="dim")
+    return _kpi_box("[bold]Postgres[/bold]", [row1, row2, row3], border)
+
+
+def render_kpi_api(state: "DashboardState") -> Panel:
+    """API box — placeholder until INC 4 lands fetch_api_metrics()."""
+    if not state.api_ip:
+        return _kpi_na("[bold]API[/bold]")
+    border = "green" if (state.api_ready.get("status") == "ok" or not state.api_ready) else "yellow"
+    row1 = Text(f"{state.api_req_rate:.1f} req/s", style="bold cyan")
+    row2 = Text()
+    row2.append("active ", style="dim")
+    row2.append(str(state.api_active), style="bold")
+    row3 = Text()
+    row3.append(f"{state.api_total} total", style="dim")
+    return _kpi_box("[bold]API[/bold]", [row1, row2, row3], border)
+
+
+def render_kpi_platform(state: "DashboardState") -> Panel:
+    """Platform box — placeholder until INC 4 lands fetch_api_ready()."""
+    if not state.api_ready:
+        return _kpi_na("[bold]Platform[/bold]")
+    r = state.api_ready
+    checks = r.get("checks") or {}
+
+    def _dot(ok: bool) -> Text:
+        g, s = HEALTH_STYLES["healthy" if ok else "unhealthy"]
+        return Text(g, style=s)
+
+    all_ok = r.get("status") == "ok"
+    border = "green" if all_ok else "bold red"
+    rows = []
+    for name in ("database", "redis", "schema"):
+        ok = str(checks.get(name, "")).lower() in ("ok", "up", "true", "ready")
+        t = Text()
+        t.append(f"{name[:6]} ", style="dim")
+        t.append_text(_dot(ok))
+        rows.append(t)
+    return _kpi_box("[bold]Platform[/bold]", rows, border)
+
+
+def render_kpi_slot(state: "DashboardState") -> Panel:
+    """Slot / Upgrade box — A/B installed versions + trial / upgrade /
+    reboot status. Restores the slot + reboot-pending (P0.9) + trial-boot
+    safety lines removed from the header in INC 1. Amber on any pending
+    trial / upgrade / reboot; green when committed with nothing pending."""
+    slots = slot_info()
+    if slots is None:
+        return _kpi_na("[bold]Slot[/bold]")
+    current, durable = slots
+    cur = _slot_letter(current)
+    dur = _slot_letter(durable) if durable else ""
+    ver_a = state.slot_a_version or "—"
+    ver_b = state.slot_b_version or "—"
+
+    def slot_row(letter: str, ver: str) -> Text:
+        booted = letter == cur
+        t = Text()
+        t.append(f"{letter} ", style="bold cyan" if booted else "dim")
+        t.append(ver, style="bold cyan" if booted else "dim")
+        tags = []
+        if booted:
+            tags.append("booted")
+        if letter == dur:
+            tags.append("default")
+        if tags:
+            t.append("  " + "·".join(tags), style="dim")
+        return t
+
+    rows = [slot_row("A", ver_a), slot_row("B", ver_b)]
+
+    border = "green"
+    ustatus = upgrade_status() if state.role in ("appliance", "application") else None
+    nxt = state.slot_next_entry
+    if reboot_pending():
+        rows.append(Text("REBOOT pending — F5", style="bold bright_yellow"))
+        border = "yellow"
+    elif ustatus is not None:
+        ulabel, ustyle = ustatus
+        rows.append(Text(ulabel, style=ustyle))
+        border = "yellow"
+    elif durable and durable != current:
+        rows.append(Text(f"TRIAL — reboot→{dur}", style="bold bright_yellow"))
+        border = "yellow"
+    elif nxt and nxt != durable and nxt != current:
+        rows.append(Text(f"Next→{_slot_letter(nxt)} (trial)", style="bold bright_yellow"))
+        border = "yellow"
+    else:
+        rows.append(Text("committed — no trial", style="dim"))
+
+    return _kpi_box("[bold]Slot[/bold]", rows, border)
+
+
+def render_kpi_ribbon(state: "DashboardState", cols: int):
+    """Build the KPI ribbon as a 1-row ``Table.grid`` of stat boxes (§4).
+    Horizontal clamp (§3c): six boxes at ≥150 cols, the highest-value three
+    (Cluster / Platform / Slot) below that. The Slot box gets a wider column
+    (ratio 2) since its version strings are the longest."""
+    if cols >= 150:
+        specs = [
+            (render_kpi_cluster, "[bold]Cluster[/bold]", 1),
+            (render_kpi_etcd, "[bold]etcd[/bold]", 1),
+            (render_kpi_pg, "[bold]Postgres[/bold]", 1),
+            (render_kpi_api, "[bold]API[/bold]", 1),
+            (render_kpi_platform, "[bold]Platform[/bold]", 1),
+            (render_kpi_slot, "[bold]Slot[/bold]", 2),
+        ]
+    else:
+        specs = [
+            (render_kpi_cluster, "[bold]Cluster[/bold]", 1),
+            (render_kpi_platform, "[bold]Platform[/bold]", 1),
+            (render_kpi_slot, "[bold]Slot[/bold]", 2),
+        ]
+    grid = Table.grid(expand=True, padding=(0, 0))
+    for _fn, _title, ratio in specs:
+        grid.add_column(ratio=ratio)
+    grid.add_row(*[_kpi_safe(fn, state, title) for fn, title, _ratio in specs])
+    return grid
+
+
 # ── Phase 2 sizing constants (§3) ──────────────────────────────────────
 # Every fixed band is a literal constant now — the constant-header model
 # (§3a) eliminated the old ``short_count`` mirror-bug class entirely.
@@ -2963,9 +3212,10 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
 
     layout["header"].update(render_header(state, mono_t))
 
-    # KPI ribbon — INC 1 leaves an EMPTY placeholder; INC 2 fills it.
+    # KPI ribbon — the row of stat boxes (§4). Width drives the 6-vs-3 box
+    # clamp inside render_kpi_ribbon.
     if show_kpi:
-        layout["kpi"].update(Text(""))
+        layout["kpi"].update(render_kpi_ribbon(state, cols))
 
     # ── main row — pods | top-pods split_row (§2) ───────────────────────
     layout["main"].split_row(
@@ -3060,6 +3310,20 @@ class DashboardState:
         )
         self.disks: list[tuple[str, float, float, float]] = []
         self.pod_stats: dict = {}
+        # Phase 2 KPI-ribbon collectors (5 s data tier). Default empty so
+        # the etcd / Postgres / API / Platform boxes render dim "n/a" until
+        # INC 3 (etcd) + INC 4 (api/cnpg/node-parse) populate them. Adding
+        # the fields now keeps the INC 2 placeholder boxes AttributeError-free.
+        self.etcd: dict = {}
+        self.cnpg: dict = {}
+        self.api_ready: dict = {}
+        self.api_ip: str | None = None
+        self.api_req_rate: float = 0.0
+        self.api_active: int = 0
+        self.api_total: int = 0
+        self.node_cpu_pct: float | None = None
+        self.node_mem_pct: float | None = None
+        self.node_fs_pct: float | None = None
 
     def refresh(self, force: bool = False) -> None:
         now = time.monotonic()
