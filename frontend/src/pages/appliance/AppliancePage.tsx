@@ -195,6 +195,9 @@ export function AppliancePage() {
   // #404 — a deep-link / onNavigateTab target that now lives in the Fleet
   // sidebar jumps to Fleet and hands the section down for FleetTab to select.
   const [fleetSection, setFleetSection] = useState<string | null>(null);
+  // Deep-linked sub-section for the Cluster tab (e.g. Platform Insights →
+  // Containers links to ?tab=cluster&section=pods, #404 follow-up).
+  const [clusterSection, setClusterSection] = useState<string | null>(null);
   const navigate = (t: string) => {
     const target = LEGACY_TAB_TO_FLEET_SECTION[t];
     if (target) {
@@ -216,6 +219,7 @@ export function AppliancePage() {
   // deep-linked tab turns out to be hidden on a docker/k8s control plane.
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab");
+  const requestedSection = searchParams.get("section");
   useEffect(() => {
     if (!requestedTab) return;
     const target = LEGACY_TAB_TO_FLEET_SECTION[requestedTab];
@@ -226,11 +230,17 @@ export function AppliancePage() {
       setFleetSection(target);
     } else if (TABS.some((t) => t.key === requestedTab)) {
       setTab(requestedTab as Tab);
+      // ?section= deep-links a tab's left sub-section (Cluster: Platform
+      // Insights → Containers points at ?tab=cluster&section=pods).
+      if (requestedTab === "cluster" && requestedSection) {
+        setClusterSection(requestedSection);
+      }
     }
     const next = new URLSearchParams(searchParams);
     next.delete("tab");
+    next.delete("section");
     setSearchParams(next, { replace: true });
-  }, [requestedTab, searchParams, setSearchParams, setTab]);
+  }, [requestedTab, requestedSection, searchParams, setSearchParams, setTab]);
 
   const effectiveTab: Tab = visibleTabs.some((t) => t.key === tab)
     ? tab
@@ -314,7 +324,10 @@ export function AppliancePage() {
         ) : effectiveTab === "firewall" ? (
           <FirewallTab />
         ) : effectiveTab === "cluster" ? (
-          <ClusterTab />
+          <ClusterTab
+            initialSection={clusterSection}
+            onSectionApplied={() => setClusterSection(null)}
+          />
         ) : effectiveTab === "logs" ? (
           <LogsTab />
         ) : effectiveTab === "network" ? (

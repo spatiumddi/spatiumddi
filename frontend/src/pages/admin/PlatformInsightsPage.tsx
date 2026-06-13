@@ -443,7 +443,7 @@ function ContainersPanel() {
 
   // On a k3s appliance the control-plane workloads run as Kubernetes pods,
   // not Docker containers, so this docker-stats view is empty/irrelevant.
-  // Send the operator to the Appliance → Pods surface (live logs + restart).
+  // Send the operator to Appliance → Cluster → Pods (live logs + restart).
   if (isAppliance) {
     return (
       <div className="rounded border border-blue-500/40 bg-blue-500/5 p-4">
@@ -455,10 +455,10 @@ function ContainersPanel() {
           Control-plane workloads run as Kubernetes pods, not Docker containers.
           View and manage them — with restart and live log streaming — under{" "}
           <Link
-            to="/appliance?tab=containers"
+            to="/appliance?tab=cluster&section=pods"
             className="font-medium text-primary hover:underline"
           >
-            Appliance → Pods
+            Appliance → Cluster → Pods
           </Link>
           .
         </p>

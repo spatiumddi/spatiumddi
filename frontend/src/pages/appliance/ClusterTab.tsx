@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   Boxes,
@@ -62,11 +63,29 @@ const SECTIONS: {
   },
 ];
 
-export function ClusterTab() {
+export function ClusterTab({
+  initialSection = null,
+  onSectionApplied,
+}: {
+  // #404 follow-up — a deep-link (?tab=cluster&section=pods, e.g. from Platform
+  // Insights → Containers) selects a sub-section on arrival; cleared via
+  // onSectionApplied so re-navigating to the same section fires again.
+  initialSection?: string | null;
+  onSectionApplied?: () => void;
+} = {}) {
   const [section, setSection] = useSessionState<ClusterSection>(
     "appliance.cluster.section",
     "overview",
   );
+
+  useEffect(() => {
+    if (initialSection) {
+      setSection(initialSection as ClusterSection);
+      onSectionApplied?.();
+    }
+    // Gate purely on the prop; setSection/onSectionApplied identities are stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialSection]);
 
   // Shared with EtcdSnapshotsCard (same query key → React Query dedupes)
   // purely so the etcd section can show a friendly placeholder instead of
