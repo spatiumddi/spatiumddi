@@ -105,12 +105,22 @@ def _age_seconds(iso: str | None) -> int | None:
 # ── per-resource extractors ────────────────────────────────────────────────
 
 
+_ROLE_LABEL_NS = "node-role.kubernetes.io"
+
+
 def _node_roles(node: dict[str, Any]) -> list[str]:
+    """Roles from ``node-role.kubernetes.io/<role>`` label keys (k3s sets
+    control-plane / etcd / master). Match the label *namespace* exactly via
+    ``partition`` rather than a prefix ``startswith`` — the latter is an
+    incomplete-substring check (CodeQL py/incomplete-url-substring-sanitization)
+    and an exact equality is also more precise."""
     labels = (node.get("metadata") or {}).get("labels") or {}
-    roles = sorted(
-        k.split("/", 1)[1] for k in labels if k.startswith("node-role.kubernetes.io/") and "/" in k
-    )
-    return roles or ["worker"]
+    roles: list[str] = []
+    for key in labels:
+        ns, sep, role = key.partition("/")
+        if sep and ns == _ROLE_LABEL_NS and role:
+            roles.append(role)
+    return sorted(roles) or ["worker"]
 
 
 def _node_condition(node: dict[str, Any], kind: str) -> bool:
