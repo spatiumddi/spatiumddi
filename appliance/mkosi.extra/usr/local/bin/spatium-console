@@ -2201,6 +2201,19 @@ _POD_NAME_PREFIXES = (
 )
 
 
+def _pod_display_name(row: dict) -> str:
+    """Short pod name + a ``(primary)`` / ``(replica)`` suffix for CNPG
+    Postgres instances (cnpg.io/instanceRole label) so failover triage at
+    the console knows which instance currently serves writes (P1.7)."""
+    name = _short_pod_name(row.get("Names") or "")
+    labels = row.get("Labels") or {}
+    if isinstance(labels, dict):
+        role = labels.get("cnpg.io/instanceRole") or labels.get("role")
+        if role in ("primary", "replica"):
+            name = f"{name} ({role})"
+    return name
+
+
 def _short_pod_name(name: str) -> str:
     for p in _POD_NAME_PREFIXES:
         if name.startswith(p):
@@ -2385,7 +2398,7 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         tbl.add_row(
             Text(glyph, style=style),
             Text(row.get("Namespace") or "—", style="dim"),
-            Text(_short_pod_name(row.get("Names") or ""), style="bold"),
+            Text(_pod_display_name(row), style="bold"),
             Text(row.get("Type") or "—", style="dim"),
             Text(row.get("Node") or "—", style="dim"),
             Text(ready, style=ready_style),
