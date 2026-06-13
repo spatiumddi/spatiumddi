@@ -2982,15 +2982,42 @@ def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple
     return ("Bootstrapping…", "bold yellow")
 
 
+# Severity matchers for the live-log pane (compiled once). Level TOKENS only,
+# never bare substrings — see _log_line_style's docstring for why. The
+# uppercase alternatives are case-SENSITIVE (a real Python/Celery level token
+# is uppercase), so a lowercase ``error``/``failed`` in a message body or a
+# result dict does NOT match; the lowercase ``level=…`` / JSON forms are
+# matched explicitly for k3s / structlog.
+_LOG_RED_RE = re.compile(
+    r"\b(?:ERROR|CRITICAL|FATAL|PANIC|EMERG|ALERT)\b"
+    r"|level=(?:error|fatal|critical|panic|emerg|alert)\b"
+    r'|"level"\s*:\s*"(?:error|fatal|critical|emergency)"'
+    r"|Traceback \(most recent call last\)"
+    r'|HTTP/[0-9.]+"\s+5\d\d\b'
+    r"|connection refused|Connection refused"
+)
+_LOG_YELLOW_RE = re.compile(
+    r"\b(?:WARNING|WARN)\b"
+    r"|level=warn(?:ing)?\b"
+    r'|"level"\s*:\s*"warn(?:ing)?"'
+)
+
+
 def _log_line_style(line: str) -> str:
-    """Colour a log line by severity for the live-log pane: red on an
-    error/failure marker, yellow on a warning, dim otherwise."""
-    low = line.lower()
-    if ("error" in low or "fail" in low or "fatal" in low or "panic" in low
-            or "refused" in low or "traceback" in low or " 500 " in line
-            or " 503 " in line):
+    """Colour a log line by its SEVERITY LEVEL for the live-log pane: red on
+    error/fatal, yellow on warning, dim otherwise.
+
+    Matches the level TOKEN, not a bare substring — an earlier version
+    flagged any line containing ``fail``/``error`` anywhere, so a perfectly
+    healthy Celery INFO line whose result dict reported ``{'failed': 0}`` (or
+    a message like "0 errors") rendered alarming red. We instead match the
+    uppercase level word at a boundary (Python/Celery: ``... ERROR/Worker``),
+    the ``level=error`` / ``"level":"error"`` forms (k3s / structlog), a
+    Python traceback header, a 5xx HTTP status right after the request line,
+    and "connection refused"."""
+    if _LOG_RED_RE.search(line):
         return "red"
-    if "warn" in low:
+    if _LOG_YELLOW_RE.search(line):
         return "yellow"
     return "dim"
 
@@ -3649,36 +3676,54 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
 
     # ── COMPACT tree (§2) — header(4) / main / log / footer, no KPI ─────
     if COMPACT:
+        # Size the Pods panel to its CONTENT (not a fixed half) so it doesn't
+        # leave a blank gap and squeeze the log — the log (ratio=1) absorbs
+        # the leftover rows. Capped at 2/3 of the remainder so a long pod
+        # list still leaves the log a healthy third (overflow → the "+N more"
+        # subtitle).
+        remainder = max(rows - header_rows - footer_rows, _MIN_MAIN + _MIN_LOG)
+        pod_rows, pod_filter = _filtered_pods(state)
+        main_h = max(_MIN_MAIN, min(len(pod_rows) + 3, remainder * 2 // 3))
+        max_pod_rows = max(main_h - 3, 1)  # -3 = top border + col-header + bottom border
+        pods_overflow = max(len(pod_rows) - max_pod_rows, 0)
+        log_h = max(remainder - main_h, _MIN_LOG)
         layout.split_column(
             Layout(name="header", size=header_rows),
-            Layout(name="main", ratio=1),
+            Layout(name="main", size=main_h),
             Layout(name="log", ratio=1),
             Layout(name="footer", size=footer_rows),
         )
         layout["header"].update(render_header(state, mono_t, compact=True))
-        # Pods cap from the ratio split of the remainder (main + log share
-        # 1:1). ``main_h`` is the floor of the post-header/footer budget.
-        remainder = max(rows - header_rows - footer_rows, _MIN_MAIN + _MIN_LOG)
-        main_h = max(remainder // 2, _MIN_MAIN)
-        max_pod_rows = max(main_h - 3, 1)  # -3 = top border + col-header + bottom border
-        pod_rows, pod_filter = _filtered_pods(state)
-        pods_overflow = max(len(pod_rows) - max_pod_rows, 0)
         layout["main"].update(
             render_services(state.role, pod_rows, cap=max_pod_rows,
                             overflow=pods_overflow, filter_label=pod_filter)
         )
-        log_h = max(remainder - main_h, _MIN_LOG)
         layout["log"].update(render_log(state.tail, log_h))
         layout["footer"].update(render_footer(state.status_message, state.role))
         return layout
 
     # ── WIDE / MEDIUM tree (§2) ─────────────────────────────────────────
+    # Size the main (pods | top-pods) row to its CONTENT so it neither leaves
+    # a blank gap nor hogs the screen; the log (ratio=1) then absorbs the rest
+    # — it grows when pods are few and can never be the band that clips
+    # (operator feedback: the log was getting squeezed under a fixed 2/3
+    # main). Cap main at 2/3 of the remainder so a long pod list still leaves
+    # the log a healthy third (overflow → the "+N more" subtitle). main_h
+    # fits the TALLER of Pods / Top-pods (they share the split_row height).
+    remainder = max(rows - reserved, _MIN_MAIN + _MIN_LOG)
+    pod_rows, pod_filter = _filtered_pods(state)
+    main_content = max(len(pod_rows), len(state.pod_stats), 1) + 3  # col-header + 2 border
+    main_h = max(_MIN_MAIN, min(main_content, remainder * 2 // 3))
+    log_h = max(remainder - main_h, _MIN_LOG)
+    max_pod_rows = max(main_h - 3, 1)
+    pods_overflow = max(len(pod_rows) - max_pod_rows, 0)
+
     children = [Layout(name="header", size=header_rows)]
     if show_kpi:
         children.append(Layout(name="kpi", size=kpi_rows))
     if show_nodes:
         children.append(Layout(name="nodes", size=nodes_rows))
-    children.append(Layout(name="main", ratio=2))
+    children.append(Layout(name="main", size=main_h))
     children.append(Layout(name="log", ratio=1))
     children.append(Layout(name="footer", size=footer_rows))
     layout.split_column(*children)
@@ -3695,17 +3740,6 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
         Layout(name="pods", ratio=3),
         Layout(name="top", ratio=2),
     )
-
-    # Pods cap (§3c) — main height comes from the ratio split of the
-    # remainder; pods can show at most ``main_h - 3`` rows (border +
-    # col-header + the trailing "+M more" row). ``visible_pods`` already
-    # drops Succeeded; the unhealthy-first sort lives in render_services.
-    remainder = max(rows - reserved, _MIN_MAIN + _MIN_LOG)
-    main_h = max(remainder * 2 // 3, _MIN_MAIN)
-    log_h = max(remainder - main_h, _MIN_LOG)
-    max_pod_rows = max(main_h - 3, 1)
-    pod_rows, pod_filter = _filtered_pods(state)
-    pods_overflow = max(len(pod_rows) - max_pod_rows, 0)
 
     if show_nodes:
         layout["nodes"].update(
