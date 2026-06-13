@@ -10,8 +10,13 @@ follow-ups). Endpoints:
   ``target_ip`` / ``status``.
 * ``GET /scans/{id}`` — full record (incl. raw XML on completion).
 * ``GET /scans/{id}/stream`` — Server-Sent Events relaying the live
-  ``raw_stdout`` buffer. Auth via ``?token=<jwt-or-api-token>`` query
-  arg because ``EventSource`` can't set Authorization headers.
+  ``raw_stdout`` buffer. Auth preferred via the ``Authorization:
+  Bearer <jwt-or-api-token>`` header (the frontend consumes this
+  stream with ``fetch()`` + ``ReadableStream``, which — unlike
+  ``EventSource`` — can set request headers). A ``?token=`` query
+  arg is still accepted as a back-compat fallback, but is
+  discouraged: SECURITY (#400, M8) tokens in the URL leak via proxy
+  access logs, browser history, and the ``Referer`` header.
 * ``DELETE /scans/{id}`` — operator cancel; flips status to
   ``cancelled`` so the runner self-terminates on its next poll.
 
@@ -486,16 +491,40 @@ async def stamp_discovered(
 # ── SSE stream ──────────────────────────────────────────────────────
 
 
-async def _resolve_user_from_query_token(db: AsyncSession, token: str, request: Request) -> User:
-    """Validate a JWT or API token passed as a query parameter.
+def _extract_stream_token(request: Request, query_token: str | None) -> str:
+    """Resolve the SSE auth token, preferring the Authorization header.
 
-    EventSource can't set ``Authorization`` headers, so the SSE
-    endpoint accepts ``?token=<...>``. We re-implement the relevant
-    branches of :func:`app.api.deps.get_current_user` here rather
-    than reach into Security() — that dep is wired to the Bearer
-    extractor which won't see a query arg. ``request`` is forwarded
-    into ``_resolve_api_token`` so the scope guard (issue #74) can
-    inspect the SSE endpoint's path before allowing the connection.
+    SECURITY (#400, M8): the live nmap stream is consumed by the
+    frontend with ``fetch()`` + ``ReadableStream`` (not
+    ``EventSource``), so the access token now rides the standard
+    ``Authorization: Bearer <token>`` header where it never lands in
+    a URL — keeping it out of nginx/proxy access logs, browser
+    history, and the ``Referer`` header. The legacy ``?token=`` query
+    arg is still honoured as a fallback so older clients / bookmarked
+    URLs keep working, but the header takes precedence.
+    """
+    auth = request.headers.get("Authorization") or request.headers.get("authorization")
+    if auth and auth.lower().startswith("bearer "):
+        header_token = auth[len("bearer ") :].strip()
+        if header_token:
+            return header_token
+    if query_token:
+        return query_token
+    raise HTTPException(status_code=401, detail="Missing authentication token")
+
+
+async def _resolve_user_from_query_token(db: AsyncSession, token: str, request: Request) -> User:
+    """Validate a JWT or API token presented to the SSE endpoint.
+
+    The token is sourced by :func:`_extract_stream_token` (header
+    preferred, ``?token=`` query arg as a back-compat fallback). We
+    re-implement the relevant branches of
+    :func:`app.api.deps.get_current_user` here rather than reach into
+    Security() — that dep is wired to the Bearer extractor and would
+    have 401'd the connection before our header/query resolution
+    runs. ``request`` is forwarded into ``_resolve_api_token`` so the
+    scope guard (issue #74) can inspect the SSE endpoint's path
+    before allowing the connection.
     """
     if token.startswith("sddi_"):
         # API tokens — re-use the deps helper.
@@ -521,17 +550,20 @@ async def _resolve_user_from_query_token(db: AsyncSession, token: str, request: 
 async def stream_scan(
     scan_id: uuid.UUID,
     request: Request,
-    token: Annotated[str, Query(...)],
     db: Annotated[AsyncSession, Depends(get_db)],
+    token: Annotated[str | None, Query()] = None,
 ) -> StreamingResponse:
     """Server-Sent Events relay for a running scan.
 
-    Auth is via ``?token=`` query arg (EventSource can't send
-    Authorization headers). Each ``data:`` frame carries one line of
-    nmap stdout. On terminal status we emit one final
-    ``event: done`` frame and close.
+    SECURITY (#400, M8): auth is preferred via the ``Authorization:
+    Bearer`` header (the frontend uses ``fetch()`` + ``ReadableStream``
+    so the token stays out of the URL). The ``?token=`` query arg is
+    accepted only as a back-compat fallback. Each ``data:`` frame
+    carries one line of nmap stdout. On terminal status we emit one
+    final ``event: done`` frame and close.
     """
-    user = await _resolve_user_from_query_token(db, token, request)
+    resolved_token = _extract_stream_token(request, token)
+    user = await _resolve_user_from_query_token(db, resolved_token, request)
     if not user_has_permission(user, "read", PERMISSION):
         raise HTTPException(status_code=403, detail="Permission denied")
 
@@ -574,6 +606,10 @@ async def stream_scan(
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
         "Connection": "keep-alive",
+        # SECURITY (#400, M8): defence-in-depth for any back-compat
+        # ``?token=`` callers — never leak the request URL (which may
+        # still carry the token) onward via the Referer header.
+        "Referrer-Policy": "no-referrer",
     }
     return StreamingResponse(_event_stream(), media_type="text/event-stream", headers=headers)
 

@@ -31,6 +31,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
+from app.core.ssrf import assert_safe_target
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
@@ -670,6 +671,12 @@ async def test_connection(
             status_code=422,
             detail="api_server_url and token are required (either in body or via stored cluster_id)",
         )
+
+    # SECURITY (#400, L5): advisory SSRF guard — log the resolved API
+    # server IP so operators can audit what the control plane dialed.
+    # Not hard-blocked: a co-located k3s appliance legitimately points
+    # at an on-box / RFC1918 API server.
+    assert_safe_target(api_server_url, label="kubernetes")
 
     result = await _probe_cluster(
         api_server_url=api_server_url,

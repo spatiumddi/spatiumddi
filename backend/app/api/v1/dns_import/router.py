@@ -23,6 +23,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel
+from app.core.ssrf import assert_safe_target
 from app.models.dns import DNSServer, DNSServerGroup
 from app.services.dns_import import (
     CLOUD_DRIVERS,
@@ -634,6 +635,12 @@ async def powerdns_test_connection(
     """Probe the PowerDNS REST API and return the daemon's
     identifying info. Operator clicks this before kicking off a
     full pull on a giant server."""
+
+    # SECURITY (#400, L5): advisory SSRF guard — log the resolved
+    # PowerDNS API IP so operators can audit the connect target. Not
+    # hard-blocked: a co-located / LAN PowerDNS daemon is a legitimate
+    # import source.
+    assert_safe_target(body.api_url, label="dns_import_powerdns")
 
     try:
         info = await test_powerdns_connection(

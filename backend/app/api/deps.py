@@ -24,6 +24,29 @@ _bearer = HTTPBearer(auto_error=False)
 # on every request. See ``app.core.security.generate_api_token``.
 _API_TOKEN_PREFIX = "sddi_"
 
+# SECURITY (#400 / M4): when ``User.force_password_change`` is set (a fresh
+# account, an admin-forced reset, or a max-age-expired password), the user
+# must be barred from every authenticated endpoint EXCEPT the handful needed
+# to actually rotate the password and read enough state to do so. Without
+# this gate the flag was advisory only — the frontend honoured it, but the
+# API happily served every other request to a token minted for a
+# must-change-password account. These suffixes are matched against the
+# request path so a forced user can still reach the recovery flow.
+_FORCE_PW_CHANGE_ALLOWLIST: tuple[str, ...] = (
+    "/auth/change-password",
+    "/auth/logout",
+    "/auth/me",
+    "/auth/password-policy",
+)
+
+
+def _path_in_recovery_allowlist(path: str) -> bool:
+    """True when ``path`` ends with one of the password-recovery endpoints
+    a ``force_password_change`` user is still allowed to reach. Suffix match
+    so the API ``/api/v1`` prefix (and any mount-point reverse-proxy rewrite)
+    doesn't matter — the allowlisted set is unambiguous on its tail."""
+    return any(path.rstrip("/").endswith(suffix) for suffix in _FORCE_PW_CHANGE_ALLOWLIST)
+
 
 async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> User:
     """Validate an ``sddi_*`` bearer and return the owning user.
@@ -77,6 +100,16 @@ async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> Us
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled"
+        )
+    # SECURITY (#400 / M4): the must-change-password gate applies to API
+    # tokens too — a token minted for an account that later gets a forced
+    # reset (or whose password expires) must not be a bypass around the
+    # interactive lockout. Same recovery allowlist (the recovery endpoints
+    # are session-only, so in practice this just 403s the token).
+    if user.force_password_change and not _path_in_recovery_allowlist(request.url.path):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Password change required before continuing",
         )
     # Fire-and-forget last-used bump. Failure to write this shouldn't
     # 500 the request — we commit on the caller's session so if the
@@ -158,6 +191,18 @@ async def get_current_user(
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled"
+        )
+
+    # SECURITY (#400 / M4): enforce the must-change-password gate server-side.
+    # ``force_password_change`` is set on fresh accounts, on admin resets, and
+    # is flipped on by the login-time max-age check (issue #70), so honouring
+    # it here closes both the "must change" and the "password expired" cases.
+    # We reject every request EXCEPT the password-recovery allowlist so the
+    # user can still rotate their password and log out — anything else 403s.
+    if user.force_password_change and not _path_in_recovery_allowlist(request.url.path):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Password change required before continuing",
         )
 
     await _load_time_bound_grants(db, user)

@@ -1,7 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Loader2, StopCircle } from "lucide-react";
-import { type NmapScanRead, type NmapScanStatus, nmapApi } from "@/lib/api";
+import {
+  type NmapScanRead,
+  type NmapScanStatus,
+  nmapApi,
+  streamNmapScan,
+} from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { cn } from "@/lib/utils";
 import { NmapResultPanel } from "./NmapResultPanel";
@@ -42,12 +47,15 @@ export interface NmapScanLiveViewerProps {
 /**
  * Live SSE-driven output viewer plus parsed-summary panel.
  *
- * The viewer opens an EventSource against
- * ``/api/v1/nmap/scans/{id}/stream`` and appends every ``data:``
- * frame to a rolling buffer. When the ``done`` event arrives we
- * refetch the full scan record so the parsed summary (open ports,
- * OS guess, exit code) and final stdout buffer are rendered from
- * the persisted row.
+ * The viewer streams ``/api/v1/nmap/scans/{id}/stream`` via
+ * ``fetch()`` + ``ReadableStream`` (not ``EventSource``) so the
+ * access token rides the ``Authorization`` header instead of a
+ * ``?token=`` query arg — SECURITY (#400, M8): tokens in URLs leak
+ * through proxy logs / browser history / Referer. Every ``data:``
+ * frame is appended to a rolling buffer. When the ``done`` event
+ * arrives we refetch the full scan record so the parsed summary
+ * (open ports, OS guess, exit code) and final stdout buffer are
+ * rendered from the persisted row.
  */
 export function NmapScanLiveViewer({
   scanId,
@@ -84,28 +92,40 @@ export function NmapScanLiveViewer({
     setLines([]);
     setStreamStatus("connecting");
 
-    const url = nmapApi.streamUrl(scanId);
-    const es = new EventSource(url);
+    // SECURITY (#400, M8): stream via fetch() so the access token
+    // rides the Authorization header (see streamNmapScan) instead of
+    // a leak-prone ``?token=`` query arg. Cancel via AbortController
+    // on unmount / scanId change.
+    const ctrl = new AbortController();
 
-    es.onopen = () => setStreamStatus("open");
-    es.onmessage = (ev) => {
-      setLines((prev) => [...prev, ev.data]);
-    };
-    es.addEventListener("done", () => {
-      setStreamStatus("done");
-      es.close();
-      qc.invalidateQueries({ queryKey: ["nmap-scan", scanId] });
-      qc.invalidateQueries({ queryKey: ["nmap-scans"] });
-    });
-    es.onerror = () => {
-      // EventSource auto-reconnects; surface the state once but don't
-      // tear it down — server-side close after `done` fires onerror
-      // too in some browsers.
-      setStreamStatus((s) => (s === "done" ? s : "error"));
-    };
+    (async () => {
+      try {
+        for await (const { data, done } of streamNmapScan(
+          scanId,
+          ctrl.signal,
+        )) {
+          if (ctrl.signal.aborted) return;
+          setStreamStatus((s) => (s === "connecting" ? "open" : s));
+          if (done) {
+            setStreamStatus("done");
+            qc.invalidateQueries({ queryKey: ["nmap-scan", scanId] });
+            qc.invalidateQueries({ queryKey: ["nmap-scans"] });
+            return;
+          }
+          if (data) setLines((prev) => [...prev, data]);
+        }
+      } catch {
+        // Aborting the fetch on unmount throws — swallow it. Any real
+        // network/HTTP failure surfaces as the "error" badge; the
+        // polling refetch above still drives the final summary.
+        if (!ctrl.signal.aborted) {
+          setStreamStatus((s) => (s === "done" ? s : "error"));
+        }
+      }
+    })();
 
     return () => {
-      es.close();
+      ctrl.abort();
     };
   }, [scanId, qc]);
 

@@ -47,7 +47,25 @@ class Settings(BaseSettings):
     # allow credentials" combo Starlette produces for ``["*"]`` +
     # ``allow_credentials=True``. Set explicit origins to lock the API
     # down to your frontend(s); credentials are then enabled for them.
+    #
+    # SECURITY (#400 / M6): if ``"*"`` appears MIXED with explicit
+    # origins (e.g. ``"*,https://app.example.com"``) we treat the whole
+    # list as a wildcard (``cors_origins_list`` collapses to ``["*"]``),
+    # which forces ``allow_credentials=False`` at the middleware. Without
+    # this, the explicit entries would flip credentials on while the
+    # ``"*"`` still reflected every Origin — the exact "trust any site +
+    # send credentials" combo we guard against above.
     cors_origins: str = "*"
+
+    # TrustedHostMiddleware allow-list (#400 / L3). Comma-separated host
+    # patterns (e.g. "ddi.example.com,*.example.com"). Default "*"
+    # accepts any Host header so existing deploys behind a trusted
+    # reverse proxy / on the appliance keep working out of the box.
+    # Operators who terminate TLS directly on the API (or want defence
+    # against Host-header injection / DNS-rebinding / cache-poisoning)
+    # set this to their real hostnames. Starlette's TrustedHostMiddleware
+    # treats ``["*"]`` as "allow everything".
+    trusted_hosts: str = "*"
 
     # External auth providers (LDAP / OIDC / SAML) are configured via the GUI at
     # /admin/auth-providers — see backend/app/models/auth_provider.py. Secrets are
@@ -183,11 +201,37 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         """``cors_origins`` parsed into a list. ``"*"`` (the default)
         yields ``["*"]``; a comma-separated value yields the trimmed,
-        non-empty entries."""
+        non-empty entries.
+
+        SECURITY (#400 / M6): if ``"*"`` is present ANYWHERE in the list
+        (even mixed with explicit origins), the whole list collapses to
+        ``["*"]``. The middleware keys ``allow_credentials`` off this
+        result being exactly ``["*"]``, so a wildcard always disables
+        credentials regardless of any explicit entries the operator
+        also listed. This closes the "explicit origin enables creds while
+        ``*`` still reflects every Origin" combo.
+        """
         raw = self.cors_origins.strip()
         if raw == "*" or not raw:
             return ["*"]
-        return [o.strip() for o in raw.split(",") if o.strip()]
+        entries = [o.strip() for o in raw.split(",") if o.strip()]
+        if "*" in entries:
+            return ["*"]
+        return entries
+
+    @property
+    def trusted_hosts_list(self) -> list[str]:
+        """``trusted_hosts`` parsed into a list for TrustedHostMiddleware
+        (#400 / L3). ``"*"`` (the default) yields ``["*"]`` — accept any
+        Host header; a comma-separated value yields the trimmed,
+        non-empty patterns."""
+        raw = self.trusted_hosts.strip()
+        if raw == "*" or not raw:
+            return ["*"]
+        entries = [h.strip() for h in raw.split(",") if h.strip()]
+        if "*" in entries:
+            return ["*"]
+        return entries or ["*"]
 
     @model_validator(mode="after")
     def _check_secret_key_default(self) -> "Settings":

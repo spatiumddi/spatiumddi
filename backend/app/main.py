@@ -8,6 +8,7 @@ import structlog.contextvars
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.health import router as health_router
 from app.api.v1.router import api_v1_router
@@ -28,6 +29,79 @@ from app.services import (
 logger = structlog.get_logger(__name__)
 
 
+async def _assert_demo_mode_not_on_prod_data() -> None:
+    """SECURITY (#400 / M7): DEMO_MODE seeds an unlocked admin/admin
+    superadmin (``force_password_change`` skipped) and unlocks abusable
+    surfaces — it must NEVER land on a production image. Detect the
+    tell-tale signs of a real deployment (configured backup targets,
+    integration mirror targets, or external auth providers) and fail
+    fast so the demo flag can't silently leak onto prod.
+
+    No-op unless ``DEMO_MODE=1``. On a genuine demo image these tables
+    are empty, so the legitimate demo flow is untouched. Failure-tolerant
+    on the pre-migration / missing-table case — we can't assert against a
+    schema that isn't there yet, and that's not a prod install anyway.
+    """
+    if not settings.demo_mode:
+        return
+
+    from sqlalchemy import text  # noqa: PLC0415
+
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+
+    # Tables whose presence of ANY row means "this is a real deployment".
+    # Fixed allow-list of literal identifiers (no user input) — the only
+    # values ever interpolated below are these constants, so the count
+    # query carries no injection surface. A missing table (pre-migration)
+    # degrades to the failure-tolerant skip path rather than crashing boot.
+    prod_signal_tables = (
+        "backup_target",
+        "audit_forward_target",
+        "auth_provider",
+        "kubernetes_cluster",
+        "docker_host",
+        "proxmox_node",
+        "tailscale_tenant",
+        "unifi_controller",
+        "cloud_endpoint",
+    )
+    offenders: list[str] = []
+    try:
+        async with AsyncSessionLocal() as session:
+            for table in prod_signal_tables:
+                try:
+                    # ``table`` is a hardcoded constant from the tuple
+                    # above, never request-derived — safe to interpolate.
+                    n = await session.scalar(text(f"SELECT count(*) FROM {table}"))  # noqa: S608
+                except Exception as exc:  # noqa: BLE001
+                    # Table missing (pre-migration) or unreadable — can't
+                    # be a populated prod install; skip this signal.
+                    logger.debug("demo_mode_prod_check_skipped", table=table, reason=str(exc))
+                    continue
+                if n and n > 0:
+                    offenders.append(f"{table}={n}")
+    except RuntimeError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # DB unreachable at boot — can't prove prod data either way.
+        # Don't crash the (possibly legitimate) demo boot on transient
+        # connectivity; the offender check below simply finds nothing.
+        logger.debug("demo_mode_prod_check_db_unavailable", reason=str(exc))
+
+    if offenders:
+        # SECURITY (#400 / M7): a demo image with real deployment data is
+        # a leaked demo flag on prod — refuse to boot rather than serve an
+        # unlocked admin/admin superadmin.
+        raise RuntimeError(
+            "DEMO_MODE=1 is set but real configured deployment data was "
+            "found ("
+            + ", ".join(offenders)
+            + "). DEMO_MODE seeds an unlocked admin/admin superadmin and "
+            "must NOT run against a production install. Unset DEMO_MODE "
+            "(or wipe the demo data) before booting."
+        )
+
+
 async def _seed_default_admin() -> None:
     """Create the default admin user if no users exist yet."""
     from sqlalchemy import func, select
@@ -35,6 +109,11 @@ async def _seed_default_admin() -> None:
     from app.core.security import hash_password
     from app.db import AsyncSessionLocal
     from app.models.auth import User
+
+    # SECURITY (#400 / M7): hard-stop the demo flag from booting on a real
+    # install BEFORE we (possibly) seed an unlocked admin. Raises on a
+    # prod-data collision; no-op otherwise.
+    await _assert_demo_mode_not_on_prod_data()
 
     async with AsyncSessionLocal() as session:
         try:
@@ -466,8 +545,8 @@ def create_app() -> FastAPI:
 
     # Middleware (outermost first). Note Starlette wraps in REVERSE add
     # order: the LAST-added middleware runs outermost. So the request
-    # flows in as CORS → Prometheus → Maintenance → RequestContext, and
-    # the response unwinds the other way.
+    # flows in as TrustedHost → CORS → Prometheus → Maintenance →
+    # RequestContext, and the response unwinds the other way.
     app.add_middleware(RequestContextMiddleware)
 
     # Maintenance mode (issue #57). Added AFTER RequestContextMiddleware so
@@ -489,6 +568,12 @@ def create_app() -> FastAPI:
     # (not cookies), so wildcard-without-credentials is correct + safe.
     # When the operator pins explicit origins we enable credentials for
     # them (future cookie-based flows / withCredentials fetches).
+    #
+    # SECURITY (#400 / M6): ``cors_origins_list`` collapses to ``["*"]``
+    # whenever a wildcard is present — even mixed with explicit origins
+    # ("*,https://app.example.com"). So ``allow_credentials`` below can
+    # never be True while any wildcard is in play; the dangerous
+    # "reflect every Origin + send credentials" combo is impossible.
     _cors_origins = settings.cors_origins_list
     app.add_middleware(
         CORSMiddleware,
@@ -496,6 +581,19 @@ def create_app() -> FastAPI:
         allow_credentials=_cors_origins != ["*"],
         allow_methods=["*"],
         allow_headers=["*"],
+    )
+
+    # SECURITY (#400 / L3): Host-header allow-list. Added LAST so — given
+    # Starlette's reverse wrap — it runs OUTERMOST and rejects a forged /
+    # unexpected Host header (Host-header injection, DNS-rebinding, cache
+    # poisoning) before any other middleware or handler sees the request.
+    # Default ``["*"]`` accepts any host so existing reverse-proxy /
+    # appliance deploys are unaffected; operators set TRUSTED_HOSTS to
+    # lock the API to their real hostnames. (TrustedHostMiddleware
+    # short-circuits ``["*"]`` so there's no per-request cost when open.)
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=settings.trusted_hosts_list,
     )
 
     # Routes

@@ -28,7 +28,8 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from sqlalchemy import desc, func, select
 
-from app.api.deps import DB, CurrentUser  # noqa: F401
+from app.api.deps import DB, CurrentUser
+from app.core.permissions import is_effective_superadmin, user_has_permission
 from app.models.audit import AuditLog
 from app.models.auth import APIToken, User
 
@@ -127,10 +128,24 @@ _PERMISSION_RESOURCE_TYPES: frozenset[str] = frozenset(
 
 
 @router.get("/security/summary", response_model=SecurityDashboardSummary)
-async def security_summary(
-    db: DB, current_user: CurrentUser  # noqa: ARG001
-) -> SecurityDashboardSummary:
-    """Single-shot rollup for the Security dashboard tab."""
+async def security_summary(db: DB, current_user: CurrentUser) -> SecurityDashboardSummary:
+    """Single-shot rollup for the Security dashboard tab.
+
+    SECURITY (#400 / M2): this rollup surfaces user/MFA/token/login
+    telemetry (per-user last-login times, failed-login source IPs,
+    permission-change actor history) that must not be exposed to any
+    authenticated caller. Privileged callers — an effective superadmin
+    or anyone holding ``read`` on ``audit_log`` *or* ``user`` — get the
+    full per-row detail. Everyone else still gets the aggregate
+    headline counts (so the dashboard tile renders) but the per-user
+    PII-bearing detail lists are stripped. This keeps the legitimate
+    operator flow intact while closing the unauthenticated-PII leak.
+    """
+    privileged = (
+        is_effective_superadmin(current_user)
+        or user_has_permission(current_user, "read", "audit_log")
+        or user_has_permission(current_user, "read", "user")
+    )
     now = datetime.now(UTC)
 
     # ── MFA coverage (local-auth users only) ────────────────────
@@ -260,19 +275,24 @@ async def security_summary(
         for r in perm_rows[:_DETAIL_LIMIT]
     ]
 
+    # SECURITY (#400 / M2): aggregate counts are safe for any
+    # authenticated viewer, but the per-row detail lists carry PII
+    # (usernames, last-login timestamps, failed-login source IPs,
+    # permission-change actors). Withhold those from non-privileged
+    # callers — the tile still renders from the headline counts.
     return SecurityDashboardSummary(
         generated_at=now,
         mfa_total_local_users=mfa_total,
         mfa_enrolled_count=mfa_enrolled,
         mfa_coverage_pct=round(mfa_pct, 1),
-        mfa_unenrolled=mfa_unenrolled_rows,
+        mfa_unenrolled=mfa_unenrolled_rows if privileged else [],
         api_tokens_total=int(tokens_total),
         api_tokens_expiring_count=len(expiring_tokens),
-        api_tokens_expiring=expiring_rows,
+        api_tokens_expiring=expiring_rows if privileged else [],
         failed_login_window_hours=_FAILED_LOGIN_WINDOW_HOURS,
         failed_login_total=len(failed_rows),
-        failed_login_top_sources=grouped[:_DETAIL_LIMIT],
+        failed_login_top_sources=grouped[:_DETAIL_LIMIT] if privileged else [],
         permission_change_window_days=_PERMISSION_CHANGE_WINDOW_DAYS,
         permission_change_count=len(perm_rows),
-        permission_changes=perm_change_rows,
+        permission_changes=perm_change_rows if privileged else [],
     )

@@ -390,6 +390,11 @@ async def test_connection(
             detail="tailnet and api_key are required (either in body or via stored tenant_id)",
         )
 
+    # SECURITY (#400, L5): no SSRF guard call here — ``_probe`` dials a
+    # FIXED host (``api.tailscale.com``) with ``tailnet`` only as a URL
+    # path segment, so there is no operator-controlled connect target to
+    # resolve (unlike the proxmox / unifi / opnsense / docker / k8s LAN
+    # integrations). See app/core/ssrf.py.
     result = await _probe(tailnet=tailnet, api_key=api_key)
 
     if body.tenant_id is not None and result.ok:

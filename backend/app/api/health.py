@@ -271,15 +271,25 @@ async def startup() -> JSONResponse:
 async def platform_health() -> JSONResponse:
     """Dashboard-oriented rollup of every control-plane component.
 
-    Distinct from ``/health/ready`` in that this one is authenticated-
-    dashboard-facing rather than an orchestrator probe: it enumerates
-    the individual pieces (db, redis, celery workers, celery beat)
-    instead of returning a single binary verdict, so the UI can show a
+    Distinct from ``/health/ready`` in that this one is dashboard-
+    facing rather than an orchestrator probe: it enumerates the
+    individual pieces (db, redis, celery workers, celery beat) instead
+    of returning a single binary verdict, so the UI can show a
     per-component status dot and explain what's wrong. Individual
     failures never make the endpoint itself fail — the caller always
     gets a 200 with the rollup. The top-level ``status`` folds the
     components into a single ``ok`` / ``degraded`` verdict for headline
     display.
+
+    SECURITY (#400 / M5): this endpoint is mounted UNAUTHENTICATED
+    (the AppLayout polls it before login for the demo-mode /
+    maintenance banner), so component ``detail`` fields must never echo
+    raw backend exception strings — those can leak DSNs, internal
+    hostnames, driver versions, and stack-frame paths to an anonymous
+    caller. On error we log the full ``str(exc)`` server-side (where
+    operators can see it) and return only a fixed, generic detail
+    string. The ``ok`` / ``error`` / ``warn`` status semantics are
+    unchanged, so the per-component dots still render correctly.
     """
     components: list[dict[str, Any]] = [{"name": "api", "status": "ok", "detail": "responding"}]
 
@@ -296,7 +306,10 @@ async def platform_health() -> JSONResponse:
             }
         )
     except Exception as exc:
-        components.append({"name": "postgres", "status": "error", "detail": str(exc)})
+        # SECURITY (#400 / M5): never echo str(exc) to this unauthenticated
+        # endpoint — it can leak the Postgres DSN / host. Log it server-side.
+        logger.warning("platform_health_check_failed", component="postgres", error=str(exc))
+        components.append({"name": "postgres", "status": "error", "detail": "postgres error"})
 
     # Redis
     t0 = monotonic()
@@ -315,7 +328,10 @@ async def platform_health() -> JSONResponse:
             }
         )
     except Exception as exc:
-        components.append({"name": "redis", "status": "error", "detail": str(exc)})
+        # SECURITY (#400 / M5): generic detail only — str(exc) would leak the
+        # Redis URL / host to an unauthenticated caller.
+        logger.warning("platform_health_check_failed", component="redis", error=str(exc))
+        components.append({"name": "redis", "status": "error", "detail": "redis error"})
 
     # Celery workers — `inspect().ping()` is a sync, broker-backed RPC
     # that can hang, so run it in a threadpool with a short overall
@@ -332,8 +348,11 @@ async def platform_health() -> JSONResponse:
         ping = None
         workers_detail = "inspect timed out"
     except Exception as exc:  # noqa: BLE001
+        # SECURITY (#400 / M5): generic detail only — str(exc) here can carry
+        # the broker URL / host. Log the real error server-side.
+        logger.warning("platform_health_check_failed", component="celery-workers", error=str(exc))
         ping = None
-        workers_detail = f"inspect error: {exc}"
+        workers_detail = "inspect error"
     else:
         workers_detail = None
 
@@ -397,7 +416,10 @@ async def platform_health() -> JSONResponse:
                 }
             )
     except Exception as exc:
-        components.append({"name": "celery-beat", "status": "error", "detail": str(exc)})
+        # SECURITY (#400 / M5): generic detail only — str(exc) would leak the
+        # Redis URL / internal state to an unauthenticated caller.
+        logger.warning("platform_health_check_failed", component="celery-beat", error=str(exc))
+        components.append({"name": "celery-beat", "status": "error", "detail": "celery-beat error"})
 
     rollup = "ok"
     for c in components:

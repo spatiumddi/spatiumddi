@@ -15,7 +15,12 @@ function createClient(): AxiosInstance {
     paramsSerializer: { indexes: null },
   });
 
-  // Attach Bearer token from localStorage on every request
+  // Attach Bearer token from localStorage on every request.
+  // SECURITY (#400, L1): access + refresh tokens live in
+  // localStorage and are therefore XSS-stealable. The CSP shipped in
+  // #400/L2 is the primary mitigation; the intended structural fix
+  // (refresh token -> HttpOnly cookie, access token in memory only)
+  // is documented in hooks/useAuth.ts and deferred to a follow-up.
   client.interceptors.request.use((config) => {
     const token = localStorage.getItem("access_token");
     if (token) {
@@ -10929,15 +10934,68 @@ export const nmapApi = {
         skipped_addresses: string[];
       }>(`/nmap/scans/${scanId}/stamp-discovered`)
       .then((r) => r.data),
-  // The SSE stream isn't fetched via axios — callers use `EventSource`
-  // pointed at the URL returned here. Auth piggybacks on a query
-  // token because EventSource can't set Authorization headers.
+  // SECURITY (#400, M8): the SSE stream is consumed via `streamScan`
+  // (fetch + ReadableStream) so the access token rides the
+  // Authorization header instead of a `?token=` query arg that would
+  // leak through proxy access logs / browser history / Referer.
+  // `streamUrl` is kept only for callers that build the path; it no
+  // longer embeds the token.
   streamUrl: (id: string) => {
-    const token = localStorage.getItem("access_token") ?? "";
     const base = API_BASE.replace(/\/$/, "");
-    return `${base}/nmap/scans/${id}/stream?token=${encodeURIComponent(token)}`;
+    return `${base}/nmap/scans/${id}/stream`;
   },
 };
+
+/**
+ * Stream live nmap scan output as SSE. Mirrors `streamChatTurn` /
+ * `streamApplianceContainerLogs` — uses `fetch` (not `EventSource`)
+ * so the Bearer token rides the Authorization header rather than a
+ * `?token=` query arg (SECURITY #400, M8). Yields `{ data, done }`
+ * for each frame: `done` carries the terminal event payload (the
+ * scan's final status) when the server emits `event: done`. Cancel
+ * via the AbortSignal.
+ */
+export async function* streamNmapScan(
+  scanId: string,
+  signal?: AbortSignal,
+): AsyncIterable<{ data: string; done: boolean }> {
+  const token = localStorage.getItem("access_token");
+  const url = nmapApi.streamUrl(scanId);
+  const res = await fetch(url, {
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      Accept: "text/event-stream",
+    },
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    throw new Error(`scan stream failed: HTTP ${res.status}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      if (!frame.trim() || frame.startsWith(":")) continue; // skip heartbeats
+      let isDone = false;
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event:") && line.slice(6).trim() === "done") {
+          isDone = true;
+        } else if (line.startsWith("data:")) {
+          data += line.slice(5).replace(/^ /, "");
+        }
+      }
+      yield { data, done: isDone };
+      if (isDone) return;
+    }
+  }
+}
 
 // ── Built-in network tools (issue #58) ──────────────────────────────
 //

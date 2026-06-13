@@ -31,6 +31,44 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
+    # ── Security response headers (SECURITY #400, L2) ──────────────
+    # Applied at the server level so they cover the SPA, static
+    # assets, and proxied /api responses. NOTE: nginx ``add_header``
+    # does NOT inherit into a location that declares its own
+    # ``add_header`` — the @starting + static-asset locations below
+    # re-emit these via ``include`` of the same snippet.
+    #
+    # CSP rationale (verified against the Vite build):
+    #   * default-src 'self'    — lock everything to same origin.
+    #   * script-src 'self'     — Vite emits external module scripts
+    #                             only (no inline <script>, no eval /
+    #                             new Function in the bundle), so NO
+    #                             'unsafe-inline' / 'unsafe-eval'.
+    #   * style-src 'self' 'unsafe-inline'
+    #                           — Tailwind ships an external stylesheet,
+    #                             but recharts / transition deps inject
+    #                             <style> elements at runtime and React
+    #                             style props set inline styles. Those
+    #                             genuinely need 'unsafe-inline' for
+    #                             STYLES ONLY (style injection can't
+    #                             execute script, so the risk is low).
+    #   * img-src 'self' data:  — favicons / small logos are data URIs.
+    #   * connect-src 'self'    — all XHR/fetch/SSE go to same-origin
+    #                             /api (LLM providers are proxied through
+    #                             the backend, never called from the SPA).
+    #   * font-src 'self'       — fonts are self-hosted.
+    #   * frame-ancestors 'none'— clickjacking defence (pairs with
+    #                             X-Frame-Options: DENY for old browsers).
+    #   * base-uri / form-action / object-src locked down.
+    set $spatium_csp "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
+    add_header Content-Security-Policy $spatium_csp always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
+    # HSTS is intentionally NOT set here: this image's server block is
+    # plain HTTP (TLS terminates upstream at an ingress / the appliance
+    # nginx). The appliance HTTPS server block sets HSTS itself.
+
     # Re-resolve the upstream periodically so a container / Pod restart
     # that hands out a new IP doesn't strand nginx on the old one. The
     # nameserver list comes from /etc/resolv.conf at container start —
@@ -87,6 +125,12 @@ server {
         # Surface what the upstream said so a curl debugger can tell
         # "upstream is unreachable" from "upstream timed out".
         add_header X-Upstream-Status $upstream_status always;
+        # Re-emit security headers (SECURITY #400, L2) — a location
+        # with its own add_header does NOT inherit the server-level set.
+        add_header Content-Security-Policy $spatium_csp always;
+        add_header X-Frame-Options "DENY" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
         try_files /_starting.html =503;
     }
 
@@ -190,6 +234,12 @@ server {
     location ~* \.(js|css|woff2?|png|svg|ico)$ {
         expires 1y;
         add_header Cache-Control "public, immutable";
+        # Re-emit security headers (SECURITY #400, L2) — a location
+        # with its own add_header does NOT inherit the server-level set.
+        add_header Content-Security-Policy $spatium_csp always;
+        add_header X-Frame-Options "DENY" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
     }
 
     gzip on;

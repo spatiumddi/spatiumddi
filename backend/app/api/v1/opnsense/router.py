@@ -20,6 +20,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
+from app.core.ssrf import assert_safe_target
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
@@ -452,6 +453,11 @@ async def test_connection(
             status_code=422,
             detail="host, api_key, and api_secret are required (either in body or via stored router_id)",
         )
+
+    # SECURITY (#400, L5): advisory SSRF guard — log the resolved
+    # OPNsense host IP. Not hard-blocked: firewalls live on the
+    # RFC1918 LAN by definition.
+    assert_safe_target(host, label="opnsense")
 
     result = await _probe(
         host=host,

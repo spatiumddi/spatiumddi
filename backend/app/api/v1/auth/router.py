@@ -48,6 +48,7 @@ from app.core.security import (
     create_access_token,
     create_mfa_challenge_token,
     create_refresh_token,
+    decode_access_token,
     decode_mfa_challenge_token,
     hash_password,
     hash_refresh_token,
@@ -720,10 +721,31 @@ async def get_password_policy(db: DB) -> PasswordPolicyResponse:
     )
 
 
+def _current_session_jti(request: Request) -> str | None:
+    """Best-effort extraction of the access token's ``jti`` from the
+    incoming Authorization header, so the self-service change-password
+    path can spare the caller's own session when it revokes the rest.
+
+    Returns None for API-token auth, legacy (no-jti) tokens, or anything
+    that fails to decode — in which case we simply revoke every session,
+    which is the safe direction (the caller just has to log in again)."""
+    header = request.headers.get("authorization") or ""
+    scheme, _, raw = header.partition(" ")
+    if scheme.lower() != "bearer" or not raw:
+        return None
+    try:
+        payload = decode_access_token(raw)
+    except JWTError:
+        return None
+    jti = payload.get("jti")
+    return str(jti) if jti is not None else None
+
+
 @router.post("/change-password", status_code=status.HTTP_204_NO_CONTENT)
 async def change_password(
     body: ChangePasswordRequest,
     current_user: CurrentUser,
+    request: Request,
     db: DB,
 ) -> None:
     forbid_in_demo_mode("Password change is disabled")
@@ -764,6 +786,21 @@ async def change_password(
     current_user.force_password_change = False
     current_user.password_changed_at = datetime.now(UTC)
     current_user.password_history_encrypted = new_history
+
+    # SECURITY (#400 / M3): a password change must revoke every other
+    # outstanding session + refresh token for this user. Without this a
+    # stolen/leaked session that triggered the rotation (or any old session
+    # that existed before the change) keeps working — defeating the whole
+    # point of changing the password. Reuses the exact revocation statement
+    # ``/auth/logout`` uses; we spare the caller's *current* session so a
+    # routine self-service change doesn't immediately log the user out.
+    current_jti = _current_session_jti(request)
+    revoke_stmt = update(UserSession).where(
+        UserSession.user_id == current_user.id, UserSession.revoked.is_(False)
+    )
+    if current_jti is not None:
+        revoke_stmt = revoke_stmt.where(UserSession.id != current_jti)
+    await db.execute(revoke_stmt.values(revoked=True))
 
     audit = AuditLog(
         user_id=current_user.id,

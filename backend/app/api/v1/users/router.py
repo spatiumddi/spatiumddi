@@ -8,12 +8,12 @@ import bcrypt
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator, model_validator
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.api.deps import DB, SuperAdmin
 from app.core.demo_mode import forbid_in_demo_mode
 from app.models.audit import AuditLog
-from app.models.auth import User
+from app.models.auth import User, UserSession
 from app.models.settings import PlatformSettings
 from app.services.account_lockout import (
     is_locked as is_user_locked,
@@ -286,6 +286,19 @@ async def reset_password(
     user.password_changed_at = datetime.now(UTC)
     user.password_history_encrypted = push_history(
         hashed, user.password_history_encrypted, policy.history_count
+    )
+    # SECURITY (#400 / M3): an admin password reset must revoke every
+    # outstanding session + refresh token for the target user — the whole
+    # reason an admin resets a password is usually that the account is
+    # compromised or being handed over, so leaving live sessions running
+    # against the old credential defeats the reset. No session is spared
+    # here (unlike the self-service path): the admin is acting on someone
+    # else's account, so all of the target's sessions die. Same revocation
+    # statement ``/auth/logout`` uses.
+    await db.execute(
+        update(UserSession)
+        .where(UserSession.user_id == user.id, UserSession.revoked.is_(False))
+        .values(revoked=True)
     )
     db.add(
         _audit(current_user, "reset_password", str(user.id), f"Reset password for {user.username}")

@@ -2346,6 +2346,15 @@ async def create_space(body: IPSpaceCreate, current_user: CurrentUser, db: DB) -
 
 @router.get("/spaces/{space_id}", response_model=IPSpaceResponse)
 async def get_space(space_id: uuid.UUID, current_user: CurrentUser, db: DB) -> IPSpace:
+    # SECURITY TODO (#400 / L4): no per-row token-scope re-check here. This is
+    # currently safe ONLY because ``ip_space`` is NOT in
+    # ``services/api_token_scopes.TOKEN_GRANT_RESOURCE_TYPES`` (today: subnet,
+    # dns_zone), so a resource-scoped token can never bind to a space and
+    # ``token_scope_allows`` is irrelevant. IF ``ip_space`` is ever added to
+    # that vocabulary, this handler MUST gain a
+    # ``token_scope_allows(current_user, "ip_space", space_id)`` 403 gate (see
+    # ``_enforce_subnet_token_scope``) or a space-scoped token would read any
+    # space. Keep this in lockstep with the vocabulary so the two can't drift.
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
@@ -2773,6 +2782,15 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
 
 @router.get("/blocks/{block_id}", response_model=IPBlockResponse)
 async def get_block(block_id: uuid.UUID, current_user: CurrentUser, db: DB) -> dict[str, Any]:
+    # SECURITY TODO (#400 / L4): no per-row token-scope re-check here. This is
+    # currently safe ONLY because ``ip_block`` is NOT in
+    # ``services/api_token_scopes.TOKEN_GRANT_RESOURCE_TYPES`` (today: subnet,
+    # dns_zone), so a resource-scoped token can never bind to a block and
+    # ``token_scope_allows`` is irrelevant. IF ``ip_block`` is ever added to
+    # that vocabulary, this handler MUST gain a
+    # ``token_scope_allows(current_user, "ip_block", block_id)`` 403 gate (see
+    # ``_enforce_subnet_token_scope``) or a block-scoped token would read any
+    # block. Keep this in lockstep with the vocabulary so the two can't drift.
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")

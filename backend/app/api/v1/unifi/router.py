@@ -29,6 +29,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
+from app.core.ssrf import assert_safe_target
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPAddress, IPSpace, Subnet
@@ -853,6 +854,13 @@ async def test_connection(
             status_code=422,
             detail="username + password required for auth_kind='user_password'",
         )
+
+    # SECURITY (#400, L5): advisory SSRF guard — log the resolved
+    # controller IP for local-mode probes (cloud mode dials UniFi's
+    # hosted API, not an operator-supplied host). Not hard-blocked:
+    # local controllers sit on the RFC1918 LAN.
+    if mode == "local" and host:
+        assert_safe_target(host, label="unifi")
 
     result = await _probe(
         mode=mode,
