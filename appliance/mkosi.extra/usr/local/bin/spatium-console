@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import errno
 import json
 import os
@@ -378,6 +379,109 @@ def fetch_etcd_health(timeout: float = 2.0) -> dict:
         elif line.startswith("etcd_mvcc_db_total_size_in_bytes "):
             out["db_size"] = float(line.split()[-1])
     return out
+
+
+# Module-level prev-sample for the API request RATE (delta over wall time
+# between two 5 s-tier samples). None until the first fetch.
+_API_REQ_PREV: tuple[float, float] | None = None
+
+
+def fetch_api_metrics(api_ip: str, timeout: float = 3.0) -> dict:
+    """Spatium API request metrics from ClusterIP:8000/metrics (~12 ms,
+    stdlib urllib). Returns {rate, active, total}; ``rate`` is requests/sec
+    since the previous sample (0.0 on the first call / on a counter reset).
+    {} on any error → the API box renders dim "n/a"."""
+    global _API_REQ_PREV
+    try:
+        raw = urllib.request.urlopen(
+            f"http://{api_ip}:8000/metrics", timeout=timeout
+        ).read().decode("utf-8", "replace")
+    except Exception:
+        return {}
+    total = 0.0
+    active = 0.0
+    for line in raw.splitlines():
+        if line.startswith("spatiumddi_api_requests_total{") and "_created" not in line:
+            try:
+                total += float(line.split()[-1])
+            except ValueError:
+                pass
+        elif line.startswith("spatiumddi_api_active_requests "):
+            try:
+                active = float(line.split()[-1])
+            except ValueError:
+                pass
+    now = time.monotonic()
+    rate = 0.0
+    if _API_REQ_PREV is not None:
+        prev_t, prev_total = _API_REQ_PREV
+        elapsed = now - prev_t
+        if elapsed > 0 and total >= prev_total:
+            rate = (total - prev_total) / elapsed
+    _API_REQ_PREV = (now, total)
+    return {"rate": round(rate, 1), "active": int(active), "total": int(total)}
+
+
+def fetch_api_ready(api_ip: str, timeout: float = 3.0) -> dict:
+    """API /health/ready (db/schema/redis, ~9 ms) → the parsed JSON
+    ({"status": "...", "checks": {...}}), or {} on error. Unauthenticated —
+    the console never holds credentials, so the auth-gated /health/platform
+    and alert/conformity endpoints stay off-limits (see data-sources §5)."""
+    try:
+        raw = urllib.request.urlopen(
+            f"http://{api_ip}:8000/health/ready", timeout=timeout
+        ).read().decode("utf-8", "replace")
+        out = json.loads(raw)
+        return out if isinstance(out, dict) else {}
+    except Exception:
+        return {}
+
+
+def fetch_cnpg_metrics(pg_ip: str, timeout: float = 3.0) -> dict:
+    """CloudNativePG exporter metrics from the primary postgres pod IP
+    (:9187/metrics, ~17 ms). Keys: backends_idle / backends_active /
+    backends_waiting, db_size_bytes, streaming_replicas, in_recovery.
+    {} on error → the Postgres box renders dim "n/a"."""
+    try:
+        raw = urllib.request.urlopen(
+            f"http://{pg_ip}:9187/metrics", timeout=timeout
+        ).read().decode("utf-8", "replace")
+    except Exception:
+        return {}
+    out = {
+        "backends_idle": 0, "backends_active": 0, "backends_waiting": 0,
+        "db_size_bytes": 0.0, "streaming_replicas": 0, "in_recovery": 0,
+    }
+    for line in raw.splitlines():
+        if line.startswith("cnpg_backends_total{") and 'datname="spatiumddi"' in line:
+            try:
+                v = int(float(line.split()[-1]))
+            except ValueError:
+                continue
+            if 'state="idle"' in line:
+                out["backends_idle"] += v
+            elif 'state="active"' in line:
+                out["backends_active"] += v
+        elif line.startswith("cnpg_backends_waiting_total "):
+            out["backends_waiting"] = int(float(line.split()[-1]))
+        elif line.startswith('cnpg_pg_database_size_bytes{datname="spatiumddi"}'):
+            out["db_size_bytes"] = float(line.split()[-1])
+        elif line.startswith("cnpg_pg_replication_streaming_replicas "):
+            out["streaming_replicas"] = int(float(line.split()[-1]))
+        elif line.startswith("cnpg_pg_replication_in_recovery "):
+            out["in_recovery"] = int(float(line.split()[-1]))
+    return out
+
+
+def _primary_pg_ip(ps_rows: list[dict]) -> str | None:
+    """Pod IP of the CNPG primary (cnpg.io/instanceRole=primary), scanned
+    from the already-fetched pod list — no extra subprocess. None when no
+    primary is found (no CNPG, or pre-election)."""
+    for row in ps_rows:
+        labels = row.get("Labels") or {}
+        if labels.get("cnpg.io/instanceRole") == "primary":
+            return row.get("PodIP") or None
+    return None
 
 
 def host_health_rollup() -> dict[str, object]:
@@ -767,6 +871,49 @@ def cluster_vip() -> str | None:
     return None
 
 
+def cluster_svc_ips() -> dict:
+    """ONE ``kubectl get svc -n spatium -o json`` → {"vip": <frontend
+    LoadBalancer ingress IP or None>, "api": <api ClusterIP or None>}.
+
+    Phase 2 INC 4 — replaces the data tier's separate ``cluster_vip()`` call
+    so the api ClusterIP (host-reachable: flannel adds the service routes to
+    the host netns) comes from the SAME svc JSON at zero extra subprocess
+    cost. The api IP feeds fetch_api_metrics / fetch_api_ready. {} keys map
+    to None so the API + Platform boxes render dim "n/a"."""
+    out: dict = {"vip": None, "api": None}
+    try:
+        proc = subprocess.run(
+            ["/usr/local/bin/k3s", "kubectl", "get", "svc", "-n", "spatium", "-o", "json"],
+            env={**os.environ, "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"},
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return out
+    if proc.returncode != 0:
+        return out
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return out
+    for svc in data.get("items") or []:
+        spec = svc.get("spec") or {}
+        meta = svc.get("metadata") or {}
+        labels = meta.get("labels") or {}
+        name = meta.get("name") or ""
+        comp = labels.get("app.kubernetes.io/component")
+        if comp == "api" and out["api"] is None:
+            out["api"] = spec.get("clusterIP") or None
+        if spec.get("type") == "LoadBalancer" and out["vip"] is None and (
+            comp == "frontend" or "frontend" in name
+        ):
+            ingress = ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+            for ing in ingress:
+                if ing.get("ip"):
+                    out["vip"] = ing["ip"]
+                    break
+    return out
+
+
 def cluster_nodes() -> list[dict]:
     """Return the k3s cluster's nodes via ``kubectl get nodes -o json``,
     one dict per node: ``{name, ready, roles, version, internal_ip}``.
@@ -843,6 +990,19 @@ def cluster_nodes() -> list[dict]:
             except ValueError:
                 gib = ""
         capacity = f"{alloc.get('cpu') or '?'}c/{gib or '?'}"
+        # Phase 2 INC 4 — numeric capacity for the node-CPU/mem bar
+        # denominators (the string ``capacity`` above is display-only).
+        cpu_cap = 0.0
+        try:
+            cpu_cap = float(alloc.get("cpu") or 0)
+        except ValueError:
+            cpu_cap = 0.0
+        mem_cap_bytes = 0
+        if mem_raw.endswith("Ki"):
+            try:
+                mem_cap_bytes = int(mem_raw[:-2]) * 1024
+            except ValueError:
+                mem_cap_bytes = 0
         out.append(
             {
                 "name": meta.get("name") or "",
@@ -853,6 +1013,8 @@ def cluster_nodes() -> list[dict]:
                 "created": meta.get("creationTimestamp") or "",
                 "conditions": conditions,
                 "capacity": capacity,
+                "cpu_cap": cpu_cap,
+                "mem_cap_bytes": mem_cap_bytes,
             }
         )
     out.sort(key=lambda n: n["name"])
@@ -1881,6 +2043,12 @@ def overall_verdict(
     # Phase 2 INC 3 — etcd write failures (any node count).
     if int(state.etcd.get("proposals_failed", 0) or 0) > 0:
         return ("DEGRADED", "etcd write failures")
+    # Phase 2 INC 4 — /health/ready reports db/schema/redis. Only fires when
+    # the fetch actually returned a non-ok status (empty dict = no api_ip /
+    # fetch failed → skip, don't false-DEGRADED). Distinct from the auth-gated
+    # /health/platform (celery) which the console can't read.
+    if state.api_ready and state.api_ready.get("status") != "ok":
+        return ("DEGRADED", "api: db/redis down")
     if wd_status is not None and wd_status[1] != "bold green":
         return ("DEGRADED", "supervisor watchdog stale")
     slots = slot_info()
@@ -2802,11 +2970,12 @@ def render_pod_summary(ps_rows: list[dict], height: int) -> Panel:
                  title="[bold]Pod summary[/bold]", title_align="left")
 
 
-def pod_stats(node: str) -> dict:
-    """``{(namespace, pod): (cpu_cores, mem_bytes)}`` for the pods on
-    ``node``, from the kubelet Summary API via the apiserver proxy — works
-    WITHOUT metrics-server (the appliance disables it). One
-    ``kubectl get --raw`` on the 5 s tier, cached. ``{}`` on any failure."""
+def kubelet_summary(node: str) -> dict | None:
+    """Raw kubelet Summary API JSON via the apiserver proxy — works WITHOUT
+    metrics-server (the appliance disables it). One ``kubectl get --raw`` on
+    the 5 s tier. ``None`` on any failure. Both the per-pod stats and the
+    node-level (.node) section come from this ONE response (§3 — zero extra
+    cost for the node bar)."""
     try:
         proc = subprocess.run(
             ["/usr/local/bin/k3s", "kubectl", "get", "--raw",
@@ -2815,15 +2984,20 @@ def pod_stats(node: str) -> dict:
             capture_output=True, text=True, timeout=5,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return {}
+        return None
     if proc.returncode != 0:
-        return {}
+        return None
     try:
-        data = json.loads(proc.stdout)
+        return json.loads(proc.stdout)
     except ValueError:
-        return {}
+        return None
+
+
+def pod_stats_from_summary(data: dict | None) -> dict:
+    """``{(namespace, pod): (cpu_cores, mem_bytes)}`` from a kubelet summary
+    dict (kubelet_summary() output)."""
     out: dict = {}
-    for pod in data.get("pods", []) or []:
+    for pod in (data or {}).get("pods", []) or []:
         ref = pod.get("podRef") or {}
         ns, nm = ref.get("namespace", ""), ref.get("name", "")
         if not nm:
@@ -2832,6 +3006,33 @@ def pod_stats(node: str) -> dict:
         mem = (pod.get("memory") or {}).get("workingSetBytes") or 0
         out[(ns, nm)] = (cpu / 1e9, int(mem))
     return out
+
+
+def node_stats_from_summary(data: dict | None) -> dict:
+    """Node-level CPU/mem/fs from the SAME kubelet summary (.node section).
+    Raw counters only (cpu_nc nanocores, mem_wss bytes, fs_used/fs_cap
+    bytes); percentages are derived in the data tier against the node's
+    capacity from cluster_nodes(). {} when there's no .node section."""
+    node = (data or {}).get("node") or {}
+    if not node:
+        return {}
+    cpu = node.get("cpu") or {}
+    mem = node.get("memory") or {}
+    fs = node.get("fs") or {}
+    return {
+        "cpu_nc": float(cpu.get("usageNanoCores") or 0),
+        "mem_wss": float(mem.get("workingSetBytes") or 0),
+        "mem_avail": float(mem.get("availableBytes") or 0),
+        "fs_used": float(fs.get("usedBytes") or 0),
+        "fs_cap": float(fs.get("capacityBytes") or 0),
+    }
+
+
+def pod_stats(node: str) -> dict:
+    """Back-compat wrapper: per-pod stats for ``node`` (one kubelet fetch).
+    The data tier calls kubelet_summary() once and derives both pod + node
+    stats; this stays for any standalone caller."""
+    return pod_stats_from_summary(kubelet_summary(node))
 
 
 def _human_bytes(b: float) -> str:
@@ -2998,11 +3199,15 @@ def render_kpi_pg(state: "DashboardState") -> Panel:
         return _kpi_na("[bold]Postgres[/bold]")
     c = state.cnpg
     waiting = int(c.get("backends_waiting", 0) or 0)
-    conns = int(c.get("backends", 0) or 0)
-    size = float(c.get("db_size", 0) or 0)
+    conns = int(c.get("backends_idle", 0) or 0) + int(c.get("backends_active", 0) or 0)
+    size = float(c.get("db_size_bytes", 0) or 0)
+    replicas = int(c.get("streaming_replicas", 0) or 0)
     role = "replica" if c.get("in_recovery") else "primary"
     border = "green" if waiting == 0 else "yellow"
-    row1 = Text(role, style="bold")
+    row1 = Text()
+    row1.append(role, style="bold")
+    if replicas:
+        row1.append(f"  +{replicas} repl", style="dim")
     row2 = Text()
     row2.append(f"{conns} conn  ", style="dim")
     row2.append(f"{waiting} wait", style="dim" if waiting == 0 else "bold yellow")
@@ -3038,10 +3243,10 @@ def render_kpi_platform(state: "DashboardState") -> Panel:
     all_ok = r.get("status") == "ok"
     border = "green" if all_ok else "bold red"
     rows = []
-    for name in ("database", "redis", "schema"):
-        ok = str(checks.get(name, "")).lower() in ("ok", "up", "true", "ready")
+    for key, label in (("database", "db"), ("redis", "redis"), ("schema", "schema")):
+        ok = str(checks.get(key, "")).lower() in ("ok", "up", "true", "ready")
         t = Text()
-        t.append(f"{name[:6]} ", style="dim")
+        t.append(f"{label} ", style="dim")
         t.append_text(_dot(ok))
         rows.append(t)
     return _kpi_box("[bold]Platform[/bold]", rows, border)
@@ -3367,6 +3572,29 @@ class DashboardState:
         self.node_mem_pct: float | None = None
         self.node_fs_pct: float | None = None
 
+    def _set_node_pct(self, raw: dict) -> None:
+        """Derive node CPU/mem/fs percentages from the kubelet .node section
+        (raw counters) against the LOCAL node's capacity from
+        cluster_nodes(). Leaves a value None when its capacity/usage is
+        unavailable so the Cluster box's node bar renders "n/a" rather than
+        a misleading 0%."""
+        if not raw:
+            self.node_cpu_pct = self.node_mem_pct = self.node_fs_pct = None
+            return
+        name = os.uname().nodename
+        cap = next((n for n in self.nodes if n.get("name") == name), None)
+        cpu_cap = float(cap.get("cpu_cap") or 0) if cap else 0.0
+        mem_cap = float(cap.get("mem_cap_bytes") or 0) if cap else 0.0
+        self.node_cpu_pct = (
+            raw["cpu_nc"] / 1e9 / cpu_cap * 100 if cpu_cap > 0 else None
+        )
+        self.node_mem_pct = (
+            raw["mem_wss"] / mem_cap * 100 if mem_cap > 0 else None
+        )
+        self.node_fs_pct = (
+            raw["fs_used"] / raw["fs_cap"] * 100 if raw.get("fs_cap", 0) > 0 else None
+        )
+
     def refresh(self, force: bool = False) -> None:
         now = time.monotonic()
 
@@ -3392,19 +3620,42 @@ class DashboardState:
         if force or (now - self._last_data_refresh) >= DATA_REFRESH_EVERY:
             self._last_data_refresh = now
             self.ps_rows = cluster_pods()
-            self.pod_stats = pod_stats(os.uname().nodename)
             self.nodes = cluster_nodes()
-            self.vip = cluster_vip()
+            # Phase 2 INC 4 — one kubelet Summary fetch feeds BOTH the
+            # per-pod Top-pods table AND the node-level CPU/mem/fs bars
+            # (zero extra subprocess).
+            _summary = kubelet_summary(os.uname().nodename)
+            self.pod_stats = pod_stats_from_summary(_summary)
+            self._set_node_pct(node_stats_from_summary(_summary))
+            # Phase 2 INC 4 — vip + api ClusterIP from ONE svc fetch
+            # (replaces the standalone cluster_vip() call).
+            _svc = cluster_svc_ips()
+            self.vip = _svc.get("vip")
+            self.api_ip = _svc.get("api")
             self.k3s_state = k3s_status()
             # P0.5 — host-config apply health (pure file reads). Cached
             # here so render_header / overall_verdict read it off
             # ``state`` without touching disk on the render path.
             self.host_health = host_health_rollup()
-            # Phase 2 INC 3 — etcd health (13 ms urllib). Keep last-good on
-            # an empty fetch so a transient blip doesn't flap the box to
-            # "n/a". INC 5 folds this into the ThreadPoolExecutor alongside
-            # the api/cnpg fetches; for now it's a single call on the tier.
-            self.etcd = fetch_etcd_health() or self.etcd
+            # Phase 2 INC 4 — the four urllib health fetches run
+            # CONCURRENTLY behind a small pool so a single hung endpoint
+            # (3 s timeout each) can't serialise into a 12 s data-tier
+            # stall; wall time is ~max-single (~17 ms healthy). Each
+            # fetch already returns {} on error; keep-last-good on empty
+            # so a transient blip doesn't flap a box to "n/a".
+            _pg_ip = _primary_pg_ip(self.ps_rows)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+                f_etcd = ex.submit(fetch_etcd_health)
+                f_api = ex.submit(fetch_api_metrics, self.api_ip) if self.api_ip else None
+                f_ready = ex.submit(fetch_api_ready, self.api_ip) if self.api_ip else None
+                f_cnpg = ex.submit(fetch_cnpg_metrics, _pg_ip) if _pg_ip else None
+                self.etcd = f_etcd.result() or self.etcd
+                _api = (f_api.result() if f_api else {}) or {}
+                self.api_req_rate = _api.get("rate", self.api_req_rate)
+                self.api_active = _api.get("active", self.api_active)
+                self.api_total = _api.get("total", self.api_total)
+                self.api_ready = (f_ready.result() if f_ready else {}) or self.api_ready
+                self.cnpg = (f_cnpg.result() if f_cnpg else {}) or self.cnpg
             # P0.8 — per-slot versions (file read) + grubenv next_entry
             # (one subprocess, fine at 5 s). Cached so the render path
             # never touches disk / grub for these runtime-changing values.
