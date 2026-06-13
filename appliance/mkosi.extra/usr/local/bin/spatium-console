@@ -1604,6 +1604,38 @@ _POD_RED_STATES = frozenset({
     "Failed", "CrashLoopBackOff", "ImagePullBackOff",
     "ErrImagePull", "CreateContainerError",
 })
+
+# P1.1 — pod ordering: surface the broken pod, don't bury it. k9s-style
+# tiers (0 = broken/flapping, 1 = pending/creating, 2 = not-ready,
+# 3 = healthy/completed); alpha within a tier so "where's foo-pod" still
+# scans. The header verdict + Pods-title rollup point AT a problem; this
+# puts it under the operator's eyes at the top of the list.
+_POD_PENDING_STATES = frozenset({
+    "Pending", "ContainerCreating", "PodInitializing",
+})
+
+
+def _pod_sort_priority(row: dict) -> int:
+    state = row.get("K8sState") or ""
+    if (
+        state in _POD_RED_STATES
+        or _rst_verdict(
+            int(row.get("Restarts") or 0), row.get("RestartedAt") or "", state
+        )
+        == "red"
+    ):
+        return 0
+    if state in _POD_PENDING_STATES:
+        return 1
+    ready = row.get("Ready") or ""
+    if "/" in ready:
+        try:
+            have, want = ready.split("/", 1)
+            if int(have) < int(want):
+                return 2
+        except ValueError:
+            pass
+    return 3
 # Disk %-used that escalates the verdict — ``/var`` filling wedges etcd
 # + CNPG, so this is the tightest band.
 _DISK_CRIT_PCT = 90.0
@@ -2155,7 +2187,10 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
     # consistently but obscured the natural "where is foo-pod"
     # scan; the namespace column itself still makes the grouping
     # obvious at a glance.
-    sorted_rows = sorted(visible_rows, key=lambda r: r.get("Names") or "")
+    sorted_rows = sorted(
+        visible_rows,
+        key=lambda r: (_pod_sort_priority(r), r.get("Names") or ""),
+    )
 
     # P0.4 — panel title rollup, mirroring the Nodes panel's
     # ``Cluster · N/M Ready`` pattern so the eye catches a problem
