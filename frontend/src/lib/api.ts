@@ -9047,6 +9047,13 @@ export const applianceContainersApi = {
 };
 
 // ── Appliance: Cluster health dashboard (#402) ─────────────────────
+export interface HostPartition {
+  mount: string;
+  label: string;
+  total_bytes: number;
+  used_bytes: number;
+}
+
 export interface ClusterNodeVitals {
   name: string;
   ready: boolean;
@@ -9071,6 +9078,7 @@ export interface ClusterNodeVitals {
   memory_available_bytes: number | null;
   fs_used_bytes: number | null;
   fs_capacity_bytes: number | null;
+  host_disk_partitions: HostPartition[];
 }
 
 export interface ClusterPodSummary {

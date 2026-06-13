@@ -331,6 +331,10 @@ def get_cluster_health() -> dict[str, Any]:
                 "memory_available_bytes": stats.get("memory_available_bytes"),
                 "fs_used_bytes": stats.get("fs_used_bytes"),
                 "fs_capacity_bytes": stats.get("fs_capacity_bytes"),
+                # #402 — host disk partitions are merged in by the router from
+                # the supervisor's cluster_health JSONB (the api pod can't see
+                # host partitions itself); empty here so the shape is stable.
+                "host_disk_partitions": [],
             }
         )
 

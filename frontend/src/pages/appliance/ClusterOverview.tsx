@@ -380,6 +380,7 @@ function NodeCard({ node }: { node: ClusterNodeVitals }) {
   const cpuPct = pct(node.cpu_usage_cores, node.cpu_capacity_cores);
   const memPct = pct(node.memory_working_set_bytes, node.memory_capacity_bytes);
   const diskPct = pct(node.fs_used_bytes, node.fs_capacity_bytes);
+  const parts = node.host_disk_partitions ?? [];
   const pressure =
     node.memory_pressure || node.disk_pressure || node.pid_pressure;
   return (
@@ -423,36 +424,74 @@ function NodeCard({ node }: { node: ClusterNodeVitals }) {
           sub={`${fmtBytes(node.memory_working_set_bytes)} / ${fmtBytes(node.memory_capacity_bytes)}`}
         />
         <div className="min-w-0 flex-1 space-y-2 text-[11px]">
-          <div
-            title={
-              "Kubelet node filesystem — container images, pod volumes, and " +
-              "ephemeral storage on the appliance's /var data partition. This " +
-              "is the disk-pressure signal the kubelet evicts on. The OS slot " +
-              "partitions (root A/B) and the ESP are managed separately and " +
-              "aren't shown here."
-            }
-          >
-            <div className="flex justify-between text-muted-foreground">
-              <span className="flex items-center gap-1">
-                <HardDrive className="h-3 w-3" /> Disk
-                <span className="rounded bg-muted px-1 text-[9px] font-medium uppercase tracking-wide">
-                  node /var
-                </span>
-              </span>
-              <span className="tabular-nums">
-                {fmtBytes(node.fs_used_bytes)} /{" "}
-                {fmtBytes(node.fs_capacity_bytes)}
-                {diskPct != null && (
-                  <span className="ml-1 text-foreground">
-                    · {Math.round(diskPct)}%
+          {parts.length > 0 ? (
+            // #402 — full host-partition breakdown from the supervisor
+            // (root slot / var / ESP). statvfs'd host-side; the api pod
+            // can't see host partitions itself.
+            <div
+              className="space-y-1.5"
+              title="Host partitions reported by the supervisor (statvfs of the node's mounted filesystems)."
+            >
+              {parts.map((p) => {
+                const pp = pct(p.used_bytes, p.total_bytes);
+                return (
+                  <div key={p.mount}>
+                    <div className="flex justify-between text-muted-foreground">
+                      <span className="flex items-center gap-1">
+                        <HardDrive className="h-3 w-3" /> {p.label}
+                        <span className="font-mono text-[9px] opacity-70">
+                          {p.mount}
+                        </span>
+                      </span>
+                      <span className="tabular-nums">
+                        {fmtBytes(p.used_bytes)} / {fmtBytes(p.total_bytes)}
+                        {pp != null && (
+                          <span className="ml-1 text-foreground">
+                            · {Math.round(pp)}%
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                    <div className="mt-1">
+                      <Bar value={pp ?? 0} color={usageColor(pp)} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            // Fallback before the supervisor reports: the kubelet node
+            // filesystem (the appliance's /var data partition).
+            <div
+              title={
+                "Kubelet node filesystem — container images, pod volumes, and " +
+                "ephemeral storage on the appliance's /var data partition. This " +
+                "is the disk-pressure signal the kubelet evicts on. The OS slot " +
+                "partitions (root A/B) and the ESP are managed separately."
+              }
+            >
+              <div className="flex justify-between text-muted-foreground">
+                <span className="flex items-center gap-1">
+                  <HardDrive className="h-3 w-3" /> Disk
+                  <span className="rounded bg-muted px-1 text-[9px] font-medium uppercase tracking-wide">
+                    node /var
                   </span>
-                )}
-              </span>
+                </span>
+                <span className="tabular-nums">
+                  {fmtBytes(node.fs_used_bytes)} /{" "}
+                  {fmtBytes(node.fs_capacity_bytes)}
+                  {diskPct != null && (
+                    <span className="ml-1 text-foreground">
+                      · {Math.round(diskPct)}%
+                    </span>
+                  )}
+                </span>
+              </div>
+              <div className="mt-1">
+                <Bar value={diskPct ?? 0} color={usageColor(diskPct)} />
+              </div>
             </div>
-            <div className="mt-1">
-              <Bar value={diskPct ?? 0} color={usageColor(diskPct)} />
-            </div>
-          </div>
+          )}
           <div className="flex items-center justify-between text-muted-foreground">
             <span className="flex items-center gap-1">
               <Boxes className="h-3 w-3" /> Pods

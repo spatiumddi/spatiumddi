@@ -100,12 +100,18 @@ def _summary(node: str = "ddi1") -> dict:
         },
         "pods": [
             {
-                "podRef": {"namespace": "spatium", "name": "spatium-control-spatiumddi-api-x"},
+                "podRef": {
+                    "namespace": "spatium",
+                    "name": "spatium-control-spatiumddi-api-x",
+                },
                 "cpu": {"usageNanoCores": 500_000_000},
                 "memory": {"workingSetBytes": 400 * 1024**2},
             },
             {
-                "podRef": {"namespace": "spatium", "name": "spatium-control-spatiumddi-worker-y"},
+                "podRef": {
+                    "namespace": "spatium",
+                    "name": "spatium-control-spatiumddi-worker-y",
+                },
                 "cpu": {"usageNanoCores": 120_000_000},
                 "memory": {"workingSetBytes": 250 * 1024**2},
             },
@@ -128,7 +134,10 @@ def _patch_kube(monkeypatch, *, node_status=200, summary_status=200) -> None:
     ]
     monkeypatch.setattr(
         "app.services.appliance.k8s.list_nodes",
-        lambda label_selector=None: (node_status, [_node()] if node_status == 200 else []),
+        lambda label_selector=None: (
+            node_status,
+            [_node()] if node_status == 200 else [],
+        ),
     )
     monkeypatch.setattr(
         "app.services.appliance.k8s.list_all_pods",
@@ -136,7 +145,10 @@ def _patch_kube(monkeypatch, *, node_status=200, summary_status=200) -> None:
     )
     monkeypatch.setattr(
         "app.services.appliance.k8s.get_node_stats_summary",
-        lambda name: (summary_status, _summary(name) if summary_status == 200 else None),
+        lambda name: (
+            summary_status,
+            _summary(name) if summary_status == 200 else None,
+        ),
     )
 
 
@@ -268,3 +280,67 @@ async def test_health_endpoint_503_when_sa_missing(
 async def test_health_endpoint_requires_auth(client: AsyncClient) -> None:
     r = await client.get(_HEALTH_URL)
     assert r.status_code == 401, r.text
+
+
+async def test_health_endpoint_merges_host_partitions(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch
+) -> None:
+    """#402 — host partitions the supervisor reports inside its cluster_health
+    JSONB are merged onto the matching node (hostname == kube node name)."""
+    import hashlib
+    import os
+
+    from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
+
+    _patch_kube(monkeypatch)  # kube node is "ddi1"
+    der = os.urandom(32)
+    db_session.add(
+        Appliance(
+            id=uuid.uuid4(),
+            hostname="ddi1",
+            public_key_der=der,
+            public_key_fingerprint=hashlib.sha256(der).hexdigest(),
+            state=APPLIANCE_STATE_APPROVED,
+            deployment_kind="appliance",
+            appliance_variant="control-plane",
+            session_token_hash="deadbeef",
+            cluster_health={
+                "kubeapi_ready": True,
+                "host_disk_partitions": [
+                    {
+                        "mount": "/",
+                        "label": "OS (root slot)",
+                        "total_bytes": 8_000_000_000,
+                        "used_bytes": 3_000_000_000,
+                    },
+                    {
+                        "mount": "/var",
+                        "label": "Data",
+                        "total_bytes": 15_000_000_000,
+                        "used_bytes": 9_800_000_000,
+                    },
+                    {
+                        "mount": "/boot/efi",
+                        "label": "ESP",
+                        "total_bytes": 536_000_000,
+                        "used_bytes": 12_000_000,
+                    },
+                ],
+            },
+        )
+    )
+    admin = await _superadmin(db_session)
+    await db_session.commit()
+
+    r = await client.get(_HEALTH_URL, headers=_bearer(admin))
+    assert r.status_code == 200, r.text
+    node = r.json()["nodes"][0]
+    assert node["name"] == "ddi1"
+    assert {p["mount"] for p in node["host_disk_partitions"]} == {
+        "/",
+        "/var",
+        "/boot/efi",
+    }
+    root = next(p for p in node["host_disk_partitions"] if p["mount"] == "/")
+    assert root["label"] == "OS (root slot)"
+    assert root["total_bytes"] == 8_000_000_000

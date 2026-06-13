@@ -104,6 +104,14 @@ spec:
             - name: slot-upgrade-log
               mountPath: /var/log/spatiumddi-host
               readOnly: true
+            # Issue #402 — the active root-slot filesystem (read-only), so the
+            # heartbeat can statvfs it for the Cluster → Overview disk panel.
+            # /var + the ESP are already reachable via the release-state +
+            # boot-efi binds above; this adds the OS root slot ("/"). Read-only
+            # — the supervisor never writes here.
+            - name: host-root
+              mountPath: /host-root
+              readOnly: true
       volumes:
         - name: etc-spatiumddi-host
           hostPath:
@@ -148,4 +156,11 @@ spec:
             # created there; the marker reader tolerates an empty/absent
             # file by reporting None.
             type: FileOrCreate
+        # Issue #402 — host root filesystem, read-only, for the disk panel's
+        # root-slot usage. statvfs("/host-root") reports the active root
+        # partition; /var + ESP come from the binds above.
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
 {{- end }}

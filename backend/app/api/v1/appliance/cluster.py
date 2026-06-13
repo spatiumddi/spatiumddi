@@ -16,14 +16,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 
 import anyio
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import DB
 from app.core.permissions import require_permission
+from app.db import AsyncSessionLocal
+from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.services.appliance import k8s
 from app.services.appliance.cluster_health import cluster_unavailable, get_cluster_health
 
@@ -35,6 +41,13 @@ router = APIRouter()
 # spot: kubelet's Summary API itself only refreshes every ~1–10 s, and a
 # handful of kubeapi calls per tick is cheap, but it feels live in the UI.
 _STREAM_INTERVAL_S = 2.0
+
+
+class HostPartition(BaseModel):
+    mount: str
+    label: str
+    total_bytes: int
+    used_bytes: int
 
 
 class NodeVitals(BaseModel):
@@ -61,6 +74,8 @@ class NodeVitals(BaseModel):
     memory_available_bytes: int | None = None
     fs_used_bytes: int | None = None
     fs_capacity_bytes: int | None = None
+    # #402 — host partitions (root slot / var / ESP) from the supervisor.
+    host_disk_partitions: list[HostPartition] = []
 
 
 class PodSummary(BaseModel):
@@ -108,13 +123,40 @@ class ClusterHealth(BaseModel):
     top_pods_mem: list[PodSummary]
 
 
+async def _merge_host_partitions(db: AsyncSession, snap: dict[str, Any]) -> None:
+    """Attach supervisor-reported host partitions to each node in ``snap``.
+
+    The api pod is a container and can't see host partitions — the supervisor
+    statvfs's them and ships them inside its ``cluster_health`` JSONB (#402).
+    We match by hostname == kube node name. Mutates ``snap`` in place.
+    """
+    if not snap.get("available") or not snap.get("nodes"):
+        return
+    rows = (
+        await db.execute(
+            select(Appliance.hostname, Appliance.cluster_health).where(
+                Appliance.state == APPLIANCE_STATE_APPROVED
+            )
+        )
+    ).all()
+    pmap: dict[str, list[dict[str, Any]]] = {}
+    for hostname, ch in rows:
+        if hostname and isinstance(ch, dict):
+            parts = ch.get("host_disk_partitions")
+            if isinstance(parts, list) and parts:
+                pmap[hostname] = parts
+    for node in snap["nodes"]:
+        if node["name"] in pmap:
+            node["host_disk_partitions"] = pmap[node["name"]]
+
+
 @router.get(
     "/health",
     response_model=ClusterHealth,
     dependencies=[Depends(require_permission("read", "appliance"))],
     summary="Cluster health snapshot (nodes + pods + live usage)",
 )
-async def cluster_health() -> ClusterHealth:
+async def cluster_health(db: DB) -> ClusterHealth:
     try:
         # Off-loop: the gather is a handful of blocking stdlib kubeapi calls.
         snap = await anyio.to_thread.run_sync(get_cluster_health)
@@ -123,6 +165,7 @@ async def cluster_health() -> ClusterHealth:
             status.HTTP_503_SERVICE_UNAVAILABLE,
             f"kubeapi unreachable from api: {exc}",
         )
+    await _merge_host_partitions(db, snap)
     return ClusterHealth(**snap)
 
 
@@ -146,6 +189,10 @@ async def cluster_health_stream(request: Request) -> StreamingResponse:
                 break
             try:
                 snap = await anyio.to_thread.run_sync(get_cluster_health)
+                # Short-lived session per tick (don't hold a connection open
+                # for the whole stream); cheap single-row-per-node lookup.
+                async with AsyncSessionLocal() as db:
+                    await _merge_host_partitions(db, snap)
             except k8s.KubeapiUnavailableError as exc:
                 snap = cluster_unavailable(f"kubeapi unreachable: {exc}")
             except Exception as exc:  # noqa: BLE001 — never let the stream die
