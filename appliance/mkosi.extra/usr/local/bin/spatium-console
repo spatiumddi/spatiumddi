@@ -32,6 +32,7 @@ import termios
 import threading
 import time
 import tty
+import urllib.request
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -344,6 +345,39 @@ def _read_fire_state_dash(trigger_basename: str) -> tuple[str, int]:
     except ValueError:
         attempts = 0
     return parts[0], attempts
+
+
+def fetch_etcd_health(timeout: float = 2.0) -> dict:
+    """etcd health from the embedded-etcd Prometheus endpoint
+    (``http://127.0.0.1:2381/metrics``, ~13 ms). stdlib urllib only — no
+    subprocess, no new dep. Returns ``{}`` when there is no etcd (a
+    single-node sqlite/kine backend, or the endpoint is unreachable) so the
+    etcd KPI box renders dim "n/a" rather than an error. Keys: has_leader,
+    is_leader, proposals_failed, leader_changes, db_in_use (bytes),
+    db_size (bytes). Lives on the 5 s data tier — NEVER the render path."""
+    try:
+        raw = urllib.request.urlopen(
+            "http://127.0.0.1:2381/metrics", timeout=timeout
+        ).read().decode("utf-8", "replace")
+    except Exception:
+        return {}
+    out: dict = {}
+    for line in raw.splitlines():
+        # Each is a bare ``<metric> <value>`` Prometheus line; values may be
+        # scientific notation (e.g. ``4.9e+06``) — float() then int() copes.
+        if line.startswith("etcd_server_has_leader "):
+            out["has_leader"] = int(float(line.split()[-1]))
+        elif line.startswith("etcd_server_is_leader "):
+            out["is_leader"] = int(float(line.split()[-1]))
+        elif line.startswith("etcd_server_proposals_failed_total "):
+            out["proposals_failed"] = int(float(line.split()[-1]))
+        elif line.startswith("etcd_server_leader_changes_seen_total "):
+            out["leader_changes"] = int(float(line.split()[-1]))
+        elif line.startswith("etcd_mvcc_db_total_size_in_use_in_bytes "):
+            out["db_in_use"] = float(line.split()[-1])
+        elif line.startswith("etcd_mvcc_db_total_size_in_bytes "):
+            out["db_size"] = float(line.split()[-1])
+    return out
 
 
 def host_health_rollup() -> dict[str, object]:
@@ -1827,6 +1861,11 @@ def overall_verdict(
     failing = list(hh.get("failing") or [])  # type: ignore[arg-type]
     if failing:
         return ("CRITICAL", f"host config failing: {failing[0]}")
+    # Phase 2 INC 3 — etcd quorum. Multi-node only: a single-node etcd is
+    # always its own leader (has_leader=1), so this never false-fires on a
+    # single-node appliance; an empty state.etcd (sqlite backend) is skipped.
+    if len(state.nodes) > 1 and state.etcd.get("has_leader") == 0:
+        return ("CRITICAL", "etcd quorum lost")
     if k3s_state is not None and "failed" in k3s_state[0]:
         return ("CRITICAL", "k3s failed")
     for mp, _used_g, _total_g, pct in state.disks:
@@ -1839,6 +1878,9 @@ def overall_verdict(
     retrying = list(hh.get("retrying") or [])  # type: ignore[arg-type]
     if retrying:
         return ("DEGRADED", f"host config retrying: {retrying[0]}")
+    # Phase 2 INC 3 — etcd write failures (any node count).
+    if int(state.etcd.get("proposals_failed", 0) or 0) > 0:
+        return ("DEGRADED", "etcd write failures")
     if wd_status is not None and wd_status[1] != "bold green":
         return ("DEGRADED", "supervisor watchdog stale")
     slots = slot_info()
@@ -3358,6 +3400,11 @@ class DashboardState:
             # here so render_header / overall_verdict read it off
             # ``state`` without touching disk on the render path.
             self.host_health = host_health_rollup()
+            # Phase 2 INC 3 — etcd health (13 ms urllib). Keep last-good on
+            # an empty fetch so a transient blip doesn't flap the box to
+            # "n/a". INC 5 folds this into the ThreadPoolExecutor alongside
+            # the api/cnpg fetches; for now it's a single call on the tier.
+            self.etcd = fetch_etcd_health() or self.etcd
             # P0.8 — per-slot versions (file read) + grubenv next_entry
             # (one subprocess, fine at 5 s). Cached so the render path
             # never touches disk / grub for these runtime-changing values.
