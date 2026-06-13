@@ -6,7 +6,14 @@
 // tab itself is gated in AppliancePage on the appliance.firewall feature
 // module — #14's NavItem clause is satisfied by tab-level gating because the
 // firewall family lives under the always-visible /appliance parent.
-import { useMemo, useState, type Dispatch, type SetStateAction } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -29,6 +36,8 @@ import {
   applianceApprovalApi,
   firewallApi,
   formatApiError,
+  networkToolsApi,
+  type FirewallLogLine,
   type FirewallAction,
   type FirewallEffective,
   type FirewallFamily,
@@ -208,22 +217,211 @@ export function FirewallTab() {
   );
 }
 
-// #404 Phase 2 — realtime nftables firewall-log viewer. Placeholder until the
-// supervisor-side log stream lands (nft rules don't log today; the api pod
-// can't read host kernel logs, so the supervisor tails them and streams via
-// the proxy — local node first, remote appliances via the same seam).
+// #404 Phase 2 — realtime nftables firewall-log viewer.
+//
+// nft rules don't log by default, so logging is an opt-in toggle: when on, the
+// renderer adds a rate-limited catch-all `log prefix "spatium-fw: "` before the
+// chain's policy drop. The api pod can't read host kernel logs, so the
+// supervisor tails /dev/kmsg and serves the lines over the nettool proxy —
+// which routes per-appliance, so any appliance in the fleet is selectable. We
+// poll ~2s with a since-cursor for a near-realtime tail.
+function recentlySeen(iso: string | null | undefined): boolean {
+  if (!iso) return false;
+  const t = new Date(iso).getTime();
+  return Number.isFinite(t) && Date.now() - t < 120_000;
+}
+
 function FirewallLogsSection() {
+  const qc = useQueryClient();
+  const { data: enf } = useQuery({
+    queryKey: ["firewall", "enforcement"],
+    queryFn: firewallApi.getEnforcement,
+  });
+  const setLogging = useMutation({
+    mutationFn: firewallApi.setLogging,
+    onSuccess: (d) => qc.setQueryData(["firewall", "enforcement"], d),
+  });
+
+  const { data: appliances } = useQuery({
+    queryKey: ["appliance", "fleet", "fw-logs"],
+    queryFn: applianceApprovalApi.list,
+    refetchInterval: 30_000,
+  });
+  const online = useMemo(
+    () =>
+      (appliances ?? []).filter(
+        (a) =>
+          a.state === "approved" &&
+          a.deployment_kind === "appliance" &&
+          recentlySeen(a.last_seen_at),
+      ),
+    [appliances],
+  );
+
+  const [selected, setSelected] = useState<string>("");
+  useEffect(() => {
+    if (!selected && online.length) setSelected(online[0].id);
+  }, [online, selected]);
+
+  const [lines, setLines] = useState<FirewallLogLine[]>([]);
+  const [paused, setPaused] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const cursorRef = useRef(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Reset the buffer when the target appliance changes.
+  useEffect(() => {
+    setLines([]);
+    cursorRef.current = 0;
+    setErr(null);
+  }, [selected]);
+
+  // Poll the appliance's firewall_logs nettool for new lines (~2s).
+  useEffect(() => {
+    if (!selected || paused) return;
+    let stop = false;
+    const tick = async () => {
+      try {
+        const res = await networkToolsApi.firewallLogs(
+          { since_seq: cursorRef.current, limit: 500 },
+          { kind: "appliance", id: selected },
+        );
+        if (stop) return;
+        setErr(
+          res.available ? null : "kernel log not readable on this appliance",
+        );
+        if (res.cursor) cursorRef.current = res.cursor;
+        if (res.lines.length) {
+          setLines((prev) => {
+            const next = [...prev, ...res.lines];
+            return next.length > 2000 ? next.slice(next.length - 2000) : next;
+          });
+        }
+      } catch (e) {
+        if (!stop) setErr(formatApiError(e));
+      }
+    };
+    void tick();
+    const h = setInterval(tick, 2000);
+    return () => {
+      stop = true;
+      clearInterval(h);
+    };
+  }, [selected, paused]);
+
+  // Auto-scroll to the bottom as lines arrive (unless paused).
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && !paused) el.scrollTop = el.scrollHeight;
+  }, [lines, paused]);
+
+  const loggingOn = !!enf?.logging_enabled;
+  const enforcementOff = enf ? !enf.enabled : false;
+
   return (
-    <div className="mx-auto max-w-2xl rounded-xl border border-dashed bg-muted/30 px-6 py-12 text-center">
-      <ScrollText className="mx-auto h-8 w-8 text-muted-foreground" />
-      <p className="mt-3 text-sm font-medium">Realtime firewall logs</p>
-      <p className="mt-1 text-xs text-muted-foreground">
-        A live tail of nftables drop / reject events for troubleshooting "why is
-        this blocked?" — including remote appliances in a multi-node fleet.
-        Lands in Phase 2 of this change: an opt-in logging toggle on the
-        firewall rules, with the supervisor streaming the host kernel log
-        through the control plane.
-      </p>
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h3 className="flex items-center gap-2 text-sm font-semibold">
+            <ScrollText className="h-4 w-4 text-muted-foreground" />
+            Firewall logs
+          </h3>
+          <p className="mt-1 max-w-xl text-xs text-muted-foreground">
+            Live tail of nftables drop events (prefix <code>spatium-fw:</code>)
+            for troubleshooting "why is this blocked?". Logging is opt-in; the
+            supervisor streams its host kernel log here, so you can watch any
+            appliance in the fleet.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => setLogging.mutate(!loggingOn)}
+          disabled={setLogging.isPending}
+          className={cn(
+            "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm",
+            loggingOn
+              ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+              : "bg-background hover:bg-accent",
+          )}
+        >
+          {setLogging.isPending && (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          )}
+          Logging: {loggingOn ? "On" : "Off"}
+        </button>
+      </div>
+
+      {loggingOn && enforcementOff && (
+        <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-400">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          Logging is on, but firewall enforcement is off — no packets are being
+          dropped, so there's nothing to log yet. Turn on enforcement from the
+          Policies section.
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="text-xs text-muted-foreground">Appliance</label>
+        <select
+          value={selected}
+          onChange={(e) => setSelected(e.target.value)}
+          className="rounded-md border bg-background px-2 py-1 text-sm"
+        >
+          {online.length === 0 && (
+            <option value="">No online appliances</option>
+          )}
+          {online.map((a) => (
+            <option key={a.id} value={a.id}>
+              {a.hostname}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          onClick={() => setPaused((p) => !p)}
+          className="rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
+        >
+          {paused ? "Resume" : "Pause"}
+        </button>
+        <button
+          type="button"
+          onClick={() => setLines([])}
+          className="rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
+        >
+          Clear
+        </button>
+        <span className="ml-auto text-[11px] text-muted-foreground">
+          {lines.length} line{lines.length === 1 ? "" : "s"}
+          {!paused && selected ? " · live" : ""}
+        </span>
+      </div>
+
+      {err && (
+        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
+          {err}
+        </div>
+      )}
+
+      <div
+        ref={scrollRef}
+        className="h-[28rem] overflow-auto rounded-md border bg-muted/30 px-3 py-2 font-mono text-[11px] leading-tight"
+      >
+        {lines.length === 0 ? (
+          <span className="text-muted-foreground">
+            {selected
+              ? loggingOn
+                ? "Waiting for dropped packets…"
+                : "Enable logging above, then reproduce the blocked connection."
+              : "Select an appliance to tail its firewall log."}
+          </span>
+        ) : (
+          lines.map((l) => (
+            <div key={l.seq} className="whitespace-pre-wrap break-all">
+              {l.text}
+            </div>
+          ))
+        )}
+      </div>
     </div>
   );
 }

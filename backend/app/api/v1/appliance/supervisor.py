@@ -2031,6 +2031,7 @@ async def supervisor_heartbeat(
         firewall_enabled=bool(cfg_row.firewall_enabled) if cfg_row else False,
         appliance_id=row.id,
         web_ui_allowed_cidrs=(list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []),
+        firewall_logging_enabled=(bool(cfg_row.firewall_logging_enabled) if cfg_row else False),
     )
     # Persist the rendered hash so 2d's apply-stalled alarm + the Fleet drift
     # chip can compare it against the runner's reported applied_hash. Only

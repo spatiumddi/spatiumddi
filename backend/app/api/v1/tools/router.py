@@ -44,6 +44,8 @@ from app.api.v1.dns_tools import (
 from app.api.v1.tools.schemas import (
     CommandResult,
     DigRequest,
+    FirewallLogsRequest,
+    FirewallLogsResult,
     HostRequest,
     MacVendorEntry,
     MacVendorRequest,
@@ -100,6 +102,7 @@ async def _dispatch_to_appliance[ResultT: BaseModel](
     target: NetToolTarget,
     db: DB,
     current_user: CurrentUser,
+    allowed: frozenset[str] = agent_cmd.REACHABILITY_TOOLS,
 ) -> ResultT:
     """Run a reachability tool FROM a Fleet appliance's vantage.
 
@@ -120,8 +123,9 @@ async def _dispatch_to_appliance[ResultT: BaseModel](
     Every appliance-targeted run is audit-logged (non-negotiable #4)
     with the tool, the target appliance id+name, and the target host.
     """
-    # (a) reachability gate.
-    if tool not in agent_cmd.REACHABILITY_TOOLS:
+    # (a) dispatch gate — reachability tools by default; callers pass an
+    # explicit allow-set for appliance-diagnostic tools (e.g. firewall_logs).
+    if tool not in allowed:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             f"Tool {tool!r} cannot be run from an appliance vantage.",
@@ -352,6 +356,40 @@ async def tls_cert(
             current_user=current_user,
         )
     return await inspect_tls_cert(body.host, body.port, body.server_name, body.timeout_seconds)
+
+
+# ── firewall logs (appliance-diagnostic, #404) ──────────────────────
+
+
+@router.post("/firewall-logs", response_model=FirewallLogsResult, dependencies=[_RequirePerm])
+async def firewall_logs(
+    body: FirewallLogsRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
+) -> FirewallLogsResult:
+    """Tail an appliance's nftables drop logs (#404).
+
+    Always runs from an appliance vantage — the api container can't read host
+    kernel logs, so a server target is rejected. Dispatched over the same
+    supervisor poll/reply channel the reachability tools use, so it works for
+    the local control-plane appliance AND remote fleet appliances. The UI polls
+    this with the returned ``cursor`` for a near-realtime tail.
+    """
+    if _server_target(body.target):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "firewall-logs requires an appliance target — the control plane "
+            "can't read host kernel logs itself.",
+        )
+    assert body.target is not None
+    return await _dispatch_to_appliance(
+        tool="firewall_logs",
+        params=body.model_dump(mode="json"),
+        request_model=FirewallLogsRequest,
+        result_model=FirewallLogsResult,
+        target=body.target,
+        db=db,
+        current_user=current_user,
+        allowed=frozenset({"firewall_logs"}),
+    )
 
 
 # ── DNS propagation (reuses the dns_tools helper; off-prem budget) ──

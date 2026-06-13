@@ -661,6 +661,15 @@ class PlatformSettings(Base):
     firewall_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
+    # #404 — opt-in firewall logging. When on (and firewall_enabled is on),
+    # the rendered nft drop-in gets a rate-limited catch-all `log prefix
+    # "spatium-fw: "` before the chain's policy drop, so dropped/rejected
+    # packets land in the kernel log. The supervisor tails /dev/kmsg for that
+    # prefix and serves it to the Firewall → Logs viewer. Off by default
+    # (log volume); flip on for troubleshooting, off when done.
+    firewall_logging_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
     # #285 Phase 6 — source-scope the Web UI (frontend hostPort 80/443 + the
     # MetalLB control-plane VIP). Empty = open (today's behaviour). When set,
     # both firewall renderers emit a peer-scoped 80/443 accept (requires the

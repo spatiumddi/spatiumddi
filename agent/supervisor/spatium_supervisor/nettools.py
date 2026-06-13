@@ -684,10 +684,40 @@ async def _run_tls_cert(params: dict[str, Any]) -> dict[str, Any]:
             pass
 
 
+# ── firewall logs (#404) ─────────────────────────────────────────────
+
+
+async def _run_firewall_logs(params: dict[str, Any]) -> dict[str, Any]:
+    """Serve buffered nftables drop-log lines from the kmsg reader.
+
+    Not a reachability probe — this reads the local kmsg ring buffer
+    (#404) for lines our firewall renderer tagged ``spatium-fw: ``.
+    ``since_seq`` is the incremental cursor; the result carries the new
+    cursor so the UI can poll for just-arrived lines.
+    """
+    from . import kmsg_reader  # noqa: PLC0415
+
+    try:
+        since_seq = int(params.get("since_seq", 0) or 0)
+    except (TypeError, ValueError):
+        since_seq = 0
+    try:
+        limit = int(params.get("limit", 200) or 200)
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(1, min(limit, 1000))
+    lines, cursor = kmsg_reader.get_since(since_seq, limit)
+    return {
+        "available": kmsg_reader.is_available(),
+        "lines": [{"seq": s, "ts_us": t, "text": txt} for (s, t, txt) in lines],
+        "cursor": cursor,
+    }
+
+
 # ── dispatch ─────────────────────────────────────────────────────────
 
-# The five reachability tools this executor knows how to run. Mirrors
-# the backend's ``agent_cmd.REACHABILITY_TOOLS`` set — a job for any tool
+# The reachability tools this executor knows how to run. Mirrors the
+# backend's ``agent_cmd.REACHABILITY_TOOLS`` set — a job for any tool
 # outside it is rejected (the control plane never enqueues one, but we
 # guard defensively so a malformed command can't crash the loop).
 _RUNNERS: Final[dict[str, Any]] = {
@@ -696,9 +726,16 @@ _RUNNERS: Final[dict[str, Any]] = {
     "dig": _run_dig,
     "port-test": _run_port_test,
     "tls-cert": _run_tls_cert,
+    # #404 — appliance-diagnostic tool (not a reachability probe), dispatched
+    # the same way; the backend allows it via an explicit allow-set.
+    "firewall_logs": _run_firewall_logs,
 }
 
-REACHABILITY_TOOLS: Final[frozenset[str]] = frozenset(_RUNNERS)
+# True reachability probes only — keep firewall_logs out of this so the set
+# keeps its meaning (the backend gates appliance dispatch on its own set).
+REACHABILITY_TOOLS: Final[frozenset[str]] = frozenset(
+    {"ping", "traceroute", "dig", "port-test", "tls-cert"}
+)
 
 
 async def execute(tool: str, params: dict[str, Any]) -> dict[str, Any]:

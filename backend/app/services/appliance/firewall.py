@@ -233,6 +233,7 @@ async def firewall_bundle(
     firewall_enabled: bool,
     appliance_id: Any = None,
     web_ui_allowed_cidrs: list[Any] | None = None,
+    firewall_logging_enabled: bool = False,
 ) -> dict[str, Any]:
     """The ``firewall_settings`` block shipped on the supervisor heartbeat.
 
@@ -270,11 +271,27 @@ async def firewall_bundle(
         appliance_policy=appliance_policy,
         web_ui_allowed_cidrs=web_ui_allowed_cidrs,
     )
+    if firewall_logging_enabled:
+        # #404 — a rate-limited catch-all log just before the chain's
+        # policy drop. The drop-in's accept rules terminate first; anything
+        # falling through gets logged (≤10/s so a scan can't flood dmesg)
+        # then hits the base chain's `policy drop`. The supervisor tails
+        # /dev/kmsg for this prefix → Firewall → Logs viewer.
+        body = body.rstrip("\n") + "\n" + _FIREWALL_LOG_RULE + "\n"
     return {
         "enabled": True,
         "config_hash": hashlib.sha256(body.encode("utf-8")).hexdigest(),
         "firewall_conf": body,
     }
+
+
+# nft rule appended to the rendered drop-in when firewall logging is on. No
+# verdict → it logs + continues, so the base chain's `policy drop` still drops.
+_FIREWALL_LOG_RULE = (
+    "limit rate 10/second burst 20 packets "
+    'log prefix "spatium-fw: " level info '
+    'comment "spatiumddi dropped-packet log (#404)"'
+)
 
 
 __all__ = ["compile_firewall_body", "firewall_bundle"]

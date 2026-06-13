@@ -344,6 +344,14 @@ def main() -> int:
     identity_for_nettool, _ = load_or_generate(cfg.state_dir)
     start_nettool_thread(cfg, identity_for_nettool)
 
+    # #404 — tail /dev/kmsg for nftables drop logs so the firewall_logs
+    # nettool can serve them to the Firewall → Logs viewer. Harmless if no
+    # drops are ever logged (firewall logging off) — the buffer just stays
+    # empty. Daemon thread; no-op if /dev/kmsg can't be opened.
+    from .kmsg_reader import start as start_kmsg_reader  # noqa: PLC0415
+
+    start_kmsg_reader()
+
     stop = False
 
     def _handle_signal(signum: int, _frame: object) -> None:
