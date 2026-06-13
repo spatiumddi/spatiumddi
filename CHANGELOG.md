@@ -112,9 +112,9 @@ works across remote appliances too (#404).
   unprivileged supervisor can read the kernel ring buffer.
 * **#395 — in-place host-migration framework.** A/B slot upgrades
   replace the rootfs but not the install-time, shared-ESP
-  `grub.cfg`, so menu-structure or kernel-cmdline changes (such as
-  #393's verbose branch) previously required a full reinstall to
-  reach an installed box. New `spatium-grub-render` (idempotent,
+  `grub.cfg`, so menu-structure or kernel-cmdline changes (like the
+  verbose-boot branch from #393) previously required a full
+  reinstall to reach an installed box. New `spatium-grub-render` (idempotent,
   single source of truth for grub.cfg, shared by the install + live
   paths) and `spatium-host-migrate` (version-gated, every-boot
   reconcile of numbered idempotent host-patches run before the
