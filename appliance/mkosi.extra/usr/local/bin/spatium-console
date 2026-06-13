@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -284,6 +285,159 @@ def effective_role_label(role: str) -> str:
     return role_label(role)
 
 
+# ── host-config apply health (P0.5) ───────────────────────────────────
+#
+# The supervisor's ``appliance_state.read_host_config_health()`` rolls up
+# whether the control-plane-desired host config (ntp/snmp/lldp/syslog/
+# ssh/resolver/firewall/timezone) has actually LANDED on the host. These
+# failures are otherwise silent at the console — a "failing" NTP plane
+# drifts chrony further every reboot and the operator has no idea until
+# they SSH in and read sidecars. The console is a standalone host script
+# (stdlib + psutil + rich) and MUST NOT import the supervisor package, so
+# we replicate the ~15 lines of file-read logic inline here. On the host
+# the supervisor's ``/var/lib/spatiumddi-host/release-state/`` bind mount
+# resolves to ``/var/lib/spatiumddi/release-state/`` (same path the
+# existing ``upgrade_status`` / ``cluster_join_state`` readers use).
+_RELEASE_STATE_DIR = Path("/var/lib/spatiumddi/release-state")
+
+# (plane-name, applied-hash-sidecar-basename) for the 8 host-config
+# planes. The console compares each plane's last-FIRED hash (the
+# ``<trigger>.fire-state`` sidecar) against its APPLIED hash; a mismatch
+# means the host runner hasn't converged. Mirrors
+# ``appliance_state._HOST_CONFIG_PLANES`` — keep in sync.
+_HOST_CONFIG_PLANES_DASH: tuple[tuple[str, str, str], ...] = (
+    ("snmp", "snmp-config-pending", "snmp-config-hash"),
+    ("ntp", "ntp-config-pending", "ntp-config-hash"),
+    ("lldp", "lldp-config-pending", "lldp-config-hash"),
+    ("syslog", "syslog-config-pending", "syslog-config-hash"),
+    ("ssh", "ssh-config-pending", "ssh-config-hash"),
+    ("resolver", "resolver-config-pending", "resolver-config-hash"),
+    ("firewall", "firewall-pending", "firewall-applied-hash"),
+    ("timezone", "tz-pending", "tz-hash"),
+)
+# At/above this many fires of the SAME hash → "failing" (apply keeps
+# missing); below → "retrying" (still backing off). Mirrors
+# ``appliance_state._HOSTCFG_FAILING_ATTEMPTS``.
+_HOSTCFG_FAILING_ATTEMPTS_DASH = 3
+
+
+def _read_state_line(name: str) -> str:
+    """Stripped single-line content of a release-state sidecar (by
+    basename), or "" when missing / unreadable / empty."""
+    try:
+        return (_RELEASE_STATE_DIR / name).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _read_fire_state_dash(trigger_basename: str) -> tuple[str, int]:
+    """Read ``<hash>\\t<attempts>\\t<iso>`` from a ``<trigger>.fire-state``
+    sidecar → (hash, attempts). Missing / malformed → ("", 0)."""
+    text = _read_state_line(trigger_basename + ".fire-state")
+    if not text:
+        return "", 0
+    parts = text.split("\t")
+    if not parts or not parts[0]:
+        return "", 0
+    try:
+        attempts = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        attempts = 0
+    return parts[0], attempts
+
+
+def host_health_rollup() -> dict[str, object]:
+    """Roll up host-config apply health into a render-ready summary.
+
+    Pure file reads under ``/var/lib/spatiumddi/release-state/`` — no
+    subprocess, safe to call on the 5 s data tier (cached on
+    ``DashboardState``). Returns::
+
+        {"verdict": "ok"|"retrying"|"degraded"|"restore",
+         "failing": [<plane>, ...],   # state == "failing"
+         "retrying": [<plane>, ...],  # state == "retrying"
+         "restore": bool}             # etcd restore in-flight (loudest)
+
+    A healthy box returns ``verdict="ok"`` with empty lists. Mirrors
+    ``appliance_state.read_host_config_health()`` +
+    ``read_host_migration_health()`` + the cluster-restore sidecar,
+    collapsed into one rollup."""
+    failing: list[str] = []
+    retrying: list[str] = []
+    if _RELEASE_STATE_DIR.is_dir():
+        for name, trigger_basename, applied_basename in _HOST_CONFIG_PLANES_DASH:
+            fhash, attempts = _read_fire_state_dash(trigger_basename)
+            if not fhash:
+                continue  # never fired → nothing to report
+            applied = _read_state_line(applied_basename)
+            if applied == fhash:
+                continue  # last-fired config is applied → healthy
+            if attempts >= _HOSTCFG_FAILING_ATTEMPTS_DASH:
+                failing.append(name)
+            else:
+                retrying.append(name)
+        # Host-migration patch ledger (#395) — any patch with ok=False
+        # is a degraded plane too.
+        try:
+            ledger = json.loads(
+                (_RELEASE_STATE_DIR / "host-patches-applied.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, ValueError):
+            ledger = None
+        if isinstance(ledger, dict):
+            patches = ledger.get("patches")
+            if isinstance(patches, dict):
+                for pid, info in patches.items():
+                    if isinstance(info, dict) and info.get("ok") is False:
+                        failing.append(f"patch:{pid}")
+            if ledger.get("last_reconcile_ok") is False and not failing:
+                failing.append("patch:reconcile")
+
+    # etcd restore in-flight is the loudest possible state — the cluster
+    # is unavailable for the duration. ``cluster-restore.state`` is
+    # ``<state>\t<reason>``.
+    restore = False
+    rstate = _read_state_line("cluster-restore.state")
+    if rstate:
+        restore = rstate.split("\t", 1)[0] == "in-flight"
+
+    if restore:
+        verdict = "restore"
+    elif failing:
+        verdict = "degraded"
+    elif retrying:
+        verdict = "retrying"
+    else:
+        verdict = "ok"
+    return {
+        "verdict": verdict,
+        "failing": failing,
+        "retrying": retrying,
+        "restore": restore,
+    }
+
+
+def host_health_summary(rollup: dict[str, object]) -> tuple[str, str]:
+    """Format a ``host_health_rollup()`` dict into ``(label, style)`` for
+    the header's Health line. ``ok`` is green, ``retrying`` amber,
+    ``degraded`` / ``restore`` red. Names the offending planes so the
+    operator knows where to look without SSHing in."""
+    verdict = rollup.get("verdict")
+    failing = list(rollup.get("failing") or [])  # type: ignore[arg-type]
+    retrying = list(rollup.get("retrying") or [])  # type: ignore[arg-type]
+    if verdict == "restore":
+        return ("ETCD RESTORE IN PROGRESS — cluster unavailable", "bold red")
+    if verdict == "degraded":
+        names = ", ".join(failing[:4]) + ("…" if len(failing) > 4 else "")
+        return (f"{len(failing)} degraded: {names}", "bold red")
+    if verdict == "retrying":
+        names = ", ".join(retrying[:4]) + ("…" if len(retrying) > 4 else "")
+        return (f"{len(retrying)} retrying: {names}", "bold yellow")
+    return ("all OK", "bold green")
+
+
 # ── k3s pod state ─────────────────────────────────────────────────────
 #
 # Issue #183 Phase 7/8 — the appliance is k3s-only; this used to talk
@@ -466,6 +620,25 @@ def cluster_pods() -> list[dict]:
         ready_n = sum(1 for cs in container_statuses if cs.get("ready"))
         ready_total = len(container_statuses) or len(containers)
         restarts = sum(int(cs.get("restartCount") or 0) for cs in container_statuses)
+        # P0.2 — WHY the pod last restarted. ``lastState.terminated``
+        # carries the previous instance's exit code + reason (OOMKilled
+        # / Error / Completed). It's already in the JSON we fetched but
+        # was never extracted; the renderer folds it into the STATE
+        # column so "RST 6" reads "CrashLoop · OOMKilled" — actionable
+        # instead of merely alarming. Pick the first terminated reason
+        # across containers (one bad container is enough to flag).
+        last_exit_reason = ""
+        last_exit_code: int | None = None
+        for cs in container_statuses:
+            term = (cs.get("lastState") or {}).get("terminated") or {}
+            if not term:
+                continue
+            reason = term.get("reason") or ""
+            code = term.get("exitCode")
+            if reason or code is not None:
+                last_exit_reason = reason
+                last_exit_code = code if isinstance(code, int) else None
+                break
         # Last (re)start: when a container has restarted, its running
         # state's startedAt is when the current instance came up. Pick
         # the most recent across containers; blank when nothing restarted.
@@ -497,6 +670,8 @@ def cluster_pods() -> list[dict]:
                 "Ready": f"{ready_n}/{ready_total}",
                 "Restarts": restarts,
                 "RestartedAt": restarted_at,
+                "LastExitReason": last_exit_reason,
+                "LastExitCode": last_exit_code,
                 "PodIP": status.get("podIP") or "",
                 "Type": _pod_workload_type(meta.get("ownerReferences") or []),
             }
@@ -746,6 +921,103 @@ def _format_pod_age(creation_iso: str) -> str:
     return f"{days // 365}y"
 
 
+def _age_seconds(iso: str) -> float | None:
+    """Seconds elapsed since the ISO-8601 timestamp ``iso`` (kubectl
+    RFC3339, trailing ``Z`` tolerated), or ``None`` on parse failure.
+
+    Shares ``_format_pod_age``'s ``fromisoformat`` parse so the RST
+    recency gate and the rendered RST-AGE column agree on what "now"
+    means. Negative deltas (clock skew) clamp to 0.0."""
+    if not iso:
+        return None
+    try:
+        ts = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    secs = (datetime.now(ts.tzinfo) - ts).total_seconds()
+    return secs if secs > 0 else 0.0
+
+
+# P0.1 — RST recency/rate verdict. A fresh-install box churns ~5-8
+# restarts during boot (coredns/CNPG/api wait on each other); the old
+# raw ``>5 → bold red`` painted that healthy 25-minute-old box as "eight
+# things on fire". Instead gate red on a RECENT restart: a pod that's
+# restarted >=3 times AND last restarted <5 min ago is genuinely
+# flapping; one that restarted 6× during boot but has been quiet for 25
+# min is amber (worth a glance, not an alarm). >10 lifetime restarts is a
+# red backstop regardless of recency — that many is never benign.
+_RST_RECENT_S = 300.0    # last restart within 5 min → "recent"
+_RST_FLAP_MIN = 3        # restarts at/above this + recent → flapping
+_RST_LIFETIME_RED = 10   # lifetime restarts at/above this → red backstop
+
+
+def _rst_verdict(restarts: int, restarted_at: str, k8s_state: str = "") -> str:
+    """Classify a pod's restart history as ``red`` (flapping now /
+    pathological lifetime count / currently broken), ``amber`` (has
+    restarted but quiet), or ``quiet`` (zero restarts). Reused by
+    ``render_services`` for the RST column colour and by
+    ``overall_verdict`` for the header rollup."""
+    # A pod sitting in a broken/waiting state (CrashLoopBackOff …) is red
+    # regardless of timestamp: ``RestartedAt`` is only populated once a
+    # restarted container is RUNNING again, so a pod stuck waiting would
+    # otherwise under-colour to amber. (Empty ``k8s_state`` never matches.)
+    if k8s_state in _POD_RED_STATES:
+        return "red"
+    if restarts <= 0:
+        return "quiet"
+    if restarts >= _RST_LIFETIME_RED:
+        return "red"
+    age = _age_seconds(restarted_at)
+    recent = age is not None and age < _RST_RECENT_S
+    if restarts >= _RST_FLAP_MIN and recent:
+        return "red"
+    return "amber"
+
+
+# P0.2 — STATE column composer. The column is 16 chars wide
+# ("CrashLoopBackOff" fits exactly). When a pod has restarted we fold
+# the last-exit reason in so "RST 6" reads its WHY: "CrashLoop · OOMKill"
+# instead of a bare alarming count. We abbreviate the long k8s phase
+# ("CrashLoopBackOff" → "CrashLoop") to make room and trim the reason to
+# fit. "Completed" / exit-0 reasons are noise on a quiet pod, so we only
+# surface the reason when the pod actually restarted.
+_STATE_ABBREV = {
+    "CrashLoopBackOff": "CrashLoop",
+    "ImagePullBackOff": "ImgPull",
+    "ErrImagePull": "ErrImgPull",
+    "CreateContainerError": "CreateErr",
+    "ContainerCreating": "Creating",
+    "PodInitializing": "Init",
+}
+
+
+def _compose_state_cell(k8s_state: str, restarts: int,
+                        last_exit_reason: str, last_exit_code: int | None,
+                        width: int = 16) -> str:
+    """Build the STATE cell text, folding the last-exit reason in for a
+    restarted pod and clamping to ``width`` so the column never reflows."""
+    base = _STATE_ABBREV.get(k8s_state, k8s_state)
+    # Only fold a NAMED, actionable reason (OOMKilled / Error /
+    # ContainerCannotRun / …). ``Completed`` / exit-0 is the normal
+    # one-shot end, and kubelet reports ``Unknown`` / ``""`` for the churn
+    # restarts during a node reboot or pod-ordering wait — those are pure
+    # noise on a now-running pod (the RST + RST-AGE columns already say it
+    # restarted). A bare exit code (``last_exit_code``) is likewise noise
+    # here without a named reason, so it isn't folded.
+    reason = last_exit_reason
+    if reason in ("", "Completed", "Unknown") or last_exit_code == 0:
+        reason = ""
+    if restarts <= 0 or not reason:
+        return base[:width]
+    sep = " · "
+    room = width - len(base) - len(sep)
+    if room < 3:
+        # Not enough room for both — the WHY is more actionable than the
+        # phase once we know it restarted, so lead with the reason.
+        return reason[:width]
+    return (base + sep + reason)[:width]
+
+
 def health_from_status(status: str) -> str:
     """Extract the docker healthcheck verdict from a ps Status string.
 
@@ -778,20 +1050,31 @@ def health_from_status(status: str) -> str:
     return "unknown"
 
 
+# P0.7 — flannel's pod CIDR (k3s default 10.42.0.0/16). The cni0 /
+# flannel.1 interfaces carry the node's slice of this (e.g. the
+# 10.42.0.1 gateway) — internal cluster plumbing, never a "point your
+# browser here" address. Filter both the interfaces and the prefix from
+# the operator-facing IP list so the header shows only the real LAN IPs.
+_FLANNEL_IFACES = ("cni0", "flannel.")
+_FLANNEL_V4_PREFIX = "10.42."
+
+
 def host_ips() -> tuple[list[str], list[str]]:
     """Return ``(ipv4_addresses, ipv6_addresses)``. Splits the two
     families so the header can render the IPv4 list inline + a
     compact ``+N IPv6`` summary chip — listing every SLAAC IPv6
     inline blew past the available width on standard 80-col TTYs.
 
-    Skips: loopback, docker bridges, veth pairs, virbr, link-local
+    Skips: loopback, docker bridges, veth pairs, virbr, flannel CNI
+    interfaces (cni0 / flannel.1) + the 10.42/16 pod CIDR, link-local
     IPv4 (169.254/16), link-local IPv6 (fe80::/10).
     """
     v4: list[str] = []
     v6: list[str] = []
     for name, addrs in psutil.net_if_addrs().items():
         if name == "lo" or name.startswith("docker") or name.startswith("br-") \
-                or name.startswith("veth") or name.startswith("virbr"):
+                or name.startswith("veth") or name.startswith("virbr") \
+                or name.startswith(_FLANNEL_IFACES):
             continue
         for addr in addrs:
             fam = getattr(addr, "family", None)
@@ -802,7 +1085,8 @@ def host_ips() -> tuple[list[str], list[str]]:
             # IPv4 = AF_INET = 2 ; IPv6 = AF_INET6 = 10 on Linux. Use
             # the value rather than psutil's enum so a heredoc / mocked
             # test doesn't depend on AF_PACKET being 17.
-            if fam == 2 and not v.startswith("169.254."):
+            if fam == 2 and not v.startswith("169.254.") \
+                    and not v.startswith(_FLANNEL_V4_PREFIX):
                 v4.append(v)
             elif fam == 10 and not v.startswith("fe80"):
                 v6.append(v)
@@ -941,6 +1225,54 @@ def slot_info() -> tuple[str, str] | None:
     return _SLOT_INFO_CACHE  # type: ignore[return-value]
 
 
+# P0.8 — per-slot installed versions, written by ``spatium-upgrade-slot
+# sync-versions`` on every boot + at the end of every apply. On the host
+# the supervisor's ``/var/lib/spatiumddi-host/release-state/`` resolves to
+# ``/var/lib/spatiumddi/release-state/``.
+_SLOT_VERSIONS_FILE = Path("/var/lib/spatiumddi/release-state/slot-versions.json")
+
+
+def read_slot_versions() -> tuple[str | None, str | None]:
+    """Read ``(slot_a_version, slot_b_version)`` from ``slot-versions.json``.
+    Either / both ``None`` when the sidecar is missing or a slot is
+    unstamped. Pure file read — safe on the 5 s data tier."""
+    try:
+        data = json.loads(_SLOT_VERSIONS_FILE.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    a = data.get("slot_a")
+    b = data.get("slot_b")
+    return (a if isinstance(a, str) else None), (b if isinstance(b, str) else None)
+
+
+def read_grub_next_entry() -> str | None:
+    """Read grubenv's one-shot ``next_entry`` — set by
+    ``spatium-upgrade-slot set-next-boot`` to land the NEXT reboot on a
+    different slot than the durable default (a queued trial boot). Cleared
+    by grub on the next boot. ``None`` when unset / unreadable.
+
+    Unlike ``detect_slot_info()``'s ``saved_entry`` read (process-lifetime
+    cached because the slot we booted from never changes mid-run),
+    ``next_entry`` is set at RUNTIME by a Fleet trial-boot request, so this
+    must be read fresh on the 5 s data tier — never cached for the process
+    lifetime."""
+    try:
+        out = subprocess.run(
+            ["grub-editenv", "/boot/efi/grub/grubenv", "list"],
+            capture_output=True, text=True, check=True, timeout=2,
+        ).stdout
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired, OSError):
+        return None
+    for line in out.splitlines():
+        if line.startswith("next_entry="):
+            val = line.split("=", 1)[1].strip()
+            return val or None
+    return None
+
+
 def appliance_version_string(env: dict[str, str]) -> str:
     """Resolve the appliance + image versions for the header.
 
@@ -1038,6 +1370,35 @@ class JournalTail(threading.Thread):
         re.compile(r"Started spatium-console\.service"),
     )
 
+    # P0.10 — etcd / k3s steady-state internals. On a k3s control plane
+    # ``k3s.service`` emits a continuous wall of these (~90% of the live
+    # log) that carry ZERO operator signal — etcd compaction, snapshot
+    # bookkeeping, the apiserver's ClusterIP reconcilers, raft/mvcc
+    # internals. They pass the traceback/systemd filters above (they're
+    # neither), so they flooded the panel and buried real events. Unlike
+    # the always-noise set above, these are vetoed by ``_REAL_ERROR_RE``
+    # so a genuine ``etcdserver`` / ``mvcc`` ERROR line still survives.
+    _K3S_NOISE_PATTERNS = (
+        re.compile(r"compact(ed|ing)? tree index"),
+        re.compile(r"finished scheduled compaction"),
+        re.compile(r"apply request took too long"),
+        re.compile(r"(triggering|saved) snapshot"),
+        re.compile(r"ETCDSnapshotFile"),
+        re.compile(r"updated ClusterIP allocator"),
+        re.compile(r"\b(traceutil|etcdserver|mvcc|raft)\b"),
+        re.compile(r"Reconciling .* resources"),
+        re.compile(r"became leader|renewed lease"),
+    )
+
+    # Real-error markers — a line carrying any of these is NEVER dropped
+    # by the k3s-internal filter, so an actual etcd / apiserver failure
+    # surfaces even though it mentions an etcd internal token.
+    _REAL_ERROR_RE = re.compile(
+        r"level=(error|warn(ing)?|fatal)|"
+        r"\b(Failed|failed|error|Error|refused|not ready|timed out|"
+        r"unhealthy|panic|fatal)\b"
+    )
+
     def __init__(self, units: Iterable[str], maxlen: int = 200):
         super().__init__(daemon=True)
         self.units = list(units)
@@ -1047,7 +1408,14 @@ class JournalTail(threading.Thread):
 
     @classmethod
     def _is_noise(cls, line: str) -> bool:
-        return any(p.search(line) for p in cls._NOISE_PATTERNS)
+        # Always-noise (tracebacks / systemd churn) drop unconditionally.
+        if any(p.search(line) for p in cls._NOISE_PATTERNS):
+            return True
+        # k3s/etcd internals drop ONLY when the line carries no real-error
+        # marker — so a genuine ``etcdserver`` failure isn't filtered.
+        if any(p.search(line) for p in cls._K3S_NOISE_PATTERNS):
+            return not cls._REAL_ERROR_RE.search(line)
+        return False
 
     def stop(self) -> None:
         self._stop.set()
@@ -1230,6 +1598,102 @@ HEALTH_STYLES = {
 ONE_SHOT_SERVICES = {"migrate"}
 
 
+# k8s phases/states that mean a pod is genuinely broken (not just
+# transient boot churn). Used by ``overall_verdict``.
+_POD_RED_STATES = frozenset({
+    "Failed", "CrashLoopBackOff", "ImagePullBackOff",
+    "ErrImagePull", "CreateContainerError",
+})
+# Disk %-used that escalates the verdict — ``/var`` filling wedges etcd
+# + CNPG, so this is the tightest band.
+_DISK_CRIT_PCT = 90.0
+
+# Verdict → (chip-glyph, label, border-style). Worst-offender text is
+# appended by ``overall_verdict``.
+_VERDICT_STYLES = {
+    "HEALTHY":  ("●", "green"),
+    "DEGRADED": ("▲", "yellow"),
+    "CRITICAL": ("■", "red"),
+}
+
+
+def _vital_style(pct: float, warn: float, crit: float) -> str:
+    """P0.6 — threshold colour for a vitals percentage. ``bold`` below
+    ``warn`` (the steady-state look the operator's eye glides past),
+    ``bold yellow`` at/above ``warn``, ``bold red`` at/above ``crit`` —
+    so a hot number is the only thing that stands out on the line."""
+    if pct >= crit:
+        return "bold red"
+    if pct >= warn:
+        return "bold yellow"
+    return "bold"
+
+
+def overall_verdict(
+    state: "DashboardState",
+    k3s_state: tuple[str, str] | None = None,
+    wd_status: tuple[str, str] | None = None,
+) -> tuple[str, str]:
+    """P0.3 — roll the per-panel signals up into one box-level verdict.
+
+    Returns ``(verdict, worst_offender)`` where ``verdict`` is
+    ``HEALTHY`` / ``DEGRADED`` / ``CRITICAL`` and ``worst_offender`` is a
+    short human phrase naming the most serious problem (``""`` when
+    healthy). Reads only data already in ``state`` (pods / host_health /
+    disks / vip) plus the ``k3s_state`` + ``wd_status`` tuples the caller
+    already computed — so it adds NO subprocess on the render path.
+
+    CRITICAL outranks DEGRADED; within a tier the first match wins, so
+    the worst-offender phrase reflects the loudest problem. Inputs:
+      * etcd restore in flight (host_health) — CRITICAL
+      * a red-tier pod: flapping now (``_rst_verdict``) or in a broken
+        k8s state — CRITICAL
+      * a degraded (failing) host-config plane — CRITICAL
+      * k3s unit failed — CRITICAL
+      * disk >90% on any mount — CRITICAL
+      * k3s not yet ready / starting — DEGRADED
+      * a retrying host-config plane — DEGRADED
+      * watchdog loop stale / restart-cap — DEGRADED
+      * a trial-boot pending (current != durable slot) — DEGRADED
+    """
+    hh = state.host_health
+    # ── CRITICAL tier ──────────────────────────────────────────────
+    if hh.get("restore"):
+        return ("CRITICAL", "etcd restore in progress")
+    # Worst pod first — a flapping / broken pod is the operator's #1
+    # concern. Name it (short name) so the chip is actionable.
+    for row in visible_pods(state.ps_rows):
+        k8s_state = row.get("K8sState") or ""
+        restarts = int(row.get("Restarts") or 0)
+        if k8s_state in _POD_RED_STATES:
+            return ("CRITICAL", f"{_short_pod_name(row.get('Names') or '')} {k8s_state}")
+        if _rst_verdict(restarts, row.get("RestartedAt") or "") == "red":
+            return ("CRITICAL", f"{_short_pod_name(row.get('Names') or '')} flapping")
+    failing = list(hh.get("failing") or [])  # type: ignore[arg-type]
+    if failing:
+        return ("CRITICAL", f"host config failing: {failing[0]}")
+    if k3s_state is not None and "failed" in k3s_state[0]:
+        return ("CRITICAL", "k3s failed")
+    for mp, _used_g, _total_g, pct in state.disks:
+        if pct >= _DISK_CRIT_PCT:
+            return ("CRITICAL", f"disk {mp} {pct:.0f}% full")
+    # ── DEGRADED tier ──────────────────────────────────────────────
+    # k3s up but not ready (starting / api not responding / disabled).
+    if k3s_state is not None and "ready" not in k3s_state[0] and k3s_state[1] != "bold green":
+        return ("DEGRADED", "k3s not ready")
+    retrying = list(hh.get("retrying") or [])  # type: ignore[arg-type]
+    if retrying:
+        return ("DEGRADED", f"host config retrying: {retrying[0]}")
+    if wd_status is not None and wd_status[1] != "bold green":
+        return ("DEGRADED", "supervisor watchdog stale")
+    slots = slot_info()
+    if slots is not None:
+        current, durable = slots
+        if durable and durable != current:
+            return ("DEGRADED", "trial boot — reboot reverts")
+    return ("HEALTHY", "")
+
+
 def render_header(state: "DashboardState", mono_t: float) -> Panel:
     """6-row header with identity / vitals / disk sections separated by a Rule.
 
@@ -1288,15 +1752,28 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     line3.append(build)
 
     # Control-plane VIP — the frontend's MetalLB LoadBalancer IP, when one
-    # is assigned. The single stable Web UI address; surfaced near the top
-    # so a physical-console operator knows where to point a browser no
-    # matter which node they're at. Quiet when no VIP is configured.
+    # is assigned. Surfaced near the top so the multi-node operator sees
+    # the floating address that survives node loss. Quiet when no VIP is
+    # configured (single-node). The Web UI line below points at it.
     vip_line: Text | None = None
     if state.vip:
         vip_line = Text()
         vip_line.append("VIP  ", style="dim")
         vip_line.append(state.vip, style="bold bright_green")
-        vip_line.append("  Web UI (control-plane)", style="dim")
+        vip_line.append("  (control-plane MetalLB)", style="dim")
+
+    # P0.7 — the most-copied appliance-console fact: where to point a
+    # browser. Resolve to the VIP on a multi-node cluster (it survives
+    # node loss), else the first non-flannel LAN IPv4 (host_ips already
+    # drops 10.42/16 + loopback + bridges). Bold so it stands out as the
+    # operator's primary affordance. Quiet only on a box with no usable
+    # address yet (pre-network boot).
+    webui_line: Text | None = None
+    webui_host = state.vip or (v4_ips[0] if v4_ips else None)
+    if webui_host:
+        webui_line = Text()
+        webui_line.append("Web UI ", style="dim")
+        webui_line.append(f"https://{webui_host}", style="bold bright_cyan")
 
     # Line 3a — Control plane + Identity (only on appliance nodes that
     # pair with a remote control plane; #170 Wave D). Inlining these
@@ -1322,6 +1799,7 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # mtime delta here gives the physical-console operator the same
     # signal the host watchdog acts on.
     watchdog_line: Text | None = None
+    wd_status: tuple[str, str] | None = None
     if role in ("appliance", "application"):
         wd_status = supervisor_watchdog_status()
         if wd_status is not None:
@@ -1343,15 +1821,34 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
 
     slots = slot_info()
     slot_line: Text | None = None
+    slot_next_line: Text | None = None
     if slots is not None:
         current, durable = slots
+        # P0.8 — per-slot installed versions (cached on the 5 s tier) so
+        # the operator can see WHICH version is in A vs B before a
+        # rollback, not just "committed default". ``—`` when unstamped.
+        ver_a = state.slot_a_version or "—"
+        ver_b = state.slot_b_version or "—"
+        cur_letter = _slot_letter(current)
         slot_line = Text()
         slot_line.append("Slot  ", style="dim")
-        slot_line.append(_slot_letter(current), style="bold cyan")
+        # ``Slot A <verA> · B <verB>`` with the booted slot bold-cyan.
+        slot_line.append(
+            f"A {ver_a}",
+            style="bold cyan" if cur_letter == "A" else "dim",
+        )
+        slot_line.append(" · ", style="dim")
+        slot_line.append(
+            f"B {ver_b}",
+            style="bold cyan" if cur_letter == "B" else "dim",
+        )
+        # Trial-boot warning — running slot differs from the durable
+        # default, so a reboot reverts to the durable one (the most
+        # dangerous pre-reboot omission). Loud amber.
         if durable and durable != current:
             slot_line.append("  ", style="dim")
             slot_line.append(
-                f"TRIAL — durable default is {_slot_letter(durable)}",
+                f"TRIAL ({cur_letter}) — durable={_slot_letter(durable)}, reboot reverts",
                 style="bold bright_yellow",
             )
         elif durable:
@@ -1360,6 +1857,19 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
         else:
             slot_line.append("  ", style="dim")
             slot_line.append("(grubenv unreadable)", style="dim")
+        # One-shot next_entry queued (a Fleet trial-boot request) — the
+        # NEXT reboot lands on a different slot than the durable default.
+        # Amber so the operator at the console knows a trial is pending.
+        # Rendered as its OWN short line (NOT appended to slot_line) so
+        # neither line can wrap and push the vitals row off a narrow
+        # header. Mutually exclusive in practice with the active-TRIAL
+        # case above (grub clears next_entry once it boots the trial).
+        nxt = state.slot_next_entry
+        if nxt and nxt != durable and nxt != current:
+            slot_next_line = Text(
+                f"Next boot → Slot {_slot_letter(nxt)} (one-shot trial pending)",
+                style="bold bright_yellow",
+            )
 
     # Slot-upgrade status line. Only renders when there's something to
     # show (in-flight / failed / done waiting for reboot) — quiet
@@ -1374,6 +1884,18 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
             upgrade_line.append("Upgrade ", style="dim")
             upgrade_line.append(label, style=ustyle)
 
+    # P0.9 — a Fleet-issued reboot is queued; warn the on-console
+    # operator before the box vanishes. No role gate — the trigger is a
+    # host-level safety fact regardless of role.
+    reboot_line: Text | None = None
+    if reboot_pending():
+        reboot_line = Text()
+        reboot_line.append("Reboot ", style="dim")
+        reboot_line.append(
+            "Reboot pending — requested via Fleet UI (press F5 to ack)",
+            style="bold bright_yellow",
+        )
+
     # Issue #183 Phase 1 — k3s row. Quiet on pre-#183 slots (no k3s
     # binary baked); always-on once the slot ships k3s so operators
     # can see the cluster's version + readiness at a glance. The
@@ -1387,6 +1909,20 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
         k3s_line.append("k3s   ", style="dim")
         k3s_line.append(label, style=kstyle)
 
+    # P0.5 — host-config apply health line. Reads the cached rollup off
+    # ``state`` (refreshed on the 5 s data tier — no disk I/O here).
+    # Shown whenever this box has a release-state dir (a real appliance)
+    # so the operator gets the green "all OK" reassurance, and always
+    # when something's degraded / a restore is in flight. Quiet on dev /
+    # non-appliance boxes where the dir doesn't exist and verdict is ok.
+    health_line: Text | None = None
+    hh = state.host_health
+    if _RELEASE_STATE_DIR.is_dir() or hh.get("verdict") != "ok":
+        hlabel, hstyle = host_health_summary(hh)
+        health_line = Text()
+        health_line.append("Health ", style="dim")
+        health_line.append(hlabel, style=hstyle)
+
     # Rule — horizontal divider between identity and vitals.
     rule = Rule(style="cyan dim", characters="─")
 
@@ -1395,25 +1931,44 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # mount dedupe there are typically only 2-3 mount entries, easily
     # fitting alongside the vitals on the same row on any 80+ col TTY.
     # Saves one vertical row on the dashboard.
+    # P0.6 — threshold-coloured vitals. Every value used to render bold
+    # (RAM 64%, /var 62%, CPU 11% all visually identical), so a hot
+    # number never stood out. Now each field colours independently:
+    # CPU amber≥80/red≥95, RAM amber≥85/red≥95, disk amber≥80/red≥90
+    # (``/var`` full wedges etcd + CNPG → tightest band), load amber when
+    # the 1-min average exceeds the CPU count (annotated so the operator
+    # has the denominator).
+    ncpu = os.cpu_count() or 1
     vitals = Text()
-    vitals.append("Up ", style="dim"); vitals.append(uptime_str(), style="bold")
+    vitals.append("Up ", style="dim")
+    vitals.append(uptime_str(), style="bold")
     # Pad the per-second-volatile percentages to a fixed 3-digit width
     # (0–100) so the fields after them — RAM / Load / Disk — don't reflow
     # left/right every tick as CPU/RAM jiggle between 1 and 3 digits.
-    vitals.append("   CPU ", style="dim"); vitals.append(f"{cpu:3.0f}%", style="bold")
+    vitals.append("   CPU ", style="dim")
+    vitals.append(f"{cpu:3.0f}%", style=_vital_style(cpu, 80, 95))
     vitals.append("   RAM ", style="dim")
     vitals.append(
         f"{state.ram_used_gib:.1f}/{state.ram_total_gib:.1f} GiB ({state.ram_percent:3.0f}%)",
-        style="bold",
+        style=_vital_style(state.ram_percent, 85, 95),
     )
-    vitals.append("   Load ", style="dim"); vitals.append(load, style="bold")
+    vitals.append("   Load ", style="dim")
+    load_1m = state.load_avg[0] if state.load_avg else 0.0
+    load_style = "bold yellow" if load_1m > ncpu else "bold"
+    vitals.append(load, style=load_style)
+    vitals.append(f" ({ncpu} cpu)", style="dim")
     if state.disks:
         vitals.append("   Disk ", style="dim")
-        disk_bits = [
-            f"{mp} {used_g:.1f}/{total_g:.1f} GiB ({pct:.0f}%)"
-            for mp, used_g, total_g, pct in state.disks
-        ]
-        vitals.append("  ".join(disk_bits))
+        # Split the disk string so EACH mount colours on its own % —
+        # ``/`` healthy while ``/var`` is red shouldn't blend into one
+        # uniform-coloured blob.
+        for i, (mp, used_g, total_g, pct) in enumerate(state.disks):
+            if i:
+                vitals.append("  ", style="dim")
+            vitals.append(
+                f"{mp} {used_g:.1f}/{total_g:.1f} GiB ({pct:.0f}%)",
+                style=_vital_style(pct, 80, 90),
+            )
 
     # Pack the short label-value rows into a two-column grid so the
     # right half of the panel (~40 chars on an 80-col TTY) stops
@@ -1423,6 +1978,8 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # naturally. Everything else (IPs/Build/Agent/Watchdog/Slot/
     # Upgrade/k3s) is short enough to fit in a half-width cell.
     short_lines: list[Text] = []
+    if webui_line is not None:
+        short_lines.append(webui_line)
     if vip_line is not None:
         short_lines.append(vip_line)
     short_lines += [line2, line3]
@@ -1432,10 +1989,16 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
         short_lines.append(watchdog_line)
     if slot_line is not None:
         short_lines.append(slot_line)
+    if slot_next_line is not None:
+        short_lines.append(slot_next_line)
     if upgrade_line is not None:
         short_lines.append(upgrade_line)
+    if reboot_line is not None:
+        short_lines.append(reboot_line)
     if k3s_line is not None:
         short_lines.append(k3s_line)
+    if health_line is not None:
+        short_lines.append(health_line)
 
     paired_grid = Table.grid(expand=True, padding=(0, 2))
     paired_grid.add_column(ratio=1, no_wrap=False)
@@ -1447,8 +2010,26 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
 
     body_parts: list = [line1, paired_grid, rule, vitals]
     body = Group(*body_parts)
-    return Panel(body, box=SQUARE, border_style="cyan", padding=(0, 1),
-                 title="[bold]SpatiumDDI[/bold]", title_align="left")
+
+    # P0.3 — box-level health verdict as the header title chip + border
+    # colour. Reuse the ``k3s_state`` + ``wd_status`` already computed
+    # above so overall_verdict adds no subprocess. A red border is
+    # visible across a room on a VGA console; uniform cyan never was.
+    verdict, offender = overall_verdict(state, k3s_state, wd_status)
+    vglyph, vcolor = _VERDICT_STYLES.get(verdict, ("●", "cyan"))
+    if verdict == "HEALTHY":
+        title = "[bold]SpatiumDDI[/bold]  [green]● HEALTHY[/green]"
+    else:
+        # Escape any rich-markup metacharacters the pod name / offender
+        # phrase might contain so the title never breaks rendering.
+        safe_offender = offender.replace("[", "(").replace("]", ")")
+        title = (
+            f"[bold]SpatiumDDI[/bold]  "
+            f"[bold {vcolor}]{vglyph} {verdict}[/bold {vcolor}]"
+            + (f" [dim]— {safe_offender}[/dim]" if safe_offender else "")
+        )
+    return Panel(body, box=SQUARE, border_style=vcolor, padding=(0, 1),
+                 title=title, title_align="left")
 
 
 # Strip the long SpatiumDDI helm-release prefixes from pod names for the
@@ -1538,6 +2119,32 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
     # obvious at a glance.
     sorted_rows = sorted(visible_rows, key=lambda r: r.get("Names") or "")
 
+    # P0.4 — panel title rollup, mirroring the Nodes panel's
+    # ``Cluster · N/M Ready`` pattern so the eye catches a problem
+    # without scanning every row. A pod is "Ready" when all its
+    # containers pass probes (n/m with n>=m); "CrashLoop" counts any pod
+    # in a red-tier k8s state. Title goes red when any pod is crash-
+    # looping.
+    ready_count = 0
+    crash_count = 0
+    for r in visible_rows:
+        rdy = r.get("Ready") or "0/0"
+        try:
+            rn, rm = (int(x) for x in rdy.split("/", 1))
+        except ValueError:
+            rn, rm = 0, 0
+        if rm and rn >= rm:
+            ready_count += 1
+        if (r.get("K8sState") or "") in _POD_RED_STATES:
+            crash_count += 1
+    if crash_count:
+        pods_title = (
+            f"[bold]Pods[/bold] · {ready_count} Ready · "
+            f"[bold red]{crash_count} CrashLoop[/bold red]"
+        )
+    else:
+        pods_title = f"[bold]Pods[/bold] · {ready_count} Ready"
+
     if not sorted_rows:
         tbl.add_row(
             Text("·", style="dim"),
@@ -1547,7 +2154,7 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         )
         return Panel(
             tbl, box=SQUARE, border_style="cyan",
-            title="[bold]Pods[/bold]", title_align="left",
+            title=pods_title, title_align="left",
         )
 
     for row in sorted_rows:
@@ -1571,12 +2178,22 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
             rn, rm = 0, 0
         ready_style = "dim" if (rm and rn >= rm) else "yellow"
 
-        # RESTARTS — dim at 0, amber 1-5, red beyond (a flapping pod).
+        # RESTARTS — P0.1 recency/rate gate (see ``_rst_verdict``):
+        # dim at 0, amber when restarted-but-quiet, bold red only when
+        # flapping NOW (>=3 restarts, last one <5 min ago) or past the
+        # >10 lifetime backstop. Kills the fresh-install "everything's
+        # red" false alarm.
         restarts = int(row.get("Restarts") or 0)
+        restarted_at = row.get("RestartedAt") or ""
         rst_text = str(restarts) if restarts else "·"
-        rst_style = "dim" if restarts == 0 else "yellow" if restarts <= 5 else "bold red"
+        rst_verdict = _rst_verdict(restarts, restarted_at, row.get("K8sState") or "")
+        rst_style = (
+            "dim" if rst_verdict == "quiet"
+            else "bold red" if rst_verdict == "red"
+            else "yellow"
+        )
         # How long ago it last restarted (blank → "·").
-        rage = _format_pod_age(row.get("RestartedAt") or "") if row.get("RestartedAt") else "·"
+        rage = _format_pod_age(restarted_at) if restarted_at else "·"
 
         pod_ip = row.get("PodIP") or "—"
 
@@ -1598,6 +2215,12 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
             )
             else "dim"
         )
+        # P0.2 — fold the last-exit reason in for restarted pods so the
+        # STATE cell explains WHY (e.g. "CrashLoop · OOMKilled").
+        state_cell = _compose_state_cell(
+            k8s_state, restarts,
+            row.get("LastExitReason") or "", row.get("LastExitCode"),
+        )
 
         tbl.add_row(
             Text(glyph, style=style),
@@ -1609,14 +2232,14 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
             Text(rst_text, style=rst_style),
             Text(rage, style="dim"),
             Text(age, style="dim"),
-            Text(k8s_state, style=state_style),
+            Text(state_cell, style=state_style),
             Text(pod_ip, style="dim"),
             Text(ports or "—", style=ports_style),
         )
 
     return Panel(
         tbl, box=SQUARE, border_style="cyan",
-        title="[bold]Pods[/bold]", title_align="left",
+        title=pods_title, title_align="left",
     )
 
 
@@ -1689,6 +2312,20 @@ def render_nodes(nodes: list[dict], pods: list[dict] | None = None) -> Panel:
         tbl, box=SQUARE, border_style="magenta",
         title=title, title_align="left",
     )
+
+
+def reboot_pending() -> bool:
+    """P0.9 — True when a Fleet-issued reboot is queued.
+
+    The supervisor writes ``reboot-pending`` (sibling to
+    ``slot-upgrade-pending``) when the control plane sets
+    ``reboot_requested`` on this appliance; the host-side
+    ``spatiumddi-reboot-agent.path`` unit then reboots after a 5 s grace.
+    Surfacing it warns the on-console operator that the box is about to
+    go offline — and that pressing F5 lets them ack it gracefully rather
+    than have the machine vanish mid-keystroke. Single ``exists()``
+    check (no subprocess)."""
+    return (_RELEASE_STATE_DIR / "reboot-pending").exists()
 
 
 def upgrade_status() -> tuple[str, str] | None:
@@ -1926,14 +2563,26 @@ def render_log(tail: JournalTail, height: int) -> Panel:
             Text(line, style="dim", overflow="ellipsis", no_wrap=True)
             for line in list(tail.lines)[-(max(height - 2, 1)):]
         ))
+    # P0.10 — honest title: this pane tails the k3s system journal (the
+    # SpatiumDDI app pods log to pod stdout, surfaced via F3, not here).
+    # The "· k3s system" suffix stops the operator from expecting app
+    # events until the P1 app-log tail lands.
     return Panel(body, box=SQUARE, border_style="cyan",
-                 title="[bold]Live log[/bold]", title_align="left")
+                 title="[bold]Live log[/bold] · k3s system", title_align="left")
 
 
-def render_footer(message: str = "") -> Text:
+def render_footer(message: str = "", role: str = "control-plane") -> Text:
     """Borderless single-line F-key strip. Returns a Text (not Panel)
     so the Layout cell claims exactly one row, with no border padding
-    eating vertical space."""
+    eating vertical space.
+
+    P0.11 — built dynamically from ``role``: the Re-pair action only
+    applies to a remote-paired box (``do_pair`` hard-refuses elsewhere),
+    so the chip is dropped entirely on control-plane roles. On a paired
+    box it's renumbered F6→F7 so the strip is contiguous (no confusing
+    F7 gap). The keybinding accepts BOTH F7 (the renumbered chip) and the
+    historical F8 (muscle memory + serial F-key-passthrough robustness).
+    """
     keys = [
         ("F1", "Login"),
         ("F2", "Monitor"),
@@ -1941,8 +2590,9 @@ def render_footer(message: str = "") -> Text:
         ("F4", "Network"),
         ("F5", "Reboot"),
         ("F6", "Shutdown"),
-        ("F8", "Re-pair"),
     ]
+    if role in ("appliance", "application"):
+        keys.append(("F7", "Re-pair"))
     t = Text(no_wrap=True, overflow="ellipsis")
     t.append(" ")
     for i, (k, label) in enumerate(keys):
@@ -1984,6 +2634,28 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     )
     has_upgrade_line = state.role in ("appliance", "application") and upgrade_status() is not None
     has_k3s_line = k3s_status() is not None
+    # P0.5 — Health line. MUST mirror render_header's gate exactly
+    # (release-state dir present, or a non-ok verdict) or the header
+    # under-sizes by a row and clips the vitals line — the same class of
+    # sizing bug the VIP-line ``+1`` below fixes.
+    has_health_line = (
+        _RELEASE_STATE_DIR.is_dir()
+        or state.host_health.get("verdict") != "ok"
+    )
+    # P0.7 — Web UI line. Present whenever there's a VIP or a usable LAN
+    # IPv4 (host_ips drops loopback / bridges / flannel). MUST be counted
+    # here or the header under-sizes and clips the vitals line.
+    has_webui_line = bool(state.vip) or bool(host_ips()[0])
+    # P0.8 — a queued one-shot trial (next_entry) renders as its OWN short
+    # line (so neither it nor the slot line wraps); count it here to match
+    # render_header's gate or the vitals row clips.
+    _slots_sz = slot_info()
+    has_slot_next = (
+        bool(state.slot_next_entry)
+        and _slots_sz is not None
+        and state.slot_next_entry != _slots_sz[1]  # != durable
+        and state.slot_next_entry != _slots_sz[0]  # != current
+    )
     short_count = (
         2  # IPs + Build, always present
         # VIP line — present whenever a control-plane VIP is configured
@@ -1993,11 +2665,17 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
         # fixed-height header clipped its last element — the CPU/RAM/Disk
         # vitals row vanished exactly when a VIP was set.
         + (1 if state.vip else 0)
-        + (1 if slot_info() is not None else 0)
+        + (1 if has_webui_line else 0)
+        + (1 if _slots_sz is not None else 0)
+        + (1 if has_slot_next else 0)
         + (1 if has_agent_line else 0)
         + (1 if has_watchdog_line else 0)
         + (1 if has_upgrade_line else 0)
+        # P0.9 — reboot-pending line (sizing must match render_header's
+        # gate or the header clips the vitals line).
+        + (1 if reboot_pending() else 0)
         + (1 if has_k3s_line else 0)
+        + (1 if has_health_line else 0)
     )
     paired_rows = (short_count + 1) // 2  # ceil(short_count / 2)
     HEADER_ROWS = 1 + paired_rows + 1 + 1 + 2  # line1 + grid + rule + vitals + border
@@ -2034,7 +2712,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     layout["body"]["services"].update(render_services(state.role, state.ps_rows))
     log_height = max(state.term_size[1] - fixed, 4)
     layout["body"]["log"].update(render_log(state.tail, log_height))
-    layout["footer"].update(render_footer(state.status_message))
+    layout["footer"].update(render_footer(state.status_message, state.role))
     return layout
 
 
@@ -2050,6 +2728,19 @@ class DashboardState:
         self.ps_rows: list[dict] = []
         self.nodes: list[dict] = []
         self.vip: str | None = None
+        # P0.5 — host-config apply health rollup, refreshed on the 5 s
+        # data tier (pure file reads; must NOT be called on the 0.5 s
+        # render path). ``{}``/``ok`` until the first refresh.
+        self.host_health: dict[str, object] = {
+            "verdict": "ok", "failing": [], "retrying": [], "restore": False,
+        }
+        # P0.8 — per-slot versions + grubenv next_entry. These change at
+        # RUNTIME (an apply restamps versions; a Fleet trial-boot sets
+        # next_entry), so unlike slot_info()'s process-lifetime cache
+        # they're refreshed on the 5 s data tier.
+        self.slot_a_version: str | None = None
+        self.slot_b_version: str | None = None
+        self.slot_next_entry: str | None = None
         self.status_message = ""
         self.status_expires = 0.0
         self.pending_action: str | None = None
@@ -2099,6 +2790,15 @@ class DashboardState:
             self.ps_rows = cluster_pods()
             self.nodes = cluster_nodes()
             self.vip = cluster_vip()
+            # P0.5 — host-config apply health (pure file reads). Cached
+            # here so render_header / overall_verdict read it off
+            # ``state`` without touching disk on the render path.
+            self.host_health = host_health_rollup()
+            # P0.8 — per-slot versions (file read) + grubenv next_entry
+            # (one subprocess, fine at 5 s). Cached so the render path
+            # never touches disk / grub for these runtime-changing values.
+            self.slot_a_version, self.slot_b_version = read_slot_versions()
+            self.slot_next_entry = read_grub_next_entry()
             try:
                 self.env = read_env()
             except Exception:
@@ -2698,7 +3398,10 @@ def main() -> int:
             state.set_action("containers")
         elif key == "F4":
             state.set_action("network")
-        elif key == "F8":
+        elif key in ("F7", "F8"):
+            # P0.11 — Re-pair is the renumbered F7 chip; F8 stays bound
+            # for muscle memory + serial F-key passthrough robustness.
+            # do_pair() hard-refuses on non-application roles anyway.
             state.set_action("pair")
 
     keys = KeyReader(on_key)
@@ -2718,73 +3421,113 @@ def main() -> int:
                   refresh_per_second=4, auto_refresh=False,
                   screen=True, transient=False) as live:
             while True:
-                mono_t = time.monotonic()
-                state.refresh()  # self-throttling — only polls docker every DATA_REFRESH_EVERY
-                state.term_size = console.size
-                # ``refresh=True`` is required when Live is constructed
-                # with ``auto_refresh=False`` — otherwise update() just
-                # stores the new renderable and the screen stays stale.
-                live.update(render_frame(state, mono_t), refresh=True)
+                # P0.0 — per-tick exception guard. The console is the
+                # ONLY surface on a headless box; if any mid-tick raise
+                # (a psutil /proc race, a ``console.size`` OSError, a
+                # serial EIO after the dashboard is up, or a bug in one
+                # of the render helpers below) escaped the loop, main()
+                # would exit non-zero → systemd ``Restart=always``
+                # respawns in 2 s → start-limit → black console until a
+                # manual ``systemctl reset-failed``. So we catch here and
+                # keep painting:
+                #   * EIO (the serial device went away) is the one case
+                #     where respawning is pointless — return 75 so
+                #     RestartPreventExitStatus stops the loop, matching
+                #     the startup TTY-probe contract.
+                #   * any other OSError / Exception → log to stderr
+                #     (journald) and skip this frame; the next tick
+                #     re-renders from the (unchanged) cached state.
+                # KeyboardInterrupt / SystemExit deliberately propagate.
+                try:
+                    mono_t = time.monotonic()
+                    state.refresh()  # self-throttling — only polls docker every DATA_REFRESH_EVERY
+                    state.term_size = console.size
+                    # ``refresh=True`` is required when Live is constructed
+                    # with ``auto_refresh=False`` — otherwise update() just
+                    # stores the new renderable and the screen stays stale.
+                    live.update(render_frame(state, mono_t), refresh=True)
 
-                # Drain pending action if any.
-                action = None
-                with state.lock:
-                    if state.pending_action:
-                        action = state.pending_action
-                        state.pending_action = None
-                if action:
-                    if args.dev:
-                        state.flash(f"[dev] would invoke action: {action}", ttl=4)
-                    else:
-                        # Tear down keypress raw mode + Live so the action
-                        # has a clean cooked-tty.
-                        keys.stop()
-                        live.stop()
-                        try:
-                            if action == "login":
-                                do_login(args.tty)  # noreturn
-                            elif action == "reboot":
-                                do_reboot(console)
-                            elif action == "shutdown":
-                                do_shutdown(console)
-                            elif action == "monitor":
-                                do_monitor(console, args.tty)
-                            elif action == "containers":
-                                do_containers(console, args.tty)
-                            elif action == "network":
-                                do_network(console, args.tty)
-                            elif action == "pair":
-                                do_pair(console, args.tty)
-                        finally:
-                            # Hard-reset the terminal state before
-                            # re-entering Live. whiptail (do_pair) +
-                            # nmtui (do_network) + htop (do_monitor)
-                            # can leave the TTY in altscreen-on / raw
-                            # mode / corrupted colour state if they
-                            # exit abnormally; without an explicit
-                            # reset the next ``live.start()`` either
-                            # renders against the wrong cursor coords
-                            # or crashes on the first flush — and
-                            # systemd's Restart=always burns through
-                            # the start-limit before the dashboard
-                            # recovers, leaving operators staring at
-                            # a black tty1. ``stty sane`` + the
-                            # ``\x1b[?1049l`` (exit-altscreen) + ESC c
-                            # (full reset) sequence are cheap and
-                            # idempotent on a working TTY.
+                    # Drain pending action if any.
+                    action = None
+                    with state.lock:
+                        if state.pending_action:
+                            action = state.pending_action
+                            state.pending_action = None
+                    if action:
+                        if args.dev:
+                            state.flash(f"[dev] would invoke action: {action}", ttl=4)
+                        else:
+                            # Tear down keypress raw mode + Live so the action
+                            # has a clean cooked-tty.
+                            keys.stop()
+                            live.stop()
                             try:
-                                subprocess.run(
-                                    ["stty", "sane"], check=False, timeout=2
-                                )
-                                with open(args.tty, "w") as tty_out:
-                                    tty_out.write("\x1b[?1049l\x1bc")
-                                    tty_out.flush()
-                            except OSError:
-                                pass
-                            # Re-arm keypress capture, re-enter Live.
-                            keys = KeyReader(on_key)
-                            keys.start()
-                            live.start()
+                                if action == "login":
+                                    do_login(args.tty)  # noreturn
+                                elif action == "reboot":
+                                    do_reboot(console)
+                                elif action == "shutdown":
+                                    do_shutdown(console)
+                                elif action == "monitor":
+                                    do_monitor(console, args.tty)
+                                elif action == "containers":
+                                    do_containers(console, args.tty)
+                                elif action == "network":
+                                    do_network(console, args.tty)
+                                elif action == "pair":
+                                    do_pair(console, args.tty)
+                            finally:
+                                # Hard-reset the terminal state before
+                                # re-entering Live. whiptail (do_pair) +
+                                # nmtui (do_network) + htop (do_monitor)
+                                # can leave the TTY in altscreen-on / raw
+                                # mode / corrupted colour state if they
+                                # exit abnormally; without an explicit
+                                # reset the next ``live.start()`` either
+                                # renders against the wrong cursor coords
+                                # or crashes on the first flush — and
+                                # systemd's Restart=always burns through
+                                # the start-limit before the dashboard
+                                # recovers, leaving operators staring at
+                                # a black tty1. ``stty sane`` + the
+                                # ``\x1b[?1049l`` (exit-altscreen) + ESC c
+                                # (full reset) sequence are cheap and
+                                # idempotent on a working TTY.
+                                try:
+                                    subprocess.run(
+                                        ["stty", "sane"], check=False, timeout=2
+                                    )
+                                    with open(args.tty, "w") as tty_out:
+                                        tty_out.write("\x1b[?1049l\x1bc")
+                                        tty_out.flush()
+                                except OSError:
+                                    pass
+                                # Re-arm keypress capture, re-enter Live.
+                                keys = KeyReader(on_key)
+                                keys.start()
+                                live.start()
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        # The (serial) TTY hung up under us — there's
+                        # nothing to paint to. Let systemd stop
+                        # respawning a dead device (matches the startup
+                        # probe's 75 contract).
+                        print(
+                            f"spatium-console: TTY EIO mid-render ({exc}); exiting 75.",
+                            file=sys.stderr,
+                        )
+                        return 75
+                    print(
+                        f"spatium-console: skipping frame after OSError: {exc!r}",
+                        file=sys.stderr,
+                    )
+                except Exception as exc:  # noqa: BLE001 — never crash the only console
+                    print(
+                        f"spatium-console: skipping frame after error: {exc!r}",
+                        file=sys.stderr,
+                    )
 
                 time.sleep(REFRESH_INTERVAL)
     except KeyboardInterrupt:
