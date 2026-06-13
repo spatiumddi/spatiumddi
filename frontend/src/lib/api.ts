@@ -3004,6 +3004,12 @@ export interface PlatformSettings {
    *  verbose boot + a plain getty login (no dashboard). Appliance hosts only;
    *  applies on the next reboot (grubenv-driven). */
   console_mode: "dashboard" | "verbose_dashboard" | "text_console";
+  /** Supervisor (appliance) registration gate (#170 Wave A / #407).
+   *  When false, a remote supervisor cannot pair (register 404s).
+   *  OS-appliance control-plane installs self-enable this on first boot;
+   *  generic Kubernetes/Helm control planes must flip it on (here or via
+   *  the Fleet → Pairing toggle) before an appliance can register. */
+  supervisor_registration_enabled: boolean;
   /** Maintenance mode (issue #57). System-wide read-only switch.
    *  ``maintenance_started_at`` is server-managed (stamped on enable /
    *  cleared on disable) and is therefore read-only — not sent on PUT. */

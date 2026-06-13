@@ -1258,6 +1258,15 @@ The control-plane operator generates a short-lived 8-digit code on
 the web UI; the agent's installer prompts for that code instead of
 the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
 
+> **Generic Kubernetes / Helm control planes:** appliance registration
+> is **disabled by default** — only OS-appliance control-plane installs
+> self-enable it on first boot. Flip it on once at **Appliance →
+> Pairing** ("Appliance registration → Enable"), or set
+> ``supervisor_registration_enabled: true`` via ``PUT /api/v1/settings``,
+> *before* the first pairing — otherwise
+> ``POST /api/v1/appliance/supervisor/register`` returns 404 and the
+> supervisor idles (#407).
+
 1. On the control plane, open **Appliance → Pairing**.
 2. Click **New pairing code**, pick the agent kind (DNS / DHCP /
    DNS+DHCP for combined boxes), optionally pre-assign a server
