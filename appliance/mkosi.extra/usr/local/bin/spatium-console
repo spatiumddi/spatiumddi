@@ -26,9 +26,12 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import subprocess
 import sys
+import tarfile
+import tempfile
 import termios
 import threading
 import time
@@ -4181,14 +4184,18 @@ def do_containers(console: Console, tty: str) -> None:
 
                 console.print("")
                 try:
-                    answer = input("Pick (number/q): ").strip().lower()
+                    answer = input("Pick (number=logs, Nd=restart, q=quit): ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     return
                 if not answer or answer == "q":
                     return
 
+                # P2.4 — "<n>d" restarts pod n (confirm-gated kubectl delete
+                # --grace-period=30); a bare number tails its logs.
+                restart = answer.endswith("d")
+                num = answer[:-1] if restart else answer
                 try:
-                    pick = int(answer)
+                    pick = int(num)
                 except ValueError:
                     console.print("[red]Not a number.[/red]")
                     time.sleep(1)
@@ -4202,6 +4209,30 @@ def do_containers(console: Console, tty: str) -> None:
                     continue
 
                 ns, name, _ = pods[pick - 1]
+
+                if restart:
+                    if confirm_modal(
+                        console,
+                        f"Restart pod {ns}/{name}? (kubectl delete "
+                        "--grace-period=30 — recreated by its controller; an "
+                        "unmanaged / static pod will NOT come back)",
+                    ):
+                        console.clear()
+                        console.print(f"[bold]kubectl delete pod -n {ns} {name}[/bold]\n")
+                        try:
+                            dp = subprocess.run(
+                                ["/usr/local/bin/k3s", "kubectl", "delete", "pod",
+                                 "-n", ns, name, "--grace-period=30"],
+                                env=env, capture_output=True, text=True, timeout=45,
+                            )
+                            console.print(
+                                ((dp.stdout or "") + (dp.stderr or "")).strip()[:600]
+                                or "(no output)"
+                            )
+                        except (subprocess.TimeoutExpired, OSError) as exc:
+                            console.print(f"[red]delete failed: {exc}[/red]")
+                        time.sleep(2)
+                    continue  # back to the picker
                 console.clear()
                 console.print(
                     f"[bold]kubectl logs -f -n {ns} {name}[/bold]  "
@@ -4309,7 +4340,8 @@ def _render_health_screen(
     console.print(Panel(
         banner, box=SQUARE, border_style=vcolor,
         title="[bold]F7 — Health[/bold]", title_align="left",
-        subtitle="[dim]q/Esc return · r refresh[/dim]", subtitle_align="right",
+        subtitle="[dim]q return · r refresh · b slot · k restart-k3s · g diag[/dim]",
+        subtitle_align="right",
     ))
 
     # Crashed / restarted pods, with last-exit reason+code.
@@ -4400,12 +4432,144 @@ def _render_health_screen(
     ))
 
 
+def _health_cbreak_on() -> None:
+    """TTY into cbreak + no-echo for do_health's raw input loop. Idempotent —
+    safe to re-call after a recovery action drops back to cooked mode."""
+    tty.setcbreak(0)
+    attrs = termios.tcgetattr(0)
+    attrs[3] &= ~termios.ECHO
+    termios.tcsetattr(0, termios.TCSANOW, attrs)
+
+
+def _run_recovery_cmd(
+    console: Console, saved, title: str, cmd: list[str], timeout: float = 60.0
+) -> None:
+    """P2.4 — run a guarded recovery subprocess from the Health screen:
+    restore cooked TTY, clear, run ``cmd`` showing combined output, then wait
+    for Enter. ``saved`` is do_health's entry termios. Bounded by ``timeout``;
+    the caller re-enters cbreak afterwards."""
+    if saved is not None:
+        try:
+            termios.tcsetattr(0, termios.TCSANOW, saved)
+        except termios.error:
+            pass
+    console.clear()
+    console.print(f"[bold]{title}[/bold]\n")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        body = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        console.print(body[:2000] if body else "(no output)")
+        console.print(
+            "\n[bold green]done[/bold green]" if proc.returncode == 0
+            else f"\n[bold red]exit {proc.returncode}[/bold red]"
+        )
+    except subprocess.TimeoutExpired:
+        console.print(f"\n[bold red]timed out ({timeout:.0f}s)[/bold red]")
+    except (FileNotFoundError, OSError) as exc:
+        console.print(f"\n[bold red]failed: {exc}[/bold red]")
+    console.print("\n[dim]press Enter to return[/dim]")
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def do_slot_rollback(console: Console, state: "DashboardState", saved) -> None:
+    """P2.4 'b' — guarded A/B slot switch. In a trial boot: commit the trial
+    (set-default current). Otherwise: queue a ONE-SHOT trial of the inactive
+    slot (set-next-boot — grub auto-reverts if it fails to boot). NEVER
+    reboots; flashes "press F5". Guarded: no-op when there are no A/B slots or
+    the inactive slot is unstamped."""
+    slots = slot_info()
+    if slots is None:
+        state.flash("No A/B slots on this box", ttl=4)
+        return
+    current, durable = slots
+    other = "slot_b" if current == "slot_a" else "slot_a"
+    other_ver = state.slot_b_version if other == "slot_b" else state.slot_a_version
+    if not other_ver:
+        state.flash(
+            f"Inactive slot {_slot_letter(other)} is unstamped — nothing to roll back to",
+            ttl=5,
+        )
+        return
+    if durable and durable != current:
+        q = f"Commit current trial (slot {_slot_letter(current)}) as the durable default?"
+        cmd = ["spatium-upgrade-slot", "set-default", current]
+    else:
+        q = (f"Trial-boot slot {_slot_letter(other)} ({other_ver}) on next reboot? "
+             "(one-shot; auto-reverts if it fails)")
+        cmd = ["spatium-upgrade-slot", "set-next-boot", other]
+    if not confirm_modal(console, q):
+        return
+    _run_recovery_cmd(console, saved, "Slot rollback", cmd, timeout=30)
+    state.flash("Slot change queued — press F5 to reboot to apply", ttl=8)
+
+
+def _do_diag_bundle(console: Console, saved) -> None:
+    """P2.4 'g' — write a diagnostic bundle (read-only, no confirm).
+    ``spatium-diag-bundle`` if present, else an inline tar.gz of the journal
+    tail + ``kubectl get pods,nodes,events -A`` + the host_health rollup.
+    Shows the resulting path."""
+    if saved is not None:
+        try:
+            termios.tcsetattr(0, termios.TCSANOW, saved)
+        except termios.error:
+            pass
+    console.clear()
+    console.print("[bold]Diagnostic bundle[/bold]\n")
+    if shutil.which("spatium-diag-bundle"):
+        try:
+            proc = subprocess.run(
+                ["spatium-diag-bundle"], capture_output=True, text=True, timeout=120,
+            )
+            console.print(((proc.stdout or "") + (proc.stderr or "")).strip()[:2000] or "(no output)")
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            console.print(f"[red]spatium-diag-bundle failed: {exc}[/red]")
+    else:
+        kube = {**os.environ, "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"}
+
+        def _cap(cmd: list[str]) -> str:
+            try:
+                return subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=15, env=kube,
+                ).stdout
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                return f"(failed: {exc})\n"
+
+        try:
+            outdir = Path("/var/log/spatiumddi")
+            outdir.mkdir(parents=True, exist_ok=True)
+            bundle = outdir / f"diag-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
+            with tempfile.TemporaryDirectory() as td:
+                tdp = Path(td)
+                (tdp / "journal.txt").write_text(
+                    _cap(["journalctl", "-n", "2000", "--no-pager"]), encoding="utf-8")
+                (tdp / "cluster.txt").write_text(
+                    _cap(["/usr/local/bin/k3s", "kubectl", "get",
+                          "pods,nodes,events", "-A", "-o", "wide"]), encoding="utf-8")
+                (tdp / "host_health.json").write_text(
+                    json.dumps(host_health_rollup(), indent=2), encoding="utf-8")
+                with tarfile.open(bundle, "w:gz") as tar:
+                    for f in sorted(tdp.iterdir()):
+                        tar.add(str(f), arcname=f.name)
+            console.print(f"wrote [bold]{bundle}[/bold]")
+        except OSError as exc:
+            console.print(f"[red]diag bundle failed: {exc}[/red]")
+    console.print("\n[dim]press Enter to return[/dim]")
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 def do_health(console: Console, state: "DashboardState") -> None:
-    """F7 — full-screen Health/Errors drill-down (P1.4). Reads cached
-    ``state.*`` plus one bounded ``kubectl get events`` on entry / 'r'. Raw
-    select()-driven input loop (mirrors confirm_modal): q/Q/Esc/Ctrl-C
-    return; r/R refetch events + re-read state. Caller stops KeyReader +
-    Live first so this owns stdin/stdout."""
+    """F7 — full-screen Health/Errors drill-down (P1.4) + guarded recovery
+    actions (P2.4). Reads cached ``state.*`` plus one bounded ``kubectl get
+    events`` on entry / 'r'. Raw select()-driven input loop (mirrors
+    confirm_modal): q/Q/Esc/Ctrl-C return; r/R refetch; b slot-rollback,
+    k restart-k3s, g diag-bundle (each confirm-gated except read-only g).
+    Caller stops KeyReader + Live first so this owns stdin/stdout."""
     try:
         saved = termios.tcgetattr(0)
     except termios.error:
@@ -4415,10 +4579,7 @@ def do_health(console: Console, state: "DashboardState") -> None:
     buf = b""
     try:
         if saved is not None:
-            tty.setcbreak(0)
-            attrs = termios.tcgetattr(0)
-            attrs[3] &= ~termios.ECHO
-            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            _health_cbreak_on()
         while True:
             if need_redraw:
                 try:
@@ -4446,6 +4607,33 @@ def do_health(console: Console, state: "DashboardState") -> None:
                 return
             if buf in (b"r", b"R"):
                 events, events_err = _fetch_warning_events()
+                need_redraw = True
+                buf = b""
+                continue
+            # ── P2.4 recovery actions (real TTY only) ────────────────────
+            if buf in (b"b", b"B") and saved is not None:
+                do_slot_rollback(console, state, saved)
+                _health_cbreak_on()
+                need_redraw = True
+                buf = b""
+                continue
+            if buf in (b"k", b"K") and saved is not None:
+                if confirm_modal(
+                    console,
+                    "Restart k3s? The cluster API + this node's workloads "
+                    "go DOWN for ~30-60s.",
+                ):
+                    _run_recovery_cmd(
+                        console, saved, "Restart k3s",
+                        ["systemctl", "restart", "k3s.service"], timeout=90,
+                    )
+                _health_cbreak_on()
+                need_redraw = True
+                buf = b""
+                continue
+            if buf in (b"g", b"G") and saved is not None:
+                _do_diag_bundle(console, saved)
+                _health_cbreak_on()
                 need_redraw = True
                 buf = b""
                 continue
