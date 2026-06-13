@@ -2092,6 +2092,12 @@ def overall_verdict(
     # /health/platform (celery) which the console can't read.
     if state.api_ready and state.api_ready.get("status") != "ok":
         return ("DEGRADED", "api: db/redis down")
+    # INC 9 — MetalLB speaker down with a VIP assigned → the VIP may be
+    # unreachable (multi-node only; single-node has no VIP / no MetalLB).
+    if state.vip:
+        _sp_ready, _sp_total = metallb_speaker_health(state.ps_rows)
+        if _sp_total and _sp_ready < _sp_total:
+            return ("DEGRADED", f"metallb {_sp_total - _sp_ready}/{_sp_total} speaker down")
     if wd_status is not None and wd_status[1] != "bold green":
         return ("DEGRADED", "supervisor watchdog stale")
     slots = slot_info()
@@ -2201,6 +2207,17 @@ def render_header(
     identity.append("   ·   ", style="dim")
     identity.append("Build ", style="dim")
     identity.append(build)
+    # INC 9 — MetalLB speaker health. A speaker down WITH a VIP assigned
+    # means the control-plane VIP may be unreachable; warn loudly. Quiet
+    # when there's no VIP or no MetalLB (single-node).
+    if state.vip:
+        sp_ready, sp_total = metallb_speaker_health(state.ps_rows)
+        if sp_total and sp_ready < sp_total:
+            identity.append("   ·   ", style="dim")
+            identity.append(
+                f"MetalLB {sp_total - sp_ready}/{sp_total} speaker DOWN — VIP may be unreachable",
+                style="bold bright_yellow",
+            )
 
     # ``wd_status`` is still needed by ``overall_verdict`` (DEGRADED gate)
     # — supervisor_watchdog_status() is a pure file-stat, no subprocess,
@@ -3144,6 +3161,55 @@ def pod_stats(node: str) -> dict:
     return pod_stats_from_summary(kubelet_summary(node))
 
 
+def cluster_pod_stats(nodes: list[dict]) -> dict:
+    """INC 9 — ``{(ns, pod): (cpu_cores, mem_bytes, node_name)}`` across the
+    whole cluster. Single-node → one kubelet fetch (the local node, no
+    regression). Multi-node (≤7) → each node's stats/summary concurrently
+    behind a small pool (so a slow node can't serialise the tier), merged
+    with per-pod node attribution. {} on total failure."""
+    names = [n.get("name") for n in nodes if n.get("name")]
+    if not names:
+        names = [os.uname().nodename]
+    out: dict = {}
+    if len(names) <= 1:
+        node = names[0]
+        for key, (cpu, mem) in pod_stats_from_summary(kubelet_summary(node)).items():
+            out[key] = (cpu, mem, node)
+        return out
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(names), 7)) as ex:
+        futs = {ex.submit(kubelet_summary, n): n for n in names}
+        for fut, node in futs.items():
+            try:
+                summary = fut.result()
+            except Exception:
+                continue
+            for key, (cpu, mem) in pod_stats_from_summary(summary).items():
+                out[key] = (cpu, mem, node)
+    return out
+
+
+def metallb_speaker_health(ps_rows: list[dict]) -> tuple[int, int]:
+    """INC 9 — (ready, total) MetalLB speaker pods (namespace
+    ``metallb-system``, name starting ``speaker``). (0, 0) when MetalLB isn't
+    installed (single-node / no VIP). A speaker down with a VIP assigned means
+    the VIP may be unreachable — surfaced on the header + as a DEGRADED gate."""
+    ready = total = 0
+    for r in ps_rows:
+        if r.get("Namespace") != "metallb-system":
+            continue
+        if not (r.get("Names") or "").startswith("speaker"):
+            continue
+        total += 1
+        rdy = r.get("Ready") or "0/0"
+        try:
+            rn, rm = (int(x) for x in rdy.split("/", 1))
+        except ValueError:
+            rn, rm = 0, 0
+        if rm and rn >= rm:
+            ready += 1
+    return ready, total
+
+
 def _human_bytes(b: float) -> str:
     """Compact bytes -> ``678M`` / ``1.2G`` / ``54K``."""
     for unit, div in (("G", 2**30), ("M", 2**20), ("K", 2**10)):
@@ -3153,17 +3219,21 @@ def _human_bytes(b: float) -> str:
 
 
 def render_top_pods(state: "DashboardState", height: int) -> Panel:
-    """Top pods by CPU on THIS node with cpu + mem bar-fills, from the
-    kubelet stats API. Fills the space beside the log with real per-pod
-    metrics (gpu-talos style). Falls back to the pod-count summary when
-    stats are unavailable."""
+    """Top pods by CPU with cpu + mem bar-fills, from the kubelet stats API.
+    On a multi-node cluster this is CLUSTER-WIDE (INC 9) with a NODE column;
+    single-node keeps the original shape. Falls back to the pod-count summary
+    when stats are unavailable. ``state.pod_stats`` values are
+    ``(cpu, mem)`` (legacy) or ``(cpu, mem, node)``."""
     stats = state.pod_stats or {}
     if not stats:
         return render_pod_summary(state.ps_rows, height)
-    rows = sorted(
-        ((cpu, mem, ns, nm) for (ns, nm), (cpu, mem) in stats.items()),
-        reverse=True,
-    )
+    multi = len(state.nodes) > 1
+    rows = []
+    for (ns, nm), val in stats.items():
+        cpu, mem = val[0], val[1]
+        node = val[2] if len(val) > 2 else ""
+        rows.append((cpu, mem, ns, nm, node))
+    rows.sort(reverse=True)
     total = len(state.ps_rows)
     running = sum(1 for r in state.ps_rows if (r.get("K8sState") or "") == "Running")
     head = Text()
@@ -3174,24 +3244,35 @@ def render_top_pods(state: "DashboardState", height: int) -> Panel:
     maxcpu = max((r[0] for r in rows), default=0.0) or 1.0
     maxmem = max((r[1] for r in rows), default=0) or 1
     tbl = Table.grid(padding=(0, 1))
-    tbl.add_column(no_wrap=True)
-    tbl.add_column(justify="right", no_wrap=True)
-    tbl.add_column(no_wrap=True)
-    tbl.add_column(justify="right", no_wrap=True)
-    tbl.add_column(no_wrap=True)
-    tbl.add_row(Text("pod", style="dim"), Text("cpu", style="dim"), Text(""),
-                Text("mem", style="dim"), Text(""))
+    tbl.add_column(no_wrap=True)                              # pod
+    if multi:
+        tbl.add_column(no_wrap=True)                         # node
+    tbl.add_column(justify="right", no_wrap=True)            # cpu
+    tbl.add_column(no_wrap=True)                             # cpu bar
+    tbl.add_column(justify="right", no_wrap=True)            # mem
+    tbl.add_column(no_wrap=True)                             # mem bar
+    header = [Text("pod", style="dim")]
+    if multi:
+        header.append(Text("node", style="dim"))
+    header += [Text("cpu", style="dim"), Text(""), Text("mem", style="dim"), Text("")]
+    tbl.add_row(*header)
     cap = max(height - 4, 1)
-    for cpu, mem, _ns, nm in rows[:cap]:
-        tbl.add_row(
-            Text(_short_pod_name(nm)[:22], style="cyan"),
+    for cpu, mem, _ns, nm, node in rows[:cap]:
+        cells = [Text(_short_pod_name(nm)[:22], style="cyan")]
+        if multi:
+            cells.append(Text((node or "")[:8], style="dim"))
+        cells += [
             Text(f"{cpu:.2f}", style="bold"),
             Text(_bar_gauge(cpu, maxcpu, 6), style="bold green"),
             Text(_human_bytes(mem), style="bold"),
             Text(_bar_gauge(mem, maxmem, 6), style="bold cyan"),
-        )
+        ]
+        tbl.add_row(*cells)
+    title = "[bold]Top pods[/bold] · CPU / mem"
+    if multi:
+        title += " · cluster-wide"
     return Panel(Group(head, tbl), box=SQUARE, border_style="cyan",
-                 title="[bold]Top pods[/bold] · CPU / mem", title_align="left")
+                 title=title, title_align="left")
 
 
 # ── Phase 2 KPI ribbon (§4) ────────────────────────────────────────────
@@ -3776,8 +3857,18 @@ class DashboardState:
             # per-pod Top-pods table AND the node-level CPU/mem/fs bars
             # (zero extra subprocess).
             _summary = kubelet_summary(os.uname().nodename)
-            self.pod_stats = pod_stats_from_summary(_summary)
             self._set_node_pct(node_stats_from_summary(_summary))
+            # INC 9 — cluster-wide Top-pods on a multi-node cluster; a
+            # single-node box reuses the already-fetched local summary
+            # (tagged with the local node — no second kubelet call).
+            if len(self.nodes) > 1:
+                self.pod_stats = cluster_pod_stats(self.nodes)
+            else:
+                _local = os.uname().nodename
+                self.pod_stats = {
+                    k: (c, mm, _local)
+                    for k, (c, mm) in pod_stats_from_summary(_summary).items()
+                }
             # Phase 2 INC 4 — vip + api ClusterIP from ONE svc fetch
             # (replaces the standalone cluster_vip() call).
             _svc = cluster_svc_ips()
