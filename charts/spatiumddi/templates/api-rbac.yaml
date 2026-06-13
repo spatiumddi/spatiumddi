@@ -125,6 +125,17 @@ rules:
   - apiGroups: [""]
     resources: ["pods/eviction"]
     verbs: ["create"]
+  # #402 — read-only kubelet Summary API proxy for the Cluster health
+  # screen (per-node + per-pod CPU / memory / fs via
+  # GET /api/v1/nodes/<n>/proxy/stats/summary — the same source the TTY
+  # console uses; the appliance ships no metrics-server / Prometheus).
+  # ``get`` ONLY: this authorizes read GETs to kubelet endpoints, not
+  # exec / attach / run (those need ``create`` on nodes/proxy). Folded
+  # into the orchestrator block because the health screen already needs
+  # the cluster-scoped ``nodes`` read above.
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

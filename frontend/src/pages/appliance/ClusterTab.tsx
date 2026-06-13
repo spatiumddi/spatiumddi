@@ -3,10 +3,12 @@ import {
   Boxes,
   Container as ContainerIcon,
   DatabaseBackup,
+  Gauge,
 } from "lucide-react";
 
 import { applianceApprovalApi } from "@/lib/api";
 import { useSessionState } from "@/lib/useSessionState";
+import { ClusterOverview } from "./ClusterOverview";
 import { ContainersTab } from "./ContainersTab";
 import { EtcdSnapshotsCard } from "./EtcdSnapshotsCard";
 
@@ -32,7 +34,7 @@ import { EtcdSnapshotsCard } from "./EtcdSnapshotsCard";
  * Pods needs the in-cluster kubeapi and etcd snapshots need the embedded
  * etcd seed — neither exists on a docker / k8s control plane.
  */
-type ClusterSection = "pods" | "etcd";
+type ClusterSection = "overview" | "pods" | "etcd";
 
 const SECTIONS: {
   key: ClusterSection;
@@ -40,6 +42,12 @@ const SECTIONS: {
   icon: typeof ContainerIcon;
   hint: string;
 }[] = [
+  {
+    key: "overview",
+    label: "Overview",
+    icon: Gauge,
+    hint: "Live health & metrics",
+  },
   {
     key: "pods",
     label: "Pods",
@@ -57,7 +65,7 @@ const SECTIONS: {
 export function ClusterTab() {
   const [section, setSection] = useSessionState<ClusterSection>(
     "appliance.cluster.section",
-    "pods",
+    "overview",
   );
 
   // Shared with EtcdSnapshotsCard (same query key → React Query dedupes)
@@ -104,7 +112,9 @@ export function ClusterTab() {
       </nav>
 
       <div className="min-w-0 flex-1">
-        {section === "pods" ? (
+        {section === "overview" ? (
+          <ClusterOverview />
+        ) : section === "pods" ? (
           <ContainersTab />
         ) : etcdAvailable ? (
           <div className="mx-auto max-w-4xl">

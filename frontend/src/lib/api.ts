@@ -9046,6 +9046,87 @@ export const applianceContainersApi = {
       .then((r) => r.data),
 };
 
+// ── Appliance: Cluster health dashboard (#402) ─────────────────────
+export interface ClusterNodeVitals {
+  name: string;
+  ready: boolean;
+  roles: string[];
+  schedulable: boolean;
+  kubelet_version: string | null;
+  os_image: string | null;
+  kernel: string | null;
+  container_runtime: string | null;
+  architecture: string | null;
+  internal_ip: string | null;
+  age_seconds: number | null;
+  memory_pressure: boolean;
+  disk_pressure: boolean;
+  pid_pressure: boolean;
+  cpu_capacity_cores: number | null;
+  memory_capacity_bytes: number | null;
+  pods_capacity: number | null;
+  pods_running: number;
+  cpu_usage_cores: number | null;
+  memory_working_set_bytes: number | null;
+  memory_available_bytes: number | null;
+  fs_used_bytes: number | null;
+  fs_capacity_bytes: number | null;
+}
+
+export interface ClusterPodSummary {
+  name: string;
+  namespace: string;
+  component: string | null;
+  node: string | null;
+  phase: string;
+  state: string;
+  ready: string;
+  restarts: number;
+  age_seconds: number | null;
+  cpu_usage_cores: number | null;
+  memory_working_set_bytes: number | null;
+}
+
+export interface ClusterWorkloadHealth {
+  component: string;
+  kind: string | null;
+  ready: number;
+  total: number;
+  restarts: number;
+  status: string;
+}
+
+export interface ClusterHealthSnapshot {
+  available: boolean;
+  detail: string | null;
+  nodes_total: number;
+  nodes_ready: number;
+  pods_total: number;
+  pods_running: number;
+  pods_by_phase: Record<string, number>;
+  kubelet_version: string | null;
+  is_ha: boolean;
+  control_plane_nodes: number;
+  metrics_available: boolean;
+  cpu_usage_cores: number | null;
+  cpu_capacity_cores: number | null;
+  memory_working_set_bytes: number | null;
+  memory_capacity_bytes: number | null;
+  nodes: ClusterNodeVitals[];
+  workloads: ClusterWorkloadHealth[];
+  top_pods_cpu: ClusterPodSummary[];
+  top_pods_mem: ClusterPodSummary[];
+}
+
+export const applianceClusterApi = {
+  // One-shot snapshot — used for the very first paint while the SSE
+  // stream warms up, and as the fallback when SSE can't connect.
+  health: () =>
+    api
+      .get<ClusterHealthSnapshot>("/appliance/cluster/health")
+      .then((r) => r.data),
+};
+
 // ── Agent bootstrap keys (Phase 6 prerequisite) ────────────────────
 // Reveal the DNS_AGENT_KEY + DHCP_AGENT_KEY the control plane uses
 // to validate first-boot agent registration. Applies to every
@@ -9200,6 +9281,55 @@ export async function* streamApplianceContainerLogs(
       try {
         const parsed = JSON.parse(data) as { line: string };
         if (typeof parsed.line === "string") yield parsed.line;
+      } catch {
+        // skip malformed frames
+      }
+    }
+  }
+}
+
+/**
+ * Stream live cluster-health snapshots over SSE (#402).
+ *
+ * Server pushes a fresh `ClusterHealthSnapshot` every ~2s; we yield each
+ * parsed frame so the Cluster → Overview dashboard can animate. Same
+ * `fetch`-not-`EventSource` shape as `streamApplianceContainerLogs` so the
+ * bearer token rides an `Authorization` header (EventSource can't set
+ * headers). Caller passes an `AbortSignal` and re-invokes on error to
+ * reconnect.
+ */
+export async function* streamClusterHealth(
+  signal?: AbortSignal,
+): AsyncIterable<ClusterHealthSnapshot> {
+  const token = localStorage.getItem("access_token");
+  const res = await fetch("/api/v1/appliance/cluster/health/stream", {
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      Accept: "text/event-stream",
+    },
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    throw new Error(`cluster health stream failed: HTTP ${res.status}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      if (!frame.trim()) continue;
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;
+      try {
+        yield JSON.parse(data) as ClusterHealthSnapshot;
       } catch {
         // skip malformed frames
       }

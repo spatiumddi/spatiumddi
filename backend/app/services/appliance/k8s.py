@@ -215,6 +215,55 @@ def list_pods(namespace: str | None = None) -> list[dict[str, Any]]:
     return data.get("items") or []
 
 
+def list_all_pods() -> tuple[int, list[dict[str, Any]]]:
+    """List pods across ALL namespaces (cluster-wide).
+
+    Returns (status, items). On non-200 returns the status + empty
+    list so the Cluster-health caller can branch on a 403 (RBAC not
+    granted) without an exception. Distinct from ``list_pods`` (single
+    namespace) — the health screen rolls up control-plane + system +
+    agent pods, which span ``spatium`` / ``kube-system`` / etc.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    status, body = _request("GET", "/api/v1/pods")
+    if status != 200:
+        return status, []
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise KubeapiUnavailableError(f"kubeapi list all pods bad json: {exc}") from exc
+    return status, data.get("items") or []
+
+
+def get_node_stats_summary(node_name: str) -> tuple[int, dict[str, Any] | None]:
+    """Fetch the kubelet Summary API for a node via the apiserver proxy.
+
+    ``GET /api/v1/nodes/<n>/proxy/stats/summary`` — per-node + per-pod
+    CPU (``usageNanoCores``) + memory (``workingSetBytes``) + filesystem
+    usage. This is how the appliance surfaces live usage WITHOUT a
+    metrics-server / Prometheus (the TTY console uses the same source).
+
+    Needs the ``nodes/proxy [get]`` grant (#402). Returns
+    (status, parsed_or_None); a 403 (older chart without the grant)
+    comes back as the status so the caller degrades to "no live usage"
+    instead of erroring. A short timeout keeps a wedged kubelet from
+    stalling the health poll.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    path = f"/api/v1/nodes/{quote(node_name)}/proxy/stats/summary"
+    status, body = _request("GET", path, timeout=6.0)
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
+
+
 def get_pod_logs(
     name: str,
     namespace: str | None = None,
