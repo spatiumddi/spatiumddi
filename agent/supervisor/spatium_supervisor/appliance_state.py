@@ -2076,6 +2076,51 @@ def read_cluster_health() -> dict[str, object] | None:
     return summary
 
 
+# Issue #402 — host disk partitions for the Cluster → Overview dashboard.
+# Reported INSIDE the cluster_health dict (which the backend stores verbatim
+# to the appliance.cluster_health JSONB column), so this needs no new
+# heartbeat field / column / migration. statvfs the host filesystems the
+# supervisor can reach: the active root slot (``/`` via the #402 host-root
+# mount), the ``/var`` data partition (via the release-state bind, which
+# itself lives on /var), and the ESP (``/boot/efi-host``). Best-effort per
+# target — a missing mount (e.g. an older supervisor pod without the
+# host-root mount) is skipped, so the list degrades to whatever's reachable.
+_DISK_TARGETS = (
+    ("/", "OS (root slot)", "/host-root"),
+    ("/var", "Data", "/var/lib/spatiumddi-host/release-state"),
+    ("/boot/efi", "ESP", "/boot/efi-host"),
+)
+
+
+def read_host_disk_partitions() -> list[dict[str, object]]:
+    """statvfs the reachable host partitions → used/total bytes per mount.
+
+    Powers the Cluster → Overview node cards (#402). Each entry:
+    ``{"mount", "label", "total_bytes", "used_bytes"}`` — ``df``-style, where
+    ``used = (blocks - free) * fragment_size``. Returns the partitions that
+    could be statvfs'd (skips any whose mount isn't present in this pod).
+    """
+    out: list[dict[str, object]] = []
+    for mount, label, path in _DISK_TARGETS:
+        try:
+            st = os.statvfs(path)
+        except OSError:
+            continue
+        total = st.f_blocks * st.f_frsize
+        if total <= 0:
+            continue
+        used = (st.f_blocks - st.f_bfree) * st.f_frsize
+        out.append(
+            {
+                "mount": mount,
+                "label": label,
+                "total_bytes": int(total),
+                "used_bytes": int(used),
+            }
+        )
+    return out
+
+
 def read_node_ip() -> str | None:
     """Return this node's k3s-registered InternalIP (#272 Phase 7b).
 
@@ -2318,6 +2363,16 @@ def collect() -> dict[str, object]:
 
     slot_a_version, slot_b_version = read_slot_versions()
     cluster_health = read_cluster_health() if is_appliance else None
+    # #402 — fold host disk partitions into the cluster_health dict (stored
+    # verbatim by the backend; no schema change). Only on appliance hosts;
+    # skipped entirely when nothing was reachable so we never ship an empty key.
+    if is_appliance:
+        _partitions = read_host_disk_partitions()
+        if _partitions:
+            cluster_health = {
+                **(cluster_health or {}),
+                "host_disk_partitions": _partitions,
+            }
     k3s_version = read_k3s_version() if is_appliance else None
     kubeconfig = read_kubeconfig() if is_appliance else None
     k3s_api_cert_expires_at = read_k3s_api_cert_expiry() if is_appliance else None

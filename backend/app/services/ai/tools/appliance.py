@@ -425,6 +425,100 @@ async def find_cluster_health(
     }
 
 
+# ── find_cluster_metrics ───────────────────────────────────────────
+
+
+class FindClusterMetricsArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="find_cluster_metrics",
+    description=(
+        "Live resource metrics for the appliance k3s cluster (superadmin "
+        "only, #402). Unlike ``find_cluster_health`` (control-plane "
+        "membership from heartbeats), this reads the cluster *now* via the "
+        "api pod's ServiceAccount: per-node CPU / memory / disk from the "
+        "kubelet Summary API, pod counts by phase, a per-component workload "
+        "health rollup, and the top pods by CPU + memory. Use to answer "
+        "'how loaded is the appliance?', 'what's eating memory?', or 'are "
+        "all workloads healthy?'. Appliance control plane only; read-only — "
+        "the same data the Cluster → Overview dashboard renders."
+    ),
+    args_model=FindClusterMetricsArgs,
+    category="admin",
+    default_enabled=True,
+    module="appliance.cluster",
+)
+async def find_cluster_metrics(
+    db: AsyncSession, user: User, args: FindClusterMetricsArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+    import asyncio  # noqa: PLC0415
+
+    from app.config import settings  # noqa: PLC0415
+    from app.services.appliance import cluster_health, k8s  # noqa: PLC0415
+
+    if not settings.appliance_mode:
+        return {
+            "error": (
+                "Cluster metrics are only available on the SpatiumDDI OS "
+                "appliance control plane."
+            )
+        }
+    try:
+        snap = await asyncio.to_thread(cluster_health.get_cluster_health)
+    except k8s.KubeapiUnavailableError as exc:
+        return {"error": f"kubeapi unreachable: {exc}"}
+    if not snap.get("available"):
+        return {"available": False, "detail": snap.get("detail")}
+
+    def _pct(used: float | None, cap: float | None) -> float | None:
+        return round(100.0 * used / cap, 1) if used is not None and cap else None
+
+    nodes = [
+        {
+            "name": n["name"],
+            "ready": n["ready"],
+            "roles": n["roles"],
+            "cpu_pct": _pct(n.get("cpu_usage_cores"), n.get("cpu_capacity_cores")),
+            "mem_pct": _pct(n.get("memory_working_set_bytes"), n.get("memory_capacity_bytes")),
+            "pods_running": n.get("pods_running"),
+        }
+        for n in snap.get("nodes", [])
+    ]
+    return {
+        "available": True,
+        "nodes_ready": snap["nodes_ready"],
+        "nodes_total": snap["nodes_total"],
+        "pods_running": snap["pods_running"],
+        "pods_total": snap["pods_total"],
+        "pods_by_phase": snap["pods_by_phase"],
+        "kubelet_version": snap["kubelet_version"],
+        "is_ha": snap["is_ha"],
+        "metrics_available": snap["metrics_available"],
+        "cluster_cpu_pct": _pct(snap.get("cpu_usage_cores"), snap.get("cpu_capacity_cores")),
+        "cluster_mem_pct": _pct(
+            snap.get("memory_working_set_bytes"), snap.get("memory_capacity_bytes")
+        ),
+        "nodes": nodes,
+        "workloads": snap["workloads"],
+        "top_pods_cpu": [
+            {"name": p["name"], "namespace": p["namespace"], "cpu_cores": p["cpu_usage_cores"]}
+            for p in snap.get("top_pods_cpu", [])[:5]
+        ],
+        "top_pods_mem": [
+            {
+                "name": p["name"],
+                "namespace": p["namespace"],
+                "mem_bytes": p["memory_working_set_bytes"],
+            }
+            for p in snap.get("top_pods_mem", [])[:5]
+        ],
+    }
+
+
 # ── find_etcd_snapshots ────────────────────────────────────────────
 
 

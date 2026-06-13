@@ -22,6 +22,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
+from app.api.v1.appliance.cluster import router as cluster_router
 from app.api.v1.appliance.containers import router as containers_router
 from app.api.v1.appliance.diagnostics import router as diagnostics_router
 from app.api.v1.appliance.pairing import router as pairing_router
@@ -62,6 +63,8 @@ if settings.slot_image_mirror_mode:
         prefix="/internal/slot-images",
     )
 router.include_router(containers_router, prefix="/containers")
+# #402 — Cluster health dashboard (nodes + pods + live kubelet usage).
+router.include_router(cluster_router, prefix="/cluster")
 router.include_router(diagnostics_router, prefix="/diagnostics")
 router.include_router(system_router, prefix="/system")
 # Pairing routes use no nested prefix so the URLs are
