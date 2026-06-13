@@ -1,12 +1,10 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
-  Box,
   Boxes,
   Network,
-  Rocket,
   ScrollText,
   ShieldAlert,
   ShieldCheck,
@@ -18,14 +16,22 @@ import { applianceApi } from "@/lib/api";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
 import { FleetTab } from "./FleetTab";
-import { CertificatesTab } from "./CertificatesTab";
 import { ClusterTab } from "./ClusterTab";
-import { ClusterUpgradeTab } from "./ClusterUpgradeTab";
 import { FirewallTab } from "./FirewallTab";
 import { LogsTab } from "./LogsTab";
 import { MaintenanceTab } from "./MaintenanceTab";
 import { NetworkTab } from "./NetworkTab";
-import { ReleasesTab } from "./ReleasesTab";
+
+// #404 — Rolling Upgrade, Releases, and Web UI Certificate moved OUT of the
+// top-level tab bar and INTO the Fleet tab's left sidebar (Rolling Upgrade now
+// also hosts the Releases catalog). The legacy ?tab= deep-links + the Fleet
+// drilldown's onNavigateTab calls for those keys are remapped to the Fleet tab
+// + the matching sidebar section via LEGACY_TAB_TO_FLEET_SECTION below.
+const LEGACY_TAB_TO_FLEET_SECTION: Record<string, string> = {
+  tls: "web-ui-certificate",
+  releases: "cluster-upgrade",
+  "cluster-upgrade": "cluster-upgrade",
+};
 
 /**
  * SpatiumDDI OS appliance management hub (issue #134, Phase 4).
@@ -43,15 +49,12 @@ import { ReleasesTab } from "./ReleasesTab";
  * then releases / containers / logs / network / wizard in any order.
  */
 type Tab =
-  | "tls"
   | "fleet"
   | "firewall"
-  | "releases"
   | "cluster"
   | "logs"
   | "network"
-  | "maintenance"
-  | "cluster-upgrade";
+  | "maintenance";
 
 interface TabSpec {
   key: Tab;
@@ -96,19 +99,6 @@ const TABS: TabSpec[] = [
     icon: Stamp,
     summary:
       "Manage the Application appliance fleet — approve / reject pending pairings, assign roles + groups, schedule OS slot upgrades + reboots, re-key + delete. Pending rows pin at the top; approved rows open a per-appliance drilldown with capability detail + role assignment + firewall preview + OS upgrade controls.",
-  },
-  {
-    // #296 Phase G — Rolling Upgrade tab. Multi-node cluster upgrade
-    // orchestrator surface; consumes the Phase A-F endpoints under
-    // /api/v1/upgrades. selfOnly because the orchestrator requires
-    // kubeapi access (no docker-compose path).
-    key: "cluster-upgrade",
-    label: "Rolling Upgrade",
-    phase: "296",
-    icon: Rocket,
-    selfOnly: true,
-    summary:
-      "Multi-node rolling upgrade orchestrator — walks the cluster from version N-1 to N one node at a time with preflight gate, CNPG cordon-triggered switchover, drain, slot apply + reboot, health gate, DS-Ready gate, uncordon. Post-loop chart bump + migrate Job close the mixed-version window once every node commits the new slot.",
   },
   {
     // #402 — Cluster tab. Combines the Pods view + the etcd snapshot /
@@ -166,23 +156,6 @@ const TABS: TabSpec[] = [
     summary:
       "Declarative per-role / per-appliance nftables policy compiled into each node's drop-in. Edit fleet / role / appliance policies + rules + aliases, and preview any node's effective merged ruleset (dark until the firewall_enabled master switch is on). The seeded builtin role policies reproduce the hardcoded Phase-2 renderer byte-for-byte.",
   },
-  {
-    key: "releases",
-    label: "Releases",
-    phase: "4c",
-    icon: Box,
-    summary:
-      "GitHub Releases list with one-click pull-and-recycle, a rollback target picker, and the release notes inline so operators see what they're applying before they apply it.",
-  },
-  {
-    key: "tls",
-    label: "Web UI Certificate",
-    phase: "4b",
-    icon: ShieldCheck,
-    selfOnly: true,
-    summary:
-      "Upload an existing certificate + key, generate a CSR, or have the appliance issue a Let's Encrypt cert against a public DNS name. Reuses the existing ACME service (app/services/acme/).",
-  },
 ];
 
 export function AppliancePage() {
@@ -212,12 +185,25 @@ export function AppliancePage() {
     return a.label.localeCompare(b.label, undefined, { sensitivity: "base" });
   });
 
-  // Default tab — first self-only tab on appliance hosts (TLS),
-  // first universal tab (Releases) otherwise. Keeps the session-stored
-  // value if it's still in the visible set; falls back if the operator
-  // last visited a now-hidden tab (e.g. after a deployment-kind change).
-  const defaultTab: Tab = isApplianceHost ? "tls" : "releases";
+  // Default tab — Fleet (pinned first, always visible on every deployment
+  // shape). Keeps the session-stored value if it's still in the visible set;
+  // falls back here if the operator last visited a now-removed tab (#404 moved
+  // Rolling Upgrade / Releases / Web UI Certificate into the Fleet sidebar).
+  const defaultTab: Tab = "fleet";
   const [tab, setTab] = useSessionState<Tab>("appliance.tab", defaultTab);
+
+  // #404 — a deep-link / onNavigateTab target that now lives in the Fleet
+  // sidebar jumps to Fleet and hands the section down for FleetTab to select.
+  const [fleetSection, setFleetSection] = useState<string | null>(null);
+  const navigate = (t: string) => {
+    const target = LEGACY_TAB_TO_FLEET_SECTION[t];
+    if (target) {
+      setTab("fleet");
+      setFleetSection(target);
+    } else {
+      setTab(t as Tab);
+    }
+  };
 
   // Deep-link support: ``/appliance?tab=<key>`` forces a specific tab on
   // arrival regardless of the session-stored last-active tab — e.g. the
@@ -232,7 +218,13 @@ export function AppliancePage() {
   const requestedTab = searchParams.get("tab");
   useEffect(() => {
     if (!requestedTab) return;
-    if (TABS.some((t) => t.key === requestedTab)) {
+    const target = LEGACY_TAB_TO_FLEET_SECTION[requestedTab];
+    if (target) {
+      // Legacy ?tab=tls / ?tab=releases / ?tab=cluster-upgrade now resolve to
+      // the Fleet tab + the matching sidebar section (#404).
+      setTab("fleet");
+      setFleetSection(target);
+    } else if (TABS.some((t) => t.key === requestedTab)) {
       setTab(requestedTab as Tab);
     }
     const next = new URLSearchParams(searchParams);
@@ -266,7 +258,7 @@ export function AppliancePage() {
           {!isApplianceHost && (
             <span
               className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground"
-              title="This control plane is running on Docker or Kubernetes. Host-level tabs (TLS, Cluster, Logs, Network, Maintenance) are hidden — the OS Versions tab still drives slot upgrades on any registered appliance agents."
+              title="This control plane is running on Docker or Kubernetes. Host-level tabs (Cluster, Logs, Network, Maintenance) are hidden — the OS Versions tab still drives slot upgrades on any registered appliance agents."
             >
               docker/k8s
             </span>
@@ -275,14 +267,14 @@ export function AppliancePage() {
         <p className="mt-1 text-xs text-muted-foreground">
           {isApplianceHost ? (
             <>
-              Manage the SpatiumDDI OS appliance — TLS, releases, cluster, logs,
-              host network, and lifecycle. The OS Versions tab also drives slot
-              upgrades on every registered remote DNS + DHCP agent.
+              Manage the SpatiumDDI OS appliance — fleet, firewall, cluster,
+              logs, host network, and lifecycle. Releases, rolling OS upgrades,
+              and the Web UI certificate now live under the Fleet sidebar.
             </>
           ) : (
             <>
               This control plane is running on Docker / Kubernetes. Host-level
-              tabs (TLS, Cluster, Logs, Network, Maintenance) only apply to an
+              tabs (Cluster, Logs, Network, Maintenance) only apply to an
               appliance-hosted control plane and are hidden here. The OS
               Versions tab still drives slot upgrades on any registered
               appliance agents.
@@ -312,22 +304,15 @@ export function AppliancePage() {
       </div>
 
       <div className="flex-1 overflow-auto bg-background p-6">
-        {effectiveTab === "tls" ? (
-          <CertificatesTab />
-        ) : effectiveTab === "fleet" ? (
+        {effectiveTab === "fleet" ? (
           <FleetTab
-            onNavigateTab={(t) => setTab(t as Tab)}
+            onNavigateTab={navigate}
             isApplianceHost={isApplianceHost}
-          />
-        ) : effectiveTab === "releases" ? (
-          <ReleasesTab
-            applianceMode={isApplianceHost}
-            onNavigateTab={(t) => setTab(t as Tab)}
+            initialSection={fleetSection}
+            onSectionApplied={() => setFleetSection(null)}
           />
         ) : effectiveTab === "firewall" ? (
           <FirewallTab />
-        ) : effectiveTab === "cluster-upgrade" ? (
-          <ClusterUpgradeTab />
         ) : effectiveTab === "cluster" ? (
           <ClusterTab />
         ) : effectiveTab === "logs" ? (

@@ -46,6 +46,10 @@ import { ResolverTab } from "./ResolverTab";
 import { SNMPTab } from "./SNMPTab";
 import { SSHTab } from "./SSHTab";
 import { SyslogTab } from "./SyslogTab";
+// #404 — these three moved out of the top-level tab bar into this sidebar.
+import { CertificatesTab } from "./CertificatesTab";
+import { ClusterUpgradeTab } from "./ClusterUpgradeTab";
+import { ReleasesTab } from "./ReleasesTab";
 
 /**
  * Appliance → Fleet tab (#170 Wave D1; supersedes Wave B3 "Approvals").
@@ -639,6 +643,8 @@ const VIP_ADVISORY_DISMISS_KEY = "spatium.fleet.vipAdvisoryDismissed";
 export function FleetTab({
   onNavigateTab,
   isApplianceHost = false,
+  initialSection = null,
+  onSectionApplied,
 }: {
   // #272 Phase 6 — lets the cert card jump to the "Web UI Certificate"
   // tab. Optional so the component still renders standalone.
@@ -646,6 +652,12 @@ export function FleetTab({
   // Only appliance hosts have a local Web UI cert to manage; docker/k8s
   // control planes hide the cert tab, so we hide the card there too.
   isApplianceHost?: boolean;
+  // #404 — a legacy ?tab=tls / ?tab=releases deep-link (or the drilldown's
+  // onNavigateTab) resolves to a Fleet sidebar section; AppliancePage hands
+  // it down here so we select it on arrival, then clears it via
+  // onSectionApplied so re-navigating to the same section fires again.
+  initialSection?: string | null;
+  onSectionApplied?: () => void;
 }) {
   const qc = useQueryClient();
   const { data: me } = useQuery({
@@ -687,7 +699,9 @@ export function FleetTab({
   const [view, setView] = useSessionState<
     | "appliances"
     | "pairing"
+    | "cluster-upgrade"
     | "upgrade-images"
+    | "web-ui-certificate"
     | "lldp"
     | "ntp"
     | "resolver"
@@ -695,6 +709,18 @@ export function FleetTab({
     | "ssh"
     | "syslog"
   >("appliance.fleet.section", "appliances");
+
+  // #404 — apply a deep-linked sidebar section handed down from AppliancePage
+  // (legacy ?tab=tls / ?tab=releases / drilldown onNavigateTab). Runs whenever
+  // the prop changes to a non-null value; a later manual click won't re-fire it.
+  useEffect(() => {
+    if (initialSection) {
+      setView(initialSection as typeof view);
+      onSectionApplied?.();
+    }
+    // Gate purely on the prop; setView/onSectionApplied identities are stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialSection]);
 
   const [drilldown, setDrilldown] = useState<ApplianceRow | null>(null);
   const [showCluster, setShowCluster] = useState(false);
@@ -913,7 +939,9 @@ export function FleetTab({
     key:
       | "appliances"
       | "pairing"
+      | "cluster-upgrade"
       | "upgrade-images"
+      | "web-ui-certificate"
       | "lldp"
       | "ntp"
       | "resolver"
@@ -942,11 +970,32 @@ export function FleetTab({
           label: "Pairing codes",
           summary: "Mint codes for new appliances.",
         },
+        // #404 — Rolling Upgrade (releases catalog + multi-node A/B
+        // orchestrator) moved here from a top-level tab. Always shown: the
+        // releases catalog is universal; the orchestrator self-gates to
+        // appliance hosts inside the section.
+        {
+          key: "cluster-upgrade",
+          label: "Rolling Upgrade",
+          summary: "Releases + multi-node A/B slot upgrade.",
+        },
         {
           key: "upgrade-images",
           label: "Upgrade images",
           summary: "GitHub import or air-gap .raw.xz upload.",
         },
+        // #404 — Web UI Certificate moved here from a top-level tab.
+        // Appliance-host only (a docker/k8s control plane has no local cert
+        // to manage).
+        ...(isApplianceHost
+          ? [
+              {
+                key: "web-ui-certificate" as const,
+                label: "Web UI Certificate",
+                summary: "TLS upload / CSR / Let's Encrypt.",
+              },
+            ]
+          : []),
       ],
     },
     {
@@ -1086,6 +1135,20 @@ export function FleetTab({
               </p>
               <UpgradeImageManager />
             </div>
+          )}
+
+          {/* #404 — Rolling Upgrade orchestrator (appliance hosts) + the
+              releases catalog (universal), merged from two old top-level tabs. */}
+          {view === "cluster-upgrade" && (
+            <div className="space-y-6">
+              {isApplianceHost && <ClusterUpgradeTab />}
+              <ReleasesTab applianceMode={isApplianceHost} />
+            </div>
+          )}
+
+          {/* #404 — Web UI Certificate, moved from a top-level tab. */}
+          {view === "web-ui-certificate" && isApplianceHost && (
+            <CertificatesTab />
           )}
 
           {view === "lldp" && (

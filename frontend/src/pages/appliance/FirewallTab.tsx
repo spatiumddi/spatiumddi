@@ -11,12 +11,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   CheckCircle2,
+  Eye,
   Globe,
   Layers,
   Loader2,
   Lock,
   Plus,
   RefreshCw,
+  ScrollText,
   ShieldAlert,
   ShieldCheck,
   Tags,
@@ -86,7 +88,50 @@ const POSTURE_PRESETS: {
   },
 ];
 
-type SubTab = "policies" | "aliases" | "preview" | "effective";
+type FirewallSection =
+  | "policies"
+  | "aliases"
+  | "preview"
+  | "effective"
+  | "logs";
+
+const FW_SECTIONS: {
+  key: FirewallSection;
+  label: string;
+  icon: typeof ShieldAlert;
+  hint: string;
+}[] = [
+  {
+    key: "policies",
+    label: "Policies",
+    icon: ShieldAlert,
+    hint: "Fleet / role / appliance rules",
+  },
+  {
+    key: "aliases",
+    label: "Aliases",
+    icon: Tags,
+    hint: "Named CIDR / port sets",
+  },
+  {
+    key: "preview",
+    label: "Preview changes",
+    icon: Eye,
+    hint: "Stage & diff before save",
+  },
+  {
+    key: "effective",
+    label: "Effective render",
+    icon: Layers,
+    hint: "Per-node merged ruleset",
+  },
+  {
+    key: "logs",
+    label: "Logs",
+    icon: ScrollText,
+    hint: "Realtime nft drop log",
+  },
+];
 
 function scopeLabel(p: FirewallPolicy): string {
   if (p.scope_kind === "fleet") return "Fleet";
@@ -95,16 +140,10 @@ function scopeLabel(p: FirewallPolicy): string {
 }
 
 export function FirewallTab() {
-  const [sub, setSub] = useSessionState<SubTab>(
-    "appliance.firewall.subtab",
+  const [section, setSection] = useSessionState<FirewallSection>(
+    "appliance.firewall.section",
     "policies",
   );
-  const tabs: { key: SubTab; label: string }[] = [
-    { key: "policies", label: "Policies" },
-    { key: "aliases", label: "Aliases" },
-    { key: "preview", label: "Preview changes" },
-    { key: "effective", label: "Effective render" },
-  ];
   return (
     <div className="space-y-4">
       <div className="flex items-start gap-2">
@@ -115,7 +154,7 @@ export function FirewallTab() {
             Declarative per-role / per-appliance nftables policy. Edits stay
             dark until the <code>firewall_enabled</code> master switch is on AND
             the next supervisor heartbeat renders — preview any node's effective
-            ruleset below before you flip enforcement on.
+            ruleset before you flip enforcement on.
           </p>
         </div>
       </div>
@@ -123,28 +162,68 @@ export function FirewallTab() {
       <EnforcementCard />
       <WebUIAccessCard />
 
-      <div className="flex flex-wrap gap-1 border-b">
-        {tabs.map((t) => (
-          <button
-            key={t.key}
-            type="button"
-            onClick={() => setSub(t.key)}
-            className={cn(
-              "-mb-px border-b-2 px-3 py-1.5 text-sm",
-              sub === t.key
-                ? "border-primary text-foreground"
-                : "border-transparent text-muted-foreground hover:text-foreground",
-            )}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
+      {/* #404 — left sub-nav (Cluster-style) replacing the old top sub-tabs. */}
+      <div className="flex gap-6">
+        <nav className="w-48 shrink-0 space-y-1">
+          <div className="mb-2 flex items-center gap-1.5 px-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+            <ShieldAlert className="h-3.5 w-3.5" />
+            Firewall
+          </div>
+          {FW_SECTIONS.map((s) => {
+            const Icon = s.icon;
+            const active = section === s.key;
+            return (
+              <button
+                key={s.key}
+                type="button"
+                onClick={() => setSection(s.key)}
+                className={cn(
+                  "flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1.5 text-left",
+                  active
+                    ? "bg-accent text-foreground"
+                    : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+                )}
+              >
+                <span className="flex items-center gap-1.5 text-sm">
+                  <Icon className="h-3.5 w-3.5" />
+                  {s.label}
+                </span>
+                <span className="pl-5 text-[11px] text-muted-foreground">
+                  {s.hint}
+                </span>
+              </button>
+            );
+          })}
+        </nav>
 
-      {sub === "policies" && <PoliciesSection />}
-      {sub === "aliases" && <AliasesSection />}
-      {sub === "preview" && <PreviewSection />}
-      {sub === "effective" && <EffectiveSection />}
+        <div className="min-w-0 flex-1">
+          {section === "policies" && <PoliciesSection />}
+          {section === "aliases" && <AliasesSection />}
+          {section === "preview" && <PreviewSection />}
+          {section === "effective" && <EffectiveSection />}
+          {section === "logs" && <FirewallLogsSection />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// #404 Phase 2 — realtime nftables firewall-log viewer. Placeholder until the
+// supervisor-side log stream lands (nft rules don't log today; the api pod
+// can't read host kernel logs, so the supervisor tails them and streams via
+// the proxy — local node first, remote appliances via the same seam).
+function FirewallLogsSection() {
+  return (
+    <div className="mx-auto max-w-2xl rounded-xl border border-dashed bg-muted/30 px-6 py-12 text-center">
+      <ScrollText className="mx-auto h-8 w-8 text-muted-foreground" />
+      <p className="mt-3 text-sm font-medium">Realtime firewall logs</p>
+      <p className="mt-1 text-xs text-muted-foreground">
+        A live tail of nftables drop / reject events for troubleshooting "why is
+        this blocked?" — including remote appliances in a multi-node fleet.
+        Lands in Phase 2 of this change: an opt-in logging toggle on the
+        firewall rules, with the supervisor streaming the host kernel log
+        through the control plane.
+      </p>
     </div>
   );
 }
