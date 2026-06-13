@@ -1487,14 +1487,26 @@ async def supervisor_heartbeat(
             )
         row = cert_principal.appliance
     else:
-        # Session-token fallback for pending_approval rows.
+        # No client cert presented — authenticate via the session token
+        # (minted at register, stored only as a hash, held by the real
+        # supervisor). This is the legitimate non-mTLS path: a not-yet-cert
+        # supervisor and HTTP-only remote supervisors heartbeat with it.
+        #
+        # SECURITY (GHSA-mj4g-hw3m-62rm / #400 C1): this previously read
+        # ``row.state == APPROVED or (session_token ...)``. Python ``or``
+        # short-circuits, so for ANY approved row (the steady state of every
+        # registered appliance) it returned valid with NO cert AND NO session
+        # token — i.e. anyone who knew an appliance UUID (UUIDs leak via logs /
+        # UI / audit) could drive the heartbeat. We now REQUIRE a valid
+        # credential (the session token) on every no-cert heartbeat — the
+        # UUID alone is no longer sufficient. The cluster-admin k3s join token
+        # is additionally gated on mTLS below, so even a leaked session token
+        # cannot harvest it.
         row = await db.get(Appliance, body.appliance_id)
-        valid = row is not None and (
-            row.state == APPLIANCE_STATE_APPROVED
-            or (
-                body.session_token is not None
-                and verify_session_token(body.session_token, row.session_token_hash)
-            )
+        valid = (
+            row is not None
+            and body.session_token is not None
+            and verify_session_token(body.session_token, row.session_token_hash)
         )
         if not valid:
             await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
@@ -1887,9 +1899,16 @@ async def supervisor_heartbeat(
         ca_chain_pem = ca.cert_pem
 
     # #272 Phase 7 — decrypt the join token for the joiner (mTLS channel).
+    # SECURITY (GHSA-mj4g-hw3m-62rm / #400 C1, defence-in-depth): the k3s
+    # join token is cluster-admin-equivalent, so only ever hand it back over a
+    # cert-authenticated (mTLS) request — never the credential-less /
+    # session-token path. The auth gate above already closes the no-cert path
+    # for approved rows; this is the belt-and-braces so the secret can't leak
+    # even if that gate is later loosened.
     desired_join_token: str | None = None
     if (
-        row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+        cert_principal is not None
+        and row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
         and row.desired_k3s_join_token_encrypted is not None
     ):
         from app.core.crypto import decrypt_str  # noqa: PLC0415

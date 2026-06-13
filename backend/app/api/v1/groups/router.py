@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
-from app.core.permissions import require_permission
+from app.core.permissions import caller_can_grant, require_permission
 from app.models.audit import AuditLog
 from app.models.auth import Group, Role, User
 
@@ -131,6 +131,33 @@ async def _resolve_roles(db: DB, role_ids: list[uuid.UUID]) -> list[Role]:
     return roles
 
 
+def _enforce_attach_ceiling(actor: User, roles: list[Role]) -> None:
+    """SECURITY (#400, finding C4): privilege ceiling on role attachment.
+
+    Attaching a role to a group grants its members the role's permissions. A
+    non-superadmin holding delegated ``admin:group`` could otherwise attach a
+    Superadmin-equivalent role (e.g. one carrying ``{*, *}``) to a group they
+    belong to → effective superadmin. The union of every attached role's
+    permissions must be a subset of the caller's own effective permissions
+    (and may carry no wildcard) unless the caller is an effective superadmin —
+    ``caller_can_grant`` enforces both. Members keep whatever else they hold;
+    this only bounds what THIS mutation can add.
+    """
+    union: list[dict] = []
+    for role in roles:
+        for perm in role.permissions or []:
+            if isinstance(perm, dict):
+                union.append(perm)
+    if not caller_can_grant(actor, union):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "You can only attach roles whose permissions you already hold, and "
+                "only a superadmin can attach a role carrying wildcard ('*') permissions."
+            ),
+        )
+
+
 async def _resolve_users(db: DB, user_ids: list[uuid.UUID]) -> list[User]:
     if not user_ids:
         return []
@@ -177,6 +204,7 @@ async def create_group(body: GroupCreate, current_user: CurrentUser, db: DB) -> 
         )
 
     roles = await _resolve_roles(db, body.role_ids)
+    _enforce_attach_ceiling(current_user, roles)
     users = await _resolve_users(db, body.user_ids)
 
     g = Group(
@@ -225,7 +253,15 @@ async def update_group(
     if body.external_dn is not None:
         g.external_dn = body.external_dn
     if body.role_ids is not None:
-        g.roles = await _resolve_roles(db, body.role_ids)
+        new_roles = await _resolve_roles(db, body.role_ids)
+        # SECURITY (#400, C4): only bound roles NEWLY added by this mutation, so
+        # editing a group that already carries an over-privileged role (name /
+        # user-list edits) isn't blocked — but a delegated admin can't introduce
+        # a role above their own ceiling.
+        existing_role_ids = {r.id for r in g.roles}
+        added = [r for r in new_roles if r.id not in existing_role_ids]
+        _enforce_attach_ceiling(current_user, added)
+        g.roles = new_roles
     if body.user_ids is not None:
         g.users = await _resolve_users(db, body.user_ids)
 

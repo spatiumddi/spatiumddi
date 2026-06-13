@@ -261,6 +261,83 @@ def _user_rbac_allows(user: User, action: str, resource_type: str, req_rid: str 
     return False
 
 
+# ── Privilege ceiling for delegated role / group editing ──────────────────────
+#
+# SECURITY (#400, finding C4): a non-superadmin holding a delegated
+# ``admin:role`` (+``admin:group``) capability could previously mint a role
+# carrying ``{action:"*", resource_type:"*"}`` (or any permission the caller
+# does not themselves hold) and self-assign it, escalating to effective
+# superadmin. The default install does not delegate ``admin:role`` to
+# non-superadmins, so it is not exploitable out of the box — but the delegated
+# capability was silently unbounded.
+#
+# ``caller_can_grant`` enforces a privilege ceiling: a non-superadmin may only
+# author / attach permission triples they already hold themselves, and may
+# never mint a wildcard (``*`` action OR ``*`` resource_type) permission.
+# Effective superadmins bypass the ceiling entirely so the platform owner can
+# still build arbitrary roles. Callers (roles + groups routers) pre-screen the
+# requested permission set with this helper and 403 on any entry that exceeds
+# the caller's own grants.
+
+
+def _perm_triple(perm: object) -> tuple[str, str, str | None] | None:
+    """Normalise a permission entry (dict or grant-like object) into a
+    ``(action, resource_type, resource_id)`` triple, or ``None`` if the shape
+    is unrecognised. Empty-string / ``"*"`` resource_id collapses to ``None``
+    (any-instance)."""
+    if isinstance(perm, dict):
+        action = perm.get("action", "")
+        resource_type = perm.get("resource_type", "")
+        resource_id = perm.get("resource_id")
+    else:
+        action = getattr(perm, "action", "")
+        resource_type = getattr(perm, "resource_type", "")
+        resource_id = getattr(perm, "resource_id", None)
+    if not isinstance(action, str) or not isinstance(resource_type, str):
+        return None
+    rid = resource_id if isinstance(resource_id, str) and resource_id not in ("", "*") else None
+    return (action, resource_type, rid)
+
+
+def caller_can_grant(user: User, perms: object) -> bool:
+    """Whether ``user`` is allowed to author / attach the permission set ``perms``.
+
+    ``perms`` is an iterable of permission entries — either ``dict``s in the
+    ``Role.permissions`` JSONB shape or objects exposing ``action`` /
+    ``resource_type`` / ``resource_id`` attributes (Pydantic
+    ``PermissionEntry``, ``TimeBoundGrant`` rows).
+
+    Rules (privilege ceiling, #400 / C4):
+
+    * Effective superadmins may grant anything — return ``True`` immediately.
+    * Any wildcard permission (``action == "*"`` OR ``resource_type == "*"``)
+      may only be granted by an effective superadmin → ``False`` for everyone
+      else.
+    * Every other entry must be one the caller *already holds* (verified via
+      :func:`user_has_permission` with the same triple). A caller cannot grant
+      a permission they don't possess, so the resulting role can never widen
+      the caller's own effective access.
+
+    A malformed / unrecognised entry is treated as un-grantable (``False``) so
+    a bad shape can't sneak past the ceiling.
+    """
+    if is_effective_superadmin(user):
+        return True
+    for perm in perms:
+        triple = _perm_triple(perm)
+        if triple is None:
+            return False
+        action, resource_type, rid = triple
+        # No wildcard minting for non-superadmins — a `*` on either axis would
+        # grant access beyond what the caller can express via concrete holds.
+        if action == "*" or resource_type == "*":
+            return False
+        # The caller must already hold this exact (action, resource_type[, id]).
+        if not user_has_permission(user, action, resource_type, rid):
+            return False
+    return True
+
+
 async def _record_denial(
     db: AsyncSession,
     user: User,
@@ -445,6 +522,8 @@ KNOWN_MANAGE_PERMISSIONS: frozenset[str] = frozenset(
 
 __all__ = [
     "KNOWN_MANAGE_PERMISSIONS",
+    "caller_can_grant",
+    "is_effective_superadmin",
     "require_any_permission",
     "require_any_resource_permission",
     "require_permission",

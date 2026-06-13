@@ -24,6 +24,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
+from app.core.ssrf import assert_safe_target
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.docker import DockerHost
@@ -453,6 +454,11 @@ async def test_connection(
             status_code=422,
             detail="connection_type and endpoint are required (either in body or via stored host_id)",
         )
+
+    # SECURITY (#400, L5): advisory SSRF guard — log the resolved docker
+    # daemon IP. Not hard-blocked: docker hosts are routinely on the LAN
+    # (RFC1918) or a unix-socket endpoint (no network host to resolve).
+    assert_safe_target(endpoint, label="docker")
 
     result = await _probe(
         connection_type=connection_type,

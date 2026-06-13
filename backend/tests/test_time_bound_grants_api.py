@@ -77,8 +77,18 @@ async def test_create_requires_admin_on_group(
 
 
 async def test_create_and_audit(client: AsyncClient, db_session: AsyncSession) -> None:
+    # The caller needs ``admin`` on ``group`` to reach the endpoint AND must
+    # itself hold the permission it grants — the #400/C4 privilege ceiling
+    # (caller_can_grant) forbids a delegated group-admin from minting a
+    # time-bound grant for a permission they don't possess (an escalation
+    # path). So admin1 holds ``write:subnet`` too.
     user, token = await _user_with_perms(
-        db_session, permissions=[{"action": "admin", "resource_type": "group"}], username="admin1"
+        db_session,
+        permissions=[
+            {"action": "admin", "resource_type": "group"},
+            {"action": "write", "resource_type": "subnet"},
+        ],
+        username="admin1",
     )
     target = await _target_group(db_session)
     r = await client.post(

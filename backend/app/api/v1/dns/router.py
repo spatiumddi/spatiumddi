@@ -20,7 +20,11 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel, dns_server_channel
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
-from app.core.permissions import require_any_resource_permission, token_scope_allows
+from app.core.permissions import (
+    _token_grants_for,
+    require_any_resource_permission,
+    token_scope_allows,
+)
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import CLOUD_DNS_DRIVERS, is_agentless
 from app.drivers.dns.windows import test_winrm_credentials
@@ -2585,7 +2589,7 @@ async def delete_view(
 async def list_zones(
     group_id: uuid.UUID,
     db: DB,
-    _: CurrentUser,
+    current_user: CurrentUser,
     customer_id: uuid.UUID | None = None,
     tag: list[str] = Query(default_factory=list),
 ) -> list[DNSZone]:
@@ -2594,6 +2598,12 @@ async def list_zones(
     if customer_id is not None:
         stmt = stmt.where(DNSZone.customer_id == customer_id)
     stmt = apply_tag_filter(stmt, DNSZone.tags, tag)
+    # SECURITY (#400 / C3 — IDOR): a dns_zone-scoped token must only enumerate
+    # the zone(s) it's bound to; otherwise it could list every zone in the
+    # group. No-op (None) for sessions / unscoped / wildcard-grant tokens.
+    zone_ids = _zone_token_id_filter(current_user)
+    if zone_ids is not None:
+        stmt = stmt.where(DNSZone.id.in_(zone_ids))
     result = await db.execute(stmt)
     return list(result.scalars().all())
 
@@ -2648,7 +2658,7 @@ async def create_zone(
 async def export_all_zones(
     group_id: uuid.UUID,
     db: DB,
-    _: CurrentUser,
+    current_user: CurrentUser,
     view_id: uuid.UUID | None = None,
 ) -> StreamingResponse:
     """Return all zones in a group (optionally filtered by view) as a zip.
@@ -2662,6 +2672,12 @@ async def export_all_zones(
     stmt = select(DNSZone).where(DNSZone.group_id == group_id)
     if view_id is not None:
         stmt = stmt.where(DNSZone.view_id == view_id)
+    # SECURITY (#400 / C3 — IDOR): bulk export must respect a dns_zone-scoped
+    # token's binding — without this a single-zone token could zip-export every
+    # zone in the group. No-op for sessions / unscoped / wildcard-grant tokens.
+    zone_ids = _zone_token_id_filter(current_user)
+    if zone_ids is not None:
+        stmt = stmt.where(DNSZone.id.in_(zone_ids))
     result = await db.execute(stmt.order_by(DNSZone.name))
     zones = list(result.scalars().all())
 
@@ -2685,8 +2701,10 @@ async def export_all_zones(
 
 
 @router.get("/groups/{group_id}/zones/{zone_id}", response_model=ZoneResponse)
-async def get_zone(group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUser) -> DNSZone:
-    return await _require_zone(group_id, zone_id, db)
+async def get_zone(
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: CurrentUser
+) -> DNSZone:
+    return await _require_zone(group_id, zone_id, db, current_user)
 
 
 class ServerZoneStateEntry(BaseModel):
@@ -2710,7 +2728,7 @@ class ServerZoneStateResponse(BaseModel):
     response_model=ServerZoneStateResponse,
 )
 async def get_zone_server_state(
-    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUser
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> ServerZoneStateResponse:
     """Per-server serial snapshot for a zone.
 
@@ -2723,7 +2741,7 @@ async def get_zone_server_state(
     """
     from app.models.dns import DNSServer, DNSServerZoneState  # noqa: PLC0415
 
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
 
     # All servers in the group.
     servers_res = await db.execute(
@@ -2806,7 +2824,7 @@ class ZoneDriftResponse(BaseModel):
     response_model=ZoneDriftResponse,
 )
 async def get_zone_drift(
-    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUser
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> ZoneDriftResponse:
     """Per-server record-level config-drift report (#61).
 
@@ -2819,7 +2837,7 @@ async def get_zone_drift(
     """
     from app.services.dns.drift import compute_zone_drift  # noqa: PLC0415
 
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
     report = await compute_zone_drift(db, group_id=group_id, zone=zone)
     return ZoneDriftResponse(
         zone_id=report.zone_id,
@@ -3401,7 +3419,7 @@ async def get_zone_dnssec_info(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
     db: DB,
-    _: CurrentUser,
+    current_user: CurrentUser,
 ) -> dict[str, Any]:
     """DNSSEC state + DS records for the zone-edit DNSSEC card.
 
@@ -3411,7 +3429,7 @@ async def get_zone_dnssec_info(
     sign / unsign op, so it tracks ground truth within one config
     sync cycle (typically <30s after the operator clicks Sign).
     """
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
     keys = (
         (
             await db.execute(
@@ -3830,7 +3848,7 @@ async def create_zone_from_template(
 
 @router.get("/groups/{group_id}/zones/{zone_id}/delegation-preview")
 async def get_delegation_preview(
-    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUser
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> dict[str, Any]:
     """Compute the NS + glue records needed to delegate this zone from its parent.
 
@@ -3838,7 +3856,7 @@ async def get_delegation_preview(
     the same group; otherwise the dict is the full preview shape from
     ``preview_to_dict`` plus ``has_parent: true``.
     """
-    child = await _require_zone(group_id, zone_id, db)
+    child = await _require_zone(group_id, zone_id, db, current_user)
     parent = await find_parent_zone(db, group_id, child.name)
     if parent is None:
         return {"has_parent": False}
@@ -3861,7 +3879,7 @@ async def apply_delegation(
     flows through ``enqueue_record_op`` so the parent zone's serial bumps
     once and the agent / Windows-driver push happens uniformly.
     """
-    child = await _require_zone(group_id, zone_id, db)
+    child = await _require_zone(group_id, zone_id, db, current_user)
     parent = await find_parent_zone(db, group_id, child.name)
     if parent is None:
         raise HTTPException(
@@ -4335,7 +4353,7 @@ async def bulk_delete_records(
     if not body.record_ids:
         return BulkDeleteRecordsResponse(deleted=0, skipped=[])
 
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
 
     res = await db.execute(select(DNSRecord).where(DNSRecord.id.in_(body.record_ids)))
     records = list(res.scalars().all())
@@ -4536,13 +4554,13 @@ async def import_zone_preview(
     zone_id: uuid.UUID,
     body: ImportPreviewRequest,
     db: DB,
-    _: CurrentUser,
+    current_user: CurrentUser,
 ) -> ImportPreviewResponse:
     """Parse a zone file and return the diff against an existing zone.
 
     Non-mutating: this endpoint never writes to the database.
     """
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
     zone_name = _resolve_zone_name(body, zone)
 
     try:
@@ -4764,7 +4782,7 @@ async def sync_zone_with_server_endpoint(
     """
     from app.services.dns.pull_from_server import sync_zone_with_server
 
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
     try:
         result = await sync_zone_with_server(db, zone, apply=body.apply)
     except ValueError as exc:
@@ -4823,10 +4841,10 @@ async def export_zone(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
     db: DB,
-    _: CurrentUser,
+    current_user: CurrentUser,
 ) -> Response:
     """Return the zone as an RFC 1035 zone file."""
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
     records = await _load_zone_records(zone_id, db)
     text = write_zone_file(zone, records)
     ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
@@ -4889,13 +4907,53 @@ def _enforce_zone_token_scope(user: Any, zone_id: uuid.UUID) -> None:
         )
 
 
-async def _require_zone(group_id: uuid.UUID, zone_id: uuid.UUID, db: DB) -> DNSZone:
+def _zone_token_id_filter(user: Any) -> set[uuid.UUID] | None:
+    """Zone-ids a resource-scoped API token (#374) may enumerate, or ``None``.
+
+    SECURITY (#400 / C3 — IDOR): list / export-all handlers don't run through
+    ``_require_zone``, so the per-row gate never fires for them. Without this a
+    ``dns_zone``-scoped token could enumerate / bulk-export EVERY zone. Returns:
+
+    * ``None`` — caller is a session / unscoped token, OR holds a wildcard
+      ``dns_zone`` grant (resource_id ``*``/missing): no id-narrowing needed.
+    * a (possibly empty) set — the concrete zone-ids the token is bound to.
+      An empty set means a scoped token with no ``dns_zone`` binding at all, so
+      the list must come back empty rather than leaking every zone.
+    """
+    grants = _token_grants_for(user)
+    if not grants:
+        return None  # session / unscoped token — full visibility
+    bound: set[uuid.UUID] = set()
+    for g in grants:
+        if g.get("resource_type") != "dns_zone":
+            continue
+        rid = g.get("resource_id")
+        if rid in (None, "", "*"):
+            return None  # wildcard dns_zone grant — every zone in scope
+        try:
+            bound.add(uuid.UUID(str(rid)))
+        except (ValueError, TypeError):
+            continue
+    return bound
+
+
+async def _require_zone(
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, user: Any | None = None
+) -> DNSZone:
     result = await db.execute(
         select(DNSZone).where(DNSZone.id == zone_id, DNSZone.group_id == group_id)
     )
     zone = result.scalar_one_or_none()
     if not zone:
         raise HTTPException(status_code=404, detail="Zone not found")
+    # SECURITY (#400 / C3 — IDOR): when the caller is supplied, enforce the
+    # per-row API-token binding here so every single-zone consumer (get/export/
+    # server-state/dnssec/delegation-preview) inherits the scope check. The
+    # coarse router gate only matches on type (req_rid=None), so without this a
+    # dns_zone-scoped token could read/export ANY zone. No-op for sessions /
+    # unscoped tokens. 404-before-403 keeps zone-existence non-leaky.
+    if user is not None:
+        _enforce_zone_token_scope(user, zone_id)
     return zone
 
 

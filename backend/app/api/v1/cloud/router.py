@@ -427,6 +427,13 @@ async def test_connection(
             detail="credentials are required (either in the body or via a stored endpoint_id)",
         )
 
+    # SECURITY (#400, L5): no SSRF guard call here — the AWS / Azure /
+    # GCP connectors dial each cloud's FIXED SDK service endpoints
+    # (derived from subscription / project / region IDs), not an
+    # operator-supplied host, so there is no operator-controlled connect
+    # target to resolve. If a custom ``endpoint_url`` field is ever added
+    # to ``provider_config``, route it through
+    # ``app.core.ssrf.assert_safe_target`` here. See app/core/ssrf.py.
     try:
         connector = get_connector(
             provider,
