@@ -1492,6 +1492,11 @@ KEY_SEQUENCES: dict[bytes, str] = {
     b"\x1b[14~": "F4", b"\x1b[15~": "F5", b"\x1b[17~": "F6",
     b"\x1b[18~": "F7", b"\x1b[19~": "F8", b"\x1b[20~": "F9",
     b"\x1b[21~": "F10", b"\x1b[23~": "F11", b"\x1b[24~": "F12",
+    # P1.5 — number-key mirror. Serial / IPMI-SoL terminals (vt220 keymaps,
+    # emulators) routinely eat F-keys, so 1-7 trigger the same footer
+    # actions. The dashboard has no text input, so the digits are free.
+    b"1": "F1", b"2": "F2", b"3": "F3", b"4": "F4",
+    b"5": "F5", b"6": "F6", b"7": "F7",
 }
 
 
@@ -1658,7 +1663,7 @@ def _vital_style(pct: float, warn: float, crit: float) -> str:
         return "bold red"
     if pct >= warn:
         return "bold yellow"
-    return "bold"
+    return "bold green"
 
 
 # Live bar gauges. The linux console font (Lat15-Terminus12x6, 256
@@ -2015,7 +2020,7 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     vitals.append(" " + _bar_gauge(state.ram_percent, 100.0), style=ram_style)
     vitals.append("   Load ", style="dim")
     load_1m = state.load_avg[0] if state.load_avg else 0.0
-    load_style = "bold yellow" if load_1m > ncpu else "bold"
+    load_style = _vital_style(load_1m / ncpu * 100 if ncpu else 0.0, 100, 200)
     vitals.append(load, style=load_style)
     vitals.append(f" ({ncpu} cpu)", style="dim")
     # Load gauge scaled 0..ncpu (a full bar = every core busy).
@@ -2716,6 +2721,88 @@ def render_pod_summary(ps_rows: list[dict], height: int) -> Panel:
                  title="[bold]Pod summary[/bold]", title_align="left")
 
 
+def pod_stats(node: str) -> dict:
+    """``{(namespace, pod): (cpu_cores, mem_bytes)}`` for the pods on
+    ``node``, from the kubelet Summary API via the apiserver proxy — works
+    WITHOUT metrics-server (the appliance disables it). One
+    ``kubectl get --raw`` on the 5 s tier, cached. ``{}`` on any failure."""
+    try:
+        proc = subprocess.run(
+            ["/usr/local/bin/k3s", "kubectl", "get", "--raw",
+             f"/api/v1/nodes/{node}/proxy/stats/summary"],
+            env={**os.environ, "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"},
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        return {}
+    out: dict = {}
+    for pod in data.get("pods", []) or []:
+        ref = pod.get("podRef") or {}
+        ns, nm = ref.get("namespace", ""), ref.get("name", "")
+        if not nm:
+            continue
+        cpu = (pod.get("cpu") or {}).get("usageNanoCores") or 0
+        mem = (pod.get("memory") or {}).get("workingSetBytes") or 0
+        out[(ns, nm)] = (cpu / 1e9, int(mem))
+    return out
+
+
+def _human_bytes(b: float) -> str:
+    """Compact bytes -> ``678M`` / ``1.2G`` / ``54K``."""
+    for unit, div in (("G", 2**30), ("M", 2**20), ("K", 2**10)):
+        if b >= div:
+            return f"{b / div:.0f}{unit}"
+    return f"{b:.0f}"
+
+
+def render_top_pods(state: "DashboardState", height: int) -> Panel:
+    """Top pods by CPU on THIS node with cpu + mem bar-fills, from the
+    kubelet stats API. Fills the space beside the log with real per-pod
+    metrics (gpu-talos style). Falls back to the pod-count summary when
+    stats are unavailable."""
+    stats = state.pod_stats or {}
+    if not stats:
+        return render_pod_summary(state.ps_rows, height)
+    rows = sorted(
+        ((cpu, mem, ns, nm) for (ns, nm), (cpu, mem) in stats.items()),
+        reverse=True,
+    )
+    total = len(state.ps_rows)
+    running = sum(1 for r in state.ps_rows if (r.get("K8sState") or "") == "Running")
+    head = Text()
+    head.append(f"{total} pods", style="bold")
+    if running:
+        head.append("  ")
+        head.append(f"{running} Running", style="bold green")
+    maxcpu = max((r[0] for r in rows), default=0.0) or 1.0
+    maxmem = max((r[1] for r in rows), default=0) or 1
+    tbl = Table.grid(padding=(0, 1))
+    tbl.add_column(no_wrap=True)
+    tbl.add_column(justify="right", no_wrap=True)
+    tbl.add_column(no_wrap=True)
+    tbl.add_column(justify="right", no_wrap=True)
+    tbl.add_column(no_wrap=True)
+    tbl.add_row(Text("pod", style="dim"), Text("cpu", style="dim"), Text(""),
+                Text("mem", style="dim"), Text(""))
+    cap = max(height - 4, 1)
+    for cpu, mem, _ns, nm in rows[:cap]:
+        tbl.add_row(
+            Text(_short_pod_name(nm)[:22], style="cyan"),
+            Text(f"{cpu:.2f}", style="bold"),
+            Text(_bar_gauge(cpu, maxcpu, 6), style="bold green"),
+            Text(_human_bytes(mem), style="bold"),
+            Text(_bar_gauge(mem, maxmem, 6), style="bold cyan"),
+        )
+    return Panel(Group(head, tbl), box=SQUARE, border_style="cyan",
+                 title="[bold]Top pods[/bold] · CPU / mem", title_align="left")
+
+
 def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # Compact sizing — feedback was that the dashboard occupied too
     # many rows. Each panel claims exactly content + 2 border rows;
@@ -2829,7 +2916,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     )
     layout["body"]["log"]["logpane"].update(render_log(state.tail, log_height))
     layout["body"]["log"]["summary"].update(
-        render_pod_summary(state.ps_rows, log_height)
+        render_top_pods(state, log_height)
     )
     layout["footer"].update(render_footer(state.status_message, state.role))
     return layout
@@ -2881,6 +2968,7 @@ class DashboardState:
             "%Y-%m-%d %H:%M:%S %Z"
         )
         self.disks: list[tuple[str, float, float, float]] = []
+        self.pod_stats: dict = {}
 
     def refresh(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -2906,6 +2994,7 @@ class DashboardState:
         if force or (now - self._last_data_refresh) >= DATA_REFRESH_EVERY:
             self._last_data_refresh = now
             self.ps_rows = cluster_pods()
+            self.pod_stats = pod_stats(os.uname().nodename)
             self.nodes = cluster_nodes()
             self.vip = cluster_vip()
             # P0.5 — host-config apply health (pure file reads). Cached
