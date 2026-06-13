@@ -693,15 +693,19 @@ Operators get a real Kubernetes node without managing one.
   your own pasted PEM / CSR-on-server / Let's Encrypt cert
   whenever you're ready.
 - A **dedicated `/appliance` management hub** that handles
-  everything you'd otherwise need SSH for: pod inspection +
-  live log streaming, TLS cert manager, atomic A/B OS slot
-  upgrades, firmware-pending banner, fleet management for
-  remote agents, NTP / SNMP host config, journalctl viewer,
-  self-test runner, one-click diagnostic bundle, maintenance
-  mode, host reboot / shutdown.
-- A Talos-style **console dashboard** on the appliance's
-  physical / serial console showing live vitals, pod health,
-  and a journalctl tail — useful when the web UI is down.
+  everything you'd otherwise need SSH for: a live **Cluster
+  health dashboard** (pod inspection + log streaming + node
+  vitals + etcd snapshots), TLS cert manager, atomic A/B OS
+  slot upgrades, firmware-pending banner, fleet management for
+  remote agents, NTP / SNMP host config, a realtime
+  **firewall-log viewer**, journalctl viewer, self-test
+  runner, one-click diagnostic bundle, maintenance mode, host
+  reboot / shutdown.
+- A Talos-style **operations cockpit** on the appliance's
+  physical / serial console — a KPI ribbon (cluster / etcd /
+  Postgres / API / platform / slot), live vitals, pod health,
+  a journalctl tail, and an F7 health drill-down with guarded
+  recovery actions — useful when the web UI is down.
 - **Atomic A/B slot OS upgrades**: every appliance has two
   identical root partitions; an upgrade dd's the new image
   into the inactive one, reboots, and auto-reverts on
@@ -914,12 +918,16 @@ concern:
   presence), one-click diagnostic bundle (secrets redacted).
 - **Maintenance** — drain traffic, reboot, shutdown.
 
-The **console dashboard** on the appliance's physical or
-serial console shows live vitals, pod health, and a
-journalctl tail. F-keys give you local-login (F1), htop
-(F2), `kubectl get pods -A` (F3 — pod log viewer), `nmtui`
-for networking (F4), and confirmed reboot / shutdown
-(F5 / F6).
+The **console cockpit** on the appliance's physical or
+serial console shows a 6-box KPI ribbon (cluster / etcd /
+Postgres / API / platform / slot), live vitals, pod health,
+and a journalctl tail. F-keys give you local-login (F1),
+htop (F2), `kubectl get pods -A` (F3 — pod log viewer),
+`nmtui` for networking (F4), confirmed reboot / shutdown
+(F5 / F6), and a health drill-down with guarded recovery
+actions (F7). The post-boot console (dashboard / verbose
+dashboard / plain login) is selectable from **Appliance →
+Network & Host**.
 
 Stuck without a working web UI? SSH in as the OS admin user
 you created during install. `kubectl` is on PATH (with bash
@@ -1115,7 +1123,7 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 | Phase 1 | Core IPAM, auth, user management, audit log, Docker Compose | ✅ Done — LDAP/OIDC/SAML + RADIUS/TACACS+, group-based RBAC, bulk-edit, inheritance, mobile-responsive UI, and full IPv6 `/next-address` (EUI-64 + random /128 + sequential) all shipped |
 | Phase 2 | DHCP (Kea), DNS (BIND9), DDNS, zone/subnet tree UI | ✅ Done — DNS, Kea DHCPv4, subnet-level DDNS, agent-side Kea DDNS, block/space DDNS inheritance, per-server zone serial reporting all shipped |
 | Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin, Kea HA | 🔄 DNS features + health dashboard + alerts framework + group-centric Kea HA (self-healing peer-IP drift + supervised daemons) + DNS Views end-to-end split-horizon landed; HA state-transition actions still pending |
-| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore, ACME | 🔄 SAML + full backup/restore + factory-reset + OS appliance beta (Debian 13 ISO + embedded [k3s](https://k3s.io/) + Helm orchestration, `/appliance` management hub with TLS upload + CSR-on-server, GitHub release apply, kubeapi-driven Pods tab + live SSE logs, host log viewer + self-test + diagnostic bundle, maintenance mode + reboot, web first-boot wizard, atomic A/B slot upgrades, **multi-node rolling cluster upgrade** with CNPG switchover + lease-mutex + preflight + air-gap mirror PVC) all landed. Terraform/Ansible providers + ACME embedded client (Let's Encrypt auto-issue) still pending |
+| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore, ACME | 🔄 SAML + full backup/restore + factory-reset + OS appliance beta (Debian 13 ISO + embedded [k3s](https://k3s.io/) + Helm orchestration, `/appliance` management hub with TLS upload + CSR-on-server, GitHub release apply, kubeapi-driven Pods tab + live SSE logs, host log viewer + self-test + diagnostic bundle, maintenance mode + reboot, web first-boot wizard, atomic A/B slot upgrades, **multi-node rolling cluster upgrade** with CNPG switchover + lease-mutex + preflight + air-gap mirror PVC, consolidated **Cluster tab** (Pods + etcd + live SSE health dashboard), realtime **firewall-log viewer**, Talos-style **console cockpit**) all landed. Terraform/Ansible providers + ACME embedded client (Let's Encrypt auto-issue) still pending |
 | Phase 5 | Multi-tenancy, IP request workflows, advanced reporting | 📋 Planned |
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-release feature list and
