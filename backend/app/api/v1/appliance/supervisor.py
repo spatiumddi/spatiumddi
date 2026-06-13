@@ -632,13 +632,18 @@ async def supervisor_register(
             existing.capabilities = body.capabilities.model_dump()
         # Rotate the session token — supervisor must use the fresh one
         # for subsequent polls. Old cached tokens fail hash compare.
-        # Skip when the row already has a cert (approval-complete; the
-        # supervisor is using mTLS not session tokens at that point).
-        if existing.cert_pem is None:
-            cleartext, digest = generate_session_token()
-            existing.session_token_hash = digest
-        else:
-            cleartext = ""  # no longer needed; supervisor uses mTLS
+        # #411 — ALWAYS mint + return a fresh token, even for a cert'd
+        # (approved) row. Previously this blanked the token for cert'd
+        # rows ("supervisor uses mTLS"), but the heartbeat's mTLS verifier
+        # is not yet enforced — it's a fallback that supersedes the token
+        # only when the cert actually validates. Once #400 C1 removed the
+        # approved-state heartbeat bypass, an approved box whose cert isn't
+        # validating in the field had NO usable credential and 403'd every
+        # heartbeat (no reboot / upgrade / role delivery). The session
+        # token stays the dependable heartbeat credential until cert-auth
+        # is proven + enforced in the field.
+        cleartext, digest = generate_session_token()
+        existing.session_token_hash = digest
         await db.commit()
         logger.info(
             "supervisor_register_idempotent",
@@ -1467,13 +1472,23 @@ async def supervisor_heartbeat(
     try:
         cert_principal = await authenticate_cert(request, db)
     except CertAuthFailed as exc:
-        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        # #411 — a cert-auth FAILURE no longer hard-403s. The mTLS verifier
+        # is a fallback that supersedes the session token only when the cert
+        # actually validates; when it doesn't (no cert delivered yet, clock
+        # skew, chain mismatch), fall through to the session-token path below
+        # so an approved supervisor can still authenticate its heartbeat.
+        # The session token is a real per-appliance secret (stored as a
+        # hash), so this is NOT the credential-less UUID-only bypass #400 C1
+        # closed — the no-cert branch still REQUIRES a valid token. The
+        # cluster-admin k3s join token stays gated on ``cert_principal is not
+        # None`` below, so a token-only heartbeat can never harvest it. The
+        # warning is kept for the cert-auth-steady-state follow-up.
         logger.warning(
             "supervisor_heartbeat_cert_auth_failed",
             appliance_id=str(body.appliance_id),
             reason=exc.reason,
         )
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance client cert.")
+        cert_principal = None
 
     if cert_principal is not None:
         # Cert subject CN must match the body's appliance_id (defence-
