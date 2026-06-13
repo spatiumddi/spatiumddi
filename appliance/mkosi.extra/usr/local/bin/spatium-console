@@ -220,15 +220,11 @@ JOURNAL_UNITS = [
 # usable at 2 Hz.
 REFRESH_INTERVAL = 0.5
 VITALS_EVERY = 1.0       # seconds — CPU / RAM / Load / clock / disk poll
-# 5 s (not 2 s) so a slow ``docker ps`` (parsing JSON output of every
-# container on a 1-CPU VM can take >3 s) doesn't starve the rest of
-# the loop. The previous 2 s cadence + 3 s subprocess timeout created
-# a feedback loop where every dashboard tick timed out dockerd mid-
-# response, which dockerd then logged as "superfluous
-# response.WriteHeader call from go.opentelemetry.io/contrib/
-# instrumentation/..." — the loop kept itself fed because the console
-# tails docker.service journal output and re-rendered those errors
-# in its live-log pane.
+# 5 s so the kubectl-fork-heavy data tier (pods / nodes / svc / kubelet
+# stats) doesn't starve the 0.5 s render loop on a 1-CPU VM. (Historically
+# this guarded against a slow ``docker ps`` mid-tick timing out dockerd in a
+# self-feeding error loop — the appliance is k3s-only since #183, but the
+# "keep heavy cluster queries off the render path" rationale stands.)
 DATA_REFRESH_EVERY = 5.0
 SPINNER_CHARS = "|/-\\"
 
@@ -3848,7 +3844,8 @@ class DashboardState:
             )
             self.disks = disk_summary()
             self.ip_v4, self.ip_v6 = host_ips()
-        # Data tier (2 s) — docker ps + env re-read.
+        # Data tier (5 s, DATA_REFRESH_EVERY) — k3s pods / nodes / kubelet
+        # metrics + the etcd/api/cnpg health fetches + env re-read.
         if force or (now - self._last_data_refresh) >= DATA_REFRESH_EVERY:
             self._last_data_refresh = now
             self.ps_rows = cluster_pods()
