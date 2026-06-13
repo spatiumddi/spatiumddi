@@ -136,7 +136,9 @@ def assert_safe_target(
     except ValueError:
         try:
             infos = socket.getaddrinfo(host, None)
-            resolved = sorted({info[4][0] for info in infos})
+            # sockaddr[0] is the address string (AF_INET: (host, port);
+            # AF_INET6: (host, port, flow, scope)) — str() pins the type.
+            resolved = sorted({str(info[4][0]) for info in infos})
         except OSError as exc:
             # Resolution failed — let the downstream connect surface the
             # real error; we just record that we tried.
