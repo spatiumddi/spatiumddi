@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
   Box,
-  Container as ContainerIcon,
+  Boxes,
   Network,
   Rocket,
   ScrollText,
@@ -19,8 +19,8 @@ import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
 import { FleetTab } from "./FleetTab";
 import { CertificatesTab } from "./CertificatesTab";
+import { ClusterTab } from "./ClusterTab";
 import { ClusterUpgradeTab } from "./ClusterUpgradeTab";
-import { ContainersTab } from "./ContainersTab";
 import { FirewallTab } from "./FirewallTab";
 import { LogsTab } from "./LogsTab";
 import { MaintenanceTab } from "./MaintenanceTab";
@@ -47,7 +47,7 @@ type Tab =
   | "fleet"
   | "firewall"
   | "releases"
-  | "containers"
+  | "cluster"
   | "logs"
   | "network"
   | "maintenance"
@@ -111,13 +111,20 @@ const TABS: TabSpec[] = [
       "Multi-node rolling upgrade orchestrator — walks the cluster from version N-1 to N one node at a time with preflight gate, CNPG cordon-triggered switchover, drain, slot apply + reboot, health gate, DS-Ready gate, uncordon. Post-loop chart bump + migrate Job close the mixed-version window once every node commits the new slot.",
   },
   {
-    key: "containers",
-    label: "Pods",
-    phase: "11",
-    icon: ContainerIcon,
+    // #402 — Cluster tab. Combines the Pods view + the etcd snapshot /
+    // restore surface (lifted out of Fleet, where it crowded the roster)
+    // into one operator-friendly tab behind a left sub-nav. Named
+    // "Cluster" rather than "Kubernetes" so operators don't need k8s
+    // vocabulary to find pod / etcd controls. selfOnly: both halves need
+    // the in-cluster kubeapi / embedded-etcd seed that only an appliance
+    // host has.
+    key: "cluster",
+    label: "Cluster",
+    phase: "402",
+    icon: Boxes,
     selfOnly: true,
     summary:
-      "Pod list driven off the in-cluster kubeapi via the api pod's ServiceAccount, with restart (delete pod → controller recreate) and live log streaming over SSE. Replaces the pre-Phase-11 docker-socket surface; the appliance is k3s-only.",
+      "The k3s cluster underneath the appliance — Pods (running workloads, with restart + live log streaming over SSE) and etcd snapshots (the cluster's disaster-recovery state + guided single-node restore). Both are driven off the in-cluster kubeapi via the api pod's ServiceAccount.",
   },
   {
     key: "logs",
@@ -259,7 +266,7 @@ export function AppliancePage() {
           {!isApplianceHost && (
             <span
               className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground"
-              title="This control plane is running on Docker or Kubernetes. Host-level tabs (TLS, Pods, Logs, Network, Maintenance) are hidden — the OS Versions tab still drives slot upgrades on any registered appliance agents."
+              title="This control plane is running on Docker or Kubernetes. Host-level tabs (TLS, Cluster, Logs, Network, Maintenance) are hidden — the OS Versions tab still drives slot upgrades on any registered appliance agents."
             >
               docker/k8s
             </span>
@@ -268,15 +275,15 @@ export function AppliancePage() {
         <p className="mt-1 text-xs text-muted-foreground">
           {isApplianceHost ? (
             <>
-              Manage the SpatiumDDI OS appliance — TLS, releases, containers,
-              logs, host network, and lifecycle. The OS Versions tab also drives
-              slot upgrades on every registered remote DNS + DHCP agent.
+              Manage the SpatiumDDI OS appliance — TLS, releases, cluster, logs,
+              host network, and lifecycle. The OS Versions tab also drives slot
+              upgrades on every registered remote DNS + DHCP agent.
             </>
           ) : (
             <>
               This control plane is running on Docker / Kubernetes. Host-level
-              tabs (TLS, Containers, Logs, Network, Maintenance) only apply to
-              an appliance-hosted control plane and are hidden here. The OS
+              tabs (TLS, Cluster, Logs, Network, Maintenance) only apply to an
+              appliance-hosted control plane and are hidden here. The OS
               Versions tab still drives slot upgrades on any registered
               appliance agents.
             </>
@@ -321,8 +328,8 @@ export function AppliancePage() {
           <FirewallTab />
         ) : effectiveTab === "cluster-upgrade" ? (
           <ClusterUpgradeTab />
-        ) : effectiveTab === "containers" ? (
-          <ContainersTab />
+        ) : effectiveTab === "cluster" ? (
+          <ClusterTab />
         ) : effectiveTab === "logs" ? (
           <LogsTab />
         ) : effectiveTab === "network" ? (

@@ -39,7 +39,6 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
-import { EtcdSnapshotsCard } from "./EtcdSnapshotsCard";
 import { LLDPTab } from "./LLDPTab";
 import { NTPTab } from "./NTPTab";
 import { PairingTab } from "./PairingTab";
@@ -1338,9 +1337,8 @@ export function FleetTab({
                     onPermanentDelete={(row) => setPermanentDeleteTarget(row)}
                     onReplace={(row) => setReplaceTarget(row)}
                   />
-                  {/* #272 Phase 9b — etcd snapshot list + guided restore.
-                    Self-hides on docker / k8s control planes (no seed). */}
-                  <EtcdSnapshotsCard />
+                  {/* #402 — the etcd snapshot list + guided restore moved
+                    to the Cluster tab (it crowded the fleet roster here). */}
                   <ApplianceTableSection
                     title="Service agents"
                     subtitle="Appliance nodes running DNS / DHCP service containers paired to a remote control plane."
