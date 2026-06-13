@@ -1853,7 +1853,7 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     env = state.env
     role = state.role
     hostname = env.get("APPLIANCE_HOSTNAME") or os.uname().nodename
-    v4_ips, v6_ips = host_ips()
+    v4_ips, v6_ips = state.ip_v4, state.ip_v6
     cpu = state.cpu_percent
     load = " ".join(f"{x:.2f}" for x in state.load_avg)
     build = appliance_version_string(env)
@@ -2050,7 +2050,7 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # "disabled" state is the Phase 1 default — k3s ships in the
     # slot but isn't auto-enabled until Phase 3 wires the supervisor.
     k3s_line: Text | None = None
-    k3s_state = k3s_status()
+    k3s_state = state.k3s_state
     if k3s_state is not None:
         label, kstyle = k3s_state
         k3s_line = Text()
@@ -2931,7 +2931,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
         state.role in ("appliance", "application") and supervisor_watchdog_status() is not None
     )
     has_upgrade_line = state.role in ("appliance", "application") and upgrade_status() is not None
-    has_k3s_line = k3s_status() is not None
+    has_k3s_line = state.k3s_state is not None
     # P0.5 — Health line. MUST mirror render_header's gate exactly
     # (release-state dir present, or a non-ok verdict) or the header
     # under-sizes by a row and clips the vitals line — the same class of
@@ -2943,7 +2943,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # P0.7 — Web UI line. Present whenever there's a VIP or a usable LAN
     # IPv4 (host_ips drops loopback / bridges / flannel). MUST be counted
     # here or the header under-sizes and clips the vitals line.
-    has_webui_line = bool(state.vip) or bool(host_ips()[0])
+    has_webui_line = bool(state.vip) or bool(state.ip_v4)
     # P0.8 — a queued one-shot trial (next_entry) renders as its OWN short
     # line (so neither it nor the slot line wraps); count it here to match
     # render_header's gate or the vitals row clips.
@@ -3036,6 +3036,16 @@ class DashboardState:
         self.ps_rows: list[dict] = []
         self.nodes: list[dict] = []
         self.vip: str | None = None
+        # P1.2 — render-path probes cached OFF the 0.5 s render loop.
+        # k3s_status() forks 2 subprocesses (systemctl + kubectl readyz,
+        # 2 s timeout each) and was called ~2x/render — on a wedged
+        # apiserver that froze the only console for seconds. host_ips()
+        # was called 3x. Cache both (k3s on the 5 s data tier, IPs on the
+        # 1 s vitals tier) so render is pure-in-memory and the sizing pass
+        # always agrees with the displayed value.
+        self.k3s_state: tuple[str, str] | None = None
+        self.ip_v4: list[str] = []
+        self.ip_v6: list[str] = []
         # P0.5 — host-config apply health rollup, refreshed on the 5 s
         # data tier (pure file reads; must NOT be called on the 0.5 s
         # render path). ``{}``/``ok`` until the first refresh.
@@ -3092,6 +3102,7 @@ class DashboardState:
                 "%Y-%m-%d %H:%M:%S %Z"
             )
             self.disks = disk_summary()
+            self.ip_v4, self.ip_v6 = host_ips()
         # Data tier (2 s) — docker ps + env re-read.
         if force or (now - self._last_data_refresh) >= DATA_REFRESH_EVERY:
             self._last_data_refresh = now
@@ -3099,6 +3110,7 @@ class DashboardState:
             self.pod_stats = pod_stats(os.uname().nodename)
             self.nodes = cluster_nodes()
             self.vip = cluster_vip()
+            self.k3s_state = k3s_status()
             # P0.5 — host-config apply health (pure file reads). Cached
             # here so render_header / overall_verdict read it off
             # ``state`` without touching disk on the render path.
