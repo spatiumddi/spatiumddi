@@ -1629,6 +1629,38 @@ def _vital_style(pct: float, warn: float, crit: float) -> str:
     return "bold"
 
 
+# Live mini-graph (sparkline) support. The header carries a rolling
+# history of CPU / RAM / load / net as 8-level block bars that animate as
+# the values move — a glanceable "is it spiking?" without reading numbers.
+_SPARK_WIDTH = 10                  # samples kept (≈10 s at the 1 s vitals tier)
+_SPARK_BLOCKS = "▁▂▃▄▅▆▇█"         # U+2581..U+2588, eight vertical levels
+
+
+def _sparkline(values: "Iterable[float]", vmax: float) -> str:
+    """Render ``values`` (each 0..vmax) as a row of 8-level block chars —
+    a live mini-graph. Empty history → ``""``; ``vmax<=0`` → flat floor."""
+    vals = list(values)
+    if not vals:
+        return ""
+    hi = len(_SPARK_BLOCKS) - 1
+    out = []
+    for v in vals:
+        if vmax <= 0:
+            out.append(_SPARK_BLOCKS[0])
+        else:
+            lvl = int(max(0.0, min(float(v), vmax)) / vmax * hi + 0.5)
+            out.append(_SPARK_BLOCKS[lvl])
+    return "".join(out)
+
+
+def _human_bps(bps: float) -> str:
+    """Compact bytes/sec → ``1.2M`` / ``340K`` / ``12``."""
+    for unit, div in (("G", 2**30), ("M", 2**20), ("K", 2**10)):
+        if bps >= div:
+            return f"{bps / div:.1f}{unit}"
+    return f"{bps:.0f}"
+
+
 def overall_verdict(
     state: "DashboardState",
     k3s_state: tuple[str, str] | None = None,
@@ -1945,18 +1977,24 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # Pad the per-second-volatile percentages to a fixed 3-digit width
     # (0–100) so the fields after them — RAM / Load / Disk — don't reflow
     # left/right every tick as CPU/RAM jiggle between 1 and 3 digits.
+    cpu_style = _vital_style(cpu, 80, 95)
     vitals.append("   CPU ", style="dim")
-    vitals.append(f"{cpu:3.0f}%", style=_vital_style(cpu, 80, 95))
+    vitals.append(f"{cpu:3.0f}%", style=cpu_style)
+    vitals.append(" " + _sparkline(state.cpu_hist, 100.0), style=cpu_style)
+    ram_style = _vital_style(state.ram_percent, 85, 95)
     vitals.append("   RAM ", style="dim")
     vitals.append(
         f"{state.ram_used_gib:.1f}/{state.ram_total_gib:.1f} GiB ({state.ram_percent:3.0f}%)",
-        style=_vital_style(state.ram_percent, 85, 95),
+        style=ram_style,
     )
+    vitals.append(" " + _sparkline(state.ram_hist, 100.0), style=ram_style)
     vitals.append("   Load ", style="dim")
     load_1m = state.load_avg[0] if state.load_avg else 0.0
     load_style = "bold yellow" if load_1m > ncpu else "bold"
     vitals.append(load, style=load_style)
     vitals.append(f" ({ncpu} cpu)", style="dim")
+    # Load sparkline scaled 0..ncpu (one full core = top block).
+    vitals.append(" " + _sparkline(state.load_hist, float(ncpu)), style=load_style)
     if state.disks:
         vitals.append("   Disk ", style="dim")
         # Split the disk string so EACH mount colours on its own % —
@@ -2762,6 +2800,14 @@ class DashboardState:
             "%Y-%m-%d %H:%M:%S %Z"
         )
         self.disks: list[tuple[str, float, float, float]] = []
+        # Live mini-graph history (1 s samples). CPU/RAM are 0-100 %, load
+        # is 0..ncpu, net auto-scales to its own rolling max.
+        self.cpu_hist: deque[float] = deque(maxlen=_SPARK_WIDTH)
+        self.ram_hist: deque[float] = deque(maxlen=_SPARK_WIDTH)
+        self.load_hist: deque[float] = deque(maxlen=_SPARK_WIDTH)
+        self.net_hist: deque[float] = deque(maxlen=_SPARK_WIDTH)
+        self.net_rate_bps: float = 0.0
+        self._net_prev: tuple[float, float] | None = None  # (monotonic, bytes)
 
     def refresh(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -2783,6 +2829,22 @@ class DashboardState:
                 "%Y-%m-%d %H:%M:%S %Z"
             )
             self.disks = disk_summary()
+            # Live mini-graph samples (cheap — psutil, no subprocess).
+            self.cpu_hist.append(self.cpu_percent)
+            self.ram_hist.append(self.ram_percent)
+            self.load_hist.append(self.load_avg[0])
+            try:
+                nio = psutil.net_io_counters()
+                total_b = float(nio.bytes_sent + nio.bytes_recv)
+                if self._net_prev is not None:
+                    pt, pb = self._net_prev
+                    dt = now - pt
+                    if dt > 0:
+                        self.net_rate_bps = max(0.0, (total_b - pb) / dt)
+                self._net_prev = (now, total_b)
+                self.net_hist.append(self.net_rate_bps)
+            except Exception:
+                pass
 
         # Data tier (2 s) — docker ps + env re-read.
         if force or (now - self._last_data_refresh) >= DATA_REFRESH_EVERY:
