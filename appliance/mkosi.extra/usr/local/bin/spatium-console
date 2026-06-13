@@ -1751,7 +1751,7 @@ KEY_SEQUENCES: dict[bytes, str] = {
     # emulators) routinely eat F-keys, so 1-7 trigger the same footer
     # actions. The dashboard has no text input, so the digits are free.
     b"1": "F1", b"2": "F2", b"3": "F3", b"4": "F4",
-    b"5": "F5", b"6": "F6", b"7": "F7",
+    b"5": "F5", b"6": "F6", b"7": "F7", b"8": "F8",
 }
 
 
@@ -3003,12 +3003,10 @@ def render_footer(message: str = "", role: str = "control-plane") -> Text:
     so the Layout cell claims exactly one row, with no border padding
     eating vertical space.
 
-    P0.11 — built dynamically from ``role``: the Re-pair action only
-    applies to a remote-paired box (``do_pair`` hard-refuses elsewhere),
-    so the chip is dropped entirely on control-plane roles. On a paired
-    box it's renumbered F6→F7 so the strip is contiguous (no confusing
-    F7 gap). The keybinding accepts BOTH F7 (the renumbered chip) and the
-    historical F8 (muscle memory + serial F-key-passthrough robustness).
+    P1.4 — F7 Health is present on EVERY role (the drill-down is useful
+    everywhere). Re-pair moves to F8 and only appears on a remote-paired
+    box (``do_pair`` hard-refuses elsewhere), so the strip stays contiguous
+    on control-plane (F1-F7) and grows F8 only on application appliances.
     """
     keys = [
         ("F1", "Login"),
@@ -3017,9 +3015,10 @@ def render_footer(message: str = "", role: str = "control-plane") -> Text:
         ("F4", "Network"),
         ("F5", "Reboot"),
         ("F6", "Shutdown"),
+        ("F7", "Health"),
     ]
     if role in ("appliance", "application"):
-        keys.append(("F7", "Re-pair"))
+        keys.append(("F8", "Re-pair"))
     t = Text(no_wrap=True, overflow="ellipsis")
     t.append(" ")
     for i, (k, label) in enumerate(keys):
@@ -4269,6 +4268,200 @@ def do_network(console: Console, tty: str) -> None:
         time.sleep(3)
 
 
+def _fetch_warning_events(limit: int = 12) -> tuple[list[str], str | None]:
+    """The ONE bounded subprocess in the Health screen: ``kubectl get events
+    --field-selector type=Warning -A`` (5 s timeout, on entry / refresh
+    only — never a tier, never a loop). Returns (recent lines, error_or_None)."""
+    try:
+        proc = subprocess.run(
+            ["/usr/local/bin/k3s", "kubectl", "get", "events", "-A",
+             "--field-selector", "type=Warning",
+             "--sort-by=.lastTimestamp", "--no-headers"],
+            env={**os.environ, "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"},
+            capture_output=True, text=True, timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        return [], "timed out (5s)"
+    except (FileNotFoundError, OSError) as exc:
+        return [], str(exc)[:80]
+    if proc.returncode != 0:
+        return [], (proc.stderr.strip()[:120] or "kubectl error")
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    return lines[-limit:], None
+
+
+def _render_health_screen(
+    console: Console, state: "DashboardState",
+    events: list[str], events_err: str | None,
+) -> None:
+    """Paint the five-section F7 Health drill-down (P1.4): verdict banner ·
+    crashed/restarted pods w/ last-exit · Warning events · host-config planes
+    w/ attempt counts · storage (disk / etcd / postgres). Pure reads off
+    ``state`` plus the already-fetched ``events``."""
+    console.clear()
+    wd = supervisor_watchdog_status() if state.role in ("appliance", "application") else None
+    verdict, offender = overall_verdict(state, state.k3s_state, wd)
+    vglyph, vcolor = _VERDICT_STYLES.get(verdict, ("●", "cyan"))
+    banner = Text()
+    banner.append(f" {vglyph} {verdict} ", style=f"bold {vcolor}")
+    if offender:
+        banner.append(f"  {offender}", style="dim")
+    console.print(Panel(
+        banner, box=SQUARE, border_style=vcolor,
+        title="[bold]F7 — Health[/bold]", title_align="left",
+        subtitle="[dim]q/Esc return · r refresh[/dim]", subtitle_align="right",
+    ))
+
+    # Crashed / restarted pods, with last-exit reason+code.
+    pods_tbl = Table.grid(padding=(0, 2))
+    for _ in range(4):
+        pods_tbl.add_column()
+    pods_tbl.add_row(*(Text(h, style="bold dim") for h in ("POD", "STATE", "RST", "LAST EXIT")))
+    problem = [
+        r for r in state.ps_rows
+        if (r.get("K8sState") or "") in _POD_RED_STATES or int(r.get("Restarts") or 0) > 0
+    ]
+    problem.sort(key=lambda r: (_pod_sort_priority(r), -int(r.get("Restarts") or 0)))
+    if not problem:
+        pods_tbl.add_row(Text("— none —", style="dim"), Text(""), Text(""), Text(""))
+    for r in problem[:8]:
+        st8 = r.get("K8sState") or "Running"
+        rc = int(r.get("Restarts") or 0)
+        reason = r.get("LastExitReason") or ""
+        code = r.get("LastExitCode")
+        le = (reason + (f" ({code})" if code not in (None, "") else "")) or "—"
+        ststyle = "bold red" if st8 in _POD_RED_STATES else ("yellow" if rc else "dim")
+        pods_tbl.add_row(
+            Text(_short_pod_name(r.get("Names") or "")[:30]),
+            Text(st8, style=ststyle),
+            Text(str(rc), style="yellow" if rc else "dim"),
+            Text(le, style="dim"),
+        )
+    console.print(Panel(
+        pods_tbl, box=SQUARE, border_style="cyan",
+        title="[bold]Pods — crashed / restarted[/bold]", title_align="left",
+    ))
+
+    # Warning events (the one bounded subprocess).
+    if events_err:
+        ev_body: Group | Text = Text(f"events unavailable: {events_err}", style="dim")
+    elif not events:
+        ev_body = Text("no Warning events", style="dim")
+    else:
+        ev_body = Group(*(
+            Text(ln, style=_log_line_style(ln), overflow="ellipsis", no_wrap=True)
+            for ln in events
+        ))
+    console.print(Panel(
+        ev_body, box=SQUARE, border_style="cyan",
+        title="[bold]Warning events[/bold] · kubectl", title_align="left",
+    ))
+
+    # Host-config planes with applied/retrying/failing + attempt counts.
+    planes_tbl = Table.grid(padding=(0, 2))
+    for _ in range(3):
+        planes_tbl.add_column()
+    planes_tbl.add_row(*(Text(h, style="bold dim") for h in ("PLANE", "STATE", "ATTEMPTS")))
+    for name, trig, applied_base in _HOST_CONFIG_PLANES_DASH:
+        fhash, attempts = _read_fire_state_dash(trig)
+        if not fhash:
+            label, lstyle = "idle", "dim"
+        elif _read_state_line(applied_base) == fhash:
+            label, lstyle = "applied", "green"
+        elif attempts >= _HOSTCFG_FAILING_ATTEMPTS_DASH:
+            label, lstyle = "FAILING", "bold red"
+        else:
+            label, lstyle = "retrying", "yellow"
+        planes_tbl.add_row(
+            Text(name), Text(label, style=lstyle),
+            Text(str(attempts) if fhash else "—", style="dim"),
+        )
+    console.print(Panel(
+        planes_tbl, box=SQUARE, border_style="cyan",
+        title="[bold]Host-config planes[/bold]", title_align="left",
+    ))
+
+    # Storage trio — disks + etcd + postgres DB sizes.
+    store_tbl = Table.grid(padding=(0, 2))
+    for _ in range(2):
+        store_tbl.add_column()
+    for mp, used, total, pct in state.disks:
+        store_tbl.add_row(
+            Text(f"disk {mp}"),
+            Text(f"{used:.1f}/{total:.1f} GiB ({pct:.0f}%)", style=_vital_style(pct, 80, 90)),
+        )
+    if state.etcd:
+        store_tbl.add_row(Text("etcd db"), Text(_human_bytes(state.etcd.get("db_in_use", 0)), style="dim"))
+    if state.cnpg:
+        store_tbl.add_row(Text("postgres db"), Text(_human_bytes(state.cnpg.get("db_size_bytes", 0)), style="dim"))
+    console.print(Panel(
+        store_tbl, box=SQUARE, border_style="cyan",
+        title="[bold]Storage[/bold] · disk / etcd / postgres", title_align="left",
+    ))
+
+
+def do_health(console: Console, state: "DashboardState") -> None:
+    """F7 — full-screen Health/Errors drill-down (P1.4). Reads cached
+    ``state.*`` plus one bounded ``kubectl get events`` on entry / 'r'. Raw
+    select()-driven input loop (mirrors confirm_modal): q/Q/Esc/Ctrl-C
+    return; r/R refetch events + re-read state. Caller stops KeyReader +
+    Live first so this owns stdin/stdout."""
+    try:
+        saved = termios.tcgetattr(0)
+    except termios.error:
+        saved = None
+    events, events_err = _fetch_warning_events()
+    need_redraw = True
+    buf = b""
+    try:
+        if saved is not None:
+            tty.setcbreak(0)
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~termios.ECHO
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+        while True:
+            if need_redraw:
+                try:
+                    state.refresh(force=True)
+                except Exception:
+                    pass  # best-effort; render whatever we have
+                _render_health_screen(console, state, events, events_err)
+                need_redraw = False
+            # 0.08 s poll once buffering (disambiguate lone Esc from an
+            # arrow-key escape burst), 0.5 s idle otherwise.
+            r, _, _ = select.select([0], [], [], 0.08 if buf else 0.5)
+            if not r:
+                if buf == b"\x1b":  # lone Esc → return
+                    return
+                buf = b""
+                continue
+            try:
+                chunk = os.read(0, 16)
+            except OSError:
+                continue
+            if not chunk:
+                continue
+            buf += chunk
+            if buf in (b"q", b"Q", b"\x03"):
+                return
+            if buf in (b"r", b"R"):
+                events, events_err = _fetch_warning_events()
+                need_redraw = True
+                buf = b""
+                continue
+            # Incomplete escape sequence — keep buffering for the trailing
+            # bytes; the 0.08 s poll above resolves a lone Esc to cancel.
+            if buf.startswith(b"\x1b") and len(buf) < 4:
+                continue
+            buf = b""  # unknown / arrow seq — drop, keep waiting
+    finally:
+        if saved is not None:
+            try:
+                termios.tcsetattr(0, termios.TCSANOW, saved)
+            except termios.error:
+                pass
+
+
 def do_pair(console: Console, tty: str) -> None:
     """Run ``spatium-pair`` to re-enter control-plane URL + pairing code.
 
@@ -4411,10 +4604,11 @@ def main() -> int:
             state.set_action("containers")
         elif key == "F4":
             state.set_action("network")
-        elif key in ("F7", "F8"):
-            # P0.11 — Re-pair is the renumbered F7 chip; F8 stays bound
-            # for muscle memory + serial F-key passthrough robustness.
-            # do_pair() hard-refuses on non-application roles anyway.
+        elif key == "F7":
+            # P1.4 — Health drill-down, all roles.
+            state.set_action("health")
+        elif key == "F8":
+            # Re-pair (application roles only; do_pair() hard-refuses elsewhere).
             state.set_action("pair")
 
     keys = KeyReader(on_key)
@@ -4487,6 +4681,8 @@ def main() -> int:
                                     do_containers(console, args.tty)
                                 elif action == "network":
                                     do_network(console, args.tty)
+                                elif action == "health":
+                                    do_health(console, state)
                                 elif action == "pair":
                                     do_pair(console, args.tty)
                             finally:
