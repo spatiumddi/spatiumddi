@@ -1842,13 +1842,37 @@ def overall_verdict(
     return ("HEALTHY", "")
 
 
-def render_header(state: "DashboardState", mono_t: float) -> Panel:
-    """6-row header with identity / vitals / disk sections separated by a Rule.
+def render_header(
+    state: "DashboardState", mono_t: float, compact: bool = False
+) -> Panel:
+    """Constant-height header (Phase 2 §3a).
 
-    All values come from state.* (cached at the vitals tier, 1 s
-    cadence). Only the spinner is derived live from mono_t so its
-    rotation animates at the render cadence (4 Hz) — that's the one
-    thing operators want jittery (visible "alive" indicator).
+    The body is a FIXED 4 content rows regardless of role / vip / slot /
+    watchdog state — that is the whole point of the Phase 2 rebuild: it
+    eliminates the old ``short_count`` mirror-bug class (where ``render_frame``
+    had to hand-mirror every optional ``short_lines`` row or the header
+    under-sized and clipped the vitals line).
+
+    WIDE / MEDIUM (``compact=False``) — 4 content rows + a Rule + border:
+
+      row 1: ``line1``    — Host + Role  |  clock + spinner
+      row 2: ``identity`` — Web UI · IPs · Build  (NEW single line)
+      row 3: Rule(cyan dim)
+      row 4: ``vitals``   — Up · CPU heat · RAM heat · Load · Disk
+
+    COMPACT (``compact=True``) — 4 rows, NO rule (true 80×24 serial):
+
+      row 1: ``line1``
+      row 2: ``identity``
+      row 3: ``vitals``
+
+    All values come from state.* (cached at the vitals/data tier). Only the
+    spinner is derived live from mono_t so its rotation animates at the
+    render cadence — that's the one thing operators want jittery (visible
+    "alive" indicator). The verdict title chip + border colour (P0.3) are
+    unchanged. No subprocess on this path: ``slot_info()`` is process-cached
+    and ``supervisor_watchdog_status()`` is a file-stat — both already lived
+    here pre-Phase-2 and feed only the verdict roll-up.
     """
     env = state.env
     role = state.role
@@ -1860,11 +1884,16 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     clock = state.clock_str
     spinner = SPINNER_CHARS[int(mono_t * 2) % len(SPINNER_CHARS)]
 
-    # Line 1 — identity on the left, clock + spinner on the right.
+    # Line 1 — identity on the left, clock + spinner on the right. The
+    # left column is no-wrap + ellipsis so a long role label (e.g. the
+    # full "Control plane — api + db + frontend (…)" string) truncates
+    # rather than wrapping onto a second row — a wrapped line1 would eat
+    # into the fixed header budget and clip the vitals row, the exact
+    # mirror-bug class Phase 2 set out to kill.
     line1 = Table.grid(expand=True)
-    line1.add_column(ratio=1, no_wrap=False)
+    line1.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
     line1.add_column(justify="right", no_wrap=True)
-    left1 = Text()
+    left1 = Text(no_wrap=True, overflow="ellipsis")
     left1.append("Host ", style="dim")
     left1.append(hostname, style="bold")
     left1.append("   Role ", style="dim")
@@ -1875,203 +1904,54 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     right1.append(spinner, style="bold bright_yellow")
     line1.add_row(left1, right1)
 
-    # Line 2 — IPs. IPv4 inline; IPv6 collapsed to a ``+N IPv6``
-    # chip so SLAAC's typically-40-char addresses don't push the
-    # header off-screen on standard 80-col TTYs. Operators who need
-    # the full list can hit F4 (nmtui) for the per-NIC view.
-    line2 = Text()
-    line2.append("IPs  ", style="dim")
-    if v4_ips:
-        line2.append(", ".join(v4_ips))
-        if v6_ips:
-            line2.append(f"  +{len(v6_ips)} IPv6", style="dim")
-    elif v6_ips:
-        # IPv6-only host (rare): show the first; the chip carries
-        # the rest.
-        line2.append(v6_ips[0])
-        if len(v6_ips) > 1:
-            line2.append(f"  +{len(v6_ips) - 1} IPv6", style="dim")
-    else:
-        line2.append("—")
-
-    # Line 3 — build / version
-    line3 = Text()
-    line3.append("Build ", style="dim")
-    line3.append(build)
-
-    # Control-plane VIP — the frontend's MetalLB LoadBalancer IP, when one
-    # is assigned. Surfaced near the top so the multi-node operator sees
-    # the floating address that survives node loss. Quiet when no VIP is
-    # configured (single-node). The Web UI line below points at it.
-    vip_line: Text | None = None
-    if state.vip:
-        vip_line = Text()
-        vip_line.append("VIP  ", style="dim")
-        vip_line.append(state.vip, style="bold bright_green")
-        vip_line.append("  (control-plane MetalLB)", style="dim")
-
-    # P0.7 — the most-copied appliance-console fact: where to point a
-    # browser. Resolve to the VIP on a multi-node cluster (it survives
-    # node loss), else the first non-flannel LAN IPv4 (host_ips already
-    # drops 10.42/16 + loopback + bridges). Bold so it stands out as the
-    # operator's primary affordance. Quiet only on a box with no usable
-    # address yet (pre-network boot).
-    webui_line: Text | None = None
+    # Row 2 — the single ``identity`` line. Replaces the entire variable
+    # ``short_lines`` paired grid. Everything that used to be its own
+    # optional row (VIP / Agent / Watchdog / Slot / Upgrade / k3s /
+    # Health) migrates into the KPI ribbon (INC 2); here we keep only the
+    # three facts an operator copies most: where to point a browser, the
+    # box's IPs, and the running build. One line, never wraps at WIDE /
+    # MEDIUM widths (≥120 cols) and the COMPACT path has its own 4-row
+    # tree so it can't wrap either.
+    #
+    # P0.7 — Web UI host resolves to the VIP on a multi-node cluster (it
+    # survives node loss), else the first non-flannel LAN IPv4 (host_ips
+    # already drops 10.42/16 + loopback + bridges). Both are cached on
+    # ``state`` (vitals tier for IPs, data tier for the VIP) so this is
+    # pure-in-memory.
+    identity = Text(no_wrap=True, overflow="ellipsis")
     webui_host = state.vip or (v4_ips[0] if v4_ips else None)
+    identity.append("Web UI ", style="dim")
     if webui_host:
-        webui_line = Text()
-        webui_line.append("Web UI ", style="dim")
-        webui_line.append(f"https://{webui_host}", style="bold bright_cyan")
+        identity.append(f"https://{webui_host}", style="bold bright_cyan")
+    else:
+        identity.append("—", style="dim")
+    identity.append("   ·   ", style="dim")
+    identity.append("IPs ", style="dim")
+    if v4_ips:
+        identity.append(", ".join(v4_ips))
+        if v6_ips:
+            identity.append(f" +{len(v6_ips)} IPv6", style="dim")
+    elif v6_ips:
+        # IPv6-only host (rare): show the first; the chip carries the rest.
+        identity.append(v6_ips[0])
+        if len(v6_ips) > 1:
+            identity.append(f" +{len(v6_ips) - 1} IPv6", style="dim")
+    else:
+        identity.append("—", style="dim")
+    identity.append("   ·   ", style="dim")
+    identity.append("Build ", style="dim")
+    identity.append(build)
 
-    # Line 3a — Control plane + Identity (only on appliance nodes that
-    # pair with a remote control plane; #170 Wave D). Inlining these
-    # into the header lets us drop the separate Agent panel, saving ~4
-    # rows of vertical space the operator would otherwise spend looking
-    # at one panel title + two values.
-    agent_line: Text | None = None
-    if role in ("appliance", "application"):
-        cp_url = env.get("CONTROL_PLANE_URL") or "(not configured)"
-        pairing = pairing_status(env, role, state.ps_rows)
-        agent_line = Text()
-        agent_line.append("Agent ", style="dim")
-        agent_line.append(cp_url, style="bold")
-        if pairing is not None:
-            label, pstyle = pairing
-            agent_line.append("  ", style="dim")
-            agent_line.append(label, style=pstyle)
-
-    # Line 3a-2 — External supervisor watchdog status (Wave E). Only
-    # renders on application appliances + only when we have a
-    # supervisor liveness file to read. The host-side timer keeps
-    # the supervisor process alive across deadlocks; surfacing the
-    # mtime delta here gives the physical-console operator the same
-    # signal the host watchdog acts on.
-    watchdog_line: Text | None = None
+    # ``wd_status`` is still needed by ``overall_verdict`` (DEGRADED gate)
+    # — supervisor_watchdog_status() is a pure file-stat, no subprocess,
+    # and only fires on appliance/application roles. It no longer renders
+    # its own header line (it migrates to the KPI ribbon in INC 2).
     wd_status: tuple[str, str] | None = None
     if role in ("appliance", "application"):
         wd_status = supervisor_watchdog_status()
-        if wd_status is not None:
-            label, wstyle = wd_status
-            watchdog_line = Text()
-            watchdog_line.append("Watchdog ", style="dim")
-            watchdog_line.append(label, style=wstyle)
 
-    # Line 3b — Phase 8c A/B slot indicator. Only renders on the
-    # appliance (where slot detection succeeds). On dev/non-appliance
-    # boxes detect_slot_info() returns None and we skip the line.
-    def _slot_letter(s: str) -> str:
-        # ``slot_a`` → ``A``, ``slot_b`` → ``B``. Falls through
-        # untouched on anything else so a future ``slot_c`` doesn't
-        # render as empty.
-        if s.startswith("slot_") and len(s) > 5:
-            return s[5:].upper()
-        return s
-
-    slots = slot_info()
-    slot_line: Text | None = None
-    slot_next_line: Text | None = None
-    if slots is not None:
-        current, durable = slots
-        # P0.8 — per-slot installed versions (cached on the 5 s tier) so
-        # the operator can see WHICH version is in A vs B before a
-        # rollback, not just "committed default". ``—`` when unstamped.
-        ver_a = state.slot_a_version or "—"
-        ver_b = state.slot_b_version or "—"
-        cur_letter = _slot_letter(current)
-        slot_line = Text()
-        slot_line.append("Slot  ", style="dim")
-        # ``Slot A <verA> · B <verB>`` with the booted slot bold-cyan.
-        slot_line.append(
-            f"A {ver_a}",
-            style="bold cyan" if cur_letter == "A" else "dim",
-        )
-        slot_line.append(" · ", style="dim")
-        slot_line.append(
-            f"B {ver_b}",
-            style="bold cyan" if cur_letter == "B" else "dim",
-        )
-        # Trial-boot warning — running slot differs from the durable
-        # default, so a reboot reverts to the durable one (the most
-        # dangerous pre-reboot omission). Loud amber.
-        if durable and durable != current:
-            slot_line.append("  ", style="dim")
-            slot_line.append(
-                f"TRIAL ({cur_letter}) — durable={_slot_letter(durable)}, reboot reverts",
-                style="bold bright_yellow",
-            )
-        elif durable:
-            slot_line.append("  ", style="dim")
-            slot_line.append("· committed default", style="dim")
-        else:
-            slot_line.append("  ", style="dim")
-            slot_line.append("(grubenv unreadable)", style="dim")
-        # One-shot next_entry queued (a Fleet trial-boot request) — the
-        # NEXT reboot lands on a different slot than the durable default.
-        # Amber so the operator at the console knows a trial is pending.
-        # Rendered as its OWN short line (NOT appended to slot_line) so
-        # neither line can wrap and push the vitals row off a narrow
-        # header. Mutually exclusive in practice with the active-TRIAL
-        # case above (grub clears next_entry once it boots the trial).
-        nxt = state.slot_next_entry
-        if nxt and nxt != durable and nxt != current:
-            slot_next_line = Text(
-                f"Next boot → Slot {_slot_letter(nxt)} (one-shot trial pending)",
-                style="bold bright_yellow",
-            )
-
-    # Slot-upgrade status line. Only renders when there's something to
-    # show (in-flight / failed / done waiting for reboot) — quiet
-    # otherwise so a steady-state appliance doesn't carry a permanent
-    # "no upgrade pending" row.
-    upgrade_line: Text | None = None
-    if role in ("appliance", "application"):
-        ustatus = upgrade_status()
-        if ustatus is not None:
-            label, ustyle = ustatus
-            upgrade_line = Text()
-            upgrade_line.append("Upgrade ", style="dim")
-            upgrade_line.append(label, style=ustyle)
-
-    # P0.9 — a Fleet-issued reboot is queued; warn the on-console
-    # operator before the box vanishes. No role gate — the trigger is a
-    # host-level safety fact regardless of role.
-    reboot_line: Text | None = None
-    if reboot_pending():
-        reboot_line = Text()
-        reboot_line.append("Reboot ", style="dim")
-        reboot_line.append(
-            "Reboot pending — requested via Fleet UI (press F5 to ack)",
-            style="bold bright_yellow",
-        )
-
-    # Issue #183 Phase 1 — k3s row. Quiet on pre-#183 slots (no k3s
-    # binary baked); always-on once the slot ships k3s so operators
-    # can see the cluster's version + readiness at a glance. The
-    # "disabled" state is the Phase 1 default — k3s ships in the
-    # slot but isn't auto-enabled until Phase 3 wires the supervisor.
-    k3s_line: Text | None = None
-    k3s_state = state.k3s_state
-    if k3s_state is not None:
-        label, kstyle = k3s_state
-        k3s_line = Text()
-        k3s_line.append("k3s   ", style="dim")
-        k3s_line.append(label, style=kstyle)
-
-    # P0.5 — host-config apply health line. Reads the cached rollup off
-    # ``state`` (refreshed on the 5 s data tier — no disk I/O here).
-    # Shown whenever this box has a release-state dir (a real appliance)
-    # so the operator gets the green "all OK" reassurance, and always
-    # when something's degraded / a restore is in flight. Quiet on dev /
-    # non-appliance boxes where the dir doesn't exist and verdict is ok.
-    health_line: Text | None = None
-    hh = state.host_health
-    if _RELEASE_STATE_DIR.is_dir() or hh.get("verdict") != "ok":
-        hlabel, hstyle = host_health_summary(hh)
-        health_line = Text()
-        health_line.append("Health ", style="dim")
-        health_line.append(hlabel, style=hstyle)
-
-    # Rule — horizontal divider between identity and vitals.
+    # Rule — horizontal divider between identity and vitals. Dropped in
+    # COMPACT mode (§2) so the 4-row body fits a true 80×24 serial.
     rule = Rule(style="cyan dim", characters="─")
 
     # Vitals line — uptime / cpu / ram / load / disks all on one row.
@@ -2087,7 +1967,10 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     # the 1-min average exceeds the CPU count (annotated so the operator
     # has the denominator).
     ncpu = os.cpu_count() or 1
-    vitals = Text()
+    # no_wrap + ellipsis so the vitals row stays exactly ONE rendered line
+    # on a narrow (80-col COMPACT) terminal — a wrapped vitals row would
+    # over-run the fixed header height and clip the bottom content.
+    vitals = Text(no_wrap=True, overflow="ellipsis")
     vitals.append("Up ", style="dim")
     vitals.append(uptime_str(), style="bold")
     # Pad the per-second-volatile percentages to a fixed 3-digit width
@@ -2127,52 +2010,22 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
                 style=_vital_style(pct, 80, 90),
             )
 
-    # Pack the short label-value rows into a two-column grid so the
-    # right half of the panel (~40 chars on an 80-col TTY) stops
-    # rendering as dead space. line1 stays full-width since its
-    # right column is already used by clock+spinner; vitals stays
-    # full-width because it's one long line of bits that flows
-    # naturally. Everything else (IPs/Build/Agent/Watchdog/Slot/
-    # Upgrade/k3s) is short enough to fit in a half-width cell.
-    short_lines: list[Text] = []
-    if webui_line is not None:
-        short_lines.append(webui_line)
-    if vip_line is not None:
-        short_lines.append(vip_line)
-    short_lines += [line2, line3]
-    if agent_line is not None:
-        short_lines.append(agent_line)
-    if watchdog_line is not None:
-        short_lines.append(watchdog_line)
-    if slot_line is not None:
-        short_lines.append(slot_line)
-    if slot_next_line is not None:
-        short_lines.append(slot_next_line)
-    if upgrade_line is not None:
-        short_lines.append(upgrade_line)
-    if reboot_line is not None:
-        short_lines.append(reboot_line)
-    if k3s_line is not None:
-        short_lines.append(k3s_line)
-    if health_line is not None:
-        short_lines.append(health_line)
-
-    paired_grid = Table.grid(expand=True, padding=(0, 2))
-    paired_grid.add_column(ratio=1, no_wrap=False)
-    paired_grid.add_column(ratio=1, no_wrap=False)
-    for i in range(0, len(short_lines), 2):
-        left = short_lines[i]
-        right = short_lines[i + 1] if i + 1 < len(short_lines) else Text("")
-        paired_grid.add_row(left, right)
-
-    body_parts: list = [line1, paired_grid, rule, vitals]
+    # Body assembly — a FIXED row count. WIDE/MEDIUM gets the Rule
+    # divider between identity and vitals (4 content rows + rule);
+    # COMPACT drops the rule so the body is exactly 3 content rows and
+    # the whole panel fits a true 80×24 serial under the F-key footer.
+    if compact:
+        body_parts: list = [line1, identity, vitals]
+    else:
+        body_parts = [line1, identity, rule, vitals]
     body = Group(*body_parts)
 
     # P0.3 — box-level health verdict as the header title chip + border
-    # colour. Reuse the ``k3s_state`` + ``wd_status`` already computed
-    # above so overall_verdict adds no subprocess. A red border is
-    # visible across a room on a VGA console; uniform cyan never was.
-    verdict, offender = overall_verdict(state, k3s_state, wd_status)
+    # colour. Reads ``state.k3s_state`` (cached on the 5 s data tier) +
+    # the ``wd_status`` file-stat computed above so overall_verdict adds
+    # no subprocess. A red border is visible across a room on a VGA
+    # console; uniform cyan never was. (Unchanged from Phase 1.)
+    verdict, offender = overall_verdict(state, state.k3s_state, wd_status)
     vglyph, vcolor = _VERDICT_STYLES.get(verdict, ("●", "cyan"))
     if verdict == "HEALTHY":
         title = "[bold]SpatiumDDI[/bold]  [green]● HEALTHY[/green]"
@@ -2221,7 +2074,12 @@ def _short_pod_name(name: str) -> str:
     return name
 
 
-def render_services(role: str, ps_rows: list[dict]) -> Panel:
+def render_services(
+    role: str,
+    ps_rows: list[dict],
+    cap: int | None = None,
+    overflow: int = 0,
+) -> Panel:
     """Render the Pods panel — every pod on the local k3s cluster
     with status + node + ports (the image column was dropped — on an
     appliance every image is baked + known, so per-pod image was noise;
@@ -2236,6 +2094,13 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
 
     The ``role`` argument is unused now but kept on the signature
     so the call site in render_frame stays unchanged.
+
+    Phase 2 (§3c) — ``cap`` clamps the number of data rows rendered (after
+    the unhealthy-first sort, so the most-urgent pods always survive the
+    clamp) and ``overflow`` drives a trailing dim ``… +N more pods (F3 to
+    list)`` row. The ``Pods · N Ready · M CrashLoop`` title keeps counting
+    the FULL visible set so the rollup stays honest even when healthy rows
+    are hidden off the bottom of a small terminal.
     """
     _ = role  # signature kept for compatibility
 
@@ -2291,6 +2156,26 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
         visible_rows,
         key=lambda r: (_pod_sort_priority(r), r.get("Names") or ""),
     )
+
+    # Phase 2 (§3c) — clamp to ``cap`` TOTAL rows AFTER the unhealthy-first
+    # sort so a crash-looping pod is never the one hidden by the clamp.
+    # ``cap`` is the row budget the panel was allotted (data rows + the
+    # trailing overflow row), so when we overflow we render ``cap - 1`` data
+    # rows and spend the last row on the ``+N more`` line — otherwise the
+    # overflow row itself would be clipped by the Layout height. Derive the
+    # overflow from what's actually dropped so the count is exact.
+    # ``cap=None`` means no clamp.
+    if cap is not None and len(sorted_rows) > cap:
+        # Overflow goes in the panel SUBTITLE (bottom border line), NOT a
+        # table row: a table row's text lands in the flexible NAME column,
+        # which Rich squeezes to ~0 at 80 cols (the 12 fixed columns already
+        # exceed the width), so the "+N more" row rendered blank. The
+        # subtitle is full-panel-width + never clipped, and spends no body
+        # row — so we keep all ``cap`` data rows.
+        overflow = max(overflow, len(sorted_rows) - cap)
+        sorted_rows = sorted_rows[:cap]
+    else:
+        overflow = 0
 
     # P0.4 — panel title rollup, mirroring the Nodes panel's
     # ``Cluster · N/M Ready`` pattern so the eye catches a problem
@@ -2410,13 +2295,25 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
             Text(ports or "—", style=ports_style),
         )
 
+    # Phase 2 (§3c) — overflow indicator in the SUBTITLE (bottom border)
+    # rather than a table row (see the clamp comment above for why). F3
+    # (Pods) opens the full picker so the hidden rows stay reachable.
+    pods_subtitle = (
+        f"[dim]… +{overflow} more pods · F3 to list[/dim]" if overflow > 0 else None
+    )
     return Panel(
         tbl, box=SQUARE, border_style="cyan",
         title=pods_title, title_align="left",
+        subtitle=pods_subtitle, subtitle_align="right",
     )
 
 
-def render_nodes(nodes: list[dict], pods: list[dict] | None = None) -> Panel:
+def render_nodes(
+    nodes: list[dict],
+    pods: list[dict] | None = None,
+    cap: int | None = None,
+    overflow: int = 0,
+) -> Panel:
     """Render the cluster Nodes panel (#272) — one row per k3s node:
     Ready / roles / pod count / health / capacity / age / IP / version.
 
@@ -2424,6 +2321,11 @@ def render_nodes(nodes: list[dict], pods: list[dict] | None = None) -> Panel:
     need it — render_frame gates on len). ``pods`` (the same list the
     Pods panel uses) drives the per-node POD count, so an empty / under-
     scheduled control-plane node is obvious at a glance.
+
+    Phase 2 (§3c) — ``cap`` clamps the number of node rows rendered (clamp
+    parity with the Pods panel so a 7-node cluster can't push the footer
+    off-screen) and ``overflow`` drives a trailing dim ``… +N more nodes``
+    row. The ``Cluster · N/M Ready`` title keeps counting the FULL set.
     """
     # Pod count per node from the already-fetched pod list (no extra API).
     pod_counts: dict[str, int] = {}
@@ -2458,7 +2360,17 @@ def render_nodes(nodes: list[dict], pods: list[dict] | None = None) -> Panel:
         Text("VERSION", style=header_style),
     )
     ready_total = sum(1 for n in nodes if n.get("ready") == "True")
-    for n in nodes:
+    # Phase 2 (§3c) — clamp to ``cap`` data rows; the overflow count goes in
+    # the panel SUBTITLE (bottom border), not a table row (same column-squeeze
+    # reason as the Pods panel), so it's full-width + never clipped and spends
+    # no body row. Title keeps the full count.
+    if cap is not None and len(nodes) > cap:
+        overflow = max(overflow, len(nodes) - cap)
+        shown_nodes = nodes[:cap]
+    else:
+        shown_nodes = nodes
+        overflow = 0
+    for n in shown_nodes:
         ready = n.get("ready") or "Unknown"
         if ready == "True":
             glyph, gstyle, rtxt, rstyle = "●", "green", "Ready", "green"
@@ -2480,10 +2392,15 @@ def render_nodes(nodes: list[dict], pods: list[dict] | None = None) -> Panel:
             Text(n.get("internal_ip") or "—", style="dim"),
             Text(n.get("version") or "", style="dim"),
         )
+    # Phase 2 (§3c) — overflow indicator in the SUBTITLE (bottom border).
+    nodes_subtitle = (
+        f"[dim]… +{overflow} more nodes[/dim]" if overflow > 0 else None
+    )
     title = f"[bold]Cluster[/bold] · {ready_total}/{len(nodes)} Ready"
     return Panel(
         tbl, box=SQUARE, border_style="magenta",
         title=title, title_align="left",
+        subtitle=nodes_subtitle, subtitle_align="right",
     )
 
 
@@ -2918,121 +2835,170 @@ def render_top_pods(state: "DashboardState", height: int) -> Panel:
                  title="[bold]Top pods[/bold] · CPU / mem", title_align="left")
 
 
-def render_frame(state: "DashboardState", mono_t: float) -> Layout:
-    # Compact sizing — feedback was that the dashboard occupied too
-    # many rows. Each panel claims exactly content + 2 border rows;
-    # footer is a borderless 1-row strip.
+# ── Phase 2 sizing constants (§3) ──────────────────────────────────────
+# Every fixed band is a literal constant now — the constant-header model
+# (§3a) eliminated the old ``short_count`` mirror-bug class entirely.
+_HEADER_ROWS_FULL = 6      # 4 content rows (line1 + identity + rule + vitals) + 2 border
+# DEVIATION from PHASE2-PLAN §2/§3a literal "4": the COMPACT header keeps
+# all THREE content rows the plan lists ("line1 + one IP line + vitals,
+# NO rule"). Three content rows + the SQUARE panel's 2 border rows = 5, so
+# a literal size=4 would clip one of those rows (the vitals line — the very
+# row the field test asserts must stay visible). The plan's "4" was the
+# content-row intent ("4 minus the dropped rule"); honoured here as a
+# 5-row Layout band that renders exactly that content with nothing clipped.
+_HEADER_ROWS_COMPACT = 5   # 3 content rows (line1 + identity + vitals, no rule) + 2 border
+_KPI_ROWS = 5              # KPI boxes always render 3 body rows + 2 border (INC 2 fills them)
+_FOOTER_ROWS = 1           # borderless F-key strip
+_MIN_MAIN = 6              # pods col-header + ~3 rows + border
+_MIN_LOG = 3               # 1 log line + border
 
-    # Phase 7 — Pods panel shows every pod on the local cluster, not
-    # the pre-Phase-7 role-scoped service list. Row count is dynamic:
-    # number of pods, plus 2 for the panel border. Min 3 rows so the
-    # empty-state "no pods running" hint stays visible while k3s comes
-    # up. Capped at terminal-height-aware ceiling in render_frame's
-    # log_height clamp below.
-    # #284 — size the Pods panel off the SAME filtered set render_services
-    # renders, so hidden (Succeeded) pods don't leave blank lines. ``or 1``
-    # keeps a single row for the "no pods" fallback when nothing's visible.
-    pods_count = len(visible_pods(state.ps_rows)) or 1
-    # Header layout: 1 line1 (host+role | clock) + N rows of the
-    # 2-col paired grid + 1 horizontal rule + 1 vitals + 2 panel
-    # border. The grid packs IPs + Build + every conditional row
-    # (agent / watchdog / slot / upgrade / k3s) 2-per-row, so
-    # what would have been 5-7 separate rows becomes 3-4 paired
-    # rows — saves ~3 vertical rows on a typical appliance.
-    has_agent_line = state.role in ("appliance", "application")
-    has_watchdog_line = (
-        state.role in ("appliance", "application") and supervisor_watchdog_status() is not None
-    )
-    has_upgrade_line = state.role in ("appliance", "application") and upgrade_status() is not None
-    has_k3s_line = state.k3s_state is not None
-    # P0.5 — Health line. MUST mirror render_header's gate exactly
-    # (release-state dir present, or a non-ok verdict) or the header
-    # under-sizes by a row and clips the vitals line — the same class of
-    # sizing bug the VIP-line ``+1`` below fixes.
-    has_health_line = (
-        _RELEASE_STATE_DIR.is_dir()
-        or state.host_health.get("verdict") != "ok"
-    )
-    # P0.7 — Web UI line. Present whenever there's a VIP or a usable LAN
-    # IPv4 (host_ips drops loopback / bridges / flannel). MUST be counted
-    # here or the header under-sizes and clips the vitals line.
-    has_webui_line = bool(state.vip) or bool(state.ip_v4)
-    # P0.8 — a queued one-shot trial (next_entry) renders as its OWN short
-    # line (so neither it nor the slot line wraps); count it here to match
-    # render_header's gate or the vitals row clips.
-    _slots_sz = slot_info()
-    has_slot_next = (
-        bool(state.slot_next_entry)
-        and _slots_sz is not None
-        and state.slot_next_entry != _slots_sz[1]  # != durable
-        and state.slot_next_entry != _slots_sz[0]  # != current
-    )
-    short_count = (
-        2  # IPs + Build, always present
-        # VIP line — present whenever a control-plane VIP is configured
-        # (``state.vip``), which is the multi-node cluster case. This MUST
-        # be counted: render_header prepends vip_line to short_lines, so
-        # omitting it here under-sized HEADER_ROWS by a row and the
-        # fixed-height header clipped its last element — the CPU/RAM/Disk
-        # vitals row vanished exactly when a VIP was set.
-        + (1 if state.vip else 0)
-        + (1 if has_webui_line else 0)
-        + (1 if _slots_sz is not None else 0)
-        + (1 if has_slot_next else 0)
-        + (1 if has_agent_line else 0)
-        + (1 if has_watchdog_line else 0)
-        + (1 if has_upgrade_line else 0)
-        # P0.9 — reboot-pending line (sizing must match render_header's
-        # gate or the header clips the vitals line).
-        + (1 if reboot_pending() else 0)
-        + (1 if has_k3s_line else 0)
-        + (1 if has_health_line else 0)
-    )
-    paired_rows = (short_count + 1) // 2  # ceil(short_count / 2)
-    HEADER_ROWS = 1 + paired_rows + 1 + 1 + 2  # line1 + grid + rule + vitals + border
-    SVC_ROWS = pods_count + 3   # 1 header row + 2 panel border
-    FOOTER_ROWS = 1   # single-line borderless strip
+
+def render_frame(state: "DashboardState", mono_t: float) -> Layout:
+    """Phase 2 layout (§2/§3). Three tiers gate on ``state.term_size``:
+
+      WIDE    (cols ≥ 120 and rows ≥ 34) — the dense cockpit: header / KPI
+              ribbon / [nodes] / main(pods | top-pods) / full-width log /
+              footer.
+      MEDIUM  (rows ≥ 28, or narrower-but-present) — same tree, KPI ribbon
+              clamps horizontally (INC 2).
+      COMPACT (everything smaller — true 80×24 serial) — 4-row header /
+              main(pods, no top-pods split) / full-width log / footer; NO
+              KPI ribbon.
+
+    The P2.2 clamp (§3c) reserves the footer first, caps the Nodes panel to
+    half the budget, then sheds the KPI ribbon and finally collapses to
+    COMPACT before the footer or the main/log minimums can be squeezed off
+    the bottom of a tiny terminal. Every Layout ``size`` is floored at 1
+    (Rich rejects 0/negative sizes).
+
+    INC 1 leaves the ``kpi`` Layout as an EMPTY ``size=KPI_ROWS``
+    placeholder — INC 2 fills it with the KPI ribbon.
+    """
+    cols, rows = state.term_size
+    WIDE = cols >= 120 and rows >= 34
+    MEDIUM = (not WIDE) and rows >= 28
+    COMPACT = not (WIDE or MEDIUM)
+
+    # ── P2.2 clamp ladder — evaluated BEFORE building the tree (§3c) ─────
+    # 1. Footer is reserved first; it can never be the thing that clips.
+    # 2. Nodes panel caps to half the post-header/footer/kpi budget.
+    # 3. If even the fixed bands + main/log minimums overflow, drop the KPI
+    #    ribbon, then (if still over) collapse the header to COMPACT.
+    footer_rows = _FOOTER_ROWS
+    show_kpi = not COMPACT
+    kpi_rows = _KPI_ROWS if show_kpi else 0
+    header_rows = _HEADER_ROWS_COMPACT if COMPACT else _HEADER_ROWS_FULL
+
+    # Multi-node (#272): a full-width Nodes panel above the main row. Cap it
+    # to half the budget left after the fixed bands so a 7-node cluster
+    # can't push the footer off-screen (§3c).
+    show_nodes = len(state.nodes) > 1
+    nodes_cap = 0
+    nodes_overflow = 0
+    nodes_rows = 0
+    if show_nodes and not COMPACT:
+        avail = max(rows - header_rows - kpi_rows - footer_rows, _MIN_MAIN + _MIN_LOG)
+        nodes_cap = max(min(len(state.nodes), avail // 2 - 1), 1)
+        nodes_rows = nodes_cap + 3  # 1 col-header + 2 border
+        nodes_overflow = max(len(state.nodes) - nodes_cap, 0)
+
+    # Degrade ladder — shed top-down until the fixed bands + minimums fit.
+    reserved = header_rows + kpi_rows + nodes_rows + footer_rows
+    if reserved + _MIN_MAIN + _MIN_LOG > rows:
+        # First: drop the KPI ribbon.
+        if show_kpi:
+            show_kpi = False
+            kpi_rows = 0
+            reserved = header_rows + kpi_rows + nodes_rows + footer_rows
+    if reserved + _MIN_MAIN + _MIN_LOG > rows:
+        # Still over: collapse the header to its COMPACT 4-row form and drop
+        # the Nodes panel + top-pods split (full COMPACT tree).
+        COMPACT = True
+        WIDE = MEDIUM = False
+        header_rows = _HEADER_ROWS_COMPACT
+        show_kpi = False
+        kpi_rows = 0
+        show_nodes = False
+        nodes_rows = 0
+        nodes_overflow = 0
+        reserved = header_rows + footer_rows
 
     layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=HEADER_ROWS),
-        Layout(name="body", ratio=1),
-        Layout(name="footer", size=FOOTER_ROWS),
-    )
-    # #272 — on a multi-node control-plane cluster, show a Nodes panel
-    # (name / Ready / roles / IP / version) above Pods so operators see
-    # cluster membership + health at the TTY. Single-node boxes skip it
-    # (nothing to compare) and keep the original two-panel layout.
-    show_nodes = len(state.nodes) > 1
-    layout["header"].update(render_header(state, mono_t))
+
+    # ── COMPACT tree (§2) — header(4) / main / log / footer, no KPI ─────
+    if COMPACT:
+        layout.split_column(
+            Layout(name="header", size=header_rows),
+            Layout(name="main", ratio=1),
+            Layout(name="log", ratio=1),
+            Layout(name="footer", size=footer_rows),
+        )
+        layout["header"].update(render_header(state, mono_t, compact=True))
+        # Pods cap from the ratio split of the remainder (main + log share
+        # 1:1). ``main_h`` is the floor of the post-header/footer budget.
+        remainder = max(rows - header_rows - footer_rows, _MIN_MAIN + _MIN_LOG)
+        main_h = max(remainder // 2, _MIN_MAIN)
+        max_pod_rows = max(main_h - 3, 1)  # -3 = top border + col-header + bottom border
+        shown = visible_pods(state.ps_rows)
+        pods_overflow = max(len(shown) - max_pod_rows, 0)
+        layout["main"].update(
+            render_services(state.role, state.ps_rows,
+                            cap=max_pod_rows, overflow=pods_overflow)
+        )
+        log_h = max(remainder - main_h, _MIN_LOG)
+        layout["log"].update(render_log(state.tail, log_h))
+        layout["footer"].update(render_footer(state.status_message, state.role))
+        return layout
+
+    # ── WIDE / MEDIUM tree (§2) ─────────────────────────────────────────
+    children = [Layout(name="header", size=header_rows)]
+    if show_kpi:
+        children.append(Layout(name="kpi", size=kpi_rows))
     if show_nodes:
-        NODES_ROWS = len(state.nodes) + 3  # 1 header row + 2 panel border
-        layout["body"].split_column(
-            Layout(name="nodes", size=NODES_ROWS),
-            Layout(name="services", size=SVC_ROWS),
-            Layout(name="log", ratio=1),
-        )
-        layout["body"]["nodes"].update(render_nodes(state.nodes, state.ps_rows))
-        fixed = HEADER_ROWS + NODES_ROWS + SVC_ROWS + FOOTER_ROWS
-    else:
-        layout["body"].split_column(
-            Layout(name="services", size=SVC_ROWS),
-            Layout(name="log", ratio=1),
-        )
-        fixed = HEADER_ROWS + SVC_ROWS + FOOTER_ROWS
-    layout["body"]["services"].update(render_services(state.role, state.ps_rows))
-    log_height = max(state.term_size[1] - fixed, 4)
-    # Split the bottom band into [ log | Pod summary ] — fills the wasted
-    # space beside the (mostly k3s-noise) log with a pod rollup, gpu-talos
-    # style. Both panes share log_height (it's a horizontal split).
-    layout["body"]["log"].split_row(
-        Layout(name="logpane", ratio=2),
-        Layout(name="summary", ratio=1),
+        children.append(Layout(name="nodes", size=nodes_rows))
+    children.append(Layout(name="main", ratio=2))
+    children.append(Layout(name="log", ratio=1))
+    children.append(Layout(name="footer", size=footer_rows))
+    layout.split_column(*children)
+
+    layout["header"].update(render_header(state, mono_t))
+
+    # KPI ribbon — INC 1 leaves an EMPTY placeholder; INC 2 fills it.
+    if show_kpi:
+        layout["kpi"].update(Text(""))
+
+    # ── main row — pods | top-pods split_row (§2) ───────────────────────
+    layout["main"].split_row(
+        Layout(name="pods", ratio=3),
+        Layout(name="top", ratio=2),
     )
-    layout["body"]["log"]["logpane"].update(render_log(state.tail, log_height))
-    layout["body"]["log"]["summary"].update(
-        render_top_pods(state, log_height)
+
+    # Pods cap (§3c) — main height comes from the ratio split of the
+    # remainder; pods can show at most ``main_h - 3`` rows (border +
+    # col-header + the trailing "+M more" row). ``visible_pods`` already
+    # drops Succeeded; the unhealthy-first sort lives in render_services.
+    remainder = max(rows - reserved, _MIN_MAIN + _MIN_LOG)
+    main_h = max(remainder * 2 // 3, _MIN_MAIN)
+    log_h = max(remainder - main_h, _MIN_LOG)
+    max_pod_rows = max(main_h - 3, 1)
+    shown = visible_pods(state.ps_rows)
+    pods_overflow = max(len(shown) - max_pod_rows, 0)
+
+    if show_nodes:
+        layout["nodes"].update(
+            render_nodes(state.nodes, state.ps_rows,
+                         cap=nodes_cap, overflow=nodes_overflow)
+        )
+
+    layout["main"]["pods"].update(
+        render_services(state.role, state.ps_rows,
+                        cap=max_pod_rows, overflow=pods_overflow)
     )
+    layout["main"]["top"].update(render_top_pods(state, main_h))
+
+    # Log — full-width bottom row (§2). It absorbs the flex remainder so it
+    # can never be the thing that clips.
+    layout["log"].update(render_log(state.tail, log_h))
     layout["footer"].update(render_footer(state.status_message, state.role))
     return layout
 
