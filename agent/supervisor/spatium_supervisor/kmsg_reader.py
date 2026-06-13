@@ -33,13 +33,17 @@ _MAX = 1000
 
 _buf: deque[tuple[int, int, str]] = deque(maxlen=_MAX)  # (seq, ts_us, text)
 _lock = threading.Lock()
-_available = False
-_started = False
+# Reader state as threading primitives rather than rebound module globals:
+# ``_ready`` is set once /dev/kmsg is open (cleared if the reader exits), and
+# ``_spawned`` guards the idempotent single-thread start.
+_ready = threading.Event()
+_spawn_lock = threading.Lock()
+_spawned = threading.Event()
 
 
 def is_available() -> bool:
     """True once the reader has opened /dev/kmsg successfully."""
-    return _available
+    return _ready.is_set()
 
 
 def get_since(since_seq: int, limit: int) -> tuple[list[tuple[int, int, str]], int]:
@@ -73,7 +77,6 @@ def _parse(raw: str) -> tuple[int, int, str] | None:
 
 
 def _loop() -> None:
-    global _available
     # Open /dev/kmsg, retrying — a privileged container can briefly see EPERM
     # on /dev/kmsg right at pod start (before the device settles), and we must
     # not let that transient failure kill the reader for the life of the pod.
@@ -93,8 +96,10 @@ def _loop() -> None:
     try:
         os.lseek(fd, 0, os.SEEK_END)
     except OSError:
+        # Non-fatal: if the seek fails we just read from the current position
+        # (some backlog may show), so there's nothing to handle — keep going.
         pass
-    _available = True
+    _ready.set()
     log.info("supervisor.kmsg.reader_started")
     try:
         while True:
@@ -123,13 +128,13 @@ def _loop() -> None:
                     _buf.append(parsed)
     finally:
         os.close(fd)
-        _available = False
+        _ready.clear()
 
 
 def start() -> None:
-    """Spawn the kmsg reader daemon thread (idempotent)."""
-    global _started
-    if _started:
-        return
-    _started = True
+    """Spawn the kmsg reader daemon thread (idempotent + race-safe)."""
+    with _spawn_lock:
+        if _spawned.is_set():
+            return
+        _spawned.set()
     threading.Thread(target=_loop, name="spatium-fw-kmsg", daemon=True).start()
