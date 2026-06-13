@@ -347,12 +347,14 @@ async def test_reveal_rejects_ephemeral_code(db_session: AsyncSession, client: A
 
 
 @pytest.mark.asyncio
-async def test_reveal_rejects_external_auth_user(
+async def test_reveal_external_auth_without_mfa_must_enrol(
     db_session: AsyncSession, client: AsyncClient
 ) -> None:
-    """External-auth users (LDAP / OIDC / SAML) can't re-confirm a
-    local password. The endpoint refuses cleanly rather than failing
-    with a confusing 'password incorrect'."""
+    """#408 — external-auth users (LDAP / OIDC / SAML) have no local
+    password, so reveal re-confirmation requires TOTP. A user who hasn't
+    enrolled MFA gets a clear 'enrol MFA' 403 (not a confusing password
+    rejection); enrolling + supplying a TOTP code is covered in
+    test_reveal_mfa_reauth.py."""
     _, token = await _make_user(
         db_session,
         username="pcldap",
@@ -375,6 +377,7 @@ async def test_reveal_rejects_external_auth_user(
         json={"password": "anything"},
     )
     assert resp.status_code == 403
+    assert "mfa" in resp.json()["detail"].lower()
 
 
 # ── MCP tool ────────────────────────────────────────────────────────

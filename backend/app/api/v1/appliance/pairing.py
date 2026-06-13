@@ -55,10 +55,10 @@ from sqlalchemy import func, select
 from app.api.deps import DB, CurrentUser
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.permissions import is_effective_superadmin, require_permission
-from app.core.security import verify_password
 from app.models.appliance import PairingClaim, PairingCode
 from app.models.audit import AuditLog
 from app.models.auth import User
+from app.services.reauth import ReauthOutcome, reverify_operator
 
 logger = structlog.get_logger(__name__)
 
@@ -158,7 +158,11 @@ class PairingCodeList(BaseModel):
 
 
 class PairingCodeRevealRequest(BaseModel):
-    password: str = Field(min_length=1, description="Caller's current password.")
+    # #408 — local users supply ``password``; external-auth users (no
+    # local password) supply ``totp_code``; a local user with MFA enrolled
+    # may use either. The reauth helper decides; at least one is required.
+    password: str | None = Field(default=None, description="Caller's current password.")
+    totp_code: str | None = Field(default=None, description="Caller's current TOTP code.")
 
 
 class PairingCodeRevealResponse(BaseModel):
@@ -516,18 +520,22 @@ async def reveal_pairing_code(
     no encrypted cleartext (shown once on create); reveal 422s on
     them.
 
-    Gated: superadmin + local-auth + current-password re-check +
-    audited. Mirrors agent-bootstrap-keys reveal.
+    Gated: superadmin + password-or-TOTP re-confirm (#408) + audited.
+    Mirrors agent-bootstrap-keys reveal.
     """
     _require_superadmin(current_user)
 
-    if current_user.auth_source != "local":
+    # #408 — local users re-confirm with password or TOTP; external-auth
+    # users with TOTP (enrol under Settings → Security if not yet enrolled).
+    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
+    if outcome is ReauthOutcome.MFA_REQUIRED:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "Reveal requires a local-auth account; SSO accounts cannot re-verify password.",
+            "Re-confirmation requires MFA. Your account has no local password "
+            "— enrol TOTP under Settings → Security, then retry.",
         )
-    if not verify_password(body.password, current_user.hashed_password or ""):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password verification failed.")
+    if outcome is not ReauthOutcome.OK:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP verification failed.")
 
     row = await db.get(PairingCode, code_id)
     if row is None:

@@ -5131,11 +5131,13 @@ async def k8s_rollout_restart(
 
 
 class RevealKubeconfigRequest(BaseModel):
-    """Operator's local-auth password — re-verified before we hand
-    back the cleartext kubeconfig. Same gate the SNMP-community and
-    agent-bootstrap-key reveals use."""
+    """Operator re-confirmation before we hand back the cleartext
+    kubeconfig. Same gate the SNMP-community and agent-bootstrap-key
+    reveals use: local users supply ``password``, external-auth users
+    (no local password, #408) supply ``totp_code``."""
 
-    password: str
+    password: str | None = None
+    totp_code: str | None = None
 
 
 class RevealKubeconfigResponse(BaseModel):
@@ -5177,7 +5179,10 @@ async def reveal_appliance_kubeconfig(
     need to edit the server line to a reachable address.
     """
     from app.core.crypto import decrypt_str  # noqa: PLC0415
-    from app.core.security import verify_password  # noqa: PLC0415
+    from app.services.reauth import (  # noqa: PLC0415
+        ReauthOutcome,
+        reverify_operator,
+    )
 
     def _audit_denied(reason: str, *, row: Appliance | None = None) -> None:
         db.add(
@@ -5202,23 +5207,22 @@ async def reveal_appliance_kubeconfig(
             status.HTTP_403_FORBIDDEN,
             "Only superadmins can reveal an appliance kubeconfig.",
         )
-    if current_user.auth_source != "local":
-        _audit_denied("external_auth")
-        await db.commit()
+    # #408 — local users re-confirm with password or TOTP; external-auth
+    # users with TOTP (enrol under Settings → Security if not yet enrolled).
+    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
+    if outcome is not ReauthOutcome.OK:
         await asyncio.sleep(0.1)
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Kubeconfig reveal requires a local-auth superadmin "
-            f"(your account authenticates via {current_user.auth_source}). "
-            "Log in as a local admin to reveal the kubeconfig.",
-        )
-    if not current_user.hashed_password or not verify_password(
-        body.password, current_user.hashed_password
-    ):
-        _audit_denied("password_mismatch")
+        if outcome is ReauthOutcome.MFA_REQUIRED:
+            _audit_denied("mfa_required")
+            await db.commit()
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Re-confirmation requires MFA. Your account has no local "
+                "password — enrol TOTP under Settings → Security, then retry.",
+            )
+        _audit_denied("bad_credential")
         await db.commit()
-        await asyncio.sleep(0.1)
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password is incorrect.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP code is incorrect.")
 
     row = await db.get(Appliance, appliance_id)
     if row is None:

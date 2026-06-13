@@ -1986,7 +1986,10 @@ async def get_oui_status(current_user: CurrentUser, db: DB) -> OUIStatusResponse
 
 
 class RevealCommunityRequest(BaseModel):
-    password: str
+    # #408 — local users supply ``password``; external-auth users (no
+    # local password) supply ``totp_code``. The reauth helper decides.
+    password: str | None = None
+    totp_code: str | None = None
 
 
 class RevealCommunityResponse(BaseModel):
@@ -2012,8 +2015,8 @@ async def reveal_snmp_community(
     no local password to re-confirm.
     """
     from app.core.crypto import decrypt_str
-    from app.core.security import verify_password
     from app.models.audit import AuditLog
+    from app.services.reauth import ReauthOutcome, reverify_operator
 
     def _audit_denied(reason: str) -> None:
         db.add(
@@ -2038,22 +2041,21 @@ async def reveal_snmp_community(
             "Only superadmins can reveal the SNMP community",
         )
 
-    if current_user.auth_source != "local":
-        _audit_denied("external_auth")
+    # #408 — local users re-confirm with password or TOTP; external-auth
+    # users with TOTP (enrol under Settings → Security if not yet enrolled).
+    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
+    if outcome is not ReauthOutcome.OK:
+        if outcome is ReauthOutcome.MFA_REQUIRED:
+            _audit_denied("mfa_required")
+            await db.commit()
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Re-confirmation requires MFA. Your account has no local "
+                "password — enrol TOTP under Settings → Security, then retry.",
+            )
+        _audit_denied("bad_credential")
         await db.commit()
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "SNMP community reveal requires a local-auth superadmin "
-            f"(your account authenticates via {current_user.auth_source}). "
-            "Log in as a local admin to reveal the community.",
-        )
-
-    if not current_user.hashed_password or not verify_password(
-        body.password, current_user.hashed_password
-    ):
-        _audit_denied("password_mismatch")
-        await db.commit()
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password is incorrect")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP code is incorrect")
 
     settings = await _get_or_create(db)
     if not settings.snmp_community_encrypted:
