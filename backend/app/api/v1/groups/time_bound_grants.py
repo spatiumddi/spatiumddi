@@ -6,9 +6,15 @@ to a group until ``expires_at``; ``user_has_permission`` unions live grants
 over the static role grants.
 
 Authorization mirrors how role permissions are edited today: ``admin`` on
-``group`` is sufficient to create / revoke a grant (no extra
-privilege-escalation guard — see issue #65 resolved decisions). Listing
-needs only ``read`` on ``group``.
+``group`` is sufficient to create / revoke a grant. Listing needs only
+``read`` on ``group``.
+
+SECURITY (#400, finding C4): creating a grant adds a temporary permission to a
+group, so it must respect the same privilege ceiling as role authoring — a
+non-superadmin may only grant a triple they already hold, never a wildcard.
+``caller_can_grant`` (in ``app.core.permissions``) enforces this; effective
+superadmins bypass it. The pre-#400 "no extra privilege-escalation guard"
+stance (issue #65) is superseded.
 
 Every mutation writes an ``audit_log`` row with ``action='permission_change'``
 before the response is returned (CLAUDE.md non-negotiable #4).
@@ -26,7 +32,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.roles.router import _VALID_ACTIONS
-from app.core.permissions import require_permission
+from app.core.permissions import caller_can_grant, require_permission
 from app.models.audit import AuditLog
 from app.models.auth import Group
 from app.models.time_bound_grant import TimeBoundGrant
@@ -163,6 +169,25 @@ async def create_time_bound_grant(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="expires_at must be in the future",
+        )
+
+    # SECURITY (#400, finding C4): privilege ceiling. A grant unions a temporary
+    # permission onto a group, so a non-superadmin may only grant a triple they
+    # already hold and may never mint a wildcard — same rule as role authoring.
+    requested = [
+        {
+            "action": body.action,
+            "resource_type": body.resource_type,
+            "resource_id": body.resource_id,
+        }
+    ]
+    if not caller_can_grant(current_user, requested):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "You can only grant a permission you already hold, and only a "
+                "superadmin can grant wildcard ('*') permissions."
+            ),
         )
 
     grant = TimeBoundGrant(

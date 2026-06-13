@@ -38,6 +38,7 @@ from app.api.deps import DB, CurrentUser
 from app.services.ai.tools import (
     REGISTRY,
     ToolArgumentError,
+    ToolDisabled,
     ToolNotFound,
 )
 
@@ -79,6 +80,25 @@ def _err(req_id: int | str | None, code: int, message: str, data: Any = None) ->
     return {"jsonrpc": "2.0", "id": req_id, "error": payload}
 
 
+def _mcp_tools() -> list[Any]:
+    """The tools the MCP transport exposes — genuinely read-only only.
+
+    SECURITY (#400, M1): ``REGISTRY.read_only()`` keys off the ``writes``
+    flag, but every ``propose_*`` tool is registered ``writes=False``
+    (the propose call itself only previews + persists a proposal row;
+    the mutation runs later through the C2-gated /apply endpoint). We
+    therefore additionally drop ``propose_*`` tools so the MCP surface
+    never previews/stages a write either. ``tools/list`` (advertised
+    set) and ``tools/call`` (dispatch gate) both consume this single
+    source of truth so they can never drift apart.
+    """
+    return [t for t in REGISTRY.read_only() if not t.name.startswith("propose_")]
+
+
+def _mcp_tool_names() -> set[str]:
+    return {t.name for t in _mcp_tools()}
+
+
 # Standard JSON-RPC error codes
 _PARSE_ERROR = -32700
 _INVALID_REQUEST = -32600
@@ -97,7 +117,7 @@ async def mcp_get(current_user: CurrentUser) -> dict[str, Any]:
     return {
         "server": _SERVER_INFO,
         "protocol_version": _PROTOCOL_VERSION,
-        "available_tools": len(REGISTRY.read_only()),
+        "available_tools": len(_mcp_tools()),
         "transport": "streamable_http",
     }
 
@@ -178,7 +198,7 @@ async def _dispatch_one(raw: Any, db: Any, user: Any) -> dict[str, Any]:
         if method == "tools/list":
             return _ok(
                 req.id,
-                {"tools": [t.to_mcp_tool() for t in REGISTRY.read_only()]},
+                {"tools": [t.to_mcp_tool() for t in _mcp_tools()]},
             )
 
         if method == "tools/call":
@@ -190,9 +210,26 @@ async def _dispatch_one(raw: Any, db: Any, user: Any) -> dict[str, Any]:
                     _INVALID_PARAMS,
                     "tools/call requires string `name`",
                 )
+            # SECURITY (#400, M1): the MCP transport only advertises the
+            # read-only tool set via tools/list, so tools/call must refuse
+            # anything outside it. Passing effective={MCP tool names} makes
+            # the registry raise ToolDisabled for write/propose tools —
+            # without this, a read-scoped API-token client could invoke any
+            # registered tool (including propose_* proposals) by name.
             try:
-                result = await REGISTRY.call(name, arguments, db=db, user=user)
+                result = await REGISTRY.call(
+                    name, arguments, db=db, user=user, effective=_mcp_tool_names()
+                )
             except ToolNotFound as exc:
+                return _err(
+                    req.id,
+                    _METHOD_NOT_FOUND,
+                    f"tool not found: {exc.name!r}",
+                )
+            except ToolDisabled as exc:
+                # A registered tool the MCP surface doesn't expose (write /
+                # propose). Report it as method-not-found so we don't leak
+                # the existence of tools outside the advertised set.
                 return _err(
                     req.id,
                     _METHOD_NOT_FOUND,

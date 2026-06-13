@@ -16,7 +16,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
-from app.core.permissions import require_permission
+from app.core.permissions import caller_can_grant, require_permission
 from app.models.audit import AuditLog
 from app.models.auth import Role, User
 
@@ -130,6 +130,25 @@ def _perm_list_to_dicts(perms: list[PermissionEntry]) -> list[dict[str, Any]]:
     return out
 
 
+def _enforce_grant_ceiling(actor: User, perms: list[PermissionEntry]) -> None:
+    """SECURITY (#400, finding C4): privilege ceiling on role authoring.
+
+    A non-superadmin holding delegated ``admin:role`` could otherwise mint a
+    ``{action:"*", resource_type:"*"}`` role (or any permission they don't hold)
+    and self-assign it → effective superadmin. ``caller_can_grant`` rejects
+    wildcard minting and any triple the caller doesn't already hold. Effective
+    superadmins bypass so the platform owner can still build arbitrary roles.
+    """
+    if not caller_can_grant(actor, perms):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "You can only grant permissions you already hold, and only a "
+                "superadmin can grant wildcard ('*') permissions."
+            ),
+        )
+
+
 def _audit(actor: User, action: str, role: Role, summary: str) -> AuditLog:
     return AuditLog(
         user_id=actor.id,
@@ -163,6 +182,7 @@ async def create_role(body: RoleCreate, current_user: CurrentUser, db: DB) -> Ro
     existing = await db.scalar(select(Role).where(Role.name == body.name))
     if existing is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Role name already in use")
+    _enforce_grant_ceiling(current_user, body.permissions)
     r = Role(
         name=body.name,
         description=body.description,
@@ -212,6 +232,7 @@ async def update_role(
     if body.description is not None:
         r.description = body.description
     if body.permissions is not None:
+        _enforce_grant_ceiling(current_user, body.permissions)
         r.permissions = _perm_list_to_dicts(body.permissions)
     db.add(_audit(current_user, "update", r, f"Updated role {r.name}"))
     await db.commit()
@@ -255,6 +276,17 @@ async def clone_role(
     existing = await db.scalar(select(Role).where(Role.name == body.name))
     if existing is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Role name already in use")
+    # SECURITY (#400, C4): cloning copies the source permissions verbatim into a
+    # role the caller controls — apply the same ceiling so a non-superadmin can't
+    # clone a Superadmin (or any over-privileged) role and self-assign the clone.
+    if not caller_can_grant(current_user, list(src.permissions or [])):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "You can only clone a role whose permissions you already hold, and "
+                "only a superadmin can clone a role carrying wildcard ('*') permissions."
+            ),
+        )
     clone = Role(
         name=body.name,
         description=f"Cloned from '{src.name}'",

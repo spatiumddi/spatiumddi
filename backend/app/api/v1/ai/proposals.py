@@ -135,6 +135,23 @@ async def apply_proposal(
             detail=f"Operation {row.operation!r} is not registered",
         )
 
+    # SECURITY (#400, C2): authoritative RBAC backstop. The propose→apply
+    # flow has NO router-level require_*_permission dependency, so without
+    # this gate an authenticated Viewer who owns a proposal row could apply
+    # it and write IPAM / DNS / DHCP / multicast / alert rows the equivalent
+    # REST route would 403. We enforce the operation's declared
+    # (action, resource_type) here, before re-validating args or dispatching
+    # — matching the permission the equivalent REST route requires. The
+    # per-_apply_ checks in services/ai/operations.py are defense in depth;
+    # this endpoint is the primary gate.
+    try:
+        operations.enforce_operation_permission(current_user, op)
+    except operations.OperationPermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+
     # Re-validate args through the operation's pydantic model — guards
     # against the rare case where the model schema changed between
     # propose and apply (a redeploy mid-flight).
@@ -156,6 +173,16 @@ async def apply_proposal(
 
     try:
         result = await op.apply(db, current_user, args)
+    except operations.OperationPermissionError as exc:
+        # SECURITY (#400, C2): a permission failure raised by the op's
+        # own defense-in-depth check surfaces as a clean 403, not a
+        # rolled-back ok=False result. (The authoritative gate above
+        # should already have caught the common case.)
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
     except Exception as exc:  # noqa: BLE001
         # Apply rolled back its own transaction; reload the proposal
         # from a fresh state and stamp the error.

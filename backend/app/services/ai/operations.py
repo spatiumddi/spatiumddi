@@ -69,6 +69,18 @@ class Operation:
     # Free-form category for grouping in the admin UI — same vocabulary
     # as the read-only tool registry ("ipam", "dns", "dhcp").
     category: str = "ops"
+    # SECURITY (#400, C2): the RBAC gate the apply endpoint enforces
+    # before dispatching this operation. An ``(action, resource_type)``
+    # tuple matching the equivalent REST route's ``require_*_permission``
+    # — e.g. ``("write", "ip_address")``. ``apply_proposal`` calls
+    # ``user_has_permission(user, action, resource_type)`` and raises 403
+    # when the caller lacks it, so the AI propose→apply flow can never
+    # write a row the operator couldn't write through the REST API. The
+    # field is the authoritative backstop; declaring it on every write
+    # operation is mandatory. ``None`` is reserved for self-scoped ops
+    # (e.g. archiving your own chat session) that gate on ownership
+    # inside their own apply rather than on a coarse RBAC permission.
+    required_permission: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +113,40 @@ def get_operation(name: str) -> Operation | None:
 
 def all_operations() -> list[Operation]:
     return sorted(_OPERATIONS.values(), key=lambda o: o.name)
+
+
+class OperationPermissionError(PermissionError):
+    """Raised when the calling user lacks the RBAC permission an
+    operation declares. ``apply_proposal`` translates this into a 403.
+
+    SECURITY (#400, C2): the AI propose→apply flow has no router-level
+    ``require_*_permission`` dependency, so the operation layer is the
+    authoritative authorization gate — without it an authenticated
+    Viewer could apply a proposal that writes IPAM/DNS/DHCP/multicast/
+    alert rows the equivalent REST route would 403.
+    """
+
+    def __init__(self, action: str, resource_type: str) -> None:
+        super().__init__(f"Permission denied: need '{action}' on '{resource_type}'")
+        self.action = action
+        self.resource_type = resource_type
+
+
+def enforce_operation_permission(user: User, op: Operation) -> None:
+    """Backstop an operation's declared RBAC gate (#400, C2).
+
+    Called both by ``apply_proposal`` (the authoritative gate) and by
+    each ``_apply_*`` (defense in depth, so the gate holds even if the
+    op is ever dispatched outside the apply endpoint). No-op when the
+    operation declares ``required_permission=None`` (self-scoped ops).
+    """
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    if op.required_permission is None:
+        return
+    action, resource_type = op.required_permission
+    if not user_has_permission(user, action, resource_type):
+        raise OperationPermissionError(action, resource_type)
 
 
 def expires_at_default() -> datetime:
@@ -204,6 +250,10 @@ async def _apply_create_ip_address(
     is the simpler alternative until the apply set grows.
     """
     from app.api.v1.dhcp._audit import write_audit  # local import to avoid cycle
+
+    # SECURITY (#400, C2): RBAC backstop — the apply path has no
+    # router-level permission dependency.
+    enforce_operation_permission(user, _OPERATIONS["create_ip_address"])
 
     subnet = await db.get(Subnet, args.subnet_id)
     if subnet is None:
@@ -364,6 +414,10 @@ async def _apply_run_nmap_scan(
     from app.models.audit import AuditLog  # local import to avoid cycle
     from app.models.nmap import NmapScan  # local import to avoid cycle
 
+    # SECURITY (#400, C2): RBAC backstop — matches the REST route's
+    # require_permission("write", "manage_nmap_scans").
+    enforce_operation_permission(user, _OPERATIONS["run_nmap_scan"])
+
     target = args.target_ip.strip()
     # Re-validate at apply time too — argv builder gates dangerous flags.
     try:
@@ -436,6 +490,7 @@ register(
         preview=_preview_run_nmap_scan,
         apply=_apply_run_nmap_scan,
         category="network",
+        required_permission=("write", "manage_nmap_scans"),
     )
 )
 
@@ -553,6 +608,10 @@ async def _apply_allocate_subnet(
         allocate_subnet,
     )
 
+    # SECURITY (#400, C2): RBAC backstop — matches the IPAM router's
+    # require_any_resource_permission("subnet", ...) write gate.
+    enforce_operation_permission(user, _OPERATIONS["allocate_subnet"])
+
     alloc = SubnetAllocate(
         prefix_len=args.prefix_len,
         name=args.name or "",
@@ -582,6 +641,7 @@ register(
         preview=_preview_allocate_subnet,
         apply=_apply_allocate_subnet,
         category="ipam",
+        required_permission=("write", "subnet"),
     )
 )
 
@@ -601,6 +661,7 @@ register(
         preview=_preview_create_ip_address,
         apply=_apply_create_ip_address,
         category="ipam",
+        required_permission=("write", "ip_address"),
     )
 )
 
@@ -729,6 +790,10 @@ async def _apply_create_dns_record(
     from app.api.v1.dhcp._audit import write_audit  # local import to avoid cycle
     from app.models.dns import DNSRecord, DNSZone
 
+    # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
+    # require_any_resource_permission("dns_record", ...) write gate.
+    enforce_operation_permission(user, _OPERATIONS["create_dns_record"])
+
     rtype = args.record_type.strip().upper()
     if rtype not in _DNS_RECORD_TYPES:
         raise ValueError(f"Unsupported record type {rtype!r}.")
@@ -800,6 +865,7 @@ register(
         preview=_preview_create_dns_record,
         apply=_apply_create_dns_record,
         category="dns",
+        required_permission=("write", "dns_record"),
     )
 )
 
@@ -1046,6 +1112,10 @@ async def _apply_create_dns_zone(
     from app.models.audit import AuditLog  # noqa: PLC0415
     from app.models.dns import DNSZone  # noqa: PLC0415
 
+    # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
+    # require_any_resource_permission("dns_zone", ...) write gate.
+    enforce_operation_permission(user, _OPERATIONS["create_dns_zone"])
+
     name = _normalize_zone_name(args.name)
     grp, _drivers, err = await _resolve_group_for_zone(
         db, group_id=args.group_id, driver_hint=args.driver_hint
@@ -1111,6 +1181,7 @@ register(
         preview=_preview_create_dns_zone,
         apply=_apply_create_dns_zone,
         category="dns",
+        required_permission=("write", "dns_zone"),
     )
 )
 
@@ -1188,6 +1259,10 @@ async def _apply_create_dhcp_static(
     from app.api.v1.dhcp._audit import write_audit
     from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 
+    # SECURITY (#400, C2): RBAC backstop — matches the DHCP statics
+    # router's require_resource_permission("dhcp_static") write gate.
+    enforce_operation_permission(user, _OPERATIONS["create_dhcp_static"])
+
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:
         raise ValueError(f"DHCP scope {args.scope_id} not found.")
@@ -1246,6 +1321,7 @@ register(
         preview=_preview_create_dhcp_static,
         apply=_apply_create_dhcp_static,
         category="dhcp",
+        required_permission=("write", "dhcp_static"),
     )
 )
 
@@ -1295,7 +1371,13 @@ async def _apply_create_alert_rule(
     db: AsyncSession, user: User, args: CreateAlertRuleArgs
 ) -> dict[str, Any]:
     from app.api.v1.dhcp._audit import write_audit
+    from app.core.permissions import is_effective_superadmin  # noqa: PLC0415
     from app.models.alerts import AlertRule
+
+    # SECURITY (#400, C2): RBAC backstop — the REST POST /alerts/rules
+    # route gates on _require_superadmin, so the AI apply does too.
+    if not is_effective_superadmin(user):
+        raise OperationPermissionError("admin", "alert_rule")
 
     row = AlertRule(
         name=args.name,
@@ -1551,6 +1633,10 @@ async def _apply_create_multicast_group(
     from app.models.audit import AuditLog  # noqa: PLC0415
     from app.models.multicast import MulticastGroup  # noqa: PLC0415
 
+    # SECURITY (#400, C2): RBAC backstop — matches the multicast
+    # router's require_resource_permission("multicast") write gate.
+    enforce_operation_permission(user, _OPERATIONS["create_multicast_group"])
+
     err = _validate_multicast_address(args.address)
     if err is not None:
         raise ValueError(err)
@@ -1610,6 +1696,7 @@ register(
         preview=_preview_create_multicast_group,
         apply=_apply_create_multicast_group,
         category="multicast",
+        required_permission=("write", "multicast"),
     )
 )
 
@@ -1773,6 +1860,10 @@ async def _apply_allocate_multicast_groups(
     from app.models.audit import AuditLog  # noqa: PLC0415
     from app.models.multicast import MulticastGroup  # noqa: PLC0415
 
+    # SECURITY (#400, C2): RBAC backstop — matches the multicast
+    # router's require_resource_permission("multicast") write gate.
+    enforce_operation_permission(user, _OPERATIONS["allocate_multicast_groups"])
+
     items, conflict_count, err = await _bulk_allocate_helper(db, args)
     if err is not None:
         raise ValueError(err)
@@ -1836,6 +1927,7 @@ register(
         preview=_preview_allocate_multicast_groups,
         apply=_apply_allocate_multicast_groups,
         category="multicast",
+        required_permission=("write", "multicast"),
     )
 )
 
@@ -1921,6 +2013,11 @@ async def _apply_approve_appliance(
         sign_supervisor_cert,
     )
 
+    # SECURITY (#400, C2): RBAC backstop — matches the REST approve
+    # route's require_permission("admin", "appliance"). High-blast-
+    # radius (mints a cert), so the gate is mandatory at apply.
+    enforce_operation_permission(user, _OPERATIONS["approve_appliance"])
+
     appliance_uuid = UUID(args.appliance_id)
     row = await db.get(Appliance, appliance_uuid)
     if row is None:
@@ -1985,6 +2082,7 @@ register(
         preview=_preview_approve_appliance,
         apply=_apply_approve_appliance,
         category="admin",
+        required_permission=("admin", "appliance"),
     )
 )
 
@@ -2083,6 +2181,10 @@ async def _apply_assign_appliance_role(
     from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
     from app.models.dns import DNSServerGroup  # noqa: PLC0415
 
+    # SECURITY (#400, C2): RBAC backstop — matches the REST role-assign
+    # route's require_permission("admin", "appliance").
+    enforce_operation_permission(user, _OPERATIONS["assign_appliance_role"])
+
     appliance_uuid = UUID(args.appliance_id)
     row = await db.get(Appliance, appliance_uuid)
     if row is None:
@@ -2136,6 +2238,7 @@ register(
         preview=_preview_assign_appliance_role,
         apply=_apply_assign_appliance_role,
         category="admin",
+        required_permission=("admin", "appliance"),
     )
 )
 
@@ -2187,6 +2290,10 @@ async def _apply_toggle_firewall_policy(
     from app.models.firewall import FirewallPolicy  # noqa: PLC0415
     from app.services.appliance.firewall_merge import reset_policy_cache  # noqa: PLC0415
 
+    # SECURITY (#400, C2): RBAC backstop — the fleet-firewall routes
+    # gate on require_permission("admin", "appliance").
+    enforce_operation_permission(user, _OPERATIONS["toggle_firewall_policy"])
+
     p = await db.get(FirewallPolicy, UUID(args.policy_id))
     if p is None:
         return {"error": f"No firewall policy with id {args.policy_id}."}
@@ -2218,6 +2325,7 @@ register(
         preview=_preview_toggle_firewall_policy,
         apply=_apply_toggle_firewall_policy,
         category="admin",
+        required_permission=("admin", "appliance"),
     )
 )
 
