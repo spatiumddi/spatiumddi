@@ -37,6 +37,25 @@ Batched fixes for the next cut (not yet released).
   nonce for same-image re-fire. (Recover an already-stuck box on the host
   with ``spatium-upgrade-slot apply <url> --checksum <url>`` then reboot.)
 
+* **#421 — slot upgrade could hang at "in-flight" forever.** #419 fixed
+  the one cause that wedged a field box; this is the general robustness
+  gap — *any* mid-apply death (an OOM-killed ``dd``, a stalled download, a
+  killed process, power loss) left the upgrade state stuck at "in-flight"
+  with no terminal write, so the Fleet UI spun indefinitely and the
+  operator got no retry signal. Now four guards make a dead/stalled apply
+  surface as **failed** within minutes: the host runner re-stamps the
+  in-flight marker every 60 s while alive (so a frozen stamp means the
+  runner is gone), caps the apply with ``timeout`` so a stalled download /
+  ``dd`` self-fails, and writes ``failed`` from an EXIT trap on any abrupt
+  exit; the ``spatiumddi-slot-upgrade.service`` unit gains a
+  ``TimeoutStartSec`` backstop above the runner's own cap; and the
+  supervisor flips a stale in-flight (stamp older than 5 min — well above
+  the 60 s tick, so a live-but-slow apply is never falsely failed) to
+  ``failed``, healing the ``.state`` sidecar + lingering trigger so the
+  operator can clear + re-apply from the Fleet drilldown. The drilldown
+  also shows a "looks stuck — check the host or re-apply" hint if an
+  apply sits in-flight past ~6 min.
+
 ---
 
 ## 2026.06.14-1 — 2026-06-14

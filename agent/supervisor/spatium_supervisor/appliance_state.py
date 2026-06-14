@@ -290,6 +290,87 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     return state, stamp
 
 
+# #421 — a slot-upgrade apply that dies mid-flight (SIGKILL, an OOM-killed
+# dd, power loss) can't run the host runner's failed-on-exit trap, so the
+# .state sidecar stays "in-flight" forever and the Fleet UI shows a
+# permanent spinner — observed in the field stuck for two days. The host
+# runner re-stamps the in-flight marker every ~60s while it's alive
+# (spatiumddi-slot-upgrade INFLIGHT_TICK_SECONDS), so a stamp older than
+# this threshold means the runner is gone. Set well above the tick (a few
+# missed ticks of jitter is fine) but it never trips on a slow-but-running
+# apply because a live runner keeps the stamp fresh regardless of how long
+# the apply takes.
+_STALE_INFLIGHT_SECONDS = 300  # 5 missed 60s liveness ticks
+
+
+def _reap_stale_inflight(
+    state: str | None, stamp: datetime | None
+) -> tuple[str | None, datetime | None]:
+    """Detect a dead/stalled slot-upgrade runner and surface it as failed.
+
+    If the sidecar reads ``in-flight`` but the runner's liveness stamp has
+    gone stale (older than ``_STALE_INFLIGHT_SECONDS``), the apply died
+    without writing a terminal state. Record ``failed`` durably — rewrite
+    the sidecar, drop a progress breadcrumb, and rename the lingering
+    trigger to ``.failed.<ts>`` so a re-apply / Cancel isn't blocked by
+    ``clear_fleet_upgrade_marker``'s "trigger present" guard — and return
+    ``("failed", now)`` for this heartbeat. Best-effort: if the durable
+    write fails we still report ``failed`` this tick and retry next time.
+
+    A stamp-less ``in-flight`` (old-format sidecar) can't be aged, so it's
+    left untouched — conservative beats a false failure on a live apply.
+    """
+    if state != "in-flight" or stamp is None:
+        return state, stamp
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=UTC)
+    now = datetime.now(UTC)
+    age = (now - stamp).total_seconds()
+    if age <= _STALE_INFLIGHT_SECONDS:
+        return state, stamp
+
+    reason = (
+        f"runner exited without completing "
+        f"(stale in-flight {int(age)}s > {_STALE_INFLIGHT_SECONDS}s threshold)"
+    )
+    log.warning(
+        "supervisor.slot_upgrade.stale_inflight_reaped",
+        age_seconds=int(age),
+        threshold_seconds=_STALE_INFLIGHT_SECONDS,
+    )
+    try:
+        _HOST_SLOT_STATE.write_text(f"failed {now.isoformat()}\n", encoding="utf-8")
+    except OSError:
+        # Couldn't persist — report failed for this tick anyway; the next
+        # heartbeat re-derives the same stale condition and retries.
+        return "failed", now
+    try:
+        _SLOT_UPGRADE_PROGRESS.write_text(
+            json.dumps(
+                {"step": "failed", "pct": None, "detail": reason, "at": now.isoformat()}
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        # Cosmetic breadcrumb only — the durable "failed" .state written
+        # above is what the UI keys off; a missed progress write just
+        # leaves the prior line and is re-derived next tick.
+        pass
+    try:
+        if _TRIGGER_FILE.exists():
+            _TRIGGER_FILE.rename(
+                _TRIGGER_FILE.with_name(
+                    f"{_TRIGGER_FILE.name}.failed.{int(now.timestamp())}"
+                )
+            )
+    except OSError:
+        # Best-effort unblock — if the rename misses, the operator's
+        # Cancel path still heals failed→ready once the trigger is gone;
+        # never fatal to the heartbeat.
+        pass
+    return "failed", now
+
+
 _TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pending")
 _REBOOT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/reboot-pending")
 # Issue #386 Part B — fire-once marker. Records the last
@@ -2346,6 +2427,11 @@ def collect() -> dict[str, object]:
     last_state, last_state_at = (
         _last_upgrade_state_from_sidecar() if is_appliance else (None, None)
     )
+    # #421 — a dead/killed runner leaves the sidecar stuck at in-flight
+    # forever (its exit trap never ran). Reap it: report failed and heal
+    # the sidecar/trigger so the operator can clear + re-apply.
+    if is_appliance:
+        last_state, last_state_at = _reap_stale_inflight(last_state, last_state_at)
     # #386 Part C — ship the log tail + structured progress while an
     # upgrade is in-flight / failed / awaiting-reboot (done). For idle
     # appliances ship empty so a stale tail/progress is cleared; None

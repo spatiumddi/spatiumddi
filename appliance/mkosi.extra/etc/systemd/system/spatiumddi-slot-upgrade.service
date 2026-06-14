@@ -7,5 +7,11 @@ Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/spatiumddi-slot-upgrade
+# #421 — backstop above the runner's own $APPLY_TIMEOUT_SECONDS (2700s).
+# If the runner itself wedges (not just the apply subprocess it already
+# caps), systemd SIGTERMs it here; the runner's EXIT trap then records
+# "failed" so the upgrade never sticks at in-flight. KillMode default
+# (control-group) also reaps the in-flight ticker child on any stop.
+TimeoutStartSec=3000
 # No Install section — only invoked by the matching .path unit, never
 # directly enabled at boot.
