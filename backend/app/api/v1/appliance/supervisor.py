@@ -138,6 +138,28 @@ _HOST_ROLE_CONFIG = Path("/etc/spatiumddi-host/role-config")
 _SELF_BOOTSTRAP_VARIANTS = frozenset({"control-plane", "full-stack", "frontend-core"})
 _SELF_BOOTSTRAP_CODE_TTL = timedelta(minutes=10)
 
+# The slot-upgrade host runner only strips a URL ``#fragment`` before
+# fetching as of #386 (shipped 2026-06-12). An appliance on an older
+# supervisor hands the fragment straight to the downloader and the apply
+# wedges at "in-flight" forever (#419). Gate the re-fire nonce on the
+# target supervisor's reported version so older fleets get a clean URL.
+_URL_FRAGMENT_STRIP_MIN_VERSION = "2026.06.12"
+
+
+def _supervisor_strips_url_fragment(row: Appliance) -> bool:
+    """True if the appliance's supervisor / slot-upgrade runner strips a URL
+    ``#fragment`` before fetching (≥ 2026.06.12, i.e. has the #386 strip).
+
+    CalVer (``YYYY.MM.DD-N``) sorts lexicographically, so a string compare is
+    correct. A dev / unknown / pre-CalVer version stays on the safe clean-URL
+    path — losing only auto-re-fire of the *same* image (a new version already
+    changes the URL), never the ability to upgrade (#419)."""
+    ver = row.supervisor_version or row.installed_appliance_version or ""
+    return (
+        re.match(r"\d{4}\.\d{2}\.\d{2}", ver) is not None
+        and ver >= _URL_FRAGMENT_STRIP_MIN_VERSION
+    )
+
 
 def _read_host_role() -> str | None:
     """Parse ``ROLE=`` out of ``/etc/spatiumddi-host/role-config``.
@@ -4451,15 +4473,19 @@ async def schedule_appliance_upgrade(
         resolved_url = body.desired_slot_image_url
 
     # Issue #386 Part B — append a per-apply nonce as a URL *fragment* so
-    # each schedule yields a distinct ``desired_slot_image_url``. The
-    # supervisor fires the slot-upgrade trigger exactly once per distinct
-    # URL (no silent re-fire loop on a failed apply); a fresh apply of the
-    # same image re-fires because the fragment differs. Fragments are
-    # client-side only — the host runner strips it before fetching and
-    # HTTP never sends it — so it's safe to graft onto any URL, including
-    # query-signed ones.
-    nonce = uuid.uuid4().hex[:12]
-    resolved_url = f"{resolved_url}#a={nonce}"
+    # each schedule yields a distinct ``desired_slot_image_url`` and the
+    # supervisor re-fires the trigger on a fresh apply of the same image
+    # (it fires once per distinct URL — no silent re-fire loop on failure).
+    # The host runner strips the fragment before fetching, but only since
+    # #386 (2026-06-12); an older appliance passes it straight to the
+    # downloader and the apply wedges at "in-flight" forever (#419). So only
+    # add the nonce when the target supervisor is known to strip it — older
+    # / unknown supervisors get a clean URL (a new version already changes
+    # the URL, so re-fire still works; only re-applying the *same* version
+    # loses auto-re-fire on those boxes).
+    if _supervisor_strips_url_fragment(row):
+        nonce = uuid.uuid4().hex[:12]
+        resolved_url = f"{resolved_url}#a={nonce}"
 
     row.desired_appliance_version = body.desired_appliance_version
     row.desired_slot_image_url = resolved_url
