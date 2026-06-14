@@ -156,8 +156,7 @@ def _supervisor_strips_url_fragment(row: Appliance) -> bool:
     changes the URL), never the ability to upgrade (#419)."""
     ver = row.supervisor_version or row.installed_appliance_version or ""
     return (
-        re.match(r"\d{4}\.\d{2}\.\d{2}", ver) is not None
-        and ver >= _URL_FRAGMENT_STRIP_MIN_VERSION
+        re.match(r"\d{4}\.\d{2}\.\d{2}", ver) is not None and ver >= _URL_FRAGMENT_STRIP_MIN_VERSION
     )
 
 
