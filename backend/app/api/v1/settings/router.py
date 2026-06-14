@@ -176,6 +176,13 @@ class SettingsResponse(BaseModel):
     # ``verbose_dashboard`` = verbose boot output then dashboard;
     # ``text_console`` = verbose boot + plain getty login (no dashboard).
     console_mode: str = "dashboard"
+    # ── Supervisor (appliance) registration gate (#170 Wave A / #407) ──
+    # When false, POST /appliance/supervisor/register 404s so a remote
+    # supervisor cannot pair. OS-appliance control-plane installs self-
+    # enable this on first boot; generic Kubernetes/Helm control planes
+    # have no such auto-enable, so an operator must flip it on (here or
+    # via the Fleet → Pairing toggle) before an appliance can register.
+    supervisor_registration_enabled: bool = False
     # ── Maintenance mode (issue #57) ──────────────────────────────
     # System-wide read-only switch. ``maintenance_started_at`` is
     # server-managed (stamped on enable / cleared on disable) and so is
@@ -649,6 +656,10 @@ class SettingsUpdate(BaseModel):
     timezone: str | None = None
     # ── Appliance console mode (#393) ─────────────────────────────
     console_mode: Literal["dashboard", "verbose_dashboard", "text_console"] | None = None
+    # ── Supervisor (appliance) registration gate (#170 Wave A / #407) ──
+    # Not a host-config field (no supervisor wake needed) — it's read
+    # fresh by the register endpoint's module gate on the next pairing.
+    supervisor_registration_enabled: bool | None = None
     # ── Maintenance mode (issue #57) ──────────────────────────────
     # ``maintenance_started_at`` is intentionally NOT settable here —
     # it's server-stamped in ``update_settings`` when the enable flag
@@ -1386,6 +1397,18 @@ async def update_settings(
             detail="Maintenance mode can only be changed by a superadmin",
         )
 
+    # Supervisor (appliance) registration is a SECURITY gate (#407): while
+    # true, POST /appliance/supervisor/register accepts pairing codes; while
+    # false it 404s. Opening it widens the appliance-pairing attack surface,
+    # so it is superadmin-only — a delegated ``write:settings`` editor must
+    # not be able to flip it. Matches the superadmin-only Fleet → Pairing
+    # toggle in the UI.
+    if "supervisor_registration_enabled" in changes and not is_effective_superadmin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Appliance registration can only be changed by a superadmin",
+        )
+
     # Maintenance mode (issue #57). Capture the prior enabled state before
     # the setattr loop mutates it so we can detect an actual flip (and
     # server-stamp / clear ``maintenance_started_at`` accordingly + write
@@ -1395,6 +1418,11 @@ async def update_settings(
     _maintenance_requested = changes.get("maintenance_mode_enabled")
     _maintenance_message_prev = settings.maintenance_message or ""
     _maintenance_message_requested = changes.get("maintenance_message")
+
+    # #407 — capture the prior registration-gate state before the setattr
+    # loop so we can detect an actual flip and write a dedicated audit row.
+    _supervisor_reg_prev = bool(settings.supervisor_registration_enabled)
+    _supervisor_reg_requested = changes.get("supervisor_registration_enabled")
 
     # Whether this update touches any host-config field a HOSTCONFIG_ALL
     # subscriber acts on. The DHCP-agent /config long-poll folds SNMP /
@@ -1704,6 +1732,31 @@ async def update_settings(
             )
         )
 
+    # #407 — audit the supervisor-registration gate flip (non-negotiable #4).
+    # Security-relevant: enabling it opens the appliance-pairing endpoint.
+    if (
+        _supervisor_reg_requested is not None
+        and bool(_supervisor_reg_requested) != _supervisor_reg_prev
+    ):
+        _reg_now = bool(_supervisor_reg_requested)
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action=(
+                    "supervisor_registration.enabled"
+                    if _reg_now
+                    else "supervisor_registration.disabled"
+                ),
+                resource_type="platform_settings",
+                resource_id="supervisor_registration",
+                resource_display="Appliance registration",
+                result="success",
+                new_value={"enabled": _reg_now},
+            )
+        )
+
     await db.commit()
     await db.refresh(settings)
 
@@ -1933,7 +1986,10 @@ async def get_oui_status(current_user: CurrentUser, db: DB) -> OUIStatusResponse
 
 
 class RevealCommunityRequest(BaseModel):
-    password: str
+    # #408 — local users supply ``password``; external-auth users (no
+    # local password) supply ``totp_code``. The reauth helper decides.
+    password: str | None = None
+    totp_code: str | None = None
 
 
 class RevealCommunityResponse(BaseModel):
@@ -1959,8 +2015,8 @@ async def reveal_snmp_community(
     no local password to re-confirm.
     """
     from app.core.crypto import decrypt_str
-    from app.core.security import verify_password
     from app.models.audit import AuditLog
+    from app.services.reauth import ReauthOutcome, reverify_operator
 
     def _audit_denied(reason: str) -> None:
         db.add(
@@ -1985,22 +2041,21 @@ async def reveal_snmp_community(
             "Only superadmins can reveal the SNMP community",
         )
 
-    if current_user.auth_source != "local":
-        _audit_denied("external_auth")
+    # #408 — local users re-confirm with password or TOTP; external-auth
+    # users with TOTP (enrol under Settings → Security if not yet enrolled).
+    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
+    if outcome is not ReauthOutcome.OK:
+        if outcome is ReauthOutcome.MFA_REQUIRED:
+            _audit_denied("mfa_required")
+            await db.commit()
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Re-confirmation requires MFA. Your account has no local "
+                "password — enrol TOTP under Settings → Security, then retry.",
+            )
+        _audit_denied("bad_credential")
         await db.commit()
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "SNMP community reveal requires a local-auth superadmin "
-            f"(your account authenticates via {current_user.auth_source}). "
-            "Log in as a local admin to reveal the community.",
-        )
-
-    if not current_user.hashed_password or not verify_password(
-        body.password, current_user.hashed_password
-    ):
-        _audit_denied("password_mismatch")
-        await db.commit()
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password is incorrect")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP code is incorrect")
 
     settings = await _get_or_create(db)
     if not settings.snmp_community_encrypted:

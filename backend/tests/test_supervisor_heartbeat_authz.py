@@ -123,3 +123,45 @@ async def test_join_token_not_returned_over_session_token_path(
     )
     assert r.status_code == 200, r.text
     assert r.json()["desired_k3s_join_token"] is None
+
+
+# ── #411 — cert-auth failure falls back to the session-token path ──────────
+# Cert headers PRESENT but failing to validate (the field condition where the
+# cert pipeline isn't proven yet) must not hard-403 an approved supervisor —
+# it falls back to its valid session token so reboot / upgrade / role delivery
+# keep working. This is NOT the C1 bypass: the token is still required.
+
+_GARBAGE_CERT_HEADERS = {
+    "X-Appliance-Cert": "not-a-real-base64-cert",
+    "X-Appliance-Signature": "x",
+    "X-Appliance-Timestamp": "2026-06-13T00:00:00Z",
+}
+
+
+async def test_heartbeat_cert_failure_falls_back_to_valid_session_token(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#411 — invalid cert headers + a VALID session token → accepted (the
+    cert-auth fallback). Pre-#411 this hard-403'd on the cert failure."""
+    row, token = await _approved_appliance(db_session)
+    r = await client.post(
+        "/api/v1/appliance/supervisor/heartbeat",
+        headers=_GARBAGE_CERT_HEADERS,
+        json={"appliance_id": str(row.id), "session_token": token},
+    )
+    assert r.status_code == 200, r.text
+
+
+async def test_heartbeat_cert_failure_without_valid_token_still_rejected(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#411 — the fallback does NOT open a hole: invalid cert headers + no
+    valid session token is still rejected (a real credential is still
+    required — the C1 invariant holds)."""
+    row, _token = await _approved_appliance(db_session)
+    r = await client.post(
+        "/api/v1/appliance/supervisor/heartbeat",
+        headers=_GARBAGE_CERT_HEADERS,
+        json={"appliance_id": str(row.id), "session_token": "wrong-token"},
+    )
+    assert r.status_code == 403, r.text

@@ -32,13 +32,13 @@ from __future__ import annotations
 
 import structlog
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from app.api.deps import DB, CurrentUser
 from app.config import settings
 from app.core.permissions import is_effective_superadmin
-from app.core.security import verify_password
 from app.models.audit import AuditLog
+from app.services.reauth import ReauthOutcome, reverify_operator
 
 logger = structlog.get_logger(__name__)
 
@@ -46,7 +46,11 @@ router = APIRouter()
 
 
 class RevealRequest(BaseModel):
-    password: str = Field(min_length=1)
+    # #408 — local users supply ``password``; external-auth users (no
+    # local password) supply ``totp_code`` (a local user with MFA enrolled
+    # may use either). At least one is required; the reauth helper decides.
+    password: str | None = None
+    totp_code: str | None = None
 
 
 class RevealResponse(BaseModel):
@@ -96,14 +100,14 @@ async def reveal_agent_keys(
             "Only superadmins can reveal agent bootstrap keys",
         )
 
-    # Explicit local-auth gate. External-auth users (LDAP / OIDC /
-    # SAML / RADIUS / TACACS+) don't have a local password to confirm,
-    # so the password-re-verify flow is meaningless for them. Rather
-    # than letting it accidentally pass (or fail with a confusing
-    # "password incorrect" when in fact the user has no local
-    # password), surface the policy explicitly: "log in as a local
-    # admin to reveal these keys."
-    if current_user.auth_source != "local":
+    # #408 — re-confirm the operator. Local users with their password OR a
+    # TOTP code (if enrolled); external-auth users (LDAP / OIDC / SAML /
+    # RADIUS / TACACS+ — no local password) with a TOTP code. MFA enrolment
+    # is now open to all auth sources, so an SSO superadmin can enrol + use
+    # TOTP here instead of the old hard "log in as a local admin" dead-end.
+    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
+    if outcome is not ReauthOutcome.OK:
+        reason = "mfa_required" if outcome is ReauthOutcome.MFA_REQUIRED else "bad_credential"
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -114,39 +118,19 @@ async def reveal_agent_keys(
                 resource_id="agent-keys",
                 resource_display="agent bootstrap keys",
                 result="forbidden",
-                new_value={"reason": "external_auth"},
+                new_value={"reason": reason},
             )
         )
         await db.commit()
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Agent bootstrap keys can only be revealed by a local-auth "
-            "superadmin (your account authenticates via "
-            f"{current_user.auth_source}). Log in as a local admin to "
-            "reveal these keys, or pass them out-of-band — they also "
-            "live in /etc/spatiumddi/.env on the control plane host.",
-        )
-
-    if not current_user.hashed_password or not verify_password(
-        body.password, current_user.hashed_password
-    ):
-        db.add(
-            AuditLog(
-                user_id=current_user.id,
-                user_display_name=current_user.display_name,
-                auth_source=current_user.auth_source,
-                action="agent_keys_reveal_denied",
-                resource_type="platform",
-                resource_id="agent-keys",
-                resource_display="agent bootstrap keys",
-                result="bad_password",
-                new_value={"reason": "password_mismatch"},
+        if outcome is ReauthOutcome.MFA_REQUIRED:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Re-confirmation requires MFA. Your account has no local "
+                "password — enrol TOTP under Settings → Security, then retry.",
             )
-        )
-        await db.commit()
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "Password is incorrect",
+            "Password or TOTP code is incorrect",
         )
 
     # Success — emit an audit row carrying NOTHING about the key

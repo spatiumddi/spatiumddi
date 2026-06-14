@@ -10,6 +10,7 @@ import {
   ShieldAlert,
 } from "lucide-react";
 
+import { ReauthFields } from "@/components/ReauthFields";
 import {
   agentBootstrapKeysApi,
   type AgentBootstrapKeysReveal,
@@ -33,6 +34,7 @@ import {
  */
 export function AgentBootstrapKeysSection() {
   const [password, setPassword] = useState("");
+  const [totp, setTotp] = useState("");
   const [data, setData] = useState<AgentBootstrapKeysReveal | null>(null);
   const [shown, setShown] = useState<{ dns: boolean; dhcp: boolean }>({
     dns: false,
@@ -41,10 +43,12 @@ export function AgentBootstrapKeysSection() {
   const [copied, setCopied] = useState<"dns" | "dhcp" | null>(null);
 
   const reveal = useMutation({
-    mutationFn: agentBootstrapKeysApi.reveal,
+    mutationFn: () =>
+      agentBootstrapKeysApi.reveal(password || undefined, totp || undefined),
     onSuccess: (resp) => {
       setData(resp);
       setPassword("");
+      setTotp("");
       // Show both as masked by default — operator chooses which to
       // uncover. Reduces shoulder-surf risk when only one is needed.
       setShown({ dns: false, dhcp: false });
@@ -86,21 +90,17 @@ export function AgentBootstrapKeysSection() {
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            reveal.mutate(password);
+            reveal.mutate();
           }}
           className="max-w-md space-y-3 rounded-lg border bg-card p-4 shadow-sm"
         >
-          <label className="block text-xs font-medium text-muted-foreground">
-            Confirm your password
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-              autoComplete="current-password"
-              className="mt-1 w-full rounded-md border bg-background px-2 py-1.5 font-mono text-sm"
-            />
-          </label>
+          <ReauthFields
+            password={password}
+            onPassword={setPassword}
+            totp={totp}
+            onTotp={setTotp}
+            autoFocus
+          />
           {reveal.isError && (
             <div className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
               <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
@@ -109,7 +109,7 @@ export function AgentBootstrapKeysSection() {
           )}
           <button
             type="submit"
-            disabled={reveal.isPending || !password}
+            disabled={reveal.isPending || (!password && !totp)}
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             <Eye className="h-3.5 w-3.5" />

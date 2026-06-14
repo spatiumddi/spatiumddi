@@ -632,13 +632,18 @@ async def supervisor_register(
             existing.capabilities = body.capabilities.model_dump()
         # Rotate the session token — supervisor must use the fresh one
         # for subsequent polls. Old cached tokens fail hash compare.
-        # Skip when the row already has a cert (approval-complete; the
-        # supervisor is using mTLS not session tokens at that point).
-        if existing.cert_pem is None:
-            cleartext, digest = generate_session_token()
-            existing.session_token_hash = digest
-        else:
-            cleartext = ""  # no longer needed; supervisor uses mTLS
+        # #411 — ALWAYS mint + return a fresh token, even for a cert'd
+        # (approved) row. Previously this blanked the token for cert'd
+        # rows ("supervisor uses mTLS"), but the heartbeat's mTLS verifier
+        # is not yet enforced — it's a fallback that supersedes the token
+        # only when the cert actually validates. Once #400 C1 removed the
+        # approved-state heartbeat bypass, an approved box whose cert isn't
+        # validating in the field had NO usable credential and 403'd every
+        # heartbeat (no reboot / upgrade / role delivery). The session
+        # token stays the dependable heartbeat credential until cert-auth
+        # is proven + enforced in the field.
+        cleartext, digest = generate_session_token()
+        existing.session_token_hash = digest
         await db.commit()
         logger.info(
             "supervisor_register_idempotent",
@@ -1467,13 +1472,23 @@ async def supervisor_heartbeat(
     try:
         cert_principal = await authenticate_cert(request, db)
     except CertAuthFailed as exc:
-        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        # #411 — a cert-auth FAILURE no longer hard-403s. The mTLS verifier
+        # is a fallback that supersedes the session token only when the cert
+        # actually validates; when it doesn't (no cert delivered yet, clock
+        # skew, chain mismatch), fall through to the session-token path below
+        # so an approved supervisor can still authenticate its heartbeat.
+        # The session token is a real per-appliance secret (stored as a
+        # hash), so this is NOT the credential-less UUID-only bypass #400 C1
+        # closed — the no-cert branch still REQUIRES a valid token. The
+        # cluster-admin k3s join token stays gated on ``cert_principal is not
+        # None`` below, so a token-only heartbeat can never harvest it. The
+        # warning is kept for the cert-auth-steady-state follow-up.
         logger.warning(
             "supervisor_heartbeat_cert_auth_failed",
             appliance_id=str(body.appliance_id),
             reason=exc.reason,
         )
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance client cert.")
+        cert_principal = None
 
     if cert_principal is not None:
         # Cert subject CN must match the body's appliance_id (defence-
@@ -5116,11 +5131,13 @@ async def k8s_rollout_restart(
 
 
 class RevealKubeconfigRequest(BaseModel):
-    """Operator's local-auth password — re-verified before we hand
-    back the cleartext kubeconfig. Same gate the SNMP-community and
-    agent-bootstrap-key reveals use."""
+    """Operator re-confirmation before we hand back the cleartext
+    kubeconfig. Same gate the SNMP-community and agent-bootstrap-key
+    reveals use: local users supply ``password``, external-auth users
+    (no local password, #408) supply ``totp_code``."""
 
-    password: str
+    password: str | None = None
+    totp_code: str | None = None
 
 
 class RevealKubeconfigResponse(BaseModel):
@@ -5162,7 +5179,10 @@ async def reveal_appliance_kubeconfig(
     need to edit the server line to a reachable address.
     """
     from app.core.crypto import decrypt_str  # noqa: PLC0415
-    from app.core.security import verify_password  # noqa: PLC0415
+    from app.services.reauth import (  # noqa: PLC0415
+        ReauthOutcome,
+        reverify_operator,
+    )
 
     def _audit_denied(reason: str, *, row: Appliance | None = None) -> None:
         db.add(
@@ -5187,23 +5207,22 @@ async def reveal_appliance_kubeconfig(
             status.HTTP_403_FORBIDDEN,
             "Only superadmins can reveal an appliance kubeconfig.",
         )
-    if current_user.auth_source != "local":
-        _audit_denied("external_auth")
-        await db.commit()
+    # #408 — local users re-confirm with password or TOTP; external-auth
+    # users with TOTP (enrol under Settings → Security if not yet enrolled).
+    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
+    if outcome is not ReauthOutcome.OK:
         await asyncio.sleep(0.1)
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Kubeconfig reveal requires a local-auth superadmin "
-            f"(your account authenticates via {current_user.auth_source}). "
-            "Log in as a local admin to reveal the kubeconfig.",
-        )
-    if not current_user.hashed_password or not verify_password(
-        body.password, current_user.hashed_password
-    ):
-        _audit_denied("password_mismatch")
+        if outcome is ReauthOutcome.MFA_REQUIRED:
+            _audit_denied("mfa_required")
+            await db.commit()
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Re-confirmation requires MFA. Your account has no local "
+                "password — enrol TOTP under Settings → Security, then retry.",
+            )
+        _audit_denied("bad_credential")
         await db.commit()
-        await asyncio.sleep(0.1)
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password is incorrect.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP code is incorrect.")
 
     row = await db.get(Appliance, appliance_id)
     if row is None:

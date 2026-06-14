@@ -40,6 +40,7 @@ function CommunityField({
   const [replacing, setReplacing] = useState(false);
   const [revealing, setRevealing] = useState(false);
   const [revealPassword, setRevealPassword] = useState("");
+  const [revealTotp, setRevealTotp] = useState("");
   const [revealed, setRevealed] = useState<string | null>(null);
 
   // Operator-driven reveal — gated server-side on password +
@@ -48,12 +49,19 @@ function CommunityField({
   // the operator clicks Hide; we deliberately don't auto-hide on a
   // timer because the operator just typed a password to get here and
   // wants the value long enough to paste it into an NMS / snmpwalk.
+  // #408 — re-confirm with a local password OR a TOTP code (SSO accounts
+  // have no local password; enrol under Account → Two-factor).
   const revealMutation = useMutation({
-    mutationFn: (password: string) => settingsApi.revealSnmpCommunity(password),
+    mutationFn: () =>
+      settingsApi.revealSnmpCommunity(
+        revealPassword || undefined,
+        revealTotp || undefined,
+      ),
     onSuccess: (data) => {
       setRevealed(data.community ?? "(no community configured)");
       setRevealing(false);
       setRevealPassword("");
+      setRevealTotp("");
     },
   });
 
@@ -158,7 +166,7 @@ function CommunityField({
             className="flex items-center gap-2"
             onSubmit={(e) => {
               e.preventDefault();
-              if (revealPassword) revealMutation.mutate(revealPassword);
+              if (revealPassword || revealTotp) revealMutation.mutate();
             }}
           >
             <input
@@ -166,13 +174,24 @@ function CommunityField({
               autoComplete="current-password"
               value={revealPassword}
               onChange={(e) => setRevealPassword(e.target.value)}
-              placeholder="Confirm your password"
-              className={cn(inputCls, "w-56 font-mono")}
+              placeholder="Password"
+              className={cn(inputCls, "w-40 font-mono")}
               autoFocus
+            />
+            <input
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              value={revealTotp}
+              onChange={(e) => setRevealTotp(e.target.value)}
+              placeholder="or 6-digit code"
+              className={cn(inputCls, "w-32 font-mono")}
+              title="SSO accounts: enter an authenticator code instead of a password"
             />
             <button
               type="submit"
-              disabled={!revealPassword || revealMutation.isPending}
+              disabled={
+                (!revealPassword && !revealTotp) || revealMutation.isPending
+              }
               className="rounded-md border bg-primary px-2 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
             >
               {revealMutation.isPending ? "Verifying…" : "Reveal"}
@@ -182,6 +201,7 @@ function CommunityField({
               onClick={() => {
                 setRevealing(false);
                 setRevealPassword("");
+                setRevealTotp("");
                 revealMutation.reset();
               }}
               className="rounded-md border px-2 py-1 text-xs hover:bg-accent"

@@ -37,6 +37,7 @@ import {
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { ReauthFields } from "@/components/ReauthFields";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
 import { LLDPTab } from "./LLDPTab";
@@ -672,8 +673,22 @@ export function FleetTab({
     queryFn: applianceApprovalApi.list,
     refetchInterval: (query) => {
       const rows = query.state.data ?? [];
-      const hasPending = rows.some((r) => r.state === "pending_approval");
-      return hasPending ? 2_000 : 15_000;
+      // #410 — also fast-poll while any appliance has an upgrade or
+      // reboot in flight, so the drilldown's UpgradeStatusPanel shows
+      // download progress within ~2 s instead of the 15 s idle cadence.
+      // A terminal ``failed`` upgrade is excluded from the desired-version
+      // arm so a stale failure doesn't pin every superadmin's browser at
+      // 2 s until it's cleared (it still fast-polls while actually
+      // in-flight, and a reboot is caught by reboot_requested).
+      const busy = rows.some(
+        (r) =>
+          r.state === "pending_approval" ||
+          (r.desired_appliance_version !== null &&
+            r.last_upgrade_state !== "failed") ||
+          r.last_upgrade_state === "in-flight" ||
+          r.reboot_requested === true,
+      );
+      return busy ? 2_000 : 15_000;
     },
     enabled: isSuperadmin,
   });
@@ -1439,7 +1454,12 @@ export function FleetTab({
 
       {drilldown && (
         <ApplianceDrilldownModal
-          row={drilldown}
+          // #410 — render the freshly-polled row (matched by id) rather
+          // than the frozen open-time snapshot, so live upgrade progress
+          // shipped via the supervisor heartbeat updates the drilldown
+          // without a hard page reload. Falls back to the snapshot if the
+          // row briefly drops out of the list (e.g. mid-refetch).
+          row={data?.find((r) => r.id === drilldown.id) ?? drilldown}
           onClose={() => setDrilldown(null)}
           onApprove={() => approve.mutate(drilldown.id)}
           approving={approve.isPending}
@@ -3239,10 +3259,15 @@ function RevealKubeconfigModal({
   onClose: () => void;
 }) {
   const [password, setPassword] = useState("");
+  const [totp, setTotp] = useState("");
   const [shown, setShown] = useState<string | null>(null);
   const reveal = useMutation({
     mutationFn: () =>
-      applianceApprovalApi.revealKubeconfig(appliance.id, password),
+      applianceApprovalApi.revealKubeconfig(
+        appliance.id,
+        password || undefined,
+        totp || undefined,
+      ),
     onSuccess: (data) => {
       setShown(data.kubeconfig ?? "");
     },
@@ -3264,20 +3289,20 @@ function RevealKubeconfigModal({
     >
       <div className="space-y-3 text-sm">
         <p className="text-xs text-muted-foreground">
-          Re-confirm your password to reveal the admin kubeconfig the supervisor
-          shipped for this appliance. The reveal is audit-logged and
-          local-auth-only. The downloaded file works against the appliance from
-          its current network; for cross-network use, edit the{" "}
-          <code>server:</code> line to a reachable address.
+          Re-confirm to reveal the admin kubeconfig the supervisor shipped for
+          this appliance — with your password (local accounts) or an
+          authenticator code (SSO). The reveal is audit-logged. The downloaded
+          file works against the appliance from its current network; for
+          cross-network use, edit the <code>server:</code> line to a reachable
+          address.
         </p>
         {!shown && (
           <>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="Your password"
-              className="w-full rounded-md border bg-background px-2 py-1 text-sm"
+            <ReauthFields
+              password={password}
+              onPassword={setPassword}
+              totp={totp}
+              onTotp={setTotp}
               autoFocus
             />
             <div className="flex items-center justify-end gap-2">
@@ -3291,7 +3316,9 @@ function RevealKubeconfigModal({
               <button
                 type="button"
                 onClick={() => reveal.mutate()}
-                disabled={!password.trim() || reveal.isPending}
+                disabled={
+                  (!password.trim() && !totp.trim()) || reveal.isPending
+                }
                 className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {reveal.isPending ? (

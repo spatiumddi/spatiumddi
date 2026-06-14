@@ -16,10 +16,12 @@ export function AccountPage() {
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Account</h1>
           <p className="mt-1 text-xs text-muted-foreground">
-            Manage your password and two-factor authentication. SpatiumDDI users
-            authenticated through LDAP / OIDC / SAML / RADIUS / TACACS+ should
-            update their credentials in their identity provider — these settings
-            only apply to local accounts.
+            Manage your password and two-factor authentication. Password changes
+            apply to local accounts only — SSO users (LDAP / OIDC / SAML /
+            RADIUS / TACACS+) manage credentials in their identity provider.
+            Two-factor authentication is available to every account, and SSO
+            superadmins must enrol it to re-confirm sensitive reveals (appliance
+            kubeconfig, pairing codes, agent bootstrap keys).
           </p>
         </div>
 
@@ -351,11 +353,13 @@ function PasswordCodePrompt({
           <>
             <p className="text-xs text-muted-foreground">
               <Smartphone className="mr-1 inline h-3 w-3" />
-              Confirm with your password and a current authenticator code.
+              Confirm with a current authenticator code. Local accounts also
+              enter their password; SSO accounts can leave it blank.
             </p>
             <div className="space-y-2">
               <label className="text-xs font-medium text-muted-foreground">
-                Current password
+                Current password{" "}
+                <span className="font-normal">(local accounts)</span>
               </label>
               <input
                 type="password"
@@ -401,7 +405,7 @@ function PasswordCodePrompt({
             <button
               type="button"
               onClick={() => onSubmit(password, code)}
-              disabled={!password || code.length !== 6 || isPending}
+              disabled={code.length !== 6 || isPending}
               className={
                 destructive
                   ? "rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"

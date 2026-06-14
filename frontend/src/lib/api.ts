@@ -3004,6 +3004,12 @@ export interface PlatformSettings {
    *  verbose boot + a plain getty login (no dashboard). Appliance hosts only;
    *  applies on the next reboot (grubenv-driven). */
   console_mode: "dashboard" | "verbose_dashboard" | "text_console";
+  /** Supervisor (appliance) registration gate (#170 Wave A / #407).
+   *  When false, a remote supervisor cannot pair (register 404s).
+   *  OS-appliance control-plane installs self-enable this on first boot;
+   *  generic Kubernetes/Helm control planes must flip it on (here or via
+   *  the Fleet → Pairing toggle) before an appliance can register. */
+  supervisor_registration_enabled: boolean;
   /** Maintenance mode (issue #57). System-wide read-only switch.
    *  ``maintenance_started_at`` is server-managed (stamped on enable /
    *  cleared on disable) and is therefore read-only — not sent on PUT. */
@@ -3255,12 +3261,15 @@ export const settingsApi = {
    *  password re-verify. Superadmin + local-auth only; every reveal
    *  is audit-logged. ``community`` is null when nothing is
    *  configured (in which case ``configured`` is false). */
-  revealSnmpCommunity: (password: string) =>
+  revealSnmpCommunity: (password?: string, totpCode?: string) =>
     api
       .post<{
         configured: boolean;
         community: string | null;
-      }>("/settings/snmp/reveal-community", { password })
+      }>("/settings/snmp/reveal-community", {
+        password,
+        totp_code: totpCode,
+      })
       .then((r) => r.data),
   getOUIStatus: () =>
     api.get<OUIStatus>("/settings/oui/status").then((r) => r.data),
@@ -6606,9 +6615,9 @@ export const authApi = {
       .then((r) => r.data),
   mfaEnrollVerify: (code: string) =>
     api.post("/auth/mfa/enroll/verify", { code }),
-  mfaDisable: (password: string, code: string) =>
+  mfaDisable: (password: string | undefined, code: string) =>
     api.post("/auth/mfa/disable", { password, code }),
-  mfaRegenerateRecoveryCodes: (password: string, code: string) =>
+  mfaRegenerateRecoveryCodes: (password: string | undefined, code: string) =>
     api
       .post<MfaEnrolBeginResponse>("/auth/mfa/recovery-codes/regenerate", {
         password,
@@ -8442,11 +8451,11 @@ export const appliancePairingApi = {
     api
       .post<void>(`/appliance/pairing-codes/${id}/disable`)
       .then((r) => r.data),
-  reveal: (id: string, password: string) =>
+  reveal: (id: string, password?: string, totpCode?: string) =>
     api
       .post<PairingCodeRevealResponse>(
         `/appliance/pairing-codes/${id}/reveal`,
-        { password },
+        { password, totp_code: totpCode },
       )
       .then((r) => r.data),
 };
@@ -8874,13 +8883,16 @@ export const applianceApprovalApi = {
   // Issue #183 Phase 5 — reveal the stored kubeconfig after a
   // password re-confirmation. Same shape as the SNMP-community and
   // agent-bootstrap-key reveal endpoints.
-  revealKubeconfig: (id: string, password: string) =>
+  revealKubeconfig: (id: string, password?: string, totpCode?: string) =>
     api
       .post<{
         configured: boolean;
         kubeconfig: string | null;
         hostname: string;
-      }>(`/appliance/appliances/${id}/k8s/kubeconfig/reveal`, { password })
+      }>(`/appliance/appliances/${id}/k8s/kubeconfig/reveal`, {
+        password,
+        totp_code: totpCode,
+      })
       .then((r) => r.data),
   // Issue #183 Phase 6 — operator-controlled CIDR allowlist for
   // direct kubeapi access. Empty = proxy-only (default).
@@ -9155,9 +9167,12 @@ export interface AgentBootstrapKeysReveal {
 }
 
 export const agentBootstrapKeysApi = {
-  reveal: (password: string) =>
+  reveal: (password?: string, totpCode?: string) =>
     api
-      .post<AgentBootstrapKeysReveal>("/admin/agent-keys/reveal", { password })
+      .post<AgentBootstrapKeysReveal>("/admin/agent-keys/reveal", {
+        password,
+        totp_code: totpCode,
+      })
       .then((r) => r.data),
 };
 

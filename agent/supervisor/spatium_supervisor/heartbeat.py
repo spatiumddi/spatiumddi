@@ -520,11 +520,16 @@ def heartbeat_once(
             headers = build_auth_headers(
                 "POST", url_path, cached_cert, identity.private_key, appliance_id
             )
-            # Once we have a cert the session token shouldn't ride
-            # along — keeps the wire payload clean + makes server-
-            # side cert-only enforcement straightforward when it
-            # lands.
-            body.pop("session_token", None)
+            # #411 — KEEP the session token in the body as a fallback even
+            # when we present a cert. The server prefers the cert; if cert-
+            # auth doesn't validate (the cert pipeline isn't proven in the
+            # field yet), it falls back to the session token rather than
+            # 403ing. Previously we popped the token here in anticipation of
+            # cert-only enforcement — but combined with #400 C1 removing the
+            # approved-state bypass, that left the heartbeat with no usable
+            # credential whenever cert-auth wasn't accepted, silently
+            # killing reboot / fleet-upgrade / role delivery. Re-add the pop
+            # once cert-auth is enforced end-to-end (the #411 follow-up).
         except Exception as exc:  # noqa: BLE001
             log.warning("supervisor.heartbeat.cert_auth_skipped", error=str(exc))
 

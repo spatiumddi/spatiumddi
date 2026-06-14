@@ -898,10 +898,12 @@ class MfaEnrolVerifyRequest(BaseModel):
 
 
 class MfaPasswordCodeRequest(BaseModel):
-    """Body shape for disable + recovery-code regen — both gated on the
-    same two-factor reauth (current password + current TOTP code)."""
+    """Body shape for disable + recovery-code regen. Local users supply
+    their current password AND a current TOTP code (two-factor reauth);
+    external-auth users (no local password, #408) supply just the TOTP
+    code, so ``password`` is optional."""
 
-    password: str
+    password: str | None = None
     code: str
 
 
@@ -932,12 +934,12 @@ async def mfa_enroll_begin(current_user: CurrentUser, db: DB) -> MfaEnrolBeginRe
     over the wire twice) but leaves ``totp_enabled`` false.
 
     Calling begin a second time before verify replaces the candidate —
-    operator scanned a half-broken QR code, fine, just start over."""
-    if current_user.auth_source != "local":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="MFA enrolment is for local users only",
-        )
+    operator scanned a half-broken QR code, fine, just start over.
+
+    #408 — open to every auth source (was local-only). An external-auth
+    (OIDC / SAML / LDAP / …) superadmin needs TOTP to re-confirm sensitive
+    reveals, since they have no local password; the authenticated session
+    is the enrolment auth (begin only mints a candidate secret)."""
     if current_user.totp_enabled:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -964,12 +966,9 @@ async def mfa_enroll_verify(
 ) -> None:
     """Confirm enrolment by submitting the first 6-digit TOTP code. Until
     this succeeds ``totp_enabled`` stays false and login skips the MFA
-    gate. On success we audit-log and the next ``/login`` will MFA-gate."""
-    if current_user.auth_source != "local":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="MFA enrolment is for local users only",
-        )
+    gate. On success we audit-log and the next ``/login`` will MFA-gate.
+
+    #408 — open to every auth source (was local-only)."""
     if current_user.totp_enabled:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="MFA already enabled")
     if current_user.totp_secret_encrypted is None:
@@ -985,7 +984,7 @@ async def mfa_enroll_verify(
         AuditLog(
             user_id=current_user.id,
             user_display_name=current_user.display_name,
-            auth_source="local",
+            auth_source=current_user.auth_source,
             source_ip=_client_ip(request),
             user_agent=clean_user_agent(request.headers.get("user-agent")),
             action="mfa.enabled",
@@ -1002,22 +1001,21 @@ async def mfa_enroll_verify(
 async def mfa_disable(
     body: MfaPasswordCodeRequest, current_user: CurrentUser, request: Request, db: DB
 ) -> None:
-    """Disable MFA. Requires both the current password AND a current TOTP
-    code — neither alone is sufficient. Clears the secret and recovery
-    codes."""
-    if current_user.auth_source != "local":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="MFA management is for local users only",
-        )
+    """Disable MFA. Local users supply the current password AND a current
+    TOTP code (neither alone suffices); external-auth users (no local
+    password, #408) supply just the current TOTP code. Clears the secret
+    and recovery codes."""
     if not current_user.totp_enabled or current_user.totp_secret_encrypted is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="MFA is not currently enabled"
         )
-    if not current_user.hashed_password or not verify_password(
-        body.password, current_user.hashed_password
-    ):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    # Password is required + checked ONLY for local accounts (which have
+    # one). External-auth accounts re-confirm with the TOTP code alone.
+    if current_user.auth_source == "local" and current_user.hashed_password:
+        if not body.password or not verify_password(body.password, current_user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
+            )
     secret = decrypt_secret(current_user.totp_secret_encrypted)
     if not verify_totp(secret, body.code):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid TOTP code")
@@ -1028,7 +1026,7 @@ async def mfa_disable(
         AuditLog(
             user_id=current_user.id,
             user_display_name=current_user.display_name,
-            auth_source="local",
+            auth_source=current_user.auth_source,
             source_ip=_client_ip(request),
             user_agent=clean_user_agent(request.headers.get("user-agent")),
             action="mfa.disabled",
@@ -1051,20 +1049,18 @@ async def mfa_regenerate_recovery_codes(
     """Replace the recovery-code list. Same two-factor reauth as
     ``/disable``. Returns the new codes ONCE — operator must record them.
     The existing ``secret`` is kept so the authenticator app entry stays
-    valid; only the recovery-code list rotates."""
-    if current_user.auth_source != "local":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="MFA management is for local users only",
-        )
+    valid; only the recovery-code list rotates. Same reauth shape as
+    ``/disable``: local users supply password + TOTP, external-auth users
+    (no local password, #408) supply just the TOTP code."""
     if not current_user.totp_enabled or current_user.totp_secret_encrypted is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="MFA is not currently enabled"
         )
-    if not current_user.hashed_password or not verify_password(
-        body.password, current_user.hashed_password
-    ):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    if current_user.auth_source == "local" and current_user.hashed_password:
+        if not body.password or not verify_password(body.password, current_user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
+            )
     secret = decrypt_secret(current_user.totp_secret_encrypted)
     if not verify_totp(secret, body.code):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid TOTP code")
@@ -1074,7 +1070,7 @@ async def mfa_regenerate_recovery_codes(
         AuditLog(
             user_id=current_user.id,
             user_display_name=current_user.display_name,
-            auth_source="local",
+            auth_source=current_user.auth_source,
             source_ip=_client_ip(request),
             user_agent=clean_user_agent(request.headers.get("user-agent")),
             action="mfa.recovery_regenerated",

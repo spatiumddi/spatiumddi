@@ -295,6 +295,49 @@ async def test_register_is_idempotent_for_same_pubkey(
 
 
 @pytest.mark.asyncio
+async def test_reregister_mints_token_for_certd_row(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """#411 — re-register-from-cache returns a FRESH session token even after
+    the row has a cert (post-approval), so an approved supervisor that lost
+    its token can recover it. Pre-#411 this returned "" for cert'd rows, which
+    — once #400 C1 removed the approved-state heartbeat bypass — left such a
+    box with no usable credential and 403'd every heartbeat."""
+    await _enable_supervisor_registration(db_session)
+    await _make_pairing_code(db_session, code="55555555")
+    await db_session.commit()
+
+    _, _, _, pubkey_b64 = _new_keypair()
+    first = await client.post(
+        "/api/v1/appliance/supervisor/register",
+        json={
+            "pairing_code": "55555555",
+            "hostname": "cp-recover",
+            "public_key_der_b64": pubkey_b64,
+        },
+    )
+    assert first.status_code == 200, first.text
+
+    # Simulate approval having issued a cert on the row.
+    appliance = await db_session.get(Appliance, uuid.UUID(first.json()["appliance_id"]))
+    assert appliance is not None
+    appliance.cert_pem = "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----"
+    await db_session.commit()
+
+    # Re-register the SAME pubkey — must hand back a usable (non-empty) token.
+    second = await client.post(
+        "/api/v1/appliance/supervisor/register",
+        json={
+            "pairing_code": "55555555",
+            "hostname": "cp-recover",
+            "public_key_der_b64": pubkey_b64,
+        },
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["session_token"], "re-register must mint a fresh token for a cert'd row"
+
+
+@pytest.mark.asyncio
 async def test_register_rejects_malformed_pubkey_without_burning_code(
     db_session: AsyncSession, client: AsyncClient
 ) -> None:

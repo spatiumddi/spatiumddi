@@ -17,12 +17,14 @@ import {
 import {
   appliancePairingApi,
   authApi,
+  settingsApi,
   type PairingCodeCreated,
   type PairingCodeRow,
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { ReauthFields } from "@/components/ReauthFields";
 import { cn } from "@/lib/utils";
 
 /**
@@ -94,6 +96,25 @@ export function PairingTab() {
     },
   });
 
+  // #407 — supervisor (appliance) registration gate. When OFF, the
+  // register endpoint 404s so no supervisor can pair, no matter how many
+  // pairing codes exist. OS-appliance control-plane installs self-enable
+  // this on first boot; generic Kubernetes/Helm control planes do not, so
+  // the operator must flip it on here before pairing the first appliance.
+  const settingsQuery = useQuery({
+    queryKey: ["settings"],
+    queryFn: settingsApi.get,
+    enabled: isSuperadmin,
+    staleTime: 30_000,
+  });
+  const registrationEnabled =
+    settingsQuery.data?.supervisor_registration_enabled ?? null;
+  const registrationToggle = useMutation({
+    mutationFn: (enabled: boolean) =>
+      settingsApi.update({ supervisor_registration_enabled: enabled }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
+  });
+
   if (!isSuperadmin) {
     return (
       <div className="mx-auto max-w-4xl">
@@ -155,6 +176,65 @@ export function PairingTab() {
             New pairing code
           </button>
         </div>
+      </div>
+
+      {/* #407 — registration gate. Surfaces + toggles
+          ``supervisor_registration_enabled`` so an operator can enable
+          appliance pairing from the UI instead of hand-editing the DB.
+          Generic Kubernetes/Helm control planes ship with it OFF. */}
+      <div
+        className={cn(
+          "mb-4 rounded-md border p-3",
+          registrationEnabled === false &&
+            "border-amber-500/40 bg-amber-500/10",
+        )}
+      >
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-sm font-medium">
+              Appliance registration{" "}
+              {registrationEnabled === null ? (
+                <span className="text-muted-foreground">…</span>
+              ) : registrationEnabled ? (
+                <span className="text-emerald-600 dark:text-emerald-400">
+                  enabled
+                </span>
+              ) : (
+                <span className="text-amber-700 dark:text-amber-400">
+                  disabled
+                </span>
+              )}
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {registrationEnabled === false
+                ? "New supervisors cannot pair while this is off — the register endpoint returns 404. Enable it before pairing an appliance."
+                : "Remote supervisors may register with a valid pairing code. Turn this off to refuse all new pairings."}
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={
+              registrationEnabled === null || registrationToggle.isPending
+            }
+            onClick={() => registrationToggle.mutate(!registrationEnabled)}
+            className={cn(
+              "inline-flex flex-shrink-0 items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium disabled:opacity-60",
+              registrationEnabled
+                ? "border hover:bg-muted"
+                : "bg-primary text-primary-foreground hover:bg-primary/90",
+            )}
+          >
+            {registrationToggle.isPending && (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            )}
+            {registrationEnabled ? "Disable" : "Enable"} registration
+          </button>
+        </div>
+        {registrationToggle.isError && (
+          <p className="mt-2 text-xs text-rose-700 dark:text-rose-300">
+            {formatApiError(registrationToggle.error)}
+          </p>
+        )}
       </div>
 
       {isLoading ? (
@@ -632,11 +712,17 @@ function RevealModal({
   onClose: () => void;
 }) {
   const [password, setPassword] = useState("");
+  const [totp, setTotp] = useState("");
   const [revealed, setRevealed] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
   const mutation = useMutation({
-    mutationFn: () => appliancePairingApi.reveal(row.id, password),
+    mutationFn: () =>
+      appliancePairingApi.reveal(
+        row.id,
+        password || undefined,
+        totp || undefined,
+      ),
     onSuccess: (body) => setRevealed(body.code),
   });
 
@@ -688,19 +774,16 @@ function RevealModal({
           className="flex flex-col gap-3"
         >
           <p className="text-xs text-muted-foreground">
-            Re-display the cleartext of this persistent code. Requires
-            confirming your current password (local-auth only).
+            Re-display the cleartext of this persistent code. Re-confirm with
+            your password (local accounts) or an authenticator code (SSO).
           </p>
-          <label className="flex flex-col gap-1 text-sm">
-            <span className="text-xs font-medium">Current password</span>
-            <input
-              type="password"
-              className={inputCls}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              autoFocus
-            />
-          </label>
+          <ReauthFields
+            password={password}
+            onPassword={setPassword}
+            totp={totp}
+            onTotp={setTotp}
+            autoFocus
+          />
           {mutation.error && (
             <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
               {formatApiError(mutation.error)}
@@ -716,7 +799,7 @@ function RevealModal({
             </button>
             <button
               type="submit"
-              disabled={mutation.isPending || password.length === 0}
+              disabled={mutation.isPending || (!password && !totp)}
               className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-60"
             >
               {mutation.isPending && (
