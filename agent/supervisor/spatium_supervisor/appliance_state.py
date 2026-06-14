@@ -352,6 +352,9 @@ def _reap_stale_inflight(
             encoding="utf-8",
         )
     except OSError:
+        # Cosmetic breadcrumb only — the durable "failed" .state written
+        # above is what the UI keys off; a missed progress write just
+        # leaves the prior line and is re-derived next tick.
         pass
     try:
         if _TRIGGER_FILE.exists():
@@ -361,6 +364,9 @@ def _reap_stale_inflight(
                 )
             )
     except OSError:
+        # Best-effort unblock — if the rename misses, the operator's
+        # Cancel path still heals failed→ready once the trigger is gone;
+        # never fatal to the heartbeat.
         pass
     return "failed", now
 
