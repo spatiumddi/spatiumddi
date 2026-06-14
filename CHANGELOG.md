@@ -20,6 +20,25 @@ the formatter handles the rest.
 
 ---
 
+## Unreleased
+
+Batched fixes for the next cut (not yet released).
+
+### Fixed
+
+* **#419 — slot-upgrade wedged at "in-flight" on pre-2026.06.12
+  appliances.** The control plane appends a per-apply re-fire nonce to the
+  slot-image URL as a ``#fragment``; the host runner only strips that
+  fragment before fetching as of #386 (2026-06-12), so an appliance on an
+  older supervisor handed the fragment straight to the downloader and the
+  apply hung at "in-flight" forever. The nonce is now gated on the target
+  supervisor's reported version — pre-2026.06.12 and unknown supervisors
+  get a clean URL their runner can fetch, while current ones keep the
+  nonce for same-image re-fire. (Recover an already-stuck box on the host
+  with ``spatium-upgrade-slot apply <url> --checksum <url>`` then reboot.)
+
+---
+
 ## 2026.06.14-1 — 2026-06-14
 
 An **appliance polish + ops** release rolling up four issues (#392 /
