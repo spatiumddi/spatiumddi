@@ -28,6 +28,73 @@ the supervisor PATCHes onto the chart on heartbeat.
 >
 > Spec context: [`docs/deployment/APPLIANCE.md`](../docs/deployment/APPLIANCE.md).
 
+## Why k3s, not Docker Compose?
+
+Early appliance builds (pre-#183) ran the stack with `docker compose`
+driven from a boot script. It was fine for one box doing one job — but
+the whole point of the appliance is to *grow* with the operator, and
+Compose fought that at every turn. We moved to **embedded k3s** (a single
+~70 MB static Kubernetes binary) because it turns the appliance from "a
+box running some containers" into "a node you can build a cluster out
+of." Concretely:
+
+- **A declarative target, not a script of CLI commands.** Under Compose,
+  "make this box a DNS node" meant `docker compose down` one service,
+  `up -d` another, juggle an `--env-file`, and pray nothing failed
+  halfway (recovery was usually "delete the state file and reboot").
+  Under k3s the desired state is a *document* — a HelmChart custom
+  resource — and the bundled helm-controller continuously reconciles
+  reality to match it. A crashed pod comes back on its own; a role change
+  is a fact you assert once, not a sequence of imperative steps you have
+  to babysit and unwind by hand when one fails.
+
+- **One box today, a real HA cluster tomorrow — in place.** This is the
+  big one. Docker Compose has no native concept of a multi-machine
+  cluster; you'd be bolting on Swarm or hand-rolling orchestration. k3s
+  ships embedded etcd, so a single-VM appliance can be **promoted** into
+  a 3 / 5 / 7-node high-availability control plane (Postgres via
+  CloudNativePG, Redis via Sentinel, a MetalLB virtual IP) right from the
+  Fleet UI — no reinstall, no re-architecting. The same image that runs a
+  homelab-in-a-box scales up to a fault-tolerant production control
+  plane.
+
+- **Roles are labels, not file edits.** Which services a node runs
+  (control plane / DNS-BIND9 / DNS-PowerDNS / DHCP) is decided by a
+  per-node Kubernetes label. Flipping a role from the web UI is a single
+  `kubectl label node` — the workload schedules or drains as a
+  *consequence* of the label. No editing compose files on the box, no
+  SSH, no remembering which `COMPOSE_PROFILES` were set where. HA agents
+  run as DaemonSets, so "exactly one DNS pod per DNS-labelled node" is
+  something the platform guarantees rather than something the operator
+  maintains.
+
+- **The operator never touches raw container CLI.** Everything is driven
+  from the `/appliance` web surface (Fleet, Cluster, OS Versions tabs)
+  talking to the kube-API, or through the pre-`KUBECONFIG`'d `kubectl`
+  for anyone who wants a shell. Both are standard, documented, widely
+  understood tools — versus a pile of project-specific `docker compose`
+  incantations and hand-maintained `.env` / state files.
+
+- **One deployment model everywhere.** The appliance installs the very
+  same umbrella + appliance Helm charts that ship for standalone
+  Kubernetes deployments. There is no separate Compose path to keep in
+  sync: what we test on Kubernetes is what runs on the appliance, and
+  what you learn operating the appliance transfers to any cluster.
+
+- **Upgrades that can't drift.** k3s keeps its state in kine (SQLite)
+  under `/var/lib/rancher/`, which lives on the persistent `/var`
+  partition and so survives an atomic A/B slot swap. Container images are
+  baked into the slot and reconciled by helm-controller, so an OS upgrade
+  and a container upgrade land as **one unit** — gone is the Compose-era
+  trap where a new rootfs carried a different compose schema while old
+  containers were still running against the old one.
+
+The cost is honest and small: k3s adds ~70 MB to the slot image and a
+steady ~150 MB of RAM for the server process, both comfortably inside the
+appliance's disk and memory floor. For a deeper, change-by-change account
+of the migration, see the **"Why k3s"** section in
+[`docs/deployment/APPLIANCE.md`](../docs/deployment/APPLIANCE.md).
+
 ## What it ships
 
 - Debian 13 (trixie) amd64, `linux-image-cloud-amd64` kernel

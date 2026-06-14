@@ -19,16 +19,33 @@ dynamic context block has real numbers to summarise. Sections:
 * Domains — corp.example.com (matches the DNS zone) + example.com
 * Custom fields — one IP-level + one subnet-level
 * IPAM templates — one block + one subnet template
+* IPAM NAT mappings — 1to1 / pat / hide examples
+* Multicast — PIM domain, multicast-kind subnet, group + ports + membership
+* Subnet plan — a draft planner workspace (not applied)
+* Network modeling — customers / sites / providers / circuits / services /
+  applications / SD-WAN overlays + overlay-sites + routing policies
+* DNS sub-resources — view, ACL, TSIG key, DNSSEC policy, GSLB pool,
+  blocklist + entry + exception, catalog-template zone
+* DHCP sub-resources — client class, static reservation, MAC blocklist,
+  option template, PXE profile, phone profile
+* Governance — custom role, sample group + non-admin user, time-bound
+  grant, scoped API token, custom conformity policy, webhook subscription
 * Alert rules — utilization, server-unreachable, domain-expiring
 * AI prompts — three shared triage prompts (issue #90 Phase 2)
 
 Every section is idempotent — the script swallows 409 from already-
 existing rows, and PATCHes spaces / blocks where the FK targets need
-to converge on a re-run after new entities exist.
+to converge on a re-run after new entities exist. A handful of
+endpoints have no uniqueness constraint (time-bound grants, API
+tokens, conformity policies, webhook subscriptions); those sections
+list-then-skip on a stable key so a re-run doesn't pile up duplicates.
 
-Out of scope: AI providers (secrets), webhooks (per-deployment URLs),
-audit-forward targets (per-deployment endpoints), API tokens
-(operator-scoped). Those need real creds from the operator.
+Out of scope: AI providers (secrets), audit-forward targets
+(per-deployment endpoints), and every read-only-pull integration
+target (Kubernetes / Docker / Proxmox / Tailscale / UniFi / OPNsense /
+Cloud) — those need real creds / live external systems. The webhook
+subscription seeded here points at a deliberately non-resolving host
+and ships disabled so the worker never attempts delivery.
 """
 
 from __future__ import annotations
@@ -170,42 +187,52 @@ def seed_dhcp_group(a: Api) -> str | None:
     return g["id"] if g else None
 
 
-def seed_dhcp_scope(a: Api, group_id: str | None, subnets: list[dict]):
+def seed_dhcp_scope(a: Api, group_id: str | None, subnets: list[dict]) -> str | None:
     """Wire a scope on the Servers subnet so the DHCP page isn't empty.
 
     The subnet has gateway + DDNS already inherited from the space; the
     scope just configures the lease window + a small dynamic pool.
+    Returns the scope id so the DHCP sub-resources section can attach
+    statics / phone-profile scope links to it.
     """
     if not group_id or not subnets:
-        return
+        return None
     target = find(subnets, "name", "Servers")
     if not target:
-        return
+        return None
     print("Creating DHCP scope + pool on Servers subnet…")
     scope = a.call(
         "POST",
         f"/api/v1/dhcp/subnets/{target['id']}/dhcp-scopes",
         json={
-            "server_group_id": group_id,
+            "group_id": group_id,
             "name": "Servers DHCP",
             "lease_time": 86400,
             "enabled": True,
             "ddns_enabled": True,
         },
     )
-    if scope and scope.get("id"):
+    scope_id = scope["id"] if scope and scope.get("id") else None
+    if scope_id is None:
+        # Re-run path: the scope already exists (409 swallowed above). Look
+        # it up so downstream sections still get an id to attach to.
+        scopes = a.call("GET", f"/api/v1/dhcp/server-groups/{group_id}/scopes") or []
+        existing = find(scopes, "name", "Servers DHCP")
+        scope_id = existing["id"] if existing else None
+    if scope_id:
         # Small dynamic pool so screenshots show "▼ start / ▲ end" rows
         # in the IPAM table.
         a.call(
             "POST",
-            f"/api/v1/dhcp/scopes/{scope['id']}/pools",
+            f"/api/v1/dhcp/scopes/{scope_id}/pools",
             json={
                 "name": "Default pool",
-                "start_address": "10.10.10.100",
-                "end_address": "10.10.10.149",
-                "kind": "dynamic",
+                "start_ip": "10.10.10.100",
+                "end_ip": "10.10.10.149",
+                "pool_type": "dynamic",
             },
         )
+    return scope_id
 
 
 # ── Section: ASNs + VRFs ──────────────────────────────────────────────────
@@ -642,10 +669,10 @@ def seed_ipam_templates(a: Api, dns_group_id: str | None, dhcp_group_id: str | N
         "ddns_enabled": True,
         "ddns_hostname_policy": "leave_unchanged",
         "child_layout": {
-            "subnets": [
-                {"prefix": "27", "name_template": "Staff-{n}", "description": ""},
-                {"prefix": "27", "name_template": "Phones-{n}", "description": ""},
-                {"prefix": "27", "name_template": "Servers-{n}", "description": ""},
+            "children": [
+                {"prefix": 27, "name_template": "Staff-{n}", "description": ""},
+                {"prefix": 27, "name_template": "Phones-{n}", "description": ""},
+                {"prefix": 27, "name_template": "Servers-{n}", "description": ""},
             ]
         },
     }
@@ -762,6 +789,981 @@ def seed_ai_prompts(a: Api):
         a.call("POST", "/api/v1/ai/prompts", json=body)
 
 
+# ── Section: IPAM NAT mappings ────────────────────────────────────────────
+
+
+def seed_nat_mappings(a: Api, subnets: list[dict]):
+    """Three NAT mappings — one of each kind (1to1 / pat / hide).
+
+    internal_ip / external_ip are plain strings; the handler auto-resolves
+    them to IPAM rows when they happen to match a seeded address. Each
+    mapping uses a distinct external_ip so the external-slot conflict
+    guard (409) never fires. The hide mapping needs a real Subnet id, so
+    it pins to the seeded Office-LAN subnet when present.
+    """
+    print("Creating NAT mappings…")
+    a.call(
+        "POST",
+        "/api/v1/ipam/nat-mappings",
+        json={
+            "name": "web01 public NAT",
+            "kind": "1to1",
+            "internal_ip": "10.10.10.20",
+            "external_ip": "203.0.113.10",
+            "protocol": "any",
+            "device_label": "edge-fw1",
+            "description": "1:1 NAT for the web server",
+        },
+    )
+    a.call(
+        "POST",
+        "/api/v1/ipam/nat-mappings",
+        json={
+            "name": "app-api 443->8443 PAT",
+            "kind": "pat",
+            "internal_ip": "10.10.10.30",
+            "internal_port_start": 8443,
+            "external_ip": "203.0.113.11",
+            "external_port_start": 443,
+            "protocol": "tcp",
+            "description": "Port-forward HTTPS to app-api",
+        },
+    )
+    office_lan = find(subnets, "name", "Office-LAN")
+    if office_lan:
+        a.call(
+            "POST",
+            "/api/v1/ipam/nat-mappings",
+            json={
+                "name": "Office-LAN hide NAT",
+                "kind": "hide",
+                "internal_subnet_id": office_lan["id"],
+                "external_ip": "203.0.113.1",
+                "protocol": "any",
+                "description": "Masquerade staff LAN behind the edge public IP",
+            },
+        )
+    else:
+        print("  · skipping hide-NAT (no Office-LAN subnet to pin internal_subnet_id)")
+
+
+# ── Section: Multicast ────────────────────────────────────────────────────
+
+
+def seed_multicast(
+    a: Api,
+    space_id: str | None,
+    subnets: list[dict],
+):
+    """PIM domain + multicast-kind subnet + group + ports + membership.
+
+    The whole /multicast surface is feature-module gated (network.multicast,
+    default-enabled) so a non-200 is tolerated. Subnet.kind is auto-detected
+    from the CIDR — a 224.0.0.0/4 network stores as kind='multicast', no
+    operator-settable field. The group create auto-creates its own enclosing
+    block, but we also seed a dedicated multicast subnet so the IPAM tree
+    renders the range like a real subnet.
+    """
+    if not space_id:
+        print("  · skipping multicast (no Corporate space id)")
+        return
+    print("Creating multicast domain + subnet + group…")
+
+    # PIM domain. pim_mode='ssm' needs no rendezvous point, so it's the
+    # zero-FK safe choice (sparse/bidir would 422 without an RP).
+    a.call(
+        "POST",
+        "/api/v1/multicast/domains",
+        json={
+            "name": "HQ PIM-SSM",
+            "description": "Headquarters source-specific multicast domain",
+            "pim_mode": "ssm",
+            "ssm_range": "232.0.0.0/8",
+            "notes": "",
+        },
+    )
+
+    # Multicast-range block (encloses 239.0.0.0/8) so the multicast subnet
+    # has a parent. _assert_no_overlap runs on both, so the ranges are
+    # picked to not collide with the unicast blocks/subnets.
+    a.call(
+        "POST",
+        "/api/v1/ipam/blocks",
+        json={
+            "space_id": space_id,
+            "name": "Multicast 239.0.0.0/8",
+            "network": "239.0.0.0/8",
+            "description": "Administratively-scoped multicast (RFC 2365)",
+        },
+    )
+    blocks = a.call("GET", f"/api/v1/ipam/blocks?space_id={space_id}") or []
+    mcast_block = find(blocks, "name", "Multicast 239.0.0.0/8")
+    if mcast_block:
+        a.call(
+            "POST",
+            "/api/v1/ipam/subnets",
+            json={
+                "space_id": space_id,
+                "block_id": mcast_block["id"],
+                "network": "239.10.0.0/24",
+                "name": "Video multicast",
+                "description": "Administratively-scoped multicast (RFC 2365)",
+            },
+        )
+
+    # Multicast group. Needs only space_id + address (in 224.0.0.0/4); the
+    # handler ensures an enclosing block exists on its own.
+    group = a.call(
+        "POST",
+        "/api/v1/multicast/groups",
+        json={
+            "space_id": space_id,
+            "address": "239.10.0.10",
+            "name": "IPTV-Channel-1",
+            "description": "Set-top-box video stream",
+            "application": "IPTV",
+            "rtp_payload_type": 33,
+        },
+    )
+    group_id = group["id"] if group and group.get("id") else None
+    if group_id is None:
+        # Re-run: resolve the group by address so ports / memberships still
+        # have a parent to attach to.
+        listed = (
+            a.call(
+                "GET",
+                f"/api/v1/multicast/groups?space_id={space_id}&search=239.10.0.10",
+            )
+            or {}
+        )
+        items = listed.get("items", []) if isinstance(listed, dict) else []
+        existing = find(items, "address", "239.10.0.10")
+        group_id = existing["id"] if existing else None
+
+    if not group_id:
+        print(
+            "  · multicast group unavailable (module disabled?); skipping ports + membership"
+        )
+        return
+
+    # RTP + RTCP port pair on the group.
+    a.call(
+        "POST",
+        f"/api/v1/multicast/groups/{group_id}/ports",
+        json={
+            "port_start": 5004,
+            "port_end": 5005,
+            "transport": "rtp",
+            "notes": "RTP + RTCP pair",
+        },
+    )
+
+    # Membership needs a real IPAM address id. Pull one from the Servers
+    # subnet (the seeder already allocated several IPs there).
+    servers = find(subnets, "name", "Servers")
+    addr_id = None
+    if servers:
+        addresses = (
+            a.call("GET", f"/api/v1/ipam/subnets/{servers['id']}/addresses") or []
+        )
+        allocated = next(
+            (
+                ip
+                for ip in addresses
+                if ip.get("status") == "allocated" and ip.get("id")
+            ),
+            None,
+        )
+        if allocated is None and addresses:
+            allocated = next((ip for ip in addresses if ip.get("id")), None)
+        addr_id = allocated["id"] if allocated else None
+    if addr_id:
+        a.call(
+            "POST",
+            f"/api/v1/multicast/groups/{group_id}/memberships",
+            json={
+                "ip_address_id": addr_id,
+                "role": "producer",
+                "seen_via": "manual",
+                "notes": "Encoder feeding the stream",
+            },
+        )
+    else:
+        print("  · skipping multicast membership (no allocated IP in Servers subnet)")
+
+
+# ── Section: Subnet plan ──────────────────────────────────────────────────
+
+
+def seed_subnet_plan(a: Api, space_id: str | None):
+    """A draft planner workspace. The tree is a draft only — it does NOT
+    materialise blocks/subnets until /apply (which the seeder never calls),
+    so it's safe demo data with no side effects.
+    """
+    if not space_id:
+        print("  · skipping subnet plan (no Corporate space id)")
+        return
+    print("Creating subnet plan (draft)…")
+    a.call(
+        "POST",
+        "/api/v1/ipam/plans",
+        json={
+            "name": "Branch office /24 carve",
+            "description": "Draft layout for a new branch — 2x /26",
+            "space_id": space_id,
+            "tree": {
+                "id": "root",
+                "network": "172.16.0.0/24",
+                "name": "Branch aggregate",
+                "kind": "block",
+                "children": [
+                    {
+                        "id": "n1",
+                        "network": "172.16.0.0/26",
+                        "name": "Staff",
+                        "kind": "subnet",
+                        "children": [],
+                    },
+                    {
+                        "id": "n2",
+                        "network": "172.16.0.64/26",
+                        "name": "Phones",
+                        "kind": "subnet",
+                        "children": [],
+                    },
+                ],
+            },
+        },
+    )
+
+
+# ── Section: Network modeling (ownership + circuits + services + overlays) ──
+
+
+def seed_customers(a: Api) -> dict[str, str]:
+    print("Creating customers…")
+    rows = [
+        {
+            "name": "Acme Corp",
+            "account_number": "ACME-001",
+            "contact_email": "netops@acme.example",
+            "status": "active",
+        },
+        {
+            "name": "Globex Retail",
+            "account_number": "GLBX-002",
+            "contact_email": "it@globex.example",
+            "status": "active",
+        },
+    ]
+    for body in rows:
+        a.call("POST", "/api/v1/customers", json=body)
+    listed = a.call("GET", "/api/v1/customers") or {}
+    items = listed.get("items", []) if isinstance(listed, dict) else listed
+    return {row["name"]: row["id"] for row in items if row.get("name")}
+
+
+def seed_sites(a: Api) -> dict[str, str]:
+    print("Creating sites…")
+    rows = [
+        {
+            "name": "HQ Datacenter",
+            "code": "HQ-DC1",
+            "kind": "datacenter",
+            "region": "us-east",
+        },
+        {
+            "name": "Branch — Austin",
+            "code": "BR-AUS",
+            "kind": "branch",
+            "region": "us-central",
+        },
+        {
+            "name": "Branch — Denver",
+            "code": "BR-DEN",
+            "kind": "branch",
+            "region": "us-west",
+        },
+    ]
+    for body in rows:
+        a.call("POST", "/api/v1/sites", json=body)
+    listed = a.call("GET", "/api/v1/sites") or {}
+    items = listed.get("items", []) if isinstance(listed, dict) else listed
+    return {row["name"]: row["id"] for row in items if row.get("name")}
+
+
+def seed_providers(a: Api, asns: dict[str, str]) -> dict[str, str]:
+    print("Creating providers…")
+    rows: list[dict] = [
+        {
+            "name": "Cogent Communications",
+            "kind": "transit",
+            "account_number": "CGT-99",
+            "contact_email": "noc@cogent.example",
+        },
+        {
+            "name": "Lumen Fiber",
+            "kind": "carrier",
+            "account_number": "LMN-44",
+            "contact_email": "noc@lumen.example",
+        },
+    ]
+    # Wire the Cogent provider to the seeded Cogent ASN when available.
+    if asns.get("Cogent"):
+        rows[0]["default_asn_id"] = asns["Cogent"]
+    for body in rows:
+        a.call("POST", "/api/v1/providers", json=body)
+    listed = a.call("GET", "/api/v1/providers") or {}
+    items = listed.get("items", []) if isinstance(listed, dict) else listed
+    return {row["name"]: row["id"] for row in items if row.get("name")}
+
+
+def seed_circuits(
+    a: Api,
+    providers: dict[str, str],
+    customers: dict[str, str],
+    sites: dict[str, str],
+    subnets: list[dict],
+) -> dict[str, str]:
+    """WAN circuits. provider_id is REQUIRED (RESTRICT); a/z-end sites are
+    wired to seeded sites so the topology + by-site views populate.
+    """
+    provider_id = providers.get("Cogent Communications")
+    if not provider_id:
+        print("  · skipping circuits (no provider id)")
+        return {}
+    print("Creating WAN circuits…")
+    hq = sites.get("HQ Datacenter")
+    aus = sites.get("Branch — Austin")
+    den = sites.get("Branch — Denver")
+    acme = customers.get("Acme Corp")
+    servers = find(subnets, "name", "Servers")
+    a_end_subnet = servers["id"] if servers else None
+
+    specs = [
+        {
+            "name": "HQ-Austin MPLS",
+            "ckt_id": "CKT-10042",
+            "transport_class": "mpls",
+            "bandwidth_mbps_down": 100,
+            "bandwidth_mbps_up": 100,
+            "a_end_site_id": hq,
+            "z_end_site_id": aus,
+        },
+        {
+            "name": "HQ-Denver MPLS",
+            "ckt_id": "CKT-10043",
+            "transport_class": "mpls",
+            "bandwidth_mbps_down": 100,
+            "bandwidth_mbps_up": 100,
+            "a_end_site_id": hq,
+            "z_end_site_id": den,
+        },
+        {
+            "name": "HQ Internet DIA",
+            "ckt_id": "CKT-20001",
+            "transport_class": "internet_broadband",
+            "bandwidth_mbps_down": 1000,
+            "bandwidth_mbps_up": 1000,
+            "a_end_site_id": hq,
+        },
+    ]
+    for spec in specs:
+        body: dict = {
+            "provider_id": provider_id,
+            "status": "active",
+            "currency": "USD",
+        }
+        body.update({k: v for k, v in spec.items() if v is not None})
+        if acme:
+            body["customer_id"] = acme
+        if a_end_subnet:
+            body["a_end_subnet_id"] = a_end_subnet
+        a.call("POST", "/api/v1/circuits", json=body)
+
+    listed = a.call("GET", "/api/v1/circuits") or {}
+    items = listed.get("items", []) if isinstance(listed, dict) else listed
+    return {row["name"]: row["id"] for row in items if row.get("name")}
+
+
+def seed_applications(a: Api):
+    """One custom application-category row. Builtins (office365, zoom,
+    microsoft_teams, …) are seeded at startup and already satisfy
+    routing-policy matches; this is demo flavour.
+    """
+    print("Creating custom application category…")
+    a.call(
+        "POST",
+        "/api/v1/applications",
+        json={
+            "name": "Acme ERP",  # normalised server-side to acme_erp
+            "description": "Acme internal ERP",
+            "category": "saas",
+            "default_dscp": 18,
+        },
+    )
+
+
+def seed_services(
+    a: Api,
+    customers: dict[str, str],
+    vrfs: dict[str, str],
+    sites: dict[str, str],
+    circuits: dict[str, str],
+    subnets: list[dict],
+):
+    """A custom-kind service with a few resources attached.
+
+    kind='custom' lets us attach several resource kinds freely (an
+    mpls_l3vpn enforces at-most-one-VRF). Each attach is idempotent —
+    re-attaching the same (kind, id) just updates the role.
+    """
+    customer_id = customers.get("Acme Corp")
+    if not customer_id:
+        print("  · skipping network service (no customer id)")
+        return
+    print("Creating network service + resource attaches…")
+    svc = a.call(
+        "POST",
+        "/api/v1/services",
+        json={
+            "name": "Acme Managed WAN",
+            "kind": "custom",
+            "customer_id": customer_id,
+            "status": "active",
+            "currency": "USD",
+        },
+    )
+    service_id = svc["id"] if svc and svc.get("id") else None
+    if service_id is None:
+        listed = a.call("GET", "/api/v1/services") or {}
+        items = listed.get("items", []) if isinstance(listed, dict) else listed
+        existing = find(items, "name", "Acme Managed WAN")
+        service_id = existing["id"] if existing else None
+    if not service_id:
+        print("  · service unavailable; skipping resource attaches")
+        return
+
+    attaches: list[dict] = []
+    if vrfs.get("default"):
+        attaches.append(
+            {"resource_kind": "vrf", "resource_id": vrfs["default"], "role": "core"}
+        )
+    for site_name in ("HQ Datacenter", "Branch — Austin"):
+        if sites.get(site_name):
+            attaches.append(
+                {
+                    "resource_kind": "site",
+                    "resource_id": sites[site_name],
+                    "role": "edge",
+                }
+            )
+    if circuits.get("HQ-Austin MPLS"):
+        attaches.append(
+            {
+                "resource_kind": "circuit",
+                "resource_id": circuits["HQ-Austin MPLS"],
+                "role": "edge",
+            }
+        )
+    servers = find(subnets, "name", "Servers")
+    if servers:
+        attaches.append(
+            {"resource_kind": "subnet", "resource_id": servers["id"], "role": "lan"}
+        )
+    for body in attaches:
+        a.call("POST", f"/api/v1/services/{service_id}/resources", json=body)
+
+
+def seed_overlays(
+    a: Api,
+    customers: dict[str, str],
+    sites: dict[str, str],
+    circuits: dict[str, str],
+):
+    """SD-WAN overlay + hub/spoke site membership + a routing policy.
+
+    To get topology EDGES, the hub + spokes share one MPLS circuit in
+    their preferred_circuits. The routing policy uses match_kind='dscp'
+    + mark_dscp so it needs no application-catalog or circuit FK.
+    """
+    print("Creating SD-WAN overlay + sites + policy…")
+    body: dict = {
+        "name": "Acme SD-WAN",
+        "kind": "sdwan",
+        "vendor": "cisco_meraki",
+        "default_path_strategy": "active_backup",
+        "status": "active",
+    }
+    if customers.get("Acme Corp"):
+        body["customer_id"] = customers["Acme Corp"]
+    ov = a.call("POST", "/api/v1/overlays", json=body)
+    overlay_id = ov["id"] if ov and ov.get("id") else None
+    if overlay_id is None:
+        listed = a.call("GET", "/api/v1/overlays") or {}
+        items = listed.get("items", []) if isinstance(listed, dict) else listed
+        existing = find(items, "name", "Acme SD-WAN")
+        overlay_id = existing["id"] if existing else None
+    if not overlay_id:
+        print("  · overlay unavailable; skipping sites + policy")
+        return
+
+    hub_circuit = circuits.get("HQ-Austin MPLS")
+    shared = [hub_circuit] if hub_circuit else []
+    members = [
+        ("HQ Datacenter", "hub"),
+        ("Branch — Austin", "spoke"),
+        ("Branch — Denver", "spoke"),
+    ]
+    for site_name, role in members:
+        site_id = sites.get(site_name)
+        if not site_id:
+            continue
+        site_body: dict = {"site_id": site_id, "role": role}
+        if shared:
+            site_body["preferred_circuits"] = shared
+        a.call("POST", f"/api/v1/overlays/{overlay_id}/sites", json=site_body)
+
+    a.call(
+        "POST",
+        f"/api/v1/overlays/{overlay_id}/policies",
+        json={
+            "name": "Mark EF for voice",
+            "priority": 100,
+            "match_kind": "dscp",
+            "match_value": "46",
+            "action": "mark_dscp",
+            "action_target": "46",
+            "enabled": True,
+        },
+    )
+
+
+# ── Section: DNS sub-resources ────────────────────────────────────────────
+
+
+def seed_dns_subresources(
+    a: Api,
+    dns_group_id: str | None,
+    dns_fwd_zone_id: str | None,
+):
+    """View, ACL, TSIG key, DNSSEC policy, GSLB pool, blocklist tree, and a
+    catalog-template zone. All persist without a live agent.
+    """
+    print("Creating DNS sub-resources…")
+
+    # DNSSEC policy is global (not group-scoped) — seed it regardless.
+    a.call(
+        "POST",
+        "/api/v1/dns/dnssec-policies",
+        json={
+            "name": "ecdsa-default",
+            "description": "ECDSA P-256, 90d ZSK rollover",
+            "algorithm": "ecdsap256sha256",
+            "ksk_lifetime_days": 0,
+            "zsk_lifetime_days": 90,
+            "nsec3": False,
+        },
+    )
+
+    # Manual blocklist + entry + exception (no group needed to create).
+    bl = a.call(
+        "POST",
+        "/api/v1/dns/blocklists",
+        json={
+            "name": "Corp custom blocks",
+            "description": "Manually-curated blocked domains",
+            "category": "custom",
+            "source_type": "manual",
+            "feed_format": "hosts",
+            "block_mode": "nxdomain",
+            "enabled": True,
+        },
+    )
+    list_id = bl["id"] if bl and bl.get("id") else None
+    if list_id is None:
+        lists = a.call("GET", "/api/v1/dns/blocklists") or []
+        existing = find(lists, "name", "Corp custom blocks")
+        list_id = existing["id"] if existing else None
+    if list_id:
+        a.call(
+            "POST",
+            f"/api/v1/dns/blocklists/{list_id}/entries",
+            json={
+                "domain": "ads.example-tracker.com",
+                "entry_type": "block",
+                "is_wildcard": True,
+                "reason": "ad/tracking",
+            },
+        )
+        a.call(
+            "POST",
+            f"/api/v1/dns/blocklists/{list_id}/exceptions",
+            json={"domain": "cdn.allowed-partner.com", "reason": "required CDN"},
+        )
+
+    if not dns_group_id:
+        print("  · skipping group-scoped DNS sub-resources (no DNS group id)")
+        return
+
+    # Split-horizon view.
+    a.call(
+        "POST",
+        f"/api/v1/dns/groups/{dns_group_id}/views",
+        json={
+            "name": "internal",
+            "description": "Internal split-horizon view",
+            "match_clients": ["10.0.0.0/8", "192.168.0.0/16"],
+            "recursion": True,
+            "order": 0,
+        },
+    )
+
+    # ACL.
+    a.call(
+        "POST",
+        f"/api/v1/dns/groups/{dns_group_id}/acls",
+        json={
+            "name": "trusted-internal",
+            "description": "RFC1918 trusted ranges",
+            "entries": [
+                {"value": "10.0.0.0/8", "negate": False, "order": 0},
+                {"value": "192.168.0.0/16", "negate": False, "order": 1},
+            ],
+        },
+    )
+
+    # TSIG key — omit 'secret' so the server generates one.
+    a.call(
+        "POST",
+        f"/api/v1/dns/groups/{dns_group_id}/tsig-keys",
+        json={
+            "name": "tsig-update.spatium.local.",
+            "algorithm": "hmac-sha256",
+            "notes": "DDNS update key",
+        },
+    )
+
+    # GSLB pool with two inline members on the forward zone.
+    if dns_fwd_zone_id:
+        a.call(
+            "POST",
+            f"/api/v1/dns/groups/{dns_group_id}/zones/{dns_fwd_zone_id}/pools",
+            json={
+                "name": "web-gslb",
+                "description": "Health-balanced web frontends",
+                "record_name": "app.corp.example.com.",
+                "record_type": "A",
+                "ttl": 30,
+                "hc_type": "tcp",
+                "hc_target_port": 443,
+                "members": [
+                    {"address": "10.10.10.20", "weight": 1, "enabled": True},
+                    {"address": "10.10.10.21", "weight": 1, "enabled": True},
+                ],
+            },
+        )
+
+    # Catalog-template zone — resolve a template with no required params so
+    # the seeder doesn't have to guess parameter values.
+    catalog = a.call("GET", "/api/v1/dns/zone-templates") or {}
+    templates = catalog.get("templates", []) if isinstance(catalog, dict) else []
+    chosen = None
+    for tmpl in templates:
+        params = tmpl.get("parameters", [])
+        if not any(p.get("required") for p in params):
+            chosen = tmpl
+            break
+    if chosen:
+        a.call(
+            "POST",
+            f"/api/v1/dns/groups/{dns_group_id}/zones/from-template",
+            json={
+                "template_id": chosen["id"],
+                "zone_name": "lab.corp.example.com",
+                "params": {},
+                "zone_type": "primary",
+                "kind": "forward",
+            },
+        )
+    else:
+        print("  · skipping template zone (no zero-required-param template in catalog)")
+
+
+# ── Section: DHCP sub-resources ───────────────────────────────────────────
+
+
+def seed_dhcp_subresources(a: Api, dhcp_group_id: str | None, scope_id: str | None):
+    """Client class, static reservation, MAC block, option template, PXE
+    profile, phone profile. All persist without a live Kea agent.
+    """
+    if not dhcp_group_id:
+        print("  · skipping DHCP sub-resources (no DHCP group id)")
+        return
+    print("Creating DHCP sub-resources…")
+
+    a.call(
+        "POST",
+        f"/api/v1/dhcp/server-groups/{dhcp_group_id}/client-classes",
+        json={
+            "name": "voip-phones",
+            "match_expression": "substring(option[60].hex,0,9) == 'PXEClient'",
+            "description": "Match VoIP vendor class",
+            "options": {},
+        },
+    )
+
+    a.call(
+        "POST",
+        f"/api/v1/dhcp/server-groups/{dhcp_group_id}/mac-blocks",
+        json={
+            "mac_address": "00:11:22:33:44:55",
+            "reason": "rogue",
+            "description": "Unauthorized AP",
+            "enabled": True,
+        },
+    )
+
+    a.call(
+        "POST",
+        f"/api/v1/dhcp/server-groups/{dhcp_group_id}/option-templates",
+        json={
+            "name": "Corp DNS+NTP",
+            "description": "Standard resolver + NTP options",
+            "address_family": "ipv4",
+            "options": {
+                "domain-name-servers": "10.10.10.20,10.10.10.21",
+                "ntp-servers": "10.10.10.5",
+            },
+        },
+    )
+
+    a.call(
+        "POST",
+        f"/api/v1/dhcp/server-groups/{dhcp_group_id}/pxe-profiles",
+        json={
+            "name": "netboot-bios+ipxe",
+            "description": "BIOS PXE + iPXE chainload",
+            "next_server": "10.10.10.5",
+            "enabled": True,
+            "matches": [
+                {
+                    "priority": 100,
+                    "match_kind": "first_stage",
+                    "arch_codes": [0],
+                    "boot_filename": "undionly.kpxe",
+                },
+                {
+                    "priority": 50,
+                    "match_kind": "ipxe_chain",
+                    "boot_filename": "http://10.10.10.5/boot.ipxe",
+                },
+            ],
+        },
+    )
+
+    phone_body: dict = {
+        "name": "polycom-voip",
+        "description": "Polycom TFTP provisioning",
+        "enabled": True,
+        "vendor": "Polycom",
+        "vendor_class_match": "Polycom",
+        "option_set": [{"code": 66, "value": "10.10.10.5"}],
+        "scope_ids": [scope_id] if scope_id else [],
+    }
+    a.call(
+        "POST",
+        f"/api/v1/dhcp/server-groups/{dhcp_group_id}/phone-profiles",
+        json=phone_body,
+    )
+
+    # Static reservation needs a scope. The IP must be OUTSIDE the seeded
+    # dynamic pool (10.10.10.100-149) so the in-pool conflict guard (409)
+    # doesn't fire — .50 is clear.
+    if scope_id:
+        a.call(
+            "POST",
+            f"/api/v1/dhcp/scopes/{scope_id}/statics",
+            json={
+                "ip_address": "10.10.10.50",
+                "mac_address": "52:54:00:ab:cd:ef",
+                "hostname": "printer-lobby",
+                "description": "Reserved lobby printer",
+            },
+        )
+    else:
+        print("  · skipping DHCP static (no Servers DHCP scope id)")
+
+
+# ── Section: Governance (RBAC sample + tokens + conformity + webhooks) ─────
+
+
+def seed_rbac_sample(a: Api):
+    """A custom role + non-admin user + group binding them, plus a
+    time-bound grant on the group. Ordered role → user → group so the
+    group's role_ids / user_ids resolve on first POST.
+    """
+    print("Creating sample RBAC role + user + group…")
+
+    a.call(
+        "POST",
+        "/api/v1/roles",
+        json={
+            "name": "Helpdesk (read-only IPAM+DNS)",
+            "description": "Demo delegated role: read-only on IPAM and DNS",
+            "permissions": [
+                {"action": "read", "resource_type": "ipam"},
+                {"action": "read", "resource_type": "dns"},
+            ],
+        },
+    )
+    roles = a.call("GET", "/api/v1/roles") or []
+    role = find(roles, "name", "Helpdesk (read-only IPAM+DNS)")
+    role_id = role["id"] if role else None
+
+    a.call(
+        "POST",
+        "/api/v1/users",
+        json={
+            "username": "helpdesk-demo",
+            "email": "helpdesk-demo@corp.example.com",
+            "display_name": "Helpdesk Demo",
+            "password": "DemoPassw0rd!",
+            "is_superadmin": False,
+            "force_password_change": True,
+        },
+    )
+    users = a.call("GET", "/api/v1/users") or []
+    user = find(users, "username", "helpdesk-demo")
+    user_id = user["id"] if user else None
+
+    group_body: dict = {
+        "name": "Helpdesk",
+        "description": "Demo group — delegated read-only operators",
+        "auth_source": "local",
+        "role_ids": [role_id] if role_id else [],
+        "user_ids": [user_id] if user_id else [],
+    }
+    a.call("POST", "/api/v1/groups", json=group_body)
+    groups = a.call("GET", "/api/v1/groups") or []
+    group = find(groups, "name", "Helpdesk")
+    group_id = group["id"] if group else None
+
+    if not group_id:
+        print("  · skipping time-bound grant (no Helpdesk group id)")
+        return
+
+    # Time-bound grant — NOT idempotent (no unique constraint), so list-then-
+    # skip on a stable (action, resource_type) key to avoid pile-up on re-run.
+    existing_grants = (
+        a.call("GET", f"/api/v1/groups/time-bound-grants?group_id={group_id}") or []
+    )
+    already = any(
+        g.get("action") == "write" and g.get("resource_type") == "dhcp"
+        for g in existing_grants
+    )
+    if already:
+        print("  · time-bound grant already present; skipping")
+    else:
+        a.call(
+            "POST",
+            "/api/v1/groups/time-bound-grants",
+            json={
+                "group_id": group_id,
+                "action": "write",
+                "resource_type": "dhcp",
+                "expires_at": "2030-01-01T00:00:00Z",
+                "reason": "Demo: temporary DHCP write for on-call",
+            },
+        )
+
+
+def seed_api_token(a: Api):
+    """A read-only scoped API token. NOT idempotent (no unique name) — guard
+    via list-then-skip. The raw token is returned once; we discard it (a
+    seeded demo token is never used for real automation).
+    """
+    print("Creating scoped API token…")
+    existing = a.call("GET", "/api/v1/api-tokens") or []
+    if find(existing, "name", "Ansible inventory (read-only)"):
+        print("  · API token already present; skipping")
+        return
+    a.call(
+        "POST",
+        "/api/v1/api-tokens",
+        json={
+            "name": "Ansible inventory (read-only)",
+            "description": "Demo automation token — read scope only",
+            "expires_in_days": 365,
+            "scopes": ["read"],
+            "resource_grants": [],
+        },
+    )
+
+
+def seed_conformity_policy(a: Api):
+    """A custom conformity policy. Gated behind compliance.conformity
+    (default-enabled) — tolerate a 404 if the module is off. NOT idempotent
+    (no unique name) — guard via list-then-skip. Seeded disabled so the beat
+    engine doesn't immediately evaluate it.
+    """
+    print("Creating custom conformity policy…")
+    listed = a.call("GET", "/api/v1/conformity/policies")
+    if listed is None:
+        # Module likely disabled (404) or another non-200 — skip cleanly.
+        print("  · conformity unavailable (module disabled?); skipping")
+        return
+    if find(listed, "name", "Every subnet has an owner field"):
+        print("  · conformity policy already present; skipping")
+        return
+    a.call(
+        "POST",
+        "/api/v1/conformity/policies",
+        json={
+            "name": "Every subnet has an owner field",
+            "description": "Demo custom policy: subnets must set the 'owner' custom field",
+            "framework": "custom",
+            "severity": "warning",
+            "target_kind": "subnet",
+            "target_filter": {},
+            "check_kind": "has_field",
+            "check_args": {"field": "owner"},
+            "enabled": False,
+            "eval_interval_hours": 24,
+        },
+    )
+
+
+def seed_webhook(a: Api):
+    """A typed-event webhook subscription pointed at a non-resolving host,
+    shipped disabled so the worker never attempts delivery. NOT idempotent
+    (no unique name) — guard via list-then-skip. Blocked in DEMO_MODE (403),
+    which the Api wrapper logs and continues past.
+    """
+    print("Creating webhook subscription (disabled)…")
+    existing = a.call("GET", "/api/v1/webhooks")
+    if existing is None:
+        # 403 in DEMO_MODE or another non-200 — skip cleanly.
+        print("  · webhooks unavailable (demo mode?); skipping")
+        return
+    if find(existing, "name", "Demo SIEM forwarder"):
+        print("  · webhook subscription already present; skipping")
+        return
+    a.call(
+        "POST",
+        "/api/v1/webhooks",
+        json={
+            "name": "Demo SIEM forwarder",
+            "description": "Demo typed-event subscription (no live receiver)",
+            "enabled": False,
+            "url": "https://example.invalid/spatiumddi-hook",
+            "event_types": ["subnet.created", "dns.zone.created"],
+            "timeout_seconds": 10,
+            "max_attempts": 8,
+        },
+    )
+
+
 # ── Driver ────────────────────────────────────────────────────────────────
 
 
@@ -788,7 +1790,7 @@ def main(base: str, user: str, pw: str):
         asns=asns,
     )
     seed_addresses(a, subnets)
-    seed_dhcp_scope(a, dhcp_group_id, subnets)
+    dhcp_scope_id = seed_dhcp_scope(a, dhcp_group_id, subnets)
 
     seed_network_devices(a, space_id)
     seed_legacy_vlans(a)
@@ -796,6 +1798,35 @@ def main(base: str, user: str, pw: str):
     seed_domains(a)
     seed_custom_fields(a)
     seed_ipam_templates(a, dns_group_id, dhcp_group_id)
+
+    # IPAM extras — NAT mappings reference seeded subnets/IPs; multicast +
+    # subnet plan need the Corporate space id; multicast membership needs
+    # an allocated IP in the Servers subnet (already seeded above).
+    seed_nat_mappings(a, subnets)
+    seed_multicast(a, space_id, subnets)
+    seed_subnet_plan(a, space_id)
+
+    # Network modeling — ownership entities first (providers need ASNs;
+    # circuits need a provider; services need a customer; overlays + service
+    # attaches reference circuits / sites / vrfs / subnets).
+    customers = seed_customers(a)
+    sites = seed_sites(a)
+    providers = seed_providers(a, asns)
+    circuits = seed_circuits(a, providers, customers, sites, subnets)
+    seed_applications(a)
+    seed_services(a, customers, vrfs, sites, circuits, subnets)
+    seed_overlays(a, customers, sites, circuits)
+
+    # DNS + DHCP sub-resources — both persist without a live agent.
+    seed_dns_subresources(a, dns_group_id, dns_fwd_zone_id)
+    seed_dhcp_subresources(a, dhcp_group_id, dhcp_scope_id)
+
+    # Governance + admin data.
+    seed_rbac_sample(a)
+    seed_api_token(a)
+    seed_conformity_policy(a)
+    seed_webhook(a)
+
     seed_alert_rules(a)
     seed_ai_prompts(a)
 

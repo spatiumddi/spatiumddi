@@ -1467,6 +1467,10 @@ export function FleetTab({
           onRekey={() => setRekeyTarget(drilldown)}
           onDelete={() => setDeleteTarget(drilldown)}
           onRowUpdated={(next) => setDrilldown(next)}
+          onViewUpgradeImages={() => {
+            setDrilldown(null);
+            setView("upgrade-images");
+          }}
         />
       )}
 
@@ -2228,6 +2232,7 @@ function ApplianceDrilldownModal({
   onRekey,
   onDelete,
   onRowUpdated,
+  onViewUpgradeImages,
 }: {
   row: ApplianceRow;
   onClose: () => void;
@@ -2237,6 +2242,11 @@ function ApplianceDrilldownModal({
   onRekey: () => void;
   onDelete: () => void;
   onRowUpdated: (next: ApplianceRow) => void;
+  // Closes this modal and switches the Fleet sub-nav to the
+  // "Upgrade images" view — wired into the OS-upgrade section's
+  // empty state so operators aren't told to look for a section
+  // that moved (#199 renamed slot-images → Upgrade images).
+  onViewUpgradeImages?: () => void;
 }) {
   const caps = row.capabilities ?? {};
   const badge = stateBadge(row.state);
@@ -2357,7 +2367,12 @@ function ApplianceDrilldownModal({
           <ApplianceClusterHealthSection row={row} />
         )}
 
-        {row.state === "approved" && <ApplianceOsUpgradeSection row={row} />}
+        {row.state === "approved" && (
+          <ApplianceOsUpgradeSection
+            row={row}
+            onViewUpgradeImages={onViewUpgradeImages}
+          />
+        )}
 
         {row.state === "approved" && (
           <div>
@@ -4143,7 +4158,13 @@ function UpgradeStatusPanel({
   );
 }
 
-function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
+function ApplianceOsUpgradeSection({
+  row,
+  onViewUpgradeImages,
+}: {
+  row: ApplianceRow;
+  onViewUpgradeImages?: () => void;
+}) {
   const qc = useQueryClient();
   const [sourceKind, setSourceKind] = useState<"url" | "uploaded">("uploaded");
   const [tag, setTag] = useState("");
@@ -4345,8 +4366,21 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
               </select>
               {uploadedQuery.data && uploadedQuery.data.length === 0 && (
                 <p className="text-[11px] text-muted-foreground">
-                  No upgrade images uploaded yet. Open the &ldquo;Upgrade
-                  images&rdquo; section above to upload one.
+                  No upgrade images uploaded yet.{" "}
+                  {onViewUpgradeImages ? (
+                    <button
+                      type="button"
+                      onClick={onViewUpgradeImages}
+                      className="font-medium text-primary underline-offset-2 hover:underline"
+                    >
+                      Go to Upgrade images →
+                    </button>
+                  ) : (
+                    <>
+                      Open <strong>Fleet → Upgrade images</strong> to upload or
+                      import one.
+                    </>
+                  )}
                 </p>
               )}
               <input

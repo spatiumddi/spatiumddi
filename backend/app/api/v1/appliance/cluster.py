@@ -161,10 +161,14 @@ async def cluster_health(db: DB) -> ClusterHealth:
         # Off-loop: the gather is a handful of blocking stdlib kubeapi calls.
         snap = await anyio.to_thread.run_sync(get_cluster_health)
     except k8s.KubeapiUnavailableError as exc:
+        # Generic client-facing detail; log the exception text server-side so
+        # an internal error message can't reach the operator's browser
+        # (CodeQL py/stack-trace-exposure).
+        logger.info("cluster_health_kubeapi_unreachable", error=str(exc))
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            f"kubeapi unreachable from api: {exc}",
-        )
+            "kubeapi unreachable from api; retry shortly.",
+        ) from exc
     await _merge_host_partitions(db, snap)
     return ClusterHealth(**snap)
 
@@ -194,7 +198,11 @@ async def cluster_health_stream(request: Request) -> StreamingResponse:
                 async with AsyncSessionLocal() as db:
                     await _merge_host_partitions(db, snap)
             except k8s.KubeapiUnavailableError as exc:
-                snap = cluster_unavailable(f"kubeapi unreachable: {exc}")
+                # Log detail server-side; keep the client-facing reason generic
+                # so an exception message can't leak internals to the browser
+                # (CodeQL py/stack-trace-exposure).
+                logger.info("cluster_health_stream_kubeapi_unreachable", error=str(exc))
+                snap = cluster_unavailable("kubeapi unreachable; retrying")
             except Exception as exc:  # noqa: BLE001 — never let the stream die
                 logger.warning("cluster_health_stream_gather_failed", error=str(exc))
                 snap = cluster_unavailable("health gather failed; retrying")

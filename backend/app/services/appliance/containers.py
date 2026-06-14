@@ -63,6 +63,24 @@ class ContainerSummary:
     short_id: str
     started_at: datetime | None
     is_spatium: bool
+    component: str  # workload label (api/worker/frontend/…) — #416 log picker
+
+
+def _pod_component(pod: dict[str, Any]) -> str:
+    """Workload component for a pod — the ``app.kubernetes.io/component``
+    label, else the chart-prefix-stripped pod name. Mirrors
+    ``cluster_health._pod_component`` (kept local to avoid an import cycle)."""
+    labels = (pod.get("metadata") or {}).get("labels") or {}
+    comp = labels.get("app.kubernetes.io/component")
+    if comp:
+        return comp
+    name = (pod.get("metadata") or {}).get("name") or "?"
+    for pre in ("spatium-control-spatiumddi-", "spatium-bootstrap-", "spatium-"):
+        if name.startswith(pre):
+            name = name[len(pre) :]
+            break
+    parts = name.rsplit("-", 2)
+    return parts[0] if len(parts) == 3 else name
 
 
 def _parse_pod_to_summary(pod: dict[str, Any]) -> ContainerSummary:
@@ -153,6 +171,7 @@ def _parse_pod_to_summary(pod: dict[str, Any]) -> ContainerSummary:
         short_id=(meta.get("uid") or "")[:12],
         started_at=started_at,
         is_spatium=is_spatium,
+        component=_pod_component(pod),
     )
 
 
@@ -167,6 +186,25 @@ def list_containers() -> list[ContainerSummary]:
     # Spatium pods first, then alphabetical within each group.
     out.sort(key=lambda c: (not c.is_spatium, c.name))
     return out
+
+
+def resolve_workload_pod(component: str) -> str | None:
+    """Resolve a workload component (api/worker/frontend/…) to its current
+    running SpatiumDDI pod name — the newest, so a just-rolled Deployment
+    resolves to the fresh pod. Lets the log surface tail a stable workload
+    instead of a churny pod name (#416). None if nothing running matches."""
+    running = [
+        c
+        for c in list_containers()
+        if c.is_spatium and c.state == "running" and c.component == component
+    ]
+    if not running:
+        return None
+    running.sort(
+        key=lambda c: c.started_at or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+    return running[0].name
 
 
 def container_action(name: str, action: str) -> None:

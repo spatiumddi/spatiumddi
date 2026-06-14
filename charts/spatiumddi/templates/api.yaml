@@ -46,6 +46,14 @@ spec:
         - name: api
           image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Pin the runtime uid/gid to the image's ``app`` user (1000) so the
+          # slot-images hostPath — chowned 1000:1000 by spatiumddi-firstboot
+          # (#415) — is writable regardless of any cluster-level PodSecurity
+          # default. Matches the image USER directive: a no-op on a normal
+          # deploy, deterministic belt-and-braces on the appliance.
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
           ports:
             - name: http
               containerPort: 8000

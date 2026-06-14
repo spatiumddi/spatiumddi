@@ -490,6 +490,14 @@ jobs:
           # correct (renamed) filename — important for `sha256sum -c`.
           ( cd appliance/build && sha256sum "$(basename "$VERSIONED_XZ")" > "$(basename "$VERSIONED_SHA")" )
           ( cd appliance/build && sha256sum "$(basename "$STABLE_XZ")" > "$(basename "$STABLE_SHA")" )
+          # Drop the mkosi-ImageVersion-named sha sidecar that
+          # build-slot-image.sh wrote next to the original .raw.xz (e.g.
+          # spatiumddi-appliance-slot-0.1.0.sha256). The .raw.xz itself was
+          # renamed by the mv above; only this stray sha is left, and the
+          # upload globs below would otherwise attach the bogus 0.1.0 name
+          # to every release (#392).
+          SRC_SHA="${SRC_XZ%.raw.xz}.sha256"
+          rm -f "$SRC_SHA"
           ls -lh "$VERSIONED_XZ" "$STABLE_XZ" "$VERSIONED_SHA" "$STABLE_SHA"
           echo "slot_name=spatiumddi-appliance-slot-${VERSION}-amd64.raw.xz" >> "$GITHUB_OUTPUT"
       - name: Upload appliance artifacts (ISO + slot image)
@@ -701,3 +709,24 @@ jobs:
             ## Full Changelog
             ${{ env.PREV_TAG && format('https://github.com/{0}/compare/{1}...{2}', github.repository, env.PREV_TAG, needs.meta.outputs.version) || format('https://github.com/{0}/commits/{1}', github.repository, needs.meta.outputs.version) }}
           generate_release_notes: false
+
+      # ── Prune heavy assets off old releases (#392) ───────────────────────
+      # Version-aware retention: drop the generic-named duplicate ISO / slot
+      # assets from every non-latest release, plus the heavy *versioned*
+      # .iso + slot .raw.xz beyond the keep window. The release, tag, notes,
+      # and versioned .sha256 provenance sidecars are ALWAYS kept. Runs after
+      # the release is published, so the just-cut tag is "latest" and the
+      # keep window rolls forward on its own. A weekly scheduled run
+      # (.github/workflows/prune-release-assets.yml) is the safety net + the
+      # ad-hoc / dry-run knob; both call the same script.
+      - name: Prune old appliance release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          KEEP_VERSIONED: "15"
+          # Never prune the just-cut release's generic /latest/-backing
+          # assets even if GitHub hasn't propagated isLatest=true to it yet.
+          PROTECT_TAG: ${{ needs.meta.outputs.version }}
+        run: |
+          chmod +x scripts/prune-release-assets.sh
+          scripts/prune-release-assets.sh

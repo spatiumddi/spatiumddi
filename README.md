@@ -682,6 +682,15 @@ SpatiumDDI containers that ship as a Helm chart deploy on the
 appliance via [HelmChart CRDs](https://docs.k3s.io/helm).
 Operators get a real Kubernetes node without managing one.
 
+> **New to Kubernetes? Don't let that stop you.** You never have to
+> touch it — the six-question installer, the `/appliance` web UI, and
+> one-click atomic upgrades hide k3s completely; there are no `kubectl`
+> or `docker` commands to learn. If you're curious *why* we picked
+> embedded k3s over plain Docker Compose — flexibility, growing a single
+> box into a real high-availability cluster, and never hand-running
+> container commands — here's the plain-English rationale:
+> [**Why k3s, not Docker Compose?**](appliance/README.md#why-k3s-not-docker-compose)
+
 #### What you get out of the box
 
 - Single-node [k3s](https://k3s.io/) cluster (~70 MB static

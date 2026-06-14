@@ -191,7 +191,10 @@ async def put_image(image_id: uuid.UUID, request: Request) -> None:
     _verify_auth("put", image_id, request.headers.get(_AUTH_HEADER))
     _ensure_dir()
     target = _image_path(image_id)
-    tmp = target.with_suffix(".raw.xz.partial")
+    # Append ".partial" to the full ``<id>.raw.xz`` name — NOT
+    # ``with_suffix(".raw.xz.partial")``, which replaces only the final
+    # ``.xz`` and doubles the ``.raw`` into ``<id>.raw.raw.xz.partial`` (#415).
+    tmp = target.with_name(target.name + ".partial")
     # ``streamed`` flips True after the stream-loop completes; the
     # ``finally`` block uses it to decide whether to atomic-rename or
     # clean up the partial. Catches client disconnects + asyncio
