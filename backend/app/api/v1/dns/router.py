@@ -853,6 +853,80 @@ class RecordResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+def _normalize_record_struct_fields(
+    record_type: str,
+    priority: int | None,
+    weight: int | None,
+    port: int | None,
+) -> tuple[int | None, int | None, int | None]:
+    """Enforce per-type rules for the structured columns and return the
+    normalized ``(priority, weight, port)`` (#424).
+
+    These three columns are the source of truth — every driver
+    (bind9 / powerdns / windows) stitches them into the wire format and
+    silently substitutes ``0`` for a NULL. So a NULL weight/port on an
+    SRV renders as a meaningless ``prio 0 0 target``; the UI bug that
+    left them unset is what this guards against.
+
+    - **SRV** uses all three (RFC 2782 ``priority weight port target``);
+      all are required.
+    - **MX** uses ``priority`` (the preference); defaults to ``10`` when
+      omitted so the column is never NULL. Weight/port are not part of an
+      MX record.
+    - Every other type carries none of the three.
+
+    Raises ``HTTPException(422)`` on a type/field mismatch or out-of-range
+    value.
+    """
+    rtype = record_type.upper()
+
+    def _check_range(label: str, v: int | None) -> None:
+        if v is not None and not 0 <= v <= 65535:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{label} must be between 0 and 65535",
+            )
+
+    if rtype == "SRV":
+        missing = [
+            n for n, v in (("priority", priority), ("weight", weight), ("port", port)) if v is None
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "SRV records require "
+                    + ", ".join(missing)
+                    + " (an SRV is priority + weight + port + target)"
+                ),
+            )
+        _check_range("priority", priority)
+        _check_range("weight", weight)
+        _check_range("port", port)
+        return priority, weight, port
+
+    if rtype == "MX":
+        extra = [n for n, v in (("weight", weight), ("port", port)) if v is not None]
+        if extra:
+            raise HTTPException(
+                status_code=422,
+                detail=f"MX records take only a priority, not {', '.join(extra)}",
+            )
+        prio = priority if priority is not None else 10
+        _check_range("priority", prio)
+        return prio, None, None
+
+    extra = [
+        n for n, v in (("priority", priority), ("weight", weight), ("port", port)) if v is not None
+    ]
+    if extra:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{rtype} records do not take {', '.join(extra)}",
+        )
+    return None, None, None
+
+
 # ── Server Group endpoints ──────────────────────────────────────────────────
 
 
@@ -4139,6 +4213,11 @@ async def create_record(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
     await _check_driver_gated_record_type(body.record_type, group_id, db)
+    # #424 — per-type structured-field rules (SRV needs priority+weight+port,
+    # MX takes only priority and defaults it to 10, others take none).
+    body.priority, body.weight, body.port = _normalize_record_struct_fields(
+        body.record_type, body.priority, body.weight, body.port
+    )
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
 
     record = DNSRecord(
@@ -4201,6 +4280,12 @@ async def update_record(
     changes = body.model_dump(exclude_none=True)
     for k, v in changes.items():
         setattr(record, k, v)
+    # #424 — validate the merged per-type fields (record_type is immutable on
+    # update, so this checks the final priority/weight/port against the row's
+    # type and normalizes, e.g. defaulting MX priority to 10).
+    record.priority, record.weight, record.port = _normalize_record_struct_fields(
+        record.record_type, record.priority, record.weight, record.port
+    )
     if "name" in changes and zone:
         record.fqdn = f"{record.name}.{zone.name}" if record.name != "@" else zone.name
     target_serial = bump_zone_serial(zone) if zone is not None else None
