@@ -4077,8 +4077,8 @@ function UpgradeStatusPanel({
             live upgrade-progress reporting, so this dashboard can&rsquo;t show
             the trigger&rsquo;s status &mdash; the upgrade may already have
             fired. Verify on the host (<code>spatium-upgrade-slot status</code>,{" "}
-            <code>journalctl -u spatiumddi-slot-upgrade</code>) or apply the slot
-            image by hand, then reboot. Live progress appears here once the
+            <code>journalctl -u spatiumddi-slot-upgrade</code>) or apply the
+            slot image by hand, then reboot. Live progress appears here once the
             appliance is on &ge; 2026.06.12.
           </p>
         ) : (
