@@ -211,12 +211,15 @@ async def fetch_dhcp_audit_events(
     run_ps: Callable[[Any, dict[str, Any], str], str],
     day: str | None = None,
     max_events: int = 500,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     """Read + parse the Windows DHCP audit log for ``day``.
 
     ``day`` is the three-letter weekday code (``Mon`` / ``Tue`` / …).
-    ``None`` resolves to today. The returned list is ordered oldest →
-    newest (as in the file); the UI flips that for display.
+    ``None`` resolves to today. Returns ``(rows, truncated)`` ordered
+    oldest → newest (the UI flips that for display). #426: ``truncated``
+    is computed from the RAW row count the server returned, not the
+    post-parse count, so dropping an unparseable line can't make a capped
+    file falsely report "no more events".
     """
     day = day or current_weekday_code()
     if day not in _WEEKDAYS:
@@ -225,7 +228,7 @@ async def fetch_dhcp_audit_events(
     raw = await asyncio.to_thread(run_ps, server, creds, script)
     text = (raw or "").strip()
     if not text:
-        return []
+        return [], False
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -236,8 +239,9 @@ async def fetch_dhcp_audit_events(
             raw=text[:400],
             error=str(exc),
         )
-        return []
+        return [], False
     items: list[dict[str, Any]] = parsed if isinstance(parsed, list) else [parsed]
+    truncated = len(items) >= max_events
     year = _date.today().year
     out: list[dict[str, Any]] = []
     for it in items:
@@ -246,7 +250,7 @@ async def fetch_dhcp_audit_events(
         row = _parse_row(it, year=year)
         if row is not None:
             out.append(row)
-    return out
+    return out, truncated
 
 
 __all__ = [

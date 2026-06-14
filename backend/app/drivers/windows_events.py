@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -118,6 +118,12 @@ async def fetch_events(
     / "Verbose" / "Critical"), ``provider`` (str), ``machine`` (str),
     ``message`` (str). Empty list on no matches.
     """
+    # #426: coerce to tz-aware UTC so the ISO string carries an explicit
+    # offset. A naive `since` would isoformat() without one, and the
+    # Windows-side [datetime]::Parse() then reads it as server-LOCAL time,
+    # shifting the StartTime filter window by the host's UTC offset.
+    if since is not None:
+        since = (since.replace(tzinfo=UTC) if since.tzinfo is None else since).astimezone(UTC)
     since_iso = since.isoformat() if since else None
     script = _build_filter_script(
         log_name=log_name,

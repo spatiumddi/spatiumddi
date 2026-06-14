@@ -357,7 +357,7 @@ async def query_dhcp_audit(body: DhcpAuditRequest, db: DB) -> DhcpAuditResponse:
         )
 
     try:
-        raw_events = await get_audit_fn(
+        raw_events, raw_truncated = await get_audit_fn(
             server,
             day=body.day,
             max_events=body.max_events,
@@ -391,7 +391,9 @@ async def query_dhcp_audit(body: DhcpAuditRequest, db: DB) -> DhcpAuditResponse:
         server_id=body.server_id,
         day=resolved_day,
         events=events,
-        truncated=len(events) >= body.max_events,
+        # #426: trust the reader's raw-row-count truncation signal, not the
+        # post-parse len() (which under-reports when a line failed to parse).
+        truncated=raw_truncated,
     )
 
 
