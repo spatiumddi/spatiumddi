@@ -169,16 +169,17 @@ async def stream_workload_logs(component: str, tail: int = 100):
     (re)connect lands on the fresh pod.
     """
     try:
-        pod = resolve_workload_pod(component)
+        resolved = resolve_workload_pod(component)
     except DockerUnavailableError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
-    if pod is None:
+    if resolved is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             f"no running pod for workload {component!r}",
         )
+    pod, container = resolved
     try:
-        gen = stream_container_logs(pod, tail=tail)
+        gen = stream_container_logs(pod, tail=tail, container=container)
     except DockerUnavailableError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
     return _sse_log_response(gen)

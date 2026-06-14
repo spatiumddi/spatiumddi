@@ -43,8 +43,10 @@ changes.
   OS + app version, A/B slot + durable-default + trial-boot, upgrade
   state, nodes-ready + HA, supervisor approval + last-seen), the
   CPU / memory / nodes / workloads health ribbon and charts, and a
-  streaming pod-log tail with a workload picker, plus Reboot-host and
-  View-pods actions. Backed by a new `self_appliance` block on
+  live log tail that follows a **workload** (deployment / daemonset) —
+  resolved server-side to the current pod *and* container, so it survives
+  pod rolls, never shows churny pod names, and handles multi-container
+  pods (e.g. redis) — plus Reboot-host and View-pods actions. Backed by a new `self_appliance` block on
   `GET /appliance/info` sourced from the supervisor heartbeat — a pure
   DB read, so the api never touches host journald or files. Reproduced
   in React rather than bridging a PTY, so it re-exposes no shell / root
@@ -102,6 +104,18 @@ changes.
   empty-state told operators to open a section that had moved; it now
   offers a button that closes the dialog and jumps straight to the
   Upgrade-images view.
+* **celery-beat platform health check failed on HA Redis.** The beat
+  probe used a raw `aioredis.from_url`, which rejects the `sentinel://`
+  scheme used by HA Redis (`Redis URL must specify one of redis:// …`),
+  so the Platform Health card showed beat as errored on a Sentinel
+  deployment. It now uses the same Sentinel-aware helper as the redis +
+  workers probes.
+* **Fleet "Upgrade pending" no longer promises a fire that can't come.**
+  When an appliance's supervisor predates the 2026.06.12 upgrade-progress
+  telemetry it can't report progress, so the panel sat on "supervisor
+  will fire the trigger in ≤30 s" forever. It now detects the old version
+  and explains it, pointing at the host-side check / recovery
+  (`spatium-upgrade-slot status`, `journalctl -u spatiumddi-slot-upgrade`).
 
 ### Security
 
