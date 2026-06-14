@@ -20,6 +20,90 @@ the formatter handles the rest.
 
 ---
 
+## 2026.06.13-2 — 2026-06-13
+
+A focused **field-fix release** — five issues (#407–#411) surfaced while
+bringing up a fresh multi-appliance install on a Kubernetes / Helm
+control plane, shipped together as #412. The headline is a **hotfix for a
+reboot regression that 2026.06.13-1 introduced**: that release's
+auth-hardening (#400 C1) tightened the supervisor heartbeat and, as a
+side effect, silently broke reboot, fleet OS-upgrade, and role delivery
+for any approved appliance whose supervisor wasn't presenting a
+validating client cert. The rest fix off-cluster agent registration, a
+settings / UI gap that blocked appliance pairing on Helm control planes,
+a live-progress UX bug, and SSO operators being locked out of every
+sensitive-secret reveal. No schema changes.
+
+### Fixed
+
+* **#411 — reboot / fleet-upgrade / role delivery dead on
+  2026.06.13-1.** #400 C1 made the supervisor `/heartbeat` require a
+  client cert OR a valid session token, removing the prior
+  `state==APPROVED` bypass. An approved supervisor whose cert isn't
+  validating in the field had been riding that bypass; once it was gone
+  every heartbeat 403'd, and because the heartbeat returns before firing
+  desired-state triggers, this silently killed reboot **and** fleet
+  OS-upgrade **and** role assignment — not just the reboot button the
+  report noticed. Restored the session-token path: a cert-auth failure on
+  the heartbeat now falls back to the session token (still a real
+  per-appliance secret; the cluster-admin k3s join token stays gated on a
+  valid cert), the supervisor keeps sending its token alongside the cert,
+  and re-register mints a fresh token for already-cert'd rows so a box
+  that lost its token can recover one. Every #400 C1 invariant is
+  preserved (uuid-only rejected, wrong-token rejected, join-token
+  cert-only). The mTLS-cert-auth steady state + an auto-recover-on-403 so
+  a blanked-token box recovers without a manual re-pair are tracked as a
+  follow-up.
+* **#409 — DNS / DHCP agents fail to register with `[Errno -2] Name does
+  not resolve` on an Application appliance.** An Application appliance is
+  its own single-node k3s with no in-cluster `spatium-control` api
+  Service, so the #292 hardcoded in-cluster URL didn't resolve. The three
+  role-pod chart templates now prefer the supervisor-supplied external
+  `controlPlaneUrl` (→ `inClusterApiUrl` → the in-cluster default),
+  skipping TLS verification only on that external self-signed path — the
+  same trust-on-first-use model the supervisor pod already uses
+  (pairing-code + mTLS client cert are the real auth; TLS is just LAN
+  transport). Control-plane / full-stack appliances send
+  `controlPlaneUrl=""` and fall through to the unchanged in-cluster path.
+* **#410 — appliance OS-upgrade progress needed a hard page reload.** The
+  Fleet drilldown rendered a frozen open-time snapshot of the appliance
+  row, so the per-phase upgrade progress shipped via the supervisor
+  heartbeat never updated. It now renders the freshly-polled row by id (a
+  pure derivation — no flicker) and fast-polls every 2 s while any upgrade
+  or reboot is in flight.
+* **#407 — no way to enable appliance registration on a Helm control
+  plane.** `platform_settings.supervisor_registration_enabled` gates
+  supervisor pairing but was never exposed in the settings API, so
+  operators on a generic Kubernetes / Helm control plane (where the
+  OS-appliance self-bootstrap that auto-enables it never fires) could only
+  turn it on by hand-editing the database. Exposed it on the settings API
+  and added a **superadmin-only** toggle to the Fleet → Pairing tab; the
+  default stays FALSE, the write is superadmin-gated (mirroring
+  maintenance mode), and a flip writes a dedicated audit row.
+
+### Security
+
+* **#408 — SSO operators can now re-confirm sensitive reveals.** The
+  agent-keys / SNMP-community / appliance-kubeconfig / pairing-code
+  reveals re-verified a *local password* and hard-rejected every
+  external-auth account, and MFA enrolment was itself local-only — so an
+  OIDC / SAML / LDAP / RADIUS / TACACS+ superadmin had no way to reveal
+  those secrets. A new shared `reverify_operator` re-confirmation helper +
+  MFA enrolment opened to every auth source close the gap: **local users
+  prove their password; password-less SSO users prove a TOTP code** (enrol
+  under Account → Two-factor). A shared re-confirm component (password or
+  authenticator code) lands on all four reveal modals. An adversarial
+  review caught a defense-in-depth downgrade in the first cut — accepting
+  TOTP *in lieu of* the local password would let a hijacked session of a
+  local superadmin self-enrol MFA and reveal without the password — so the
+  shipped behaviour requires the password for local accounts and reserves
+  TOTP for password-less SSO accounts only. Deferred follow-ups: a
+  single-use replay guard on the reveal TOTP, widening the Security
+  dashboard's MFA-coverage rollup to include SSO enrollees, and adopting
+  the same helper for the delete-appliance / factory-reset flows.
+
+---
+
 ## 2026.06.13-1 — 2026-06-13
 
 The **appliance console + security-hardening** release. Six PRs: a
