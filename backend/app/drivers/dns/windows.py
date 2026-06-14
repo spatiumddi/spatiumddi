@@ -38,6 +38,14 @@ from typing import Any
 import structlog
 
 from app.core.crypto import decrypt_dict
+from app.drivers._winrm import (
+    MAX_ENCODED_COMMAND,
+    WinRMCommandTooLong,
+    encoded_command_len,
+)
+from app.drivers._winrm import (
+    run_ps as _winrm_run_ps,
+)
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
@@ -72,25 +80,32 @@ _SUPPORTED_RECORD_TYPES = (
 _WINRM_UNSUPPORTED_RECORD_TYPES = frozenset({"TLSA"})
 
 
-# Upper bound on ops bundled into a single WinRM round-trip in the batch
-# dispatcher (``apply_record_changes``). WinRM HTTP ``MaxEnvelopeSize``
-# defaults to 500KB (500 000 bytes, half a megabyte-ish). At ~1KB per
-# WinRM constraint: ``pywinrm.run_ps`` dispatches via ``powershell
-# -encodedcommand <base64>`` as a single CMD.EXE command line, capped
-# at 8191 chars by Windows. The minified wrapper below measures ~2000
-# raw chars (all eight record types + op dispatch), which costs ~5350
-# chars of cmdline budget before any ops. Each op adds ~160 raw chars
-# (~430 cmdline chars) once JSON-escaped + UTF-16-LE + base64'd.
-# Empirically **6 ops fit with realistic data**; 7 trips the CMD limit
-# ("The command line is too long"). Measured via
-# ``_ps_apply_record_batch(...)`` in the dev container.
-#
-# For 40 records that's 7 round trips — 6× faster than singular
-# dispatch with minimal added complexity. **To go higher**, switch
-# pywinrm for pypsrp: PSRP uses the WSMan Runspace protocol instead
-# of CMD.EXE and removes the 8K ceiling entirely. Tracked as a
-# follow-up (would yield ~100 ops/batch on the same envelope settings).
-_WINRM_BATCH_SIZE = 6
+# Hard upper bound on ops per WinRM round-trip in the batch dispatcher
+# (``apply_record_changes``). This is a sanity cap only — the REAL gate
+# is the encoded-command-line budget (CMD.EXE ~8191 chars; see
+# app/drivers/_winrm.py). #426: ``_pack_record_chunks`` packs each chunk
+# under ``MAX_ENCODED_COMMAND`` by measuring the actual built script, so
+# a chunk of large TXT (DKIM/SPF/DMARC) records can't silently overflow
+# the cmdline — the previous fixed count of 6 had no length check and a
+# few big TXT records would blow the cap and fail the whole chunk.
+# **To go much higher**, switch pywinrm for pypsrp: PSRP uses the WSMan
+# Runspace protocol instead of CMD.EXE and removes the 8K ceiling.
+_WINRM_MAX_BATCH_OPS = 25
+
+
+def _strip_txt_quotes(value: str) -> str:
+    """Strip one layer of surrounding double-quotes from a TXT value.
+
+    A TXT value may arrive zone-file-style (``"v=spf1 …"``). Both the
+    RFC-2136 path and the Windows ``-DescriptiveText`` cmdlet want the
+    literal text (the wire quoting is added by the renderer / by Windows),
+    so strip consistently in every write path (#426 — previously the
+    RFC-2136 path stripped but the WinRM paths shipped the value raw, so
+    the same record published differently depending on whether creds were
+    set)."""
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
+    return value
 
 
 def _format_rdata(r: RecordData) -> str:
@@ -101,13 +116,38 @@ def _format_rdata(r: RecordData) -> str:
     if rtype == "SRV":
         return f"{r.priority or 0} {r.weight or 0} {r.port or 0} {r.value}"
     if rtype == "TXT":
-        s = r.value
-        if s.startswith('"') and s.endswith('"') and len(s) >= 2:
-            s = s[1:-1]
+        s = _strip_txt_quotes(r.value)
         s = s.replace("\\", "\\\\").replace('"', '\\"')
         chunks = [s[i : i + 255] for i in range(0, len(s), 255)] or [""]
         return " ".join(f'"{c}"' for c in chunks)
     return r.value
+
+
+def _pack_record_chunks(
+    eligible: list[tuple[int, RecordChange]],
+) -> list[list[tuple[int, RecordChange]]]:
+    """Greedily pack ``(orig_idx, change)`` pairs into chunks whose built
+    PowerShell batch script stays under the encoded-command budget (and
+    the ``_WINRM_MAX_BATCH_OPS`` sanity cap). A single op that won't fit
+    even alone still ships as a one-op chunk; the dispatcher catches the
+    resulting WinRMCommandTooLong and fails just that op (#426)."""
+    chunks: list[list[tuple[int, RecordChange]]] = []
+    current: list[tuple[int, RecordChange]] = []
+
+    def fits(candidate: list[tuple[int, RecordChange]]) -> bool:
+        script = _ps_apply_record_batch([c for _, c in candidate])
+        return encoded_command_len(script) <= MAX_ENCODED_COMMAND
+
+    for pair in eligible:
+        trial = current + [pair]
+        if current and (len(trial) > _WINRM_MAX_BATCH_OPS or not fits(trial)):
+            chunks.append(current)
+            current = [pair]
+        else:
+            current = trial
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 class WindowsDNSDriver(DNSDriver):
@@ -250,18 +290,17 @@ class WindowsDNSDriver(DNSDriver):
         session, ships one PowerShell cmdlet, and tears the session down
         — roughly 1.5s of overhead per op. An 81-record "Sync with
         servers" reconcile racks up to ~3 minutes that way. Batched
-        dispatch groups up to ``_WINRM_BATCH_SIZE`` ops into one
-        PowerShell script with ``$ErrorActionPreference = 'Continue'``
-        plus per-op ``try / catch``, sends it in a single round trip,
-        and parses per-op ``{ok, error}`` back out. Same 81 ops → one
-        round trip, ~5–10s.
+        dispatch packs ops into one PowerShell script per chunk with
+        ``$ErrorActionPreference = 'Continue'`` plus per-op ``try /
+        catch``, sends it in a single round trip, and parses per-op
+        ``{ok, error}`` back out. Same 81 ops → a handful of round trips.
 
         Routing matches the singular path:
 
         * WinRM-eligible ops (server has credentials AND record type is
-          not in ``_WINRM_UNSUPPORTED_RECORD_TYPES``) are partitioned
-          into chunks of ``_WINRM_BATCH_SIZE`` and dispatched as a
-          single script per chunk.
+          not in ``_WINRM_UNSUPPORTED_RECORD_TYPES``) are packed by
+          ``_pack_record_chunks`` under the encoded-command budget (#426)
+          and dispatched as a single script per chunk.
         * Everything else (TLSA on any server, or any record on a
           credentials-less server) falls through to the RFC 2136 path.
           RFC 2136 ops are small and independent — we run them
@@ -311,19 +350,28 @@ class WindowsDNSDriver(DNSDriver):
         if rfc2136_ops:
             await asyncio.gather(*(_one_rfc2136(i, c) for i, c in rfc2136_ops))
 
-        # WinRM dispatch — chunked into single-script round trips.
+        # WinRM dispatch — chunked into single-script round trips. #426:
+        # pack each chunk under the encoded-command-line budget instead of a
+        # fixed op count, so a chunk of large TXT (DKIM/SPF/DMARC) records
+        # can't silently overflow the CMD.EXE cap. An over-budget single op
+        # fails just itself; nothing aborts the whole reconcile.
         if winrm_eligible:
             creds = _load_credentials(server)
-            chunks = [
-                winrm_eligible[i : i + _WINRM_BATCH_SIZE]
-                for i in range(0, len(winrm_eligible), _WINRM_BATCH_SIZE)
-            ]
+            chunks = _pack_record_chunks(winrm_eligible)
             total_chunks = len(chunks)
             for chunk_index, chunk in enumerate(chunks):
                 batch_changes = [c for _, c in chunk]
                 script = _ps_apply_record_batch(batch_changes)
-                raw = await asyncio.to_thread(_run_ps, server, creds, script)
-                batch_results = _parse_record_batch_results(raw, batch_changes)
+                try:
+                    raw = await asyncio.to_thread(_run_ps, server, creds, script)
+                    batch_results = _parse_record_batch_results(raw, batch_changes)
+                except WinRMCommandTooLong as exc:
+                    # 1-op chunk that still won't fit (an absurd TXT value) —
+                    # fail just it, keep the rest of the reconcile going.
+                    batch_results = [
+                        RecordChangeResult(ok=False, change=c, error=str(exc))
+                        for c in batch_changes
+                    ]
                 ok_count = sum(1 for r in batch_results if r.ok)
                 failed_count = len(batch_results) - ok_count
                 logger.info(
@@ -685,37 +733,11 @@ def _load_credentials(server: Any) -> dict[str, Any]:
 def _run_ps(server: Any, creds: dict[str, Any], script: str) -> str:
     """Run a PowerShell script on the Windows DNS server over WinRM.
 
-    Mirrors the DHCP-side helper: same credential dict shape, same
-    transport / TLS / port defaults. Blocking — call via
-    ``asyncio.to_thread``. Returns stdout as text; raises ``RuntimeError``
-    on non-zero exit.
+    Thin wrapper over the shared :func:`app.drivers._winrm.run_ps`
+    chokepoint (transport/TLS/timeout/size-budget). Blocking — call via
+    ``asyncio.to_thread``.
     """
-    # Deferred import: keeps celery-worker startup light and means hosts
-    # that only run agent-based drivers don't need the pywinrm wheel.
-    import winrm  # noqa: PLC0415
-
-    transport = creds.get("transport") or "ntlm"
-    use_tls = bool(creds.get("use_tls", False))
-    verify_tls = bool(creds.get("verify_tls", False))
-    port = int(creds.get("winrm_port") or (5986 if use_tls else 5985))
-    scheme = "https" if use_tls else "http"
-    host = getattr(server, "host", "")
-    endpoint = f"{scheme}://{host}:{port}/wsman"
-
-    session = winrm.Session(
-        endpoint,
-        auth=(creds.get("username", ""), creds.get("password", "")),
-        transport=transport,
-        server_cert_validation="validate" if verify_tls else "ignore",
-    )
-    result = session.run_ps(script)
-    stdout = (result.std_out or b"").decode("utf-8", errors="replace")
-    stderr = (result.std_err or b"").decode("utf-8", errors="replace")
-    if result.status_code != 0:
-        raise RuntimeError(
-            f"winrm exit={result.status_code}: {stderr.strip() or stdout.strip() or '<no output>'}"
-        )
-    return stdout
+    return _winrm_run_ps(getattr(server, "host", ""), creds, script, op_label="dns")
 
 
 def _parse_zones(raw: str) -> list[dict[str, Any]]:
@@ -810,6 +832,9 @@ def _ps_apply_record(change: RecordChange) -> str:
     name = _ps_escape_single_quoted(rel_name)
     ttl = int(change.record.ttl or 3600)
     value = _ps_escape_single_quoted(change.record.value)
+    # TXT: strip zone-file-style surrounding quotes so the WinRM path
+    # publishes the same literal text as the RFC-2136 path (#426).
+    txt_value = _ps_escape_single_quoted(_strip_txt_quotes(change.record.value))
 
     # Per-type create script. ``-AllowUpdateAny`` isn't a real switch — we
     # use ``-ErrorAction Stop`` so any duplicate surfaces a clean failure
@@ -863,7 +888,7 @@ def _ps_apply_record(change: RecordChange) -> str:
     elif rtype == "TXT":
         create = (
             f"Add-DnsServerResourceRecord -ZoneName '{zone}' -Name '{name}' -Txt "
-            f"-DescriptiveText '{value}' -TimeToLive ([TimeSpan]::FromSeconds({ttl})) "
+            f"-DescriptiveText '{txt_value}' -TimeToLive ([TimeSpan]::FromSeconds({ttl})) "
             "-ErrorAction Stop"
         )
     else:
@@ -946,6 +971,11 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
     for i, change in enumerate(changes):
         rtype = change.record.record_type.upper()
         name = change.record.name if change.record.name not in ("", "@") else "@"
+        value = change.record.value or ""
+        # TXT: strip zone-file-style surrounding quotes for parity with the
+        # singular WinRM path + the RFC-2136 path (#426).
+        if rtype == "TXT":
+            value = _strip_txt_quotes(value)
         ops.append(
             {
                 "i": i,
@@ -953,7 +983,7 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
                 "z": (change.zone_name or "").rstrip("."),
                 "n": name,
                 "t": rtype,
-                "v": change.record.value or "",
+                "v": value,
                 "ttl": int(change.record.ttl or 3600),
                 "pr": int(change.record.priority or 0),
                 "w": int(change.record.weight or 0),
@@ -967,12 +997,16 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
     # with UTF-16-LE then sends via ``powershell -encodedcommand <b64>``
     # as a single CMD.EXE command line — hard-capped at 8191 chars by
     # Windows. Base64 costs ×1.33, UTF-16-LE costs ×2, so each raw
-    # script char eats ~2.67 chars of command-line budget. Budget works
-    # out to ~3050 raw chars total. The wrapper below is ~1000 chars;
-    # with ~130 chars per op in JSON that leaves room for ~15 ops per
-    # batch on stock Windows. Set ``_WINRM_BATCH_SIZE`` accordingly.
+    # script char eats ~2.67 chars of command-line budget. The caller
+    # (_pack_record_chunks) measures the built script's encoded length
+    # and packs each chunk under MAX_ENCODED_COMMAND, so this wrapper's
+    # size is accounted for automatically rather than via a fixed count.
     return (
-        "$E='Continue'\n"
+        # #426: was "$E='Continue'" — a no-op (PS vars are case-insensitive,
+        # so it aliased the loop's $e and was immediately overwritten). The
+        # intent is the error-action preference; per-op isolation is anyway
+        # guaranteed by -EA Stop + the per-op try/catch below.
+        "$ErrorActionPreference='Continue'\n"
         "$p=[Text.Encoding]::UTF8.GetString("
         f"[Convert]::FromBase64String('{payload_b64}'))\n"
         "$r=@()\n"

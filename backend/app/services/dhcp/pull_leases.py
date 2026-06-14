@@ -359,10 +359,14 @@ async def _load_scope_cache(db: AsyncSession, group_id: Any) -> dict[Any, Any]:
     """
     if group_id is None:
         return {}
+    # #426: do NOT filter is_active here. The Windows lease pull now
+    # enumerates ALL scopes (it dropped its ``State -eq 'Active'`` scope
+    # pre-filter), so a lease living in a deactivated-but-existing scope
+    # would otherwise get scope_id=NULL even though its scope is right
+    # here. Match the wire reads so the FK backlink wires correctly.
     res = await db.execute(
         select(DHCPScope.subnet_id, DHCPScope.id).where(
             DHCPScope.group_id == group_id,
-            DHCPScope.is_active.is_(True),
         )
     )
     return {subnet_id: scope_id for subnet_id, scope_id in res.all()}

@@ -26,6 +26,34 @@ Batched fixes for the next cut (not yet released).
 
 ### Fixed
 
+* **#426 — Windows DNS/DHCP integration hardening (audit follow-up).** A
+  full audit of the WinRM/PowerShell integration confirmed 19 defects;
+  this fixes them. **Blocker:** DHCP bulk reservation/exclusion writes
+  embedded a full PowerShell snippet per op and overflowed the 8191-char
+  CMD.EXE ``-EncodedCommand`` cap at 3–4 ops (a 30-op batch was ~9× over)
+  → 502 + rollback. The DHCP and DNS batch dispatchers now ship
+  **data-only** payloads with one shared cmdlet body and pack each chunk
+  under the encoded-command budget (a new ``app/drivers/_winrm.py``
+  chokepoint measures it), so large batches — including DKIM/SPF/DMARC TXT
+  records — split instead of overflowing, and an over-budget single op
+  fails just itself. **Data-loss fixes:** the lease pull no longer
+  pre-filters ``State -eq 'Active'`` scopes (leases under a deactivated
+  scope were being absence-deleted), and a garbled/truncated lease
+  response now re-raises instead of reading as "zero leases" (which
+  drove a full lease + IPAM-mirror purge stamped ``success``).
+  **Write-through fixes:** exclusion idempotency is now a locale-safe
+  pre-check (the old English ``'already'`` substring match 502'd on
+  non-English hosts), an IP-only reservation edit now does remove-then-add
+  (Windows can't relocate a reservation's IP via ``Set-``), and the scope
+  option reconcile is set-then-prune (a mid-reconcile failure no longer
+  leaves options wiped). TXT values are quote-normalised consistently
+  across all write paths. **Transport hardening:** a shared chokepoint
+  adds WinRM operation/read timeouts, a one-time WARNING when TLS
+  validation is off or basic auth runs over cleartext (matching the #289
+  clients), TLS-aware port defaulting (5986 for HTTPS, not 5985), and
+  transport/port validation on the credential schemas. The #424 SRV/MX
+  field mapping was verified correct and unchanged.
+
 * **#424 — couldn't define SRV records in the UI; MX priority could be
   NULL.** The Add/Edit DNS Record form only exposed a Priority field, so
   SRV records were created with NULL ``weight`` and ``port`` — and every

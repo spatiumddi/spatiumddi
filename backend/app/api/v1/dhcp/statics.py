@@ -236,9 +236,11 @@ async def update_static(
     scope = await db.get(DHCPScope, st.scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
-    # Capture the old MAC before mutating so the write-through can
-    # remove the old reservation from Windows if the MAC changed.
+    # Capture the old MAC + IP before mutating so the write-through can
+    # remove-then-add on Windows if either changed (#426 — Windows can't
+    # relocate a reservation's IP via Set-).
     prev_mac = str(st.mac_address)
+    prev_ip = str(st.ip_address)
     changes = body.model_dump(exclude_none=True)
     new_ip = changes.get("ip_address", str(st.ip_address))
     new_mac = changes.get("mac_address", str(st.mac_address))
@@ -247,7 +249,7 @@ async def update_static(
     for k, v in changes.items():
         setattr(st, k, v)
     await db.flush()
-    await push_static_change(db, st, action="update", prev_mac=prev_mac)
+    await push_static_change(db, st, action="update", prev_mac=prev_mac, prev_ip=prev_ip)
     collect_wake(dhcp_group_channel(scope.group_id))
     await _upsert_ipam_for_static(db, scope, st, action="update")
     write_audit(

@@ -60,6 +60,22 @@ class WindowsCredentialsInput(BaseModel):
     use_tls: bool | None = None
     verify_tls: bool | None = None
 
+    @field_validator("transport")
+    @classmethod
+    def _valid_transport(cls, v: str | None) -> str | None:
+        # #426: reject a bogus transport at save instead of failing
+        # opaquely at apply (pywinrm only speaks these four).
+        if v is not None and v not in {"ntlm", "kerberos", "basic", "credssp"}:
+            raise ValueError("transport must be one of ntlm, kerberos, basic, credssp")
+        return v
+
+    @field_validator("winrm_port")
+    @classmethod
+    def _valid_port(cls, v: int | None) -> int | None:
+        if v is not None and not 1 <= v <= 65535:
+            raise ValueError("winrm_port must be between 1 and 65535")
+        return v
+
 
 class ServerCreate(BaseModel):
     name: str
@@ -282,10 +298,12 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
                 detail="windows_dhcp create requires both username and password",
             )
         # Fill in sensible defaults for optional fields not set by the client.
-        creds.setdefault("winrm_port", 5985)
         creds.setdefault("transport", "ntlm")
         creds.setdefault("use_tls", False)
         creds.setdefault("verify_tls", False)
+        # #426: HTTPS WinRM listens on 5986, not 5985 — derive the port
+        # default from the (now-resolved) use_tls flag.
+        creds.setdefault("winrm_port", 5986 if creds.get("use_tls") else 5985)
         s.credentials_encrypted = encrypt_dict(creds)
     # Agentless drivers have no agent to approve; skip the pending-approval
     # dance entirely so the UI doesn't show a bogus "Approve" button.
@@ -372,10 +390,11 @@ async def update_server(
                             "password (other fields are optional)."
                         ),
                     )
-                patch.setdefault("winrm_port", 5985)
                 patch.setdefault("transport", "ntlm")
                 patch.setdefault("use_tls", False)
                 patch.setdefault("verify_tls", False)
+                # #426: TLS-aware port default (5986 for HTTPS WinRM).
+                patch.setdefault("winrm_port", 5986 if patch.get("use_tls") else 5985)
                 s.credentials_encrypted = encrypt_dict(patch)
                 changes["windows_credentials_set"] = True
         elif body.windows_credentials == {}:
@@ -508,10 +527,12 @@ async def test_windows_credentials_endpoint(
             existing = decrypt_dict(s.credentials_encrypted)
             existing.update(creds)
             creds = existing
-        creds.setdefault("winrm_port", 5985)
         creds.setdefault("transport", "ntlm")
         creds.setdefault("use_tls", False)
         creds.setdefault("verify_tls", False)
+        # #426: HTTPS WinRM listens on 5986, not 5985 — derive the port
+        # default from the (now-resolved) use_tls flag.
+        creds.setdefault("winrm_port", 5986 if creds.get("use_tls") else 5985)
         host = body.host
     elif body.server_id is not None:
         s = await db.get(DHCPServer, body.server_id)

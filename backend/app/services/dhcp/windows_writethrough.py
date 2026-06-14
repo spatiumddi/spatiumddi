@@ -21,6 +21,16 @@ Why write-through per object (instead of a bundle push):
   * Reservations and exclusions are per-object: we push one
     ``Add/Set/Remove-DhcpServerv4*`` per user action. That keeps the
     blast radius of any failure scoped to the object being edited.
+
+**Atomicity caveat (#426).** A reservation *relocation* (MAC change, or
+an IP-only change — Windows can't move a reservation's IP via ``Set-``)
+is a remove-then-add: two separate cmdlets. If the add fails after the
+remove committed, the DB rolls back to the old MAC/IP while Windows is
+left with no reservation for that MAC — and in the multi-server fan-out,
+an earlier member can succeed while a later one fails. This window is
+inherent to two-cmdlet relocation; the next ``sync-leases`` /
+``get_scopes`` reconcile re-converges, and the 502 tells the operator to
+retry. Simple create/delete/option edits remain single-cmdlet.
 """
 
 from __future__ import annotations
@@ -41,6 +51,22 @@ from app.models.dhcp import DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignmen
 from app.models.ipam import Subnet
 
 logger = structlog.get_logger(__name__)
+
+
+def _norm_mac(mac: str) -> str:
+    """Canonicalise a MAC to bare lowercase hex so a cosmetic reformat
+    (case / ':' vs '-' separators) doesn't read as a change (#426)."""
+    return "".join(c for c in mac.lower() if c in "0123456789abcdef")
+
+
+def _norm_ip(ip: str) -> str:
+    """Canonicalise an IP for change-detection; falls back to the raw
+    string if it doesn't parse (so a bad value still compares equal to
+    itself)."""
+    try:
+        return str(ipaddress.ip_address(ip.strip()))
+    except ValueError:
+        return ip.strip()
 
 
 class WindowsPushError(HTTPException):
@@ -235,8 +261,16 @@ async def push_static_change(
     *,
     action: str,
     prev_mac: str | None = None,
+    prev_ip: str | None = None,
 ) -> None:
-    """Push a static assignment change to every Windows member of the scope's group."""
+    """Push a static assignment change to every Windows member of the scope's group.
+
+    #426: ``prev_ip`` lets an IP-only edit (MAC unchanged) work. Windows
+    keys reservations by ClientId (MAC) and ``Set-DhcpServerv4Reservation
+    -IPAddress`` cannot relocate a reservation's IP, so an IP change must
+    be a remove-then-add — otherwise the DB advances while Windows keeps
+    the old IP (silent drift).
+    """
     scope = await db.get(DHCPScope, static.scope_id)
     if scope is None:
         return
@@ -251,10 +285,29 @@ async def push_static_change(
         driver = get_driver(server.driver)
         try:
             if action in {"create", "update"}:
-                if action == "update" and prev_mac and prev_mac != str(static.mac_address):
-                    await driver.remove_reservation(  # type: ignore[attr-defined]
-                        server, scope_id=scope_id, mac_address=prev_mac
+                if action == "update":
+                    # Compare canonicalised forms so a cosmetic MAC reformat
+                    # (case / ':' vs '-') doesn't trigger a needless
+                    # remove-then-add relocation (#426).
+                    mac_changed = prev_mac is not None and _norm_mac(prev_mac) != _norm_mac(
+                        str(static.mac_address)
                     )
+                    ip_changed = prev_ip is not None and _norm_ip(prev_ip) != _norm_ip(
+                        str(static.ip_address)
+                    )
+                    if mac_changed:
+                        # Old MAC's reservation must go; the new MAC gets a
+                        # fresh add below.
+                        await driver.remove_reservation(  # type: ignore[attr-defined]
+                            server, scope_id=scope_id, mac_address=prev_mac
+                        )
+                    elif ip_changed:
+                        # Same MAC, moved IP — remove the existing (keyed by
+                        # the current MAC) then re-add at the new IP, since
+                        # Set- can't relocate it.
+                        await driver.remove_reservation(  # type: ignore[attr-defined]
+                            server, scope_id=scope_id, mac_address=str(static.mac_address)
+                        )
                 await driver.apply_reservation(  # type: ignore[attr-defined]
                     server,
                     scope_id=scope_id,

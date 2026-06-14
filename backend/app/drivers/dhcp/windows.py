@@ -54,6 +54,14 @@ from typing import Any
 import structlog
 
 from app.core.crypto import decrypt_dict
+from app.drivers._winrm import (
+    MAX_ENCODED_COMMAND,
+    WinRMCommandTooLong,
+    encoded_command_len,
+)
+from app.drivers._winrm import (
+    run_ps as _winrm_run_ps,
+)
 from app.drivers.dhcp.base import (
     ConfigBundle,
     DHCPDriver,
@@ -74,7 +82,13 @@ logger = structlog.get_logger(__name__)
 # single-object edge case is handled client-side.
 _PS_LIST_LEASES = r"""
 $ErrorActionPreference = 'Stop'
-$scopes = Get-DhcpServerv4Scope | Where-Object { $_.State -eq 'Active' }
+# #426: enumerate ALL scopes, not just State -eq 'Active'. A
+# deactivated-but-existing scope still holds valid leases on the server;
+# pre-filtering them out made them disappear from the wire and the
+# absence-delete reconcile then purged the DHCPLease rows + their IPAM
+# mirrors. get_scopes() also enumerates unfiltered, so the two reads now
+# agree. Per-lease liveness is decided by _ACTIVE_STATES below.
+$scopes = Get-DhcpServerv4Scope
 $all = @()
 foreach ($s in $scopes) {
     $leases = Get-DhcpServerv4Lease -ScopeId $s.ScopeId -AllLeases
@@ -164,16 +178,15 @@ $result | ConvertTo-Json -Compress -Depth 5
 """
 
 
-# Upper bound on ops bundled into one WinRM round-trip in the batch
-# dispatchers (``apply_reservations`` / ``remove_reservations`` /
-# ``apply_exclusions``). The real limit isn't WinRM's envelope (500KB
-# default) but PowerShell's ``-EncodedCommand`` command-line length cap,
-# which trips at ~40-60KB of base64 on stock Windows. DHCP ops serialise
-# to ~1KB of embedded JSON + PS snippet per op (scope id + MAC + IP +
-# hostname + description + cmdlet wrapper), so 30 ops × 1KB fits the
-# cmdline cap with headroom. Matches the DNS-side constant; see
-# ``backend/app/drivers/dns/windows.py`` for the full reasoning.
-_WINRM_BATCH_SIZE = 30
+# Hard upper bound on ops per WinRM round-trip in the batch dispatchers.
+# This is a sanity cap only — the REAL gate is the encoded-command-line
+# budget (CMD.EXE ~8191 chars; see app/drivers/_winrm.py). #426 reworked
+# the dispatcher to ship DATA-ONLY payloads (a few short fields per op)
+# with ONE shared cmdlet body, then pack each chunk under
+# ``MAX_ENCODED_COMMAND`` via ``encoded_command_len``. The previous design
+# embedded a full ~600-char PowerShell snippet per op and Invoke-Expression'd
+# each, so a fixed count of 30 blew the cmdline cap at 3-4 reservations.
+_WINRM_MAX_BATCH_OPS = 100
 
 
 # Windows option IDs → canonical SpatiumDDI option names (matches
@@ -312,18 +325,25 @@ if ($existing) {{
         -SubnetMask $mask -LeaseDuration $lease -State $state
 }}
 
-# Reset option values — remove everything Windows has for this scope,
-# then set whatever we want. Keeps Windows in lockstep with our DB.
-Get-DhcpServerv4OptionValue -ScopeId $scopeId -ErrorAction SilentlyContinue | ForEach-Object {{
-    Remove-DhcpServerv4OptionValue -ScopeId $scopeId -OptionId $_.OptionId -ErrorAction SilentlyContinue
-}}
+# Reconcile option values — #426: set-then-prune (NOT wipe-then-set), so a
+# failure mid-reconcile under $ErrorActionPreference='Stop' can never leave
+# the scope with its options wiped and not re-applied. Apply every desired
+# option first (upsert), then remove only the options Windows still has that
+# we no longer want.
+$desiredIds = @()
 if ($data.options) {{
     $data.options.PSObject.Properties | ForEach-Object {{
         $optId = [int]$_.Name
+        $desiredIds += $optId
         $value = $_.Value
         if ($value -isnot [array]) {{ $value = @($value) }}
         # Set-DhcpServerv4OptionValue is upsert semantics.
         Set-DhcpServerv4OptionValue -ScopeId $scopeId -OptionId $optId -Value $value
+    }}
+}}
+Get-DhcpServerv4OptionValue -ScopeId $scopeId -ErrorAction SilentlyContinue | ForEach-Object {{
+    if ($desiredIds -notcontains [int]$_.OptionId) {{
+        Remove-DhcpServerv4OptionValue -ScopeId $scopeId -OptionId $_.OptionId -ErrorAction SilentlyContinue
     }}
 }}
 "OK"
@@ -392,17 +412,23 @@ Remove-DhcpServerv4Reservation -ScopeId {_ps_literal(scope_id)} `
     async def apply_exclusion(
         self, server: Any, *, scope_id: str, start_ip: str, end_ip: str
     ) -> None:
-        """Add an exclusion range. Idempotent — Windows errors silently if
-        the range already exists so we swallow that case.
+        """Add an exclusion range, idempotently.
+
+        #426: check-then-act on the (start, end) pair instead of matching
+        the English substring 'already' in the error — the real Windows
+        overlap message is locale-dependent ("…overlaps with an existing
+        exclusion range") and has no 'already', so the old guard re-threw
+        on every re-apply on a non-English host.
         """
         script = f"""
 $ErrorActionPreference = 'Stop'
-try {{
-    Add-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
-        -StartRange {_ps_literal(start_ip)} -EndRange {_ps_literal(end_ip)}
-}} catch {{
-    # "Exclusion range already exists" — treat as idempotent success.
-    if ($_.Exception.Message -notmatch 'already') {{ throw }}
+$scopeId = {_ps_literal(scope_id)}
+$start   = {_ps_literal(start_ip)}
+$end     = {_ps_literal(end_ip)}
+$exists = Get-DhcpServerv4ExclusionRange -ScopeId $scopeId -ErrorAction SilentlyContinue |
+    Where-Object {{ [string]$_.StartRange -eq $start -and [string]$_.EndRange -eq $end }}
+if (-not $exists) {{
+    Add-DhcpServerv4ExclusionRange -ScopeId $scopeId -StartRange $start -EndRange $end
 }}
 "OK"
 """
@@ -428,9 +454,9 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
     # ``apply_exclusion`` methods open a fresh WinRM session and ship
     # one cmdlet per call — perfect for one-off UI edits but punishing
     # for many-at-once paths (initial scope import, bulk static
-    # conversion, pool rewrites). These batch methods chunk up to
-    # ``_WINRM_BATCH_SIZE`` ops into a single PowerShell script per
-    # WinRM round trip and parse per-op ``{ok, error}`` back out.
+    # conversion, pool rewrites). These batch methods pack ops into one
+    # data-only PowerShell script per WinRM round trip — sized under the
+    # encoded-command budget (#426) — and parse per-op ``{ok, error}`` back.
     #
     # Per-op failures surface as ``ReservationResult(ok=False)`` — the
     # caller decides whether to 500 or partial-success. Whole-batch
@@ -453,7 +479,8 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
             creds=creds,
             items=items,
             op_name="apply_reservations",
-            per_op_ps=_ps_apply_reservation_snippet,
+            data_fn=_data_apply_reservation,
+            op_body=_PS_BODY_APPLY_RESERVATION,
             result_ctor=lambda ok, item, error: ReservationResult(ok=ok, item=item, error=error),
             chunk_log="dhcp_apply_reservations_batch",
         )
@@ -469,7 +496,8 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
             creds=creds,
             items=items,
             op_name="remove_reservations",
-            per_op_ps=_ps_remove_reservation_snippet,
+            data_fn=_data_remove_reservation,
+            op_body=_PS_BODY_REMOVE_RESERVATION,
             result_ctor=lambda ok, item, error: ReservationResult(ok=ok, item=item, error=error),
             chunk_log="dhcp_remove_reservations_batch",
         )
@@ -485,7 +513,8 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
             creds=creds,
             items=items,
             op_name="apply_exclusions",
-            per_op_ps=_ps_apply_exclusion_snippet,
+            data_fn=_data_apply_exclusion,
+            op_body=_PS_BODY_APPLY_EXCLUSION,
             result_ctor=lambda ok, item, error: ExclusionResult(ok=ok, item=item, error=error),
             chunk_log="dhcp_apply_exclusions_batch",
         )
@@ -643,14 +672,15 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
         *,
         day: str | None = None,
         max_events: int = 500,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], bool]:
         """Read the Windows DHCP audit log for ``day``.
 
         The audit log (``C:\\Windows\\System32\\dhcp\\DhcpSrvLog-<Day>.log``)
         is the per-lease event trail — grants, renewals, releases,
         conflict detections, DNS update results. Different schema
         from the Windows Event Log (which only covers service-level
-        events), so this is exposed as a separate endpoint.
+        events), so this is exposed as a separate endpoint. Returns
+        ``(rows, truncated)``.
         """
         from app.drivers.windows_dhcp_audit import fetch_dhcp_audit_events  # noqa: PLC0415
 
@@ -718,35 +748,11 @@ def _load_credentials(server: Any) -> dict[str, Any]:
 def _run_ps(server: Any, creds: dict[str, Any], script: str) -> str:
     """Run a PowerShell script on the Windows DHCP server over WinRM.
 
-    Blocking — call via ``asyncio.to_thread``. Returns stdout as text.
-    Raises ``RuntimeError`` on non-zero exit / stderr content.
+    Thin wrapper over the shared :func:`app.drivers._winrm.run_ps`
+    chokepoint (transport/TLS/timeout/size-budget). Blocking — call via
+    ``asyncio.to_thread``.
     """
-    # Deferred import: keeps celery-worker startup light and means hosts
-    # that only run agent-based drivers don't need the pywinrm wheel in
-    # their container image.
-    import winrm  # noqa: PLC0415
-
-    transport = creds.get("transport") or "ntlm"
-    use_tls = bool(creds.get("use_tls", False))
-    verify_tls = bool(creds.get("verify_tls", False))
-    port = int(creds.get("winrm_port") or (5986 if use_tls else 5985))
-    scheme = "https" if use_tls else "http"
-    endpoint = f"{scheme}://{server.host}:{port}/wsman"
-
-    session = winrm.Session(
-        endpoint,
-        auth=(creds.get("username", ""), creds.get("password", "")),
-        transport=transport,
-        server_cert_validation="validate" if verify_tls else "ignore",
-    )
-    result = session.run_ps(script)
-    stdout = (result.std_out or b"").decode("utf-8", errors="replace")
-    stderr = (result.std_err or b"").decode("utf-8", errors="replace")
-    if result.status_code != 0:
-        raise RuntimeError(
-            f"winrm exit={result.status_code}: {stderr.strip() or stdout.strip() or '<no output>'}"
-        )
-    return stdout
+    return _winrm_run_ps(getattr(server, "host", ""), creds, script, op_label="dhcp")
 
 
 def _parse_leases(raw: str) -> list[dict[str, Any]]:
@@ -763,8 +769,13 @@ def _parse_leases(raw: str) -> list[dict[str, Any]]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
+        # #426: a garbled / truncated / warning-prefixed (but exit-0)
+        # payload must NOT read as "zero leases" — that's indistinguishable
+        # from an empty server and drives pull_leases' absence-delete to
+        # purge every active lease + IPAM mirror (stamping the audit row
+        # success). Re-raise so the reconcile aborts and leaves data intact.
         logger.warning("windows_dhcp_lease_parse_failed", raw=text[:400], error=str(exc))
-        return []
+        raise RuntimeError(f"Windows DHCP lease response was not valid JSON: {exc}") from exc
     items: list[dict[str, Any]] = parsed if isinstance(parsed, list) else [parsed]
 
     out: list[dict[str, Any]] = []
@@ -1008,65 +1019,123 @@ async def test_winrm_credentials(host: str, credentials: dict[str, Any]) -> tupl
 # ── batch dispatch helpers ───────────────────────────────────────────
 #
 # Shared between apply_reservations / remove_reservations /
-# apply_exclusions. Each call site passes a ``per_op_ps`` callable that
-# emits the PowerShell snippet for a single op (matching the body of
-# the existing singular method minus its outer
-# ``$ErrorActionPreference = 'Stop'`` / "OK" wrapper). The dispatcher
-# wraps those snippets in a loop with per-op ``try / catch`` and ships
-# one PS script per chunk.
+# apply_exclusions. #426: each call site passes a ``data_fn`` (item →
+# small JSON-safe dict of FIELDS) and an ``op_body`` (a FIXED PowerShell
+# snippet that operates on ``$op.<field>``). The dispatcher ships a
+# data-only payload + ONE embedded copy of ``op_body`` per chunk and
+# data-binds operator values through ConvertFrom-Json, so (a) the
+# payload stays tiny and (b) nothing operator-controlled ever touches
+# the PS parser. Chunks are packed under the encoded-command-line budget
+# (see app/drivers/_winrm.py), not a fixed op count.
+
+# apply_reservation — upsert keyed on ClientId (MAC with dashes).
+_PS_BODY_APPLY_RESERVATION = """
+$existing = Get-DhcpServerv4Reservation -ScopeId $op.scopeId -ErrorAction SilentlyContinue |
+    Where-Object { $_.ClientId -eq $op.clientId }
+if ($existing) {
+    Set-DhcpServerv4Reservation -ClientId $op.clientId -ScopeId $op.scopeId `
+        -IPAddress $op.ip -Name $op.name -Description $op.desc -ErrorAction Stop
+} else {
+    Add-DhcpServerv4Reservation -ScopeId $op.scopeId -IPAddress $op.ip `
+        -ClientId $op.clientId -Name $op.name -Description $op.desc -ErrorAction Stop
+}
+""".strip()
+
+_PS_BODY_REMOVE_RESERVATION = """
+Remove-DhcpServerv4Reservation -ScopeId $op.scopeId -ClientId $op.clientId `
+    -ErrorAction SilentlyContinue
+""".strip()
+
+# apply_exclusion — #426: check-then-act on the (start, end) pair so a
+# re-apply is idempotent on ANY locale (the old code matched the English
+# substring 'already', which the localized overlap message lacks).
+_PS_BODY_APPLY_EXCLUSION = """
+$exists = Get-DhcpServerv4ExclusionRange -ScopeId $op.scopeId -ErrorAction SilentlyContinue |
+    Where-Object { [string]$_.StartRange -eq $op.startRange -and [string]$_.EndRange -eq $op.endRange }
+if (-not $exists) {
+    Add-DhcpServerv4ExclusionRange -ScopeId $op.scopeId `
+        -StartRange $op.startRange -EndRange $op.endRange -ErrorAction Stop
+}
+""".strip()
 
 
-def _ps_apply_reservation_snippet(item: ReservationItem) -> str:
-    """PS body for one ``apply_reservation`` op inside a batched script.
+def _data_apply_reservation(item: ReservationItem) -> dict[str, Any]:
+    return {
+        "scopeId": item.scope_id,
+        "ip": item.ip_address,
+        "clientId": item.mac_address.lower().replace(":", "-"),
+        "name": item.hostname or "",
+        "desc": item.description or "",
+    }
 
-    Same logic as the singular ``apply_reservation``: upsert keyed on
-    ClientId (MAC with dashes). No outer ``$ErrorActionPreference`` —
-    the batch wrapper sets 'Continue' at top-level and catches per-op.
-    """
-    client_id = item.mac_address.lower().replace(":", "-")
+
+def _data_remove_reservation(item: RemoveReservationItem) -> dict[str, Any]:
+    return {
+        "scopeId": item.scope_id,
+        "clientId": item.mac_address.lower().replace(":", "-"),
+    }
+
+
+def _data_apply_exclusion(item: ExclusionItem) -> dict[str, Any]:
+    return {
+        "scopeId": item.scope_id,
+        "startRange": item.start_ip,
+        "endRange": item.end_ip,
+    }
+
+
+def _build_dhcp_batch_script(op_body: str, payload: list[dict[str, Any]]) -> str:
+    """Wrap a data-only ``payload`` + a fixed ``op_body`` into one batch
+    script. ``op_body`` reads ``$op.<field>`` (data-bound, never parsed)."""
+    payload_b64 = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
     return f"""
-$scopeId  = {_ps_literal(item.scope_id)}
-$ip       = {_ps_literal(item.ip_address)}
-$clientId = {_ps_literal(client_id)}
-$name     = {_ps_literal(item.hostname)}
-$desc     = {_ps_literal(item.description)}
-
-$existing = Get-DhcpServerv4Reservation -ScopeId $scopeId -ErrorAction SilentlyContinue |
-    Where-Object {{ $_.ClientId -eq $clientId }}
-if ($existing) {{
-    Set-DhcpServerv4Reservation -ClientId $clientId -ScopeId $scopeId `
-        -IPAddress $ip -Name $name -Description $desc -ErrorAction Stop
-}} else {{
-    Add-DhcpServerv4Reservation -ScopeId $scopeId -IPAddress $ip `
-        -ClientId $clientId -Name $name -Description $desc -ErrorAction Stop
+$ErrorActionPreference = 'Continue'
+$payload = [System.Text.Encoding]::UTF8.GetString(
+    [System.Convert]::FromBase64String('{payload_b64}'))
+$ops = $payload | ConvertFrom-Json
+$results = @()
+foreach ($op in $ops) {{
+    $entry = [ordered]@{{ index = [int]$op.index; ok = $false; error = $null }}
+    try {{
+{op_body}
+        $entry.ok = $true
+    }} catch {{
+        $entry.error = "$($_.Exception.Message)"
+    }}
+    $results += (New-Object PSObject -Property $entry)
 }}
+$results | ConvertTo-Json -Compress -Depth 3
 """.strip()
 
 
-def _ps_remove_reservation_snippet(item: RemoveReservationItem) -> str:
-    """PS body for one ``remove_reservation`` op inside a batched script."""
-    client_id = item.mac_address.lower().replace(":", "-")
-    return f"""
-Remove-DhcpServerv4Reservation -ScopeId {_ps_literal(item.scope_id)} `
-    -ClientId {_ps_literal(client_id)} -ErrorAction SilentlyContinue
-""".strip()
+def _pack_dhcp_chunks(
+    items: Sequence[Any], data_fn: Any, op_body: str
+) -> list[list[tuple[int, Any]]]:
+    """Greedily pack ``items`` into chunks whose built script stays under
+    the encoded-command budget (and the ``_WINRM_MAX_BATCH_OPS`` sanity
+    cap). Each chunk is a list of ``(global_index, item)``. A single op
+    that can't fit even alone still ships as a one-op chunk — _run_ps
+    raises WinRMCommandTooLong for it, which the dispatcher turns into a
+    failed result for that one op without aborting the rest."""
+    chunks: list[list[tuple[int, Any]]] = []
+    current: list[tuple[int, Any]] = []
 
+    def fits(candidate: list[tuple[int, Any]]) -> bool:
+        payload = [{"index": i, **data_fn(it)} for i, (_, it) in enumerate(candidate)]
+        return (
+            encoded_command_len(_build_dhcp_batch_script(op_body, payload)) <= MAX_ENCODED_COMMAND
+        )
 
-def _ps_apply_exclusion_snippet(item: ExclusionItem) -> str:
-    """PS body for one ``apply_exclusion`` op inside a batched script.
-
-    Mirrors the idempotent-add behaviour of the singular path: swallow
-    the "already exists" error so re-running a batch is safe.
-    """
-    return f"""
-try {{
-    Add-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(item.scope_id)} `
-        -StartRange {_ps_literal(item.start_ip)} -EndRange {_ps_literal(item.end_ip)} `
-        -ErrorAction Stop
-}} catch {{
-    if ($_.Exception.Message -notmatch 'already') {{ throw }}
-}}
-""".strip()
+    for gidx, item in enumerate(items):
+        trial = current + [(gidx, item)]
+        if current and (len(trial) > _WINRM_MAX_BATCH_OPS or not fits(trial)):
+            chunks.append(current)
+            current = [(gidx, item)]
+        else:
+            current = trial
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 async def _dispatch_dhcp_batch(
@@ -1075,58 +1144,38 @@ async def _dispatch_dhcp_batch(
     creds: dict[str, Any],
     items: Sequence[Any],
     op_name: str,
-    per_op_ps: Any,
+    data_fn: Any,
+    op_body: str,
     result_ctor: Any,
     chunk_log: str,
 ) -> list[Any]:
-    """Chunk ``items`` into ``_WINRM_BATCH_SIZE`` groups, dispatch one
-    PowerShell script per group, and zip per-op results back.
+    """Pack ``items`` into encoded-budget-sized chunks, dispatch one
+    data-only PowerShell script per chunk, and zip per-op results back.
 
     Each op gets a JSON record ``{index, ok, error}``; we parse those
     back and call ``result_ctor(ok, item, error)`` to build the
-    driver-typed per-op result. Any item missing from the PS output
-    (shouldn't happen, but be defensive) becomes a failed result with a
-    synthetic error message so the returned list length always matches
-    the input length.
+    driver-typed per-op result. An over-budget single op (e.g. an absurd
+    hostname/description) fails just that op; any item missing from the
+    PS output becomes a failed result, so the returned list length always
+    matches the input length.
     """
-    chunks = [
-        list(items[i : i + _WINRM_BATCH_SIZE]) for i in range(0, len(items), _WINRM_BATCH_SIZE)
-    ]
+    chunks = _pack_dhcp_chunks(items, data_fn, op_body)
     total_chunks = len(chunks)
     all_results: list[Any] = []
 
     for chunk_index, chunk in enumerate(chunks):
-        payload: list[dict[str, Any]] = []
-        for idx, item in enumerate(chunk):
-            payload.append({"index": idx, "script": per_op_ps(item)})
-        payload_b64 = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+        chunk_items = [it for _, it in chunk]
+        payload = [{"index": idx, **data_fn(it)} for idx, (_, it) in enumerate(chunk)]
+        script = _build_dhcp_batch_script(op_body, payload)
 
-        script = f"""
-$ErrorActionPreference = 'Continue'
-$payload = [System.Text.Encoding]::UTF8.GetString(
-    [System.Convert]::FromBase64String('{payload_b64}'))
-$ops = $payload | ConvertFrom-Json
-$results = @()
-foreach ($op in $ops) {{
-    $entry = [ordered]@{{
-        index = [int]$op.index
-        ok    = $false
-        error = $null
-    }}
-    try {{
-        Invoke-Expression -Command $op.script | Out-Null
-        $entry.ok = $true
-    }} catch {{
-        $entry.ok = $false
-        $entry.error = "$($_.Exception.Message)"
-    }}
-    $results += (New-Object PSObject -Property $entry)
-}}
-$results | ConvertTo-Json -Compress -Depth 3
-""".strip()
+        try:
+            raw = await asyncio.to_thread(_run_ps, server, creds, script)
+            chunk_results = _parse_dhcp_batch_results(raw, chunk_items, result_ctor)
+        except WinRMCommandTooLong as exc:
+            # Single over-budget op (a 1-item chunk that still won't fit) —
+            # fail just it; never abort the rest of the batch.
+            chunk_results = [result_ctor(False, it, str(exc)) for it in chunk_items]
 
-        raw = await asyncio.to_thread(_run_ps, server, creds, script)
-        chunk_results = _parse_dhcp_batch_results(raw, chunk, result_ctor)
         ok_count = sum(1 for r in chunk_results if r.ok)
         failed_count = len(chunk_results) - ok_count
         logger.info(
