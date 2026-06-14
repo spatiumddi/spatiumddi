@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -178,6 +179,31 @@ def _current_slot_from_cmdline() -> SlotName | None:
     return None
 
 
+# #421 — mirror the supervisor's _reap_stale_inflight threshold. The host
+# runner re-stamps the in-flight marker every ~60s while alive, so a stamp
+# older than this means the runner is gone (SIGKILL / power loss, where its
+# failed-on-exit trap can't run).
+_STALE_INFLIGHT_SECONDS = 300
+
+
+def _stamp_is_stale(stamp: str | None) -> bool:
+    """True if an in-flight stamp is older than the staleness threshold.
+
+    ``date -Iseconds`` emits an offset-aware stamp, so ``fromisoformat`` +
+    the UTC subtraction is wall-clock-correct regardless of host tz; an
+    old-format stamp without an offset is treated as UTC.
+    """
+    if not stamp:
+        return False
+    try:
+        dt = datetime.fromisoformat(stamp)
+    except ValueError:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - dt).total_seconds() > _STALE_INFLIGHT_SECONDS
+
+
 def _upgrade_state_now() -> tuple[UpgradeState, str | None]:
     """Read the .state sidecar the host-side runner maintains. Returns
     ('ready', None) when no upgrade has run recently — ``ready`` is
@@ -207,6 +233,16 @@ def _upgrade_state_now() -> tuple[UpgradeState, str | None]:
             # had time to see it; flip green.
             if state == "failed" and not _TRIGGER_FILE.exists():
                 return "ready", None
+            # #421 — a dead/killed apply on this host leaves in-flight
+            # stuck forever (the runner's exit trap couldn't run), which
+            # would 409 a per-box re-apply / rollback. A stale liveness
+            # stamp means the runner is gone — report failed so the
+            # operator can act. (The supervisor's _reap_stale_inflight is
+            # the source of truth for the operator-visible Fleet status +
+            # the durable sidecar heal; this just keeps the per-box reader
+            # consistent so is_apply_in_flight() stops blocking.)
+            if state == "in-flight" and _stamp_is_stale(stamp):
+                return "failed", stamp
             return state, stamp  # type: ignore[return-value]
     return "ready", None
 

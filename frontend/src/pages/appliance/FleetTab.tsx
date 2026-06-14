@@ -4040,6 +4040,19 @@ function UpgradeStatusPanel({
   const stepIndex = progress
     ? UPGRADE_STEPS.findIndex((s) => s.key === progress.step)
     : -1;
+  // #421 — complementary stuck hint. A live runner re-stamps the
+  // in-flight marker every ~60s, so the supervisor reaps a dead/stalled
+  // apply to "failed" within ~5 min (→ the red card above). If we're
+  // STILL amber well past that, the supervisor's own backstop isn't
+  // running (e.g. the supervisor is down) — say "looks stuck" rather than
+  // spin a spinner forever. The Cancel button below already lets the
+  // operator clear + re-apply. Never trips on a live apply: the stamp
+  // keeps advancing so this stays small regardless of apply duration.
+  const inFlightMs =
+    state === "in-flight" && row.last_upgrade_state_at
+      ? Date.now() - new Date(row.last_upgrade_state_at).getTime()
+      : 0;
+  const looksStuck = !rebootPending && inFlightMs > 6 * 60_000;
 
   return (
     <div
@@ -4142,6 +4155,18 @@ function UpgradeStatusPanel({
             style={{ width: `${Math.min(100, Math.max(0, progress.pct))}%` }}
           />
         </div>
+      )}
+
+      {looksStuck && (
+        <p className="mt-2 flex items-start gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px] text-amber-800 dark:text-amber-200">
+          <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+          <span>
+            In progress for {Math.round(inFlightMs / 60_000)} min — a real apply
+            finishes in seconds to minutes. It looks stuck. Check the host (
+            <code>journalctl -u spatiumddi-slot-upgrade</code>,{" "}
+            <code>spatium-upgrade-slot status</code>), or cancel and re-apply.
+          </span>
+        </p>
       )}
 
       {row.last_upgrade_log_tail && (

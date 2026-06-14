@@ -31,10 +31,34 @@
 
 set -euo pipefail
 
-TRIGGER=/var/lib/spatiumddi/release-state/slot-upgrade-pending
-PROGRESS=/var/lib/spatiumddi/release-state/slot-upgrade.progress
-LOG_DIR=/var/log/spatiumddi
+# Paths are env-overridable (defaulting to the production appliance
+# locations) so appliance/tests/test_slot_upgrade_runner.py can drive this
+# against a synthetic tmp tree without rewriting the script — same pattern
+# as spatium-host-migrate's SPATIUM_HOST_* overrides.
+TRIGGER="${SPATIUM_SLOT_TRIGGER:-/var/lib/spatiumddi/release-state/slot-upgrade-pending}"
+PROGRESS="${SPATIUM_SLOT_PROGRESS:-/var/lib/spatiumddi/release-state/slot-upgrade.progress}"
+LOG_DIR="${SPATIUM_SLOT_LOG_DIR:-/var/log/spatiumddi}"
 LOG="$LOG_DIR/slot-upgrade.log"
+UPGRADE_SLOT_BIN="${SPATIUM_UPGRADE_SLOT_BIN:-/usr/local/bin/spatium-upgrade-slot}"
+
+# #421 — a slot-upgrade apply that dies or stalls part-way must never
+# leave the state stuck at "in-flight" forever. Three guards work
+# together (see issue for the field case that wedged at in-flight for two
+# days):
+#   * a background ticker refreshes the in-flight stamp every
+#     $INFLIGHT_TICK_SECONDS so the supervisor's staleness backstop can
+#     tell a live-but-slow apply (stamp keeps advancing) from a dead
+#     runner (stamp frozen) — without it the supervisor would have to
+#     wait out the whole worst-case apply time before declaring failure;
+#   * a hard $APPLY_TIMEOUT_SECONDS cap on the apply so a stalled
+#     download / dd self-fails instead of hanging;
+#   * an EXIT trap that records "failed" on any abrupt exit (signal,
+#     timeout, set -e error) the explicit fail() path didn't already
+#     cover — only SIGKILL / power-loss escape it, and the supervisor
+#     backstop catches those via the frozen stamp.
+INFLIGHT_TICK_SECONDS="${SPATIUM_SLOT_TICK_SECONDS:-60}"
+APPLY_TIMEOUT_SECONDS="${SPATIUM_SLOT_APPLY_TIMEOUT:-2700}"  # 45 min ceiling
+TICKER_PID=
 
 mkdir -p "$LOG_DIR"
 exec >> "$LOG" 2>&1
@@ -51,13 +75,69 @@ write_progress() {  # $1 = step, $2 = human detail
         && mv "${PROGRESS}.new" "$PROGRESS" 2>/dev/null || true
 }
 
+# #421 — keep the coarse in-flight stamp fresh while we work. Best-effort:
+# a transient write hiccup must not kill the ticker subshell under set -e
+# (a dead ticker would let the supervisor falsely reap a live apply).
+mark_inflight() {
+    echo "in-flight $(date -Iseconds)" > "${TRIGGER}.state" 2>/dev/null || true
+}
+
+# Background loop that re-stamps in-flight every $INFLIGHT_TICK_SECONDS
+# until the main script exits. Guarded on the parent still being alive so
+# a SIGKILL of the main pid (which skips the EXIT trap) lets the ticker
+# self-terminate within one tick rather than masking the death by keeping
+# the stamp fresh forever.
+start_inflight_ticker() {
+    local parent=$$
+    (
+        while kill -0 "$parent" 2>/dev/null; do
+            sleep "$INFLIGHT_TICK_SECONDS"
+            kill -0 "$parent" 2>/dev/null || break
+            mark_inflight
+        done
+    ) &
+    TICKER_PID=$!
+}
+
+stop_inflight_ticker() {
+    if [ -n "${TICKER_PID:-}" ]; then
+        kill "$TICKER_PID" 2>/dev/null || true
+        wait "$TICKER_PID" 2>/dev/null || true
+        TICKER_PID=
+    fi
+}
+
 fail() {  # $1 = human reason
+    stop_inflight_ticker  # before the terminal write so it can't be reverted
     echo
     echo "  ✗ $1"
     echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
     write_progress "failed" "$1"
     mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
     exit 1
+}
+
+# #421 — last line of defence. Fires on ANY exit once the apply region
+# has been entered (the trap is armed only there). If we leave without a
+# terminal state already on disk, the run died abruptly (SIGTERM from
+# systemd's TimeoutStartSec, an unhandled error under set -e, a killed
+# subprocess) — record it as failed so the upgrade never sticks at
+# in-flight. A clean done/failed exit leaves a terminal state, so this is
+# a no-op then.
+on_exit() {
+    local rc=$?
+    stop_inflight_ticker
+    if [ -f "${TRIGGER}.state" ]; then
+        local st
+        st=$(cut -d' ' -f1 < "${TRIGGER}.state" 2>/dev/null || true)
+        if [ "$st" = "in-flight" ]; then
+            echo
+            echo "  ✗ runner exited (rc=$rc) without writing a terminal state"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            write_progress "failed" "runner exited (rc=$rc) without completing"
+            [ -f "$TRIGGER" ] && mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
+        fi
+    fi
 }
 
 if [ ! -f "$TRIGGER" ]; then
@@ -129,29 +209,45 @@ echo
 
 # Mark trigger as in-flight so the UI can show "applying" state. We
 # don't rename it (the .path unit fires on close-after-write, not on
-# every read) but we do touch a sibling marker + progress.
-echo "in-flight $(date -Iseconds)" > "${TRIGGER}.state"
+# every read) but we do touch a sibling marker + progress. From here on
+# we're in the apply region: arm the abrupt-exit trap and start the
+# liveness ticker (#421).
+mark_inflight
 write_progress "queued" "starting slot upgrade"
+trap on_exit EXIT
+start_inflight_ticker
 
 APPLY_ARGS=("apply" "$IMAGE_SRC")
 [ -n "$EXPECTED_SHA256" ] && APPLY_ARGS+=("--expected-sha256" "$EXPECTED_SHA256")
 [ -n "$CHECKSUM_SRC" ] && APPLY_ARGS+=("--checksum" "$CHECKSUM_SRC")
 [ -n "$INSECURE" ] && APPLY_ARGS+=("--insecure")
 
-echo "  → /usr/local/bin/spatium-upgrade-slot ${APPLY_ARGS[*]}"
-if /usr/local/bin/spatium-upgrade-slot "${APPLY_ARGS[@]}"; then
+# #421 — cap the apply so a stalled download / dd self-fails instead of
+# hanging forever. `timeout` sends SIGTERM at the deadline, SIGKILL 30s
+# later; capture the rc without tripping set -e so we can branch on it.
+echo "  → $UPGRADE_SLOT_BIN ${APPLY_ARGS[*]} (timeout ${APPLY_TIMEOUT_SECONDS}s)"
+apply_rc=0
+timeout --kill-after=30 "$APPLY_TIMEOUT_SECONDS" \
+    "$UPGRADE_SLOT_BIN" "${APPLY_ARGS[@]}" || apply_rc=$?
+if [ "$apply_rc" -eq 0 ]; then
     echo
     echo "  apply succeeded — calling set-next-boot"
     write_progress "arming" "arming next-boot"
-    if /usr/local/bin/spatium-upgrade-slot set-next-boot; then
+    if "$UPGRADE_SLOT_BIN" set-next-boot; then
         echo
         echo "  ✓ next-boot armed. Operator needs to reboot to switch slots."
+        stop_inflight_ticker  # before the terminal write so it can't be reverted
         echo "done $(date -Iseconds)" > "${TRIGGER}.state"
         write_progress "reboot-pending" "upgrade staged — reboot to boot the new slot"
-        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        # Parity with every other terminal mv: never let a rename race
+        # (e.g. supervisor already reaped the trigger) abort under set -e
+        # after the correct terminal state is already on disk (#421).
+        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)" 2>/dev/null || true
     else
         fail "set-next-boot failed (image is written but next-boot not armed)"
     fi
+elif [ "$apply_rc" -eq 124 ] || [ "$apply_rc" -eq 137 ]; then
+    fail "apply timed out after ${APPLY_TIMEOUT_SECONDS}s (stalled download or dd) — see slot-upgrade.log"
 else
-    fail "apply failed — see slot-upgrade.log for the cause (download / verify / write)"
+    fail "apply failed (rc=${apply_rc}) — see slot-upgrade.log for the cause (download / verify / write)"
 fi
