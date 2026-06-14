@@ -58,9 +58,13 @@ SpatiumDDI's auth stack has three layers:
 
 ## TOTP MFA (issue #69)
 
-Local-user 2FA stacks on top of the password flow. External-identity
-users (LDAP / OIDC / SAML / RADIUS / TACACS+) handle MFA at the
-provider, not in SpatiumDDI.
+Local-user 2FA stacks on top of the password flow. As of #408, TOTP
+enrolment is also open to external-identity users (LDAP / OIDC / SAML /
+RADIUS / TACACS+) — **not for login** (they still authenticate at their
+provider), but so an SSO superadmin can re-confirm sensitive reveals
+(appliance kubeconfig, pairing codes, agent bootstrap keys, SNMP
+community) with a TOTP code, since those reveals demand a credential the
+session alone doesn't prove and an SSO account has no local password.
 
 - **Enrolment**: Settings → Security → "Enable MFA" generates a fresh
   TOTP secret stored Fernet-encrypted in `user_mfa_secret`. The
@@ -79,6 +83,17 @@ provider, not in SpatiumDDI.
 - **Admin force-disable**: a superadmin can clear another user's MFA
   via `DELETE /users/{id}/mfa`. The action lands in the audit log and
   the affected user can re-enrol from scratch.
+- **Re-confirming sensitive reveals (#408)**: the secret-reveal
+  endpoints (agent keys / SNMP community / appliance kubeconfig / pairing
+  codes) re-verify the operator right before handing back the cleartext,
+  via the shared `app.services.reauth.reverify_operator` helper. A **local
+  user proves their password**; a **password-less external-auth user
+  proves a current TOTP code** (so they must enrol MFA first, hence the
+  open enrolment above). TOTP is deliberately **not** accepted in lieu of
+  a local user's password — that would downgrade the password step-up,
+  since MFA enrolment needs only a session and a hijacked session could
+  otherwise self-enrol and reveal. Disable / regenerate-recovery-codes
+  follow the same shape (password for local, TOTP-only for SSO).
 
 ## External identity providers
 
