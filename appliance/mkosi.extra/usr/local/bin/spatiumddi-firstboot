@@ -86,6 +86,18 @@ mkdir -p /var/lib/spatiumddi/release-state /var/log/spatiumddi
 chmod 1777 /var/lib/spatiumddi/release-state
 chmod 0755 /var/log/spatiumddi
 
+# /var/lib/spatiumddi/slot-images — OS A/B upgrade images uploaded /
+# imported through the api before the host-side slot-upgrade runner
+# applies them. The api pod mounts this as a hostPath and runs as
+# uid 1000 (app). kubelet's DirectoryOrCreate would otherwise create
+# it root:root 0755, so the api's upload write fails EACCES (#415).
+# Own it to the api uid; 0700 because the bytes stream back through
+# the api's auth gate, never directly off disk. Idempotent + on every
+# boot, so it survives A/B slot swaps and repairs an already-wrong dir.
+mkdir -p /var/lib/spatiumddi/slot-images
+chown 1000:1000 /var/lib/spatiumddi/slot-images
+chmod 0700 /var/lib/spatiumddi/slot-images
+
 # Detect the host's root block device's rotational flag so the
 # supervisor pod (which can't see the host's /proc/mounts properly —
 # its container view shows ``overlay`` mounted at /) can surface

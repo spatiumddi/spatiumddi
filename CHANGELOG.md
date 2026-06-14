@@ -20,6 +20,114 @@ the formatter handles the rest.
 
 ---
 
+## 2026.06.14-1 — 2026-06-14
+
+An **appliance polish + ops** release rolling up four issues (#392 /
+#415 / #416 / #417) plus a Cluster-dashboard redesign, a comprehensive
+demo-seeder refresh, and a CodeQL fix. The headline is a browser
+**Cluster console**: the appliance's Talos-style physical-console
+dashboard reproduced in the web UI and merged into the Cluster → Overview
+screen — an identity ribbon (role / host / version / A-B slot / pairing /
+supervisor health), live node + workload health, and a streaming pod-log
+tail, all over the existing authenticated SSE feed (no shell, no new
+privilege). It also fixes a Permission-denied that blocked OS-upgrade
+image uploads on the k3s appliance, stops old releases from hoarding
+multi-GB binaries, and moves the frontend build to Node 22. No schema
+changes.
+
+### Added
+
+* **#416 — browser Cluster console.** The appliance's physical-console
+  dashboard, reproduced in the web UI and folded into Cluster → Overview
+  as a single view: a live identity header (role, hostname, host IP,
+  OS + app version, A/B slot + durable-default + trial-boot, upgrade
+  state, nodes-ready + HA, supervisor approval + last-seen), the
+  CPU / memory / nodes / workloads health ribbon and charts, and a
+  live log tail that follows a **workload** (deployment / daemonset) —
+  resolved server-side to the current pod *and* container, so it survives
+  pod rolls, never shows churny pod names, and handles multi-container
+  pods (e.g. redis) — plus Reboot-host and View-pods actions. Backed by a new `self_appliance` block on
+  `GET /appliance/info` sourced from the supervisor heartbeat — a pure
+  DB read, so the api never touches host journald or files. Reproduced
+  in React rather than bridging a PTY, so it re-exposes no shell / root
+  surface and works for remote agents too; the standalone TTY
+  `spatium-console` is unchanged.
+
+### Changed
+
+* **#417 — frontend build moves to Node 22.** CI and the frontend
+  Dockerfile build on `node:22-alpine` (Node 20 reached end-of-life in
+  April 2026; the Vite 8 toolchain prefers 22.12+). Runtime is
+  unaffected — Node is build-time only.
+* **#392 — version-aware release-asset retention.** A new prune step
+  (post-release plus a weekly scheduled workflow) trims the heavy
+  appliance binaries every release attaches: the generic-named duplicate
+  ISO / slot images come off every non-latest release, and the versioned
+  `.iso` + slot `.raw.xz` come off releases beyond a configurable keep
+  window (default 15). The release, tag, notes, and the versioned
+  `.sha256` provenance sidecars are always kept, and a freshly-cut
+  release is guarded against propagation races so its `/latest/`
+  download URLs never break. The OS-upgrade picker already hides any
+  release missing its slot image, so it stays honest after a prune.
+* **Cluster "Pods" KPI no longer counts completed Jobs.** The dashboard
+  tile divided running by *total* pods, so a healthy box read `10/14`
+  (the four being finished migrate / helm-install Jobs) and looked
+  broken. It now divides by *active* pods, excluding the `Succeeded`
+  phase: a healthy box reads `10/10` with a small "N completed" note,
+  and the tile turns rose only on a genuine shortfall.
+* **`scripts/seed_demo.py` catches up to the data model.** The demo
+  seeder gained the 17 resource families it had drifted behind on — NAT
+  mappings, multicast domains / groups, customers / sites / providers,
+  WAN circuits, the service catalog, SD-WAN overlays, DNS sub-resources
+  (DNSSEC / blocklists / views / GSLB / catalog zones), DHCP
+  sub-resources (classes / statics / MAC blocks / option templates /
+  PXE profiles), a sample RBAC role + user + group, a scoped API token,
+  a conformity policy, and a webhook subscription.
+* **Appliance README gains a "Why k3s, not Docker Compose?" rationale**
+  (declarative reconciliation, growing one box into an HA cluster, no
+  hand-run container commands), cross-linked from the main README for
+  readers wary of Kubernetes.
+
+### Fixed
+
+* **#415 — OS-upgrade image upload failed with Permission denied on
+  k3s.** The api pod runs as uid 1000, but kubelet created the
+  `/var/lib/spatiumddi/slot-images` hostPath as `root:root 0755`, so
+  every upload / GitHub import died with `EACCES`. The
+  `spatiumddi-firstboot` boot step now creates and owns that directory
+  (1000:1000, mode 0700) on every boot — mirroring the existing
+  release-state fix — and the api container pins its runtime uid for
+  good measure. Also corrects a cosmetic `pathlib` bug that wrote the
+  in-flight temp file with a doubled suffix
+  (`<id>.raw.raw.xz.partial`) instead of `<id>.raw.xz.partial`.
+* **Stale "upgrade images" pointer in the fleet upgrade modal.** The
+  empty-state told operators to open a section that had moved; it now
+  offers a button that closes the dialog and jumps straight to the
+  Upgrade-images view.
+* **celery-beat platform health check failed on HA Redis.** The beat
+  probe used a raw `aioredis.from_url`, which rejects the `sentinel://`
+  scheme used by HA Redis (`Redis URL must specify one of redis:// …`),
+  so the Platform Health card showed beat as errored on a Sentinel
+  deployment. It now uses the same Sentinel-aware helper as the redis +
+  workers probes.
+* **Fleet "Upgrade pending" no longer promises a fire that can't come.**
+  When an appliance's supervisor predates the 2026.06.12 upgrade-progress
+  telemetry it can't report progress, so the panel sat on "supervisor
+  will fire the trigger in ≤30 s" forever. It now detects the old version
+  and explains it, pointing at the host-side check / recovery
+  (`spatium-upgrade-slot status`, `journalctl -u spatiumddi-slot-upgrade`).
+
+### Security
+
+* **Stack-trace exposure on the Cluster health endpoints (CodeQL
+  `py/stack-trace-exposure`, alert #68).** The one-shot and SSE
+  cluster-health handlers echoed the raw kubeapi exception text into the
+  client-facing error (`kubeapi unreachable: <exc>`), which could leak
+  internal detail to the operator's browser. Both now log the exception
+  server-side and return a generic reason.
+
+---
+
 ## 2026.06.13-2 — 2026-06-13
 
 A focused **field-fix release** — five issues (#407–#411) surfaced while

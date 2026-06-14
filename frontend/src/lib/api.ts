@@ -7701,10 +7701,37 @@ export const versionApi = {
 // 4b-4g extend this client with the real management surfaces (TLS
 // cert upload, release manager, containers, logs, network/host
 // config, web first-boot wizard).
+// #416 — identity + lifecycle of the LOCAL appliance for the browser
+// Console view, sourced from the self ``Appliance`` row the supervisor
+// populates on heartbeat (matched by hostname). ``null`` on docker / k8s
+// control planes (no supervisor) or before the local supervisor has
+// registered + been approved. Mirrors the backend ``SelfApplianceInfo``.
+export interface SelfApplianceInfo {
+  state: string;
+  deployment_kind: string | null;
+  supervisor_version: string | null;
+  installed_appliance_version: string | null;
+  current_slot: string | null;
+  durable_default: string | null;
+  is_trial_boot: boolean;
+  last_upgrade_state: string | null;
+  node_ip: string | null;
+  // ``{<compose-service>: {role, status, since, …}}`` — the supervisor's
+  // service-container watchdog rollup; drives the Console's per-role chips.
+  role_health: Record<
+    string,
+    { role?: string; status?: string; since?: string; [k: string]: unknown }
+  >;
+  role_switch_state: string | null;
+  last_seen_at: string | null;
+}
+
 export interface ApplianceInfo {
   appliance_mode: boolean;
   appliance_version: string | null;
   appliance_hostname: string | null;
+  // #416 — local appliance lifecycle for the Console view; null off-box.
+  self_appliance: SelfApplianceInfo | null;
 }
 
 export const applianceApi = {
@@ -9275,13 +9302,11 @@ export const applianceDiagnosticsApi = {
  * (not EventSource) so we can send the Bearer token in Authorization.
  * Yields each parsed log line; cancel via the AbortSignal.
  */
-export async function* streamApplianceContainerLogs(
-  name: string,
+async function* _streamApplianceLogSse(
+  url: string,
   signal?: AbortSignal,
-  tail = 100,
 ): AsyncIterable<string> {
   const token = localStorage.getItem("access_token");
-  const url = `/api/v1/appliance/containers/${encodeURIComponent(name)}/logs/stream?tail=${tail}`;
   const res = await fetch(url, {
     headers: {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -9316,6 +9341,32 @@ export async function* streamApplianceContainerLogs(
       }
     }
   }
+}
+
+// Tail one pod's logs by exact pod name (used by the Pods tab).
+export function streamApplianceContainerLogs(
+  name: string,
+  signal?: AbortSignal,
+  tail = 100,
+): AsyncIterable<string> {
+  return _streamApplianceLogSse(
+    `/api/v1/appliance/containers/${encodeURIComponent(name)}/logs/stream?tail=${tail}`,
+    signal,
+  );
+}
+
+// Tail a workload (deployment / daemonset) by its component label
+// (api / worker / frontend / …); the backend resolves it to the current
+// pod, so the stream survives pod rolls without exposing pod names (#416).
+export function streamApplianceWorkloadLogs(
+  component: string,
+  signal?: AbortSignal,
+  tail = 100,
+): AsyncIterable<string> {
+  return _streamApplianceLogSse(
+    `/api/v1/appliance/containers/workloads/${encodeURIComponent(component)}/logs/stream?tail=${tail}`,
+    signal,
+  );
 }
 
 /**

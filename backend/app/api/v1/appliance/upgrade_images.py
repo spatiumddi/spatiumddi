@@ -125,6 +125,16 @@ def _image_path(image_id: uuid.UUID) -> Path:
     return SLOT_IMAGE_DIR / f"{image_id}.raw.xz"
 
 
+def _partial_path(image_id: uuid.UUID) -> Path:
+    # In-flight upload temp file, atomically renamed to ``_image_path``
+    # on success. Append ".partial" to the full ``<id>.raw.xz`` name —
+    # NOT ``with_suffix(".raw.xz.partial")``, which replaces only the
+    # final ``.xz`` component and doubles the ``.raw`` into the bogus
+    # ``<id>.raw.raw.xz.partial`` (#415).
+    target = _image_path(image_id)
+    return target.with_name(target.name + ".partial")
+
+
 def _ensure_storage_dir() -> None:
     SLOT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -359,7 +369,7 @@ async def _store_verified_image(
     # an atomic .partial → final rename.
     _ensure_storage_dir()
     target_path = _image_path(image_id)
-    tmp_path = target_path.with_suffix(".raw.xz.partial")
+    tmp_path = _partial_path(image_id)
     try:
         with tmp_path.open("wb") as out:
             async for chunk in source:

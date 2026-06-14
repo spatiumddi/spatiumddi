@@ -1,17 +1,25 @@
 import { useEffect, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
+  AlertCircle,
   AlertTriangle,
   Boxes,
   CheckCircle2,
+  Clock,
   Cpu,
   Database,
   HardDrive,
   Layers,
   MemoryStick,
+  Network,
+  Pause,
+  Power,
   Radio,
   RotateCcw,
+  ScrollText,
   Server,
+  Tag,
 } from "lucide-react";
 import {
   Area,
@@ -24,17 +32,35 @@ import {
 } from "recharts";
 
 import {
-  applianceClusterApi,
-  streamClusterHealth,
-  type ClusterHealthSnapshot,
+  applianceApi,
+  applianceSystemApi,
+  streamApplianceWorkloadLogs,
+  versionApi,
   type ClusterNodeVitals,
   type ClusterPodSummary,
   type ClusterWorkloadHealth,
+  type SelfApplianceInfo,
 } from "@/lib/api";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
+import {
+  AMBER,
+  EMERALD,
+  ROSE,
+  SKY,
+  SLATE,
+  VIOLET,
+  fmtAge,
+  fmtBytes,
+  fmtCores,
+  pct,
+  usageColor,
+  useClusterHealthStream,
+  type HistPoint,
+} from "./clusterShared";
 
 /**
- * Cluster → Overview (#402) — a live, near-real-time dashboard for the k3s
- * cluster underneath the appliance.
+ * Cluster → Overview (#402 / #416) — one cohesive, near-real-time dashboard
+ * for the k3s cluster underneath the appliance.
  *
  * Fed by an SSE stream (`/appliance/cluster/health/stream`) that pushes a
  * fresh snapshot every ~2s; each frame animates the gradient CPU/memory hero
@@ -42,64 +68,14 @@ import {
  * leaderboard. There's no metrics-server / Prometheus on the appliance — live
  * usage comes from the kubelet Summary API, the same source the TTY console
  * uses. The stream self-reconnects; a one-shot GET paints instantly on mount.
+ *
+ * The top identity header + live pod-log tail + reboot action fold in what was
+ * a separate "Console" sub-view: identity / lifecycle come from
+ * `applianceApi.getInfo()` (the `self_appliance` block) + the app version from
+ * `versionApi.get()`. Degrades gracefully when `self_appliance` is null
+ * (docker / k8s control plane or pre-registration) — slot / pairing chips drop
+ * out, while hostname / version / cluster / log / actions stay.
  */
-
-const MAX_POINTS = 90; // ~3 min of history at the 2s stream cadence
-
-const EMERALD = "#10b981";
-const SKY = "#0ea5e9";
-const AMBER = "#f59e0b";
-const ROSE = "#f43f5e";
-const VIOLET = "#8b5cf6";
-const SLATE = "#64748b";
-
-interface HistPoint {
-  i: number;
-  cpu: number | null;
-  mem: number | null;
-}
-
-// ── formatting helpers ──────────────────────────────────────────────────────
-
-function fmtBytes(n: number | null | undefined): string {
-  if (n == null) return "—";
-  if (n < 1024) return `${n} B`;
-  const u = ["KiB", "MiB", "GiB", "TiB"];
-  let v = n / 1024;
-  let i = 0;
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v < 10 ? 1 : 0)} ${u[i]}`;
-}
-
-function fmtCores(c: number | null | undefined): string {
-  if (c == null) return "—";
-  return c < 1 ? `${Math.round(c * 1000)}m` : c.toFixed(2);
-}
-
-function pct(
-  used: number | null | undefined,
-  cap: number | null | undefined,
-): number | null {
-  if (used == null || !cap) return null;
-  return Math.max(0, Math.min(100, (used / cap) * 100));
-}
-
-function fmtAge(s: number | null | undefined): string {
-  if (s == null) return "—";
-  if (s < 3600) return `${Math.max(1, Math.floor(s / 60))}m`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h`;
-  return `${Math.floor(s / 86400)}d`;
-}
-
-function usageColor(p: number | null): string {
-  if (p == null) return SLATE;
-  if (p < 60) return EMERALD;
-  if (p < 85) return AMBER;
-  return ROSE;
-}
 
 function shortPodName(p: { name: string }): string {
   return p.name
@@ -108,70 +84,16 @@ function shortPodName(p: { name: string }): string {
     .replace(/^spatium-/, "");
 }
 
-// ── live stream hook ─────────────────────────────────────────────────────────
-
-function useClusterHealthStream() {
-  const [snapshot, setSnapshot] = useState<ClusterHealthSnapshot | null>(null);
-  const [history, setHistory] = useState<HistPoint[]>([]);
-  const [connected, setConnected] = useState(false);
-  const seq = useRef(0);
-
-  useEffect(() => {
-    const ctrl = new AbortController();
-    let stopped = false;
-
-    const ingest = (snap: ClusterHealthSnapshot) => {
-      setSnapshot(snap);
-      if (snap.available) {
-        const cpu = pct(snap.cpu_usage_cores, snap.cpu_capacity_cores);
-        const mem = pct(
-          snap.memory_working_set_bytes,
-          snap.memory_capacity_bytes,
-        );
-        setHistory((prev) => {
-          const next = [...prev, { i: seq.current++, cpu, mem }];
-          return next.length > MAX_POINTS
-            ? next.slice(next.length - MAX_POINTS)
-            : next;
-        });
-      }
-    };
-
-    // Instant first paint while the SSE stream warms up.
-    applianceClusterApi
-      .health()
-      .then((s) => {
-        if (!stopped) ingest(s);
-      })
-      .catch(() => {
-        /* stream will deliver shortly */
-      });
-
-    const run = async () => {
-      while (!stopped) {
-        try {
-          for await (const snap of streamClusterHealth(ctrl.signal)) {
-            if (stopped) break;
-            setConnected(true);
-            ingest(snap);
-          }
-        } catch {
-          if (stopped) break;
-        }
-        setConnected(false);
-        if (stopped) break;
-        await new Promise((r) => setTimeout(r, 2000)); // backoff then reconnect
-      }
-    };
-    void run();
-
-    return () => {
-      stopped = true;
-      ctrl.abort();
-    };
-  }, []);
-
-  return { snapshot, history, connected };
+// ── small relative-time helper (no shared util exists) ─────────────────────
+function relTime(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "—";
+  const s = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
 }
 
 // ── small visual primitives ──────────────────────────────────────────────────
@@ -234,7 +156,7 @@ function RadialGauge({
   );
 }
 
-function Sparkline({
+export function Sparkline({
   data,
   color,
   max,
@@ -302,7 +224,63 @@ function Bar({ value, color }: { value: number; color: string }) {
   );
 }
 
-function KpiTile({
+// ── identity chip ──────────────────────────────────────────────────────────
+function Chip({
+  icon: Icon,
+  children,
+  color,
+  title,
+}: {
+  icon?: typeof Cpu;
+  children: React.ReactNode;
+  color?: string;
+  title?: string;
+}) {
+  return (
+    <span
+      title={title}
+      className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium"
+      style={
+        color
+          ? { color, borderColor: `${color}55`, background: `${color}12` }
+          : undefined
+      }
+    >
+      {Icon && <Icon className="h-3 w-3" />}
+      {children}
+    </span>
+  );
+}
+
+function upgradeStateColor(state: string | null | undefined): string {
+  switch (state) {
+    case "ready":
+    case "done":
+      return EMERALD;
+    case "in-flight":
+      return VIOLET;
+    case "failed":
+      return ROSE;
+    default:
+      return SLATE;
+  }
+}
+
+// Derive the list of roles the box runs from the watchdog role_health keys
+// (compose-service names → their reported ``role``), falling back to the
+// deployment kind so a box with no watchdog rollup still labels itself.
+function deriveRoles(self: SelfApplianceInfo | null): string[] {
+  if (self) {
+    const fromHealth = Object.entries(self.role_health)
+      .map(([svc, v]) => v?.role || svc)
+      .filter(Boolean);
+    if (fromHealth.length) return [...new Set(fromHealth)];
+    if (self.deployment_kind) return [self.deployment_kind];
+  }
+  return [];
+}
+
+export function KpiTile({
   icon: Icon,
   label,
   value,
@@ -336,7 +314,7 @@ function KpiTile({
   );
 }
 
-function RoleBadge({ role }: { role: string }) {
+export function RoleBadge({ role }: { role: string }) {
   const color =
     role === "control-plane" || role === "master"
       ? VIOLET
@@ -353,7 +331,7 @@ function RoleBadge({ role }: { role: string }) {
   );
 }
 
-function StatusChip({ status }: { status: string }) {
+export function StatusChip({ status }: { status: string }) {
   const map: Record<string, [string, string]> = {
     healthy: [EMERALD, "Healthy"],
     degraded: [AMBER, "Degraded"],
@@ -605,7 +583,7 @@ function TopPods({
 
 // ── hero live chart ───────────────────────────────────────────────────────────
 
-function HeroChart({
+export function HeroChart({
   history,
   cpuPct,
   memPct,
@@ -725,7 +703,11 @@ function HeroChart({
 
 // ── workload health ───────────────────────────────────────────────────────────
 
-function WorkloadHealth({ workloads }: { workloads: ClusterWorkloadHealth[] }) {
+export function WorkloadHealth({
+  workloads,
+}: {
+  workloads: ClusterWorkloadHealth[];
+}) {
   return (
     <div className="rounded-xl border bg-card p-4 shadow-sm">
       <h3 className="flex items-center gap-1.5 text-sm font-semibold">
@@ -774,10 +756,184 @@ function WorkloadHealth({ workloads }: { workloads: ClusterWorkloadHealth[] }) {
   );
 }
 
+// ── service roles (supervisor watchdog rollup) ─────────────────────────────────
+
+function ServiceRoles({
+  rows,
+}: {
+  rows: { service: string; status: string; since: string | null }[];
+}) {
+  return (
+    <div className="rounded-xl border bg-card p-4 shadow-sm">
+      <h3 className="flex items-center gap-1.5 text-sm font-semibold">
+        <Layers className="h-4 w-4 text-muted-foreground" />
+        Service roles
+      </h3>
+      <div className="mt-3 space-y-1.5">
+        {rows.map((r) => (
+          <div
+            key={r.service}
+            className="flex items-center justify-between gap-2 rounded-md px-1 py-1 text-xs"
+          >
+            <div className="flex min-w-0 items-center gap-2">
+              <StatusChip status={r.status} />
+              <span className="truncate font-medium">{r.service}</span>
+            </div>
+            {r.since && (
+              <span className="shrink-0 text-[10px] text-muted-foreground">
+                since {relTime(r.since)}
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── live log pane ──────────────────────────────────────────────────────────
+function LiveLogPane({ workload }: { workload: string }) {
+  const [lines, setLines] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [paused, setPaused] = useState(false);
+  const boxRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setLines([]);
+    setError(null);
+    setPaused(false);
+    const ctrl = new AbortController();
+    (async () => {
+      try {
+        for await (const line of streamApplianceWorkloadLogs(
+          workload,
+          ctrl.signal,
+          200,
+        )) {
+          setLines((prev) => {
+            const next = [...prev, line];
+            // Cap at 2000 lines so a chatty pod doesn't blow up memory / DOM.
+            if (next.length > 2000) next.splice(0, next.length - 2000);
+            return next;
+          });
+        }
+      } catch (e) {
+        if (!ctrl.signal.aborted) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      }
+    })();
+    return () => ctrl.abort();
+  }, [workload]);
+
+  // Auto-scroll to bottom unless the operator scrolled up (pause).
+  useEffect(() => {
+    if (paused) return;
+    const el = boxRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [lines, paused]);
+
+  const onScroll = () => {
+    const el = boxRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
+    setPaused(!atBottom);
+  };
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+        <Activity className="h-3 w-3 text-emerald-500" />
+        Live · {lines.length} line{lines.length === 1 ? "" : "s"}
+        {paused && (
+          <button
+            type="button"
+            onClick={() => setPaused(false)}
+            className="ml-auto inline-flex items-center gap-1 rounded-md border bg-background px-2 py-0.5 text-[11px] hover:bg-accent"
+            title="Jump to bottom + resume auto-scroll"
+          >
+            <Pause className="h-3 w-3" />
+            Paused — click to resume
+          </button>
+        )}
+      </div>
+      {error && (
+        <div className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
+          <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+      <div
+        ref={boxRef}
+        onScroll={onScroll}
+        className="h-80 overflow-auto rounded-md border bg-muted/30 px-3 py-2 font-mono text-[11px] leading-tight"
+      >
+        {lines.length === 0 && !error ? (
+          <span className="text-muted-foreground">Waiting for logs…</span>
+        ) : (
+          lines.map((line, i) => (
+            <div key={i} className="whitespace-pre-wrap">
+              {line}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
-export function ClusterOverview() {
+export function ClusterOverview({
+  onViewPods,
+}: { onViewPods?: () => void } = {}) {
   const { snapshot, history, connected } = useClusterHealthStream();
+
+  // Identity + lifecycle for the header / reboot action (folds in the former
+  // Console view). These hooks run unconditionally — the early returns below
+  // come after them, so no hooks-rule violation.
+  const { data: info } = useQuery({
+    queryKey: ["appliance", "info"],
+    queryFn: applianceApi.getInfo,
+    staleTime: 20_000,
+    refetchInterval: 30_000,
+  });
+  const { data: version } = useQuery({
+    queryKey: ["version"],
+    queryFn: versionApi.get,
+    staleTime: 30_000,
+  });
+
+  const self = info?.self_appliance ?? null;
+  const isApplianceHost = self?.deployment_kind === "appliance";
+
+  const [confirmReboot, setConfirmReboot] = useState(false);
+  const [rebooting, setRebooting] = useState(false);
+
+  // ── log workload picker — tail a deployment/daemonset by its component ──
+  // The operator picks a stable workload (api / worker / frontend / …) and
+  // the backend resolves it to the current pod, so the stream survives pod
+  // rolls and never exposes churny pod names (#416).
+  const workloadNames = (snapshot?.workloads ?? []).map((w) => w.component);
+  const defaultWorkload =
+    workloadNames.find((n) => /api|control/i.test(n)) ?? workloadNames[0] ?? "";
+  const [selectedWorkload, setSelectedWorkload] = useState<string>("");
+  // Honor the explicit pick only while it's still a known workload; else fall
+  // back to the default (deriving avoids a stale picker without an effect).
+  const effectiveWorkload =
+    selectedWorkload && workloadNames.includes(selectedWorkload)
+      ? selectedWorkload
+      : defaultWorkload;
+
+  const doReboot = async () => {
+    setRebooting(true);
+    try {
+      await applianceSystemApi.reboot();
+      setConfirmReboot(false);
+    } finally {
+      setRebooting(false);
+    }
+  };
 
   if (snapshot === null) {
     return (
@@ -809,55 +965,154 @@ export function ClusterOverview() {
   ).length;
   const cpuSpark = history.map((h) => h.cpu ?? 0);
   const memSpark = history.map((h) => h.mem ?? 0);
-  const phaseSummary = Object.entries(s.pods_by_phase)
-    .sort((a, b) => b[1] - a[1])
-    .map(([k, v]) => `${k} ${v}`)
+
+  // Pods KPI — exclude completed Jobs (Succeeded phase: migrate / helm-install
+  // / CNPG bootstrap) from the denominator so a healthy box reads "10/10"
+  // instead of an alarming "10/14". Finished Jobs still surface as a small
+  // "N completed" sub-line; any pending / failed pods are noted too.
+  const succeeded = s.pods_by_phase?.["Succeeded"] ?? 0;
+  const pending = s.pods_by_phase?.["Pending"] ?? 0;
+  const failed = s.pods_by_phase?.["Failed"] ?? 0;
+  const activePods = Math.max(0, s.pods_total - succeeded);
+  const podsSub = [
+    succeeded > 0 ? `${succeeded} completed` : null,
+    pending > 0 ? `${pending} pending` : null,
+    failed > 0 ? `${failed} failed` : null,
+  ]
+    .filter(Boolean)
     .join(" · ");
+
+  // ── derived identity values ─────────────────────────────────────────────
+  const roles = deriveRoles(self);
+  const hostIp =
+    self?.node_ip ?? s.nodes.find((n) => n.internal_ip)?.internal_ip ?? null;
+
+  // role_health → flat list of {service, status, since}; rendered only when
+  // non-empty (a control-plane appliance reports none — no empty placeholder).
+  const roleHealthRows = self
+    ? Object.entries(self.role_health).map(([service, v]) => ({
+        service,
+        status: (v?.status as string | undefined) ?? "unknown",
+        since: (v?.since as string | undefined) ?? null,
+      }))
+    : [];
 
   return (
     <div className="space-y-4">
-      {/* Header */}
-      <div className="flex flex-wrap items-center gap-2">
-        <h2 className="flex items-center gap-2 text-base font-semibold">
-          <Boxes className="h-4 w-4 text-muted-foreground" />
-          Cluster overview
-        </h2>
-        <span
-          className="inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium"
-          style={{
-            color: connected ? EMERALD : AMBER,
-            borderColor: `${connected ? EMERALD : AMBER}55`,
-            background: `${connected ? EMERALD : AMBER}12`,
-          }}
-        >
-          <span
-            className={`h-1.5 w-1.5 rounded-full ${connected ? "animate-pulse" : ""}`}
-            style={{ background: connected ? EMERALD : AMBER }}
-          />
-          {connected ? "LIVE" : "reconnecting…"}
-        </span>
-        <span className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
-          {s.kubelet_version && (
-            <span className="rounded-md bg-muted px-1.5 py-0.5 font-mono">
-              {s.kubelet_version}
-            </span>
-          )}
-          <span
-            className="rounded-md px-1.5 py-0.5 font-medium"
-            style={
-              s.is_ha
-                ? { color: EMERALD, background: `${EMERALD}1f` }
-                : { color: SLATE, background: `${SLATE}1f` }
-            }
+      {/* Identity header */}
+      <div className="rounded-xl border bg-card p-4 shadow-sm">
+        <div className="flex flex-wrap items-center gap-2">
+          <h2 className="flex items-center gap-2 text-base font-semibold">
+            <Boxes className="h-4 w-4 text-muted-foreground" />
+            Cluster
+          </h2>
+          <Chip
+            icon={Radio}
+            color={connected ? EMERALD : AMBER}
+            title={connected ? "Streaming live" : "Reconnecting"}
           >
-            {s.is_ha ? `HA · ${s.control_plane_nodes} nodes` : "single node"}
-          </span>
-          {!s.metrics_available && (
-            <span className="rounded-md bg-amber-500/15 px-1.5 py-0.5 text-amber-600 dark:text-amber-400">
-              live usage unavailable
+            {connected ? "LIVE" : "reconnecting…"}
+          </Chip>
+          {self?.last_seen_at && (
+            <span className="ml-auto flex items-center gap-1 text-[11px] text-muted-foreground">
+              <Clock className="h-3 w-3" />
+              supervisor seen {relTime(self.last_seen_at)}
             </span>
           )}
-        </span>
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-center gap-1.5">
+          {roles.map((r) => (
+            <Chip key={r} icon={Layers} color={VIOLET}>
+              {r}
+            </Chip>
+          ))}
+          <Chip icon={Server}>
+            {info?.appliance_hostname ?? s.nodes[0]?.name ?? "unknown"}
+          </Chip>
+          {hostIp && (
+            <Chip icon={Network} title="Host IP">
+              <span className="font-mono">{hostIp}</span>
+            </Chip>
+          )}
+          {(self?.installed_appliance_version ?? info?.appliance_version) && (
+            <Chip icon={Tag} title="Appliance OS version">
+              OS {self?.installed_appliance_version ?? info?.appliance_version}
+            </Chip>
+          )}
+          {version?.version && (
+            <Chip icon={Tag} title="SpatiumDDI app version">
+              app {version.version}
+            </Chip>
+          )}
+
+          {/* A/B slot — appliance only */}
+          {self?.current_slot && (
+            <Chip
+              icon={HardDrive}
+              color={self.is_trial_boot ? AMBER : EMERALD}
+              title={`Running slot ${self.current_slot}; durable default ${self.durable_default ?? "?"}`}
+            >
+              slot {self.current_slot}
+              {self.durable_default && (
+                <span className="opacity-70">
+                  · default {self.durable_default}
+                </span>
+              )}
+            </Chip>
+          )}
+          {self?.is_trial_boot && (
+            <Chip
+              color={AMBER}
+              title="Running slot differs from durable default"
+            >
+              TRIAL BOOT
+            </Chip>
+          )}
+          {self?.last_upgrade_state && (
+            <Chip
+              color={upgradeStateColor(self.last_upgrade_state)}
+              title="Last A/B slot upgrade state"
+            >
+              upgrade: {self.last_upgrade_state}
+            </Chip>
+          )}
+
+          {/* Cluster status */}
+          <Chip
+            color={s.nodes_ready === s.nodes_total ? EMERALD : ROSE}
+            title="Nodes ready / total"
+          >
+            {s.nodes_ready}/{s.nodes_total} nodes
+            {s.is_ha && <span className="opacity-70">· HA</span>}
+          </Chip>
+          {s.kubelet_version && (
+            <Chip title="Kubelet version">
+              <span className="font-mono">{s.kubelet_version}</span>
+            </Chip>
+          )}
+          {!s.metrics_available && (
+            <Chip color={AMBER} title="kubelet Summary API not reporting yet">
+              live usage unavailable
+            </Chip>
+          )}
+          {self?.state && (
+            <Chip
+              color={self.state === "approved" ? EMERALD : AMBER}
+              title="Supervisor approval / pairing lifecycle"
+            >
+              {self.state}
+            </Chip>
+          )}
+        </div>
+
+        {!self && (
+          <p className="mt-3 text-[11px] text-muted-foreground">
+            No local supervisor registered — showing cluster health only. Slot,
+            lifecycle, and per-role chips appear once the local appliance's
+            supervisor is approved.
+          </p>
+        )}
       </div>
 
       {/* KPI ribbon */}
@@ -894,14 +1149,16 @@ export function ClusterOverview() {
         <KpiTile
           icon={Boxes}
           label="Pods running"
-          value={`${s.pods_running}/${s.pods_total}`}
-          accent={VIOLET}
+          value={`${s.pods_running}/${activePods}`}
+          accent={s.pods_running >= activePods ? EMERALD : ROSE}
         >
           <div
             className="truncate text-[11px] text-muted-foreground"
-            title={phaseSummary}
+            title={Object.entries(s.pods_by_phase)
+              .map(([k, v]) => `${k} ${v}`)
+              .join(" · ")}
           >
-            {phaseSummary || "—"}
+            {podsSub || "all running"}
           </div>
         </KpiTile>
         <KpiTile
@@ -941,11 +1198,90 @@ export function ClusterOverview() {
         ))}
       </div>
 
-      {/* Workloads + top pods */}
+      {/* Workloads + top pods (+ service roles when the supervisor reports them) */}
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
         <WorkloadHealth workloads={s.workloads} />
         <TopPods cpu={s.top_pods_cpu} mem={s.top_pods_mem} />
+        {roleHealthRows.length > 0 && <ServiceRoles rows={roleHealthRows} />}
       </div>
+
+      {/* Live log pane */}
+      <div className="rounded-xl border bg-card p-4 shadow-sm">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="flex items-center gap-1.5 text-sm font-semibold">
+            <ScrollText className="h-4 w-4 text-muted-foreground" />
+            Live log
+          </h3>
+          {workloadNames.length > 0 && (
+            <select
+              value={effectiveWorkload}
+              onChange={(e) => setSelectedWorkload(e.target.value)}
+              className="rounded-md border bg-background px-2 py-1 text-xs"
+            >
+              {workloadNames.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+        <div className="mt-3">
+          {effectiveWorkload ? (
+            <LiveLogPane key={effectiveWorkload} workload={effectiveWorkload} />
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No workloads to tail yet.
+            </p>
+          )}
+        </div>
+      </div>
+
+      {/* Action bar */}
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={() => setConfirmReboot(true)}
+          disabled={!isApplianceHost}
+          title={
+            isApplianceHost
+              ? "Reboot the appliance host OS"
+              : "Reboot is only available on appliance hosts"
+          }
+          className="inline-flex items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-3 py-1.5 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <Power className="h-3.5 w-3.5" />
+          Reboot host
+        </button>
+        {onViewPods && (
+          <button
+            type="button"
+            onClick={onViewPods}
+            className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            <Boxes className="h-3.5 w-3.5" />
+            View all pods →
+          </button>
+        )}
+      </div>
+
+      <ConfirmModal
+        open={confirmReboot}
+        title="Reboot appliance?"
+        message={
+          <span>
+            The host will power-cycle in ~10 seconds. Existing DHCP leases keep
+            their state (DB-backed); DNS zones reload from the served config;
+            the web UI will be unreachable for ~1 minute.
+          </span>
+        }
+        confirmLabel="Reboot now"
+        tone="destructive"
+        requireCheckboxLabel="I understand the appliance will go offline for ~1 minute."
+        onClose={() => !rebooting && setConfirmReboot(false)}
+        onConfirm={() => void doReboot()}
+        loading={rebooting}
+      />
     </div>
   );
 }

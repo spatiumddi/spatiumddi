@@ -1467,6 +1467,10 @@ export function FleetTab({
           onRekey={() => setRekeyTarget(drilldown)}
           onDelete={() => setDeleteTarget(drilldown)}
           onRowUpdated={(next) => setDrilldown(next)}
+          onViewUpgradeImages={() => {
+            setDrilldown(null);
+            setView("upgrade-images");
+          }}
         />
       )}
 
@@ -2228,6 +2232,7 @@ function ApplianceDrilldownModal({
   onRekey,
   onDelete,
   onRowUpdated,
+  onViewUpgradeImages,
 }: {
   row: ApplianceRow;
   onClose: () => void;
@@ -2237,6 +2242,11 @@ function ApplianceDrilldownModal({
   onRekey: () => void;
   onDelete: () => void;
   onRowUpdated: (next: ApplianceRow) => void;
+  // Closes this modal and switches the Fleet sub-nav to the
+  // "Upgrade images" view — wired into the OS-upgrade section's
+  // empty state so operators aren't told to look for a section
+  // that moved (#199 renamed slot-images → Upgrade images).
+  onViewUpgradeImages?: () => void;
 }) {
   const caps = row.capabilities ?? {};
   const badge = stateBadge(row.state);
@@ -2357,7 +2367,12 @@ function ApplianceDrilldownModal({
           <ApplianceClusterHealthSection row={row} />
         )}
 
-        {row.state === "approved" && <ApplianceOsUpgradeSection row={row} />}
+        {row.state === "approved" && (
+          <ApplianceOsUpgradeSection
+            row={row}
+            onViewUpgradeImages={onViewUpgradeImages}
+          />
+        )}
 
         {row.state === "approved" && (
           <div>
@@ -3973,6 +3988,14 @@ function UpgradeStatusPanel({
   const state = row.last_upgrade_state;
   const failed = state === "failed" || progress?.step === "failed";
   const target = row.desired_appliance_version;
+  // A supervisor older than the #386 (2026.06.12) upgrade-progress telemetry
+  // never reports last_upgrade_progress, so without this the panel sits on
+  // "pending" forever even after the trigger fired. Detect it from the
+  // reported version (CalVer sorts lexicographically) and say so honestly
+  // rather than promising a fire "in ≤30s" that already happened.
+  const supVer = row.supervisor_version ?? row.installed_appliance_version;
+  const predatesProgress =
+    !!supVer && /^\d{4}\.\d{2}\.\d{2}/.test(supVer) && supVer < "2026.06.12";
 
   if (failed) {
     return (
@@ -4047,12 +4070,24 @@ function UpgradeStatusPanel({
         )}
       </div>
 
-      {stepIndex === -1 && (
-        <p className="mt-1 text-muted-foreground">
-          Supervisor will fire the slot-upgrade trigger on its next heartbeat (≤
-          30 s).
-        </p>
-      )}
+      {stepIndex === -1 &&
+        (predatesProgress ? (
+          <p className="mt-1 text-muted-foreground">
+            This appliance&rsquo;s supervisor (<code>{supVer}</code>) predates
+            live upgrade-progress reporting, so this dashboard can&rsquo;t show
+            the trigger&rsquo;s status &mdash; the upgrade may already have
+            fired. Verify on the host (<code>spatium-upgrade-slot status</code>,{" "}
+            <code>journalctl -u spatiumddi-slot-upgrade</code>) or apply the
+            slot image by hand, then reboot. Live progress appears here once the
+            appliance is on &ge; 2026.06.12.
+          </p>
+        ) : (
+          <p className="mt-1 text-muted-foreground">
+            Supervisor will fire the slot-upgrade trigger on its next heartbeat
+            (&le; 30 s). If it stays here, check{" "}
+            <code>journalctl -u spatiumddi-slot-upgrade</code> on the host.
+          </p>
+        ))}
 
       <ol className="mt-2 space-y-1">
         {UPGRADE_STEPS.map((s, i) => {
@@ -4143,7 +4178,13 @@ function UpgradeStatusPanel({
   );
 }
 
-function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
+function ApplianceOsUpgradeSection({
+  row,
+  onViewUpgradeImages,
+}: {
+  row: ApplianceRow;
+  onViewUpgradeImages?: () => void;
+}) {
   const qc = useQueryClient();
   const [sourceKind, setSourceKind] = useState<"url" | "uploaded">("uploaded");
   const [tag, setTag] = useState("");
@@ -4345,8 +4386,21 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
               </select>
               {uploadedQuery.data && uploadedQuery.data.length === 0 && (
                 <p className="text-[11px] text-muted-foreground">
-                  No upgrade images uploaded yet. Open the &ldquo;Upgrade
-                  images&rdquo; section above to upload one.
+                  No upgrade images uploaded yet.{" "}
+                  {onViewUpgradeImages ? (
+                    <button
+                      type="button"
+                      onClick={onViewUpgradeImages}
+                      className="font-medium text-primary underline-offset-2 hover:underline"
+                    >
+                      Go to Upgrade images →
+                    </button>
+                  ) : (
+                    <>
+                      Open <strong>Fleet → Upgrade images</strong> to upload or
+                      import one.
+                    </>
+                  )}
                 </p>
               )}
               <input

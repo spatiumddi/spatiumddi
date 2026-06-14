@@ -106,6 +106,18 @@ def test_pick_upgrade_assets_prefers_versioned() -> None:
     assert "-2026.05.14-1-amd64.raw.xz" in picked[0]
 
 
+def test_partial_path_does_not_double_suffix() -> None:
+    # #415 regression: with_suffix(".raw.xz.partial") replaces only the
+    # ``.xz`` of ``<id>.raw.xz`` and doubles the ``.raw`` into the bogus
+    # ``<id>.raw.raw.xz.partial``. _partial_path appends instead.
+    img = uuid.UUID("c1ce67bb-e165-44a0-a2fd-1f03b3abcb5f")
+    partial = upgrade_images._partial_path(img)
+    assert partial.name == f"{img}.raw.xz.partial"
+    assert ".raw.raw" not in partial.name
+    # the atomic-rename target is the un-suffixed image path
+    assert upgrade_images._image_path(img).name == f"{img}.raw.xz"
+
+
 async def test_list_available_upgrade_images_filters(monkeypatch: pytest.MonkeyPatch) -> None:
     raw = [
         _release("2026.05.14-1", assets=_image_assets("2026.05.14-1")),

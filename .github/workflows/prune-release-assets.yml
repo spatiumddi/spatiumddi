@@ -1,0 +1,52 @@
+name: Prune release assets
+
+# Version-aware retention sweep for the heavy appliance release assets
+# (#392). The release workflow runs the same script as a post-publish step
+# so the window rolls forward on every cut; this scheduled run is the
+# safety net (catches the backlog of releases cut before #392, and any
+# release where the post-step was skipped) plus an on-demand / dry-run
+# knob via workflow_dispatch.
+#
+# Deletes ASSETS only — never a release, tag, or notes. See
+# scripts/prune-release-assets.sh for the two-tier retention rules.
+
+on:
+  schedule:
+    # Weekly, Monday 04:17 UTC. Off-the-hour minute to avoid the
+    # top-of-hour cron stampede on GitHub's shared schedulers.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      keep_versioned:
+        description: "Newest releases to keep versioned heavy assets on"
+        required: false
+        default: "15"
+      dry_run:
+        description: "Log only — delete nothing"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+# Never let two prune runs race on the same release set.
+concurrency:
+  group: prune-release-assets
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    name: Prune old appliance release assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prune
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          KEEP_VERSIONED: ${{ github.event.inputs.keep_versioned || '15' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          chmod +x scripts/prune-release-assets.sh
+          scripts/prune-release-assets.sh

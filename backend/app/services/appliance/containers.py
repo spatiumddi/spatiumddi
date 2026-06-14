@@ -63,6 +63,24 @@ class ContainerSummary:
     short_id: str
     started_at: datetime | None
     is_spatium: bool
+    component: str  # workload label (api/worker/frontend/…) — #416 log picker
+
+
+def _pod_component(pod: dict[str, Any]) -> str:
+    """Workload component for a pod — the ``app.kubernetes.io/component``
+    label, else the chart-prefix-stripped pod name. Mirrors
+    ``cluster_health._pod_component`` (kept local to avoid an import cycle)."""
+    labels = (pod.get("metadata") or {}).get("labels") or {}
+    comp = labels.get("app.kubernetes.io/component")
+    if comp:
+        return comp
+    name = (pod.get("metadata") or {}).get("name") or "?"
+    for pre in ("spatium-control-spatiumddi-", "spatium-bootstrap-", "spatium-"):
+        if name.startswith(pre):
+            name = name[len(pre) :]
+            break
+    parts = name.rsplit("-", 2)
+    return parts[0] if len(parts) == 3 else name
 
 
 def _parse_pod_to_summary(pod: dict[str, Any]) -> ContainerSummary:
@@ -153,6 +171,7 @@ def _parse_pod_to_summary(pod: dict[str, Any]) -> ContainerSummary:
         short_id=(meta.get("uid") or "")[:12],
         started_at=started_at,
         is_spatium=is_spatium,
+        component=_pod_component(pod),
     )
 
 
@@ -167,6 +186,78 @@ def list_containers() -> list[ContainerSummary]:
     # Spatium pods first, then alphabetical within each group.
     out.sort(key=lambda c: (not c.is_spatium, c.name))
     return out
+
+
+# Container names that are never the workload's "main" log source — skip
+# them when a multi-container pod has no component-matching or default
+# container (e.g. the redis pod ships a render-config sidecar).
+_LOG_SIDECAR_NAMES = frozenset({"render-config"})
+
+
+def _pick_log_container(pod: dict[str, Any], prefer: str | None = None) -> str | None:
+    """Which container's logs to tail for a (possibly multi-container) pod.
+
+    kubeapi 400s a logs request on a multi-container pod unless a container
+    is named (#416 follow-up: the redis pod is render-config + redis +
+    sentinel). Returns None for a single-container pod — kubeapi defaults to
+    the only one. Otherwise prefer the component-matching container (redis →
+    redis), then the ``kubectl.kubernetes.io/default-container`` annotation,
+    then the first non-sidecar, then the first."""
+    names = [
+        c.get("name") for c in (pod.get("spec") or {}).get("containers") or [] if c.get("name")
+    ]
+    if len(names) <= 1:
+        return None
+    if prefer and prefer in names:
+        return prefer
+    ann = (pod.get("metadata") or {}).get("annotations") or {}
+    default_c = ann.get("kubectl.kubernetes.io/default-container")
+    if default_c in names:
+        return default_c
+    for n in names:
+        if n not in _LOG_SIDECAR_NAMES:
+            return n
+    return names[0]
+
+
+def _default_log_container(name: str) -> str | None:
+    """Default log container for a bare pod name (the Pods-tab path), so a
+    multi-container pod doesn't 400. None if the pod isn't found / single."""
+    try:
+        pods = k8s.list_pods()
+    except k8s.KubeapiUnavailableError:
+        return None
+    for p in pods:
+        if (p.get("metadata") or {}).get("name") == name:
+            return _pick_log_container(p)
+    return None
+
+
+def resolve_workload_pod(component: str) -> tuple[str, str | None] | None:
+    """Resolve a workload component (api/worker/frontend/…) to ``(pod_name,
+    container)`` for its current running SpatiumDDI pod — the newest, so a
+    just-rolled Deployment resolves to the fresh pod, and the right container
+    on a multi-container pod (e.g. redis). Lets the log surface tail a stable
+    workload instead of a churny pod name (#416). None if nothing matches."""
+    if not settings.appliance_mode:
+        return None
+    try:
+        pods = k8s.list_pods()
+    except k8s.KubeapiUnavailableError as exc:
+        raise DockerUnavailableError(str(exc)) from exc
+    matches: list[tuple[ContainerSummary, dict[str, Any]]] = []
+    for p in pods:
+        summary = _parse_pod_to_summary(p)
+        if summary.is_spatium and summary.state == "running" and summary.component == component:
+            matches.append((summary, p))
+    if not matches:
+        return None
+    matches.sort(
+        key=lambda sp: sp[0].started_at or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+    summary, pod = matches[0]
+    return summary.name, _pick_log_container(pod, prefer=component)
 
 
 def container_action(name: str, action: str) -> None:
@@ -208,7 +299,9 @@ def get_container_logs(name: str, tail: int = 200, since_seconds: int | None = N
     return body
 
 
-async def stream_container_logs(name: str, tail: int = 100) -> AsyncGenerator[str, None]:
+async def stream_container_logs(
+    name: str, tail: int = 100, container: str | None = None
+) -> AsyncGenerator[str, None]:
     """Yield log lines from the named pod as they arrive.
 
     Wraps ``k8s.stream_pod_logs`` (a sync generator) with
@@ -222,8 +315,13 @@ async def stream_container_logs(name: str, tail: int = 100) -> AsyncGenerator[st
     worker thread is closed via the generator's GeneratorExit
     propagation through the iter wrapper below.
     """
+    if container is None:
+        # A bare pod name (the Pods tab) on a multi-container pod (e.g. redis:
+        # render-config / redis / sentinel) makes kubeapi 400 "a container
+        # name must be specified". Resolve a default from the pod's spec.
+        container = _default_log_container(name)
     try:
-        gen = k8s.stream_pod_logs(name, tail=tail)
+        gen = k8s.stream_pod_logs(name, tail=tail, container=container)
     except k8s.KubeapiUnavailableError as exc:
         raise DockerUnavailableError(str(exc)) from exc
 

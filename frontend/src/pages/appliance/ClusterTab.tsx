@@ -47,7 +47,7 @@ const SECTIONS: {
     key: "overview",
     label: "Overview",
     icon: Gauge,
-    hint: "Live health & metrics",
+    hint: "Live dashboard & metrics",
   },
   {
     key: "pods",
@@ -132,7 +132,7 @@ export function ClusterTab({
 
       <div className="min-w-0 flex-1">
         {section === "overview" ? (
-          <ClusterOverview />
+          <ClusterOverview onViewPods={() => setSection("pods")} />
         ) : section === "pods" ? (
           <ContainersTab />
         ) : etcdAvailable ? (

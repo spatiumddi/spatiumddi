@@ -25,6 +25,7 @@ from app.services.appliance.containers import (
     DockerUnavailableError,
     container_action,
     get_container_logs,
+    resolve_workload_pod,
     stream_container_logs,
 )
 from app.services.appliance.containers import (
@@ -119,38 +120,66 @@ async def get_logs(name: str, tail: int = 200) -> dict[str, str]:
     return {"name": name, "tail": text}
 
 
-@router.get(
-    "/{name}/logs/stream",
-    dependencies=[Depends(require_permission("read", "appliance"))],
-    summary="Stream container logs as SSE (follow=true)",
-)
-async def stream_logs(name: str, tail: int = 100):
-    """Yields SSE ``data:`` frames with each log chunk as it arrives.
+def _sse_log_response(gen) -> StreamingResponse:
+    """Wrap a log-chunk generator as an SSE response.
 
-    Client disconnects close the underlying docker stream. Chunks
-    are JSON-encoded ``{"line": "..."}`` so embedded newlines /
+    Chunks are JSON-encoded ``{"line": "..."}`` so embedded newlines /
     quotes round-trip cleanly through the SSE wire format.
+    ``X-Accel-Buffering: no`` disables nginx response buffering so each
+    line reaches the browser ASAP (same pattern as the AI-chat stream).
     """
-    try:
-        gen = stream_container_logs(name, tail=tail)
-    except DockerUnavailableError as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
 
     async def event_source():
         async for chunk in gen:
             for line in chunk.splitlines():
-                # SSE frame format — ``data:`` + payload + double newline
-                payload = json.dumps({"line": line})
-                yield f"data: {payload}\n\n"
+                yield f"data: {json.dumps({'line': line})}\n\n"
 
-    # X-Accel-Buffering disables nginx response buffering so each log
-    # line arrives at the browser ASAP. Same pattern as the AI chat
-    # streaming endpoint.
     return StreamingResponse(
         event_source(),
         media_type="text/event-stream",
-        headers={
-            "X-Accel-Buffering": "no",
-            "Cache-Control": "no-cache",
-        },
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )
+
+
+@router.get(
+    "/{name}/logs/stream",
+    dependencies=[Depends(require_permission("read", "appliance"))],
+    summary="Stream a single pod's logs as SSE (follow=true)",
+)
+async def stream_logs(name: str, tail: int = 100):
+    """Stream one pod's logs by exact pod name; closes on client disconnect."""
+    try:
+        gen = stream_container_logs(name, tail=tail)
+    except DockerUnavailableError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+    return _sse_log_response(gen)
+
+
+@router.get(
+    "/workloads/{component}/logs/stream",
+    dependencies=[Depends(require_permission("read", "appliance"))],
+    summary="Stream a workload's logs as SSE — resolves component → current pod",
+)
+async def stream_workload_logs(component: str, tail: int = 100):
+    """Tail a workload (deployment / daemonset) by its component label
+    (api / worker / frontend / …) instead of a churny pod name (#416).
+
+    Resolves the component to its current running pod server-side, so the
+    operator picks a stable workload and a pod roll just means the next
+    (re)connect lands on the fresh pod.
+    """
+    try:
+        resolved = resolve_workload_pod(component)
+    except DockerUnavailableError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+    if resolved is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"no running pod for workload {component!r}",
+        )
+    pod, container = resolved
+    try:
+        gen = stream_container_logs(pod, tail=tail, container=container)
+    except DockerUnavailableError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+    return _sse_log_response(gen)

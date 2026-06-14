@@ -381,12 +381,14 @@ async def platform_health() -> JSONResponse:
     # beat is stopped or has been stopped for >5 min. Present but older
     # than 90 s → degraded (two beat intervals missed).
     try:
-        import redis.asyncio as aioredis
-
         from app.config import settings
+        from app.core.redis_client import make_async_redis
         from app.tasks.heartbeat import BEAT_HEARTBEAT_KEY  # noqa: PLC0415
 
-        r = aioredis.from_url(settings.redis_url, socket_connect_timeout=2)
+        # Sentinel-aware (HA Redis uses ``sentinel://``, which raw
+        # ``aioredis.from_url`` rejects with "must specify one of redis:// …"
+        # — the same helper the redis + workers checks above use).
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         raw = await r.get(BEAT_HEARTBEAT_KEY)
         await r.aclose()
         if raw is None:
