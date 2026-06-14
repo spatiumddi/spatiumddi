@@ -57,7 +57,11 @@ async def _seed_appliance(db: AsyncSession) -> Appliance:
         public_key_fingerprint="ff" * 32,
         cert_serial="0000",
         deployment_kind="appliance",
-        installed_appliance_version="2026.06.11-1",
+        # The fire-once nonce fragment is gated on a supervisor new enough to
+        # strip it before fetching (#419 / >= 2026.06.12). These tests assert
+        # the nonce IS appended, so the fixture must present a capable box.
+        supervisor_version="2026.06.13-2",
+        installed_appliance_version="2026.06.13-2",
     )
     db.add(appliance)
     await db.flush()
