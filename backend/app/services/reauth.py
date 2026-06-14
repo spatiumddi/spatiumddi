@@ -9,9 +9,11 @@ bootstrap key, or the SNMP community.
 
 This helper unifies the re-confirmation:
 
-* **Local users** (have a password): a correct password OR a correct TOTP code
-  (when MFA is enrolled) passes — the password stays the primary, TOTP is an
-  added option.
+* **Local users** (have a password): only a correct password passes — TOTP is
+  NOT accepted in lieu of it. Local users already hold the strongest factor,
+  and accepting TOTP-instead-of-password would downgrade the reveal step-up
+  (MFA enrolment needs only a session, so a hijacked session could self-enrol
+  and reveal without the password). See the SECURITY note in reverify_operator.
 * **External-auth users** (no local password): a correct TOTP code passes. MFA
   enrolment is now open to every auth source (#408), so an SSO superadmin can
   enrol TOTP and then re-confirm with it. If they have NOT enrolled, the helper
@@ -70,14 +72,24 @@ def reverify_operator(
     """
     has_local_password = bool(user.auth_source == "local" and user.hashed_password)
     if has_local_password:
+        # SECURITY (review of #408): a local user must prove their PASSWORD —
+        # TOTP is NOT accepted as a substitute here. Accepting TOTP-in-lieu-of-
+        # password would be a defense-in-depth downgrade: MFA enrolment only
+        # needs an authenticated session, so a hijacked session of a local
+        # superadmin who hasn't enrolled could self-enrol TOTP and then reveal
+        # secrets without ever proving the password the reveal step-up exists
+        # to demand. Local users already hold the strongest factor (password);
+        # only password-less SSO users fall back to TOTP below.
         assert user.hashed_password is not None  # narrowed by has_local_password
         if password and verify_password(password, user.hashed_password):
             return ReauthOutcome.OK
-        if _totp_ok(user, totp_code):
-            return ReauthOutcome.OK
         return ReauthOutcome.BAD_CREDENTIAL
 
-    # External-auth (or a local account with no password set) — TOTP only.
+    # External-auth (or a local account with no password set) — TOTP only,
+    # since there is no password to prove. A "local" row with a NULL password
+    # is a misconfiguration that cannot hold a session today (login rejects
+    # it); it falls here and still requires enrolled MFA + a valid code, so
+    # the password check is never silently skipped for a credentialed account.
     if not user.totp_enabled:
         return ReauthOutcome.MFA_REQUIRED
     if _totp_ok(user, totp_code):

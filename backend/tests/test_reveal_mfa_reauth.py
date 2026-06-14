@@ -58,11 +58,16 @@ def test_local_wrong_password_is_bad_credential() -> None:
     assert out is ReauthOutcome.BAD_CREDENTIAL
 
 
-def test_local_user_may_use_totp_when_enrolled() -> None:
+def test_local_user_totp_is_not_a_password_substitute() -> None:
+    # SECURITY (review of #408): a local user must prove their PASSWORD —
+    # a valid TOTP alone must NOT pass, else a hijacked session could
+    # self-enrol MFA and reveal secrets without the password.
     secret = generate_secret()
     u = _user(password="pw", totp_secret=secret)
     out = reverify_operator(u, totp_code=pyotp.TOTP(secret).now())
-    assert out is ReauthOutcome.OK
+    assert out is ReauthOutcome.BAD_CREDENTIAL
+    # ...and the password still works for that same enrolled local user.
+    assert reverify_operator(u, password="pw") is ReauthOutcome.OK
 
 
 def test_sso_user_with_totp_ok() -> None:
@@ -101,6 +106,37 @@ async def _sso_superadmin(db: AsyncSession, username: str = "ssoadmin") -> tuple
     db.add(user)
     await db.flush()
     return user, create_access_token(str(user.id))
+
+
+async def _local_superadmin(
+    db: AsyncSession, username: str = "localadmin", password: str = "password123"
+) -> tuple[User, str]:
+    user = User(
+        username=username,
+        email=f"{username}@example.com",
+        display_name=username,
+        hashed_password=hash_password(password),
+        auth_source="local",
+        is_superadmin=True,
+    )
+    user.groups = []
+    db.add(user)
+    await db.flush()
+    return user, create_access_token(str(user.id))
+
+
+async def _enrol_mfa(client: AsyncClient, headers: dict[str, str]) -> str:
+    """Enrol TOTP via begin + verify; return the secret for code generation."""
+    begin = await client.post("/api/v1/auth/mfa/enroll/begin", headers=headers)
+    assert begin.status_code == 200, begin.text
+    secret = begin.json()["secret"]
+    verify = await client.post(
+        "/api/v1/auth/mfa/enroll/verify",
+        headers=headers,
+        json={"code": pyotp.TOTP(secret).now()},
+    )
+    assert verify.status_code == 204, verify.text
+    return secret
 
 
 @pytest.mark.asyncio
@@ -158,3 +194,52 @@ async def test_sso_user_without_mfa_is_told_to_enrol(
     )
     assert resp.status_code == 403, resp.text
     assert "mfa" in resp.json()["detail"].lower()
+
+
+# ── MFA disable: password conditional (local needs it, SSO doesn't) ──
+
+
+@pytest.mark.asyncio
+async def test_sso_user_disables_mfa_with_totp_only(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """#408 — an SSO user (no local password) disables MFA with just a current
+    TOTP code; the disable endpoint no longer demands a password they lack."""
+    _, token = await _sso_superadmin(db_session, username="ssodisable")
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    secret = await _enrol_mfa(client, headers)
+    resp = await client.post(
+        "/api/v1/auth/mfa/disable",
+        headers=headers,
+        json={"code": pyotp.TOTP(secret).now()},
+    )
+    assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
+async def test_local_user_disable_still_requires_password(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """#408 — a LOCAL user still must supply their password to disable MFA;
+    a TOTP-only disable is rejected (the password step-up is preserved)."""
+    _, token = await _local_superadmin(db_session, username="localdisable")
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    secret = await _enrol_mfa(client, headers)
+
+    # TOTP only, no password → rejected.
+    no_pw = await client.post(
+        "/api/v1/auth/mfa/disable",
+        headers=headers,
+        json={"code": pyotp.TOTP(secret).now()},
+    )
+    assert no_pw.status_code == 401, no_pw.text
+
+    # Password + code → disabled.
+    ok = await client.post(
+        "/api/v1/auth/mfa/disable",
+        headers=headers,
+        json={"password": "password123", "code": pyotp.TOTP(secret).now()},
+    )
+    assert ok.status_code == 204, ok.text
