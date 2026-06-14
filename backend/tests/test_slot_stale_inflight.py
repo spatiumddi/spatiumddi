@@ -64,9 +64,7 @@ def test_live_inflight_reported_inflight(paths: dict[str, Path]) -> None:
 
 def test_stale_inflight_reported_failed(paths: dict[str, Path]) -> None:
     paths["trigger"].write_text("https://example/img.raw.xz\n")
-    paths["state"].write_text(
-        f"in-flight {_iso_ago(slot._STALE_INFLIGHT_SECONDS + 120)}\n"
-    )
+    paths["state"].write_text(f"in-flight {_iso_ago(slot._STALE_INFLIGHT_SECONDS + 120)}\n")
     state, _ = slot._upgrade_state_now()
     assert state == "failed"
     # And so the per-box apply path is unblocked.

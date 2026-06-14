@@ -68,7 +68,9 @@ def _state(tmp_path: Path) -> str:
 
 
 def test_clean_apply_writes_done_and_renames_trigger(tmp_path: Path) -> None:
-    stub = _write_stub(tmp_path, 'exit 0')  # any subcommand (apply / set-next-boot) succeeds
+    stub = _write_stub(
+        tmp_path, "exit 0"
+    )  # any subcommand (apply / set-next-boot) succeeds
     trigger = _seed_trigger(tmp_path)
     subprocess.run(
         ["bash", str(RUNNER)], env=_env(tmp_path, stub), capture_output=True, timeout=30
@@ -79,7 +81,7 @@ def test_clean_apply_writes_done_and_renames_trigger(tmp_path: Path) -> None:
 
 
 def test_apply_failure_writes_failed(tmp_path: Path) -> None:
-    stub = _write_stub(tmp_path, 'exit 1')
+    stub = _write_stub(tmp_path, "exit 1")
     trigger = _seed_trigger(tmp_path)
     subprocess.run(
         ["bash", str(RUNNER)], env=_env(tmp_path, stub), capture_output=True, timeout=30
@@ -90,7 +92,7 @@ def test_apply_failure_writes_failed(tmp_path: Path) -> None:
 
 
 def test_stalled_apply_self_fails_via_timeout(tmp_path: Path) -> None:
-    stub = _write_stub(tmp_path, 'sleep 60')
+    stub = _write_stub(tmp_path, "sleep 60")
     _seed_trigger(tmp_path)
     subprocess.run(
         ["bash", str(RUNNER)],
@@ -106,7 +108,7 @@ def test_stalled_apply_self_fails_via_timeout(tmp_path: Path) -> None:
 def test_sigterm_mid_apply_trap_writes_failed(tmp_path: Path) -> None:
     """systemd's TimeoutStartSec backstop SIGTERMs a wedged runner — the
     EXIT trap must then record failed rather than leaving in-flight."""
-    stub = _write_stub(tmp_path, 'sleep 60')
+    stub = _write_stub(tmp_path, "sleep 60")
     _seed_trigger(tmp_path)
     proc = subprocess.Popen(
         ["bash", str(RUNNER)],
@@ -128,7 +130,9 @@ def test_ticker_keeps_stamp_fresh_then_cleans_up(tmp_path: Path) -> None:
     """A slow-but-successful apply: the 1 s ticker re-stamps the in-flight
     marker (so the supervisor never falsely reaps a live apply), then the
     ticker is reaped and the terminal state is done."""
-    stub = _write_stub(tmp_path, '[ "$1" = "set-next-boot" ] && exit 0; sleep 3; exit 0')
+    stub = _write_stub(
+        tmp_path, '[ "$1" = "set-next-boot" ] && exit 0; sleep 3; exit 0'
+    )
     _seed_trigger(tmp_path)
     proc = subprocess.Popen(
         ["bash", str(RUNNER)],
@@ -153,7 +157,7 @@ def test_ticker_keeps_stamp_fresh_then_cleans_up(tmp_path: Path) -> None:
 def test_no_trigger_is_noop(tmp_path: Path) -> None:
     """No trigger file → exit 0 with no terminal state churn (the EXIT
     trap is armed only inside the apply region)."""
-    stub = _write_stub(tmp_path, 'exit 0')
+    stub = _write_stub(tmp_path, "exit 0")
     proc = subprocess.run(
         ["bash", str(RUNNER)], env=_env(tmp_path, stub), capture_output=True, timeout=30
     )
