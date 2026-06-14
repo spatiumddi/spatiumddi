@@ -716,7 +716,8 @@ class CreateDNSRecordArgs(BaseModel):
         description=(
             "Right-hand-side value. For A/AAAA an IP; for CNAME / NS "
             "a target FQDN; for TXT the quoted text; for MX the "
-            "target host (priority is a separate arg)."
+            "target host (priority is a separate arg); for SRV the "
+            "target host (priority/weight/port are separate args)."
         )
     )
     ttl: int | None = Field(
@@ -730,7 +731,19 @@ class CreateDNSRecordArgs(BaseModel):
     )
     priority: int | None = Field(
         default=None,
-        description="MX/SRV priority. Required for MX records.",
+        description="MX/SRV priority. Required for MX and SRV records.",
+        ge=0,
+        le=65_535,
+    )
+    weight: int | None = Field(
+        default=None,
+        description="SRV weight. Required for SRV records (not used elsewhere).",
+        ge=0,
+        le=65_535,
+    )
+    port: int | None = Field(
+        default=None,
+        description="SRV port. Required for SRV records (not used elsewhere).",
         ge=0,
         le=65_535,
     )
@@ -746,6 +759,21 @@ async def _preview_create_dns_record(
         return PreviewResult(ok=False, detail=f"Unsupported record type {rtype!r}.")
     if rtype == "MX" and args.priority is None:
         return PreviewResult(ok=False, detail="MX records require a priority.")
+    if rtype == "SRV":
+        missing = [
+            n
+            for n, v in (
+                ("priority", args.priority),
+                ("weight", args.weight),
+                ("port", args.port),
+            )
+            if v is None
+        ]
+        if missing:
+            return PreviewResult(
+                ok=False,
+                detail="SRV records require " + ", ".join(missing) + ".",
+            )
 
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None:
@@ -781,6 +809,10 @@ async def _preview_create_dns_record(
         parts.append(f"ttl={args.ttl}")
     if args.priority is not None:
         parts.append(f"priority={args.priority}")
+    if args.weight is not None:
+        parts.append(f"weight={args.weight}")
+    if args.port is not None:
+        parts.append(f"port={args.port}")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts) + suffix)
 
 
@@ -788,7 +820,10 @@ async def _apply_create_dns_record(
     db: AsyncSession, user: User, args: CreateDNSRecordArgs
 ) -> dict[str, Any]:
     from app.api.v1.dhcp._audit import write_audit  # local import to avoid cycle
+    from app.core.agent_wake import dns_group_channel, publish_wake
     from app.models.dns import DNSRecord, DNSZone
+    from app.services.dns.record_ops import enqueue_record_op
+    from app.services.dns.serial import bump_zone_serial
 
     # SECURITY (#400, C2): RBAC backstop — matches the DNS router's
     # require_any_resource_permission("dns_record", ...) write gate.
@@ -799,6 +834,8 @@ async def _apply_create_dns_record(
         raise ValueError(f"Unsupported record type {rtype!r}.")
     if rtype == "MX" and args.priority is None:
         raise ValueError("MX records require a priority.")
+    if rtype == "SRV" and (args.priority is None or args.weight is None or args.port is None):
+        raise ValueError("SRV records require priority, weight, and port.")
 
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None:
@@ -819,10 +856,34 @@ async def _apply_create_dns_record(
         value=args.value,
         ttl=args.ttl,
         priority=args.priority,
+        weight=args.weight if rtype == "SRV" else None,
+        port=args.port if rtype == "SRV" else None,
         created_by_user_id=user.id,
     )
     db.add(row)
+    # Mirror the REST create path so a Copilot-created record actually
+    # propagates: bump the zone serial and queue a record op for every
+    # agent in the group. Without this the row lands in the DB but never
+    # reaches BIND9/PowerDNS (the agent only converges on the next ETag
+    # shift). enqueue_record_op collects a Redis wake; flush it explicitly
+    # here since this runs outside the router's wake_publishing dependency.
+    target_serial = bump_zone_serial(zone)
     await db.flush()
+    await enqueue_record_op(
+        db,
+        zone,
+        "create",
+        {
+            "name": row.name,
+            "type": row.record_type,
+            "value": row.value,
+            "ttl": row.ttl,
+            "priority": row.priority,
+            "weight": row.weight,
+            "port": row.port,
+        },
+        target_serial=target_serial,
+    )
 
     write_audit(
         db,
@@ -839,11 +900,16 @@ async def _apply_create_dns_record(
             "value": args.value,
             "ttl": args.ttl,
             "priority": args.priority,
+            "weight": args.weight if rtype == "SRV" else None,
+            "port": args.port if rtype == "SRV" else None,
             "via": "ai_proposal",
         },
     )
     await db.commit()
     await db.refresh(row)
+    # Instant wake (advisory — the ETag compare is still the source of
+    # truth; if Redis is down the agent converges on its poll/safety tick).
+    await publish_wake(dns_group_channel(zone.group_id))
     return {
         "id": str(row.id),
         "zone_id": str(zone.id),

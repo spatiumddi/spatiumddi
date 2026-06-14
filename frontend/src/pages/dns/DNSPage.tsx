@@ -2340,6 +2340,32 @@ const RECORD_TYPES = [
   "DNAME",
 ];
 
+// Per-type placeholder for the Value field. For MX / SRV the Value is the
+// *target host* only — priority/weight/port are entered in their own
+// fields and stitched into the wire format by the driver. The
+// packed-value types (CAA / NAPTR / SSHFP / TLSA / LOC / SVCB / HTTPS)
+// carry their whole RDATA in Value, so the hint shows the wire format so
+// operators know what to type (#424 — sweep of every record type).
+const RECORD_VALUE_PLACEHOLDER: Record<string, string> = {
+  A: "10.0.0.1",
+  AAAA: "2001:db8::1",
+  CNAME: "other.example.com.",
+  ALIAS: "lb.elsewhere.example.net.",
+  PTR: "host.example.com.",
+  NS: "ns1.example.com.",
+  MX: "mail.example.com.  (target host — set Priority below)",
+  SRV: "target host, e.g. sipserver.example.com.",
+  TXT: '"v=spf1 include:_spf.example.com ~all"',
+  CAA: '0 issue "letsencrypt.org"',
+  NAPTR: '100 10 "U" "E2U+sip" "!^.*$!sip:info@ex.com!" .',
+  SSHFP: "2 1 123456789abcdef67890...",
+  TLSA: "3 1 1 0123456789abcdef...",
+  LOC: "37 23 30.900 N 121 59 19.000 W 7m",
+  SVCB: '1 . alpn="h2,h3"',
+  HTTPS: '1 . alpn="h2,h3"',
+  DNAME: "target.example.net.",
+};
+
 function RecordModal({
   groupId,
   zoneId,
@@ -2363,6 +2389,8 @@ function RecordModal({
   const [value, setValue] = useState(record?.value ?? "");
   const [ttl, setTtl] = useState(String(record?.ttl ?? ""));
   const [priority, setPriority] = useState(String(record?.priority ?? ""));
+  const [weight, setWeight] = useState(String(record?.weight ?? ""));
+  const [port, setPort] = useState(String(record?.port ?? ""));
   const [viewId, setViewId] = useState<string>(record?.view_id ?? "");
   const [error, setError] = useState("");
 
@@ -2371,7 +2399,10 @@ function RecordModal({
     queryFn: () => dnsApi.listViews(groupId),
   });
 
-  const showPriority = ["MX", "SRV"].includes(type);
+  // SRV carries priority + weight + port (RFC 2782); MX carries only a
+  // priority (the preference). Everything else carries none. (#424)
+  const isSrv = type === "SRV";
+  const usesPriority = type === "MX" || isSrv;
 
   const mut = useMutation({
     mutationFn: (d: Record<string, unknown>) =>
@@ -2388,12 +2419,22 @@ function RecordModal({
   function submit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
+    // Client-side guard mirroring the API's per-type rules so the operator
+    // gets an inline message instead of a round-trip 422 (#424).
+    if (isSrv && (priority === "" || weight === "" || port === "")) {
+      setError("SRV records require priority, weight, and port.");
+      return;
+    }
     mut.mutate({
       name,
       record_type: type,
       value,
       ttl: ttl ? parseInt(ttl, 10) : null,
-      priority: priority ? parseInt(priority, 10) : null,
+      // Only send the structured fields the type actually uses, so the API
+      // never sees a stray weight/port on a non-SRV record.
+      priority: usesPriority && priority !== "" ? parseInt(priority, 10) : null,
+      weight: isSrv && weight !== "" ? parseInt(weight, 10) : null,
+      port: isSrv && port !== "" ? parseInt(port, 10) : null,
       view_id: viewId || null,
     });
   }
@@ -2417,6 +2458,10 @@ function RecordModal({
               className={inputCls}
               value={type}
               onChange={(e) => setType(e.target.value)}
+              // record_type is immutable on update (the API ignores it), so
+              // lock it in edit mode rather than let the per-type fields
+              // shift around a Type that won't actually change (#424).
+              disabled={!!record}
             >
               {RECORD_TYPES.map((t) => (
                 <option key={t} value={t}>
@@ -2487,19 +2532,15 @@ function RecordModal({
               className={inputCls}
               value={value}
               onChange={(e) => setValue(e.target.value)}
-              placeholder={
-                type === "A"
-                  ? "10.0.0.1"
-                  : type === "CNAME"
-                    ? "other.example.com."
-                    : type === "ALIAS"
-                      ? "lb.elsewhere.example.net."
-                      : type === "PTR"
-                        ? "host.example.com."
-                        : "record value"
-              }
+              placeholder={RECORD_VALUE_PLACEHOLDER[type] ?? "record value"}
               required
             />
+          )}
+          {isSrv && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Value is the <strong>target host</strong> only — set priority,
+              weight, and port in the fields below.
+            </p>
           )}
         </Field>
         {type === "ALIAS" && (
@@ -2549,9 +2590,12 @@ function RecordModal({
               placeholder="zone default"
             />
           </Field>
-          {showPriority && (
+          {type === "MX" && (
             <Field label="Priority">
               <input
+                type="number"
+                min={0}
+                max={65535}
                 className={inputCls}
                 value={priority}
                 onChange={(e) => setPriority(e.target.value)}
@@ -2560,6 +2604,46 @@ function RecordModal({
             </Field>
           )}
         </div>
+        {isSrv && (
+          <div className="grid grid-cols-3 gap-3">
+            <Field label="Priority">
+              <input
+                type="number"
+                min={0}
+                max={65535}
+                className={inputCls}
+                value={priority}
+                onChange={(e) => setPriority(e.target.value)}
+                placeholder="0"
+                required
+              />
+            </Field>
+            <Field label="Weight">
+              <input
+                type="number"
+                min={0}
+                max={65535}
+                className={inputCls}
+                value={weight}
+                onChange={(e) => setWeight(e.target.value)}
+                placeholder="0"
+                required
+              />
+            </Field>
+            <Field label="Port">
+              <input
+                type="number"
+                min={0}
+                max={65535}
+                className={inputCls}
+                value={port}
+                onChange={(e) => setPort(e.target.value)}
+                placeholder="e.g. 5060"
+                required
+              />
+            </Field>
+          </div>
+        )}
         <Field label="View (optional — scope record to a split-horizon view)">
           <select
             className={inputCls}

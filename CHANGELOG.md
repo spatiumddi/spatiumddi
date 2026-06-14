@@ -26,6 +26,27 @@ Batched fixes for the next cut (not yet released).
 
 ### Fixed
 
+* **#424 — couldn't define SRV records in the UI; MX priority could be
+  NULL.** The Add/Edit DNS Record form only exposed a Priority field, so
+  SRV records were created with NULL ``weight`` and ``port`` — and every
+  driver (bind9 / powerdns / windows) substitutes ``0`` for a NULL,
+  rendering a meaningless ``priority 0 0 target``. The form now shows
+  Priority + Weight + Port for SRV (all required) and a clean
+  Priority-only field for MX, and every record type gained a wire-format
+  placeholder for its Value (CAA / NAPTR / SSHFP / TLSA / LOC / SVCB /
+  HTTPS show the expected RDATA shape). The API enforces the per-type
+  rules server-side: SRV requires priority + weight + port, MX takes only
+  a priority and defaults it to 10 (no more NULL MX priority), and every
+  other type rejects stray priority/weight/port with a 422. A one-shot data
+  migration backfills existing rows the old UI left NULL (SRV
+  priority/weight/port → 0, MX priority → 10 — the values the drivers
+  already substitute, so wire output is unchanged) so those rows stay
+  editable under the new validation. The Operator Copilot's
+  ``create_dns_record`` proposal gained ``weight`` + ``port`` so the
+  assistant can create valid SRV records too — and now correctly enqueues a
+  record op so a Copilot-created record actually propagates to the agents
+  (previously it landed in the DB but was never pushed).
+
 * **#419 — slot-upgrade wedged at "in-flight" on pre-2026.06.12
   appliances.** The control plane appends a per-apply re-fire nonce to the
   slot-image URL as a ``#fragment``; the host runner only strips that
