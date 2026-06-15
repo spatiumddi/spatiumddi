@@ -384,6 +384,8 @@ async def _apply_blocks_and_subnets(
     desired_blocks: list[_DesiredBlock],
     desired_subnets: list[_DesiredSubnet],
     summary: ReconcileSummary,
+    *,
+    allow_delete: bool = True,
 ) -> None:
     block_rows = (
         (await db.execute(select(IPBlock).where(IPBlock.space_id == endpoint.ipam_space_id)))
@@ -459,12 +461,14 @@ async def _apply_blocks_and_subnets(
 
     desired_map = {d.network: d for d in desired_subnets}
 
-    # Prune endpoint-owned subnets no longer in the desired set.
-    for net_str, row in current_subnets.items():
-        if net_str in desired_map:
-            continue
-        await db.delete(row)
-        summary.subnets_deleted += 1
+    # Prune endpoint-owned subnets no longer in the desired set. Skipped on a
+    # partial pull (#430) — a failed scope makes "absent" unreliable.
+    if allow_delete:
+        for net_str, row in current_subnets.items():
+            if net_str in desired_map:
+                continue
+            await db.delete(row)
+            summary.subnets_deleted += 1
 
     for net_str, d in desired_map.items():
         # An operator subnet at this exact CIDR wins — reused untouched.
@@ -545,14 +549,16 @@ async def _apply_blocks_and_subnets(
 
     await db.flush()
 
-    # Drop endpoint-owned blocks that no longer back any subnet.
-    for net_str, block in endpoint_blocks.items():
-        if net_str in desired_block_cidrs:
-            continue
-        refs = await db.execute(select(Subnet).where(Subnet.block_id == block.id))
-        if refs.scalar_one_or_none() is None:
-            await db.delete(block)
-            summary.blocks_deleted += 1
+    # Drop endpoint-owned blocks that no longer back any subnet. Skipped on a
+    # partial pull (#430).
+    if allow_delete:
+        for net_str, block in endpoint_blocks.items():
+            if net_str in desired_block_cidrs:
+                continue
+            refs = await db.execute(select(Subnet).where(Subnet.block_id == block.id))
+            if refs.scalar_one_or_none() is None:
+                await db.delete(block)
+                summary.blocks_deleted += 1
 
 
 # ── Apply: addresses ──────────────────────────────────────────────────
@@ -563,6 +569,8 @@ async def _apply_addresses(
     endpoint: CloudEndpoint,
     desired: list[_DesiredAddress],
     summary: ReconcileSummary,
+    *,
+    allow_delete: bool = True,
 ) -> None:
     subnet_rows = (
         (await db.execute(select(Subnet).where(Subnet.cloud_endpoint_id == endpoint.id)))
@@ -634,16 +642,18 @@ async def _apply_addresses(
     dirty_subnets: set[Any] = set(endpoint_subnet_ids)
 
     # Prune endpoint-owned rows no longer desired (preserve operator-edited
-    # rows by releasing the FK instead of deleting).
-    for addr, row in current.items():
-        if addr not in desired_map:
-            dirty_subnets.add(row.subnet_id)
-            if row.user_modified_at is not None:
-                row.cloud_endpoint_id = None
-                summary.addresses_updated += 1
-            else:
-                await db.delete(row)
-                summary.addresses_deleted += 1
+    # rows by releasing the FK instead of deleting). Skipped on a partial
+    # pull (#430) — a failed scope makes "no longer desired" unreliable.
+    if allow_delete:
+        for addr, row in current.items():
+            if addr not in desired_map:
+                dirty_subnets.add(row.subnet_id)
+                if row.user_modified_at is not None:
+                    row.cloud_endpoint_id = None
+                    summary.addresses_updated += 1
+                else:
+                    await db.delete(row)
+                    summary.addresses_deleted += 1
 
     for addr, d in desired_map.items():
         subnet = _find_subnet_for_ip(subnets, d.address)
@@ -834,13 +844,28 @@ async def reconcile_endpoint(db: AsyncSession, endpoint: CloudEndpoint) -> Recon
 
     desired_blocks, desired_subnets, desired_addresses = _compute_desired(endpoint, inv)
 
-    await _apply_blocks_and_subnets(db, endpoint, desired_blocks, desired_subnets, summary)
-    await _apply_addresses(db, endpoint, desired_addresses, summary)
+    # #430 — a partial pull (one or more scopes failed mid-fetch) yields an
+    # incomplete desired set. Upsert what we got, but suppress the
+    # absence-delete pass so a transient scope failure can't mass-delete the
+    # rows for the missing project/region/subscription.
+    allow_delete = not inv.failed_scopes
+    await _apply_blocks_and_subnets(
+        db, endpoint, desired_blocks, desired_subnets, summary, allow_delete=allow_delete
+    )
+    await _apply_addresses(db, endpoint, desired_addresses, summary, allow_delete=allow_delete)
 
     summary.warnings.extend(inv.warnings)
 
     endpoint.last_synced_at = datetime.now(UTC)
-    endpoint.last_sync_error = None
+    # On a partial pull, record the failed scopes so the operator sees the
+    # mirror is incomplete (and the interval backoff treats it as an error)
+    # rather than a misleading green "last sync OK".
+    if inv.failed_scopes:
+        partial_msg = "partial pull — absence-delete skipped for: " + ", ".join(inv.failed_scopes)
+        endpoint.last_sync_error = partial_msg
+        summary.warnings.append(partial_msg)
+    else:
+        endpoint.last_sync_error = None
     endpoint.provider_account_id = inv.account_id
     endpoint.network_count = summary.network_count
     endpoint.instance_count = summary.instance_count

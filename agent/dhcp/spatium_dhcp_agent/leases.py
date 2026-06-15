@@ -31,6 +31,11 @@ log = structlog.get_logger(__name__)
 
 _BATCH_MAX_EVENTS = 100
 _BATCH_MAX_SECONDS = 5.0
+# #430 — hard cap on the pending buffer. A persistent reject (422/500/401)
+# leaves _pending unflushed while run() keeps appending new lease rows, so
+# without a cap the buffer (and the re-POSTed body) grows without bound.
+# Trim-half on overflow, mirroring the log + fingerprint shippers.
+_BATCH_MAX_BUFFER = 5000
 
 _STATE_MAP = {"0": "active", "1": "declined", "2": "expired"}
 
@@ -153,6 +158,10 @@ class LeaseWatcher:
             for row in rows:
                 evt = _parse_row(row)
                 if evt is not None:
+                    if len(self._pending) >= _BATCH_MAX_BUFFER:
+                        drop = _BATCH_MAX_BUFFER // 2
+                        self._pending = self._pending[drop:]
+                        log.warning("lease_events_buffer_trimmed", dropped=drop)
                     self._pending.append(evt)
                 if len(self._pending) >= _BATCH_MAX_EVENTS:
                     self._flush()

@@ -148,7 +148,15 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             "id": str(z.id),
             "name": getattr(z, "name", None) or getattr(z, "fqdn", None),
             "type": getattr(z, "zone_type", "primary"),
-            "ttl": getattr(z, "default_ttl", 3600),
+            # #430 — was getattr(z, "default_ttl", 3600): DNSZone has no
+            # default_ttl, so this silently pinned every zone's $TTL to the
+            # literal 3600 and editing a zone's TTL never re-rendered.
+            "ttl": getattr(z, "ttl", 3600),
+            # #430 (D1) — the agent's zone-state reporter skips any zone with
+            # serial=None, so omitting this made it report nothing for every
+            # zone and the per-server ZoneSyncPill stayed empty. Ship the
+            # authoritative serial the agent renders from.
+            "serial": getattr(z, "last_serial", 0),
             # Forward-zone-only fields (ignored by the agent for other types).
             "forwarders": list(getattr(z, "forwarders", []) or []),
             "forward_only": bool(getattr(z, "forward_only", True)),
@@ -172,7 +180,11 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         if not has_views:
             # Flat render — one zone copy, all records, no view (today's path).
             zone_payload.append(
-                {**base_zp, "view_name": None, "records": [_rec_dict(r) for r in rec_rows]}
+                {
+                    **base_zp,
+                    "view_name": None,
+                    "records": [_rec_dict(r) for r in rec_rows],
+                }
             )
             continue
 
@@ -198,7 +210,11 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
                 else rec_rows
             )
             zone_payload.append(
-                {**base_zp, "view_name": v.name, "records": [_rec_dict(r) for r in recs]}
+                {
+                    **base_zp,
+                    "view_name": v.name,
+                    "records": [_rec_dict(r) for r in recs],
+                }
             )
 
     # Pending record ops — every agent-based server in the group
@@ -323,6 +339,12 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             "match_destinations": getattr(v, "match_destinations", []) or [],
             "recursion": bool(getattr(v, "recursion", True)),
             "order": getattr(v, "order", 0),
+            # #430 — per-view query ACL overrides. None → inherit the
+            # server-options allow-query (the agent renderer omits the line).
+            # Carried in views_block, which is part of the structural
+            # fingerprint, so editing a view ACL re-renders named.conf.
+            "allow_query": getattr(v, "allow_query", None),
+            "allow_query_cache": getattr(v, "allow_query_cache", None),
         }
         # Ordered low→high so the rendered view blocks honour BIND's
         # first-match-wins precedence (issue #24).

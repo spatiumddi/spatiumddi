@@ -30,6 +30,8 @@ from typing import Any
 import httpx
 import structlog
 
+from app.services._mirror_shape import require_keyed_list
+
 logger = structlog.get_logger(__name__)
 
 _BASE_URL = "https://api.tailscale.com/api/v2"
@@ -146,7 +148,13 @@ class TailscaleClient:
         from the default ``?fields=default`` shape.
         """
         data = await self._get(f"/tailnet/{self._tailnet}/devices", fields="all")
-        items = data.get("devices") or []
+        # #430 — a 200 without a "devices" list (CDN/auth maintenance page,
+        # envelope change) must raise so the reconciler keeps existing rows,
+        # not collapse to [] and mass-delete the tailnet. Empty tailnet is
+        # {"devices": []}.
+        items = require_keyed_list(
+            data, "devices", make_error=TailscaleClientError, context="list_devices"
+        )
         out: list[_TailscaleDevice] = []
         for d in items:
             out.append(

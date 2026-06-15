@@ -24,7 +24,6 @@ class HeartbeatClient:
         self._stop = threading.Event()
         self.pending_acks: list[dict[str, Any]] = []
         self.daemon_status: dict[str, Any] = {}
-        self.zone_serials: dict[str, int] = {}
         self.failed_ops_count = 0
 
     def stop(self) -> None:
@@ -36,7 +35,9 @@ class HeartbeatClient:
             verify = False
         elif self.cfg.tls_ca_path:
             verify = self.cfg.tls_ca_path
-        return httpx.Client(base_url=self.cfg.control_plane_url, verify=verify, timeout=15.0)
+        return httpx.Client(
+            base_url=self.cfg.control_plane_url, verify=verify, timeout=15.0
+        )
 
     def send_once(self) -> None:
         body: dict[str, Any] = {
@@ -45,7 +46,6 @@ class HeartbeatClient:
             "config": {},
             "ops_ack": self.pending_acks,
             "failed_ops_count": self.failed_ops_count,
-            "zone_serials": self.zone_serials,
         }
         # #170 Wave C1 — slot / deployment / upgrade-state telemetry
         # used to ship here per Phase 8f-2; now lives on the
@@ -80,7 +80,9 @@ class HeartbeatClient:
                 log.warning(
                     "heartbeat_will_rebootstrap",
                     status=resp.status_code,
-                    reason="token_invalid" if resp.status_code == 401 else "server_missing",
+                    reason=(
+                        "token_invalid" if resp.status_code == 401 else "server_missing"
+                    ),
                 )
                 save_token(self.cfg.state_dir, "")
                 self._stop.set()

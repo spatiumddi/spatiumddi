@@ -25,7 +25,11 @@ from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPServer
 from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.pull_leases import pull_leases_from_server
-from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
+from app.services.oui import (
+    bulk_lookup_vendors,
+    is_voip_phone_vendor,
+    normalize_mac_key,
+)
 
 router = APIRouter(
     prefix="/servers",
@@ -323,6 +327,11 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
         resource_display=s.name,
         new_value=audit_payload,
     )
+    # #430 — a new member can flip a group from standalone to HA (≥2 Kea
+    # members), re-rendering every peer's failover block. Wake the group so
+    # survivors converge at ~0 s instead of the 12 s safety tick.
+    if s.server_group_id is not None:
+        collect_wake(dhcp_group_channel(s.server_group_id))
     await db.commit()
     await db.refresh(s)
     return ServerResponse.from_model(s)
@@ -435,7 +444,12 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
         resource_id=str(s.id),
         resource_display=s.name,
     )
+    # #430 — capture the group before delete; removing a member can drop a
+    # group out of HA, re-rendering the survivors' failover block. Wake it.
+    gid = s.server_group_id
     await db.delete(s)
+    if gid is not None:
+        collect_wake(dhcp_group_channel(gid))
     await db.commit()
 
 

@@ -225,6 +225,10 @@ class AWSConnector(CloudConnector):
                 # region) shouldn't sink the whole sweep — warn + move on.
                 logger.warning("aws_region_fetch_failed", region=region, error=str(exc))
                 inv.warnings.append(f"region {region}: {exc}")
+                # #430 — mark this scope failed so the reconciler skips the
+                # absence-delete pass; a region throttle after subnets land
+                # must not purge the region's instance IPs.
+                inv.failed_scopes.append(f"region {region}")
 
         return inv
 

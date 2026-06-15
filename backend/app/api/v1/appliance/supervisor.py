@@ -1024,6 +1024,10 @@ class SupervisorHeartbeatRequest(BaseModel):
     # once no longer in-flight (clear); None on non-appliance.
     last_upgrade_progress: dict[str, Any] | None = None
     snmpd_running: bool | None = None
+    # Issue #430 — the supervisor already ships this every heartbeat
+    # (appliance_state lldpd sidecar); it was silently dropped (no field /
+    # column / handler). Now persisted alongside lldp_neighbours.
+    lldpd_running: bool | None = None
     ntp_sync_state: Literal["synchronized", "unsynchronized", "unknown"] | None = None
     # Issue #156 — best-effort rsyslog-forwarding status. None = not
     # collected (leave the stored column alone); a value persists.
@@ -1602,6 +1606,8 @@ async def supervisor_heartbeat(
         row.last_upgrade_progress = body.last_upgrade_progress or None
     if body.snmpd_running is not None:
         row.snmpd_running = body.snmpd_running
+    if body.lldpd_running is not None:
+        row.lldpd_running = body.lldpd_running
     if body.ntp_sync_state is not None:
         row.ntp_sync_state = body.ntp_sync_state
     if body.syslog_forwarding is not None:
@@ -2292,6 +2298,7 @@ class ApplianceRow(BaseModel):
     last_upgrade_log_tail: str | None
     last_upgrade_progress: dict[str, Any] | None
     snmpd_running: bool | None
+    lldpd_running: bool | None
     ntp_sync_state: str | None
     # Issue #156 — best-effort rsyslog-forwarding status surfaced from
     # the appliance row (forwarding / unreachable / disabled).
@@ -2417,6 +2424,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         last_upgrade_log_tail=row.last_upgrade_log_tail,
         last_upgrade_progress=row.last_upgrade_progress,
         snmpd_running=row.snmpd_running,
+        lldpd_running=row.lldpd_running,
         ntp_sync_state=row.ntp_sync_state,
         syslog_forwarding=row.syslog_forwarding,
         ssh_key_count=row.ssh_key_count,

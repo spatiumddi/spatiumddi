@@ -148,6 +148,35 @@ def test_per_view_zone_files_hold_view_scoped_records(tmp_path: Path) -> None:
     assert "mail.example.com." in external_zone
 
 
+def test_per_view_allow_query_acl_is_enforced(tmp_path: Path) -> None:
+    """#430 — a view's allow_query / allow_query_cache render into its block.
+
+    Previously these round-tripped through the API but were never emitted,
+    so a view-scoped query ACL silently never took effect."""
+    bundle = _split_horizon_bundle()
+    # internal: restrict queries to the RFC 1918 client range + cache to it.
+    bundle["views"][0]["allow_query"] = ["10.0.0.0/8", "localhost"]
+    bundle["views"][0]["allow_query_cache"] = ["10.0.0.0/8"]
+    # external: leave both unset → inherit server-options allow-query.
+    bundle["views"][1]["allow_query"] = None
+    bundle["views"][1]["allow_query_cache"] = None
+
+    drv = Bind9Driver(state_dir=tmp_path)
+    drv.render(bundle)
+    conf = (tmp_path / "rendered.new" / "named.conf").read_text()
+
+    internal_block = conf.split('view "internal" {', 1)[1].split(
+        'view "external" {', 1
+    )[0]
+    external_block = conf.split('view "external" {', 1)[1]
+
+    assert "allow-query { 10.0.0.0/8; localhost; };" in internal_block
+    assert "allow-query-cache { 10.0.0.0/8; };" in internal_block
+    # The unset view emits neither line (inherits server options).
+    assert "allow-query {" not in external_block
+    assert "allow-query-cache {" not in external_block
+
+
 def test_no_views_keeps_flat_render(tmp_path: Path) -> None:
     # Backward-compat: a bundle with no views renders flat (no view {}
     # blocks, zone file at zones/<name>.db).

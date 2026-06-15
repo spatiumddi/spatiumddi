@@ -8589,6 +8589,7 @@ export interface ApplianceRow {
   last_upgrade_log_tail: string | null;
   last_upgrade_progress: ApplianceUpgradeProgress | null;
   snmpd_running: boolean | null;
+  lldpd_running: boolean | null;
   ntp_sync_state: string | null;
   /** Issue #156 — best-effort rsyslog forwarding status:
    *  "forwarding" / "unreachable" / "disabled", or null on

@@ -497,6 +497,11 @@ async def agent_config_longpoll(
                             {
                                 "subnet_cidr": s.subnet_cidr,
                                 "lease_time": s.lease_time,
+                                # #430 — min/max were settable + in the ETag but
+                                # never shipped, so the agent never rendered
+                                # min/max-valid-lifetime (silent no-op).
+                                "min_lease_time": s.min_lease_time,
+                                "max_lease_time": s.max_lease_time,
                                 "options": s.options,
                                 # Issue #330 — the agent's render_kea branches on
                                 # these to emit a Dhcp6/subnet6 entry for v6
@@ -532,6 +537,14 @@ async def agent_config_longpoll(
                                         "ip_address": st.ip_address,
                                         "mac_address": st.mac_address,
                                         "hostname": st.hostname,
+                                        # #430 — client_id + options_override
+                                        # are settable, ETag-hashed, and the
+                                        # agent renderer reads them, but were
+                                        # omitted here: a client-id-keyed
+                                        # reservation silently fell back to MAC
+                                        # and per-host options were dropped.
+                                        "client_id": st.client_id,
+                                        "options_override": st.options_override,
                                         # DHCPv6 DUID (#368) — keys the v6
                                         # reservation instead of the MAC.
                                         "duid": st.duid,

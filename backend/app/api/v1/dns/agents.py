@@ -15,7 +15,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from jose import JWTError
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 
@@ -76,12 +76,23 @@ class AgentRegisterResponseV2(BaseModel):
 
 
 class AgentHeartbeatRequest(BaseModel):
+    # #430 (D4) — reject a wrong-envelope heartbeat loudly instead of
+    # validating into an all-default body (ops_ack=[] → ACK loop runs 0× →
+    # 200 → agent clears its ACK buffer). The model is a strict superset of
+    # what the DNS agent sends (the slot/deployment fields below are still
+    # accepted from pre-Wave-C1 agents), so forbid is backward-compatible.
+    model_config = ConfigDict(extra="forbid")
+
     agent_version: str | None = None
     daemon: dict[str, Any] = {}
     config: dict[str, Any] = {}
-    ops_ack: list[dict[str, Any]] = []
+    # Bound the ACK list so a malformed/hostile heartbeat can't pin memory.
+    ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
     failed_ops_count: int = 0
     disk_free_bytes: int | None = None
+    # #430 (D6) — deprecated: serial convergence is reported via the
+    # dedicated /zone-state endpoint. The current agent no longer sends this;
+    # retained (default {}) so pre-#430 agents still validate under forbid.
     zone_serials: dict[str, int] = {}
     # Phase 8f-2 — agent reports its slot state + deployment environment.
     # All optional so older agents that haven't been upgraded keep

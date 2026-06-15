@@ -521,6 +521,11 @@ class Appliance(Base):
     # ``{}`` once an upgrade is no longer in-flight to clear it.
     last_upgrade_progress: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     snmpd_running: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Issue #347 / #430 — whether the host lldpd daemon is running. Companion
+    # to the lldp_neighbours set (an empty set means "no neighbours" only when
+    # lldpd is up; "lldpd down" otherwise). NULL on non-appliance / pre-#430
+    # rows; the heartbeat handler only overwrites on a non-None value.
+    lldpd_running: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     ntp_sync_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Issue #156 — best-effort rsyslog-forwarding status the supervisor
     # reports from ``systemctl is-active rsyslog`` + config-applied
