@@ -73,6 +73,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `routing_policy`  | Per-overlay declarative routing policies (#95)        |
 | `application_category` | SaaS application catalog used by `match_kind=application` (#95) |
 | `conformity`      | Conformity policies + results + auditor PDF export (#106) |
+| `manage_packet_capture` | On-demand packet capture (tcpdump) — start / read / download / delete captures (#59). High-sensitivity (captured bytes can contain plaintext creds/PII); granted to `Network Editor`, not `Viewer`. Download is audited. |
 | `*`               | Wildcard — match any resource type                    |
 
 ## Evaluation rules
@@ -133,7 +134,7 @@ on inactive.
 | `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `vlan`, `nat_mapping`, `custom_field`, `manage_ipam_templates`, `customer`, `site`, `provider`, `network_service` |
 | `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`, `manage_dns_pools` |
 | `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block` |
-| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans`, `manage_asns`, `vrf`, `circuit`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider` |
+| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans`, `manage_packet_capture`, `manage_asns`, `vrf`, `circuit`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider` |
 | `Auditor`        | `read` on `conformity`, `audit`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
 | `Compliance Editor` | `admin` on `conformity`, `read` on `audit`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope` — for the team that authors / tunes conformity policies without touching operational config |
 

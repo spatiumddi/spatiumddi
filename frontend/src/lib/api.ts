@@ -11209,6 +11209,131 @@ export async function* streamNmapScan(
   }
 }
 
+// ── Packet capture (tcpdump) — issue #59 ────────────────────────────
+//
+// Persisted long-running capture jobs (mirrors the nmap scanner) whose
+// deliverable is a binary `.pcap` download. NO SSE — the UI polls
+// `getCapture` for live `bytes_captured` + status while running.
+
+export type PcapVantageKind = "server" | "appliance";
+export type PcapStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface PcapCaptureRead {
+  id: string;
+  vantage_kind: PcapVantageKind;
+  appliance_id: string | null;
+  vantage_label: string;
+  interface: string | null;
+  bpf_filter: string | null;
+  snaplen: number;
+  promiscuous: boolean;
+  max_packets: number | null;
+  max_duration_s: number | null;
+  max_bytes: number | null;
+  status: PcapStatus;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_seconds: number | null;
+  exit_code: number | null;
+  command_line: string | null;
+  error_message: string | null;
+  packets_captured: number;
+  bytes_captured: number;
+  pcap_size_bytes: number | null;
+  pcap_sha256: string | null;
+  has_artifact: boolean;
+  metadata_json: Record<string, unknown> | null;
+  created_by_user_id: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface PcapCaptureCreate {
+  vantage_kind?: PcapVantageKind;
+  appliance_id?: string | null;
+  interface?: string | null;
+  bpf_filter?: string | null;
+  snaplen?: number;
+  promiscuous?: boolean;
+  max_packets?: number | null;
+  max_duration_s?: number | null;
+  max_bytes?: number | null;
+}
+
+export interface PcapCaptureListResponse {
+  items: PcapCaptureRead[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface PcapCaptureListQuery {
+  status?: PcapStatus;
+  vantage?: PcapVantageKind;
+  appliance_id?: string;
+  page?: number;
+  page_size?: number;
+}
+
+export interface PcapInterfacesResponse {
+  interfaces: string[];
+  note: string;
+}
+
+export const pcapApi = {
+  listCaptures: (params?: PcapCaptureListQuery) =>
+    api
+      .get<PcapCaptureListResponse>("/pcap/captures", { params })
+      .then((r) => r.data),
+  getCapture: (id: string) =>
+    api.get<PcapCaptureRead>(`/pcap/captures/${id}`).then((r) => r.data),
+  createCapture: (body: PcapCaptureCreate) =>
+    api.post<PcapCaptureRead>("/pcap/captures", body).then((r) => r.data),
+  cancelCapture: (id: string) => api.delete(`/pcap/captures/${id}`),
+  /** Cancel + delete up to 500 captures; returns `{deleted, cancelled}`. */
+  bulkDeleteCaptures: (captureIds: string[]) =>
+    api
+      .post<{ deleted: number; cancelled: number }>("/pcap/captures/bulk-delete", {
+        capture_ids: captureIds,
+      })
+      .then((r) => r.data),
+  listInterfaces: (vantage: PcapVantageKind = "server", applianceId?: string) =>
+    api
+      .get<PcapInterfacesResponse>("/pcap/interfaces", {
+        params: { vantage, appliance_id: applianceId },
+      })
+      .then((r) => r.data),
+  /** Download the finished `.pcap` as an authed blob → trigger a save.
+   *  Uses the axios instance so the Bearer token rides the
+   *  Authorization header (no `?token=` in the URL). */
+  downloadCapture: async (id: string): Promise<void> => {
+    const res = await api.get<Blob>(`/pcap/captures/${id}/download`, {
+      responseType: "blob",
+    });
+    const disposition = (res.headers as Record<string, string>)[
+      "content-disposition"
+    ];
+    const match = disposition?.match(/filename="?([^"]+)"?/);
+    const filename = match ? match[1] : `capture-${id}.pcap`;
+    const blob = new Blob([res.data as BlobPart], {
+      type: "application/vnd.tcpdump.pcap",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
+};
+
 // ── Built-in network tools (issue #58) ──────────────────────────────
 //
 // Stateless, synchronous server-perspective utilities. Each call POSTs

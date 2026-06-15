@@ -73,6 +73,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2 \
     libxmlsec1-openssl \
     nmap \
+    tcpdump \
     iputils-ping \
     traceroute \
     mtr-tiny \
@@ -81,6 +82,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcap2-bin \
     postgresql-client-16 \
     && setcap cap_net_raw,cap_net_bind_service+eip /usr/bin/nmap \
+    # issue #59 — grant tcpdump CAP_NET_RAW so the non-root app user can
+    # capture (server vantage). cap_net_admin is NOT granted; we run
+    # non-promiscuous by default so cap_net_raw alone suffices. Assert the
+    # cap landed so a wrong binary path fails the build instead of
+    # silently relying on a privileged container.
+    && setcap cap_net_raw+eip /usr/bin/tcpdump \
+    && getcap /usr/bin/tcpdump | grep -q cap_net_raw \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user. Pre-create + chown the on-volume paths so the
@@ -95,6 +103,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #                                      nginx container at /etc/nginx/certs)
 #   /var/lib/spatiumddi/slot-images  — #170 follow-up (air-gap appliance
 #                                      slot-image upload storage)
+#   /var/lib/spatiumddi/pcaps        — issue #59 (packet-capture .pcap
+#                                      artifacts; shared api+worker volume)
 #
 # The user is created BEFORE the COPYs so we can use BuildKit's
 # ``--chown=app:app`` flag and avoid a trailing ``chown -R /app``
@@ -102,7 +112,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # file in a new layer (~550 MB doubled). Setting ownership at COPY
 # time keeps the source layer authoritative.
 RUN useradd --no-create-home --shell /bin/false app \
-    && mkdir -p /var/lib/spatiumddi/backups /var/lib/spatiumddi/certs /var/lib/spatiumddi/slot-images \
+    && mkdir -p /var/lib/spatiumddi/backups /var/lib/spatiumddi/certs /var/lib/spatiumddi/slot-images /var/lib/spatiumddi/pcaps \
+    && chmod 0700 /var/lib/spatiumddi/pcaps \
     && chown app:app /app \
     && chown -R app:app /var/lib/spatiumddi
 

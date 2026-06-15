@@ -38,6 +38,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.services.nmap import NmapArgError, build_argv
+from app.services.pcap import (
+    PcapArgError,
+    build_pcap_argv,
+    clamp_caps,
+    validate_bpf_filter,
+    validate_interface,
+)
 
 # Per-proposal TTL. 30 minutes is a generous window for a thoughtful
 # review without keeping yesterday's proposals lying around — the
@@ -491,6 +498,165 @@ register(
         apply=_apply_run_nmap_scan,
         category="network",
         required_permission=("write", "manage_nmap_scans"),
+    )
+)
+
+
+# ── run_packet_capture operation (issue #59) ───────────────────────────
+
+
+class RunPacketCaptureArgs(BaseModel):
+    """Args for ``run_packet_capture`` — server vantage only (Phase 1)."""
+
+    interface: str | None = Field(
+        default=None,
+        description=(
+            "Interface to capture on (control-plane container network). "
+            "Omit for 'any'. Must be a real interface on the vantage."
+        ),
+    )
+    bpf_filter: str | None = Field(
+        default=None,
+        description=(
+            "Optional tcpdump BPF expression (e.g. 'port 53', "
+            "'host 10.0.0.1 and tcp'). Passed to tcpdump as a single "
+            "argv element; shell metacharacters are rejected."
+        ),
+    )
+    max_duration_s: int | None = Field(
+        default=60,
+        description="Stop after N seconds (≤1800). At least one stop condition required.",
+    )
+    max_packets: int | None = Field(default=None, description="Stop after N packets (≤1,000,000).")
+    max_bytes: int | None = Field(default=None, description="Stop near N bytes (≤100 MiB).")
+    snaplen: int | None = Field(default=256, description="Bytes captured per packet (default 256).")
+
+
+async def _preview_run_packet_capture(
+    db: AsyncSession, user: User, args: RunPacketCaptureArgs
+) -> PreviewResult:
+    try:
+        interface = validate_interface(args.interface)
+        bpf = validate_bpf_filter(args.bpf_filter)
+        mp, md, mb, sl = clamp_caps(
+            max_packets=args.max_packets,
+            max_duration_s=args.max_duration_s,
+            max_bytes=args.max_bytes,
+            snaplen=args.snaplen,
+        )
+        argv = build_pcap_argv(
+            interface=interface,
+            bpf_filter=bpf,
+            snaplen=sl,
+            promiscuous=False,
+            max_packets=mp,
+            output_path="<file>",
+        )
+    except PcapArgError as exc:
+        return PreviewResult(ok=False, detail=f"capture arg validation failed: {exc}")
+
+    parts = [
+        f"Run a packet capture on `{interface}` (control-plane vantage)",
+        f"filter: `{bpf}`" if bpf else "filter: (none — all traffic)",
+        f"stop: {md or '—'}s / {mp or '—'} pkts / {mb or '—'} bytes, snaplen {sl}",
+        f"argv: `{' '.join(argv)}`",
+        "This captures raw traffic (may include credentials/PII). Apply "
+        "only if you're authorised; the .pcap is downloadable + audited.",
+    ]
+    return PreviewResult(ok=True, detail="ready", preview_text="\n".join(parts))
+
+
+async def _apply_run_packet_capture(
+    db: AsyncSession, user: User, args: RunPacketCaptureArgs
+) -> dict[str, Any]:
+    from app.models.audit import AuditLog  # local import to avoid cycle
+    from app.models.pcap import PacketCapture  # local import to avoid cycle
+
+    # RBAC backstop — matches the REST route's
+    # require_permission("write", "manage_packet_capture").
+    enforce_operation_permission(user, _OPERATIONS["run_packet_capture"])
+
+    try:
+        interface = validate_interface(args.interface)
+        bpf = validate_bpf_filter(args.bpf_filter)
+        mp, md, mb, sl = clamp_caps(
+            max_packets=args.max_packets,
+            max_duration_s=args.max_duration_s,
+            max_bytes=args.max_bytes,
+            snaplen=args.snaplen,
+        )
+    except PcapArgError as exc:
+        raise ValueError(f"capture arg validation failed: {exc}") from exc
+
+    cap = PacketCapture(
+        vantage_kind="server",
+        vantage_label="control plane",
+        interface=interface,
+        bpf_filter=bpf,
+        snaplen=sl,
+        promiscuous=False,
+        max_packets=mp,
+        max_duration_s=md,
+        max_bytes=mb,
+        status="queued",
+        created_by_user_id=user.id,
+    )
+    db.add(cap)
+    await db.flush()
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=getattr(user, "auth_source", "local") or "local",
+            action="create",
+            resource_type="packet_capture",
+            resource_id=str(cap.id),
+            resource_display=f"pcap:{interface}",
+            new_value={
+                "vantage_kind": "server",
+                "interface": interface,
+                "bpf_filter": bpf,
+                "via": "ai_proposal",
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(cap)
+
+    try:
+        from app.tasks.pcap import run_capture_task  # noqa: PLC0415
+
+        run_capture_task.delay(str(cap.id))
+    except Exception:  # noqa: BLE001 — broker down
+        pass
+
+    return {
+        "id": str(cap.id),
+        "vantage_kind": "server",
+        "interface": interface,
+        "status": "queued",
+        "hint": (
+            "Capture dispatched. Poll get_packet_capture until status == "
+            "'completed', then download the .pcap from the UI."
+        ),
+    }
+
+
+register(
+    Operation(
+        name="run_packet_capture",
+        description=(
+            "Start an on-demand packet capture (tcpdump) on the "
+            "control-plane vantage. Always go through "
+            "propose_run_packet_capture — never call this directly. "
+            "Capturing raw traffic is sensitive, so operator approval is "
+            "required before each apply."
+        ),
+        args_model=RunPacketCaptureArgs,
+        preview=_preview_run_packet_capture,
+        apply=_apply_run_packet_capture,
+        category="network",
+        required_permission=("write", "manage_packet_capture"),
     )
 )
 

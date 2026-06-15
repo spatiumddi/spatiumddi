@@ -186,6 +186,8 @@ backend/alembic/versions/b7e2d9a5f314_dns_import_source.py:drop_column:89
 backend/alembic/versions/b7e3a1f4c8d2_add_dns_agent_ops.py:drop_column:67
 backend/alembic/versions/b7e3a1f4c8d2_add_dns_agent_ops.py:drop_table:61
 backend/alembic/versions/b8c3f2a9e147_appliance_lldp_settings.py:drop_column:109
+backend/alembic/versions/b8e3f1c47a92_packet_capture.py:drop_column:100
+backend/alembic/versions/b8e3f1c47a92_packet_capture.py:drop_table:105
 backend/alembic/versions/b95e2d71f042_appliance_snmp_settings.py:drop_column:95
 backend/alembic/versions/b9e1c43f7d28_pairing_code_auto_approve.py:drop_column:44
 backend/alembic/versions/b9e4d2a17c83_network_neighbour.py:drop_column:112

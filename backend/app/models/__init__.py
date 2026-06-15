@@ -101,6 +101,7 @@ from app.models.overlay import (
     RoutingPolicy,
 )
 from app.models.ownership import Customer, Provider, Site
+from app.models.pcap import PacketCapture
 from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
 from app.models.system_upgrade import SystemUpgradeRun
@@ -204,6 +205,7 @@ __all__ = [
     "MulticastGroupPort",
     "MulticastMembership",
     "NmapScan",
+    "PacketCapture",
     "EventSubscription",
     "EventOutbox",
     "Customer",

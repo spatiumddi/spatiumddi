@@ -24,6 +24,31 @@ the formatter handles the rest.
 
 Batched fixes for the next cut (not yet released).
 
+### Added
+
+* **#59 — Packet capture (tcpdump), Phase 1 (server vantage).** On-demand
+  packet capture as a first-class, RBAC-gated, audited platform tool —
+  for troubleshooting an appliance/container where there's no easy shell.
+  A new **Tools → Packet Capture** page starts a capture (interface +
+  BPF filter with presets + stop conditions: packets / duration / bytes +
+  snaplen), watches live byte/packet progress, and downloads the
+  ``.pcap`` for Wireshark. Mirrors the nmap scanner (persisted job rows,
+  5-state lifecycle, history + bulk-delete, ``tools.pcap`` feature
+  module, DEMO_MODE lockdown, ``setcap cap_net_raw`` on the binary) but
+  the deliverable is a binary ``.pcap`` artifact on disk (download-only,
+  auto-pruned after ``pcap_retention_days`` — default 7 — since captures
+  are large + sensitive). The BPF filter is passed as tcpdump's single
+  trailing argv element (never shell-interpolated) + charset-validated.
+  Phase 1 runs tcpdump in the worker container (the control-plane network
+  vantage); a new dedicated ``manage_packet_capture`` permission (seeded
+  to **Network Editor**, not Viewer — captured bytes are a privileged
+  read) gates every endpoint, and every start / download / cancel /
+  delete is audit-logged. Operator Copilot gets read tools
+  (``find_packet_captures`` / ``count_packet_captures`` /
+  ``get_packet_capture`` — metadata only, never bytes) + a gated
+  ``propose_run_packet_capture`` write. Appliance-host capture (the real
+  NICs, via the supervisor host-runner) lands in Phase 2.
+
 ### Fixed
 
 * **#430 — DDI hardening sweep: integration-mirror mass-delete on

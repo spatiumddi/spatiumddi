@@ -43,6 +43,7 @@ celery_app = Celery(
         "app.tasks.cloud_sync",
         "app.tasks.snmp_poll",
         "app.tasks.nmap",
+        "app.tasks.pcap",
         "app.tasks.dns_pool_healthcheck",
         "app.tasks.dhcp_fingerprint",
         "app.tasks.event_outbox",
@@ -99,6 +100,7 @@ celery_app.conf.update(
         "app.tasks.cloud_sync.*": {"queue": "default"},
         "app.tasks.snmp_poll.*": {"queue": "default"},
         "app.tasks.nmap.*": {"queue": "default"},
+        "app.tasks.pcap.*": {"queue": "default"},
         "app.tasks.dns_pool_healthcheck.*": {"queue": "dns"},
         "app.tasks.dhcp_fingerprint.*": {"queue": "dhcp"},
         "app.tasks.event_outbox.*": {"queue": "default"},
@@ -251,6 +253,14 @@ celery_app.conf.update(
         "log-entries-prune": {
             "task": "app.tasks.prune_logs.prune_log_entries",
             "schedule": schedule(run_every=24 * 3600.0),
+        },
+        # Daily at 03:45 UTC (offset from the other prunes), delete
+        # terminal packet-capture rows past the retention window
+        # (default 7 d) + unlink their .pcap files, and reap captures
+        # stuck non-terminal past their deadline. Issue #59.
+        "pcap-captures-prune": {
+            "task": "app.tasks.pcap.prune_captures",
+            "schedule": crontab(hour=3, minute=45),
         },
         # Every 5 min, reap IGMP-snooping membership rows whose
         # ``last_seen_at`` is older than 30 min — see issue #126
