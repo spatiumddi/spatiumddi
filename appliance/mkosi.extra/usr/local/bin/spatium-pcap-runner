@@ -154,8 +154,11 @@ fi
 wait "$pid" 2>/dev/null
 rc=$?
 
-# tcpdump prints "N packets captured" to stderr at exit.
+# tcpdump prints "N packets captured" to stderr at exit. Grab the tail of
+# stderr for the failure-path diagnostic BEFORE unlinking it (otherwise the
+# failed-state error would read an already-deleted file and lose the cause).
 packets=$(grep -oE '[0-9]+ packets captured' "$errfile" 2>/dev/null | grep -oE '^[0-9]+' | head -1)
+err=$(tail -c 300 "$errfile" 2>/dev/null)
 bytes=0; [ -f "$pcap" ] && bytes=$(stat -c%s "$pcap" 2>/dev/null || echo 0)
 rm -f "$errfile"
 
@@ -166,7 +169,6 @@ if [ "$bytes" -gt 0 ] || [ "$rc" -eq 0 ]; then
   log "capture $cid done: $bytes bytes, ${packets:-?} packets (reason=${stopped_reason:-eof})"
   write_state "$cid" done "${packets:-}" "$bytes" ""
 else
-  err=$(cat "$PCAP_DIR/$cid.stderr" 2>/dev/null | tail -c 300)
   write_state "$cid" failed "" 0 "tcpdump exited ($rc) with no capture${err:+: $err}"
 fi
 exit 0

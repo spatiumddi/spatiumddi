@@ -305,3 +305,12 @@ async def test_permission_granted_with_perm(client: AsyncClient, db_session: Asy
     await db_session.commit()
     r = await client.get("/api/v1/pcap/captures", headers=_hdr(token))
     assert r.status_code == 200
+
+
+def test_tools_pcap_in_demo_restricted_modules() -> None:
+    # DEMO_MODE forces tools.pcap off at startup; the runtime 404 path is
+    # covered by test_module_disabled_404. This pins the membership so the
+    # demo can't become a free packet-capture launchpad.
+    from app.core.demo_mode import DEMO_RESTRICTED_MODULES
+
+    assert "tools.pcap" in DEMO_RESTRICTED_MODULES

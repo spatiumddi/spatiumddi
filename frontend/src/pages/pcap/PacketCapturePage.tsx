@@ -73,9 +73,9 @@ export function PacketCapturePage() {
           <h1 className="text-lg font-semibold">Packet capture</h1>
         </div>
         <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
-          Run tcpdump from the control-plane vantage, watch live progress, and
-          download the .pcap for Wireshark. Captures raw traffic (may include
-          sensitive payloads) — every start and download is audited.
+          Run tcpdump on the control plane or an appliance host, watch live
+          progress, and download the .pcap for Wireshark. Captures raw traffic
+          (may include sensitive payloads) — every start and download is audited.
         </p>
       </div>
 
