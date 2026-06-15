@@ -486,6 +486,16 @@ def heartbeat_once(
         if _cached_role_health:
             body["role_health"] = _cached_role_health
 
+        # #59 — host NICs (ens18, cni0, …) for the appliance-vantage
+        # packet-capture interface picker. Only shipped when non-empty so
+        # a transient empty /run/udev read never wipes the learned set.
+        try:
+            ifaces = appliance_state.host_network_interfaces()
+            if ifaces:
+                body["host_interfaces"] = ifaces
+        except Exception as exc:  # noqa: BLE001 — never break the heartbeat
+            log.warning("supervisor.host_interfaces.failed", error=str(exc))
+
         # #272 Phase 9b — report the seed's etcd snapshot inventory (read
         # from the k3s ETCDSnapshotFile CRs over the kubeapi, no host k3s
         # binary needed) so Fleet can show recoverable snapshots without an

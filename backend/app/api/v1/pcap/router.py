@@ -151,7 +151,7 @@ async def list_interfaces(
     db: DB,
     current_user: CurrentUser,  # noqa: ARG001 — gate handled by dep
     vantage: str = Query("server"),
-    appliance_id: uuid.UUID | None = Query(None),  # noqa: ARG001 — Phase 2
+    appliance_id: uuid.UUID | None = Query(None),
 ) -> PcapInterfacesResponse:
     if vantage == "server":
         return PcapInterfacesResponse(
@@ -162,12 +162,33 @@ async def list_interfaces(
             ),
         )
     if vantage == "appliance":
-        # Phase 2 dispatches a list-interfaces request to the supervisor,
-        # which answers from the host net namespace. Not yet available.
-        return PcapInterfacesResponse(
-            interfaces=[],
-            note="Appliance-host capture ships in a follow-up phase.",
-        )
+        # The supervisor enumerates the host's real NICs from
+        # /run/udev/data and reports them on every heartbeat; we surface
+        # that list so the operator picks (not guesses) the capture NIC.
+        if appliance_id is None:
+            return PcapInterfacesResponse(
+                interfaces=[],
+                note="Select an appliance to list its host network interfaces.",
+            )
+        appliance = await db.get(Appliance, appliance_id)
+        if appliance is None:
+            raise HTTPException(status_code=422, detail="appliance_id not found")
+        ifaces = [i for i in (appliance.host_interfaces or []) if i]
+        if ifaces:
+            if "any" not in ifaces:
+                ifaces = ["any", *ifaces]
+            note = (
+                "The appliance host's real NICs (reported by the supervisor). "
+                'Pick the LAN NIC to capture subnet traffic; "any" spans all '
+                "host interfaces."
+            )
+        else:
+            note = (
+                "No interfaces reported yet — the supervisor enumerates them on "
+                'its heartbeat (~30 s). Type a NIC name (e.g. eth0) or "any" '
+                "meanwhile."
+            )
+        return PcapInterfacesResponse(interfaces=ifaces, note=note)
     raise HTTPException(status_code=422, detail=f"unknown vantage: {vantage!r}")
 
 

@@ -272,3 +272,43 @@ async def test_supervisor_pcap_poll_requires_cert(
     # No cert headers → 403 (the supervisor channel is cert-only).
     r = await client.post("/api/v1/appliance/supervisor/pcap/poll")
     assert r.status_code == 403
+
+
+async def test_appliance_interfaces_lists_reported_host_nics(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#59 — the appliance vantage surfaces the host NICs the supervisor
+    reported (heartbeat), with "any" prepended and the misleading
+    "follow-up phase" note gone."""
+    _, token = await _superadmin(db_session)
+    appl = await _appliance(db_session)
+    appl.host_interfaces = ["ens18", "cni0"]
+    await db_session.commit()
+    r = await client.get(
+        f"/api/v1/pcap/interfaces?vantage=appliance&appliance_id={appl.id}",
+        headers=_hdr(token),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["interfaces"][0] == "any"  # always offered first
+    assert "ens18" in body["interfaces"]
+    assert "cni0" in body["interfaces"]
+    assert "follow-up phase" not in (body["note"] or "")
+
+
+async def test_appliance_interfaces_empty_before_first_report(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Before the supervisor's first NIC report, the list is empty and the
+    note tells the operator to wait / type one."""
+    _, token = await _superadmin(db_session)
+    appl = await _appliance(db_session)  # host_interfaces stays NULL
+    await db_session.commit()
+    r = await client.get(
+        f"/api/v1/pcap/interfaces?vantage=appliance&appliance_id={appl.id}",
+        headers=_hdr(token),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["interfaces"] == []
+    assert "reported yet" in body["note"]

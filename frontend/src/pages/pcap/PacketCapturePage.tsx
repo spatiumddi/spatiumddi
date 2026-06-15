@@ -49,6 +49,24 @@ function isTerminal(s: PcapCaptureRead): boolean {
   );
 }
 
+// "Settled" = terminal AND the artifact question is resolved. A Stop
+// flips status to `cancelled` immediately, but the partial .pcap lands a
+// moment later (the server vantage finalizes after SIGTERM; the appliance
+// vantage relays the upload through the supervisor). So for a cancel we
+// keep waiting until has_artifact is true OR a grace window passes — that
+// way the Download button appears right at Stop instead of looking absent.
+const CANCEL_ARTIFACT_GRACE_MS = 20000;
+
+function isSettled(s: PcapCaptureRead): boolean {
+  if (s.status === "completed" || s.status === "failed") return true;
+  if (s.status === "cancelled") {
+    if (s.has_artifact) return true;
+    const fin = s.finished_at ? Date.parse(s.finished_at) : 0;
+    return fin > 0 && Date.now() - fin > CANCEL_ARTIFACT_GRACE_MS;
+  }
+  return false;
+}
+
 export function PacketCapturePage() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [displayId, setDisplayId] = useState<string | null>(null);
@@ -202,13 +220,22 @@ function CaptureForm({
   });
   const approved = (appliances ?? []).filter((a) => a.state === "approved");
 
-  // Server vantage enumerates the worker's NICs; appliance vantage can't
-  // (the control plane can't see the host's NICs) so the operator types it.
+  // Both vantages enumerate NICs now: server lists the worker's own
+  // container NICs; appliance lists the host's real NICs (ens18, …) that
+  // the supervisor reported via heartbeat. Re-runs when the picked
+  // appliance changes so the dropdown matches that host.
   const { data: ifaces } = useQuery({
-    enabled: !isAppliance,
-    queryKey: ["pcap-interfaces", "server"],
-    queryFn: () => pcapApi.listInterfaces("server"),
+    queryKey: [
+      "pcap-interfaces",
+      isAppliance ? `appliance:${vantage}` : "server",
+    ],
+    queryFn: () =>
+      pcapApi.listInterfaces(
+        isAppliance ? "appliance" : "server",
+        isAppliance ? vantage : undefined,
+      ),
   });
+  const ifaceList = ifaces?.interfaces ?? [];
 
   const start = useMutation({
     mutationFn: (body: PcapCaptureCreate) => pcapApi.createCapture(body),
@@ -274,39 +301,36 @@ function CaptureForm({
 
       <div>
         <label className="mb-1 block text-xs font-medium">Interface</label>
-        {isAppliance ? (
-          <>
-            <input
-              type="text"
-              value={iface}
-              onChange={(e) => setIface(e.target.value)}
-              placeholder="e.g. eth0, bond0, any"
-              className="w-full rounded-md border bg-background px-2 py-1.5 font-mono text-sm"
-            />
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              The appliance host's real NIC — validated against the host when
-              the capture runs. "any" includes all host traffic.
-            </p>
-          </>
+        {ifaceList.length > 0 ? (
+          <select
+            value={iface}
+            onChange={(e) => setIface(e.target.value)}
+            className="w-full rounded-md border bg-background px-2 py-1.5 text-sm"
+          >
+            {(ifaceList.includes(iface)
+              ? ifaceList
+              : [iface, ...ifaceList]
+            ).map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
         ) : (
-          <>
-            <select
-              value={iface}
-              onChange={(e) => setIface(e.target.value)}
-              className="w-full rounded-md border bg-background px-2 py-1.5 text-sm"
-            >
-              {(ifaces?.interfaces ?? ["any"]).map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
-            </select>
-            {ifaces?.note && (
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                {ifaces.note}
-              </p>
-            )}
-          </>
+          // Appliance vantage before the supervisor's first NIC report —
+          // free-text fallback so the operator isn't blocked.
+          <input
+            type="text"
+            value={iface}
+            onChange={(e) => setIface(e.target.value)}
+            placeholder="e.g. eth0, bond0, any"
+            className="w-full rounded-md border bg-background px-2 py-1.5 font-mono text-sm"
+          />
+        )}
+        {ifaces?.note && (
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {ifaces.note}
+          </p>
         )}
       </div>
 
@@ -466,22 +490,29 @@ function LiveTab({
     enabled: !!captureId,
     queryKey: ["pcap-capture", captureId],
     queryFn: () => pcapApi.getCapture(captureId!),
+    // Keep polling until the artifact question is settled — not just
+    // until terminal — so a Stopped capture's partial .pcap shows up.
     refetchInterval: (q) =>
-      q.state.data && isTerminal(q.state.data) ? false : 1500,
+      q.state.data && isSettled(q.state.data) ? false : 1500,
   });
 
   useEffect(() => {
-    if (data && isTerminal(data)) {
+    // Only hand off to the Result tab once settled, so we never switch to
+    // a "no artifact" view a beat before the partial .pcap lands.
+    if (data && isSettled(data)) {
       qc.invalidateQueries({ queryKey: ["pcap-captures"] });
       onComplete(data.id);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data?.status]);
+  }, [data?.status, data?.has_artifact]);
 
   const cancel = useMutation({
     mutationFn: (id: string) => pcapApi.cancelCapture(id),
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["pcap-capture", captureId] }),
+  });
+  const download = useMutation({
+    mutationFn: (id: string) => pcapApi.downloadCapture(id),
   });
 
   if (!captureId || !data) {
@@ -519,6 +550,38 @@ function LiveTab({
           <Trash2 className="h-3 w-3" /> Stop capture
         </button>
       )}
+      {/* After Stop (or natural finish): offer the download right here so
+          the operator never has to dig through History. The partial .pcap
+          lands a beat after a cancel — until then show a spinner. */}
+      {isTerminal(data) && data.has_artifact && (
+        <button
+          type="button"
+          onClick={() => download.mutate(data.id)}
+          disabled={download.isPending}
+          className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+        >
+          {download.isPending ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <Download className="h-3.5 w-3.5" />
+          )}
+          Download .pcap ({fmtBytes(data.pcap_size_bytes)})
+        </button>
+      )}
+      {data.status === "cancelled" &&
+        !data.has_artifact &&
+        !isSettled(data) && (
+          <p className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <Loader2 className="h-3 w-3 animate-spin" />
+            Finalizing the captured packets…
+          </p>
+        )}
+      {isTerminal(data) && !data.has_artifact && isSettled(data) && (
+        <p className="text-[11px] italic text-muted-foreground">
+          No downloadable artifact — the capture produced no packets before it
+          stopped.
+        </p>
+      )}
     </div>
   );
 }
@@ -539,6 +602,10 @@ function ResultTab({ captureId }: { captureId: string | null }) {
     enabled: !!captureId,
     queryKey: ["pcap-capture", captureId],
     queryFn: () => pcapApi.getCapture(captureId!),
+    // Keep refreshing until the artifact settles so a just-stopped
+    // capture's Download button appears without a manual refresh.
+    refetchInterval: (q) =>
+      q.state.data && isSettled(q.state.data) ? false : 2000,
   });
   const download = useMutation({
     mutationFn: (id: string) => pcapApi.downloadCapture(id),

@@ -1083,6 +1083,12 @@ class SupervisorHeartbeatRequest(BaseModel):
     # Empty dict on legacy compose appliances; None / omitted = the
     # supervisor didn't run the probe this tick (pre-#183 supervisors).
     cluster_health: dict[str, Any] | None = None
+    # #59 — host NICs the supervisor read from /run/udev/data (real
+    # NICs like ens18 + cni0; ephemeral veth* filtered). Surfaced as the
+    # appliance-vantage packet-capture interface picker. None / omitted =
+    # the supervisor didn't enumerate this tick (non-appliance or
+    # pre-#59 supervisor); empty list = enumerated but found nothing.
+    host_interfaces: list[str] | None = None
     # Issue #183 Phase 5 — operator-facing k3s metadata.
     # ``k3s_version`` is the upstream release tag the slot was baked
     # against (e.g. ``v1.35.5+k3s1``). ``kubeconfig`` is the raw
@@ -1665,6 +1671,12 @@ async def supervisor_heartbeat(
         # Same overwrite-verbatim shape as role_health. Empty dict
         # is a meaningful signal (legacy compose; clear stale state).
         row.cluster_health = dict(body.cluster_health)
+    if body.host_interfaces is not None:
+        # #59 — host NICs for the appliance-vantage capture picker.
+        # Overwrite verbatim (the supervisor sends the current host set
+        # each tick); only update when reported so non-appliance /
+        # pre-#59 supervisors don't wipe a previously-learned list.
+        row.host_interfaces = list(body.host_interfaces)
 
     # Issue #183 Phase 5 — k3s version + kubeconfig persist. Both
     # follow "only update when not None" so legacy compose / pre-
