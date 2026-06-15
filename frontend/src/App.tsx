@@ -40,6 +40,7 @@ import { ProvidersPage } from "@/pages/network/ProvidersPage";
 import { ServicesPage } from "@/pages/network/ServicesPage";
 import { SitesPage } from "@/pages/network/SitesPage";
 import { NmapToolsPage } from "@/pages/nmap/NmapToolsPage";
+import { PacketCapturePage } from "@/pages/pcap/PacketCapturePage";
 import { NetworkToolsPage } from "@/pages/tools/NetworkToolsPage";
 import { CidrCalculatorPage } from "@/pages/tools/CidrCalculatorPage";
 import { SubnetPlannerListPage } from "@/pages/ipam/SubnetPlannerListPage";
@@ -142,6 +143,7 @@ export default function App() {
             redirecting to /network/devices/:id. */}
         <Route path="network/:id" element={<DeviceDetailView />} />
         <Route path="tools/nmap" element={<NmapToolsPage />} />
+        <Route path="tools/pcap" element={<PacketCapturePage />} />
         <Route path="tools/network" element={<NetworkToolsPage />} />
         <Route path="tools/cidr" element={<CidrCalculatorPage />} />
         <Route path="dhcp" element={<DHCPPage />} />

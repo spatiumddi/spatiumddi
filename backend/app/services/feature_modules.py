@@ -162,6 +162,17 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
             "Permission-gated + rate-limited."
         ),
     ),
+    ModuleSpec(
+        id="tools.pcap",
+        label="Packet capture",
+        group="Tools",
+        description=(
+            "On-demand tcpdump capture from the control-plane (or appliance "
+            "host) vantage — BPF filter + presets, live progress, downloadable "
+            ".pcap, history with auto-retention. Captures raw traffic; high "
+            "sensitivity (gated by the manage_packet_capture permission)."
+        ),
+    ),
     # DNS — togglable extras under the Settings → Import surface and
     # the DNS sidebar group. The importer is one-shot (issue #128) —
     # operators upload BIND9 configs / live-pull from Windows DNS or

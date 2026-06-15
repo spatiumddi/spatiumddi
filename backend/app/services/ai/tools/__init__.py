@@ -35,6 +35,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     ops,
     ownership,
     pairing,
+    pcap,
     proposals,
     redis,
     reports,

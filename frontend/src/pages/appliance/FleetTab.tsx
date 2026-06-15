@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Activity,
   AlertCircle,
   Ban,
   CheckCircle2,
@@ -2276,6 +2278,17 @@ function ApplianceDrilldownModal({
                 ? ` · ${caps.baked_images_version}`
                 : ""}
             </span>
+          )}
+          {row.state === "approved" && (
+            // #59 — capture on this appliance's real NICs. Lands on the
+            // Packet Capture tool prefilled with this appliance as vantage.
+            // (404s gracefully if the tools.pcap module is off.)
+            <Link
+              to={`/tools/pcap?vantage=appliance&appliance=${row.id}`}
+              className="ml-auto inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs hover:bg-accent"
+            >
+              <Activity className="h-3 w-3" /> Packet capture
+            </Link>
           )}
         </div>
 

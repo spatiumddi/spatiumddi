@@ -344,6 +344,16 @@ def main() -> int:
     identity_for_nettool, _ = load_or_generate(cfg.state_dir)
     start_nettool_thread(cfg, identity_for_nettool)
 
+    # #59 Phase 2 — appliance-host packet capture. Daemon thread that
+    # long-polls for queued appliance-vantage captures, drives the host
+    # runner over the trigger-file pattern, and streams the finished
+    # .pcap back. Self-resilient (no cert / registration / 404 → sleep +
+    # retry); dormant when no capture is queued.
+    from .pcap_proxy import start_pcap_thread  # noqa: PLC0415
+
+    identity_for_pcap, _ = load_or_generate(cfg.state_dir)
+    start_pcap_thread(cfg, identity_for_pcap)
+
     # #404 — tail /dev/kmsg for nftables drop logs so the firewall_logs
     # nettool can serve them to the Firewall → Logs viewer. Harmless if no
     # drops are ever logged (firewall logging off) — the buffer just stays

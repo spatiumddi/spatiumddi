@@ -516,6 +516,7 @@ KNOWN_MANAGE_PERMISSIONS: frozenset[str] = frozenset(
         "manage_domains",
         "manage_network_devices",
         "manage_nmap_scans",
+        "manage_packet_capture",
     }
 )
 

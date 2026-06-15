@@ -52,6 +52,7 @@ from app.api.v1.ownership import (
     providers_router,
     sites_router,
 )
+from app.api.v1.pcap import router as pcap_router
 from app.api.v1.proxmox import router as proxmox_router
 from app.api.v1.reports import router as reports_router
 from app.api.v1.roles.router import router as roles_router
@@ -240,6 +241,12 @@ api_v1_router.include_router(
     prefix="/nmap",
     tags=["nmap"],
     dependencies=[Depends(require_module("tools.nmap"))],
+)
+api_v1_router.include_router(
+    pcap_router,
+    prefix="/pcap",
+    tags=["pcap"],
+    dependencies=[Depends(require_module("tools.pcap"))],
 )
 api_v1_router.include_router(
     opnsense_router,

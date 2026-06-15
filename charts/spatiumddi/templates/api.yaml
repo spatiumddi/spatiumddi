@@ -138,6 +138,11 @@ spec:
             - name: slot-images
               mountPath: /var/lib/spatiumddi/slot-images
             {{- end }}
+            # #59 — packet-capture .pcap store. api READS here on download;
+            # the worker writes. Single-node shared hostPath (firstboot
+            # chowns it 1000:1000). Always mounted (not mirror-gated).
+            - name: pcaps
+              mountPath: /var/lib/spatiumddi/pcaps
           {{- end }}
       {{- if .Values.api.applianceHostMounts.enabled }}
       volumes:
@@ -161,6 +166,11 @@ spec:
             path: {{ .Values.api.applianceHostMounts.slotImagesDir }}
             type: DirectoryOrCreate
         {{- end }}
+        # #59 — packet-capture .pcap store (shared with the worker).
+        - name: pcaps
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.pcapsDir }}
+            type: DirectoryOrCreate
       {{- end }}
       {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.api.nodeSelector) .) | nindent 6 }}
       {{- with .Values.api.tolerations }}

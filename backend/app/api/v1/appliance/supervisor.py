@@ -5046,6 +5046,197 @@ async def nettool_reply(
     return {"delivered": "true" if delivered else "stale"}
 
 
+# ── Packet capture (appliance-host vantage, #59 Phase 2) ─────────────────
+#
+# The supervisor's pcap_proxy thread drives these. Unlike the nettool /
+# k8s-proxy in-memory queues, the authority is the packet_capture DB row
+# (claimed via a guarded UPDATE), so any api replica can serve the poll.
+
+
+class PcapPollResponse(BaseModel):
+    """A claimed appliance-vantage capture command, or empty (capture_id
+    == "") when nothing is queued. Structured fields only — the
+    supervisor + host runner rebuild the tcpdump argv from these."""
+
+    capture_id: str = ""
+    interface: str | None = None
+    bpf_filter: str | None = None
+    snaplen: int = 256
+    promiscuous: bool = False
+    max_packets: int | None = None
+    max_duration_s: int | None = None
+    max_bytes: int | None = None
+
+
+class PcapProgressRequest(BaseModel):
+    packets: int | None = None
+    bytes_captured: int | None = None
+    elapsed_s: float | None = None
+
+
+async def _pcap_capture_for_appliance(db: DB, capture_id: uuid.UUID, appliance: Appliance) -> Any:
+    from app.models.pcap import PacketCapture  # noqa: PLC0415
+
+    row = await db.get(PacketCapture, capture_id)
+    if row is None or row.appliance_id != appliance.id:
+        # Don't leak existence of another appliance's capture.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "capture not found for this appliance")
+    return row
+
+
+@router.post(
+    "/supervisor/pcap/poll",
+    response_model=PcapPollResponse,
+    summary="Long-poll for the next queued appliance-host packet capture",
+)
+async def pcap_poll(request: Request, db: DB) -> PcapPollResponse:
+    """Cert-authed. Claims (guarded UPDATE → running) the oldest queued
+    appliance-vantage capture for the caller's appliance, or returns an
+    empty shape after ~30 s so the supervisor re-polls."""
+    import asyncio as _asyncio  # noqa: PLC0415
+
+    from app.services.appliance import pcap_capture as _pc  # noqa: PLC0415
+
+    appliance = await _require_cert_auth(request, db)
+    deadline = _asyncio.get_running_loop().time() + 30.0
+    while True:
+        cmd = await _pc.claim_next(db, appliance.id)
+        if cmd is not None:
+            return PcapPollResponse(**cmd)
+        if _asyncio.get_running_loop().time() >= deadline:
+            return PcapPollResponse()
+        await _asyncio.sleep(2.0)
+
+
+@router.post(
+    "/supervisor/pcap/progress/{capture_id}",
+    summary="Report live capture progress; returns the operator cancel flag",
+)
+async def pcap_progress(
+    capture_id: uuid.UUID, body: PcapProgressRequest, request: Request, db: DB
+) -> dict[str, bool]:
+    from app.services.appliance import pcap_capture as _pc  # noqa: PLC0415
+
+    appliance = await _require_cert_auth(request, db)
+    await _pcap_capture_for_appliance(db, capture_id, appliance)
+    cancel = await _pc.record_progress(
+        db,
+        capture_id,
+        packets=body.packets,
+        bytes_captured=body.bytes_captured,
+        elapsed_s=body.elapsed_s,
+    )
+    return {"cancel": cancel}
+
+
+@router.post(
+    "/supervisor/pcap/upload/{capture_id}",
+    summary="Stream the finished .pcap back (or finalize as failed via ?error=)",
+)
+async def pcap_upload(capture_id: uuid.UUID, request: Request, db: DB) -> dict[str, str]:
+    """Cert-authed. Streams the host-captured ``.pcap`` to the shared
+    PCAP_DIR (``.partial`` → atomic rename + sha256), capped at
+    ``max_bytes`` + margin. ``?error=`` (empty body) finalizes a failed
+    capture. Cancel is terminal — a cancelled row discards the bytes."""
+    import hashlib as _hashlib  # noqa: PLC0415
+    import os as _os  # noqa: PLC0415
+
+    from app.services.appliance import pcap_capture as _pc  # noqa: PLC0415
+    from app.services.pcap.runner import HARD_MAX_BYTES, pcap_dir  # noqa: PLC0415
+
+    appliance = await _require_cert_auth(request, db)
+    row = await _pcap_capture_for_appliance(db, capture_id, appliance)
+
+    error = request.query_params.get("error")
+    if error:
+        await _pc.finalize_capture(
+            db,
+            capture_id,
+            pcap_path=None,
+            pcap_size_bytes=None,
+            pcap_sha256=None,
+            packet_count=None,
+            metadata={"stop_reason": "error"},
+            error=error,
+        )
+        return {"status": "failed"}
+
+    packets_q = request.query_params.get("packets")
+    packet_count = int(packets_q) if packets_q and packets_q.isdigit() else None
+    # Generous transfer ceiling: the configured byte cap + 16 MiB headroom
+    # (pcap framing), never above the hard ceiling + headroom.
+    cap = min((row.max_bytes or HARD_MAX_BYTES), HARD_MAX_BYTES) + 16 * 1024 * 1024
+
+    # ``capture_id`` is a FastAPI-coerced uuid.UUID (path separators are
+    # impossible), but resolve + assert the path stays inside PCAP_DIR
+    # anyway — defence-in-depth + it clears the CodeQL path-injection taint
+    # from the HTTP path param.
+    pcap_root = pcap_dir().resolve()
+    dest = (pcap_root / f"{capture_id}.pcap").resolve()
+    if dest.parent != pcap_root:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid capture id")
+    partial = dest.with_name(f"{dest.stem}.pcap.partial")
+    h = _hashlib.sha256()
+    size = 0
+    try:
+        with open(partial, "wb") as fh:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > cap:
+                    fh.close()
+                    partial.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        "uploaded pcap exceeds the capture's byte cap",
+                    )
+                fh.write(chunk)
+                h.update(chunk)
+        _os.replace(partial, dest)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        partial.unlink(missing_ok=True)
+        await _pc.finalize_capture(
+            db,
+            capture_id,
+            pcap_path=None,
+            pcap_size_bytes=None,
+            pcap_sha256=None,
+            packet_count=None,
+            metadata={"stop_reason": "upload_error"},
+            error=f"upload failed: {exc}",
+        )
+        return {"status": "failed"}
+
+    final_status = await _pc.finalize_capture(
+        db,
+        capture_id,
+        pcap_path=str(dest),
+        pcap_size_bytes=size,
+        pcap_sha256=h.hexdigest(),
+        packet_count=packet_count,
+        metadata={
+            "packet_count": packet_count,
+            "byte_count": size,
+            "stop_reason": "completed",
+        },
+        error=None,
+    )
+    if final_status == "cancelled":
+        # Cancel won the race — discard the bytes we just stored.
+        dest.unlink(missing_ok=True)
+    logger.info(
+        "appliance.pcap.upload",
+        appliance_id=str(appliance.id),
+        capture_id=str(capture_id),
+        bytes=size,
+        status=final_status,
+    )
+    return {"status": final_status}
+
+
 class ApplianceRestartDeploymentRequest(BaseModel):
     """Operator-driven Deployment / DaemonSet rollout-restart.
 

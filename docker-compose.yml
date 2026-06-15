@@ -84,6 +84,10 @@ services:
       # authenticated under /api/v1/appliance/slot-images/{id}/raw.xz
       # for the supervisor to download.
       - spatium_slot_images:/var/lib/spatiumddi/slot-images
+      # Packet-capture .pcap artifacts (issue #59). The worker writes
+      # captures here; the api streams them back on download. Shared so
+      # the server-vantage capture works end-to-end on compose.
+      - spatium_pcaps:/var/lib/spatiumddi/pcaps
     depends_on:
       postgres:
         condition: service_healthy
@@ -117,8 +121,13 @@ services:
     #
     # Backup local-volume target (issue #117) — the worker runs the
     # scheduled backup sweep, so it must mount the same volume the
-    # api lists archives from. Uncomment alongside the api service.
-    # volumes:
+    # api lists archives from. Uncomment the spatium_backups line below
+    # alongside the api service.
+    volumes:
+      # Packet-capture .pcap artifacts (issue #59) — the worker runs the
+      # capture, so it writes here; the api reads the same volume on
+      # download. MUST stay in sync with the api mount above.
+      - spatium_pcaps:/var/lib/spatiumddi/pcaps
     #   - /var/run/docker.sock:/var/run/docker.sock:ro
     #   - spatium_backups:/var/lib/spatiumddi/backups
     # group_add:
@@ -390,3 +399,7 @@ volumes:
   # to download. Capacity: each image is ~800 MiB-1.2 GiB; the
   # backend caps a single upload at 4 GiB.
   spatium_slot_images:
+  # Packet-capture .pcap artifacts (issue #59). Shared by api + worker
+  # so the server-vantage capture works end-to-end. Auto-pruned after
+  # PlatformSettings.pcap_retention_days (default 7).
+  spatium_pcaps:

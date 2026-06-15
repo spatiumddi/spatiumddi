@@ -288,6 +288,13 @@ class PlatformSettings(Base):
         Integer, nullable=False, default=90, server_default=sa_text("90")
     )
 
+    # How many days to retain terminal packet-capture rows (+ their .pcap
+    # files) before the nightly prune deletes them. pcaps are large +
+    # sensitive (plaintext creds/PII) so the default is short (issue #59).
+    pcap_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=7, server_default=sa_text("7")
+    )
+
     # Fingerbank API key for passive DHCP device fingerprinting (Phase 2 of
     # the device profiling feature). Fernet-encrypted at rest; null when the
     # operator hasn't configured a key. When unset, the agent still ships

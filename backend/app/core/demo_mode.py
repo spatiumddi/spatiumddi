@@ -44,6 +44,7 @@ from app.config import settings
 DEMO_RESTRICTED_MODULES: Final[frozenset[str]] = frozenset(
     {
         "tools.nmap",
+        "tools.pcap",
         "ai.copilot",
         "integrations.kubernetes",
         "integrations.docker",

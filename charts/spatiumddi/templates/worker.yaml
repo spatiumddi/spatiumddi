@@ -68,6 +68,21 @@ spec:
             failureThreshold: 3
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
+          {{- if .Values.api.applianceHostMounts.enabled }}
+          volumeMounts:
+            # #59 — packet-capture .pcap store. The worker WRITES captures
+            # here; the api reads them back on download. Same single-node
+            # shared hostPath (firstboot chowns it 1000:1000).
+            - name: pcaps
+              mountPath: /var/lib/spatiumddi/pcaps
+          {{- end }}
+      {{- if .Values.api.applianceHostMounts.enabled }}
+      volumes:
+        - name: pcaps
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.pcapsDir }}
+            type: DirectoryOrCreate
+      {{- end }}
       {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.worker.nodeSelector) .) | nindent 6 }}
       {{- with .Values.worker.tolerations }}
       tolerations:

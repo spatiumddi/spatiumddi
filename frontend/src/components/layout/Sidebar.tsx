@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
+  Activity,
   Network,
   Globe,
   LayoutDashboard,
@@ -201,6 +202,12 @@ const toolsNav = [
     icon: Wrench,
     to: "/tools/network",
     module: "tools.network",
+  },
+  {
+    label: "Packet Capture",
+    icon: Activity,
+    to: "/tools/pcap",
+    module: "tools.pcap",
   },
 ];
 
