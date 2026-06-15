@@ -136,6 +136,15 @@ class LeaseEvent(BaseModel):
 
 
 class LeaseEventBatch(BaseModel):
+    # #428: forbid unknown top-level keys. ``leases`` defaults to [], so an
+    # agent that posts the wrong envelope (e.g. the old ``{"events":[…]}``
+    # shape) would otherwise validate to an EMPTY batch and the endpoint
+    # would 200-no-op — silently dropping every lease. ``extra="forbid"``
+    # turns that into a loud 422 the agent logs as ``lease_events_failed``
+    # instead of a phantom success. (Per-event field drift already fails
+    # loudly: ip_address/mac_address are required.)
+    model_config = {"extra": "forbid"}
+
     # The agent batches up to 100 events per POST (``leases._BATCH_MAX_EVENTS``);
     # cap with generous headroom so a malformed/hostile client can't ship an
     # unbounded batch into the per-event ingestion loop.
@@ -231,7 +240,8 @@ async def agent_register(
         group = res.scalar_one_or_none()
         if group is None:
             group = DHCPServerGroup(
-                name=body.group_name, description="Auto-created by DHCP agent registration"
+                name=body.group_name,
+                description="Auto-created by DHCP agent registration",
             )
             db.add(group)
             await db.flush()
@@ -374,14 +384,24 @@ async def agent_config_longpoll(
             lldp_block = (
                 lldp_bundle(settings_row)
                 if settings_row is not None
-                else {"enabled": False, "config_hash": "", "lldpd_conf": "", "daemon_args": ""}
+                else {
+                    "enabled": False,
+                    "config_hash": "",
+                    "lldpd_conf": "",
+                    "daemon_args": "",
+                }
             )
             # Issue #156 — same pattern for rsyslog. Stable dict shape so the
             # etag math stays uniform whether settings exist or not.
             syslog_block = (
                 syslog_bundle(settings_row)
                 if settings_row is not None
-                else {"enabled": False, "config_hash": "", "rsyslog_conf": "", "ca_certs": {}}
+                else {
+                    "enabled": False,
+                    "config_hash": "",
+                    "rsyslog_conf": "",
+                    "ca_certs": {},
+                }
             )
             # Issue #157 — same pattern for SSH. Stable dict shape so the
             # etag math stays uniform whether settings exist or not.
@@ -435,7 +455,8 @@ async def agent_config_longpoll(
             else:
                 ops_res = await db.execute(
                     select(DHCPConfigOp).where(
-                        DHCPConfigOp.server_id == server.id, DHCPConfigOp.status == "pending"
+                        DHCPConfigOp.server_id == server.id,
+                        DHCPConfigOp.status == "pending",
                     )
                 )
                 pending_ops = [
@@ -724,7 +745,10 @@ async def agent_lease_events(
       - Released/expired lease → if the IPAM row is auto_from_lease, remove it.
     """
     from app.models.ipam import IPAddress
-    from app.services.dhcp.pull_leases import _find_containing_subnet, _load_subnet_cache
+    from app.services.dhcp.pull_leases import (
+        _find_containing_subnet,
+        _load_subnet_cache,
+    )
 
     server, _ = auth
     now = datetime.now(UTC)
@@ -758,6 +782,11 @@ async def agent_lease_events(
     upserted = 0
     for ev in events:
         key = (ev.ip_address, ev.mac_address)
+        # #428: fall back to ends_at when the agent didn't send a distinct
+        # expires_at (Kea ships the same absolute reclaim time as ends_at).
+        # Without a non-NULL expires_at the time-based sweep_expired_leases
+        # — which filters `expires_at IS NOT NULL` — can never reap the row.
+        expires_at = ev.expires_at or ev.ends_at
         lease = lease_by_key.get(key)
         if lease is None:
             lease = DHCPLease(
@@ -770,7 +799,7 @@ async def agent_lease_events(
                 state=ev.state,
                 starts_at=ev.starts_at,
                 ends_at=ev.ends_at,
-                expires_at=ev.expires_at,
+                expires_at=expires_at,
                 last_seen_at=now,
             )
             db.add(lease)
@@ -782,7 +811,7 @@ async def agent_lease_events(
             lease.state = ev.state
             lease.starts_at = ev.starts_at
             lease.ends_at = ev.ends_at
-            lease.expires_at = ev.expires_at
+            lease.expires_at = expires_at
             lease.last_seen_at = now
         upserted += 1
     await db.flush()

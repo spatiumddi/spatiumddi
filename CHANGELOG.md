@@ -26,6 +26,36 @@ Batched fixes for the next cut (not yet released).
 
 ### Fixed
 
+* **#428 — DHCP↔IPAM↔DNS replication gaps (Kea push dead + cleanup
+  holes).** A replication audit found the **Kea lease-event push was a
+  silent no-op**: the agent shipped ``{"events":[{"ip","mac"}]}`` but the
+  server's ``LeaseEventBatch`` expects ``{"leases":[{"ip_address",
+  "mac_address","expires_at"}]}`` with ``leases`` defaulting to ``[]``, so
+  the POST validated to an empty batch, returned 200, and the agent
+  cleared its queue — every Kea lease dropped, so a Kea-served client was
+  never mirrored to IPAM and never DDNS-registered (the Windows pull path
+  was unaffected; there's no Kea poll fallback). The agent now emits the
+  server's exact shape (incl. a non-NULL ``expires_at`` so the time-based
+  sweep can reap Kea mirrors), and the batch model gains ``extra="forbid"``
+  so any future envelope drift 422s loudly instead of phantom-succeeding.
+  Two cleanup/consistency fixes ride along: the scheduled
+  ``ipam-dns-auto-sync`` backstop is now **DDNS-aware** — it regenerates a
+  lease's DDNS record if a swallowed inline apply missed it (incl.
+  generated ``dhcp-<x-y>`` names the drift check can't see), and it honors
+  the DDNS opt-in by **not** publishing lease-mirrored rows for subnets
+  whose DDNS is disabled (manual allocations still sync); and **subnet
+  soft-delete now revokes** the lease mirrors' DDNS A/PTR records + drops
+  the transient mirror rows (they were orphaned on the DNS server before),
+  with a warning in the delete-subnet modal. DDNS stays opt-in by design.
+  Also folds in the smaller audit findings: DDNS now consumes the
+  previously-dead ``ddns_ttl`` (stamps the record TTL) and
+  ``ddns_domain_override`` (publishes the forward record into the override
+  zone); an agentless Windows-DNS record whose synchronous apply *fails*
+  no longer leaves ``dns_record_id`` stamped (so DDNS retries instead of
+  permanently skipping it); and Windows-pull DDNS now wakes the agent
+  long-poll on commit so it converges immediately instead of on the safety
+  tick.
+
 * **#426 — Windows DNS/DHCP integration hardening (audit follow-up).** A
   full audit of the WinRM/PowerShell integration confirmed 19 defects;
   this fixes them. **Blocker:** DHCP bulk reservation/exclusion writes

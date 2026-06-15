@@ -74,6 +74,10 @@ class PullLeasesResult:
     pools_synced: int = 0  # DHCPPool rows (re-)created from the import
     statics_synced: int = 0  # DHCPStaticAssignment rows (re-)created
     errors: list[str] = field(default_factory=list)
+    # #428 — DNS group ids whose zones received a DDNS record this pull;
+    # the caller publishes an agent wake for them AFTER its commit so the
+    # records converge instantly instead of on the agent's safety tick.
+    dns_wake_group_ids: set[str] = field(default_factory=set)
 
 
 async def pull_leases_from_server(
@@ -263,12 +267,21 @@ async def pull_leases_from_server(
             try:
                 from app.services.dns.ddns import apply_ddns_for_lease  # noqa: PLC0415
 
-                await apply_ddns_for_lease(
+                fired = await apply_ddns_for_lease(
                     db,
                     subnet=containing,
                     ipam_row=ipam_row,
                     client_hostname=lease.get("hostname"),
                 )
+                # #428 — record the affected DNS group(s) so the task wakes
+                # the agent after commit (instead of waiting the safety tick).
+                if fired:
+                    from app.api.v1.ipam.router import (  # noqa: PLC0415
+                        _resolve_effective_dns,
+                    )
+
+                    group_ids, _, _ = await _resolve_effective_dns(db, containing)
+                    result.dns_wake_group_ids.update(str(g) for g in group_ids)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "dhcp_pull_leases_ddns_failed",

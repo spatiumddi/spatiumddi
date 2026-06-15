@@ -43,12 +43,20 @@ def _parse_row(row: list[str]) -> dict[str, Any] | None:
     try:
         ip = row[0].strip()
         mac = row[1].strip() or None
+        # #428: the server keys leases on (ip, mac) and mac_address is a
+        # required field — a MAC-less row can't be mirrored, so skip it
+        # rather than 422 the whole batch (mirrors the Windows pull path,
+        # which drops leases with no ClientId).
+        if not ip or not mac:
+            return None
         valid_lifetime = int(row[3]) if row[3] else 0
         expire_epoch = int(row[4]) if row[4] else 0
         hostname = row[8].strip() or None
         state = _STATE_MAP.get(row[9].strip(), "active")
         starts_at = (
-            datetime.fromtimestamp(expire_epoch - valid_lifetime, tz=timezone.utc).isoformat()
+            datetime.fromtimestamp(
+                expire_epoch - valid_lifetime, tz=timezone.utc
+            ).isoformat()
             if expire_epoch and valid_lifetime
             else None
         )
@@ -57,13 +65,20 @@ def _parse_row(row: list[str]) -> dict[str, Any] | None:
             if expire_epoch
             else None
         )
+        # #428: emit the server's LeaseEventBatch/LeaseEvent shape exactly —
+        # field names ip_address/mac_address (NOT ip/mac) and an explicit
+        # expires_at (Kea's CSV `expire` is the absolute reclaim time, same
+        # as ends_at). The old {ip,mac,ends_at} shape was silently dropped
+        # by the server's Pydantic model (leases defaulted to [], HTTP 200),
+        # so no Kea lease ever reached IPAM/DDNS.
         return {
-            "ip": ip,
-            "mac": mac,
+            "ip_address": ip,
+            "mac_address": mac,
             "hostname": hostname,
             "state": state,
             "starts_at": starts_at,
             "ends_at": ends_at,
+            "expires_at": ends_at,
         }
     except (ValueError, IndexError):
         return None
@@ -93,7 +108,7 @@ class LeaseWatcher:
         if not self._pending:
             self._last_flush = time.monotonic()
             return
-        body = {"events": self._pending}
+        body = {"leases": self._pending}
         try:
             with self._client() as c:
                 resp = c.post(

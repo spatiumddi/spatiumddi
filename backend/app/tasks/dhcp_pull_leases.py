@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.core.agent_wake import dns_group_channel, publish_wake
 from app.drivers.dhcp import is_agentless
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPServer
@@ -98,6 +99,7 @@ async def _run_pull() -> dict[str, Any]:
             total_pools_synced = 0
             total_statics_synced = 0
             errors: list[str] = []
+            wake_group_ids: set[str] = set()  # #428 — DNS groups to wake post-commit
 
             for server in servers:
                 if not is_agentless(server.driver):
@@ -129,6 +131,7 @@ async def _run_pull() -> dict[str, Any]:
                 total_scopes_skipped += result.scopes_skipped_no_subnet
                 total_pools_synced += result.pools_synced
                 total_statics_synced += result.statics_synced
+                wake_group_ids.update(result.dns_wake_group_ids)
                 errors.extend(f"{server.name}: {e}" for e in result.errors)
 
             ps.dhcp_pull_leases_last_run_at = now
@@ -170,6 +173,13 @@ async def _run_pull() -> dict[str, Any]:
                     )
                 )
             await db.commit()
+
+            # #428 — wake the agent long-polls for any DNS group whose zone
+            # got a DDNS record this pull, AFTER commit (per the wake
+            # contract), so Windows-pull DDNS converges instantly instead of
+            # waiting on the agent's safety tick.
+            for gid in wake_group_ids:
+                await publish_wake(dns_group_channel(gid))
 
             logger.info(
                 "dhcp_pull_leases_completed",

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from typing import Any
 
 import structlog
 from sqlalchemy import select
@@ -272,20 +273,62 @@ async def apply_ddns_for_lease(
 
     ipam_row.hostname = hostname
 
+    # #428 — honor the effective DDNS config that was resolved but never
+    # consumed: publish into ddns_domain_override's zone when set (else the
+    # subnet's default), and stamp the record TTL with ddns_ttl.
+    override_zone_id = await _resolve_override_zone_id(db, eff.domain_override)
+
     # Lazy-import: the router imports sync_check / reverse_zone at top
     # level, so a top-level import of the router here would close the
     # cycle. Calling at the bottom of the service call is cycle-free.
     from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
 
-    await _sync_dns_record(db, ipam_row, subnet, action="create")
+    await _sync_dns_record(
+        db, ipam_row, subnet, zone_id=override_zone_id, action="create", ttl=eff.ttl
+    )
     logger.info(
         "ddns_applied",
         subnet_id=str(subnet.id),
         ip=str(ipam_row.address),
         hostname=hostname,
         policy=subnet.ddns_hostname_policy,
+        zone_override=eff.domain_override,
+        ttl=eff.ttl,
     )
     return True
+
+
+async def _resolve_override_zone_id(db: AsyncSession, domain_override: str | None) -> Any:
+    """#428 — map ``ddns_domain_override`` to a forward DNSZone id so DDNS
+    publishes the A/AAAA into that zone instead of the subnet's default.
+    Returns None (→ default zone resolution) when unset, unknown, or
+    ambiguous. The reverse/PTR zone is unaffected (it's keyed by IP)."""
+    if not domain_override or not domain_override.strip():
+        return None
+    from app.models.dns import DNSZone  # noqa: PLC0415 — lazy, avoid cycle
+
+    name = domain_override.strip().rstrip(".")
+    zones = (
+        (
+            await db.execute(
+                select(DNSZone).where(
+                    DNSZone.name.in_([name, name + "."]),
+                    DNSZone.kind == "forward",
+                    DNSZone.deleted_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(zones) == 1:
+        return zones[0].id
+    logger.warning(
+        "ddns_domain_override_unresolved",
+        domain=domain_override,
+        match_count=len(zones),
+    )
+    return None
 
 
 async def revoke_ddns_for_lease(
