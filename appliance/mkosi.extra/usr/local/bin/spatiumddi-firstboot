@@ -110,9 +110,14 @@ chmod 0700 /var/lib/spatiumddi/pcaps
 # #59 Phase 2 — appliance-host capture trigger dir under release-state.
 # The supervisor (control-plane→host) drops <cid>.request here and the
 # spatiumddi-pcap.path unit watches it; the host runner writes <cid>.pcap
-# + <cid>.state back. Create it up front so the .path unit has a dir to
-# watch from first boot (the supervisor also mkdirs it on first capture).
+# + <cid>.state back. Owned by the supervisor's unprivileged uid (the
+# spatium user, 100:101 in the supervisor image) so it can write the
+# request + clean up afterwards; the host runner writes the pcap/state as
+# root into this dir (root writes anywhere) and the supervisor (dir owner,
+# no sticky bit) can still unlink them. Created up front so the .path unit
+# has a dir to watch from first boot.
 mkdir -p /var/lib/spatiumddi/release-state/pcap
+chown 100:101 /var/lib/spatiumddi/release-state/pcap
 chmod 0755 /var/lib/spatiumddi/release-state/pcap
 
 # Detect the host's root block device's rotational flag so the
