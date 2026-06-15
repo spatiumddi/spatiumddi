@@ -6436,6 +6436,16 @@ function EditSubnetModal({
             </strong>
             {subnet.name ? ` (${subnet.name})` : ""}?
           </p>
+          {/* #428 — lease-mirrored rows + their DDNS records don't survive
+              the delete, so warn before any orphaned DNS lingers. */}
+          <div className="flex items-start gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              Any DHCP-leased addresses in this subnet and their auto-published
+              DNS (DDNS) records will be revoked and removed. Manually-allocated
+              addresses are unaffected.
+            </span>
+          </div>
           {deleteError && (
             <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
               {deleteError}

@@ -4472,6 +4472,41 @@ async def update_subnet(
     return subnet
 
 
+async def _revoke_subnet_lease_mirrors(db: DB, subnet: Subnet) -> int:
+    """#428 — on subnet delete, revoke the DDNS records published for the
+    subnet's DHCP-lease mirrors and drop the transient mirror rows. Returns
+    the count revoked. Best-effort per row: a DNS-revoke hiccup must not
+    block the delete (the backstop / next reconcile cleans residue)."""
+    from app.services.dns.ddns import revoke_ddns_for_lease  # noqa: PLC0415
+
+    rows = (
+        (
+            await db.execute(
+                select(IPAddress).where(
+                    IPAddress.subnet_id == subnet.id,
+                    IPAddress.auto_from_lease.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    revoked = 0
+    for row in rows:
+        try:
+            await revoke_ddns_for_lease(db, subnet=subnet, ipam_row=row)
+        except Exception as exc:  # noqa: BLE001 — never block the delete
+            logger.warning(
+                "subnet_delete_ddns_revoke_failed",
+                subnet_id=str(subnet.id),
+                ip=str(row.address),
+                error=str(exc),
+            )
+        await db.delete(row)
+        revoked += 1
+    return revoked
+
+
 @router.delete("/subnets/{subnet_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_subnet(
     subnet_id: uuid.UUID,
@@ -4497,6 +4532,16 @@ async def delete_subnet(
     _enforce_subnet_token_scope(current_user, subnet_id)
 
     if not permanent:
+        # #428 — a DHCP-lease-mirrored IPAM row's DDNS A/PTR record must not
+        # outlive the subnet. The soft-delete batch only stamps the subnet +
+        # its scopes (not IPAddress/DNSRecord), so without this the lease
+        # mirrors + their published DNS records would be orphaned: still on
+        # the DNS server, pointing at a now-deleted subnet, invisible to the
+        # sweeps (the subnet is hidden). Revoke the DNS records and drop the
+        # transient mirror rows; if the subnet is restored with live leases,
+        # the lease pipeline re-mirrors + re-publishes them.
+        await _revoke_subnet_lease_mirrors(db, subnet)
+
         # Soft-delete: cascade-stamp the subnet + its scopes. Non-emptiness
         # is allowed since the operator can restore via /admin/trash.
         batch = await collect_soft_delete_batch(db, subnet)
