@@ -33,9 +33,7 @@ async def _seed(db: AsyncSession) -> tuple[DHCPServer, Subnet]:
     block = IPBlock(space_id=space.id, network="10.70.0.0/16", name="le-blk")
     db.add(block)
     await db.flush()
-    subnet = Subnet(
-        space_id=space.id, block_id=block.id, network="10.70.1.0/24", name="le-sn"
-    )
+    subnet = Subnet(space_id=space.id, block_id=block.id, network="10.70.1.0/24", name="le-sn")
     db.add(subnet)
     server = DHCPServer(
         name=f"le-kea-{uuid.uuid4().hex[:6]}",
@@ -76,9 +74,7 @@ async def test_agent_shaped_lease_event_mirrors_to_ipam(
 
     app.dependency_overrides[_auth_agent] = lambda: (server, {})
     try:
-        resp = await client.post(
-            "/api/v1/dhcp/agents/lease-events", json=_agent_payload()
-        )
+        resp = await client.post("/api/v1/dhcp/agents/lease-events", json=_agent_payload())
     finally:
         app.dependency_overrides.pop(_auth_agent, None)
 
@@ -88,18 +84,14 @@ async def test_agent_shaped_lease_event_mirrors_to_ipam(
     # DHCPLease row created with a non-NULL expires_at (so the time-based
     # sweep can reap it) ...
     lease = (
-        await db_session.execute(
-            select(DHCPLease).where(DHCPLease.ip_address == "10.70.1.50")
-        )
+        await db_session.execute(select(DHCPLease).where(DHCPLease.ip_address == "10.70.1.50"))
     ).scalar_one()
     assert lease.mac_address == "aa:bb:cc:dd:ee:ff"
     assert lease.expires_at is not None
 
     # ... and mirrored into IPAM as an auto_from_lease row in the subnet.
     addr = (
-        await db_session.execute(
-            select(IPAddress).where(IPAddress.address == "10.70.1.50")
-        )
+        await db_session.execute(select(IPAddress).where(IPAddress.address == "10.70.1.50"))
     ).scalar_one()
     assert addr.subnet_id == subnet.id
     assert addr.auto_from_lease is True
@@ -128,8 +120,6 @@ async def test_old_events_envelope_is_rejected_loudly(
     assert resp.status_code == 422, resp.text
     # And no lease/IPAM row leaked through.
     leaked = (
-        await db_session.execute(
-            select(DHCPLease).where(DHCPLease.ip_address == "10.70.1.50")
-        )
+        await db_session.execute(select(DHCPLease).where(DHCPLease.ip_address == "10.70.1.50"))
     ).scalar_one_or_none()
     assert leaked is None
