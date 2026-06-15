@@ -67,6 +67,22 @@ router = APIRouter(tags=["pcap"])
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+# A capture is downloadable once it has a real on-disk artifact — true for
+# a normally-completed capture AND for one the operator Stopped early
+# (#59 follow-up): tcpdump flushes the savefile on SIGTERM, so the packets
+# captured before Stop are a valid, downloadable ``.pcap``. A failed
+# capture never exposes a partial (its bytes are unreliable).
+_DOWNLOADABLE_STATUSES = ("completed", "cancelled")
+
+
+def _has_artifact(row: PacketCapture) -> bool:
+    return bool(
+        row.status in _DOWNLOADABLE_STATUSES
+        and row.pcap_path
+        and not row.artifact_missing
+        and (row.pcap_size_bytes or 0) > 0
+    )
+
 
 def _to_read(row: PacketCapture) -> PcapCaptureRead:
     return PcapCaptureRead(
@@ -92,12 +108,7 @@ def _to_read(row: PacketCapture) -> PcapCaptureRead:
         bytes_captured=row.bytes_captured,
         pcap_size_bytes=row.pcap_size_bytes,
         pcap_sha256=row.pcap_sha256,
-        has_artifact=bool(
-            row.status == "completed"
-            and row.pcap_path
-            and not row.artifact_missing
-            and (row.pcap_size_bytes or 0) > 0
-        ),
+        has_artifact=_has_artifact(row),
         metadata_json=row.metadata_json,
         created_by_user_id=row.created_by_user_id,
         created_at=row.created_at,
@@ -413,7 +424,7 @@ async def download_capture(
     row = await db.get(PacketCapture, capture_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Capture not found")
-    if row.status != "completed":
+    if not _has_artifact(row):
         raise HTTPException(status_code=404, detail="Capture has no downloadable artifact yet")
     if not row.pcap_path or not Path(row.pcap_path).exists():
         raise HTTPException(

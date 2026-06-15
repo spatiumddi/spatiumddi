@@ -157,23 +157,30 @@ async def test_finalize_completed_and_cancel_wins(db_session: AsyncSession) -> N
     assert cap.packets_captured == 42
     assert cap.pcap_path.endswith("x.pcap")
 
-    # A cancelled row stays cancelled even if a late upload finalizes.
+    # A cancelled row stays cancelled even if a late upload finalizes — but
+    # it now KEEPS the partial bytes captured before Stop (#59 follow-up),
+    # so the operator can still download what was captured.
     cap2 = await _queued_appliance_capture(db_session, appl.id)
     cap2.status = "cancelled"
     await db_session.commit()
     status2 = await pcap_capture.finalize_capture(
         db_session,
         cap2.id,
-        pcap_path="/x.pcap",
-        pcap_size_bytes=1,
+        pcap_path="/var/lib/spatiumddi/pcaps/partial.pcap",
+        pcap_size_bytes=1234,
         pcap_sha256="z",
-        packet_count=1,
+        packet_count=7,
         metadata={},
         error=None,
     )
     assert status2 == "cancelled"
     await db_session.refresh(cap2)
     assert cap2.status == "cancelled"
+    # Partial artifact retained — not discarded.
+    assert cap2.pcap_path.endswith("partial.pcap")
+    assert cap2.pcap_size_bytes == 1234
+    assert cap2.packets_captured == 7
+    assert (cap2.metadata_json or {}).get("stop_reason") == "cancelled"
 
 
 @pytest.mark.asyncio

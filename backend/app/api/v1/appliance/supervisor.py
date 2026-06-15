@@ -5137,7 +5137,9 @@ async def pcap_upload(capture_id: uuid.UUID, request: Request, db: DB) -> dict[s
     """Cert-authed. Streams the host-captured ``.pcap`` to the shared
     PCAP_DIR (``.partial`` → atomic rename + sha256), capped at
     ``max_bytes`` + margin. ``?error=`` (empty body) finalizes a failed
-    capture. Cancel is terminal — a cancelled row discards the bytes."""
+    capture. A cancelled row keeps its uploaded bytes (valid partial
+    ``.pcap`` up to the last flushed packet) so Stop-early stays
+    downloadable; it just stays terminal-cancelled (#59 follow-up)."""
     import hashlib as _hashlib  # noqa: PLC0415
     import os as _os  # noqa: PLC0415
 
@@ -5224,9 +5226,9 @@ async def pcap_upload(capture_id: uuid.UUID, request: Request, db: DB) -> dict[s
         },
         error=None,
     )
-    if final_status == "cancelled":
-        # Cancel won the race — discard the bytes we just stored.
-        dest.unlink(missing_ok=True)
+    # NOTE: a cancelled capture KEEPS its uploaded bytes (#59 follow-up) —
+    # the savefile is a valid partial .pcap up to the last flushed packet,
+    # so the operator can still download what was captured before Stop.
     logger.info(
         "appliance.pcap.upload",
         appliance_id=str(appliance.id),

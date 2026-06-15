@@ -596,8 +596,9 @@ function ResultTab({ captureId }: { captureId: string | null }) {
         </button>
       ) : (
         <p className="text-[11px] italic text-muted-foreground">
-          No downloadable artifact (capture produced no bytes, was cancelled, or
-          was pruned).
+          No downloadable artifact (capture produced no bytes, failed, or was
+          pruned). A stopped capture still downloads whatever was captured
+          before Stop.
         </p>
       )}
     </div>
