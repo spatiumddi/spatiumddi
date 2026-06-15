@@ -36,9 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.pcap import PacketCapture
 
 
-async def claim_next(
-    db: AsyncSession, appliance_id: uuid.UUID
-) -> dict[str, Any] | None:
+async def claim_next(db: AsyncSession, appliance_id: uuid.UUID) -> dict[str, Any] | None:
     """Atomically claim the oldest queued appliance-vantage capture.
 
     Returns a structured command dict (NEVER a shell string / pre-joined
