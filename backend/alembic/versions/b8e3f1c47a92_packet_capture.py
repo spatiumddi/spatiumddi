@@ -33,8 +33,18 @@ def upgrade() -> None:
     op.create_table(
         "packet_capture",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("modified_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "modified_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
         # vantage
         sa.Column("vantage_kind", sa.String(length=16), nullable=False, server_default="server"),
         sa.Column("appliance_id", postgresql.UUID(as_uuid=True), nullable=True),
