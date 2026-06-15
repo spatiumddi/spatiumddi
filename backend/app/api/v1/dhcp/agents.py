@@ -255,14 +255,10 @@ async def agent_register(
         res = await db.execute(select(DHCPServer).where(DHCPServer.agent_id == aid))
         server = res.scalar_one_or_none()
     if server is None:
-        res = await db.execute(
-            select(DHCPServer).where(DHCPServer.name == body.hostname)
-        )
+        res = await db.execute(select(DHCPServer).where(DHCPServer.name == body.hostname))
         server = res.scalar_one_or_none()
 
-    require_approval = (
-        os.environ.get("DHCP_REQUIRE_AGENT_APPROVAL", "false").lower() == "true"
-    )
+    require_approval = os.environ.get("DHCP_REQUIRE_AGENT_APPROVAL", "false").lower() == "true"
     pending_approval = False
     if server is None:
         agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
@@ -280,9 +276,7 @@ async def agent_register(
             agent_fingerprint=body.fingerprint,
             agent_version=body.version,
             description=(
-                f"auto-registered agent v{body.version}"
-                if body.version
-                else "auto-registered"
+                f"auto-registered agent v{body.version}" if body.version else "auto-registered"
             ),
         )
         pending_approval = require_approval
@@ -300,9 +294,7 @@ async def agent_register(
         server.agent_version = body.version
         server.agent_registered = True
         if server.agent_id is None:
-            server.agent_id = (
-                uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
-            )
+            server.agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
 
     token, exp = mint_agent_token(
         server_id=str(server.id),
@@ -453,10 +445,7 @@ async def agent_config_longpoll(
                 f"|resolver:{int(bool(resolver_block.get('enabled')))}"
                 f":{resolver_block.get('config_hash', '')}"
             )
-            etag = (
-                "sha256:"
-                + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
-            )
+            etag = "sha256:" + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
 
             # Pending ops fast-path. Issue #182: paused servers don't ship
             # ops — they accumulate as ``pending`` and dispatch as soon as
@@ -846,9 +835,7 @@ async def agent_lease_events(
     subnets = await _load_subnet_cache(db)
     subnet_for_ip = {ip: _find_containing_subnet(ip, subnets) for ip in ips}
     ipam_existing = (
-        (await db.execute(select(IPAddress).where(IPAddress.address.in_(ips))))
-        .scalars()
-        .all()
+        (await db.execute(select(IPAddress).where(IPAddress.address.in_(ips)))).scalars().all()
     )
     ipam_by_key: dict[tuple[Any, str], IPAddress] = {
         (row.subnet_id, row.address): row for row in ipam_existing
@@ -1010,9 +997,7 @@ async def agent_metrics(
     }
     existing = await db.get(DHCPMetricSample, (server.id, body.bucket_at))
     if existing is None:
-        db.add(
-            DHCPMetricSample(server_id=server.id, bucket_at=body.bucket_at, **values)
-        )
+        db.add(DHCPMetricSample(server_id=server.id, bucket_at=body.bucket_at, **values))
     else:
         for k, v in values.items():
             setattr(existing, k, v)

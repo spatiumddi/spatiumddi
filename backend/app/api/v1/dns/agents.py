@@ -169,9 +169,7 @@ async def agent_register(
     """Bootstrap registration: PSK-authenticated; returns a per-server JWT."""
     # Resolve or create group
     if body.group_name:
-        res = await db.execute(
-            select(DNSServerGroup).where(DNSServerGroup.name == body.group_name)
-        )
+        res = await db.execute(select(DNSServerGroup).where(DNSServerGroup.name == body.group_name))
         group = res.scalar_one_or_none()
         if group is None:
             group = DNSServerGroup(
@@ -180,14 +178,10 @@ async def agent_register(
             db.add(group)
             await db.flush()
     else:
-        res = await db.execute(
-            select(DNSServerGroup).order_by(DNSServerGroup.created_at).limit(1)
-        )
+        res = await db.execute(select(DNSServerGroup).order_by(DNSServerGroup.created_at).limit(1))
         group = res.scalar_one_or_none()
         if group is None:
-            group = DNSServerGroup(
-                name="default", description="Auto-created by agent registration"
-            )
+            group = DNSServerGroup(name="default", description="Auto-created by agent registration")
             db.add(group)
             await db.flush()
 
@@ -203,9 +197,7 @@ async def agent_register(
 
     if server is None:
         res = await db.execute(
-            select(DNSServer).where(
-                DNSServer.group_id == group.id, DNSServer.name == body.hostname
-            )
+            select(DNSServer).where(DNSServer.group_id == group.id, DNSServer.name == body.hostname)
         )
         server = res.scalar_one_or_none()
 
@@ -236,9 +228,7 @@ async def agent_register(
     # high-trust environments flip this to true, which engages the
     # anti-hijack behaviour: any fingerprint mismatch on re-registration
     # forces a manual approval step before the agent can pull config.
-    require_approval = (
-        os.environ.get("DNS_REQUIRE_AGENT_APPROVAL", "false").lower() == "true"
-    )
+    require_approval = os.environ.get("DNS_REQUIRE_AGENT_APPROVAL", "false").lower() == "true"
 
     pending_approval = False
     if server is None:
@@ -279,9 +269,7 @@ async def agent_register(
         server.roles = body.roles
         server.status = "active"
         if server.agent_id is None:
-            server.agent_id = (
-                uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
-            )
+            server.agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
 
     # Mint token
     token, exp = mint_agent_token(
@@ -668,9 +656,7 @@ async def agent_dnssec_state(
         if not n.endswith("."):
             name_set.add(n + ".")
     res = await db.execute(select(DNSZone).where(DNSZone.name.in_(name_set)))
-    zones_by_name: dict[str, DNSZone] = {
-        z.name.rstrip("."): z for z in res.scalars().all()
-    }
+    zones_by_name: dict[str, DNSZone] = {z.name.rstrip("."): z for z in res.scalars().all()}
 
     for entry in body.zones:
         zone = zones_by_name.get(entry.zone_name.rstrip("."))
@@ -882,10 +868,7 @@ async def agent_rendered_config(
         if len(f.content) > _RENDERED_FILE_SIZE_MAX:
             # Truncate rather than reject — operator wants to *see*
             # something even if a single file blew the cap.
-            content = (
-                f.content[:_RENDERED_FILE_SIZE_MAX]
-                + "\n... [truncated by control plane]\n"
-            )
+            content = f.content[:_RENDERED_FILE_SIZE_MAX] + "\n... [truncated by control plane]\n"
         else:
             content = f.content
         total += len(content)

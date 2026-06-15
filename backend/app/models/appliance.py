@@ -61,9 +61,7 @@ class ApplianceCertificate(Base):
 
     __tablename__ = "appliance_certificate"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
     # Operator-chosen label. Unique so audit log lines + UI cards can
     # refer to "letsencrypt-2026.05" without ambiguity. Distinct from
@@ -100,9 +98,7 @@ class ApplianceCertificate(Base):
     # the most recent activation timestamp so the UI can show "active
     # since X" without consulting the audit log.
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    activated_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Identity extracted from the cert at upload time (so listing
     # doesn't need to re-parse every PEM on every request). subject_cn
@@ -127,12 +123,8 @@ class ApplianceCertificate(Base):
     # render "expires in N days" badges and by a future renewal task
     # (Phase 4b.4) to schedule Let's Encrypt rotations. NULL on
     # CSR-pending rows.
-    valid_from: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    valid_to: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Operator notes — purely descriptive. UI shows them on the card
     # for context ("Let's Encrypt prod cert — renew script in cron").
@@ -192,15 +184,11 @@ class PairingCode(Base):
 
     __tablename__ = "pairing_code"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
     # sha256 hex digest of the cleartext code. UNIQUE so the consume
     # endpoint can look up by hash in O(log n) without collision risk.
-    code_hash: Mapped[str] = mapped_column(
-        String(64), nullable=False, unique=True, index=True
-    )
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
 
     # Last two digits of the cleartext code. Surfaced in the list
     # endpoint for visual correlation ("which row is the code I just
@@ -254,9 +242,7 @@ class PairingCode(Base):
     # revoking a code is permanent ("dead row"), disabling is
     # reversible ("paused"). Revoking a claimed code is a no-op for
     # already-issued certs but still useful audit signal.
-    revoked_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
@@ -291,9 +277,7 @@ class PairingClaim(Base):
 
     __tablename__ = "pairing_claim"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     pairing_code_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("pairing_code.id", ondelete="CASCADE"),
@@ -395,9 +379,7 @@ class Appliance(Base):
 
     __tablename__ = "appliance"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
     hostname: Mapped[str] = mapped_column(String(255), nullable=False)
 
@@ -439,15 +421,11 @@ class Appliance(Base):
     # an admin can Re-authorize (clear ``revoked_at`` + state back
     # to ``approved``). A retention cron hard-deletes after
     # ``platform_settings.appliance_revoked_retention_days``.
-    revoked_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Updated by Wave A2+'s supervisor heartbeat path. Stays NULL
     # until the supervisor's first post-register check-in.
-    last_seen_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_seen_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Wave B1 — supervisor-reported capabilities (can_run_dns_bind9,
@@ -473,24 +451,16 @@ class Appliance(Base):
     # supervisor auto-renews 30 days before expiry (Wave C polish).
     cert_pem: Mapped[str | None] = mapped_column(Text, nullable=True)
     cert_serial: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    cert_issued_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    cert_expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    cert_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cert_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Approval audit columns (the canonical state is still `state` —
     # these timestamps are for UI relative-time chips).
-    approved_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
-    rejected_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     rejected_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
@@ -514,9 +484,7 @@ class Appliance(Base):
     # shape — the handler leaves the column untouched when the field
     # is missing so a stale supervisor doesn't null out its variant.
     appliance_variant: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    installed_appliance_version: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
+    installed_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     current_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
     durable_default: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Per-slot installed version — supervisor reads the
@@ -551,9 +519,7 @@ class Appliance(Base):
     # "pct": <int|null>, "detail": "<human line>", "at": "<iso8601>"}``.
     # NULL on non-appliance / never-reported rows; the supervisor ships
     # ``{}`` once an upgrade is no longer in-flight to clear it.
-    last_upgrade_progress: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB, nullable=True
-    )
+    last_upgrade_progress: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     snmpd_running: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # Issue #347 / #430 — whether the host lldpd daemon is running. Companion
     # to the lldp_neighbours set (an empty set means "no neighbours" only when
@@ -593,9 +559,7 @@ class Appliance(Base):
     # trigger files on the appliance host. Heartbeat handler auto-
     # clears once installed catches up (upgrade) or a fresh heartbeat
     # arrives post-reboot.
-    desired_appliance_version: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
+    desired_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     desired_slot_image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Issue #386 Part A — integrity + transport hints for the host-side
     # ``spatium-upgrade-slot`` runner. When the scheduler points
@@ -608,9 +572,7 @@ class Appliance(Base):
     # self-served URL. External (public-CA) URLs leave both NULL/false and
     # stay fully verified. ``tls_insecure`` is refused host-side unless an
     # expected sha256 is present.
-    desired_slot_image_sha256: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
+    desired_slot_image_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     desired_slot_image_tls_insecure: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa.text("false")
     )
@@ -633,9 +595,7 @@ class Appliance(Base):
     #
     # Both auto-clear in the heartbeat handler once the supervisor's
     # reported state matches what was requested.
-    desired_next_boot_slot: Mapped[str | None] = mapped_column(
-        String(16), nullable=True
-    )
+    desired_next_boot_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
     desired_default_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # Role assignment — #170 Wave C2. Operator picks a subset of
@@ -761,9 +721,7 @@ class Appliance(Base):
     # ships one (legacy compose / pre-#183 supervisors / k3s not yet
     # started).
     k3s_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    kubeconfig_encrypted: Mapped[bytes | None] = mapped_column(
-        LargeBinary, nullable=True
-    )
+    kubeconfig_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     # Issue #183 Phase 6 — k3s server-cert expiry + direct-kubeapi
     # firewall allowlist.
@@ -818,9 +776,7 @@ class Appliance(Base):
     # heartbeat (read from ``/var/lib/rancher/k3s/server/token``), Fernet-
     # encrypted at rest. The promote endpoint reads this off the primary
     # row to populate ``desired_k3s_join_token_encrypted`` on each joiner.
-    k3s_join_token_encrypted: Mapped[bytes | None] = mapped_column(
-        LargeBinary, nullable=True
-    )
+    k3s_join_token_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     # Supervisor-reported progress of the in-flight join/leave:
     # ``joining`` | ``ready`` | ``leaving`` | ``failed`` | NULL (idle).
     cluster_join_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
@@ -940,9 +896,7 @@ class ApplianceCA(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-    expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class ApplianceUpgradeImage(Base):
@@ -973,9 +927,7 @@ class ApplianceUpgradeImage(Base):
 
     __tablename__ = "appliance_upgrade_image"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     size_bytes: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)

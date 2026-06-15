@@ -290,9 +290,7 @@ async def list_servers(db: DB, _: CurrentUser) -> list[ServerResponse]:
 async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerResponse:
     existing = await db.execute(select(DHCPServer).where(DHCPServer.name == body.name))
     if existing.scalar_one_or_none():
-        raise HTTPException(
-            status_code=409, detail="A DHCP server with that name exists"
-        )
+        raise HTTPException(status_code=409, detail="A DHCP server with that name exists")
 
     payload = body.model_dump(exclude={"windows_credentials"})
     s = DHCPServer(**payload)
@@ -412,9 +410,7 @@ async def update_server(
             s.credentials_encrypted = None
             changes["windows_credentials_cleared"] = True
 
-    audit_payload = body.model_dump(
-        mode="json", exclude_none=True, exclude={"windows_credentials"}
-    )
+    audit_payload = body.model_dump(mode="json", exclude_none=True, exclude={"windows_credentials"})
     if "windows_credentials_set" in changes:
         audit_payload["windows_credentials_set"] = True
     if "windows_credentials_cleared" in changes:
@@ -557,9 +553,7 @@ async def test_windows_credentials_endpoint(
         if s is None:
             raise HTTPException(status_code=404, detail="Server not found")
         if not s.credentials_encrypted:
-            raise HTTPException(
-                status_code=400, detail="Server has no stored credentials to test"
-            )
+            raise HTTPException(status_code=400, detail="Server has no stored credentials to test")
         creds = decrypt_dict(s.credentials_encrypted)
         host = body.host or s.host
     else:
@@ -573,9 +567,7 @@ async def test_windows_credentials_endpoint(
 
 
 @router.post("/{server_id}/sync-leases", response_model=SyncLeasesResponse)
-async def sync_leases_now(
-    server_id: uuid.UUID, db: DB, user: SuperAdmin
-) -> SyncLeasesResponse:
+async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> SyncLeasesResponse:
     """Poll the DHCP server for current leases and reconcile into the DB.
 
     Only valid for agentless drivers (windows_dhcp today). Agent-based
@@ -678,9 +670,7 @@ async def sync_leases_now(
 
 
 @router.post("/{server_id}/approve", response_model=ServerResponse)
-async def approve_server(
-    server_id: uuid.UUID, db: DB, user: SuperAdmin
-) -> ServerResponse:
+async def approve_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> ServerResponse:
     s = await db.get(DHCPServer, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -1020,9 +1010,9 @@ async def list_leases(
     q = select(DHCPLease).where(DHCPLease.server_id == server_id)
     if device_class:
         # Inner-join the fingerprint table so the limit lands on matching rows.
-        q = q.join(
-            DHCPFingerprint, DHCPFingerprint.mac_address == DHCPLease.mac_address
-        ).where(DHCPFingerprint.fingerbank_device_class == device_class)
+        q = q.join(DHCPFingerprint, DHCPFingerprint.mac_address == DHCPLease.mac_address).where(
+            DHCPFingerprint.fingerbank_device_class == device_class
+        )
     q = q.order_by(DHCPLease.last_seen_at.desc()).limit(min(limit, 5000))
     rows = list((await db.execute(q)).scalars().all())
 
@@ -1036,9 +1026,7 @@ async def list_leases(
     fps: dict[str, DHCPFingerprint] = {}
     if macs:
         fp_rows = (
-            await db.execute(
-                select(DHCPFingerprint).where(DHCPFingerprint.mac_address.in_(macs))
-            )
+            await db.execute(select(DHCPFingerprint).where(DHCPFingerprint.mac_address.in_(macs)))
         ).scalars()
         for fp in fp_rows:
             fps[normalize_mac_key(str(fp.mac_address))] = fp

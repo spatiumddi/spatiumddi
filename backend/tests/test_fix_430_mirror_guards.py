@@ -142,9 +142,7 @@ async def test_proxmox_data_null_raises(body: Any) -> None:
 
 
 def _opnsense() -> OPNsenseClient:
-    return OPNsenseClient(
-        host="fw.test", port=443, api_key="k", api_secret="s", verify_tls=False
-    )
+    return OPNsenseClient(host="fw.test", port=443, api_key="k", api_secret="s", verify_tls=False)
 
 
 @pytest.mark.asyncio
