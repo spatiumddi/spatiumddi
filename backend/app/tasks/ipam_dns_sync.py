@@ -30,12 +30,61 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
 from app.models.audit import AuditLog
-from app.models.ipam import Subnet
+from app.models.ipam import IPAddress, Subnet
 from app.models.settings import PlatformSettings
 
 logger = structlog.get_logger(__name__)
 
 _SINGLETON_ID = 1
+
+
+async def _auto_from_lease_ip_ids(db: Any, subnet_id: Any) -> set[Any]:
+    """IDs of the DHCP-lease-mirrored IPAM rows in a subnet (#428). The
+    backstop uses this to honor the DDNS opt-in: lease-mirrored rows are
+    only DNS-published when the subnet has DDNS enabled — manual
+    allocations always sync."""
+    rows = await db.execute(
+        select(IPAddress.id).where(
+            IPAddress.subnet_id == subnet_id,
+            IPAddress.auto_from_lease.is_(True),
+        )
+    )
+    return set(rows.scalars().all())
+
+
+async def _reapply_ddns_for_active_leases(db: Any, subnet: Subnet) -> tuple[int, list[str]]:
+    """#428 — eventual-consistency net for DDNS-enabled subnets. Re-runs
+    the DDNS policy for every active lease-mirrored row so a record that a
+    swallowed inline ``apply_ddns_for_lease`` failure missed — including a
+    generated ``dhcp-<x-y>`` name the hostname-driven drift check can't
+    see — gets regenerated. Idempotent: ``apply_ddns_for_lease`` skips a
+    row whose hostname is unchanged and already has a linked record.
+    Returns (records_fired, errors)."""
+    from app.services.dns.ddns import apply_ddns_for_lease  # noqa: PLC0415
+
+    rows = (
+        (
+            await db.execute(
+                select(IPAddress).where(
+                    IPAddress.subnet_id == subnet.id,
+                    IPAddress.auto_from_lease.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    fired = 0
+    errors: list[str] = []
+    for row in rows:
+        try:
+            if await apply_ddns_for_lease(
+                db, subnet=subnet, ipam_row=row, client_hostname=row.hostname or None
+            ):
+                fired += 1
+        except Exception as exc:  # noqa: BLE001 — one lease must not poison the run
+            errors.append(f"ddns-reapply({subnet.id}/{row.address}): {exc}")
+    return fired, errors
 
 
 async def _run_auto_sync() -> dict[str, Any]:
@@ -47,6 +96,7 @@ async def _run_auto_sync() -> dict[str, Any]:
         _apply_dns_sync,  # noqa: PLC0415
         _resolve_effective_dns,  # noqa: PLC0415
     )
+    from app.services.dns.ddns import resolve_effective_ddns  # noqa: PLC0415
     from app.services.dns.sync_check import compute_subnet_dns_drift  # noqa: PLC0415
 
     engine = create_async_engine(settings.database_url, future=True)
@@ -81,12 +131,39 @@ async def _run_auto_sync() -> dict[str, Any]:
             # groups (worker process: no request collector, publish directly).
             touched_subnet_ids: set[Any] = set()
 
+            total_ddns_reapplied = 0
             for subnet_id in subnets:
+                subnet_obj = await db.get(Subnet, subnet_id)
+                if subnet_obj is None:
+                    continue
+                ddns_on = (await resolve_effective_ddns(db, subnet_obj)).enabled
+
                 try:
                     report = await compute_subnet_dns_drift(db, subnet_id)
                 except Exception as exc:  # noqa: BLE001 — never let one subnet poison the run
                     errors.append(f"drift({subnet_id}): {exc}")
                     continue
+
+                # #428 — honor the DDNS opt-in (Q1): when a subnet's DDNS is
+                # OFF, the backstop must not publish lease-mirrored rows.
+                # Manual allocations still sync regardless. (When DDNS is ON,
+                # the re-apply pass below is the authority for lease rows.)
+                if not ddns_on and (report.missing or report.mismatched):
+                    lease_ip_ids = await _auto_from_lease_ip_ids(db, subnet_id)
+                    report.missing = [m for m in report.missing if m.ip_id not in lease_ip_ids]
+                    report.mismatched = [
+                        m for m in report.mismatched if m.ip_id not in lease_ip_ids
+                    ]
+
+                # #428 — eventual-consistency net (Q3): regenerate any lease
+                # DDNS record a swallowed inline apply missed.
+                if ddns_on:
+                    fired, ddns_errors = await _reapply_ddns_for_active_leases(db, subnet_obj)
+                    total_ddns_reapplied += fired
+                    errors.extend(ddns_errors)
+                    if fired:
+                        total_created += fired
+                        touched_subnet_ids.add(subnet_id)
 
                 if (
                     not report.missing
@@ -115,9 +192,11 @@ async def _run_auto_sync() -> dict[str, Any]:
                 total_deleted += deleted
                 errors.extend(subnet_errors)
                 if created or updated or deleted:
-                    subnets_touched += 1
                     touched_subnet_ids.add(subnet_id)
 
+            # Dedup-accurate count (a subnet touched by both the drift sync
+            # and the DDNS re-apply is one touched subnet, #428).
+            subnets_touched = len(touched_subnet_ids)
             ps.dns_auto_sync_last_run_at = now
 
             if total_created or total_updated or total_deleted or errors:
@@ -134,6 +213,7 @@ async def _run_auto_sync() -> dict[str, Any]:
                             "created": total_created,
                             "updated": total_updated,
                             "deleted": total_deleted,
+                            "ddns_reapplied": total_ddns_reapplied,
                             "subnets_touched": subnets_touched,
                             "subnets_scanned": len(subnets),
                             "errors": errors[:20],
@@ -170,6 +250,7 @@ async def _run_auto_sync() -> dict[str, Any]:
                 "created": total_created,
                 "updated": total_updated,
                 "deleted": total_deleted,
+                "ddns_reapplied": total_ddns_reapplied,
                 "subnets_touched": subnets_touched,
                 "subnets_scanned": len(subnets),
                 "errors": len(errors),
