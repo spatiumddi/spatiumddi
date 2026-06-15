@@ -133,6 +133,8 @@ def _read_state(path: Path) -> dict[str, str]:
             if k:
                 out[k.strip()] = v.strip()
     except (OSError, ValueError):
+        # Unreadable / half-written state file — treat as "no state yet";
+        # the next ~3 s poll re-reads it. Never fatal to the capture.
         pass
     return out
 
@@ -144,6 +146,8 @@ def _cleanup(cid: str) -> None:
         try:
             f.unlink()
         except OSError:
+            # Best-effort cleanup — a file already gone (or briefly locked
+            # by the host runner) is harmless; the next capture overwrites.
             pass
 
 

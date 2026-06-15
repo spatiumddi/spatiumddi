@@ -30,16 +30,15 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-import structlog
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.pcap import PacketCapture
 
-logger = structlog.get_logger(__name__)
 
-
-async def claim_next(db: AsyncSession, appliance_id: uuid.UUID) -> dict[str, Any] | None:
+async def claim_next(
+    db: AsyncSession, appliance_id: uuid.UUID
+) -> dict[str, Any] | None:
     """Atomically claim the oldest queued appliance-vantage capture.
 
     Returns a structured command dict (NEVER a shell string / pre-joined

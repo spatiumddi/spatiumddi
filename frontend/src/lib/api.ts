@@ -11298,9 +11298,12 @@ export const pcapApi = {
   /** Cancel + delete up to 500 captures; returns `{deleted, cancelled}`. */
   bulkDeleteCaptures: (captureIds: string[]) =>
     api
-      .post<{ deleted: number; cancelled: number }>("/pcap/captures/bulk-delete", {
-        capture_ids: captureIds,
-      })
+      .post<{ deleted: number; cancelled: number }>(
+        "/pcap/captures/bulk-delete",
+        {
+          capture_ids: captureIds,
+        },
+      )
       .then((r) => r.data),
   listInterfaces: (vantage: PcapVantageKind = "server", applianceId?: string) =>
     api

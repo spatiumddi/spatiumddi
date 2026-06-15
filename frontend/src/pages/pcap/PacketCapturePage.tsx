@@ -43,7 +43,9 @@ function fmtBytes(n: number | null | undefined): string {
 
 function isTerminal(s: PcapCaptureRead): boolean {
   return (
-    s.status === "completed" || s.status === "failed" || s.status === "cancelled"
+    s.status === "completed" ||
+    s.status === "failed" ||
+    s.status === "cancelled"
   );
 }
 
@@ -75,7 +77,8 @@ export function PacketCapturePage() {
         <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
           Run tcpdump on the control plane or an appliance host, watch live
           progress, and download the .pcap for Wireshark. Captures raw traffic
-          (may include sensitive payloads) — every start and download is audited.
+          (may include sensitive payloads) — every start and download is
+          audited.
         </p>
       </div>
 
@@ -83,7 +86,10 @@ export function PacketCapturePage() {
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
           <div className="rounded-lg border bg-card p-4">
             <h2 className="mb-3 text-sm font-medium">New capture</h2>
-            <CaptureForm onStarted={onStarted} initialVantage={initialVantage} />
+            <CaptureForm
+              onStarted={onStarted}
+              initialVantage={initialVantage}
+            />
           </div>
 
           <div className="flex flex-col rounded-lg border bg-card">
@@ -95,7 +101,10 @@ export function PacketCapturePage() {
               >
                 Live
               </TabButton>
-              <TabButton active={tab === "history"} onClick={() => setTab("history")}>
+              <TabButton
+                active={tab === "history"}
+                onClick={() => setTab("history")}
+              >
                 History
               </TabButton>
               <TabButton
@@ -209,7 +218,15 @@ function CaptureForm({
   const hasStop = durationS !== "" || maxPackets !== "" || maxMiB !== "";
 
   const commandPreview = useMemo(() => {
-    const parts = ["tcpdump", "-n", "-U", "-i", iface, "-s", String(snaplen || 0)];
+    const parts = [
+      "tcpdump",
+      "-n",
+      "-U",
+      "-i",
+      iface,
+      "-s",
+      String(snaplen || 0),
+    ];
     if (!promiscuous) parts.push("-p");
     if (maxPackets !== "") parts.push("-c", String(maxPackets));
     parts.push("-w", "<file>");
@@ -267,8 +284,8 @@ function CaptureForm({
               className="w-full rounded-md border bg-background px-2 py-1.5 font-mono text-sm"
             />
             <p className="mt-1 text-[11px] text-muted-foreground">
-              The appliance host's real NIC — validated against the host when the
-              capture runs. "any" includes all host traffic.
+              The appliance host's real NIC — validated against the host when
+              the capture runs. "any" includes all host traffic.
             </p>
           </>
         ) : (
@@ -285,7 +302,9 @@ function CaptureForm({
               ))}
             </select>
             {ifaces?.note && (
-              <p className="mt-1 text-[11px] text-muted-foreground">{ifaces.note}</p>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                {ifaces.note}
+              </p>
             )}
           </>
         )}
@@ -328,7 +347,12 @@ function CaptureForm({
           onChange={setMaxPackets}
           max={1000000}
         />
-        <NumField label="Max MiB" value={maxMiB} onChange={setMaxMiB} max={100} />
+        <NumField
+          label="Max MiB"
+          value={maxMiB}
+          onChange={setMaxMiB}
+          max={100}
+        />
       </div>
 
       <div className="grid grid-cols-2 items-end gap-2">
@@ -419,7 +443,12 @@ function StatusPill({ status }: { status: PcapCaptureRead["status"] }) {
     cancelled: "bg-amber-500/15 text-amber-600",
   };
   return (
-    <span className={cn("rounded px-1.5 py-0.5 text-[11px] font-medium", map[status])}>
+    <span
+      className={cn(
+        "rounded px-1.5 py-0.5 text-[11px] font-medium",
+        map[status],
+      )}
+    >
       {status}
     </span>
   );
@@ -451,7 +480,8 @@ function LiveTab({
 
   const cancel = useMutation({
     mutationFn: (id: string) => pcapApi.cancelCapture(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["pcap-capture", captureId] }),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["pcap-capture", captureId] }),
   });
 
   if (!captureId || !data) {
@@ -577,7 +607,9 @@ function ResultTab({ captureId }: { captureId: string | null }) {
 function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
   const qc = useQueryClient();
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [pendingBulk, setPendingBulk] = useState<PcapCaptureRead[] | null>(null);
+  const [pendingBulk, setPendingBulk] = useState<PcapCaptureRead[] | null>(
+    null,
+  );
 
   const { data, isLoading, isError } = useQuery({
     queryKey: ["pcap-captures", "recent"],
@@ -645,7 +677,9 @@ function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
           <span>{selected.size} selected</span>
           <button
             type="button"
-            onClick={() => setPendingBulk(items.filter((s) => selected.has(s.id)))}
+            onClick={() =>
+              setPendingBulk(items.filter((s) => selected.has(s.id)))
+            }
             disabled={bulkDelete.isPending}
             className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-0.5 text-[11px] text-destructive hover:bg-destructive/10 disabled:opacity-60"
           >
@@ -769,7 +803,9 @@ function ConfirmBulkDeleteModal({
           {terminal > 0 && (
             <>
               {terminal} finished capture
-              {terminal === 1 ? " (and its .pcap) will be" : "s (and their .pcaps) will be"}{" "}
+              {terminal === 1
+                ? " (and its .pcap) will be"
+                : "s (and their .pcaps) will be"}{" "}
               permanently removed.
             </>
           )}

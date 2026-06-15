@@ -64,8 +64,6 @@ PERMISSION = "manage_packet_capture"
 
 router = APIRouter(tags=["pcap"])
 
-_TERMINAL = ("completed", "failed", "cancelled")
-
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -175,7 +173,9 @@ async def create_capture(
     body: PcapCaptureCreate, db: DB, current_user: CurrentUser
 ) -> PcapCaptureRead:
     if body.vantage_kind not in ("server", "appliance"):
-        raise HTTPException(status_code=422, detail=f"unknown vantage: {body.vantage_kind!r}")
+        raise HTTPException(
+            status_code=422, detail=f"unknown vantage: {body.vantage_kind!r}"
+        )
 
     appliance_label = "control plane"
     appliance_id = body.appliance_id
@@ -185,7 +185,8 @@ async def create_capture(
     if body.vantage_kind == "appliance":
         if appliance_id is None:
             raise HTTPException(
-                status_code=422, detail="appliance_id is required for appliance-host capture"
+                status_code=422,
+                detail="appliance_id is required for appliance-host capture",
             )
         appliance = await db.get(Appliance, appliance_id)
         if appliance is None:
@@ -268,7 +269,9 @@ async def create_capture(
 
             run_capture_task.delay(str(cap.id))
         except Exception as exc:  # noqa: BLE001 — broker down
-            logger.warning("pcap_dispatch_failed", capture_id=str(cap.id), error=str(exc))
+            logger.warning(
+                "pcap_dispatch_failed", capture_id=str(cap.id), error=str(exc)
+            )
 
     return _to_read(cap)
 
@@ -295,7 +298,11 @@ async def list_captures(
     if appliance_id is not None:
         base = base.where(PacketCapture.appliance_id == appliance_id)
 
-    total = int((await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one())
+    total = int(
+        (
+            await db.execute(select(func.count()).select_from(base.subquery()))
+        ).scalar_one()
+    )
     stmt = (
         base.order_by(PacketCapture.created_at.desc())
         .limit(page_size)
@@ -343,7 +350,9 @@ async def cancel_or_delete_capture(
         row.status = "cancelled"
         if row.finished_at is None:
             row.finished_at = datetime.now(UTC)
-        await _audit(db, user=current_user, action="cancel", capture_id=row.id, label=label)
+        await _audit(
+            db, user=current_user, action="cancel", capture_id=row.id, label=label
+        )
         await db.commit()
         return
 
@@ -380,13 +389,17 @@ async def bulk_delete_captures(
             row.status = "cancelled"
             if row.finished_at is None:
                 row.finished_at = now
-            await _audit(db, user=current_user, action="cancel", capture_id=row.id, label=label)
+            await _audit(
+                db, user=current_user, action="cancel", capture_id=row.id, label=label
+            )
             cancelled += 1
         else:
             if row.pcap_path:
                 with suppress(OSError):
                     Path(row.pcap_path).unlink()
-            await _audit(db, user=current_user, action="delete", capture_id=row.id, label=label)
+            await _audit(
+                db, user=current_user, action="delete", capture_id=row.id, label=label
+            )
             await db.delete(row)
             deleted += 1
     await db.commit()
@@ -415,7 +428,9 @@ async def download_capture(
     if row is None:
         raise HTTPException(status_code=404, detail="Capture not found")
     if row.status != "completed":
-        raise HTTPException(status_code=404, detail="Capture has no downloadable artifact yet")
+        raise HTTPException(
+            status_code=404, detail="Capture has no downloadable artifact yet"
+        )
     if not row.pcap_path or not Path(row.pcap_path).exists():
         raise HTTPException(
             status_code=404,

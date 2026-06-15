@@ -185,10 +185,17 @@ def clamp_caps(
     """
     if max_packets is None and max_duration_s is None and max_bytes is None:
         raise PcapArgError(
-            "at least one stop condition is required " "(max_packets, max_duration_s, or max_bytes)"
+            "at least one stop condition is required "
+            "(max_packets, max_duration_s, or max_bytes)"
         )
-    mp = None if max_packets is None else max(1, min(int(max_packets), HARD_MAX_PACKETS))
-    md = None if max_duration_s is None else max(1, min(int(max_duration_s), HARD_MAX_DURATION_S))
+    mp = (
+        None if max_packets is None else max(1, min(int(max_packets), HARD_MAX_PACKETS))
+    )
+    md = (
+        None
+        if max_duration_s is None
+        else max(1, min(int(max_duration_s), HARD_MAX_DURATION_S))
+    )
     mb = None if max_bytes is None else max(1, min(int(max_bytes), HARD_MAX_BYTES))
     sl = DEFAULT_SNAPLEN if snaplen is None else max(0, min(int(snaplen), MAX_SNAPLEN))
     return mp, md, mb, sl
@@ -301,7 +308,9 @@ async def run_pcap(capture_id: uuid.UUID) -> None:
                 cap.error_message = str(exc)
                 cap.finished_at = datetime.now(UTC)
                 await db.commit()
-                logger.warning("pcap_argv_invalid", capture_id=str(capture_id), error=str(exc))
+                logger.warning(
+                    "pcap_argv_invalid", capture_id=str(capture_id), error=str(exc)
+                )
                 return
 
             cap.status = "running"
@@ -318,7 +327,9 @@ async def run_pcap(capture_id: uuid.UUID) -> None:
                 )
             except FileNotFoundError:
                 cap.status = "failed"
-                cap.error_message = "tcpdump binary not found. Install tcpdump in the worker image."
+                cap.error_message = (
+                    "tcpdump binary not found. Install tcpdump in the worker image."
+                )
                 cap.finished_at = datetime.now(UTC)
                 await db.commit()
                 logger.error("pcap_binary_missing", capture_id=str(capture_id))
@@ -345,6 +356,9 @@ async def run_pcap(capture_id: uuid.UUID) -> None:
                         await asyncio.wait_for(proc.wait(), timeout=_POLL_INTERVAL_S)
                         break  # tcpdump exited on its own (count cap / error)
                     except TimeoutError:
+                        # Expected: the poll tick elapsed and tcpdump is
+                        # still running — fall through to the progress /
+                        # cancel / cap checks below, then loop.
                         pass
 
                     # Progress: honest byte count from the growing file.
@@ -385,7 +399,9 @@ async def run_pcap(capture_id: uuid.UUID) -> None:
             stderr_text = ""
             if proc.stderr is not None:
                 with contextlib.suppress(Exception):
-                    stderr_text = (await proc.stderr.read()).decode("utf-8", errors="replace")
+                    stderr_text = (await proc.stderr.read()).decode(
+                        "utf-8", errors="replace"
+                    )
 
             cap_row = await db.get(PacketCapture, capture_id)
             if cap_row is None:
@@ -401,7 +417,9 @@ async def run_pcap(capture_id: uuid.UUID) -> None:
             if packet_count is not None:
                 cap_row.packets_captured = packet_count
 
-            truncated = bool(hit_byte_cap or timed_out or (mp is not None and packet_count == mp))
+            truncated = bool(
+                hit_byte_cap or timed_out or (mp is not None and packet_count == mp)
+            )
 
             if file_size > 0:
                 cap_row.pcap_path = str(out_path)
@@ -440,7 +458,8 @@ async def run_pcap(capture_id: uuid.UUID) -> None:
             else:
                 cap_row.status = "failed"
                 cap_row.error_message = (
-                    stderr_text.strip()[-500:] or f"tcpdump exited with code {proc.returncode}"
+                    stderr_text.strip()[-500:]
+                    or f"tcpdump exited with code {proc.returncode}"
                 )
 
             await db.commit()
