@@ -38,6 +38,8 @@ from typing import Any
 import httpx
 import structlog
 
+from app.services._mirror_shape import require_list
+
 logger = structlog.get_logger(__name__)
 
 
@@ -192,7 +194,12 @@ class DockerClient:
         are returned; the reconciler filters them based on
         ``include_default_networks`` / driver.
         """
-        items = await self._get("/networks")
+        # #430 — Docker returns a JSON array on success; a 200 that decodes
+        # to {} (proxy/gateway error in front of a tcp:// daemon) must raise,
+        # not iterate-to-empty and purge every mirrored Docker subnet/row.
+        items = require_list(
+            await self._get("/networks"), make_error=DockerClientError, context="/networks"
+        )
         out: list[_DockerNetwork] = []
         for item in items:
             ipam = (item.get("IPAM") or {}).get("Config") or []
@@ -218,7 +225,11 @@ class DockerClient:
 
     async def list_containers(self, *, include_stopped: bool) -> list[_DockerContainer]:
         """Every container that has at least one network IP assigned."""
-        items = await self._get("/containers/json", all=str(include_stopped).lower())
+        items = require_list(
+            await self._get("/containers/json", all=str(include_stopped).lower()),
+            make_error=DockerClientError,
+            context="/containers/json",
+        )
         out: list[_DockerContainer] = []
         for item in items:
             # ``Names`` is a list with a leading slash each. Take the

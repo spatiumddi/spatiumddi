@@ -127,6 +127,11 @@ class CloudInventory:
     # Non-fatal connector notes (a region that failed, an unsupported
     # resource skipped) surfaced into the reconcile summary warnings.
     warnings: list[str] = field(default_factory=list)
+    # #430 — scopes (project / region / subscription) whose fetch failed
+    # mid-pull. When non-empty the inventory is INCOMPLETE: the reconciler
+    # still upserts what it got but MUST skip the absence-delete pass, or a
+    # partial read would mass-delete rows for the missing scope.
+    failed_scopes: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

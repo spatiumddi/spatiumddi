@@ -20,6 +20,8 @@ from typing import Any
 import httpx
 import structlog
 
+from app.services._mirror_shape import require_keyed_list
+
 logger = structlog.get_logger(__name__)
 
 
@@ -141,7 +143,12 @@ class KubernetesClient:
             raise KubernetesClientError(f"{path}: HTTP {resp.status_code} — RBAC or token issue")
         if resp.status_code >= 400:
             raise KubernetesClientError(f"{path}: HTTP {resp.status_code} {resp.text[:200]}")
-        return resp.json().get("items") or []
+        # #430 — a 200 that isn't a List object (auth-proxy page, Status
+        # object, envelope change) must raise, not collapse to [] and purge
+        # the whole cluster mirror. A real empty cluster is {"items": []}.
+        return require_keyed_list(
+            resp.json(), "items", make_error=KubernetesClientError, context=path
+        )
 
     # ── Public surface ───────────────────────────────────────────────
 

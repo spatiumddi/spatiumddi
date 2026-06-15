@@ -1021,8 +1021,16 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
                     try:
                         nets = await client.list_networks(site.name)
                     except UnifiClientError as exc:
-                        summary.warnings.append(f"site {site.name}: list_networks failed — {exc}")
-                        nets = []
+                        # #430 — abort the whole reconcile on a per-site fetch
+                        # failure (matches the Proxmox per-node pattern). The
+                        # absence-delete pass is controller-wide and unions
+                        # desired rows across ALL sites, so treating one
+                        # throttled/5xx site as "zero networks" would
+                        # mass-delete that site's subnets (and cascade its
+                        # addresses). A transient 429 self-heals next pass.
+                        raise UnifiClientError(
+                            f"site {site.name}: list_networks failed — {exc}"
+                        ) from exc
                     nets = [n for n in nets if _network_allowed(n, site, net_allow)]
                     site_to_networks[site] = nets
                 else:
@@ -1033,18 +1041,23 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
                     try:
                         clients_combined.extend(await client.list_active_clients(site.name))
                     except UnifiClientError as exc:
-                        summary.warnings.append(
+                        # #430 — abort, don't swallow (see list_networks above).
+                        # list_active_clients (stat/sta) is the heaviest, most
+                        # rate-limited call; a routine 429 here would otherwise
+                        # mass-delete every active-client address on the site.
+                        raise UnifiClientError(
                             f"site {site.name}: list_active_clients failed — {exc}"
-                        )
+                        ) from exc
                 if controller.mirror_fixed_ips:
                     try:
                         for known in await client.list_known_clients(site.name):
                             if known.fixed_ip and known.ip:
                                 clients_combined.append(known)
                     except UnifiClientError as exc:
-                        summary.warnings.append(
+                        # #430 — abort, don't swallow (see list_networks above).
+                        raise UnifiClientError(
                             f"site {site.name}: list_known_clients failed — {exc}"
-                        )
+                        ) from exc
                 site_to_clients[site] = clients_combined
     except UnifiClientError as exc:
         summary.error = str(exc)

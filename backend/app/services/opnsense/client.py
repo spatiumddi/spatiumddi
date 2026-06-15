@@ -286,9 +286,17 @@ class OPNsenseClient:
         contribute nothing.
         """
         data = await self._get("/api/diagnostics/interface/getInterfaceConfig")
+        # #430 — getInterfaceConfig always returns a non-empty dict keyed by
+        # logical interface name; a non-dict or empty-dict 200 (proxy error
+        # body, envelope change) is a degraded read. Returning [] here would
+        # absence-delete every router-owned interface subnet. Matches the
+        # #426 reasoning already applied to list_leases/list_arp.
+        if not isinstance(data, dict) or not data:
+            raise OPNsenseClientError(
+                "getInterfaceConfig returned no interfaces — treating as a "
+                "degraded read, not zero interfaces"
+            )
         out: list[_OPNInterface] = []
-        if not isinstance(data, dict):
-            return out
         for logical, cfg in data.items():
             if not isinstance(cfg, dict):
                 continue
@@ -326,13 +334,18 @@ class OPNsenseClient:
         except OPNsenseClientError as exc:
             logger.debug("opnsense_vlans_unavailable", error=str(exc))
             return []
-        rows: dict[str, Any] = {}
-        if isinstance(data, dict):
-            outer = data.get("vlan")
-            if isinstance(outer, dict):
-                inner = outer.get("vlan")
-                if isinstance(inner, dict):
-                    rows = inner
+        # #430 — distinguish a legitimately-empty VLAN set (envelope present,
+        # inner {}) from a degraded read (envelope absent). Returning [] on a
+        # degraded read would absence-delete VLAN-derived subnets. The 404 /
+        # plugin-absent case is already handled by the except above.
+        outer = data.get("vlan") if isinstance(data, dict) else None
+        inner = outer.get("vlan") if isinstance(outer, dict) else None
+        if not isinstance(inner, dict):
+            raise OPNsenseClientError(
+                "vlan_settings/get missing the vlan.vlan envelope — treating "
+                "as a degraded read, not zero VLANs"
+            )
+        rows: dict[str, Any] = inner
         out: list[_OPNVlan] = []
         for _uuid, row in rows.items():
             if not isinstance(row, dict):

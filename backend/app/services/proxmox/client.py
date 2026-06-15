@@ -34,6 +34,8 @@ from typing import Any
 import httpx
 import structlog
 
+from app.services._mirror_shape import require_list
+
 logger = structlog.get_logger(__name__)
 
 
@@ -374,10 +376,13 @@ class ProxmoxClient:
         )
 
     async def list_nodes(self) -> list[_ProxmoxNodeInfo]:
-        items = await self._get("/nodes")
+        # #430 — a data:null / non-list body (confused PVE, proxy error page)
+        # must raise, not yield zero nodes — zero nodes collects zero guests
+        # and absence-deletes every Proxmox-owned IP. Empty cluster → [].
+        items = require_list(
+            await self._get("/nodes"), make_error=ProxmoxClientError, context="/nodes"
+        )
         out: list[_ProxmoxNodeInfo] = []
-        if not isinstance(items, list):
-            return out
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -391,10 +396,12 @@ class ProxmoxClient:
         """Bridges / VLAN interfaces / bonds — the stuff with a CIDR is
         what we mirror into IPAM as a subnet.
         """
-        items = await self._get(f"/nodes/{node}/network")
+        items = require_list(
+            await self._get(f"/nodes/{node}/network"),
+            make_error=ProxmoxClientError,
+            context=f"/nodes/{node}/network",
+        )
         out: list[_ProxmoxNetworkIface] = []
-        if not isinstance(items, list):
-            return out
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -530,9 +537,11 @@ class ProxmoxClient:
         return out
 
     async def list_qemu(self, node: str, *, include_stopped: bool) -> list[_ProxmoxGuest]:
-        items = await self._get(f"/nodes/{node}/qemu")
-        if not isinstance(items, list):
-            return []
+        items = require_list(
+            await self._get(f"/nodes/{node}/qemu"),
+            make_error=ProxmoxClientError,
+            context=f"/nodes/{node}/qemu",
+        )
         guests: list[_ProxmoxGuest] = []
         for item in items:
             if not isinstance(item, dict):
@@ -569,9 +578,11 @@ class ProxmoxClient:
         return guests
 
     async def list_lxc(self, node: str, *, include_stopped: bool) -> list[_ProxmoxGuest]:
-        items = await self._get(f"/nodes/{node}/lxc")
-        if not isinstance(items, list):
-            return []
+        items = require_list(
+            await self._get(f"/nodes/{node}/lxc"),
+            make_error=ProxmoxClientError,
+            context=f"/nodes/{node}/lxc",
+        )
         guests: list[_ProxmoxGuest] = []
         for item in items:
             if not isinstance(item, dict):

@@ -420,6 +420,43 @@ async def test_removed_instance_prunes_its_row(db_session: AsyncSession) -> None
 
 
 @pytest.mark.asyncio
+async def test_partial_pull_suppresses_absence_delete(db_session: AsyncSession) -> None:
+    """#430 — when a scope failed mid-fetch (failed_scopes non-empty), the
+    reconciler upserts what it got but must NOT run the absence-delete pass.
+
+    A region throttle that drops db-1 from the inventory would otherwise
+    purge its mirrored row even though the row still exists upstream."""
+    space = await _make_space(db_session)
+    endpoint = await _make_endpoint(db_session, space)
+    await db_session.commit()
+
+    # First (clean) pass mirrors both instances.
+    with _patch_connector(_FakeConnector(inventory=_aws_inventory())):
+        await reconcile_endpoint(db_session, endpoint)
+    assert (
+        await db_session.scalar(select(IPAddress).where(IPAddress.address == "10.0.2.20"))
+    ) is not None
+
+    # Second pass: db-1 (10.0.2.20) is missing, but ONLY because a region
+    # failed mid-pull — the inventory is incomplete, not authoritatively empty.
+    inv = _aws_inventory()
+    inv.instances = [inv.instances[0]]  # db-1 absent from the partial inventory
+    inv.failed_scopes = ["region us-east-1"]
+    with _patch_connector(_FakeConnector(inventory=inv)):
+        summary = await reconcile_endpoint(db_session, endpoint)
+
+    # No deletes ran; the row the partial pull "lost" is preserved.
+    assert summary.addresses_deleted == 0
+    assert summary.subnets_deleted == 0
+    assert (
+        await db_session.scalar(select(IPAddress).where(IPAddress.address == "10.0.2.20"))
+    ) is not None
+    # The incompleteness is surfaced, not reported as a clean sync.
+    assert endpoint.last_sync_error is not None
+    assert "region us-east-1" in endpoint.last_sync_error
+
+
+@pytest.mark.asyncio
 async def test_public_ip_lands_when_enclosing_subnet_mirrored(
     db_session: AsyncSession,
 ) -> None:

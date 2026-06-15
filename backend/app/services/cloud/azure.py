@@ -186,6 +186,10 @@ class AzureConnector(CloudConnector):
                     subscription_id=subscription_id,
                     error=str(exc),
                 )
+                # #430 — mark this scope failed so the reconciler skips the
+                # absence-delete pass; a failed subscription in a multi-sub
+                # endpoint must not purge that subscription's rows.
+                inventory.failed_scopes.append(f"subscription {subscription_id}")
 
         if succeeded == 0:
             raise CloudConnectorError(

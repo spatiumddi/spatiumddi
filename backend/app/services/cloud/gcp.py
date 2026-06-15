@@ -250,6 +250,10 @@ class GCPConnector(CloudConnector):
                 msg = f"GCP project {project}: {self._describe_error(exc)}"
                 logger.warning("cloud.gcp.project_failed", project=project, error=str(exc))
                 inventory.warnings.append(msg)
+                # #430 — mark this scope failed so the reconciler skips the
+                # absence-delete pass; a partial walk (subnets landed,
+                # instances denied) must not purge the project's rows.
+                inventory.failed_scopes.append(f"project {project}")
 
         return inventory
 
