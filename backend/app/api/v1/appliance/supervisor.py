@@ -5192,6 +5192,7 @@ async def pcap_upload(capture_id: uuid.UUID, request: Request, db: DB) -> dict[s
     partial = dest.with_name(f"{dest.stem}.pcap.partial")
     h = _hashlib.sha256()
     size = 0
+    over_cap = False
     try:
         with open(partial, "wb") as fh:
             async for chunk in request.stream():
@@ -5199,18 +5200,31 @@ async def pcap_upload(capture_id: uuid.UUID, request: Request, db: DB) -> dict[s
                     continue
                 size += len(chunk)
                 if size > cap:
-                    fh.close()
-                    partial.unlink(missing_ok=True)
-                    raise HTTPException(
-                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        "uploaded pcap exceeds the capture's byte cap",
-                    )
+                    over_cap = True
+                    break
                 fh.write(chunk)
                 h.update(chunk)
-        _os.replace(partial, dest)
-    except HTTPException:
-        raise
     except Exception as exc:  # noqa: BLE001
+        partial.unlink(missing_ok=True)
+        return {
+            "status": await _pc.finalize_capture(
+                db,
+                capture_id,
+                pcap_path=None,
+                pcap_size_bytes=None,
+                pcap_sha256=None,
+                packet_count=None,
+                metadata={"stop_reason": "upload_error"},
+                error=f"upload failed: {exc}",
+            )
+        }
+
+    if over_cap:
+        # The savefile exceeds the capture's own byte cap + margin — the host
+        # runner caps tcpdump at max_bytes, so this shouldn't happen. Finalize
+        # as failed (don't leave the row dangling for the reaper) and drop the
+        # oversized partial. A prior cancel still wins. Over-cap is the one
+        # case we can't honour the keep-partial promise for.
         partial.unlink(missing_ok=True)
         await _pc.finalize_capture(
             db,
@@ -5218,12 +5232,40 @@ async def pcap_upload(capture_id: uuid.UUID, request: Request, db: DB) -> dict[s
             pcap_path=None,
             pcap_size_bytes=None,
             pcap_sha256=None,
-            packet_count=None,
-            metadata={"stop_reason": "upload_error"},
-            error=f"upload failed: {exc}",
+            packet_count=packet_count,
+            metadata={"stop_reason": "over_cap"},
+            error="uploaded pcap exceeds the capture's byte cap",
         )
-        return {"status": "failed"}
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            "uploaded pcap exceeds the capture's byte cap",
+        )
 
+    if size == 0:
+        # Stopped before the first packet flushed. Never leave a 0-byte file
+        # orphaned in PCAP_DIR (no row would reference it, so prune/delete —
+        # which key on pcap_path — could never reclaim it).
+        partial.unlink(missing_ok=True)
+        final_status = await _pc.finalize_capture(
+            db,
+            capture_id,
+            pcap_path=None,
+            pcap_size_bytes=0,
+            pcap_sha256=None,
+            packet_count=packet_count,
+            metadata={"packet_count": packet_count, "byte_count": 0, "stop_reason": "empty"},
+            error=None,
+        )
+        logger.info(
+            "appliance.pcap.upload",
+            appliance_id=str(appliance.id),
+            capture_id=str(capture_id),
+            bytes=0,
+            status=final_status,
+        )
+        return {"status": final_status}
+
+    _os.replace(partial, dest)
     final_status = await _pc.finalize_capture(
         db,
         capture_id,

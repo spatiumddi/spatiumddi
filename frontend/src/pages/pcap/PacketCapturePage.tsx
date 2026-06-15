@@ -58,13 +58,15 @@ function isTerminal(s: PcapCaptureRead): boolean {
 const CANCEL_ARTIFACT_GRACE_MS = 20000;
 
 function isSettled(s: PcapCaptureRead): boolean {
-  if (s.status === "completed" || s.status === "failed") return true;
-  if (s.status === "cancelled") {
-    if (s.has_artifact) return true;
+  if (!isTerminal(s)) return false; // queued / running
+  // Terminal: a Stopped capture with no artifact yet is still finalizing —
+  // wait out the grace window for the partial to land. Everything else
+  // (completed, failed, cancelled-with-artifact) is fully settled.
+  if (s.status === "cancelled" && !s.has_artifact) {
     const fin = s.finished_at ? Date.parse(s.finished_at) : 0;
     return fin > 0 && Date.now() - fin > CANCEL_ARTIFACT_GRACE_MS;
   }
-  return false;
+  return true;
 }
 
 export function PacketCapturePage() {
@@ -205,6 +207,10 @@ function CaptureForm({
   // vantage select value: "server" or an appliance UUID.
   const [vantage, setVantage] = useState<string>(initialVantage);
   const [iface, setIface] = useState<string>("any");
+  // When the operator picks "Other…" in the interface dropdown, fall back to
+  // a free-text field — udev doesn't name every host NIC (bridges, overlay /
+  // VPN interfaces), and the host runner validates whatever name is typed.
+  const [customIface, setCustomIface] = useState(false);
   const [filter, setFilter] = useState("");
   const [durationS, setDurationS] = useState<number | "">(60);
   const [maxPackets, setMaxPackets] = useState<number | "">(10000);
@@ -286,7 +292,8 @@ function CaptureForm({
           value={vantage}
           onChange={(e) => {
             setVantage(e.target.value);
-            setIface("any"); // reset — server enumerates, appliance is free-text
+            setIface("any"); // reset — interface list is per-vantage
+            setCustomIface(false);
           }}
           className="w-full rounded-md border bg-background px-2 py-1.5 text-sm"
         >
@@ -301,13 +308,20 @@ function CaptureForm({
 
       <div>
         <label className="mb-1 block text-xs font-medium">Interface</label>
-        {ifaceList.length > 0 ? (
+        {ifaceList.length > 0 && (
           <select
-            value={iface}
-            onChange={(e) => setIface(e.target.value)}
+            value={customIface ? "__other__" : iface}
+            onChange={(e) => {
+              if (e.target.value === "__other__") {
+                setCustomIface(true);
+              } else {
+                setCustomIface(false);
+                setIface(e.target.value);
+              }
+            }}
             className="w-full rounded-md border bg-background px-2 py-1.5 text-sm"
           >
-            {(ifaceList.includes(iface)
+            {(customIface || ifaceList.includes(iface)
               ? ifaceList
               : [iface, ...ifaceList]
             ).map((n) => (
@@ -315,16 +329,23 @@ function CaptureForm({
                 {n}
               </option>
             ))}
+            <option value="__other__">Other — type a NIC name…</option>
           </select>
-        ) : (
-          // Appliance vantage before the supervisor's first NIC report —
-          // free-text fallback so the operator isn't blocked.
+        )}
+        {(customIface || ifaceList.length === 0) && (
+          // "Other…" picked, or the appliance hasn't reported NICs yet — let
+          // the operator type any NIC (bridges / overlay / VPN that udev
+          // didn't name). The host runner validates it against /sys/class/net.
           <input
             type="text"
             value={iface}
             onChange={(e) => setIface(e.target.value)}
-            placeholder="e.g. eth0, bond0, any"
-            className="w-full rounded-md border bg-background px-2 py-1.5 font-mono text-sm"
+            placeholder="e.g. br0, vmbr0, tailscale0, any"
+            className={cn(
+              "w-full rounded-md border bg-background px-2 py-1.5 font-mono text-sm",
+              ifaceList.length > 0 && "mt-1",
+            )}
+            autoFocus={customIface}
           />
         )}
         {ifaces?.note && (
@@ -511,9 +532,6 @@ function LiveTab({
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["pcap-capture", captureId] }),
   });
-  const download = useMutation({
-    mutationFn: (id: string) => pcapApi.downloadCapture(id),
-  });
 
   if (!captureId || !data) {
     return (
@@ -550,24 +568,10 @@ function LiveTab({
           <Trash2 className="h-3 w-3" /> Stop capture
         </button>
       )}
-      {/* After Stop (or natural finish): offer the download right here so
-          the operator never has to dig through History. The partial .pcap
-          lands a beat after a cancel — until then show a spinner. */}
-      {isTerminal(data) && data.has_artifact && (
-        <button
-          type="button"
-          onClick={() => download.mutate(data.id)}
-          disabled={download.isPending}
-          className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-        >
-          {download.isPending ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <Download className="h-3.5 w-3.5" />
-          )}
-          Download .pcap ({fmtBytes(data.pcap_size_bytes)})
-        </button>
-      )}
+      {/* After Stop, the partial .pcap lands a beat later (server finalizes
+          post-SIGTERM; appliance relays via the supervisor). Show a spinner
+          until it settles, then onComplete hands off to the Result tab which
+          owns the Download button + the no-artifact message. */}
       {data.status === "cancelled" &&
         !data.has_artifact &&
         !isSettled(data) && (
@@ -576,12 +580,6 @@ function LiveTab({
             Finalizing the captured packets…
           </p>
         )}
-      {isTerminal(data) && !data.has_artifact && isSettled(data) && (
-        <p className="text-[11px] italic text-muted-foreground">
-          No downloadable artifact — the capture produced no packets before it
-          stopped.
-        </p>
-      )}
     </div>
   );
 }

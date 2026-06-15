@@ -131,12 +131,22 @@ async def finalize_capture(
     row = await db.get(PacketCapture, capture_id)
     if row is None:
         return "missing"
-    row.finished_at = datetime.now(UTC)
+    # Preserve an existing finished_at — the cancel endpoint stamps it at
+    # Stop time, which is the true "when it stopped". The upload (and this
+    # finalize) can land seconds later via the supervisor relay; re-stamping
+    # to upload-time would push the UI's cancel→artifact grace window out.
+    if row.finished_at is None:
+        row.finished_at = datetime.now(UTC)
     was_cancelled = row.status == "cancelled"
 
     if error:
-        # Failure finalize (no usable bytes). A prior cancel still wins —
-        # don't relabel a Stopped capture as failed.
+        # Failure finalize (no usable bytes). Record the metadata either way
+        # so a failed/empty row still carries its stop_reason for diagnostics.
+        row.metadata_json = {
+            **(metadata or {}),
+            "stop_reason": (metadata or {}).get("stop_reason", "error"),
+        }
+        # A prior cancel still wins — don't relabel a Stopped capture as failed.
         if was_cancelled:
             await db.commit()
             return "cancelled"

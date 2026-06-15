@@ -10,6 +10,7 @@ poll endpoint rejects a non-cert caller.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -203,6 +204,60 @@ async def test_finalize_failed(db_session: AsyncSession) -> None:
     await db_session.refresh(cap)
     assert cap.status == "failed"
     assert "failed" in (cap.error_message or "")
+    # #59 review: the error path now records metadata so a failed row still
+    # carries its stop_reason for diagnostics.
+    assert (cap.metadata_json or {}).get("stop_reason") == "error"
+
+
+@pytest.mark.asyncio
+async def test_finalize_empty_keeps_no_artifact(db_session: AsyncSession) -> None:
+    """An upload that streamed 0 bytes (Stopped before the first packet) is
+    completed but artifact-less — no pcap_path recorded, so nothing orphans."""
+    appl = await _appliance(db_session)
+    cap = await _queued_appliance_capture(db_session, appl.id)
+    cap.status = "running"
+    await db_session.commit()
+    status = await pcap_capture.finalize_capture(
+        db_session,
+        cap.id,
+        pcap_path=None,
+        pcap_size_bytes=0,
+        pcap_sha256=None,
+        packet_count=0,
+        metadata={"stop_reason": "empty"},
+        error=None,
+    )
+    assert status == "completed"
+    await db_session.refresh(cap)
+    assert cap.pcap_path is None
+    assert cap.pcap_size_bytes is None or cap.pcap_size_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_finalize_preserves_cancel_time_finished_at(db_session: AsyncSession) -> None:
+    """A cancelled row's finished_at (stamped at Stop time) is preserved, not
+    re-stamped to the later upload/finalize time (#59 review — keeps the UI's
+    cancel→artifact grace window anchored on the real stop time)."""
+    from datetime import timedelta
+
+    appl = await _appliance(db_session)
+    cap = await _queued_appliance_capture(db_session, appl.id)
+    cap.status = "cancelled"
+    t0 = datetime.now(UTC) - timedelta(seconds=30)
+    cap.finished_at = t0
+    await db_session.commit()
+    await pcap_capture.finalize_capture(
+        db_session,
+        cap.id,
+        pcap_path="/var/lib/spatiumddi/pcaps/p.pcap",
+        pcap_size_bytes=42,
+        pcap_sha256="a",
+        packet_count=1,
+        metadata={},
+        error=None,
+    )
+    await db_session.refresh(cap)
+    assert abs((cap.finished_at - t0).total_seconds()) < 1.0  # not re-stamped to now
 
 
 # ── create-capture appliance branch ──────────────────────────────────
