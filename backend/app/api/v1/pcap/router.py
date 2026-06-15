@@ -38,7 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_permission
-from app.models.appliance import Appliance
+from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
 from app.models.pcap import PacketCapture
 from app.services.pcap import (
@@ -174,26 +174,36 @@ async def list_interfaces(
 async def create_capture(
     body: PcapCaptureCreate, db: DB, current_user: CurrentUser
 ) -> PcapCaptureRead:
-    if body.vantage_kind == "appliance":
-        # Phase 2 — the host-runner transport isn't wired yet.
-        raise HTTPException(
-            status_code=422,
-            detail="appliance-host capture is not available yet (ships in a follow-up phase)",
-        )
-    if body.vantage_kind != "server":
+    if body.vantage_kind not in ("server", "appliance"):
         raise HTTPException(status_code=422, detail=f"unknown vantage: {body.vantage_kind!r}")
 
     appliance_label = "control plane"
     appliance_id = body.appliance_id
-    if appliance_id is not None:
+    # Server vantage enumerates the worker's own NICs; appliance vantage
+    # can't (different host), so the host runner does the membership check.
+    require_avail = True
+    if body.vantage_kind == "appliance":
+        if appliance_id is None:
+            raise HTTPException(
+                status_code=422, detail="appliance_id is required for appliance-host capture"
+            )
         appliance = await db.get(Appliance, appliance_id)
         if appliance is None:
             raise HTTPException(status_code=422, detail="appliance_id not found")
+        if appliance.state != APPLIANCE_STATE_APPROVED:
+            raise HTTPException(
+                status_code=422,
+                detail=f"appliance is {appliance.state!r}, not approved — can't dispatch a capture",
+            )
         appliance_label = appliance.hostname or str(appliance_id)
+        require_avail = False
+    else:
+        # server vantage carries no appliance binding.
+        appliance_id = None
 
     # Pre-validate (surfaces PcapArgError before persisting a doomed row).
     try:
-        interface = validate_interface(body.interface)
+        interface = validate_interface(body.interface, require_available=require_avail)
         bpf = validate_bpf_filter(body.bpf_filter)
         mp, md, mb, sl = clamp_caps(
             max_packets=body.max_packets,
@@ -214,7 +224,7 @@ async def create_capture(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     cap = PacketCapture(
-        vantage_kind="server",
+        vantage_kind=body.vantage_kind,
         appliance_id=appliance_id,
         vantage_label=appliance_label,
         interface=interface,
@@ -234,9 +244,10 @@ async def create_capture(
         user=current_user,
         action="create",
         capture_id=cap.id,
-        label=f"{interface}",
+        label=f"{appliance_label}:{interface}",
         new_value={
-            "vantage_kind": "server",
+            "vantage_kind": body.vantage_kind,
+            "appliance_id": str(appliance_id) if appliance_id else None,
             "interface": interface,
             "bpf_filter": bpf,
             "snaplen": sl,
@@ -248,13 +259,16 @@ async def create_capture(
     await db.commit()
     await db.refresh(cap)
 
-    # Dispatch — broker outage shouldn't 500; leave queued for re-trigger.
-    try:
-        from app.tasks.pcap import run_capture_task  # noqa: PLC0415
+    # Server vantage runs in the worker via Celery. Appliance vantage is
+    # NOT dispatched here — the supervisor's pcap_proxy long-polls
+    # /supervisor/pcap/poll and claims the queued row itself.
+    if body.vantage_kind == "server":
+        try:
+            from app.tasks.pcap import run_capture_task  # noqa: PLC0415
 
-        run_capture_task.delay(str(cap.id))
-    except Exception as exc:  # noqa: BLE001 — broker down
-        logger.warning("pcap_dispatch_failed", capture_id=str(cap.id), error=str(exc))
+            run_capture_task.delay(str(cap.id))
+        except Exception as exc:  # noqa: BLE001 — broker down
+            logger.warning("pcap_dispatch_failed", capture_id=str(cap.id), error=str(exc))
 
     return _to_read(cap)
 

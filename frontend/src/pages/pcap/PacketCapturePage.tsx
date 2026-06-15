@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Download, Loader2, Trash2 } from "lucide-react";
 import {
+  applianceApprovalApi,
   type PcapCaptureCreate,
   type PcapCaptureRead,
   pcapApi,
@@ -50,6 +52,14 @@ export function PacketCapturePage() {
   const [displayId, setDisplayId] = useState<string | null>(null);
   const [tab, setTab] = useState<RightTab>("history");
 
+  // Deep-link from the Fleet drilldown: /tools/pcap?vantage=appliance&appliance=<id>
+  // prefills the form to capture on that appliance host.
+  const [params] = useSearchParams();
+  const initialVantage =
+    params.get("vantage") === "appliance" && params.get("appliance")
+      ? (params.get("appliance") as string)
+      : "server";
+
   const onStarted = (c: PcapCaptureRead) => {
     setActiveId(c.id);
     setTab("live");
@@ -73,7 +83,7 @@ export function PacketCapturePage() {
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
           <div className="rounded-lg border bg-card p-4">
             <h2 className="mb-3 text-sm font-medium">New capture</h2>
-            <CaptureForm onStarted={onStarted} />
+            <CaptureForm onStarted={onStarted} initialVantage={initialVantage} />
           </div>
 
           <div className="flex flex-col rounded-lg border bg-card">
@@ -158,7 +168,15 @@ function TabButton({
   );
 }
 
-function CaptureForm({ onStarted }: { onStarted: (c: PcapCaptureRead) => void }) {
+function CaptureForm({
+  onStarted,
+  initialVantage = "server",
+}: {
+  onStarted: (c: PcapCaptureRead) => void;
+  initialVantage?: string;
+}) {
+  // vantage select value: "server" or an appliance UUID.
+  const [vantage, setVantage] = useState<string>(initialVantage);
   const [iface, setIface] = useState<string>("any");
   const [filter, setFilter] = useState("");
   const [durationS, setDurationS] = useState<number | "">(60);
@@ -167,7 +185,18 @@ function CaptureForm({ onStarted }: { onStarted: (c: PcapCaptureRead) => void })
   const [snaplen, setSnaplen] = useState<number | "">(256);
   const [promiscuous, setPromiscuous] = useState(false);
 
+  const isAppliance = vantage !== "server";
+
+  const { data: appliances } = useQuery({
+    queryKey: ["pcap-appliances"],
+    queryFn: () => applianceApprovalApi.list(),
+  });
+  const approved = (appliances ?? []).filter((a) => a.state === "approved");
+
+  // Server vantage enumerates the worker's NICs; appliance vantage can't
+  // (the control plane can't see the host's NICs) so the operator types it.
   const { data: ifaces } = useQuery({
+    enabled: !isAppliance,
     queryKey: ["pcap-interfaces", "server"],
     queryFn: () => pcapApi.listInterfaces("server"),
   });
@@ -195,7 +224,8 @@ function CaptureForm({ onStarted }: { onStarted: (c: PcapCaptureRead) => void })
         e.preventDefault();
         if (!hasStop) return;
         start.mutate({
-          vantage_kind: "server",
+          vantage_kind: isAppliance ? "appliance" : "server",
+          appliance_id: isAppliance ? vantage : null,
           interface: iface,
           bpf_filter: filter.trim() || null,
           snaplen: snaplen === "" ? 256 : Number(snaplen),
@@ -207,20 +237,57 @@ function CaptureForm({ onStarted }: { onStarted: (c: PcapCaptureRead) => void })
       }}
     >
       <div>
-        <label className="mb-1 block text-xs font-medium">Interface</label>
+        <label className="mb-1 block text-xs font-medium">Vantage</label>
         <select
-          value={iface}
-          onChange={(e) => setIface(e.target.value)}
+          value={vantage}
+          onChange={(e) => {
+            setVantage(e.target.value);
+            setIface("any"); // reset — server enumerates, appliance is free-text
+          }}
           className="w-full rounded-md border bg-background px-2 py-1.5 text-sm"
         >
-          {(ifaces?.interfaces ?? ["any"]).map((n) => (
-            <option key={n} value={n}>
-              {n}
+          <option value="server">Control plane (container network)</option>
+          {approved.map((a) => (
+            <option key={a.id} value={a.id}>
+              {a.hostname} (appliance host)
             </option>
           ))}
         </select>
-        {ifaces?.note && (
-          <p className="mt-1 text-[11px] text-muted-foreground">{ifaces.note}</p>
+      </div>
+
+      <div>
+        <label className="mb-1 block text-xs font-medium">Interface</label>
+        {isAppliance ? (
+          <>
+            <input
+              type="text"
+              value={iface}
+              onChange={(e) => setIface(e.target.value)}
+              placeholder="e.g. eth0, bond0, any"
+              className="w-full rounded-md border bg-background px-2 py-1.5 font-mono text-sm"
+            />
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              The appliance host's real NIC — validated against the host when the
+              capture runs. "any" includes all host traffic.
+            </p>
+          </>
+        ) : (
+          <>
+            <select
+              value={iface}
+              onChange={(e) => setIface(e.target.value)}
+              className="w-full rounded-md border bg-background px-2 py-1.5 text-sm"
+            >
+              {(ifaces?.interfaces ?? ["any"]).map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+            {ifaces?.note && (
+              <p className="mt-1 text-[11px] text-muted-foreground">{ifaces.note}</p>
+            )}
+          </>
         )}
       </div>
 

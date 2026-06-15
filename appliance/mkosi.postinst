@@ -58,6 +58,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-resolved-reload.path \
             spatiumddi-tz-reload.path \
             spatiumddi-verbose-boot-reload.path \
+            spatiumddi-pcap.path \
             spatium-firewall-reload.path \
             spatiumddi-firewall-revert.timer \
             spatium-install.service \

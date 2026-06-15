@@ -1,0 +1,16 @@
+[Unit]
+Description=Watch for SpatiumDDI appliance-host packet-capture requests (issue #59)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/59
+# Skip on the live ISO — tcpdump capture is a post-install operator action.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# Fires while a *.request file exists in the trigger dir (level-triggered).
+# The supervisor writes <cid>.request (atomic rename); the runner claims it
+# by renaming to <cid>.request.running, which stops the glob matching, so a
+# capture fires exactly once. A second queued request re-fires the service
+# after the first completes.
+PathExistsGlob=/var/lib/spatiumddi/release-state/pcap/*.request
+
+[Install]
+WantedBy=multi-user.target

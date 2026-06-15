@@ -115,19 +115,32 @@ def enumerate_interfaces() -> list[str]:
     return names
 
 
-def validate_interface(iface: str | None, *, available: list[str] | None = None) -> str:
+def validate_interface(
+    iface: str | None,
+    *,
+    available: list[str] | None = None,
+    require_available: bool = True,
+) -> str:
     """Validate the requested interface against the vantage's real NICs.
 
     Charset-tight + membership-checked (422 on an unknown name) so the
     operator can't smuggle an argv token through the interface field and
     can't capture on a non-existent device. Defaults to ``any`` when
     unset, but the API encourages a specific NIC.
+
+    ``require_available=False`` skips the membership check (charset only) —
+    used for the appliance-host vantage, where the control plane can't
+    enumerate the host's NICs; the host runner does the real membership
+    check in the host net namespace and fails the capture cleanly on an
+    unknown interface.
     """
     if iface is None or not iface.strip():
         return "any"
     iface = iface.strip()
     if not _IFACE_RE.match(iface):
         raise PcapArgError(f"interface name has invalid characters: {iface!r}")
+    if not require_available:
+        return iface
     avail = available if available is not None else enumerate_interfaces()
     if iface not in avail:
         raise PcapArgError(

@@ -1,0 +1,172 @@
+#!/bin/bash
+# spatium-pcap-runner — host-side packet-capture runner (#59 Phase 2).
+#
+# The supervisor pod can't run tcpdump against the host's real NICs (it
+# isn't hostNetwork), so it drops a request trigger and this host-side
+# runner does the capture in the real host net namespace.
+#
+# Trigger dir: /var/lib/spatiumddi/release-state/pcap/ (the supervisor
+# writes to it via its release-state bind mount; the spatiumddi-pcap.path
+# unit watches it). Per-capture files (keyed by <cid>):
+#
+#   <cid>.request   supervisor → runner. Line-based key=value (NO json so
+#                   this stays dependency-free). Keys: capture_id,
+#                   interface, snaplen, promiscuous(0|1), max_packets,
+#                   max_duration_s, max_bytes, bpf (LAST line, rest-of-line;
+#                   validated upstream to a safe charset, no newlines).
+#   <cid>.cancel    supervisor → runner. Touch to stop the capture early.
+#   <cid>.pcap      runner → supervisor. The capture (grows during run).
+#   <cid>.state     runner → supervisor. key=value: state(starting|running|
+#                   done|failed), packets, bytes, error.
+#
+# Security: the bpf filter is passed to tcpdump as a SINGLE quoted argv
+# element — never eval'd, never re-split, never through a shell builtin —
+# so a hostile filter can at worst be an invalid BPF expression tcpdump
+# rejects. The interface is membership-checked against /sys/class/net.
+#
+# tcpdump is part of the appliance OS (mkosi.conf). The runner is a
+# oneshot that processes the OLDEST pending *.request and exits; systemd
+# re-fires it (via the .path unit) for the next one.
+set -u
+
+PCAP_DIR=/var/lib/spatiumddi/release-state/pcap
+IFACE_RE='^[A-Za-z0-9_.:@-]{1,64}$'
+# The BPF filter is charset-validated upstream (control plane + supervisor)
+# and passed to tcpdump as a single quoted argv element here — never eval'd
+# or re-split — so it needs no re-validation in the runner.
+POLL_S=1
+GRACE_S=10
+
+log() { logger -t spatium-pcap-runner "$*" 2>/dev/null || echo "spatium-pcap-runner: $*" >&2; }
+
+write_state() {
+  # $1=cid $2=state $3=packets $4=bytes $5=error
+  local cid="$1" tmp
+  tmp="$PCAP_DIR/$cid.state.tmp"
+  {
+    echo "state=$2"
+    echo "packets=${3:-}"
+    echo "bytes=${4:-0}"
+    echo "error=${5:-}"
+  } > "$tmp"
+  mv -f "$tmp" "$PCAP_DIR/$cid.state"
+}
+
+# Pick the oldest pending request (skip already-claimed *.request.running).
+req=""
+if [ -d "$PCAP_DIR" ]; then
+  req=$(ls -1tr "$PCAP_DIR"/*.request 2>/dev/null | head -1)
+fi
+[ -z "$req" ] && exit 0
+
+# Claim it immediately so the .path glob stops matching + a concurrent
+# runner can't double-process.
+running="$req.running"
+mv -f "$req" "$running" 2>/dev/null || exit 0
+
+# Parse the line-based request.
+cid=""; interface="any"; snaplen=256; promiscuous=0
+max_packets=""; max_duration_s=""; max_bytes=""; bpf=""
+while IFS= read -r line; do
+  key=${line%%=*}; val=${line#*=}
+  case "$key" in
+    capture_id) cid="$val" ;;
+    interface) interface="$val" ;;
+    snaplen) snaplen="$val" ;;
+    promiscuous) promiscuous="$val" ;;
+    max_packets) max_packets="$val" ;;
+    max_duration_s) max_duration_s="$val" ;;
+    max_bytes) max_bytes="$val" ;;
+    bpf) bpf="$val" ;;
+  esac
+done < "$running"
+
+[ -z "$cid" ] && { rm -f "$running"; exit 0; }
+pcap="$PCAP_DIR/$cid.pcap"
+cancel="$PCAP_DIR/$cid.cancel"
+write_state "$cid" starting "" 0 ""
+
+# ── Validate (defence in depth; the supervisor + control plane already
+# charset-validated). The interface MUST exist on the host. ──
+if ! [[ "$interface" =~ $IFACE_RE ]]; then
+  write_state "$cid" failed "" 0 "invalid interface name"
+  exit 0
+fi
+if [ "$interface" != "any" ] && [ ! -e "/sys/class/net/$interface" ]; then
+  write_state "$cid" failed "" 0 "interface $interface not found on this host"
+  exit 0
+fi
+[[ -z "$snaplen" || ! "$snaplen" =~ ^[0-9]+$ ]] && snaplen=256
+
+# Free-space pre-check: refuse if free < max_bytes + 64 MiB headroom.
+want_mb=$(( ( ${max_bytes:-52428800} / 1048576 ) + 64 ))
+free_mb=$(df -Pm "$PCAP_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+if [ -n "$free_mb" ] && [ "$free_mb" -lt "$want_mb" ]; then
+  write_state "$cid" failed "" 0 "insufficient disk: ${free_mb}MiB free, need ~${want_mb}MiB"
+  exit 0
+fi
+
+# ── Build the tcpdump argv as an ARRAY (no eval, no shell re-split). ──
+argv=(tcpdump -n -U -i "$interface" -s "$snaplen" -w "$pcap")
+[ "$promiscuous" != "1" ] && argv+=(-p)
+[ -n "$max_packets" ] && [[ "$max_packets" =~ ^[0-9]+$ ]] && argv+=(-c "$max_packets")
+# BPF filter is a single trailing argv element. Empty → omit.
+if [ -n "$bpf" ]; then
+  argv+=("$bpf")
+fi
+
+log "starting capture $cid on $interface (snaplen=$snaplen dur=${max_duration_s:-none} pkts=${max_packets:-none} bytes=${max_bytes:-none})"
+write_state "$cid" running "" 0 ""
+
+# Spawn tcpdump in its own process group so we can kill the whole group.
+errfile="$PCAP_DIR/$cid.stderr"
+setsid "${argv[@]}" 2>"$errfile" &
+pid=$!
+pgid=$pid
+
+start=$(date +%s)
+stopped_reason=""
+while kill -0 "$pid" 2>/dev/null; do
+  sleep "$POLL_S"
+  now=$(date +%s)
+  bytes=0; [ -f "$pcap" ] && bytes=$(stat -c%s "$pcap" 2>/dev/null || echo 0)
+  write_state "$cid" running "" "$bytes" ""
+  # Operator cancel.
+  if [ -e "$cancel" ]; then stopped_reason="cancelled"; break; fi
+  # Wall-clock cap (hard kill independent of any cancel signal).
+  if [ -n "$max_duration_s" ] && [[ "$max_duration_s" =~ ^[0-9]+$ ]] \
+     && [ $(( now - start )) -ge "$max_duration_s" ]; then
+    stopped_reason="duration"; break
+  fi
+  # Byte cap (approximate — checked each ${POLL_S}s).
+  if [ -n "$max_bytes" ] && [[ "$max_bytes" =~ ^[0-9]+$ ]] \
+     && [ "$bytes" -ge "$max_bytes" ]; then
+    stopped_reason="bytes"; break
+  fi
+done
+
+# Stop tcpdump if still running (SIGTERM → flush savefile → SIGKILL).
+if kill -0 "$pid" 2>/dev/null; then
+  kill -TERM -- "-$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  for _ in $(seq 1 "$GRACE_S"); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  kill -KILL -- "-$pgid" 2>/dev/null || true
+fi
+wait "$pid" 2>/dev/null
+rc=$?
+
+# tcpdump prints "N packets captured" to stderr at exit.
+packets=$(grep -oE '[0-9]+ packets captured' "$errfile" 2>/dev/null | grep -oE '^[0-9]+' | head -1)
+bytes=0; [ -f "$pcap" ] && bytes=$(stat -c%s "$pcap" 2>/dev/null || echo 0)
+rm -f "$errfile"
+
+# A SIGTERM kill exits non-zero but the savefile is valid; treat a clean
+# stop-condition exit as done. Only a spawn/parse failure with no bytes
+# is a real failure.
+if [ "$bytes" -gt 0 ] || [ "$rc" -eq 0 ]; then
+  log "capture $cid done: $bytes bytes, ${packets:-?} packets (reason=${stopped_reason:-eof})"
+  write_state "$cid" done "${packets:-}" "$bytes" ""
+else
+  err=$(cat "$PCAP_DIR/$cid.stderr" 2>/dev/null | tail -c 300)
+  write_state "$cid" failed "" 0 "tcpdump exited ($rc) with no capture${err:+: $err}"
+fi
+exit 0

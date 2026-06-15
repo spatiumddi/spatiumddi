@@ -1,0 +1,20 @@
+[Unit]
+Description=Run a pending SpatiumDDI appliance-host packet capture (issue #59)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/59
+# The trigger dir + the runner's output live under /var/lib/spatiumddi,
+# available after local-fs. No /etc overlay dependency — the runner writes
+# only under /var/lib/spatiumddi/release-state (the pcap is uploaded back
+# to the control plane + the files are cleaned up; nothing persists to /etc).
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatium-pcap-runner
+# A capture can run up to the operator's max_duration cap (≤30 min) plus
+# grace — don't let systemd's default start timeout kill a long capture.
+TimeoutStartSec=infinity
+# Raw-socket capture needs CAP_NET_RAW (+ CAP_NET_ADMIN for promiscuous).
+# The runner executes as root on the host via systemd, so caps are present;
+# these are belt-and-braces if the unit is ever hardened with NoNewPrivileges.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+# No [Install] — invoked only by spatiumddi-pcap.path, never enabled directly.

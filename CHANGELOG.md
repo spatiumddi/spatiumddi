@@ -26,7 +26,7 @@ Batched fixes for the next cut (not yet released).
 
 ### Added
 
-* **#59 — Packet capture (tcpdump), Phase 1 (server vantage).** On-demand
+* **#59 — Packet capture (tcpdump).** On-demand
   packet capture as a first-class, RBAC-gated, audited platform tool —
   for troubleshooting an appliance/container where there's no easy shell.
   A new **Tools → Packet Capture** page starts a capture (interface +
@@ -46,8 +46,18 @@ Batched fixes for the next cut (not yet released).
   delete is audit-logged. Operator Copilot gets read tools
   (``find_packet_captures`` / ``count_packet_captures`` /
   ``get_packet_capture`` — metadata only, never bytes) + a gated
-  ``propose_run_packet_capture`` write. Appliance-host capture (the real
-  NICs, via the supervisor host-runner) lands in Phase 2.
+  ``propose_run_packet_capture`` write. **Appliance-host vantage (Phase 2)**
+  adds capture on an appliance's *real NICs*: the operator picks the
+  appliance from a vantage dropdown (or the Fleet drilldown's "Packet
+  capture" link), the supervisor's ``pcap_proxy`` long-polls a cert-authed
+  DB-poll dispatch (any api replica can serve it — no in-memory queue to
+  strand the job), drives a host-side ``spatium-pcap-runner`` over the
+  existing trigger-file → systemd ``.path`` pattern (tcpdump runs in the
+  real host net namespace — NOT a privileged ``hostNetwork`` pod), streams
+  progress, and uploads the finished ``.pcap`` back over the supervisor
+  channel. On a single-node appliance the api + worker share the pcap dir
+  via a hostPath; multi-node server-vantage download needs the slot-image
+  mirror proxy (a tracked follow-up).
 
 ### Fixed
 
