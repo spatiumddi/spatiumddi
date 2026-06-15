@@ -160,6 +160,7 @@ SpatiumDDI is built on nights and weekends with no commercial backing — every 
 | ☁️ | **Cloud (AWS / Azure / GCP)** | VPCs → IP blocks · subnets · NIC / public / load-balancer IPs · per-provider picker · paired with the agentless Cloud DNS drivers |
 | 🔐 | **Tailscale** | tailnet devices + synthetic `*.ts.net` zone |
 | 📡 | **UniFi Network** | controller sites · networks (VLANs / CIDRs) · clients (with hostnames + MAC) |
+| 🛡 | **OPNsense** | firewall interfaces (LAN / OPT / VLAN → subnets) · VLANs · DHCPv4 leases + static reservations → IPAM |
 
 ### 🛡 Identity & ops
 
@@ -169,10 +170,10 @@ SpatiumDDI is built on nights and weekends with no commercial backing — every 
 | 🛡 | **TOTP MFA** | 2FA on local logins — QR enrolment via `pyotp` + `qrcode` · single-use backup codes · admin force-disable per user (audit-logged) · enrolment also open to SSO accounts so external-auth superadmins can re-confirm sensitive secret reveals (#408) |
 | 🔐 | **Local-auth hardening** | configurable **password policy** (min length · per-class complexity · history depth · max-age) · **account lockout** after N failed logins inside a rolling window (default off; opt-in in Settings) · **active session viewer + force-logout** at `/admin/sessions` — every login carries a `jti` claim that resolves to a `UserSession` row, flip `revoked=True` to 401 the in-flight token on its next call |
 | 🏷 | **Subnet classification tags** | `pci_scope` · `hipaa_scope` · `internet_facing` first-class boolean columns on every subnet · indexed predicates · compliance roll-up card on Platform Insights · feeds the compliance-change alert + conformity policy filters |
-| 🤖 | **Operator Copilot (AI)** | grounded chat over your live IPAM / DNS / DHCP / Network data — multi-vendor (OpenAI / Anthropic / Azure OpenAI / Gemini / OpenAI-compat for Ollama, vLLM, etc.) with automatic failover · **180 tools** spanning IPAM (incl. discovery / stale-IP / reconciliation / utilization trends / hygiene findings), DNS (records / pools / blocklists / views / DNSSEC / query stats / drift), DHCP (pools / statics / classes / option templates / PXE / MAC blocks / pool occupancy / rogue responders), network modeling (ASNs / VRFs / circuits / services / overlays / domains), ownership (customers / sites / providers), admin (users / groups / roles / time-bound grants), reports (top-N), network tools (ping / traceroute / dig / port-test / TLS-cert / whois / MAC-vendor), integration mirrors (K8s / Docker / Proxmox / Tailscale / UniFi / Cloud / OPNsense), appliance fleet (firewall policies / LLDP neighbours / pairing / OS upgrades / upgrade images / etcd snapshots / host-config syslog + SSH + resolver), observability (DNS query / DHCP activity / metrics / Redis stats / global search), compliance (conformity policies + results + framework rollups), maintenance mode, typed-event webhooks (registry + event-type catalog + delivery history), multi-node rolling upgrade state (preflight / runs / lease), and Apply-gated write proposals — `propose_create_ip_address` / `propose_create_dns_record` / `propose_create_dhcp_static` / `propose_create_alert_rule` / `propose_run_nmap_scan` / `propose_archive_session` plus conformity / webhooks / DNSSEC / multicast / SNMP-NTP / DNS + DHCP import commits · MCP HTTP endpoint for Claude Desktop / Cursor / Cline · "Ask AI about this" affordances on every resource · per-provider editable system prompt · per-provider tool allowlist · OUI vendor enrichment baked in · live nmap results in chat · per-message token / latency footer · Markdown + GFM tables in replies · daily digest |
+| 🤖 | **Operator Copilot (AI)** | grounded chat over your live IPAM / DNS / DHCP / Network data — multi-vendor (OpenAI / Anthropic / Azure OpenAI / Gemini / OpenAI-compat for Ollama, vLLM, etc.) with automatic failover · **183 tools** spanning IPAM (incl. discovery / stale-IP / reconciliation / utilization trends / hygiene findings), DNS (records / pools / blocklists / views / DNSSEC / query stats / drift), DHCP (pools / statics / classes / option templates / PXE / MAC blocks / pool occupancy / rogue responders), network modeling (ASNs / VRFs / circuits / services / overlays / domains), ownership (customers / sites / providers), admin (users / groups / roles / time-bound grants), reports (top-N), network tools (ping / traceroute / dig / port-test / TLS-cert / whois / MAC-vendor), integration mirrors (K8s / Docker / Proxmox / Tailscale / UniFi / Cloud / OPNsense), appliance fleet (firewall policies / LLDP neighbours / pairing / OS upgrades / upgrade images / etcd snapshots / host-config syslog + SSH + resolver), observability (DNS query / DHCP activity / metrics / Redis stats / global search), compliance (conformity policies + results + framework rollups), maintenance mode, typed-event webhooks (registry + event-type catalog + delivery history), multi-node rolling upgrade state (preflight / runs / lease), and Apply-gated write proposals — `propose_create_ip_address` / `propose_create_dns_record` / `propose_create_dhcp_static` / `propose_create_alert_rule` / `propose_run_nmap_scan` / `propose_archive_session` plus conformity / webhooks / DNSSEC / multicast / SNMP-NTP / DNS + DHCP import commits · MCP HTTP endpoint for Claude Desktop / Cursor / Cline · "Ask AI about this" affordances on every resource · per-provider editable system prompt · per-provider tool allowlist · OUI vendor enrichment baked in · live nmap results in chat · per-message token / latency footer · Markdown + GFM tables in replies · daily digest |
 | 🔔 | **Alerts + forwarding** | rule-based alerts · `compliance_change` rule type (PCI / HIPAA / internet-facing audit-log scanner with 24 h auto-resolve, three disabled seed rules) · DNS query-anomaly rules (`dns_nxdomain_spike` / `dns_query_rate_spike`) · IP-hygiene rules (`ip_free_but_responding` / `stale_reservation` / `unknown_mac_in_static_range`) · `rogue_dhcp` (unexpected DHCP responder) · multi-target syslog (RFC 5424 / CEF / LEEF / RFC 3164) · HTTP webhooks · SMTP email · Slack / Teams / Discord chat |
-| 📑 | **Conformity evaluations** | declarative policy library scheduled against PCI-DSS / HIPAA / SOC2 frameworks · 6 starter check kinds (`has_field` · `in_separate_vrf` · `no_open_ports` · `alert_rule_covers` · `last_seen_within` · `audit_log_immutable`) · 8 disabled seed policies, opt-in toggle · pass→fail transitions emit alert events · auditor-facing PDF export with SHA-256 integrity hash · `Auditor` + `Compliance Editor` builtin roles |
-| 🪝 | **Typed-event webhooks** | 96 typed events (resource × verb) · HMAC-SHA256 signed · outbox-backed retry with backoff + dead-letter |
+| 📑 | **Conformity evaluations** | declarative policy library scheduled against PCI-DSS / HIPAA / SOC2 frameworks · 9 check kinds (`has_field` · `in_separate_vrf` · `no_open_ports` · `alert_rule_covers` · `last_seen_within` · `audit_log_immutable` · `voice_segment_not_internet_facing` · `no_multicast_collision` · `no_lanwide_control_plane_ports`) · 11 disabled seed policies, opt-in toggle · pass→fail transitions emit alert events · auditor-facing PDF export with SHA-256 integrity hash · `Auditor` + `Compliance Editor` builtin roles |
+| 🪝 | **Typed-event webhooks** | 131 typed events (38 resource namespaces × 3 verbs + 17 special-cased names) · HMAC-SHA256 signed · outbox-backed retry with backoff + dead-letter |
 | 🐛 | **Diagnostics — captured uncaught exceptions** | every uncaught Python exception across API + Celery lands in a queryable `internal_error` table with **fingerprint dedup** (sha256 of class + top-2 frames), occurrence counter, last-seen-at bumping, redaction of headers + secret-shaped payload fields, `context_json` blob capped at 16 KB · admin viewer at `/admin/diagnostics/errors` with Acknowledge / Suppress (1 h / 1 d / 1 w) / Delete / **Submit-bug** (pre-filled GitHub-issue template URL) actions · daily prune sweep against the configured retention window |
 | 🏷 | **Platform-wide tags + filter** | `tags JSONB` columns across IPAM (spaces / blocks / subnets / IPs) · Network modeling (ASNs / VRFs / circuits / services / overlays / customers / sites / providers) · DNS (zones / records) · DHCP (scopes / pools / statics) · `?tag=` filter on every REST list endpoint with multi-tag AND/OR semantics · `/api/v1/tags/autocomplete` ranked by occurrence · tag chips on every list view + clickable pills on the IP detail modal that navigate to a filtered IPAM view |
 | 🔐 | **ACME DNS-01** | `acme-dns`-compatible — certbot / lego / acme.sh issue public certs (wildcards included) |
@@ -187,7 +188,7 @@ SpatiumDDI is built on nights and weekends with no commercial backing — every 
 |---|---|---|
 | 🐳 | **Docker Compose** | `docker compose up -d` |
 | ☸️ | **Kubernetes** | Helm umbrella chart, OCI-published |
-| 🖥 | **Bare metal / OS appliance** | bare metal today · self-contained appliance ISO (beta — Debian 13 + full stack, hybrid USB/CD, see [Getting Started](#quick-start-with-the-os-appliance-iso)) |
+| 🖥 | **Bare metal / OS appliance** | bare metal today · self-contained appliance ISO (beta — Debian 13 + full stack, hybrid USB/CD, see [Getting Started](#quick-start-with-the-os-appliance-iso-recommended)) |
 
 ---
 
@@ -469,14 +470,17 @@ The tables above are the elevator pitch. The bullets here are the same surface w
 
 - 📑 **Conformity evaluations** — proactive: prove steady state and produce the auditor PDF.
   - Declarative `ConformityPolicy` rows pin a `check_kind` against a target set (subnet / IP address / DNS zone / DHCP scope / platform). Beat-driven engine ticks every 60 s and runs every enabled policy on its `eval_interval_hours` cadence (default 24 h). On-demand re-eval via `POST /conformity/policies/{id}/evaluate`
-  - 6 starter check kinds:
+  - 9 check kinds:
     - `has_field` — non-empty value on a named target column (e.g. PCI subnet must have `customer_id`)
     - `in_separate_vrf` — subnet's effective VRF holds only classification-matched siblings (no PCI ↔ non-PCI mixing)
     - `no_open_ports` — latest nmap scan within N days didn't expose forbidden ports (`warn` when no recent scan; never silent-pass)
     - `alert_rule_covers` — at least one enabled alert rule of the named type covers this scope (positive coverage signal — confirms the reactive #105 channel is wired)
     - `last_seen_within` — IP / subnet recency check (catches rows that should be decommissioned)
     - `audit_log_immutable` — platform-level positive-presence signal for the auditor checkbox
-  - 8 disabled seed policies covering PCI-DSS / HIPAA / SOC2: PCI dedicated VRF, PCI owner_assigned, PCI no admin ports, PCI alert coverage, PCI no stale IPs, HIPAA dedicated VRF, internet-facing alert coverage, audit log immutable
+    - `voice_segment_not_internet_facing` — a voice / VoIP-classified subnet must not also carry the `internet_facing` flag
+    - `no_multicast_collision` — no two multicast group registrations in an IPSpace claim the same address
+    - `no_lanwide_control_plane_ports` — no appliance exposes k3s control-plane ports (etcd / kubelet / apiserver) to the LAN
+  - 11 disabled seed policies covering PCI-DSS / HIPAA / SOC2: PCI dedicated VRF, PCI owner_assigned, PCI no admin ports, PCI alert coverage, PCI no stale IPs, HIPAA dedicated VRF, internet-facing alert coverage, voice-not-internet-facing, multicast-collision-free, audit log immutable, no LAN-wide control-plane ports
   - `pass→fail` transitions emit `AlertEvent` rows against the policy's wired alert rule when set, so conformity drift surfaces in the existing alerts dashboard
   - Append-only `ConformityResult` history indexed twice (by policy and by resource) so both natural drilldowns hit an index — answers "every result for this policy" + "every policy that touched this resource" in O(log n)
   - Auditor-facing **PDF export** via `reportlab` — per-framework summary table, per-policy section with pass / warn / fail counts, enumerated failing rows with diagnostic JSON pretty-printed beneath, trailer with a SHA-256 hash over `(result_id, status)` tuples so the auditor can verify post-generation tampering. `GET /conformity/export.pdf` with optional `?framework=` filter
@@ -517,7 +521,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - **Pre-flight backup as warn-only with override** — if no enabled backup target exists, `POST /system/factory-reset/execute` returns 412 unless the operator passes `acknowledge_no_backup=true`. The Backup admin tab surfaces the warning + checkbox up front
   - UI lives as a third tab on the Backup admin page (after Manual + Destinations) — backup snapshots state, factory reset wipes it, two ends of the same lifecycle. Per-section cards in a 2-col grid + red-bordered "Reset everything" card. Modal gates the password field on a green-border phrase match
 
-- 🤖 **Operator Copilot** — AI assistant grounded in your live IPAM / DNS / DHCP / Network data. Hosted-API or fully on-prem (Ollama). One provider config, **180 tools**, real conversations about your network.
+- 🤖 **Operator Copilot** — AI assistant grounded in your live IPAM / DNS / DHCP / Network data. Hosted-API or fully on-prem (Ollama). One provider config, **183 tools**, real conversations about your network.
 
   **Provider + model**
 
@@ -528,11 +532,11 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - **Reasoning-channel fallback** — `qwen3.5` / DeepSeek-R1 / o1 / o3 family that route their answer to `reasoning` instead of `content` are handled transparently by the driver
   - **Ollama context-window forwarding** — driver forwards `options.num_ctx` / `num_predict` / `extra_body` so Ollama respects the configured context window. Operators can also set `OLLAMA_CONTEXT_LENGTH` env var on the server side (recommended); without one or the other, Ollama silently truncates to 2048 tokens and small models hallucinate tool names from a half-cut tool list
 
-  **Tool registry (180 tools — highlights below)**
+  **Tool registry (183 tools — highlights below)**
 
   Each tool is gated by both the `feature_module` it belongs to (`integrations.unifi` off → UniFi tool disappears from the registry) and an admin-controlled per-tool allowlist at **Admin → AI → Tools**, so operators can trim what the model can see without touching code. Every tool can also be flipped per-provider via the AI Provider modal's Tools tab — the right call for small Ollama models that struggle with 100+ tool schemas.
 
-  The per-category bullets below are a representative tour, not an exhaustive enumeration — the canonical inventory is `backend/app/services/ai/tools/` (one module per category, every `@register_tool(...)` decorator is a live entry) and the live `/api/v1/ai/tools` endpoint on a running install. Categories not surfaced here (multicast, appliance fleet, …) round out the 180 total.
+  The per-category bullets below are a representative tour, not an exhaustive enumeration — the canonical inventory is `backend/app/services/ai/tools/` (one module per category, every `@register_tool(...)` decorator is a live entry) and the live `/api/v1/ai/tools` endpoint on a running install. Categories not surfaced here (multicast, appliance fleet, …) round out the 183 total.
 
   - **IPAM (10)** — `list_ip_spaces`, `list_ip_blocks`, `list_subnets`, `get_subnet_summary`, `find_ip` (returns MAC + **vendor**), `find_by_tag`, `count_ipam_resources`, `find_devices_by_vendor`, `count_devices_by_vendor`, `propose_create_ip_address`. Name-or-UUID resolution on `space_id` / `block_id` so the model can pass `"home"` directly without a UUID-lookup hop
   - **DNS (10)** — `list_dns_server_groups`, `list_dns_zones`, `list_dns_views`, `list_dns_records` (cross-zone substring search), `list_dns_pools` (GSLB pools + per-member health), `list_dns_blocklists` (RPZ rows + sync state), `query_dns_records`, `forward_dns`, `reverse_dns`, `propose_create_dns_record`
@@ -542,7 +546,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - **Admin (3)** — `list_users`, `list_groups`, `list_roles` (superadmin-gated inline; the orchestrator returns an error dict for non-admins)
   - **Appliance fleet config (3)** — `find_snmp_settings`, `find_ntp_settings`, `find_pairing_codes`. All three superadmin-gated; pairing codes also redact the cleartext code + sha256 hash, only the last two digits ever leave the database. No `propose_*` write companions by design — the create response for a pairing code carries the cleartext code, which we don't want in chat transcripts
   - **Backup + factory-reset (3)** — `list_backup_targets` (every configured destination with last-run state, schedule, retention; `config` blob deliberately omitted so destination credentials stay out of the LLM context), `list_backup_archives_at_target` (calls the driver's `list_archives` so the result matches the Backup admin Archives drawer), `find_backup_audit_history` (windowed timeline of backup_created / target-run-success/failed / backup_restored / factory_reset_performed audit rows). All three superadmin-gated. **No `propose_*` writes by design** — restore + factory-reset are password-gated + confirm-phrase-gated, an LLM intermediary in "should I restore?" adds friction without value
-  - **Integration mirrors (5)** — `list_kubernetes_targets`, `list_docker_targets`, `list_proxmox_targets`, `list_tailscale_targets`, `list_unifi_targets` (each tagged with the matching `integrations.*` module so disabling the integration removes the tool in lock-step with the sidebar entry; credentials never enter the response)
+  - **Integration mirrors (7)** — `list_kubernetes_targets`, `list_docker_targets`, `list_proxmox_targets`, `list_tailscale_targets`, `list_unifi_targets`, `list_cloud_targets`, `list_opnsense_targets` (each tagged with the matching `integrations.*` module so disabling the integration removes the tool in lock-step with the sidebar entry; credentials never enter the response)
   - **Ops, observability + audit (18)** — `list_alerts`, `list_alert_rules`, `get_audit_history`, `audit_walk` (paginated chronology), `current_state` (platform health snapshot), `query_dns_query_log`, `query_dhcp_activity_log`, `query_logs`, `get_dns_query_rate` / `get_dhcp_lease_rate` (24-bucket timeseries), `global_search`, `lookup_whois_asn` / `lookup_whois_domain` / `lookup_whois_ip`, `tls_cert_check`, `help_write_permission`, `propose_create_alert_rule`, `propose_archive_session`
   - **Compliance (3)** — `list_conformity_policies` (per-framework registry filter), `find_conformity_results` (append-only evaluation history), `get_conformity_summary` (per-framework rollup of policy + result counts)
   - **Typed-event webhooks (3, superadmin-gated)** — `list_webhooks` (registry; secrets NEVER returned, `secret_set` boolean only), `get_webhook_event_types` (the full typed-event vocabulary so the LLM can validate `event_types[]` references before proposing a subscription), `find_webhook_deliveries` (outbox history — state / attempts / last_error / last_status_code)
@@ -596,7 +600,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Per-target filters
 
 - 🪝 **Typed-event webhooks** — curated automation surface for downstream consumers.
-  - 96 typed events covering every resource × verb (e.g. `subnet.created`, `dns.zone.updated`, `ip.allocated`)
+  - 131 typed events covering every resource × verb (e.g. `subnet.created`, `dns.zone.updated`, `ip.allocated`)
   - HMAC-SHA256 signed POSTs with reserved `X-SpatiumDDI-*` headers
   - Outbox-backed at-least-once delivery with exponential backoff + dead-letter
   - Per-subscription manual retry, custom headers, and one-time secret reveal
@@ -614,7 +618,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Docker Compose
   - Kubernetes — Helm umbrella chart, OCI-published
   - Bare metal
-  - OS appliance ISO — beta (Debian 13 + k3s + full stack pre-installed, dedicated `/appliance` management hub with TLS, releases, containers, logs, host config — SNMP / NTP / **LLDP** / timezone driven from the UI; **declarative fleet firewall** — per-role nftables policy with posture presets, staged-preview diffs, an enforcement master switch that cuts LAN-wide etcd / kubelet exposure, and source-scopable Web UI; **multi-node control-plane HA** — promote appliances to a 3/5/7-node cluster with CloudNativePG + Redis Sentinel + a MetalLB VIP; see [Getting Started](#quick-start-with-the-os-appliance-iso) + [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md))
+  - OS appliance ISO — beta (Debian 13 + k3s + full stack pre-installed, dedicated `/appliance` management hub (Fleet · Cluster · Firewall · Logs & Diagnostics · Maintenance · Network & Host) with TLS cert upload, GitHub releases, atomic A/B + rolling cluster upgrades, and host config — SNMP / NTP / **LLDP** / timezone driven from the UI; **declarative fleet firewall** — per-role nftables policy with posture presets, staged-preview diffs, an enforcement master switch that cuts LAN-wide etcd / kubelet exposure, and source-scopable Web UI; **multi-node control-plane HA** — promote appliances to a 3/5/7-node cluster with CloudNativePG + Redis Sentinel + a MetalLB VIP; see [Getting Started](#quick-start-with-the-os-appliance-iso-recommended) + [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md))
 
 ---
 
@@ -640,17 +644,23 @@ _Click any image to open the full-size version._
   <img src="docs/assets/architecture.svg" alt="SpatiumDDI architecture" width="900"/>
 </p>
 
-**Control plane** — FastAPI + PostgreSQL + Redis + Celery. Single source of truth for everything (IPAM tree, DNS records, auth, audit log). Exposes a REST API; the web UI and any Terraform / Ansible / CLI integration all speak the same API.
+**Control plane** — FastAPI + PostgreSQL 16 + Redis 7 + Celery. Single source of truth for everything (IPAM tree, DNS records, DHCP scopes, auth, audit log). Exposes a REST API; the web UI and any Terraform / Ansible / CLI / MCP integration all speak the same API. Runs single-node by default; on the OS appliance it can **scale to a 3/5/7-node HA cluster** — replicated PostgreSQL (CloudNativePG), Redis Sentinel, k3s embedded-etcd quorum, and a MetalLB control-plane VIP. The **Operator Copilot** (multi-vendor LLM + 183-tool registry + MCP HTTP endpoint) is grounded in this same live data.
 
-**Data plane — two shapes:**
+**Data plane — four independent shapes (mix freely):**
 
-- **Agented** (BIND9, Kea) — one container per service. Each bakes in a sidecar agent (`spatium-dns-agent` / `spatium-dhcp-agent`) that (1) bootstraps with a PSK → rotating JWT, (2) long-polls `/config` with an ETag, (3) caches the last-known-good bundle on disk so the service keeps serving if the control plane is unreachable, (4) drains record / config ops over loopback (nsupdate + TSIG for BIND9; Kea Control Agent API for Kea). Structural changes reload named / kea-dhcp4; record changes do not.
+- **Agented, on-prem** (BIND9 *or* PowerDNS, plus Kea) — one container per service. Each bakes in a sidecar agent (`spatium-dns-agent` / `spatium-dhcp-agent`) that (1) bootstraps with a PSK or pairing code → rotating JWT, (2) long-polls `/config` with an ETag (woken over a Redis pub/sub channel), (3) caches the last-known-good bundle on disk so the service keeps serving if the control plane is unreachable, (4) drains record / config ops over loopback (nsupdate + TSIG for BIND9; REST Control Agent for PowerDNS / Kea). Structural changes reload the daemon; record changes do not. The DNS engine is mutually exclusive per server group.
 
-- **Agentless** (Windows DNS, Windows DHCP) — no software on the Windows side. The control plane speaks directly: RFC 2136 over UDP/TCP 53 (DNS record writes + AXFR), WinRM + PowerShell over 5985/5986 (DNS zone CRUD, DHCP lease / scope reads). Credentials are Fernet-encrypted on the server row.
+- **Agentless, on-prem** (Windows DNS, Windows DHCP) — no software on the Windows side. The control plane speaks directly: RFC 2136 over UDP/TCP 53 (DNS record writes + AXFR), WinRM + PowerShell over 5985/5986 (DNS zone CRUD, DHCP lease / scope reads). Credentials are Fernet-encrypted on the server row.
 
-The driver abstraction is backend-neutral — services speak to `DNSDriver` / `DHCPDriver`, never to BIND9 / Kea / PowerShell specifics.
+- **Agentless, cloud DNS** (Cloudflare, Route 53, Azure DNS, Google Cloud DNS, plus DigitalOcean / Hetzner / Linode / Vultr) — first-class drivers that call the provider's REST API / SDK directly, with import-existing-zones. No agent, no daemon.
 
-**Tech stack**: Python 3.12 · FastAPI · SQLAlchemy 2.x (async) · PostgreSQL 16 · Redis 7 · Celery · React 18 · TypeScript · Tailwind · shadcn/ui · pywinrm · dnspython · Docker · Kubernetes + Helm
+- **Read-only integration mirrors** (Kubernetes, Docker, Proxmox VE, Cloud AWS/Azure/GCP, Tailscale, UniFi, OPNsense) — scheduled pulls reconcile external state into IPAM; never written back.
+
+On the **OS appliance**, a host-side **`spatium-supervisor`** (Ed25519 identity, pairing-code onboarding, heartbeat long-poll) orchestrates the local k3s node — it picks up role assignments, atomic A/B OS upgrades, and firewall + host-config (SNMP / NTP / LLDP / syslog / SSH) from the control plane and enforces them on the host.
+
+The driver abstraction is backend-neutral — services speak to `DNSDriver` / `DHCPDriver`, never to BIND9 / PowerDNS / Kea / PowerShell / cloud-SDK specifics.
+
+**Tech stack**: Python 3.12 · FastAPI · SQLAlchemy 2.x (async) · PostgreSQL 16 · Redis 7 · Celery · React 18 · TypeScript · Tailwind · shadcn/ui · pywinrm · dnspython · cloud provider SDKs · Docker · Kubernetes + Helm · k3s (appliance)
 
 ---
 
@@ -666,7 +676,7 @@ The driver abstraction is backend-neutral — services speak to `DNSDriver` / `D
 
 One click brings up a full SpatiumDDI stack in a fresh Codespace, builds the images from `main`, runs migrations, and seeds realistic IPAM / DNS / DHCP / network-modeling demo data so every screen has something to look at. Sign in with **`admin / admin`**.
 
-The demo Codespace runs in **DEMO_MODE** — abusable surfaces are server-side locked: nmap, the AI Copilot, every read-only integration mirror (Kubernetes / Docker / Proxmox / Tailscale / UniFi), webhook subscriptions, audit-forward / SMTP, backup target creation, factory reset, and password change all return 403. IPAM / DNS / DHCP CRUD on the seeded data stays open so you can play with it.
+The demo Codespace runs in **DEMO_MODE** — abusable surfaces are server-side locked: nmap, packet capture, the AI Copilot, every read-only integration mirror (Kubernetes / Docker / Proxmox / Tailscale / UniFi / Cloud / OPNsense), webhook subscriptions, backup target creation, factory reset, and password change all return 403. IPAM / DNS / DHCP CRUD on the seeded data stays open so you can play with it.
 
 Cold start is ~5–8 minutes (image build) on a 4-core machine; the Codespace's free-tier hours come from your own GitHub account, and trashing the data only affects your own copy. To start fresh, delete the Codespace and click the badge again.
 
@@ -887,45 +897,55 @@ schedules Postgres onto it.
 
 #### Managing the appliance
 
-The **Appliance** section in the sidebar groups every host
-concern:
+The **Appliance** section in the sidebar opens a management
+hub with six tabs:
 
-- **Fleet** — every registered appliance in two tables
-  (control-plane nodes + service agents): approve pairings,
-  assign DNS/DHCP roles, watch per-service health, and
-  promote/demote control-plane cluster members + set the
-  MetalLB control-plane VIP (see HA above).
-- **OS Versions** — atomic A/B slot upgrades for this
-  appliance and every registered remote agent. Pick a
-  release, optionally bulk-select agents, click Apply.
-  Failed upgrades auto-revert on the next reboot; rollback
-  is a single click.
-- **Rolling Upgrade** — coordinated, one-node-at-a-time
-  upgrade of every node in the local control-plane cluster
-  (preflight → CNPG cordon-triggered switchover → drain →
-  slot apply → reboot → health-gate → DaemonSet-ready gate
-  → uncordon → chart `image.tag` bump → migrate Job → post-
-  upgrade verification). Two source modes: upload `.raw.xz`
-  to the in-cluster mirror PVC (air-gap) or paste a GitHub
-  release URL (online). Halt / Resume / Abort exposed.
-  Detail: [`docs/deployment/APPLIANCE.md#5d-multi-node-rolling-cluster-upgrade-296`](docs/deployment/APPLIANCE.md#5d-multi-node-rolling-cluster-upgrade-296).
-- **Pairing** — generate single-use codes to onboard agents.
-- **Releases** — GitHub releases list with one-click upgrades.
-- **Web UI Certificate** — replace the self-signed cert with
-  a pasted PEM + key, an in-server CSR, or a Let's Encrypt
-  cert. Modifies the k8s Secret + bumps the frontend pod's
-  rollout annotation; nginx reloads with the new cert in ~15 s.
-- **NTP** — chrony config that propagates to every
-  registered agent appliance.
-- **SNMP** — read-only monitoring access (v2c with community
-  + CIDR allowlist, or v3 USM).
-- **Pods** — live pod list across the spatium namespace via
-  the api's mounted ServiceAccount; per-pod restart (delete
-  → controller recreate) and SSE live log streaming.
-- **Logs & Diagnostics** — journal viewer, self-test runner
-  (DNS resolution + kubeapi reachability + pod health + role
-  presence), one-click diagnostic bundle (secrets redacted).
-- **Maintenance** — drain traffic, reboot, shutdown.
+- **Fleet** — the heart of it: a roster of every registered
+  appliance (control-plane nodes + service agents). Approve /
+  reject pending pairings, assign DNS / DHCP roles + server
+  groups, watch per-service health, schedule per-box atomic
+  A/B OS slot upgrades + reboots, re-key, and delete. Promote
+  / demote control-plane cluster members and set the MetalLB
+  control-plane VIP from the roster drilldown (see HA above).
+  A left sidebar holds the fleet-wide config surfaces:
+  **Pairing codes** (single-use onboarding codes), **Rolling
+  Upgrade** (coordinated one-node-at-a-time OS+app upgrade of
+  the whole cluster — preflight → CNPG switchover → drain →
+  slot apply → reboot → health-gate → uncordon → chart
+  `image.tag` bump → migrate Job; air-gap mirror PVC or
+  GitHub-release source; Halt / Resume / Abort — plus the
+  GitHub release catalog), **Upgrade images** (air-gap
+  slot-image mirror), **Web UI Certificate** (pasted PEM +
+  key, in-server CSR, or Let's Encrypt — nginx reloads in
+  ~15 s), **NTP** (chrony, propagates to every agent), and
+  **SNMP** (v2c community + CIDR allowlist, or v3 USM).
+- **Cluster** — the k3s cluster underneath: a **Pods** view
+  (running workloads with per-pod restart + SSE live logs)
+  and **etcd snapshots** (disaster-recovery state + guided
+  single-node restore), both driven off the in-cluster
+  kube-API via the api pod's ServiceAccount. *(Appliance
+  host only.)*
+- **Firewall** — declarative per-role / per-appliance
+  nftables policy compiled into each node's drop-in, with a
+  staged-preview diff of any node's effective merged ruleset,
+  an enforcement master switch that cuts LAN-wide etcd /
+  kubelet exposure, and a realtime firewall-log viewer.
+  *(Module-gated on `appliance.firewall`.)*
+- **Logs & Diagnostics** — host-log viewer, the self-test
+  runner (DNS resolution + kube-API reachability + pod
+  health + role presence), and a one-click diagnostic bundle
+  (secrets redacted). *(Appliance host only.)*
+- **Maintenance** — maintenance-mode toggle (drains DNS /
+  DHCP traffic before host work) plus reboot / shutdown with
+  confirmation. *(Appliance host only.)*
+- **Network & Host** — hostname, DNS resolvers, IPv4 / IPv6
+  mode (DHCP or static), the nftables drop-in editor, SSH-key
+  upload, proxy config, console-mode selector, and a
+  reboot-pending banner. *(Appliance host only.)*
+
+> On docker / k8s control planes the host-only tabs hide;
+> **Fleet** stays so operators can still drive remote
+> appliance agents.
 
 The **console cockpit** on the appliance's physical or
 serial console shows a 6-box KPI ribbon (cluster / etcd /
@@ -1006,7 +1026,7 @@ docker compose up -d                  # recreate api/worker/beat/frontend on the
 
 ```bash
 # In your .env:
-SPATIUMDDI_VERSION=2026.05.11-1
+SPATIUMDDI_VERSION=2026.06.14-1
 
 # Then:
 docker compose pull
@@ -1112,16 +1132,22 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 | [Getting Started](docs/GETTING_STARTED.md) | Recommended setup order — from server groups down to allocating an IP |
 | [IPAM Features](docs/features/IPAM.md) | IP space, block, subnet, address management |
 | [DHCP Features](docs/features/DHCP.md) | DHCP server management — Kea, Windows DHCP |
-| [DNS Features](docs/features/DNS.md) | DNS zones, views, server groups, blocking lists, Windows DNS |
+| [DNS Features](docs/features/DNS.md) | DNS zones, views, server groups, blocking lists, Windows DNS, PowerDNS, Cloud DNS |
+| [Integrations](docs/features/INTEGRATIONS.md) | Read-only mirrors — Kubernetes, Docker, Proxmox, Cloud, Tailscale, UniFi, OPNsense |
+| [Migration / Import](docs/features/MIGRATION.md) | One-shot DNS + DHCP config importers (BIND9 / Windows / PowerDNS / Kea / ISC dhcpd) |
+| [ACME DNS-01](docs/features/ACME.md) | acme-dns-compatible provider for Let's Encrypt / public-CA cert issuance |
 | [Auth & Permissions](docs/features/AUTH.md) | LDAP, OIDC, SAML, RADIUS, TACACS+, roles, scoped permissions |
+| [Permissions (RBAC)](docs/PERMISSIONS.md) | Permission grammar, builtin roles, wildcards, group-scoped access |
 | [System Admin](docs/features/SYSTEM_ADMIN.md) | Health dashboard, backup, notifications |
 | [Observability](docs/OBSERVABILITY.md) | Logging, metrics, alerting |
 | [Deployment Topologies](docs/deployment/TOPOLOGIES.md) | Six reference topologies — single VM through HA cloud + on-prem hybrid — with diagrams |
 | [Windows Server Setup](docs/deployment/WINDOWS.md) | WinRM, service accounts, firewall — Windows-side checklist |
 | [DNS Agent Design](docs/deployment/DNS_AGENT.md) | Agent protocol, auto-registration, config sync |
-| [DNS Driver Spec](docs/drivers/DNS_DRIVERS.md) | BIND9 + Windows DNS driver internals |
+| [DNS Driver Spec](docs/drivers/DNS_DRIVERS.md) | BIND9 + PowerDNS + Windows DNS + cloud (Route 53 / Azure DNS / Cloudflare / Google) driver internals |
 | [DHCP Driver Spec](docs/drivers/DHCP_DRIVERS.md) | Kea + Windows DHCP driver internals |
+| [Docker Compose](docs/deployment/DOCKER.md) | Compose setup, ports, first-time setup, TLS, HA, password reset |
 | [Appliance Deployment](docs/deployment/APPLIANCE.md) | OS appliance ISO — base OS selection, build pipeline, first-boot orchestration, `/appliance` management hub spec |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Recovery recipes — deleted agent rows, password reset, subnet-delete refused |
 
 ---
 
@@ -1131,8 +1157,8 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 |---|---|---|
 | Phase 1 | Core IPAM, auth, user management, audit log, Docker Compose | ✅ Done — LDAP/OIDC/SAML + RADIUS/TACACS+, group-based RBAC, bulk-edit, inheritance, mobile-responsive UI, and full IPv6 `/next-address` (EUI-64 + random /128 + sequential) all shipped |
 | Phase 2 | DHCP (Kea), DNS (BIND9), DDNS, zone/subnet tree UI | ✅ Done — DNS, Kea DHCPv4, subnet-level DDNS, agent-side Kea DDNS, block/space DDNS inheritance, per-server zone serial reporting all shipped |
-| Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin, Kea HA | 🔄 DNS features + health dashboard + alerts framework + group-centric Kea HA (self-healing peer-IP drift + supervised daemons) + DNS Views end-to-end split-horizon landed; HA state-transition actions still pending |
-| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore, ACME | 🔄 SAML + full backup/restore + factory-reset + OS appliance beta (Debian 13 ISO + embedded [k3s](https://k3s.io/) + Helm orchestration, `/appliance` management hub with TLS upload + CSR-on-server, GitHub release apply, kubeapi-driven Pods tab + live SSE logs, host log viewer + self-test + diagnostic bundle, maintenance mode + reboot, web first-boot wizard, atomic A/B slot upgrades, **multi-node rolling cluster upgrade** with CNPG switchover + lease-mutex + preflight + air-gap mirror PVC, consolidated **Cluster tab** (Pods + etcd + live SSE health dashboard), realtime **firewall-log viewer**, Talos-style **console cockpit**) all landed. Terraform/Ansible providers + ACME embedded client (Let's Encrypt auto-issue) still pending |
+| Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin, Kea HA | ✅ Done — DNS features + health dashboard + alerts framework + group-centric Kea HA (self-healing peer-IP drift + supervised daemons) + DNS Views end-to-end split-horizon + **multi-node control-plane HA** (CloudNativePG + Redis Sentinel + MetalLB VIP, operator promote/demote) all shipped |
+| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore, ACME | 🔄 SAML + full backup/restore + factory-reset + OS appliance beta (Debian 13 ISO + embedded [k3s](https://k3s.io/) + Helm orchestration, `/appliance` management hub with TLS upload + CSR-on-server, GitHub release apply, kubeapi-driven Pods tab + live SSE logs, host log viewer + self-test + diagnostic bundle, maintenance mode + reboot, web first-boot wizard, atomic A/B slot upgrades, **multi-node rolling cluster upgrade** with CNPG switchover + lease-mutex + preflight + air-gap mirror PVC, consolidated **Cluster tab** (Pods + etcd + live SSE health dashboard), realtime **firewall-log viewer**, Talos-style **console cockpit**) + the **ACME DNS-01 provider** (acme-dns-compatible, for external certbot / lego / acme.sh clients) all landed. Terraform / Ansible providers + the ACME *embedded client* (auto-issuing TLS for SpatiumDDI's own services) still pending |
 | Phase 5 | Multi-tenancy, IP request workflows, advanced reporting | 📋 Planned |
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-release feature list and
