@@ -148,7 +148,15 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             "id": str(z.id),
             "name": getattr(z, "name", None) or getattr(z, "fqdn", None),
             "type": getattr(z, "zone_type", "primary"),
-            "ttl": getattr(z, "default_ttl", 3600),
+            # #430 — was getattr(z, "default_ttl", 3600): DNSZone has no
+            # default_ttl, so this silently pinned every zone's $TTL to the
+            # literal 3600 and editing a zone's TTL never re-rendered.
+            "ttl": getattr(z, "ttl", 3600),
+            # #430 (D1) — the agent's zone-state reporter skips any zone with
+            # serial=None, so omitting this made it report nothing for every
+            # zone and the per-server ZoneSyncPill stayed empty. Ship the
+            # authoritative serial the agent renders from.
+            "serial": getattr(z, "last_serial", 0),
             # Forward-zone-only fields (ignored by the agent for other types).
             "forwarders": list(getattr(z, "forwarders", []) or []),
             "forward_only": bool(getattr(z, "forward_only", True)),

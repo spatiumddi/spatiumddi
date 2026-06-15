@@ -532,6 +532,14 @@ async def agent_config_longpoll(
                                         "ip_address": st.ip_address,
                                         "mac_address": st.mac_address,
                                         "hostname": st.hostname,
+                                        # #430 — client_id + options_override
+                                        # are settable, ETag-hashed, and the
+                                        # agent renderer reads them, but were
+                                        # omitted here: a client-id-keyed
+                                        # reservation silently fell back to MAC
+                                        # and per-host options were dropped.
+                                        "client_id": st.client_id,
+                                        "options_override": st.options_override,
                                         # DHCPv6 DUID (#368) — keys the v6
                                         # reservation instead of the MAC.
                                         "duid": st.duid,

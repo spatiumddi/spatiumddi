@@ -42,6 +42,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
+from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
 from app.core.permissions import user_has_permission
 from app.core.request_meta import client_ip
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
@@ -1099,6 +1100,10 @@ async def set_enforcement(
             )
         )
     await db.commit()
+    # Wake every supervisor's heartbeat hold so the enforcement flip converges
+    # at ~0 s instead of waiting out the parked long-poll (≤28 s). Firewall
+    # state feeds firewall_render_inputs() in the heartbeat.
+    await publish_wake(HOSTCONFIG_ALL)
     return await _enforcement_status(db)
 
 
@@ -1371,6 +1376,9 @@ async def set_web_ui_access(
             )
         )
     await db.commit()
+    # Mgmt-UI CIDR lock is security-critical — wake the fleet so the new
+    # allow-list lands immediately rather than at the next heartbeat tick.
+    await publish_wake(HOSTCONFIG_ALL)
     cidrs = list(cfg.web_ui_allowed_cidrs or [])
     return WebUIAccessResponse(
         allowed_cidrs=cidrs,
