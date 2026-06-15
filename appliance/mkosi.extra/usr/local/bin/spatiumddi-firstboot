@@ -98,6 +98,15 @@ mkdir -p /var/lib/spatiumddi/slot-images
 chown 1000:1000 /var/lib/spatiumddi/slot-images
 chmod 0700 /var/lib/spatiumddi/slot-images
 
+# /var/lib/spatiumddi/pcaps — packet-capture .pcap artifacts (#59). The
+# worker writes captures here; the api reads them back on download — both
+# pods hostPath-mount this same single-node dir. Same uid-1000 + 0700
+# reasoning as slot-images (kubelet would create it root:root 0755 → the
+# worker's write fails EACCES). Idempotent on every boot.
+mkdir -p /var/lib/spatiumddi/pcaps
+chown 1000:1000 /var/lib/spatiumddi/pcaps
+chmod 0700 /var/lib/spatiumddi/pcaps
+
 # Detect the host's root block device's rotational flag so the
 # supervisor pod (which can't see the host's /proc/mounts properly —
 # its container view shows ``overlay`` mounted at /) can surface

@@ -121,6 +121,12 @@ api:
     # they don't 404 with "bytes missing on disk" on the next upgrade.
     # Only mounted when the multi-node slot-image mirror is off.
     slotImagesDir: /var/lib/spatiumddi/slot-images
+    # #59 — host dir backing packet-capture .pcap artifacts
+    # (SPATIUM_PCAP_DIR). Shared by api (reads on download) + worker
+    # (writes the capture) on a single node. Multi-node server-vantage
+    # capture needs the mirror-proxy (a tracked follow-up); appliance is
+    # single-node so the shared hostPath is correct.
+    pcapsDir: /var/lib/spatiumddi/pcaps
 
 # ── Slot-image mirror (#296 Phase B) ────────────────────────────────────────
 # A single-replica Deployment + node-pinned local-path PVC + ClusterIP
