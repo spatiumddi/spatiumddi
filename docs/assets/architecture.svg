@@ -1,40 +1,31 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1100" viewBox="0 0 1200 1100"
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1310" viewBox="0 0 1400 1310"
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <defs>
-    <!-- Palette: soft gradients, consistent family -->
     <linearGradient id="g-client" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#60a5fa"/>
-      <stop offset="100%" stop-color="#3b82f6"/>
+      <stop offset="0%" stop-color="#60a5fa"/><stop offset="100%" stop-color="#3b82f6"/>
     </linearGradient>
     <linearGradient id="g-api" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#8b5cf6"/>
-      <stop offset="100%" stop-color="#6d28d9"/>
+      <stop offset="0%" stop-color="#8b5cf6"/><stop offset="100%" stop-color="#6d28d9"/>
     </linearGradient>
     <linearGradient id="g-worker" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#a78bfa"/>
-      <stop offset="100%" stop-color="#7c3aed"/>
+      <stop offset="0%" stop-color="#a78bfa"/><stop offset="100%" stop-color="#7c3aed"/>
     </linearGradient>
     <linearGradient id="g-store" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#34d399"/>
-      <stop offset="100%" stop-color="#059669"/>
+      <stop offset="0%" stop-color="#34d399"/><stop offset="100%" stop-color="#059669"/>
     </linearGradient>
     <linearGradient id="g-agented" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#fb923c"/>
-      <stop offset="100%" stop-color="#ea580c"/>
+      <stop offset="0%" stop-color="#fb923c"/><stop offset="100%" stop-color="#ea580c"/>
     </linearGradient>
     <linearGradient id="g-agentless" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#22d3ee"/>
-      <stop offset="100%" stop-color="#0891b2"/>
+      <stop offset="0%" stop-color="#22d3ee"/><stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <linearGradient id="g-cloud" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#818cf8"/><stop offset="100%" stop-color="#4f46e5"/>
     </linearGradient>
     <linearGradient id="g-integrations" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#14b8a6"/>
-      <stop offset="100%" stop-color="#0f766e"/>
-    </linearGradient>
-    <linearGradient id="g-discovery" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#f472b6"/>
-      <stop offset="100%" stop-color="#be185d"/>
+      <stop offset="0%" stop-color="#14b8a6"/><stop offset="100%" stop-color="#0f766e"/>
     </linearGradient>
 
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
@@ -47,290 +38,317 @@
     </marker>
 
     <style>
-      .card {
-        stroke: rgba(15, 23, 42, 0.14);
-        stroke-width: 1;
-        filter: drop-shadow(0 2px 4px rgba(15, 23, 42, 0.10));
-      }
-      .title-lg { font-size: 22px; font-weight: 700; fill: #0f172a; }
+      .card { stroke: rgba(15,23,42,0.14); stroke-width: 1; filter: drop-shadow(0 2px 4px rgba(15,23,42,0.10)); }
+      .title-lg { font-size: 26px; font-weight: 700; fill: #0f172a; }
       .subtitle { font-size: 13px; fill: #64748b; }
-
-      .card-title { font-size: 16px; font-weight: 700; fill: #ffffff; }
-      .card-sub { font-size: 12px; fill: rgba(255, 255, 255, 0.9); }
-      .card-sub-dim { font-size: 11px; fill: rgba(255, 255, 255, 0.75); }
-
-      .layer-label {
-        font-size: 11px; font-weight: 700; fill: #475569;
-        letter-spacing: 0.12em; text-transform: uppercase;
-      }
-      .band {
-        fill: #f8fafc; stroke: #e2e8f0; stroke-width: 1;
-      }
-      .lane-label {
-        font-size: 12px; font-weight: 600; fill: #334155;
-      }
-
+      .card-title { font-size: 15px; font-weight: 700; fill: #ffffff; }
+      .card-title-sm { font-size: 13px; font-weight: 700; fill: #ffffff; }
+      .card-sub { font-size: 11.5px; fill: rgba(255,255,255,0.92); }
+      .card-sub-dim { font-size: 10.5px; fill: rgba(255,255,255,0.78); }
+      .layer-label { font-size: 11px; font-weight: 700; fill: #475569; letter-spacing: 0.10em; text-transform: uppercase; }
+      .band { fill: #f8fafc; stroke: #e2e8f0; stroke-width: 1; }
+      .subband { fill: #ffffff; stroke: #e2e8f0; stroke-width: 1; }
+      .subband-dash { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1; stroke-dasharray: 5,4; }
+      .lane-label { font-size: 12px; font-weight: 600; fill: #334155; }
       .edge { stroke: #475569; stroke-width: 1.5; fill: none; }
       .edge-dashed { stroke: #94a3b8; stroke-width: 1.5; stroke-dasharray: 5,4; fill: none; }
       .edge-label { font-size: 10.5px; fill: #475569; font-weight: 600; }
-
       .note-box { fill: #f1f5f9; stroke: #cbd5e1; stroke-width: 1; }
       .note-title { font-size: 12px; font-weight: 700; fill: #1e293b; }
-      .note { font-size: 11px; fill: #475569; }
-
-      .pill {
-        fill: rgba(255, 255, 255, 0.22);
-        stroke: rgba(255, 255, 255, 0.35);
-        stroke-width: 0.5;
-      }
-      .pill-text { font-size: 10px; font-weight: 600; fill: #ffffff; }
+      .note { font-size: 10.5px; fill: #475569; }
+      .pill { fill: rgba(255,255,255,0.22); stroke: rgba(255,255,255,0.35); stroke-width: 0.5; }
+      .pill-text { font-size: 10.5px; font-weight: 600; fill: #ffffff; }
+      .divider { stroke: rgba(255,255,255,0.35); stroke-width: 1; }
+      .lane-div { stroke: #e2e8f0; stroke-width: 1; }
     </style>
   </defs>
 
-  <!-- ─────────────────── Title ─────────────────── -->
-  <text x="600" y="36" text-anchor="middle" class="title-lg">SpatiumDDI — Architecture</text>
-  <text x="600" y="58" text-anchor="middle" class="subtitle">
-    Control plane is source of truth · data plane runs either agented (built-in) or agentless (Windows)
-  </text>
+  <!-- ───── Title ───── -->
+  <text x="700" y="38" text-anchor="middle" class="title-lg">SpatiumDDI — Architecture</text>
+  <text x="700" y="62" text-anchor="middle" class="subtitle">Single control plane · four data-plane shapes · single-node or multi-node HA · grounded AI copilot</text>
 
-  <!-- ─────────────────── Clients ─────────────────── -->
-  <text x="40" y="96" class="layer-label">Clients</text>
-
-  <g>
-    <rect x="40" y="108" width="230" height="72" rx="10" ry="10" class="card" fill="url(#g-client)"/>
-    <text x="155" y="136" text-anchor="middle" class="card-title">Browser</text>
-    <text x="155" y="156" text-anchor="middle" class="card-sub">React 18 SPA · served by nginx</text>
-    <text x="155" y="172" text-anchor="middle" class="card-sub-dim">dark / light / system</text>
-  </g>
+  <!-- ───── Clients ───── -->
+  <text x="40" y="92" class="layer-label">Clients</text>
+  <rect x="36" y="100" width="1328" height="104" rx="12" class="band"/>
 
   <g>
-    <rect x="290" y="108" width="230" height="72" rx="10" ry="10" class="card" fill="url(#g-client)" fill-opacity="0.78"/>
-    <text x="405" y="136" text-anchor="middle" class="card-title">CLI &amp; API clients</text>
-    <text x="405" y="156" text-anchor="middle" class="card-sub">curl · Terraform · Ansible</text>
-    <text x="405" y="172" text-anchor="middle" class="card-sub-dim">REST + OpenAPI 3 / Swagger</text>
+    <rect x="56" y="116" width="250" height="72" rx="10" class="card" fill="url(#g-client)"/>
+    <text x="181" y="144" text-anchor="middle" class="card-title">Browser</text>
+    <text x="181" y="164" text-anchor="middle" class="card-sub">React 18 SPA · served by nginx</text>
+    <text x="181" y="180" text-anchor="middle" class="card-sub-dim">dark / light / system</text>
   </g>
-
-  <!-- ─────────────────── Control Plane band ─────────────────── -->
-  <text x="40" y="220" class="layer-label">Control plane</text>
-  <rect x="36" y="228" width="820" height="172" rx="12" ry="12" class="band"/>
-
   <g>
-    <rect x="56" y="248" width="240" height="132" rx="10" ry="10" class="card" fill="url(#g-api)"/>
-    <text x="176" y="278" text-anchor="middle" class="card-title">API</text>
-    <text x="176" y="298" text-anchor="middle" class="card-sub">FastAPI · Python 3.12 · async</text>
-    <text x="176" y="316" text-anchor="middle" class="card-sub">JWT + RBAC · audit log</text>
-    <text x="176" y="334" text-anchor="middle" class="card-sub">/docs (Swagger) · /redoc</text>
-    <text x="176" y="352" text-anchor="middle" class="card-sub-dim">long-poll endpoints for agents</text>
-    <text x="176" y="370" text-anchor="middle" class="card-sub-dim">direct WinRM for agentless</text>
+    <rect x="326" y="116" width="250" height="72" rx="10" class="card" fill="url(#g-client)" fill-opacity="0.82"/>
+    <text x="451" y="144" text-anchor="middle" class="card-title">CLI &amp; API clients</text>
+    <text x="451" y="164" text-anchor="middle" class="card-sub">curl · Terraform · Ansible</text>
+    <text x="451" y="180" text-anchor="middle" class="card-sub-dim">REST + OpenAPI 3 / Swagger</text>
   </g>
-
   <g>
-    <rect x="316" y="248" width="200" height="62" rx="10" ry="10" class="card" fill="url(#g-worker)"/>
-    <text x="416" y="278" text-anchor="middle" class="card-title">Worker</text>
-    <text x="416" y="296" text-anchor="middle" class="card-sub">Celery · ipam / dns / dhcp</text>
+    <rect x="596" y="116" width="250" height="72" rx="10" class="card" fill="url(#g-client)" fill-opacity="0.66"/>
+    <text x="721" y="144" text-anchor="middle" class="card-title">MCP clients</text>
+    <text x="721" y="164" text-anchor="middle" class="card-sub">Claude Desktop · Cursor · Cline</text>
+    <text x="721" y="180" text-anchor="middle" class="card-sub-dim">via /api/v1/ai/mcp</text>
   </g>
 
+  <!-- Non-negotiables legend -->
+  <rect x="946" y="108" width="416" height="90" rx="8" class="note-box"/>
+  <text x="960" y="128" class="note-title">Non-negotiables</text>
+  <text x="960" y="146" class="note">• API-first — UI + CLI + MCP share one REST surface.</text>
+  <text x="960" y="162" class="note">• Agent local cache survives control-plane outage.</text>
+  <text x="960" y="178" class="note">• Every mutation audit-logged · creds Fernet-encrypted.</text>
+  <text x="960" y="194" class="note">• Multi-arch images (amd64 · arm64).</text>
+
+  <!-- ───── Control Plane ───── -->
+  <text x="40" y="246" class="layer-label">Control plane</text>
+  <rect x="36" y="254" width="1328" height="240" rx="12" class="band"/>
+
+  <!-- Core -->
+  <rect x="52" y="266" width="560" height="212" rx="10" class="subband"/>
+  <text x="64" y="286" class="lane-label">Core — all deployments</text>
   <g>
-    <rect x="316" y="318" width="200" height="62" rx="10" ry="10" class="card" fill="url(#g-worker)" fill-opacity="0.85"/>
-    <text x="416" y="348" text-anchor="middle" class="card-title">Beat</text>
-    <text x="416" y="366" text-anchor="middle" class="card-sub">sync jobs · health · cleanup</text>
+    <rect x="66" y="298" width="152" height="172" rx="9" class="card" fill="url(#g-api)"/>
+    <text x="142" y="324" text-anchor="middle" class="card-title">API</text>
+    <text x="142" y="344" text-anchor="middle" class="card-sub">FastAPI · Python 3.12</text>
+    <text x="142" y="362" text-anchor="middle" class="card-sub">async · JWT + RBAC</text>
+    <text x="142" y="380" text-anchor="middle" class="card-sub">audit log · REST/OpenAPI</text>
+    <text x="142" y="402" text-anchor="middle" class="card-sub-dim">long-poll /config (agents)</text>
+    <text x="142" y="420" text-anchor="middle" class="card-sub-dim">WinRM / RFC 2136 (agentless)</text>
+    <text x="142" y="438" text-anchor="middle" class="card-sub-dim">REST/SDK (cloud DNS)</text>
+    <text x="142" y="458" text-anchor="middle" class="card-sub-dim">/api/docs · /api/redoc</text>
   </g>
-
   <g>
-    <rect x="536" y="248" width="200" height="62" rx="10" ry="10" class="card" fill="url(#g-store)"/>
-    <text x="636" y="278" text-anchor="middle" class="card-title">PostgreSQL 16</text>
-    <text x="636" y="296" text-anchor="middle" class="card-sub">IPAM · DNS · DHCP · Audit</text>
+    <rect x="232" y="298" width="160" height="82" rx="9" class="card" fill="url(#g-worker)"/>
+    <text x="312" y="326" text-anchor="middle" class="card-title">Worker</text>
+    <text x="312" y="346" text-anchor="middle" class="card-sub">Celery · ipam / dns / dhcp</text>
+    <text x="312" y="364" text-anchor="middle" class="card-sub-dim">integrations · alerts</text>
   </g>
-
   <g>
-    <rect x="536" y="318" width="200" height="62" rx="10" ry="10" class="card" fill="url(#g-store)" fill-opacity="0.85"/>
-    <text x="636" y="348" text-anchor="middle" class="card-title">Redis 7</text>
-    <text x="636" y="366" text-anchor="middle" class="card-sub">cache · Celery broker</text>
+    <rect x="232" y="388" width="160" height="82" rx="9" class="card" fill="url(#g-worker)" fill-opacity="0.85"/>
+    <text x="312" y="416" text-anchor="middle" class="card-title">Beat</text>
+    <text x="312" y="436" text-anchor="middle" class="card-sub">scheduled: sync · health</text>
+    <text x="312" y="454" text-anchor="middle" class="card-sub-dim">cleanup · reconcile</text>
   </g>
-
-  <!-- ─────────────────── Data plane ─────────────────── -->
-  <text x="40" y="436" class="layer-label">Data plane</text>
-
-  <!-- Lane: Agented (BIND9 + Kea containers) -->
-  <rect x="36" y="452" width="560" height="336" rx="12" ry="12" class="band"/>
-  <text x="52" y="476" class="lane-label">Agented — built-in containers (auto-register)</text>
-
   <g>
-    <rect x="56" y="492" width="250" height="282" rx="10" ry="10" class="card" fill="url(#g-agented)"/>
-    <text x="181" y="520" text-anchor="middle" class="card-title">dns-bind9</text>
-    <text x="181" y="538" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dns-bind9</text>
-
-    <line x1="76" y1="552" x2="286" y2="552" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
-
-    <!-- agent pill -->
-    <rect x="80" y="566" width="202" height="84" rx="6" ry="6" class="pill"/>
-    <text x="181" y="584" text-anchor="middle" class="pill-text">spatium-dns-agent</text>
-    <text x="181" y="602" text-anchor="middle" class="card-sub-dim">bootstrap (PSK → JWT)</text>
-    <text x="181" y="618" text-anchor="middle" class="card-sub-dim">long-poll /config · ETag</text>
-    <text x="181" y="634" text-anchor="middle" class="card-sub-dim">last-known-good cache</text>
-
-    <line x1="76" y1="668" x2="286" y2="668" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
-    <text x="181" y="688" text-anchor="middle" class="card-sub">named (BIND9 9.18)</text>
-    <text x="181" y="706" text-anchor="middle" class="card-sub-dim">loopback nsupdate + TSIG</text>
-    <text x="181" y="724" text-anchor="middle" class="card-sub-dim">53/udp · 53/tcp</text>
-    <text x="181" y="752" text-anchor="middle" class="card-sub-dim">survives control-plane outage</text>
+    <rect x="406" y="298" width="190" height="82" rx="9" class="card" fill="url(#g-store)"/>
+    <text x="501" y="326" text-anchor="middle" class="card-title">PostgreSQL 16</text>
+    <text x="501" y="346" text-anchor="middle" class="card-sub">IPAM · DNS · DHCP</text>
+    <text x="501" y="364" text-anchor="middle" class="card-sub-dim">Network · Audit · Auth</text>
   </g>
-
   <g>
-    <rect x="326" y="492" width="250" height="282" rx="10" ry="10" class="card" fill="url(#g-agented)" fill-opacity="0.9"/>
-    <text x="451" y="520" text-anchor="middle" class="card-title">dhcp-kea</text>
-    <text x="451" y="538" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dhcp-kea</text>
-
-    <line x1="346" y1="552" x2="556" y2="552" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
-
-    <rect x="350" y="566" width="202" height="84" rx="6" ry="6" class="pill"/>
-    <text x="451" y="584" text-anchor="middle" class="pill-text">spatium-dhcp-agent</text>
-    <text x="451" y="602" text-anchor="middle" class="card-sub-dim">bootstrap (PSK → JWT)</text>
-    <text x="451" y="618" text-anchor="middle" class="card-sub-dim">long-poll /config · ETag</text>
-    <text x="451" y="634" text-anchor="middle" class="card-sub-dim">last-known-good cache</text>
-
-    <line x1="346" y1="668" x2="556" y2="668" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
-    <text x="451" y="688" text-anchor="middle" class="card-sub">kea-dhcp4 / kea-dhcp6</text>
-    <text x="451" y="706" text-anchor="middle" class="card-sub-dim">Control Agent · loopback</text>
-    <text x="451" y="724" text-anchor="middle" class="card-sub-dim">67/udp · HA hook library</text>
-    <text x="451" y="752" text-anchor="middle" class="card-sub-dim">survives control-plane outage</text>
+    <rect x="406" y="388" width="190" height="82" rx="9" class="card" fill="url(#g-store)" fill-opacity="0.85"/>
+    <text x="501" y="416" text-anchor="middle" class="card-title">Redis 7</text>
+    <text x="501" y="436" text-anchor="middle" class="card-sub">cache · Celery broker</text>
+    <text x="501" y="454" text-anchor="middle" class="card-sub-dim">pub/sub agent wake</text>
   </g>
 
-  <!-- Lane: Agentless (Windows DC) -->
-  <rect x="612" y="452" width="552" height="336" rx="12" ry="12" class="band"/>
-  <text x="628" y="476" class="lane-label">Agentless — Windows Server (no software installed on the DC)</text>
-
+  <!-- HA add-ons -->
+  <rect x="628" y="266" width="298" height="212" rx="10" class="subband-dash"/>
+  <text x="640" y="286" class="lane-label">Multi-node HA — cluster only</text>
   <g>
-    <rect x="632" y="492" width="252" height="282" rx="10" ry="10" class="card" fill="url(#g-agentless)"/>
-    <text x="758" y="520" text-anchor="middle" class="card-title">Windows DNS</text>
-    <text x="758" y="538" text-anchor="middle" class="card-sub-dim">existing Active Directory DC</text>
-
-    <line x1="652" y1="552" x2="864" y2="552" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
-
-    <rect x="656" y="566" width="204" height="36" rx="6" ry="6" class="pill"/>
-    <text x="758" y="582" text-anchor="middle" class="pill-text">Path A — record CRUD</text>
-    <text x="758" y="596" text-anchor="middle" class="card-sub-dim">RFC 2136 + dnspython</text>
-
-    <rect x="656" y="614" width="204" height="36" rx="6" ry="6" class="pill"/>
-    <text x="758" y="630" text-anchor="middle" class="pill-text">Path B — zone CRUD (creds)</text>
-    <text x="758" y="644" text-anchor="middle" class="card-sub-dim">WinRM + DnsServer PS module</text>
-
-    <line x1="652" y1="668" x2="864" y2="668" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
-    <text x="758" y="688" text-anchor="middle" class="card-sub">53/udp · 53/tcp (RFC 2136)</text>
-    <text x="758" y="706" text-anchor="middle" class="card-sub">5985/5986 (WinRM)</text>
-    <text x="758" y="728" text-anchor="middle" class="card-sub-dim">AXFR or Get-DnsServerResource…</text>
-    <text x="758" y="752" text-anchor="middle" class="card-sub-dim">zones auto-import on sync</text>
+    <rect x="640" y="298" width="134" height="80" rx="9" class="card" fill="url(#g-store)" fill-opacity="0.62"/>
+    <text x="707" y="322" text-anchor="middle" class="card-title-sm">CloudNativePG</text>
+    <text x="707" y="342" text-anchor="middle" class="card-sub-dim">replicated Postgres</text>
+    <text x="707" y="358" text-anchor="middle" class="card-sub-dim">auto failover</text>
   </g>
-
   <g>
-    <rect x="904" y="492" width="252" height="282" rx="10" ry="10" class="card" fill="url(#g-agentless)" fill-opacity="0.9"/>
-    <text x="1030" y="520" text-anchor="middle" class="card-title">Windows DHCP</text>
-    <text x="1030" y="538" text-anchor="middle" class="card-sub-dim">existing DHCP server</text>
-
-    <line x1="924" y1="552" x2="1136" y2="552" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
-
-    <rect x="928" y="566" width="204" height="36" rx="6" ry="6" class="pill"/>
-    <text x="1030" y="582" text-anchor="middle" class="pill-text">Path A — read-only</text>
-    <text x="1030" y="596" text-anchor="middle" class="card-sub-dim">WinRM + DhcpServer PS module</text>
-
-    <rect x="928" y="614" width="204" height="36" rx="6" ry="6" class="pill"/>
-    <text x="1030" y="630" text-anchor="middle" class="pill-text">leases + scopes (polling)</text>
-    <text x="1030" y="644" text-anchor="middle" class="card-sub-dim">Get-DhcpServerv4Lease</text>
-
-    <line x1="924" y1="668" x2="1136" y2="668" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
-    <text x="1030" y="688" text-anchor="middle" class="card-sub">5985/5986 (WinRM)</text>
-    <text x="1030" y="710" text-anchor="middle" class="card-sub-dim">mirrors leases into IPAM</text>
-    <text x="1030" y="728" text-anchor="middle" class="card-sub-dim">status=dhcp · auto-cleanup</text>
-    <text x="1030" y="752" text-anchor="middle" class="card-sub-dim">Path B (full CRUD) — roadmap</text>
+    <rect x="784" y="298" width="130" height="80" rx="9" class="card" fill="url(#g-store)" fill-opacity="0.62"/>
+    <text x="849" y="322" text-anchor="middle" class="card-title-sm">Redis Sentinel</text>
+    <text x="849" y="342" text-anchor="middle" class="card-sub-dim">master election</text>
+    <text x="849" y="358" text-anchor="middle" class="card-sub-dim">sentinel:// URL</text>
   </g>
-
-  <!-- ─────────────────── Edges ─────────────────── -->
-  <!-- Browser → API -->
-  <path d="M 155 180 L 155 248" class="edge" marker-end="url(#arrow)"/>
-  <text x="162" y="216" class="edge-label">HTTPS</text>
-  <!-- CLI → API -->
-  <path d="M 405 180 L 240 248" class="edge" marker-end="url(#arrow)"/>
-
-  <!-- API ↔ Worker -->
-  <path d="M 296 278 L 316 278" class="edge" marker-end="url(#arrow)"/>
-  <!-- API ↔ Beat -->
-  <path d="M 296 348 L 316 348" class="edge" marker-end="url(#arrow)"/>
-  <!-- Worker ↔ Redis / PG -->
-  <path d="M 516 278 L 536 278" class="edge" marker-end="url(#arrow)"/>
-  <text x="520" y="270" class="edge-label">async SQL</text>
-  <path d="M 516 348 L 536 348" class="edge" marker-end="url(#arrow)"/>
-  <text x="520" y="340" class="edge-label">broker</text>
-
-  <!-- API → agented lane (via sidecar) -->
-  <path d="M 176 380 L 176 448 Q 176 460 188 460 L 306 460 Q 316 460 316 472 L 316 492" class="edge" marker-end="url(#arrow)"/>
-  <text x="200" y="436" class="edge-label">long-poll /config · heartbeat</text>
-  <!-- dashed return (config bundle) -->
-  <path d="M 181 492 L 181 464 Q 181 456 173 456 L 140 456 Q 132 456 132 448 L 132 380" class="edge-dashed" marker-end="url(#arrow-dashed)"/>
-
-  <!-- API → agentless lane (direct) -->
-  <path d="M 176 380 L 176 428 Q 176 440 188 440 L 744 440 Q 758 440 758 452 L 758 492" class="edge" marker-end="url(#arrow)"/>
-  <text x="430" y="434" class="edge-label">RFC 2136 · AXFR · WinRM (direct from API)</text>
-
-  <!-- Beat → agentless (scheduled sync jobs) -->
-  <path d="M 416 380 L 416 420 Q 416 432 428 432 L 1020 432 Q 1030 432 1030 444 L 1030 492" class="edge-dashed" marker-end="url(#arrow-dashed)"/>
-  <text x="720" y="427" class="edge-label">scheduled: lease pull · zone sync · IPAM→DNS reconcile</text>
-
-  <!-- ─────────────────── Read-only sources band ─────────────────── -->
-  <text x="40" y="824" class="layer-label">Read-only sources — pulled into IPAM (scheduled by Worker)</text>
-  <rect x="36" y="836" width="1128" height="240" rx="12" ry="12" class="band"/>
-
-  <!-- Lane: Integrations -->
   <g>
-    <rect x="56" y="856" width="540" height="200" rx="10" ry="10" class="card" fill="url(#g-integrations)"/>
-    <text x="326" y="884" text-anchor="middle" class="card-title">Integrations (read-only mirrors)</text>
-    <text x="326" y="902" text-anchor="middle" class="card-sub-dim">Settings → Integrations · per-target Sync Now</text>
-
-    <line x1="76" y1="918" x2="576" y2="918" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
-
-    <text x="76" y="942" class="card-sub" font-weight="600">Kubernetes</text>
-    <text x="76" y="958" class="card-sub-dim">CIDRs · nodes · LB VIPs · Ingress → DNS</text>
-
-    <text x="76" y="982" class="card-sub" font-weight="600">Docker</text>
-    <text x="76" y="998" class="card-sub-dim">networks · optional container IPs</text>
-
-    <text x="316" y="942" class="card-sub" font-weight="600">Proxmox VE</text>
-    <text x="316" y="958" class="card-sub-dim">bridges · SDN VNets · VM/LXC NICs</text>
-
-    <text x="316" y="982" class="card-sub" font-weight="600">Tailscale</text>
-    <text x="316" y="998" class="card-sub-dim">devices + synthetic *.ts.net zone</text>
-
-    <line x1="76" y1="1014" x2="576" y2="1014" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
-    <text x="326" y="1034" text-anchor="middle" class="card-sub-dim">credentials Fernet-encrypted · 30 s default sync</text>
+    <rect x="640" y="388" width="134" height="80" rx="9" class="card" fill="url(#g-store)" fill-opacity="0.62"/>
+    <text x="707" y="412" text-anchor="middle" class="card-title-sm">k3s etcd</text>
+    <text x="707" y="432" text-anchor="middle" class="card-sub-dim">state quorum</text>
+    <text x="707" y="448" text-anchor="middle" class="card-sub-dim">3 / 5 / 7 nodes</text>
   </g>
-
-  <!-- Lane: Network discovery (SNMP) -->
   <g>
-    <rect x="616" y="856" width="540" height="200" rx="10" ry="10" class="card" fill="url(#g-discovery)"/>
-    <text x="886" y="884" text-anchor="middle" class="card-title">Network discovery (SNMP)</text>
-    <text x="886" y="902" text-anchor="middle" class="card-sub-dim">routers + switches · standard MIBs</text>
-
-    <line x1="636" y1="918" x2="1136" y2="918" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
-
-    <text x="886" y="942" text-anchor="middle" class="card-sub">v1 · v2c · v3 (USM auth + priv)</text>
-    <text x="886" y="960" text-anchor="middle" class="card-sub-dim">IF-MIB · IP-MIB · Q-BRIDGE-MIB · LLDP-MIB</text>
-
-    <text x="886" y="984" text-anchor="middle" class="card-sub">interfaces · ARP · FDB · LLDP neighbours</text>
-    <text x="886" y="1002" text-anchor="middle" class="card-sub-dim">cross-referenced into IP rows</text>
-
-    <line x1="636" y1="1014" x2="1136" y2="1014" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
-    <text x="886" y="1034" text-anchor="middle" class="card-sub-dim">per-IP switch-port + VLAN visibility in IPAM</text>
+    <rect x="784" y="388" width="130" height="80" rx="9" class="card" fill="url(#g-store)" fill-opacity="0.62"/>
+    <text x="849" y="412" text-anchor="middle" class="card-title-sm">MetalLB</text>
+    <text x="849" y="432" text-anchor="middle" class="card-sub-dim">control-plane VIP</text>
+    <text x="849" y="448" text-anchor="middle" class="card-sub-dim">one UI address</text>
   </g>
 
-  <!-- Worker → Read-only sources band (scheduled pulls) -->
-  <path d="M 416 380 L 416 412 Q 416 422 426 422 L 580 422 Q 596 422 596 836" class="edge-dashed" marker-end="url(#arrow-dashed)"/>
-  <text x="486" y="416" class="edge-label">scheduled: integration sync · SNMP poll · GSLB health</text>
+  <!-- Operator Copilot -->
+  <rect x="942" y="266" width="402" height="212" rx="10" class="subband"/>
+  <text x="954" y="286" class="lane-label">Operator Copilot — grounded AI</text>
+  <g>
+    <rect x="956" y="298" width="374" height="56" rx="9" class="card" fill="url(#g-api)"/>
+    <text x="1143" y="322" text-anchor="middle" class="card-title">LLM Provider</text>
+    <text x="1143" y="341" text-anchor="middle" class="card-sub">OpenAI · Anthropic · Azure · Gemini · Ollama (auto-failover)</text>
+  </g>
+  <g>
+    <rect x="956" y="364" width="182" height="106" rx="9" class="card" fill="url(#g-worker)"/>
+    <text x="1047" y="390" text-anchor="middle" class="card-title">Tool Registry</text>
+    <text x="1047" y="410" text-anchor="middle" class="card-sub">183 tools</text>
+    <text x="1047" y="428" text-anchor="middle" class="card-sub-dim">IPAM / DNS / DHCP / Net</text>
+    <text x="1047" y="444" text-anchor="middle" class="card-sub-dim">admin / appliance / …</text>
+    <text x="1047" y="460" text-anchor="middle" class="card-sub-dim">Apply-gated writes</text>
+  </g>
+  <g>
+    <rect x="1148" y="364" width="182" height="106" rx="9" class="card" fill="url(#g-api)" fill-opacity="0.82"/>
+    <text x="1239" y="390" text-anchor="middle" class="card-title">MCP Server</text>
+    <text x="1239" y="410" text-anchor="middle" class="card-sub-dim">/api/v1/ai/mcp</text>
+    <text x="1239" y="428" text-anchor="middle" class="card-sub-dim">per-provider prompt</text>
+    <text x="1239" y="446" text-anchor="middle" class="card-sub-dim">+ tool allowlist</text>
+    <text x="1239" y="462" text-anchor="middle" class="card-sub-dim">grounded in live data</text>
+  </g>
 
-  <!-- ─────────────────── Notes / legend ─────────────────── -->
-  <rect x="880" y="96" width="280" height="120" rx="8" ry="8" class="note-box"/>
-  <text x="892" y="118" class="note-title">Non-negotiables</text>
-  <text x="892" y="138" class="note">• API-first (UI + CLI speak the same REST).</text>
-  <text x="892" y="156" class="note">• Agent local cache survives CP outage.</text>
-  <text x="892" y="174" class="note">• Every mutation is audit-logged.</text>
-  <text x="892" y="192" class="note">• Credentials: Fernet-encrypted at rest.</text>
-  <text x="892" y="210" class="note">• Multi-arch images: amd64 · arm64.</text>
+  <!-- ───── Appliance Fleet ───── -->
+  <text x="40" y="512" class="layer-label">OS appliance fleet (optional)</text>
+  <rect x="36" y="520" width="1328" height="158" rx="12" class="band"/>
+  <g>
+    <rect x="56" y="536" width="430" height="126" rx="10" class="card" fill="url(#g-agented)"/>
+    <text x="271" y="562" text-anchor="middle" class="card-title">spatium-supervisor</text>
+    <text x="271" y="582" text-anchor="middle" class="card-sub-dim">Ed25519 identity · pairing-code onboarding</text>
+    <text x="271" y="602" text-anchor="middle" class="card-sub">heartbeat long-poll → control plane</text>
+    <text x="271" y="622" text-anchor="middle" class="card-sub-dim">pulls: roles · A/B OS upgrade · firewall · host-config</text>
+    <text x="271" y="642" text-anchor="middle" class="card-sub-dim">enforces on host (k3s node label · nft · grub)</text>
+  </g>
+  <g>
+    <rect x="506" y="536" width="380" height="126" rx="10" class="card" fill="url(#g-agented)" fill-opacity="0.88"/>
+    <text x="696" y="562" text-anchor="middle" class="card-title">Role pods (DaemonSets)</text>
+    <text x="696" y="582" text-anchor="middle" class="card-sub">dns-bind9 / dns-powerdns / dhcp-kea</text>
+    <text x="696" y="602" text-anchor="middle" class="card-sub-dim">role-picked at fleet promotion</text>
+    <text x="696" y="622" text-anchor="middle" class="card-sub-dim">= the agented data plane (below)</text>
+    <text x="696" y="642" text-anchor="middle" class="card-sub-dim">scheduled by spatium.io/role-* labels</text>
+  </g>
+  <g>
+    <rect x="906" y="536" width="438" height="126" rx="10" class="card" fill="url(#g-agented)"/>
+    <text x="1125" y="562" text-anchor="middle" class="card-title">Host config &amp; firewall</text>
+    <text x="1125" y="582" text-anchor="middle" class="card-sub">SNMP · NTP · LLDP · syslog · SSH · timezone</text>
+    <text x="1125" y="602" text-anchor="middle" class="card-sub-dim">declarative, control-plane-driven</text>
+    <text x="1125" y="622" text-anchor="middle" class="card-sub">per-role nftables firewall enforce</text>
+    <text x="1125" y="642" text-anchor="middle" class="card-sub-dim">systemd / grub / A-B slot management</text>
+  </g>
+
+  <!-- ───── Data Plane ───── -->
+  <text x="40" y="712" class="layer-label">Data plane — independent shapes, mix freely</text>
+  <rect x="36" y="718" width="1328" height="322" rx="12" class="band"/>
+  <line x1="476" y1="730" x2="476" y2="1028" class="lane-div"/>
+  <line x1="916" y1="730" x2="916" y2="1028" class="lane-div"/>
+
+  <!-- Lane A: Agented on-prem -->
+  <text x="52" y="740" class="lane-label">Agented (on-prem) — built-in containers, auto-register</text>
+  <g>
+    <rect x="52" y="750" width="412" height="82" rx="9" class="card" fill="url(#g-agented)"/>
+    <text x="258" y="773" text-anchor="middle" class="card-title">dns-bind9</text>
+    <text x="258" y="791" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dns-bind9</text>
+    <text x="258" y="811" text-anchor="middle" class="card-sub">spatium-dns-agent · BIND9 9.18 · nsupdate+TSIG · 53/udp+tcp</text>
+  </g>
+  <g>
+    <rect x="52" y="842" width="412" height="82" rx="9" class="card" fill="url(#g-agented)" fill-opacity="0.9"/>
+    <text x="258" y="865" text-anchor="middle" class="card-title">dns-powerdns</text>
+    <text x="258" y="883" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dns-powerdns</text>
+    <text x="258" y="903" text-anchor="middle" class="card-sub">spatium-dns-agent · PowerDNS · REST Control Agent · DNSSEC</text>
+  </g>
+  <g>
+    <rect x="52" y="934" width="412" height="82" rx="9" class="card" fill="url(#g-agented)" fill-opacity="0.8"/>
+    <text x="258" y="957" text-anchor="middle" class="card-title">dhcp-kea</text>
+    <text x="258" y="975" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dhcp-kea</text>
+    <text x="258" y="995" text-anchor="middle" class="card-sub">spatium-dhcp-agent · kea-dhcp4/6 · 67/udp · HA hook</text>
+  </g>
+  <text x="258" y="1024" text-anchor="middle" class="lane-label" font-size="10.5px" fill="#64748b">PSK/pairing→JWT · long-poll ETag · last-known-good cache · DNS engine mutually exclusive</text>
+
+  <!-- Lane B: Agentless on-prem (Windows) -->
+  <text x="488" y="740" class="lane-label">Agentless (on-prem) — Windows Server, nothing installed</text>
+  <g>
+    <rect x="488" y="750" width="420" height="128" rx="9" class="card" fill="url(#g-agentless)"/>
+    <text x="698" y="773" text-anchor="middle" class="card-title">Windows DNS</text>
+    <text x="698" y="790" text-anchor="middle" class="card-sub-dim">existing Active Directory DC</text>
+    <rect x="508" y="800" width="380" height="28" rx="6" class="pill"/>
+    <text x="698" y="818" text-anchor="middle" class="pill-text">Path A — RFC 2136 record CRUD</text>
+    <rect x="508" y="836" width="380" height="28" rx="6" class="pill"/>
+    <text x="698" y="854" text-anchor="middle" class="pill-text">Path B — WinRM zone CRUD (DnsServer PS)</text>
+  </g>
+  <g>
+    <rect x="488" y="888" width="420" height="128" rx="9" class="card" fill="url(#g-agentless)" fill-opacity="0.9"/>
+    <text x="698" y="911" text-anchor="middle" class="card-title">Windows DHCP</text>
+    <text x="698" y="928" text-anchor="middle" class="card-sub-dim">existing DHCP server</text>
+    <rect x="508" y="938" width="380" height="28" rx="6" class="pill"/>
+    <text x="698" y="956" text-anchor="middle" class="pill-text">read-only WinRM polling → IPAM mirror</text>
+    <text x="698" y="984" text-anchor="middle" class="card-sub-dim">5985/5986 · status=dhcp · Path B (CRUD) roadmap</text>
+  </g>
+  <text x="698" y="1024" text-anchor="middle" class="lane-label" font-size="10.5px" fill="#64748b">no software on the DC · credentials Fernet-encrypted on the server row</text>
+
+  <!-- Lane C: Agentless cloud DNS -->
+  <text x="924" y="740" class="lane-label">Agentless (cloud DNS) — provider API, no agent</text>
+  <g>
+    <rect x="924" y="750" width="204" height="70" rx="9" class="card" fill="url(#g-cloud)"/>
+    <text x="1026" y="778" text-anchor="middle" class="card-title">Cloudflare</text>
+    <text x="1026" y="796" text-anchor="middle" class="card-sub-dim">API token · REST</text>
+  </g>
+  <g>
+    <rect x="1140" y="750" width="204" height="70" rx="9" class="card" fill="url(#g-cloud)"/>
+    <text x="1242" y="778" text-anchor="middle" class="card-title">Route 53</text>
+    <text x="1242" y="796" text-anchor="middle" class="card-sub-dim">boto3 · IAM</text>
+  </g>
+  <g>
+    <rect x="924" y="830" width="204" height="70" rx="9" class="card" fill="url(#g-cloud)" fill-opacity="0.9"/>
+    <text x="1026" y="858" text-anchor="middle" class="card-title">Azure DNS</text>
+    <text x="1026" y="876" text-anchor="middle" class="card-sub-dim">Azure SDK</text>
+  </g>
+  <g>
+    <rect x="1140" y="830" width="204" height="70" rx="9" class="card" fill="url(#g-cloud)" fill-opacity="0.9"/>
+    <text x="1242" y="858" text-anchor="middle" class="card-title">Google Cloud DNS</text>
+    <text x="1242" y="876" text-anchor="middle" class="card-sub-dim">service-account JSON</text>
+  </g>
+  <g>
+    <rect x="924" y="910" width="420" height="70" rx="9" class="card" fill="url(#g-cloud)" fill-opacity="0.8"/>
+    <text x="1134" y="938" text-anchor="middle" class="card-title">DigitalOcean · Hetzner · Linode · Vultr</text>
+    <text x="1134" y="956" text-anchor="middle" class="card-sub-dim">single API-token REST</text>
+  </g>
+  <text x="1134" y="1024" text-anchor="middle" class="lane-label" font-size="10.5px" fill="#64748b">control plane calls REST/SDK directly · import-existing-zones</text>
+
+  <!-- ───── Integration mirrors ───── -->
+  <text x="40" y="1062" class="layer-label">Read-only integration mirrors — scheduled pull → IPAM (never written back)</text>
+  <rect x="36" y="1068" width="1328" height="186" rx="12" class="band"/>
+  <rect x="52" y="1082" width="1292" height="158" rx="10" class="card" fill="url(#g-integrations)"/>
+
+  <text x="212" y="1116" text-anchor="middle" class="card-title-sm">Kubernetes</text>
+  <text x="212" y="1134" text-anchor="middle" class="card-sub-dim">CIDRs · nodes · LB VIPs · Ingress→DNS</text>
+  <text x="532" y="1116" text-anchor="middle" class="card-title-sm">Docker</text>
+  <text x="532" y="1134" text-anchor="middle" class="card-sub-dim">networks · container IPs</text>
+  <text x="852" y="1116" text-anchor="middle" class="card-title-sm">Proxmox VE</text>
+  <text x="852" y="1134" text-anchor="middle" class="card-sub-dim">bridges · SDN VNets · VM/LXC NICs</text>
+  <text x="1180" y="1116" text-anchor="middle" class="card-title-sm">Cloud (AWS / Azure / GCP)</text>
+  <text x="1180" y="1134" text-anchor="middle" class="card-sub-dim">VPCs→blocks · subnets · NIC/LB IPs</text>
+
+  <line x1="76" y1="1158" x2="1320" y2="1158" class="divider"/>
+
+  <text x="212" y="1190" text-anchor="middle" class="card-title-sm">Tailscale</text>
+  <text x="212" y="1208" text-anchor="middle" class="card-sub-dim">devices · synthetic *.ts.net zone</text>
+  <text x="532" y="1190" text-anchor="middle" class="card-title-sm">UniFi Network</text>
+  <text x="532" y="1208" text-anchor="middle" class="card-sub-dim">sites · VLANs · clients (host+MAC)</text>
+  <text x="852" y="1190" text-anchor="middle" class="card-title-sm">OPNsense</text>
+  <text x="852" y="1208" text-anchor="middle" class="card-sub-dim">interfaces · DHCP leases + reservations</text>
+  <text x="1180" y="1196" text-anchor="middle" class="card-sub">Fernet-encrypted creds · 30 s sync</text>
+  <text x="1180" y="1214" text-anchor="middle" class="card-sub-dim">shape-guarded absence-delete</text>
+
+  <!-- ───── Edges ───── -->
+  <!-- Clients → control plane -->
+  <path d="M 181 188 L 181 254" class="edge" marker-end="url(#arrow)"/>
+  <text x="188" y="228" class="edge-label">HTTPS</text>
+  <path d="M 451 188 L 451 254" class="edge" marker-end="url(#arrow)"/>
+  <text x="458" y="228" class="edge-label">REST / OpenAPI</text>
+  <path d="M 721 188 L 721 254" class="edge" marker-end="url(#arrow)"/>
+  <text x="728" y="228" class="edge-label">MCP</text>
+
+  <!-- Control plane → appliance supervisor -->
+  <path d="M 271 494 L 271 536" class="edge-dashed" marker-end="url(#arrow-dashed)"/>
+  <text x="300" y="511" class="edge-label">supervisor: register · heartbeat · pull desired-state (roles · upgrade · firewall · host-config)</text>
+
+  <!-- Appliance → data plane (supervisor schedules role pods) -->
+  <path d="M 660 662 L 660 718" class="edge-dashed" marker-end="url(#arrow-dashed)"/>
+  <text x="668" y="700" class="edge-label">schedules role pods</text>
+
+  <!-- Control plane → data plane (left spine) -->
+  <path d="M 66 408 L 24 408 L 24 700 L 200 700 L 200 718" class="edge" marker-end="url(#arrow)"/>
+  <text x="34" y="688" class="edge-label">API → data plane (direct): long-poll /config · RFC 2136 / WinRM · REST/SDK</text>
+  <!-- dashed config-bundle return -->
+  <path d="M 120 750 L 120 690 L 14 690 L 14 426 L 66 426" class="edge-dashed" marker-end="url(#arrow-dashed)"/>
+
+  <!-- Beat → integration mirrors (right spine) -->
+  <path d="M 1344 470 L 1378 470 L 1378 1080 L 1344 1080" class="edge-dashed" marker-end="url(#arrow-dashed)"/>
+  <text x="1150" y="1062" class="edge-label" text-anchor="end">Beat: scheduled pull → IPAM ↘</text>
 </svg>
