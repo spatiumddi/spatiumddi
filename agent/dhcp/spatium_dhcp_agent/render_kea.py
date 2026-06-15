@@ -134,12 +134,18 @@ def _options_from_mapping(options: dict[str, Any] | None) -> list[dict[str, Any]
             return
         out.append(_opt(name, val))
 
-    _put("domain-name-servers", options.get("dns_servers") or options.get("domain-name-servers"))
+    _put(
+        "domain-name-servers",
+        options.get("dns_servers") or options.get("domain-name-servers"),
+    )
     _put("ntp-servers", options.get("ntp_servers") or options.get("ntp-servers"))
     _put("routers", options.get("routers") or options.get("gateway"))
     _put("domain-name", options.get("domain_name") or options.get("domain-name"))
     _put("domain-search", options.get("domain_search") or options.get("domain-search"))
-    _put("tftp-server-name", options.get("tftp_server") or options.get("tftp-server-name"))
+    _put(
+        "tftp-server-name",
+        options.get("tftp_server") or options.get("tftp-server-name"),
+    )
     _put("boot-file-name", options.get("boot_file") or options.get("boot-file-name"))
 
     # Pass through any raw Kea-style list already shaped correctly.
@@ -324,6 +330,12 @@ def _scope_to_subnet6(scope: dict[str, Any]) -> dict[str, Any]:
             out["reservations"] = resv
     if scope.get("lease_time"):
         out["valid-lifetime"] = int(scope["lease_time"])
+    # #430 — honour the per-scope min/max lease bounds (Kea clamps the
+    # client-requested lease into [min, max]). Omitted → Kea defaults.
+    if scope.get("min_lease_time"):
+        out["min-valid-lifetime"] = int(scope["min_lease_time"])
+    if scope.get("max_lease_time"):
+        out["max-valid-lifetime"] = int(scope["max_lease_time"])
     relay = scope.get("relay_addresses")
     if relay:
         out["relay"] = {"ip-addresses": list(relay)}
@@ -397,7 +409,8 @@ def _subnet(subnet: dict[str, Any]) -> dict[str, Any]:
     pools = subnet.get("pools") or []
     if pools:
         out["pools"] = [
-            {"pool": p["pool"]} if isinstance(p, dict) else {"pool": str(p)} for p in pools
+            {"pool": p["pool"]} if isinstance(p, dict) else {"pool": str(p)}
+            for p in pools
         ]
     opts = _options_from_mapping(subnet.get("options"))
     if opts:
@@ -475,6 +488,12 @@ def _scope_to_subnet(scope: dict[str, Any]) -> dict[str, Any]:
         out["reservations"] = resv
     if scope.get("lease_time"):
         out["valid-lifetime"] = int(scope["lease_time"])
+    # #430 — honour the per-scope min/max lease bounds (Kea clamps the
+    # client-requested lease into [min, max]). Omitted → Kea defaults.
+    if scope.get("min_lease_time"):
+        out["min-valid-lifetime"] = int(scope["min_lease_time"])
+    if scope.get("max_lease_time"):
+        out["max-valid-lifetime"] = int(scope["max_lease_time"])
     # Relay-agent matching (issue #337) — Kea selects this subnet for
     # packets whose giaddr is one of these relay IPs. Required for
     # subnets not directly attached to a centralized server.
@@ -616,7 +635,9 @@ def render(
             "max-reclaim-time": 250,
             "unwarned-reclaim-cycles": 5,
         },
-        "valid-lifetime": int(bundle.get("global_options", {}).get("lease_time") or 3600),
+        "valid-lifetime": int(
+            bundle.get("global_options", {}).get("lease_time") or 3600
+        ),
         "renew-timer": 900,
         "rebind-timer": 1800,
         "hooks-libraries": [
