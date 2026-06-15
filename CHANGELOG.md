@@ -47,6 +47,14 @@ Batched fixes for the next cut (not yet released).
   soft-delete now revokes** the lease mirrors' DDNS A/PTR records + drops
   the transient mirror rows (they were orphaned on the DNS server before),
   with a warning in the delete-subnet modal. DDNS stays opt-in by design.
+  Also folds in the smaller audit findings: DDNS now consumes the
+  previously-dead ``ddns_ttl`` (stamps the record TTL) and
+  ``ddns_domain_override`` (publishes the forward record into the override
+  zone); an agentless Windows-DNS record whose synchronous apply *fails*
+  no longer leaves ``dns_record_id`` stamped (so DDNS retries instead of
+  permanently skipping it); and Windows-pull DDNS now wakes the agent
+  long-poll on commit so it converges immediately instead of on the safety
+  tick.
 
 * **#426 — Windows DNS/DHCP integration hardening (audit follow-up).** A
   full audit of the WinRM/PowerShell integration confirmed 19 defects;

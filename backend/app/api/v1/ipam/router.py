@@ -795,9 +795,14 @@ _dns_op_collector: contextvars.ContextVar[list[tuple[DNSZone, dict[str, Any]]] |
 
 async def _enqueue_dns_op(
     db: AsyncSession, zone: DNSZone, op: str, name: str, rtype: str, value: str, ttl: int | None
-) -> None:
+) -> Any:
     """Wrapper to enqueue a record op against the zone's primary server.
-    Imported lazily to avoid circular import."""
+    Imported lazily to avoid circular import.
+
+    Returns the ``DNSRecordOp`` (or None in batch mode / when nothing was
+    enqueued). For an agentless primary (Windows DNS) the op is applied
+    synchronously and its ``state`` is ``applied`` / ``failed`` on return —
+    callers use that to avoid stamping a record that didn't land (#428)."""
     from app.services.dns.record_ops import enqueue_record_op
     from app.services.dns.serial import bump_zone_serial
 
@@ -810,9 +815,9 @@ async def _enqueue_dns_op(
         # zone. The serial bump above still happens per op exactly as the
         # inline path does, so ``target_serial`` snapshots match.
         collector.append((zone, {"op": op, "record": record, "target_serial": target_serial}))
-        return
+        return None
 
-    await enqueue_record_op(db, zone, op, record, target_serial=target_serial)
+    return await enqueue_record_op(db, zone, op, record, target_serial=target_serial)
 
 
 async def _flush_dns_op_collector(
@@ -961,12 +966,18 @@ async def _sync_dns_record(
     subnet: Subnet,
     zone_id: uuid.UUID | None = None,
     action: str = "create",  # create | update | delete
+    ttl: int | None = None,
 ) -> None:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
     Forward A goes in the subnet's DNS zone (or explicitly passed zone_id);
     reverse PTR goes in the matching `kind=reverse` zone. Both records are
     pushed to the agent via RFC 2136 dynamic update through the record_op queue.
+
+    ``ttl`` sets the record TTL on **newly created** records (the DDNS path
+    passes the subnet's effective ``ddns_ttl`` — #428); None inherits the
+    zone default. Updates preserve the existing TTL so a rename doesn't
+    churn it.
     """
     if action == "delete":
         result = await db.execute(
@@ -1143,24 +1154,32 @@ async def _sync_dns_record(
                     fqdn=target_fqdn,
                     record_type=forward_rtype,
                     value=str(ip.address),
+                    ttl=ttl,
                     auto_generated=True,
                     ip_address_id=ip.id,
                     created_by_user_id=ip.created_by_user_id,
                 )
                 db.add(new_rec)
                 await db.flush()
-                if desired_zone_id == effective_zone_id:
+                is_primary = desired_zone_id == effective_zone_id
+                if is_primary:
                     ip.dns_record_id = new_rec.id
                     ip.forward_zone_id = effective_zone_id
-                await _enqueue_dns_op(
+                op = await _enqueue_dns_op(
                     db,
                     target_zone,
                     "create",
                     ip.hostname,
                     forward_rtype,
                     str(ip.address),
-                    None,
+                    ttl,
                 )
+                # #428 — for an agentless (Windows DNS) primary the op
+                # applies synchronously; if it failed, don't leave
+                # dns_record_id stamped or DDNS idempotency never retries.
+                # Agent-based ops are 'pending' and self-heal via the bundle.
+                if is_primary and getattr(op, "state", None) == "failed":
+                    ip.dns_record_id = None
             elif existing.record_type != forward_rtype:
                 # Address family swap (v4↔v6) — delete the stale record
                 # in this zone and recreate with the new rtype.
@@ -1180,6 +1199,7 @@ async def _sync_dns_record(
                     fqdn=target_fqdn,
                     record_type=forward_rtype,
                     value=str(ip.address),
+                    ttl=ttl,
                     auto_generated=True,
                     ip_address_id=ip.id,
                     created_by_user_id=ip.created_by_user_id,
@@ -1196,7 +1216,7 @@ async def _sync_dns_record(
                     ip.hostname,
                     forward_rtype,
                     str(ip.address),
-                    None,
+                    ttl,
                 )
             else:
                 changed = existing.name != ip.hostname or existing.value != str(ip.address)
@@ -1251,13 +1271,14 @@ async def _sync_dns_record(
             fqdn=rev_pointer_full,
             record_type="PTR",
             value=ptr_value,
+            ttl=ttl,
             auto_generated=True,
             ip_address_id=ip.id,
             created_by_user_id=ip.created_by_user_id,
         )
         db.add(ptr_rec)
         ip.reverse_zone_id = rev_zone.id
-        await _enqueue_dns_op(db, rev_zone, "create", ptr_name, "PTR", ptr_value, None)
+        await _enqueue_dns_op(db, rev_zone, "create", ptr_name, "PTR", ptr_value, ttl)
     else:
         for record in existing_ptr:
             if record.zone_id != rev_zone.id:
@@ -1273,13 +1294,14 @@ async def _sync_dns_record(
                     fqdn=rev_pointer_full,
                     record_type="PTR",
                     value=ptr_value,
+                    ttl=ttl,
                     auto_generated=True,
                     ip_address_id=ip.id,
                     created_by_user_id=ip.created_by_user_id,
                 )
                 db.add(new_ptr)
                 ip.reverse_zone_id = rev_zone.id
-                await _enqueue_dns_op(db, rev_zone, "create", ptr_name, "PTR", ptr_value, None)
+                await _enqueue_dns_op(db, rev_zone, "create", ptr_name, "PTR", ptr_value, ttl)
             else:
                 changed = record.value != ptr_value or record.name != ptr_name
                 record.name = ptr_name
