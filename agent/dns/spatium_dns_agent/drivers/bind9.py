@@ -410,11 +410,28 @@ class Bind9Driver(DriverBase):
                     if md
                     else ""
                 )
+                # #430 — per-view query ACLs. When the control plane sets
+                # allow_query / allow_query_cache on a view, enforce it here;
+                # a null/empty value inherits the server-options allow-query.
+                aq = view.get("allow_query")
+                aq_line = (
+                    f"    allow-query {{ {'; '.join(str(c) for c in aq)}; }};\n"
+                    if aq
+                    else ""
+                )
+                aqc = view.get("allow_query_cache")
+                aqc_line = (
+                    f"    allow-query-cache {{ {'; '.join(str(c) for c in aqc)}; }};\n"
+                    if aqc
+                    else ""
+                )
                 conf += (
                     f'view "{vname}" {{\n'
                     f"    match-clients {{ {match_clients}; }};\n"
                     f"{md_line}"
                     f"    recursion {recursion_v};\n"
+                    f"{aq_line}"
+                    f"{aqc_line}"
                     f"{_indent(body)}"
                     f"}};\n"
                 )

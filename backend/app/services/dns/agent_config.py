@@ -96,7 +96,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     opts = opts_res.scalar_one_or_none()
 
     # Views
-    views_res = await db.execute(select(DNSView).where(DNSView.group_id == server.group_id))
+    views_res = await db.execute(
+        select(DNSView).where(DNSView.group_id == server.group_id)
+    )
     views = views_res.scalars().all()
     # Split-horizon (issue #24). When the group defines views, every zone is
     # rendered INSIDE a ``view { match-clients … }`` block and records are
@@ -114,7 +116,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     acls = acls_res.scalars().all()
 
     # Zones (+ records for primary only)
-    zones_res = await db.execute(select(DNSZone).where(DNSZone.group_id == server.group_id))
+    zones_res = await db.execute(
+        select(DNSZone).where(DNSZone.group_id == server.group_id)
+    )
     zones = zones_res.scalars().all()
 
     def _rec_dict(r: DNSRecord) -> dict[str, Any]:
@@ -174,13 +178,19 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         # files for serving — primary/secondary distinction matters for
         # accepting RFC 2136 updates, not for which server gets the data.
         rec_rows = list(
-            (await db.execute(select(DNSRecord).where(DNSRecord.zone_id == z.id))).scalars().all()
+            (await db.execute(select(DNSRecord).where(DNSRecord.zone_id == z.id)))
+            .scalars()
+            .all()
         )
 
         if not has_views:
             # Flat render — one zone copy, all records, no view (today's path).
             zone_payload.append(
-                {**base_zp, "view_name": None, "records": [_rec_dict(r) for r in rec_rows]}
+                {
+                    **base_zp,
+                    "view_name": None,
+                    "records": [_rec_dict(r) for r in rec_rows],
+                }
             )
             continue
 
@@ -206,7 +216,11 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
                 else rec_rows
             )
             zone_payload.append(
-                {**base_zp, "view_name": v.name, "records": [_rec_dict(r) for r in recs]}
+                {
+                    **base_zp,
+                    "view_name": v.name,
+                    "records": [_rec_dict(r) for r in recs],
+                }
             )
 
     # Pending record ops — every agent-based server in the group
@@ -295,7 +309,11 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # auto-generated single key on DNSServerGroup. Both kinds end up in
     # the same `key { … };` block via the named.conf template.
     op_keys = (
-        (await db.execute(select(DNSTSIGKey).where(DNSTSIGKey.group_id == server.group_id)))
+        (
+            await db.execute(
+                select(DNSTSIGKey).where(DNSTSIGKey.group_id == server.group_id)
+            )
+        )
         .scalars()
         .all()
     )
@@ -313,15 +331,21 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "forwarders": getattr(opts, "forwarders", []) if opts else [],
         "forward_policy": getattr(opts, "forward_policy", "first") if opts else "first",
         "recursion_enabled": getattr(opts, "recursion_enabled", True) if opts else True,
-        "dnssec_validation": (getattr(opts, "dnssec_validation", "auto") if opts else "auto"),
+        "dnssec_validation": (
+            getattr(opts, "dnssec_validation", "auto") if opts else "auto"
+        ),
         "allow_query": getattr(opts, "allow_query", ["any"]) if opts else ["any"],
-        "allow_transfer": (getattr(opts, "allow_transfer", ["none"]) if opts else ["none"]),
+        "allow_transfer": (
+            getattr(opts, "allow_transfer", ["none"]) if opts else ["none"]
+        ),
         # Query logging — surfaced to BIND9's named.conf via template
         # render and to PowerDNS's pdns.conf via the agent's
         # ``_render_conf``. Keep ``query_log_enabled`` in the
         # structural fingerprint so toggling it in the UI reliably
         # triggers a daemon reload.
-        "query_log_enabled": (bool(getattr(opts, "query_log_enabled", False)) if opts else False),
+        "query_log_enabled": (
+            bool(getattr(opts, "query_log_enabled", False)) if opts else False
+        ),
     }
     views_block = [
         {
@@ -331,6 +355,12 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             "match_destinations": getattr(v, "match_destinations", []) or [],
             "recursion": bool(getattr(v, "recursion", True)),
             "order": getattr(v, "order", 0),
+            # #430 — per-view query ACL overrides. None → inherit the
+            # server-options allow-query (the agent renderer omits the line).
+            # Carried in views_block, which is part of the structural
+            # fingerprint, so editing a view ACL re-renders named.conf.
+            "allow_query": getattr(v, "allow_query", None),
+            "allow_query_cache": getattr(v, "allow_query_cache", None),
         }
         # Ordered low→high so the rendered view blocks honour BIND's
         # first-match-wins precedence (issue #24).
@@ -375,7 +405,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             # Members are every primary zone in the group. Forward / stub
             # zones don't belong in a catalog (they're lookups, not
             # served data); secondaries are the consumer's responsibility.
-            member_names = sorted(z.name for z in zones if z.zone_type in ("primary", "master"))
+            member_names = sorted(
+                z.name for z in zones if z.zone_type in ("primary", "master")
+            )
             if server.id == producer.id:
                 catalog_block = {
                     "mode": "producer",
@@ -520,7 +552,8 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         # shifts the structural etag and triggers a full, view-correct
         # re-render. ``view_name`` is always retained either way.
         "zones_structural": [
-            {k: val for k, val in z.items() if (k != "records" or has_views)} for z in zone_payload
+            {k: val for k, val in z.items() if (k != "records" or has_views)}
+            for z in zone_payload
         ],
         # DNSSEC signing intent / policy params rewrite named.conf, so a
         # change must trigger a full reload (issue #49).
