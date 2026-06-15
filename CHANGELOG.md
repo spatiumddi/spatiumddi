@@ -26,6 +26,52 @@ Batched fixes for the next cut (not yet released).
 
 ### Fixed
 
+* **#430 — DDI hardening sweep: integration-mirror mass-delete on
+  degraded reads + agent wire-contract + ConfigBundle/wake gaps.** A
+  three-area audit (integration mirrors, agent↔control-plane wire
+  contracts, ConfigBundle ETag + wake coverage) surfaced one systemic
+  data-loss class plus a batch of wire/lifecycle gaps. **Systemic
+  (highest value):** every read-only integration mirror (Kubernetes,
+  Docker, Proxmox, Cloud AWS/Azure/GCP, UniFi, OPNsense, Tailscale)
+  could **mass-delete the entire mirror on a degraded read** — a 200
+  with a wrong-shape body (proxy/auth error page, envelope change,
+  ``data: null``) or a partial multi-scope pull collapsed to "zero
+  items", and the unconditional absence-delete pass purged every
+  mirrored IPAM/DNS row while reporting ``ok=True``. UniFi was the
+  worst: a routine ``stat/sta`` 429 on one site mass-deleted that
+  site's subnets + client addresses. Fixed in two layers — a shared
+  shape guard (``app/services/_mirror_shape.py``) makes each client
+  **raise** its typed error on a wrong-shape 200 (a legitimately-empty
+  upstream like ``{"items": []}`` still returns ``[]``), and the
+  reconcilers now **skip the absence-delete pass on a partial pull**
+  (cloud connectors record ``failed_scopes`` + the reconciler upserts
+  but doesn't delete + records the partial pull in ``last_sync_error``;
+  UniFi aborts the whole reconcile on a per-site fetch failure like the
+  Proxmox per-node pattern). **Agent wire-contract / bundle fixes:**
+  DNS per-zone TTL was pinned to a constant 3600 (a ``default_ttl``
+  getattr typo — the column is ``ttl``) so editing a zone's TTL never
+  re-rendered; DNS per-server convergence (the ZoneSyncPill) never
+  reported because the bundle shipped no per-zone serial, so the agent
+  skipped every zone; DHCP static reservations dropped ``client_id`` +
+  ``options_override`` on the wire (a client-id-keyed reservation
+  silently fell back to MAC); DHCP scope ``min/max_lease_time`` were
+  settable + in the ETag but never reached the agent (now rendered as
+  Kea ``min/max-valid-lifetime``); and a DNS **view's
+  ``allow_query`` / ``allow_query_cache`` ACL** round-tripped through
+  the API but was never carried in the bundle or emitted by the BIND9
+  renderer, so a view-scoped query ACL silently never took effect.
+  **Wake / hardening:** the appliance fleet-firewall master switch
+  (``PUT /enforcement``) and mgmt-UI CIDR lock (``PUT /web-ui-access``)
+  published no agent wake, so security changes converged only when the
+  parked heartbeat hold timed out (≤28 s) — they now wake immediately;
+  DHCP server create/delete now wake the group (an HA-membership change
+  re-renders peers); the DHCP lease shipper caps its pending buffer
+  (was unbounded on a persistent reject); and the DNS heartbeat model
+  gains ``extra="forbid"`` + a bounded ``ops_ack`` so a wrong-envelope
+  ACK batch 422s loudly instead of silently clearing the agent's ACK
+  queue. The supervisor's ``lldpd_running`` (shipped every heartbeat
+  since #347 but silently dropped) is now persisted.
+
 * **#428 — DHCP↔IPAM↔DNS replication gaps (Kea push dead + cleanup
   holes).** A replication audit found the **Kea lease-event push was a
   silent no-op**: the agent shipped ``{"events":[{"ip","mac"}]}`` but the
@@ -134,6 +180,21 @@ Batched fixes for the next cut (not yet released).
   operator can clear + re-apply from the Fleet drilldown. The drilldown
   also shows a "looks stuck — check the host or re-apply" hint if an
   apply sits in-flight past ~6 min.
+
+### Migrations
+
+* **#430 — ``appliance.lldpd_running``** (``a3f7c1e84d59``). Adds a
+  nullable Boolean column persisting the supervisor's LLDP daemon
+  up/down status (companion to the already-wired ``lldp_neighbours``
+  set). Additive + nullable; no backfill.
+
+### Deprecated
+
+* **#430 — DNS heartbeat ``zone_serials``.** Serial convergence is
+  reported via the dedicated ``/dns/agents/zone-state`` endpoint; the
+  current agent no longer sends ``zone_serials`` in its heartbeat. The
+  field is retained (default ``{}``) on the request model so pre-#430
+  agents still validate under the new ``extra="forbid"``.
 
 ---
 
