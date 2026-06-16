@@ -15,14 +15,11 @@ from __future__ import annotations
 
 import uuid
 
-import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.acme_client import ACMEHTTPChallenge
-
-logger = structlog.get_logger(__name__)
 
 
 async def publish(
