@@ -772,3 +772,31 @@ class PlatformSettings(Base):
     dhcp_relay_vip: Mapped[str] = mapped_column(
         String(64), nullable=False, default="", server_default=sa_text("''")
     )
+
+    # ── Embedded ACME client — Let's Encrypt for the Web UI (issue #438) ─
+    # SpatiumDDI acting as an ACME client against a public CA to issue a
+    # CA-trusted TLS cert for the appliance Web UI, solving DNS-01 through
+    # its own managed DNS zones. The issued cert lands in the existing
+    # ``ApplianceCertificate`` storage with ``source="letsencrypt"``.
+    # ``acme_enabled`` gates issuance and is enforced by ``POST /issue``:
+    # configuring an ACME account (``PUT /account``) flips it True (the
+    # operator's explicit opt-in), DELETE clears it. The
+    # ``security.certificates`` feature module is the separate discovery
+    # toggle. ``acme_auto_renew`` is the seam for the deferred renewal
+    # beat task (not yet consumed in Phase 1). ``acme_challenge_type`` /
+    # ``acme_dns_provider`` / ``acme_domains`` are populated by
+    # ``POST /issue`` to record the desired issuance shape for that
+    # Phase-2 renewal task to read.
+    acme_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    acme_auto_renew: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+    acme_challenge_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="dns-01", server_default=sa_text("'dns-01'")
+    )
+    acme_dns_provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    acme_domains: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )

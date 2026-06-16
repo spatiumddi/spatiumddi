@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from app.api.acme_well_known import router as acme_well_known_router
 from app.api.health import router as health_router
 from app.api.v1.router import api_v1_router
 from app.config import settings
@@ -599,6 +600,9 @@ def create_app() -> FastAPI:
 
     # Routes
     app.include_router(health_router)
+    # Unauthenticated ACME http-01 well-known endpoint (issue #438 Phase 4),
+    # mounted at root so the public CA can fetch it anonymously.
+    app.include_router(acme_well_known_router)
     app.include_router(api_v1_router, prefix="/api/v1")
 
     if settings.prometheus_metrics_enabled:

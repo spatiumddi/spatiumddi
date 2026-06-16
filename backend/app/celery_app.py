@@ -54,6 +54,7 @@ celery_app = Celery(
         "app.tasks.audit_chain_verify",
         "app.tasks.upgrade_orchestrator",
         "app.tasks.time_bound_grant_sweep",
+        "app.tasks.acme",
     ],
 )
 
@@ -110,6 +111,7 @@ celery_app.conf.update(
         "app.tasks.ai_digest.*": {"queue": "default"},
         "app.tasks.audit_chain_verify.*": {"queue": "default"},
         "app.tasks.time_bound_grant_sweep.*": {"queue": "default"},
+        "app.tasks.acme.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60 s, mark DNS agents as ``unreachable`` if their
@@ -290,6 +292,13 @@ celery_app.conf.update(
         "dhcp-lease-history-prune": {
             "task": "app.tasks.dhcp_lease_history_prune.prune_lease_history",
             "schedule": crontab(hour=3, minute=15),
+        },
+        # Every 12 h, re-issue active Let's Encrypt Web-UI certs that are
+        # within 30 d of expiry (issue #438 Phase 2). Idempotent +
+        # advisory-locked; gated on acme_enabled + acme_auto_renew.
+        "acme-renew-due": {
+            "task": "app.tasks.acme.renew_due_certificates",
+            "schedule": schedule(run_every=12 * 3600.0),
         },
         # Once a day, check GitHub for the latest release tag. Gated
         # on ``PlatformSettings.github_release_check_enabled`` — so

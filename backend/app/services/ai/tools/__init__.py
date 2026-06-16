@@ -14,6 +14,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     auth_grants,
     backup,
     bgp,
+    certificates,
     conformity,
     copilot,
     dhcp,

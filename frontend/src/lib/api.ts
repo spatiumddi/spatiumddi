@@ -8033,6 +8033,144 @@ export const applianceTlsApi = {
     api.delete<void>(`/appliance/tls/${id}`).then((r) => r.data),
 };
 
+// ── Appliance: embedded ACME client — Let's Encrypt (issue #438) ───
+//
+// Mounted at /api/v1/appliance/acme behind the "security.certificates"
+// feature module (the whole surface 404s when the module is off).
+// SpatiumDDI acts as an RFC 8555 ACME client against a public CA
+// (Let's Encrypt), solving the DNS-01 challenge through its OWN managed
+// DNS zones, and lands the issued chain in the existing
+// ApplianceCertificate storage with source="letsencrypt".
+//
+// dns-01 (Phase 1/3) solves over SpatiumDDI-managed zones, cloud-hosted
+// zones (Cloudflare / Route53 / Azure / Google via the agentless drivers),
+// or — with allow_manual — an operator-pasted TXT for an unmanaged domain.
+// http-01 (Phase 4) is supported (frontend nginx proxies the challenge to
+// the api). tls-alpn-01 (Phase 5) is NOT supported on the nginx/k3s
+// topology — POST /issue 422s for it and the UI marks it disabled.
+// Active LE certs auto-renew ~30d before expiry (Phase 2 Celery task).
+//
+// Secret material (account key, EAB HMAC) NEVER comes back over the
+// wire — the account summary exposes only an ``eab_hmac_set`` boolean.
+export type AcmeChallengeType = "dns-01" | "http-01" | "tls-alpn-01";
+
+export type AcmeOrderStatus = "pending" | "processing" | "valid" | "invalid";
+
+export interface AcmeAccountConfig {
+  id: string;
+  directory_url: string;
+  account_url: string | null;
+  email: string | null;
+  eab_kid: string | null;
+  // Boolean presence flag only — the HMAC itself never leaves the server.
+  eab_hmac_set: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface AcmeAccountUpsert {
+  directory_url: string;
+  email?: string | null;
+  eab_kid?: string | null;
+  // Write-only — supply to set/replace, omit to leave unchanged.
+  eab_hmac_b64?: string | null;
+}
+
+// Per-domain solvability report (POST /preview, dns-01 only). When
+// ``managed`` the challenge is solved automatically (SpatiumDDI-managed
+// zone or a cloud driver named in ``driver``); otherwise the operator
+// must add the TXT by hand (allow_manual on the order).
+export interface ACMEDomainResolution {
+  domain: string;
+  challenge_fqdn: string;
+  managed: boolean;
+  zone_name: string | null;
+  record_name: string | null;
+  driver: string | null;
+}
+
+// A manual TXT the operator must publish for an allow_manual order to
+// converge. The order sits in "processing" until each record_name's
+// txt_value is visible in public DNS.
+export interface AcmeManualChallenge {
+  fqdn: string;
+  record_name: string;
+  txt_value: string;
+}
+
+export interface AcmeOrder {
+  id: string;
+  domains: string[];
+  challenge_type: string;
+  dns_provider: string | null;
+  status: AcmeOrderStatus;
+  order_url: string | null;
+  finalize_url: string | null;
+  // Set to the new ApplianceCertificate (source="letsencrypt") row on
+  // a valid order.
+  certificate_id: string | null;
+  last_error: string | null;
+  // True when the operator opted into solving unmanaged domains by hand.
+  allow_manual: boolean;
+  // Populated while a manual order is "processing" — the TXT records the
+  // operator must add. Empty for fully-managed orders.
+  manual_challenges: AcmeManualChallenge[];
+  created_at: string;
+  modified_at: string;
+}
+
+export interface AcmeIssueRequest {
+  domains: string[];
+  challenge_type?: AcmeChallengeType;
+  dns_provider?: string | null;
+  // dns-01 only — let an unmanaged domain be solved by an operator-pasted
+  // TXT (the order goes "processing" with manual_challenges populated).
+  allow_manual?: boolean;
+}
+
+// Well-known Let's Encrypt directory endpoints surfaced as form
+// presets — operators rarely type these by hand.
+export const ACME_DIRECTORY_PRESETS: { label: string; url: string }[] = [
+  {
+    label: "Let's Encrypt (production)",
+    url: "https://acme-v02.api.letsencrypt.org/directory",
+  },
+  {
+    label: "Let's Encrypt (staging)",
+    url: "https://acme-staging-v02.api.letsencrypt.org/directory",
+  },
+];
+
+export const applianceAcmeApi = {
+  // null (not 404) when no account is configured — gate the Issue
+  // button on a configured account.
+  getAccount: () =>
+    api
+      .get<AcmeAccountConfig | null>("/appliance/acme/account")
+      .then((r) => r.data),
+  setAccount: (body: AcmeAccountUpsert) =>
+    api
+      .put<AcmeAccountConfig>("/appliance/acme/account", body)
+      .then((r) => r.data),
+  deleteAccount: () =>
+    api.delete<void>("/appliance/acme/account").then((r) => r.data),
+  // dns-01 solvability check — per-domain managed(auto)/manual + driver.
+  preview: (domains: string[]) =>
+    api
+      .post<ACMEDomainResolution[]>("/appliance/acme/preview", { domains })
+      .then((r) => r.data),
+  issue: (body: AcmeIssueRequest) =>
+    api.post<AcmeOrder>("/appliance/acme/issue", body).then((r) => r.data),
+  listOrders: () =>
+    api.get<AcmeOrder[]>("/appliance/acme/orders").then((r) => r.data),
+  getOrder: (id: string) =>
+    api.get<AcmeOrder>(`/appliance/acme/orders/${id}`).then((r) => r.data),
+  cancelOrder: (id: string) =>
+    api
+      .post<AcmeOrder>(`/appliance/acme/orders/${id}/cancel`)
+      .then((r) => r.data),
+};
+
 // ── Appliance: release management (Phase 4c) ───────────────────────
 export interface ApplianceRelease {
   tag: string;

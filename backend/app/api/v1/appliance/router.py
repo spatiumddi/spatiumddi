@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.api.deps import DB
+from app.api.v1.appliance.acme import router as acme_router
 from app.api.v1.appliance.cluster import router as cluster_router
 from app.api.v1.appliance.containers import router as containers_router
 from app.api.v1.appliance.diagnostics import router as diagnostics_router
@@ -41,6 +42,7 @@ from app.api.v1.appliance.upgrade_images import router as upgrade_images_router
 from app.config import settings
 from app.core.permissions import require_permission
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
+from app.services.feature_modules import require_module
 
 router = APIRouter()
 
@@ -48,6 +50,14 @@ router = APIRouter()
 # file lands. Prefixes are scoped under the appliance namespace so
 # the URL stays /api/v1/appliance/<surface>/...
 router.include_router(tls_router, prefix="/tls")
+# #438 — embedded ACME client (Let's Encrypt via DNS-01). Gated behind
+# the ``security.certificates`` feature module (404 when off) on top of
+# the appliance read/admin permission gates on each route.
+router.include_router(
+    acme_router,
+    prefix="/acme",
+    dependencies=[Depends(require_module("security.certificates"))],
+)
 router.include_router(releases_router, prefix="/releases")
 router.include_router(slot_router, prefix="/slot-upgrade")
 # Upgrade-image management (#199 — renamed from slot-images): upload /
