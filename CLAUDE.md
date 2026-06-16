@@ -359,7 +359,7 @@ suggestion, free-space treemap.
 - ⬜ [**Time-travel queries**](https://github.com/spatiumddi/spatiumddi/issues/56)
 - ⬜ [**Maintenance mode**](https://github.com/spatiumddi/spatiumddi/issues/57)
 - ⬜ [**Built-in network tools page**](https://github.com/spatiumddi/spatiumddi/issues/58)
-- ⬜ [**PCAP capture trigger**](https://github.com/spatiumddi/spatiumddi/issues/59)
+- ✅ [**PCAP capture trigger**](https://github.com/spatiumddi/spatiumddi/issues/59) — shipped `2026.06.15-1`: on-demand tcpdump as an RBAC-gated/audited Tools page, both server-container and appliance-host (real-NIC) vantages, keep-partial-on-Stop, `.pcap` download, 4 Operator Copilot tools.
 - ⬜ [**ACL / prefix-list generator**](https://github.com/spatiumddi/spatiumddi/issues/60)
 - ⬜ [**Config-drift report (full record diff)**](https://github.com/spatiumddi/spatiumddi/issues/61)
 

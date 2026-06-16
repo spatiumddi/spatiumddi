@@ -22,7 +22,26 @@ the formatter handles the rest.
 
 ## Unreleased
 
-Batched fixes for the next cut (not yet released).
+_Nothing yet — the next cut starts here._
+
+---
+
+## 2026.06.15-1 — 2026-06-15
+
+A **troubleshooting + hardening** release. The headline is **#59 —
+on-demand packet capture (tcpdump)**: a first-class, RBAC-gated, audited
+Tools page that captures on the control-plane container *or* an
+appliance's real host NICs (picked from a supervisor-reported interface
+dropdown), watches live progress, keeps whatever was captured when you
+press Stop, and downloads the ``.pcap`` for Wireshark — plus four
+Operator Copilot tools. Riding along: a DDI replication + Windows-
+integration hardening sweep (#426 / #428 / #430) that closes a systemic
+integration-mirror mass-delete class and a dead Kea lease-push, SRV/MX
+record-form fixes (#424), slot-upgrade robustness (#419 / #421), a 4-way
+CI shard that cuts the backend-test job from ~18 min to ~5 min, and
+security bumps for two flagged frontend transitive deps (form-data,
+js-yaml). The only schema changes are the additive
+``appliance.host_interfaces`` and ``appliance.lldpd_running`` columns.
 
 ### Added
 
@@ -55,9 +74,28 @@ Batched fixes for the next cut (not yet released).
   existing trigger-file → systemd ``.path`` pattern (tcpdump runs in the
   real host net namespace — NOT a privileged ``hostNetwork`` pod), streams
   progress, and uploads the finished ``.pcap`` back over the supervisor
-  channel. On a single-node appliance the api + worker share the pcap dir
-  via a hostPath; multi-node server-vantage download needs the slot-image
-  mirror proxy (a tracked follow-up).
+  channel. The appliance-vantage interface is a **dropdown of the host's
+  real NICs** — the supervisor enumerates them from ``/run/udev/data`` and
+  reports them on its heartbeat (persisted to ``appliance.host_interfaces``),
+  so the operator picks ``ens18`` instead of guessing — with an *Other…*
+  free-text escape hatch for NICs udev didn't name (bridges / overlay /
+  VPN). Pressing **Stop** now **keeps the packets captured so far**
+  (tcpdump flushes a valid savefile on SIGTERM) and offers the download
+  right there, no trip to History. On a single-node appliance the api +
+  worker share the pcap dir via a hostPath; multi-node server-vantage
+  download needs the slot-image mirror proxy (a tracked follow-up).
+
+### Changed
+
+* **#435 — backend-test CI sharded 4-way.** The ~1,900-test suite is
+  DB-bound (per-test connection churn) and ran with only 4-way
+  parallelism on a single runner (~18 min). It now fans out across four
+  concurrent runners via ``pytest-split`` (each still ``-n auto``), with a
+  small aggregator job that preserves the required ``Backend — Tests``
+  check name so branch protection is unchanged — wall-clock ~18 min →
+  ~5 min. Coverage is dropped from the PR gate (it was a non-gating
+  ``continue-on-error`` upload that added ~15-30% tracing overhead on
+  every run; it can return as a nightly/main-only job).
 
 ### Fixed
 
@@ -216,8 +254,22 @@ Batched fixes for the next cut (not yet released).
   also shows a "looks stuck — check the host or re-apply" hint if an
   apply sits in-flight past ~6 min.
 
+### Security
+
+* **Frontend transitive dependency bumps (Dependabot #18 / #19).**
+  ``form-data`` 4.0.5 → 4.0.6 (GHSA-hmw2-7cc7-3qxx — CRLF injection via
+  unescaped multipart field names/filenames, **high**) and ``js-yaml``
+  4.1.1 → 4.2.0 (GHSA-h67p-54hq-rp68 — quadratic-complexity DoS in
+  merge-key handling, moderate). Both are transitive (pulled by build/
+  test tooling), so the change is ``package-lock.json``-only; ``npm
+  audit`` reports zero vulnerabilities after the bump.
+
 ### Migrations
 
+* **#59 — ``appliance.host_interfaces``** (``c3a1f9d24b80``). Adds a
+  nullable JSONB column holding the host NICs the supervisor enumerates
+  (for the appliance-vantage packet-capture interface picker). Additive +
+  nullable; no backfill.
 * **#430 — ``appliance.lldpd_running``** (``a3f7c1e84d59``). Adds a
   nullable Boolean column persisting the supervisor's LLDP daemon
   up/down status (companion to the already-wired ``lldp_neighbours``
