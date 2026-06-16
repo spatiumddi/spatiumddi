@@ -49,6 +49,26 @@ function isTerminal(s: PcapCaptureRead): boolean {
   );
 }
 
+// "Settled" = terminal AND the artifact question is resolved. A Stop
+// flips status to `cancelled` immediately, but the partial .pcap lands a
+// moment later (the server vantage finalizes after SIGTERM; the appliance
+// vantage relays the upload through the supervisor). So for a cancel we
+// keep waiting until has_artifact is true OR a grace window passes — that
+// way the Download button appears right at Stop instead of looking absent.
+const CANCEL_ARTIFACT_GRACE_MS = 20000;
+
+function isSettled(s: PcapCaptureRead): boolean {
+  if (!isTerminal(s)) return false; // queued / running
+  // Terminal: a Stopped capture with no artifact yet is still finalizing —
+  // wait out the grace window for the partial to land. Everything else
+  // (completed, failed, cancelled-with-artifact) is fully settled.
+  if (s.status === "cancelled" && !s.has_artifact) {
+    const fin = s.finished_at ? Date.parse(s.finished_at) : 0;
+    return fin > 0 && Date.now() - fin > CANCEL_ARTIFACT_GRACE_MS;
+  }
+  return true;
+}
+
 export function PacketCapturePage() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [displayId, setDisplayId] = useState<string | null>(null);
@@ -187,6 +207,10 @@ function CaptureForm({
   // vantage select value: "server" or an appliance UUID.
   const [vantage, setVantage] = useState<string>(initialVantage);
   const [iface, setIface] = useState<string>("any");
+  // When the operator picks "Other…" in the interface dropdown, fall back to
+  // a free-text field — udev doesn't name every host NIC (bridges, overlay /
+  // VPN interfaces), and the host runner validates whatever name is typed.
+  const [customIface, setCustomIface] = useState(false);
   const [filter, setFilter] = useState("");
   const [durationS, setDurationS] = useState<number | "">(60);
   const [maxPackets, setMaxPackets] = useState<number | "">(10000);
@@ -202,13 +226,22 @@ function CaptureForm({
   });
   const approved = (appliances ?? []).filter((a) => a.state === "approved");
 
-  // Server vantage enumerates the worker's NICs; appliance vantage can't
-  // (the control plane can't see the host's NICs) so the operator types it.
+  // Both vantages enumerate NICs now: server lists the worker's own
+  // container NICs; appliance lists the host's real NICs (ens18, …) that
+  // the supervisor reported via heartbeat. Re-runs when the picked
+  // appliance changes so the dropdown matches that host.
   const { data: ifaces } = useQuery({
-    enabled: !isAppliance,
-    queryKey: ["pcap-interfaces", "server"],
-    queryFn: () => pcapApi.listInterfaces("server"),
+    queryKey: [
+      "pcap-interfaces",
+      isAppliance ? `appliance:${vantage}` : "server",
+    ],
+    queryFn: () =>
+      pcapApi.listInterfaces(
+        isAppliance ? "appliance" : "server",
+        isAppliance ? vantage : undefined,
+      ),
   });
+  const ifaceList = ifaces?.interfaces ?? [];
 
   const start = useMutation({
     mutationFn: (body: PcapCaptureCreate) => pcapApi.createCapture(body),
@@ -259,7 +292,8 @@ function CaptureForm({
           value={vantage}
           onChange={(e) => {
             setVantage(e.target.value);
-            setIface("any"); // reset — server enumerates, appliance is free-text
+            setIface("any"); // reset — interface list is per-vantage
+            setCustomIface(false);
           }}
           className="w-full rounded-md border bg-background px-2 py-1.5 text-sm"
         >
@@ -274,39 +308,50 @@ function CaptureForm({
 
       <div>
         <label className="mb-1 block text-xs font-medium">Interface</label>
-        {isAppliance ? (
-          <>
-            <input
-              type="text"
-              value={iface}
-              onChange={(e) => setIface(e.target.value)}
-              placeholder="e.g. eth0, bond0, any"
-              className="w-full rounded-md border bg-background px-2 py-1.5 font-mono text-sm"
-            />
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              The appliance host's real NIC — validated against the host when
-              the capture runs. "any" includes all host traffic.
-            </p>
-          </>
-        ) : (
-          <>
-            <select
-              value={iface}
-              onChange={(e) => setIface(e.target.value)}
-              className="w-full rounded-md border bg-background px-2 py-1.5 text-sm"
-            >
-              {(ifaces?.interfaces ?? ["any"]).map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
-            </select>
-            {ifaces?.note && (
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                {ifaces.note}
-              </p>
+        {ifaceList.length > 0 && (
+          <select
+            value={customIface ? "__other__" : iface}
+            onChange={(e) => {
+              if (e.target.value === "__other__") {
+                setCustomIface(true);
+              } else {
+                setCustomIface(false);
+                setIface(e.target.value);
+              }
+            }}
+            className="w-full rounded-md border bg-background px-2 py-1.5 text-sm"
+          >
+            {(customIface || ifaceList.includes(iface)
+              ? ifaceList
+              : [iface, ...ifaceList]
+            ).map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+            <option value="__other__">Other — type a NIC name…</option>
+          </select>
+        )}
+        {(customIface || ifaceList.length === 0) && (
+          // "Other…" picked, or the appliance hasn't reported NICs yet — let
+          // the operator type any NIC (bridges / overlay / VPN that udev
+          // didn't name). The host runner validates it against /sys/class/net.
+          <input
+            type="text"
+            value={iface}
+            onChange={(e) => setIface(e.target.value)}
+            placeholder="e.g. br0, vmbr0, tailscale0, any"
+            className={cn(
+              "w-full rounded-md border bg-background px-2 py-1.5 font-mono text-sm",
+              ifaceList.length > 0 && "mt-1",
             )}
-          </>
+            autoFocus={customIface}
+          />
+        )}
+        {ifaces?.note && (
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {ifaces.note}
+          </p>
         )}
       </div>
 
@@ -466,17 +511,21 @@ function LiveTab({
     enabled: !!captureId,
     queryKey: ["pcap-capture", captureId],
     queryFn: () => pcapApi.getCapture(captureId!),
+    // Keep polling until the artifact question is settled — not just
+    // until terminal — so a Stopped capture's partial .pcap shows up.
     refetchInterval: (q) =>
-      q.state.data && isTerminal(q.state.data) ? false : 1500,
+      q.state.data && isSettled(q.state.data) ? false : 1500,
   });
 
   useEffect(() => {
-    if (data && isTerminal(data)) {
+    // Only hand off to the Result tab once settled, so we never switch to
+    // a "no artifact" view a beat before the partial .pcap lands.
+    if (data && isSettled(data)) {
       qc.invalidateQueries({ queryKey: ["pcap-captures"] });
       onComplete(data.id);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data?.status]);
+  }, [data?.status, data?.has_artifact]);
 
   const cancel = useMutation({
     mutationFn: (id: string) => pcapApi.cancelCapture(id),
@@ -519,6 +568,18 @@ function LiveTab({
           <Trash2 className="h-3 w-3" /> Stop capture
         </button>
       )}
+      {/* After Stop, the partial .pcap lands a beat later (server finalizes
+          post-SIGTERM; appliance relays via the supervisor). Show a spinner
+          until it settles, then onComplete hands off to the Result tab which
+          owns the Download button + the no-artifact message. */}
+      {data.status === "cancelled" &&
+        !data.has_artifact &&
+        !isSettled(data) && (
+          <p className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <Loader2 className="h-3 w-3 animate-spin" />
+            Finalizing the captured packets…
+          </p>
+        )}
     </div>
   );
 }
@@ -539,6 +600,10 @@ function ResultTab({ captureId }: { captureId: string | null }) {
     enabled: !!captureId,
     queryKey: ["pcap-capture", captureId],
     queryFn: () => pcapApi.getCapture(captureId!),
+    // Keep refreshing until the artifact settles so a just-stopped
+    // capture's Download button appears without a manual refresh.
+    refetchInterval: (q) =>
+      q.state.data && isSettled(q.state.data) ? false : 2000,
   });
   const download = useMutation({
     mutationFn: (id: string) => pcapApi.downloadCapture(id),
@@ -596,8 +661,9 @@ function ResultTab({ captureId }: { captureId: string | null }) {
         </button>
       ) : (
         <p className="text-[11px] italic text-muted-foreground">
-          No downloadable artifact (capture produced no bytes, was cancelled, or
-          was pruned).
+          No downloadable artifact (capture produced no bytes, failed, or was
+          pruned). A stopped capture still downloads whatever was captured
+          before Stop.
         </p>
       )}
     </div>

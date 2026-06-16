@@ -122,31 +122,58 @@ async def finalize_capture(
 ) -> str:
     """Stamp the terminal state after the supervisor finishes.
 
-    Returns the final status. Cancel is terminal + idempotent: if the row
-    was cancelled while the capture was finishing, the uploaded bytes are
-    discarded by the caller and the row stays ``cancelled`` (a
-    late-completing capture never overwrites a cancel)."""
+    Returns the final status. Cancel is terminal — a late-completing
+    capture never flips a cancelled row back to ``completed``. But the
+    bytes captured *before* the operator pressed Stop are kept: tcpdump
+    flushes the savefile on SIGTERM, so a partial ``.pcap`` is valid and
+    stays downloadable (#59 follow-up). Only a failed/empty upload leaves
+    the row without an artifact."""
     row = await db.get(PacketCapture, capture_id)
     if row is None:
         return "missing"
-    row.finished_at = datetime.now(UTC)
-    if row.status == "cancelled":
-        # Caller unlinks the bytes; cancel wins.
-        return "cancelled"
+    # Preserve an existing finished_at — the cancel endpoint stamps it at
+    # Stop time, which is the true "when it stopped". The upload (and this
+    # finalize) can land seconds later via the supervisor relay; re-stamping
+    # to upload-time would push the UI's cancel→artifact grace window out.
+    if row.finished_at is None:
+        row.finished_at = datetime.now(UTC)
+    was_cancelled = row.status == "cancelled"
+
     if error:
+        # Failure finalize (no usable bytes). Record the metadata either way
+        # so a failed/empty row still carries its stop_reason for diagnostics.
+        row.metadata_json = {
+            **(metadata or {}),
+            "stop_reason": (metadata or {}).get("stop_reason", "error"),
+        }
+        # A prior cancel still wins — don't relabel a Stopped capture as failed.
+        if was_cancelled:
+            await db.commit()
+            return "cancelled"
         row.status = "failed"
         row.error_message = error[:500]
         await db.commit()
         return "failed"
-    row.status = "completed"
-    row.pcap_path = pcap_path
-    row.pcap_size_bytes = pcap_size_bytes
-    row.pcap_sha256 = pcap_sha256
-    if packet_count is not None:
-        row.packets_captured = packet_count
-    if pcap_size_bytes is not None:
+
+    # Success finalize — a (possibly partial, if Stopped early) savefile
+    # was uploaded. Record the artifact even when cancelled so the packets
+    # captured before Stop remain downloadable.
+    if pcap_path is not None and (pcap_size_bytes or 0) > 0:
+        row.pcap_path = pcap_path
+        row.pcap_size_bytes = pcap_size_bytes
+        row.pcap_sha256 = pcap_sha256
+        if packet_count is not None:
+            row.packets_captured = packet_count
         row.bytes_captured = pcap_size_bytes
-    row.metadata_json = metadata
+    row.metadata_json = {
+        **(metadata or {}),
+        "stop_reason": "cancelled" if was_cancelled else "completed",
+    }
+    if was_cancelled:
+        # Keep the partial; the row stays terminal-cancelled.
+        await db.commit()
+        return "cancelled"
+    row.status = "completed"
     await db.commit()
     return "completed"
 

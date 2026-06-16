@@ -265,6 +265,48 @@ async def test_download_streams_pcap_and_audits(
     assert any(a.action == "download" for a in rows)
 
 
+async def test_stopped_capture_keeps_partial_download(
+    client: AsyncClient, db_session: AsyncSession, tmp_path: Path
+) -> None:
+    """A capture the operator Stopped early still serves the bytes captured
+    before Stop (#59 follow-up): tcpdump flushes the savefile on SIGTERM, so
+    a cancelled row with a non-empty .pcap is a valid, downloadable artifact."""
+    _, token = await _superadmin(db_session)
+    f = tmp_path / "partial.pcap"
+    f.write_bytes(b"\xd4\xc3\xb2\xa1partialbytes")
+    cap = await _make_capture(
+        db_session,
+        status="cancelled",
+        pcap_path=str(f),
+        pcap_size_bytes=f.stat().st_size,
+        finished_at=datetime.now(UTC),
+    )
+    await db_session.commit()
+
+    # has_artifact is exposed on the read model so the UI shows Download.
+    detail = await client.get(f"/api/v1/pcap/captures/{cap.id}", headers=_hdr(token))
+    assert detail.status_code == 200
+    assert detail.json()["has_artifact"] is True
+
+    # And the bytes actually stream.
+    r = await client.get(f"/api/v1/pcap/captures/{cap.id}/download", headers=_hdr(token))
+    assert r.status_code == 200, r.text
+    assert r.content == b"\xd4\xc3\xb2\xa1partialbytes"
+
+
+async def test_cancelled_with_no_bytes_has_no_artifact(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A cancelled capture that never wrote bytes stays artifact-less."""
+    _, token = await _superadmin(db_session)
+    cap = await _make_capture(db_session, status="cancelled", pcap_size_bytes=0)
+    await db_session.commit()
+    detail = await client.get(f"/api/v1/pcap/captures/{cap.id}", headers=_hdr(token))
+    assert detail.json()["has_artifact"] is False
+    r = await client.get(f"/api/v1/pcap/captures/{cap.id}/download", headers=_hdr(token))
+    assert r.status_code == 404
+
+
 # ── interfaces ───────────────────────────────────────────────────────
 
 

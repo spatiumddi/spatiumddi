@@ -58,6 +58,53 @@ _UDEV_DATA = Path("/run/udev/data")
 
 _UUID_RE = re.compile(r"root=UUID=([0-9a-fA-F-]+)")
 
+# #59 — ephemeral / uninteresting net devices the operator would never
+# pick as a capture interface (pod veths, docker/cni internal, tunnels).
+_IFACE_SKIP_RE = re.compile(r"^(lo$|veth|vnet|docker|kube-|cali|tunl|nodelocaldns)")
+
+
+def host_network_interfaces() -> list[str]:
+    """Host NICs (e.g. ``ens18``, ``cni0``) for the appliance-vantage
+    packet-capture interface picker (#59).
+
+    The supervisor pod isn't ``hostNetwork``, so its own
+    ``/sys/class/net`` shows pod veths — NOT the host's real NICs. But
+    udev writes every host net device into ``/run/udev/data/n<ifindex>``
+    with an ``E:ID_NET_NAME=<name>`` line (``ID_NET_NAME_PATH`` as a
+    fallback), and ``/run/udev`` is already bind-mounted into the
+    supervisor — the same source the slot detector uses for block
+    devices. Ephemeral pod veths + loopback are filtered. Returns a
+    sorted, de-duplicated list; empty on non-appliance hosts or before
+    udev populates net entries (the caller only ships a non-empty list,
+    so a transient empty read never wipes the control plane's set).
+    """
+    names: set[str] = set()
+    try:
+        entries = list(_UDEV_DATA.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        # ``n<ifindex>`` files are network devices (``b…`` block, ``c…``
+        # char, ``+…`` subsystem tags are irrelevant here).
+        if not (entry.name.startswith("n") and entry.name[1:].isdigit()):
+            continue
+        try:
+            text = entry.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        name_exact: str | None = None
+        name_path: str | None = None
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("E:ID_NET_NAME="):
+                name_exact = line.split("=", 1)[1].strip()
+            elif line.startswith("E:ID_NET_NAME_PATH="):
+                name_path = line.split("=", 1)[1].strip()
+        name = name_exact or name_path
+        if name and not _IFACE_SKIP_RE.match(name):
+            names.add(name)
+    return sorted(names)
+
 
 def detect_runtime() -> str:
     """Issue #183 Phase 7 — the appliance is k3s-only.

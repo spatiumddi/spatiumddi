@@ -67,6 +67,22 @@ router = APIRouter(tags=["pcap"])
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+# A capture is downloadable once it has a real on-disk artifact — true for
+# a normally-completed capture AND for one the operator Stopped early
+# (#59 follow-up): tcpdump flushes the savefile on SIGTERM, so the packets
+# captured before Stop are a valid, downloadable ``.pcap``. A failed
+# capture never exposes a partial (its bytes are unreliable).
+_DOWNLOADABLE_STATUSES = ("completed", "cancelled")
+
+
+def _has_artifact(row: PacketCapture) -> bool:
+    return bool(
+        row.status in _DOWNLOADABLE_STATUSES
+        and row.pcap_path
+        and not row.artifact_missing
+        and (row.pcap_size_bytes or 0) > 0
+    )
+
 
 def _to_read(row: PacketCapture) -> PcapCaptureRead:
     return PcapCaptureRead(
@@ -92,12 +108,7 @@ def _to_read(row: PacketCapture) -> PcapCaptureRead:
         bytes_captured=row.bytes_captured,
         pcap_size_bytes=row.pcap_size_bytes,
         pcap_sha256=row.pcap_sha256,
-        has_artifact=bool(
-            row.status == "completed"
-            and row.pcap_path
-            and not row.artifact_missing
-            and (row.pcap_size_bytes or 0) > 0
-        ),
+        has_artifact=_has_artifact(row),
         metadata_json=row.metadata_json,
         created_by_user_id=row.created_by_user_id,
         created_at=row.created_at,
@@ -140,7 +151,7 @@ async def list_interfaces(
     db: DB,
     current_user: CurrentUser,  # noqa: ARG001 — gate handled by dep
     vantage: str = Query("server"),
-    appliance_id: uuid.UUID | None = Query(None),  # noqa: ARG001 — Phase 2
+    appliance_id: uuid.UUID | None = Query(None),
 ) -> PcapInterfacesResponse:
     if vantage == "server":
         return PcapInterfacesResponse(
@@ -151,12 +162,33 @@ async def list_interfaces(
             ),
         )
     if vantage == "appliance":
-        # Phase 2 dispatches a list-interfaces request to the supervisor,
-        # which answers from the host net namespace. Not yet available.
-        return PcapInterfacesResponse(
-            interfaces=[],
-            note="Appliance-host capture ships in a follow-up phase.",
-        )
+        # The supervisor enumerates the host's real NICs from
+        # /run/udev/data and reports them on every heartbeat; we surface
+        # that list so the operator picks (not guesses) the capture NIC.
+        if appliance_id is None:
+            return PcapInterfacesResponse(
+                interfaces=[],
+                note="Select an appliance to list its host network interfaces.",
+            )
+        appliance = await db.get(Appliance, appliance_id)
+        if appliance is None:
+            raise HTTPException(status_code=422, detail="appliance_id not found")
+        ifaces = [i for i in (appliance.host_interfaces or []) if i]
+        if ifaces:
+            if "any" not in ifaces:
+                ifaces = ["any", *ifaces]
+            note = (
+                "The appliance host's real NICs (reported by the supervisor). "
+                'Pick the LAN NIC to capture subnet traffic; "any" spans all '
+                "host interfaces."
+            )
+        else:
+            note = (
+                "No interfaces reported yet — the supervisor enumerates them on "
+                'its heartbeat (~30 s). Type a NIC name (e.g. eth0) or "any" '
+                "meanwhile."
+            )
+        return PcapInterfacesResponse(interfaces=ifaces, note=note)
     raise HTTPException(status_code=422, detail=f"unknown vantage: {vantage!r}")
 
 
@@ -413,7 +445,7 @@ async def download_capture(
     row = await db.get(PacketCapture, capture_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Capture not found")
-    if row.status != "completed":
+    if not _has_artifact(row):
         raise HTTPException(status_code=404, detail="Capture has no downloadable artifact yet")
     if not row.pcap_path or not Path(row.pcap_path).exists():
         raise HTTPException(
