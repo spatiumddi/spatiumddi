@@ -58,9 +58,19 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3 scripts/lint_migrations.py
 
-  backend-test:
-    name: Backend — Tests
+  # The ~1900-test suite is DB-bound, so we fan it out across 4 parallel
+  # jobs (free concurrent runners) via pytest-split; each job still runs
+  # ``-n auto`` (4 xdist workers on a 4-vCPU runner) → ~16-way parallelism
+  # total, taking the wall-clock from ~18 min to ~5 min. Coverage is no
+  # longer collected on the PR gate (it was a non-gating ``continue-on-error``
+  # upload anyway and added ~15-30% tracing overhead on every run).
+  backend-test-shard:
+    name: Backend — Tests (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     defaults:
       run:
         working-directory: backend
@@ -107,7 +117,7 @@ jobs:
           DATABASE_URL: postgresql+asyncpg://spatiumddi:test@localhost:5432/spatiumddi_test
         run: alembic upgrade head
 
-      - name: Run tests
+      - name: Run tests (shard ${{ matrix.shard }} of 4)
         env:
           DATABASE_URL: postgresql+asyncpg://spatiumddi:test@localhost:5432/spatiumddi_test
           # conftest reads its own TEST_DATABASE_URL (defaults to "changeme")
@@ -116,18 +126,29 @@ jobs:
           CELERY_BROKER_URL: redis://localhost:6379/1
           CELERY_RESULT_BACKEND: redis://localhost:6379/2
           SECRET_KEY: ci-test-secret-key-not-for-production
-        # ``-n auto`` runs one worker per CPU via pytest-xdist; each worker
-        # carves its own throwaway ``spatiumddi_test_gw<N>`` database in
-        # conftest so they can't trample each other's state. GitHub-hosted
-        # Linux runners are 4 vCPU, so this typically lands 4 workers.
-        run: python -m pytest -n auto --cov=app --cov-report=xml
+        # ``--splits 4 --group N`` (pytest-split) selects this shard's slice
+        # of the suite (even split by test count when no .test_durations file
+        # is present); ``-n auto`` then runs that slice across the runner's
+        # 4 vCPUs, each xdist worker on its own ``spatiumddi_test_gw<N>`` DB.
+        run: python -m pytest -n auto --splits 4 --group ${{ matrix.shard }}
 
-      - name: Upload coverage
-        uses: codecov/codecov-action@v4
-        with:
-          file: backend/coverage.xml
-          flags: backend
-        continue-on-error: true
+  # Required-status-check aggregator: branch protection gates on the stable
+  # name "Backend — Tests"; this job passes only if every shard did. Keep
+  # this name (and the shard count above) in sync with the required check.
+  backend-test:
+    name: Backend — Tests
+    runs-on: ubuntu-latest
+    needs: [backend-test-shard]
+    if: always()
+    steps:
+      - name: All shards passed
+        run: |
+          result="${{ needs.backend-test-shard.result }}"
+          if [ "$result" != "success" ]; then
+            echo "::error::backend test shards did not all pass (result=$result)"
+            exit 1
+          fi
+          echo "all 4 backend test shards passed"
 
   # ── Frontend ───────────────────────────────────────────────────────────────
   frontend-lint:
