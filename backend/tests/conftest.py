@@ -148,6 +148,32 @@ async def create_test_schema() -> AsyncGenerator[None, None]:
 
 
 @pytest_asyncio.fixture(autouse=True)
+async def _reset_global_caches() -> AsyncGenerator[None, None]:
+    """Reset the process-global short-TTL caches around every test.
+
+    System maintenance mode (``app.core.maintenance_mode``) and feature-
+    module enablement (``app.services.feature_modules``) are cached at
+    module level, keyed on a monotonic clock — NOT on the per-test DB. So
+    a test that flips maintenance mode on, or a feature module off, leaks
+    that state into later tests on the same xdist worker for up to the
+    cache TTL, regardless of the per-test TRUNCATE. That surfaced as flaky
+    503 / 404s once the suite was sharded across workers (#435): e.g. a
+    leaked maintenance-on cache 503'd an unrelated multicast POST whose
+    flush-but-not-committed superadmin the middleware's bypass session
+    couldn't see. Individual suites used to opt in to a local reset
+    fixture; doing it globally fixes the whole class.
+    """
+    from app.core import maintenance_mode
+    from app.services import feature_modules
+
+    maintenance_mode.invalidate_cache()
+    feature_modules.invalidate_cache()
+    yield
+    maintenance_mode.invalidate_cache()
+    feature_modules.invalidate_cache()
+
+
+@pytest_asyncio.fixture(autouse=True)
 async def _isolate_db() -> AsyncGenerator[None, None]:
     """Truncate every table after each test so state doesn't leak.
 

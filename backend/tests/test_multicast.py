@@ -20,19 +20,6 @@ from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.multicast import MulticastDomain, MulticastGroup, MulticastMembership
-from app.services import feature_modules
-
-
-@pytest.fixture(autouse=True)
-def _reset_module_cache() -> None:
-    # ``network.multicast`` is a gated feature module behind a process-global
-    # cache; ``test_disabled_module_returns_404`` flips it off. The per-test
-    # TRUNCATE clears the DB row, but NOT the cache — so without resetting it
-    # here the disabled state bleeds into other tests under sharded / parallel
-    # runs (KeyError 'id' on a 404). Mirror of test_pcap_appliance.py.
-    feature_modules.invalidate_cache()
-    yield
-    feature_modules.invalidate_cache()
 
 
 async def _make_admin(db: AsyncSession) -> tuple[User, str]:
