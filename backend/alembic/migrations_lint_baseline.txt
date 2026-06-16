@@ -124,6 +124,13 @@ backend/alembic/versions/a7c3e9f1b405_console_mode.py:drop_column:65
 backend/alembic/versions/a7e3c1f49d20_subnet_ip_discovery.py:drop_column:54
 backend/alembic/versions/a7e3c1f49d20_subnet_ip_discovery.py:drop_column:55
 backend/alembic/versions/a7e3c1f49d20_subnet_ip_discovery.py:drop_column:56
+backend/alembic/versions/a7f2c9e4d1b8_acme_client.py:drop_column:146
+backend/alembic/versions/a7f2c9e4d1b8_acme_client.py:drop_column:147
+backend/alembic/versions/a7f2c9e4d1b8_acme_client.py:drop_column:148
+backend/alembic/versions/a7f2c9e4d1b8_acme_client.py:drop_column:149
+backend/alembic/versions/a7f2c9e4d1b8_acme_client.py:drop_column:150
+backend/alembic/versions/a7f2c9e4d1b8_acme_client.py:drop_table:152
+backend/alembic/versions/a7f2c9e4d1b8_acme_client.py:drop_table:153
 backend/alembic/versions/a7f3c1e85d20_alert_rule_min_free_addresses.py:drop_column:29
 backend/alembic/versions/a8d2e91f5c47_appliance_variant.py:drop_column:38
 backend/alembic/versions/a8d31e6b2f47_ipv6_allocation_policy.py:drop_column:38
@@ -145,6 +152,8 @@ backend/alembic/versions/b1d4c9e57f02_appliance_id_fk_on_dns_dhcp_server.py:drop
 backend/alembic/versions/b2c84f7a91d3_unifi_integration.py:drop_column:168
 backend/alembic/versions/b2c84f7a91d3_unifi_integration.py:drop_column:171
 backend/alembic/versions/b2c84f7a91d3_unifi_integration.py:drop_table:173
+backend/alembic/versions/b2f5a9c41e07_acme_manual_dns.py:drop_column:55
+backend/alembic/versions/b2f5a9c41e07_acme_manual_dns.py:drop_column:56
 backend/alembic/versions/b2f7e91d3c48_dhcp_pull_interval_seconds.py:rename_column:34
 backend/alembic/versions/b2f7e91d3c48_dhcp_pull_interval_seconds.py:rename_column:54
 backend/alembic/versions/b3a82c0d4e95_appliance_k3s_kubeconfig.py:drop_column:43
@@ -219,6 +228,7 @@ backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_column:72
 backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_column:73
 backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_column:74
 backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_table:75
+backend/alembic/versions/c3d8a1f9e62b_acme_http_challenge.py:drop_table:56
 backend/alembic/versions/c3e8b57a2f14_unifi_router_link.py:drop_column:48
 backend/alembic/versions/c3e9a2b71f48_dns_server_runtime_state.py:drop_table:42
 backend/alembic/versions/c3f1a7e09d52_api_token_resource_grants.py:drop_column:33

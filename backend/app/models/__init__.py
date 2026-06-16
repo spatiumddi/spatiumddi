@@ -1,4 +1,5 @@
 from app.models.acme import ACMEAccount
+from app.models.acme_client import ACMEClientAccount, ACMEHTTPChallenge, ACMEOrder
 from app.models.ai import AIChatMessage, AIChatSession, AIProvider
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.appliance import (
@@ -113,6 +114,9 @@ from app.models.vrf import VRF
 
 __all__ = [
     "ACMEAccount",
+    "ACMEClientAccount",
+    "ACMEHTTPChallenge",
+    "ACMEOrder",
     "AIChatMessage",
     "AIChatSession",
     "AIProvider",

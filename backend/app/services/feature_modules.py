@@ -273,6 +273,18 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Appliance",
         description="Declarative per-role, fleet-wide appliance firewall policy compiled to nftables. DISCOVERY/STAGING only — enforcement is a separate master switch (Settings → firewall_enabled, default OFF). Enabling this module does NOT apply any firewall.",
     ),
+    # Security — embedded ACME client for the Web UI TLS cert (#438).
+    # Default-ENABLED deliberately: the module is the DISCOVERY toggle so
+    # operators see the "Issue via Let's Encrypt" affordance exists.
+    # Issuance itself is separately RBAC-gated (admin,appliance) AND
+    # gated on the operator's explicit ``platform_settings.acme_enabled``
+    # intent, so a default-on module does NOT auto-issue anything.
+    ModuleSpec(
+        id="security.certificates",
+        label="Certificates (ACME / Let's Encrypt)",
+        group="Security",
+        description="Embedded RFC 8555 ACME client that issues a CA-trusted Web UI TLS cert from Let's Encrypt, solving the DNS-01 challenge through SpatiumDDI's own managed DNS zones. Discovery toggle only — issuance is RBAC-gated and requires an explicit operator opt-in (Settings → acme_enabled).",
+    ),
 )
 
 # Map a feature_module id to the ``PlatformSettings`` column whose

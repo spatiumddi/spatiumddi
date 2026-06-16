@@ -22,9 +22,13 @@ a SpatiumDDI-managed zone and issue public certs from Let's Encrypt
   whatever host needs the cert. SpatiumDDI does not issue certs; it
   answers the DNS challenge for you.
 
-If you want SpatiumDDI to issue and auto-renew certs for **its own**
-services (frontend HTTPS, DNS-over-TLS, etc.), that's a separate
-embedded-client feature, still on the roadmap.
+If instead you want SpatiumDDI to issue a CA-trusted cert for **its
+own** Web UI, that's the embedded ACME *client* — a separate surface
+documented below under
+[ACME client (issuing certs for the Web UI)](#acme-client-issuing-certs-for-the-web-ui).
+The two don't overlap: the *provider* answers DNS challenges for
+external clients; the *client* asks Let's Encrypt for a cert and
+solves its own DNS-01 challenge through SpatiumDDI's managed zones.
 
 ---
 
@@ -362,6 +366,250 @@ next attempt.
   `_acme-challenge.<your-fqdn>` outward with `dig +trace` and verify
   the delegation NS records in your upstream zone point to
   SpatiumDDI.
+
+---
+
+## ACME client (issuing certs for the Web UI)
+
+> **Issue [#438](https://github.com/spatiumddi/spatiumddi/issues/438)
+> — landed on `issue-438`.** Distinct from the ACME *provider*
+> documented above. The provider answers DNS-01 challenges for
+> *external* ACME clients (certbot / lego / acme.sh). The client
+> documented here is SpatiumDDI itself acting as an ACME client
+> against a public CA (Let's Encrypt) to issue a **CA-trusted TLS
+> cert for the appliance Web UI** — solving its own challenge through
+> SpatiumDDI's own managed DNS zones (or, for HTTP-01, through the
+> appliance's own web server). Phases 1–5 are implemented; Phase 6
+> (per-appliance certs) is resolved as not-applicable. The
+> phase-by-phase detail is in the sections below.
+
+The embedded client closes the loop the provider couldn't: an
+appliance that hosts its own public DNS zone no longer needs an
+external client at all. It asks Let's Encrypt for a cert, proves
+control of the name by writing a `_acme-challenge` TXT into the
+matching managed zone, and lands the issued chain in the same
+`ApplianceCertificate` storage + deploy path the self-signed and
+operator-uploaded certs use — with `source="letsencrypt"`. The
+`SourceBadge` in the Web UI renders the new source.
+
+This is a **fleet-level** cert (the control plane's Web UI), not a
+per-appliance cert — see *Phase 6* below.
+
+### Feature module
+
+The whole surface lives behind the **`security.certificates`**
+feature module (group **Security**, label *Certificates (ACME /
+Let's Encrypt)*). It's **default-enabled** as a discovery toggle so
+operators see the "Issue via Let's Encrypt" affordance exists — but
+enabling the module does **not** auto-issue anything. Issuance is
+separately RBAC-gated (`admin` on `appliance`) and requires the
+operator's explicit `platform_settings.acme_enabled` intent. When
+the module is off, every `/api/v1/appliance/acme` endpoint 404s.
+
+### DNS-01 self-solve flow (the default path)
+
+DNS-01 over SpatiumDDI's own managed zones is the default
+`challenge_type` and the original Phase 1 flow. HTTP-01 and
+cloud-hosted DNS-01 layer on top of it (Phases 3–4 below).
+
+1. The operator configures the install's **ACME account** (`PUT
+   /account`). A fresh EC-P256 account key is generated locally and
+   Fernet-encrypted at rest; it is **never** returned by the API.
+   The CA-side `account_url` is filled lazily on the first order.
+   External Account Binding (`eab_kid` + `eab_hmac_b64`) is accepted
+   for CAs that require it (ZeroSSL, some private CAs) — both NULL for
+   Let's Encrypt; the HMAC is write-only and exposed only as an
+   `eab_hmac_set` boolean.
+2. The operator requests a cert (`POST /issue`) with one or more
+   domains. This creates a `pending` `ACMEOrder` and enqueues the
+   Celery task `app.tasks.acme.run_acme_order`, which drives the rest
+   off the request thread. Poll `GET /orders/{id}` for progress.
+3. The orchestrator
+   (`backend/app/services/acme_client/orchestrator.py`) ensures the
+   account exists at the CA, creates the order, and fetches its
+   authorizations.
+4. For each authorization it solves the `dns-01` challenge
+   (`backend/app/services/acme_client/dns01.py`): the challenge FQDN
+   is resolved to the **most specific managed primary zone** that is a
+   suffix of the name (longest-suffix match), a
+   `_acme-challenge.<domain>` TXT record is written through the exact
+   same `record_ops` pipeline the rest of DNS uses
+   (`enqueue_record_op` + `bump_zone_serial` + `wait_for_op_applied`),
+   and the solve **blocks until the DNS agent acknowledges the op as
+   applied** — so the record is live before the CA validates. A
+   best-effort dnspython lookup runs afterward but never gates
+   success. If no managed primary zone covers the FQDN, the order
+   fails with a clear `last_error`.
+5. The orchestrator tells the CA each challenge is ready, polls every
+   authorization to `valid`, generates a fresh EC-P256 cert key + CSR
+   (reusing `generate_csr_and_key` from
+   `services/appliance/tls.py`), finalizes the order, polls to
+   `valid`, and downloads the full PEM chain.
+6. The chain lands in an `ApplianceCertificate` row
+   (`source="letsencrypt"`, identity columns from
+   `parse_pem_certificate`, cert key Fernet-encrypted), is made the
+   sole active cert, and is deployed to nginx via
+   `deploy_and_reload`. **Deploy failure is logged, not raised** — the
+   DB is the source of truth and the api boot re-deploys the active
+   row.
+7. The challenge TXT records are **always** torn down in a `finally`
+   block (each cleanup on a fresh session), so a failed issuance
+   doesn't leave zone noise behind.
+
+On success the order is `valid` with `certificate_id` pointing at the
+new row. On any protocol / DNS failure the order is `invalid` with a
+populated `last_error`; the task records the failure rather than
+crash-looping. The whole flow is idempotent + re-runnable — a re-run
+for the same order updates the existing cert row in place.
+
+The CA directory defaults to Let's Encrypt **staging**
+(`https://acme-staging-v02.api.letsencrypt.org/directory`) — which
+issues untrusted certs but has far higher rate limits — until an
+operator explicitly points the account at production
+(`https://acme-v02.api.letsencrypt.org/directory`). `directory_url`
+must be an `https://` URL; `http://` / unschemed values are rejected.
+
+### Endpoints
+
+All under `/api/v1/appliance/acme` (full path; mounted inside the
+appliance router behind `require_module("security.certificates")`).
+Mutations require `admin` on `appliance`; reads accept `read` on
+`appliance`. Secret material — the account key and the EAB HMAC — is
+**never** returned; the account responses expose only an
+`eab_hmac_set` boolean. Every mutation is audited.
+
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| `GET` | `/account` | read | Account metadata, or `null` if none configured (not 404). |
+| `PUT` | `/account` | admin | Upsert the install's ACME account. `directory_url` https-validated; `eab_hmac_b64` write-only (omit to leave unchanged). |
+| `DELETE` | `/account` | admin | 204. Orders cascade (`ON DELETE CASCADE`). |
+| `POST` | `/preview` | read | Body `domains[]`. Returns one `ACMEDomainResolution` per domain — whether the name is auto-solvable, and how (`managed` boolean + `zone_name` / `record_name` / `driver`). No mutation; safe to call before `/issue`. |
+| `POST` | `/issue` | admin | Body `domains[]` + `challenge_type` (`dns-01` default, or `http-01`; `tls-alpn-01` → 422) + optional `dns_provider` + `allow_manual`. Creates a `pending` order + enqueues the task. 201. Requires an account to exist first. |
+| `GET` | `/orders` | read | All orders, newest first. |
+| `GET` | `/orders/{id}` | read | One order — poll while `status` ∈ {`pending`, `processing`}. `manual_challenges[]` carries the TXT pairs to add when `allow_manual` left a domain unsolvable automatically. |
+| `POST` | `/orders/{id}/cancel` | admin | Local bookkeeping cancel (marks `invalid`); RFC 8555 has no client-driven order recall. Only `pending` / `processing` orders. |
+
+One more route lives **outside** `/api/v1` and outside the auth
+chain: `GET /.well-known/acme-challenge/{token}` returns the HTTP-01
+key-authorization as `text/plain`. It is CA-facing only — the
+frontend nginx proxies it to the api so Let's Encrypt can reach it on
+port 80/443. There is no UI for it; see *Phase 4* below.
+
+### Operator Copilot tools
+
+Matching MCP tools surface cert state to the copilot:
+`find_certificates` (read, default enabled, no key material),
+`count_certificates_expiring` (read, default enabled), and
+`get_acme_account` (default **disabled**, exposes `eab_hmac_set`
+boolean only — never key/HMAC material). `propose_*` issuance writes
+are deferred.
+
+### Phase 2 — auto-renewal
+
+Once a cert is issued, SpatiumDDI keeps it fresh on its own. A Celery
+beat task — `app.tasks.acme.renew_due_certificates` — runs every
+**12 hours** and re-issues any active Let's Encrypt cert that falls
+within **30 days of its `valid_to`**. The re-issue reuses the exact
+`POST /issue` machinery (same orchestrator, same self-solve), so a
+renewal is just a normal order against the stored account.
+
+The task is **gated on two flags** — it does nothing unless both
+`platform_settings.acme_enabled` and
+`platform_settings.acme_auto_renew` are on. `acme_enabled` is set
+automatically the first time you save an ACME account; `acme_auto_renew`
+is the operator's "keep it renewed" intent and is the knob to flip if
+you'd rather renew by hand.
+
+It is **idempotent and advisory-locked**: the task takes a Postgres
+advisory lock so two overlapping beat ticks can't both drive the same
+renewal, and a cert already comfortably inside its validity window is
+skipped. A renewal failure is recorded on the order's `last_error`
+and retried on the next 12 h tick — it never crash-loops.
+
+The shipped **`secret_expiring`** alert rule now also watches the
+Let's Encrypt Web-UI cert (subject `appliance_cert_tls:<id>`), so even
+if auto-renew is off — or a renewal keeps failing — the alerts surface
+fires before the cert lapses.
+
+### Phase 3 — cloud-hosted DNS-01 + manual TXT fallback
+
+Phase 1 only self-solved against zones SpatiumDDI hosts directly.
+Phase 3 widens DNS-01 to names whose zones live on a **cloud DNS
+provider** SpatiumDDI already drives as an agentless driver —
+**Cloudflare, Route 53, Azure DNS, and Google Cloud DNS**. When the
+challenge FQDN maps to such a zone, the orchestrator writes the
+`_acme-challenge` TXT straight through that driver and tears it down
+afterward, exactly as it does for a managed zone.
+
+There is **no extra configuration on the ACME screen** for this — you
+configure the provider's credentials once under **DNS** (the same
+cloud-DNS driver config the rest of DNS uses), and the ACME client
+reuses it. The `dns_provider` field on `POST /issue` just lets you pin
+a specific provider when a name is ambiguous.
+
+**Preview first.** `POST /preview` takes the same `domains[]` and
+returns, per domain, whether it is auto-solvable and how — `managed`
+(true if a managed *or* cloud-driver zone covers it), the `zone_name`,
+the `record_name` that will hold the TXT, and the `driver`. The Web UI
+calls this in the Issue modal so the operator sees green "auto" rows
+vs. amber "manual" rows before committing.
+
+**Manual TXT fallback.** For a domain that *no* driver can solve —
+e.g. a name whose authoritative DNS is somewhere SpatiumDDI has no
+credentials — set **`allow_manual: true`** on `POST /issue`. Instead
+of failing, the order goes to `processing` and exposes the work to do
+in **`manual_challenges[]`**: each entry is the `fqdn` /
+`record_name` / `txt_value` pair you must publish in your own DNS. The
+orchestrator then **polls public DNS** for those TXT values and
+finalizes the order automatically once they're visible to resolvers —
+no second click required. Domains that *can* be solved automatically
+in the same order are still solved automatically; `allow_manual` only
+changes the fallback for the ones that can't.
+
+### Phase 4 — HTTP-01
+
+`challenge_type: "http-01"` solves the challenge over HTTP instead of
+DNS. The CA fetches
+`http://<fqdn>/.well-known/acme-challenge/<token>`; SpatiumDDI answers
+it from the unauthenticated root route described under *Endpoints*
+above, with the frontend nginx proxying that path through to the api.
+
+HTTP-01 is the right choice when you **don't** host the name's DNS in
+SpatiumDDI (or any cloud driver) but the appliance *is* the host the
+name points at. The trade-offs vs. DNS-01:
+
+- The appliance must be **reachable from the public internet on
+  port 80/443 at the exact cert FQDN** — the CA connects inbound to
+  validate. Behind NAT or a firewall that blocks :80, use DNS-01.
+- HTTP-01 **cannot issue wildcards** — that's an RFC 8555 limitation,
+  not ours. Wildcards still require DNS-01.
+
+### Phase 5 — TLS-ALPN-01 (not supported)
+
+`tls-alpn-01` is **not supported** on the appliance topology, and
+`POST /issue` returns **422** if you request it. The Web UI shows the
+option disabled with this reason.
+
+TLS-ALPN-01 requires the validating server to terminate the TLS
+handshake itself and present a special self-signed cert in the
+`acme-tls/1` ALPN protocol on port 443. On the SpatiumDDI appliance,
+443 is owned by nginx (and, in the HA topology, fronted by a MetalLB
+VIP) — there's no seam to hand a single connection's ALPN negotiation
+to the ACME client mid-handshake without a custom nginx/Lua build we
+don't ship. DNS-01 and HTTP-01 cover every case TLS-ALPN-01 would,
+so it stays unsupported by design rather than as a missing feature.
+
+### Phase 6 — per-appliance certs (resolved: not applicable)
+
+Phase 1 left "a distinct cert per appliance host" as an open seam.
+On reflection it's **not applicable** to how SpatiumDDI serves its
+Web UI: the UI is served **only by the control plane**, behind a
+single shared cert (the MetalLB VIP / hostname in the HA topology, or
+the single control-plane host otherwise). DNS/DHCP-role appliances run
+no operator-facing Web UI of their own — they're agents. So there is
+exactly one **fleet-singleton** Web-UI cert to manage, not one per
+box, and the embedded ACME client correctly issues and renews that
+one cert. No per-appliance code is needed or planned.
 
 ---
 

@@ -32,7 +32,22 @@ data:
         listen 80 default_server;
         listen [::]:80 default_server;
         server_name _;
-        return 301 https://$host$request_uri;
+        resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
+
+        # ACME http-01 challenge (issue #438) — served over plain HTTP so
+        # the CA reaches it before the HTTPS redirect. In its own location
+        # (not the server-level return) so location matching wins.
+        location /.well-known/acme-challenge/ {
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass         $api_upstream;
+            proxy_set_header   Host $http_host;
+            proxy_http_version 1.1;
+            proxy_set_header   Connection "";
+        }
+
+        location / {
+            return 301 https://$host$request_uri;
+        }
     }
 
     # HTTPS — same routing the image's default template has,
@@ -101,6 +116,16 @@ data:
             proxy_http_version 1.1;
             proxy_set_header   Connection "";
             proxy_read_timeout 60s;
+        }
+
+        # ACME http-01 challenge (issue #438) — also reachable over HTTPS
+        # so a CA that follows the :80→:443 redirect still resolves it.
+        location /.well-known/acme-challenge/ {
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass         $api_upstream;
+            proxy_set_header   Host $http_host;
+            proxy_http_version 1.1;
+            proxy_set_header   Connection "";
         }
 
         location ~ ^/(health|metrics) {

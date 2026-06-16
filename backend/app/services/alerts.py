@@ -1413,6 +1413,45 @@ async def _matching_secret_expiring_subjects(
         )
         matches.append((f"api_token:{t.id}", f"{t.name} API token", message, sev))
 
+    # 3. ACME-issued Web UI TLS certs (#438) — active letsencrypt certs
+    #    nearing expiry. Distinct subject prefix from the supervisor cert
+    #    so they latch independently. Phase-2 auto-renewal normally renews
+    #    these well before this fires; an alert means renewal is stuck.
+    from app.models.appliance import (  # noqa: PLC0415
+        CERT_SOURCE_LETSENCRYPT,
+        ApplianceCertificate,
+    )
+
+    web_certs = (
+        (
+            await db.execute(
+                select(ApplianceCertificate)
+                .where(ApplianceCertificate.source == CERT_SOURCE_LETSENCRYPT)
+                .where(ApplianceCertificate.is_active.is_(True))
+                .where(ApplianceCertificate.valid_to.is_not(None))
+                .where(ApplianceCertificate.valid_to <= cutoff)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for c in web_certs:
+        if c.valid_to is None:
+            continue
+        days = (c.valid_to - now).days
+        sev = _escalate_severity_for_expiring(
+            rule.severity, threshold_days=threshold_days, days_to_expiry=days
+        )
+        message = (
+            f"Let's Encrypt Web UI certificate '{c.subject_cn or c.name}' "
+            f"{_descriptor(days)} ({c.valid_to.isoformat()}, threshold "
+            f"{threshold_days} d). Auto-renewal may be stuck — check "
+            f"Appliance → Web UI Certificate."
+        )
+        matches.append(
+            (f"appliance_cert_tls:{c.id}", f"{c.subject_cn or c.name} (LE)", message, sev)
+        )
+
     return matches
 
 
