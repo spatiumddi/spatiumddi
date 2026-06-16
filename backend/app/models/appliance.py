@@ -668,6 +668,13 @@ class Appliance(Base):
         server_default="{}",
     )
 
+    # #59 — host NICs the supervisor enumerated from /run/udev/data
+    # (e.g. ens18, cni0; ephemeral veth* filtered out). Surfaced as the
+    # appliance-vantage interface picker for packet capture so operators
+    # don't have to guess the host NIC name. Reported on every
+    # appliance-mode heartbeat; None until the first one lands.
+    host_interfaces: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+
     # #387 — per-plane host-config apply health from the supervisor's
     # bounded-retry fire-guard. ``{<plane>: {state, attempts, at}}`` for
     # the hash-keyed host-config runners (snmp / ntp / lldp / syslog /

@@ -10,6 +10,7 @@ poll endpoint rejects a non-cert caller.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -157,23 +158,30 @@ async def test_finalize_completed_and_cancel_wins(db_session: AsyncSession) -> N
     assert cap.packets_captured == 42
     assert cap.pcap_path.endswith("x.pcap")
 
-    # A cancelled row stays cancelled even if a late upload finalizes.
+    # A cancelled row stays cancelled even if a late upload finalizes — but
+    # it now KEEPS the partial bytes captured before Stop (#59 follow-up),
+    # so the operator can still download what was captured.
     cap2 = await _queued_appliance_capture(db_session, appl.id)
     cap2.status = "cancelled"
     await db_session.commit()
     status2 = await pcap_capture.finalize_capture(
         db_session,
         cap2.id,
-        pcap_path="/x.pcap",
-        pcap_size_bytes=1,
+        pcap_path="/var/lib/spatiumddi/pcaps/partial.pcap",
+        pcap_size_bytes=1234,
         pcap_sha256="z",
-        packet_count=1,
+        packet_count=7,
         metadata={},
         error=None,
     )
     assert status2 == "cancelled"
     await db_session.refresh(cap2)
     assert cap2.status == "cancelled"
+    # Partial artifact retained — not discarded.
+    assert cap2.pcap_path.endswith("partial.pcap")
+    assert cap2.pcap_size_bytes == 1234
+    assert cap2.packets_captured == 7
+    assert (cap2.metadata_json or {}).get("stop_reason") == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -196,6 +204,60 @@ async def test_finalize_failed(db_session: AsyncSession) -> None:
     await db_session.refresh(cap)
     assert cap.status == "failed"
     assert "failed" in (cap.error_message or "")
+    # #59 review: the error path now records metadata so a failed row still
+    # carries its stop_reason for diagnostics.
+    assert (cap.metadata_json or {}).get("stop_reason") == "error"
+
+
+@pytest.mark.asyncio
+async def test_finalize_empty_keeps_no_artifact(db_session: AsyncSession) -> None:
+    """An upload that streamed 0 bytes (Stopped before the first packet) is
+    completed but artifact-less — no pcap_path recorded, so nothing orphans."""
+    appl = await _appliance(db_session)
+    cap = await _queued_appliance_capture(db_session, appl.id)
+    cap.status = "running"
+    await db_session.commit()
+    status = await pcap_capture.finalize_capture(
+        db_session,
+        cap.id,
+        pcap_path=None,
+        pcap_size_bytes=0,
+        pcap_sha256=None,
+        packet_count=0,
+        metadata={"stop_reason": "empty"},
+        error=None,
+    )
+    assert status == "completed"
+    await db_session.refresh(cap)
+    assert cap.pcap_path is None
+    assert cap.pcap_size_bytes is None or cap.pcap_size_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_finalize_preserves_cancel_time_finished_at(db_session: AsyncSession) -> None:
+    """A cancelled row's finished_at (stamped at Stop time) is preserved, not
+    re-stamped to the later upload/finalize time (#59 review — keeps the UI's
+    cancel→artifact grace window anchored on the real stop time)."""
+    from datetime import timedelta
+
+    appl = await _appliance(db_session)
+    cap = await _queued_appliance_capture(db_session, appl.id)
+    cap.status = "cancelled"
+    t0 = datetime.now(UTC) - timedelta(seconds=30)
+    cap.finished_at = t0
+    await db_session.commit()
+    await pcap_capture.finalize_capture(
+        db_session,
+        cap.id,
+        pcap_path="/var/lib/spatiumddi/pcaps/p.pcap",
+        pcap_size_bytes=42,
+        pcap_sha256="a",
+        packet_count=1,
+        metadata={},
+        error=None,
+    )
+    await db_session.refresh(cap)
+    assert abs((cap.finished_at - t0).total_seconds()) < 1.0  # not re-stamped to now
 
 
 # ── create-capture appliance branch ──────────────────────────────────
@@ -265,3 +327,43 @@ async def test_supervisor_pcap_poll_requires_cert(
     # No cert headers → 403 (the supervisor channel is cert-only).
     r = await client.post("/api/v1/appliance/supervisor/pcap/poll")
     assert r.status_code == 403
+
+
+async def test_appliance_interfaces_lists_reported_host_nics(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#59 — the appliance vantage surfaces the host NICs the supervisor
+    reported (heartbeat), with "any" prepended and the misleading
+    "follow-up phase" note gone."""
+    _, token = await _superadmin(db_session)
+    appl = await _appliance(db_session)
+    appl.host_interfaces = ["ens18", "cni0"]
+    await db_session.commit()
+    r = await client.get(
+        f"/api/v1/pcap/interfaces?vantage=appliance&appliance_id={appl.id}",
+        headers=_hdr(token),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["interfaces"][0] == "any"  # always offered first
+    assert "ens18" in body["interfaces"]
+    assert "cni0" in body["interfaces"]
+    assert "follow-up phase" not in (body["note"] or "")
+
+
+async def test_appliance_interfaces_empty_before_first_report(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Before the supervisor's first NIC report, the list is empty and the
+    note tells the operator to wait / type one."""
+    _, token = await _superadmin(db_session)
+    appl = await _appliance(db_session)  # host_interfaces stays NULL
+    await db_session.commit()
+    r = await client.get(
+        f"/api/v1/pcap/interfaces?vantage=appliance&appliance_id={appl.id}",
+        headers=_hdr(token),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["interfaces"] == []
+    assert "reported yet" in body["note"]
