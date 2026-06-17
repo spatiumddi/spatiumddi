@@ -295,6 +295,10 @@ def _served_chain_ders(connect_ip: str, port: int, sni: str, timeout: float) -> 
     trust is judged separately by :func:`_verify_trust`. Leaf-first DERs.
     Raises on transport / handshake failure (the caller classifies)."""
     ctx = SSL.Context(SSL.TLS_CLIENT_METHOD)
+    # Floor at TLS 1.2 — TLS 1.0/1.1 are deprecated, and a monitor probing
+    # 2026-era endpoints shouldn't negotiate them. Verification is still off
+    # (we capture untrusted chains); trust is judged by _verify_trust.
+    ctx.set_min_proto_version(SSL.TLS1_2_VERSION)
     ctx.set_verify(SSL.VERIFY_NONE, lambda *_a: True)
     sock = socket.create_connection((connect_ip, port), timeout=timeout)
     # Non-blocking + a select() deadline: a timeout-mode socket makes
@@ -340,6 +344,7 @@ def _verify_trust(
     as chain-invalid). (True, None) trusted; (False, error) verification
     failure; (None, None) when a transport hiccup leaves it undetermined."""
     ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # explicit (default, but pinned)
     ctx.check_hostname = False
     try:
         with socket.create_connection((connect_ip, port), timeout=timeout) as sock:

@@ -140,11 +140,13 @@ async def create_test_schema() -> AsyncGenerator[None, None]:
         await conn.execute(text("CREATE SCHEMA public"))
         await conn.run_sync(Base.metadata.create_all)
     yield
-    # Teardown: same trick in reverse. No-op for CI (ephemeral DB) but keeps
-    # local runs clean.
-    async with _test_engine.begin() as conn:
-        await conn.execute(text("DROP SCHEMA public CASCADE"))
-        await conn.execute(text("CREATE SCHEMA public"))
+    # No session-teardown drop. The setup above already wipes any prior
+    # schema, so a teardown ``DROP SCHEMA … CASCADE`` is purely cosmetic —
+    # and as the schema grew it became a liability: all xdist workers finish
+    # ~together, so their simultaneous CASCADE drops (one AccessExclusiveLock
+    # per table/index/FK/sequence) exhausted the shared lock table on the CI
+    # Postgres ("out of shared memory / increase max_locks_per_transaction").
+    # CI DBs are ephemeral; local runs are cleaned by the next run's setup.
 
 
 @pytest_asyncio.fixture(autouse=True)

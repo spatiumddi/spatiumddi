@@ -45,8 +45,15 @@ async def lookup_ct(host: str, *, limit: int = 50) -> dict[str, Any]:
             resp.raise_for_status()
             raw = resp.json()
     except (httpx.HTTPError, ValueError) as exc:
+        # Log the detail server-side; return a generic message to the client
+        # (don't echo the raw exception — info exposure).
         logger.info("ct_log_lookup_failed", host=host, error=str(exc))
-        return {"host": host, "entries": [], "count": 0, "error": str(exc)}
+        return {
+            "host": host,
+            "entries": [],
+            "count": 0,
+            "error": "CT-log lookup failed (crt.sh unreachable or rate-limited)",
+        }
 
     if not isinstance(raw, list):
         return {"host": host, "entries": [], "count": 0, "error": "unexpected response"}
