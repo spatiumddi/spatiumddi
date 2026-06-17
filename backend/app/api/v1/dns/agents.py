@@ -706,6 +706,8 @@ class DNSMetricReport(BaseModel):
     nxdomain: int = 0
     servfail: int = 0
     recursion: int = 0
+    rate_dropped: int = 0
+    rate_slipped: int = 0
 
 
 @router.post("/metrics")
@@ -729,6 +731,8 @@ async def agent_metrics(
         "nxdomain": max(0, body.nxdomain),
         "servfail": max(0, body.servfail),
         "recursion": max(0, body.recursion),
+        "rate_dropped": max(0, body.rate_dropped),
+        "rate_slipped": max(0, body.rate_slipped),
     }
     existing = await db.get(DNSMetricSample, (server.id, body.bucket_at))
     if existing is None:

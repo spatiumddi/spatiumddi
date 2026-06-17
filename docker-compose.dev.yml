@@ -285,6 +285,23 @@ services:
       api:
         condition: service_started
 
+  # dnsdist front (issue #146 Phase 2) — build-from-source override.
+  dns-dnsdist:
+    profiles: ["dns-powerdns-with-dnsdist"]
+    image: spatiumddi-dns-dnsdist:dev
+    build:
+      context: .
+      dockerfile: agent/dns/images/dnsdist/Dockerfile
+    restart: unless-stopped
+    network_mode: "service:dns-powerdns"
+    cap_add:
+      - NET_BIND_SERVICE
+    volumes:
+      - dns_powerdns_state:/agent-state:ro
+    depends_on:
+      dns-powerdns:
+        condition: service_started
+
   # ── DHCP agent (primary) ──────────────────────────────────────────────
   # Enable with:
   #   docker compose -f docker-compose.yml -f docker-compose.dev.yml \

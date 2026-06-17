@@ -766,6 +766,11 @@ async def find_dns_rate_limit_settings(
                 "tcp_clients": None,
                 "clients_per_query": None,
                 "max_clients_per_query": None,
+                "dnsdist_enabled": False,
+                "dnsdist_max_qps_per_client": None,
+                "dnsdist_action": "truncate",
+                "dnsdist_dynblock_qps": None,
+                "dnsdist_dynblock_seconds": 60,
             }
         return {
             "group_id": str(g.id),
@@ -782,6 +787,11 @@ async def find_dns_rate_limit_settings(
             "tcp_clients": o.tcp_clients,
             "clients_per_query": o.clients_per_query,
             "max_clients_per_query": o.max_clients_per_query,
+            "dnsdist_enabled": o.dnsdist_enabled,
+            "dnsdist_max_qps_per_client": o.dnsdist_max_qps_per_client,
+            "dnsdist_action": o.dnsdist_action,
+            "dnsdist_dynblock_qps": o.dnsdist_dynblock_qps,
+            "dnsdist_dynblock_seconds": o.dnsdist_dynblock_seconds,
         }
 
     groups = [_defaulted(g, o) for g, o in rows]

@@ -5012,6 +5012,12 @@ function OptionsTab({ groupId }: { groupId: string }) {
   const [tcpClients, setTcpClients] = useState("");
   const [clientsPerQuery, setClientsPerQuery] = useState("");
   const [maxClientsPerQuery, setMaxClientsPerQuery] = useState("");
+  // dnsdist front for PowerDNS (#146 Phase 2).
+  const [dnsdistEnabled, setDnsdistEnabled] = useState(false);
+  const [dnsdistMaxQps, setDnsdistMaxQps] = useState("");
+  const [dnsdistAction, setDnsdistAction] = useState("truncate");
+  const [dnsdistDynblockQps, setDnsdistDynblockQps] = useState("");
+  const [dnsdistDynblockSeconds, setDnsdistDynblockSeconds] = useState(60);
   const [dirty, setDirty] = useState(false);
   const [saved, setSaved] = useState(false);
   const [initialized, setInitialized] = useState(false);
@@ -5041,6 +5047,11 @@ function OptionsTab({ groupId }: { groupId: string }) {
     setTcpClients(opts.tcp_clients?.toString() ?? "");
     setClientsPerQuery(opts.clients_per_query?.toString() ?? "");
     setMaxClientsPerQuery(opts.max_clients_per_query?.toString() ?? "");
+    setDnsdistEnabled(opts.dnsdist_enabled);
+    setDnsdistMaxQps(opts.dnsdist_max_qps_per_client?.toString() ?? "");
+    setDnsdistAction(opts.dnsdist_action);
+    setDnsdistDynblockQps(opts.dnsdist_dynblock_qps?.toString() ?? "");
+    setDnsdistDynblockSeconds(opts.dnsdist_dynblock_seconds);
     setInitialized(true);
   }
 
@@ -5103,6 +5114,11 @@ function OptionsTab({ groupId }: { groupId: string }) {
       tcp_clients: numOrNull(tcpClients),
       clients_per_query: numOrNull(clientsPerQuery),
       max_clients_per_query: numOrNull(maxClientsPerQuery),
+      dnsdist_enabled: dnsdistEnabled,
+      dnsdist_max_qps_per_client: numOrNull(dnsdistMaxQps),
+      dnsdist_action: dnsdistAction,
+      dnsdist_dynblock_qps: numOrNull(dnsdistDynblockQps),
+      dnsdist_dynblock_seconds: dnsdistDynblockSeconds,
     });
   }
 
@@ -5408,6 +5424,96 @@ function OptionsTab({ groupId }: { groupId: string }) {
             </Field>
           </div>
         </div>
+      </div>
+
+      <div className={card}>
+        <div className="flex items-center justify-between">
+          <h4 className={cardTitle}>
+            <Shield className="h-4 w-4 text-muted-foreground" /> dnsdist front
+            (PowerDNS)
+          </h4>
+          <label className="flex items-center gap-2 cursor-pointer text-sm">
+            <input
+              type="checkbox"
+              checked={dnsdistEnabled}
+              onChange={(e) => {
+                setDnsdistEnabled(e.target.checked);
+                setDirty(true);
+              }}
+              className="h-4 w-4"
+            />
+            Enable
+          </label>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          PowerDNS Authoritative has no built-in rate limiting, so a dnsdist
+          sidecar fronts it on :53 and forwards to pdns. Applies only to
+          PowerDNS server groups, and requires the dnsdist sidecar deployed
+          (compose <code>dns-powerdns-with-dnsdist</code> profile / Helm value).
+          With it enabled the group's pdns moves to :5300.
+        </p>
+        {dnsdistEnabled && (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Max QPS per client IP (blank = none)">
+                <input
+                  type="number"
+                  min={1}
+                  className={inputCls}
+                  value={dnsdistMaxQps}
+                  onChange={(e) => {
+                    setDnsdistMaxQps(e.target.value);
+                    setDirty(true);
+                  }}
+                  placeholder="e.g. 50"
+                />
+              </Field>
+              <Field label="Over-limit action">
+                <select
+                  className={selCls}
+                  value={dnsdistAction}
+                  onChange={(e) => {
+                    setDnsdistAction(e.target.value);
+                    setDirty(true);
+                  }}
+                >
+                  <option value="truncate">
+                    truncate (TC=1 — client retries over TCP)
+                  </option>
+                  <option value="drop">drop (no response)</option>
+                </select>
+              </Field>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Dynamic-block QPS (blank = off)">
+                <input
+                  type="number"
+                  min={1}
+                  className={inputCls}
+                  value={dnsdistDynblockQps}
+                  onChange={(e) => {
+                    setDnsdistDynblockQps(e.target.value);
+                    setDirty(true);
+                  }}
+                  placeholder="e.g. 200"
+                />
+              </Field>
+              <Field label="Dynamic-block duration (s)">
+                <input
+                  type="number"
+                  min={1}
+                  max={86400}
+                  className={inputCls}
+                  value={dnsdistDynblockSeconds}
+                  onChange={(e) => {
+                    setDnsdistDynblockSeconds(numOrDefault(e.target.value, 60));
+                    setDirty(true);
+                  }}
+                />
+              </Field>
+            </div>
+          </>
+        )}
       </div>
 
       <div className={card}>

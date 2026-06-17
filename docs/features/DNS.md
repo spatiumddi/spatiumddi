@@ -357,11 +357,28 @@ DNSServerOptions.max_clients_per_query: int | null  -- optional; ceiling for cli
   max-clients-per-query 100;               // only when set
   ```
 - **Defaults are a no-op.** With `rrl_enabled=false`, `minimal_responses=false`, and the optional knobs unset, the rendered `named.conf` is byte-identical to before the feature existed — adding it never changes an existing group's behavior until an operator opts in.
-- **PowerDNS:** authoritative `pdns_server` has no RRL equivalent; the project's answer there is a dnsdist front (issue #146 Phase 2, not yet shipped). These knobs are BIND9-only.
+- **PowerDNS:** authoritative `pdns_server` has no RRL equivalent; the project's answer there is a **dnsdist front** (Phase 2 — see below). These RRL/amplification knobs are BIND9-only.
 - **Recommended starting point** for an internet-facing authoritative server: `rrl_enabled=true`, `responses-per-second≈15`, `window=15`, `slip=2`, exempt your own secondaries. Run with `log-only=true` first and watch the drop counters before enforcing.
 - UI: **DNS → Server Group → Server Options → "Rate limiting (RRL) & amplification"** card.
 - MCP: `find_dns_rate_limit_settings` (read-only) reports the posture per group.
-- **Observability** (RRL drop counters surfaced in the server detail modal + a `dns_rate_limit_dropping` alert) is issue #146 Phase 3, not yet shipped.
+- **Observability (Phase 3 — shipped):** the BIND9 agent ships `RateDropped` + `RateSlipped` from the statistics-channels XML as `rate_dropped` / `rate_slipped` on the per-minute `dns_metric_sample`; the server detail modal's Stats tab draws an **"RRL drops/s"** line (shown once a server has dropped anything), and the default-off **`dns_rate_limit_dropping`** alert rule fires when drops over a 15-minute window clear a floor (`min_free_addresses`, default 100) — i.e. the server is actively shedding a flood. Auto-resolves when it subsides.
+
+#### dnsdist front for PowerDNS (Phase 2)
+
+PowerDNS Authoritative has no RRL, so rate limiting / DDoS defense in front of a PowerDNS group is provided by an opt-in **dnsdist sidecar** that binds `:53` and forwards to pdns. Configured group-level on `DNSServerOptions` (PowerDNS groups), default-off:
+
+```
+DNSServerOptions.dnsdist_enabled: bool                   -- default false
+DNSServerOptions.dnsdist_max_qps_per_client: int | null  -- per-source-IP QPS cap (MaxQPSIPRule)
+DNSServerOptions.dnsdist_action: enum(truncate, drop)    -- over-cap action; truncate sets TC=1 so a
+                                                         --   legit client retries over TCP (default)
+DNSServerOptions.dnsdist_dynblock_qps: int | null        -- sustained-rate dynamic block (exceedQRate over 10s)
+DNSServerOptions.dnsdist_dynblock_seconds: int           -- dynamic block duration (default 60)
+```
+
+- The PowerDNS agent renders these into a `dnsdist.conf` (newServer → pdns, `MaxQPSIPRule` + `TCAction`/`DropAction`, `dynBlockRulesGroup:setQueryRate`) in a shared volume; the dnsdist sidecar watches + reloads it. When dnsdist is enabled for a group, **pdns moves to `127.0.0.1:5300`** and dnsdist owns `:53` (shared netns).
+- **Deploy the sidecar** for the group's pdns: compose `--profile dns-powerdns-with-dnsdist` (alongside `--profile dns-powerdns`) or Helm `dnsPowerdns.dnsdist.enabled=true`. Because enabling dnsdist moves pdns off `:53`, the sidecar **must** be deployed or the group stops answering — hence both the per-group toggle and the deploy flag.
+- UI: **DNS → Server Group → Server Options → "dnsdist front (PowerDNS)"** card. MCP `find_dns_rate_limit_settings` reports the dnsdist posture alongside RRL.
 
 ### 3.9 Options Precedence
 

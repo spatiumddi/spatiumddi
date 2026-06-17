@@ -75,3 +75,45 @@ def test_partial_amplification_omits_unset() -> None:
     assert "tcp-clients 150;" in out
     assert "minimal-responses" not in out
     assert "clients-per-query" not in out
+
+
+# ── dnsdist front (#146 Phase 2) ──────────────────────────────────────
+
+
+def test_dnsdist_disabled_is_empty() -> None:
+    from spatium_dns_agent.drivers.powerdns import render_dnsdist_conf
+
+    assert render_dnsdist_conf({}) == ""
+    assert render_dnsdist_conf({"dnsdist_enabled": False, "dnsdist_max_qps_per_client": 50}) == ""
+
+
+def test_dnsdist_basic_forwards_to_backend() -> None:
+    from spatium_dns_agent.drivers.powerdns import render_dnsdist_conf
+
+    out = render_dnsdist_conf({"dnsdist_enabled": True})
+    assert 'setLocal("0.0.0.0:53")' in out
+    assert 'newServer({address="127.0.0.1:5300", name="pdns"})' in out
+    assert "MaxQPSIPRule" not in out
+    assert "setQueryRate" not in out
+
+
+def test_dnsdist_qps_cap_action() -> None:
+    from spatium_dns_agent.drivers.powerdns import render_dnsdist_conf
+
+    trunc = render_dnsdist_conf({"dnsdist_enabled": True, "dnsdist_max_qps_per_client": 50})
+    assert "addAction(MaxQPSIPRule(50), TCAction())" in trunc
+    drop = render_dnsdist_conf(
+        {"dnsdist_enabled": True, "dnsdist_max_qps_per_client": 50, "dnsdist_action": "drop"}
+    )
+    assert "addAction(MaxQPSIPRule(50), DropAction())" in drop
+
+
+def test_dnsdist_dynblock() -> None:
+    from spatium_dns_agent.drivers.powerdns import render_dnsdist_conf
+
+    out = render_dnsdist_conf(
+        {"dnsdist_enabled": True, "dnsdist_dynblock_qps": 200, "dnsdist_dynblock_seconds": 120}
+    )
+    assert "dynBlockRulesGroup()" in out
+    assert 'dbr:setQueryRate(200, 10, "exceeded query rate", 120)' in out
+    assert "function maintenance() dbr:apply() end" in out

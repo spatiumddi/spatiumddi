@@ -346,6 +346,17 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "tcp_clients": getattr(opts, "tcp_clients", None) if opts else None,
         "clients_per_query": getattr(opts, "clients_per_query", None) if opts else None,
         "max_clients_per_query": (getattr(opts, "max_clients_per_query", None) if opts else None),
+        # dnsdist front for PowerDNS (issue #146 Phase 2). The PowerDNS agent
+        # renders dnsdist.conf from these; the sidecar watches + reloads it.
+        "dnsdist_enabled": (bool(getattr(opts, "dnsdist_enabled", False)) if opts else False),
+        "dnsdist_max_qps_per_client": (
+            getattr(opts, "dnsdist_max_qps_per_client", None) if opts else None
+        ),
+        "dnsdist_action": (getattr(opts, "dnsdist_action", "truncate") if opts else "truncate"),
+        "dnsdist_dynblock_qps": (getattr(opts, "dnsdist_dynblock_qps", None) if opts else None),
+        "dnsdist_dynblock_seconds": (
+            int(getattr(opts, "dnsdist_dynblock_seconds", 60)) if opts else 60
+        ),
     }
     views_block = [
         {

@@ -203,8 +203,25 @@ the control-plane preview template `named.conf.j2`.
   byte-identical config for groups that haven't opted in (the bundle etag
   shifts once on upgrade, causing a single graceful `rndc reconfig`).
 - BIND9-only. PowerDNS authoritative has no RRL equivalent; the planned
-  answer there is a dnsdist front (#146 Phase 2, not yet shipped). RRL drop
-  counters + a `dns_rate_limit_dropping` alert are #146 Phase 3.
+  answer there is a dnsdist front (#146 Phase 2 — shipped; see below). RRL
+  drop counters (`RateDropped`/`RateSlipped` → `dns_metric_sample` →
+  Stats-tab "RRL drops/s" line) + the default-off `dns_rate_limit_dropping`
+  alert are #146 Phase 3 (shipped).
+
+### 2.7 dnsdist front for PowerDNS (issue #146 Phase 2)
+
+PowerDNS Authoritative has no RRL, so rate limiting in front of a PowerDNS
+group is an opt-in **dnsdist sidecar** (`ghcr.io/spatiumddi/dns-dnsdist`,
+Alpine + dnsdist). The PowerDNS agent's `render_dnsdist_conf(opts)` compiles
+the group's `dnsdist_*` `DNSServerOptions` into a `dnsdist.conf`
+(`newServer` → pdns, `MaxQPSIPRule` + `TCAction`/`DropAction`,
+`dynBlockRulesGroup:setQueryRate`) written to the shared agent-state volume;
+the sidecar's entrypoint `--check-config`-validates + (re)starts dnsdist on
+file change (dnsdist has no clean full-config hot reload). When dnsdist is
+enabled the agent renders pdns at loopback `:5300` and dnsdist owns `:53`
+(shared netns: compose `network_mode: service:dns-powerdns` / same k8s pod).
+Default-off; deploy via the `dns-powerdns-with-dnsdist` compose profile or
+`dnsPowerdns.dnsdist.enabled` Helm value.
 
 ---
 

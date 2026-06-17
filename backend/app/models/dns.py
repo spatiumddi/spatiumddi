@@ -415,6 +415,22 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     clients_per_query: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_clients_per_query: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # ── dnsdist front for PowerDNS (#146 Phase 2) ──────────────────────────
+    # PowerDNS Authoritative has no RRL equivalent, so the project's answer is
+    # a dnsdist sidecar on :53 that forwards to pdns. These knobs compile to
+    # the dnsdist config the sidecar runs. Default-off (opt-in per group) so
+    # existing PowerDNS deployments don't get a surprise topology change.
+    dnsdist_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Per-source-IP QPS cap (MaxQPSIPRule). null = no per-client cap.
+    dnsdist_max_qps_per_client: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Action when the per-client cap is exceeded: truncate (TC=1, lets a legit
+    # client retry over TCP) or drop.
+    dnsdist_action: Mapped[str] = mapped_column(String(10), nullable=False, default="truncate")
+    # Dynamic block: clients exceeding this QPS over 10s get blocked for
+    # dnsdist_dynblock_seconds (exceedQRate). null = no dynamic blocking.
+    dnsdist_dynblock_qps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dnsdist_dynblock_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="options")
     trust_anchors: Mapped[list["DNSTrustAnchor"]] = relationship(
         "DNSTrustAnchor", back_populates="server_options", cascade="all, delete-orphan"

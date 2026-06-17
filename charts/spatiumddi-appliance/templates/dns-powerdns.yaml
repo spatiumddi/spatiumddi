@@ -104,6 +104,23 @@ spec:
               mountPath: /var/lib/spatium-dns-agent
             - name: data
               mountPath: /var/lib/powerdns
+        {{- if .Values.dnsPowerdns.dnsdist.enabled }}
+        # dnsdist front (#146 Phase 2). Same pod as pdns → shared netns, so it
+        # forwards to pdns at 127.0.0.1:5300 and owns :53. The PowerDNS agent
+        # renders /agent-state/dnsdist.conf from the group's dnsdist_* options;
+        # this sidecar watches + reloads it. pdns moves to :5300 automatically
+        # once dnsdist is enabled for the group. Inherits the pod's
+        # spatium.io/role-dns-powerdns node-label gate (NN #16).
+        - name: dnsdist
+          image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dnsPowerdns.dnsdist.image.repository) }}
+          securityContext:
+            capabilities:
+              add: ["NET_BIND_SERVICE"]
+          volumeMounts:
+            - name: agent-state
+              mountPath: /agent-state
+              readOnly: true
+        {{- end }}
       # #292 — per-node hostPath (not shared PVC, not emptyDir); see
       # dns-bind9.yaml for the rationale.
       volumes:

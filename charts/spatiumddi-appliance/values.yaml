@@ -80,6 +80,15 @@ dnsPowerdns:
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
   serverGroupName: ""
+  # dnsdist front (#146 Phase 2) — opt-in rate-limit / DDoS sidecar for the
+  # authoritative PowerDNS agent (pdns auth has no RRL of its own). When
+  # enabled, a dnsdist container joins the pod (shared netns), owns :53, and
+  # forwards to pdns on :5300; the agent renders its config from the group's
+  # dnsdist_* options. Turn this on AND set dnsdist_enabled for the group.
+  dnsdist:
+    enabled: false
+    image:
+      repository: ghcr.io/spatiumddi/dns-dnsdist
 
 # DHCP — Kea backend. DaemonSet (single node) with ``hostNetwork:
 # true`` + ``CAP_NET_BIND_SERVICE`` so Kea sees DHCP-discover

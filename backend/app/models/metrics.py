@@ -37,6 +37,10 @@ class DNSMetricSample(Base):
     nxdomain: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     servfail: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     recursion: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # Response Rate Limiting drops (#146 Phase 3). rate_dropped = responses
+    # dropped, rate_slipped = responses truncated (TC=1). 0 unless RRL is on.
+    rate_dropped: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    rate_slipped: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
 
 
 class DHCPMetricSample(Base):

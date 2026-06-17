@@ -117,6 +117,11 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             tcp_clients=opts_row.tcp_clients,
             clients_per_query=opts_row.clients_per_query,
             max_clients_per_query=opts_row.max_clients_per_query,
+            dnsdist_enabled=opts_row.dnsdist_enabled,
+            dnsdist_max_qps_per_client=opts_row.dnsdist_max_qps_per_client,
+            dnsdist_action=opts_row.dnsdist_action,
+            dnsdist_dynblock_qps=opts_row.dnsdist_dynblock_qps,
+            dnsdist_dynblock_seconds=opts_row.dnsdist_dynblock_seconds,
             trust_anchors=tuple(
                 TrustAnchorData(
                     zone_name=ta.zone_name,

@@ -53,6 +53,8 @@ class DNSTimePoint(BaseModel):
     nxdomain: int
     servfail: int
     recursion: int
+    rate_dropped: int = 0
+    rate_slipped: int = 0
 
 
 class DNSTimeseries(BaseModel):
@@ -115,6 +117,8 @@ async def dns_timeseries(
         func.sum(DNSMetricSample.nxdomain).label("nxdomain"),
         func.sum(DNSMetricSample.servfail).label("servfail"),
         func.sum(DNSMetricSample.recursion).label("recursion"),
+        func.sum(DNSMetricSample.rate_dropped).label("rate_dropped"),
+        func.sum(DNSMetricSample.rate_slipped).label("rate_slipped"),
     ).where(DNSMetricSample.bucket_at >= since)
     if server_id is not None:
         stmt = stmt.where(DNSMetricSample.server_id == server_id)
@@ -129,6 +133,8 @@ async def dns_timeseries(
             nxdomain=int(row.nxdomain or 0),
             servfail=int(row.servfail or 0),
             recursion=int(row.recursion or 0),
+            rate_dropped=int(row.rate_dropped or 0),
+            rate_slipped=int(row.rate_slipped or 0),
         )
         for row in rows
     ]

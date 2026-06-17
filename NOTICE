@@ -35,6 +35,7 @@ components. Grouped by role; license + project URL for each.
 - ISC Kea DHCP — MPL 2.0 — https://kea.isc.org
 - ISC BIND 9 — MPL 2.0 — https://isc.org/bind
 - PowerDNS Authoritative Server — GPL v2 — https://powerdns.com
+- PowerDNS dnsdist — GPL v2 — https://dnsdist.org
 
 ── Backend (Python) ───────────────────────────────────────────────────────
 - Python — PSF License — https://python.org

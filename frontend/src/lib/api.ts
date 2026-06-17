@@ -4430,6 +4430,12 @@ export interface DNSServerOptions {
   tcp_clients: number | null;
   clients_per_query: number | null;
   max_clients_per_query: number | null;
+  // dnsdist front for PowerDNS (issue #146 Phase 2)
+  dnsdist_enabled: boolean;
+  dnsdist_max_qps_per_client: number | null;
+  dnsdist_action: string;
+  dnsdist_dynblock_qps: number | null;
+  dnsdist_dynblock_seconds: number;
   trust_anchors: DNSTrustAnchor[];
   modified_at: string;
 }
@@ -7777,6 +7783,8 @@ export interface DNSMetricsPoint {
   nxdomain: number;
   servfail: number;
   recursion: number;
+  rate_dropped: number;
+  rate_slipped: number;
 }
 
 export interface DNSMetricsSeries {

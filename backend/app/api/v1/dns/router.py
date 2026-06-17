@@ -145,6 +145,7 @@ _DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
 VALID_FORWARD_POLICIES = {"first", "only"}
 VALID_DNSSEC = {"auto", "yes", "no"}
 VALID_NOTIFY = {"yes", "no", "explicit", "master-only"}
+VALID_DNSDIST_ACTIONS = {"truncate", "drop"}
 
 
 # ── Pydantic schemas ────────────────────────────────────────────────────────
@@ -460,6 +461,19 @@ class ServerOptionsUpdate(BaseModel):
     tcp_clients: int | None = Field(default=None, ge=1, le=10000)
     clients_per_query: int | None = Field(default=None, ge=1, le=1000)
     max_clients_per_query: int | None = Field(default=None, ge=1, le=10000)
+    # dnsdist front for PowerDNS (#146 Phase 2)
+    dnsdist_enabled: bool | None = None
+    dnsdist_max_qps_per_client: int | None = Field(default=None, ge=1, le=1000000)
+    dnsdist_action: str | None = None
+    dnsdist_dynblock_qps: int | None = Field(default=None, ge=1, le=1000000)
+    dnsdist_dynblock_seconds: int | None = Field(default=None, ge=1, le=86400)
+
+    @field_validator("dnsdist_action")
+    @classmethod
+    def validate_dnsdist_action(cls, v: str | None) -> str | None:
+        if v is not None and v not in VALID_DNSDIST_ACTIONS:
+            raise ValueError(f"dnsdist_action must be one of {sorted(VALID_DNSDIST_ACTIONS)}")
+        return v
 
     @field_validator("forward_policy")
     @classmethod
@@ -537,6 +551,11 @@ class ServerOptionsResponse(BaseModel):
     tcp_clients: int | None
     clients_per_query: int | None
     max_clients_per_query: int | None
+    dnsdist_enabled: bool
+    dnsdist_max_qps_per_client: int | None
+    dnsdist_action: str
+    dnsdist_dynblock_qps: int | None
+    dnsdist_dynblock_seconds: int
     trust_anchors: list[TrustAnchorResponse]
     modified_at: datetime
 
@@ -2137,7 +2156,14 @@ async def update_options(
     # operator explicitly sent null (mirrors the update_zone color /
     # dnssec_policy_id pattern). Without this an amplification limit can never
     # be removed via the UI/API once set (issue #146 review finding).
-    for field in ("rrl_qps_scale", "tcp_clients", "clients_per_query", "max_clients_per_query"):
+    for field in (
+        "rrl_qps_scale",
+        "tcp_clients",
+        "clients_per_query",
+        "max_clients_per_query",
+        "dnsdist_max_qps_per_client",
+        "dnsdist_dynblock_qps",
+    ):
         if field in body.model_fields_set and getattr(body, field) is None:
             changes[field] = None
     for k, v in changes.items():
