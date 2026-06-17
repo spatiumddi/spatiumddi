@@ -78,9 +78,25 @@ IP_STATUSES: frozenset[str] = IP_STATUSES_OPERATOR_SETTABLE | IP_STATUSES_INTEGR
 # Roles in ``IP_ROLES_SHARED`` (anycast / vip / vrrp) are intentionally
 # shared across multiple devices and bypass the MAC-collision warning.
 IP_ROLES: frozenset[str] = frozenset(
-    {"host", "loopback", "anycast", "vip", "vrrp", "secondary", "gateway"}
+    {
+        "host",
+        "loopback",
+        "anycast",
+        "vip",
+        "vrrp",
+        "secondary",
+        "gateway",
+        # TLS-serving classifications (#118 Phase 2) — an IP in one of these
+        # roles is auto-added as a TLS cert probe target by the discovery
+        # reconciler (see TLS_SERVING_ROLES).
+        "web",
+        "api",
+        "lb",
+    }
 )
 IP_ROLES_SHARED: frozenset[str] = frozenset({"anycast", "vip", "vrrp"})
+# IP roles that imply a TLS endpoint worth probing for a cert (#118 Phase 2).
+TLS_SERVING_ROLES: frozenset[str] = frozenset({"web", "api", "lb"})
 
 # Network-role classification on Subnet (issue #112 phase 2). Operators
 # pick one when the subnet has a clear network function; null means

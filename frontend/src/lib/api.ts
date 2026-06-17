@@ -12398,6 +12398,7 @@ export interface TLSCertTarget {
   dns_record_id: string | null;
   dns_zone_id: string | null;
   domain_id: string | null;
+  ip_address_id: string | null;
   interval_hours: number | null;
   next_check_at: string | null;
   last_checked_at: string | null;
@@ -12517,7 +12518,26 @@ export interface TLSCertTargetListQuery {
   enabled?: boolean;
   dns_zone_id?: string;
   domain_id?: string;
+  ip_address_id?: string;
   search?: string;
+}
+
+export interface TLSCertCTEntry {
+  id: number | null;
+  common_name: string | null;
+  name_value: string | null;
+  issuer_name: string | null;
+  serial_number: string | null;
+  not_before: string | null;
+  not_after: string | null;
+  entry_timestamp: string | null;
+}
+
+export interface TLSCertCTResult {
+  host: string;
+  entries: TLSCertCTEntry[];
+  count: number;
+  error: string | null;
 }
 
 export interface TLSCertProbeListResponse {
@@ -12545,6 +12565,10 @@ export const tlsCertsApi = {
       .then((r) => r.data),
   chain: (id: string) =>
     api.get<TLSCertChain>(`/tls-certs/${id}/chain`).then((r) => r.data),
+  ctLog: (id: string, params?: { limit?: number }) =>
+    api
+      .get<TLSCertCTResult>(`/tls-certs/${id}/ct-log`, { params })
+      .then((r) => r.data),
   probeNow: (id: string) =>
     api.post<TLSCertTarget>(`/tls-certs/${id}/probe`).then((r) => r.data),
 };

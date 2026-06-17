@@ -120,6 +120,14 @@ class TLSCertTarget(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    # IPAM linkage (#118 Phase 2) — set for role-discovered targets + lets
+    # the IP detail modal list "certs served from this IP".
+    ip_address_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ip_address.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     # ── schedule ────────────────────────────────────────────────────
     # Per-target cadence override; NULL → use the platform default.

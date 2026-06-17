@@ -291,6 +291,97 @@ async def test_discovery_disable_then_reenable_cycle(db_session: AsyncSession):
     assert (await db_session.execute(select(TLSCertTarget))).scalars().all().__len__() == 1
 
 
+async def test_discovery_from_ip_role(db_session: AsyncSession):
+    """#118 Phase 2 — an IP in a TLS-serving role auto-becomes a target."""
+    from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+    from app.services.tls_cert.discovery import reconcile_discovered_targets
+
+    sp = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}")
+    db_session.add(sp)
+    await db_session.flush()
+    blk = IPBlock(space_id=sp.id, network="10.9.0.0/16")
+    db_session.add(blk)
+    await db_session.flush()
+    sn = Subnet(space_id=sp.id, block_id=blk.id, network="10.9.1.0/24")
+    db_session.add(sn)
+    await db_session.flush()
+    ip = IPAddress(
+        subnet_id=sn.id,
+        address="10.9.1.10",
+        role="web",
+        fqdn="svc.example.com",
+        status="allocated",
+    )
+    db_session.add(ip)
+    await db_session.flush()
+
+    res = await reconcile_discovered_targets(db_session)
+    await db_session.flush()
+    assert res["created"] == 1
+    t = (await db_session.execute(select(TLSCertTarget))).scalars().one()
+    assert t.host == "svc.example.com"
+    assert t.ip_address_id == ip.id
+    assert t.source == "discovered"
+
+    # Role cleared → target disabled (no longer a TLS-serving IP).
+    ip.role = "host"
+    await db_session.flush()
+    res2 = await reconcile_discovered_targets(db_session)
+    await db_session.flush()
+    await db_session.refresh(t)
+    assert t.enabled is False and res2["disabled"] == 1
+
+
+async def test_ct_log_no_host():
+    from app.services.tls_cert.ct_log import lookup_ct
+
+    out = await lookup_ct("")
+    assert out["entries"] == [] and out["count"] == 0 and out["error"]
+
+
+async def test_issuer_change_alert(db_session: AsyncSession):
+    from app.models.alerts import AlertEvent, AlertRule
+    from app.services.alerts import (
+        RULE_TYPE_TLS_CERT_ISSUER_CHANGED,
+        _evaluate_tls_cert_transition_rule,
+    )
+
+    now = datetime.now(UTC)
+    t = TLSCertTarget(host="rot.example.com", port=443, enabled=True, issuer_cn="Let's Encrypt")
+    db_session.add(t)
+    rule = AlertRule(name="ic", rule_type=RULE_TYPE_TLS_CERT_ISSUER_CHANGED, severity="warning")
+    db_session.add(rule)
+    await db_session.flush()
+
+    # First sighting → silent baseline (no open event).
+    opened, *_ = await _evaluate_tls_cert_transition_rule(
+        db_session, rule, now, value_attr="issuer_cn", what="issuer"
+    )
+    await db_session.flush()
+    assert opened == 0
+
+    # Issuer flips → one open event.
+    t.issuer_cn = "Rogue CA"
+    await db_session.flush()
+    opened2, *_ = await _evaluate_tls_cert_transition_rule(
+        db_session, rule, now + timedelta(minutes=1), value_attr="issuer_cn", what="issuer"
+    )
+    await db_session.flush()
+    assert opened2 == 1
+    events = (
+        (
+            await db_session.execute(
+                select(AlertEvent).where(
+                    AlertEvent.rule_id == rule.id, AlertEvent.resolved_at.is_(None)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(events) == 1 and "Rogue CA" in events[0].message
+
+
 # ── alert matchers ───────────────────────────────────────────────────
 
 

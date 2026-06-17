@@ -109,6 +109,7 @@ class TLSCertTargetRead(BaseModel):
     dns_record_id: uuid.UUID | None
     dns_zone_id: uuid.UUID | None
     domain_id: uuid.UUID | None
+    ip_address_id: uuid.UUID | None
     interval_hours: int | None
     next_check_at: datetime | None
     last_checked_at: datetime | None
@@ -222,6 +223,7 @@ async def list_targets(
     enabled: bool | None = Query(default=None),
     dns_zone_id: uuid.UUID | None = Query(default=None),
     domain_id: uuid.UUID | None = Query(default=None),
+    ip_address_id: uuid.UUID | None = Query(default=None),
     search: str | None = Query(
         default=None, description="Case-insensitive substring on host / display_name / subject_cn."
     ),
@@ -237,6 +239,8 @@ async def list_targets(
         stmt = stmt.where(TLSCertTarget.dns_zone_id == dns_zone_id)
     if domain_id is not None:
         stmt = stmt.where(TLSCertTarget.domain_id == domain_id)
+    if ip_address_id is not None:
+        stmt = stmt.where(TLSCertTarget.ip_address_id == ip_address_id)
     if search:
         needle = f"%{search.strip()}%"
         stmt = stmt.where(
@@ -419,6 +423,24 @@ async def get_chain(target_id: uuid.UUID, db: DB, _: CurrentUser) -> dict[str, A
         # captured bundle, for the cert detail view.
         "chain": parse_chain_pem(probe.chain_pem or probe.leaf_pem),
     }
+
+
+@router.get("/{target_id}/ct-log")
+async def ct_log(
+    target_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    limit: int = Query(50, ge=1, le=100),
+) -> dict[str, Any]:
+    """Cross-reference this target's host against Certificate Transparency
+    logs (crt.sh). OFF-PREM + explicit: this leaks the hostname to crt.sh,
+    so it only runs on this on-demand request — never the scheduled probe."""
+    row = await db.get(TLSCertTarget, target_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="target not found")
+    from app.services.tls_cert.ct_log import lookup_ct  # noqa: PLC0415
+
+    return await lookup_ct(row.server_name or row.host, limit=limit)
 
 
 @router.post("/{target_id}/probe", response_model=TLSCertTargetRead)

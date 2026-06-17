@@ -439,6 +439,9 @@ function CertDetailModal({
 }) {
   const qc = useQueryClient();
   const [showPem, setShowPem] = useState(false);
+  // CT log is an off-prem call (leaks the hostname to crt.sh) — opt-in,
+  // fetched only when the operator expands it.
+  const [showCt, setShowCt] = useState(false);
 
   // Live row so a probe-now reflects without reopening.
   const { data: t = target } = useQuery({
@@ -453,6 +456,14 @@ function CertDetailModal({
     retry: false, // 404 until the first successful probe — don't hammer
   });
   const chain = chainQuery.data?.chain ?? [];
+
+  const ctQuery = useQuery({
+    queryKey: ["tls-certs", "ct-log", target.id],
+    queryFn: () => tlsCertsApi.ctLog(target.id, { limit: 50 }),
+    enabled: showCt,
+    retry: false,
+    staleTime: 5 * 60 * 1000,
+  });
 
   const probe = useMutation({
     mutationFn: () => tlsCertsApi.probeNow(target.id),
@@ -631,6 +642,69 @@ function CertDetailModal({
                     chainQuery.data?.leaf_pem ??
                     "No PEM captured.")}
             </pre>
+          )}
+        </div>
+
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={() => setShowCt((v) => !v)}
+            className="text-xs font-medium text-primary hover:underline"
+            title="Queries crt.sh — sends this hostname off-prem"
+          >
+            {showCt ? "Hide" : "Show"} CT-log cross-reference (crt.sh ↗)
+          </button>
+          {showCt && (
+            <div className="mt-2 rounded-md border">
+              {ctQuery.isLoading ? (
+                <p className="px-3 py-2 text-xs text-muted-foreground">
+                  Querying crt.sh…
+                </p>
+              ) : ctQuery.isError ? (
+                <p className="px-3 py-2 text-xs text-destructive">
+                  CT-log lookup failed.
+                </p>
+              ) : (ctQuery.data?.entries.length ?? 0) === 0 ? (
+                <p className="px-3 py-2 text-xs text-muted-foreground">
+                  {ctQuery.data?.error
+                    ? `crt.sh: ${ctQuery.data.error}`
+                    : "No CT-log entries found for this host."}
+                </p>
+              ) : (
+                <table className="w-full text-[11px]">
+                  <thead className="text-left uppercase tracking-wider text-muted-foreground">
+                    <tr className="border-b bg-muted/30">
+                      <th className="px-2 py-1">Issuer</th>
+                      <th className="px-2 py-1">Common name</th>
+                      <th className="px-2 py-1">Not before</th>
+                      <th className="px-2 py-1">Not after</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ctQuery.data?.entries.map((e) => (
+                      <tr key={`${e.id}`} className="border-t align-top">
+                        <td className="px-2 py-1 break-words">
+                          {e.issuer_name ?? "—"}
+                        </td>
+                        <td className="px-2 py-1 break-words font-mono">
+                          {e.common_name ?? "—"}
+                        </td>
+                        <td className="px-2 py-1 tabular-nums">
+                          {e.not_before
+                            ? new Date(e.not_before).toLocaleDateString()
+                            : "—"}
+                        </td>
+                        <td className="px-2 py-1 tabular-nums">
+                          {e.not_after
+                            ? new Date(e.not_after).toLocaleDateString()
+                            : "—"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
           )}
         </div>
       </div>

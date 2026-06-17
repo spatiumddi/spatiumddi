@@ -35,9 +35,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSZone
 from app.models.domain import Domain
+from app.models.ipam import TLS_SERVING_ROLES, IPAddress
 from app.models.tls_cert import SOURCE_DISCOVERED, TLSCertTarget
 
 logger = structlog.get_logger(__name__)
+
+
+def _host_for_ip(ip: IPAddress) -> str:
+    """Probe host for a TLS-serving IP — prefer a name (so SNI + cert-name
+    match work), fall back to the literal IP."""
+    if ip.fqdn and ip.fqdn.strip():
+        return ip.fqdn.rstrip(".").lower()
+    if ip.hostname and ip.hostname.strip():
+        return ip.hostname.rstrip(".").lower()
+    return str(ip.address).split("/")[0]
 
 
 def _best_suffix_match(
@@ -106,7 +117,14 @@ async def reconcile_discovered_targets(
     """Create / disable discovered targets + relink by SAN. No commit."""
     _ = now or datetime.now(UTC)
 
-    rows = (
+    # Unified candidate map keyed on the connect tuple (host, 443, None).
+    # Each value carries whatever provenance links apply (DNS record/zone/
+    # domain + IPAM IP) — the same FQDN can surface from a DNS record AND a
+    # TLS-serving IP, which merge into one target.
+    candidates: dict[tuple[str, int, None], dict[str, uuid.UUID | None]] = {}
+
+    # Source 1 — opted-in DNS A/AAAA records.
+    dns_rows = (
         await db.execute(
             select(DNSRecord, DNSZone)
             .join(DNSZone, DNSRecord.zone_id == DNSZone.id)
@@ -119,14 +137,27 @@ async def reconcile_discovered_targets(
             )
         )
     ).all()
-
-    # Dedupe candidates on the connect tuple (same FQDN from >1 record).
-    candidates: dict[tuple[str, int, None], tuple[DNSRecord, DNSZone]] = {}
-    for rec, zone in rows:
+    for rec, zone in dns_rows:
         host = (rec.fqdn or "").rstrip(".").lower()
         if not host:
             continue
-        candidates.setdefault((host, 443, None), (rec, zone))
+        cand = candidates.setdefault((host, 443, None), {})
+        cand.setdefault("dns_record_id", rec.id)
+        cand.setdefault("dns_zone_id", zone.id)
+        cand.setdefault("domain_id", zone.domain_id)
+
+    # Source 2 — IPs classified into a TLS-serving role (#118 Phase 2).
+    ip_rows = (
+        (await db.execute(select(IPAddress).where(IPAddress.role.in_(TLS_SERVING_ROLES))))
+        .scalars()
+        .all()
+    )
+    for ip in ip_rows:
+        host = _host_for_ip(ip)
+        if not host:
+            continue
+        cand = candidates.setdefault((host, 443, None), {})
+        cand.setdefault("ip_address_id", ip.id)
 
     existing = (
         (await db.execute(select(TLSCertTarget).where(TLSCertTarget.source == SOURCE_DISCOVERED)))
@@ -136,23 +167,22 @@ async def reconcile_discovered_targets(
     existing_by_key = {(t.host.lower(), t.port, t.server_name): t for t in existing}
 
     created = reenabled = 0
-    for (host, port, sni), (rec, zone) in candidates.items():
+    for (host, port, sni), cand in candidates.items():
         et = existing_by_key.get((host, port, sni))
         if et is not None:
-            # Already tracked. Re-enable + refresh provenance if the record
-            # came back (a re-added record is a NEW row with a fresh uuid).
-            # Discovered targets are a projection of DNS state — to stop
-            # probing, opt the record/zone OUT (auto_tls_probe=False); a
-            # manually-disabled discovered row is re-enabled here by design.
+            # Already tracked. Re-enable + refresh provenance. Discovered
+            # targets are a projection of DNS/IPAM state — to stop probing,
+            # opt the source out; a manually-disabled discovered row is
+            # re-enabled here by design.
             touched = False
             if not et.enabled:
                 et.enabled = True
                 touched = True
-            if et.dns_record_id != rec.id:
-                et.dns_record_id = rec.id
-                touched = True
-            if et.dns_zone_id is None:
-                et.dns_zone_id = zone.id
+            for field in ("dns_record_id", "dns_zone_id", "domain_id", "ip_address_id"):
+                val = cand.get(field)
+                if val is not None and getattr(et, field) != val:
+                    setattr(et, field, val)
+                    touched = True
             reenabled += 1 if touched else 0
             continue
         # Don't collide with a manually-added target on the same tuple.
@@ -172,18 +202,19 @@ async def reconcile_discovered_targets(
                 server_name=None,
                 display_name=host,
                 source=SOURCE_DISCOVERED,
-                dns_record_id=rec.id,
-                dns_zone_id=zone.id,
-                domain_id=zone.domain_id,
+                dns_record_id=cand.get("dns_record_id"),
+                dns_zone_id=cand.get("dns_zone_id"),
+                domain_id=cand.get("domain_id"),
+                ip_address_id=cand.get("ip_address_id"),
                 enabled=True,
                 next_check_at=None,  # picked up on the next probe sweep
             )
         )
         created += 1
 
-    # Disable discovered targets no longer backed by an opted-in record —
-    # keyed on the connect tuple (not dns_record_id), so a hard-deleted
-    # record (FK SET NULL'd to dns_record_id=None) is caught too.
+    # Disable discovered targets no longer backed by any opted-in source —
+    # keyed on the connect tuple (not the FK), so a hard-deleted record /
+    # role change (FK SET NULL'd) is caught too.
     candidate_keys = set(candidates.keys())
     disabled = 0
     for t in existing:

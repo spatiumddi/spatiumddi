@@ -198,6 +198,9 @@ RULE_TYPE_TLS_CERT_EXPIRING = "tls_cert_expiring"
 RULE_TYPE_TLS_CERT_CHAIN_INVALID = "tls_cert_chain_invalid"
 RULE_TYPE_TLS_CERT_UNREACHABLE = "tls_cert_unreachable"
 RULE_TYPE_TLS_CERT_CHANGED = "tls_cert_changed"
+# Cert-rotation deviation (#118 Phase 3) — the issuing CA changed (a
+# normally-ACME cert coming back from a different issuer); transition-once.
+RULE_TYPE_TLS_CERT_ISSUER_CHANGED = "tls_cert_issuer_changed"
 # Unreachable only pages after a couple of consecutive failures so a
 # single transient handshake blip doesn't fire.
 _TLS_CERT_UNREACHABLE_MIN_FAILURES = 2
@@ -237,6 +240,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_TLS_CERT_CHAIN_INVALID,
         RULE_TYPE_TLS_CERT_UNREACHABLE,
         RULE_TYPE_TLS_CERT_CHANGED,
+        RULE_TYPE_TLS_CERT_ISSUER_CHANGED,
     }
 )
 
@@ -1191,15 +1195,25 @@ async def _matching_tls_cert_unreachable_subjects(
     return matches
 
 
-async def _evaluate_tls_cert_changed_rule(
+async def _evaluate_tls_cert_transition_rule(
     db: AsyncSession,
     rule: AlertRule,
     now: datetime,
+    *,
+    value_attr: str = "fingerprint_sha256",
+    what: str = "fingerprint",
 ) -> tuple[int, int, int, int, int]:
-    """``tls_cert_changed`` — transition-once rule latching the leaf
-    fingerprint pair, modelled on :func:`_evaluate_domain_transition_rule`.
-    Legitimate on renewal, suspicious otherwise. First sighting records a
-    silent baseline; open events auto-resolve after
+    """Transition-once rule over a per-target cert attribute, modelled on
+    :func:`_evaluate_domain_transition_rule`. ``value_attr`` selects the
+    watched column:
+
+    * ``fingerprint_sha256`` (``tls_cert_changed``) — any cert swap;
+      legitimate on renewal, suspicious otherwise.
+    * ``issuer_cn`` (``tls_cert_issuer_changed``) — the issuing CA changed,
+      i.e. cert-rotation *deviation* (a normally-ACME cert coming back from a
+      different issuer). Higher-signal than a plain fingerprint change.
+
+    First sighting records a silent baseline; open events auto-resolve after
     ``_TRANSITION_AUTO_RESOLVE_DAYS``."""
     targets = await audit_forward._load_targets()  # noqa: SLF001
 
@@ -1235,7 +1249,7 @@ async def _evaluate_tls_cert_changed_rule(
     )
     for t in rows:
         subject_id = str(t.id)
-        current_value = t.fingerprint_sha256
+        current_value = getattr(t, value_attr)
         if open_by_subject.get(subject_id) is not None:
             continue
 
@@ -1256,7 +1270,7 @@ async def _evaluate_tls_cert_changed_rule(
                     subject_id=subject_id,
                     subject_display=label,
                     severity="info",
-                    message=f"Initial TLS cert fingerprint baseline for {label}: {current_value}",
+                    message=f"Initial TLS cert {what} baseline for {label}: {current_value}",
                     fired_at=now,
                     resolved_at=now,
                     last_observed_value={"from": None, "to": current_value},
@@ -1267,7 +1281,7 @@ async def _evaluate_tls_cert_changed_rule(
         if current_value is None or current_value == prior_value:
             continue
 
-        message = f"TLS cert for {label} changed: {prior_value} → {current_value}"
+        message = f"TLS cert {what} for {label} changed: {prior_value} → {current_value}"
         event = AlertEvent(
             rule_id=rule.id,
             subject_type="tls_cert",
@@ -2768,6 +2782,19 @@ _TLS_CERT_RULE_SEEDS: list[dict[str, object]] = [
             "otherwise). Auto-resolves after the transition window."
         ),
     },
+    {
+        "name": "TLS cert issuer changed",
+        "rule_type": RULE_TYPE_TLS_CERT_ISSUER_CHANGED,
+        "severity": "warning",
+        "threshold_days": None,
+        "description": (
+            "Fires once when a monitored endpoint's certificate comes back "
+            "from a DIFFERENT issuing CA — cert-rotation deviation (e.g. a "
+            "normally-Let's-Encrypt cert suddenly issued by another CA), a "
+            "higher-signal subset of 'cert changed'. Auto-resolves after the "
+            "transition window."
+        ),
+    },
 ]
 
 
@@ -2941,7 +2968,20 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 subject_type = "tls_cert"
             elif rule.rule_type == RULE_TYPE_TLS_CERT_CHANGED:
                 # Transition-once — latches the fingerprint pair + auto-resolves.
-                op_, res_, dsy, dwh, dsm = await _evaluate_tls_cert_changed_rule(db, rule, now)
+                op_, res_, dsy, dwh, dsm = await _evaluate_tls_cert_transition_rule(
+                    db, rule, now, value_attr="fingerprint_sha256", what="fingerprint"
+                )
+                opened += op_
+                resolved += res_
+                delivered_syslog += dsy
+                delivered_webhook += dwh
+                delivered_smtp += dsm
+                continue
+            elif rule.rule_type == RULE_TYPE_TLS_CERT_ISSUER_CHANGED:
+                # Transition-once on the issuing CA — cert-rotation deviation.
+                op_, res_, dsy, dwh, dsm = await _evaluate_tls_cert_transition_rule(
+                    db, rule, now, value_attr="issuer_cn", what="issuer"
+                )
                 opened += op_
                 resolved += res_
                 delivered_syslog += dsy

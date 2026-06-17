@@ -276,6 +276,36 @@ async def count_tls_targets_by_state(
     return {"by_state": by_state, "total": sum(by_state.values())}
 
 
+# ── find_ct_log_entries (off-prem read, default-disabled) ──────────
+
+
+class FindCTLogEntriesArgs(BaseModel):
+    host: str = Field(description="Hostname / domain to query CT logs for.")
+    limit: int = Field(default=25, ge=1, le=100)
+
+
+@register_tool(
+    name="find_ct_log_entries",
+    description=(
+        "Cross-reference a host/domain against public Certificate "
+        "Transparency logs (crt.sh) — every CA-logged cert issued for the "
+        "name, to spot issuance you didn't deploy. OFF-PREM: this queries "
+        "crt.sh and leaks the hostname to it, so it's default-disabled; an "
+        "operator opts in per provider. Read-only."
+    ),
+    args_model=FindCTLogEntriesArgs,
+    category="security",
+    default_enabled=False,
+    module=_MODULE,
+)
+async def find_ct_log_entries(
+    db: AsyncSession, user: User, args: FindCTLogEntriesArgs
+) -> dict[str, Any]:
+    from app.services.tls_cert.ct_log import lookup_ct  # noqa: PLC0415
+
+    return await lookup_ct(args.host, limit=args.limit)
+
+
 # ── propose_run_cert_probe (gated write, default-disabled) ─────────
 
 
