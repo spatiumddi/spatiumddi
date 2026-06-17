@@ -1,0 +1,15 @@
+[Unit]
+Description=Weekly prune of unreferenced k3s container images (issue #441)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/441
+ConditionKernelCommandLine=!boot=live
+
+[Timer]
+# Passive backstop to the prune-on-upgrade-commit path — catches any
+# accumulation between upgrades (runtime pulls, missed commits). Weekly is
+# plenty; the per-upgrade prune does the heavy lifting.
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

@@ -266,6 +266,36 @@ swaps). Replicas are per-node anyway, so node-pinned PVs are acceptable;
 a shared-storage class (Longhorn / Rook-Ceph / NFS) for true PV mobility
 is an open question on #272.
 
+**Container-image store growth (#441).** The containerd image/snapshot
+store (`/var/lib/rancher/k3s/agent/containerd`) also lives on `/var` —
+it is **shared across both A/B slots** (a slot swap replaces the rootfs,
+not the image store), so every release imports a new image-set on top of
+the old one. Left alone this creeps toward full and competes with the
+real data on `/var` (etcd, the PVCs above, logs).
+
+`spatiumddi-image-prune` bounds it **rollback-safely**: it is *not* a
+blunt `crictl rmi --prune` (that would delete the inactive slot's images,
+which an A/B rollback needs — the baked airgap tarballs are versionless
+and overwritten each upgrade, and every pod is `imagePullPolicy: Never`,
+so a pruned image can't be re-pulled). Instead it reads
+`slot-versions.json` and removes only `ghcr.io/spatiumddi/*` images that
+are tagged with *neither* slot's version *and* not referenced by a live
+container — i.e. releases older than the two slots + stale dev tags. Both
+slots stay bootable. It runs async (`systemctl start --no-block`) from
+`spatiumddi-firstboot` after a healthy slot commit — so each per-box
+upgrade *and* each rolling-upgrade node drops the 3rd-oldest release —
+plus a weekly `spatiumddi-image-prune.timer` backstop. If
+`slot-versions.json` can't name both versions it prunes nothing
+(fail-safe).
+
+kubelet image-GC stays at the conservative **95/85** band for the same
+rollback reason — a lower band would evict the inactive slot's (unused)
+images sooner under disk pressure. Headroom for data comes from the
+proactive prune above, not from the GC band; `evictionHard
+imagefs.available=5%` remains the hard floor. The store stays on `/var`
+deliberately — the 8 GiB root slots can't hold the OS + ~6 GiB of images,
+and runtime/airgap pulls need a persistent home.
+
 ---
 
 ## Fleet firewall — declarative per-role policy (#285)

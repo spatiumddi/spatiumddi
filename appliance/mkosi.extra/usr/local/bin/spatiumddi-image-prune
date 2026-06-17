@@ -1,0 +1,144 @@
+#!/bin/bash
+# spatiumddi-image-prune — reclaim STALE SpatiumDDI container images while
+# keeping both A/B slots bootable (issue #441).
+#
+# Why not `crictl rmi --prune`: that removes every image not referenced by
+# a live container — which includes the *previous* slot's images. On an
+# A/B appliance the baked airgap tarballs under
+# /var/lib/rancher/k3s/agent/images are VERSIONLESS (bake-images.sh writes
+# `<short>.tar.zst`) and overwritten on each upgrade, so only the CURRENT
+# release's tarballs survive on the shared /var. A rollback to the other
+# slot therefore depends on that slot's images still being in containerd —
+# every appliance pod is `imagePullPolicy: Never`, so a pruned-then-needed
+# image is unrecoverable (ErrImageNeverPull). Blindly pruning the previous
+# release's images would break the A/B rollback safety net.
+#
+# What this does instead — version-aware prune:
+#   * KEEP every image referenced by a live (running/created) container.
+#   * KEEP every `ghcr.io/spatiumddi/*` image tagged with EITHER slot's
+#     installed version (from slot-versions.json) — both slots stay bootable.
+#   * KEEP all non-SpatiumDDI images (k3s / coredns / pause / postgres /
+#     redis / metallb / cnpg …) — those are managed by kubelet image-GC.
+#   * REMOVE the rest: older `ghcr.io/spatiumddi/*` releases (3rd-oldest+)
+#     and stale dev tags — the actual accumulation.
+#
+# Fail-safe: if slot-versions.json is missing or names no real version, we
+# can't tell which two releases to keep, so we DO NOTHING (kubelet GC stays
+# the backstop) rather than risk pruning a slot's images.
+#
+# When: triggered async by spatiumddi-firstboot after a healthy slot commit
+# (systemctl start --no-block, so it never blocks the boot path) and weekly
+# by spatiumddi-image-prune.timer. Safe + idempotent.
+
+set -uo pipefail
+
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/image-prune.log"
+LOCK=/run/spatiumddi-image-prune.lock
+SLOT_VERSIONS=/var/lib/spatiumddi/release-state/slot-versions.json
+mkdir -p "$LOG_DIR"
+exec >> "$LOG" 2>&1
+
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "[$(date -Iseconds)] another prune in progress, skipping"
+    exit 0
+fi
+
+if ! command -v k3s >/dev/null 2>&1; then
+    echo "[$(date -Iseconds)] k3s not present (non-appliance); nothing to do"
+    exit 0
+fi
+
+# df -P → single-line POSIX output so a long device name can't wrap the
+# usage row onto a second line and break the field positions.
+var_use() { df -P /var 2>/dev/null | awk 'NR==2{print $5" used, "$4"K free"}'; }
+
+echo "[$(date -Iseconds)] image-prune start — /var $(var_use)"
+
+# Compute the image IDs to remove. python3 is always present on the
+# appliance (same as the snmp / apt runners). It reads crictl's JSON +
+# slot-versions.json and prints one image ID per line to remove; on any
+# uncertainty it prints nothing (fail-safe → no removals).
+mapfile -t TO_REMOVE < <(
+    k3s crictl images -o json 2>/dev/null | python3 - "$SLOT_VERSIONS" <<'PYEOF'
+import json, subprocess, sys
+
+slot_versions_path = sys.argv[1]
+try:
+    images = json.load(sys.stdin).get("images", [])
+except Exception:
+    sys.exit(0)  # crictl unavailable / bad JSON → keep everything
+
+# Versions of the two slots we must keep bootable (rollback safety).
+keep_versions = set()
+try:
+    with open(slot_versions_path, encoding="utf-8") as fh:
+        sv = json.load(fh)
+    for k in ("slot_a", "slot_b"):
+        v = (sv.get(k) or "").strip()
+        if v and v not in ("unknown", "unstamped"):
+            keep_versions.add(v)
+except Exception:
+    keep_versions = set()
+# Fail-safe: can't determine the two slot versions → prune nothing.
+if not keep_versions:
+    sys.exit(0)
+
+# Image refs (ids + names) in use by any live container — never remove these
+# (protects the running release, incl. a dev tag deployed for testing).
+inuse = set()
+try:
+    ps = json.loads(
+        subprocess.run(
+            ["k3s", "crictl", "ps", "-a", "-o", "json"],
+            capture_output=True, text=True, check=False,
+        ).stdout
+        or "{}"
+    )
+    for c in ps.get("containers", []):
+        if c.get("imageRef"):
+            inuse.add(c["imageRef"])
+        img = (c.get("image") or {}).get("image")
+        if img:
+            inuse.add(img)
+except Exception:
+    inuse = set()
+
+SP = "ghcr.io/spatiumddi/"
+remove = []
+for img in images:
+    iid = img.get("id") or ""
+    tags = img.get("repoTags") or []
+    # Only ever touch SpatiumDDI service images; leave infra (k3s/coredns/
+    # pause/postgres/redis/metallb/cnpg) to kubelet image-GC.
+    if not any(t.startswith(SP) for t in tags):
+        continue
+    if iid in inuse or any(t in inuse for t in tags):
+        continue  # running — keep
+    # Keep if any tag is one of the two slots' versions.
+    versions = {t.rsplit(":", 1)[1] for t in tags if ":" in t}
+    if versions & keep_versions:
+        continue
+    remove.append(iid)
+
+for iid in remove:
+    print(iid)
+PYEOF
+)
+
+if [ "${#TO_REMOVE[@]}" -eq 0 ]; then
+    echo "[$(date -Iseconds)] nothing stale to prune (kept both slots + running). /var $(var_use)"
+    exit 0
+fi
+
+echo "  removing ${#TO_REMOVE[@]} stale SpatiumDDI image(s)"
+removed=0
+for iid in "${TO_REMOVE[@]}"; do
+    # rmi can hit the CRI RemoveImage deadline on a large layer; best-effort.
+    if k3s crictl rmi "$iid" >/dev/null 2>&1; then
+        removed=$((removed + 1))
+    fi
+done
+
+echo "[$(date -Iseconds)] image-prune done — removed $removed/${#TO_REMOVE[@]}; /var $(var_use)"
