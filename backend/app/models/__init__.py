@@ -109,6 +109,7 @@ from app.models.settings import PlatformSettings
 from app.models.system_upgrade import SystemUpgradeRun
 from app.models.tailscale import TailscaleTenant
 from app.models.time_bound_grant import TimeBoundGrant
+from app.models.tls_cert import TLSCertProbe, TLSCertTarget
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
 from app.models.vrf import VRF
@@ -212,6 +213,8 @@ __all__ = [
     "NmapScan",
     "PacketCapture",
     "SavedView",
+    "TLSCertTarget",
+    "TLSCertProbe",
     "EventSubscription",
     "EventOutbox",
     "Customer",

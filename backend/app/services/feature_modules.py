@@ -285,6 +285,12 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Security",
         description="Embedded RFC 8555 ACME client that issues a CA-trusted Web UI TLS cert from Let's Encrypt, solving the DNS-01 challenge through SpatiumDDI's own managed DNS zones. Discovery toggle only — issuance is RBAC-gated and requires an explicit operator opt-in (Settings → acme_enabled).",
     ),
+    ModuleSpec(
+        id="security.tls_certs",
+        label="TLS certificate monitoring",
+        group="Security",
+        description="Watch external TLS endpoints for expiry / chain validity / SAN drift; auto-discover probe targets from DNS A/AAAA records; alert on approaching expiry, broken chains, unreachable endpoints, and unexpected cert changes. Read-only monitoring — distinct from the ACME client that issues the appliance's own cert.",
+    ),
     # UI — cross-cutting personalisation surfaces. Per-user, never shared.
     ModuleSpec(
         id="ui.saved_views",

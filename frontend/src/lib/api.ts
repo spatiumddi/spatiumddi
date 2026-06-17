@@ -2979,6 +2979,7 @@ export interface PlatformSettings {
    *  effect on the next tick without restarting beat. 1–168 h range
    *  enforced server-side. */
   domain_whois_interval_hours: number;
+  tls_cert_check_interval_hours: number;
   asn_whois_interval_hours: number;
   rpki_roa_source: string;
   rpki_roa_refresh_interval_hours: number;
@@ -4481,6 +4482,7 @@ export interface DNSZone {
   linked_subnet_id: string | null;
   domain_id?: string | null;
   dnssec_enabled: boolean;
+  auto_tls_probe?: boolean;
   dnssec_policy_id?: string | null;
   dnssec_ds_records: string[] | null;
   dnssec_synced_at: string | null;
@@ -12365,6 +12367,186 @@ export const circuitsApi = {
       .then((r) => r.data),
   bySite: (siteId: string) =>
     api.get<CircuitRead[]>(`/circuits/by-site/${siteId}`).then((r) => r.data),
+};
+
+// ── TLS certificate monitoring (issue #118 Phase 1) ───────────────
+//
+// Read-only-style watch list of TLS endpoints. Each ``TLSCertTarget``
+// is probed on its interval (or on demand); the server records the
+// leaf cert subject / issuer / validity window + chain status and
+// derives a single ``state`` pill. ``days_remaining`` is computed
+// server-side from ``not_after``.
+
+export type TLSCertState =
+  | "unknown"
+  | "ok"
+  | "expiring"
+  | "expired"
+  | "mismatch"
+  | "unreachable";
+
+export type TLSCertSource = "manual" | "discovered";
+
+export interface TLSCertTarget {
+  id: string;
+  host: string;
+  port: number;
+  server_name: string | null;
+  display_name: string | null;
+  enabled: boolean;
+  source: TLSCertSource;
+  dns_record_id: string | null;
+  dns_zone_id: string | null;
+  domain_id: string | null;
+  interval_hours: number | null;
+  next_check_at: string | null;
+  last_checked_at: string | null;
+  state: TLSCertState;
+  last_error: string | null;
+  consecutive_failures: number;
+  serial: string | null;
+  subject_cn: string | null;
+  issuer_cn: string | null;
+  not_before: string | null;
+  not_after: string | null;
+  sans_json: string[];
+  key_algo: string | null;
+  key_size: number | null;
+  sig_algo: string | null;
+  chain_depth: number | null;
+  chain_valid: boolean | null;
+  chain_error: string | null;
+  self_signed: boolean | null;
+  fingerprint_sha256: string | null;
+  created_at: string;
+  modified_at: string;
+  days_remaining: number | null;
+}
+
+export interface TLSCertProbe {
+  id: string;
+  target_id: string;
+  probed_at: string;
+  ok: boolean;
+  state: TLSCertState;
+  error: string | null;
+  serial: string | null;
+  subject_cn: string | null;
+  issuer_cn: string | null;
+  not_before: string | null;
+  not_after: string | null;
+  sans_json: string[];
+  key_algo: string | null;
+  key_size: number | null;
+  sig_algo: string | null;
+  chain_depth: number | null;
+  chain_valid: boolean | null;
+  chain_error: string | null;
+  self_signed: boolean | null;
+  fingerprint_sha256: string | null;
+}
+
+export interface TLSChainCert {
+  position: number;
+  role: "leaf" | "intermediate" | "root";
+  subject_cn: string;
+  issuer_cn: string;
+  serial: string;
+  not_before: string;
+  not_after: string;
+  key_algo: string | null;
+  key_size: number | null;
+  sig_algo: string | null;
+  is_ca: boolean | null;
+  self_signed: boolean;
+  fingerprint_sha256: string;
+}
+
+export interface TLSCertChain {
+  target_id: string;
+  probed_at: string;
+  subject_cn: string | null;
+  issuer_cn: string | null;
+  serial: string | null;
+  not_before: string | null;
+  not_after: string | null;
+  sans: string[];
+  key_algo: string | null;
+  key_size: number | null;
+  sig_algo: string | null;
+  chain_depth: number | null;
+  chain_valid: boolean | null;
+  chain_error: string | null;
+  self_signed: boolean | null;
+  fingerprint_sha256: string | null;
+  leaf_pem: string | null;
+  chain_pem: string | null;
+  chain: TLSChainCert[];
+}
+
+export interface TLSCertTargetCreate {
+  host: string;
+  port?: number;
+  server_name?: string | null;
+  display_name?: string | null;
+  interval_hours?: number | null;
+  enabled?: boolean;
+}
+
+export interface TLSCertTargetUpdate {
+  host?: string;
+  port?: number;
+  server_name?: string | null;
+  display_name?: string | null;
+  interval_hours?: number | null;
+  enabled?: boolean;
+}
+
+export interface TLSCertTargetListResponse {
+  items: TLSCertTarget[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface TLSCertTargetListQuery {
+  limit?: number;
+  offset?: number;
+  state?: TLSCertState;
+  source?: TLSCertSource;
+  enabled?: boolean;
+  dns_zone_id?: string;
+  domain_id?: string;
+  search?: string;
+}
+
+export interface TLSCertProbeListResponse {
+  items: TLSCertProbe[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export const tlsCertsApi = {
+  list: (params?: TLSCertTargetListQuery) =>
+    api
+      .get<TLSCertTargetListResponse>("/tls-certs", { params })
+      .then((r) => r.data),
+  get: (id: string) =>
+    api.get<TLSCertTarget>(`/tls-certs/${id}`).then((r) => r.data),
+  create: (data: TLSCertTargetCreate) =>
+    api.post<TLSCertTarget>("/tls-certs", data).then((r) => r.data),
+  update: (id: string, data: TLSCertTargetUpdate) =>
+    api.put<TLSCertTarget>(`/tls-certs/${id}`, data).then((r) => r.data),
+  remove: (id: string) => api.delete(`/tls-certs/${id}`),
+  probes: (id: string, params?: { limit?: number; offset?: number }) =>
+    api
+      .get<TLSCertProbeListResponse>(`/tls-certs/${id}/probes`, { params })
+      .then((r) => r.data),
+  chain: (id: string) =>
+    api.get<TLSCertChain>(`/tls-certs/${id}/chain`).then((r) => r.data),
+  probeNow: (id: string) =>
+    api.post<TLSCertTarget>(`/tls-certs/${id}/probe`).then((r) => r.data),
 };
 
 // ── Multicast groups (issue #126 Phase 1) ─────────────────────────

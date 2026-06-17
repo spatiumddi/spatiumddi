@@ -104,6 +104,10 @@ _BLOCKED_NETWORKS: Final[tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ..
     ipaddress.ip_network("::1/128"),
     ipaddress.ip_network("169.254.0.0/16"),
     ipaddress.ip_network("fe80::/10"),
+    # 0.0.0.0 (and ::) — the kernel routes a connect() to these to
+    # loopback, so they're an SSRF bypass of the 127/8 block.
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("::/128"),
 )
 
 

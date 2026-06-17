@@ -26,6 +26,10 @@ dependencies = [
     "joserfc>=1.0.0",
     "httpx>=0.28.0",
     "cryptography>=43.0.0",
+    # TLS cert monitoring (#118) — get_peer_cert_chain() captures the
+    # server-presented chain (leaf + intermediates) for the cert detail
+    # view; stdlib ssl can't on Python 3.12 (get_*_chain is 3.13+).
+    "pyOpenSSL>=24.0.0",
     "ldap3>=2.9.1",
     "python3-saml>=1.16.0",
     "pyrad>=2.4",
