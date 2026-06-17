@@ -13,11 +13,14 @@ import {
   alertsApi,
   dnsApi,
   domainsApi,
+  tlsCertsApi,
   type AlertSeverity,
   type Domain,
   type DomainWhoisState,
 } from "@/lib/api";
 import { RdapPanel } from "@/components/network/rdap-panel";
+import { CertsCompactTable } from "@/pages/network/CertificatesPage";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { cn, zebraBodyCls } from "@/lib/utils";
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -120,7 +123,7 @@ function SeverityBadge({ severity }: { severity: AlertSeverity }) {
 
 // ── Tab button ───────────────────────────────────────────────────────────────
 
-type Tab = "whois" | "zones" | "alerts";
+type Tab = "whois" | "zones" | "certs" | "alerts";
 
 function TabButton({
   active,
@@ -348,6 +351,35 @@ function LinkedZonesTab({ domain }: { domain: Domain }) {
         </tbody>
       </table>
     </div>
+  );
+}
+
+// ── Certificates tab ──────────────────────────────────────────────────────────
+
+function CertificatesTab({ domainId }: { domainId: string }) {
+  const { enabled, ready } = useFeatureModules();
+  const moduleOn = enabled("security.tls_certs");
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["tls-certs", "domain", domainId],
+    queryFn: () => tlsCertsApi.list({ domain_id: domainId, limit: 200 }),
+    enabled: ready && moduleOn,
+  });
+
+  if (ready && !moduleOn) {
+    return (
+      <p className="rounded-lg border bg-card px-4 py-8 text-center text-xs text-muted-foreground">
+        TLS certificate monitoring is disabled.
+      </p>
+    );
+  }
+
+  return (
+    <CertsCompactTable
+      targets={data?.items ?? []}
+      isLoading={isLoading}
+      emptyLabel="No TLS certificates linked to this domain."
+    />
   );
 }
 
@@ -599,6 +631,11 @@ export function DomainDetailPage() {
               label="Linked DNS Zones"
             />
             <TabButton
+              active={tab === "certs"}
+              onClick={() => setTab("certs")}
+              label="Certificates"
+            />
+            <TabButton
               active={tab === "alerts"}
               onClick={() => setTab("alerts")}
               label="Alert History"
@@ -607,6 +644,7 @@ export function DomainDetailPage() {
           <div className="mt-4">
             {tab === "whois" && <WhoisTab domain={domain} />}
             {tab === "zones" && <LinkedZonesTab domain={domain} />}
+            {tab === "certs" && <CertificatesTab domainId={domain.id} />}
             {tab === "alerts" && <AlertHistoryTab domainId={domain.id} />}
           </div>
         </div>

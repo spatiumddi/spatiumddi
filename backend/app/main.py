@@ -223,6 +223,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "customer"},
             {"action": "admin", "resource_type": "site"},
             {"action": "admin", "resource_type": "provider"},
+            {"action": "admin", "resource_type": "tls_cert"},
         ],
     ),
     "Auditor": (
@@ -237,6 +238,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "ip_address"},
             {"action": "read", "resource_type": "dns_zone"},
             {"action": "read", "resource_type": "dhcp_scope"},
+            {"action": "read", "resource_type": "tls_cert"},
         ],
     ),
     "Compliance Editor": (
@@ -415,6 +417,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_rogue_dhcp_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("rogue_dhcp_alert_rule_seed_skipped", reason=str(exc))
+    # TLS certificate monitoring alert rules — four, DISABLED by default
+    # (issue #118). Opt-in once the operator adds probe targets.
+    try:
+        from app.services.alerts import seed_tls_cert_alert_rules  # noqa: PLC0415
+
+        await seed_tls_cert_alert_rules()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("tls_cert_alert_rules_seed_skipped", reason=str(exc))
     # Appliance Web UI cert bootstrap (issue #134, Phase 4b.5). On
     # appliance installs without an active row in appliance_certificate,
     # generate a self-signed default + deploy it to /etc/nginx/certs

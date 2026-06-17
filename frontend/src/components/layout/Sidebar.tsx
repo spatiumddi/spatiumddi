@@ -157,6 +157,12 @@ const networkInfrastructureNav = [
     module: "network.asn",
   },
   {
+    label: "Certificates",
+    icon: ShieldCheck,
+    to: "/network/certificates",
+    module: "security.tls_certs",
+  },
+  {
     label: "Circuits",
     icon: Waypoints,
     to: "/network/circuits",

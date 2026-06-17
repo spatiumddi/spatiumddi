@@ -642,6 +642,9 @@ class ZoneCreate(BaseModel):
     primary_ns: str = ""
     admin_email: str = ""
     dnssec_enabled: bool = False
+    # TLS cert monitoring (#118) — opt every A/AAAA record in this zone
+    # into auto-discovered cert probing.
+    auto_tls_probe: bool = False
     color: str | None = None
     linked_subnet_id: uuid.UUID | None = None
     domain_id: uuid.UUID | None = None
@@ -719,6 +722,7 @@ class ZoneUpdate(BaseModel):
     primary_ns: str | None = None
     admin_email: str | None = None
     dnssec_enabled: bool | None = None
+    auto_tls_probe: bool | None = None  # TLS cert monitoring (#118)
     # DNSSEC signing policy (issue #49). null ⇒ BIND built-in "default".
     dnssec_policy_id: uuid.UUID | None = None
     color: str | None = None
@@ -785,6 +789,7 @@ class ZoneResponse(BaseModel):
     linked_subnet_id: uuid.UUID | None
     domain_id: uuid.UUID | None = None
     dnssec_enabled: bool
+    auto_tls_probe: bool = False
     dnssec_policy_id: uuid.UUID | None = None
     color: str | None
     last_serial: int

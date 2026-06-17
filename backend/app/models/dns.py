@@ -612,6 +612,12 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     # the allowed keys.
     color: Mapped[str | None] = mapped_column(String(20), nullable=True)
     dnssec_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # TLS certificate monitoring (#118) — when True, the discovery
+    # reconciler auto-creates a tls_cert_target for every A/AAAA record
+    # in this zone. Per-record opt-in lives on DNSRecord.auto_tls_probe.
+    auto_tls_probe: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     # Populated by the agent after a successful PowerDNS online-signing
     # apply. The DS rrset strings live here so the zone-edit page can
     # surface them for the operator to paste into their parent registrar
@@ -727,6 +733,11 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     weight: Mapped[int | None] = mapped_column(Integer, nullable=True)
     port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     auto_generated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # TLS certificate monitoring (#118) — per-record opt-in for cert
+    # probing (the parent zone's auto_tls_probe opts in the whole zone).
+    auto_tls_probe: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     ip_address_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("ip_address.id", ondelete="SET NULL"), nullable=True
     )

@@ -502,6 +502,92 @@ register(
 )
 
 
+# ── run_cert_probe operation (issue #118) ──────────────────────────────
+
+
+class RunCertProbeArgs(BaseModel):
+    """Args for ``run_cert_probe`` — probe one existing TLS cert target."""
+
+    target_id: str = Field(description="UUID of the tls_cert_target to probe now")
+
+
+async def _preview_run_cert_probe(
+    db: AsyncSession, user: User, args: RunCertProbeArgs
+) -> PreviewResult:
+    from app.models.tls_cert import TLSCertTarget  # noqa: PLC0415
+
+    try:
+        tid = UUID(args.target_id)
+    except ValueError:
+        return PreviewResult(ok=False, detail=f"invalid target_id {args.target_id!r}")
+    t = await db.get(TLSCertTarget, tid)
+    if t is None:
+        return PreviewResult(ok=False, detail=f"target {args.target_id} not found")
+    label = t.display_name or t.host
+    parts = [
+        f"Probe TLS endpoint **{label}** (`{t.host}:{t.port}`) now.",
+        "This opens a real TLS connection from the SpatiumDDI host and "
+        "refreshes the captured certificate + chain validity.",
+    ]
+    return PreviewResult(ok=True, detail="ready", preview_text="\n".join(parts))
+
+
+async def _apply_run_cert_probe(
+    db: AsyncSession, user: User, args: RunCertProbeArgs
+) -> dict[str, Any]:
+    from app.models.audit import AuditLog  # noqa: PLC0415
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+    from app.models.tls_cert import TLSCertTarget  # noqa: PLC0415
+    from app.services.tls_cert.probe import probe_one  # noqa: PLC0415
+
+    # SECURITY (#400, C2): matches the REST route's write/tls_cert gate.
+    enforce_operation_permission(user, _OPERATIONS["run_cert_probe"])
+
+    t = await db.get(TLSCertTarget, UUID(args.target_id))
+    if t is None:
+        raise ValueError(f"target {args.target_id} not found")
+    ps = await db.get(PlatformSettings, 1)
+    interval = max(1, min(168, (ps.tls_cert_check_interval_hours if ps else 6) or 6))
+    result = await probe_one(db, t, default_interval_hours=interval)
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=getattr(user, "auth_source", "local") or "local",
+            action="probe",
+            resource_type="tls_cert",
+            resource_id=str(t.id),
+            resource_display=t.display_name or t.host,
+            result="success" if result.ok else "error",
+            new_value={"state": result.state, "ok": result.ok, "via": "ai_proposal"},
+        )
+    )
+    await db.commit()
+    return {
+        "id": str(t.id),
+        "state": result.state,
+        "ok": result.ok,
+        "error": result.error,
+    }
+
+
+register(
+    Operation(
+        name="run_cert_probe",
+        description=(
+            "Probe an existing TLS cert target now. Always go through "
+            "propose_run_cert_probe — never call this directly. The probe "
+            "opens a real TLS connection, so operator approval is required."
+        ),
+        args_model=RunCertProbeArgs,
+        preview=_preview_run_cert_probe,
+        apply=_apply_run_cert_probe,
+        category="security",
+        required_permission=("write", "tls_cert"),
+    )
+)
+
+
 # ── run_packet_capture operation (issue #59) ───────────────────────────
 
 

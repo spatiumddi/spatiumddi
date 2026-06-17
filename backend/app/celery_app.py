@@ -55,6 +55,7 @@ celery_app = Celery(
         "app.tasks.upgrade_orchestrator",
         "app.tasks.time_bound_grant_sweep",
         "app.tasks.acme",
+        "app.tasks.tls_certs",
     ],
 )
 
@@ -112,6 +113,7 @@ celery_app.conf.update(
         "app.tasks.audit_chain_verify.*": {"queue": "default"},
         "app.tasks.time_bound_grant_sweep.*": {"queue": "default"},
         "app.tasks.acme.*": {"queue": "default"},
+        "app.tasks.tls_certs.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60 s, mark DNS agents as ``unreachable`` if their
@@ -487,6 +489,27 @@ celery_app.conf.update(
         "time-bound-grant-sweep": {
             "task": "app.tasks.time_bound_grant_sweep.sweep_expired_grants",
             "schedule": schedule(run_every=60.0),
+        },
+        # Every 60 s, probe every enabled TLS cert target whose
+        # ``next_check_at`` has elapsed (issue #118). Per-target cadence
+        # default is ``PlatformSettings.tls_cert_check_interval_hours``
+        # (6 h), read each run so UI changes take effect without a beat
+        # restart. Idle when no targets are due.
+        "tls-cert-probe-dispatch": {
+            "task": "app.tasks.tls_certs.probe_due_certs",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Every 5 min, project TLS cert probe targets from opted-in DNS
+        # A/AAAA records + relink targets to zones/domains by SAN.
+        "tls-cert-discovery": {
+            "task": "app.tasks.tls_certs.reconcile_discovered",
+            "schedule": schedule(run_every=300.0),
+        },
+        # Daily at 03:50 UTC, prune tls_cert_probe history older than the
+        # retention window (90 d). Offset from the other 03:xx prunes.
+        "tls-cert-probe-prune": {
+            "task": "app.tasks.tls_certs.prune_probes",
+            "schedule": crontab(hour=3, minute=50),
         },
     },
 )

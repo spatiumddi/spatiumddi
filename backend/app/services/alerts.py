@@ -56,6 +56,11 @@ from app.models.network_service import NetworkService, NetworkServiceResource
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Site
 from app.models.settings import PlatformSettings
+from app.models.tls_cert import (
+    STATE_MISMATCH,
+    STATE_UNREACHABLE,
+    TLSCertTarget,
+)
 from app.models.vrf import VRF
 from app.services import audit_forward
 
@@ -183,6 +188,23 @@ RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE = "unknown_mac_in_static_range"
 RULE_TYPE_ROGUE_DHCP = "rogue_dhcp"
 _ROGUE_DHCP_RECENCY_DAYS = 1
 
+# TLS certificate monitoring — issue #118. Subject = tls_cert (one per
+# tls_cert_target). ``tls_cert_expiring`` is a standard escalating-expiry
+# rule (info → warning → critical as not_after nears, like domain_expiring);
+# ``tls_cert_chain_invalid`` / ``tls_cert_unreachable`` are standard
+# open-while-true rules; ``tls_cert_changed`` is a transition-once rule that
+# latches the fingerprint pair and auto-resolves after the window.
+RULE_TYPE_TLS_CERT_EXPIRING = "tls_cert_expiring"
+RULE_TYPE_TLS_CERT_CHAIN_INVALID = "tls_cert_chain_invalid"
+RULE_TYPE_TLS_CERT_UNREACHABLE = "tls_cert_unreachable"
+RULE_TYPE_TLS_CERT_CHANGED = "tls_cert_changed"
+# Cert-rotation deviation (#118 Phase 3) — the issuing CA changed (a
+# normally-ACME cert coming back from a different issuer); transition-once.
+RULE_TYPE_TLS_CERT_ISSUER_CHANGED = "tls_cert_issuer_changed"
+# Unreachable only pages after a couple of consecutive failures so a
+# single transient handshake blip doesn't fire.
+_TLS_CERT_UNREACHABLE_MIN_FAILURES = 2
+
 RULE_TYPES = frozenset(
     {
         RULE_TYPE_SUBNET_UTILIZATION,
@@ -214,6 +236,11 @@ RULE_TYPES = frozenset(
         RULE_TYPE_STALE_RESERVATION,
         RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE,
         RULE_TYPE_ROGUE_DHCP,
+        RULE_TYPE_TLS_CERT_EXPIRING,
+        RULE_TYPE_TLS_CERT_CHAIN_INVALID,
+        RULE_TYPE_TLS_CERT_UNREACHABLE,
+        RULE_TYPE_TLS_CERT_CHANGED,
+        RULE_TYPE_TLS_CERT_ISSUER_CHANGED,
     }
 )
 
@@ -1040,6 +1067,246 @@ async def _matching_domain_expiring_subjects(
         )
         matches.append((str(d.id), d.name, message, sev))
     return matches
+
+
+async def _matching_tls_cert_expiring_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """``tls_cert_expiring`` — escalating-expiry rule over the latest-known
+    ``not_after`` per enabled target (same severity ramp as domain_expiring).
+    Auto-resolves via the generic loop once the cert is renewed past the
+    cutoff (not_after moves out → no longer returned)."""
+    threshold_days = rule.threshold_days or _DEFAULT_EXPIRING_THRESHOLD_DAYS
+    cutoff = now + timedelta(days=threshold_days)
+    rows = (
+        (
+            await db.execute(
+                select(TLSCertTarget).where(
+                    TLSCertTarget.enabled.is_(True),
+                    TLSCertTarget.not_after.is_not(None),
+                    TLSCertTarget.not_after <= cutoff,
+                    # NOTE: intentionally NOT excluding unreachable here — a
+                    # cert's expiry is a fact from the last good probe, so a
+                    # briefly-unreachable endpoint near expiry should keep the
+                    # expiring event OPEN (excluding it makes the generic loop
+                    # resolve→reopen → notification flap on a flapping host).
+                    # The unreachable rule co-fires to signal the data is stale.
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str, str]] = []
+    for t in rows:
+        exp = t.not_after
+        if exp is None:
+            continue
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=UTC)
+        days_to_expiry = (exp - now).total_seconds() / 86400.0
+        sev = _escalate_severity_for_expiring(
+            rule.severity,
+            threshold_days=threshold_days,
+            days_to_expiry=days_to_expiry,
+        )
+        if days_to_expiry <= 0:
+            descriptor = "expired"
+        elif days_to_expiry < 1:
+            descriptor = "expires within 24 h"
+        else:
+            descriptor = f"expires in {int(days_to_expiry)} day(s)"
+        label = t.display_name or t.host
+        message = (
+            f"TLS cert for {label} {descriptor} (not_after "
+            f"{exp.isoformat()}, threshold {threshold_days} d)"
+        )
+        matches.append((str(t.id), label, message, sev))
+    return matches
+
+
+async def _matching_tls_cert_chain_invalid_subjects(
+    db: AsyncSession, rule: AlertRule
+) -> list[tuple[str, str, str]]:
+    """``tls_cert_chain_invalid`` — fires for a reachable, unexpired cert
+    that isn't usable: an untrusted chain (self-signed / wrong CA / broken
+    chain → ``chain_valid IS FALSE``) OR a trusted chain served on the wrong
+    hostname (SAN/CN mismatch → ``chain_valid IS TRUE`` but the probed name
+    isn't covered). ``derive_tls_state`` buckets BOTH as ``STATE_MISMATCH``
+    (expiry + unreachable take precedence in that ordering), so keying on the
+    state covers the hostname-mismatch case the rule advertises without
+    double-paging an expired or down cert (owned by the expiring /
+    unreachable rules). Auto-resolves once a probe validates + name-matches."""
+    rows = (
+        (
+            await db.execute(
+                select(TLSCertTarget).where(
+                    TLSCertTarget.enabled.is_(True),
+                    TLSCertTarget.state == STATE_MISMATCH,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str]] = []
+    for t in rows:
+        label = t.display_name or t.host
+        if t.chain_valid is False:
+            detail = t.chain_error or "certificate chain did not validate"
+        else:
+            # Trusted chain, wrong name — the SAN-drift case the module advertises.
+            detail = "certificate served does not match the expected hostname (SAN mismatch)"
+        message = f"TLS cert for {label} invalid: {detail}"
+        matches.append((str(t.id), label, message))
+    return matches
+
+
+async def _matching_tls_cert_unreachable_subjects(
+    db: AsyncSession, rule: AlertRule
+) -> list[tuple[str, str, str]]:
+    """``tls_cert_unreachable`` — fires while the endpoint can't be probed,
+    gated on a couple of consecutive failures so a single transient blip
+    doesn't page. Auto-resolves on the next successful probe."""
+    rows = (
+        (
+            await db.execute(
+                select(TLSCertTarget).where(
+                    TLSCertTarget.enabled.is_(True),
+                    TLSCertTarget.state == STATE_UNREACHABLE,
+                    TLSCertTarget.consecutive_failures >= _TLS_CERT_UNREACHABLE_MIN_FAILURES,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str]] = []
+    for t in rows:
+        label = t.display_name or t.host
+        message = (
+            f"TLS endpoint {label} unreachable "
+            f"({t.consecutive_failures} consecutive failures): "
+            f"{t.last_error or 'probe failed'}"
+        )
+        matches.append((str(t.id), label, message))
+    return matches
+
+
+async def _evaluate_tls_cert_transition_rule(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+    *,
+    value_attr: str = "fingerprint_sha256",
+    what: str = "fingerprint",
+) -> tuple[int, int, int, int, int]:
+    """Transition-once rule over a per-target cert attribute, modelled on
+    :func:`_evaluate_domain_transition_rule`. ``value_attr`` selects the
+    watched column:
+
+    * ``fingerprint_sha256`` (``tls_cert_changed``) — any cert swap;
+      legitimate on renewal, suspicious otherwise.
+    * ``issuer_cn`` (``tls_cert_issuer_changed``) — the issuing CA changed,
+      i.e. cert-rotation *deviation* (a normally-ACME cert coming back from a
+      different issuer). Higher-signal than a plain fingerprint change.
+
+    First sighting records a silent baseline; open events auto-resolve after
+    ``_TRANSITION_AUTO_RESOLVE_DAYS``."""
+    targets = await audit_forward._load_targets()  # noqa: SLF001
+
+    opened = resolved = delivered_syslog = delivered_webhook = delivered_smtp = 0
+
+    open_res = await db.execute(
+        select(AlertEvent).where(
+            AlertEvent.rule_id == rule.id,
+            AlertEvent.resolved_at.is_(None),
+        )
+    )
+    open_events = list(open_res.scalars().all())
+    open_by_subject: dict[str, AlertEvent] = {ev.subject_id: ev for ev in open_events}
+
+    cutoff = now - timedelta(days=_TRANSITION_AUTO_RESOLVE_DAYS)
+    for ev in list(open_events):
+        if ev.fired_at < cutoff:
+            ev.resolved_at = now
+            resolved += 1
+            del open_by_subject[ev.subject_id]
+
+    last_event_res = await db.execute(
+        select(AlertEvent).where(AlertEvent.rule_id == rule.id).order_by(AlertEvent.fired_at.desc())
+    )
+    last_event_by_subject: dict[str, AlertEvent] = {}
+    for ev in last_event_res.scalars().all():
+        last_event_by_subject.setdefault(ev.subject_id, ev)
+
+    rows = (
+        (await db.execute(select(TLSCertTarget).where(TLSCertTarget.enabled.is_(True))))
+        .scalars()
+        .all()
+    )
+    for t in rows:
+        subject_id = str(t.id)
+        current_value = getattr(t, value_attr)
+        if open_by_subject.get(subject_id) is not None:
+            continue
+
+        prior_event = last_event_by_subject.get(subject_id)
+        if prior_event is not None and isinstance(prior_event.last_observed_value, dict):
+            prior_value = prior_event.last_observed_value.get("to")
+        else:
+            prior_value = None
+
+        label = t.display_name or t.host
+        if prior_event is None:
+            if current_value is None:
+                continue
+            db.add(
+                AlertEvent(
+                    rule_id=rule.id,
+                    subject_type="tls_cert",
+                    subject_id=subject_id,
+                    subject_display=label,
+                    severity="info",
+                    message=f"Initial TLS cert {what} baseline for {label}: {current_value}",
+                    fired_at=now,
+                    resolved_at=now,
+                    last_observed_value={"from": None, "to": current_value},
+                )
+            )
+            continue
+
+        if current_value is None or current_value == prior_value:
+            continue
+
+        message = f"TLS cert {what} for {label} changed: {prior_value} → {current_value}"
+        event = AlertEvent(
+            rule_id=rule.id,
+            subject_type="tls_cert",
+            subject_id=subject_id,
+            subject_display=label,
+            severity=rule.severity,
+            message=message,
+            fired_at=now,
+            last_observed_value={"from": prior_value, "to": current_value},
+        )
+        db.add(event)
+        await db.flush()
+        ds, dw, dm = await _deliver(rule, event, targets)
+        event.delivered_syslog = ds
+        event.delivered_webhook = dw
+        event.delivered_smtp = dm
+        opened += 1
+        if ds:
+            delivered_syslog += 1
+        if dw:
+            delivered_webhook += 1
+        if dm:
+            delivered_smtp += 1
+
+    return opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp
 
 
 async def _matching_domain_drift_subjects(
@@ -2468,6 +2735,103 @@ async def _deliver(
 # ── Main entry point ───────────────────────────────────────────────────────
 
 
+_TLS_CERT_RULE_SEEDS: list[dict[str, object]] = [
+    {
+        "name": "TLS cert expiring",
+        "rule_type": RULE_TYPE_TLS_CERT_EXPIRING,
+        "severity": "warning",
+        "threshold_days": 30,
+        "description": (
+            "Fires when a monitored TLS endpoint's served certificate is "
+            "within threshold_days of expiry. Severity escalates info → "
+            "warning → critical as the expiry nears. Auto-resolves on renewal."
+        ),
+    },
+    {
+        "name": "TLS cert chain invalid",
+        "rule_type": RULE_TYPE_TLS_CERT_CHAIN_INVALID,
+        "severity": "critical",
+        "threshold_days": None,
+        "description": (
+            "Fires when a monitored endpoint's certificate is reachable and "
+            "unexpired but not usable: an untrusted chain (self-signed / wrong "
+            "CA / broken chain) or a trusted cert served for the wrong hostname "
+            "(SAN/CN mismatch). Expiry is covered by the expiring rule. "
+            "Auto-resolves once the cert validates and matches the hostname."
+        ),
+    },
+    {
+        "name": "TLS cert unreachable",
+        "rule_type": RULE_TYPE_TLS_CERT_UNREACHABLE,
+        "severity": "warning",
+        "threshold_days": None,
+        "description": (
+            "Fires when a monitored endpoint can't be probed (TCP refused / "
+            "TLS handshake failed / DNS) for a couple of consecutive cycles. "
+            "Auto-resolves on the next successful probe."
+        ),
+    },
+    {
+        "name": "TLS cert changed",
+        "rule_type": RULE_TYPE_TLS_CERT_CHANGED,
+        "severity": "info",
+        "threshold_days": None,
+        "description": (
+            "Fires once when a monitored endpoint's certificate fingerprint "
+            "changes unexpectedly (legitimate on renewal, suspicious "
+            "otherwise). Auto-resolves after the transition window."
+        ),
+    },
+    {
+        "name": "TLS cert issuer changed",
+        "rule_type": RULE_TYPE_TLS_CERT_ISSUER_CHANGED,
+        "severity": "warning",
+        "threshold_days": None,
+        "description": (
+            "Fires once when a monitored endpoint's certificate comes back "
+            "from a DIFFERENT issuing CA — cert-rotation deviation (e.g. a "
+            "normally-Let's-Encrypt cert suddenly issued by another CA), a "
+            "higher-signal subset of 'cert changed'. Auto-resolves after the "
+            "transition window."
+        ),
+    },
+]
+
+
+async def seed_tls_cert_alert_rules() -> None:
+    """Seed the four ``tls_cert_*`` rules (issue #118), DISABLED by default.
+
+    Opt-in like the other monitoring signals — seeding them surfaces their
+    existence in the Alerts UI without firing on installs that never add a
+    probe target. Keyed on ``rule_type`` (one per type); an operator who
+    enables / renames one is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        for seed in _TLS_CERT_RULE_SEEDS:
+            existing = await session.scalar(
+                select(AlertRule).where(AlertRule.rule_type == seed["rule_type"])
+            )
+            if existing is not None:
+                continue
+            session.add(
+                AlertRule(
+                    name=seed["name"],
+                    description=seed["description"],
+                    rule_type=seed["rule_type"],
+                    severity=seed["severity"],
+                    threshold_days=seed["threshold_days"],
+                    enabled=False,
+                    notify_syslog=True,
+                    notify_webhook=True,
+                    notify_smtp=False,
+                )
+            )
+        await session.commit()
+
+
 async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     """Evaluate every enabled rule; open / resolve events as needed.
 
@@ -2590,6 +2954,40 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 expiring = await _matching_decom_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
                 subject_type = "subnet"
+            elif rule.rule_type == RULE_TYPE_TLS_CERT_EXPIRING:
+                expiring = await _matching_tls_cert_expiring_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
+                subject_type = "tls_cert"
+            elif rule.rule_type == RULE_TYPE_TLS_CERT_CHAIN_INVALID:
+                invalid = await _matching_tls_cert_chain_invalid_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in invalid]
+                subject_type = "tls_cert"
+            elif rule.rule_type == RULE_TYPE_TLS_CERT_UNREACHABLE:
+                down = await _matching_tls_cert_unreachable_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in down]
+                subject_type = "tls_cert"
+            elif rule.rule_type == RULE_TYPE_TLS_CERT_CHANGED:
+                # Transition-once — latches the fingerprint pair + auto-resolves.
+                op_, res_, dsy, dwh, dsm = await _evaluate_tls_cert_transition_rule(
+                    db, rule, now, value_attr="fingerprint_sha256", what="fingerprint"
+                )
+                opened += op_
+                resolved += res_
+                delivered_syslog += dsy
+                delivered_webhook += dwh
+                delivered_smtp += dsm
+                continue
+            elif rule.rule_type == RULE_TYPE_TLS_CERT_ISSUER_CHANGED:
+                # Transition-once on the issuing CA — cert-rotation deviation.
+                op_, res_, dsy, dwh, dsm = await _evaluate_tls_cert_transition_rule(
+                    db, rule, now, value_attr="issuer_cn", what="issuer"
+                )
+                opened += op_
+                resolved += res_
+                delivered_syslog += dsy
+                delivered_webhook += dwh
+                delivered_smtp += dsm
+                continue
             elif rule.rule_type == RULE_TYPE_SERVICE_RESOURCE_ORPHANED:
                 orphans = await _matching_service_resource_orphaned_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in orphans]

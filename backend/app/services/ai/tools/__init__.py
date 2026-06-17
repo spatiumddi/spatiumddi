@@ -46,6 +46,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     snmp,
     ssh,
     syslog,
+    tls_certs,
     upgrades,
     vendor,
     webhooks,

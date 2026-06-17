@@ -55,6 +55,7 @@ import {
   alertsApi,
   conformityApi,
   dashboardsApi,
+  tlsCertsApi,
   type IPSpace,
   type Subnet,
   type DNSServer,
@@ -2649,7 +2650,7 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
   return (
     <div className="space-y-5">
       {/* Headline KPIs */}
-      <div className="grid gap-3 grid-cols-1 md:grid-cols-3">
+      <div className="grid gap-3 grid-cols-1 md:grid-cols-2 xl:grid-cols-4">
         <ComplianceKpi
           label="PCI scope"
           count={pciCount}
@@ -2671,6 +2672,7 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
           to="/admin/compliance"
           tone="warn"
         />
+        <CertsExpiringKpi />
       </div>
 
       <div className="grid gap-5 lg:grid-cols-2">
@@ -2785,6 +2787,46 @@ function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
         auditor-facing PDF export.
       </p>
     </div>
+  );
+}
+
+// TLS certs expiring within 30 days (#118). Self-contained + gated on
+// the ``security.tls_certs`` feature module so it renders nothing when
+// the operator has the module turned off.
+function CertsExpiringKpi() {
+  const { enabled, ready } = useFeatureModules();
+  const moduleOn = enabled("security.tls_certs");
+
+  const { data } = useQuery({
+    queryKey: ["tls-certs", "kpi"],
+    queryFn: () => tlsCertsApi.list({ limit: 500 }),
+    enabled: ready && moduleOn,
+    staleTime: 60_000,
+  });
+
+  if (ready && !moduleOn) return null;
+
+  const items = data?.items ?? [];
+  const expiring = items.filter(
+    (t) => t.days_remaining !== null && t.days_remaining <= 30,
+  ).length;
+  const cls = TONE_CLASS[expiring > 0 ? "bad" : "good"];
+
+  return (
+    <Link
+      to="/network/certificates"
+      className="rounded-lg border bg-card p-4 transition-colors hover:bg-accent/40"
+    >
+      <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
+        Certs expiring ≤30d
+      </p>
+      <p className={cn("mt-2 text-3xl font-bold tabular-nums", cls.value)}>
+        {expiring}
+      </p>
+      <p className="text-[11px] text-muted-foreground">
+        of {items.length} monitored · click to review
+      </p>
+    </Link>
   );
 }
 

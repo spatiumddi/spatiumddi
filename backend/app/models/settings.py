@@ -359,6 +359,14 @@ class PlatformSettings(Base):
         Integer, nullable=False, default=24, server_default=sa_text("24")
     )
 
+    # TLS certificate monitoring (#118) — default probe cadence per
+    # target (a target may override via tls_cert_target.interval_hours).
+    # Read every dispatch run so cadence changes take effect without
+    # restarting beat. Clamped 1..168 in the task.
+    tls_cert_check_interval_hours: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=6, server_default=sa_text("6")
+    )
+
     # VRF cross-cutting validation gate (Phase 2 of issue #86). When
     # False (default), an ``ASN:N`` route-distinguisher whose ASN
     # portion does not match the VRF's linked ``asn.number`` produces

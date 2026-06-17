@@ -64,6 +64,7 @@ from app.api.v1.settings.router import router as settings_router
 from app.api.v1.system import router as system_router
 from app.api.v1.tags import router as tags_router
 from app.api.v1.tailscale import router as tailscale_router
+from app.api.v1.tls_certs import router as tls_certs_router
 from app.api.v1.tools import router as tools_router
 from app.api.v1.unifi import router as unifi_router
 from app.api.v1.upgrades import router as upgrades_router
@@ -308,6 +309,12 @@ api_v1_router.include_router(
     prefix="/tailscale",
     tags=["tailscale"],
     dependencies=[Depends(require_module("integrations.tailscale"))],
+)
+api_v1_router.include_router(
+    tls_certs_router,
+    prefix="/tls-certs",
+    tags=["tls-certs"],
+    dependencies=[Depends(require_module("security.tls_certs"))],
 )
 api_v1_router.include_router(
     tools_router,

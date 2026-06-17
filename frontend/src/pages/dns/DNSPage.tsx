@@ -49,6 +49,11 @@ import { ZoneTemplateModal } from "./ZoneTemplateModal";
 import { ServerDetailModal } from "./ServerDetailModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { PoolsView } from "./PoolsView";
+import {
+  CertsCompactTable,
+  TLSStatePill,
+} from "@/pages/network/CertificatesPage";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
@@ -58,6 +63,7 @@ import {
   dnsBlocklistApi,
   domainsApi,
   formatApiError,
+  tlsCertsApi,
   type DNSServerGroup,
   type DNSServer,
   type DNSZone,
@@ -2813,6 +2819,33 @@ function ZoneDetailView({
     queryFn: () => dnsApi.listRecords(group.id, zone.id),
   });
 
+  // TLS cert targets linked to this zone (#118). Powers the Certs
+  // sub-tab + the per-record state pill on A/AAAA rows. Gated on the
+  // feature module so disabling it stops the extra query entirely.
+  const { enabled: moduleEnabled, ready: modulesReady } = useFeatureModules();
+  const tlsCertsOn = moduleEnabled("security.tls_certs");
+  const { data: tlsCerts, isLoading: tlsCertsLoading } = useQuery({
+    queryKey: ["tls-certs", "dns-zone", zone.id],
+    queryFn: () => tlsCertsApi.list({ dns_zone_id: zone.id, limit: 200 }),
+    enabled: modulesReady && tlsCertsOn,
+  });
+  // #118 — toggle auto-discovery of cert probe targets for this zone's
+  // A/AAAA records. The discovery reconciler picks the change up on its
+  // next sweep (~5 min).
+  const autoTlsProbeMutation = useMutation({
+    mutationFn: (next: boolean) =>
+      dnsApi.updateZone(group.id, zone.id, { auto_tls_probe: next }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-zones", group.id] });
+      qc.invalidateQueries({ queryKey: ["tls-certs", "dns-zone", zone.id] });
+    },
+  });
+  const certStateByRecord = new Map(
+    (tlsCerts?.items ?? [])
+      .filter((t) => t.dns_record_id)
+      .map((t) => [t.dns_record_id as string, t.state]),
+  );
+
   const deleteZone = useMutation({
     mutationFn: () => dnsApi.deleteZone(group.id, zone.id),
     onSuccess: () => {
@@ -2858,10 +2891,17 @@ function ZoneDetailView({
   // pre-selects the Pools tab so the deep-link lands on the right
   // surface; otherwise default to Records.
   const [zoneSearchParams, setZoneSearchParams] = useSearchParams();
-  const initialSubtab =
-    zoneSearchParams.get("subtab") === "pools" ? "pools" : "records";
-  const [zoneView, _setZoneView] = useState<"records" | "pools">(initialSubtab);
-  const setZoneView = (v: "records" | "pools") => {
+  const subtabParam = zoneSearchParams.get("subtab");
+  const initialSubtab: "records" | "pools" | "certs" =
+    subtabParam === "pools"
+      ? "pools"
+      : subtabParam === "certs"
+        ? "certs"
+        : "records";
+  const [zoneView, _setZoneView] = useState<"records" | "pools" | "certs">(
+    initialSubtab,
+  );
+  const setZoneView = (v: "records" | "pools" | "certs") => {
     _setZoneView(v);
     // Keep the URL in sync so a refresh / back-navigation lands on
     // the same tab. ``subtab=records`` is the default state — drop
@@ -2869,8 +2909,8 @@ function ZoneDetailView({
     setZoneSearchParams(
       (prev: URLSearchParams) => {
         const next = new URLSearchParams(prev);
-        if (v === "pools") next.set("subtab", "pools");
-        else next.delete("subtab");
+        if (v === "records") next.delete("subtab");
+        else next.set("subtab", v);
         return next;
       },
       { replace: true },
@@ -3163,12 +3203,58 @@ function ZoneDetailView({
           >
             Pools ({poolsForCount.length})
           </button>
+          {(!modulesReady || tlsCertsOn) && (
+            <button
+              type="button"
+              onClick={() => setZoneView("certs")}
+              className={
+                "border-b-2 px-3 py-2 text-xs font-medium transition-colors " +
+                (zoneView === "certs"
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground")
+              }
+            >
+              Certificates ({tlsCerts?.items.length ?? 0})
+            </button>
+          )}
         </div>
       )}
 
       {/* Pools sub-view */}
       {!isForward && !zone.tailscale_tenant_id && zoneView === "pools" && (
         <PoolsView group={group} zone={zone} />
+      )}
+
+      {/* Certificates sub-view */}
+      {!isForward && !zone.tailscale_tenant_id && zoneView === "certs" && (
+        <div className="flex-1 overflow-auto p-5">
+          {modulesReady && !tlsCertsOn ? (
+            <p className="text-sm text-muted-foreground">
+              TLS certificate monitoring is disabled.
+            </p>
+          ) : (
+            <>
+              <label className="mb-4 flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={!!zone.auto_tls_probe}
+                  disabled={autoTlsProbeMutation.isPending}
+                  onChange={(e) =>
+                    autoTlsProbeMutation.mutate(e.target.checked)
+                  }
+                />
+                <span>
+                  Auto-discover &amp; probe every A/AAAA record in this zone
+                </span>
+              </label>
+              <CertsCompactTable
+                targets={tlsCerts?.items ?? []}
+                isLoading={tlsCertsLoading}
+                emptyLabel="No TLS certificates linked to records in this zone."
+              />
+            </>
+          )}
+        </div>
       )}
 
       {/* Bulk actions — shown when any manual records are selected. */}
@@ -3391,10 +3477,19 @@ function ZoneDetailView({
                             )}
                           </td>
                           <td className="py-1.5">
-                            <span
-                              className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${RECORD_TYPE_BADGE[r.record_type] ?? RECORD_TYPE_BADGE_FALLBACK}`}
-                            >
-                              {r.record_type}
+                            <span className="inline-flex items-center gap-1.5">
+                              <span
+                                className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${RECORD_TYPE_BADGE[r.record_type] ?? RECORD_TYPE_BADGE_FALLBACK}`}
+                              >
+                                {r.record_type}
+                              </span>
+                              {(r.record_type === "A" ||
+                                r.record_type === "AAAA") &&
+                                certStateByRecord.has(r.id) && (
+                                  <TLSStatePill
+                                    state={certStateByRecord.get(r.id)!}
+                                  />
+                                )}
                             </span>
                           </td>
                           <td className="py-1.5 font-mono text-xs text-muted-foreground max-w-xs truncate">

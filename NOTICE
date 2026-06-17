@@ -47,6 +47,7 @@ components. Grouped by role; license + project URL for each.
 - Celery — BSD 3-Clause — https://celeryq.dev
 - structlog — MIT / Apache 2.0 — https://www.structlog.org
 - cryptography — Apache 2.0 / BSD 3-Clause — https://cryptography.io
+- pyOpenSSL (TLS cert chain capture) — Apache 2.0 — https://www.pyopenssl.org
 - httpx — BSD 3-Clause — https://www.python-httpx.org
 - Authlib (OIDC/OAuth) — BSD 3-Clause — https://authlib.org
 - ldap3 (LDAP) — LGPL v3 — https://github.com/cannatag/ldap3

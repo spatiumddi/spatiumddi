@@ -9,6 +9,7 @@ import {
   Radar,
   Radio,
   RefreshCw,
+  ShieldCheck,
   Trash2,
   X,
 } from "lucide-react";
@@ -17,6 +18,7 @@ import {
   ipamApi,
   multicastApi,
   nmapApi,
+  tlsCertsApi,
   type DHCPFingerprintResponse,
   type IPAddress,
   type MulticastMembershipReadWithGroup,
@@ -24,6 +26,7 @@ import {
   type Subnet,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { CertsCompactTable } from "@/pages/network/CertificatesPage";
 import {
   MODAL_BACKDROP_CLS,
   useDraggableModal,
@@ -475,6 +478,8 @@ export function IPDetailModal({
           {/* Multicast memberships (issue #126 Wave 4). Hidden when
               the network.multicast feature module is disabled. */}
           <MulticastMembershipsSection addressId={addr.id} />
+
+          <CertsSection addressId={addr.id} />
         </div>
       </div>
     </div>
@@ -487,6 +492,32 @@ export function IPDetailModal({
 // consumer / RP). Hidden when the network.multicast feature module
 // is off, so non-multicast deployments don't see chrome they don't
 // need.
+
+function CertsSection({ addressId }: { addressId: string }) {
+  const { enabled } = useFeatureModules();
+  const certsEnabled = enabled("security.tls_certs");
+
+  const q = useQuery({
+    queryKey: ["tls-certs", "by-ip", addressId],
+    queryFn: () => tlsCertsApi.list({ ip_address_id: addressId, limit: 50 }),
+    enabled: certsEnabled,
+    staleTime: 30_000,
+  });
+
+  if (!certsEnabled) return null;
+  const targets = q.data?.items ?? [];
+  // Most IPs serve no monitored cert — hide the section entirely then.
+  if (targets.length === 0) return null;
+
+  return (
+    <div>
+      <div className="mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+        <ShieldCheck className="h-3 w-3" /> TLS certificates
+      </div>
+      <CertsCompactTable targets={targets} />
+    </div>
+  );
+}
 
 function MulticastMembershipsSection({ addressId }: { addressId: string }) {
   const { enabled } = useFeatureModules();

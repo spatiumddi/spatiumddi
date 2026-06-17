@@ -271,6 +271,8 @@ backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:drop_c
 backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:drop_table:105
 backend/alembic/versions/c6c3137e3554_appliance_slot_image_upload.py:drop_table:110
 backend/alembic/versions/c7a3e1f90d24_subnet_utilization_history.py:drop_table:47
+backend/alembic/versions/c7d1f04e9a2b_tls_cert_target_ip_address.py:drop_column:44
+backend/alembic/versions/c7d1f04e9a2b_tls_cert_target_ip_address.py:drop_constraint_fk:43
 backend/alembic/versions/c7e2f5a91d48_audit_forward_targets.py:drop_table:172
 backend/alembic/versions/c7e5d918a3f2_appliance_cluster_health.py:drop_column:42
 backend/alembic/versions/c7e9b3a481f2_appliance_approval_workflow.py:drop_column:152
@@ -538,6 +540,11 @@ backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:139
 backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:140
 backend/alembic/versions/f3b8d24a1c70_appliance_evict_requested.py:drop_column:39
 backend/alembic/versions/f3b9c1d6a274_dhcp_group_socket_mode.py:drop_column:49
+backend/alembic/versions/f3e8b1d72a9c_tls_cert_monitoring.py:drop_column:175
+backend/alembic/versions/f3e8b1d72a9c_tls_cert_monitoring.py:drop_column:176
+backend/alembic/versions/f3e8b1d72a9c_tls_cert_monitoring.py:drop_column:177
+backend/alembic/versions/f3e8b1d72a9c_tls_cert_monitoring.py:drop_table:169
+backend/alembic/versions/f3e8b1d72a9c_tls_cert_monitoring.py:drop_table:174
 backend/alembic/versions/f4a1c9e7b2d8_appliance_host_config_health.py:drop_column:43
 backend/alembic/versions/f4a6c8b2e571_bgp_communities.py:drop_table:83
 backend/alembic/versions/f4a9c1b2d6e7_dns_zone_color.py:drop_column:33
