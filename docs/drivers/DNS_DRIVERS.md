@@ -185,6 +185,27 @@ config-driven, not op-driven (unlike PowerDNS's REST sign):
 Gating: `_DRIVER_GATED_OPERATIONS` allows `dnssec_sign`/`dnssec_unsign` on
 `{powerdns, bind9}` and `dnssec_rollover` on `{bind9}`.
 
+### 2.6 Rate limiting (RRL) + amplification (issue #146)
+
+Group-level `DNSServerOptions` fields flow through the standard
+`ServerOptions` → `ConfigBundle` → ETag → long-poll path (so a UI change
+shifts the etag and re-renders `named.conf` with no extra wake plumbing) and
+land in the `options {}` block of both renderers — the agent's
+`NAMED_CONF_SKELETON` (the live config; see `_render_rate_limit_block`) and
+the control-plane preview template `named.conf.j2`.
+
+- `rrl_enabled` gates a `rate-limit { responses-per-second; window; slip;
+  [qps-scale]; [exempt-clients]; [log-only]; }` stanza. `log-only` is BIND's
+  dry-run (count + log drops, drop nothing) for sizing the limit safely.
+- `minimal_responses`, `tcp_clients`, `clients_per_query`,
+  `max_clients_per_query` each render only when set.
+- **Every field defaults to a no-op**, so adding the feature renders
+  byte-identical config for groups that haven't opted in (the bundle etag
+  shifts once on upgrade, causing a single graceful `rndc reconfig`).
+- BIND9-only. PowerDNS authoritative has no RRL equivalent; the planned
+  answer there is a dnsdist front (#146 Phase 2, not yet shipped). RRL drop
+  counters + a `dns_rate_limit_dropping` alert are #146 Phase 3.
+
 ---
 
 ## 3. Windows DNS Driver

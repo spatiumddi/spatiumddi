@@ -21,6 +21,7 @@ from app.models.dns import (
     DNSPoolMember,
     DNSRecord,
     DNSServerGroup,
+    DNSServerOptions,
     DNSView,
     DNSZone,
 )
@@ -249,15 +250,33 @@ async def forward_dns(
     try:
         answers = await asyncio.to_thread(resolver.resolve, target, args.rdtype)
     except dns.resolver.NXDOMAIN:
-        return {"name": target, "rdtype": args.rdtype, "rcode": "NXDOMAIN", "answers": []}
+        return {
+            "name": target,
+            "rdtype": args.rdtype,
+            "rcode": "NXDOMAIN",
+            "answers": [],
+        }
     except dns.resolver.NoAnswer:
-        return {"name": target, "rdtype": args.rdtype, "rcode": "NOERROR", "answers": []}
+        return {
+            "name": target,
+            "rdtype": args.rdtype,
+            "rcode": "NOERROR",
+            "answers": [],
+        }
     except dns.resolver.NoNameservers as exc:
-        return {"name": target, "rdtype": args.rdtype, "error": f"no nameservers: {exc}"}
+        return {
+            "name": target,
+            "rdtype": args.rdtype,
+            "error": f"no nameservers: {exc}",
+        }
     except dns.exception.Timeout:
         return {"name": target, "rdtype": args.rdtype, "error": "resolver timeout"}
     except dns.exception.DNSException as exc:
-        return {"name": target, "rdtype": args.rdtype, "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "name": target,
+            "rdtype": args.rdtype,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
     return {
         "name": target,
         "rdtype": args.rdtype,
@@ -310,13 +329,27 @@ async def reverse_dns(
     try:
         answers = await asyncio.to_thread(resolver.resolve, arpa, "PTR")
     except dns.resolver.NXDOMAIN:
-        return {"address": args.address, "arpa": arpa, "rcode": "NXDOMAIN", "answers": []}
+        return {
+            "address": args.address,
+            "arpa": arpa,
+            "rcode": "NXDOMAIN",
+            "answers": [],
+        }
     except dns.resolver.NoAnswer:
-        return {"address": args.address, "arpa": arpa, "rcode": "NOERROR", "answers": []}
+        return {
+            "address": args.address,
+            "arpa": arpa,
+            "rcode": "NOERROR",
+            "answers": [],
+        }
     except dns.exception.Timeout:
         return {"address": args.address, "arpa": arpa, "error": "resolver timeout"}
     except dns.exception.DNSException as exc:
-        return {"address": args.address, "arpa": arpa, "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "address": args.address,
+            "arpa": arpa,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
     return {
         "address": args.address,
         "arpa": arpa,
@@ -478,7 +511,7 @@ async def list_dns_blocklists(
             "sinkhole_ip": r.sinkhole_ip,
             "enabled": r.enabled,
             "entry_count": r.entry_count,
-            "last_synced_at": r.last_synced_at.isoformat() if r.last_synced_at else None,
+            "last_synced_at": (r.last_synced_at.isoformat() if r.last_synced_at else None),
             "last_sync_status": r.last_sync_status,
             "last_sync_error": r.last_sync_error,
         }
@@ -557,7 +590,7 @@ async def list_dns_pools(
             "hc_interval_seconds": p.hc_interval_seconds,
             "hc_unhealthy_threshold": p.hc_unhealthy_threshold,
             "hc_healthy_threshold": p.hc_healthy_threshold,
-            "last_checked_at": p.last_checked_at.isoformat() if p.last_checked_at else None,
+            "last_checked_at": (p.last_checked_at.isoformat() if p.last_checked_at else None),
             "members": [
                 {
                     "address": m.address,
@@ -662,7 +695,7 @@ async def find_zone_dnssec_info(
         "zone_id": str(zone.id),
         "name": zone.name,
         "dnssec_enabled": zone.dnssec_enabled,
-        "dnssec_policy_id": str(zone.dnssec_policy_id) if zone.dnssec_policy_id else None,
+        "dnssec_policy_id": (str(zone.dnssec_policy_id) if zone.dnssec_policy_id else None),
         "dnssec_ds_records": zone.dnssec_ds_records,
         "dnssec_synced_at": (zone.dnssec_synced_at.isoformat() if zone.dnssec_synced_at else None),
         "last_serial": zone.last_serial,
@@ -677,6 +710,82 @@ async def find_zone_dnssec_info(
             for k in keys
         ],
     }
+
+
+class FindDNSRateLimitSettingsArgs(BaseModel):
+    group_id: uuid.UUID | None = Field(
+        default=None,
+        description="UUID of a dns_server_group to inspect. Omit for all groups.",
+    )
+
+
+@register_tool(
+    name="find_dns_rate_limit_settings",
+    description=(
+        "Return the BIND9 Response Rate Limiting (RRL) + amplification "
+        "defense posture for one DNS server group (or all groups when "
+        "group_id is omitted): whether RRL is enabled, responses-per-second "
+        "/ window / slip / qps-scale, the exempt-clients list, log-only "
+        "(dry-run) mode, and the amplification knobs (minimal-responses, "
+        "tcp-clients, clients-per-query, max-clients-per-query). Use this to "
+        "answer 'is rate limiting on for the prod DNS group?' or 'what's the "
+        "RRL responses-per-second?'. Read-only."
+    ),
+    args_model=FindDNSRateLimitSettingsArgs,
+    category="dns",
+    module="dns",
+)
+async def find_dns_rate_limit_settings(
+    db: AsyncSession, user: User, args: FindDNSRateLimitSettingsArgs
+) -> dict[str, Any]:
+    # LEFT JOIN from the group: a DNSServerOptions row is created lazily (on
+    # first GET/PUT of options), so an inner join would silently omit any
+    # group that hasn't materialised one yet. Those groups report the model
+    # defaults (RRL off) — which is their effective posture.
+    stmt = select(DNSServerGroup, DNSServerOptions).outerjoin(
+        DNSServerOptions, DNSServerOptions.group_id == DNSServerGroup.id
+    )
+    if args.group_id is not None:
+        stmt = stmt.where(DNSServerGroup.id == args.group_id)
+    rows = (await db.execute(stmt)).all()
+
+    def _defaulted(g: DNSServerGroup, o: DNSServerOptions | None) -> dict[str, Any]:
+        if o is None:
+            return {
+                "group_id": str(g.id),
+                "group_name": g.name,
+                "options_row_exists": False,
+                "rrl_enabled": False,
+                "rrl_responses_per_second": 15,
+                "rrl_window": 15,
+                "rrl_slip": 2,
+                "rrl_qps_scale": None,
+                "rrl_exempt_clients": [],
+                "rrl_log_only": False,
+                "minimal_responses": False,
+                "tcp_clients": None,
+                "clients_per_query": None,
+                "max_clients_per_query": None,
+            }
+        return {
+            "group_id": str(g.id),
+            "group_name": g.name,
+            "options_row_exists": True,
+            "rrl_enabled": o.rrl_enabled,
+            "rrl_responses_per_second": o.rrl_responses_per_second,
+            "rrl_window": o.rrl_window,
+            "rrl_slip": o.rrl_slip,
+            "rrl_qps_scale": o.rrl_qps_scale,
+            "rrl_exempt_clients": o.rrl_exempt_clients or [],
+            "rrl_log_only": o.rrl_log_only,
+            "minimal_responses": o.minimal_responses,
+            "tcp_clients": o.tcp_clients,
+            "clients_per_query": o.clients_per_query,
+            "max_clients_per_query": o.max_clients_per_query,
+        }
+
+    groups = [_defaulted(g, o) for g, o in rows]
+    return {"count": len(groups), "groups": groups}
 
 
 class FindZoneDriftArgs(BaseModel):

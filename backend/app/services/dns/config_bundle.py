@@ -106,6 +106,17 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             query_log_print_category=opts_row.query_log_print_category,
             query_log_print_severity=opts_row.query_log_print_severity,
             query_log_print_time=opts_row.query_log_print_time,
+            rrl_enabled=opts_row.rrl_enabled,
+            rrl_responses_per_second=opts_row.rrl_responses_per_second,
+            rrl_window=opts_row.rrl_window,
+            rrl_slip=opts_row.rrl_slip,
+            rrl_qps_scale=opts_row.rrl_qps_scale,
+            rrl_exempt_clients=tuple(opts_row.rrl_exempt_clients or ()),
+            rrl_log_only=opts_row.rrl_log_only,
+            minimal_responses=opts_row.minimal_responses,
+            tcp_clients=opts_row.tcp_clients,
+            clients_per_query=opts_row.clients_per_query,
+            max_clients_per_query=opts_row.max_clients_per_query,
             trust_anchors=tuple(
                 TrustAnchorData(
                     zone_name=ta.zone_name,

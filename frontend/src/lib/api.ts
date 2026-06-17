@@ -4418,6 +4418,18 @@ export interface DNSServerOptions {
   query_log_print_category: boolean;
   query_log_print_severity: boolean;
   query_log_print_time: boolean;
+  // Response Rate Limiting + amplification defenses (issue #146)
+  rrl_enabled: boolean;
+  rrl_responses_per_second: number;
+  rrl_window: number;
+  rrl_slip: number;
+  rrl_qps_scale: number | null;
+  rrl_exempt_clients: string[];
+  rrl_log_only: boolean;
+  minimal_responses: boolean;
+  tcp_clients: number | null;
+  clients_per_query: number | null;
+  max_clients_per_query: number | null;
   trust_anchors: DNSTrustAnchor[];
   modified_at: string;
 }

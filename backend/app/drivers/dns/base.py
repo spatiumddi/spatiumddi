@@ -140,6 +140,19 @@ class ServerOptions:
     query_log_print_category: bool = True
     query_log_print_severity: bool = True
     query_log_print_time: bool = True
+    # Response Rate Limiting + amplification defenses (issue #146). Defaults
+    # render nothing, so adding these is a no-op for existing groups.
+    rrl_enabled: bool = False
+    rrl_responses_per_second: int = 15
+    rrl_window: int = 15
+    rrl_slip: int = 2
+    rrl_qps_scale: int | None = None
+    rrl_exempt_clients: tuple[str, ...] = ()
+    rrl_log_only: bool = False
+    minimal_responses: bool = False
+    tcp_clients: int | None = None
+    clients_per_query: int | None = None
+    max_clients_per_query: int | None = None
 
 
 @dataclass(frozen=True)

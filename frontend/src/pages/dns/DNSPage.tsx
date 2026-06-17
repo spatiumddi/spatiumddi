@@ -4999,6 +4999,19 @@ function OptionsTab({ groupId }: { groupId: string }) {
     "/var/log/named/queries.log",
   );
   const [queryLogSeverity, setQueryLogSeverity] = useState("info");
+  // RRL + amplification (issue #146). Optional numerics held as strings so
+  // "" round-trips to null.
+  const [rrlEnabled, setRrlEnabled] = useState(false);
+  const [rrlRps, setRrlRps] = useState(15);
+  const [rrlWindow, setRrlWindow] = useState(15);
+  const [rrlSlip, setRrlSlip] = useState(2);
+  const [rrlQpsScale, setRrlQpsScale] = useState("");
+  const [rrlExempt, setRrlExempt] = useState("");
+  const [rrlLogOnly, setRrlLogOnly] = useState(false);
+  const [minimalResponses, setMinimalResponses] = useState(false);
+  const [tcpClients, setTcpClients] = useState("");
+  const [clientsPerQuery, setClientsPerQuery] = useState("");
+  const [maxClientsPerQuery, setMaxClientsPerQuery] = useState("");
   const [dirty, setDirty] = useState(false);
   const [saved, setSaved] = useState(false);
   const [initialized, setInitialized] = useState(false);
@@ -5017,6 +5030,17 @@ function OptionsTab({ groupId }: { groupId: string }) {
     setQueryLogChannel(opts.query_log_channel);
     setQueryLogFile(opts.query_log_file);
     setQueryLogSeverity(opts.query_log_severity);
+    setRrlEnabled(opts.rrl_enabled);
+    setRrlRps(opts.rrl_responses_per_second);
+    setRrlWindow(opts.rrl_window);
+    setRrlSlip(opts.rrl_slip);
+    setRrlQpsScale(opts.rrl_qps_scale?.toString() ?? "");
+    setRrlExempt(opts.rrl_exempt_clients.join(", "));
+    setRrlLogOnly(opts.rrl_log_only);
+    setMinimalResponses(opts.minimal_responses);
+    setTcpClients(opts.tcp_clients?.toString() ?? "");
+    setClientsPerQuery(opts.clients_per_query?.toString() ?? "");
+    setMaxClientsPerQuery(opts.max_clients_per_query?.toString() ?? "");
     setInitialized(true);
   }
 
@@ -5038,6 +5062,22 @@ function OptionsTab({ groupId }: { groupId: string }) {
       .filter(Boolean);
   }
 
+  // "" → null (clear), else the parsed number. Used for the optional RRL /
+  // amplification numerics.
+  function numOrNull(s: string): number | null {
+    const t = s.trim();
+    return t === "" ? null : Number(t);
+  }
+
+  // For the REQUIRED RRL numerics: a blank/invalid input must not silently
+  // coerce to 0 (Number("") === 0). slip=0 is a valid-but-different BIND
+  // behavior; rps/window=0 fail server validation. Fall back to the BIND
+  // default instead.
+  function numOrDefault(raw: string, dflt: number): number {
+    const n = Number(raw);
+    return raw.trim() === "" || Number.isNaN(n) ? dflt : n;
+  }
+
   function save() {
     saveMut.mutate({
       forwarders: forwardersEnabled ? list(forwarders) : [],
@@ -5052,6 +5092,17 @@ function OptionsTab({ groupId }: { groupId: string }) {
       query_log_channel: queryLogChannel,
       query_log_file: queryLogFile,
       query_log_severity: queryLogSeverity,
+      rrl_enabled: rrlEnabled,
+      rrl_responses_per_second: rrlRps,
+      rrl_window: rrlWindow,
+      rrl_slip: rrlSlip,
+      rrl_qps_scale: numOrNull(rrlQpsScale),
+      rrl_exempt_clients: list(rrlExempt),
+      rrl_log_only: rrlLogOnly,
+      minimal_responses: minimalResponses,
+      tcp_clients: numOrNull(tcpClients),
+      clients_per_query: numOrNull(clientsPerQuery),
+      max_clients_per_query: numOrNull(maxClientsPerQuery),
     });
   }
 
@@ -5195,6 +5246,168 @@ function OptionsTab({ groupId }: { groupId: string }) {
             <option value="no">no — do not validate DNSSEC signatures</option>
           </select>
         </Field>
+      </div>
+
+      <div className={card}>
+        <div className="flex items-center justify-between">
+          <h4 className={cardTitle}>
+            <Shield className="h-4 w-4 text-muted-foreground" /> Rate limiting
+            (RRL) &amp; amplification
+          </h4>
+          <label className="flex items-center gap-2 cursor-pointer text-sm">
+            <input
+              type="checkbox"
+              checked={rrlEnabled}
+              onChange={(e) => {
+                setRrlEnabled(e.target.checked);
+                setDirty(true);
+              }}
+              className="h-4 w-4"
+            />
+            Enable RRL
+          </label>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          BIND9 Response Rate Limiting drops/truncates duplicate responses to
+          the same client /24 — the primary defense against DNS amplification.
+          Applies to every view on this server group.
+        </p>
+        {rrlEnabled && (
+          <>
+            <div className="grid grid-cols-3 gap-3">
+              <Field label="responses/sec (1–1000)">
+                <input
+                  type="number"
+                  min={1}
+                  max={1000}
+                  className={inputCls}
+                  value={rrlRps}
+                  onChange={(e) => {
+                    setRrlRps(numOrDefault(e.target.value, 15));
+                    setDirty(true);
+                  }}
+                />
+              </Field>
+              <Field label="window sec (1–3600)">
+                <input
+                  type="number"
+                  min={1}
+                  max={3600}
+                  className={inputCls}
+                  value={rrlWindow}
+                  onChange={(e) => {
+                    setRrlWindow(numOrDefault(e.target.value, 15));
+                    setDirty(true);
+                  }}
+                />
+              </Field>
+              <Field label="slip (0–10)">
+                <input
+                  type="number"
+                  min={0}
+                  max={10}
+                  className={inputCls}
+                  value={rrlSlip}
+                  onChange={(e) => {
+                    setRrlSlip(numOrDefault(e.target.value, 2));
+                    setDirty(true);
+                  }}
+                />
+              </Field>
+            </div>
+            <Field label="qps-scale (optional — tighten limit under load)">
+              <input
+                type="number"
+                min={1}
+                className={inputCls}
+                value={rrlQpsScale}
+                onChange={(e) => {
+                  setRrlQpsScale(e.target.value);
+                  setDirty(true);
+                }}
+                placeholder="unset"
+              />
+            </Field>
+            <Field label="exempt-clients (comma/newline CIDRs or ACL names)">
+              <input
+                className={inputCls}
+                value={rrlExempt}
+                onChange={(e) => {
+                  setRrlExempt(e.target.value);
+                  setDirty(true);
+                }}
+                placeholder="10.0.0.0/8, 192.168.0.0/16"
+              />
+            </Field>
+            <label className="flex items-center gap-2 cursor-pointer text-sm">
+              <input
+                type="checkbox"
+                checked={rrlLogOnly}
+                onChange={(e) => {
+                  setRrlLogOnly(e.target.checked);
+                  setDirty(true);
+                }}
+                className="h-4 w-4"
+              />
+              log-only (dry run — count would-be drops without dropping)
+            </label>
+          </>
+        )}
+        <div className="border-t pt-3 space-y-3">
+          <label className="flex items-center gap-2 cursor-pointer text-sm">
+            <input
+              type="checkbox"
+              checked={minimalResponses}
+              onChange={(e) => {
+                setMinimalResponses(e.target.checked);
+                setDirty(true);
+              }}
+              className="h-4 w-4"
+            />
+            minimal-responses (shrink amplification payload)
+          </label>
+          <div className="grid grid-cols-3 gap-3">
+            <Field label="tcp-clients">
+              <input
+                type="number"
+                min={1}
+                className={inputCls}
+                value={tcpClients}
+                onChange={(e) => {
+                  setTcpClients(e.target.value);
+                  setDirty(true);
+                }}
+                placeholder="default"
+              />
+            </Field>
+            <Field label="clients-per-query">
+              <input
+                type="number"
+                min={1}
+                className={inputCls}
+                value={clientsPerQuery}
+                onChange={(e) => {
+                  setClientsPerQuery(e.target.value);
+                  setDirty(true);
+                }}
+                placeholder="default"
+              />
+            </Field>
+            <Field label="max-clients-per-query">
+              <input
+                type="number"
+                min={1}
+                className={inputCls}
+                value={maxClientsPerQuery}
+                onChange={(e) => {
+                  setMaxClientsPerQuery(e.target.value);
+                  setDirty(true);
+                }}
+                placeholder="default"
+              />
+            </Field>
+          </div>
+        </div>
       </div>
 
       <div className={card}>

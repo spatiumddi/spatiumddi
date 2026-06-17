@@ -110,7 +110,7 @@ SpatiumDDI is built on nights and weekends with no commercial backing — every 
 | 🗂 | **Hierarchical IPAM** | spaces · blocks · subnets · IPv4 + full IPv6 (EUI-64 / random / sequential) · per-IP roles · MAC history · reservation TTL · bulk allocate with name templates · atomic next-available-subnet carve (`POST /blocks/{id}/allocate-subnet` — race-safe, Terraform-ready) · scheduled reconciliation hygiene alerts (free-but-responding / stale reservation / unknown-MAC squatting) |
 | ✂️ | **Subnet operations** | Split · Merge · Find-free · subnet planner (multi-level CIDR design + transactional apply) — preview-then-commit with typed-CIDR confirm · single Tools dropdown on subnet headers |
 | 🧮 | **Planning tools** | CIDR calculator · address planner (pack /N requests into free space) · aggregation suggestion · free-space treemap |
-| 🌐 | **DNS** | BIND9 container, auto-registering · RFC 2136 dynamic updates · per-server zone-serial drift · TSIG keys · zone delegation wizard · zone templates · RPZ blocklists with curated catalog · BIND9 catalog zones (RFC 9432) · secondary / stub zones (`masters`) · SVCB / HTTPS / DNAME records · query-log analytics (top names / clients / qtypes + per-view breakdown) with NXDOMAIN-spike / query-rate-spike alerting |
+| 🌐 | **DNS** | BIND9 container, auto-registering · RFC 2136 dynamic updates · per-server zone-serial drift · TSIG keys · zone delegation wizard · zone templates · RPZ blocklists with curated catalog · BIND9 catalog zones (RFC 9432) · secondary / stub zones (`masters`) · SVCB / HTTPS / DNAME records · Response Rate Limiting (RRL) + amplification defenses · query-log analytics (top names / clients / qtypes + per-view breakdown) with NXDOMAIN-spike / query-rate-spike alerting |
 | 🔐 | **DNSSEC** | BIND9 inline-signing (BIND owns + auto-rotates keys) + PowerDNS online sign · reusable `dnssec-policy` library · per-zone public key state + DS export · manual + automatic rollover |
 | 🔀 | **DNS Views (split-horizon)** | per-view zone + record rendering on BIND9 — `view_id IS NULL` records shared across views, scoped records render only in their view, RPZ / blocklists replicate into each view block |
 | ⚖️ | **GSLB-lite** | health-checked DNS pools — tcp / http / https / icmp / none probes flip A/AAAA records in/out of the rendered rrset; manual enable per member |
@@ -254,6 +254,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
     - Rows distribute through the existing `tsig_keys` ConfigBundle block
   - **RPZ blocklists** — 14-source curated catalog with one-click subscribe + immediate refresh
     - Sources: AdGuard, StevenBlack, OISD, Hagezi, 1Hosts, Phishing Army, URLhaus, EasyPrivacy, …
+  - **Rate limiting (RRL) + amplification defenses** — BIND9 Response Rate Limiting (responses-per-second / window / slip / qps-scale / exempt-clients) with a `log-only` dry-run, plus `minimal-responses` / `tcp-clients` / `clients-per-query` toggles; group-level, default-off (no-op until opted in)
   - **Catalog zones (RFC 9432)** — producer / consumer roles auto-derived from the group's primary
     - RFC-compliant SHA-1 hashing of zone names
   - **Operator tools**:

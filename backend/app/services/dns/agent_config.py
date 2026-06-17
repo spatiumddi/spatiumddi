@@ -330,6 +330,22 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         # structural fingerprint so toggling it in the UI reliably
         # triggers a daemon reload.
         "query_log_enabled": (bool(getattr(opts, "query_log_enabled", False)) if opts else False),
+        # Response Rate Limiting + amplification defenses (issue #146). These
+        # ride the same options dict → bundle etag, so a UI change wakes the
+        # long-poll and reliably re-renders named.conf.
+        "rrl_enabled": (bool(getattr(opts, "rrl_enabled", False)) if opts else False),
+        "rrl_responses_per_second": (
+            int(getattr(opts, "rrl_responses_per_second", 15)) if opts else 15
+        ),
+        "rrl_window": int(getattr(opts, "rrl_window", 15)) if opts else 15,
+        "rrl_slip": int(getattr(opts, "rrl_slip", 2)) if opts else 2,
+        "rrl_qps_scale": getattr(opts, "rrl_qps_scale", None) if opts else None,
+        "rrl_exempt_clients": (list(getattr(opts, "rrl_exempt_clients", []) or []) if opts else []),
+        "rrl_log_only": (bool(getattr(opts, "rrl_log_only", False)) if opts else False),
+        "minimal_responses": (bool(getattr(opts, "minimal_responses", False)) if opts else False),
+        "tcp_clients": getattr(opts, "tcp_clients", None) if opts else None,
+        "clients_per_query": getattr(opts, "clients_per_query", None) if opts else None,
+        "max_clients_per_query": (getattr(opts, "max_clients_per_query", None) if opts else None),
     }
     views_block = [
         {
