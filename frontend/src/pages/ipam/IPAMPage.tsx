@@ -100,6 +100,7 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { matchesAllTagChips } from "@/components/tag-filter-utils";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
+import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import {
   ImportModal,
   ExportButton,
@@ -4229,6 +4230,11 @@ function SubnetDetail({
                 .join(", ")}
               tooltip="Ask AI about this subnet"
               prompt="Tell me about this subnet — utilisation, recent changes, and anything I should worry about."
+            />
+            <ServicesUsingButton
+              kind="subnet"
+              resourceId={subnet.id}
+              label={subnet.network}
             />
             <HeaderButton icon={Pencil} onClick={() => setShowEditSubnet(true)}>
               Edit
@@ -10492,6 +10498,11 @@ function BlockDetailView({
                     Find Free…
                   </HeaderButton>
                 )}
+                <ServicesUsingButton
+                  kind="ip_block"
+                  resourceId={block.id}
+                  label={block.network}
+                />
                 <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
                   Edit
                 </HeaderButton>

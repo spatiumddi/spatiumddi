@@ -21,6 +21,7 @@ from app.models.audit_forward import AuditForwardTarget
 from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
 from app.services import audit_forward as audit_forward_svc
+from app.services.appliance.apt import render_sources_list
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
 
@@ -230,6 +231,18 @@ class SettingsResponse(BaseModel):
     resolver_search_domains: list[str] = []
     resolver_dnssec: str = "allow-downgrade"
     resolver_dns_over_tls: str = "no"
+    # ── Appliance APT (issue #155) ─────────────────────────────────
+    # Opt-in managed sources / proxy / GPG keys / private-mirror auth.
+    # GPG armoured-key text + auth passwords fold into per-entry
+    # ``armoured_text_set`` / ``password_set`` booleans (redacted below).
+    apt_managed: bool = False
+    apt_sources: list[dict[str, Any]] = []
+    apt_gpg_keys: list[dict[str, Any]] = []
+    apt_proxy_http: str = ""
+    apt_proxy_https: str = ""
+    apt_proxy_no_proxy: str = ""
+    apt_auth: list[dict[str, Any]] = []
+    apt_unattended_upgrades_enabled: bool = True
 
     model_config = {"from_attributes": True}
 
@@ -252,8 +265,37 @@ class SettingsResponse(BaseModel):
             # a ``ca_cert_set`` boolean so the wire never carries the PEM.
             raw_targets = cols.get("syslog_targets") or []
             cols["syslog_targets"] = [_redact_syslog_target(t) for t in raw_targets]
+            # Issue #155 — fold APT GPG armoured-key + private-mirror
+            # password ciphertext into ``*_set`` booleans.
+            cols["apt_gpg_keys"] = [
+                _redact_apt_gpg_key(k) for k in (cols.get("apt_gpg_keys") or [])
+            ]
+            cols["apt_auth"] = [_redact_apt_auth(a) for a in (cols.get("apt_auth") or [])]
             return cols
         return data
+
+
+def _redact_apt_gpg_key(k: Any) -> dict[str, Any]:
+    """Strip the armoured-key ciphertext from a stored APT GPG-key dict —
+    the operator only needs to know a key is present (#155)."""
+    if not isinstance(k, dict):
+        return {"key_id": "", "comment": "", "armoured_text_set": False}
+    return {
+        "key_id": k.get("key_id", ""),
+        "comment": k.get("comment", ""),
+        "armoured_text_set": bool(k.get("armoured_text_enc")),
+    }
+
+
+def _redact_apt_auth(a: Any) -> dict[str, Any]:
+    """Strip the password ciphertext from a stored APT auth dict (#155)."""
+    if not isinstance(a, dict):
+        return {"machine": "", "login": "", "password_set": False}
+    return {
+        "machine": a.get("machine", ""),
+        "login": a.get("login", ""),
+        "password_set": bool(a.get("password_enc")),
+    }
 
 
 def _redact_v3_user(u: dict[str, Any]) -> dict[str, Any]:
@@ -559,6 +601,165 @@ class SshAuthorizedKeyUpdate(BaseModel):
         return v.strip()
 
 
+class AptSourceUpdate(BaseModel):
+    """One repo row in ``apt_sources`` on PUT (#155). No secrets — the
+    armoured key lives in ``apt_gpg_keys`` and is referenced by
+    ``signed_by_key_id``."""
+
+    name: str = ""
+    uri: str
+    suites: str
+    components: str = ""
+    signed_by_key_id: str = ""
+    enabled: bool = True
+
+    @field_validator("uri")
+    @classmethod
+    def _valid_uri(cls, v: str) -> str:
+        s = v.strip()
+        # apt transports: a typo here is exactly the "bricks apt update"
+        # case the issue calls out — reject an unknown scheme at the PUT
+        # so the operator's request is the error site.
+        allowed = ("http://", "https://", "ftp://", "file:", "cdrom:", "mirror+")
+        if not s or not s.startswith(allowed):
+            raise ValueError(
+                "uri must start with a supported apt transport "
+                "(http://, https://, ftp://, file:, …)"
+            )
+        if any(c.isspace() for c in s):
+            raise ValueError("uri may not contain whitespace")
+        return s
+
+    @field_validator("suites")
+    @classmethod
+    def _suites_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("suites may not be empty")
+        return v.strip()
+
+    @field_validator("signed_by_key_id")
+    @classmethod
+    def _valid_signed_by(cls, v: str) -> str:
+        # Flows into the rendered ``[signed-by=/etc/apt/keyrings/spatiumddi-
+        # <id>.asc]`` option — restrict to the same filesystem-safe charset
+        # as AptGpgKeyUpdate.key_id so a source can't inject a path
+        # separator / apt option syntax into the deb line.
+        s = v.strip()
+        if s and not all(c.isalnum() or c in "._-" for c in s):
+            raise ValueError("signed_by_key_id may only contain alphanumerics, '.', '_', '-'")
+        return s
+
+    @field_validator("name", "components")
+    @classmethod
+    def _no_control_chars(cls, v: str) -> str:
+        # ``name`` → sources.list comment, ``components`` → the deb line;
+        # reject newlines / control chars so a value can't inject an extra
+        # directive into the rendered file.
+        if any(ord(c) < 0x20 for c in v):
+            raise ValueError("must not contain control characters")
+        return v.strip()
+
+
+class AptGpgKeyUpdate(BaseModel):
+    """One entry in ``apt_gpg_keys`` on PUT (#155).
+
+    ``armoured_text`` merge semantics mirror the SNMP v3 pass shape:
+    ``None`` keeps the existing ciphertext (matched by ``key_id``), ``""``
+    clears it, a non-empty string is encrypted fresh.
+    """
+
+    key_id: str
+    comment: str = ""
+    armoured_text: str | None = None
+
+    @field_validator("key_id")
+    @classmethod
+    def _key_id_nonempty(cls, v: str) -> str:
+        s = v.strip()
+        # ``key_id`` becomes the keyring filename (spatiumddi-<id>.asc) so
+        # restrict it to a filesystem-safe charset.
+        if not s:
+            raise ValueError("key_id may not be empty")
+        if not all(c.isalnum() or c in "._-" for c in s):
+            raise ValueError("key_id may only contain alphanumerics, '.', '_', '-'")
+        return s
+
+
+class AptAuthUpdate(BaseModel):
+    """One entry in ``apt_auth`` (private-mirror creds) on PUT (#155).
+
+    ``password`` merge semantics mirror the SNMP v3 pass shape (None
+    preserves, "" clears, non-empty encrypts).
+    """
+
+    machine: str
+    login: str
+    password: str | None = None
+
+    @field_validator("machine", "login")
+    @classmethod
+    def _nonempty_no_ws(cls, v: str) -> str:
+        s = v.strip()
+        if not s or any(c.isspace() for c in s):
+            raise ValueError("must be non-empty and contain no whitespace")
+        return s
+
+    @field_validator("password")
+    @classmethod
+    def _password_no_control(cls, v: str | None) -> str | None:
+        # Rendered into a netrc-style ``machine … password <value>`` line;
+        # reject newlines / control chars so a value can't inject an extra
+        # auth.conf line. ``None`` (preserve) / ``""`` (clear) pass through.
+        if v and any(ord(c) < 0x20 for c in v):
+            raise ValueError("password must not contain control characters")
+        return v
+
+
+def _merge_apt_gpg_keys(
+    existing: list[dict[str, Any]], incoming: list[AptGpgKeyUpdate]
+) -> list[dict[str, Any]]:
+    """Atomic replace + per-key armoured-text merge keyed on ``key_id``.
+    ``armoured_text`` None preserves the stored ciphertext, "" clears,
+    non-empty encrypts fresh (mirrors ``_merge_snmp_v3_users``)."""
+    from app.core.crypto import encrypt_str
+
+    by_id = {k.get("key_id"): k for k in existing if isinstance(k, dict)}
+    out: list[dict[str, Any]] = []
+    for entry in incoming:
+        prior = by_id.get(entry.key_id, {})
+        if entry.armoured_text is None:
+            prior_enc = prior.get("armoured_text_enc")
+            enc = prior_enc if isinstance(prior_enc, str) and prior_enc else None
+        elif entry.armoured_text == "":
+            enc = None
+        else:
+            enc = encrypt_str(entry.armoured_text).decode("ascii")
+        out.append({"key_id": entry.key_id, "comment": entry.comment, "armoured_text_enc": enc})
+    return out
+
+
+def _merge_apt_auth(
+    existing: list[dict[str, Any]], incoming: list[AptAuthUpdate]
+) -> list[dict[str, Any]]:
+    """Atomic replace + per-entry password merge keyed on ``(machine,
+    login)`` (mirrors ``_merge_apt_gpg_keys``)."""
+    from app.core.crypto import encrypt_str
+
+    by_key = {(a.get("machine"), a.get("login")): a for a in existing if isinstance(a, dict)}
+    out: list[dict[str, Any]] = []
+    for entry in incoming:
+        prior = by_key.get((entry.machine, entry.login), {})
+        if entry.password is None:
+            prior_enc = prior.get("password_enc")
+            enc = prior_enc if isinstance(prior_enc, str) and prior_enc else None
+        elif entry.password == "":
+            enc = None
+        else:
+            enc = encrypt_str(entry.password).decode("ascii")
+        out.append({"machine": entry.machine, "login": entry.login, "password_enc": enc})
+    return out
+
+
 class SettingsUpdate(BaseModel):
     app_title: str | None = None
     app_base_url: str | None = None
@@ -699,6 +900,39 @@ class SettingsUpdate(BaseModel):
     resolver_search_domains: list[str] | None = None
     resolver_dnssec: str | None = None
     resolver_dns_over_tls: str | None = None
+    # ── Appliance APT (issue #155) ─────────────────────────────────
+    apt_managed: bool | None = None
+    apt_sources: list[AptSourceUpdate] | None = None
+    apt_gpg_keys: list[AptGpgKeyUpdate] | None = None
+    apt_proxy_http: str | None = None
+    apt_proxy_https: str | None = None
+    apt_proxy_no_proxy: str | None = None
+    apt_auth: list[AptAuthUpdate] | None = None
+    apt_unattended_upgrades_enabled: bool | None = None
+
+    @field_validator("apt_proxy_http", "apt_proxy_https")
+    @classmethod
+    def _valid_apt_proxy(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        s = v.strip()
+        if s and not s.startswith(("http://", "https://")):
+            raise ValueError("proxy URL must start with http:// or https://")
+        # Interpolated into ``Acquire::http::Proxy "<value>";`` — reject the
+        # double-quote / control chars that would break the apt.conf grammar
+        # or inject an extra directive.
+        if any(c == '"' or ord(c) < 0x20 for c in s):
+            raise ValueError("proxy URL must not contain quotes or control characters")
+        return s
+
+    @field_validator("apt_proxy_no_proxy")
+    @classmethod
+    def _valid_apt_no_proxy(cls, v: str | None) -> str | None:
+        # Each comma-separated host becomes ``Acquire::http::Proxy::<host>
+        # "DIRECT";`` — reject quotes / control chars for the same reason.
+        if v and any(c == '"' or ord(c) < 0x20 for c in v):
+            raise ValueError("no_proxy must not contain quotes or control characters")
+        return v
 
     @field_validator("resolver_mode")
     @classmethod
@@ -1424,6 +1658,12 @@ async def update_settings(
     _supervisor_reg_prev = bool(settings.supervisor_registration_enabled)
     _supervisor_reg_requested = changes.get("supervisor_registration_enabled")
 
+    # Issue #155 — whether this request touched any APT field. Computed here
+    # (before the secret-bearing apt_sources / apt_gpg_keys / apt_auth get
+    # popped out of ``changes`` during processing) so an apt_sources-only
+    # change still triggers the dedicated audit row below (NN #4).
+    _apt_touched = any(f.startswith("apt_") for f in changes)
+
     # Whether this update touches any host-config field a HOSTCONFIG_ALL
     # subscriber acts on. The DHCP-agent /config long-poll folds SNMP /
     # NTP / LLDP into its ETag; the supervisor heartbeat (#358 Phase 1)
@@ -1444,7 +1684,7 @@ async def update_settings(
         "web_ui_allowed_cidrs",
     }
     _host_config_touched = any(
-        field.startswith(("snmp_", "ntp_", "lldp_", "syslog_", "ssh_", "resolver_"))
+        field.startswith(("snmp_", "ntp_", "lldp_", "syslog_", "ssh_", "resolver_", "apt_"))
         or field in _supervisor_host_config_fields
         for field in changes
     )
@@ -1522,6 +1762,41 @@ async def update_settings(
         settings.syslog_targets = merged_targets
         syslog_targets_audit = [_redact_syslog_target(t) for t in merged_targets]
 
+    # apt_sources: plain atomic replace — no secrets (the armoured key
+    # lives in apt_gpg_keys). Normalise the pydantic models to JSON dicts.
+    if "apt_sources" in changes:
+        changes.pop("apt_sources")
+        settings.apt_sources = [
+            {
+                "name": s.name,
+                "uri": s.uri,
+                "suites": s.suites,
+                "components": s.components,
+                "signed_by_key_id": s.signed_by_key_id,
+                "enabled": s.enabled,
+            }
+            for s in (body.apt_sources or [])
+        ]
+
+    # apt_gpg_keys / apt_auth: atomic replace + per-entry secret merge,
+    # same shape as snmp_v3_users / syslog_targets. Stash redacted shapes
+    # for the audit log; never put the merged (ciphertext-bearing) list
+    # back on ``changes`` or the setattr loop would clobber it.
+    apt_gpg_keys_audit: list[dict[str, Any]] | None = None
+    if "apt_gpg_keys" in changes:
+        changes.pop("apt_gpg_keys")
+        merged_keys = _merge_apt_gpg_keys(
+            list(settings.apt_gpg_keys or []), body.apt_gpg_keys or []
+        )
+        settings.apt_gpg_keys = merged_keys
+        apt_gpg_keys_audit = [_redact_apt_gpg_key(k) for k in merged_keys]
+    apt_auth_audit: list[dict[str, Any]] | None = None
+    if "apt_auth" in changes:
+        changes.pop("apt_auth")
+        merged_auth = _merge_apt_auth(list(settings.apt_auth or []), body.apt_auth or [])
+        settings.apt_auth = merged_auth
+        apt_auth_audit = [_redact_apt_auth(a) for a in merged_auth]
+
     # ssh_authorized_keys: atomic replace (no per-entry secret merge — public
     # keys are not secrets). Normalise the incoming pydantic models into
     # plain ``{name, public_key, comment}`` dicts so the JSONB column stays
@@ -1585,6 +1860,10 @@ async def update_settings(
         changes["syslog_targets"] = syslog_targets_audit
     if ssh_keys_normalised is not None:
         changes["ssh_authorized_keys"] = ssh_keys_normalised
+    if apt_gpg_keys_audit is not None:
+        changes["apt_gpg_keys"] = apt_gpg_keys_audit
+    if apt_auth_audit is not None:
+        changes["apt_auth"] = apt_auth_audit
 
     # Issue #157 — dedicated audit row for any SSH config change
     # (non-negotiable #4). SSH access is high-blast-radius (it gates who
@@ -1676,6 +1955,36 @@ async def update_settings(
                     "targets": [_redact_syslog_target(t) for t in (settings.syslog_targets or [])],
                     "filter": settings.syslog_filter or "",
                     "buffer_disk": bool(settings.syslog_buffer_disk),
+                },
+            )
+        )
+
+    # Issue #155 — dedicated audit row for any APT config change
+    # (non-negotiable #4). APT management steers every appliance host's
+    # package sources + carries secrets (GPG keys + private-mirror
+    # passwords), so a durable, redacted audit entry is required — the
+    # generic ``logger.info`` below is not an ``audit_log`` row. The shape
+    # records counts + presence only (never the armoured key / password,
+    # and not the raw proxy URL which may embed credentials).
+    if _apt_touched:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="apt",
+                resource_display="APT sources",
+                result="success",
+                new_value={
+                    "managed": bool(settings.apt_managed),
+                    "source_count": len(settings.apt_sources or []),
+                    "gpg_key_count": len(settings.apt_gpg_keys or []),
+                    "auth_entry_count": len(settings.apt_auth or []),
+                    "proxy_http_set": bool(settings.apt_proxy_http),
+                    "proxy_https_set": bool(settings.apt_proxy_https),
+                    "unattended_upgrades_enabled": bool(settings.apt_unattended_upgrades_enabled),
                 },
             )
         )
@@ -2090,6 +2399,109 @@ async def reveal_snmp_community(
     await db.commit()
     logger.info("snmp_community_revealed", user=current_user.username)
     return RevealCommunityResponse(configured=True, community=plaintext)
+
+
+# ── APT host-config pre-apply validation (issue #155) ──────────────
+
+
+class AptValidateRequest(BaseModel):
+    """A candidate APT config to structurally pre-check before save.
+
+    ``apt_gpg_key_ids`` is the set of key ids that WILL exist after the
+    pending save (so a source can reference a key the operator is adding
+    in the same form) — defaults to the currently-stored ids if omitted.
+    """
+
+    apt_sources: list[AptSourceUpdate]
+    apt_gpg_key_ids: list[str] | None = None
+    apt_proxy_http: str | None = None
+    apt_proxy_https: str | None = None
+
+
+class AptValidateResponse(BaseModel):
+    valid: bool
+    errors: list[str]
+    warnings: list[str]
+    sources_list_preview: str
+
+
+@router.post("/apt/validate", response_model=AptValidateResponse)
+async def validate_apt_config(
+    body: AptValidateRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> AptValidateResponse:
+    """Structural pre-apply check for a candidate APT config (no save).
+
+    The host runner does the *real* validation (``apt-get update`` against
+    a staged config, which only the appliance host can run); this catches
+    the structural mistakes that would brick that run — zero enabled
+    sources, a ``signed-by`` reference to a key that won't exist, a
+    malformed proxy — so the operator sees pass/fail before clicking Save.
+    """
+    if not user_has_permission(current_user, "write", "settings"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: need 'write' on 'settings'",
+        )
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    enabled_sources = [s for s in body.apt_sources if s.enabled]
+    if not enabled_sources:
+        errors.append("No enabled sources — apt-get update would fail with no repositories.")
+
+    # Resolve the set of key ids that will exist post-save.
+    if body.apt_gpg_key_ids is not None:
+        known_key_ids = {k.strip() for k in body.apt_gpg_key_ids if k.strip()}
+    else:
+        settings = await _get_or_create(db)
+        known_key_ids = {
+            str(k.get("key_id"))
+            for k in (settings.apt_gpg_keys or [])
+            if isinstance(k, dict) and k.get("key_id")
+        }
+
+    for src in enabled_sources:
+        key_id = (src.signed_by_key_id or "").strip()
+        if key_id and key_id not in known_key_ids:
+            warnings.append(
+                f"Source '{src.name or src.uri}' references GPG key '{key_id}' "
+                "which isn't configured — apt-get update would fail with NO_PUBKEY."
+            )
+        if not key_id and src.uri.startswith(("http://", "https://")):
+            warnings.append(
+                f"Source '{src.name or src.uri}' has no signing key — apt requires "
+                "a signed-by key for non-trusted repos on modern Debian."
+            )
+
+    for proxy in (body.apt_proxy_http, body.apt_proxy_https):
+        if proxy and not proxy.strip().startswith(("http://", "https://")):
+            errors.append(f"Proxy URL '{proxy}' must start with http:// or https://.")
+
+    # Render a preview the operator can eyeball. Build a throwaway settings
+    # shim so the renderer (which reads attributes) works without a row.
+    shim = PlatformSettings(id=0)
+    shim.apt_sources = [
+        {
+            "name": s.name,
+            "uri": s.uri,
+            "suites": s.suites,
+            "components": s.components,
+            "signed_by_key_id": s.signed_by_key_id,
+            "enabled": s.enabled,
+        }
+        for s in body.apt_sources
+    ]
+    preview = render_sources_list(shim)
+
+    return AptValidateResponse(
+        valid=not errors,
+        errors=errors,
+        warnings=warnings,
+        sources_list_preview=preview,
+    )
 
 
 @router.post(

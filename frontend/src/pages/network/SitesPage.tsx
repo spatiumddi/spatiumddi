@@ -34,6 +34,8 @@ import { useSessionState } from "@/lib/useSessionState";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ServicesUsingButton } from "@/components/ServicesUsingButton";
+import { SavedViewsMenu } from "@/components/SavedViewsMenu";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -491,11 +493,17 @@ function SiteTreeRow({
           </span>
         )}
         <div className="ml-auto flex items-center">
+          <ServicesUsingButton
+            kind="site"
+            resourceId={site.id}
+            label={site.name}
+            compact
+          />
           <button
             type="button"
             title="Move"
             onClick={() => onMove(site)}
-            className="rounded p-1 hover:bg-muted"
+            className="ml-1 rounded p-1 hover:bg-muted"
           >
             <Move className="h-3.5 w-3.5" />
           </button>
@@ -715,6 +723,19 @@ export function SitesPage() {
       }),
   });
 
+  // Saved-views payload (#77) — the page's filter + layout state.
+  type SitesViewPayload = {
+    search: string;
+    kind: SiteKind | "";
+    view: "table" | "tree";
+  };
+  const viewPayload: SitesViewPayload = { search, kind: kindFilter, view };
+  function applyView(p: SitesViewPayload) {
+    setSearch(typeof p.search === "string" ? p.search : "");
+    setKindFilter((p.kind ?? "") as SiteKind | "");
+    if (p.view === "table" || p.view === "tree") setView(p.view);
+  }
+
   // For the parent picker — a separate fetch so that filter changes
   // on the table don't shrink the picker's options.
   const allSitesQuery = useQuery({
@@ -817,6 +838,11 @@ export function SitesPage() {
                 Tree
               </button>
             </div>
+            <SavedViewsMenu
+              page="network.sites"
+              currentPayload={viewPayload}
+              onApply={applyView}
+            />
             <HeaderButton
               icon={RefreshCw}
               onClick={() => query.refetch()}

@@ -553,6 +553,14 @@ class Appliance(Base):
     # overwrites when the supervisor sends a non-None value. Per-host,
     # like ``ssh_key_count`` / ``syslog_forwarding``.
     resolver_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Issue #155 — best-effort APT host-config state the supervisor
+    # reports from the host runner's .state sidecar after a validate +
+    # swap: ``synced`` (config applied + apt-get update OK) /
+    # ``proxy-failed`` / ``mirror-unreachable`` / ``signature-mismatch``
+    # / ``no-sources`` / ``unmanaged`` (apt_managed off) / ``unknown``.
+    # NULL on non-appliance / pre-#155 rows; the heartbeat handler only
+    # overwrites when the supervisor sends a non-None value.
+    apt_state: Mapped[str | None] = mapped_column(String(24), nullable=True)
 
     # Operator-driven desired state. Set via the fleet UI / API;
     # supervisor's heartbeat poll picks them up + writes the matching

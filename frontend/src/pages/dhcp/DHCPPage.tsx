@@ -49,6 +49,7 @@ import {
 import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
+import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { CreateServerGroupModal } from "./CreateServerGroupModal";
 import { CreateServerModal } from "./CreateServerModal";
 import { ServerDetailModal } from "./ServerDetailModal";
@@ -1115,6 +1116,12 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                               prompt="Summarise this DHCP scope — utilisation, recent leases, any conflicts, anything notable."
                               iconOnly
                               className="px-1.5 py-1"
+                            />
+                            <ServicesUsingButton
+                              kind="dhcp_scope"
+                              resourceId={sc.id}
+                              label={sc.name}
+                              compact
                             />
                             <button
                               onClick={() => setEditScope(sc)}

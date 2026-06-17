@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from decimal import Decimal
 
@@ -16,6 +17,37 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
+
+# Default managed APT repos (issue #155) — mirror the Debian 13 (trixie)
+# set baked into the appliance ISO so enabling APT management starts from
+# the working defaults rather than an empty sources.list. Used as both
+# the ORM default and the migration server_default (kept in sync).
+DEFAULT_APT_SOURCES: list[dict] = [
+    {
+        "name": "Debian trixie",
+        "uri": "http://deb.debian.org/debian",
+        "suites": "trixie",
+        "components": "main contrib non-free-firmware",
+        "signed_by_key_id": "",
+        "enabled": True,
+    },
+    {
+        "name": "Debian trixie-updates",
+        "uri": "http://deb.debian.org/debian",
+        "suites": "trixie-updates",
+        "components": "main contrib non-free-firmware",
+        "signed_by_key_id": "",
+        "enabled": True,
+    },
+    {
+        "name": "Debian Security",
+        "uri": "http://security.debian.org/debian-security",
+        "suites": "trixie-security",
+        "components": "main contrib non-free-firmware",
+        "signed_by_key_id": "",
+        "enabled": True,
+    },
+]
 
 
 class PlatformSettings(Base):
@@ -439,6 +471,48 @@ class PlatformSettings(Base):
     )
     ntp_allow_client_networks: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+
+    # ── Appliance APT sources / proxy / GPG keys (issue #155) ───────
+    # Third leg of the "Settings → Host services" surface alongside
+    # SNMP (#153) + NTP (#154). Opt-in: ``apt_managed`` default False
+    # leaves Debian's baked sources.list untouched; when on, the
+    # appliance renders /etc/apt/sources.list.d/spatiumddi.list (+
+    # proxy / auth / keyring artifacts) from these columns via the same
+    # ConfigBundle → trigger-file → host-runner pipeline. GPG armoured
+    # key text + private-mirror passwords are Fernet-encrypted inline in
+    # JSONB (URL-safe-base64 ciphertext, mirroring snmp_v3_users).
+    apt_managed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    # [{name, uri, suites, components, signed_by_key_id, enabled}]
+    apt_sources: Mapped[list[dict]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: [dict(s) for s in DEFAULT_APT_SOURCES],
+        server_default=sa_text(
+            "'" + json.dumps(DEFAULT_APT_SOURCES).replace("'", "''") + "'::jsonb"
+        ),
+    )
+    # [{key_id, comment, armoured_text_enc}]  (armoured_text_enc Fernet)
+    apt_gpg_keys: Mapped[list[dict]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    apt_proxy_http: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default=sa_text("''")
+    )
+    apt_proxy_https: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default=sa_text("''")
+    )
+    apt_proxy_no_proxy: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=sa_text("''")
+    )
+    # [{machine, login, password_enc}]  (password_enc Fernet)
+    apt_auth: Mapped[list[dict]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    apt_unattended_upgrades_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
 
     # ── Appliance timezone (issue #165) ─────────────────────────────
