@@ -189,32 +189,22 @@ def apt_bundle(settings: PlatformSettings) -> dict[str, Any]:
 
     # Change-detection fingerprint. NOT computed over the decrypted secrets
     # (auth_conf cleartext / keyring armour) — instead over the stable
-    # encrypted-at-rest tokens, which change in the DB exactly when the
-    # operator changes a secret (and never otherwise). This keeps the
-    # re-fire trigger correct while keeping cleartext passwords out of the
-    # digest. ``usedforsecurity=False`` documents that this is a config
-    # fingerprint, not password hashing.
-    secret_fp = {
-        "auth": sorted(
-            [
-                str(a.get("machine") or ""),
-                str(a.get("login") or ""),
-                str(a.get("password_enc") or ""),
-            ]
-            for a in (settings.apt_auth or [])
-            if isinstance(a, dict)
-        ),
-        "keys": sorted(
-            [str(k.get("key_id") or ""), str(k.get("armoured_text_enc") or "")]
-            for k in (settings.apt_gpg_keys or [])
-            if isinstance(k, dict)
-        ),
-    }
+    # encrypted-at-rest material: the raw apt_auth / apt_gpg_keys rows hold
+    # Fernet ciphertext that changes in the DB exactly when the operator
+    # changes a secret (and never otherwise). Serialised as opaque JSON via
+    # the model attributes (no per-field secret access) so this stays a
+    # config fingerprint, not password hashing — also flagged
+    # ``usedforsecurity=False``.
+    secret_material = json.dumps(
+        [settings.apt_auth or [], settings.apt_gpg_keys or []],
+        sort_keys=True,
+        default=str,
+    )
     canonical = json.dumps(
         {
             "sources_list": sources_list,
             "proxy_conf": proxy_conf,
-            "secret_fp": secret_fp,
+            "secret_material": secret_material,
             "unattended_upgrades_enabled": unattended,
         },
         sort_keys=True,
