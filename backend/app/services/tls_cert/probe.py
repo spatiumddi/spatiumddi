@@ -296,8 +296,11 @@ def _served_chain_ders(connect_ip: str, port: int, sni: str, timeout: float) -> 
     Raises on transport / handshake failure (the caller classifies)."""
     ctx = SSL.Context(SSL.TLS_CLIENT_METHOD)
     # Floor at TLS 1.2 — TLS 1.0/1.1 are deprecated, and a monitor probing
-    # 2026-era endpoints shouldn't negotiate them. Verification is still off
+    # 2026-era endpoints shouldn't negotiate them. set_options(OP_NO_*) is
+    # the explicit, statically-recognised form (set_min_proto_version alone
+    # isn't seen as remediation by static analysis). Verification stays off
     # (we capture untrusted chains); trust is judged by _verify_trust.
+    ctx.set_options(SSL.OP_NO_SSLv2 | SSL.OP_NO_SSLv3 | SSL.OP_NO_TLSv1 | SSL.OP_NO_TLSv1_1)
     ctx.set_min_proto_version(SSL.TLS1_2_VERSION)
     ctx.set_verify(SSL.VERIFY_NONE, lambda *_a: True)
     sock = socket.create_connection((connect_ip, port), timeout=timeout)
