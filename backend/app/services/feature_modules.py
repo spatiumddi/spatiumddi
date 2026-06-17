@@ -290,7 +290,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="ui.saved_views",
         label="Saved views",
         group="UI",
-        description="Per-user named filter/sort/column presets on list pages — \"All subnets in DC1 over 80% utilization, sorted by name\" becomes a one-click view. Personal-only; no cross-user visibility.",
+        description='Per-user named filter/sort/column presets on list pages — "All subnets in DC1 over 80% utilization, sorted by name" becomes a one-click view. Personal-only; no cross-user visibility.',
     ),
 )
 

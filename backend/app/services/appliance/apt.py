@@ -187,19 +187,39 @@ def apt_bundle(settings: PlatformSettings) -> dict[str, Any]:
     keyrings = apt_keyrings(settings)
     unattended = bool(settings.apt_unattended_upgrades_enabled)
 
-    # Hash over a canonical JSON of everything the runner writes — order
-    # the keyring map so the digest is stable across dict orderings.
+    # Change-detection fingerprint. NOT computed over the decrypted secrets
+    # (auth_conf cleartext / keyring armour) — instead over the stable
+    # encrypted-at-rest tokens, which change in the DB exactly when the
+    # operator changes a secret (and never otherwise). This keeps the
+    # re-fire trigger correct while keeping cleartext passwords out of the
+    # digest. ``usedforsecurity=False`` documents that this is a config
+    # fingerprint, not password hashing.
+    secret_fp = {
+        "auth": sorted(
+            [
+                str(a.get("machine") or ""),
+                str(a.get("login") or ""),
+                str(a.get("password_enc") or ""),
+            ]
+            for a in (settings.apt_auth or [])
+            if isinstance(a, dict)
+        ),
+        "keys": sorted(
+            [str(k.get("key_id") or ""), str(k.get("armoured_text_enc") or "")]
+            for k in (settings.apt_gpg_keys or [])
+            if isinstance(k, dict)
+        ),
+    }
     canonical = json.dumps(
         {
             "sources_list": sources_list,
             "proxy_conf": proxy_conf,
-            "auth_conf": auth_conf,
-            "keyrings": dict(sorted(keyrings.items())),
+            "secret_fp": secret_fp,
             "unattended_upgrades_enabled": unattended,
         },
         sort_keys=True,
     )
-    config_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    config_hash = hashlib.sha256(canonical.encode("utf-8"), usedforsecurity=False).hexdigest()
     return {
         "enabled": True,
         "config_hash": config_hash,
