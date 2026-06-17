@@ -16,6 +16,8 @@ import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ServicesUsingButton } from "@/components/ServicesUsingButton";
+import { SavedViewsMenu } from "@/components/SavedViewsMenu";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import {
   CustomerChip,
@@ -599,6 +601,29 @@ export function CircuitsPage() {
     staleTime: 60_000,
   });
 
+  // Saved-views payload (#77) — the page's filter state, stored verbatim.
+  type CircuitsViewPayload = {
+    search: string;
+    status: CircuitStatus | "";
+    transport: TransportClass | "";
+    provider_id: string;
+    tags: string[];
+  };
+  const viewPayload: CircuitsViewPayload = {
+    search,
+    status: statusFilter,
+    transport: transportFilter,
+    provider_id: providerFilter,
+    tags: tagFilters,
+  };
+  function applyView(p: CircuitsViewPayload) {
+    setSearch(typeof p.search === "string" ? p.search : "");
+    setStatusFilter((p.status ?? "") as CircuitStatus | "");
+    setTransportFilter((p.transport ?? "") as TransportClass | "");
+    setProviderFilter(typeof p.provider_id === "string" ? p.provider_id : "");
+    setTagFilters(Array.isArray(p.tags) ? p.tags : []);
+  }
+
   const query = useQuery({
     queryKey: [
       "circuits",
@@ -668,6 +693,11 @@ export function CircuitsPage() {
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
+            <SavedViewsMenu
+              page="network.circuits"
+              currentPayload={viewPayload}
+              onApply={applyView}
+            />
             <HeaderButton
               icon={RefreshCw}
               onClick={() => query.refetch()}
@@ -861,11 +891,17 @@ export function CircuitsPage() {
                     <StatusBadge status={c.status} />
                   </td>
                   <td className="px-3 py-2 align-top text-right">
+                    <ServicesUsingButton
+                      kind="circuit"
+                      resourceId={c.id}
+                      label={c.name}
+                      compact
+                    />
                     <button
                       type="button"
                       title="Edit"
                       onClick={() => setEditing(c)}
-                      className="rounded p-1 hover:bg-muted"
+                      className="ml-1 rounded p-1 hover:bg-muted"
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>

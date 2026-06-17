@@ -52,6 +52,7 @@ import { PoolsView } from "./PoolsView";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
+import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import {
   dnsApi,
   dnsBlocklistApi,
@@ -3016,6 +3017,11 @@ function ZoneDetailView({
               Delegate
             </HeaderButton>
           )}
+          <ServicesUsingButton
+            kind="dns_zone"
+            resourceId={zone.id}
+            label={zone.name}
+          />
           <HeaderButton
             icon={Pencil}
             onClick={() => setShowEditZone(true)}

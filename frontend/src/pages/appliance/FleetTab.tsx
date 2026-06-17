@@ -43,6 +43,7 @@ import { ReauthFields } from "@/components/ReauthFields";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
 import { LLDPTab } from "./LLDPTab";
+import { AptTab } from "./AptTab";
 import { NTPTab } from "./NTPTab";
 import { PairingTab } from "./PairingTab";
 import { ResolverTab } from "./ResolverTab";
@@ -719,6 +720,7 @@ export function FleetTab({
     | "cluster-upgrade"
     | "upgrade-images"
     | "web-ui-certificate"
+    | "apt"
     | "lldp"
     | "ntp"
     | "resolver"
@@ -959,6 +961,7 @@ export function FleetTab({
       | "cluster-upgrade"
       | "upgrade-images"
       | "web-ui-certificate"
+      | "apt"
       | "lldp"
       | "ntp"
       | "resolver"
@@ -1020,6 +1023,11 @@ export function FleetTab({
       // Keep these alphabetical by label so new host-config services slot
       // in by position rather than append-order.
       items: [
+        {
+          key: "apt",
+          label: "APT",
+          summary: "Fleet-wide apt sources / proxy / GPG keys.",
+        },
         {
           key: "resolver",
           label: "DNS Resolver",
@@ -1178,6 +1186,22 @@ export function FleetTab({
                 firewall port is opened.
               </p>
               <LLDPTab />
+            </div>
+          )}
+
+          {view === "apt" && (
+            <div>
+              <h2 className="mb-1 text-base font-semibold">APT sources</h2>
+              <p className="mb-4 text-xs text-muted-foreground">
+                Fleet-wide APT configuration — managed repositories, proxy, GPG
+                signing keys, and private-mirror credentials for air-gapped /
+                proxied / internal-mirror sites. The rendered artifacts ship
+                through the ConfigBundle long-poll; the appliance host validates
+                against a staged config (real <code>apt-get update</code>)
+                before swapping the live files. Opt-in — off by default, leaving
+                Debian's baked sources untouched.
+              </p>
+              <AptTab />
             </div>
           )}
 
@@ -1879,6 +1903,45 @@ function ResolverChip({ row }: { row: ApplianceRow }) {
   );
 }
 
+// Issue #155 — best-effort APT host-config status chip, rendered under the
+// other host-config chips. Only shown when the supervisor has reported a
+// value: ``synced`` green / ``unmanaged`` muted / everything else (proxy-
+// failed / mirror-unreachable / signature-mismatch / no-sources) red. A
+// null status (non-appliance / pre-#155 / never reported) renders nothing.
+function AptChip({ row }: { row: ApplianceRow }) {
+  const status = row.apt_state;
+  if (!status) return null;
+  const style =
+    status === "synced"
+      ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+      : status === "unmanaged"
+        ? "border-muted bg-muted/40 text-muted-foreground"
+        : "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-400";
+  const label =
+    status === "synced"
+      ? "APT: synced"
+      : status === "unmanaged"
+        ? "APT: unmanaged"
+        : `APT: ${status}`;
+  return (
+    <span
+      className={cn(
+        "inline-flex w-fit items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+        style,
+      )}
+      title={
+        status === "synced"
+          ? "Managed apt config applied + apt-get update succeeded on this host"
+          : status === "unmanaged"
+            ? "SpatiumDDI isn't managing apt — Debian's baked sources are in effect"
+            : "The managed apt config failed to validate/apply on this host"
+      }
+    >
+      {label}
+    </span>
+  );
+}
+
 // #272 Phase 1 — Fleet UI two-table split. One section per bucket
 // (Control plane / Service agents). Pending rows pin to the top of
 // their section, others below. Empty section renders a dashed
@@ -2081,6 +2144,7 @@ function ApplianceTableRow({
           <SyslogChip row={row} />
           <SshKeyChip row={row} />
           <ResolverChip row={row} />
+          <AptChip row={row} />
         </div>
       </td>
       <td className="px-4 py-3">

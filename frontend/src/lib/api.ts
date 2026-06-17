@@ -2245,6 +2245,47 @@ export const featureModulesApi = {
       .then((r) => r.data),
 };
 
+// ── Saved views (issue #77) ──────────────────────────────────────────
+//
+// Per-user, per-page named filter/sort/column presets. ``payload`` is
+// opaque JSON shaped by each page; the SavedViewsMenu just stores and
+// restores it via the page's apply callback. Gated by the
+// ``ui.saved_views`` feature module.
+export interface SavedView {
+  id: string;
+  page: string;
+  name: string;
+  payload: Record<string, unknown>;
+  is_default: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface SavedViewCreate {
+  page: string;
+  name: string;
+  payload: Record<string, unknown>;
+  is_default?: boolean;
+}
+
+export interface SavedViewUpdate {
+  name?: string;
+  payload?: Record<string, unknown>;
+  is_default?: boolean;
+}
+
+export const savedViewsApi = {
+  list: (page?: string) =>
+    api
+      .get<SavedView[]>("/saved-views", { params: page ? { page } : undefined })
+      .then((r) => r.data),
+  create: (body: SavedViewCreate) =>
+    api.post<SavedView>("/saved-views", body).then((r) => r.data),
+  update: (id: string, body: SavedViewUpdate) =>
+    api.patch<SavedView>(`/saved-views/${id}`, body).then((r) => r.data),
+  remove: (id: string) => api.delete(`/saved-views/${id}`),
+};
+
 export const auditApi = {
   list: (params?: {
     limit?: number;
@@ -3061,6 +3102,82 @@ export interface PlatformSettings {
   resolver_search_domains: string[];
   resolver_dnssec: ResolverDnssec;
   resolver_dns_over_tls: ResolverDoT;
+  // ── Appliance APT (issue #155) ───────────────────────────────────
+  apt_managed: boolean;
+  apt_sources: AptSource[];
+  apt_gpg_keys: AptGpgKeyRedacted[];
+  apt_proxy_http: string;
+  apt_proxy_https: string;
+  apt_proxy_no_proxy: string;
+  apt_auth: AptAuthRedacted[];
+  apt_unattended_upgrades_enabled: boolean;
+}
+
+/** One managed APT repo. No secrets — the armoured key lives in
+ *  ``apt_gpg_keys`` and is referenced by ``signed_by_key_id``. */
+export interface AptSource {
+  name: string;
+  uri: string;
+  suites: string;
+  components: string;
+  signed_by_key_id: string;
+  enabled: boolean;
+}
+
+/** Read shape of a GPG key — the armoured text is redacted to a bool. */
+export interface AptGpgKeyRedacted {
+  key_id: string;
+  comment: string;
+  armoured_text_set: boolean;
+}
+
+/** Write shape — ``armoured_text`` null preserves, "" clears, else sets. */
+export interface AptGpgKeyUpdate {
+  key_id: string;
+  comment?: string;
+  armoured_text?: string | null;
+}
+
+/** Read shape of a private-mirror credential — password redacted. */
+export interface AptAuthRedacted {
+  machine: string;
+  login: string;
+  password_set: boolean;
+}
+
+/** Write shape — ``password`` null preserves, "" clears, else sets. */
+export interface AptAuthUpdate {
+  machine: string;
+  login: string;
+  password?: string | null;
+}
+
+/** PUT /settings body for the APT block — carries the write shapes for
+ *  the secret-bearing fields (gpg keys / auth) that the redacted
+ *  PlatformSettings read type can't express. */
+export interface AptSettingsUpdate {
+  apt_managed?: boolean;
+  apt_sources?: AptSource[];
+  apt_gpg_keys?: AptGpgKeyUpdate[];
+  apt_proxy_http?: string;
+  apt_proxy_https?: string;
+  apt_proxy_no_proxy?: string;
+  apt_auth?: AptAuthUpdate[];
+  apt_unattended_upgrades_enabled?: boolean;
+}
+
+export interface AptValidateRequest {
+  apt_sources: AptSource[];
+  apt_gpg_key_ids?: string[];
+  apt_proxy_http?: string;
+  apt_proxy_https?: string;
+}
+
+export interface AptValidateResponse {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+  sources_list_preview: string;
 }
 
 export type ResolverMode = "automatic" | "override";
@@ -3270,6 +3387,17 @@ export const settingsApi = {
         password,
         totp_code: totpCode,
       })
+      .then((r) => r.data),
+  /** Issue #155 — PUT the APT host-config block (carries write shapes
+   *  for the secret-bearing gpg-key / auth fields). */
+  updateApt: (data: AptSettingsUpdate) =>
+    api.put<PlatformSettings>("/settings", data).then((r) => r.data),
+  /** Issue #155 — structural pre-apply check for a candidate APT config
+   *  (no save). The host runner does the real apt-get-update validation;
+   *  this catches the structural mistakes before Save. */
+  validateApt: (req: AptValidateRequest) =>
+    api
+      .post<AptValidateResponse>("/settings/apt/validate", req)
       .then((r) => r.data),
   getOUIStatus: () =>
     api.get<OUIStatus>("/settings/oui/status").then((r) => r.data),
@@ -8741,6 +8869,11 @@ export interface ApplianceRow {
    *  "override" / "automatic" / "failed", or null on non-appliance /
    *  pre-#158 / never-reported rows. */
   resolver_status: string | null;
+  /** Issue #155 — per-host APT host-config state the supervisor reported:
+   *  "synced" / "proxy-failed" / "mirror-unreachable" / "signature-mismatch"
+   *  / "no-sources" / "unmanaged", or null on non-appliance / pre-#155 /
+   *  never-reported rows. */
+  apt_state: string | null;
   desired_appliance_version: string | null;
   desired_slot_image_url: string | null;
   // #386 Part A — integrity + transport hints (not secret). sha256 the

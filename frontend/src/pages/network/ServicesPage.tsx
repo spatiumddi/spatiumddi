@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { Filter, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import {
   circuitsApi,
   customersApi,
@@ -27,6 +28,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerChip } from "@/components/ownership/pickers";
+import { SavedViewsMenu } from "@/components/SavedViewsMenu";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -998,6 +1000,15 @@ function ServiceEditorModal({
 
 export function ServicesPage() {
   const qc = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  // Reverse-lookup mode (#99): when both params are present we show only the
+  // services that reference the given resource instead of the full catalog.
+  const resourceKindParam = searchParams.get(
+    "resource_kind",
+  ) as ServiceResourceKind | null;
+  const resourceIdParam = searchParams.get("resource_id");
+  const resourceLabelParam = searchParams.get("resource_label");
+  const byResourceActive = Boolean(resourceKindParam && resourceIdParam);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<ServiceStatus | "">("");
   const [kindFilter, setKindFilter] = useState<ServiceKind | "">("");
@@ -1037,9 +1048,47 @@ export function ServicesPage() {
         customer_id: customerFilter || undefined,
         tag: tagFilters.length > 0 ? tagFilters : undefined,
       }),
+    enabled: !byResourceActive,
   });
 
-  const items = query.data?.items ?? [];
+  const byResourceQuery = useQuery({
+    queryKey: ["services-by-resource", resourceKindParam, resourceIdParam],
+    queryFn: () =>
+      servicesApi.byResource(
+        resourceKindParam as ServiceResourceKind,
+        resourceIdParam as string,
+      ),
+    enabled: byResourceActive,
+  });
+
+  // One handle the rest of the page reads from regardless of mode.
+  const activeQuery = byResourceActive ? byResourceQuery : query;
+  const items = byResourceActive
+    ? (byResourceQuery.data ?? [])
+    : (query.data?.items ?? []);
+
+  // Saved-views payload (#77) — the page's filter state, stored verbatim.
+  type ServicesViewPayload = {
+    search: string;
+    status: ServiceStatus | "";
+    kind: ServiceKind | "";
+    customer_id: string;
+    tags: string[];
+  };
+  const viewPayload: ServicesViewPayload = {
+    search,
+    status: statusFilter,
+    kind: kindFilter,
+    customer_id: customerFilter,
+    tags: tagFilters,
+  };
+  function applyView(p: ServicesViewPayload) {
+    setSearch(typeof p.search === "string" ? p.search : "");
+    setStatusFilter((p.status ?? "") as ServiceStatus | "");
+    setKindFilter((p.kind ?? "") as ServiceKind | "");
+    setCustomerFilter(typeof p.customer_id === "string" ? p.customer_id : "");
+    setTagFilters(Array.isArray(p.tags) ? p.tags : []);
+  }
 
   const allChecked = useMemo(
     () => items.length > 0 && items.every((s) => selectedIds.has(s.id)),
@@ -1095,10 +1144,19 @@ export function ServicesPage() {
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
+            {!byResourceActive && (
+              <SavedViewsMenu
+                page="network.services"
+                currentPayload={viewPayload}
+                onApply={applyView}
+              />
+            )}
             <HeaderButton
               icon={RefreshCw}
-              onClick={() => query.refetch()}
-              iconClassName={query.isFetching ? "animate-spin" : undefined}
+              onClick={() => activeQuery.refetch()}
+              iconClassName={
+                activeQuery.isFetching ? "animate-spin" : undefined
+              }
             >
               Refresh
             </HeaderButton>
@@ -1112,58 +1170,89 @@ export function ServicesPage() {
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <input
-            className={cn(inputCls, "max-w-xs")}
-            placeholder="Search name…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-          />
-          <select
-            className={cn(inputCls, "max-w-[180px]")}
-            value={kindFilter}
-            onChange={(e) => setKindFilter(e.target.value as ServiceKind | "")}
-          >
-            <option value="">All kinds</option>
-            {KINDS.map((k) => (
-              <option key={k} value={k}>
-                {KIND_LABELS[k]}
-              </option>
-            ))}
-          </select>
-          <select
-            className={cn(inputCls, "max-w-[180px]")}
-            value={statusFilter}
-            onChange={(e) =>
-              setStatusFilter(e.target.value as ServiceStatus | "")
-            }
-          >
-            <option value="">All statuses</option>
-            {STATUSES.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-          <select
-            className={cn(inputCls, "max-w-[200px]")}
-            value={customerFilter}
-            onChange={(e) => setCustomerFilter(e.target.value)}
-          >
-            <option value="">All customers</option>
-            {(customersQ.data?.items ?? []).map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </select>
-        </div>
+        {byResourceActive && (
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-sm">
+            <span className="flex items-center gap-2 text-muted-foreground">
+              <Filter className="h-4 w-4 shrink-0 text-primary" />
+              Showing services that reference{" "}
+              {resourceKindParam && (
+                <span className="font-medium text-foreground">
+                  {RESOURCE_KIND_LABELS[resourceKindParam]}
+                </span>
+              )}{" "}
+              <span className="font-medium text-foreground break-all">
+                {resourceLabelParam ?? resourceIdParam}
+              </span>
+              .
+            </span>
+            <button
+              type="button"
+              onClick={() => setSearchParams({})}
+              className="inline-flex shrink-0 items-center gap-1 rounded border px-2 py-1 hover:bg-muted"
+            >
+              <X className="h-3.5 w-3.5" /> Clear filter
+            </button>
+          </div>
+        )}
 
-        <TagFilterChips
-          value={tagFilters}
-          onChange={setTagFilters}
-          placeholder="Filter by tag — try env or env:prod…"
-        />
+        {!byResourceActive && (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                className={cn(inputCls, "max-w-xs")}
+                placeholder="Search name…"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
+              <select
+                className={cn(inputCls, "max-w-[180px]")}
+                value={kindFilter}
+                onChange={(e) =>
+                  setKindFilter(e.target.value as ServiceKind | "")
+                }
+              >
+                <option value="">All kinds</option>
+                {KINDS.map((k) => (
+                  <option key={k} value={k}>
+                    {KIND_LABELS[k]}
+                  </option>
+                ))}
+              </select>
+              <select
+                className={cn(inputCls, "max-w-[180px]")}
+                value={statusFilter}
+                onChange={(e) =>
+                  setStatusFilter(e.target.value as ServiceStatus | "")
+                }
+              >
+                <option value="">All statuses</option>
+                {STATUSES.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+              <select
+                className={cn(inputCls, "max-w-[200px]")}
+                value={customerFilter}
+                onChange={(e) => setCustomerFilter(e.target.value)}
+              >
+                <option value="">All customers</option>
+                {(customersQ.data?.items ?? []).map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <TagFilterChips
+              value={tagFilters}
+              onChange={setTagFilters}
+              placeholder="Filter by tag — try env or env:prod…"
+            />
+          </>
+        )}
 
         {selectedIds.size > 0 && (
           <div className="flex items-center justify-between rounded-md border bg-muted/50 px-3 py-2 text-sm">
@@ -1211,7 +1300,7 @@ export function ServicesPage() {
               </tr>
             </thead>
             <tbody className={zebraBodyCls}>
-              {query.isLoading && (
+              {activeQuery.isLoading && (
                 <tr>
                   <td
                     className="px-3 py-6 text-center text-muted-foreground"
@@ -1221,13 +1310,15 @@ export function ServicesPage() {
                   </td>
                 </tr>
               )}
-              {!query.isLoading && items.length === 0 && (
+              {!activeQuery.isLoading && items.length === 0 && (
                 <tr>
                   <td
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={10}
                   >
-                    No services yet — click "New service" to add one.
+                    {byResourceActive
+                      ? `No services reference this ${resourceKindParam ? RESOURCE_KIND_LABELS[resourceKindParam] : "resource"}.`
+                      : 'No services yet — click "New service" to add one.'}
                   </td>
                 </tr>
               )}

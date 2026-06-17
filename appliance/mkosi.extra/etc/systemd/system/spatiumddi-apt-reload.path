@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch for SpatiumDDI APT config-reload trigger (issue #155)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/155
+# Skip on the live ISO — apt management isn't part of the installer env.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# PathChanged fires on close-after-write. The supervisor writes this file
+# atomically (.new → mv rename) so the unit fires once per applied config.
+PathChanged=/var/lib/spatiumddi/release-state/apt-config-pending
+
+[Install]
+WantedBy=multi-user.target

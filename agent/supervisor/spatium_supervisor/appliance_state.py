@@ -485,6 +485,12 @@ _SNMP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/snmp-status"
 _NTP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/ntp-config-pending")
 _NTP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-config-hash")
 _NTP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-status")
+# Issue #155 — APT sources / proxy / GPG-key equivalents. Same shape as
+# SNMP / NTP; the trigger's line-3+ payload is a JSON blob (multiple
+# rendered files + keyrings) parsed by the host runner's python3.
+_APT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/apt-config-pending")
+_APT_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/apt-config-hash")
+_APT_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/apt-status")
 # Issue #343 — LLDP / lldpd equivalents. Same shape as SNMP / NTP.
 _LLDP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/lldp-config-pending")
 _LLDP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/lldp-config-hash")
@@ -791,6 +797,7 @@ _HOSTCFG_FAILING_ATTEMPTS = 3  # at/after this many fires of one hash → "faili
 _HOST_CONFIG_PLANES: list[tuple[str, Path, Path]] = [
     ("snmp", _SNMP_TRIGGER_FILE, _SNMP_HASH_SIDECAR),
     ("ntp", _NTP_TRIGGER_FILE, _NTP_HASH_SIDECAR),
+    ("apt", _APT_TRIGGER_FILE, _APT_HASH_SIDECAR),
     ("lldp", _LLDP_TRIGGER_FILE, _LLDP_HASH_SIDECAR),
     ("syslog", _SYSLOG_TRIGGER_FILE, _SYSLOG_HASH_SIDECAR),
     ("ssh", _SSH_TRIGGER_FILE, _SSH_HASH_SIDECAR),
@@ -895,6 +902,12 @@ def _fire_host_config(
         trigger_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = trigger_file.with_suffix(".new")
         tmp.write_text(payload, encoding="utf-8")
+        # The payload can carry decrypted secrets (SNMP community, APT
+        # GPG armour + private-mirror passwords #155) and lands in the
+        # 1777-sticky release-state dir; restrict to owner-only so another
+        # unprivileged host user can't read it in the window before the
+        # root .path runner consumes it. The runner reads as root regardless.
+        tmp.chmod(0o600)
         tmp.replace(trigger_file)
     except OSError:
         return False
@@ -1477,6 +1490,76 @@ def read_k3s_join_token() -> str | None:
     except OSError:
         return None
     return tok or None
+
+
+def maybe_fire_apt_reload(bundle_block: object) -> bool:
+    """Issue #155 — write the apt-config trigger when the control plane's
+    rendered APT artifacts hash differs from the last one this agent
+    applied.
+
+    Strict appliance-only gate + hash-sidecar idempotency, mirroring
+    ``maybe_fire_snmp_reload``. The line-3+ payload is a JSON blob (the
+    multiple rendered files + keyring map don't fit the SNMP single-body
+    shape) the host runner parses with python3:
+
+        line 1:   ``enabled`` | ``disabled`` marker
+        line 2:   config_hash (sha256 hex, blank when unmanaged)
+        line 3+:  JSON {sources_list, proxy_conf, auth_conf, keyrings,
+                  unattended_upgrades_enabled}
+
+    An empty config_hash (apt_managed off) only fires a disable trigger
+    if a non-empty config was previously applied — handled by the
+    ``config_hash == applied_hash`` short-circuit inside the guard.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not isinstance(bundle_block, dict):
+        return False
+    config_hash = str(bundle_block.get("config_hash") or "")
+    enabled = bool(bundle_block.get("enabled"))
+    blob = json.dumps(
+        {
+            "sources_list": bundle_block.get("sources_list") or "",
+            "proxy_conf": bundle_block.get("proxy_conf") or "",
+            "auth_conf": bundle_block.get("auth_conf") or "",
+            "keyrings": bundle_block.get("keyrings") or {},
+            "unattended_upgrades_enabled": bool(
+                bundle_block.get("unattended_upgrades_enabled", True)
+            ),
+        }
+    )
+    payload = (
+        ("enabled\n" if enabled else "disabled\n") + (config_hash + "\n") + blob
+    )
+    return _fire_host_config(
+        _APT_TRIGGER_FILE, _APT_HASH_SIDECAR, config_hash, payload
+    )
+
+
+def read_apt_state() -> str | None:
+    """Read the APT host-config state the runner writes to its status
+    sidecar after a validate + swap (#155). One of ``synced`` /
+    ``proxy-failed`` / ``mirror-unreachable`` / ``signature-mismatch`` /
+    ``no-sources`` / ``unmanaged``. ``None`` = unknown (sidecar missing /
+    unreadable / non-appliance)."""
+    if not _APT_STATUS_SIDECAR.exists():
+        return None
+    try:
+        text = _APT_STATUS_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    valid = {
+        "synced",
+        "proxy-failed",
+        "mirror-unreachable",
+        "signature-mismatch",
+        "no-sources",
+        "unmanaged",
+        # The runner writes this on a malformed-blob / unknown-marker apply
+        # failure; without it the structural failure is silently dropped.
+        "unknown",
+    }
+    return text if text in valid else None
 
 
 def read_snmpd_running() -> bool | None:
@@ -2549,6 +2632,9 @@ def collect() -> dict[str, object]:
         # reference / stratum >= 16; ``unknown`` = chronyc unreadable
         # (transient at boot). None on non-appliance deploys.
         "ntp_sync_state": read_ntp_sync_state() if is_appliance else None,
+        # Issue #155 — APT host-config state from the runner's status
+        # sidecar after validate + swap. None on non-appliance deploys.
+        "apt_state": read_apt_state() if is_appliance else None,
         # #387 — per-plane host-config apply health (snmp / ntp / lldp /
         # syslog / ssh / resolver / firewall / timezone). Surfaces a
         # stuck apply (the bounded-retry guard is backing it off) so the

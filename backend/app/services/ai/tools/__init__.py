@@ -11,6 +11,7 @@ side-effect imports below register every read-only tool.
 from app.services.ai.tools import (  # noqa: F401, E402
     admin,
     appliance,
+    apt,
     auth_grants,
     backup,
     bgp,
@@ -41,6 +42,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     redis,
     reports,
     resolver,
+    saved_views,
     snmp,
     ssh,
     syslog,

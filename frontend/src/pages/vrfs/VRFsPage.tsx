@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { AsnPicker } from "@/components/ipam/asn-picker";
 import { CustomerChip, CustomerPicker } from "@/components/ownership/pickers";
@@ -652,9 +653,15 @@ export function VRFsPage() {
                       : "—"}
                   </td>
                   <td className="px-2 py-1.5 text-right">
+                    <ServicesUsingButton
+                      kind="vrf"
+                      resourceId={v.id}
+                      label={v.name}
+                      compact
+                    />
                     <button
                       onClick={() => setEditing(v)}
-                      className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      className="ml-1 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                       title="Edit VRF"
                     >
                       <Pencil className="h-3.5 w-3.5" />

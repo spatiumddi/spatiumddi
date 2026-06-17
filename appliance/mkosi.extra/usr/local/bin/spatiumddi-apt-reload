@@ -1,0 +1,257 @@
+#!/bin/bash
+# spatiumddi-apt-reload — host-side APT config-apply runner (issue #155).
+#
+# The supervisor writes
+# /var/lib/spatiumddi/release-state/apt-config-pending whenever the
+# control plane's rendered APT artifacts hash changes vs. what's been
+# applied here. File format:
+#   line 1:    "enabled" | "disabled"
+#   line 2:    sha256 hex of the config (blank when disabled)
+#   line 3+:   JSON {sources_list, proxy_conf, auth_conf, keyrings,
+#              unattended_upgrades_enabled}  (parsed with python3)
+#
+# CRITICAL: validate-before-swap. A typo in sources.list (bad scheme,
+# unsigned repo, unreachable mirror, wrong proxy) bricks ``apt update``
+# going forward and there's no GUI to recover short of SSH. So the runner
+# stages the candidate config in a temp tree, runs ``apt-get update``
+# against it with APT_CONFIG pointed at the staging dir (live config
+# UNTOUCHED), and only swaps into /etc/apt when that succeeds. On failure
+# it classifies the apt output (NO_PUBKEY / proxy / connect / no-sources)
+# into a state the supervisor reports back via heartbeat.
+#
+# Persistence across A/B slot swaps (Phase 8a): every file written lives
+# under the /etc overlay's upper layer (/var/persist/etc) or /var
+# directly, so a slot upgrade/rollback preserves the operator's apt
+# config + the sources.list backup automatically.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/apt-config-pending
+HASH_SIDECAR=/var/lib/spatiumddi/release-state/apt-config-hash
+STATUS_SIDECAR=/var/lib/spatiumddi/release-state/apt-status
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/apt-reload.log"
+LOCK=/run/spatiumddi-apt-reload.lock
+
+SOURCES_LIST=/etc/apt/sources.list
+MANAGED_LIST=/etc/apt/sources.list.d/spatiumddi.list
+PROXY_CONF=/etc/apt/apt.conf.d/95spatiumddi-proxy
+AUTH_CONF=/etc/apt/auth.conf.d/spatiumddi.conf
+KEYRING_DIR=/etc/apt/keyrings
+SOURCES_BAK=/etc/apt/sources.list.spatiumddi-bak
+# unattended-upgrades activation toggle (debian's 20auto-upgrades).
+AUTO_UPGRADES=/etc/apt/apt.conf.d/20auto-upgrades
+
+mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$KEYRING_DIR"
+exec >> "$LOG" 2>&1
+
+echo
+echo "[$(date -Iseconds)] === spatiumddi-apt-reload fired ==="
+
+if [ ! -f "$TRIGGER" ]; then
+    echo "  no trigger file at $TRIGGER, nothing to do"
+    exit 0
+fi
+
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "  another reload in progress, deferring"
+    exit 0
+fi
+
+MARKER=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
+HASH=$(sed -n '2p' "$TRIGGER" | tr -d '\r\n')
+BLOB=$(mktemp /tmp/spatium-apt-blob.XXXXXX)
+STAGE=$(mktemp -d /tmp/spatium-apt-stage.XXXXXX)
+trap 'rm -rf "$BLOB" "$STAGE"' EXIT
+tail -n +3 "$TRIGGER" > "$BLOB"
+
+echo "  marker: $MARKER"
+echo "  hash:   ${HASH:-<empty>}"
+
+finish() {
+    # finish <state> <trigger-suffix>
+    echo "$1" > "$STATUS_SIDECAR"
+    echo "$2 $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.${2}.$(date +%s)"
+}
+
+set_unattended() {
+    # set_unattended <0|1> — flip Debian's periodic Update + Unattended-
+    # Upgrade keys. Idempotent; creates the file if missing.
+    local val="$1"
+    cat > "$AUTO_UPGRADES" <<EOF
+// Managed by SpatiumDDI — Settings → Appliance → APT.
+APT::Periodic::Update-Package-Lists "$val";
+APT::Periodic::Unattended-Upgrade "$val";
+EOF
+    chmod 0644 "$AUTO_UPGRADES"
+}
+
+case "$MARKER" in
+    enabled)
+        # Explode the JSON blob into the staging tree. python3 is always
+        # present on the appliance (same approach the syslog runner uses).
+        if ! python3 - "$BLOB" "$STAGE" "$KEYRING_DIR" <<'PYEOF'
+import json, os, sys
+
+blob_path, stage, keyring_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(blob_path, encoding="utf-8") as fh:
+    data = json.load(fh)
+
+# Staging tree for the validate pass (live /etc/apt untouched).
+os.makedirs(os.path.join(stage, "sources.list.d"), exist_ok=True)
+os.makedirs(os.path.join(stage, "apt.conf.d"), exist_ok=True)
+os.makedirs(os.path.join(stage, "auth.conf.d"), exist_ok=True)
+os.makedirs(os.path.join(stage, "state", "lists", "partial"), exist_ok=True)
+os.makedirs(os.path.join(stage, "cache", "archives", "partial"), exist_ok=True)
+
+# Empty top-level sources.list so only our managed list is read.
+open(os.path.join(stage, "sources.list"), "w").close()
+with open(os.path.join(stage, "sources.list.d", "spatiumddi.list"), "w",
+          encoding="utf-8") as fh:
+    fh.write(data.get("sources_list") or "")
+proxy = data.get("proxy_conf") or ""
+if proxy:
+    with open(os.path.join(stage, "apt.conf.d", "95spatiumddi-proxy"), "w",
+              encoding="utf-8") as fh:
+        fh.write(proxy)
+auth = data.get("auth_conf") or ""
+if auth:
+    p = os.path.join(stage, "auth.conf.d", "spatiumddi.conf")
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write(auth)
+    os.chmod(p, 0o600)
+
+# Keyrings are referenced by absolute path in the sources.list entries, so
+# they must exist at the live location BEFORE validation. Additive + safe.
+for key_id, armour in (data.get("keyrings") or {}).items():
+    safe = "".join(c for c in str(key_id) if c.isalnum() or c in "._-")
+    if not safe:
+        continue
+    p = os.path.join(keyring_dir, f"spatiumddi-{safe}.asc")
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write(armour)
+    os.chmod(p, 0o644)
+
+# Emit the artifact paths + unattended flag for the bash half.
+with open(os.path.join(stage, "manifest.env"), "w", encoding="utf-8") as fh:
+    fh.write(f"HAS_PROXY={'1' if proxy else '0'}\n")
+    fh.write(f"HAS_AUTH={'1' if auth else '0'}\n")
+    fh.write(
+        "UNATTENDED="
+        + ("1" if data.get("unattended_upgrades_enabled", True) else "0")
+        + "\n"
+    )
+PYEOF
+        then
+            echo "  ✗ failed to parse / stage apt config blob"
+            finish "unknown" "failed"
+            exit 1
+        fi
+        # shellcheck disable=SC1091
+        . "$STAGE/manifest.env"
+
+        # Build a throwaway APT_CONFIG that reads ONLY the staged tree and
+        # writes its lists/cache to temp dirs, so a validate never touches
+        # /var/lib/apt or the live /etc/apt.
+        cat > "$STAGE/apt.conf" <<EOF
+Dir::Etc::sourcelist "$STAGE/sources.list";
+Dir::Etc::sourceparts "$STAGE/sources.list.d";
+Dir::Etc::main "/dev/null";
+Dir::Etc::parts "$STAGE/apt.conf.d";
+Dir::Etc::netrcparts "$STAGE/auth.conf.d";
+Dir::State "$STAGE/state";
+Dir::Cache "$STAGE/cache";
+Acquire::Languages "none";
+EOF
+
+        echo "  validating staged config (apt-get update, live untouched)…"
+        VALIDATE_LOG="$STAGE/validate.log"
+        if APT_CONFIG="$STAGE/apt.conf" apt-get update > "$VALIDATE_LOG" 2>&1; then
+            echo "  ✓ staged apt-get update succeeded"
+        else
+            echo "  ✗ staged apt-get update failed:"
+            sed 's/^/      /' "$VALIDATE_LOG" | tail -30
+            # Classify the failure into an operator-meaningful state.
+            state="mirror-unreachable"
+            if grep -qiE "NO_PUBKEY|not signed|no.*public key|GPG error" "$VALIDATE_LOG"; then
+                state="signature-mismatch"
+            elif grep -qiE "proxy|407 |Proxy CONNECT" "$VALIDATE_LOG"; then
+                state="proxy-failed"
+            elif grep -qiE "You may want to run apt-get update|no sources|The list of sources" "$VALIDATE_LOG"; then
+                state="no-sources"
+            fi
+            echo "  classified as: $state (live config left untouched)"
+            finish "$state" "failed"
+            exit 1
+        fi
+
+        # Validation passed — swap into the live config atomically.
+        # Back up the baked sources.list ONCE so a later disable restores it.
+        if [ -f "$SOURCES_LIST" ] && [ ! -f "$SOURCES_BAK" ]; then
+            cp -a "$SOURCES_LIST" "$SOURCES_BAK"
+            echo "  backed up baked sources.list → $SOURCES_BAK"
+        fi
+        # Neutralise the baked top-level sources.list so only our managed
+        # list is effective (operator's repos are the source of truth).
+        cat > "$SOURCES_LIST" <<'EOF'
+# Managed by SpatiumDDI — repos are configured in
+# /etc/apt/sources.list.d/spatiumddi.list (Settings → Appliance → APT).
+# Original baked sources.list saved at sources.list.spatiumddi-bak.
+EOF
+        install -m 0644 "$STAGE/sources.list.d/spatiumddi.list" "$MANAGED_LIST"
+        if [ "$HAS_PROXY" = "1" ]; then
+            install -m 0644 "$STAGE/apt.conf.d/95spatiumddi-proxy" "$PROXY_CONF"
+        else
+            rm -f "$PROXY_CONF"
+        fi
+        if [ "$HAS_AUTH" = "1" ]; then
+            install -m 0600 "$STAGE/auth.conf.d/spatiumddi.conf" "$AUTH_CONF"
+        else
+            rm -f "$AUTH_CONF"
+        fi
+        set_unattended "${UNATTENDED:-1}"
+
+        echo "  applied live config; confirming with live apt-get update…"
+        if apt-get update > /tmp/spatium-apt-live.log 2>&1; then
+            echo "  ✓ live apt-get update succeeded"
+            # Stamp the applied-hash sidecar the supervisor's idempotency
+            # guard reads (mirrors spatiumddi-snmp-reload). Only on the
+            # synced-success path — leaving it unwritten on failure paths
+            # lets the supervisor re-fire/retry (bounded by the #387 backoff).
+            echo "$HASH" > "$HASH_SIDECAR"
+            finish "synced" "done"
+        else
+            # The staged validate passed but the live run failed — re-classify
+            # and report; leave the (validated) config in place, the daily
+            # unattended-upgrades run will keep retrying.
+            echo "  ! live apt-get update failed after a passing validate:"
+            sed 's/^/      /' /tmp/spatium-apt-live.log | tail -20
+            state="mirror-unreachable"
+            grep -qiE "NO_PUBKEY|GPG error" /tmp/spatium-apt-live.log && state="signature-mismatch"
+            grep -qiE "proxy|407 " /tmp/spatium-apt-live.log && state="proxy-failed"
+            finish "$state" "done"
+        fi
+        ;;
+    disabled)
+        # Retract managed apt config — restore the baked sources.list and
+        # remove our drop-ins so Debian's default repos take back over.
+        if [ -f "$SOURCES_BAK" ]; then
+            cp -a "$SOURCES_BAK" "$SOURCES_LIST"
+            echo "  restored baked sources.list from backup"
+        fi
+        rm -f "$MANAGED_LIST" "$PROXY_CONF" "$AUTH_CONF"
+        rm -f "$KEYRING_DIR"/spatiumddi-*.asc
+        # Clear the applied-hash sidecar so the disabled state is idempotent
+        # (next bundle's empty config_hash == empty applied → no re-fire).
+        : > "$HASH_SIDECAR"
+        echo "  ✓ managed apt config removed; baked repos in effect"
+        finish "unmanaged" "done"
+        ;;
+    *)
+        echo "  ✗ unknown marker line: ${MARKER:-<empty>}"
+        finish "unknown" "failed"
+        exit 1
+        ;;
+esac

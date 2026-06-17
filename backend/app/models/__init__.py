@@ -104,6 +104,7 @@ from app.models.overlay import (
 from app.models.ownership import Customer, Provider, Site
 from app.models.pcap import PacketCapture
 from app.models.proxmox import ProxmoxNode
+from app.models.saved_view import SavedView
 from app.models.settings import PlatformSettings
 from app.models.system_upgrade import SystemUpgradeRun
 from app.models.tailscale import TailscaleTenant
@@ -210,6 +211,7 @@ __all__ = [
     "MulticastMembership",
     "NmapScan",
     "PacketCapture",
+    "SavedView",
     "EventSubscription",
     "EventOutbox",
     "Customer",

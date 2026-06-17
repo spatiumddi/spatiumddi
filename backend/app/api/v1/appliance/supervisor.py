@@ -89,6 +89,7 @@ from app.models.appliance import (
 from app.models.audit import AuditLog
 from app.models.firewall import FirewallApplyState
 from app.models.settings import PlatformSettings
+from app.services.appliance.apt import apt_bundle
 from app.services.appliance.ca import (
     ensure_ca,
     generate_session_token,
@@ -1041,6 +1042,21 @@ class SupervisorHeartbeatRequest(BaseModel):
     # column alone); a value persists. ``override`` = spatiumddi.conf
     # drop-in applied; ``automatic`` = no drop-in; ``failed`` = apply error.
     resolver_status: Literal["override", "automatic", "failed"] | None = None
+    # Issue #155 — APT host-config state the runner reports from its
+    # .state sidecar after validate + swap. None = not collected (leave
+    # the stored column alone); a value persists.
+    apt_state: (
+        Literal[
+            "synced",
+            "proxy-failed",
+            "mirror-unreachable",
+            "signature-mismatch",
+            "no-sources",
+            "unmanaged",
+            "unknown",
+        ]
+        | None
+    ) = None
     # Issue #347 — LLDP neighbours the local lldpd discovered. ``None`` = not
     # collected (leave the stored set alone); a list (possibly empty) is the
     # authoritative current set the handler upserts + absence-deletes against.
@@ -1364,6 +1380,10 @@ class SupervisorHeartbeatResponse(BaseModel):
     # still sent so the supervisor can retract the managed drop-in (revert
     # to per-link DHCP / NetworkManager DNS).
     resolver_settings: dict[str, Any] = Field(default_factory=dict)
+    # Issue #155 — rendered APT artifacts (sources.list / proxy / auth /
+    # keyrings) + unattended-upgrades flag. Disabled-shape block still
+    # sent so the supervisor can retract managed apt config.
+    apt_settings: dict[str, Any] = Field(default_factory=dict)
     # #285 Phase 2a — server-side firewall render. ``{enabled, config_hash,
     # firewall_conf}``; empty config_hash when firewall_enabled is off (the
     # supervisor then keeps its in-pod fallback render). The supervisor
@@ -1626,6 +1646,10 @@ async def supervisor_heartbeat(
     # collected (leave the column alone); a value persists.
     if body.resolver_status is not None:
         row.resolver_status = body.resolver_status
+    # Issue #155 — applied APT host-config state (per-host). None = not
+    # collected (leave the column alone); a value persists.
+    if body.apt_state is not None:
+        row.apt_state = body.apt_state
     # Issue #347 — ingest the supervisor's local LLDP neighbours (upsert +
     # absence-delete). None = not collected (leave the set alone).
     if body.lldp_neighbours is not None:
@@ -2068,6 +2092,22 @@ async def supervisor_heartbeat(
         if cfg_row is not None
         else {"enabled": False, "config_hash": "", "resolved_conf": ""}
     )
+    # Issue #155 — APT host-config. Disabled-shape fallback keeps a stable
+    # key set when no settings row exists yet so the supervisor's hash
+    # compare never KeyErrors.
+    apt_block = (
+        apt_bundle(cfg_row)
+        if cfg_row is not None
+        else {
+            "enabled": False,
+            "config_hash": "",
+            "sources_list": "",
+            "proxy_conf": "",
+            "auth_conf": "",
+            "keyrings": {},
+            "unattended_upgrades_enabled": True,
+        }
+    )
     # #285 Phase 2a — server-side firewall render. Same inputs the in-pod
     # renderer consumes (byte-identical body). Gated on the firewall_enabled
     # master switch (default off → disabled-shape block → supervisor keeps
@@ -2160,6 +2200,7 @@ async def supervisor_heartbeat(
         syslog_settings=syslog_block,
         ssh_settings=ssh_block,
         resolver_settings=resolver_block,
+        apt_settings=apt_block,
         firewall_settings=firewall_block,
         long_poll=long_poll,
     )
@@ -2322,6 +2363,10 @@ class ApplianceRow(BaseModel):
     # (override / automatic / failed). None on non-appliance / pre-#158 /
     # never-reported rows.
     resolver_status: str | None
+    # Issue #155 — APT host-config state (synced / proxy-failed /
+    # mirror-unreachable / signature-mismatch / no-sources / unmanaged /
+    # unknown). None on non-appliance / pre-#155 / never-reported rows.
+    apt_state: str | None
     desired_appliance_version: str | None
     desired_slot_image_url: str | None
     # #386 Part A — integrity + transport hints surfaced for the UI /
@@ -2441,6 +2486,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         syslog_forwarding=row.syslog_forwarding,
         ssh_key_count=row.ssh_key_count,
         resolver_status=row.resolver_status,
+        apt_state=row.apt_state,
         desired_appliance_version=row.desired_appliance_version,
         desired_slot_image_url=row.desired_slot_image_url,
         desired_slot_image_sha256=row.desired_slot_image_sha256,

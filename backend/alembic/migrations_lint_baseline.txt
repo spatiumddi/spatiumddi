@@ -343,6 +343,7 @@ backend/alembic/versions/d4c1f7e3b821_appliance_k3s_cert_and_cidrs.py:drop_colum
 backend/alembic/versions/d4c1f7e3b821_appliance_k3s_cert_and_cidrs.py:drop_column:53
 backend/alembic/versions/d4e2f7a9b1c6_utilization_max_prefix.py:drop_column:49
 backend/alembic/versions/d4e2f7a9b1c6_utilization_max_prefix.py:drop_column:50
+backend/alembic/versions/d4e9f2a7c1b8_saved_views.py:drop_table:79
 backend/alembic/versions/d4f2a86c5b91_device_profiling_phase1.py:drop_column:79
 backend/alembic/versions/d4f2a86c5b91_device_profiling_phase1.py:drop_column:80
 backend/alembic/versions/d4f2a86c5b91_device_profiling_phase1.py:drop_column:81
@@ -398,6 +399,15 @@ backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:357
 backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:359
 backend/alembic/versions/d9e4c12a7f85_aggregation_snooze.py:drop_column:39
 backend/alembic/versions/d9f3b21e8c54_wan_circuits.py:drop_table:187
+backend/alembic/versions/e1a4b8c92f3d_appliance_apt_settings.py:drop_column:104
+backend/alembic/versions/e1a4b8c92f3d_appliance_apt_settings.py:drop_column:105
+backend/alembic/versions/e1a4b8c92f3d_appliance_apt_settings.py:drop_column:106
+backend/alembic/versions/e1a4b8c92f3d_appliance_apt_settings.py:drop_column:107
+backend/alembic/versions/e1a4b8c92f3d_appliance_apt_settings.py:drop_column:108
+backend/alembic/versions/e1a4b8c92f3d_appliance_apt_settings.py:drop_column:109
+backend/alembic/versions/e1a4b8c92f3d_appliance_apt_settings.py:drop_column:110
+backend/alembic/versions/e1a4b8c92f3d_appliance_apt_settings.py:drop_column:111
+backend/alembic/versions/e1a4b8c92f3d_appliance_apt_settings.py:drop_column:112
 backend/alembic/versions/e1c4a9d27b63_appliance_upgrade_download_monitoring.py:drop_column:61
 backend/alembic/versions/e1c4a9d27b63_appliance_upgrade_download_monitoring.py:drop_column:62
 backend/alembic/versions/e1c4a9d27b63_appliance_upgrade_download_monitoring.py:drop_column:63

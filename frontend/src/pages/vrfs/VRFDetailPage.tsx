@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, Loader2, Pencil, Route as RouteIcon } from "lucide-react";
 import { asnsApi, ipamApi, vrfsApi } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { VRFEditorModal } from "./VRFsPage";
 
 type Tab = "spaces" | "blocks";
@@ -160,6 +161,11 @@ export function VRFDetailPage() {
             )}
           </div>
           <div className="flex flex-shrink-0 items-center gap-2">
+            <ServicesUsingButton
+              kind="vrf"
+              resourceId={vrf.id}
+              label={vrf.name}
+            />
             <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
               Edit
             </HeaderButton>

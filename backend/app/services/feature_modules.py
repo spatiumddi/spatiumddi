@@ -285,6 +285,13 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Security",
         description="Embedded RFC 8555 ACME client that issues a CA-trusted Web UI TLS cert from Let's Encrypt, solving the DNS-01 challenge through SpatiumDDI's own managed DNS zones. Discovery toggle only — issuance is RBAC-gated and requires an explicit operator opt-in (Settings → acme_enabled).",
     ),
+    # UI — cross-cutting personalisation surfaces. Per-user, never shared.
+    ModuleSpec(
+        id="ui.saved_views",
+        label="Saved views",
+        group="UI",
+        description='Per-user named filter/sort/column presets on list pages — "All subnets in DC1 over 80% utilization, sorted by name" becomes a one-click view. Personal-only; no cross-user visibility.',
+    ),
 )
 
 # Map a feature_module id to the ``PlatformSettings`` column whose

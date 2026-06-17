@@ -56,6 +56,7 @@ from app.api.v1.pcap import router as pcap_router
 from app.api.v1.proxmox import router as proxmox_router
 from app.api.v1.reports import router as reports_router
 from app.api.v1.roles.router import router as roles_router
+from app.api.v1.saved_views import router as saved_views_router
 from app.api.v1.search.router import router as search_router
 from app.api.v1.services import router as services_router
 from app.api.v1.sessions.router import router as sessions_router
@@ -279,6 +280,12 @@ api_v1_router.include_router(
     dependencies=[Depends(require_module("reports.top_n"))],
 )
 api_v1_router.include_router(roles_router, prefix="/roles", tags=["roles"])
+api_v1_router.include_router(
+    saved_views_router,
+    prefix="/saved-views",
+    tags=["saved-views"],
+    dependencies=[Depends(require_module("ui.saved_views"))],
+)
 api_v1_router.include_router(search_router, prefix="/search", tags=["search"])
 api_v1_router.include_router(
     services_router,
