@@ -536,7 +536,9 @@ function CertDetailModal({
           <DetailRow label="Signature">{t.sig_algo || DASH}</DetailRow>
         </DetailSection>
 
-        <DetailSection title={`Subject alternative names (${t.sans_json.length})`}>
+        <DetailSection
+          title={`Subject alternative names (${t.sans_json.length})`}
+        >
           {t.sans_json.length === 0 ? (
             <p className="py-1 text-sm text-muted-foreground">{DASH}</p>
           ) : (
@@ -782,7 +784,9 @@ export function CertificatesPage() {
           <select
             className={cn(inputCls, "max-w-[180px]")}
             value={stateFilter}
-            onChange={(e) => setStateFilter(e.target.value as TLSCertState | "")}
+            onChange={(e) =>
+              setStateFilter(e.target.value as TLSCertState | "")
+            }
           >
             <option value="">All states</option>
             {TLS_CERT_STATES.map((s) => (

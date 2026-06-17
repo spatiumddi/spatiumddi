@@ -3239,7 +3239,9 @@ function ZoneDetailView({
                   type="checkbox"
                   checked={!!zone.auto_tls_probe}
                   disabled={autoTlsProbeMutation.isPending}
-                  onChange={(e) => autoTlsProbeMutation.mutate(e.target.checked)}
+                  onChange={(e) =>
+                    autoTlsProbeMutation.mutate(e.target.checked)
+                  }
                 />
                 <span>
                   Auto-discover &amp; probe every A/AAAA record in this zone
