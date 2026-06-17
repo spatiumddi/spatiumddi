@@ -100,12 +100,14 @@ async def test_duplicate_name_same_page_conflicts(client: AsyncClient, db_sessio
     _, token = await _user(db_session)
     h = _hdr(token)
     body = {"page": "network.services", "name": "dupe", "payload": {}}
-    assert (await client.post("/api/v1/saved-views", headers=h, json=body)).status_code == 201
-    r = await client.post("/api/v1/saved-views", headers=h, json=body)
-    assert r.status_code == 409
+    first = await client.post("/api/v1/saved-views", headers=h, json=body)
+    assert first.status_code == 201
+    dupe = await client.post("/api/v1/saved-views", headers=h, json=body)
+    assert dupe.status_code == 409
     # Same name on a *different* page is fine.
     body2 = {"page": "network.circuits", "name": "dupe", "payload": {}}
-    assert (await client.post("/api/v1/saved-views", headers=h, json=body2)).status_code == 201
+    other_page = await client.post("/api/v1/saved-views", headers=h, json=body2)
+    assert other_page.status_code == 201
 
 
 async def test_at_most_one_default_per_page(client: AsyncClient, db_session):
@@ -134,20 +136,22 @@ async def test_at_most_one_default_per_page(client: AsyncClient, db_session):
 async def test_other_user_cannot_see_or_touch(client: AsyncClient, db_session):
     _, t1 = await _user(db_session)
     _, t2 = await _user(db_session)
-    vid = (
-        await client.post(
-            "/api/v1/saved-views",
-            headers=_hdr(t1),
-            json={"page": "p", "name": "mine", "payload": {}},
-        )
-    ).json()["id"]
+    created = await client.post(
+        "/api/v1/saved-views",
+        headers=_hdr(t1),
+        json={"page": "p", "name": "mine", "payload": {}},
+    )
+    vid = created.json()["id"]
 
     # User 2 sees an empty list and gets 404 on user 1's view.
-    assert (await client.get("/api/v1/saved-views", headers=_hdr(t2))).json() == []
-    assert (
-        await client.patch(f"/api/v1/saved-views/{vid}", headers=_hdr(t2), json={"name": "hijack"})
-    ).status_code == 404
-    assert (await client.delete(f"/api/v1/saved-views/{vid}", headers=_hdr(t2))).status_code == 404
+    listed = await client.get("/api/v1/saved-views", headers=_hdr(t2))
+    assert listed.json() == []
+    patched = await client.patch(
+        f"/api/v1/saved-views/{vid}", headers=_hdr(t2), json={"name": "hijack"}
+    )
+    assert patched.status_code == 404
+    deleted = await client.delete(f"/api/v1/saved-views/{vid}", headers=_hdr(t2))
+    assert deleted.status_code == 404
 
 
 async def test_mcp_tools_scope_to_caller(client: AsyncClient, db_session):
