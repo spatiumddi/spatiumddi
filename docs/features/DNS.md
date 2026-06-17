@@ -1,6 +1,6 @@
 # DNS Feature Specification
 
-> **Implementation status (2026-04-28):** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); **curated 14-source RPZ blocklist catalog** with one-click subscribe; per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); **conditional forwarders as a first-class zone type**; **zone delegation wizard** (auto-stamps NS + glue records in the parent zone); **four starter zone-template wizards** (Email / Active Directory / Web / k8s external-dns target); **operator-managed TSIG keys** with Fernet-encrypted secrets and one-shot reveal modal; query logging + **clickable analytics strip** (top qnames + top clients + qtype distribution); **multi-resolver propagation check** (Cloudflare / Google / Quad9 / OpenDNS in parallel); **BIND9 catalog zones (RFC 9432)** with producer / consumer roles auto-derived from the group's primary; per-server zone serial reporting + drift pill; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill; **Windows DNS driver shipped** — Path A (agentless, RFC 2136) and Path B (agentless, WinRM + PowerShell for zone CRUD and zone-record pull that sidesteps AXFR); group-level "Sync with Servers" button performs bi-directional zone reconciliation. **Deferred:** DNSSEC (KSK / ZSK rollover, NSEC3, DS handoff), DoT / DoH listener (gated on the embedded ACME client), secondary-zone (AXFR/IXFR) full support, GSS-TSIG (Kerberos-signed RFC 2136), Windows DNS Path B record-level writes.
+> **Implementation status (2026-04-28):** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); **curated 14-source RPZ blocklist catalog** with one-click subscribe; per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); **conditional forwarders as a first-class zone type**; **zone delegation wizard** (auto-stamps NS + glue records in the parent zone); **four starter zone-template wizards** (Email / Active Directory / Web / k8s external-dns target); **operator-managed TSIG keys** with Fernet-encrypted secrets and one-shot reveal modal; query logging + **clickable analytics strip** (top qnames + top clients + qtype distribution); **multi-resolver propagation check** (Cloudflare / Google / Quad9 / OpenDNS in parallel); **BIND9 catalog zones (RFC 9432)** with producer / consumer roles auto-derived from the group's primary; per-server zone serial reporting + drift pill; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill; **Windows DNS driver shipped** — Path A (agentless, RFC 2136) and Path B (agentless, WinRM + PowerShell for zone CRUD and zone-record pull that sidesteps AXFR); group-level "Sync with Servers" button performs bi-directional zone reconciliation; **BIND9 Response Rate Limiting (RRL) + amplification toggles** (responses-per-second / window / slip / qps-scale / exempt-clients / log-only dry-run + minimal-responses / tcp-clients / clients-per-query; group-level, default-off — issue #146 Phase 1). **Deferred:** DNSSEC (KSK / ZSK rollover, NSEC3, DS handoff), DoT / DoH listener (gated on the embedded ACME client), secondary-zone (AXFR/IXFR) full support, GSS-TSIG (Kerberos-signed RFC 2136), Windows DNS Path B record-level writes.
 
 ## Overview
 
@@ -319,7 +319,68 @@ blackhole:         ["198.51.100.0/24"]            -- silently drop known bad act
 - ACLs are managed at the **server group** level; views and zones within that group reference them by name
 - UI: ACL editor under DNS Server Group settings — list of named ACLs, each with an ordered entry list; drag-to-reorder entries; inline negation toggle
 
-### 3.8 Options Precedence
+### 3.8 Rate limiting (RRL) + amplification defenses (issue #146)
+
+BIND9 Response Rate Limiting (RRL) and the related amplification-reduction knobs are exposed on `DNSServerOptions` (group-level; they apply to every view on the group) and render into the `options {}` block of `named.conf`. RRL is the single most effective in-process defense against DNS amplification — it drops or truncates duplicate responses to the same client `/24` + qname within a sliding window.
+
+```
+DNSServerOptions.rrl_enabled: bool                  -- default false (feature off — no rate-limit{} block rendered)
+DNSServerOptions.rrl_responses_per_second: int      -- 1–1000; per-client-/24 response budget
+DNSServerOptions.rrl_window: int                    -- 1–3600 seconds; the accounting window
+DNSServerOptions.rrl_slip: int                      -- 0–10; every Nth dropped response is truncated (TC=1)
+                                                    --   instead of dropped, so legit clients can retry over TCP
+DNSServerOptions.rrl_qps_scale: int | null          -- optional; tighten the limit as overall QPS rises
+DNSServerOptions.rrl_exempt_clients: list[str]      -- CIDRs / ACL names never rate-limited (e.g. your secondaries)
+DNSServerOptions.rrl_log_only: bool                 -- default false; DRY RUN — count + log would-be drops without
+                                                    --   actually dropping. Use to size the limit before enforcing.
+
+DNSServerOptions.minimal_responses: bool            -- default false; emit "minimal-responses yes;" to shrink the
+                                                    --   amplification payload (omit the extra section unless required)
+DNSServerOptions.tcp_clients: int | null            -- optional; max simultaneous TCP clients
+DNSServerOptions.clients_per_query: int | null      -- optional; starting per-query duplicate-client cap
+DNSServerOptions.max_clients_per_query: int | null  -- optional; ceiling for clients_per_query
+```
+
+- **BIND9:** renders into `options {}`:
+  ```
+  rate-limit {
+      responses-per-second 15;
+      window 15;
+      slip 2;
+      qps-scale 250;                       // only when set
+      exempt-clients { 10.0.0.0/8; };      // only when non-empty
+      log-only yes;                        // only when rrl_log_only
+  };
+  minimal-responses yes;                   // only when minimal_responses
+  tcp-clients 150;                         // only when set
+  clients-per-query 10;                    // only when set
+  max-clients-per-query 100;               // only when set
+  ```
+- **Defaults are a no-op.** With `rrl_enabled=false`, `minimal_responses=false`, and the optional knobs unset, the rendered `named.conf` is byte-identical to before the feature existed — adding it never changes an existing group's behavior until an operator opts in.
+- **PowerDNS:** authoritative `pdns_server` has no RRL equivalent; the project's answer there is a **dnsdist front** (Phase 2 — see below). These RRL/amplification knobs are BIND9-only.
+- **Recommended starting point** for an internet-facing authoritative server: `rrl_enabled=true`, `responses-per-second≈15`, `window=15`, `slip=2`, exempt your own secondaries. Run with `log-only=true` first and watch the drop counters before enforcing.
+- UI: **DNS → Server Group → Server Options → "Rate limiting (RRL) & amplification"** card.
+- MCP: `find_dns_rate_limit_settings` (read-only) reports the posture per group.
+- **Observability (Phase 3 — shipped):** the BIND9 agent ships `RateDropped` + `RateSlipped` from the statistics-channels XML as `rate_dropped` / `rate_slipped` on the per-minute `dns_metric_sample`; the server detail modal's Stats tab draws an **"RRL drops/s"** line (shown once a server has dropped anything), and the default-off **`dns_rate_limit_dropping`** alert rule fires when drops over a 15-minute window clear a floor (`min_free_addresses`, default 100) — i.e. the server is actively shedding a flood. Auto-resolves when it subsides.
+
+#### dnsdist front for PowerDNS (Phase 2)
+
+PowerDNS Authoritative has no RRL, so rate limiting / DDoS defense in front of a PowerDNS group is provided by an opt-in **dnsdist sidecar** that binds `:53` and forwards to pdns. Configured group-level on `DNSServerOptions` (PowerDNS groups), default-off:
+
+```
+DNSServerOptions.dnsdist_enabled: bool                   -- default false
+DNSServerOptions.dnsdist_max_qps_per_client: int | null  -- per-source-IP QPS cap (MaxQPSIPRule)
+DNSServerOptions.dnsdist_action: enum(truncate, drop)    -- over-cap action; truncate sets TC=1 so a
+                                                         --   legit client retries over TCP (default)
+DNSServerOptions.dnsdist_dynblock_qps: int | null        -- sustained-rate dynamic block (exceedQRate over 10s)
+DNSServerOptions.dnsdist_dynblock_seconds: int           -- dynamic block duration (default 60)
+```
+
+- The PowerDNS agent renders only the **rate-limit rules** (`MaxQPSIPRule` + `TCAction`/`DropAction`, `dynBlockRulesGroup:setQueryRate`) into a shared `dnsdist-rules.conf`; the dnsdist **front is a separate container** whose entrypoint composes those rules onto its base (`setLocal(:53)` + `newServer → dns-powerdns:53`) and reloads on change. **pdns never moves port** — the front forwards to pdns:53 over the network, fully decoupled from pdns's lifecycle. With dnsdist disabled the front is a plain pass-through (safe no-op).
+- **Deploy the front:** compose `--profile dns-powerdns-with-dnsdist` (alongside `--profile dns-powerdns`); point DNS clients at the front (host `:5455` in the dev compose). **docker-compose only for now** — the k8s/appliance front (a dnsdist Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.
+- UI: **DNS → Server Group → Server Options → "dnsdist front (PowerDNS)"** card. MCP `find_dns_rate_limit_settings` reports the dnsdist posture alongside RRL.
+
+### 3.9 Options Precedence
 
 Settings can be defined at three levels and are evaluated from most-specific to least-specific:
 

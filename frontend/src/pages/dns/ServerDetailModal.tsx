@@ -830,8 +830,17 @@ function StatsTab({ serverId }: { serverId: string }) {
       noerror: round2(p.noerror / bs),
       nxdomain: round2(p.nxdomain / bs),
       servfail: round2(p.servfail / bs),
+      rrl_dropped: round2(p.rate_dropped / bs),
+      rrl_slipped: round2(p.rate_slipped / bs),
     }));
   }, [ts.data]);
+
+  // Only surface the RRL lines once the server has actually dropped/slipped
+  // something — keeps the chart clean on the (common) non-RRL case.
+  const hasRrl = useMemo(
+    () => points.some((p) => p.rrl_dropped > 0 || p.rrl_slipped > 0),
+    [points],
+  );
 
   return (
     <div className="space-y-3">
@@ -910,6 +919,27 @@ function StatsTab({ serverId }: { serverId: string }) {
                   dot={false}
                   name="SERVFAIL"
                 />
+                {hasRrl && (
+                  <Line
+                    type="monotone"
+                    dataKey="rrl_dropped"
+                    stroke="#a855f7"
+                    strokeWidth={2}
+                    dot={false}
+                    name="RRL drops/s"
+                  />
+                )}
+                {hasRrl && (
+                  <Line
+                    type="monotone"
+                    dataKey="rrl_slipped"
+                    stroke="#c084fc"
+                    strokeWidth={1.5}
+                    strokeDasharray="4 2"
+                    dot={false}
+                    name="RRL slipped/s"
+                  />
+                )}
               </LineChart>
             </ResponsiveContainer>
           )}

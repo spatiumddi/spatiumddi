@@ -164,6 +164,10 @@ RULE_TYPE_DECOM_EXPIRING = "decom_expiring"
 # same approach as the firewall / transition rules' fixed grace windows.
 RULE_TYPE_DNS_NXDOMAIN_SPIKE = "dns_nxdomain_spike"
 RULE_TYPE_DNS_QUERY_RATE_SPIKE = "dns_query_rate_spike"
+# Response Rate Limiting actively dropping (#146 Phase 3). Subject =
+# dns_server. Open-while-true: fires when RateDropped summed over the window
+# clears the floor, auto-resolves when the flood subsides.
+RULE_TYPE_DNS_RATE_LIMIT_DROPPING = "dns_rate_limit_dropping"
 
 # Active IP reconciliation hygiene alerts — issue #369. Subject = ip_address.
 # Reuse the on-the-wire liveness signal (IPAddress.last_seen_at) the discovery
@@ -232,6 +236,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DECOM_EXPIRING,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
         RULE_TYPE_DNS_QUERY_RATE_SPIKE,
+        RULE_TYPE_DNS_RATE_LIMIT_DROPPING,
         RULE_TYPE_IP_FREE_BUT_RESPONDING,
         RULE_TYPE_STALE_RESERVATION,
         RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE,
@@ -261,6 +266,11 @@ _DNS_NXDOMAIN_RATIO_DEFAULT = 40  # % of queries that are NXDOMAIN
 _DNS_NXDOMAIN_MIN_COUNT_DEFAULT = 200  # absolute NXDOMAIN floor over the window
 _DNS_QUERY_RATE_SPIKE_PCT_DEFAULT = 200  # current ≥ prior × (1 + 200%) = ×3
 _DNS_QUERY_RATE_MIN_DEFAULT = 1000  # absolute query floor over the window
+# RRL actively-dropping floor (#146 Phase 3): RateDropped summed over the
+# window must clear this to fire — a sustained drop stream means the server
+# is shedding a flood, i.e. likely under attack. Below it, a few drops from
+# an over-eager client are just noise.
+_DNS_RATE_LIMIT_DROP_MIN_DEFAULT = 100
 
 # Issue #285 Phase 2d — how long a control-plane-rendered firewall hash may
 # go un-applied (ok-status) before it's "stalled". Comfortably larger than
@@ -831,6 +841,47 @@ async def _matching_dns_query_rate_spike_subjects(
                 f"DNS server {name} — {q_cur} queries in the last {win_min} min "
                 f"from a cold prior window (floor {floor})."
             )
+        matches.append((str(sid), name, message))
+    return matches
+
+
+async def _matching_dns_rate_limit_dropping_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """DNS servers whose Response Rate Limiting is actively shedding a flood
+    (#146 Phase 3): RateDropped summed over the trailing window clears the
+    floor. Open-while-true — auto-resolves when the flood subsides."""
+    floor = (
+        rule.min_free_addresses
+        if rule.min_free_addresses is not None
+        else _DNS_RATE_LIMIT_DROP_MIN_DEFAULT
+    )
+    since = datetime.now(UTC) - _DNS_ANOMALY_WINDOW
+    stmt = (
+        select(
+            DNSMetricSample.server_id,
+            func.sum(DNSMetricSample.rate_dropped).label("dropped"),
+            func.sum(DNSMetricSample.rate_slipped).label("slipped"),
+        )
+        .where(DNSMetricSample.bucket_at >= since)
+        .group_by(DNSMetricSample.server_id)
+    )
+    rows = (await db.execute(stmt)).all()
+    hits = {sid: (int(d or 0), int(s or 0)) for sid, d, s in rows if int(d or 0) >= floor}
+    if not hits:
+        return []
+    names = await _dns_server_names(db, list(hits.keys()))
+    win_min = int(_DNS_ANOMALY_WINDOW.total_seconds() // 60)
+    matches: list[tuple[str, str, str]] = []
+    for sid, (dropped, slipped) in hits.items():
+        name = names.get(sid) or str(sid)
+        message = (
+            f"DNS server {name} — Response Rate Limiting dropped {dropped} "
+            f"responses in the last {win_min} min ({slipped} slipped/truncated); "
+            f"the server is shedding a query flood (floor {floor}). Investigate a "
+            "possible amplification attempt or misbehaving client."
+        )
         matches.append((str(sid), name, message))
     return matches
 
@@ -2487,6 +2538,21 @@ async def seed_dns_query_anomaly_alert_rules() -> None:
             "threshold_percent": _DNS_QUERY_RATE_SPIKE_PCT_DEFAULT,
             "min_free_addresses": _DNS_QUERY_RATE_MIN_DEFAULT,
         },
+        {
+            "name": "DNS rate limiting actively dropping",
+            "rule_type": RULE_TYPE_DNS_RATE_LIMIT_DROPPING,
+            "description": (
+                "Fires when a BIND9 server's Response Rate Limiting drops more "
+                "than min_free_addresses responses (default "
+                f"{_DNS_RATE_LIMIT_DROP_MIN_DEFAULT}) over a 15-minute window — "
+                "the server is actively shedding a query flood, i.e. likely "
+                "under a DNS amplification attempt. Needs RRL enabled on the "
+                "server group (issue #146 Phase 1). Auto-resolves when the flood "
+                "subsides. threshold_percent is unused."
+            ),
+            "threshold_percent": None,
+            "min_free_addresses": _DNS_RATE_LIMIT_DROP_MIN_DEFAULT,
+        },
     ]
     async with AsyncSessionLocal() as session:
         for seed in seeds:
@@ -2888,6 +2954,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 subject_type = "dns_server"
             elif rule.rule_type == RULE_TYPE_DNS_QUERY_RATE_SPIKE:
                 base = await _matching_dns_query_rate_spike_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "dns_server"
+            elif rule.rule_type == RULE_TYPE_DNS_RATE_LIMIT_DROPPING:
+                base = await _matching_dns_rate_limit_dropping_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "dns_server"
             elif rule.rule_type == RULE_TYPE_IP_FREE_BUT_RESPONDING:

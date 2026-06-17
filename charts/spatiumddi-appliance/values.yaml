@@ -80,6 +80,9 @@ dnsPowerdns:
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
   serverGroupName: ""
+  # The dnsdist front (#146 Phase 2) is docker-compose-only for now — see the
+  # note in templates/dns-powerdns.yaml. k8s/appliance support (a dnsdist
+  # Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.
 
 # DHCP — Kea backend. DaemonSet (single node) with ``hostNetwork:
 # true`` + ``CAP_NET_BIND_SERVICE`` so Kea sees DHCP-discover

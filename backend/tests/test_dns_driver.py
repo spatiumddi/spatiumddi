@@ -217,6 +217,92 @@ def test_render_server_config_includes_acl_and_forwarders(bundle: ConfigBundle) 
     assert 'view "' not in out
 
 
+def _bundle_with_opts(zone: ZoneData, opts: ServerOptions) -> ConfigBundle:
+    return ConfigBundle(
+        server_id=str(uuid.uuid4()),
+        server_name="ns1",
+        driver="bind9",
+        roles=("authoritative",),
+        options=opts,
+        acls=(),
+        views=(),
+        zones=(zone,),
+        tsig_keys=(),
+        blocklists=(),
+        generated_at=datetime(2026, 4, 14, 12, 0, tzinfo=UTC),
+    )
+
+
+def test_render_server_config_rrl_enabled(zone: ZoneData) -> None:
+    """#146 — RRL + amplification directives render into options{}."""
+    opts = ServerOptions(
+        rrl_enabled=True,
+        rrl_responses_per_second=20,
+        rrl_window=10,
+        rrl_slip=3,
+        rrl_qps_scale=250,
+        rrl_exempt_clients=("10.0.0.0/8",),
+        rrl_log_only=True,
+        minimal_responses=True,
+        tcp_clients=200,
+        clients_per_query=12,
+        max_clients_per_query=120,
+    )
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id="x", name="ns1"), opts, bundle=_bundle_with_opts(zone, opts)
+    )
+    assert "rate-limit {" in out
+    assert "responses-per-second 20;" in out
+    assert "window 10;" in out
+    assert "slip 3;" in out
+    assert "qps-scale 250;" in out
+    assert "exempt-clients { 10.0.0.0/8; };" in out
+    assert "log-only yes;" in out
+    assert "minimal-responses yes;" in out
+    assert "tcp-clients 200;" in out
+    assert "clients-per-query 12;" in out
+    assert "max-clients-per-query 120;" in out
+
+
+def test_rrl_exempt_clients_normalized() -> None:
+    """#146 review — the schema strips + drops blanks + dedups so neither
+    renderer emits an invalid ``exempt-clients { ; };`` stanza."""
+    from app.api.v1.dns.router import ServerOptionsUpdate
+
+    body = ServerOptionsUpdate(rrl_exempt_clients=[" 10.0.0.0/8 ", "", "   ", "10.0.0.0/8", "any"])
+    assert body.rrl_exempt_clients == ["10.0.0.0/8", "any"]
+    # None (field absent) passes through untouched — means "not provided".
+    assert ServerOptionsUpdate().rrl_exempt_clients is None
+
+
+def test_rrl_nullable_clear_precondition() -> None:
+    """#146 review — the update handler re-injects explicit nulls because
+    exclude_none drops them. Verify the precondition the fix relies on: an
+    explicitly-set None is in model_fields_set but NOT in the exclude_none
+    dump (so without re-injection the clear would be silently lost)."""
+    from app.api.v1.dns.router import ServerOptionsUpdate
+
+    body = ServerOptionsUpdate(rrl_qps_scale=None, tcp_clients=None)
+    assert "rrl_qps_scale" in body.model_fields_set
+    assert "tcp_clients" in body.model_fields_set
+    dumped = body.model_dump(exclude_none=True)
+    assert "rrl_qps_scale" not in dumped
+    assert "tcp_clients" not in dumped
+
+
+def test_render_server_config_rrl_default_noop(zone: ZoneData) -> None:
+    """Default options render NO rate-limit / amplification config — adding
+    the feature is a no-op for groups that haven't opted in."""
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id="x", name="ns1"),
+        ServerOptions(),
+        bundle=_bundle_with_opts(zone, ServerOptions()),
+    )
+    assert "rate-limit {" not in out
+    assert "minimal-responses" not in out
+    assert "tcp-clients" not in out
+
+
 def test_render_server_config_split_horizon_views() -> None:
     """Issue #24: the same zone name materialises once per view (with
     each view's filtered records pre-expanded by the bundle builder),

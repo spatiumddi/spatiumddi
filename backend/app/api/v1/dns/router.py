@@ -145,6 +145,7 @@ _DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
 VALID_FORWARD_POLICIES = {"first", "only"}
 VALID_DNSSEC = {"auto", "yes", "no"}
 VALID_NOTIFY = {"yes", "no", "explicit", "master-only"}
+VALID_DNSDIST_ACTIONS = {"truncate", "drop"}
 
 
 # ── Pydantic schemas ────────────────────────────────────────────────────────
@@ -448,6 +449,31 @@ class ServerOptionsUpdate(BaseModel):
     query_log_print_category: bool | None = None
     query_log_print_severity: bool | None = None
     query_log_print_time: bool | None = None
+    # RRL + amplification defenses (issue #146). Ranges per the issue.
+    rrl_enabled: bool | None = None
+    rrl_responses_per_second: int | None = Field(default=None, ge=1, le=1000)
+    rrl_window: int | None = Field(default=None, ge=1, le=3600)
+    rrl_slip: int | None = Field(default=None, ge=0, le=10)
+    rrl_qps_scale: int | None = Field(default=None, ge=1, le=1000)
+    rrl_exempt_clients: list[str] | None = None
+    rrl_log_only: bool | None = None
+    minimal_responses: bool | None = None
+    tcp_clients: int | None = Field(default=None, ge=1, le=10000)
+    clients_per_query: int | None = Field(default=None, ge=1, le=1000)
+    max_clients_per_query: int | None = Field(default=None, ge=1, le=10000)
+    # dnsdist front for PowerDNS (#146 Phase 2)
+    dnsdist_enabled: bool | None = None
+    dnsdist_max_qps_per_client: int | None = Field(default=None, ge=1, le=1000000)
+    dnsdist_action: str | None = None
+    dnsdist_dynblock_qps: int | None = Field(default=None, ge=1, le=1000000)
+    dnsdist_dynblock_seconds: int | None = Field(default=None, ge=1, le=86400)
+
+    @field_validator("dnsdist_action")
+    @classmethod
+    def validate_dnsdist_action(cls, v: str | None) -> str | None:
+        if v is not None and v not in VALID_DNSDIST_ACTIONS:
+            raise ValueError(f"dnsdist_action must be one of {sorted(VALID_DNSDIST_ACTIONS)}")
+        return v
 
     @field_validator("forward_policy")
     @classmethod
@@ -469,6 +495,23 @@ class ServerOptionsUpdate(BaseModel):
         if v is not None and v not in VALID_NOTIFY:
             raise ValueError(f"notify_enabled must be one of {sorted(VALID_NOTIFY)}")
         return v
+
+    @field_validator("rrl_exempt_clients")
+    @classmethod
+    def normalize_rrl_exempt_clients(cls, v: list[str] | None) -> list[str] | None:
+        # Strip + drop blank entries + dedup (preserve order). A blank token
+        # would render an invalid ``exempt-clients { ; };`` stanza; normalizing
+        # at the boundary keeps both renderers (agent + Jinja preview) fed clean
+        # data. Entries may be CIDRs/IPs OR BIND ACL names (any/localhost/…), so
+        # we don't hard-validate as CIDR.
+        if v is None:
+            return None
+        out: list[str] = []
+        for item in v:
+            tok = item.strip()
+            if tok and tok not in out:
+                out.append(tok)
+        return out
 
 
 class ServerOptionsResponse(BaseModel):
@@ -497,6 +540,22 @@ class ServerOptionsResponse(BaseModel):
     query_log_print_category: bool
     query_log_print_severity: bool
     query_log_print_time: bool
+    rrl_enabled: bool
+    rrl_responses_per_second: int
+    rrl_window: int
+    rrl_slip: int
+    rrl_qps_scale: int | None
+    rrl_exempt_clients: list[str]
+    rrl_log_only: bool
+    minimal_responses: bool
+    tcp_clients: int | None
+    clients_per_query: int | None
+    max_clients_per_query: int | None
+    dnsdist_enabled: bool
+    dnsdist_max_qps_per_client: int | None
+    dnsdist_action: str
+    dnsdist_dynblock_qps: int | None
+    dnsdist_dynblock_seconds: int
     trust_anchors: list[TrustAnchorResponse]
     modified_at: datetime
 
@@ -1186,7 +1245,8 @@ async def update_server(
 ) -> ServerResponse:
     server = await _require_server(group_id, server_id, db)
     changes = body.model_dump(
-        exclude_none=True, exclude={"api_key", "windows_credentials", "cloud_credentials"}
+        exclude_none=True,
+        exclude={"api_key", "windows_credentials", "cloud_credentials"},
     )
     if body.api_key is not None:
         # Issue #210 — Fernet-encrypted at rest; matches the create
@@ -2091,6 +2151,21 @@ async def update_options(
         db.add(opts)
 
     changes = body.model_dump(exclude_none=True)
+    # NULL is a meaningful "clear back to BIND default" for the optional RRL /
+    # amplification knobs, but exclude_none drops it — so re-inject when the
+    # operator explicitly sent null (mirrors the update_zone color /
+    # dnssec_policy_id pattern). Without this an amplification limit can never
+    # be removed via the UI/API once set (issue #146 review finding).
+    for field in (
+        "rrl_qps_scale",
+        "tcp_clients",
+        "clients_per_query",
+        "max_clients_per_query",
+        "dnsdist_max_qps_per_client",
+        "dnsdist_dynblock_qps",
+    ):
+        if field in body.model_fields_set and getattr(body, field) is None:
+            changes[field] = None
     for k, v in changes.items():
         setattr(opts, k, v)
 

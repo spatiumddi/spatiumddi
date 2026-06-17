@@ -260,6 +260,37 @@ services:
       api:
         condition: service_started
 
+  # ── dnsdist front for PowerDNS (issue #146 Phase 2) ───────────────────
+  # Opt-in rate-limit / DDoS front for the authoritative PowerDNS agent
+  # (pdns auth has no RRL of its own). A SEPARATE container (its own netns)
+  # that forwards to pdns over the network at dns-powerdns:53 — pdns never
+  # moves port. The PowerDNS agent renders the rate-limit RULES into the
+  # shared state volume (dnsdist-rules.conf); this front's entrypoint
+  # composes them onto its base (listen :53 → dns-powerdns:53) and reloads
+  # on change. Enable BOTH profiles together:
+  #   docker compose --profile dns-powerdns --profile dns-powerdns-with-dnsdist up -d
+  # then point clients at the dnsdist front (host :5455 here) and turn
+  # dnsdist on for the group in DNS → Server Options. With dnsdist off the
+  # front is a plain pass-through (safe no-op); pdns keeps answering on :53.
+  dns-dnsdist:
+    profiles: ["dns-powerdns-with-dnsdist"]
+    image: ghcr.io/spatiumddi/dns-dnsdist:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks:
+      - spatiumddi
+    environment:
+      DNSDIST_BACKEND: dns-powerdns:53
+    cap_add:
+      - NET_BIND_SERVICE
+    volumes:
+      - dns_powerdns_state:/agent-state:ro
+    ports:
+      - "5455:53/udp"
+      - "5455:53/tcp"
+    depends_on:
+      dns-powerdns:
+        condition: service_started
+
   # ── DHCP agent (primary) ──────────────────────────────────────────────
   # Enable with:
   #   docker compose --profile dhcp up -d                         # single node

@@ -41,7 +41,7 @@ options {{
     dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
     check-integrity no;
-{forwarders}{response_policy}
+{forwarders}{response_policy}{rate_limit}
 }};
 statistics-channels {{
     inet 127.0.0.1 port 8053 allow {{ 127.0.0.1; }};
@@ -68,6 +68,48 @@ logging {
     category query-errors { queries_channel; };
 };
 """
+
+
+def _render_rate_limit_block(opts: dict[str, Any]) -> str:
+    """Build the named.conf RRL + amplification directives from bundle opts
+    (issue #146). Returns "" (no-op) unless something is enabled/set, so the
+    options{} block is byte-identical for groups that haven't opted in.
+
+    Emitted inside ``options {}``: ``minimal-responses``, ``tcp-clients``,
+    ``clients-per-query``, ``max-clients-per-query`` (each only when set), and
+    the ``rate-limit { … }`` stanza (only when ``rrl_enabled``)."""
+    lines: list[str] = []
+    if opts.get("minimal_responses"):
+        lines.append("    minimal-responses yes;")
+    for key, directive in (
+        ("tcp_clients", "tcp-clients"),
+        ("clients_per_query", "clients-per-query"),
+        ("max_clients_per_query", "max-clients-per-query"),
+    ):
+        val = opts.get(key)
+        if val is not None:
+            lines.append(f"    {directive} {int(val)};")
+    if opts.get("rrl_enabled"):
+        rrl = [
+            "    rate-limit {",
+            f"        responses-per-second {int(opts.get('rrl_responses_per_second', 15))};",
+            f"        window {int(opts.get('rrl_window', 15))};",
+            f"        slip {int(opts.get('rrl_slip', 2))};",
+        ]
+        if opts.get("rrl_qps_scale") is not None:
+            rrl.append(f"        qps-scale {int(opts['rrl_qps_scale'])};")
+        exempt = [
+            c.strip()
+            for c in (opts.get("rrl_exempt_clients") or [])
+            if isinstance(c, str) and c.strip()
+        ]
+        if exempt:
+            rrl.append("        exempt-clients { " + "; ".join(exempt) + "; };")
+        if opts.get("rrl_log_only"):
+            rrl.append("        log-only yes;")
+        rrl.append("    };")
+        lines.extend(rrl)
+    return ("\n" + "\n".join(lines)) if lines else ""
 
 
 def _lifetime(days: int) -> str:
@@ -136,9 +178,7 @@ def _parse_dnssec_status(text: str) -> list[dict[str, Any]]:
         low = line.lower()
         if ("key signing:" in low or "zone signing:" in low) and "yes" in low:
             cur["state"] = "active"
-        mt = re.match(
-            r"(published|active|retire|remove|key signing|zone signing):\s*(.+)", low
-        )
+        mt = re.match(r"(published|active|retire|remove|key signing|zone signing):\s*(.+)", low)
         if mt:
             cur["timing"][mt.group(1).replace(" ", "_")] = mt.group(2).strip()
     if cur is not None:
@@ -224,9 +264,7 @@ class Bind9Driver(DriverBase):
 
         tsig_keys = bundle.get("tsig_keys") or []
         tsig_key_name = tsig_keys[0]["name"] if tsig_keys else None
-        tsig_include = (
-            'include "/var/lib/spatium-dns-agent/tsig/ddns.key";\n' if tsig_keys else ""
-        )
+        tsig_include = 'include "/var/lib/spatium-dns-agent/tsig/ddns.key";\n' if tsig_keys else ""
 
         # Split-horizon (issue #24): when the group defines views, every
         # zone — and every RPZ/response-policy — lives INSIDE a
@@ -242,16 +280,12 @@ class Bind9Driver(DriverBase):
         blocklists = bundle.get("blocklists") or []
         response_policy_block = ""
         if blocklists and not has_views:
-            zones_list = "; ".join(
-                f'zone "{bl["rpz_zone_name"].rstrip(".")}"' for bl in blocklists
-            )
+            zones_list = "; ".join(f'zone "{bl["rpz_zone_name"].rstrip(".")}"' for bl in blocklists)
             # break-dnssec lets RPZ rewrite responses from DNSSEC-signed zones
             # (otherwise BIND9 returns SERVFAIL on a DNSSEC conflict). For a
             # blocking use-case this is what you want: the user intent is to
             # block, not to preserve validation integrity.
-            response_policy_block = (
-                f"    response-policy {{ {zones_list}; }} break-dnssec yes;\n"
-            )
+            response_policy_block = f"    response-policy {{ {zones_list}; }} break-dnssec yes;\n"
 
         logging_block = _QUERY_LOG_BLOCK if bool(opts.get("query_log_enabled")) else ""
         conf = NAMED_CONF_SKELETON.format(
@@ -260,6 +294,7 @@ class Bind9Driver(DriverBase):
             dnssec=dnssec,
             forwarders=fwd_block,
             response_policy=response_policy_block,
+            rate_limit=_render_rate_limit_block(opts),
             logging_block=logging_block,
             tsig_include=tsig_include,
         )
@@ -333,9 +368,7 @@ class Bind9Driver(DriverBase):
             # `directory` (/var/cache/bind, not our rendered tree).
             rel_zfile = f"zones/{file_prefix}{zname.rstrip('.')}.db"
             abs_zfile = self.state_dir / self.rendered_dir_name / rel_zfile
-            allow_update = (
-                f'allow-update {{ key "{tsig_key_name}"; }}; ' if tsig_key_name else ""
-            )
+            allow_update = f'allow-update {{ key "{tsig_key_name}"; }}; ' if tsig_key_name else ""
             # DNSSEC inline-signing (issue #49): primary zones with signing on
             # reference a dnssec-policy + enable inline-signing; BIND
             # auto-generates keys in key-directory + signs on load.
@@ -368,8 +401,7 @@ class Bind9Driver(DriverBase):
         def _indent(text: str, spaces: int = 4) -> str:
             pad = " " * spaces
             return "".join(
-                (pad + ln if ln.strip() else ln)
-                for ln in text.splitlines(keepends=True)
+                (pad + ln if ln.strip() else ln) for ln in text.splitlines(keepends=True)
             )
 
         if has_views:
@@ -385,13 +417,9 @@ class Bind9Driver(DriverBase):
                 vname = view.get("name") or ""
                 if not vname:
                     continue
-                match_clients = "; ".join(
-                    str(c) for c in (view.get("match_clients") or ["any"])
-                )
+                match_clients = "; ".join(str(c) for c in (view.get("match_clients") or ["any"]))
                 recursion_v = "yes" if view.get("recursion", True) else "no"
-                view_bls = [
-                    bl for bl in blocklists if bl.get("view_name") == vname
-                ] + global_bls
+                view_bls = [bl for bl in blocklists if bl.get("view_name") == vname] + global_bls
                 body = ""
                 if view_bls:
                     zlist = "; ".join(
@@ -414,11 +442,7 @@ class Bind9Driver(DriverBase):
                 # allow_query / allow_query_cache on a view, enforce it here;
                 # a null/empty value inherits the server-options allow-query.
                 aq = view.get("allow_query")
-                aq_line = (
-                    f"    allow-query {{ {'; '.join(str(c) for c in aq)}; }};\n"
-                    if aq
-                    else ""
-                )
+                aq_line = f"    allow-query {{ {'; '.join(str(c) for c in aq)}; }};\n" if aq else ""
                 aqc = view.get("allow_query_cache")
                 aqc_line = (
                     f"    allow-query-cache {{ {'; '.join(str(c) for c in aqc)}; }};\n"
@@ -667,9 +691,7 @@ class Bind9Driver(DriverBase):
             res = subprocess.run(cmd, capture_output=True, text=True, check=False)
             rndc_ok = res.returncode == 0
             if not rndc_ok:
-                log.warning(
-                    "rndc_failed_falling_back_to_sighup", stderr=res.stderr.strip()
-                )
+                log.warning("rndc_failed_falling_back_to_sighup", stderr=res.stderr.strip())
         if not rndc_ok and self.daemon_pid:
             try:
                 os.kill(self.daemon_pid, signal.SIGHUP)
@@ -728,12 +750,7 @@ class Bind9Driver(DriverBase):
             pri = rec.get("priority")
             wt = rec.get("weight")
             prt = rec.get("port")
-            if (
-                pri is not None
-                and wt is not None
-                and prt is not None
-                and len(value.split()) < 4
-            ):
+            if pri is not None and wt is not None and prt is not None and len(value.split()) < 4:
                 wire_value = f"{pri} {wt} {prt} {value}"
 
         # ``rrset_action`` is set by callers that need precise multi-RR

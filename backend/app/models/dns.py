@@ -158,7 +158,10 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         "DNSAcl", back_populates="group", cascade="all, delete-orphan"
     )
     options: Mapped["DNSServerOptions | None"] = relationship(
-        "DNSServerOptions", back_populates="group", uselist=False, cascade="all, delete-orphan"
+        "DNSServerOptions",
+        back_populates="group",
+        uselist=False,
+        cascade="all, delete-orphan",
     )
     blocklists: Mapped[list["DNSBlockList"]] = relationship(
         "DNSBlockList",
@@ -392,6 +395,41 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     query_log_print_category: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     query_log_print_severity: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     query_log_print_time: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # ── Response Rate Limiting (RRL) + amplification defenses (issue #146) ──
+    # All default to a no-op so an existing install renders byte-identical
+    # named.conf until an operator opts in. The rate-limit{} block is emitted
+    # only when rrl_enabled; the amplification knobs render only when set.
+    rrl_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    rrl_responses_per_second: Mapped[int] = mapped_column(Integer, nullable=False, default=15)
+    rrl_window: Mapped[int] = mapped_column(Integer, nullable=False, default=15)
+    rrl_slip: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    rrl_qps_scale: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rrl_exempt_clients: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # log-only: count + log would-be drops without actually dropping (dry run).
+    rrl_log_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Amplification reduction (each renders only when set; null = BIND default).
+    minimal_responses: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    tcp_clients: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    clients_per_query: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_clients_per_query: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # ── dnsdist front for PowerDNS (#146 Phase 2) ──────────────────────────
+    # PowerDNS Authoritative has no RRL equivalent, so the project's answer is
+    # a dnsdist sidecar on :53 that forwards to pdns. These knobs compile to
+    # the dnsdist config the sidecar runs. Default-off (opt-in per group) so
+    # existing PowerDNS deployments don't get a surprise topology change.
+    dnsdist_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Per-source-IP QPS cap (MaxQPSIPRule). null = no per-client cap.
+    dnsdist_max_qps_per_client: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Action when the per-client cap is exceeded: truncate (TC=1, lets a legit
+    # client retry over TCP) or drop.
+    dnsdist_action: Mapped[str] = mapped_column(String(10), nullable=False, default="truncate")
+    # Dynamic block: clients exceeding this QPS over 10s get blocked for
+    # dnsdist_dynblock_seconds (exceedQRate). null = no dynamic blocking.
+    dnsdist_dynblock_qps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dnsdist_dynblock_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
 
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="options")
     trust_anchors: Mapped[list["DNSTrustAnchor"]] = relationship(
@@ -718,7 +756,9 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         index=True,
     )
     view_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("dns_view.id", ondelete="SET NULL"), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("dns_view.id", ondelete="SET NULL"),
+        nullable=True,
     )
     # name: relative label, e.g. "host1" (not "host1.example.com.")
     # "@" means zone apex
@@ -739,7 +779,9 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         Boolean, nullable=False, default=False, server_default="false"
     )
     ip_address_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("ip_address.id", ondelete="SET NULL"), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("ip_address.id", ondelete="SET NULL"),
+        nullable=True,
     )
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
@@ -1091,7 +1133,16 @@ DNSSEC_ALGORITHMS: frozenset[str] = frozenset(
 # Per-key lifecycle states BIND reports via ``rndc dnssec -status`` (the
 # RFC 7583 key-timing "states"). Stored verbatim on DNSKey.state.
 DNSKEY_STATES: frozenset[str] = frozenset(
-    {"generated", "published", "rumoured", "active", "omnipresent", "retired", "removed", "unknown"}
+    {
+        "generated",
+        "published",
+        "rumoured",
+        "active",
+        "omnipresent",
+        "retired",
+        "removed",
+        "unknown",
+    }
 )
 
 
@@ -1115,7 +1166,10 @@ class DNSSECPolicy(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     algorithm: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="ecdsap256sha256", server_default="ecdsap256sha256"
+        String(20),
+        nullable=False,
+        default="ecdsap256sha256",
+        server_default="ecdsap256sha256",
     )
     # KSK / ZSK lifetimes in days (0 = unlimited). For ECDSA the key size is
     # fixed by the algorithm, so no explicit bits field is needed.

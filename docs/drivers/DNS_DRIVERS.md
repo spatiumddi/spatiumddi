@@ -185,6 +185,50 @@ config-driven, not op-driven (unlike PowerDNS's REST sign):
 Gating: `_DRIVER_GATED_OPERATIONS` allows `dnssec_sign`/`dnssec_unsign` on
 `{powerdns, bind9}` and `dnssec_rollover` on `{bind9}`.
 
+### 2.6 Rate limiting (RRL) + amplification (issue #146)
+
+Group-level `DNSServerOptions` fields flow through the standard
+`ServerOptions` → `ConfigBundle` → ETag → long-poll path (so a UI change
+shifts the etag and re-renders `named.conf` with no extra wake plumbing) and
+land in the `options {}` block of both renderers — the agent's
+`NAMED_CONF_SKELETON` (the live config; see `_render_rate_limit_block`) and
+the control-plane preview template `named.conf.j2`.
+
+- `rrl_enabled` gates a `rate-limit { responses-per-second; window; slip;
+  [qps-scale]; [exempt-clients]; [log-only]; }` stanza. `log-only` is BIND's
+  dry-run (count + log drops, drop nothing) for sizing the limit safely.
+- `minimal_responses`, `tcp_clients`, `clients_per_query`,
+  `max_clients_per_query` each render only when set.
+- **Every field defaults to a no-op**, so adding the feature renders
+  byte-identical config for groups that haven't opted in (the bundle etag
+  shifts once on upgrade, causing a single graceful `rndc reconfig`).
+- BIND9-only. PowerDNS authoritative has no RRL equivalent; the planned
+  answer there is a dnsdist front (#146 Phase 2 — shipped; see below). RRL
+  drop counters (`RateDropped`/`RateSlipped` → `dns_metric_sample` →
+  Stats-tab "RRL drops/s" line) + the default-off `dns_rate_limit_dropping`
+  alert are #146 Phase 3 (shipped).
+
+### 2.7 dnsdist front for PowerDNS (issue #146 Phase 2)
+
+PowerDNS Authoritative has no RRL, so rate limiting in front of a PowerDNS
+group is an opt-in **dnsdist front** (`ghcr.io/spatiumddi/dns-dnsdist`, Alpine
++ dnsdist) — a **separate container** that forwards to pdns:53 over the
+network. **pdns never moves port** (no shared netns, no restart race): the
+front owns the published `:53` and forwards to `dns-powerdns:53`.
+
+The PowerDNS agent's `render_dnsdist_conf(opts)` compiles ONLY the operator's
+rate-limit **rules** (`MaxQPSIPRule` + `TCAction`/`DropAction`,
+`dynBlockRulesGroup:setQueryRate`) from the group's `dnsdist_*`
+`DNSServerOptions` into a shared `dnsdist-rules.conf`. The front container's
+entrypoint composes those rules onto its env-driven base (`setLocal(:53)` +
+`newServer({address=$DNSDIST_BACKEND})`), `--check-config`-validates, and
+(re)starts dnsdist on rule-file change (dnsdist has no clean full-config hot
+reload). With dnsdist disabled the rules file is absent and the front runs as
+a plain pass-through — so the per-group toggle is decoupled from the deploy
+and can't break pdns. Default-off; deploy via the `dns-powerdns-with-dnsdist`
+compose profile. **docker-compose only for now** — the k8s/appliance front (a
+dnsdist Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.
+
 ---
 
 ## 3. Windows DNS Driver

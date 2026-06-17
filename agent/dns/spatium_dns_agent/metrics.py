@@ -49,6 +49,12 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
     "nxdomain": ("QryNXDOMAIN",),
     "servfail": ("QrySERVFAIL",),
     "recursion": ("QryRecursion",),
+    # Response Rate Limiting (#146 Phase 3). BIND9 publishes these in the
+    # same statistics-channels XML under the rate-limiting family:
+    # RateDropped = responses dropped, RateSlipped = responses truncated
+    # (TC=1) so a legit client can retry over TCP. Both 0 when RRL is off.
+    "rate_dropped": ("RateDropped",),
+    "rate_slipped": ("RateSlipped",),
 }
 
 

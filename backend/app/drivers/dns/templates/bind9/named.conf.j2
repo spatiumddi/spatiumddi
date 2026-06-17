@@ -32,6 +32,36 @@ options {
     forwarders { {% for f in options.forwarders %}{{ f }}; {% endfor %}};
     forward {{ options.forward_policy }};
     {%- endif %}
+    {#- RRL + amplification defenses (issue #146); render only when set #}
+    {%- if options.minimal_responses %}
+    minimal-responses yes;
+    {%- endif %}
+    {%- if options.tcp_clients is not none %}
+    tcp-clients {{ options.tcp_clients }};
+    {%- endif %}
+    {%- if options.clients_per_query is not none %}
+    clients-per-query {{ options.clients_per_query }};
+    {%- endif %}
+    {%- if options.max_clients_per_query is not none %}
+    max-clients-per-query {{ options.max_clients_per_query }};
+    {%- endif %}
+    {%- if options.rrl_enabled %}
+    rate-limit {
+        responses-per-second {{ options.rrl_responses_per_second }};
+        window {{ options.rrl_window }};
+        slip {{ options.rrl_slip }};
+        {%- if options.rrl_qps_scale is not none %}
+        qps-scale {{ options.rrl_qps_scale }};
+        {%- endif %}
+        {%- set _exempt = options.rrl_exempt_clients | map("trim") | select | list %}
+        {%- if _exempt %}
+        exempt-clients { {% for c in _exempt %}{{ c }}; {% endfor %}};
+        {%- endif %}
+        {%- if options.rrl_log_only %}
+        log-only yes;
+        {%- endif %}
+    };
+    {%- endif %}
 };
 
 {#- DNSSEC signing policies (issue #49). Custom policies referenced by a

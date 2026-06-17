@@ -4418,6 +4418,24 @@ export interface DNSServerOptions {
   query_log_print_category: boolean;
   query_log_print_severity: boolean;
   query_log_print_time: boolean;
+  // Response Rate Limiting + amplification defenses (issue #146)
+  rrl_enabled: boolean;
+  rrl_responses_per_second: number;
+  rrl_window: number;
+  rrl_slip: number;
+  rrl_qps_scale: number | null;
+  rrl_exempt_clients: string[];
+  rrl_log_only: boolean;
+  minimal_responses: boolean;
+  tcp_clients: number | null;
+  clients_per_query: number | null;
+  max_clients_per_query: number | null;
+  // dnsdist front for PowerDNS (issue #146 Phase 2)
+  dnsdist_enabled: boolean;
+  dnsdist_max_qps_per_client: number | null;
+  dnsdist_action: string;
+  dnsdist_dynblock_qps: number | null;
+  dnsdist_dynblock_seconds: number;
   trust_anchors: DNSTrustAnchor[];
   modified_at: string;
 }
@@ -7765,6 +7783,8 @@ export interface DNSMetricsPoint {
   nxdomain: number;
   servfail: number;
   recursion: number;
+  rate_dropped: number;
+  rate_slipped: number;
 }
 
 export interface DNSMetricsSeries {
