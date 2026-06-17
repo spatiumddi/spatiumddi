@@ -256,7 +256,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
     - Sources: AdGuard, StevenBlack, OISD, Hagezi, 1Hosts, Phishing Army, URLhaus, EasyPrivacy, …
   - **Rate limiting (RRL) + amplification defenses** — BIND9 Response Rate Limiting (responses-per-second / window / slip / qps-scale / exempt-clients) with a `log-only` dry-run, plus `minimal-responses` / `tcp-clients` / `clients-per-query` toggles; group-level, default-off (no-op until opted in)
     - **RRL drop observability** — `RateDropped` / `RateSlipped` charted as an "RRL drops/s" line on the server Stats tab + a default-off `dns_rate_limit_dropping` alert (fires when the server is actively shedding a flood)
-    - **dnsdist front for PowerDNS** — opt-in sidecar (PowerDNS auth has no RRL of its own): per-source-IP QPS cap (truncate / drop) + sustained-rate dynamic blocking, on a `dns-powerdns-with-dnsdist` compose profile / Helm value
+    - **dnsdist front for PowerDNS** — opt-in front container (PowerDNS auth has no RRL of its own) forwarding to pdns: per-source-IP QPS cap (truncate / drop) + sustained-rate dynamic blocking, on a `dns-powerdns-with-dnsdist` compose profile (docker-compose for now)
   - **Catalog zones (RFC 9432)** — producer / consumer roles auto-derived from the group's primary
     - RFC-compliant SHA-1 hashing of zone names
   - **Operator tools**:

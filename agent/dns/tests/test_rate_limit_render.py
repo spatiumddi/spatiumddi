@@ -87,12 +87,15 @@ def test_dnsdist_disabled_is_empty() -> None:
     assert render_dnsdist_conf({"dnsdist_enabled": False, "dnsdist_max_qps_per_client": 50}) == ""
 
 
-def test_dnsdist_basic_forwards_to_backend() -> None:
+def test_dnsdist_rules_only_no_base() -> None:
     from spatium_dns_agent.drivers.powerdns import render_dnsdist_conf
 
+    # Rules-only: the base (setLocal/newServer) is composed by the front
+    # container's entrypoint, NOT rendered here.
     out = render_dnsdist_conf({"dnsdist_enabled": True})
-    assert 'setLocal("0.0.0.0:53")' in out
-    assert 'newServer({address="127.0.0.1:5300", name="pdns"})' in out
+    assert "setLocal" not in out
+    assert "newServer" not in out
+    # Enabled-but-no-rules → just the header, no actions yet.
     assert "MaxQPSIPRule" not in out
     assert "setQueryRate" not in out
 

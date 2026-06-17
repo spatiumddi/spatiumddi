@@ -23,7 +23,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        flavor: [bind9, powerdns]
+        # dnsdist (#146 Phase 2) follows the same image path convention
+        # (agent/dns/images/<flavor>/Dockerfile → ghcr.io/spatiumddi/dns-<flavor>).
+        flavor: [bind9, powerdns, dnsdist]
     steps:
       - uses: actions/checkout@v4
 

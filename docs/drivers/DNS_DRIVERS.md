@@ -211,17 +211,23 @@ the control-plane preview template `named.conf.j2`.
 ### 2.7 dnsdist front for PowerDNS (issue #146 Phase 2)
 
 PowerDNS Authoritative has no RRL, so rate limiting in front of a PowerDNS
-group is an opt-in **dnsdist sidecar** (`ghcr.io/spatiumddi/dns-dnsdist`,
-Alpine + dnsdist). The PowerDNS agent's `render_dnsdist_conf(opts)` compiles
-the group's `dnsdist_*` `DNSServerOptions` into a `dnsdist.conf`
-(`newServer` → pdns, `MaxQPSIPRule` + `TCAction`/`DropAction`,
-`dynBlockRulesGroup:setQueryRate`) written to the shared agent-state volume;
-the sidecar's entrypoint `--check-config`-validates + (re)starts dnsdist on
-file change (dnsdist has no clean full-config hot reload). When dnsdist is
-enabled the agent renders pdns at loopback `:5300` and dnsdist owns `:53`
-(shared netns: compose `network_mode: service:dns-powerdns` / same k8s pod).
-Default-off; deploy via the `dns-powerdns-with-dnsdist` compose profile or
-`dnsPowerdns.dnsdist.enabled` Helm value.
+group is an opt-in **dnsdist front** (`ghcr.io/spatiumddi/dns-dnsdist`, Alpine
++ dnsdist) — a **separate container** that forwards to pdns:53 over the
+network. **pdns never moves port** (no shared netns, no restart race): the
+front owns the published `:53` and forwards to `dns-powerdns:53`.
+
+The PowerDNS agent's `render_dnsdist_conf(opts)` compiles ONLY the operator's
+rate-limit **rules** (`MaxQPSIPRule` + `TCAction`/`DropAction`,
+`dynBlockRulesGroup:setQueryRate`) from the group's `dnsdist_*`
+`DNSServerOptions` into a shared `dnsdist-rules.conf`. The front container's
+entrypoint composes those rules onto its env-driven base (`setLocal(:53)` +
+`newServer({address=$DNSDIST_BACKEND})`), `--check-config`-validates, and
+(re)starts dnsdist on rule-file change (dnsdist has no clean full-config hot
+reload). With dnsdist disabled the rules file is absent and the front runs as
+a plain pass-through — so the per-group toggle is decoupled from the deploy
+and can't break pdns. Default-off; deploy via the `dns-powerdns-with-dnsdist`
+compose profile. **docker-compose only for now** — the k8s/appliance front (a
+dnsdist Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.
 
 ---
 

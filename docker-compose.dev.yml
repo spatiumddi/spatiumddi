@@ -293,11 +293,17 @@ services:
       context: .
       dockerfile: agent/dns/images/dnsdist/Dockerfile
     restart: unless-stopped
-    network_mode: "service:dns-powerdns"
+    networks:
+      - spatiumddi
+    environment:
+      DNSDIST_BACKEND: dns-powerdns:53
     cap_add:
       - NET_BIND_SERVICE
     volumes:
       - dns_powerdns_state:/agent-state:ro
+    ports:
+      - "5455:53/udp"
+      - "5455:53/tcp"
     depends_on:
       dns-powerdns:
         condition: service_started

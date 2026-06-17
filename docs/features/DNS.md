@@ -376,8 +376,8 @@ DNSServerOptions.dnsdist_dynblock_qps: int | null        -- sustained-rate dynam
 DNSServerOptions.dnsdist_dynblock_seconds: int           -- dynamic block duration (default 60)
 ```
 
-- The PowerDNS agent renders these into a `dnsdist.conf` (newServer → pdns, `MaxQPSIPRule` + `TCAction`/`DropAction`, `dynBlockRulesGroup:setQueryRate`) in a shared volume; the dnsdist sidecar watches + reloads it. When dnsdist is enabled for a group, **pdns moves to `127.0.0.1:5300`** and dnsdist owns `:53` (shared netns).
-- **Deploy the sidecar** for the group's pdns: compose `--profile dns-powerdns-with-dnsdist` (alongside `--profile dns-powerdns`) or Helm `dnsPowerdns.dnsdist.enabled=true`. Because enabling dnsdist moves pdns off `:53`, the sidecar **must** be deployed or the group stops answering — hence both the per-group toggle and the deploy flag.
+- The PowerDNS agent renders only the **rate-limit rules** (`MaxQPSIPRule` + `TCAction`/`DropAction`, `dynBlockRulesGroup:setQueryRate`) into a shared `dnsdist-rules.conf`; the dnsdist **front is a separate container** whose entrypoint composes those rules onto its base (`setLocal(:53)` + `newServer → dns-powerdns:53`) and reloads on change. **pdns never moves port** — the front forwards to pdns:53 over the network, fully decoupled from pdns's lifecycle. With dnsdist disabled the front is a plain pass-through (safe no-op).
+- **Deploy the front:** compose `--profile dns-powerdns-with-dnsdist` (alongside `--profile dns-powerdns`); point DNS clients at the front (host `:5455` in the dev compose). **docker-compose only for now** — the k8s/appliance front (a dnsdist Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.
 - UI: **DNS → Server Group → Server Options → "dnsdist front (PowerDNS)"** card. MCP `find_dns_rate_limit_settings` reports the dnsdist posture alongside RRL.
 
 ### 3.9 Options Precedence

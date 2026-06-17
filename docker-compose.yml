@@ -262,24 +262,31 @@ services:
 
   # ── dnsdist front for PowerDNS (issue #146 Phase 2) ───────────────────
   # Opt-in rate-limit / DDoS front for the authoritative PowerDNS agent
-  # (pdns auth has no RRL of its own). Shares the dns-powerdns network
-  # namespace so it reaches pdns at 127.0.0.1:5300 and binds :53 itself;
-  # the PowerDNS agent renders /agent-state/dnsdist.conf from the group's
-  # dnsdist_* options and this sidecar watches + reloads it. Enable BOTH
-  # profiles together:
+  # (pdns auth has no RRL of its own). A SEPARATE container (its own netns)
+  # that forwards to pdns over the network at dns-powerdns:53 — pdns never
+  # moves port. The PowerDNS agent renders the rate-limit RULES into the
+  # shared state volume (dnsdist-rules.conf); this front's entrypoint
+  # composes them onto its base (listen :53 → dns-powerdns:53) and reloads
+  # on change. Enable BOTH profiles together:
   #   docker compose --profile dns-powerdns --profile dns-powerdns-with-dnsdist up -d
-  # then turn dnsdist on for the group in DNS → Server Options. With it
-  # enabled the group's pdns moves to :5300 and dnsdist owns the published
-  # :53 — so the sidecar MUST be running, or the group stops answering.
+  # then point clients at the dnsdist front (host :5455 here) and turn
+  # dnsdist on for the group in DNS → Server Options. With dnsdist off the
+  # front is a plain pass-through (safe no-op); pdns keeps answering on :53.
   dns-dnsdist:
     profiles: ["dns-powerdns-with-dnsdist"]
     image: ghcr.io/spatiumddi/dns-dnsdist:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
-    network_mode: "service:dns-powerdns"
+    networks:
+      - spatiumddi
+    environment:
+      DNSDIST_BACKEND: dns-powerdns:53
     cap_add:
       - NET_BIND_SERVICE
     volumes:
       - dns_powerdns_state:/agent-state:ro
+    ports:
+      - "5455:53/udp"
+      - "5455:53/tcp"
     depends_on:
       dns-powerdns:
         condition: service_started

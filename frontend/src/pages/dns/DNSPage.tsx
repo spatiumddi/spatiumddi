@@ -5447,10 +5447,11 @@ function OptionsTab({ groupId }: { groupId: string }) {
         </div>
         <p className="text-xs text-muted-foreground">
           PowerDNS Authoritative has no built-in rate limiting, so a dnsdist
-          sidecar fronts it on :53 and forwards to pdns. Applies only to
-          PowerDNS server groups, and requires the dnsdist sidecar deployed
-          (compose <code>dns-powerdns-with-dnsdist</code> profile / Helm value).
-          With it enabled the group's pdns moves to :5300.
+          front (a separate container) forwards to pdns and applies these rules.
+          Applies to PowerDNS server groups, and requires the dnsdist front
+          deployed (compose <code>dns-powerdns-with-dnsdist</code> profile —
+          docker-compose only for now). pdns is unaffected; with the front off
+          it's a plain pass-through. Point DNS clients at the front.
         </p>
         {dnsdistEnabled && (
           <>
