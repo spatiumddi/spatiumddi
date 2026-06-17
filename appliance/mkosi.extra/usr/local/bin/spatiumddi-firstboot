@@ -912,8 +912,20 @@ commit_slot_if_healthy() {
     fi
     echo "  trial boot detected (booted=$current_slot, durable=${saved:-unset})."
     echo "  k3s reports Ready — committing $current_slot as the new default."
-    grub-set-default --boot-directory="$grub_boot_dir" "$current_slot" \
-        >> "$LOG" 2>&1 || true
+    if grub-set-default --boot-directory="$grub_boot_dir" "$current_slot" \
+        >> "$LOG" 2>&1; then
+        # #441 — the upgrade is now durable. Kick off a version-aware image
+        # prune to drop releases OLDER than the two slots (keeps BOTH slots
+        # bootable for rollback + the running set). Fired async via systemd
+        # (--no-block) so a slow rmi never blocks firstboot / risks its
+        # start timeout; gated on the commit actually succeeding so we never
+        # prune when the slot didn't become durable (a revert is still
+        # possible). The weekly timer is the backstop.
+        systemctl start --no-block spatiumddi-image-prune.service \
+            >> "$LOG" 2>&1 || true
+    else
+        echo "  WARN: grub-set-default failed — slot NOT committed, skipping prune" >> "$LOG"
+    fi
 }
 
 # #277 — place the deferred control chart only AFTER the CNPG operator

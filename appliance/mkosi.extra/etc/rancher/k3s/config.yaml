@@ -108,10 +108,23 @@ kube-apiserver-arg:
   # kube-apiserver crash-loops at boot.
   - enable-admission-plugins=NodeRestriction
 
-# Kubelet args. image-gc thresholds high so we don't churn the
-# baked image set under disk pressure (images are intentionally
-# preloaded; if the operator's running low on /var space the gc
-# pressure shows up elsewhere first).
+# Kubelet args. Image-GC band (issue #441). Kept HIGH (95/85) ON PURPOSE,
+# even though /var is the shared partition that also holds etcd + the
+# local-path PVCs + logs and we want headroom for that data:
+#
+# kubelet image-GC evicts UNUSED images, and on an A/B appliance the
+# *inactive slot's* images are unused but MUST stay resident for a
+# rollback to work — the baked airgap tarballs on /var are versionless and
+# overwritten each upgrade (only the current release's survive), and every
+# pod is imagePullPolicy:Never, so an evicted inactive-slot image can't be
+# re-pulled or re-imported → broken rollback. A lower GC band would evict
+# those rollback images sooner under disk pressure.
+#
+# So data headroom is provided PROACTIVELY by spatiumddi-image-prune (a
+# version-aware prune that keeps BOTH slot versions + the running set and
+# drops only older releases / stale dev tags — run async after a healthy
+# slot commit + weekly), NOT by lowering this band. This band stays a
+# last-resort backstop; evictionHard imagefs.available=5% is the hard floor.
 kubelet-arg:
   - image-gc-high-threshold=95
   - image-gc-low-threshold=85

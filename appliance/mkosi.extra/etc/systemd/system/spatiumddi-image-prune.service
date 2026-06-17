@@ -1,0 +1,14 @@
+[Unit]
+Description=Prune unreferenced k3s container images to reclaim /var (issue #441)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/441
+# Skip on the live ISO — no k3s there.
+ConditionKernelCommandLine=!boot=live
+# Needs the k3s containerd socket; /var holds the log + image store.
+After=k3s.service local-fs.target
+Wants=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-image-prune
+# No [Install] — invoked by the matching .timer (and by firstboot after a
+# healthy slot commit), never enabled standalone at boot.
