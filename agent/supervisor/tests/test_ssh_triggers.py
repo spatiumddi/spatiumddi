@@ -9,6 +9,7 @@ reload is the host-side runner (spatiumddi-ssh-reload).
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,16 @@ def test_enabled_writes_payload(ssh_paths: Path) -> None:
     rest = body.split("\n", 6)[6]
     assert rest.encode("utf-8")[:ak_len].decode("utf-8") == _AUTH_KEYS
     assert rest.encode("utf-8")[ak_len:].decode("utf-8") == _SSHD_CONF
+
+
+def test_trigger_is_owner_only(ssh_paths: Path) -> None:
+    # _fire_host_config writes secret-bearing payloads (here the sshd
+    # config; for the APT/SNMP planes, mirror passwords + the SNMP
+    # community) into the 1777-sticky release-state dir, so the trigger
+    # file must land 0o600 with no world-readable window (sec scanning #82).
+    assert appliance_state.maybe_fire_ssh_reload(_BLOCK) is True
+    mode = stat.S_IMODE((ssh_paths / "ssh-config-pending").stat().st_mode)
+    assert mode == 0o600
 
 
 def test_idempotent_until_consumed(ssh_paths: Path) -> None:
