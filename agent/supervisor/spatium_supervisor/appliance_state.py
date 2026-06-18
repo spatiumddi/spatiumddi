@@ -875,6 +875,28 @@ def _hostcfg_should_fire(
     return True, attempts + 1
 
 
+def _write_owner_only(tmp: Path, payload: str) -> None:
+    """Write ``payload`` to ``tmp`` as an owner-only (0o600) file, with the
+    restrictive mode set *at creation* rather than after the fact.
+
+    The host-config trigger files can carry decrypted secrets — the SNMP
+    community, APT private-mirror passwords + GPG armour (#155), the syslog
+    forwarding CA material (#156), the SSH config (#157), and the k3s join
+    token (#272) — and they land in the 1777-sticky ``release-state`` dir
+    that any unprivileged host user can list. A plain ``write_text`` then
+    ``chmod(0o600)`` left a window where the file existed at the umask
+    default (typically 0644, world-readable) before the chmod landed, so a
+    local user could race-open the ``.new`` temp and read the secret.
+    ``os.open`` with ``O_CREAT`` + mode ``0o600`` closes that window;
+    ``O_NOFOLLOW`` refuses a symlink an attacker could plant in the
+    world-writable dir. The root ``.path`` runner reads as root and is
+    unaffected by the tighter mode.
+    """
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(payload)
+
+
 def _fire_host_config(
     trigger_file: Path,
     applied_hash_sidecar: Path,
@@ -901,13 +923,12 @@ def _fire_host_config(
     try:
         trigger_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = trigger_file.with_suffix(".new")
-        tmp.write_text(payload, encoding="utf-8")
         # The payload can carry decrypted secrets (SNMP community, APT
-        # GPG armour + private-mirror passwords #155) and lands in the
-        # 1777-sticky release-state dir; restrict to owner-only so another
-        # unprivileged host user can't read it in the window before the
-        # root .path runner consumes it. The runner reads as root regardless.
-        tmp.chmod(0o600)
+        # GPG armour + private-mirror passwords #155, syslog CA #156, the
+        # SSH config #157) and lands in the 1777-sticky release-state dir.
+        # Create it owner-only atomically — see _write_owner_only — so no
+        # window exists where another unprivileged host user could read it.
+        _write_owner_only(tmp, payload)
         tmp.replace(trigger_file)
     except OSError:
         return False
@@ -1360,9 +1381,10 @@ def maybe_fire_cluster_join(
     try:
         _CLUSTER_JOIN_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _CLUSTER_JOIN_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(
-            f"{_CLUSTER_JOIN_CONFIRM}\n{server_url}\n{join_token}\n", encoding="utf-8"
-        )
+        # The join token is a control-plane-admin-equivalent secret; write
+        # it owner-only atomically (see _write_owner_only) so it can't be
+        # read by another unprivileged user out of the 1777-sticky dir.
+        _write_owner_only(tmp, f"{_CLUSTER_JOIN_CONFIRM}\n{server_url}\n{join_token}\n")
         tmp.replace(_CLUSTER_JOIN_TRIGGER_FILE)
         return True
     except OSError:
