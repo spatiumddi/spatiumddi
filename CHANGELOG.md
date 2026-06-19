@@ -26,6 +26,182 @@ _Nothing yet — the next cut starts here._
 
 ---
 
+## 2026.06.19-1 — 2026-06-19
+
+A **certificates + DNS-hardening** release. Three headlines land
+together: **#118 TLS certificate monitoring** — auto-discover the certs
+serving from the hostnames SpatiumDDI already manages, probe the full
+chain, and alert before they expire or break; **#438 the embedded ACME /
+Let's Encrypt client** — a hand-rolled RFC 8555 client that issues a
+CA-trusted cert for SpatiumDDI's own Web UI (DNS-01 over managed + cloud
+zones, HTTP-01, manual fallback, auto-renewal); and **#146 native DNS
+rate limiting** — BIND9 Response Rate Limiting + amplification defenses,
+a dnsdist front that gives PowerDNS the RRL it lacks, and drop-rate
+observability with a `dns_rate_limit_dropping` alert. Riding along:
+**#77 saved views**, **#99 a "services using this resource"
+reverse-lookup UI**, **#155 appliance APT host-config** (managed sources
+/ proxy / GPG keys driven from the UI), a **rollback-safe k3s image
+prune** (#441) that stops the shared `/var` partition from creeping full
+over upgrades, and a supervisor **secret-handling hardening fix** (#446,
+CodeQL alert #82). The Operator Copilot tool registry grows 186 → 198.
+All ten schema changes are additive.
+
+### Added
+
+* **#118 — TLS certificate monitoring.** Watch the TLS certs serving
+  from the hostnames SpatiumDDI already manages, so expiring or
+  misconfigured certs surface before they break clients. New
+  ``tls_cert_target`` (connect tuple + per-row schedule + denormalised
+  latest cert identity) + immutable ``tls_cert_probe`` history. The probe
+  service captures the served chain (leaf + intermediates) via pyOpenSSL,
+  resolves the root from the system trust store, and validates trust in a
+  separate pass (DNS-rebinding-safe: resolves once + pins the connect
+  IP). A discovery reconciler projects targets from opted-in DNS A/AAAA
+  records **and** IPAM ``web`` / ``api`` / ``lb`` roles, deduped on the
+  connect tuple, re-enabling on return + disabling on drop. Four alert
+  kinds (expiring / chain-invalid + SAN-mismatch / unreachable / changed),
+  startup-seeded disabled. Surface at ``/api/v1/tls-certs`` (CRUD +
+  probes + per-cert chain breakdown + synchronous probe-now), gated on
+  the ``tls_cert`` permission + ``security.tls_certs`` feature module
+  (granted to Network Editor admin + Auditor read). A **Network →
+  Certificates** page (list + filters + saved views, click-through detail
+  with the full leaf → intermediate(s) → root chain + PEM), Domain +
+  DNS-zone Certs tabs, a DNS-record state pill, and a "Certs expiring
+  ≤30d" dashboard KPI. MCP: ``find_tls_cert`` /
+  ``count_tls_certs_expiring`` / ``get_cert_chain`` /
+  ``count_tls_targets_by_state`` (read, default-on) +
+  ``propose_run_cert_probe`` (write, default-off).
+* **#438 — Embedded ACME / Let's Encrypt client.** A hand-rolled RFC
+  8555 client (``backend/app/services/acme_client/`` — manual JWS over
+  ``cryptography`` + ``httpx``) that issues a **CA-trusted cert for
+  SpatiumDDI's own Web UI**, landing the chain in the existing
+  ``ApplianceCertificate`` storage + deploy path with
+  ``source="letsencrypt"``. DNS-01 self-solves over managed zones via the
+  record-ops pipeline **and** over cloud zones (Cloudflare / Route 53 /
+  Azure / Google agentless drivers), with an ``allow_manual`` TXT
+  fallback; HTTP-01 via an unauthenticated ``GET /.well-known/acme-
+  challenge/{token}`` route; ``tls-alpn-01`` reports 422 (unsupported on
+  the nginx/k3s topology). A 12 h beat task re-issues active certs within
+  30 d of expiry (idempotent + advisory-locked), and the
+  ``secret_expiring`` alert now covers the LE Web-UI cert. Surface at
+  ``/api/v1/appliance/acme`` (account upsert + ``POST /preview`` + ``POST
+  /issue`` + orders list/get/cancel) behind the default-enabled
+  ``security.certificates`` feature module. Account key + EAB HMAC are
+  Fernet-encrypted + never returned. MCP: ``find_certificates`` /
+  ``count_certificates_expiring`` (default on) + ``get_acme_account``
+  (default off). Distinct from the shipped ACME *provider*
+  (``/api/v1/acme/``). See ``docs/features/ACME.md``.
+* **#146 — Native DNS rate limiting + amplification defenses.** BIND9
+  **Response Rate Limiting** + amplification-reduction knobs
+  (``rrl_*`` + ``minimal_responses`` / ``tcp_clients`` /
+  ``clients_per_query`` / ``max_clients_per_query``) on
+  ``DNSServerOptions`` (group-level), rendered into ``named.conf`` via the
+  existing ConfigBundle → ETag → long-poll path. Every field defaults to
+  a no-op, so existing groups render byte-identical config until an
+  operator opts in. PowerDNS Authoritative has no RRL, so a new
+  **dnsdist front** (``ghcr.io/spatiumddi/dns-dnsdist`` image,
+  watch-and-reload entrypoint) puts ``MaxQPSIPRule`` + TC/Drop +
+  ``dynBlockRulesGroup`` in front of pdns — opt-in via the
+  ``dns-powerdns-with-dnsdist`` compose profile + Helm sidecar. Drop-rate
+  observability: the agent ships BIND9 ``RateDropped`` / ``RateSlipped``
+  into ``dns_metric_sample``, the server-detail Stats tab draws an "RRL
+  drops/s" line, and a ``dns_rate_limit_dropping`` alert fires when drops
+  over a 15-min window clear a floor (seeded disabled). MCP:
+  ``find_dns_rate_limit_settings``. See ``docs/features/DNS.md`` §3.8/§3.9
+  + ``docs/drivers/DNS_DRIVERS.md`` §2.6/§2.7.
+* **#77 — Saved searches / views.** Per-user ``SavedView(user_id, page,
+  name, payload, is_default)`` + ``/api/v1/saved-views`` CRUD (scoped by
+  user, audited) behind the default-enabled ``ui.saved_views`` feature
+  module, plus a reusable ``SavedViewsMenu`` header dropdown (save / load
+  / set-default / auto-apply / delete) wired into the Services / Circuits
+  / Sites list pages. MCP: ``find_saved_views`` / ``count_saved_views``.
+* **#99 — "Services using this resource" reverse-lookup UI.**
+  ``ServicesPage`` gains a ``?resource_kind=&resource_id=`` filter mode,
+  and a ``ServicesUsingButton`` entry point (header + compact row) lands
+  on VRF / Subnet / IPBlock / Circuit / Site / DNSZone / DHCPScope.
+* **#155 — Appliance APT host-config.** Opt-in
+  ``platform_settings.apt_*`` (managed sources / proxy / Fernet-encrypted
+  GPG keys + private-mirror auth / unattended-upgrades) flows through the
+  supervisor heartbeat as an ``apt_bundle`` to a new
+  ``spatiumddi-apt-reload`` host runner that **validates a staged config
+  with ``apt-get update`` before swapping the live files** (classifying
+  failures: proxy-failed / mirror-unreachable / signature-mismatch /
+  no-sources). ``POST /settings/apt/validate`` structural pre-check,
+  ``find_apt_settings`` MCP tool, an APT Services-sidebar form + a per-row
+  ``apt_state`` Fleet chip.
+
+### Changed
+
+* **Operator Copilot tool registry 186 → 198 tools** — the TLS-cert (5),
+  ACME (3), saved-views (2), APT (1), and DNS-rate-limit (1) reads land
+  this release.
+* **dnsdist deployment shape (PowerDNS RRL).** When the dnsdist front is
+  enabled, pdns binds ``127.0.0.1:5300`` and dnsdist owns ``:53``; opt in
+  via the ``dns-powerdns-with-dnsdist`` compose profile or the
+  ``dnsPowerdns.dnsdist.enabled`` Helm value (inherits the
+  ``role-dns-powerdns`` node gate).
+
+### Fixed
+
+* **#441 — k3s image accumulation on shared ``/var``.** The containerd
+  image store lives on the shared ``/var`` partition and nothing pruned
+  superseded releases, so ``/var`` crept toward full over upgrades
+  (a field appliance hit 91 %). New ``spatiumddi-image-prune`` removes
+  only ``ghcr.io/spatiumddi/*`` images tagged with **neither** slot's
+  installed version **and** not referenced by a live container — keeping
+  both A/B slots bootable + the running set + all non-SpatiumDDI images,
+  and pruning nothing if it can't name both slot versions. Triggered
+  async after a healthy slot commit (per-box + each rolling-upgrade node)
+  + a weekly timer backstop. **Not** a blunt ``crictl rmi --prune``,
+  which would delete the inactive slot's images and break rollback.
+
+### Security
+
+* **#446 — Supervisor secret-bearing host-config triggers written
+  owner-only at creation** (CodeQL ``py/clear-text-storage-sensitive-
+  data``, alert #82, high). The host-config trigger writer
+  (``_fire_host_config`` — SNMP community / APT mirror passwords + GPG
+  armour / syslog CA / SSH config) and the k3s-join-token writer landed
+  their ``.new`` temp at the umask default (typically ``0644``,
+  world-readable) before a follow-up ``chmod`` — a TOCTOU window in the
+  ``1777``-sticky ``release-state`` dir where another unprivileged host
+  user could race-read the secret (the join token had no ``chmod`` at
+  all). A shared ``_write_owner_only`` helper now creates the temp
+  ``0o600`` atomically via ``os.open(..., O_CREAT|O_NOFOLLOW, 0o600)`` —
+  the mode is set at creation so no window exists, and ``O_NOFOLLOW``
+  refuses a planted symlink.
+* **#438 — ACME account secrets at rest.** The ACME account key + EAB
+  HMAC are Fernet-encrypted in the DB and never returned over the API
+  (only an ``eab_hmac_set`` boolean).
+* **#155 — APT config fingerprint over opaque ciphertext, not
+  cleartext** (CodeQL ``py/weak-sensitive-data-hashing``). The
+  ``apt_bundle`` change-detection hash is computed over the
+  encrypted-at-rest token material (which changes iff the secret changes),
+  marked ``usedforsecurity=False`` — no decrypted private-mirror password
+  reaches the digest.
+
+### Migrations
+
+Ten new additive migrations; chain head ``d8f3a1c6e09b``.
+
+* **#438 — ACME client** (``a7f2c9e4d1b8`` → ``b2f5a9c41e07`` →
+  ``c3d8a1f9e62b``). Account / order / challenge storage, manual-DNS
+  fallback, and the HTTP-01 challenge surface.
+* **#77 — Saved views** (``d4e9f2a7c1b8``). Per-user ``saved_view``
+  table.
+* **#155 — Appliance APT settings** (``e1a4b8c92f3d``). ``apt_*`` columns
+  on ``platform_settings`` + the ``apt_state`` reporting column.
+* **#118 — TLS cert monitoring** (``f3e8b1d72a9c`` → ``c7d1f04e9a2b``).
+  ``tls_cert_target`` (NULLS-NOT-DISTINCT connect-tuple unique) +
+  ``tls_cert_probe``, the ``auto_tls_probe`` opt-ins, and the
+  ``ip_address_id`` FK for IPAM-role-discovered targets.
+* **#146 — DNS RRL + dnsdist** (``b9c3f5e1a8d4`` → ``c5a7e2f9b1d6`` →
+  ``d8f3a1c6e09b``). RRL + amplification fields, ``rate_dropped`` /
+  ``rate_slipped`` on ``dns_metric_sample``, and the ``dnsdist_*``
+  options. All ``server_default``'d no-op.
+
+---
+
 ## 2026.06.15-1 — 2026-06-15
 
 A **troubleshooting + hardening** release. The headline is **#59 —
