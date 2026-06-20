@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -23,8 +23,14 @@ from app.drivers.dhcp.windows import test_winrm_credentials
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPServer
 from app.models.dhcp_fingerprint import DHCPFingerprint
+from app.models.metrics import DHCPMetricSample
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.pull_leases import pull_leases_from_server
+from app.services.dhcp.stats import (
+    STATS_BUCKET_SECONDS,
+    STATS_WINDOW_SECONDS,
+    active_lease_count,
+)
 from app.services.oui import (
     bulk_lookup_vendors,
     is_voip_phone_vendor,
@@ -1043,3 +1049,116 @@ async def list_leases(
         )
         lease.fingerbank_score = fp.fingerbank_score if fp else None  # type: ignore[attr-defined]
     return rows
+
+
+# --- Per-server stats (#195) ------------------------------------------------
+# The range -> window/bucket maps + the active-lease count live in
+# app.services.dhcp.stats so this endpoint and the find_dhcp_server_stats MCP
+# tool stay in lockstep.
+
+
+class DHCPRateBucket(BaseModel):
+    """One time bucket of DHCP message-type counts (#195).
+
+    Exactly the 7 contract keys — ``inform`` is summed in the DB but
+    dropped here to match the pinned issue contract.
+    """
+
+    ts: datetime
+    discover: int
+    offer: int
+    request: int
+    ack: int
+    nak: int
+    decline: int
+    release: int
+
+
+class DHCPServerStatsResponse(BaseModel):
+    leases_active: int
+    range: str
+    bucket_seconds: int
+    rate_buckets: list[DHCPRateBucket]
+
+
+@router.get("/{server_id}/stats", response_model=DHCPServerStatsResponse)
+async def get_server_stats(
+    server_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    range: str = "1h",
+) -> DHCPServerStatsResponse:
+    """Lease-rate timeseries + active lease count for the modal Stats tab (#195).
+
+    Aggregates ``DHCPMetricSample`` (agent-reported Kea pkt4 counter deltas)
+    into fixed time buckets, plus the current active lease count. Read-only:
+    no audit_log write (this endpoint performs no mutation).
+
+    Empty servers / windows return ``leases_active`` and an empty
+    ``rate_buckets`` list without error — the UI shows a "no activity"
+    empty state. ``date_bin`` emits rows only for buckets that have samples
+    (sparse), so empty windows naturally yield ``[]``; the client renders
+    whatever points exist. Agentless (windows_dhcp) servers are not
+    special-cased — they return synced ``leases_active`` and empty
+    ``rate_buckets`` (no Kea metric stream); the frontend hides the tab for
+    them anyway.
+    """
+    if range not in STATS_WINDOW_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"range must be one of {sorted(STATS_WINDOW_SECONDS)}",
+        )
+    server = await db.get(DHCPServer, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    bucket_s = STATS_BUCKET_SECONDS[range]
+    since = datetime.now(UTC) - timedelta(seconds=STATS_WINDOW_SECONDS[range])
+
+    leases_active = await active_lease_count(db, server_id)
+
+    # Bucketed message-type sums. date_bin anchors buckets on stable
+    # boundaries across requests (same pattern as /metrics/dhcp/timeseries).
+    # coalesce keeps the per-bucket sums non-null so the rows map straight to
+    # ints (matches the find_dhcp_server_stats tool's SQL-side null handling).
+    bucket_col = func.date_bin(
+        timedelta(seconds=bucket_s),
+        DHCPMetricSample.bucket_at,
+        datetime(2000, 1, 1, tzinfo=UTC),
+    ).label("ts")
+    stmt = (
+        select(
+            bucket_col,
+            func.coalesce(func.sum(DHCPMetricSample.discover), 0).label("discover"),
+            func.coalesce(func.sum(DHCPMetricSample.offer), 0).label("offer"),
+            func.coalesce(func.sum(DHCPMetricSample.request), 0).label("request"),
+            func.coalesce(func.sum(DHCPMetricSample.ack), 0).label("ack"),
+            func.coalesce(func.sum(DHCPMetricSample.nak), 0).label("nak"),
+            func.coalesce(func.sum(DHCPMetricSample.decline), 0).label("decline"),
+            func.coalesce(func.sum(DHCPMetricSample.release), 0).label("release"),
+        )
+        .where(DHCPMetricSample.server_id == server_id)
+        .where(DHCPMetricSample.bucket_at >= since)
+        .group_by(bucket_col)
+        .order_by(bucket_col)
+    )
+    rows = (await db.execute(stmt)).all()
+    rate_buckets = [
+        DHCPRateBucket(
+            ts=r._mapping["ts"],
+            discover=int(r.discover or 0),
+            offer=int(r.offer or 0),
+            request=int(r.request or 0),
+            ack=int(r.ack or 0),
+            nak=int(r.nak or 0),
+            decline=int(r.decline or 0),
+            release=int(r.release or 0),
+        )
+        for r in rows
+    ]
+    return DHCPServerStatsResponse(
+        leases_active=int(leases_active),
+        range=range,
+        bucket_seconds=bucket_s,
+        rate_buckets=rate_buckets,
+    )

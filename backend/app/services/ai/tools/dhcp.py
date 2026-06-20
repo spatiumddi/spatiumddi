@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -25,7 +27,9 @@ from app.models.dhcp import (
     DHCPStaticAssignment,
 )
 from app.models.dhcp_fingerprint import DHCPFingerprint
+from app.models.metrics import DHCPMetricSample
 from app.services.ai.tools.base import register_tool
+from app.services.dhcp.stats import STATS_WINDOW_SECONDS, active_lease_count
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 
 
@@ -792,3 +796,77 @@ async def find_dhcp_responders(
         }
         for r in rows
     ]
+
+
+class FindDHCPServerStatsArgs(BaseModel):
+    server_id: str = Field(description="DHCP server UUID to summarize.")
+    range: str = Field(default="1h", description="Time window: 1h, 6h, 24h, or 7d.")
+
+
+@register_tool(
+    name="find_dhcp_server_stats",
+    description=(
+        "Summarize a DHCP server's recent traffic: active lease count and "
+        "per-message-type totals (discover/offer/request/ack/nak/decline/"
+        "release) over a 1h/6h/24h/7d window. Use for 'how busy is server X?'."
+    ),
+    args_model=FindDHCPServerStatsArgs,
+    category="dhcp",
+    # Read-only summary of agent-reported counters; no secrets, no off-prem
+    # calls, no writes -> default-enabled per non-negotiable #13.
+    default_enabled=True,
+)
+async def find_dhcp_server_stats(
+    db: AsyncSession, user: User, args: FindDHCPServerStatsArgs
+) -> dict[str, Any]:
+    """Window totals (not per-bucket) — the AI wants a summary, not a chart."""
+    if args.range not in STATS_WINDOW_SECONDS:
+        return {
+            "error": f"invalid range: {args.range!r}; "
+            f"must be one of {sorted(STATS_WINDOW_SECONDS)}"
+        }
+    rng = args.range
+    try:
+        sid = uuid.UUID(args.server_id)
+    except (ValueError, AttributeError):
+        return {"error": f"invalid server_id: {args.server_id!r}"}
+
+    server = await db.get(DHCPServer, sid)
+    if server is None:
+        return {"error": f"DHCP server {args.server_id} not found"}
+
+    since = datetime.now(UTC) - timedelta(seconds=STATS_WINDOW_SECONDS[rng])
+
+    leases_active = await active_lease_count(db, sid)
+
+    totals_row = (
+        await db.execute(
+            select(
+                func.coalesce(func.sum(DHCPMetricSample.discover), 0).label("discover"),
+                func.coalesce(func.sum(DHCPMetricSample.offer), 0).label("offer"),
+                func.coalesce(func.sum(DHCPMetricSample.request), 0).label("request"),
+                func.coalesce(func.sum(DHCPMetricSample.ack), 0).label("ack"),
+                func.coalesce(func.sum(DHCPMetricSample.nak), 0).label("nak"),
+                func.coalesce(func.sum(DHCPMetricSample.decline), 0).label("decline"),
+                func.coalesce(func.sum(DHCPMetricSample.release), 0).label("release"),
+            )
+            .where(DHCPMetricSample.server_id == sid)
+            .where(DHCPMetricSample.bucket_at >= since)
+        )
+    ).one()
+
+    return {
+        "server_id": str(sid),
+        "server_name": server.name,
+        "range": rng,
+        "leases_active": int(leases_active),
+        "totals": {
+            "discover": int(totals_row.discover or 0),
+            "offer": int(totals_row.offer or 0),
+            "request": int(totals_row.request or 0),
+            "ack": int(totals_row.ack or 0),
+            "nak": int(totals_row.nak or 0),
+            "decline": int(totals_row.decline or 0),
+            "release": int(totals_row.release or 0),
+        },
+    }

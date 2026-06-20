@@ -6253,6 +6253,27 @@ export interface DHCPRenderedConfigResponse {
   config: string;
 }
 
+// Per-server lease-rate stats for the ServerDetailModal Stats tab (#195).
+export type DHCPStatsRange = "1h" | "6h" | "24h" | "7d";
+
+export interface DHCPRateBucket {
+  ts: string;
+  discover: number;
+  offer: number;
+  request: number;
+  ack: number;
+  nak: number;
+  decline: number;
+  release: number;
+}
+
+export interface DHCPServerStatsResponse {
+  leases_active: number;
+  range: DHCPStatsRange;
+  bucket_seconds: number;
+  rate_buckets: DHCPRateBucket[];
+}
+
 export const dhcpApi = {
   listGroups: () =>
     api.get<DHCPServerGroup[]>("/dhcp/server-groups").then((r) => r.data),
@@ -6339,6 +6360,13 @@ export const dhcpApi = {
       .get<DHCPRenderedConfigResponse>(
         `/dhcp/servers/${serverId}/rendered-config`,
       )
+      .then((r) => r.data),
+  // Lease-rate timeseries + active lease count for the Stats tab (#195).
+  serverStats: (serverId: string, range: DHCPStatsRange = "1h") =>
+    api
+      .get<DHCPServerStatsResponse>(`/dhcp/servers/${serverId}/stats`, {
+        params: { range },
+      })
       .then((r) => r.data),
 
   listScopesBySubnet: (subnetId: string, params?: { tag?: string[] }) =>
