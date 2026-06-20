@@ -965,9 +965,20 @@ def _address_set_targets(args: CreateAddressSetArgs) -> list[str]:
 async def _preview_create_address_set(
     db: AsyncSession, user: User, args: CreateAddressSetArgs
 ) -> PreviewResult:
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
     subnet = await db.get(Subnet, args.subnet_id)
     if subnet is None:
         return PreviewResult(ok=False, detail=f"Subnet {args.subnet_id} not found")
+
+    # Carving a delegation slice is a subnet-owner operation — require write/admin
+    # on the PARENT SUBNET so the operator isn't shown a false "ready" preview
+    # they can't actually apply (#103, finding #3; mirrors the REST create gate).
+    if not user_has_permission(user, "write", "subnet", args.subnet_id):
+        return PreviewResult(
+            ok=False,
+            detail="You need write on the parent subnet to create an address set in it.",
+        )
 
     shape_err = _validate_address_set_shape(args)
     if shape_err is not None:
@@ -1000,12 +1011,20 @@ async def _apply_create_address_set(
     db: AsyncSession, user: User, args: CreateAddressSetArgs
 ) -> dict[str, Any]:
     from app.api.v1.dhcp._audit import write_audit  # local import to avoid cycle
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
 
     enforce_operation_permission(user, _OPERATIONS["create_address_set"])
 
     subnet = await db.get(Subnet, args.subnet_id)
     if subnet is None:
         raise ValueError(f"Subnet {args.subnet_id} not found")
+
+    # Subnet-owner gate — same wording as the REST create path (#103, finding #3).
+    # ``enforce_operation_permission`` already proved type-wide admin:address_set;
+    # this additionally requires write/admin on the PARENT SUBNET so a delegate
+    # can't self-escalate by carving a slice out of a subnet they don't control.
+    if not user_has_permission(user, "write", "subnet", args.subnet_id):
+        raise ValueError("You need write on the parent subnet to create an address set in it.")
 
     shape_err = _validate_address_set_shape(args)
     if shape_err is not None:

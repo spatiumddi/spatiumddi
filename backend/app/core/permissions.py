@@ -608,6 +608,83 @@ def require_any_resource_permission(
     return _dep
 
 
+def has_any_grant_for(user: User, action: str, resource_type: str) -> bool:
+    """True if the user holds ANY grant matching ``(action, resource_type)``,
+    SCOPED OR UNSCOPED — ``resource_id`` is ignored.
+
+    For COARSE router gates that must admit an instance-scoped delegate so a
+    downstream per-row gate can enforce the real boundary. The ordinary
+    ``require_*_resource_permission`` dependencies do an *unscoped* check
+    (``resource_id=None``) which a purely instance-scoped grant fails:
+    ``_resource_id_matches`` returns ``False`` when the request is unscoped but
+    the grant is scoped. Address-set delegation (issue #103) hands out scoped
+    ``{write, address_set, <id>}`` grants, so the IPAM router gate uses this to
+    let those callers *reach* the per-IP gate
+    (``app.services.ipam.address_set_gate``), which is the authoritative check.
+    """
+    if not user.is_active:
+        return False
+    if is_effective_superadmin(user):
+        return True
+    perms: list[object] = []
+    for group in user.groups:
+        for role in group.roles:
+            perms.extend(role.permissions or [])
+    perms.extend(getattr(user, "_active_time_bound_grants", None) or [])
+    for perm in perms:
+        triple = _perm_triple(perm)
+        if triple is None:
+            continue
+        g_action, g_type, _rid = triple
+        if _action_matches(g_action, action) and _resource_type_matches(g_type, resource_type):
+            return True
+    return False
+
+
+def require_any_resource_or_scoped(
+    unscoped_types: tuple[str, ...],
+    scoped_types: tuple[str, ...],
+) -> Callable[..., Awaitable[User]]:
+    """Coarse router gate that also admits instance-scoped delegates.
+
+    Passes if the user has the method-derived action (unscoped) on ANY
+    ``unscoped_types`` — the normal :func:`require_any_resource_permission`
+    behaviour — OR, for **mutating** methods only (write / delete, never read),
+    holds ANY grant (scoped or unscoped) on ANY ``scoped_types`` via
+    :func:`has_any_grant_for`.
+
+    The scoped admit exists for delegation types (``address_set``, #103) whose
+    real boundary is enforced by a downstream per-row gate, so a delegate with
+    only ``{write, address_set, <id>}`` clears the coarse gate and reaches that
+    gate. It is restricted to write/delete so a scoped *read* grant can never
+    widen read access to the aggregate router's data; read still requires a
+    normal (typically type-level) read grant.
+    """
+
+    async def _dep(
+        request: Request,
+        current_user: CurrentUser,
+        db: Annotated[AsyncSession, Depends(get_db)],
+    ) -> User:
+        action = _METHOD_TO_ACTION.get(request.method.upper(), "write")
+        for rt in unscoped_types:
+            if user_has_permission(current_user, action, rt):
+                return current_user
+        if action != "read":
+            for rt in scoped_types:
+                if has_any_grant_for(current_user, action, rt):
+                    return current_user
+        all_types = list(unscoped_types) + list(scoped_types)
+        first = all_types[0] if all_types else "*"
+        await _record_denial(db, current_user, request, action, first, None)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Permission denied: need '{action}' on one of {all_types}",
+        )
+
+    return _dep
+
+
 # ── Known synthetic permission resource_types ─────────────────────────────────
 #
 # Most resource_types map 1:1 to a real DB row (``ip_space``, ``dns_zone`` …),

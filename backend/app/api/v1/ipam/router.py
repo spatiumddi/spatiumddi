@@ -20,7 +20,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
 from app.core.permissions import (
-    require_any_resource_permission,
+    require_any_resource_or_scoped,
     token_scope_allows,
     user_has_permission,
 )
@@ -77,15 +77,25 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(
     dependencies=[
         Depends(
-            require_any_resource_permission(
-                "ip_space",
-                "ip_block",
-                "subnet",
-                "ip_address",
-                "address_set",
-                "custom_field",
-                "nat_mapping",
-                "manage_ipam_templates",
+            require_any_resource_or_scoped(
+                # Unscoped types: a normal (type-level / wildcard) grant on any
+                # of these admits the request.
+                (
+                    "ip_space",
+                    "ip_block",
+                    "subnet",
+                    "ip_address",
+                    "custom_field",
+                    "nat_mapping",
+                    "manage_ipam_templates",
+                ),
+                # Scoped-admit types (write/delete only): a delegate holding only
+                # an instance-scoped ``{write, address_set, <id>}`` grant clears
+                # this coarse gate and reaches the per-IP gate
+                # (``_user_can_write_ip``), which enforces the real range boundary
+                # (#103). require_any_resource_permission's unscoped check would
+                # 403 such a delegate before delegation ever runs.
+                ("address_set",),
             )
         )
     ]

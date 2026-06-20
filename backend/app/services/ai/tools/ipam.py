@@ -944,6 +944,8 @@ class FindAddressSetsArgs(BaseModel):
 async def find_address_sets(
     db: AsyncSession, user: User, args: FindAddressSetsArgs
 ) -> list[dict[str, Any]] | dict[str, Any]:
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
     stmt = select(AddressSet)
     if args.subnet_id:
         try:
@@ -954,6 +956,10 @@ async def find_address_sets(
         stmt = stmt.where(AddressSet.name.ilike(f"%{args.search}%"))
     stmt = stmt.order_by(AddressSet.name).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
+    # Read-model (#103, finding #4): an MCP caller may see a set only if they can
+    # READ its parent subnet — otherwise any authenticated copilot user could
+    # enumerate the whole fleet's delegation slices. Superadmin / IPAM-reader
+    # pass for all; a zero-subnet-read caller gets nothing.
     return [
         {
             "id": str(s.id),
@@ -967,6 +973,7 @@ async def find_address_sets(
             "site_id": str(s.site_id) if s.site_id else None,
         }
         for s in rows
+        if user_has_permission(user, "read", "subnet", s.subnet_id)
     ]
 
 
@@ -988,15 +995,22 @@ class CountAddressSetsArgs(BaseModel):
 async def count_address_sets(
     db: AsyncSession, user: User, args: CountAddressSetsArgs
 ) -> dict[str, Any]:
-    total = await db.scalar(select(func.count(AddressSet.id)))
-    by_kind_rows = (
-        await db.execute(
-            select(AddressSet.range_kind, func.count(AddressSet.id)).group_by(AddressSet.range_kind)
-        )
-    ).all()
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    # Count only sets whose parent subnet the caller can READ (#103, finding #4).
+    # The per-row subnet check is synchronous Python, so the SQL can't group it
+    # in-DB; pull just (subnet_id, range_kind) and aggregate the visible rows.
+    rows = (await db.execute(select(AddressSet.subnet_id, AddressSet.range_kind))).all()
+    total = 0
+    by_kind: dict[str, int] = {}
+    for subnet_id, range_kind in rows:
+        if not user_has_permission(user, "read", "subnet", subnet_id):
+            continue
+        total += 1
+        by_kind[range_kind] = by_kind.get(range_kind, 0) + 1
     return {
-        "address_sets": int(total or 0),
-        "by_range_kind": {row[0]: int(row[1]) for row in by_kind_rows},
+        "address_sets": total,
+        "by_range_kind": by_kind,
     }
 
 

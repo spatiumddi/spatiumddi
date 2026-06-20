@@ -28,7 +28,11 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_any_resource_permission, user_has_permission
-from app.models.address_set import AddressSet, validate_address_set_shape
+from app.models.address_set import (
+    EXPLICIT_ADDRESSES_MAX,
+    AddressSet,
+    validate_address_set_shape,
+)
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.ipam import Subnet
@@ -67,7 +71,7 @@ class AddressSetCreate(BaseModel):
     range_kind: str = "contiguous"
     start_address: str | None = None
     end_address: str | None = None
-    explicit_addresses: list[str] = Field(default_factory=list)
+    explicit_addresses: list[str] = Field(default_factory=list, max_length=EXPLICIT_ADDRESSES_MAX)
     tags: dict[str, Any] = Field(default_factory=dict)
     custom_fields: dict[str, Any] = Field(default_factory=dict)
 
@@ -87,12 +91,20 @@ class AddressSetUpdate(BaseModel):
     range_kind: str | None = None
     start_address: str | None = None
     end_address: str | None = None
-    explicit_addresses: list[str] | None = None
+    explicit_addresses: list[str] | None = Field(default=None, max_length=EXPLICIT_ADDRESSES_MAX)
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+
+
+def _can_read_set(user: User, row: AddressSet) -> bool:
+    """Read-model (#103 security): a set is visible only to a caller who can
+    READ its parent subnet. The coarse router-level gate only proves the caller
+    holds *some* address_set permission; this scopes each row to the subnet it
+    carves from so a delegate can't enumerate the whole fleet."""
+    return user_has_permission(user, "read", "subnet", row.subnet_id)
 
 
 def _validate_range_shape(
@@ -222,7 +234,10 @@ async def list_address_sets(
         stmt = stmt.where(AddressSet.name.ilike(f"%{search}%"))
     stmt = stmt.order_by(AddressSet.name).limit(limit)
     rows = (await db.execute(stmt)).scalars().all()
-    return [_to_response(r) for r in rows]
+    # Read-model (#103 security): a caller may see a set only if they can read
+    # its parent subnet. Superadmin / IPAM-reader pass for all; a zero-subnet
+    # caller gets nothing even though the coarse address_set gate let them in.
+    return [_to_response(r) for r in rows if _can_read_set(current_user, r)]
 
 
 @router.get("/{set_id}", response_model=AddressSetResponse)
@@ -233,6 +248,10 @@ async def get_address_set(
 ) -> AddressSetResponse:
     row = await db.get(AddressSet, set_id)
     if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Address set not found.")
+    # Read-model (#103 security): scope to the parent subnet. 404 (not 403) so
+    # we don't confirm the set exists to a caller who can't read its subnet.
+    if not _can_read_set(current_user, row):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Address set not found.")
     return _to_response(row)
 
@@ -248,6 +267,11 @@ async def create_address_set(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Permission denied: need 'admin' on address_set to create.",
         )
+    # ``_validate_within_subnet`` loads + range-checks the subnet (404 if it's
+    # gone). Carving a delegation slice is a subnet-owner operation, so it ALSO
+    # requires write/admin on the PARENT SUBNET — otherwise an Address Set
+    # Editor (type-wide admin:address_set) could self-delegate write on any
+    # subnet (#103 self-escalation, finding #1).
     await _validate_within_subnet(
         db,
         body.subnet_id,
@@ -256,6 +280,11 @@ async def create_address_set(
         end_address=body.end_address,
         explicit_addresses=body.explicit_addresses,
     )
+    if not user_has_permission(current_user, "write", "subnet", body.subnet_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You need write on the parent subnet to create an address set in it.",
+        )
     # Friendly 409 rather than leaking the unique-constraint error.
     existing = (
         await db.execute(
@@ -338,6 +367,29 @@ async def update_address_set(
         k in data for k in ("range_kind", "start_address", "end_address", "explicit_addresses")
     )
     if range_touched:
+        # A change to any RANGE field is a subnet-owner operation (resize of the
+        # delegated slice), so it requires write/admin on the PARENT SUBNET — a
+        # delegate holding only scoped admin:address_set must not widen their own
+        # slice (#103, finding #2). Non-range edits (name / description / tags /
+        # custom_fields / customer_id / site_id) stay allowed for a set-scoped
+        # admin. Compare resolved-new against the stored row so a no-op resend of
+        # the same range doesn't demand subnet write.
+        cur_start = str(row.start_address) if row.start_address is not None else None
+        cur_end = str(row.end_address) if row.end_address is not None else None
+        cur_explicit = list(row.explicit_addresses or [])
+        range_changed = (
+            new_range_kind != row.range_kind
+            or new_start != cur_start
+            or new_end != cur_end
+            or new_explicit != cur_explicit
+        )
+        if range_changed and not user_has_permission(
+            current_user, "write", "subnet", row.subnet_id
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You need write on the parent subnet to resize an address set.",
+            )
         _validate_range_shape(new_range_kind, new_start, new_end, new_explicit)
         await _validate_within_subnet(
             db,

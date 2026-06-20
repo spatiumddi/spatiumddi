@@ -43,6 +43,14 @@ from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 # ``explicit``   — an arbitrary list of host addresses in ``explicit_addresses``.
 ADDRESS_SET_RANGE_KINDS: frozenset[str] = frozenset({"contiguous", "explicit"})
 
+# Upper bound on the number of host addresses an ``explicit`` set may carry.
+# The write-delegation gate (``services.ipam.address_set_gate``) re-parses every
+# explicit host on EVERY IPAM mutation to build its membership set, so an
+# unbounded list is a per-request DoS vector (#103, finding #6). Enforced in
+# BOTH the Pydantic schemas (REST) and here (the shared validator the AI path +
+# any direct caller also run through), so no surface can exceed it.
+EXPLICIT_ADDRESSES_MAX: int = 1024
+
 
 def validate_address_set_shape(
     range_kind: str,
@@ -76,6 +84,11 @@ def validate_address_set_shape(
     else:  # explicit
         if not explicit_addresses:
             return "explicit range requires a non-empty explicit_addresses list"
+        if len(explicit_addresses) > EXPLICIT_ADDRESSES_MAX:
+            return (
+                f"explicit_addresses may not exceed {EXPLICIT_ADDRESSES_MAX} entries "
+                f"(got {len(explicit_addresses)})"
+            )
         for raw in explicit_addresses:
             try:
                 ipaddress.ip_address(raw)
@@ -150,6 +163,7 @@ class AddressSet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 __all__ = [
     "ADDRESS_SET_RANGE_KINDS",
+    "EXPLICIT_ADDRESSES_MAX",
     "AddressSet",
     "validate_address_set_shape",
 ]
