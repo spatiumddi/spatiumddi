@@ -1843,6 +1843,83 @@ export const ipamApi = {
       .then((r) => r.data),
 };
 
+// ── Address sets (#103) ────────────────────────────────────────────────────────
+//
+// A named, RBAC-scoped slice of a subnet's address space. Granting
+// ``admin`` on a single ``address_set`` id (via a role permission entry
+// ``{action:"admin", resource_type:"address_set", resource_id:<id>}``)
+// lets a delegated admin edit just their range of a subnet without
+// holding subnet-wide write. The CRUD surface lives at the top-level
+// ``/address-sets`` endpoint (list is filterable by ``subnet_id``).
+
+export type AddressSetRangeKind = "contiguous" | "explicit";
+
+export interface AddressSet {
+  id: string;
+  name: string;
+  description: string;
+  subnet_id: string;
+  customer_id: string | null;
+  site_id: string | null;
+  range_kind: AddressSetRangeKind;
+  // Contiguous span — both set when ``range_kind === "contiguous"``.
+  start_address: string | null;
+  end_address: string | null;
+  // Arbitrary host list — non-empty when ``range_kind === "explicit"``.
+  explicit_addresses: string[];
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface AddressSetCreate {
+  name: string;
+  description?: string;
+  subnet_id: string;
+  customer_id?: string | null;
+  site_id?: string | null;
+  range_kind?: AddressSetRangeKind;
+  start_address?: string | null;
+  end_address?: string | null;
+  explicit_addresses?: string[];
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface AddressSetUpdate {
+  name?: string;
+  description?: string;
+  customer_id?: string | null;
+  site_id?: string | null;
+  range_kind?: AddressSetRangeKind;
+  start_address?: string | null;
+  end_address?: string | null;
+  explicit_addresses?: string[];
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export const addressSetsApi = {
+  // ``list`` returns a bare array (ordered by name), matching the
+  // sibling subnet sub-resources (aliases) rather than the paginated
+  // ``{items,total,...}`` envelope customers/sites use.
+  list: (params?: {
+    subnet_id?: string;
+    customer_id?: string;
+    site_id?: string;
+    search?: string;
+    limit?: number;
+  }) => api.get<AddressSet[]>("/address-sets", { params }).then((r) => r.data),
+  get: (id: string) =>
+    api.get<AddressSet>(`/address-sets/${id}`).then((r) => r.data),
+  create: (data: AddressSetCreate) =>
+    api.post<AddressSet>("/address-sets", data).then((r) => r.data),
+  update: (id: string, data: AddressSetUpdate) =>
+    api.put<AddressSet>(`/address-sets/${id}`, data).then((r) => r.data),
+  remove: (id: string) => api.delete(`/address-sets/${id}`),
+};
+
 // ── IPAM Import / Export ───────────────────────────────────────────────────────
 
 export interface ImportDiffRow {
@@ -6738,6 +6815,22 @@ export interface PublicAuthProvider {
   type: AuthProviderType;
 }
 
+/** One effective permission triple the calling credential resolves to.
+ *  `resource_id === null` means "any instance" of `resource_type`. */
+export interface PermissionGrant {
+  action: string;
+  resource_type: string;
+  resource_id: string | null;
+}
+
+/** Self-introspection of the calling credential's effective permissions
+ *  (`GET /auth/me/permissions`). When `is_superadmin` is true, callers
+ *  short-circuit and never inspect `grants`. */
+export interface MyPermissions {
+  is_superadmin: boolean;
+  grants: PermissionGrant[];
+}
+
 export const authApi = {
   login: (username: string, password: string) =>
     api
@@ -6781,6 +6874,12 @@ export const authApi = {
         auth_source: string;
       }>("/auth/me")
       .then((r) => r.data),
+
+  /** Effective permissions of the calling credential (self-only; reflects
+   *  RBAC ∪ live time-bound grants, narrowed by any API-token resource
+   *  binding). Drives client-side gating via the `usePermissions` hook. */
+  myPermissions: () =>
+    api.get<MyPermissions>("/auth/me/permissions").then((r) => r.data),
 
   // ── MFA (issue #69) ─────────────────────────────────────────────────
   mfaStatus: () =>

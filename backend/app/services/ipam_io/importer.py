@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -525,6 +526,9 @@ class AddressImportResult:
     created: int = 0
     updated: int = 0
     skipped: int = 0
+    # Rows skipped because the caller has no write permission on the IP
+    # (subnet-wide nor any covering address set) — #103 delegation.
+    skipped_no_perm: int = 0
     dns_synced: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -725,6 +729,7 @@ async def commit_address_import(
     current_user: Any,
     subnet_id: uuid.UUID,
     strategy: Strategy = "fail",
+    can_write_ip: Callable[[str], bool] | None = None,
 ) -> AddressImportResult:
     """Apply the address import in the caller's transaction.
 
@@ -734,6 +739,12 @@ async def commit_address_import(
     that the interactive UI uses. The import is equivalent to N calls to
     ``POST /ipam/addresses`` / ``PUT /ipam/addresses/{id}`` — same audit
     log, same DNS side-effects.
+
+    ``can_write_ip`` is the optional #103 address-set write-delegation gate
+    (a closure over the caller's writable ranges). Rows the caller can't
+    write are skipped and counted in ``skipped_no_perm`` rather than
+    mutated. ``None`` means "no per-IP gate" (caller already proved
+    subnet-wide write).
     """
     from app.api.v1.ipam.router import _sync_dns_record
 
@@ -742,11 +753,18 @@ async def commit_address_import(
     subnet_net = ipaddress.ip_network(str(subnet.network), strict=False)
     existing = await _load_existing_addresses(db, subnet.id)
 
-    # Pre-flight: fail-strategy bails out before mutating anything.
+    # Pre-flight: fail-strategy bails out before mutating anything. A
+    # permission-blocked row (#103 delegation gate) is skipped from the
+    # duplicate check — we don't 409 a caller on a row they can't write
+    # anyway — but it is NOT silent: it's counted below so a fully
+    # permission-blocked import can't masquerade as a generic 0-created
+    # success (#7).
     if strategy == "fail":
         for row in payload.addresses:
             canonical, _, err = _row_address_fields(row)
             if err or canonical is None:
+                continue
+            if can_write_ip is not None and not can_write_ip(canonical):
                 continue
             if canonical in existing:
                 raise HTTPException(
@@ -769,6 +787,12 @@ async def commit_address_import(
                 continue
         except ValueError:
             result_obj.errors.append(f"{canonical}: invalid IP")
+            continue
+
+        # Address-set write delegation (#103): skip rows outside the caller's
+        # writable ranges.
+        if can_write_ip is not None and not can_write_ip(canonical):
+            result_obj.skipped_no_perm += 1
             continue
 
         existing_ip = existing.get(canonical)
@@ -873,6 +897,18 @@ async def commit_address_import(
                 result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")
         result_obj.created += 1
 
+    # #7: surface a permission-blocked batch distinctly. ``skipped_no_perm``
+    # already carries the per-row count, but a fully RBAC-blocked import would
+    # otherwise return created=0 / updated=0 with no ``errors`` entry — which
+    # reads as a benign no-op rather than the authorization failure it is. When
+    # nothing landed AND at least one row was permission-blocked, add a clear
+    # error so the caller can tell "blocked" apart from "already exists" / empty.
+    if result_obj.skipped_no_perm and not result_obj.created and not result_obj.updated:
+        result_obj.errors.append(
+            f"Permission denied: {result_obj.skipped_no_perm} row(s) fall outside "
+            "the subnet or any address set you can write — nothing was imported."
+        )
+
     # Keep the subnet's utilization counters roughly honest. The periodic
     # allocation-recount task corrects drift, but users expect the UI to
     # reflect the new row count immediately.
@@ -887,6 +923,7 @@ async def commit_address_import(
         created=result_obj.created,
         updated=result_obj.updated,
         skipped=result_obj.skipped,
+        skipped_no_perm=result_obj.skipped_no_perm,
         dns_synced=result_obj.dns_synced,
         errors=len(result_obj.errors),
     )

@@ -21,6 +21,7 @@ from sqlalchemy import cast, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.address_set import AddressSet
 from app.models.asn import ASN
 from app.models.auth import User
 from app.models.circuit import Circuit
@@ -913,6 +914,103 @@ async def count_ipam_resources(
         "subnets": int(subnet_count or 0),
         "ip_addresses": int(ip_count or 0),
         "ip_addresses_by_status": {row[0]: int(row[1]) for row in by_status_rows},
+    }
+
+
+# ── address sets (#103) ───────────────────────────────────────────────
+
+
+class FindAddressSetsArgs(BaseModel):
+    subnet_id: str | None = Field(
+        default=None,
+        description="Filter by subnet UUID — omit to search across all subnets.",
+    )
+    search: str | None = Field(default=None, description="Substring match on the address-set name.")
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+@register_tool(
+    name="find_address_sets",
+    description=(
+        "List address sets — named, RBAC-scoped slices of a subnet's "
+        "address space (a contiguous range like .50–.99 or an explicit "
+        "list of hosts) used to delegate edit of just that slice without "
+        "subnet-wide write. Filterable by subnet and name substring."
+    ),
+    args_model=FindAddressSetsArgs,
+    category="ipam",
+    module="ipam.address_sets",
+)
+async def find_address_sets(
+    db: AsyncSession, user: User, args: FindAddressSetsArgs
+) -> list[dict[str, Any]] | dict[str, Any]:
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    stmt = select(AddressSet)
+    if args.subnet_id:
+        try:
+            stmt = stmt.where(AddressSet.subnet_id == uuid.UUID(args.subnet_id))
+        except ValueError:
+            return {"error": f"subnet_id {args.subnet_id!r} is not a valid UUID."}
+    if args.search:
+        stmt = stmt.where(AddressSet.name.ilike(f"%{args.search}%"))
+    stmt = stmt.order_by(AddressSet.name).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    # Read-model (#103, finding #4): an MCP caller may see a set only if they can
+    # READ its parent subnet — otherwise any authenticated copilot user could
+    # enumerate the whole fleet's delegation slices. Superadmin / IPAM-reader
+    # pass for all; a zero-subnet-read caller gets nothing.
+    return [
+        {
+            "id": str(s.id),
+            "name": s.name,
+            "subnet_id": str(s.subnet_id),
+            "range_kind": s.range_kind,
+            "start_address": str(s.start_address) if s.start_address is not None else None,
+            "end_address": str(s.end_address) if s.end_address is not None else None,
+            "explicit_addresses": list(s.explicit_addresses or []),
+            "customer_id": str(s.customer_id) if s.customer_id else None,
+            "site_id": str(s.site_id) if s.site_id else None,
+        }
+        for s in rows
+        if user_has_permission(user, "read", "subnet", s.subnet_id)
+    ]
+
+
+class CountAddressSetsArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="count_address_sets",
+    description=(
+        "Total count of address sets plus a breakdown by range kind "
+        "(contiguous vs explicit). Use to answer 'how many address sets "
+        "do I have?'."
+    ),
+    args_model=CountAddressSetsArgs,
+    category="ipam",
+    module="ipam.address_sets",
+)
+async def count_address_sets(
+    db: AsyncSession, user: User, args: CountAddressSetsArgs
+) -> dict[str, Any]:
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    # Count only sets whose parent subnet the caller can READ (#103, finding #4).
+    # The per-row subnet check is synchronous Python, so the SQL can't group it
+    # in-DB; pull just (subnet_id, range_kind) and aggregate the visible rows.
+    rows = (await db.execute(select(AddressSet.subnet_id, AddressSet.range_kind))).all()
+    total = 0
+    by_kind: dict[str, int] = {}
+    for subnet_id, range_kind in rows:
+        if not user_has_permission(user, "read", "subnet", subnet_id):
+            continue
+        total += 1
+        by_kind[range_kind] = by_kind.get(range_kind, 0) + 1
+    return {
+        "address_sets": total,
+        "by_range_kind": by_kind,
     }
 
 

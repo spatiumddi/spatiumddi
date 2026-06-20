@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 
 from app.api.v1.acme import router as acme_router
+from app.api.v1.address_sets import router as address_sets_router
 from app.api.v1.admin.agent_keys import router as agent_keys_router
 from app.api.v1.admin.containers import router as containers_router
 from app.api.v1.admin.feature_modules import router as feature_modules_router
@@ -81,6 +82,12 @@ api_v1_router = APIRouter()
 # Tags are alphabetised so the ReDoc / Swagger surface lists sections
 # A → Z. New entries should be inserted in sort order.
 api_v1_router.include_router(acme_router, prefix="/acme", tags=["acme"])
+api_v1_router.include_router(
+    address_sets_router,
+    prefix="/address-sets",
+    dependencies=[Depends(require_module("ipam.address_sets"))],
+    tags=["address-sets"],
+)
 api_v1_router.include_router(
     ai_router,
     prefix="/ai",
