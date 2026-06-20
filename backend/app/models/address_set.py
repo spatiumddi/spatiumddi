@@ -22,6 +22,7 @@ once its subnet is gone.
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 
 from sqlalchemy import (
@@ -41,6 +42,46 @@ from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 # ``contiguous`` — a ``start_address``..``end_address`` span.
 # ``explicit``   — an arbitrary list of host addresses in ``explicit_addresses``.
 ADDRESS_SET_RANGE_KINDS: frozenset[str] = frozenset({"contiguous", "explicit"})
+
+
+def validate_address_set_shape(
+    range_kind: str,
+    start_address: str | None,
+    end_address: str | None,
+    explicit_addresses: list[str],
+) -> str | None:
+    """Validate the contiguous/explicit shape (parse-only — no subnet check).
+
+    Single source of truth for the contiguous/explicit + IPv4/IPv6 rules,
+    shared by the REST router (``api.v1.address_sets.router``) and the AI
+    operation (``services.ai.operations``) so the two surfaces can't
+    diverge. Returns ``None`` when the shape is valid, otherwise an
+    operator-readable error string. Each call site adapts the string into
+    its own error surface (HTTP 422 vs ``PreviewResult.detail``).
+    """
+    if range_kind not in ADDRESS_SET_RANGE_KINDS:
+        return f"range_kind must be one of {sorted(ADDRESS_SET_RANGE_KINDS)}"
+    if range_kind == "contiguous":
+        if not start_address or not end_address:
+            return "contiguous range requires start_address and end_address"
+        try:
+            s = ipaddress.ip_address(start_address)
+            e = ipaddress.ip_address(end_address)
+        except ValueError as exc:
+            return f"invalid start/end address: {exc}"
+        if s.version != e.version:
+            return "start_address and end_address must be the same IP family"
+        if int(s) > int(e):
+            return "start_address must be <= end_address"
+    else:  # explicit
+        if not explicit_addresses:
+            return "explicit range requires a non-empty explicit_addresses list"
+        for raw in explicit_addresses:
+            try:
+                ipaddress.ip_address(raw)
+            except ValueError:
+                return f"invalid address in explicit_addresses: {raw}"
+    return None
 
 
 class AddressSet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -110,4 +151,5 @@ class AddressSet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 __all__ = [
     "ADDRESS_SET_RANGE_KINDS",
     "AddressSet",
+    "validate_address_set_shape",
 ]

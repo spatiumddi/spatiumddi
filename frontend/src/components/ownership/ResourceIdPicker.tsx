@@ -101,7 +101,11 @@ export function ResourceIdPicker({
 
   const { data } = useQuery({
     queryKey: config?.queryKey ?? ["resource-id-picker", "noop"],
-    queryFn: config!.queryFn,
+    // ``config`` may be undefined for unmapped resource types; the query is
+    // gated off via ``enabled`` below so this never actually runs, but supply
+    // a safe no-op fn instead of a non-null assertion that would crash if the
+    // ``enabled`` gate ever changed.
+    queryFn: config ? config.queryFn : async () => [] as PickerOption[],
     staleTime: 60_000,
     enabled: !!config && !disabled,
   });

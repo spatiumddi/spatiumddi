@@ -28,7 +28,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_any_resource_permission, user_has_permission
-from app.models.address_set import ADDRESS_SET_RANGE_KINDS, AddressSet
+from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.ipam import Subnet
@@ -101,50 +101,16 @@ def _validate_range_shape(
     end_address: str | None,
     explicit_addresses: list[str],
 ) -> None:
-    """Validate the contiguous/explicit shape (parse-only — no subnet check)."""
-    if range_kind not in ADDRESS_SET_RANGE_KINDS:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"range_kind must be one of {sorted(ADDRESS_SET_RANGE_KINDS)}",
-        )
-    if range_kind == "contiguous":
-        if not start_address or not end_address:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="contiguous range requires start_address and end_address",
-            )
-        try:
-            s = ipaddress.ip_address(start_address)
-            e = ipaddress.ip_address(end_address)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"invalid start/end address: {exc}",
-            ) from exc
-        if s.version != e.version:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="start_address and end_address must be the same IP family",
-            )
-        if int(s) > int(e):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="start_address must be <= end_address",
-            )
-    else:  # explicit
-        if not explicit_addresses:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="explicit range requires a non-empty explicit_addresses list",
-            )
-        for raw in explicit_addresses:
-            try:
-                ipaddress.ip_address(raw)
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail=f"invalid address in explicit_addresses: {raw}",
-                ) from exc
+    """422-adapter over the shared ``validate_address_set_shape`` validator.
+
+    The contiguous/explicit + IPv4/IPv6 rules live once in
+    ``app.models.address_set`` so the REST surface and the AI operation
+    can't diverge; here we just turn the returned error string into an
+    HTTP 422.
+    """
+    err = validate_address_set_shape(range_kind, start_address, end_address, explicit_addresses)
+    if err is not None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=err)
 
 
 async def _validate_within_subnet(
@@ -196,19 +162,16 @@ def _to_response(row: AddressSet) -> AddressSetResponse:
 
 
 def _snapshot(row: AddressSet) -> dict[str, Any]:
-    return {
-        "name": row.name,
-        "description": row.description,
-        "subnet_id": str(row.subnet_id),
-        "customer_id": str(row.customer_id) if row.customer_id else None,
-        "site_id": str(row.site_id) if row.site_id else None,
-        "range_kind": row.range_kind,
-        "start_address": str(row.start_address) if row.start_address is not None else None,
-        "end_address": str(row.end_address) if row.end_address is not None else None,
-        "explicit_addresses": list(row.explicit_addresses or []),
-        "tags": dict(row.tags or {}),
-        "custom_fields": dict(row.custom_fields or {}),
-    }
+    """Audit snapshot — delegates to ``_to_response`` so the stored
+    old/new_value shape matches what the API returns (same INET / uuid /
+    JSONB / ``description or ""`` coercion rules), then drops the
+    server-managed identity + timestamp fields the snapshot doesn't need.
+    JSON-mode dump stringifies the uuid fields for audit storage.
+    """
+    data = _to_response(row).model_dump(mode="json")
+    for key in ("id", "created_at", "modified_at"):
+        data.pop(key, None)
+    return data
 
 
 def _audit(

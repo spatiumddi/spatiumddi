@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import {
   useQuery,
@@ -3670,6 +3670,85 @@ function ipStringToInt(ip: string): number {
   return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
 }
 
+// Parse a dotted IPv4 quad to its 32-bit BigInt value, or null if malformed.
+function ipv4ToBigInt(ip: string): bigint | null {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+  let acc = 0n;
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) return null;
+    const n = Number(part);
+    if (n < 0 || n > 255) return null;
+    acc = (acc << 8n) | BigInt(n);
+  }
+  return acc;
+}
+
+// Parse any IPv4 or IPv6 literal to its integer value as a BigInt, mirroring
+// Python's ``int(ipaddress.ip_address(...))`` so the client-side address-set
+// membership test matches the backend gate (``_user_can_write_ip``) exactly.
+// Handles ``::`` zero-run expansion and embedded IPv4-mapped suffixes
+// (e.g. ``::ffff:192.0.2.10``). Returns null on truly-unparseable input so
+// callers can fail closed.
+function ipToBigInt(ip: string): bigint | null {
+  const raw = ip.trim();
+  if (raw === "") return null;
+  // Strip a zone id (``fe80::1%eth0``) — not significant for containment.
+  const addr = raw.includes("%") ? raw.slice(0, raw.indexOf("%")) : raw;
+
+  if (!addr.includes(":")) {
+    return ipv4ToBigInt(addr);
+  }
+
+  // IPv6. Split off an optional trailing embedded IPv4 quad and fold it into
+  // two 16-bit groups.
+  let head = addr;
+  const tailGroups: string[] = [];
+  const lastColon = addr.lastIndexOf(":");
+  const tail = addr.slice(lastColon + 1);
+  if (tail.includes(".")) {
+    const v4 = ipv4ToBigInt(tail);
+    if (v4 === null) return null;
+    tailGroups.push(((v4 >> 16n) & 0xffffn).toString(16));
+    tailGroups.push((v4 & 0xffffn).toString(16));
+    head = addr.slice(0, lastColon + 1); // keep trailing ':' for split
+  }
+
+  // Expand the ``::`` zero run (at most one allowed).
+  const doubleColonCount = (head.match(/::/g) ?? []).length;
+  if (doubleColonCount > 1) return null;
+
+  let groups: string[];
+  if (doubleColonCount === 1) {
+    const [left, right] = head.split("::");
+    const leftGroups = left === "" ? [] : left.split(":");
+    const rightGroups =
+      right === "" ? [] : right.split(":").filter((g) => g !== "");
+    const known = leftGroups.length + rightGroups.length + tailGroups.length;
+    const missing = 8 - known;
+    if (missing < 0) return null;
+    groups = [
+      ...leftGroups,
+      ...Array(missing).fill("0"),
+      ...rightGroups,
+      ...tailGroups,
+    ];
+  } else {
+    // No ``::`` — head may carry a trailing ':' from the embedded-v4 split.
+    const trimmed = head.endsWith(":") ? head.slice(0, -1) : head;
+    const headGroups = trimmed === "" ? [] : trimmed.split(":");
+    groups = [...headGroups, ...tailGroups];
+  }
+
+  if (groups.length !== 8) return null;
+  let acc = 0n;
+  for (const g of groups) {
+    if (g === "" || !/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+    acc = (acc << 16n) | BigInt(parseInt(g, 16));
+  }
+  return acc;
+}
+
 function intToIpv4(n: number): string {
   return [
     (n >>> 24) & 0xff,
@@ -3792,28 +3871,58 @@ function SubnetDetail({
   const writableSets = addressSets.filter((s) =>
     perms.can("write", "address_set", s.id),
   );
+  // Stable cache key for the memo below: the ``perms.can`` closure is a fresh
+  // identity every render, so we can't depend on ``writableSets`` directly
+  // (it re-allocates each render and would defeat the memo). Hash the writable
+  // sets' ids + bounds into a string instead so re-parsing only happens when
+  // the writable set membership or its ranges actually change.
+  const writableSetsKey = writableSets
+    .map(
+      (s) =>
+        `${s.id}|${s.range_kind}|${s.start_address ?? ""}|${s.end_address ?? ""}|${s.explicit_addresses.join(",")}`,
+    )
+    .join(";");
 
-  // True when the operator may edit the given IP: subnet-write, OR the IP
-  // falls inside a writable address set's range. Contiguous ranges are
-  // compared numerically (IPv4 via ``ipStringToInt``; IPv6 falls through
-  // to string-equality on the bounds), explicit sets by string match.
-  const ipInWritableSet = (address: string): boolean => {
+  // Pre-parse every writable address set's bounds once (BigInt, IPv4+IPv6),
+  // so per-row ``ipInWritableSet`` checks don't re-parse the same strings on
+  // every render (was O(IPs × sets × parse) per render). Mirrors the backend
+  // gate (``_user_can_write_ip``): contiguous = ``lo <= ip <= hi`` on the
+  // integer value, explicit = exact integer membership — both computed via
+  // ``ipToBigInt`` so the client and server agree for IPv4 and IPv6 alike.
+  const writableRanges = useMemo(() => {
+    const contiguous: Array<{ lo: bigint; hi: bigint }> = [];
+    const explicit = new Set<bigint>();
     for (const s of writableSets) {
       if (s.range_kind === "explicit") {
-        if (s.explicit_addresses.includes(address)) return true;
+        for (const raw of s.explicit_addresses) {
+          const v = ipToBigInt(raw);
+          if (v !== null) explicit.add(v);
+        }
         continue;
       }
       if (!s.start_address || !s.end_address) continue;
-      // IPv4 numeric containment.
-      if (address.includes(".") && s.start_address.includes(".")) {
-        const ipInt = ipStringToInt(address);
-        const lo = ipStringToInt(s.start_address);
-        const hi = ipStringToInt(s.end_address);
-        if (ipInt >= lo && ipInt <= hi) return true;
-      } else if (address === s.start_address || address === s.end_address) {
-        // IPv6 / non-dotted — conservative: only the exact bounds count.
-        return true;
-      }
+      let lo = ipToBigInt(s.start_address);
+      let hi = ipToBigInt(s.end_address);
+      if (lo === null || hi === null) continue;
+      if (lo > hi) [lo, hi] = [hi, lo];
+      contiguous.push({ lo, hi });
+    }
+    return { contiguous, explicit };
+    // ``writableSets`` is intentionally read inside but keyed via the stable
+    // ``writableSetsKey`` string so the memo only re-runs on real changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [writableSetsKey]);
+
+  // True when the operator may edit the given IP: subnet-write, OR the IP
+  // falls inside a writable address set's range. Unparseable input fails
+  // closed (no set match) as a last resort, consistent with the backend
+  // skipping unparseable bounds.
+  const ipInWritableSet = (address: string): boolean => {
+    const ip = ipToBigInt(address);
+    if (ip === null) return false;
+    if (writableRanges.explicit.has(ip)) return true;
+    for (const { lo, hi } of writableRanges.contiguous) {
+      if (ip >= lo && ip <= hi) return true;
     }
     return false;
   };

@@ -753,7 +753,12 @@ async def commit_address_import(
     subnet_net = ipaddress.ip_network(str(subnet.network), strict=False)
     existing = await _load_existing_addresses(db, subnet.id)
 
-    # Pre-flight: fail-strategy bails out before mutating anything.
+    # Pre-flight: fail-strategy bails out before mutating anything. A
+    # permission-blocked row (#103 delegation gate) is skipped from the
+    # duplicate check — we don't 409 a caller on a row they can't write
+    # anyway — but it is NOT silent: it's counted below so a fully
+    # permission-blocked import can't masquerade as a generic 0-created
+    # success (#7).
     if strategy == "fail":
         for row in payload.addresses:
             canonical, _, err = _row_address_fields(row)
@@ -892,6 +897,18 @@ async def commit_address_import(
                 result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")
         result_obj.created += 1
 
+    # #7: surface a permission-blocked batch distinctly. ``skipped_no_perm``
+    # already carries the per-row count, but a fully RBAC-blocked import would
+    # otherwise return created=0 / updated=0 with no ``errors`` entry — which
+    # reads as a benign no-op rather than the authorization failure it is. When
+    # nothing landed AND at least one row was permission-blocked, add a clear
+    # error so the caller can tell "blocked" apart from "already exists" / empty.
+    if result_obj.skipped_no_perm and not result_obj.created and not result_obj.updated:
+        result_obj.errors.append(
+            f"Permission denied: {result_obj.skipped_no_perm} row(s) fall outside "
+            "the subnet or any address set you can write — nothing was imported."
+        )
+
     # Keep the subnet's utilization counters roughly honest. The periodic
     # allocation-recount task corrects drift, but users expect the UI to
     # reflect the new row count immediately.
@@ -906,6 +923,7 @@ async def commit_address_import(
         created=result_obj.created,
         updated=result_obj.updated,
         skipped=result_obj.skipped,
+        skipped_no_perm=result_obj.skipped_no_perm,
         dns_synced=result_obj.dns_synced,
         errors=len(result_obj.errors),
     )

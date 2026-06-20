@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.address_set import ADDRESS_SET_RANGE_KINDS, AddressSet
+from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.services.nmap import NmapArgError, build_argv
@@ -942,30 +942,18 @@ class CreateAddressSetArgs(BaseModel):
 
 
 def _validate_address_set_shape(args: CreateAddressSetArgs) -> str | None:
-    """Return an error string if the contiguous/explicit shape is invalid."""
-    if args.range_kind not in ADDRESS_SET_RANGE_KINDS:
-        return f"range_kind must be one of {sorted(ADDRESS_SET_RANGE_KINDS)}"
-    if args.range_kind == "contiguous":
-        if not args.start_address or not args.end_address:
-            return "contiguous range requires start_address and end_address"
-        try:
-            s = ipaddress.ip_address(args.start_address)
-            e = ipaddress.ip_address(args.end_address)
-        except ValueError as exc:
-            return f"invalid start/end address: {exc}"
-        if s.version != e.version:
-            return "start_address and end_address must be the same IP family"
-        if int(s) > int(e):
-            return "start_address must be <= end_address"
-    else:
-        if not args.explicit_addresses:
-            return "explicit range requires a non-empty explicit_addresses list"
-        for raw in args.explicit_addresses:
-            try:
-                ipaddress.ip_address(raw)
-            except ValueError:
-                return f"invalid address in explicit_addresses: {raw}"
-    return None
+    """Return an error string if the contiguous/explicit shape is invalid.
+
+    Thin adapter over the shared ``validate_address_set_shape`` validator
+    in ``app.models.address_set`` — the rules live there once so the AI
+    operation and the REST router can't diverge.
+    """
+    return validate_address_set_shape(
+        args.range_kind,
+        args.start_address,
+        args.end_address,
+        list(args.explicit_addresses),
+    )
 
 
 def _address_set_targets(args: CreateAddressSetArgs) -> list[str]:
@@ -1055,7 +1043,10 @@ async def _apply_create_address_set(
         db,
         user=user,
         action="create",
-        resource_type="ipam.address_set",
+        # Bare RBAC type — the audit→event mapping in event_publisher keys
+        # on "address_set" (→ "ipam.address_set"); using the namespaced
+        # string here would silence the webhook event for AI-created sets.
+        resource_type="address_set",
         resource_id=str(row.id),
         resource_display=args.name,
         new_value={

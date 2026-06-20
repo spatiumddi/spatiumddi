@@ -279,7 +279,11 @@ async def _propose_via(
     args_model=CreateAddressSetArgs,
     writes=False,
     category="ipam",
-    default_enabled=False,
+    # Default-on (NN #13): no secrets, no broad blast radius, no off-prem
+    # call — matches sibling propose_create_ip_address / propose_allocate
+    # _subnet. The op still requires admin on address_set + explicit Apply.
+    default_enabled=True,
+    module="ipam.address_sets",
 )
 async def propose_create_address_set(
     db: AsyncSession, user: User, args: CreateAddressSetArgs

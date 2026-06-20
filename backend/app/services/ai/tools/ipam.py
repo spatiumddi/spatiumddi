@@ -939,6 +939,7 @@ class FindAddressSetsArgs(BaseModel):
     ),
     args_model=FindAddressSetsArgs,
     category="ipam",
+    module="ipam.address_sets",
 )
 async def find_address_sets(
     db: AsyncSession, user: User, args: FindAddressSetsArgs
@@ -982,6 +983,7 @@ class CountAddressSetsArgs(BaseModel):
     ),
     args_model=CountAddressSetsArgs,
     category="ipam",
+    module="ipam.address_sets",
 )
 async def count_address_sets(
     db: AsyncSession, user: User, args: CountAddressSetsArgs

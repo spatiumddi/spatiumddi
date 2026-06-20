@@ -277,10 +277,12 @@ def effective_grants(user: User) -> list[dict]:
       enforces.
 
     Resource ids are normalised through :func:`_perm_triple` so ``""`` / ``"*"``
-    collapse to ``None`` (any-instance). A legacy-column superadmin with no RBAC
-    wildcard gets a synthetic ``{*, *}`` entry appended so the list is non-empty
-    and backs the client-side ``is_superadmin`` short-circuit. Returns ``[]`` for
-    an inactive user (mirrors ``user_has_permission`` failing closed).
+    collapse to ``None`` (any-instance). A legacy-column superadmin
+    (``user.is_superadmin``) always gets a synthetic ``{*, *}`` entry added
+    before role processing so the list is non-empty and backs the client-side
+    ``is_superadmin`` short-circuit; if a role already carries the RBAC wildcard
+    the set-dedup makes the synthetic add a harmless no-op. Returns ``[]`` for an
+    inactive user (mirrors ``user_has_permission`` failing closed).
 
     Pure / synchronous — reads only attributes already stashed on ``user`` by
     the auth dependency; performs no DB or network IO.
@@ -290,8 +292,10 @@ def effective_grants(user: User) -> list[dict]:
 
     triples: set[tuple[str, str, str | None]] = set()
 
-    # Legacy-column superadmin without an RBAC wildcard role: surface the
-    # wildcard explicitly so the introspection payload is non-empty.
+    # Legacy-column superadmin: surface the wildcard explicitly so the
+    # introspection payload is non-empty. Added unconditionally before role
+    # processing — if a role already carries ``{*, *}`` the set-dedup makes
+    # this a harmless no-op.
     if user.is_superadmin:
         triples.add(("*", "*", None))
 
@@ -310,11 +314,50 @@ def effective_grants(user: User) -> list[dict]:
             triples.add(triple)
 
     # Token narrowing (issue #374): when the active credential is a
-    # resource-scoped token, keep only triples the token also permits — the
-    # exact intersection ``user_has_permission`` applies.
+    # resource-scoped token, intersect the RBAC set with the token's grants so
+    # ``permissionMatch`` over the returned list equals ``user_has_permission``
+    # for EVERY (action, resource_type, resource_id).
+    #
+    # The scoped path (``rid is not None``) reuses ``_token_grants_allow``'s
+    # exact check verbatim. The any-instance path (``rid is None``) must NOT be
+    # kept verbatim — ``_token_grants_allow`` returns True for a None req_rid as
+    # a COARSE router gate (so the request reaches the handler), but enforcement
+    # via per-row ``token_scope_allows`` is narrower. Keeping the broad
+    # ``(a, ty, None)`` triple here over-reports: it would claim any-instance
+    # access the token doesn't actually grant. So for a None-rid RBAC triple we
+    # substitute the token's own narrower scoped ids: if a covering grant is
+    # itself any-instance (None/``""``/``*``) we keep ``(a, ty, None)``; for each
+    # scoped covering grant we emit ``(a, ty, <grant.resource_id>)`` instead. A
+    # grant "covers" the action under the same rule ``_token_grants_allow`` uses
+    # (``_action_matches`` OR the read-implies-write/delete relaxation).
     token_grants = _token_grants_for(user)
     if token_grants:
-        triples = {t for t in triples if _token_grants_allow(token_grants, t[0], t[1], t[2])}
+        narrowed: set[tuple[str, str, str | None]] = set()
+        for action, resource_type, rid in triples:
+            if rid is not None:
+                # Scoped RBAC triple — keep iff the token also permits that
+                # exact instance (unchanged exact-scope intersection).
+                if _token_grants_allow(token_grants, action, resource_type, rid):
+                    narrowed.add((action, resource_type, rid))
+                continue
+            # Any-instance RBAC triple — narrow by each covering token grant.
+            for g in token_grants:
+                g_action = g.get("action", "")
+                action_ok = _action_matches(g_action, action) or (
+                    action == "read" and g_action in ("write", "delete")
+                )
+                if not action_ok:
+                    continue
+                if not _resource_type_matches(g.get("resource_type", ""), resource_type):
+                    continue
+                g_rid = g.get("resource_id")
+                if g_rid is None or g_rid == "" or g_rid == "*":
+                    # Token grant is itself any-instance — the broad triple holds.
+                    narrowed.add((action, resource_type, None))
+                else:
+                    # Substitute the token's narrower scoped id.
+                    narrowed.add((action, resource_type, str(g_rid)))
+        triples = narrowed
 
     ordered = sorted(triples, key=lambda t: (t[1], t[0], t[2] or ""))
     return [

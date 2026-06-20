@@ -25,7 +25,6 @@ from app.core.permissions import (
     user_has_permission,
 )
 from app.drivers.dhcp import is_agentless
-from app.models.address_set import AddressSet
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
@@ -50,6 +49,13 @@ from app.services.dhcp.windows_writethrough import (
     push_scope_delete,
     push_statics_bulk_delete,
 )
+from app.services.ipam.address_set_gate import (
+    WritableSetRanges,
+    load_writable_set_ranges,
+)
+from app.services.ipam.address_set_gate import (
+    user_can_write_ip as _user_can_write_ip,
+)
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.soft_delete import (
     apply_soft_delete,
@@ -61,10 +67,13 @@ logger = structlog.get_logger(__name__)
 
 # Router-level permission gate: GET → `read`, POST/PUT/PATCH → `write`,
 # DELETE → `delete`. Endpoints under /ipam manipulate IPAM resources, so we
-# accept any of the four IPAM resource types (an "IPAM Editor" role grants all
+# accept any of the IPAM resource types (an "IPAM Editor" role grants all
 # four; a scoped Subnet-writer role would be matched here for subnet routes
-# and fail for space routes — which is intended). Per-row scoping happens
-# inline in the handlers via `user_has_permission`.
+# and fail for space routes — which is intended). ``address_set`` is included
+# so the "Address Set Editor" role (admin on address_set only, #103) clears
+# this coarse gate and reaches the per-IP delegation gate
+# (``_user_can_write_ip``), which enforces the real per-row boundary. Per-row
+# scoping happens inline in the handlers via `user_has_permission`.
 router = APIRouter(
     dependencies=[
         Depends(
@@ -73,6 +82,7 @@ router = APIRouter(
                 "ip_block",
                 "subnet",
                 "ip_address",
+                "address_set",
                 "custom_field",
                 "nat_mapping",
                 "manage_ipam_templates",
@@ -613,64 +623,18 @@ def _ip_int_in_dynamic_pool(ip_int: int, ranges: list[tuple[int, int]]) -> bool:
 # ── Address-set write delegation (#103) ───────────────────────────────────
 #
 # A caller without subnet-wide ``write`` may still mutate an IP if it falls
-# inside an AddressSet they hold ``write``/``admin`` on. Resolve the writable
-# ranges once per request and check each IP against the packed int tuples.
+# inside an AddressSet they hold ``write``/``admin`` on. The gate helpers live
+# in ``app.services.ipam.address_set_gate`` (shared with the import path, #12);
+# ``_load_writable_set_ranges`` is a thin local alias preserving the original
+# call-site name.
 
 
 async def _load_writable_set_ranges(
     db: AsyncSession, user: Any, subnet_id: uuid.UUID
-) -> list[tuple[int, int]]:
-    """Return packed ``[(start_int, end_int)]`` for every AddressSet on this
-    subnet the user can WRITE (``write`` OR ``admin`` on that address_set id).
-
-    Resolved once per request; contiguous sets expand to one tuple, explicit
-    sets to one tuple per host (``(ip, ip)``). Empty when none — the caller
-    still must hold subnet write for any IP outside these ranges.
-    """
-    rows = await db.execute(
-        select(
-            AddressSet.id,
-            AddressSet.range_kind,
-            AddressSet.start_address,
-            AddressSet.end_address,
-            AddressSet.explicit_addresses,
-        ).where(AddressSet.subnet_id == subnet_id)
-    )
-    out: list[tuple[int, int]] = []
-    for set_id, range_kind, start_addr, end_addr, explicit in rows.all():
-        if not (
-            user_has_permission(user, "write", "address_set", set_id)
-            or user_has_permission(user, "admin", "address_set", set_id)
-        ):
-            continue
-        if range_kind == "contiguous" and start_addr is not None and end_addr is not None:
-            try:
-                s = int(ipaddress.ip_address(str(start_addr)))
-                e = int(ipaddress.ip_address(str(end_addr)))
-            except (ValueError, TypeError):
-                continue
-            if s > e:
-                s, e = e, s
-            out.append((s, e))
-        else:
-            for raw in explicit or []:
-                try:
-                    v = int(ipaddress.ip_address(str(raw)))
-                except (ValueError, TypeError):
-                    continue
-                out.append((v, v))
-    return out
-
-
-def _user_can_write_ip(
-    user: Any,
-    ip_int: int,
-    subnet_writable: bool,
-    set_ranges: list[tuple[int, int]],
-) -> bool:
-    """True if the caller may mutate this IP — either subnet-wide write, or
-    the IP falls inside an address set they hold write/admin on."""
-    return subnet_writable or any(s <= ip_int <= e for s, e in set_ranges)
+) -> WritableSetRanges:
+    """Resolve the caller's address-set-delegated writable ranges on this subnet
+    (alias for :func:`app.services.ipam.address_set_gate.load_writable_set_ranges`)."""
+    return await load_writable_set_ranges(db, user, subnet_id)
 
 
 def _eui64_from_mac(net: ipaddress.IPv6Network, mac: str) -> ipaddress.IPv6Address | None:
@@ -703,11 +667,20 @@ async def _pick_next_available_ip(
     *,
     strategy: str = "sequential",
     mac_address: str | None = None,
+    allowed_ranges: WritableSetRanges | None = None,
 ) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     """Return the first free host in ``subnet`` that isn't in a dynamic pool.
 
     Shared by ``allocate_next_ip`` (which commits) and the read-only
     preview endpoint.
+
+    ``allowed_ranges`` (#8): when set, candidate IPs are constrained to the
+    caller's address-set-delegated writable space (intersected with the
+    subnet). A caller who lacks subnet-wide write but holds writable sets must
+    pass their resolved ranges here so the picker never hands out an address
+    the per-IP gate would then 403 (and reports "no available IP" only when no
+    free host inside *their* ranges exists). ``None`` = unconstrained (the
+    subnet-write-holder path).
 
     For IPv6 the ``strategy`` argument is honoured but also falls back
     to ``Subnet.ipv6_allocation_policy`` when the caller doesn't know
@@ -730,6 +703,11 @@ async def _pick_next_available_ip(
 
     dynamic_ranges = await _load_dynamic_pool_ranges(db, subnet.id)
 
+    def _allowed(ip_int: int) -> bool:
+        """#8: when the caller is address-set-delegated, the candidate must
+        fall inside their writable ranges. ``None`` = unconstrained."""
+        return allowed_ranges is None or allowed_ranges.contains(ip_int)
+
     # ── IPv6 ──────────────────────────────────────────────────────────
     if isinstance(net, ipaddress.IPv6Network):
         effective = strategy
@@ -744,7 +722,7 @@ async def _pick_next_available_ip(
 
         if effective == "eui64":
             candidate = _eui64_from_mac(net, mac_address or "")
-            if candidate is not None and str(candidate) not in used:
+            if candidate is not None and str(candidate) not in used and _allowed(int(candidate)):
                 return candidate
             # Fall through to random if EUI-64 can't be honoured (bad
             # MAC, non-/64, or collision with an existing row).
@@ -759,6 +737,8 @@ async def _pick_next_available_ip(
                 if str(host) in used:
                     continue
                 if dynamic_ranges and _ip_int_in_dynamic_pool(int(host), dynamic_ranges):
+                    continue
+                if not _allowed(int(host)):
                     continue
                 return host
             return None
@@ -786,6 +766,8 @@ async def _pick_next_available_ip(
                 continue
             if dynamic_ranges and _ip_int_in_dynamic_pool(candidate_int, dynamic_ranges):
                 continue
+            if not _allowed(candidate_int):
+                continue
             return candidate
         return None
 
@@ -803,6 +785,8 @@ async def _pick_next_available_ip(
         if str(host) in used:
             continue
         if dynamic_ranges and _ip_int_in_dynamic_pool(int(host), dynamic_ranges):
+            continue
+        if not _allowed(int(host)):
             continue
         return host
     return None
@@ -7675,6 +7659,19 @@ async def allocate_next_ip(
     # so a caller scoped to one set can't allocate outside it.
     subnet_writable = user_has_permission(current_user, "write", "subnet", subnet_id)
     set_ranges = await _load_writable_set_ranges(db, current_user, subnet_id)
+    # #8: a caller with neither subnet-wide write nor any writable address set
+    # on this subnet can't allocate anywhere — 403 early with a clear message
+    # rather than scanning the subnet and 403'ing per-candidate. When the
+    # caller IS address-set-delegated (no subnet write), constrain the
+    # candidate space to their writable ranges so the picker never hands out
+    # an address outside them (which would then 403, or report "none available"
+    # while free IPs exist outside their reach).
+    if not subnet_writable and not set_ranges:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No write permission on this subnet or any address set on it.",
+        )
+    allowed_ranges = None if subnet_writable else set_ranges
     if subnet.kind == "multicast":
         raise HTTPException(
             status_code=422,
@@ -7707,15 +7704,23 @@ async def allocate_next_ip(
         subnet,
         strategy=body.strategy,
         mac_address=body.mac_address,
+        allowed_ranges=allowed_ranges,
     )
     if chosen is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
+        # Tailor the message: a delegated caller's "none" means none free
+        # inside THEIR ranges, not the whole subnet.
+        if allowed_ranges is not None:
+            detail = (
+                "No available IP addresses inside the address set(s) you can "
+                "write on this subnet (every host is allocated or in a dynamic "
+                "DHCP pool)."
+            )
+        else:
+            detail = (
                 "No available IP addresses in this subnet (every free host "
                 "is reserved or falls in a dynamic DHCP pool)."
-            ),
-        )
+            )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
 
     if not _user_can_write_ip(current_user, int(chosen), subnet_writable, set_ranges):
         raise HTTPException(
@@ -8293,9 +8298,9 @@ async def bulk_delete_addresses(
     subnets_touched: set[uuid.UUID] = set()
     # Address-set write delegation (#103): resolve writable ranges once per
     # distinct subnet so a per-IP check is cheap.
-    set_gate_cache: dict[uuid.UUID, tuple[bool, list[tuple[int, int]]]] = {}
+    set_gate_cache: dict[uuid.UUID, tuple[bool, WritableSetRanges]] = {}
 
-    async def _gate_for(sid: uuid.UUID) -> tuple[bool, list[tuple[int, int]]]:
+    async def _gate_for(sid: uuid.UUID) -> tuple[bool, WritableSetRanges]:
         if sid not in set_gate_cache:
             set_gate_cache[sid] = (
                 user_has_permission(current_user, "write", "subnet", sid),
@@ -8498,9 +8503,9 @@ async def bulk_edit_addresses(
     subnet_cache: dict[uuid.UUID, Subnet] = {}
     # Address-set write delegation (#103): resolve writable ranges once per
     # distinct subnet (not per IP).
-    set_gate_cache: dict[uuid.UUID, tuple[bool, list[tuple[int, int]]]] = {}
+    set_gate_cache: dict[uuid.UUID, tuple[bool, WritableSetRanges]] = {}
 
-    async def _gate_for(sid: uuid.UUID) -> tuple[bool, list[tuple[int, int]]]:
+    async def _gate_for(sid: uuid.UUID) -> tuple[bool, WritableSetRanges]:
         if sid not in set_gate_cache:
             set_gate_cache[sid] = (
                 user_has_permission(current_user, "write", "subnet", sid),
