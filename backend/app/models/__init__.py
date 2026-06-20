@@ -1,5 +1,6 @@
 from app.models.acme import ACMEAccount
 from app.models.acme_client import ACMEClientAccount, ACMEHTTPChallenge, ACMEOrder
+from app.models.address_set import ADDRESS_SET_RANGE_KINDS, AddressSet
 from app.models.ai import AIChatMessage, AIChatSession, AIProvider
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.appliance import (
@@ -119,6 +120,8 @@ __all__ = [
     "ACMEClientAccount",
     "ACMEHTTPChallenge",
     "ACMEOrder",
+    "ADDRESS_SET_RANGE_KINDS",
+    "AddressSet",
     "AIChatMessage",
     "AIChatSession",
     "AIProvider",

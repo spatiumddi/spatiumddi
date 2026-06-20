@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { timeBoundGrantsApi, type TimeBoundGrantCreate } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { ResourceIdPicker } from "@/components/ownership/ResourceIdPicker";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -20,6 +21,7 @@ const RESOURCE_TYPES: string[] = [
   "ip_block",
   "subnet",
   "ip_address",
+  "address_set",
   "vlan",
   "vrf",
   "asn",
@@ -168,11 +170,11 @@ export function CreateTimeBoundGrantModal({
         </div>
 
         <Field label="Resource ID (optional — scope to one instance)">
-          <input
+          <ResourceIdPicker
             className={inputCls}
-            value={resourceId}
-            onChange={(e) => setResourceId(e.target.value)}
-            placeholder="Leave blank for the whole resource type"
+            resourceType={resourceType}
+            value={resourceId || null}
+            onChange={(id) => setResourceId(id ?? "")}
           />
         </Field>
 

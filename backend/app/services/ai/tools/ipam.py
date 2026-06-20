@@ -21,6 +21,7 @@ from sqlalchemy import cast, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.address_set import AddressSet
 from app.models.asn import ASN
 from app.models.auth import User
 from app.models.circuit import Circuit
@@ -913,6 +914,87 @@ async def count_ipam_resources(
         "subnets": int(subnet_count or 0),
         "ip_addresses": int(ip_count or 0),
         "ip_addresses_by_status": {row[0]: int(row[1]) for row in by_status_rows},
+    }
+
+
+# ── address sets (#103) ───────────────────────────────────────────────
+
+
+class FindAddressSetsArgs(BaseModel):
+    subnet_id: str | None = Field(
+        default=None,
+        description="Filter by subnet UUID — omit to search across all subnets.",
+    )
+    search: str | None = Field(default=None, description="Substring match on the address-set name.")
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+@register_tool(
+    name="find_address_sets",
+    description=(
+        "List address sets — named, RBAC-scoped slices of a subnet's "
+        "address space (a contiguous range like .50–.99 or an explicit "
+        "list of hosts) used to delegate edit of just that slice without "
+        "subnet-wide write. Filterable by subnet and name substring."
+    ),
+    args_model=FindAddressSetsArgs,
+    category="ipam",
+)
+async def find_address_sets(
+    db: AsyncSession, user: User, args: FindAddressSetsArgs
+) -> list[dict[str, Any]] | dict[str, Any]:
+    stmt = select(AddressSet)
+    if args.subnet_id:
+        try:
+            stmt = stmt.where(AddressSet.subnet_id == uuid.UUID(args.subnet_id))
+        except ValueError:
+            return {"error": f"subnet_id {args.subnet_id!r} is not a valid UUID."}
+    if args.search:
+        stmt = stmt.where(AddressSet.name.ilike(f"%{args.search}%"))
+    stmt = stmt.order_by(AddressSet.name).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(s.id),
+            "name": s.name,
+            "subnet_id": str(s.subnet_id),
+            "range_kind": s.range_kind,
+            "start_address": str(s.start_address) if s.start_address is not None else None,
+            "end_address": str(s.end_address) if s.end_address is not None else None,
+            "explicit_addresses": list(s.explicit_addresses or []),
+            "customer_id": str(s.customer_id) if s.customer_id else None,
+            "site_id": str(s.site_id) if s.site_id else None,
+        }
+        for s in rows
+    ]
+
+
+class CountAddressSetsArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="count_address_sets",
+    description=(
+        "Total count of address sets plus a breakdown by range kind "
+        "(contiguous vs explicit). Use to answer 'how many address sets "
+        "do I have?'."
+    ),
+    args_model=CountAddressSetsArgs,
+    category="ipam",
+)
+async def count_address_sets(
+    db: AsyncSession, user: User, args: CountAddressSetsArgs
+) -> dict[str, Any]:
+    total = await db.scalar(select(func.count(AddressSet.id)))
+    by_kind_rows = (
+        await db.execute(
+            select(AddressSet.range_kind, func.count(AddressSet.id)).group_by(AddressSet.range_kind)
+        )
+    ).all()
+    return {
+        "address_sets": int(total or 0),
+        "by_range_kind": {row[0]: int(row[1]) for row in by_kind_rows},
     }
 
 

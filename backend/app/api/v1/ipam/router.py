@@ -19,8 +19,13 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
-from app.core.permissions import require_any_resource_permission, token_scope_allows
+from app.core.permissions import (
+    require_any_resource_permission,
+    token_scope_allows,
+    user_has_permission,
+)
 from app.drivers.dhcp import is_agentless
+from app.models.address_set import AddressSet
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
@@ -603,6 +608,69 @@ async def _load_dynamic_pool_ranges(
 
 def _ip_int_in_dynamic_pool(ip_int: int, ranges: list[tuple[int, int]]) -> bool:
     return any(s <= ip_int <= e for s, e in ranges)
+
+
+# ── Address-set write delegation (#103) ───────────────────────────────────
+#
+# A caller without subnet-wide ``write`` may still mutate an IP if it falls
+# inside an AddressSet they hold ``write``/``admin`` on. Resolve the writable
+# ranges once per request and check each IP against the packed int tuples.
+
+
+async def _load_writable_set_ranges(
+    db: AsyncSession, user: Any, subnet_id: uuid.UUID
+) -> list[tuple[int, int]]:
+    """Return packed ``[(start_int, end_int)]`` for every AddressSet on this
+    subnet the user can WRITE (``write`` OR ``admin`` on that address_set id).
+
+    Resolved once per request; contiguous sets expand to one tuple, explicit
+    sets to one tuple per host (``(ip, ip)``). Empty when none — the caller
+    still must hold subnet write for any IP outside these ranges.
+    """
+    rows = await db.execute(
+        select(
+            AddressSet.id,
+            AddressSet.range_kind,
+            AddressSet.start_address,
+            AddressSet.end_address,
+            AddressSet.explicit_addresses,
+        ).where(AddressSet.subnet_id == subnet_id)
+    )
+    out: list[tuple[int, int]] = []
+    for set_id, range_kind, start_addr, end_addr, explicit in rows.all():
+        if not (
+            user_has_permission(user, "write", "address_set", set_id)
+            or user_has_permission(user, "admin", "address_set", set_id)
+        ):
+            continue
+        if range_kind == "contiguous" and start_addr is not None and end_addr is not None:
+            try:
+                s = int(ipaddress.ip_address(str(start_addr)))
+                e = int(ipaddress.ip_address(str(end_addr)))
+            except (ValueError, TypeError):
+                continue
+            if s > e:
+                s, e = e, s
+            out.append((s, e))
+        else:
+            for raw in explicit or []:
+                try:
+                    v = int(ipaddress.ip_address(str(raw)))
+                except (ValueError, TypeError):
+                    continue
+                out.append((v, v))
+    return out
+
+
+def _user_can_write_ip(
+    user: Any,
+    ip_int: int,
+    subnet_writable: bool,
+    set_ranges: list[tuple[int, int]],
+) -> bool:
+    """True if the caller may mutate this IP — either subnet-wide write, or
+    the IP falls inside an address set they hold write/admin on."""
+    return subnet_writable or any(s <= ip_int <= e for s, e in set_ranges)
 
 
 def _eui64_from_mac(net: ipaddress.IPv6Network, mac: str) -> ipaddress.IPv6Address | None:
@@ -6234,6 +6302,16 @@ async def create_address(
             detail=f"Address {body.address} is not within subnet {subnet.network}",
         )
 
+    # Address-set write delegation (#103): permit if the caller holds subnet
+    # write OR write/admin on an address set covering this IP.
+    subnet_writable = user_has_permission(current_user, "write", "subnet", subnet_id)
+    set_ranges = await _load_writable_set_ranges(db, current_user, subnet_id)
+    if not _user_can_write_ip(current_user, int(addr), subnet_writable, set_ranges):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(f"No write permission on subnet or any address set covering {body.address}"),
+        )
+
     # Refuse allocation inside a dynamic DHCP pool — the DHCP server owns
     # that range and will hand it out on first ``DISCOVER``. Other pool
     # types (excluded / reserved) don't conflict with manual allocation.
@@ -6437,6 +6515,16 @@ async def update_address(
                 "DHCP server. Edit the lease or convert it to a reservation "
                 "at the source."
             ),
+        )
+
+    # Address-set write delegation (#103).
+    subnet_writable = user_has_permission(current_user, "write", "subnet", ip.subnet_id)
+    set_ranges = await _load_writable_set_ranges(db, current_user, ip.subnet_id)
+    ip_int = int(ipaddress.ip_address(str(ip.address)))
+    if not _user_can_write_ip(current_user, ip_int, subnet_writable, set_ranges):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(f"No write permission on subnet or any address set covering {ip.address}"),
         )
 
     # MAC required if transitioning to static_dhcp
@@ -6881,6 +6969,17 @@ async def delete_address(
             ),
         )
 
+    # Address-set write delegation (#103).
+    subnet_writable = user_has_permission(current_user, "write", "subnet", ip.subnet_id)
+    set_ranges = await _load_writable_set_ranges(db, current_user, ip.subnet_id)
+    if not _user_can_write_ip(
+        current_user, int(ipaddress.ip_address(str(ip.address))), subnet_writable, set_ranges
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(f"No write permission on subnet or any address set covering {ip.address}"),
+        )
+
     subnet = await db.get(Subnet, ip.subnet_id)
 
     # Clean up any DHCP static reservations tied to this IP. The FK is
@@ -7157,6 +7256,9 @@ class BulkAllocateCommitResponse(BaseModel):
     skipped_in_use: int
     skipped_in_pool: int
     skipped_fqdn_collision: int
+    # IPs the caller has no write permission on (subnet-wide nor any address
+    # set covering them) — #103 delegation.
+    skipped_no_perm: int = 0
     sample_created: list[str]
     summary: list[str]
 
@@ -7341,6 +7443,9 @@ async def bulk_allocate_commit(
     subnet = result.unique().scalar_one_or_none()
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    # Token-scope parity with the other address handlers (this one historically
+    # lacked the check).
+    _enforce_subnet_token_scope(current_user, subnet_id)
     if subnet.kind == "multicast":
         raise HTTPException(
             status_code=422,
@@ -7350,6 +7455,18 @@ async def bulk_allocate_commit(
             ),
         )
 
+    # Address-set write delegation (#103), resolved once for the whole batch.
+    subnet_writable = user_has_permission(current_user, "write", "subnet", subnet_id)
+    set_ranges = await _load_writable_set_ranges(db, current_user, subnet_id)
+
+    def _no_perm(addr: str) -> bool:
+        try:
+            return not _user_can_write_ip(
+                current_user, int(ipaddress.ip_address(addr)), subnet_writable, set_ranges
+            )
+        except ValueError:
+            return True
+
     items, _warnings, _ = await _build_bulk_allocate_candidates(db, subnet, body)
 
     skipped_in_use = sum(1 for i in items if i.in_use)
@@ -7357,7 +7474,14 @@ async def bulk_allocate_commit(
     skipped_fqdn = sum(
         1 for i in items if not i.in_use and not i.in_dynamic_pool and i.fqdn_collision
     )
-    total_conflicts = skipped_in_use + skipped_in_pool + skipped_fqdn
+    # Only IPs that survive the other conflict buckets can be perm-blocked —
+    # count them on the would-be-created set so the buckets don't double-count.
+    skipped_no_perm = sum(
+        1
+        for i in items
+        if not i.in_use and not i.in_dynamic_pool and not i.fqdn_collision and _no_perm(i.address)
+    )
+    total_conflicts = skipped_in_use + skipped_in_pool + skipped_fqdn + skipped_no_perm
 
     if body.on_collision == "abort" and total_conflicts > 0:
         raise HTTPException(
@@ -7370,6 +7494,7 @@ async def bulk_allocate_commit(
                 "conflicts_in_use": skipped_in_use,
                 "conflicts_in_pool": skipped_in_pool,
                 "conflicts_fqdn": skipped_fqdn,
+                "conflicts_no_perm": skipped_no_perm,
             },
         )
 
@@ -7381,6 +7506,8 @@ async def bulk_allocate_commit(
     async with _batched_dns_ops(db):
         for item in items:
             if item.in_use or item.in_dynamic_pool or item.fqdn_collision:
+                continue
+            if _no_perm(item.address):
                 continue
             ip = IPAddress(
                 subnet_id=subnet_id,
@@ -7431,6 +7558,7 @@ async def bulk_allocate_commit(
                 "skipped_in_use": skipped_in_use,
                 "skipped_in_pool": skipped_in_pool,
                 "skipped_fqdn": skipped_fqdn,
+                "skipped_no_perm": skipped_no_perm,
             },
         )
     )
@@ -7444,6 +7572,7 @@ async def bulk_allocate_commit(
         skipped_in_use=skipped_in_use,
         skipped_in_pool=skipped_in_pool,
         skipped_fqdn=skipped_fqdn,
+        skipped_no_perm=skipped_no_perm,
     )
 
     sample_created = (
@@ -7456,12 +7585,15 @@ async def bulk_allocate_commit(
         summary.append(f"Skipped {skipped_in_pool} IP(s) inside dynamic DHCP pools.")
     if skipped_fqdn:
         summary.append(f"Skipped {skipped_fqdn} IP(s) due to FQDN collisions.")
+    if skipped_no_perm:
+        summary.append(f"Skipped {skipped_no_perm} IP(s) outside your write permission.")
 
     return BulkAllocateCommitResponse(
         created=len(created_addrs),
         skipped_in_use=skipped_in_use,
         skipped_in_pool=skipped_in_pool,
         skipped_fqdn_collision=skipped_fqdn,
+        skipped_no_perm=skipped_no_perm,
         sample_created=sample_created,
         summary=summary,
     )
@@ -7539,6 +7671,10 @@ async def allocate_next_ip(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(current_user, subnet_id)
+    # Resolve address-set write delegation (#103) once, before the pick loop
+    # so a caller scoped to one set can't allocate outside it.
+    subnet_writable = user_has_permission(current_user, "write", "subnet", subnet_id)
+    set_ranges = await _load_writable_set_ranges(db, current_user, subnet_id)
     if subnet.kind == "multicast":
         raise HTTPException(
             status_code=422,
@@ -7579,6 +7715,12 @@ async def allocate_next_ip(
                 "No available IP addresses in this subnet (every free host "
                 "is reserved or falls in a dynamic DHCP pool)."
             ),
+        )
+
+    if not _user_can_write_ip(current_user, int(chosen), subnet_writable, set_ranges):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(f"No write permission on subnet or any address set covering {chosen}"),
         )
 
     ip = IPAddress(
@@ -8149,6 +8291,17 @@ async def bulk_delete_addresses(
     deleted = 0
     skipped: list[uuid.UUID] = []
     subnets_touched: set[uuid.UUID] = set()
+    # Address-set write delegation (#103): resolve writable ranges once per
+    # distinct subnet so a per-IP check is cheap.
+    set_gate_cache: dict[uuid.UUID, tuple[bool, list[tuple[int, int]]]] = {}
+
+    async def _gate_for(sid: uuid.UUID) -> tuple[bool, list[tuple[int, int]]]:
+        if sid not in set_gate_cache:
+            set_gate_cache[sid] = (
+                user_has_permission(current_user, "write", "subnet", sid),
+                await _load_writable_set_ranges(db, current_user, sid),
+            )
+        return set_gate_cache[sid]
 
     for ip in rows:
         if ip.status in ("network", "broadcast"):
@@ -8160,6 +8313,14 @@ async def bulk_delete_addresses(
         # Resource-scoped token (#374): skip IPs outside the token's bound
         # subnet so a subnet-scoped token can't bulk-delete across subnets.
         if not token_scope_allows(current_user, "subnet", ip.subnet_id):
+            skipped.append(ip.id)
+            continue
+        # Address-set write delegation (#103): skip IPs the caller has no
+        # write permission on (subnet-wide nor any covering address set).
+        subnet_writable, set_ranges = await _gate_for(ip.subnet_id)
+        if not _user_can_write_ip(
+            current_user, int(ipaddress.ip_address(str(ip.address))), subnet_writable, set_ranges
+        ):
             skipped.append(ip.id)
             continue
         subnet = await db.get(Subnet, ip.subnet_id)
@@ -8335,6 +8496,17 @@ async def bulk_edit_addresses(
 
     # Cache the subnet rows so per-IP DNS sync doesn't re-query for every row.
     subnet_cache: dict[uuid.UUID, Subnet] = {}
+    # Address-set write delegation (#103): resolve writable ranges once per
+    # distinct subnet (not per IP).
+    set_gate_cache: dict[uuid.UUID, tuple[bool, list[tuple[int, int]]]] = {}
+
+    async def _gate_for(sid: uuid.UUID) -> tuple[bool, list[tuple[int, int]]]:
+        if sid not in set_gate_cache:
+            set_gate_cache[sid] = (
+                user_has_permission(current_user, "write", "subnet", sid),
+                await _load_writable_set_ranges(db, current_user, sid),
+            )
+        return set_gate_cache[sid]
 
     # A zone re-assignment edit fans the same op out to one new zone across
     # every selected IP — batch per zone so an agentless Windows-DNS primary
@@ -8353,6 +8525,17 @@ async def bulk_edit_addresses(
             # Resource-scoped token (#374): a subnet-scoped token can't bulk-edit
             # IPs outside its bound subnet.
             if not token_scope_allows(current_user, "subnet", ip.subnet_id):
+                skipped.append(ip.id)
+                continue
+            # Address-set write delegation (#103): skip IPs the caller has no
+            # write permission on (subnet-wide nor any covering address set).
+            subnet_writable, set_ranges = await _gate_for(ip.subnet_id)
+            if not _user_can_write_ip(
+                current_user,
+                int(ipaddress.ip_address(str(ip.address))),
+                subnet_writable,
+                set_ranges,
+            ):
                 skipped.append(ip.id)
                 continue
 

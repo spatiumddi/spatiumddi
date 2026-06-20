@@ -79,6 +79,7 @@ _RESOURCE_NAMESPACE: dict[str, str] = {
     "ip_address": "ip",
     "nat_mapping": "ipam.nat",
     "subnet_plan": "ipam.plan",
+    "address_set": "ipam.address_set",
     # DNS
     "dns_zone": "dns.zone",
     "dns_record": "dns.record",

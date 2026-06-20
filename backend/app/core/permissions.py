@@ -261,6 +261,68 @@ def _user_rbac_allows(user: User, action: str, resource_type: str, req_rid: str 
     return False
 
 
+def effective_grants(user: User) -> list[dict]:
+    """Assemble the deduped, effective permission triples ``user`` resolves to.
+
+    Mirrors the resolution path of :func:`user_has_permission` exactly so the
+    list answers "which (action, resource_type, resource_id) does this caller
+    actually get?" for self-introspection (``GET /auth/me/permissions``):
+
+    * static role permissions (``group → role → permissions``)
+    * ∪ live time-bound grants (issue #65, stashed on
+      ``_active_time_bound_grants`` by the auth dep)
+    * **then narrowed** by the active credential's API-token resource grants
+      (issue #374) — a resource-scoped token only ever shrinks the owner's set,
+      so the returned list is the intersection that ``user_has_permission``
+      enforces.
+
+    Resource ids are normalised through :func:`_perm_triple` so ``""`` / ``"*"``
+    collapse to ``None`` (any-instance). A legacy-column superadmin with no RBAC
+    wildcard gets a synthetic ``{*, *}`` entry appended so the list is non-empty
+    and backs the client-side ``is_superadmin`` short-circuit. Returns ``[]`` for
+    an inactive user (mirrors ``user_has_permission`` failing closed).
+
+    Pure / synchronous — reads only attributes already stashed on ``user`` by
+    the auth dependency; performs no DB or network IO.
+    """
+    if not user.is_active:
+        return []
+
+    triples: set[tuple[str, str, str | None]] = set()
+
+    # Legacy-column superadmin without an RBAC wildcard role: surface the
+    # wildcard explicitly so the introspection payload is non-empty.
+    if user.is_superadmin:
+        triples.add(("*", "*", None))
+
+    # Static role permissions.
+    for group in user.groups:
+        for role in group.roles:
+            for perm in role.permissions or []:
+                triple = _perm_triple(perm)
+                if triple is not None:
+                    triples.add(triple)
+
+    # Additive union over any live time-bound grants (issue #65).
+    for grant in getattr(user, "_active_time_bound_grants", None) or []:
+        triple = _perm_triple(grant)
+        if triple is not None:
+            triples.add(triple)
+
+    # Token narrowing (issue #374): when the active credential is a
+    # resource-scoped token, keep only triples the token also permits — the
+    # exact intersection ``user_has_permission`` applies.
+    token_grants = _token_grants_for(user)
+    if token_grants:
+        triples = {t for t in triples if _token_grants_allow(token_grants, t[0], t[1], t[2])}
+
+    ordered = sorted(triples, key=lambda t: (t[1], t[0], t[2] or ""))
+    return [
+        {"action": action, "resource_type": resource_type, "resource_id": rid}
+        for action, resource_type, rid in ordered
+    ]
+
+
 # ── Privilege ceiling for delegated role / group editing ──────────────────────
 #
 # SECURITY (#400, finding C4): a non-superadmin holding a delegated
@@ -524,6 +586,7 @@ KNOWN_MANAGE_PERMISSIONS: frozenset[str] = frozenset(
 __all__ = [
     "KNOWN_MANAGE_PERMISSIONS",
     "caller_can_grant",
+    "effective_grants",
     "is_effective_superadmin",
     "require_any_permission",
     "require_any_resource_permission",

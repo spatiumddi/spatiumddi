@@ -167,6 +167,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "ip_block"},
             {"action": "admin", "resource_type": "subnet"},
             {"action": "admin", "resource_type": "ip_address"},
+            {"action": "admin", "resource_type": "address_set"},
             {"action": "admin", "resource_type": "vlan"},
             {"action": "admin", "resource_type": "nat_mapping"},
             {"action": "admin", "resource_type": "custom_field"},
@@ -175,6 +176,14 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "site"},
             {"action": "admin", "resource_type": "provider"},
             {"action": "admin", "resource_type": "network_service"},
+        ],
+    ),
+    "Address Set Editor": (
+        "Admin on address sets — delegated edit of a named IP slice within a "
+        "subnet (its own range) without subnet-wide write. Grant on a specific "
+        "address-set id to scope a department admin to just their slice.",
+        [
+            {"action": "admin", "resource_type": "address_set"},
         ],
     ),
     "DNS Editor": (

@@ -42,7 +42,7 @@ from app.core.auth.user_sync import (
 )
 from app.core.auth_throttle import login_rate_limited, mfa_challenge_consume
 from app.core.demo_mode import forbid_in_demo_mode
-from app.core.permissions import is_effective_superadmin
+from app.core.permissions import effective_grants, is_effective_superadmin
 from app.core.request_meta import clean_user_agent
 from app.core.security import (
     create_access_token,
@@ -141,6 +141,17 @@ class UserResponse(BaseModel):
     auth_source: str
 
     model_config = {"from_attributes": True}
+
+
+class PermissionGrant(BaseModel):
+    action: str
+    resource_type: str
+    resource_id: str | None = None
+
+
+class MyPermissionsResponse(BaseModel):
+    is_superadmin: bool
+    grants: list[PermissionGrant]
 
 
 class ChangePasswordRequest(BaseModel):
@@ -859,6 +870,41 @@ async def get_me(current_user: CurrentUser) -> UserResponse:
         is_superadmin=is_effective_superadmin(current_user),
         force_password_change=current_user.force_password_change,
         auth_source=current_user.auth_source,
+    )
+
+
+@router.get("/me/permissions", response_model=MyPermissionsResponse)
+async def get_my_permissions(current_user: CurrentUser) -> MyPermissionsResponse:
+    """Return the calling credential's effective permission grants (issue #449).
+
+    Self-only introspection: reads only ``current_user`` (no user-id param, no
+    DB query by id), so a caller can never enumerate another user's grants. The
+    payload is the *effective* set — static role permissions ∪ live time-bound
+    grants (issue #65), then narrowed by the active credential's API-token
+    resource grants (issue #374) — assembled by ``effective_grants`` along the
+    exact resolution path ``user_has_permission`` enforces. ``is_superadmin``
+    reports the *effective* status (legacy column OR RBAC ``{*, *}`` wildcard),
+    matching ``/auth/me``; the client short-circuits on it and treats the user
+    as omnipotent without inspecting ``grants``.
+
+    Read-only introspection → **no audit row** (consistent with ``/auth/me`` and
+    ``/auth/mfa/status``). The grant triples are already stashed on
+    ``current_user`` by the auth dependency, so the body performs no DB or
+    network IO.
+
+    Explicit non-coverage decisions:
+
+    * **MCP (#13):** no MCP tool is warranted. This is caller-credential-scoped
+      self-data with no resource ``find_*`` / ``count_*`` semantics; the MCP
+      transport exposes the read-only tool registry, not per-credential
+      introspection.
+    * **Feature module (#14):** not a new top-level resource family — it is an
+      introspection read on the existing ``/auth`` router, so no ``ModuleSpec``
+      gating applies.
+    """
+    return MyPermissionsResponse(
+        is_superadmin=is_effective_superadmin(current_user),
+        grants=[PermissionGrant(**g) for g in effective_grants(current_user)],
     )
 
 

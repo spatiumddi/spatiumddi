@@ -182,12 +182,38 @@ async def import_addresses_commit(
     """
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
+
+    # Address-set write delegation (#103): resolve the caller's writable
+    # ranges once and refuse the whole import if they hold neither subnet-wide
+    # write nor any address set on this subnet. Otherwise pass a per-IP gate
+    # closure so rows outside the writable ranges are skipped + reported.
+    import ipaddress
+
+    from app.api.v1.ipam.router import _load_writable_set_ranges, _user_can_write_ip
+    from app.core.permissions import user_has_permission
+
+    subnet_writable = user_has_permission(current_user, "write", "subnet", subnet_id)
+    set_ranges = await _load_writable_set_ranges(db, current_user, subnet_id)
+    if not subnet_writable and not set_ranges:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No write permission on subnet or any address set on it.",
+        )
+
+    def _can_write(addr: str) -> bool:
+        try:
+            ip_int = int(ipaddress.ip_address(addr))
+        except ValueError:
+            return False
+        return _user_can_write_ip(current_user, ip_int, subnet_writable, set_ranges)
+
     result = await commit_address_import(
         db,
         payload,
         current_user=current_user,
         subnet_id=subnet_id,
         strategy=strategy,
+        can_write_ip=None if subnet_writable else _can_write,
     )
     await db.commit()
     return result.as_dict()

@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.address_set import ADDRESS_SET_RANGE_KINDS, AddressSet
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.services.nmap import NmapArgError, build_argv
@@ -914,6 +915,183 @@ register(
         apply=_apply_create_ip_address,
         category="ipam",
         required_permission=("write", "ip_address"),
+    )
+)
+
+
+# ── create_address_set operation (issue #103) ───────────────────────────────
+
+
+class CreateAddressSetArgs(BaseModel):
+    """Args for the ``create_address_set`` operation."""
+
+    name: str = Field(description="Name of the address set (unique within the subnet)")
+    subnet_id: UUID = Field(description="UUID of the subnet to create the set in")
+    description: str = Field(default="", description="Free-form description")
+    range_kind: str = Field(
+        default="contiguous",
+        description="'contiguous' (start..end span) or 'explicit' (list of host IPs)",
+    )
+    start_address: str | None = Field(
+        default=None, description="First address of a contiguous range"
+    )
+    end_address: str | None = Field(default=None, description="Last address of a contiguous range")
+    explicit_addresses: list[str] = Field(
+        default_factory=list, description="Host addresses for an explicit set"
+    )
+
+
+def _validate_address_set_shape(args: CreateAddressSetArgs) -> str | None:
+    """Return an error string if the contiguous/explicit shape is invalid."""
+    if args.range_kind not in ADDRESS_SET_RANGE_KINDS:
+        return f"range_kind must be one of {sorted(ADDRESS_SET_RANGE_KINDS)}"
+    if args.range_kind == "contiguous":
+        if not args.start_address or not args.end_address:
+            return "contiguous range requires start_address and end_address"
+        try:
+            s = ipaddress.ip_address(args.start_address)
+            e = ipaddress.ip_address(args.end_address)
+        except ValueError as exc:
+            return f"invalid start/end address: {exc}"
+        if s.version != e.version:
+            return "start_address and end_address must be the same IP family"
+        if int(s) > int(e):
+            return "start_address must be <= end_address"
+    else:
+        if not args.explicit_addresses:
+            return "explicit range requires a non-empty explicit_addresses list"
+        for raw in args.explicit_addresses:
+            try:
+                ipaddress.ip_address(raw)
+            except ValueError:
+                return f"invalid address in explicit_addresses: {raw}"
+    return None
+
+
+def _address_set_targets(args: CreateAddressSetArgs) -> list[str]:
+    if args.range_kind == "contiguous":
+        return [a for a in (args.start_address, args.end_address) if a]
+    return list(args.explicit_addresses)
+
+
+async def _preview_create_address_set(
+    db: AsyncSession, user: User, args: CreateAddressSetArgs
+) -> PreviewResult:
+    subnet = await db.get(Subnet, args.subnet_id)
+    if subnet is None:
+        return PreviewResult(ok=False, detail=f"Subnet {args.subnet_id} not found")
+
+    shape_err = _validate_address_set_shape(args)
+    if shape_err is not None:
+        return PreviewResult(ok=False, detail=shape_err)
+
+    try:
+        net = ipaddress.ip_network(str(subnet.network), strict=False)
+    except ValueError:
+        return PreviewResult(ok=False, detail=f"Subnet network {subnet.network!r} is unparseable")
+    for raw in _address_set_targets(args):
+        if ipaddress.ip_address(raw) not in net:
+            return PreviewResult(
+                ok=False, detail=f"address {raw} is outside subnet {subnet.network}"
+            )
+
+    if args.range_kind == "contiguous":
+        scope = f"{args.start_address}–{args.end_address}"
+    else:
+        scope = f"{len(args.explicit_addresses)} explicit address(es)"
+    parts = [
+        f"Create address set {args.name!r}",
+        f"in subnet {subnet.network}{f' ({subnet.name})' if subnet.name else ''}",
+        f"kind={args.range_kind}",
+        scope,
+    ]
+    return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts))
+
+
+async def _apply_create_address_set(
+    db: AsyncSession, user: User, args: CreateAddressSetArgs
+) -> dict[str, Any]:
+    from app.api.v1.dhcp._audit import write_audit  # local import to avoid cycle
+
+    enforce_operation_permission(user, _OPERATIONS["create_address_set"])
+
+    subnet = await db.get(Subnet, args.subnet_id)
+    if subnet is None:
+        raise ValueError(f"Subnet {args.subnet_id} not found")
+
+    shape_err = _validate_address_set_shape(args)
+    if shape_err is not None:
+        raise ValueError(shape_err)
+
+    net = ipaddress.ip_network(str(subnet.network), strict=False)
+    for raw in _address_set_targets(args):
+        if ipaddress.ip_address(raw) not in net:
+            raise ValueError(f"address {raw} is outside subnet {subnet.network}")
+
+    existing = (
+        await db.execute(
+            select(AddressSet.id).where(
+                AddressSet.subnet_id == subnet.id,
+                AddressSet.name == args.name,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise ValueError(f"An address set named {args.name!r} already exists on this subnet")
+
+    row = AddressSet(
+        name=args.name,
+        description=args.description or "",
+        subnet_id=subnet.id,
+        range_kind=args.range_kind,
+        start_address=args.start_address if args.range_kind == "contiguous" else None,
+        end_address=args.end_address if args.range_kind == "contiguous" else None,
+        explicit_addresses=(list(args.explicit_addresses) if args.range_kind == "explicit" else []),
+    )
+    db.add(row)
+    await db.flush()
+
+    write_audit(
+        db,
+        user=user,
+        action="create",
+        resource_type="ipam.address_set",
+        resource_id=str(row.id),
+        resource_display=args.name,
+        new_value={
+            "subnet_id": str(subnet.id),
+            "subnet": str(subnet.network),
+            "name": args.name,
+            "range_kind": args.range_kind,
+            "via": "ai_proposal",
+        },
+    )
+    await db.commit()
+    await db.refresh(row)
+    return {
+        "id": str(row.id),
+        "name": row.name,
+        "subnet_id": str(subnet.id),
+        "range_kind": row.range_kind,
+    }
+
+
+register(
+    Operation(
+        name="create_address_set",
+        description=(
+            "Create a named, RBAC-scoped address set (a slice of a subnet's "
+            "address space) so edit of that slice can be delegated without "
+            "subnet-wide write. Pass name, subnet_id, range_kind "
+            "('contiguous' with start/end, or 'explicit' with a host list). "
+            "Always go through propose_create_address_set — never call this "
+            "directly without an explicit operator approval step."
+        ),
+        args_model=CreateAddressSetArgs,
+        preview=_preview_create_address_set,
+        apply=_apply_create_address_set,
+        category="ipam",
+        required_permission=("admin", "address_set"),
     )
 )
 

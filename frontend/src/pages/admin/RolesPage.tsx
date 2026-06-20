@@ -10,6 +10,7 @@ import {
 } from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ResourceIdPicker } from "@/components/ownership/ResourceIdPicker";
 
 // Mirror of docs/PERMISSIONS.md — keep these in sync.
 const ACTIONS = ["read", "write", "delete", "admin", "*"] as const;
@@ -19,6 +20,7 @@ const RESOURCE_TYPES = [
   "ip_block",
   "subnet",
   "ip_address",
+  "address_set",
   "vlan",
   "dns_group",
   "dns_zone",
@@ -121,13 +123,11 @@ function PermissionEditor({
               <option key={t}>{t}</option>
             ))}
           </select>
-          <input
+          <ResourceIdPicker
             className={inputCls}
-            placeholder="resource_id (optional)"
-            value={p.resource_id ?? ""}
-            onChange={(e) =>
-              update(idx, { resource_id: e.target.value || null })
-            }
+            resourceType={p.resource_type}
+            value={p.resource_id ?? null}
+            onChange={(id) => update(idx, { resource_id: id })}
           />
           <button
             onClick={() => remove(idx)}

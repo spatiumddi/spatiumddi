@@ -34,6 +34,7 @@ import {
   Maximize2,
   ShieldCheck,
   Radio,
+  Boxes,
 } from "lucide-react";
 import {
   DndContext,
@@ -55,6 +56,7 @@ import {
   asnsApi,
   vrfsApi,
   multicastApi,
+  addressSetsApi,
   IP_ROLE_OPTIONS,
   SUBNET_ROLES,
   SUBNET_ROLE_LABELS,
@@ -75,8 +77,12 @@ import {
   type MacHistoryEntry,
   type NATMapping,
   type NetworkContextEntry,
+  type AddressSet,
+  type AddressSetCreate,
+  type AddressSetUpdate,
   formatApiError,
 } from "@/lib/api";
+import { usePermissions } from "@/hooks/usePermissions";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -97,6 +103,7 @@ import {
   useDraggableModal,
 } from "@/components/ui/use-draggable-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { matchesAllTagChips } from "@/components/tag-filter-utils";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
@@ -3763,12 +3770,64 @@ function SubnetDetail({
     queryFn: () => ipamApi.dnsSyncSummary(subnet.id),
     refetchOnMount: "always",
   });
+  // Effective-permission self-introspection (#449). Drives gray-out of
+  // edit affordances on addresses the operator can't write — the server
+  // is always the real gate (403 on the mutation), this only hides the
+  // affordance. Fail-closed: ``can`` returns false while loading.
+  const perms = usePermissions();
+
+  // Address sets on this subnet (#103). Fetched here (not just inside the
+  // Address Sets panel) because the IP table's per-row gray-out derives
+  // editability from "does the operator hold write/admin on a set whose
+  // range contains this IP?" — computed client-side from these rows.
+  const { data: addressSets = [] } = useQuery({
+    queryKey: ["address-sets", subnet.id],
+    queryFn: () => addressSetsApi.list({ subnet_id: subnet.id }),
+  });
+
+  // Subnet-wide write gate (one lookup, reused for every row).
+  const subnetWritable = perms.can("write", "subnet", subnet.id);
+  // Address sets the operator may write (holds write/admin on the row id).
+  // Empty until ``perms`` resolves — fail-closed, like ``subnetWritable``.
+  const writableSets = addressSets.filter((s) =>
+    perms.can("write", "address_set", s.id),
+  );
+
+  // True when the operator may edit the given IP: subnet-write, OR the IP
+  // falls inside a writable address set's range. Contiguous ranges are
+  // compared numerically (IPv4 via ``ipStringToInt``; IPv6 falls through
+  // to string-equality on the bounds), explicit sets by string match.
+  const ipInWritableSet = (address: string): boolean => {
+    for (const s of writableSets) {
+      if (s.range_kind === "explicit") {
+        if (s.explicit_addresses.includes(address)) return true;
+        continue;
+      }
+      if (!s.start_address || !s.end_address) continue;
+      // IPv4 numeric containment.
+      if (address.includes(".") && s.start_address.includes(".")) {
+        const ipInt = ipStringToInt(address);
+        const lo = ipStringToInt(s.start_address);
+        const hi = ipStringToInt(s.end_address);
+        if (ipInt >= lo && ipInt <= hi) return true;
+      } else if (address === s.start_address || address === s.end_address) {
+        // IPv6 / non-dotted — conservative: only the exact bounds count.
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // The full per-IP write decision used by gray-out + checkbox + menu.
+  const permitsWriteIp = (address: string): boolean =>
+    subnetWritable || ipInWritableSet(address);
+
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
   const [viewingAddress, setViewingAddress] = useState<IPAddress | null>(null);
   const [scanFromDetail, setScanFromDetail] = useState<IPAddress | null>(null);
   const [showFilters, setShowFilters] = useState(false);
   const [activeSubnetTab, setActiveSubnetTab] = useState<
-    "addresses" | "dhcp" | "aliases" | "nat" | "trend"
+    "addresses" | "dhcp" | "aliases" | "nat" | "trend" | "address-sets"
   >("addresses");
   const [natModalIp, setNatModalIp] = useState<IPAddress | null>(null);
   const [selectedIpIds, setSelectedIpIds] = useState<Set<string>>(new Set());
@@ -4415,6 +4474,18 @@ function SubnetDetail({
             Aliases
           </button>
           <button
+            onClick={() => setActiveSubnetTab("address-sets")}
+            className={cn(
+              "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
+              activeSubnetTab === "address-sets"
+                ? "border-primary text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground",
+            )}
+            title="Named, RBAC-scoped slices of this subnet's address space"
+          >
+            Address Sets
+          </button>
+          <button
             onClick={() => setActiveSubnetTab("nat")}
             className={cn(
               "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
@@ -4491,6 +4562,12 @@ function SubnetDetail({
       {activeSubnetTab === "trend" && (
         <div className="flex-1 overflow-auto p-4">
           <SubnetUtilizationHistory subnetId={subnet.id} />
+        </div>
+      )}
+
+      {activeSubnetTab === "address-sets" && (
+        <div className="flex-1 overflow-auto">
+          <AddressSetsSubnetPanel subnet={subnet} />
         </div>
       )}
 
@@ -4883,10 +4960,15 @@ function SubnetDetail({
                       addr.status === "broadcast" ||
                       !!addr.auto_from_lease;
                     const rowSelected = selectedIpIds.has(addr.id);
+                    // RBAC gate (#103/#449): subnet-write OR the IP falls
+                    // inside an address set the operator can write. The
+                    // server is the real gate — this only hides affordances.
+                    const permitsWrite = permitsWriteIp(addr.address);
                     const canEdit =
                       !systemRow &&
                       addr.status !== "orphan" &&
-                      !isReadOnly(addr.status);
+                      !isReadOnly(addr.status) &&
+                      permitsWrite;
                     return (
                       <ContextMenu key={addr.id}>
                         <ContextMenuTrigger asChild>
@@ -4899,6 +4981,13 @@ function SubnetDetail({
                                 addr.status === "broadcast") &&
                                 "opacity-50",
                               addr.status === "orphan" && "opacity-40",
+                              // Gray out rows the operator can't write
+                              // (no subnet-write + not in a writable set).
+                              // Read stays active (row click → detail).
+                              !systemRow &&
+                                addr.status !== "orphan" &&
+                                !permitsWrite &&
+                                "opacity-50",
                               rowSelected && "bg-primary/5",
                               isHighlightedRow(addr.id) &&
                                 "spatium-row-highlight",
@@ -4908,7 +4997,7 @@ function SubnetDetail({
                               className="w-8 px-2 py-2"
                               onClick={(e) => e.stopPropagation()}
                             >
-                              {!systemRow && (
+                              {!systemRow && permitsWrite && (
                                 <input
                                   type="checkbox"
                                   checked={rowSelected}
@@ -5431,7 +5520,7 @@ function SubnetDetail({
               !!viewingAddress.auto_from_lease ||
               viewingAddress.status === "orphan" ||
               isReadOnly(viewingAddress.status)
-            )
+            ) && permitsWriteIp(viewingAddress.address)
           }
           onClose={() => setViewingAddress(null)}
           onEdit={() => {
@@ -7932,6 +8021,389 @@ function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
         />
       )}
     </div>
+  );
+}
+
+// ── Address Sets panel (#103) ──────────────────────────────────────────────
+//
+// Named, RBAC-scoped slices of a subnet. List / create / edit / delete.
+// Management (create + per-row edit/delete) is gated on subnet-write OR
+// ``admin`` on the specific set row; the server is the real gate (403 +
+// audit on every mutation) — this only drives affordance visibility.
+
+function addressSetRangeLabel(s: AddressSet): string {
+  if (s.range_kind === "explicit") {
+    const n = s.explicit_addresses.length;
+    return `${n} address${n === 1 ? "" : "es"}`;
+  }
+  if (s.start_address && s.end_address) {
+    return s.start_address === s.end_address
+      ? s.start_address
+      : `${s.start_address} – ${s.end_address}`;
+  }
+  return "—";
+}
+
+function AddressSetsSubnetPanel({ subnet }: { subnet: Subnet }) {
+  const qc = useQueryClient();
+  const perms = usePermissions();
+  const { data: sets = [], isLoading } = useQuery({
+    queryKey: ["address-sets", subnet.id],
+    queryFn: () => addressSetsApi.list({ subnet_id: subnet.id }),
+  });
+  // Resolve customer / site names for the Owner chips.
+  const subnetWritable = perms.can("write", "subnet", subnet.id);
+  // ``admin`` on the ``address_set`` type lets you create new sets.
+  const canCreate = perms.can("admin", "address_set");
+  const canManageSet = (id: string) =>
+    subnetWritable || perms.can("admin", "address_set", id);
+
+  const [showCreate, setShowCreate] = useState(false);
+  const [editingSet, setEditingSet] = useState<AddressSet | null>(null);
+  const [confirmDel, setConfirmDel] = useState<AddressSet | null>(null);
+
+  const delSet = useMutation({
+    mutationFn: (id: string) => addressSetsApi.remove(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["address-sets", subnet.id] });
+      qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
+      setConfirmDel(null);
+    },
+  });
+
+  if (isLoading) {
+    return (
+      <p className="p-6 text-sm text-muted-foreground">Loading address sets…</p>
+    );
+  }
+
+  return (
+    <div className="flex flex-col">
+      <div className="flex items-center justify-between gap-2 border-b bg-card px-4 py-2">
+        <p className="text-xs text-muted-foreground">
+          Named, RBAC-scoped slices of this subnet. Grant a role{" "}
+          <span className="font-mono">admin</span> on a set to delegate edit
+          rights for just its range.
+        </p>
+        {canCreate && (
+          <HeaderButton
+            icon={Plus}
+            variant="primary"
+            onClick={() => setShowCreate(true)}
+          >
+            New address set
+          </HeaderButton>
+        )}
+      </div>
+
+      {sets.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-16 text-center">
+          <Boxes className="mb-3 h-10 w-10 text-muted-foreground/30" />
+          <p className="text-sm text-muted-foreground">
+            No address sets in this subnet.
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground/70">
+            Create one to delegate edit rights over a range of addresses.
+          </p>
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[720px] text-sm">
+            <thead>
+              <tr className="border-b bg-muted/40 text-xs">
+                <th className="px-4 py-2 text-left font-medium">Name</th>
+                <th className="px-4 py-2 text-left font-medium">Range</th>
+                <th className="px-4 py-2 text-left font-medium">Kind</th>
+                <th className="px-4 py-2 text-left font-medium">Owner</th>
+                <th className="px-4 py-2" />
+              </tr>
+            </thead>
+            <tbody className={zebraBodyCls}>
+              {sets.map((s) => {
+                const manageable = canManageSet(s.id);
+                return (
+                  <tr
+                    key={s.id}
+                    className="border-b last:border-0 hover:bg-muted/20"
+                  >
+                    <td className="px-4 py-2">
+                      <div className="font-medium">{s.name}</div>
+                      {s.description && (
+                        <div className="text-xs text-muted-foreground">
+                          {s.description}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-4 py-2 font-mono text-xs">
+                      {addressSetRangeLabel(s)}
+                    </td>
+                    <td className="px-4 py-2">
+                      <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
+                        {s.range_kind}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2">
+                      <div className="flex flex-wrap items-center gap-1">
+                        <CustomerChip customerId={s.customer_id} />
+                        <SiteChip siteId={s.site_id} />
+                        {!s.customer_id && !s.site_id && (
+                          <span className="text-muted-foreground/40">—</span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-4 py-2 text-right">
+                      {manageable && (
+                        <div className="flex justify-end gap-1">
+                          <button
+                            onClick={() => setEditingSet(s)}
+                            className="rounded p-1 text-muted-foreground hover:text-foreground"
+                            title="Edit address set"
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            onClick={() => setConfirmDel(s)}
+                            className="rounded p-1 text-muted-foreground hover:text-destructive"
+                            title="Delete address set"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {showCreate && (
+        <AddressSetModal
+          subnet={subnet}
+          onClose={() => setShowCreate(false)}
+          onSaved={() => {
+            qc.invalidateQueries({ queryKey: ["address-sets", subnet.id] });
+            qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
+            setShowCreate(false);
+          }}
+        />
+      )}
+      {editingSet && (
+        <AddressSetModal
+          subnet={subnet}
+          existing={editingSet}
+          onClose={() => setEditingSet(null)}
+          onSaved={() => {
+            qc.invalidateQueries({ queryKey: ["address-sets", subnet.id] });
+            qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
+            setEditingSet(null);
+          }}
+        />
+      )}
+      <ConfirmModal
+        open={confirmDel !== null}
+        title="Delete address set"
+        tone="destructive"
+        confirmLabel="Delete"
+        loading={delSet.isPending}
+        message={
+          confirmDel
+            ? `Delete address set "${confirmDel.name}"? Any permissions ` +
+              `granted on this set will no longer match. The IP addresses ` +
+              `themselves are not removed.`
+            : ""
+        }
+        onConfirm={() => confirmDel && delSet.mutate(confirmDel.id)}
+        onClose={() => setConfirmDel(null)}
+      />
+    </div>
+  );
+}
+
+function AddressSetModal({
+  subnet,
+  existing,
+  onClose,
+  onSaved,
+}: {
+  subnet: Subnet;
+  existing?: AddressSet;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const isEdit = !!existing;
+  const [name, setName] = useState(existing?.name ?? "");
+  const [description, setDescription] = useState(existing?.description ?? "");
+  const [rangeKind, setRangeKind] = useState<AddressSet["range_kind"]>(
+    existing?.range_kind ?? "contiguous",
+  );
+  const [startAddress, setStartAddress] = useState(
+    existing?.start_address ?? "",
+  );
+  const [endAddress, setEndAddress] = useState(existing?.end_address ?? "");
+  // Explicit addresses edited as a newline/comma-separated textarea.
+  const [explicitText, setExplicitText] = useState(
+    (existing?.explicit_addresses ?? []).join("\n"),
+  );
+  const [customerId, setCustomerId] = useState<string | null>(
+    existing?.customer_id ?? null,
+  );
+  const [siteId, setSiteId] = useState<string | null>(
+    existing?.site_id ?? null,
+  );
+  const [error, setError] = useState<string | null>(null);
+
+  const parseExplicit = (): string[] =>
+    explicitText
+      .split(/[\s,]+/)
+      .map((t) => t.trim())
+      .filter(Boolean);
+
+  const save = useMutation({
+    mutationFn: () => {
+      const explicit = parseExplicit();
+      if (isEdit && existing) {
+        const body: AddressSetUpdate = {
+          name,
+          description,
+          customer_id: customerId,
+          site_id: siteId,
+          range_kind: rangeKind,
+          start_address: rangeKind === "contiguous" ? startAddress : null,
+          end_address: rangeKind === "contiguous" ? endAddress : null,
+          explicit_addresses: rangeKind === "explicit" ? explicit : [],
+        };
+        return addressSetsApi.update(existing.id, body);
+      }
+      const body: AddressSetCreate = {
+        name,
+        description,
+        subnet_id: subnet.id,
+        customer_id: customerId,
+        site_id: siteId,
+        range_kind: rangeKind,
+        start_address: rangeKind === "contiguous" ? startAddress : null,
+        end_address: rangeKind === "contiguous" ? endAddress : null,
+        explicit_addresses: rangeKind === "explicit" ? explicit : [],
+      };
+      return addressSetsApi.create(body);
+    },
+    onSuccess: () => onSaved(),
+    onError: (e) => setError(formatApiError(e)),
+  });
+
+  const canSubmit =
+    name.trim() !== "" &&
+    (rangeKind === "contiguous"
+      ? startAddress.trim() !== "" && endAddress.trim() !== ""
+      : parseExplicit().length > 0);
+
+  return (
+    <Modal
+      title={isEdit ? `Edit ${existing!.name}` : "New address set"}
+      onClose={onClose}
+      wide
+    >
+      <div className="space-y-3">
+        <Field label="Name">
+          <input
+            className={inputCls}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. Servers, Printers"
+            autoFocus
+          />
+        </Field>
+        <Field label="Description">
+          <input
+            className={inputCls}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="Optional"
+          />
+        </Field>
+        <Field label="Range kind">
+          <select
+            className={inputCls}
+            value={rangeKind}
+            onChange={(e) =>
+              setRangeKind(e.target.value as AddressSet["range_kind"])
+            }
+          >
+            <option value="contiguous">Contiguous (start – end)</option>
+            <option value="explicit">Explicit (list of addresses)</option>
+          </select>
+        </Field>
+        {rangeKind === "contiguous" ? (
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Start address">
+              <input
+                className={inputCls}
+                value={startAddress}
+                onChange={(e) => setStartAddress(e.target.value)}
+                placeholder={`First IP in ${subnet.network}`}
+              />
+            </Field>
+            <Field label="End address">
+              <input
+                className={inputCls}
+                value={endAddress}
+                onChange={(e) => setEndAddress(e.target.value)}
+                placeholder={`Last IP in ${subnet.network}`}
+              />
+            </Field>
+          </div>
+        ) : (
+          <Field
+            label="Addresses"
+            hint="One per line (or comma / space separated). Each must fall within the subnet."
+          >
+            <textarea
+              className={cn(inputCls, "min-h-[96px] font-mono text-xs")}
+              value={explicitText}
+              onChange={(e) => setExplicitText(e.target.value)}
+              placeholder={"10.0.0.10\n10.0.0.20"}
+            />
+          </Field>
+        )}
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Customer">
+            <CustomerPicker value={customerId} onChange={setCustomerId} />
+          </Field>
+          <Field label="Site">
+            <SitePicker value={siteId} onChange={setSiteId} />
+          </Field>
+        </div>
+        {error && (
+          <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            {error}
+          </p>
+        )}
+        <div className="flex justify-end gap-2 pt-1">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={save.isPending}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={!canSubmit || save.isPending}
+            onClick={() => {
+              setError(null);
+              save.mutate();
+            }}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {save.isPending ? "Saving…" : isEdit ? "Save" : "Create"}
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 

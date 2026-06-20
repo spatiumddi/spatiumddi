@@ -125,6 +125,12 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Network",
         description="Multicast group registry — addresses + producer/consumer memberships for SMPTE 2110 / Dante / NDI / market-data deployments. Niche but high-value when operators need it.",
     ),
+    ModuleSpec(
+        id="ipam.address_sets",
+        label="Address sets",
+        group="Network",
+        description="Named IP ranges within a subnet carrying their own RBAC scope, so edit of a slice (e.g. .50–.99) can be delegated without subnet-wide write.",
+    ),
     # AI — operator copilot, gated as a whole.
     ModuleSpec(
         id="ai.copilot",

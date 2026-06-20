@@ -26,6 +26,7 @@ from app.services.ai.operations import (
     AllocateMulticastGroupsArgs,
     AllocateSubnetArgs,
     ArchiveSessionArgs,
+    CreateAddressSetArgs,
     CreateAlertRuleArgs,
     CreateDHCPStaticArgs,
     CreateDNSRecordArgs,
@@ -258,6 +259,32 @@ async def _propose_via(
         preview_text=preview.preview_text,
     )
     return _proposal_result(proposal, preview_text=preview.preview_text)
+
+
+# ── propose_create_address_set (issue #103) ───────────────────────────
+
+
+@register_tool(
+    name="propose_create_address_set",
+    description=(
+        "Prepare an address-set creation proposal. Operator must click "
+        "Approve in the chat drawer to apply. An address set is a named, "
+        "RBAC-scoped slice of a subnet (a contiguous range or an explicit "
+        "host list) used to delegate edit of just that slice without "
+        "subnet-wide write. Pass name, subnet_id, range_kind "
+        "('contiguous' with start_address/end_address, or 'explicit' with "
+        "explicit_addresses). Returns a kind='proposal' card; never call "
+        "twice for the same change."
+    ),
+    args_model=CreateAddressSetArgs,
+    writes=False,
+    category="ipam",
+    default_enabled=False,
+)
+async def propose_create_address_set(
+    db: AsyncSession, user: User, args: CreateAddressSetArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="create_address_set", args=args)
 
 
 # ── propose_create_dns_record ─────────────────────────────────────────
