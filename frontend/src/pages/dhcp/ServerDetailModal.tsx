@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
@@ -14,9 +14,19 @@ import {
   ScrollText,
   Server,
 } from "lucide-react";
-import { DHCPTrafficCard } from "@/components/MetricsCharts";
+import {
+  Area,
+  AreaChart,
+  CartesianGrid,
+  Legend,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import { Modal } from "@/components/ui/modal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
+import { formatBucket } from "@/lib/chart-time";
 import {
   dhcpApi,
   logsApi,
@@ -24,6 +34,7 @@ import {
   type DHCPPendingOpEntry,
   type DHCPServer,
   type DHCPServerEventEntry,
+  type DHCPStatsRange,
 } from "@/lib/api";
 
 /**
@@ -187,16 +198,12 @@ export function ServerDetailModal({
             <ConfigTab serverId={server.id} />
           )}
           {/* #195 — DHCP lease-rate timeseries (DISCOVER/OFFER/REQUEST/ACK/
-              NAK/…), scoped to this server. Reuses the dashboard's
-              DHCPTrafficCard pinned to server.id — symmetric with how the
-              DNS modal's Stats tab reuses metricsApi.dnsTimeseries. Gated on
+              NAK/…), scoped to this server. Stacked-area chart over the new
+              GET /dhcp/servers/{id}/stats endpoint — symmetric with how the
+              DNS modal's Stats tab renders its timeseries. Gated on
               !isReadOnly like Logs/Config (Windows DHCP has no Kea metric
               stream). */}
-          {tab === "stats" && !isReadOnly && (
-            <div className="p-3">
-              <DHCPTrafficCard pinnedServerId={server.id} />
-            </div>
-          )}
+          {tab === "stats" && !isReadOnly && <StatsTab serverId={server.id} />}
         </div>
       </div>
     </Modal>
@@ -744,6 +751,157 @@ function ConfigTab({ serverId }: { serverId: string }) {
       <pre className="max-h-[28rem] overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-snug">
         {pretty}
       </pre>
+    </div>
+  );
+}
+
+// ── Stats tab ─────────────────────────────────────────────────────────────
+
+// #195: one stacked-area series per DHCP message type. The four handshake
+// types the dashboard DHCPTrafficCard also plots use that card's exact colours
+// (DISCOVER purple, REQUEST blue, ACK green, NAK red) so an operator reads the
+// same hue for the same message across both surfaces; OFFER / DECLINE / RELEASE
+// (modal-only) get distinct non-colliding hues.
+const STATS_SERIES: Array<{ key: string; name: string; color: string }> = [
+  { key: "discover", name: "DISCOVER", color: "#8b5cf6" },
+  { key: "offer", name: "OFFER", color: "#06b6d4" },
+  { key: "request", name: "REQUEST", color: "#3b82f6" },
+  { key: "ack", name: "ACK", color: "#10b981" },
+  { key: "nak", name: "NAK", color: "#ef4444" },
+  { key: "decline", name: "DECLINE", color: "#f59e0b" },
+  { key: "release", name: "RELEASE", color: "#ec4899" },
+];
+
+function StatsTab({ serverId }: { serverId: string }) {
+  const [range, setRange] = useState<DHCPStatsRange>("1h");
+
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ["dhcp-server-stats", serverId, range],
+    queryFn: () => dhcpApi.serverStats(serverId, range),
+    refetchInterval: 60_000,
+  });
+
+  // Multi-day windows need the month/day prefix on each tick: 24h crosses a
+  // midnight and 7d spans a week (at 30-min buckets), so a bare HH:MM repeats
+  // across days and can't be told apart. 1h/6h are intra-day — time alone.
+  const withDate = range === "24h" || range === "7d";
+
+  const points = useMemo(() => {
+    if (!data) return [];
+    return data.rate_buckets.map((b) => ({
+      t: formatBucket(b.ts, withDate),
+      discover: b.discover,
+      offer: b.offer,
+      request: b.request,
+      ack: b.ack,
+      nak: b.nak,
+      decline: b.decline,
+      release: b.release,
+    }));
+  }, [data, withDate]);
+
+  // date_bin emits only non-empty buckets, so an idle server usually yields
+  // points.length === 0. But a window can also hold rows whose seven plotted
+  // counters are all zero (e.g. INFORM-only traffic, which the DB sums but the
+  // chart contract excludes) — treat that as "no activity" too rather than
+  // rendering a flat zero-height chart.
+  const hasActivity = useMemo(
+    () =>
+      points.some(
+        (p) =>
+          p.discover +
+            p.offer +
+            p.request +
+            p.ack +
+            p.nak +
+            p.decline +
+            p.release >
+          0,
+      ),
+    [points],
+  );
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-md border bg-card">
+        <div className="flex items-center justify-between border-b px-3 py-2">
+          <div className="flex items-center gap-2">
+            <BarChart3 className="h-3.5 w-3.5 text-blue-500" />
+            <h4 className="text-xs font-semibold uppercase tracking-wider">
+              DHCP traffic
+            </h4>
+            {data && (
+              <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600">
+                {data.leases_active} active{" "}
+                {data.leases_active === 1 ? "lease" : "leases"}
+              </span>
+            )}
+          </div>
+          <select
+            value={range}
+            onChange={(e) => setRange(e.target.value as DHCPStatsRange)}
+            className="rounded border bg-background px-2 py-0.5 text-[11px] focus:outline-none focus:ring-1 focus:ring-ring"
+          >
+            <option value="1h">1h</option>
+            <option value="6h">6h</option>
+            <option value="24h">24h</option>
+            <option value="7d">7d</option>
+          </select>
+        </div>
+        <div className="h-72 p-3">
+          {isLoading ? (
+            <LoadingBlock />
+          ) : isError ? (
+            <ErrorBlock />
+          ) : !hasActivity ? (
+            <p className="flex h-full flex-col items-center justify-center gap-1 text-center text-xs text-muted-foreground">
+              <span>No activity in the last {range}.</span>
+              <span className="text-[11px]">
+                Kea agents report pkt4 counter deltas every 60&nbsp;s.
+              </span>
+            </p>
+          ) : (
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart
+                data={points}
+                margin={{ top: 5, right: 12, left: 0, bottom: 0 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
+                <XAxis dataKey="t" tick={{ fontSize: 10 }} minTickGap={32} />
+                <YAxis
+                  tick={{ fontSize: 10 }}
+                  width={52}
+                  allowDecimals={false}
+                  label={{
+                    value: "msgs / bucket",
+                    angle: -90,
+                    position: "insideLeft",
+                    style: { fontSize: 10, textAnchor: "middle" },
+                  }}
+                />
+                <Tooltip
+                  contentStyle={{ fontSize: 11, borderRadius: 6 }}
+                  labelStyle={{ fontWeight: 600 }}
+                />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                {STATS_SERIES.map((s) => (
+                  <Area
+                    key={s.key}
+                    type="monotone"
+                    dataKey={s.key}
+                    name={s.name}
+                    stackId="msg"
+                    stroke={s.color}
+                    fill={s.color}
+                    fillOpacity={0.25}
+                    strokeWidth={1.5}
+                  />
+                ))}
+              </AreaChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

@@ -29,6 +29,7 @@ import {
   YAxis,
 } from "recharts";
 import { Modal } from "@/components/ui/modal";
+import { formatBucket } from "@/lib/chart-time";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import {
   dnsApi,
@@ -825,7 +826,7 @@ function StatsTab({ serverId }: { serverId: string }) {
     if (!ts.data) return [];
     const bs = ts.data.bucket_seconds || 60;
     return ts.data.points.map((p) => ({
-      t: formatBucket(p.t, bs),
+      t: formatBucket(p.t, bs >= 3600),
       qps: round2(p.queries_total / bs),
       noerror: round2(p.noerror / bs),
       nxdomain: round2(p.nxdomain / bs),
@@ -1135,18 +1136,6 @@ function fmtBytes(n: number): string {
   if (n < 1024) return `${n}B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
   return `${(n / 1024 / 1024).toFixed(1)}MB`;
-}
-
-function formatBucket(iso: string, bucketSeconds: number): string {
-  const d = new Date(iso);
-  if (bucketSeconds >= 3600) {
-    return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:00`;
-  }
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-function pad(n: number): string {
-  return n.toString().padStart(2, "0");
 }
 
 function round2(x: number): number {
