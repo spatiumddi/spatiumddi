@@ -204,6 +204,13 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     ("executed", "change_request"): "change_request.executed",
     ("failed", "change_request"): "change_request.failed",
     ("expired", "change_request"): "change_request.expired",
+    # Self-governance break-glass (#62). A superadmin forced a protected
+    # control change (disable module / disable-delete-or-weaken a policy /
+    # unlock) past the two-person gate. HIGH-severity by intent — there is no
+    # severity column, so this distinct event name is the signal operators
+    # wire a dedicated alert / SIEM rule on. Special-map-only (like
+    # change_request): no _RESOURCE_NAMESPACE entry for ``approval_control``.
+    ("approvals.break_glass", "approval_control"): "governance.break_glass",
 }
 
 

@@ -48,6 +48,7 @@ from app.core.request_meta import clean_user_agent, client_ip
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.change_request import ApprovalPolicy, ChangeRequest
+from app.services.ai.operations_control import is_controls_protected, maybe_gate_control
 from app.services.approvals.policy import GATEABLE_ACTIONS, GATEABLE_RESOURCE_TYPES
 from app.services.approvals.service import (
     ChangeRequestStateError,
@@ -355,14 +356,14 @@ async def create_policy(
     return _policy_to_response(policy)
 
 
-@router.put("/policies/{policy_id}", response_model=ApprovalPolicyResponse)
+@router.put("/policies/{policy_id}")
 async def update_policy(
     policy_id: uuid.UUID,
     body: ApprovalPolicyUpdate,
     _admin: SuperAdmin,
     db: DB,
     request: Request,
-) -> ApprovalPolicyResponse:
+):  # noqa: ANN201 — ApprovalPolicyResponse OR a 202 JSONResponse (gated)
     policy = await db.get(ApprovalPolicy, policy_id)
     if policy is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
@@ -373,6 +374,35 @@ async def update_policy(
         changes.get("action", policy.action),
         changes.get("resource_type", policy.resource_type),
     )
+
+    # #62 self-governance lock: detect WEAKENING transitions on this PUT and
+    # gate them behind a second superadmin when the lock is on. Only the
+    # weakening half is gated — ``enabled`` false→true, ``applies_to_superadmin``
+    # false→true, and name/ttl/min_count edits all stay inline. ``maybe_gate_control``
+    # short-circuits to None the instant the lock is off, so the inline path
+    # below is byte-identical to today. A single PUT that weakens BOTH knobs is
+    # gated on the first weakening it sees (disable wins); the requester
+    # re-submits post-approval for any remaining change.
+    if await is_controls_protected(db):
+        disabling = changes.get("enabled") is False and policy.enabled
+        lowering = changes.get("applies_to_superadmin") is False and policy.applies_to_superadmin
+        kind = "disable_policy" if disabling else ("lower_superadmin_gate" if lowering else None)
+        if kind is not None:
+            pending = await maybe_gate_control(
+                db,
+                _admin,
+                request,
+                kind=kind,  # type: ignore[arg-type]
+                policy_id=policy_id,
+                resource_type="approval_policy",
+                resource_id=str(policy_id),
+                resource_display=policy.name,
+            )
+            if pending is not None:
+                from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+                return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
+
     for field, value in changes.items():
         setattr(policy, field, value)
     _audit_policy(
@@ -389,13 +419,13 @@ async def update_policy(
     return _policy_to_response(policy)
 
 
-@router.delete("/policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/policies/{policy_id}")
 async def delete_policy(
     policy_id: uuid.UUID,
     _admin: SuperAdmin,
     db: DB,
     request: Request,
-) -> None:
+):  # noqa: ANN201 — 204 (deleted) OR a 202 JSONResponse (gated)
     policy = await db.get(ApprovalPolicy, policy_id)
     if policy is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
@@ -406,6 +436,25 @@ async def delete_policy(
             status_code=status.HTTP_409_CONFLICT,
             detail="Built-in policies cannot be deleted — disable them instead",
         )
+
+    # #62 self-governance lock: deleting a policy is a WEAKENING change →
+    # gate behind a second superadmin when the lock is on. Off → inline 204.
+    if await is_controls_protected(db):
+        pending = await maybe_gate_control(
+            db,
+            _admin,
+            request,
+            kind="delete_policy",
+            policy_id=policy_id,
+            resource_type="approval_policy",
+            resource_id=str(policy_id),
+            resource_display=policy.name,
+        )
+        if pending is not None:
+            from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+            return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
+
     name = policy.name
     await db.delete(policy)
     _audit_policy(
@@ -417,7 +466,9 @@ async def delete_policy(
         name=name,
     )
     await db.commit()
-    return None
+    from fastapi import Response  # noqa: PLC0415
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/{cr_id}", response_model=ChangeRequestResponse)

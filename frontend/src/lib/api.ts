@@ -2324,12 +2324,64 @@ export interface FeatureModuleEntry {
   enabled: boolean;
 }
 
+// #62 break-glass: force a weakening control change immediately (the 5 kinds
+// the backend ``ModifyApprovalControlArgs.kind`` accepts).
+export type ApprovalControlKind =
+  | "disable_module"
+  | "disable_policy"
+  | "delete_policy"
+  | "lower_superadmin_gate"
+  | "unlock";
+
+export interface BreakGlassBody {
+  kind: ApprovalControlKind;
+  policy_id?: string | null;
+  password?: string | null;
+  totp_code?: string | null;
+  confirm_phrase: string;
+}
+
 export const featureModulesApi = {
   list: () =>
     api.get<FeatureModuleEntry[]>("/admin/feature-modules").then((r) => r.data),
-  toggle: (id: string, enabled: boolean) =>
+  // Toggle a module. Returns the FULL axios response (no trailing
+  // ``.then(r => r.data)``) so the #62 self-governance lock's 202
+  // approval-queue envelope is observable: disabling ``governance.approvals``
+  // while the lock is on returns 202 + a ``ChangeRequestQueued`` body instead
+  // of the FeatureModuleEntry. Callers route the response through
+  // ``handleApprovalQueued`` (``@/lib/approvalQueue``) and read ``.data`` for
+  // the inline 200 case. ``protectControls`` is only honoured by the backend
+  // when enabling ``governance.approvals`` (strengthening → single-person).
+  toggle: (id: string, enabled: boolean, protectControls?: boolean) =>
+    api.patch<FeatureModuleEntry | ChangeRequestQueued>(
+      `/admin/feature-modules/${id}`,
+      { enabled, protect_controls: protectControls },
+    ),
+  // #62 self-governance lock state. ON ⇒ disabling/weakening the approval
+  // control requires a second superadmin (or break-glass).
+  getApprovalsLock: () =>
     api
-      .patch<FeatureModuleEntry>(`/admin/feature-modules/${id}`, { enabled })
+      .get<{
+        approvals_protect_controls: boolean;
+      }>("/admin/feature-modules/approvals-lock")
+      .then((r) => r.data),
+  // Turn the lock on (strengthen → inline 200) or off (weaken → 202 gated
+  // when currently on). Full response so the 202 envelope is observable.
+  setApprovalsLock: (enabled: boolean) =>
+    api.post<{ approvals_protect_controls: boolean } | ChangeRequestQueued>(
+      "/admin/feature-modules/approvals-lock",
+      { enabled },
+    ),
+  // #62 break-glass — force a protected control change IMMEDIATELY, bypassing
+  // the two-person gate. Superadmin-only; the backend re-confirms password /
+  // TOTP + the typed phrase, writes a HIGH-severity audit row, and fires the
+  // ``governance.break_glass`` event.
+  breakGlass: (body: BreakGlassBody) =>
+    api
+      .post<{
+        forced: boolean;
+        kind: string;
+      }>("/admin/feature-modules/break-glass", body)
       .then((r) => r.data),
 };
 
@@ -8053,11 +8105,19 @@ export const changeRequestsApi = {
     api
       .post<ApprovalPolicy>("/change-requests/policies", body)
       .then((r) => r.data),
+  // #62 self-governance lock: WEAKENING a policy (disable enabled→false, lower
+  // applies_to_superadmin true→false, or delete) returns **202** with a
+  // ``ChangeRequestQueued`` body when the lock is on instead of mutating
+  // inline. Return the FULL axios response so callers can route it through
+  // ``handleApprovalQueued``; strengthening edits + lock-off return the
+  // 200/204 inline path. (See featureModulesApi.toggle for the same shape.)
   updatePolicy: (id: string, body: ApprovalPolicyWrite) =>
-    api
-      .put<ApprovalPolicy>(`/change-requests/policies/${id}`, body)
-      .then((r) => r.data),
-  deletePolicy: (id: string) => api.delete(`/change-requests/policies/${id}`),
+    api.put<ApprovalPolicy | ChangeRequestQueued>(
+      `/change-requests/policies/${id}`,
+      body,
+    ),
+  deletePolicy: (id: string) =>
+    api.delete<ChangeRequestQueued | "">(`/change-requests/policies/${id}`),
 };
 
 export type MetricsWindow = "1h" | "6h" | "24h" | "7d";

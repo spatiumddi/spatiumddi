@@ -21,6 +21,7 @@
 
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import type { AxiosResponse } from "axios";
 import {
   Ban,
   Check,
@@ -38,16 +39,25 @@ import {
   type ApprovalPolicy,
   type ApprovalPolicyWrite,
   type ChangeRequest,
+  type ChangeRequestQueued,
   type ChangeRequestState,
   authApi,
   changeRequestsApi,
   formatApiError,
 } from "@/lib/api";
+import {
+  APPROVAL_QUEUED_MESSAGE,
+  CHANGE_REQUEST_QUERY_KEY,
+  handleApprovalQueued,
+} from "@/lib/approvalQueue";
+import { featureModulesApi } from "@/lib/api";
 import { usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ShieldAlert, AlertTriangle } from "lucide-react";
+import { BreakGlassModal } from "./BreakGlassModal";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -415,9 +425,13 @@ function RequestTable({
 function PolicyEditor({
   existing,
   onClose,
+  onQueued,
 }: {
   existing: ApprovalPolicy | null;
   onClose: () => void;
+  /** Fired when a weakening edit was queued for approval (#62) instead of
+   *  mutating inline. */
+  onQueued?: () => void;
 }) {
   const qc = useQueryClient();
   const locked = existing?.is_builtin ?? false;
@@ -438,7 +452,15 @@ function PolicyEditor({
   );
   const [error, setError] = useState<string | null>(null);
 
-  const mutation = useMutation({
+  const mutation = useMutation<
+    // createPolicy returns the unwrapped row; updatePolicy returns the full
+    // axios response so the #62 lock's 202 envelope is observable. Both shapes
+    // flow through handleApprovalQueued (unwrapped rows have no `status`, so
+    // they read as "executed inline").
+    ApprovalPolicy | AxiosResponse<ApprovalPolicy | ChangeRequestQueued>,
+    unknown,
+    void
+  >({
     mutationFn: () => {
       const body: ApprovalPolicyWrite = {
         name: name.trim(),
@@ -449,11 +471,25 @@ function PolicyEditor({
         applies_to_superadmin: appliesToSuperadmin,
         ttl_hours: Number(ttlHours) || 168,
       };
+      // createPolicy already returns the unwrapped row; updatePolicy returns
+      // the full axios response so the #62 self-governance lock's 202
+      // approval-queue envelope (weakening a policy while the lock is on) is
+      // observable.
       return existing
         ? changeRequestsApi.updatePolicy(existing.id, body)
         : changeRequestsApi.createPolicy(body);
     },
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // #62: a weakening edit (disable / lower applies_to_superadmin) returns
+      // 202 + a pending change_request when the lock is on instead of mutating
+      // inline. Surface the queued state rather than closing silently.
+      if (handleApprovalQueued(resp)) {
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        qc.invalidateQueries({ queryKey: ["change-requests", "policies"] });
+        onQueued?.();
+        onClose();
+        return;
+      }
       qc.invalidateQueries({ queryKey: ["change-requests", "policies"] });
       onClose();
     },
@@ -592,13 +628,30 @@ function PoliciesTab() {
     queryKey: ["change-requests", "policies"],
     queryFn: changeRequestsApi.listPolicies,
   });
+  // #62 self-governance lock state — drives the banner + the queued path on
+  // policy weakening + the break-glass affordance.
+  const { data: lockState } = useQuery({
+    queryKey: ["approvals-lock"],
+    queryFn: featureModulesApi.getApprovalsLock,
+  });
+  const lockOn = lockState?.approvals_protect_controls ?? false;
+
   const [editing, setEditing] = useState<ApprovalPolicy | null>(null);
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<ApprovalPolicy | null>(null);
+  const [queuedNotice, setQueuedNotice] = useState<string | null>(null);
+  // Break-glass for a specific policy weakening (delete it now).
+  const [breakGlass, setBreakGlass] = useState<ApprovalPolicy | null>(null);
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => changeRequestsApi.deletePolicy(id),
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // #62: deleting a policy while the lock is on returns 202 + a pending
+      // change_request instead of deleting inline.
+      if (handleApprovalQueued(resp)) {
+        setQueuedNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+      }
       qc.invalidateQueries({ queryKey: ["change-requests", "policies"] });
       setDeleting(null);
     },
@@ -606,6 +659,29 @@ function PoliciesTab() {
 
   return (
     <div className="space-y-3">
+      {lockOn && (
+        <div className="flex flex-wrap items-start gap-3 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+          <ShieldAlert className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-600 dark:text-amber-400" />
+          <div className="min-w-0 flex-1">
+            <p className="font-medium text-amber-700 dark:text-amber-300">
+              Self-governance lock is ON
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Weakening a policy — <strong>disabling</strong> it,{" "}
+              <strong>deleting</strong> it, or turning off{" "}
+              <em>Applies to superadmin</em> — now needs a second superadmin to
+              approve via the Queue. Strengthening edits stay single-person. Use
+              break-glass (per-row) to force a weakening change immediately if
+              you're locked out.
+            </p>
+          </div>
+        </div>
+      )}
+      {queuedNotice && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300">
+          {queuedNotice} See the Queue tab.
+        </div>
+      )}
       <div className="flex justify-end">
         <HeaderButton
           variant="primary"
@@ -679,6 +755,18 @@ function PoliciesTab() {
                           Delete
                         </HeaderButton>
                       )}
+                      {/* #62: when the lock is on, deleting/disabling routes
+                       *  through approval. Break-glass forces it now. */}
+                      {lockOn && !p.is_builtin && (
+                        <HeaderButton
+                          variant="destructive"
+                          icon={AlertTriangle}
+                          title="Force-delete this policy now (break-glass)"
+                          onClick={() => setBreakGlass(p)}
+                        >
+                          Break glass
+                        </HeaderButton>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -695,6 +783,7 @@ function PoliciesTab() {
             setCreating(false);
             setEditing(null);
           }}
+          onQueued={() => setQueuedNotice(APPROVAL_QUEUED_MESSAGE)}
         />
       )}
 
@@ -702,17 +791,35 @@ function PoliciesTab() {
         open={deleting !== null}
         title="Delete approval policy"
         tone="destructive"
-        confirmLabel="Delete"
+        confirmLabel={lockOn ? "Submit for approval" : "Delete"}
         loading={deleteMutation.isPending}
         message={
           <span>
             Delete the policy <strong>{deleting?.name}</strong>? Operations it
             covered will no longer require a second approver.
+            {lockOn && (
+              <span className="mt-2 block text-amber-600 dark:text-amber-400">
+                The self-governance lock is on — this will be queued for a
+                second superadmin to approve rather than deleted immediately.
+              </span>
+            )}
           </span>
         }
         onConfirm={() => deleting && deleteMutation.mutate(deleting.id)}
         onClose={() => setDeleting(null)}
       />
+
+      {breakGlass && (
+        <BreakGlassModal
+          kind="delete_policy"
+          policyId={breakGlass.id}
+          policyName={breakGlass.name}
+          onClose={() => setBreakGlass(null)}
+          onDone={() =>
+            qc.invalidateQueries({ queryKey: ["change-requests", "policies"] })
+          }
+        />
+      )}
     </div>
   );
 }

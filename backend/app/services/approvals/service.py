@@ -26,6 +26,7 @@ from fastapi import HTTPException, Request, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import is_effective_superadmin
 from app.core.request_meta import clean_user_agent, client_ip
 from app.models.audit import AuditLog
 from app.models.auth import User
@@ -589,6 +590,23 @@ async def approve_change_request(
         operations.enforce_operation_permission(approver, op)
     except OperationPermissionError as exc:
         raise DecisionForbidden(str(exc)) from exc
+
+    # 4b. Self-governance control ops (#62) are SUPERADMIN-ONLY to approve —
+    #     IN ADDITION to the {approve, change_request} + required_permission
+    #     checks above. A control op weakens the approval control plane
+    #     itself, so only a *different* superadmin may sign off (the
+    #     "different" half is the step-2b self-approval block above; this
+    #     half is the superadmin requirement). Without this, a plain
+    #     {approve, change_request} + {admin, approval_control} holder could
+    #     rubber-stamp turning the whole workflow off.
+    from app.services.ai.operations_control import (  # noqa: PLC0415
+        CONTROL_OPERATION_NAMES,
+    )
+
+    if cr.operation in CONTROL_OPERATION_NAMES and not is_effective_superadmin(approver):
+        raise DecisionForbidden(
+            "Approving a control-plane change to the approval workflow requires superadmin"
+        )
 
     # Re-validate frozen args (guards the rare redeploy-mid-flight schema change).
     # #6: never echo the Pydantic ValidationError back to the client — it
