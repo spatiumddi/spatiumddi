@@ -48,7 +48,11 @@ from app.core.request_meta import clean_user_agent, client_ip
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.change_request import ApprovalPolicy, ChangeRequest
-from app.services.ai.operations_control import is_controls_protected, maybe_gate_control
+from app.services.ai.operations_control import (
+    coverage_reducing_diffs,
+    is_controls_protected,
+    maybe_gate_control,
+)
 from app.services.approvals.policy import GATEABLE_ACTIONS, GATEABLE_RESOURCE_TYPES
 from app.services.approvals.service import (
     ChangeRequestStateError,
@@ -109,11 +113,19 @@ class ApprovalPolicyResponse(BaseModel):
     modified_at: datetime
 
 
+# Upper bound on ``min_count`` (#2). ``ge=1`` alone let a superadmin inflate
+# the threshold to an astronomical value so an enabled-looking policy gates
+# nothing — bound it so an inflated threshold is rejected at the schema layer
+# (422) before it can be used as a side-door. Generous: a real op never touches
+# this many rows.
+_MIN_COUNT_MAX = 1_000_000
+
+
 class ApprovalPolicyCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     resource_type: str = Field(min_length=1, max_length=100)
     action: str = Field(min_length=1, max_length=50)
-    min_count: int | None = Field(default=None, ge=1)
+    min_count: int | None = Field(default=None, ge=1, le=_MIN_COUNT_MAX)
     enabled: bool = False
     applies_to_superadmin: bool = True
     ttl_hours: int = Field(default=168, ge=1, le=8760)
@@ -123,7 +135,7 @@ class ApprovalPolicyUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     resource_type: str | None = Field(default=None, min_length=1, max_length=100)
     action: str | None = Field(default=None, min_length=1, max_length=50)
-    min_count: int | None = Field(default=None, ge=1)
+    min_count: int | None = Field(default=None, ge=1, le=_MIN_COUNT_MAX)
     enabled: bool | None = None
     applies_to_superadmin: bool | None = None
     ttl_hours: int | None = Field(default=None, ge=1, le=8760)
@@ -375,33 +387,36 @@ async def update_policy(
         changes.get("resource_type", policy.resource_type),
     )
 
-    # #62 self-governance lock: detect WEAKENING transitions on this PUT and
-    # gate them behind a second superadmin when the lock is on. Only the
-    # weakening half is gated — ``enabled`` false→true, ``applies_to_superadmin``
-    # false→true, and name/ttl/min_count edits all stay inline. ``maybe_gate_control``
-    # short-circuits to None the instant the lock is off, so the inline path
-    # below is byte-identical to today. A single PUT that weakens BOTH knobs is
-    # gated on the first weakening it sees (disable wins); the requester
-    # re-submits post-approval for any remaining change.
-    if await is_controls_protected(db):
-        disabling = changes.get("enabled") is False and policy.enabled
-        lowering = changes.get("applies_to_superadmin") is False and policy.applies_to_superadmin
-        kind = "disable_policy" if disabling else ("lower_superadmin_gate" if lowering else None)
-        if kind is not None:
-            pending = await maybe_gate_control(
-                db,
-                _admin,
-                request,
-                kind=kind,  # type: ignore[arg-type]
-                policy_id=policy_id,
-                resource_type="approval_policy",
-                resource_id=str(policy_id),
-                resource_display=policy.name,
-            )
-            if pending is not None:
-                from fastapi.responses import JSONResponse  # noqa: PLC0415
+    # #62 self-governance lock: detect every COVERAGE-REDUCING transition on
+    # this PUT and gate the whole edit behind a second superadmin when the lock
+    # is on. Coverage-reducing = enabled true→false, applies_to_superadmin
+    # true→false, resource_type changed, action changed, min_count raised, or
+    # min_count set NULL→value (NULL is always-gate = strongest). A superadmin
+    # used to be able to neuter a policy INLINE by repointing resource_type /
+    # action to a non-matching pair or inflating min_count while keeping
+    # enabled=true so it LOOKED live but matched nothing — #2's side-door.
+    # Strengthening / neutral edits (name, ttl, enabling, raising the superadmin
+    # gate, lowering min_count, min_count→NULL) stay inline.
+    # ``maybe_gate_control`` short-circuits to None the instant the lock is off,
+    # so the inline path below is byte-identical to today. The WHOLE proposed
+    # ``changes`` payload rides into the gate so the approved op replays the
+    # exact edit (not just the weakening half) under the approver.
+    if await is_controls_protected(db) and coverage_reducing_diffs(policy, changes):
+        pending = await maybe_gate_control(
+            db,
+            _admin,
+            request,
+            kind="update_policy",
+            policy_id=policy_id,
+            update_payload=changes,
+            resource_type="approval_policy",
+            resource_id=str(policy_id),
+            resource_display=policy.name,
+        )
+        if pending is not None:
+            from fastapi.responses import JSONResponse  # noqa: PLC0415
 
-                return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
+            return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
 
     for field, value in changes.items():
         setattr(policy, field, value)

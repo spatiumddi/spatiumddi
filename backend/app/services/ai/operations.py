@@ -99,11 +99,23 @@ class PreviewResult:
     subnet doesn't exist, address out of range) — surface ``detail``
     to the operator and don't even create a proposal row. ``ok=True``
     proceeds to persist the proposal with ``preview_text``.
+
+    ``idempotent=True`` (only meaningful when ``ok=True``) signals the
+    target is ALREADY in the desired end-state at approve time — the
+    effect this change requested was achieved by some other path (e.g. a
+    concurrent break-glass) between request and approval. The approve spine
+    resolves such a request as IDEMPOTENT SUCCESS (``executed`` with an
+    "already in desired state" note) WITHOUT re-running ``apply()`` and
+    WITHOUT the scope-drift guard 409'ing — so a change_request whose effect
+    already landed resolves cleanly instead of stranding ``pending`` / failing
+    (#62 concurrent break-glass). Defaults False so no existing op changes
+    behaviour.
     """
 
     ok: bool
     detail: str
     preview_text: str = ""
+    idempotent: bool = False
 
 
 _OPERATIONS: dict[str, Operation] = {}

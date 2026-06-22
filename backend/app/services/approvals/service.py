@@ -623,6 +623,43 @@ async def approve_change_request(
         )
         raise DecisionUnprocessable("Stored args no longer validate for this operation") from exc
 
+    # 4c. Control-op gate-premise re-assertion (#62, #6). A queued control op
+    #     (modify_approval_control) was created BECAUSE the self-protection lock
+    #     was on; if the lock is now off (e.g. a concurrent break-glass unlock
+    #     landed first), the second-superadmin protection premise has
+    #     evaporated. Resolve the request idempotently rather than executing a
+    #     weakening change under approver authority whose rationale is gone. The
+    #     flag is read FOR UPDATE so this can't race a concurrent flip.
+    from app.services.ai.operations_control import (  # noqa: PLC0415
+        ModifyApprovalControlArgs,
+        control_gate_premise_lost,
+    )
+
+    if cr.operation in CONTROL_OPERATION_NAMES and isinstance(args, ModifyApprovalControlArgs):
+        if await control_gate_premise_lost(db, args):
+            requester_id = cr.requested_by_user_id
+            await mark_approved(db, cr, approver=approver, request=request, note=note)
+            await mark_executed(
+                db,
+                cr,
+                approver=approver,
+                requester_id=requester_id,
+                request=request,
+                result={
+                    "idempotent": True,
+                    "note": "self-protection lock already off; gated change no longer applies",
+                },
+            )
+            await db.commit()
+            await db.refresh(cr)
+            logger.info(
+                "change_request.control_premise_lost",
+                change_request_id=str(cr.id),
+                operation=cr.operation,
+                approver=str(approver.id),
+            )
+            return cr
+
     # 5. Stale-state re-check — do NOT execute a doomed op; leave it pending.
     preview = await op.preview(db, approver, args)
     if not preview.ok:
@@ -634,6 +671,42 @@ async def approve_change_request(
             approver=str(approver.id),
         )
         raise DecisionConflict(preview.detail)
+
+    # 5a. Idempotent resolution (#62 concurrent break-glass). When the op's
+    #     preview reports the target is ALREADY in the desired end-state
+    #     (``idempotent=True``) — e.g. a break-glass deleted the policy / flipped
+    #     the lock between request and approval — the effect this request asked
+    #     for already happened. Resolve the request as EXECUTED with an
+    #     "already in desired state" note WITHOUT re-running apply() (there's
+    #     nothing left to do) and WITHOUT the scope-drift guard 409'ing on the
+    #     changed preview text. This unwedges a CR whose effect was achieved out
+    #     of band, instead of leaving it stuck pending / marking it failed.
+    if preview.idempotent:
+        requester_id = cr.requested_by_user_id
+        cr.preview_text = preview.preview_text
+        await mark_approved(db, cr, approver=approver, request=request, note=note)
+        await mark_executed(
+            db,
+            cr,
+            approver=approver,
+            requester_id=requester_id,
+            request=request,
+            result={
+                "idempotent": True,
+                "note": "already in desired state",
+                "detail": preview.detail,
+            },
+        )
+        await db.commit()
+        await db.refresh(cr)
+        logger.info(
+            "change_request.idempotent",
+            change_request_id=str(cr.id),
+            operation=cr.operation,
+            approver=str(approver.id),
+            detail=preview.detail,
+        )
+        return cr
 
     # 5b. Scope-drift guard (#3b — TOCTOU). The frozen ``cr.preview_text`` is
     #     what the approver saw rendered when the request was created; each

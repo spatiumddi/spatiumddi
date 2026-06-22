@@ -17,6 +17,8 @@ gated behind a SECOND superadmin's approval, reusing the same
   * deleting a policy                                    (kind=delete_policy)
   * lowering a policy's superadmin gate (true → false)   (kind=lower_superadmin_gate)
   * turning the lock itself off (true → false)           (kind=unlock)
+  * any coverage-REDUCING policy edit (repoint resource_type/action, raise
+    min_count, set min_count NULL→value)                 (kind=update_policy)
 
 STRENGTHENING moves (enabling the module, enabling a policy, raising the
 superadmin gate, turning the lock on) stay single-person inline — making
@@ -52,6 +54,7 @@ from uuid import UUID
 import structlog
 from fastapi import Request
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
@@ -82,6 +85,7 @@ _KIND_LABELS: dict[str, str] = {
     "delete_policy": "Delete approval policy",
     "lower_superadmin_gate": "Stop a policy applying to superadmins",
     "unlock": "Remove the require-approval-to-disable lock",
+    "update_policy": "Weaken approval policy (coverage-reducing edit)",
 }
 
 ControlKind = Literal[
@@ -90,19 +94,40 @@ ControlKind = Literal[
     "delete_policy",
     "lower_superadmin_gate",
     "unlock",
+    "update_policy",
 ]
+
+# Fields a ``update_policy`` weakening edit may carry in ``update_payload``.
+# Mirrors ApprovalPolicyUpdate; the apply() replays these verbatim under the
+# approver. Unknown keys are ignored (defensive).
+_POLICY_UPDATE_FIELDS: frozenset[str] = frozenset(
+    {
+        "name",
+        "resource_type",
+        "action",
+        "min_count",
+        "enabled",
+        "applies_to_superadmin",
+        "ttl_hours",
+    }
+)
 
 
 class ModifyApprovalControlArgs(BaseModel):
     """Args for the ``modify_approval_control`` operation.
 
-    ``kind`` discriminates the five weakening changes. ``policy_id`` is
-    required for the three policy-scoped kinds; ignored for
-    ``disable_module`` / ``unlock``.
+    ``kind`` discriminates the weakening changes. ``policy_id`` is required for
+    the policy-scoped kinds; ignored for ``disable_module`` / ``unlock``.
+    ``update_payload`` carries the full proposed policy edit for the
+    ``update_policy`` kind (a coverage-reducing PUT routed through the gate) —
+    it is the exact ``model_dump(exclude_unset=True)`` of the operator's
+    ``ApprovalPolicyUpdate`` so apply() can REPLAY the identical edit under the
+    approver. Ignored for every other kind.
     """
 
     kind: ControlKind
     policy_id: UUID | None = None
+    update_payload: dict[str, Any] | None = None
 
 
 async def is_controls_protected(db: AsyncSession) -> bool:
@@ -115,7 +140,73 @@ async def is_controls_protected(db: AsyncSession) -> bool:
     return bool(ps is not None and ps.approvals_protect_controls)
 
 
+async def _get_policy_for_update(db: AsyncSession, policy_id: UUID) -> ApprovalPolicy | None:
+    """Load an ``ApprovalPolicy`` row with ``FOR UPDATE`` (#5).
+
+    Locking the row in both preview and apply closes the TOCTOU window where a
+    concurrent break-glass deletes / flips the policy between the spine's
+    preview and its apply — the second caller blocks until the first commits,
+    then sees the settled state (gone / changed) and resolves idempotently."""
+    stmt = select(ApprovalPolicy).where(ApprovalPolicy.id == policy_id).with_for_update()
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+async def _settings_for_update(db: AsyncSession) -> PlatformSettings | None:
+    """Load ``PlatformSettings(1)`` with ``FOR UPDATE`` (#6) where the lock flag
+    is mutated, so a flag flip can't race the gate-decision read."""
+    stmt = select(PlatformSettings).where(PlatformSettings.id == 1).with_for_update()
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
 # ── modify_approval_control operation ───────────────────────────────────
+
+
+def _coverage_reducing_diffs(policy: ApprovalPolicy, payload: dict[str, Any]) -> list[str]:
+    """Return human diffs for every COVERAGE-REDUCING field in ``payload``.
+
+    A coverage-reducing edit makes a live policy match FEWER operations while
+    still looking enabled — the side-door #2 closes. Compared against the live
+    ``policy`` row so the same rule decides the gate (in the router, pre-edit)
+    AND re-asserts it at approve/replay time (in preview, against whatever the
+    row is then). Empty list ⇒ the edit doesn't weaken coverage (inline-safe).
+
+    Weakening transitions (each gated):
+      * ``enabled`` true → false           — policy goes dark.
+      * ``applies_to_superadmin`` true→false — superadmins escape the gate.
+      * ``resource_type`` changed          — repoints at a different surface.
+      * ``action`` changed                 — repoints at a different verb.
+      * ``min_count`` raised               — gates fewer (larger) ops.
+      * ``min_count`` NULL → a value       — NULL = always-gate (strongest);
+        any concrete threshold lets small ops slip through ungated.
+
+    Strengthening / neutral edits (NOT gated — return no diff for them):
+      name, description, ttl_hours, enabling, raising applies_to_superadmin,
+      lowering min_count, min_count → NULL.
+    """
+    diffs: list[str] = []
+
+    if payload.get("enabled") is False and policy.enabled:
+        diffs.append("disabled (enabled true→false)")
+
+    if payload.get("applies_to_superadmin") is False and policy.applies_to_superadmin:
+        diffs.append("no longer applies to superadmins")
+
+    if "resource_type" in payload and payload["resource_type"] != policy.resource_type:
+        diffs.append(f"resource_type {policy.resource_type!r}→{payload['resource_type']!r}")
+
+    if "action" in payload and payload["action"] != policy.action:
+        diffs.append(f"action {policy.action!r}→{payload['action']!r}")
+
+    if "min_count" in payload:
+        new_mc = payload["min_count"]
+        old_mc = policy.min_count
+        if old_mc is None and new_mc is not None:
+            # NULL (always-gate) → a concrete threshold = weaker.
+            diffs.append(f"min_count NULL→{new_mc} (was always-gate)")
+        elif old_mc is not None and new_mc is not None and new_mc > old_mc:
+            diffs.append(f"min_count {old_mc}→{new_mc} (gates fewer ops)")
+
+    return diffs
 
 
 async def _preview_modify_approval_control(
@@ -123,10 +214,21 @@ async def _preview_modify_approval_control(
 ) -> PreviewResult:
     """Re-validate the weakening change + render a clear human description.
 
-    ``ok=False`` (with a reason) when the change is already moot — the
-    module is already off, the policy vanished or is already disabled, the
-    lock is already off — so the approve spine refuses to execute a no-op /
-    doomed control change exactly like a stale risky delete.
+    Three outcomes (#5 / #6):
+
+    * ``ok=False`` — the change is structurally invalid (missing policy_id,
+      built-in delete, unknown kind). The approve spine 409s like a stale delete.
+    * ``ok=True, idempotent=True`` — the desired end-state is ALREADY reached
+      (module already off, lock already off, policy already gone / already
+      disabled, edit already applied) OR the gate PREMISE is gone (the lock was
+      turned off out of band, e.g. by a concurrent break-glass ``unlock``). The
+      approve spine resolves the request as EXECUTED-idempotent WITHOUT
+      re-running apply(), so a CR whose effect already landed (or whose
+      protection premise vanished) resolves cleanly instead of stranding.
+    * ``ok=True`` (not idempotent) — proceed; apply() performs the change.
+
+    Rows are read FOR UPDATE so a concurrent break-glass can't delete / flip
+    the target between this preview and apply() in the same spine call.
     """
     from app.services.feature_modules import is_module_enabled  # noqa: PLC0415
 
@@ -134,7 +236,12 @@ async def _preview_modify_approval_control(
 
     if kind == "disable_module":
         if not await is_module_enabled(db, MODULE_ID):
-            return PreviewResult(ok=False, detail="Approval workflows are already disabled.")
+            return PreviewResult(
+                ok=True,
+                idempotent=True,
+                detail="Approval workflows are already disabled.",
+                preview_text="Disable approval workflows entirely",
+            )
         return PreviewResult(
             ok=True, detail="ready", preview_text="Disable approval workflows entirely"
         )
@@ -142,7 +249,10 @@ async def _preview_modify_approval_control(
     if kind == "unlock":
         if not await is_controls_protected(db):
             return PreviewResult(
-                ok=False, detail="The require-approval-to-disable lock is already off."
+                ok=True,
+                idempotent=True,
+                detail="The require-approval-to-disable lock is already off.",
+                preview_text="Remove the require-approval-to-disable lock",
             )
         return PreviewResult(
             ok=True,
@@ -150,16 +260,30 @@ async def _preview_modify_approval_control(
             preview_text="Remove the require-approval-to-disable lock",
         )
 
-    # Policy-scoped kinds need the row.
+    # Policy-scoped kinds need the row — locked FOR UPDATE (#5) so a concurrent
+    # break-glass delete can't slip in between preview and apply.
     if args.policy_id is None:
         return PreviewResult(ok=False, detail=f"{kind} requires a policy_id.")
-    policy = await db.get(ApprovalPolicy, args.policy_id)
+    policy = await _get_policy_for_update(db, args.policy_id)
     if policy is None:
+        # For delete_policy a vanished row IS the desired end-state (#5).
+        if kind == "delete_policy":
+            return PreviewResult(
+                ok=True,
+                idempotent=True,
+                detail=f"Approval policy {args.policy_id} is already gone.",
+                preview_text="Delete approval policy",
+            )
         return PreviewResult(ok=False, detail=f"Approval policy {args.policy_id} not found.")
 
     if kind == "disable_policy":
         if not policy.enabled:
-            return PreviewResult(ok=False, detail=f"Policy {policy.name!r} is already disabled.")
+            return PreviewResult(
+                ok=True,
+                idempotent=True,
+                detail=f"Policy {policy.name!r} is already disabled.",
+                preview_text=f"Disable approval policy `{policy.name}`",
+            )
         return PreviewResult(
             ok=True, detail="ready", preview_text=f"Disable approval policy `{policy.name}`"
         )
@@ -175,13 +299,40 @@ async def _preview_modify_approval_control(
     if kind == "lower_superadmin_gate":
         if not policy.applies_to_superadmin:
             return PreviewResult(
-                ok=False,
+                ok=True,
+                idempotent=True,
                 detail=f"Policy {policy.name!r} already does not apply to superadmins.",
+                preview_text=f"Stop policy `{policy.name}` applying to superadmins",
             )
         return PreviewResult(
             ok=True,
             detail="ready",
             preview_text=f"Stop policy `{policy.name}` applying to superadmins",
+        )
+
+    if kind == "update_policy":
+        payload = args.update_payload or {}
+        diffs = _coverage_reducing_diffs(policy, payload)
+        if not diffs:
+            # The proposed edit no longer reduces coverage vs the live row —
+            # already applied, or the row drifted. The requested weakening is a
+            # no-op now → idempotent success (#5) rather than a 409 dead-end.
+            return PreviewResult(
+                ok=True,
+                idempotent=True,
+                detail=(
+                    f"Policy {policy.name!r} edit no longer reduces coverage "
+                    "(already applied or the policy changed)."
+                ),
+                preview_text=f"Weaken approval policy `{policy.name}`",
+            )
+        return PreviewResult(
+            ok=True,
+            detail="ready",
+            preview_text=(
+                f"Weaken approval policy `{policy.name}` — coverage-reducing edit: "
+                + "; ".join(diffs)
+            ),
         )
 
     return PreviewResult(ok=False, detail=f"Unknown control kind {kind!r}.")  # pragma: no cover
@@ -253,9 +404,13 @@ async def _apply_modify_approval_control(
         return {"kind": kind, "module": MODULE_ID, "enabled": False}
 
     if kind == "unlock":
-        ps = await db.get(PlatformSettings, 1)
-        if ps is not None:
-            ps.approvals_protect_controls = False
+        # FOR UPDATE (#6) so a racing flag flip can't clobber this write.
+        ps = await _settings_for_update(db)
+        if ps is None or not ps.approvals_protect_controls:
+            # Already off (idempotent) — nothing to do, no audit noise.
+            await db.commit()
+            return {"kind": kind, "approvals_protect_controls": False, "idempotent": True}
+        ps.approvals_protect_controls = False
         _control_audit(
             db,
             user=user,
@@ -268,12 +423,17 @@ async def _apply_modify_approval_control(
         await db.commit()
         return {"kind": kind, "approvals_protect_controls": False}
 
-    # Policy-scoped kinds.
+    # Policy-scoped kinds — lock the row FOR UPDATE (#5).
     if args.policy_id is None:
         raise ValueError(f"{kind} requires a policy_id.")
-    policy = await db.get(ApprovalPolicy, args.policy_id)
+    policy = await _get_policy_for_update(db, args.policy_id)
     if policy is None:
-        raise ValueError(f"Approval policy {args.policy_id} not found.")
+        # The policy vanished (e.g. a concurrent break-glass delete won the
+        # race). For delete that IS the desired end-state → idempotent success;
+        # for the others there's nothing left to weaken → also idempotent, not
+        # a crash (the direct break-glass call path must not 500 here).
+        await db.commit()
+        return {"kind": kind, "policy_id": str(args.policy_id), "idempotent": True}
     name = policy.name
 
     if kind == "disable_policy":
@@ -283,6 +443,19 @@ async def _apply_modify_approval_control(
     elif kind == "lower_superadmin_gate":
         policy.applies_to_superadmin = False
         new_value = {"applies_to_superadmin": False, "via": "approval_control"}
+        action_audit = "write"
+    elif kind == "update_policy":
+        # REPLAY the operator's exact coverage-reducing edit under the approver.
+        # Apply only known policy fields from the frozen payload (defensive
+        # filter — never trust extra keys); the preview() re-asserted it still
+        # reduces coverage before we got here.
+        payload = args.update_payload or {}
+        applied: dict[str, Any] = {}
+        for field, value in payload.items():
+            if field in _POLICY_UPDATE_FIELDS:
+                setattr(policy, field, value)
+                applied[field] = value
+        new_value = {**applied, "via": "approval_control"}
         action_audit = "write"
     elif kind == "delete_policy":
         if policy.is_builtin:
@@ -331,6 +504,25 @@ register(_OP_MODIFY_APPROVAL_CONTROL)
 CONTROL_OPERATION_NAMES: frozenset[str] = frozenset({"modify_approval_control"})
 
 
+async def control_gate_premise_lost(db: AsyncSession, args: ModifyApprovalControlArgs) -> bool:
+    """True iff a queued control-op change_request's gate PREMISE has evaporated
+    (#6 — TOCTOU defense-in-depth).
+
+    Every control change_request was queued BECAUSE the self-protection lock was
+    ON when it was requested. If the lock is now OFF at approve time (e.g. a
+    concurrent break-glass ``unlock`` landed first), the second-superadmin
+    protection rationale no longer holds — the approve spine should resolve the
+    request as idempotent/clear rather than silently executing a weakening
+    change under approver authority whose premise is gone. ``unlock`` itself is
+    exempt: its desired end-state IS the lock being off, so the op's own
+    preview() already reports it idempotent. The flag is read FOR UPDATE so the
+    decision can't race a concurrent flip."""
+    if args.kind == "unlock":
+        return False
+    ps = await _settings_for_update(db)
+    return not bool(ps is not None and ps.approvals_protect_controls)
+
+
 def _assert_registered() -> None:  # pragma: no cover — import-time invariant
     if get_operation("modify_approval_control") is None:
         raise RuntimeError("modify_approval_control operation not registered")
@@ -349,6 +541,7 @@ async def maybe_gate_control(
     *,
     kind: ControlKind,
     policy_id: UUID | None = None,
+    update_payload: dict[str, Any] | None = None,
     resource_type: str,
     resource_id: str | None,
     resource_display: str,
@@ -376,7 +569,7 @@ async def maybe_gate_control(
 
     op = get_operation("modify_approval_control")
     assert op is not None  # registered at import
-    args = ModifyApprovalControlArgs(kind=kind, policy_id=policy_id)
+    args = ModifyApprovalControlArgs(kind=kind, policy_id=policy_id, update_payload=update_payload)
 
     # 2. Re-run preview — don't queue a doomed / no-op control change.
     from fastapi import HTTPException, status  # noqa: PLC0415
@@ -414,6 +607,12 @@ __all__ = [
     "CONTROL_OPERATION_NAMES",
     "ControlKind",
     "ModifyApprovalControlArgs",
+    "coverage_reducing_diffs",
     "is_controls_protected",
     "maybe_gate_control",
 ]
+
+
+# Public alias for the router's gate-decision call (the leading underscore
+# keeps the impl private; the router imports this name).
+coverage_reducing_diffs = _coverage_reducing_diffs
