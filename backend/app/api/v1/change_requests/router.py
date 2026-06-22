@@ -33,7 +33,6 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-import structlog
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -64,7 +63,6 @@ from app.services.approvals.service import (
     reject_change_request,
 )
 
-logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 
