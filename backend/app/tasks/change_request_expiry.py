@@ -42,12 +42,14 @@ async def _sweep() -> dict[str, int]:
         now = datetime.now(UTC)
         # Candidate ids only — re-load each FOR UPDATE so a mid-loop decision
         # by an approver/requester is observed under the lock (#12).
+        # #10: ``expires_at <= now`` is the single "expired" convention,
+        # matching the approve-path check + the per-row recheck below.
         candidate_ids = list(
             (
                 await db.execute(
                     select(ChangeRequest.id)
                     .where(ChangeRequest.state == "pending")
-                    .where(ChangeRequest.expires_at < now)
+                    .where(ChangeRequest.expires_at <= now)
                 )
             )
             .scalars()
@@ -62,8 +64,9 @@ async def _sweep() -> dict[str, int]:
             try:
                 cr = await get_change_request(db, cr_id, for_update=True)
                 # Re-check under the lock: an approver/requester may have
-                # flipped it out of pending (or it may have re-expired-past).
-                if cr is None or cr.state != "pending" or cr.expires_at >= datetime.now(UTC):
+                # flipped it out of pending. #10: ``expires_at > now`` (the
+                # negation of ``<= now``) means not-yet-expired → skip.
+                if cr is None or cr.state != "pending" or cr.expires_at > datetime.now(UTC):
                     skipped += 1
                     await db.commit()  # release the row lock
                     continue

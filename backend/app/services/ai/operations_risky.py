@@ -70,6 +70,62 @@ from app.services.ai.operations import (
 logger = structlog.get_logger(__name__)
 
 
+# ── Blast-radius preview helper (#3a) ──────────────────────────────────────
+#
+# The approve path re-runs preview() and compares its preview_text against the
+# frozen request-time preview_text; any drift refuses execution (#3b). For
+# that drift check to actually catch a cascade that GREW between request and
+# approval, every delete op's preview_text must embed the CURRENT blast radius
+# (counts that move when the cascade changes), not just a static label.
+
+
+async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
+    """Render the soft-delete cascade blast radius for ``root`` as a stable,
+    count-bearing string (#3a).
+
+    Uses the SAME ``collect_soft_delete_batch`` walk ``apply()`` will use, so
+    the preview reflects exactly what would be soft-deleted right now. Counts
+    are grouped by resource type and rendered in a fixed order so the string is
+    deterministic for a given set of rows (the approve-time drift compare is a
+    plain string equality, so ordering must not jitter). The root row itself is
+    excluded from the cascade counts (it's the target, not collateral)."""
+    # Local import — keep the soft_delete dependency off module load.
+    from app.services.soft_delete import (  # noqa: PLC0415
+        _resource_type,
+        collect_soft_delete_batch,
+    )
+
+    batch = await collect_soft_delete_batch(db, root)
+    root_id = getattr(root, "id", None)
+    root_rt = _resource_type(root)
+    counts: dict[str, int] = {}
+    for row in batch.rows:
+        if getattr(row.obj, "id", None) == root_id and row.resource_type == root_rt:
+            continue
+        counts[row.resource_type] = counts.get(row.resource_type, 0) + 1
+    labels = {
+        "ip_block": "child block",
+        "subnet": "subnet",
+        "dhcp_scope": "DHCP scope",
+        "dns_record": "DNS record",
+    }
+    order = ["ip_block", "subnet", "dhcp_scope", "dns_record"]
+    parts = []
+    for rt in order:
+        n = counts.get(rt, 0)
+        if n:
+            noun = labels[rt]
+            parts.append(f"{n} {noun}" + ("s" if n != 1 else ""))
+    # Include the leftover types deterministically (sorted) in case the walk
+    # grows to cover a type not in ``order`` — never silently drop a count.
+    for rt in sorted(counts):
+        if rt not in order and counts[rt]:
+            parts.append(f"{counts[rt]} {rt}")
+    if not parts:
+        return "cascades nothing (empty)"
+    return "cascades " + ", ".join(parts)
+
+
 # ── delete_subnet ──────────────────────────────────────────────────────────
 
 
@@ -136,6 +192,8 @@ async def _preview_delete_subnet(
     mode = "Permanently delete" if args.permanent else "Soft-delete"
     parts = [f"{mode} subnet `{subnet.network}`" + (f" ({subnet.name})" if subnet.name else "")]
     if args.permanent:
+        # #3a: counts move as the cascade grows → the approve-time drift check
+        # catches a subnet that gained IPs/scopes since it was requested.
         scope_count = (
             await db.execute(
                 select(func.count(DHCPScope.id)).where(DHCPScope.subnet_id == args.subnet_id)
@@ -147,12 +205,15 @@ async def _preview_delete_subnet(
             )
         ).scalar_one()
         parts.append(
-            f"cascade: {scope_count} DHCP scope(s) + {ip_count} IP row(s) + auto DNS cleanup"
+            f"cascades {scope_count} DHCP scope(s) + {ip_count} IP row(s) + auto DNS cleanup"
         )
         if args.force:
             parts.append("force=true (skip non-empty check)")
     else:
-        parts.append("the subnet + its DHCP scopes are restorable from /admin/trash")
+        # #3a: the soft-delete cascade summary embeds the current blast radius
+        # (DHCP scopes the subnet holds) so a grown cascade is detectable.
+        parts.append(await _soft_delete_cascade_summary(db, subnet))
+        parts.append("restorable from /admin/trash")
     return PreviewResult(ok=True, detail="ready", preview_text="; ".join(parts))
 
 
@@ -354,12 +415,15 @@ async def _preview_delete_block(
             preview_text=f"Permanently delete empty block `{block.network}` ({block.name})",
         )
 
+    # #3a: embed the current cascade counts so the approve-time drift check
+    # catches new child blocks / subnets added since the request.
     return PreviewResult(
         ok=True,
         detail="ready",
         preview_text=(
-            f"Soft-delete block `{block.network}` ({block.name}) — cascades to child "
-            "blocks + subnets + their DHCP scopes; restorable from /admin/trash"
+            f"Soft-delete block `{block.network}` ({block.name}) — "
+            f"{await _soft_delete_cascade_summary(db, block)}; "
+            "restorable from /admin/trash"
         ),
     )
 
@@ -480,12 +544,15 @@ async def _preview_delete_space(
             preview_text=f"Permanently delete empty IP space `{space.name}`",
         )
 
+    # #3a: embed the current cascade counts so the approve-time drift check
+    # catches new blocks / subnets / scopes added since the request.
     return PreviewResult(
         ok=True,
         detail="ready",
         preview_text=(
-            f"Soft-delete IP space `{space.name}` — cascades to every block, subnet, "
-            "and DHCP scope under it; restorable from /admin/trash"
+            f"Soft-delete IP space `{space.name}` — "
+            f"{await _soft_delete_cascade_summary(db, space)}; "
+            "restorable from /admin/trash"
         ),
     )
 
@@ -571,11 +638,26 @@ async def _preview_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArg
         return PreviewResult(ok=False, detail=str(exc.detail))
 
     mode = "Permanently delete" if args.permanent else "Soft-delete"
-    suffix = (
-        " (pushes a remove-zone write-through to agentless servers first)"
-        if args.permanent
-        else " — the zone + its records are restorable from /admin/trash"
-    )
+    if args.permanent:
+        # #3a: count the records this zone holds so a permanent delete of a
+        # zone that grew records since request is caught by the drift check.
+        from app.models.dns import DNSRecord  # noqa: PLC0415
+
+        rec_count = (
+            await db.execute(
+                select(func.count(DNSRecord.id)).where(DNSRecord.zone_id == args.zone_id)
+            )
+        ).scalar_one()
+        suffix = (
+            f" — cascades {rec_count} DNS record(s)"
+            " (pushes a remove-zone write-through to agentless servers first)"
+        )
+    else:
+        # #3a: the soft-delete cascade summary embeds the current record count.
+        suffix = (
+            f" — {await _soft_delete_cascade_summary(db, zone)};"
+            " the zone + its records are restorable from /admin/trash"
+        )
     return PreviewResult(
         ok=True, detail="ready", preview_text=f"{mode} DNS zone `{zone.name}`{suffix}"
     )
@@ -670,11 +752,13 @@ async def _preview_delete_scope(
     if scope is None:
         return PreviewResult(ok=False, detail="Scope not found")
     mode = "Permanently delete" if args.permanent else "Soft-delete"
-    suffix = (
-        " (pushes a remove-scope write-through to Windows members first)"
-        if args.permanent
-        else " — restorable from /admin/trash"
-    )
+    if args.permanent:
+        # A scope is a cascade leaf (no soft-delete descendants), so there is
+        # no growing blast radius — the preview stays stable across request →
+        # approve, which is correct (#3a: a leaf has nothing to drift).
+        suffix = " (pushes a remove-scope write-through to Windows members first)"
+    else:
+        suffix = f" — {await _soft_delete_cascade_summary(db, scope)}; restorable from /admin/trash"
     return PreviewResult(
         ok=True, detail="ready", preview_text=f"{mode} DHCP scope `{scope.id}`{suffix}"
     )

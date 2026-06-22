@@ -35,6 +35,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import (
+    RESOURCE_TYPE_CHANGE_REQUEST,
+    is_effective_superadmin,
+    user_has_permission,
+)
 from app.models.auth import User
 from app.models.change_request import CHANGE_REQUEST_STATES, ChangeRequest
 from app.services.ai import operations
@@ -45,6 +50,18 @@ from app.services.ai.operations import (
 from app.services.ai.tools.base import register_tool
 
 MODULE = "governance.approvals"
+
+
+def _can_see_all_change_requests(user: User) -> bool:
+    """READ RULE (#1), identical to the REST router: a superadmin or a holder
+    of ``{approve, change_request}`` may see EVERY change request; everyone
+    else is scoped to their own. The MCP read tools have no router gate, so the
+    scope is enforced here in-tool — without it the copilot would leak the
+    whole platform queue (args / preview / target / requester / approver) to
+    any user who can reach the (default-off) governance.approvals module."""
+    return is_effective_superadmin(user) or user_has_permission(
+        user, "approve", RESOURCE_TYPE_CHANGE_REQUEST
+    )
 
 
 def _cr_to_dict(cr: ChangeRequest) -> dict[str, Any]:
@@ -109,7 +126,9 @@ async def find_change_requests(
         stmt = stmt.where(ChangeRequest.state == args.state)
     if args.resource_type is not None:
         stmt = stmt.where(ChangeRequest.resource_type == args.resource_type)
-    if args.mine:
+    # READ RULE (#1): force own-scope for callers who aren't a superadmin /
+    # approve-holder, regardless of the ``mine`` arg.
+    if args.mine or not _can_see_all_change_requests(user):
         stmt = stmt.where(ChangeRequest.requested_by_user_id == user.id)
     stmt = stmt.order_by(ChangeRequest.created_at.desc()).limit(args.limit)
     rows = list((await db.execute(stmt)).scalars().all())
@@ -145,7 +164,10 @@ async def count_change_requests(
     db: AsyncSession, user: User, args: CountChangeRequestsArgs
 ) -> dict[str, Any]:
     stmt = select(ChangeRequest.state, func.count(ChangeRequest.id)).group_by(ChangeRequest.state)
-    if args.mine:
+    # READ RULE (#1): a non-superadmin / non-approve-holder may only count
+    # their own requests — counting the whole queue leaks backlog size + (via
+    # find) row contents. Force own-scope regardless of the ``mine`` arg.
+    if args.mine or not _can_see_all_change_requests(user):
         stmt = stmt.where(ChangeRequest.requested_by_user_id == user.id)
     by_state: dict[str, int] = {s: 0 for s in sorted(CHANGE_REQUEST_STATES)}
     total = 0

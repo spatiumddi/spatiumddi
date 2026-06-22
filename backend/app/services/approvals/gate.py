@@ -46,7 +46,11 @@ from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
 from app.services.ai.operations import Operation, get_operation
 from app.services.ai.operations_risky import RISKY_OPERATION_NAMES
-from app.services.approvals.policy import match_policy
+from app.services.approvals.policy import (
+    GATEABLE_ACTIONS,
+    GATEABLE_RESOURCE_TYPES,
+    match_policy,
+)
 from app.services.approvals.service import create_change_request
 from app.services.feature_modules import is_module_enabled
 
@@ -56,22 +60,40 @@ MODULE_ID = "governance.approvals"
 
 
 def _assert_risky_ops_have_permission() -> None:
-    """Fail loudly at import if any registered risky op lacks a
-    ``required_permission`` (#3).
+    """Fail loudly at import if any registered risky op can't be gated (#4).
 
     The gate derives the policy-lookup ``(action, resource_type)`` straight
     from ``operation.required_permission``; an op that forgets to declare one
-    would silently never gate (fail-open). Catch the drift at boot instead.
+    would silently never gate (fail-open). Worse: an op that DOES declare a
+    permission whose ``(action, resource_type)`` is not in the gateable sets
+    passes a "permission exists" check but ``match_policy`` can never select a
+    policy for it (the policy CRUD rejects non-gateable pairs), so it would
+    still run inline with no approval — a fail-open trap. Require BOTH: the
+    permission exists AND its pair is gateable, so a future risky op forces an
+    explicit widening of ``GATEABLE_ACTIONS`` / ``GATEABLE_RESOURCE_TYPES``
+    instead of silently never gating. Catch the drift at boot.
     """
-    missing = []
+    missing: list[str] = []
+    non_gateable: list[str] = []
     for name in RISKY_OPERATION_NAMES:
         op = get_operation(name)
         if op is None or op.required_permission is None:
             missing.append(name)
+            continue
+        action, resource_type = op.required_permission
+        if action not in GATEABLE_ACTIONS or resource_type not in GATEABLE_RESOURCE_TYPES:
+            non_gateable.append(f"{name} ({action}:{resource_type})")
     if missing:  # pragma: no cover — import-time invariant
         raise RuntimeError(
             f"risky operations missing required_permission (cannot derive "
             f"approval policy keys): {sorted(missing)}"
+        )
+    if non_gateable:  # pragma: no cover — import-time invariant
+        raise RuntimeError(
+            "risky operations declare a non-gateable (action, resource_type) — "
+            "match_policy can never gate them, so they would run inline with no "
+            f"approval (fail-open). Widen GATEABLE_ACTIONS / "
+            f"GATEABLE_RESOURCE_TYPES: {sorted(non_gateable)}"
         )
 
 

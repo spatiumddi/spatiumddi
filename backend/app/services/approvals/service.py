@@ -22,8 +22,8 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from fastapi import HTTPException, Request
-from sqlalchemy import select
+from fastapi import HTTPException, Request, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.request_meta import clean_user_agent, client_ip
@@ -46,6 +46,13 @@ _ACTION_CANCELLED = "cancelled"
 _ACTION_EXECUTED = "executed"
 _ACTION_FAILED = "failed"
 _ACTION_EXPIRED = "expired"
+
+# #8: per-user pending-request cap. Bounds change_request table + expiry-sweep
+# growth from a single noisy requester (or a script). A requester at the cap
+# must let some of their pending requests resolve (approve / reject / cancel /
+# expire) before queuing more. Sized generously — a human operator rarely has
+# this many open at once; it's a runaway guard, not a workflow throttle.
+_MAX_PENDING_PER_USER = 50
 
 
 class ChangeRequestStateError(Exception):
@@ -113,7 +120,29 @@ async def create_change_request(
 
     The caller (the gate) owns the commit. ``ttl_hours`` comes from the
     matched policy; ``expires_at`` is stamped now + ttl.
+
+    #8: refuses (429) when the requester already holds ``_MAX_PENDING_PER_USER``
+    pending requests — a per-user cap that bounds table + sweep growth.
     """
+    # #8: per-user pending quota — fail before persisting anything.
+    pending_count = (
+        await db.execute(
+            select(func.count(ChangeRequest.id)).where(
+                ChangeRequest.requested_by_user_id == user.id,
+                ChangeRequest.state == "pending",
+            )
+        )
+    ).scalar_one()
+    if pending_count >= _MAX_PENDING_PER_USER:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"You already have {pending_count} pending change requests "
+                f"(max {_MAX_PENDING_PER_USER}). Resolve or cancel some before "
+                "submitting more."
+            ),
+        )
+
     now = datetime.now(UTC)
     cr = ChangeRequest(
         operation=operation,
@@ -261,13 +290,20 @@ async def mark_cancelled(
     *,
     user: User,
     request: Request | None,
+    note: str | None = None,
 ) -> ChangeRequest:
     """``pending`` → ``cancelled`` (terminal). Driven by the requester (or
-    a superadmin); the API layer enforces who may cancel."""
+    a superadmin); the API layer enforces who may cancel.
+
+    #5: the optional cancellation ``note`` is stamped on the row AND carried
+    into the audit ``new_value`` here — previously the router set
+    ``cr.decision_note`` only AFTER this wrote the audit row, so the note never
+    reached ``audit_log`` (unlike approve/reject)."""
     _require_state(cr, "pending")
     cr.state = "cancelled"
     cr.decided_by_user_id = user.id
     cr.decided_by_display = user.display_name
+    cr.decision_note = note
     cr.decided_at = datetime.now(UTC)
     _audit(
         db,
@@ -276,7 +312,7 @@ async def mark_cancelled(
         action=_ACTION_CANCELLED,
         cr=cr,
         old_value={"state": "pending"},
-        new_value={"state": "cancelled"},
+        new_value={"state": "cancelled", "note": note},
     )
     return cr
 
@@ -514,7 +550,10 @@ async def approve_change_request(
         raise DecisionNotFound(f"Change request {cr_id} not found")
     if cr.state != "pending":
         raise DecisionConflict(f"Change request is not pending (state={cr.state!r})")
-    if cr.expires_at < datetime.now(UTC):
+    # #10: one expiry convention everywhere — ``expires_at <= now`` means expired
+    # (matches the sweep select + recheck), so a request can't be approved in the
+    # same instant the sweep would expire it.
+    if cr.expires_at <= datetime.now(UTC):
         # #13: route through the audited mark_expired transition (not a raw
         # field poke) so the change_request.expired audit row lands.
         await mark_expired(db, cr)
@@ -552,10 +591,19 @@ async def approve_change_request(
         raise DecisionForbidden(str(exc)) from exc
 
     # Re-validate frozen args (guards the rare redeploy-mid-flight schema change).
+    # #6: never echo the Pydantic ValidationError back to the client — it
+    # interpolates ``input_value`` (the frozen args). Log the detail
+    # server-side and surface a generic message.
     try:
         args = op.args_model.model_validate(cr.args or {})
     except Exception as exc:  # noqa: BLE001
-        raise DecisionUnprocessable(f"Stored args no longer validate: {exc}") from exc
+        logger.warning(
+            "change_request.args_revalidation_failed",
+            change_request_id=str(cr.id),
+            operation=cr.operation,
+            error=str(exc),
+        )
+        raise DecisionUnprocessable("Stored args no longer validate for this operation") from exc
 
     # 5. Stale-state re-check — do NOT execute a doomed op; leave it pending.
     preview = await op.preview(db, approver, args)
@@ -569,7 +617,36 @@ async def approve_change_request(
         )
         raise DecisionConflict(preview.detail)
 
+    # 5b. Scope-drift guard (#3b — TOCTOU). The frozen ``cr.preview_text`` is
+    #     what the approver saw rendered when the request was created; each
+    #     delete op's preview_text now embeds the CURRENT blast radius (#3a).
+    #     If the fresh preview_text differs, the blast radius CHANGED between
+    #     request and approval (e.g. the requester added 50 IPs to a subnet
+    #     queued for soft-delete) — refuse so the approver never rubber-stamps
+    #     a scope larger than the one they reviewed. Treat any drift as stale;
+    #     the requester must cancel and re-submit to capture the new scope.
+    #     This closes the TOCTOU for both soft and permanent paths via one rule.
+    if preview.preview_text != cr.preview_text:
+        logger.info(
+            "change_request.scope_drift",
+            change_request_id=str(cr.id),
+            operation=cr.operation,
+            approver=str(approver.id),
+            frozen_preview=cr.preview_text,
+            fresh_preview=preview.preview_text,
+        )
+        raise DecisionConflict(
+            "The change's scope changed since it was requested — cancel and "
+            "re-submit to capture the new scope."
+        )
+
     requester_id = cr.requested_by_user_id
+
+    # #3b transparency: surface the freshly-rendered preview on the returned
+    # row. On the success path it equals the frozen text (drift would have
+    # 409'd above), but persisting it makes the executed row reflect exactly
+    # what was re-validated at approve time.
+    cr.preview_text = preview.preview_text
 
     # Record the approval transition (pending → approved, audited).
     await mark_approved(db, cr, approver=approver, request=request, note=note)

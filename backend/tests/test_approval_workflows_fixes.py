@@ -375,3 +375,271 @@ def test_change_request_event_type_single_namespaced() -> None:
     assert "change_request.requested" in catalog
     assert "change_request.created" not in catalog
     assert "change_request.deleted" not in catalog
+
+
+# ── #1: queue read scoping (REST list / get + MCP find) ────────────────────────
+
+
+async def _pending_cr(
+    db: AsyncSession, subnet: Subnet, requester: User, *, display: str = "owned"
+) -> ChangeRequest:
+    """Seed a pending delete_subnet change request owned by ``requester``."""
+    cr = ChangeRequest(
+        operation="delete_subnet",
+        resource_type="subnet",
+        resource_id=str(subnet.id),
+        resource_display=display,
+        args={"subnet_id": str(subnet.id), "force": False, "permanent": False},
+        preview_text=f"Soft-delete subnet ({display})",
+        risk_reason="delete:subnet",
+        state="pending",
+        requested_by_user_id=requester.id,
+        requested_by_display=requester.display_name,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    db.add(cr)
+    await db.flush()
+    return cr
+
+
+@pytest.mark.asyncio
+async def test_read_only_user_sees_only_own_requests(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """READ RULE (#1): a plain {read, change_request} holder (not approve, not
+    superadmin) sees ONLY their own rows via the list endpoint — never another
+    user's — and ``mine=false`` can't widen that."""
+    await _enable_module(db_session)
+    subnet_a = await _subnet(db_session, "10.20.1.0/24")
+    subnet_b = await _subnet(db_session, "10.20.2.0/24")
+
+    reader, rtok = await _user(
+        db_session,
+        name="reader",
+        permissions=[{"action": "read", "resource_type": "change_request"}],
+    )
+    other, _ = await _user(db_session, name="other")
+
+    mine = await _pending_cr(db_session, subnet_a, reader, display="mine")
+    theirs = await _pending_cr(db_session, subnet_b, other, display="theirs")
+    await db_session.commit()
+
+    # Even with mine=false the read-only user is forced to own-scope.
+    r = await client.get("/api/v1/change-requests?mine=false", headers=_auth(rtok))
+    assert r.status_code == 200, r.text
+    ids = {row["id"] for row in r.json()}
+    assert str(mine.id) in ids
+    assert str(theirs.id) not in ids
+
+
+@pytest.mark.asyncio
+async def test_read_only_user_404_on_another_users_request(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """READ RULE (#1): get/{id} on a row the read-only caller doesn't own 404s
+    (not 403) — existence isn't confirmed."""
+    await _enable_module(db_session)
+    subnet = await _subnet(db_session, "10.21.1.0/24")
+    _, rtok = await _user(
+        db_session,
+        name="reader2",
+        permissions=[{"action": "read", "resource_type": "change_request"}],
+    )
+    owner, _ = await _user(db_session, name="owner2")
+    theirs = await _pending_cr(db_session, subnet, owner, display="theirs")
+    await db_session.commit()
+
+    r = await client.get(f"/api/v1/change-requests/{theirs.id}", headers=_auth(rtok))
+    assert r.status_code == 404, r.text
+
+
+@pytest.mark.asyncio
+async def test_approve_holder_sees_all_requests(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """READ RULE (#1): an {approve, change_request} holder sees EVERY row (an
+    eligible approver needs the whole queue) — list + get."""
+    await _enable_module(db_session)
+    subnet_a = await _subnet(db_session, "10.22.1.0/24")
+    subnet_b = await _subnet(db_session, "10.22.2.0/24")
+    approver, atok = await _user(
+        db_session,
+        name="approver-reader",
+        permissions=[
+            {"action": "read", "resource_type": "change_request"},
+            {"action": "approve", "resource_type": "change_request"},
+        ],
+    )
+    other, _ = await _user(db_session, name="other3")
+    a = await _pending_cr(db_session, subnet_a, approver, display="approvers-own")
+    b = await _pending_cr(db_session, subnet_b, other, display="someone-elses")
+    await db_session.commit()
+
+    r = await client.get("/api/v1/change-requests", headers=_auth(atok))
+    assert r.status_code == 200, r.text
+    ids = {row["id"] for row in r.json()}
+    assert str(a.id) in ids
+    assert str(b.id) in ids
+
+    # And get/{id} on someone else's row succeeds for an approve-holder.
+    r2 = await client.get(f"/api/v1/change-requests/{b.id}", headers=_auth(atok))
+    assert r2.status_code == 200, r2.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_find_change_requests_scopes_to_own(db_session: AsyncSession) -> None:
+    """READ RULE (#1) parity in the MCP surface: find_change_requests scopes a
+    plain read-only user to their own rows, and lets an approve-holder see all.
+    The MCP tools have no router gate, so the scope is enforced in-tool."""
+    from app.services.ai.tools.changes import (
+        FindChangeRequestsArgs,
+        find_change_requests,
+    )
+
+    subnet_a = await _subnet(db_session, "10.23.1.0/24")
+    subnet_b = await _subnet(db_session, "10.23.2.0/24")
+    reader, _ = await _user(
+        db_session,
+        name="mcp-reader",
+        permissions=[{"action": "read", "resource_type": "change_request"}],
+    )
+    approver, _ = await _user(
+        db_session,
+        name="mcp-approver",
+        permissions=[{"action": "approve", "resource_type": "change_request"}],
+    )
+    mine = await _pending_cr(db_session, subnet_a, reader, display="mcp-mine")
+    theirs = await _pending_cr(db_session, subnet_b, approver, display="mcp-theirs")
+    await db_session.commit()
+
+    # Read-only user: own row only, even with mine=False.
+    res = await find_change_requests(db_session, reader, FindChangeRequestsArgs(mine=False))
+    ids = {row["id"] for row in res["change_requests"]}
+    assert str(mine.id) in ids
+    assert str(theirs.id) not in ids
+
+    # Approve-holder: sees both.
+    res2 = await find_change_requests(db_session, approver, FindChangeRequestsArgs(mine=False))
+    ids2 = {row["id"] for row in res2["change_requests"]}
+    assert str(mine.id) in ids2
+    assert str(theirs.id) in ids2
+
+
+# ── #2: policies list gated on SuperAdmin ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_policies_list_forbidden_for_non_superadmin(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The policy LIST leaks un-gated (resource, threshold) pairs +
+    applies_to_superadmin → SuperAdmin-only (#2). A read-holder is 403."""
+    await _enable_module(db_session)
+    _, rtok = await _user(
+        db_session,
+        name="policy-reader",
+        permissions=[{"action": "read", "resource_type": "change_request"}],
+    )
+    r = await client.get("/api/v1/change-requests/policies", headers=_auth(rtok))
+    assert r.status_code == 403, r.text
+
+
+@pytest.mark.asyncio
+async def test_policies_list_ok_for_superadmin(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A superadmin can still read the policy list (#2)."""
+    await _enable_module(db_session)
+    _, stok = await _user(db_session, name="policy-super", superadmin=True)
+    r = await client.get("/api/v1/change-requests/policies", headers=_auth(stok))
+    assert r.status_code == 200, r.text
+
+
+# ── #3b: approve refuses with 409 when the blast radius drifted ────────────────
+
+
+@pytest.mark.asyncio
+async def test_approve_refuses_on_scope_drift(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#3: a permanent+force delete request whose subnet GREW IP rows between
+    submit and approve has a changed preview blast radius → approve refuses
+    (409 scope drift); the row stays pending and the subnet survives.
+
+    force=true keeps the op preview ``ok`` (it skips the non-empty check), so
+    the refusal is driven purely by the blast-radius drift compare, not the
+    pre-existing non-empty stale check."""
+    from app.models.change_request import ApprovalPolicy
+
+    await _enable_module(db_session)
+    db_session.add(
+        ApprovalPolicy(
+            name="delete:subnet",
+            resource_type="subnet",
+            action="delete",
+            min_count=None,
+            enabled=True,
+            applies_to_superadmin=True,
+            ttl_hours=168,
+            is_builtin=True,
+        )
+    )
+    await db_session.flush()
+
+    subnet = await _subnet(db_session, "10.24.1.0/24")
+    _, rtok = await _user(db_session, name="drift-requester", superadmin=True)
+    _, atok = await _user(db_session, name="drift-approver", superadmin=True)
+
+    # Submit a permanent+force delete while the subnet is empty.
+    r = await client.delete(
+        f"/api/v1/ipam/subnets/{subnet.id}?permanent=true&force=true", headers=_auth(rtok)
+    )
+    assert r.status_code == 202, r.text
+    cr_id = r.json()["change_request_id"]
+    frozen = (await db_session.get(ChangeRequest, uuid.UUID(cr_id))).preview_text
+
+    # Blast radius grows: add IP rows after submission.
+    for i in range(3):
+        db_session.add(
+            IPAddress(subnet_id=subnet.id, address=f"10.24.1.{10 + i}", status="allocated")
+        )
+    await db_session.flush()
+    await db_session.commit()
+
+    r2 = await client.post(f"/api/v1/change-requests/{cr_id}/approve", headers=_auth(atok), json={})
+    assert r2.status_code == 409, r2.text
+    assert "scope changed" in r2.json()["detail"].lower()
+
+    # Left pending; subnet untouched; frozen preview unchanged.
+    cr = await db_session.get(ChangeRequest, uuid.UUID(cr_id))
+    assert cr is not None and cr.state == "pending"
+    assert cr.preview_text == frozen
+    await db_session.refresh(subnet)
+    assert subnet.deleted_at is None
+
+
+# ── #4: import-time assert rejects a non-gateable risky op ─────────────────────
+
+
+def test_gate_import_assert_rejects_non_gateable_pair() -> None:
+    """#4: the gate's import-time assert fails loudly when a registered risky
+    op declares a (action, resource_type) outside the gateable sets — such an
+    op would pass a 'permission exists' check but match_policy could never gate
+    it (fail-open). Simulate by monkeypatching the registry's view."""
+    from app.services.approvals import gate
+
+    real_get = gate.get_operation
+
+    class _FakeOp:
+        required_permission = ("delete", "totally_not_gateable")
+
+    def _fake_get(name: str):
+        return _FakeOp()
+
+    gate.get_operation = _fake_get  # type: ignore[assignment]
+    try:
+        with pytest.raises(RuntimeError) as ei:
+            gate._assert_risky_ops_have_permission()
+        assert "non-gateable" in str(ei.value).lower()
+    finally:
+        gate.get_operation = real_get  # type: ignore[assignment]

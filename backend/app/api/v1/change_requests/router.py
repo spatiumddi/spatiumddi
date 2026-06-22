@@ -236,6 +236,27 @@ def _require_read(user: CurrentUser) -> None:
         )
 
 
+def _can_see_all_change_requests(user: User) -> bool:
+    """READ RULE (#1): who may see EVERY change request (not just their own).
+
+    A change request row leaks the frozen args / preview_text / target /
+    requester / approver. Only callers who can act on the governance surface
+    should see the whole queue:
+
+    * an **effective superadmin** (governance admin); or
+    * a holder of ``{approve, change_request}`` (an eligible approver who
+      needs the queue to do their job).
+
+    Everyone else — including a plain ``{read, change_request}`` holder — sees
+    only the rows they themselves requested (``requested_by_user_id ==
+    caller.id``). The list endpoint forces that scope; get/{id} 404s on a row
+    the caller may not see (404, not 403, so existence isn't confirmed).
+    """
+    return is_effective_superadmin(user) or user_has_permission(
+        user, "approve", RESOURCE_TYPE_CHANGE_REQUEST
+    )
+
+
 # ── Change-request queue ───────────────────────────────────────────────────
 
 
@@ -250,13 +271,23 @@ async def list_requests(
     offset: int = 0,
 ) -> list[ChangeRequestResponse]:
     """List change requests newest-first. ``mine=true`` scopes to the
-    caller's own requests; ``state`` / ``resource_type`` filter."""
+    caller's own requests; ``state`` / ``resource_type`` filter.
+
+    READ RULE (#1): a caller who isn't a superadmin / approve-holder is
+    ALWAYS scoped to their own requests regardless of the ``mine`` flag — a
+    plain ``{read, change_request}`` holder can never enumerate the platform
+    queue (which leaks args / preview / target / requester / approver)."""
     _require_read(current_user)
+    if _can_see_all_change_requests(current_user):
+        scope_user_id = current_user.id if mine else None
+    else:
+        # Force own-scope — ignore the requested ``mine`` value.
+        scope_user_id = current_user.id
     rows = await list_change_requests(
         db,
         state=state,
         resource_type=resource_type,
-        requested_by_user_id=current_user.id if mine else None,
+        requested_by_user_id=scope_user_id,
         limit=max(1, min(limit, 500)),
         offset=max(0, offset),
     )
@@ -267,8 +298,12 @@ async def list_requests(
 
 
 @router.get("/policies", response_model=list[ApprovalPolicyResponse])
-async def list_policies(current_user: CurrentUser, db: DB) -> list[ApprovalPolicyResponse]:
-    _require_read(current_user)
+async def list_policies(_admin: SuperAdmin, db: DB) -> list[ApprovalPolicyResponse]:
+    # #2: the policy list exposes which (resource, threshold) pairs are
+    # un-gated, plus the ``applies_to_superadmin`` flag — an attacker could use
+    # it to learn what to delete to dodge approval. Gate on SuperAdmin, matching
+    # the create/update/delete handlers (the frontend already hides the tab from
+    # non-superadmins).
     rows = (
         (await db.execute(select(ApprovalPolicy).order_by(ApprovalPolicy.name.asc())))
         .scalars()
@@ -389,7 +424,13 @@ async def delete_policy(
 async def get_request(cr_id: uuid.UUID, current_user: CurrentUser, db: DB) -> ChangeRequestResponse:
     _require_read(current_user)
     cr = await get_change_request(db, cr_id)
-    if cr is None:
+    # READ RULE (#1): 404 (not 403) unless the caller is the requester, holds
+    # approve, or is a superadmin — so a non-eligible caller can't even confirm
+    # a given change-request id EXISTS, let alone read its contents.
+    if cr is None or (
+        not _can_see_all_change_requests(current_user)
+        and cr.requested_by_user_id != current_user.id
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return _cr_to_response(cr)
 
@@ -485,13 +526,14 @@ async def cancel_request(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the requester or a superadmin can cancel this request",
         )
+    # #5: pass the optional note INTO mark_cancelled so it lands on both the row
+    # and the change_request.cancelled audit row (was set after the audit wrote,
+    # so it never reached audit_log).
+    note = body.decision_note if body is not None else None
     try:
-        await mark_cancelled(db, cr, user=current_user, request=request)
+        await mark_cancelled(db, cr, user=current_user, request=request, note=note)
     except ChangeRequestStateError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    # Carry the optional note even though cancel doesn't require one.
-    if body is not None and body.decision_note is not None:
-        cr.decision_note = body.decision_note
     await db.commit()
     await db.refresh(cr)
     return _cr_to_response(cr)
