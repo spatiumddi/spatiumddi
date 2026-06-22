@@ -8,26 +8,43 @@ the original handler did inline. The REST handler delegates to
 replays the same ``apply()`` under the approver's identity after a
 fresh ``preview()`` stale-state check — one mutation path, two callers.
 
-CRITICAL — byte-identical inline behaviour:
+THE INLINE-FIDELITY CONTRACT — ``apply()`` must be byte-identical to the
+pre-#62 handler when the module is off:
 
 * The ``apply()`` body is the original handler body, unchanged. Every
   side effect (soft-delete batch + per-row audit, permanent cascade of
   DHCP scopes / DNS records / zones, agent bundle rebuilds, ``collect_wake``
   / ``publish_wake`` of the affected channel, ``_update_block_utilization``)
   is preserved in the same order.
+* ``apply()`` / ``preview()`` raise the original handler's HTTP statuses —
+  ``HTTPException(404)`` for not-found, ``HTTPException(409)`` for
+  not-empty / conflict, ``HTTPException(403)`` for superadmin-required —
+  CONSISTENTLY across all six ops. (A bare ``ValueError`` here would
+  surface as a 500 to the inline caller — fixed.)
+* ``apply()`` does NOT call ``enforce_operation_permission``: the inline
+  handler is already authorized by the router's permission gate, and the
+  two callers that bypass that gate — the approve endpoint + the AI
+  propose→apply path — enforce the permission themselves *before*
+  dispatching ``apply()``. Re-checking inside ``apply()`` would 403 a
+  delegate whose scoped grant the router admitted (#103 address-set
+  delegate) — fidelity break.
+* Superadmin parity with the ORIGINAL ROUTE (so the approve path, which
+  bypasses the delete route's dependencies, enforces identically):
+  subnet / block / space require superadmin only on the ``permanent``
+  branch; ``delete_zone`` / ``delete_scope`` / ``delete_group`` were
+  fully ``SuperAdmin``-gated at the route, so their ``apply()`` requires
+  superadmin ALWAYS. A failed check raises ``HTTPException(403)``.
 * The ``permanent`` / ``force`` flags are frozen into the args model so
   the approved replay takes the *identical* branch the requester intended.
-* The ``require_superadmin`` check that the original ``permanent`` /
-  ``force`` paths ran inline lives inside ``apply()`` (and the matching
-  ``preview()``), so both the inline path and the approver replay enforce
-  it — a non-superadmin approver can never complete a ``permanent`` op.
 * Audit ``action`` strings stay exactly as today (``soft_delete`` on the
   default path, ``delete`` on the permanent path) — never collapsed.
+* The not-found / not-empty validation is factored into one shared helper
+  used by both ``preview()`` and ``apply()`` so the two never drift.
 
 CLAUDE.md non-negotiables honoured: #2 (async throughout), #3 (server-side
-permission enforcement via ``enforce_operation_permission`` defense-in-depth
-+ the original route gates), #4 (every mutation writes its audit row before
-the commit inside ``apply()``).
+permission enforcement — by the router gate inline, by the approve / AI
+dispatch sites for the bypass callers), #4 (every mutation writes its audit
+row before the commit inside ``apply()``).
 """
 
 from __future__ import annotations
@@ -37,6 +54,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
+from fastapi import HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,7 +63,6 @@ from app.models.auth import User
 from app.services.ai.operations import (
     Operation,
     PreviewResult,
-    enforce_operation_permission,
     get_operation,
     register,
 )
@@ -60,6 +77,41 @@ class DeleteSubnetArgs(BaseModel):
     subnet_id: UUID
     force: bool = False
     permanent: bool = False
+
+
+async def _subnet_not_empty_detail(db: AsyncSession, subnet_id: UUID) -> str | None:
+    """Shared non-empty check for subnet permanent-delete (#17).
+
+    Returns the 409 detail string when the subnet still holds user IPs or
+    DHCP scopes, else ``None``. Both ``preview()`` and ``apply()`` call this
+    so the two can never drift. Mirrors the inline handler's count query.
+    """
+    from app.models.dhcp import DHCPScope
+    from app.models.ipam import IPAddress
+
+    user_ip_count = (
+        await db.execute(
+            select(func.count(IPAddress.id)).where(
+                IPAddress.subnet_id == subnet_id,
+                IPAddress.status.notin_(["network", "broadcast", "orphan"]),
+                IPAddress.auto_from_lease.is_(False),
+            )
+        )
+    ).scalar_one()
+    scope_count = (
+        await db.execute(select(func.count(DHCPScope.id)).where(DHCPScope.subnet_id == subnet_id))
+    ).scalar_one()
+    if not (user_ip_count or scope_count):
+        return None
+    parts = []
+    if user_ip_count:
+        parts.append(f"{user_ip_count} allocated IP address" + ("es" if user_ip_count != 1 else ""))
+    if scope_count:
+        parts.append(f"{scope_count} DHCP scope" + ("s" if scope_count != 1 else ""))
+    return (
+        f"Subnet is not empty: {', '.join(parts)}. "
+        "Delete the contents first, or retry with force=true to cascade."
+    )
 
 
 async def _preview_delete_subnet(
@@ -77,35 +129,9 @@ async def _preview_delete_subnet(
 
     if args.permanent and not args.force:
         # Re-run the non-empty 409 the inline permanent path raises.
-        user_ip_count = (
-            await db.execute(
-                select(func.count(IPAddress.id)).where(
-                    IPAddress.subnet_id == args.subnet_id,
-                    IPAddress.status.notin_(["network", "broadcast", "orphan"]),
-                    IPAddress.auto_from_lease.is_(False),
-                )
-            )
-        ).scalar_one()
-        scope_count = (
-            await db.execute(
-                select(func.count(DHCPScope.id)).where(DHCPScope.subnet_id == args.subnet_id)
-            )
-        ).scalar_one()
-        if user_ip_count or scope_count:
-            parts = []
-            if user_ip_count:
-                parts.append(
-                    f"{user_ip_count} allocated IP address" + ("es" if user_ip_count != 1 else "")
-                )
-            if scope_count:
-                parts.append(f"{scope_count} DHCP scope" + ("s" if scope_count != 1 else ""))
-            return PreviewResult(
-                ok=False,
-                detail=(
-                    f"Subnet is not empty: {', '.join(parts)}. "
-                    "Delete the contents first, or retry with force=true to cascade."
-                ),
-            )
+        detail = await _subnet_not_empty_detail(db, args.subnet_id)
+        if detail is not None:
+            return PreviewResult(ok=False, detail=detail)
 
     mode = "Permanently delete" if args.permanent else "Soft-delete"
     parts = [f"{mode} subnet `{subnet.network}`" + (f" ({subnet.name})" if subnet.name else "")]
@@ -151,11 +177,9 @@ async def _apply_delete_subnet(
     from app.services.dhcp.windows_writethrough import push_scope_delete
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
 
-    enforce_operation_permission(user, _OP_DELETE_SUBNET)
-
     subnet = await db.get(Subnet, args.subnet_id)
     if subnet is None:
-        raise ValueError("Subnet not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(user, args.subnet_id)
 
     if not args.permanent:
@@ -180,32 +204,9 @@ async def _apply_delete_subnet(
     require_superadmin(user)
 
     if not args.force:
-        user_ip_count = (
-            await db.execute(
-                select(func.count(IPAddress.id)).where(
-                    IPAddress.subnet_id == args.subnet_id,
-                    IPAddress.status.notin_(["network", "broadcast", "orphan"]),
-                    IPAddress.auto_from_lease.is_(False),
-                )
-            )
-        ).scalar_one()
-        scope_count = (
-            await db.execute(
-                select(func.count(DHCPScope.id)).where(DHCPScope.subnet_id == args.subnet_id)
-            )
-        ).scalar_one()
-        if user_ip_count or scope_count:
-            parts = []
-            if user_ip_count:
-                parts.append(
-                    f"{user_ip_count} allocated IP address" + ("es" if user_ip_count != 1 else "")
-                )
-            if scope_count:
-                parts.append(f"{scope_count} DHCP scope" + ("s" if scope_count != 1 else ""))
-            raise ValueError(
-                f"Subnet is not empty: {', '.join(parts)}. "
-                "Delete the contents first, or retry with force=true to cascade."
-            )
+        detail = await _subnet_not_empty_detail(db, args.subnet_id)
+        if detail is not None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
 
     block_id = subnet.block_id
 
@@ -307,41 +308,46 @@ class DeleteBlockArgs(BaseModel):
     permanent: bool = False
 
 
+async def _block_not_empty_detail(db: AsyncSession, block_id: UUID, network: Any) -> str | None:
+    """Shared non-empty check for block permanent-delete (#17)."""
+    from app.models.ipam import IPBlock, Subnet
+
+    subnet_count = (
+        await db.execute(
+            select(func.count()).select_from(Subnet).where(Subnet.block_id == block_id)
+        )
+    ).scalar_one()
+    child_block_count = (
+        await db.execute(
+            select(func.count()).select_from(IPBlock).where(IPBlock.parent_block_id == block_id)
+        )
+    ).scalar_one()
+    if not (subnet_count or child_block_count):
+        return None
+    parts = []
+    if child_block_count:
+        parts.append(f"{child_block_count} child block(s)")
+    if subnet_count:
+        parts.append(f"{subnet_count} subnet(s)")
+    return (
+        f"Block {network} still contains {' and '.join(parts)}. "
+        "Delete or move them before deleting the block."
+    )
+
+
 async def _preview_delete_block(
     db: AsyncSession, user: User, args: DeleteBlockArgs
 ) -> PreviewResult:
-    from app.models.ipam import IPBlock, Subnet
+    from app.models.ipam import IPBlock
 
     block = await db.get(IPBlock, args.block_id)
     if block is None:
         return PreviewResult(ok=False, detail="IP block not found")
 
     if args.permanent:
-        subnet_count = (
-            await db.execute(
-                select(func.count()).select_from(Subnet).where(Subnet.block_id == args.block_id)
-            )
-        ).scalar_one()
-        child_block_count = (
-            await db.execute(
-                select(func.count())
-                .select_from(IPBlock)
-                .where(IPBlock.parent_block_id == args.block_id)
-            )
-        ).scalar_one()
-        if subnet_count or child_block_count:
-            parts = []
-            if child_block_count:
-                parts.append(f"{child_block_count} child block(s)")
-            if subnet_count:
-                parts.append(f"{subnet_count} subnet(s)")
-            return PreviewResult(
-                ok=False,
-                detail=(
-                    f"Block {block.network} still contains {' and '.join(parts)}. "
-                    "Delete or move them before deleting the block."
-                ),
-            )
+        detail = await _block_not_empty_detail(db, args.block_id, block.network)
+        if detail is not None:
+            return PreviewResult(ok=False, detail=detail)
         return PreviewResult(
             ok=True,
             detail="ready",
@@ -364,39 +370,18 @@ async def _apply_delete_block(
     """Body factored verbatim from ipam/router.py:delete_block."""
     from app.api.deps import require_superadmin
     from app.api.v1.ipam.router import _audit
-    from app.models.ipam import IPBlock, Subnet
+    from app.models.ipam import IPBlock
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
-
-    enforce_operation_permission(user, _OP_DELETE_BLOCK)
 
     block = await db.get(IPBlock, args.block_id)
     if block is None:
-        raise ValueError("IP block not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
 
     if args.permanent:
         require_superadmin(user)
-        subnet_count = (
-            await db.execute(
-                select(func.count()).select_from(Subnet).where(Subnet.block_id == args.block_id)
-            )
-        ).scalar_one()
-        child_block_count = (
-            await db.execute(
-                select(func.count())
-                .select_from(IPBlock)
-                .where(IPBlock.parent_block_id == args.block_id)
-            )
-        ).scalar_one()
-        if subnet_count or child_block_count:
-            parts = []
-            if child_block_count:
-                parts.append(f"{child_block_count} child block(s)")
-            if subnet_count:
-                parts.append(f"{subnet_count} subnet(s)")
-            raise ValueError(
-                f"Block {block.network} still contains {' and '.join(parts)}. "
-                "Delete or move them before deleting the block."
-            )
+        detail = await _block_not_empty_detail(db, args.block_id, block.network)
+        if detail is not None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
 
         db.add(
             _audit(
@@ -449,39 +434,46 @@ class DeleteSpaceArgs(BaseModel):
     permanent: bool = False
 
 
+async def _space_not_empty_detail(db: AsyncSession, space_id: UUID, name: str) -> str | None:
+    """Shared non-empty check for space permanent-delete (#17)."""
+    from app.models.ipam import IPBlock, Subnet
+
+    subnet_count = (
+        await db.execute(
+            select(func.count()).select_from(Subnet).where(Subnet.space_id == space_id)
+        )
+    ).scalar_one()
+    block_count = (
+        await db.execute(
+            select(func.count()).select_from(IPBlock).where(IPBlock.space_id == space_id)
+        )
+    ).scalar_one()
+    if not (subnet_count or block_count):
+        return None
+    parts = []
+    if block_count:
+        parts.append(f"{block_count} block(s)")
+    if subnet_count:
+        parts.append(f"{subnet_count} subnet(s)")
+    return (
+        f"IP space {name!r} still contains {' and '.join(parts)}. "
+        "Delete or move them before deleting the space."
+    )
+
+
 async def _preview_delete_space(
     db: AsyncSession, user: User, args: DeleteSpaceArgs
 ) -> PreviewResult:
-    from app.models.ipam import IPBlock, IPSpace, Subnet
+    from app.models.ipam import IPSpace
 
     space = await db.get(IPSpace, args.space_id)
     if space is None:
         return PreviewResult(ok=False, detail="IP space not found")
 
     if args.permanent:
-        subnet_count = (
-            await db.execute(
-                select(func.count()).select_from(Subnet).where(Subnet.space_id == args.space_id)
-            )
-        ).scalar_one()
-        block_count = (
-            await db.execute(
-                select(func.count()).select_from(IPBlock).where(IPBlock.space_id == args.space_id)
-            )
-        ).scalar_one()
-        if subnet_count or block_count:
-            parts = []
-            if block_count:
-                parts.append(f"{block_count} block(s)")
-            if subnet_count:
-                parts.append(f"{subnet_count} subnet(s)")
-            return PreviewResult(
-                ok=False,
-                detail=(
-                    f"IP space {space.name!r} still contains {' and '.join(parts)}. "
-                    "Delete or move them before deleting the space."
-                ),
-            )
+        detail = await _space_not_empty_detail(db, args.space_id, space.name)
+        if detail is not None:
+            return PreviewResult(ok=False, detail=detail)
         return PreviewResult(
             ok=True,
             detail="ready",
@@ -504,37 +496,18 @@ async def _apply_delete_space(
     """Body factored verbatim from ipam/router.py:delete_space."""
     from app.api.deps import require_superadmin
     from app.api.v1.ipam.router import _audit
-    from app.models.ipam import IPBlock, IPSpace, Subnet
+    from app.models.ipam import IPSpace
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
-
-    enforce_operation_permission(user, _OP_DELETE_SPACE)
 
     space = await db.get(IPSpace, args.space_id)
     if space is None:
-        raise ValueError("IP space not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
     if args.permanent:
         require_superadmin(user)
-        subnet_count = (
-            await db.execute(
-                select(func.count()).select_from(Subnet).where(Subnet.space_id == args.space_id)
-            )
-        ).scalar_one()
-        block_count = (
-            await db.execute(
-                select(func.count()).select_from(IPBlock).where(IPBlock.space_id == args.space_id)
-            )
-        ).scalar_one()
-        if subnet_count or block_count:
-            parts = []
-            if block_count:
-                parts.append(f"{block_count} block(s)")
-            if subnet_count:
-                parts.append(f"{subnet_count} subnet(s)")
-            raise ValueError(
-                f"IP space {space.name!r} still contains {' and '.join(parts)}. "
-                "Delete or move them before deleting the space."
-            )
+        detail = await _space_not_empty_detail(db, args.space_id, space.name)
+        if detail is not None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
 
         db.add(
             _audit(
@@ -589,8 +562,6 @@ class DeleteZoneArgs(BaseModel):
 
 
 async def _preview_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs) -> PreviewResult:
-    from fastapi import HTTPException
-
     from app.api.v1.dns.router import _reject_if_synthesised_zone, _require_zone
 
     try:
@@ -612,6 +583,7 @@ async def _preview_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArg
 
 async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs) -> dict[str, Any]:
     """Body factored verbatim from dns/router.py:delete_zone."""
+    from app.api.deps import require_superadmin
     from app.api.v1.dns.router import (
         _push_zone_to_agentless_servers,
         _reject_if_synthesised_zone,
@@ -621,9 +593,12 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     from app.models.audit import AuditLog
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
 
-    enforce_operation_permission(user, _OP_DELETE_ZONE)
+    # The original DELETE route was fully SuperAdmin-gated — replicate here so
+    # the approve path (which bypasses the route's SuperAdmin dependency)
+    # enforces identically (#8). require_superadmin raises HTTPException(403).
+    require_superadmin(user)
 
-    zone = await _require_zone(args.group_id, args.zone_id, db)
+    zone = await _require_zone(args.group_id, args.zone_id, db)  # raises 404 if absent
     _reject_if_synthesised_zone(zone, "delete")
 
     if not args.permanent:
@@ -709,17 +684,19 @@ async def _apply_delete_scope(
     db: AsyncSession, user: User, args: DeleteScopeArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from dhcp/scopes.py:delete_scope."""
+    from app.api.deps import require_superadmin
     from app.api.v1.dhcp._audit import write_audit
     from app.core.agent_wake import collect_wake, dhcp_group_channel
     from app.models.dhcp import DHCPScope
     from app.services.dhcp.windows_writethrough import push_scope_delete
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
 
-    enforce_operation_permission(user, _OP_DELETE_SCOPE)
+    # The original DELETE route was fully SuperAdmin-gated (#8).
+    require_superadmin(user)
 
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:
-        raise ValueError("Scope not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")
     collect_wake(dhcp_group_channel(scope.group_id))
 
     if not args.permanent:
@@ -804,16 +781,16 @@ async def _apply_delete_group(
     db: AsyncSession, user: User, args: DeleteGroupArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from dhcp/server_groups.py:delete_group."""
-    from fastapi import HTTPException, status
-
+    from app.api.deps import require_superadmin
     from app.api.v1.dhcp._audit import write_audit
     from app.models.dhcp import DHCPServer, DHCPServerGroup
 
-    enforce_operation_permission(user, _OP_DELETE_GROUP)
+    # The original DELETE route was fully SuperAdmin-gated (#8).
+    require_superadmin(user)
 
     g = await db.get(DHCPServerGroup, args.group_id)
     if g is None:
-        raise ValueError("Server group not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Server group not found")
 
     server_count = (
         await db.execute(

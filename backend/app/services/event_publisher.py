@@ -120,9 +120,13 @@ _RESOURCE_NAMESPACE: dict[str, str] = {
     "firewall_policy": "firewall.policy",
     "firewall_rule": "firewall.rule",
     "firewall_alias": "firewall.alias",
-    # Approvals (#62) — change_request.requested / .approved / .rejected /
-    # .cancelled / .executed / .failed / .expired flow as typed events.
-    "change_request": "change_request",
+    # NOTE: ``change_request`` (#62) is deliberately NOT here. Its lifecycle
+    # uses non-CRUD verbs (requested / approved / rejected / cancelled /
+    # executed / failed / expired), so a namespace entry would make the
+    # catalog advertise the never-fired change_request.created/updated/deleted
+    # trio. Instead every change_request event is an explicit
+    # _SPECIAL_EVENT_MAP row below — checked before this map at publish time
+    # AND unioned into the event-type catalog.
 }
 
 
@@ -185,6 +189,21 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     ("upgrade.node_failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.chart_bump_failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.post_upgrade_verify_failed", "system_upgrade_run"): "system.upgrade.failed",
+    # Approval workflow lifecycle (#62). The service layer writes plain-verb
+    # audit actions (requested / approved / …); without these explicit
+    # entries the auto-derivation still yields ``change_request.<verb>`` (the
+    # action passes through as the verb), but the event-type CATALOG
+    # enumeration only knows the create/update/delete trio per namespace — so
+    # it would advertise the never-fired change_request.created/updated/deleted
+    # and miss the real lifecycle. Listing them here makes them authoritative
+    # AND surfaces them in the catalog (which unions _SPECIAL_EVENT_MAP.values).
+    ("requested", "change_request"): "change_request.requested",
+    ("approved", "change_request"): "change_request.approved",
+    ("rejected", "change_request"): "change_request.rejected",
+    ("cancelled", "change_request"): "change_request.cancelled",
+    ("executed", "change_request"): "change_request.executed",
+    ("failed", "change_request"): "change_request.failed",
+    ("expired", "change_request"): "change_request.expired",
 }
 
 

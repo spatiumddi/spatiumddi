@@ -195,7 +195,10 @@ async def test_policy_on_queues_request(client: AsyncClient, db_session: AsyncSe
     # The ``requested`` audit row was committed before the response (NN #4).
     n_requested = (
         await db_session.execute(
-            select(func.count(AuditLog.id)).where(AuditLog.action == "change_request.requested")
+            select(func.count(AuditLog.id)).where(
+                AuditLog.action == "requested",
+                AuditLog.resource_type == "change_request",
+            )
         )
     ).scalar_one()
     assert n_requested == 1
@@ -289,7 +292,8 @@ async def test_two_person_approve_executes(client: AsyncClient, db_session: Asyn
     row = (
         await db_session.execute(
             select(AuditLog).where(
-                AuditLog.action == "change_request.executed",
+                AuditLog.action == "executed",
+                AuditLog.resource_type == "change_request",
                 AuditLog.resource_id == cr_id,
             )
         )
@@ -413,7 +417,10 @@ async def test_expiry_sweep(db_session: AsyncSession) -> None:
 
     n_expired = (
         await db_session.execute(
-            select(func.count(AuditLog.id)).where(AuditLog.action == "change_request.expired")
+            select(func.count(AuditLog.id)).where(
+                AuditLog.action == "expired",
+                AuditLog.resource_type == "change_request",
+            )
         )
     ).scalar_one()
     assert n_expired == 1

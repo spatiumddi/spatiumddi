@@ -116,6 +116,15 @@ def upgrade() -> None:
 
     # ── built-in approval policies — all enabled=FALSE so existing ───────
     # installs see zero behaviour change until an operator opts in.
+    #
+    # P1 HONESTY (#2/#4): seed ONLY the six delete:<resource> policies —
+    # the only actions actually wired to a registered risky Operation +
+    # gate threading today. The bulk_delete / bulk_edit / bulk_allocate /
+    # factory_reset / import_commit policies are deliberately NOT seeded:
+    # nothing gates those actions in P1, so an operator who flips one to
+    # enabled=TRUE would get an enabled-but-inert rule that silently never
+    # fires (a fail-open trap). They land in P2 alongside their gate
+    # threading. The policy CRUD likewise rejects creating them (422).
     op.execute(sa.text("""
             INSERT INTO approval_policy
                 (id, name, resource_type, action, min_count,
@@ -132,17 +141,7 @@ def upgrade() -> None:
                 (gen_random_uuid(), 'Delete DHCP scope', 'dhcp_scope', 'delete',
                  NULL, FALSE, TRUE, 168, TRUE),
                 (gen_random_uuid(), 'Delete DHCP server group',
-                 'dhcp_server_group', 'delete', NULL, FALSE, TRUE, 168, TRUE),
-                (gen_random_uuid(), 'Bulk delete (>= 25)', '*', 'bulk_delete',
-                 25, FALSE, TRUE, 168, TRUE),
-                (gen_random_uuid(), 'Bulk edit (>= 50)', '*', 'bulk_edit',
-                 50, FALSE, TRUE, 168, TRUE),
-                (gen_random_uuid(), 'Bulk allocate (>= 256)', '*',
-                 'bulk_allocate', 256, FALSE, TRUE, 168, TRUE),
-                (gen_random_uuid(), 'Factory reset', 'platform',
-                 'factory_reset', NULL, FALSE, TRUE, 168, TRUE),
-                (gen_random_uuid(), 'Import commit (>= 100)', '*',
-                 'import_commit', 100, FALSE, TRUE, 168, TRUE)
+                 'dhcp_server_group', 'delete', NULL, FALSE, TRUE, 168, TRUE)
             """))
 
 

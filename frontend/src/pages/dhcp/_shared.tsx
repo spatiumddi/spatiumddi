@@ -87,6 +87,7 @@ export function DeleteConfirmModal({
   onClose,
   isPending,
   error,
+  notice,
 }: {
   title: string;
   description: string;
@@ -96,6 +97,10 @@ export function DeleteConfirmModal({
   onClose: () => void;
   isPending?: boolean;
   error?: string | null;
+  // Non-error feedback shown in a neutral box — used for the #62
+  // two-person approval queue "Submitted for approval" message, where
+  // the delete returned 202 instead of executing.
+  notice?: string | null;
 }) {
   const [checked, setChecked] = useState(false);
   return (
@@ -126,6 +131,11 @@ export function DeleteConfirmModal({
         {error && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
+          </div>
+        )}
+        {notice && (
+          <div className="rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400">
+            {notice}
           </div>
         )}
         <div className="flex justify-end gap-2">

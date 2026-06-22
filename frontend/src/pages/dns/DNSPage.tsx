@@ -103,6 +103,11 @@ import {
   RECORD_TYPE_BADGE,
   RECORD_TYPE_BADGE_FALLBACK,
 } from "./recordTypeBadge";
+import {
+  APPROVAL_QUEUED_MESSAGE,
+  CHANGE_REQUEST_QUERY_KEY,
+  handleApprovalQueued,
+} from "@/lib/approvalQueue";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -485,6 +490,7 @@ function ConfirmDestroyModal({
   onClose,
   isPending,
   error,
+  notice,
 }: {
   title: string;
   description: React.ReactNode;
@@ -493,6 +499,10 @@ function ConfirmDestroyModal({
   onClose: () => void;
   isPending?: boolean;
   error?: string | null;
+  // Non-error feedback shown in a neutral box — used for the #62
+  // two-person approval queue "Submitted for approval" message, where
+  // the delete returned 202 instead of executing.
+  notice?: string | null;
 }) {
   const [step, setStep] = useState<1 | 2>(1);
   const [checked, setChecked] = useState(false);
@@ -505,6 +515,11 @@ function ConfirmDestroyModal({
           {error && (
             <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
               {error}
+            </div>
+          )}
+          {notice && (
+            <div className="rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400">
+              {notice}
             </div>
           )}
           <div className="flex justify-end gap-2">
@@ -545,6 +560,11 @@ function ConfirmDestroyModal({
         {error && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
+          </div>
+        )}
+        {notice && (
+          <div className="rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400">
+            {notice}
           </div>
         )}
         <div className="flex justify-end gap-2">
@@ -2750,6 +2770,7 @@ function ZoneDetailView({
   const [showAddSubzone, setShowAddSubzone] = useState(false);
   const [showDelegate, setShowDelegate] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
   const [showRecFilters, setShowRecFilters] = useState(false);
   const [recFilter, setRecFilter] = useState({ name: "", type: "", value: "" });
@@ -2848,7 +2869,15 @@ function ZoneDetailView({
 
   const deleteZone = useMutation({
     mutationFn: () => dnsApi.deleteZone(group.id, zone.id),
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // Two-person approval (#62): a covered delete returns 202 with a
+      // queued change-request instead of deleting. Surface the message,
+      // refresh the approval queue, and leave the zone in place.
+      if (handleApprovalQueued(resp)) {
+        setDeleteNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
       qc.invalidateQueries({ queryKey: ["dns-zones", group.id] });
       onDeleted();
     },
@@ -3738,8 +3767,13 @@ function ZoneDetailView({
           description={`Permanently delete zone "${zone.name}" and all its records from SpatiumDDI?`}
           checkLabel={`I understand all records in "${zone.name}" will be permanently deleted.`}
           onConfirm={() => deleteZone.mutate()}
-          onClose={() => setConfirmDelete(false)}
+          onClose={() => {
+            setConfirmDelete(false);
+            setDeleteNotice(null);
+            deleteZone.reset();
+          }}
           isPending={deleteZone.isPending}
+          notice={deleteNotice}
         />
       )}
       {syncResult && (
@@ -8422,6 +8456,9 @@ export function DNSPage() {
   const [editGroup, setEditGroup] = useState<DNSServerGroup | null>(null);
   const [confirmDeleteGroup, setConfirmDeleteGroup] =
     useState<DNSServerGroup | null>(null);
+  const [deleteGroupNotice, setDeleteGroupNotice] = useState<string | null>(
+    null,
+  );
   const [expandedGroups, setExpandedGroups] = useSessionState<Set<string>>(
     "spatium.dns.expandedGroups",
     new Set(),
@@ -8546,7 +8583,15 @@ export function DNSPage() {
 
   const deleteGroup = useMutation({
     mutationFn: (id: string) => dnsApi.deleteGroup(id),
-    onSuccess: (_, id) => {
+    onSuccess: (resp, id) => {
+      // Two-person approval (#62): a covered delete returns 202 with a
+      // queued change-request instead of deleting. Surface the message,
+      // refresh the approval queue, and leave the group in place.
+      if (handleApprovalQueued(resp)) {
+        setDeleteGroupNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
       qc.invalidateQueries({ queryKey: ["dns-groups"] });
       if (selection && "group" in selection && selection.group.id === id)
         setSelection(null);
@@ -8750,10 +8795,12 @@ export function DNSPage() {
           onConfirm={() => deleteGroup.mutate(confirmDeleteGroup.id)}
           onClose={() => {
             setConfirmDeleteGroup(null);
+            setDeleteGroupNotice(null);
             deleteGroup.reset();
           }}
           isPending={deleteGroup.isPending}
           error={deleteGroupError || null}
+          notice={deleteGroupNotice}
         />
       )}
     </div>

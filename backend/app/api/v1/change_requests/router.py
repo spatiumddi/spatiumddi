@@ -30,7 +30,7 @@ other sees 409).
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -48,16 +48,15 @@ from app.core.request_meta import clean_user_agent, client_ip
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.change_request import ApprovalPolicy, ChangeRequest
-from app.services.ai import operations
+from app.services.approvals.policy import GATEABLE_ACTIONS, GATEABLE_RESOURCE_TYPES
 from app.services.approvals.service import (
     ChangeRequestStateError,
+    DecisionError,
+    approve_change_request,
     get_change_request,
     list_change_requests,
-    mark_approved,
     mark_cancelled,
-    mark_executed,
-    mark_failed,
-    mark_rejected,
+    reject_change_request,
 )
 
 logger = structlog.get_logger(__name__)
@@ -201,6 +200,31 @@ def _audit_policy(
     )
 
 
+def _validate_gateable(action: str | None, resource_type: str | None) -> None:
+    """Reject a policy whose (action, resource_type) isn't currently wired to
+    a registered risky operation (#4 — no enabled-but-inert policies).
+
+    Only validates the fields that are present (so a PUT touching just
+    ``enabled`` doesn't re-validate the unchanged action). ``"*"`` wildcard
+    resource_types are P2-only (bulk ops) and rejected in P1.
+    """
+    if action is not None and action not in GATEABLE_ACTIONS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"action {action!r} is not gateable yet — supported: " f"{sorted(GATEABLE_ACTIONS)}"
+            ),
+        )
+    if resource_type is not None and resource_type not in GATEABLE_RESOURCE_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"resource_type {resource_type!r} is not gateable yet — supported: "
+                f"{sorted(GATEABLE_RESOURCE_TYPES)}"
+            ),
+        )
+
+
 def _require_read(user: CurrentUser) -> None:
     """Reads on the queue need ``read,change_request`` (or superadmin)."""
     if is_effective_superadmin(user):
@@ -264,6 +288,7 @@ async def create_policy(
     db: DB,
     request: Request,
 ) -> ApprovalPolicyResponse:
+    _validate_gateable(body.action, body.resource_type)
     policy = ApprovalPolicy(
         name=body.name,
         resource_type=body.resource_type,
@@ -307,6 +332,12 @@ async def update_policy(
     if policy is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     changes = body.model_dump(exclude_unset=True)
+    # Validate the post-update (action, resource_type) — an operator can't
+    # repoint a policy at an action/type that isn't wired yet (#4).
+    _validate_gateable(
+        changes.get("action", policy.action),
+        changes.get("resource_type", policy.resource_type),
+    )
     for field, value in changes.items():
         setattr(policy, field, value)
     _audit_policy(
@@ -373,11 +404,16 @@ async def approve_request(
 ) -> ChangeRequestResponse:
     """Approve and execute a pending change request — the two-person spine.
 
-    Server-side invariants (every one enforced here, never trusting the UI):
+    Thin wrapper over ``services.approvals.service.approve_change_request``,
+    which owns every server-side invariant (never trusting the UI) so this
+    HTTP path and the AI propose→apply path enforce them identically:
 
     1. The row is loaded ``FOR UPDATE`` and must still be ``pending`` (a
-       racing approver loses with 409); an expired row flips to ``expired``.
-    2. **Self-approval blocked** — ``approver.id != requested_by_user_id``.
+       racing approver loses with 409); an expired row routes through the
+       audited ``mark_expired`` then 409s.
+    2. **Self-approval blocked** — ``approver.id != requested_by_user_id``;
+       a request whose requester was deleted (``requested_by_user_id`` NULL)
+       is refused (409) rather than failing open.
     3. Approver holds ``{approve, change_request}``.
     4. Approver holds the underlying operation's ``required_permission`` —
        they can't rubber-stamp a delete they couldn't perform themselves.
@@ -386,122 +422,24 @@ async def approve_request(
        (409, left ``pending`` so the requester can cancel).
     6. ``apply()`` dispatches under the **approver's** identity; the audit
        ``executed`` row carries the approver as actor and the requester id
-       in ``old_value.requested_by``.
+       in ``old_value.requested_by``. A client 4xx raised by ``apply()``
+       leaves the row ``pending`` and surfaces the status; a server fault
+       marks it ``failed``.
     """
     note = body.decision_note if body is not None else None
 
-    # 1. Row lock + state guard — race-safe against a second approver.
-    cr = await get_change_request(db, cr_id, for_update=True)
-    if cr is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    if cr.state != "pending":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Change request is not pending (state={cr.state!r})",
-        )
-    if cr.expires_at < datetime.now(UTC):
-        cr.state = "expired"
-        cr.decided_at = datetime.now(UTC)
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Change request has expired",
-        )
-
-    # 2. Self-approval is forbidden — the whole point of two-person.
-    if cr.requested_by_user_id is not None and current_user.id == cr.requested_by_user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You cannot approve your own change request",
-        )
-
-    op = operations.get_operation(cr.operation)
-    if op is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Operation {cr.operation!r} is not registered",
-        )
-
-    # 3. Approver holds the approve capability.
-    if not user_has_permission(current_user, "approve", RESOURCE_TYPE_CHANGE_REQUEST):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Permission denied: need 'approve' on '{RESOURCE_TYPE_CHANGE_REQUEST}'",
-        )
-
-    # 4. Approver holds the underlying operation's own permission.
+    # Delegate to the single two-person spine (services/approvals/service.py)
+    # so this HTTP path and the AI propose→apply path enforce the IDENTICAL
+    # invariants (#5 fail-closed on a deleted requester, #11 client-4xx from
+    # apply leaves the row pending, #13 expiry routes through the audited
+    # mark_expired, #14 mark_failed carries the requester id, #15 guarded
+    # rollback). DecisionError subclasses carry the right HTTP status.
     try:
-        operations.enforce_operation_permission(current_user, op)
-    except operations.OperationPermissionError as exc:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
-
-    # Re-validate the frozen args through the op's pydantic model — guards
-    # the rare redeploy-mid-flight schema-change case.
-    try:
-        args = op.args_model.model_validate(cr.args or {})
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Stored args no longer validate: {exc}",
-        ) from exc
-
-    # 5. Stale-state re-check. Leave the row pending (requester may cancel)
-    #    but surface the diagnostic — do NOT execute a doomed op.
-    preview = await op.preview(db, current_user, args)
-    if not preview.ok:
-        logger.info(
-            "change_request.stale",
-            change_request_id=str(cr.id),
-            operation=cr.operation,
-            detail=preview.detail,
-            approver=str(current_user.id),
+        cr = await approve_change_request(
+            db, cr_id, approver=current_user, request=request, note=note
         )
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=preview.detail)
-
-    requester_id = cr.requested_by_user_id
-
-    # Record the approval transition (pending → approved, audited).
-    await mark_approved(db, cr, approver=current_user, request=request, note=note)
-
-    # 6. Dispatch apply() under the approver's identity. ``apply`` runs its
-    #    own mutation + writes its own audit row(s); on success mark_executed
-    #    writes the change_request.executed audit row carrying both ids.
-    try:
-        result = await op.apply(db, current_user, args)
-    except operations.OperationPermissionError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        # apply() rolled back its own transaction; reload + lock the row to
-        # stamp the failure (the approval transition was rolled back too).
-        await db.rollback()
-        cr = await get_change_request(db, cr_id, for_update=True)
-        if cr is None or cr.state != "pending":
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Change request vanished or changed state mid-apply — investigate",
-            ) from exc
-        await mark_approved(db, cr, approver=current_user, request=request, note=note)
-        await mark_failed(db, cr, approver=current_user, request=request, error=str(exc))
-        await db.commit()
-        logger.warning(
-            "change_request.apply_failed",
-            change_request_id=str(cr.id),
-            operation=cr.operation,
-            error=str(exc),
-        )
-        return _cr_to_response(cr)
-
-    await mark_executed(
-        db,
-        cr,
-        approver=current_user,
-        requester_id=requester_id,
-        request=request,
-        result=result,
-    )
-    await db.commit()
-    await db.refresh(cr)
+    except DecisionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     return _cr_to_response(cr)
 
 
@@ -516,26 +454,13 @@ async def reject_request(
     """Decline a pending request. Needs ``approve,change_request``; like
     approve, the rejecter may not be the requester (a self-reject is just a
     cancel — use that)."""
-    if not user_has_permission(current_user, "approve", RESOURCE_TYPE_CHANGE_REQUEST):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Permission denied: need 'approve' on '{RESOURCE_TYPE_CHANGE_REQUEST}'",
-        )
-    cr = await get_change_request(db, cr_id, for_update=True)
-    if cr is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    if cr.requested_by_user_id is not None and current_user.id == cr.requested_by_user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You cannot reject your own request — cancel it instead",
-        )
     note = body.decision_note if body is not None else None
     try:
-        await mark_rejected(db, cr, approver=current_user, request=request, note=note)
-    except ChangeRequestStateError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    await db.commit()
-    await db.refresh(cr)
+        cr = await reject_change_request(
+            db, cr_id, approver=current_user, request=request, note=note
+        )
+    except DecisionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     return _cr_to_response(cr)
 
 

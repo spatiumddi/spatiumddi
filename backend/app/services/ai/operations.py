@@ -3055,7 +3055,14 @@ async def _preview_approve_change_request(
         )
     if cr.expires_at < datetime.now(UTC):
         return PreviewResult(ok=False, detail="Change request has expired.")
-    if cr.requested_by_user_id is not None and user.id == cr.requested_by_user_id:
+    # #5 fail CLOSED: a deleted requester (requested_by_user_id NULL) is
+    # refused, not silently approvable — mirrors approve_change_request.
+    if cr.requested_by_user_id is None:
+        return PreviewResult(
+            ok=False,
+            detail="Requester no longer exists; cancel and recreate this change request.",
+        )
+    if user.id == cr.requested_by_user_id:
         return PreviewResult(ok=False, detail="You cannot approve your own change request.")
     if not user_has_permission(user, "approve", RESOURCE_TYPE_CHANGE_REQUEST):
         return PreviewResult(

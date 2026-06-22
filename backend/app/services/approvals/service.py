@@ -22,7 +22,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from fastapi import Request
+from fastapi import HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,17 +33,19 @@ from app.models.change_request import ChangeRequest
 
 logger = structlog.get_logger(__name__)
 
-# Audit action strings — kept aligned with the ``change_request`` event
-# namespace (event_publisher.py) so typed webhook events flow
-# automatically: change_request.{requested,approved,rejected,cancelled,
-# executed,failed,expired}.
-_ACTION_REQUESTED = "change_request.requested"
-_ACTION_APPROVED = "change_request.approved"
-_ACTION_REJECTED = "change_request.rejected"
-_ACTION_CANCELLED = "change_request.cancelled"
-_ACTION_EXECUTED = "change_request.executed"
-_ACTION_FAILED = "change_request.failed"
-_ACTION_EXPIRED = "change_request.expired"
+# Audit action strings — PLAIN verbs (#10). The event publisher maps
+# resource_type ``change_request`` → namespace ``change_request`` and, for a
+# verb outside the create/update/delete trio, passes the action through as
+# the verb, yielding ``change_request.<verb>`` (e.g. ``change_request.requested``).
+# Using already-namespaced strings here would double the namespace
+# (``change_request.change_request.requested``) — so keep these bare verbs.
+_ACTION_REQUESTED = "requested"
+_ACTION_APPROVED = "approved"
+_ACTION_REJECTED = "rejected"
+_ACTION_CANCELLED = "cancelled"
+_ACTION_EXECUTED = "executed"
+_ACTION_FAILED = "failed"
+_ACTION_EXPIRED = "expired"
 
 
 class ChangeRequestStateError(Exception):
@@ -323,11 +325,14 @@ async def mark_failed(
     cr: ChangeRequest,
     *,
     approver: User,
+    requester_id: UUID | None,
     request: Request | None,
     error: str,
 ) -> ChangeRequest:
     """``approved`` → ``failed`` (terminal). ``apply()`` (or its
-    re-preview stale-state guard) failed at execution time."""
+    re-preview stale-state guard) failed at execution time. Like
+    :func:`mark_executed`, the audit row carries the requester→approver
+    correlation (#14): ``user_id=approver`` + ``old_value.requested_by``."""
     _require_state(cr, "approved")
     cr.state = "failed"
     cr.error = error
@@ -338,7 +343,10 @@ async def mark_failed(
         request=request,
         action=_ACTION_FAILED,
         cr=cr,
-        old_value={"state": "approved"},
+        old_value={
+            "state": "approved",
+            "requested_by": str(requester_id) if requester_id is not None else None,
+        },
         new_value={"state": "failed", "error": error},
     )
     logger.warning(
@@ -419,6 +427,64 @@ class DecisionUnprocessable(DecisionError):
     status_code = 422
 
 
+def _decision_for_status(status_code: int, detail: str) -> DecisionError:
+    """Map an HTTP 4xx ``apply()`` raised to the matching DecisionError so the
+    approve callers surface the precondition status (#11)."""
+    mapping: dict[int, type[DecisionError]] = {
+        403: DecisionForbidden,
+        404: DecisionNotFound,
+        409: DecisionConflict,
+        422: DecisionUnprocessable,
+    }
+    return mapping.get(status_code, DecisionConflict)(detail)
+
+
+async def _safe_rollback(db: AsyncSession) -> None:
+    """Roll back, swallowing a rollback-time failure (#15).
+
+    If ``apply()`` already rolled back (or the connection is wedged) a second
+    rollback can itself raise; letting that propagate would mask the original
+    error and could strand the row. Best-effort + log, never re-raise.
+    """
+    try:
+        await db.rollback()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("change_request.rollback_failed", error=str(exc))
+
+
+async def _stamp_apply_failed(
+    db: AsyncSession,
+    cr_id: UUID,
+    *,
+    approver: User,
+    request: Request | None,
+    note: str | None,
+    error: str,
+) -> ChangeRequest:
+    """Re-lock the (rolled-back) row and stamp ``pending → approved → failed``.
+
+    Shared by the approve spine's 5xx and generic-exception paths. The
+    approval transition was rolled back alongside ``apply()``, so replay it
+    before ``mark_failed``. Raises :class:`DecisionError` if the row vanished
+    or another actor flipped it mid-apply."""
+    cr = await get_change_request(db, cr_id, for_update=True)
+    if cr is None or cr.state != "pending":
+        raise DecisionError("Change request vanished or changed state mid-apply — investigate")
+    requester_id = cr.requested_by_user_id
+    await mark_approved(db, cr, approver=approver, request=request, note=note)
+    await mark_failed(
+        db, cr, approver=approver, requester_id=requester_id, request=request, error=error
+    )
+    await db.commit()
+    logger.warning(
+        "change_request.apply_failed",
+        change_request_id=str(cr.id),
+        operation=cr.operation,
+        error=error,
+    )
+    return cr
+
+
 async def approve_change_request(
     db: AsyncSession,
     cr_id: UUID,
@@ -449,13 +515,24 @@ async def approve_change_request(
     if cr.state != "pending":
         raise DecisionConflict(f"Change request is not pending (state={cr.state!r})")
     if cr.expires_at < datetime.now(UTC):
-        cr.state = "expired"
-        cr.decided_at = datetime.now(UTC)
+        # #13: route through the audited mark_expired transition (not a raw
+        # field poke) so the change_request.expired audit row lands.
+        await mark_expired(db, cr)
         await db.commit()
         raise DecisionConflict("Change request has expired")
 
-    # 2. Self-approval is forbidden — the whole point of two-person.
-    if cr.requested_by_user_id is not None and approver.id == cr.requested_by_user_id:
+    # 2a. Fail CLOSED when the requester row is gone (#5). ON DELETE SET NULL
+    #     nulls ``requested_by_user_id`` if the requester is deleted; the
+    #     self-approval guard below would then fail OPEN (None != approver.id
+    #     is always true), letting anyone rubber-stamp an orphaned request and
+    #     defeating two-person. Refuse instead — the requester must recreate.
+    if cr.requested_by_user_id is None:
+        raise DecisionConflict(
+            "Requester no longer exists; cancel and recreate this change request"
+        )
+
+    # 2b. Self-approval is forbidden — the whole point of two-person.
+    if approver.id == cr.requested_by_user_id:
         raise DecisionForbidden("You cannot approve your own change request")
 
     op = operations.get_operation(cr.operation)
@@ -503,27 +580,37 @@ async def approve_change_request(
     try:
         result = await op.apply(db, approver, args)
     except OperationPermissionError as exc:
-        await db.rollback()
+        await _safe_rollback(db)
         raise DecisionForbidden(str(exc)) from exc
+    except HTTPException as exc:
+        # #11: a client 4xx from apply() is NOT an execution failure — it's a
+        # raced precondition the op rejected (e.g. the subnet became
+        # non-empty, or the row vanished, between preview and apply). Surface
+        # the same status, leave the request PENDING (the requester can cancel
+        # or retry once the precondition clears). Only a 5xx (server fault)
+        # falls through to mark_failed below.
+        await _safe_rollback(db)
+        sc = exc.status_code
+        if 400 <= sc < 500:
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            logger.info(
+                "change_request.apply_precondition",
+                change_request_id=str(cr_id),
+                operation=op.name,
+                status_code=sc,
+                detail=detail,
+            )
+            raise _decision_for_status(sc, detail) from exc
+        return await _stamp_apply_failed(
+            db, cr_id, approver=approver, request=request, note=note, error=str(exc.detail)
+        )
     except Exception as exc:  # noqa: BLE001
         # apply() rolled back its own transaction; reload + lock to stamp the
         # failure (the approval transition was rolled back too).
-        await db.rollback()
-        cr = await get_change_request(db, cr_id, for_update=True)
-        if cr is None or cr.state != "pending":
-            raise DecisionError(
-                "Change request vanished or changed state mid-apply — investigate"
-            ) from exc
-        await mark_approved(db, cr, approver=approver, request=request, note=note)
-        await mark_failed(db, cr, approver=approver, request=request, error=str(exc))
-        await db.commit()
-        logger.warning(
-            "change_request.apply_failed",
-            change_request_id=str(cr.id),
-            operation=cr.operation,
-            error=str(exc),
+        await _safe_rollback(db)
+        return await _stamp_apply_failed(
+            db, cr_id, approver=approver, request=request, note=note, error=str(exc)
         )
-        return cr
 
     await mark_executed(
         db,

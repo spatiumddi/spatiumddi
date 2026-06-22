@@ -1254,6 +1254,13 @@ export const ipamApi = {
     api.post<IPSpace>("/ipam/spaces", data).then((r) => r.data),
   updateSpace: (id: string, data: Partial<IPSpace>) =>
     api.put<IPSpace>(`/ipam/spaces/${id}`, data).then((r) => r.data),
+  // #62 two-person approval: when the ``governance.approvals`` module is on
+  // and a policy matches, this returns **202** with a ``ChangeRequestQueued``
+  // body (queued, NOT deleted) instead of 204. Returns the FULL axios
+  // response on purpose — do NOT chain ``.then((r) => r.data)`` here or the
+  // 202 status is invisible. Callers pass the response to
+  // ``handleApprovalQueued`` (``@/lib/approvalQueue``); see deleteBlock /
+  // deleteSubnet below + dnsApi/dhcpApi delete methods.
   deleteSpace: (id: string) => api.delete(`/ipam/spaces/${id}`),
 
   listBlocks: (spaceId?: string) =>
@@ -1287,6 +1294,8 @@ export const ipamApi = {
       >
     >,
   ) => api.put<IPBlock>(`/ipam/blocks/${id}`, data).then((r) => r.data),
+  // #62: returns the full axios response (may be 202 queued-for-approval —
+  // see deleteSpace). Do NOT add ``.then((r) => r.data)``.
   deleteBlock: (id: string) => api.delete(`/ipam/blocks/${id}`),
   availableSubnets: (blockId: string, prefixLen: number) =>
     api
@@ -1451,6 +1460,8 @@ export const ipamApi = {
   // explicit ("…and all IP address records will be permanently
   // deleted") so they pass force=true; the bare-id callable shape is
   // kept for any future "soft" call site.
+  // #62: returns the full axios response (may be 202 queued-for-approval —
+  // see deleteSpace). Do NOT add ``.then((r) => r.data)``.
   deleteSubnet: (id: string, force: boolean = false) =>
     api.delete(`/ipam/subnets/${id}${force ? "?force=true" : ""}`),
 
@@ -4846,6 +4857,9 @@ export const dnsApi = {
     api.post<DNSServerGroup>("/dns/groups", data).then((r) => r.data),
   updateGroup: (id: string, data: Partial<DNSServerGroup>) =>
     api.put<DNSServerGroup>(`/dns/groups/${id}`, data).then((r) => r.data),
+  // #62: returns the full axios response (may be 202 queued-for-approval —
+  // see ipamApi.deleteSpace). Do NOT add ``.then((r) => r.data)`` or the
+  // 202 envelope is lost; callers pass it to ``handleApprovalQueued``.
   deleteGroup: (id: string) => api.delete(`/dns/groups/${id}`),
 
   // Servers
@@ -5045,6 +5059,8 @@ export const dnsApi = {
     api
       .put<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}`, data)
       .then((r) => r.data),
+  // #62: returns the full axios response (may be 202 queued-for-approval —
+  // see ipamApi.deleteSpace). Do NOT add ``.then((r) => r.data)``.
   deleteZone: (groupId: string, zoneId: string) =>
     api.delete(`/dns/groups/${groupId}/zones/${zoneId}`),
   getZoneServerState: (groupId: string, zoneId: string) =>
@@ -6362,6 +6378,9 @@ export const dhcpApi = {
     api
       .put<DHCPServerGroup>(`/dhcp/server-groups/${id}`, data)
       .then((r) => r.data),
+  // #62: returns the full axios response (may be 202 queued-for-approval —
+  // see ipamApi.deleteSpace). Do NOT add ``.then((r) => r.data)`` or the
+  // 202 envelope is lost; callers pass it to ``handleApprovalQueued``.
   deleteGroup: (id: string) => api.delete(`/dhcp/server-groups/${id}`),
 
   listServers: (groupId?: string) =>
@@ -6462,6 +6481,8 @@ export const dhcpApi = {
       .then((r) => r.data),
   updateScope: (id: string, data: Partial<DHCPScope>) =>
     api.put<DHCPScope>(`/dhcp/scopes/${id}`, data).then((r) => r.data),
+  // #62: returns the full axios response (may be 202 queued-for-approval —
+  // see ipamApi.deleteSpace). Do NOT add ``.then((r) => r.data)``.
   deleteScope: (id: string) => api.delete(`/dhcp/scopes/${id}`),
 
   listPools: (scopeId: string) =>

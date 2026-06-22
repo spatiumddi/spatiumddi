@@ -60,6 +60,11 @@ import { CreateOptionTemplateModal } from "./CreateOptionTemplateModal";
 import { MacBlocksTab } from "./MacBlocksTab";
 import { PhoneProfilesTab } from "./PhoneProfilesTab";
 import { DeleteConfirmModal, StatusDot } from "./_shared";
+import {
+  APPROVAL_QUEUED_MESSAGE,
+  CHANGE_REQUEST_QUERY_KEY,
+  handleApprovalQueued,
+} from "@/lib/approvalQueue";
 
 type Selection =
   | { type: "group"; group: DHCPServerGroup }
@@ -929,12 +934,15 @@ function ScopeDeleteModal({
   onConfirm,
   onClose,
   isPending,
+  notice,
 }: {
   scope: DHCPScope;
   groupId: string;
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  // #62 two-person approval queue "Submitted for approval" message.
+  notice?: string | null;
 }) {
   const { data: pools = [] } = useQuery({
     queryKey: ["dhcp-pools", scope.id],
@@ -977,6 +985,7 @@ function ScopeDeleteModal({
       onConfirm={onConfirm}
       onClose={onClose}
       isPending={isPending}
+      notice={notice}
     />
   );
 }
@@ -1013,10 +1022,19 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
   const [createForSubnet, setCreateForSubnet] = useState<string | null>(null);
   const [editScope, setEditScope] = useState<DHCPScope | null>(null);
   const [delScope, setDelScope] = useState<DHCPScope | null>(null);
+  const [delScopeNotice, setDelScopeNotice] = useState<string | null>(null);
 
   const delMut = useMutation({
     mutationFn: (id: string) => dhcpApi.deleteScope(id),
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // Two-person approval (#62): a covered delete returns 202 with a
+      // queued change-request instead of deleting. Surface the message,
+      // refresh the approval queue, and leave the scope in place.
+      if (handleApprovalQueued(resp)) {
+        setDelScopeNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
       qc.invalidateQueries({ queryKey: ["dhcp-scopes-subnet"] });
       qc.invalidateQueries({ queryKey: ["dhcp-scopes-group"] });
       qc.invalidateQueries({ queryKey: ["dhcp-pools"] });
@@ -1191,8 +1209,13 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
           scope={delScope}
           groupId={groupId}
           onConfirm={() => delMut.mutate(delScope.id)}
-          onClose={() => setDelScope(null)}
+          onClose={() => {
+            setDelScope(null);
+            setDelScopeNotice(null);
+            delMut.reset();
+          }}
           isPending={delMut.isPending}
+          notice={delScopeNotice}
         />
       )}
     </div>
@@ -2439,6 +2462,7 @@ export function DHCPPage() {
   const [showCreateGroup, setShowCreateGroup] = useState(false);
   const [editGroup, setEditGroup] = useState<DHCPServerGroup | null>(null);
   const [delGroup, setDelGroup] = useState<DHCPServerGroup | null>(null);
+  const [delGroupNotice, setDelGroupNotice] = useState<string | null>(null);
   const [addServerFor, setAddServerFor] = useState<string | null>(null);
   const [editServer, setEditServer] = useState<DHCPServer | null>(null);
   const [delServer, setDelServer] = useState<DHCPServer | null>(null);
@@ -2519,7 +2543,15 @@ export function DHCPPage() {
 
   const deleteGroupMut = useMutation({
     mutationFn: (id: string) => dhcpApi.deleteGroup(id),
-    onSuccess: (_, id) => {
+    onSuccess: (resp, id) => {
+      // Two-person approval (#62): a covered delete returns 202 with a
+      // queued change-request instead of deleting. Surface the message,
+      // refresh the approval queue, and leave the group in place.
+      if (handleApprovalQueued(resp)) {
+        setDelGroupNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
       qc.invalidateQueries({ queryKey: ["dhcp-groups"] });
       if (selection && "group" in selection && selection.group?.id === id)
         setSelection(null);
@@ -2616,10 +2648,12 @@ export function DHCPPage() {
           onConfirm={() => deleteGroupMut.mutate(delGroup.id)}
           onClose={() => {
             setDelGroup(null);
+            setDelGroupNotice(null);
             deleteGroupMut.reset();
           }}
           isPending={deleteGroupMut.isPending}
           error={deleteGroupError || null}
+          notice={delGroupNotice}
         />
       )}
       {addServerFor && (

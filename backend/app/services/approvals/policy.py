@@ -20,6 +20,21 @@ from app.models.change_request import ApprovalPolicy
 
 logger = structlog.get_logger(__name__)
 
+# ── Currently-gateable surface (#4) ────────────────────────────────────────
+#
+# A policy is only enforceable when there's a registered risky Operation
+# whose ``required_permission`` produces the policy's (action, resource_type).
+# In P1 the only gated action is ``delete`` and the only gated resource types
+# are the six delete-covered families. The policy CRUD validates against these
+# sets so an operator can't create an *enabled-but-inert* policy for an action
+# that isn't wired yet (the fail-open #2/#4 the seed used to ship). P2 widens
+# both sets as bulk_delete / bulk_edit / bulk_allocate / factory_reset /
+# import_commit ops land their gate threading.
+GATEABLE_ACTIONS: frozenset[str] = frozenset({"delete"})
+GATEABLE_RESOURCE_TYPES: frozenset[str] = frozenset(
+    {"subnet", "ip_block", "ip_space", "dns_zone", "dhcp_scope", "dhcp_server_group"}
+)
+
 
 async def match_policy(
     db: AsyncSession,
@@ -56,7 +71,12 @@ async def match_policy(
 
     best: ApprovalPolicy | None = None
     for policy in rows:
-        # Threshold gate.
+        # Threshold gate. NOTE (P1): no covered op threads a ``count`` —
+        # ``gate_or_execute`` always calls this with ``count=None`` for the
+        # six single-target deletes, so a policy carrying a numeric
+        # ``min_count`` never matches yet. The machinery stays for the P2
+        # bulk_* ops (which will pass a row count); the P1 migration seeds no
+        # min_count policies, so this branch is inert until then.
         if policy.min_count is not None and (count is None or count < policy.min_count):
             continue
         if best is None or _is_stronger(policy, best, resource_type):
@@ -94,4 +114,4 @@ def _is_stronger(candidate: ApprovalPolicy, current: ApprovalPolicy, resource_ty
     return candidate.min_count < current.min_count
 
 
-__all__ = ["match_policy"]
+__all__ = ["GATEABLE_ACTIONS", "GATEABLE_RESOURCE_TYPES", "match_policy"]

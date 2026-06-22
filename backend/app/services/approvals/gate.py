@@ -15,9 +15,12 @@ return value tells the handler what to do:
 Control flow (pinned by the #62 design):
 
 1. Module off → ``None`` (never touches the policy table).
-2. Derive ``(action, resource_type)`` for the policy lookup from the
-   operation (delete-family → ``action="delete"``; resource_type is the
-   operation's ``required_permission[1]``).
+2. Derive ``(action, resource_type)`` for the policy lookup *directly*
+   from the operation's ``required_permission`` (e.g. ``("delete",
+   "subnet")``) — no hand-maintained name→action map to drift out of
+   sync (#2/#3). An import-time assertion proves every registered risky
+   op carries a ``required_permission`` so a future op that forgets one
+   fails loudly at boot rather than silently never-gating.
 3. ``match_policy`` → no enabled match → ``None``.
 4. Superadmin caller + ``not policy.applies_to_superadmin`` → ``None``.
 5. ``operation.preview`` → if not ok, raise 409 (don't queue a doomed
@@ -41,7 +44,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
-from app.services.ai.operations import Operation
+from app.services.ai.operations import Operation, get_operation
+from app.services.ai.operations_risky import RISKY_OPERATION_NAMES
 from app.services.approvals.policy import match_policy
 from app.services.approvals.service import create_change_request
 from app.services.feature_modules import is_module_enabled
@@ -50,19 +54,28 @@ logger = structlog.get_logger(__name__)
 
 MODULE_ID = "governance.approvals"
 
-# Maps a registered risky operation name to the (action, ...) the policy
-# lookup keys on. The resource_type comes from the operation's
-# ``required_permission[1]`` so the policy ``resource_type`` matches the
-# seeded rows (``subnet`` / ``ip_block`` / ``ip_space`` / ``dns_zone`` /
-# ``dhcp_scope`` / ``dhcp_server_group``). Every covered op is a delete.
-OPERATION_ACTION: dict[str, str] = {
-    "delete_subnet": "delete",
-    "delete_block": "delete",
-    "delete_space": "delete",
-    "delete_zone": "delete",
-    "delete_scope": "delete",
-    "delete_group": "delete",
-}
+
+def _assert_risky_ops_have_permission() -> None:
+    """Fail loudly at import if any registered risky op lacks a
+    ``required_permission`` (#3).
+
+    The gate derives the policy-lookup ``(action, resource_type)`` straight
+    from ``operation.required_permission``; an op that forgets to declare one
+    would silently never gate (fail-open). Catch the drift at boot instead.
+    """
+    missing = []
+    for name in RISKY_OPERATION_NAMES:
+        op = get_operation(name)
+        if op is None or op.required_permission is None:
+            missing.append(name)
+    if missing:  # pragma: no cover — import-time invariant
+        raise RuntimeError(
+            f"risky operations missing required_permission (cannot derive "
+            f"approval policy keys): {sorted(missing)}"
+        )
+
+
+_assert_risky_ops_have_permission()
 
 
 @dataclass(frozen=True)
@@ -117,12 +130,15 @@ async def gate_or_execute(
     if not await is_module_enabled(db, MODULE_ID):
         return None
 
-    # 2. Derive the policy lookup keys from the operation.
-    action = OPERATION_ACTION.get(operation.name)
-    if action is None or operation.required_permission is None:
-        # An operation not in the action map isn't gateable — run inline.
+    # 2. Derive the policy lookup keys directly from the operation's
+    #    declared permission — no hand-maintained name→action map (#2).
+    #    ``required_permission`` is guaranteed present for every risky op by
+    #    the import-time assertion above; the guard keeps mypy + a
+    #    defensive run-inline fallthrough for any op dispatched here that
+    #    didn't declare one.
+    if operation.required_permission is None:
         return None
-    resource_type = operation.required_permission[1]
+    action, resource_type = operation.required_permission
 
     # 3. Strongest enabled matching policy, or None.
     policy = await match_policy(db, resource_type, action, count)
@@ -139,6 +155,11 @@ async def gate_or_execute(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=preview.detail)
 
     # 6. Persist the pending change request + its audit row, then commit.
+    #    #18: args are frozen as JSON via ``model_dump(mode="json")`` here and
+    #    rehydrated with ``args_model.model_validate(...)`` at approve time.
+    #    That round-trip assumes every arg type is JSON-coercible (UUID→str,
+    #    bool, int, str) — true for all six covered delete ops. A future op
+    #    carrying a non-JSON-native arg type would need a custom (de)serializer.
     cr = await create_change_request(
         db,
         user=user,
@@ -166,4 +187,4 @@ async def gate_or_execute(
     )
 
 
-__all__ = ["ChangeRequestPending", "OPERATION_ACTION", "gate_or_execute"]
+__all__ = ["ChangeRequestPending", "gate_or_execute"]

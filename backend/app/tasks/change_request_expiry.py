@@ -12,6 +12,13 @@ synthetic ``system`` actor (NN #4 — every state change is audited). The
 approve endpoint also lazily expires a row it finds stale on read, so a
 request never executes past its TTL regardless of when this sweep runs;
 the sweep is the durable bookkeeping layer that clears the queue.
+
+Resilience (#12): the sweep processes one row at a time, each re-locked
+``FOR UPDATE`` and re-checked for ``state == "pending"`` inside its own
+transaction. A row an approver / requester flips out of ``pending`` between
+the candidate SELECT and the per-row lock is skipped (not an error), and a
+single row that raises is logged + skipped rather than aborting the whole
+batch — so one wedged row can't strand the queue.
 """
 
 from __future__ import annotations
@@ -25,7 +32,7 @@ from sqlalchemy import select
 from app.celery_app import celery_app
 from app.db import task_session
 from app.models.change_request import ChangeRequest
-from app.services.approvals.service import mark_expired
+from app.services.approvals.service import get_change_request, mark_expired
 
 logger = structlog.get_logger(__name__)
 
@@ -33,10 +40,12 @@ logger = structlog.get_logger(__name__)
 async def _sweep() -> dict[str, int]:
     async with task_session() as db:
         now = datetime.now(UTC)
-        rows = list(
+        # Candidate ids only — re-load each FOR UPDATE so a mid-loop decision
+        # by an approver/requester is observed under the lock (#12).
+        candidate_ids = list(
             (
                 await db.execute(
-                    select(ChangeRequest)
+                    select(ChangeRequest.id)
                     .where(ChangeRequest.state == "pending")
                     .where(ChangeRequest.expires_at < now)
                 )
@@ -44,10 +53,35 @@ async def _sweep() -> dict[str, int]:
             .scalars()
             .all()
         )
-        for cr in rows:
-            await mark_expired(db, cr)
-        await db.commit()
-        return {"checked": len(rows), "expired": len(rows)}
+
+        checked = 0
+        expired = 0
+        skipped = 0
+        for cr_id in candidate_ids:
+            checked += 1
+            try:
+                cr = await get_change_request(db, cr_id, for_update=True)
+                # Re-check under the lock: an approver/requester may have
+                # flipped it out of pending (or it may have re-expired-past).
+                if cr is None or cr.state != "pending" or cr.expires_at >= datetime.now(UTC):
+                    skipped += 1
+                    await db.commit()  # release the row lock
+                    continue
+                await mark_expired(db, cr)
+                await db.commit()
+                expired += 1
+            except Exception as exc:  # noqa: BLE001 — one bad row can't abort the batch
+                skipped += 1
+                logger.warning(
+                    "change_request_expiry_row_failed",
+                    change_request_id=str(cr_id),
+                    error=str(exc),
+                )
+                try:
+                    await db.rollback()
+                except Exception as rb_exc:  # noqa: BLE001
+                    logger.warning("change_request_expiry_rollback_failed", error=str(rb_exc))
+        return {"checked": checked, "expired": expired, "skipped": skipped}
 
 
 @celery_app.task(name="app.tasks.change_request_expiry.sweep_expired_change_requests")

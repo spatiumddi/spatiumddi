@@ -10,6 +10,11 @@ import {
 } from "lucide-react";
 import { dhcpApi, type DHCPPool, type DHCPScope } from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
+import {
+  APPROVAL_QUEUED_MESSAGE,
+  CHANGE_REQUEST_QUERY_KEY,
+  handleApprovalQueued,
+} from "@/lib/approvalQueue";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreatePoolModal } from "./CreatePoolModal";
 import { DeleteConfirmModal } from "./_shared";
@@ -75,6 +80,7 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
   const [showAddPool, setShowAddPool] = useState(false);
   const [editScope, setEditScope] = useState(false);
   const [deleteScope, setDeleteScope] = useState(false);
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
 
   const { data: pools = [] } = useQuery({
     queryKey: ["dhcp-pools", scope.id],
@@ -93,7 +99,15 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
 
   const delMut = useMutation({
     mutationFn: () => dhcpApi.deleteScope(scope.id),
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // Two-person approval (#62): a covered delete returns 202 with a
+      // queued change-request instead of deleting. Surface the message,
+      // refresh the approval queue, and leave the scope in place.
+      if (handleApprovalQueued(resp)) {
+        setDeleteNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
       qc.invalidateQueries({
         queryKey: ["dhcp-scopes-subnet", scope.subnet_id],
       });
@@ -197,8 +211,13 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
           description={`Delete scope "${scope.name}" and all its pools?`}
           references={[`${pools.length} pool${pools.length !== 1 ? "s" : ""}`]}
           onConfirm={() => delMut.mutate()}
-          onClose={() => setDeleteScope(false)}
+          onClose={() => {
+            setDeleteScope(false);
+            setDeleteNotice(null);
+            delMut.reset();
+          }}
           isPending={delMut.isPending}
+          notice={deleteNotice}
         />
       )}
     </div>
