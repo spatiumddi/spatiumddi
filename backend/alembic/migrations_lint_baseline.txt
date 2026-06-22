@@ -22,6 +22,8 @@ backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:308
 backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:310
 backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:312
 backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:317
+backend/alembic/versions/2c24fe41a7ed_change_requests.py:drop_table:151
+backend/alembic/versions/2c24fe41a7ed_change_requests.py:drop_table:155
 backend/alembic/versions/2c4e9d1a7f63_vrf_first_class.py:drop_column:264
 backend/alembic/versions/2c4e9d1a7f63_vrf_first_class.py:drop_column:268
 backend/alembic/versions/2c4e9d1a7f63_vrf_first_class.py:drop_constraint_fk:263
@@ -57,6 +59,7 @@ backend/alembic/versions/4c9e1f82a3b7_add_dns_schema.py:drop_table:195
 backend/alembic/versions/4c9e1f82a3b7_add_dns_schema.py:drop_table:196
 backend/alembic/versions/4c9e1f82a3b7_add_dns_schema.py:drop_table:197
 backend/alembic/versions/4c9e1f82a3b7_add_dns_schema.py:drop_table:198
+backend/alembic/versions/5443d2756647_approvals_protect_controls.py:drop_column:40
 backend/alembic/versions/5d2a8f91c4e6_add_dns_settings_and_fix_session_timeout.py:drop_column:39
 backend/alembic/versions/5d2a8f91c4e6_add_dns_settings_and_fix_session_timeout.py:drop_column:40
 backend/alembic/versions/5d2a8f91c4e6_add_dns_settings_and_fix_session_timeout.py:drop_column:41
@@ -439,7 +442,7 @@ backend/alembic/versions/e1f2a3b4c5d6_subnet_ddns_fields.py:drop_column:64
 backend/alembic/versions/e1f2a3b4c5d6_subnet_ddns_fields.py:drop_column:65
 backend/alembic/versions/e1f2a3b4c5d6_subnet_ddns_fields.py:drop_column:66
 backend/alembic/versions/e2a6f3b8c1d4_add_auto_from_lease_to_ipaddress.py:drop_column:33
-backend/alembic/versions/e2b9c4f1a7d6_address_sets.py:drop_table:104
+backend/alembic/versions/e2b9c4f1a7d6_address_sets.py:drop_table:102
 backend/alembic/versions/e2c91d5f7a48_appliance_pairing_codes.py:drop_table:126
 backend/alembic/versions/e3f1c92a4d68_compliance_change_alerts.py:drop_column:59
 backend/alembic/versions/e3f1c92a4d68_compliance_change_alerts.py:drop_column:60

@@ -190,6 +190,19 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "address_set"},
         ],
     ),
+    "Change Approver": (
+        "Approve or reject queued change requests in the two-person approval "
+        "workflow (#62). Grants ``approve`` + ``read`` on the synthetic "
+        "``change_request`` resource_type. Note: this role only confers the "
+        "second-person decision capability — to approve a specific request the "
+        "operator must ALSO hold the underlying operation's permission (e.g. "
+        "``delete,subnet`` to approve a subnet delete), enforced server-side at "
+        "the approve endpoint, and may never approve their own request.",
+        [
+            {"action": "approve", "resource_type": "change_request"},
+            {"action": "read", "resource_type": "change_request"},
+        ],
+    ),
     "DNS Editor": (
         "Full CRUD on DNS zones, records, server groups, blocklists, and pools.",
         [

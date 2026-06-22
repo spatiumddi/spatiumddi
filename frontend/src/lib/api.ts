@@ -1254,6 +1254,13 @@ export const ipamApi = {
     api.post<IPSpace>("/ipam/spaces", data).then((r) => r.data),
   updateSpace: (id: string, data: Partial<IPSpace>) =>
     api.put<IPSpace>(`/ipam/spaces/${id}`, data).then((r) => r.data),
+  // #62 two-person approval: when the ``governance.approvals`` module is on
+  // and a policy matches, this returns **202** with a ``ChangeRequestQueued``
+  // body (queued, NOT deleted) instead of 204. Returns the FULL axios
+  // response on purpose — do NOT chain ``.then((r) => r.data)`` here or the
+  // 202 status is invisible. Callers pass the response to
+  // ``handleApprovalQueued`` (``@/lib/approvalQueue``); see deleteBlock /
+  // deleteSubnet below + dnsApi/dhcpApi delete methods.
   deleteSpace: (id: string) => api.delete(`/ipam/spaces/${id}`),
 
   listBlocks: (spaceId?: string) =>
@@ -1287,6 +1294,8 @@ export const ipamApi = {
       >
     >,
   ) => api.put<IPBlock>(`/ipam/blocks/${id}`, data).then((r) => r.data),
+  // #62: returns the full axios response (may be 202 queued-for-approval —
+  // see deleteSpace). Do NOT add ``.then((r) => r.data)``.
   deleteBlock: (id: string) => api.delete(`/ipam/blocks/${id}`),
   availableSubnets: (blockId: string, prefixLen: number) =>
     api
@@ -1451,6 +1460,8 @@ export const ipamApi = {
   // explicit ("…and all IP address records will be permanently
   // deleted") so they pass force=true; the bare-id callable shape is
   // kept for any future "soft" call site.
+  // #62: returns the full axios response (may be 202 queued-for-approval —
+  // see deleteSpace). Do NOT add ``.then((r) => r.data)``.
   deleteSubnet: (id: string, force: boolean = false) =>
     api.delete(`/ipam/subnets/${id}${force ? "?force=true" : ""}`),
 
@@ -2313,12 +2324,64 @@ export interface FeatureModuleEntry {
   enabled: boolean;
 }
 
+// #62 break-glass: force a weakening control change immediately (the 5 kinds
+// the backend ``ModifyApprovalControlArgs.kind`` accepts).
+export type ApprovalControlKind =
+  | "disable_module"
+  | "disable_policy"
+  | "delete_policy"
+  | "lower_superadmin_gate"
+  | "unlock";
+
+export interface BreakGlassBody {
+  kind: ApprovalControlKind;
+  policy_id?: string | null;
+  password?: string | null;
+  totp_code?: string | null;
+  confirm_phrase: string;
+}
+
 export const featureModulesApi = {
   list: () =>
     api.get<FeatureModuleEntry[]>("/admin/feature-modules").then((r) => r.data),
-  toggle: (id: string, enabled: boolean) =>
+  // Toggle a module. Returns the FULL axios response (no trailing
+  // ``.then(r => r.data)``) so the #62 self-governance lock's 202
+  // approval-queue envelope is observable: disabling ``governance.approvals``
+  // while the lock is on returns 202 + a ``ChangeRequestQueued`` body instead
+  // of the FeatureModuleEntry. Callers route the response through
+  // ``handleApprovalQueued`` (``@/lib/approvalQueue``) and read ``.data`` for
+  // the inline 200 case. ``protectControls`` is only honoured by the backend
+  // when enabling ``governance.approvals`` (strengthening → single-person).
+  toggle: (id: string, enabled: boolean, protectControls?: boolean) =>
+    api.patch<FeatureModuleEntry | ChangeRequestQueued>(
+      `/admin/feature-modules/${id}`,
+      { enabled, protect_controls: protectControls },
+    ),
+  // #62 self-governance lock state. ON ⇒ disabling/weakening the approval
+  // control requires a second superadmin (or break-glass).
+  getApprovalsLock: () =>
     api
-      .patch<FeatureModuleEntry>(`/admin/feature-modules/${id}`, { enabled })
+      .get<{
+        approvals_protect_controls: boolean;
+      }>("/admin/feature-modules/approvals-lock")
+      .then((r) => r.data),
+  // Turn the lock on (strengthen → inline 200) or off (weaken → 202 gated
+  // when currently on). Full response so the 202 envelope is observable.
+  setApprovalsLock: (enabled: boolean) =>
+    api.post<{ approvals_protect_controls: boolean } | ChangeRequestQueued>(
+      "/admin/feature-modules/approvals-lock",
+      { enabled },
+    ),
+  // #62 break-glass — force a protected control change IMMEDIATELY, bypassing
+  // the two-person gate. Superadmin-only; the backend re-confirms password /
+  // TOTP + the typed phrase, writes a HIGH-severity audit row, and fires the
+  // ``governance.break_glass`` event.
+  breakGlass: (body: BreakGlassBody) =>
+    api
+      .post<{
+        forced: boolean;
+        kind: string;
+      }>("/admin/feature-modules/break-glass", body)
       .then((r) => r.data),
 };
 
@@ -4846,6 +4909,9 @@ export const dnsApi = {
     api.post<DNSServerGroup>("/dns/groups", data).then((r) => r.data),
   updateGroup: (id: string, data: Partial<DNSServerGroup>) =>
     api.put<DNSServerGroup>(`/dns/groups/${id}`, data).then((r) => r.data),
+  // #62: returns the full axios response (may be 202 queued-for-approval —
+  // see ipamApi.deleteSpace). Do NOT add ``.then((r) => r.data)`` or the
+  // 202 envelope is lost; callers pass it to ``handleApprovalQueued``.
   deleteGroup: (id: string) => api.delete(`/dns/groups/${id}`),
 
   // Servers
@@ -5045,6 +5111,8 @@ export const dnsApi = {
     api
       .put<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}`, data)
       .then((r) => r.data),
+  // #62: returns the full axios response (may be 202 queued-for-approval —
+  // see ipamApi.deleteSpace). Do NOT add ``.then((r) => r.data)``.
   deleteZone: (groupId: string, zoneId: string) =>
     api.delete(`/dns/groups/${groupId}/zones/${zoneId}`),
   getZoneServerState: (groupId: string, zoneId: string) =>
@@ -6362,6 +6430,9 @@ export const dhcpApi = {
     api
       .put<DHCPServerGroup>(`/dhcp/server-groups/${id}`, data)
       .then((r) => r.data),
+  // #62: returns the full axios response (may be 202 queued-for-approval —
+  // see ipamApi.deleteSpace). Do NOT add ``.then((r) => r.data)`` or the
+  // 202 envelope is lost; callers pass it to ``handleApprovalQueued``.
   deleteGroup: (id: string) => api.delete(`/dhcp/server-groups/${id}`),
 
   listServers: (groupId?: string) =>
@@ -6462,6 +6533,8 @@ export const dhcpApi = {
       .then((r) => r.data),
   updateScope: (id: string, data: Partial<DHCPScope>) =>
     api.put<DHCPScope>(`/dhcp/scopes/${id}`, data).then((r) => r.data),
+  // #62: returns the full axios response (may be 202 queued-for-approval —
+  // see ipamApi.deleteSpace). Do NOT add ``.then((r) => r.data)``.
   deleteScope: (id: string) => api.delete(`/dhcp/scopes/${id}`),
 
   listPools: (scopeId: string) =>
@@ -7899,6 +7972,152 @@ export const webhooksApi = {
     api
       .post<WebhookDelivery>(`/webhooks/deliveries/${deliveryId}/retry`)
       .then((r) => r.data),
+};
+
+// ── Change requests (two-person approval workflow, #62) ─────────────────────
+//
+// Gated behind the default-OFF ``governance.approvals`` feature module — the
+// whole router 404s when the module is disabled, so every covered mutation
+// executes inline exactly as before (the Sidebar nav entry carries the same
+// module gate so the page is hidden until an operator turns the feature on).
+
+export type ChangeRequestState =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "executed"
+  | "failed"
+  | "expired"
+  | "cancelled";
+
+export interface ChangeRequest {
+  id: string;
+  operation: string;
+  resource_type: string;
+  resource_id: string | null;
+  resource_display: string;
+  args: Record<string, unknown>;
+  preview_text: string;
+  risk_reason: string;
+  state: ChangeRequestState;
+  requested_by_user_id: string | null;
+  requested_by_display: string;
+  decided_by_user_id: string | null;
+  decided_by_display: string | null;
+  decision_note: string | null;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  expires_at: string;
+  decided_at: string | null;
+  executed_at: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface ChangeRequestListParams {
+  state?: ChangeRequestState;
+  resource_type?: string;
+  mine?: boolean;
+  limit?: number;
+  offset?: number;
+}
+
+// Threshold actions an approval policy can gate (mirror the backend
+// ``APPROVAL_POLICY_ACTIONS`` frozenset).
+export const APPROVAL_POLICY_ACTIONS = [
+  "delete",
+  "bulk_delete",
+  "bulk_edit",
+  "bulk_allocate",
+  "factory_reset",
+  "import_commit",
+] as const;
+export type ApprovalPolicyAction = (typeof APPROVAL_POLICY_ACTIONS)[number];
+
+export interface ApprovalPolicy {
+  id: string;
+  name: string;
+  resource_type: string;
+  action: string;
+  min_count: number | null;
+  enabled: boolean;
+  applies_to_superadmin: boolean;
+  ttl_hours: number;
+  is_builtin: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface ApprovalPolicyWrite {
+  name: string;
+  resource_type: string;
+  action: string;
+  min_count?: number | null;
+  enabled: boolean;
+  applies_to_superadmin: boolean;
+  ttl_hours: number;
+}
+
+// The 202 envelope a covered mutation returns (instead of 204) when the
+// operation was queued for approval rather than executed inline.
+export interface ChangeRequestQueued {
+  change_request_id: string;
+  state: "pending";
+  preview_text: string;
+}
+
+export const changeRequestsApi = {
+  list: (params: ChangeRequestListParams = {}) =>
+    api
+      .get<ChangeRequest[]>("/change-requests", { params })
+      .then((r) => r.data),
+  get: (id: string) =>
+    api.get<ChangeRequest>(`/change-requests/${id}`).then((r) => r.data),
+  // No dedicated pending-count endpoint server-side — derive the badge from
+  // a state=pending list (cheap; the queue is small by construction).
+  countPending: () =>
+    api
+      .get<ChangeRequest[]>("/change-requests", {
+        params: { state: "pending", limit: 500 },
+      })
+      .then((r) => r.data.length),
+  approve: (id: string, decisionNote?: string) =>
+    api
+      .post<ChangeRequest>(`/change-requests/${id}/approve`, {
+        decision_note: decisionNote ?? null,
+      })
+      .then((r) => r.data),
+  reject: (id: string, decisionNote?: string) =>
+    api
+      .post<ChangeRequest>(`/change-requests/${id}/reject`, {
+        decision_note: decisionNote ?? null,
+      })
+      .then((r) => r.data),
+  cancel: (id: string, decisionNote?: string) =>
+    api
+      .post<ChangeRequest>(`/change-requests/${id}/cancel`, {
+        decision_note: decisionNote ?? null,
+      })
+      .then((r) => r.data),
+  listPolicies: () =>
+    api.get<ApprovalPolicy[]>("/change-requests/policies").then((r) => r.data),
+  createPolicy: (body: ApprovalPolicyWrite) =>
+    api
+      .post<ApprovalPolicy>("/change-requests/policies", body)
+      .then((r) => r.data),
+  // #62 self-governance lock: WEAKENING a policy (disable enabled→false, lower
+  // applies_to_superadmin true→false, or delete) returns **202** with a
+  // ``ChangeRequestQueued`` body when the lock is on instead of mutating
+  // inline. Return the FULL axios response so callers can route it through
+  // ``handleApprovalQueued``; strengthening edits + lock-off return the
+  // 200/204 inline path. (See featureModulesApi.toggle for the same shape.)
+  updatePolicy: (id: string, body: ApprovalPolicyWrite) =>
+    api.put<ApprovalPolicy | ChangeRequestQueued>(
+      `/change-requests/policies/${id}`,
+      body,
+    ),
+  deletePolicy: (id: string) =>
+    api.delete<ChangeRequestQueued | "">(`/change-requests/policies/${id}`),
 };
 
 export type MetricsWindow = "1h" | "6h" | "24h" | "7d";

@@ -10,7 +10,8 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
@@ -20,13 +21,11 @@ from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPScope, DHCPServerGroup
 from app.models.ipam import Subnet
+from app.services.ai.operations import get_operation
+from app.services.ai.operations_risky import DeleteScopeArgs
+from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp.windows_writethrough import (
-    push_scope_delete,
     push_scope_upsert,
-)
-from app.services.soft_delete import (
-    apply_soft_delete,
-    collect_soft_delete_batch,
 )
 from app.services.tags import apply_tag_filter
 
@@ -460,13 +459,14 @@ async def update_scope(
     return _scope_to_response(scope)
 
 
-@router.delete("/scopes/{scope_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/scopes/{scope_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def delete_scope(
     scope_id: uuid.UUID,
     db: DB,
     user: SuperAdmin,
+    request: Request,
     permanent: bool = False,
-) -> None:
+) -> Any:
     """Delete a DHCP scope.
 
     Default soft-delete stamps the scope with a fresh batch UUID so it
@@ -474,36 +474,17 @@ async def delete_scope(
     fired on the permanent path; soft-delete leaves the scope in the
     rendered config until restoration deadline expires (the purge sweep
     triggers the actual config refresh by hard-deleting then).
+
+    Two-person approval (#62): when the ``governance.approvals`` module is on
+    and a ``delete:dhcp_scope`` policy matches, returns ``202`` with a pending
+    change-request; otherwise executes inline via ``operation.apply`` exactly
+    as before (route stays SuperAdmin-gated).
     """
-    scope = await db.get(DHCPScope, scope_id)
-    if scope is None:
-        raise HTTPException(status_code=404, detail="Scope not found")
-    collect_wake(dhcp_group_channel(scope.group_id))
-
-    if not permanent:
-        batch = await collect_soft_delete_batch(db, scope)
-        apply_soft_delete(batch, user.id)
-        for row in batch.rows:
-            write_audit(
-                db,
-                user=user,
-                action="soft_delete",
-                resource_type=row.resource_type,
-                resource_id=str(row.obj.id),
-                resource_display=row.display,
-                old_value={"deletion_batch_id": str(batch.batch_id)},
-            )
-        await db.commit()
-        return
-
-    await push_scope_delete(db, scope)
-    write_audit(
-        db,
-        user=user,
-        action="delete",
-        resource_type="dhcp_scope",
-        resource_id=str(scope.id),
-        resource_display=str(scope.id),
-    )
-    await db.delete(scope)
-    await db.commit()
+    op = get_operation("delete_scope")
+    assert op is not None  # registered at import
+    args = DeleteScopeArgs(scope_id=scope_id, permanent=permanent)
+    pending = await gate_or_execute(db, user, request, operation=op, args=args)
+    if pending is not None:
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
+    await op.apply(db, user, args)
+    return None

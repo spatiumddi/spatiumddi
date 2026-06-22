@@ -21,6 +21,7 @@ from app.api.v1.auth.router import router as auth_router
 from app.api.v1.auth_providers.router import router as auth_providers_router
 from app.api.v1.backup import router as backup_router
 from app.api.v1.bgp import router as bgp_router
+from app.api.v1.change_requests import router as change_requests_router
 from app.api.v1.circuits import router as circuits_router
 from app.api.v1.cloud import router as cloud_router
 from app.api.v1.conformity import router as conformity_router
@@ -131,6 +132,12 @@ api_v1_router.include_router(
 )
 api_v1_router.include_router(backup_router, prefix="/backup", tags=["backup"])
 api_v1_router.include_router(bgp_router, prefix="/bgp", tags=["bgp"])
+api_v1_router.include_router(
+    change_requests_router,
+    prefix="/change-requests",
+    tags=["change-requests"],
+    dependencies=[Depends(require_module("governance.approvals"))],
+)
 api_v1_router.include_router(
     circuits_router,
     prefix="/circuits",

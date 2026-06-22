@@ -83,6 +83,11 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { usePermissions } from "@/hooks/usePermissions";
+import {
+  APPROVAL_QUEUED_MESSAGE,
+  CHANGE_REQUEST_QUERY_KEY,
+  handleApprovalQueued,
+} from "@/lib/approvalQueue";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -6604,7 +6609,15 @@ function EditSubnetModal({
     // operator to tick "…and all its contents will be permanently
     // deleted" — cascade is the right semantics. force=true.
     mutationFn: () => ipamApi.deleteSubnet(subnet.id, true),
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // Two-person approval (#62): a covered delete returns 202 with a
+      // queued change-request instead of deleting. Surface the message,
+      // refresh the approval queue, and leave the subnet in place.
+      if (handleApprovalQueued(resp)) {
+        setDeleteError(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: ["change-requests"] });
+        return;
+      }
       qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
       qc.invalidateQueries({ queryKey: ["blocks", subnet.space_id] });
       onDeleted?.();
@@ -9400,6 +9413,7 @@ function ConfirmDestroyModal({
   onClose,
   isPending,
   error,
+  notice,
 }: {
   title: string;
   description: string;
@@ -9408,6 +9422,10 @@ function ConfirmDestroyModal({
   onClose: () => void;
   isPending?: boolean;
   error?: string | null;
+  // Non-error feedback shown in a neutral box — used for the #62
+  // two-person approval queue "Submitted for approval" message, where
+  // the delete returned 202 instead of executing.
+  notice?: string | null;
 }) {
   const [step, setStep] = useState<1 | 2>(1);
   const [checked, setChecked] = useState(false);
@@ -9420,6 +9438,11 @@ function ConfirmDestroyModal({
           {error && (
             <div className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
               {error}
+            </div>
+          )}
+          {notice && (
+            <div className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400">
+              {notice}
             </div>
           )}
           <div className="flex justify-end gap-2">
@@ -9460,6 +9483,11 @@ function ConfirmDestroyModal({
         {error && (
           <div className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
+          </div>
+        )}
+        {notice && (
+          <div className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400">
+            {notice}
           </div>
         )}
         <div className="flex justify-end gap-2">
@@ -10884,6 +10912,9 @@ function BlockDetailView({
   const [blockBulkDeleteError, setBlockBulkDeleteError] = useState<
     string | null
   >(null);
+  const [blockBulkDeleteNotice, setBlockBulkDeleteNotice] = useState<
+    string | null
+  >(null);
   const blockBulkDeleteMut = useMutation({
     // allSettled on both phases so a single 409 (non-empty subnet/block)
     // doesn't hide the rest. Subnets first — a subnet hanging off a leaf
@@ -10905,6 +10936,11 @@ function BlockDetailView({
       );
       type Fail = { id: string; kind: "subnet" | "block"; message: string };
       const failures: Fail[] = [];
+      // #62: a covered delete returns 202 (a *fulfilled* response, not a
+      // rejection) with a queued change-request instead of executing. The
+      // old logic counted every non-rejected promise as deleted, silently
+      // swallowing the queue. Inspect each fulfilled response's status.
+      let queued = 0;
       const collect = (
         ids: string[],
         results: PromiseSettledResult<unknown>[],
@@ -10927,20 +10963,34 @@ function BlockDetailView({
                     ? JSON.stringify(detail)
                     : "Unknown error",
             });
+          } else if (handleApprovalQueued(r.value)) {
+            queued += 1;
           }
         });
       };
       collect(subnetIds, subnetResults, "subnet");
       collect(blockIds, blockResults, "block");
-      return { failures, total: subnetIds.length + blockIds.length };
+      return { failures, queued, total: subnetIds.length + blockIds.length };
     },
-    onSuccess: ({ failures, total }) => {
+    onSuccess: ({ failures, queued, total }) => {
       qc.invalidateQueries({ queryKey: ["subnets", block.space_id] });
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
+      if (queued > 0)
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+      const queuedNote =
+        queued > 0 ? `${queued} of ${total} submitted for approval.` : null;
       if (failures.length === 0) {
+        setBlockBulkDeleteError(null);
+        if (queued > 0) {
+          // Some/all were queued — keep the modal open to show the
+          // approval notice instead of reporting them deleted.
+          setBlockBulkDeleteNotice(queuedNote);
+          setSelected(new Set());
+          return;
+        }
         setSelected(new Set());
         setShowBulkDelete(false);
-        setBlockBulkDeleteError(null);
+        setBlockBulkDeleteNotice(null);
         return;
       }
       const subnetLookup = new Map(allSubnets.map((s) => [s.id, s.network]));
@@ -10951,6 +11001,7 @@ function BlockDetailView({
           return `• ${f.kind} ${lookup.get(f.id) ?? f.id}: ${f.message}`;
         })
         .join("\n");
+      setBlockBulkDeleteNotice(queuedNote);
       setBlockBulkDeleteError(
         `${failures.length} of ${total} items could not be deleted:\n${detail}`,
       );
@@ -11300,12 +11351,16 @@ function BlockDetailView({
               checkLabel={`I understand ${noun} will be deleted.`}
               isPending={blockBulkDeleteMut.isPending}
               error={blockBulkDeleteError}
+              notice={blockBulkDeleteNotice}
               onClose={() => {
                 setShowBulkDelete(false);
                 setBlockBulkDeleteError(null);
+                setBlockBulkDeleteNotice(null);
+                blockBulkDeleteMut.reset();
               }}
               onConfirm={() => {
                 setBlockBulkDeleteError(null);
+                setBlockBulkDeleteNotice(null);
                 blockBulkDeleteMut.mutate();
               }}
             />
@@ -12160,6 +12215,9 @@ function SpaceTableView({
   const [spaceBulkDeleteError, setSpaceBulkDeleteError] = useState<
     string | null
   >(null);
+  const [spaceBulkDeleteNotice, setSpaceBulkDeleteNotice] = useState<
+    string | null
+  >(null);
   const bulkDeleteMut = useMutation({
     // allSettled on both phases so a single 409 (non-empty subnet/block)
     // doesn't hide the rest. Subnets first — a subnet hanging off a leaf
@@ -12184,6 +12242,11 @@ function SpaceTableView({
       );
       type Fail = { id: string; kind: "subnet" | "block"; message: string };
       const failures: Fail[] = [];
+      // #62: a covered delete returns 202 (a *fulfilled* response, not a
+      // rejection) with a queued change-request instead of executing. The
+      // old logic counted every non-rejected promise as deleted, silently
+      // swallowing the queue. Inspect each fulfilled response's status.
+      let queued = 0;
       const collect = (
         ids: string[],
         results: PromiseSettledResult<unknown>[],
@@ -12206,20 +12269,34 @@ function SpaceTableView({
                     ? JSON.stringify(detail)
                     : "Unknown error",
             });
+          } else if (handleApprovalQueued(r.value)) {
+            queued += 1;
           }
         });
       };
       collect(subnetIds, subnetResults, "subnet");
       collect(blockIds, blockResults, "block");
-      return { failures, total: subnetIds.length + blockIds.length };
+      return { failures, queued, total: subnetIds.length + blockIds.length };
     },
-    onSuccess: ({ failures, total }) => {
+    onSuccess: ({ failures, queued, total }) => {
       qc.invalidateQueries({ queryKey: ["subnets", space.id] });
       qc.invalidateQueries({ queryKey: ["blocks", space.id] });
+      if (queued > 0)
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+      const queuedNote =
+        queued > 0 ? `${queued} of ${total} submitted for approval.` : null;
       if (failures.length === 0) {
+        setSpaceBulkDeleteError(null);
+        if (queued > 0) {
+          // Some/all were queued — keep the modal open to show the
+          // approval notice instead of reporting them deleted.
+          setSpaceBulkDeleteNotice(queuedNote);
+          setSelected(new Set());
+          return;
+        }
         setSelected(new Set());
         setShowBulkDelete(false);
-        setSpaceBulkDeleteError(null);
+        setSpaceBulkDeleteNotice(null);
         return;
       }
       const lookup = new Map<string, string>();
@@ -12228,6 +12305,7 @@ function SpaceTableView({
       const detail = failures
         .map((f) => `• ${f.kind} ${lookup.get(f.id) ?? f.id}: ${f.message}`)
         .join("\n");
+      setSpaceBulkDeleteNotice(queuedNote);
       setSpaceBulkDeleteError(
         `${failures.length} of ${total} items could not be deleted:\n${detail}`,
       );
@@ -12883,12 +12961,16 @@ function SpaceTableView({
               checkLabel={`I understand ${summary} will be moved to Trash.`}
               isPending={bulkDeleteMut.isPending}
               error={spaceBulkDeleteError}
+              notice={spaceBulkDeleteNotice}
               onClose={() => {
                 setShowBulkDelete(false);
                 setSpaceBulkDeleteError(null);
+                setSpaceBulkDeleteNotice(null);
+                bulkDeleteMut.reset();
               }}
               onConfirm={() => {
                 setSpaceBulkDeleteError(null);
+                setSpaceBulkDeleteNotice(null);
                 bulkDeleteMut.mutate();
               }}
             />

@@ -882,3 +882,19 @@ class PlatformSettings(Base):
     acme_domains: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
     )
+
+    # ── Governance self-protection lock (#62) ────────────────────────────
+    # OPT-IN at enable time. When True, WEAKENING the approval control plane
+    # (disabling the ``governance.approvals`` module, disabling / deleting a
+    # policy, lowering a policy's ``applies_to_superadmin``, or turning this
+    # very lock back off) requires a SECOND superadmin's approval via the
+    # change-request flow — so a single compromised / rogue superadmin can't
+    # quietly defang the workflow. STRENGTHENING moves (enabling the module,
+    # enabling a policy, raising ``applies_to_superadmin``, turning this lock
+    # on) stay single-person inline. A superadmin break-glass (password
+    # re-confirm + typed phrase) can force any weakening change immediately so
+    # the platform can never be permanently locked out. The lock is ON iff
+    # this flag is True.
+    approvals_protect_controls: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )

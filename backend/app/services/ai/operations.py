@@ -99,11 +99,23 @@ class PreviewResult:
     subnet doesn't exist, address out of range) — surface ``detail``
     to the operator and don't even create a proposal row. ``ok=True``
     proceeds to persist the proposal with ``preview_text``.
+
+    ``idempotent=True`` (only meaningful when ``ok=True``) signals the
+    target is ALREADY in the desired end-state at approve time — the
+    effect this change requested was achieved by some other path (e.g. a
+    concurrent break-glass) between request and approval. The approve spine
+    resolves such a request as IDEMPOTENT SUCCESS (``executed`` with an
+    "already in desired state" note) WITHOUT re-running ``apply()`` and
+    WITHOUT the scope-drift guard 409'ing — so a change_request whose effect
+    already landed resolves cleanly instead of stranding ``pending`` / failing
+    (#62 concurrent break-glass). Defaults False so no existing op changes
+    behaviour.
     """
 
     ok: bool
     detail: str
     preview_text: str = ""
+    idempotent: bool = False
 
 
 _OPERATIONS: dict[str, Operation] = {}
@@ -2980,5 +2992,246 @@ register(
         preview=_preview_grant_temporary_access,
         apply=_apply_grant_temporary_access,
         category="admin",
+    )
+)
+
+
+# ── approve / reject change request (#62 two-person spine) ─────────────
+#
+# The change-request approval flow is itself an Operation so the Copilot
+# can surface "approve change request X" as a propose→Apply card. The
+# propose tool only persists a proposal (read-only); the human operator
+# who clicks Apply in the chat drawer becomes the *approver*, and the
+# server-side two-person invariants in apply() still fire — the model can
+# never self-approve. The whole spine (self-approval block, approver !=
+# requester, approver holds {approve, change_request} AND the underlying
+# op's required_permission, stale-state re-preview, execute-under-approver)
+# lives in services/approvals/service.py and is shared verbatim with the
+# REST router so there is exactly one implementation of the invariants.
+#
+# required_permission=("approve", "change_request") is the apply endpoint's
+# authoritative RBAC backstop (#400, C2); the deeper checks (self-approval,
+# underlying-op permission, stale state) run inside the shared orchestrator.
+
+
+class ApproveChangeRequestArgs(BaseModel):
+    """Args for the ``approve_change_request`` operation."""
+
+    change_request_id: str = Field(description="UUID of the pending change request to approve.")
+    note: str | None = Field(
+        default=None,
+        description="Optional decision note recorded on the change request.",
+    )
+
+
+class RejectChangeRequestArgs(BaseModel):
+    """Args for the ``reject_change_request`` operation."""
+
+    change_request_id: str = Field(description="UUID of the pending change request to reject.")
+    note: str | None = Field(
+        default=None,
+        description="Optional decision note recorded on the change request.",
+    )
+
+
+def _parse_cr_id(raw: str) -> UUID | None:
+    try:
+        return UUID(str(raw))
+    except (ValueError, AttributeError):
+        return None
+
+
+async def _preview_approve_change_request(
+    db: AsyncSession, user: User, args: ApproveChangeRequestArgs
+) -> PreviewResult:
+    """Surface every two-person failure mode as ``ok=False`` so the propose
+    tool returns ``proposal_rejected`` rather than queuing a doomed proposal.
+    Read-only — mirrors the early checks the shared orchestrator re-runs."""
+    from app.core.permissions import (  # noqa: PLC0415
+        RESOURCE_TYPE_CHANGE_REQUEST,
+        user_has_permission,
+    )
+    from app.services.approvals.service import get_change_request  # noqa: PLC0415
+
+    cr_id = _parse_cr_id(args.change_request_id)
+    if cr_id is None:
+        return PreviewResult(
+            ok=False, detail=f"Invalid change request id: {args.change_request_id!r}"
+        )
+    cr = await get_change_request(db, cr_id)
+    if cr is None:
+        return PreviewResult(ok=False, detail=f"Change request {args.change_request_id} not found.")
+    if cr.state != "pending":
+        return PreviewResult(
+            ok=False, detail=f"Change request is not pending (state={cr.state!r})."
+        )
+    if cr.expires_at < datetime.now(UTC):
+        return PreviewResult(ok=False, detail="Change request has expired.")
+    # #5 fail CLOSED: a deleted requester (requested_by_user_id NULL) is
+    # refused, not silently approvable — mirrors approve_change_request.
+    if cr.requested_by_user_id is None:
+        return PreviewResult(
+            ok=False,
+            detail="Requester no longer exists; cancel and recreate this change request.",
+        )
+    if user.id == cr.requested_by_user_id:
+        return PreviewResult(ok=False, detail="You cannot approve your own change request.")
+    if not user_has_permission(user, "approve", RESOURCE_TYPE_CHANGE_REQUEST):
+        return PreviewResult(
+            ok=False, detail="Permission denied: need 'approve' on 'change_request'."
+        )
+    op = get_operation(cr.operation)
+    if op is None:
+        return PreviewResult(ok=False, detail=f"Operation {cr.operation!r} is not registered.")
+    try:
+        enforce_operation_permission(user, op)
+    except OperationPermissionError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
+    # Re-run the underlying op's preview as the stale-state guard.
+    try:
+        inner_args = op.args_model.model_validate(cr.args or {})
+    except Exception as exc:  # noqa: BLE001
+        return PreviewResult(ok=False, detail=f"Stored args no longer validate: {exc}")
+    inner = await op.preview(db, user, inner_args)
+    if not inner.ok:
+        return PreviewResult(ok=False, detail=f"Stale change request: {inner.detail}")
+    preview_text = (
+        f"Approve + execute change request `{cr.id}` "
+        f"({cr.operation} on {cr.resource_display}), requested by "
+        f"{cr.requested_by_display}. On Apply it runs under YOUR identity "
+        f"after re-validating state. Underlying preview:\n{inner.preview_text}"
+    )
+    return PreviewResult(ok=True, detail="ready", preview_text=preview_text)
+
+
+async def _apply_approve_change_request(
+    db: AsyncSession, user: User, args: ApproveChangeRequestArgs
+) -> dict[str, Any]:
+    """Approve + execute under the approver's identity. Delegates to the
+    shared orchestrator so the two-person invariants are enforced once,
+    server-side, identically to the REST router."""
+    from app.services.approvals.service import (  # noqa: PLC0415
+        DecisionError,
+        DecisionForbidden,
+        approve_change_request,
+    )
+
+    enforce_operation_permission(user, _OPERATIONS["approve_change_request"])
+
+    cr_id = _parse_cr_id(args.change_request_id)
+    if cr_id is None:
+        raise ValueError(f"Invalid change request id: {args.change_request_id!r}")
+    try:
+        cr = await approve_change_request(db, cr_id, approver=user, request=None, note=args.note)
+    except DecisionForbidden as exc:
+        # Map the self-approval / missing-permission case to the op's RBAC
+        # error so the apply endpoint returns a clean 403.
+        raise OperationPermissionError("approve", "change_request") from exc
+    except DecisionError as exc:
+        raise ValueError(str(exc)) from exc
+    return {
+        "id": str(cr.id),
+        "operation": cr.operation,
+        "state": cr.state,
+        "result": cr.result,
+        "error": cr.error,
+    }
+
+
+async def _preview_reject_change_request(
+    db: AsyncSession, user: User, args: RejectChangeRequestArgs
+) -> PreviewResult:
+    from app.core.permissions import (  # noqa: PLC0415
+        RESOURCE_TYPE_CHANGE_REQUEST,
+        user_has_permission,
+    )
+    from app.services.approvals.service import get_change_request  # noqa: PLC0415
+
+    cr_id = _parse_cr_id(args.change_request_id)
+    if cr_id is None:
+        return PreviewResult(
+            ok=False, detail=f"Invalid change request id: {args.change_request_id!r}"
+        )
+    cr = await get_change_request(db, cr_id)
+    if cr is None:
+        return PreviewResult(ok=False, detail=f"Change request {args.change_request_id} not found.")
+    if cr.state != "pending":
+        return PreviewResult(
+            ok=False, detail=f"Change request is not pending (state={cr.state!r})."
+        )
+    if cr.requested_by_user_id is not None and user.id == cr.requested_by_user_id:
+        return PreviewResult(
+            ok=False, detail="You cannot reject your own request — cancel it instead."
+        )
+    if not user_has_permission(user, "approve", RESOURCE_TYPE_CHANGE_REQUEST):
+        return PreviewResult(
+            ok=False, detail="Permission denied: need 'approve' on 'change_request'."
+        )
+    preview_text = (
+        f"Reject change request `{cr.id}` "
+        f"({cr.operation} on {cr.resource_display}), requested by "
+        f"{cr.requested_by_display}. The operation will NOT run."
+    )
+    return PreviewResult(ok=True, detail="ready", preview_text=preview_text)
+
+
+async def _apply_reject_change_request(
+    db: AsyncSession, user: User, args: RejectChangeRequestArgs
+) -> dict[str, Any]:
+    from app.services.approvals.service import (  # noqa: PLC0415
+        DecisionError,
+        DecisionForbidden,
+        reject_change_request,
+    )
+
+    enforce_operation_permission(user, _OPERATIONS["reject_change_request"])
+
+    cr_id = _parse_cr_id(args.change_request_id)
+    if cr_id is None:
+        raise ValueError(f"Invalid change request id: {args.change_request_id!r}")
+    try:
+        cr = await reject_change_request(db, cr_id, approver=user, request=None, note=args.note)
+    except DecisionForbidden as exc:
+        raise OperationPermissionError("approve", "change_request") from exc
+    except DecisionError as exc:
+        raise ValueError(str(exc)) from exc
+    return {"id": str(cr.id), "operation": cr.operation, "state": cr.state}
+
+
+register(
+    Operation(
+        name="approve_change_request",
+        description=(
+            "Approve a pending two-person change request (#62). Re-runs the "
+            "underlying operation's preview as a stale-state guard, then "
+            "executes it under the approver's identity. Always route via "
+            "propose_approve_change_request — the human operator clicks Apply "
+            "and becomes the approver; the model can never self-approve. "
+            "Server enforces approver != requester + the underlying op's "
+            "permission."
+        ),
+        args_model=ApproveChangeRequestArgs,
+        preview=_preview_approve_change_request,
+        apply=_apply_approve_change_request,
+        category="ops",
+        required_permission=("approve", "change_request"),
+    )
+)
+
+
+register(
+    Operation(
+        name="reject_change_request",
+        description=(
+            "Reject a pending two-person change request (#62). The underlying "
+            "operation does NOT run. Always route via "
+            "propose_reject_change_request. Server enforces rejecter != "
+            "requester + {approve, change_request}."
+        ),
+        args_model=RejectChangeRequestArgs,
+        preview=_preview_reject_change_request,
+        apply=_apply_reject_change_request,
+        category="ops",
+        required_permission=("approve", "change_request"),
     )
 )

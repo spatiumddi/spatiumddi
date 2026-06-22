@@ -120,6 +120,13 @@ _RESOURCE_NAMESPACE: dict[str, str] = {
     "firewall_policy": "firewall.policy",
     "firewall_rule": "firewall.rule",
     "firewall_alias": "firewall.alias",
+    # NOTE: ``change_request`` (#62) is deliberately NOT here. Its lifecycle
+    # uses non-CRUD verbs (requested / approved / rejected / cancelled /
+    # executed / failed / expired), so a namespace entry would make the
+    # catalog advertise the never-fired change_request.created/updated/deleted
+    # trio. Instead every change_request event is an explicit
+    # _SPECIAL_EVENT_MAP row below — checked before this map at publish time
+    # AND unioned into the event-type catalog.
 }
 
 
@@ -182,6 +189,28 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     ("upgrade.node_failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.chart_bump_failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.post_upgrade_verify_failed", "system_upgrade_run"): "system.upgrade.failed",
+    # Approval workflow lifecycle (#62). The service layer writes plain-verb
+    # audit actions (requested / approved / …); without these explicit
+    # entries the auto-derivation still yields ``change_request.<verb>`` (the
+    # action passes through as the verb), but the event-type CATALOG
+    # enumeration only knows the create/update/delete trio per namespace — so
+    # it would advertise the never-fired change_request.created/updated/deleted
+    # and miss the real lifecycle. Listing them here makes them authoritative
+    # AND surfaces them in the catalog (which unions _SPECIAL_EVENT_MAP.values).
+    ("requested", "change_request"): "change_request.requested",
+    ("approved", "change_request"): "change_request.approved",
+    ("rejected", "change_request"): "change_request.rejected",
+    ("cancelled", "change_request"): "change_request.cancelled",
+    ("executed", "change_request"): "change_request.executed",
+    ("failed", "change_request"): "change_request.failed",
+    ("expired", "change_request"): "change_request.expired",
+    # Self-governance break-glass (#62). A superadmin forced a protected
+    # control change (disable module / disable-delete-or-weaken a policy /
+    # unlock) past the two-person gate. HIGH-severity by intent — there is no
+    # severity column, so this distinct event name is the signal operators
+    # wire a dedicated alert / SIEM rule on. Special-map-only (like
+    # change_request): no _RESOURCE_NAMESPACE entry for ``approval_control``.
+    ("approvals.break_glass", "approval_control"): "governance.break_glass",
 }
 
 
