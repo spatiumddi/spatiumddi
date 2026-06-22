@@ -42,15 +42,16 @@ from fastapi import HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# Side-effect import: loading operations_control registers the flag-gated
+# ``modify_approval_control`` op into the shared registry. Done here (a module
+# every approvals path imports) so the op is available wherever the approve
+# spine / control surfaces run, without depending on import order elsewhere.
+# (The approve spine imports ``CONTROL_OPERATION_NAMES`` directly from
+# operations_control where it needs it.)
+import app.services.ai.operations_control  # noqa: F401
 from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
 from app.services.ai.operations import Operation, get_operation
-
-# Importing operations_control registers the flag-gated ``modify_approval_control``
-# op into the shared registry. Done here (a module every approvals path imports)
-# so the op + ``CONTROL_OPERATION_NAMES`` are available wherever the approve spine
-# / control surfaces run, without depending on import order elsewhere.
-from app.services.ai.operations_control import CONTROL_OPERATION_NAMES  # noqa: F401
 from app.services.ai.operations_risky import RISKY_OPERATION_NAMES
 from app.services.approvals.policy import (
     GATEABLE_ACTIONS,

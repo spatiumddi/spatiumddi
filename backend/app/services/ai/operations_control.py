@@ -77,17 +77,6 @@ MODULE_ID = "governance.approvals"
 # assertion must never see them (they're absent from RISKY_OPERATION_NAMES).
 _CONTROL_PERMISSION: tuple[str, str] = ("admin", "approval_control")
 
-# Human kind → preview verb. Single source of truth for both preview() and
-# the break-glass audit ``resource_display``.
-_KIND_LABELS: dict[str, str] = {
-    "disable_module": "Disable approval workflows entirely",
-    "disable_policy": "Disable approval policy",
-    "delete_policy": "Delete approval policy",
-    "lower_superadmin_gate": "Stop a policy applying to superadmins",
-    "unlock": "Remove the require-approval-to-disable lock",
-    "update_policy": "Weaken approval policy (coverage-reducing edit)",
-}
-
 ControlKind = Literal[
     "disable_module",
     "disable_policy",
