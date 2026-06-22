@@ -22,6 +22,8 @@ backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:308
 backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:310
 backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:312
 backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:317
+backend/alembic/versions/2c24fe41a7ed_change_requests.py:drop_table:152
+backend/alembic/versions/2c24fe41a7ed_change_requests.py:drop_table:156
 backend/alembic/versions/2c4e9d1a7f63_vrf_first_class.py:drop_column:264
 backend/alembic/versions/2c4e9d1a7f63_vrf_first_class.py:drop_column:268
 backend/alembic/versions/2c4e9d1a7f63_vrf_first_class.py:drop_constraint_fk:263
@@ -439,7 +441,7 @@ backend/alembic/versions/e1f2a3b4c5d6_subnet_ddns_fields.py:drop_column:64
 backend/alembic/versions/e1f2a3b4c5d6_subnet_ddns_fields.py:drop_column:65
 backend/alembic/versions/e1f2a3b4c5d6_subnet_ddns_fields.py:drop_column:66
 backend/alembic/versions/e2a6f3b8c1d4_add_auto_from_lease_to_ipaddress.py:drop_column:33
-backend/alembic/versions/e2b9c4f1a7d6_address_sets.py:drop_table:104
+backend/alembic/versions/e2b9c4f1a7d6_address_sets.py:drop_table:102
 backend/alembic/versions/e2c91d5f7a48_appliance_pairing_codes.py:drop_table:126
 backend/alembic/versions/e3f1c92a4d68_compliance_change_alerts.py:drop_column:59
 backend/alembic/versions/e3f1c92a4d68_compliance_change_alerts.py:drop_column:60

@@ -11,9 +11,10 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -24,9 +25,8 @@ from app.core.permissions import (
     token_scope_allows,
     user_has_permission,
 )
-from app.drivers.dhcp import is_agentless
 from app.models.audit import AuditLog
-from app.models.dhcp import DHCPConfigOp, DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignment
+from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import (
     IP_ROLES,
@@ -44,9 +44,14 @@ from app.models.ipam import (
 )
 from app.models.settings import PlatformSettings
 from app.models.vlans import VLAN
-from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.ai.operations import get_operation
+from app.services.ai.operations_risky import (
+    DeleteBlockArgs,
+    DeleteSpaceArgs,
+    DeleteSubnetArgs,
+)
+from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp.windows_writethrough import (
-    push_scope_delete,
     push_statics_bulk_delete,
 )
 from app.services.ipam.address_set_gate import (
@@ -57,10 +62,6 @@ from app.services.ipam.address_set_gate import (
     user_can_write_ip as _user_can_write_ip,
 )
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
-from app.services.soft_delete import (
-    apply_soft_delete,
-    collect_soft_delete_batch,
-)
 from app.services.tags import apply_tag_filter
 
 logger = structlog.get_logger(__name__)
@@ -2525,13 +2526,14 @@ async def get_effective_space_dhcp(
     )
 
 
-@router.delete("/spaces/{space_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/spaces/{space_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def delete_space(
     space_id: uuid.UUID,
     current_user: CurrentUser,
     db: DB,
+    request: Request,
     permanent: bool = False,
-) -> None:
+) -> Any:
     """Delete an IP space.
 
     Default behavior is soft-delete: the space, every block under it, every
@@ -2541,72 +2543,20 @@ async def delete_space(
     hidden from every default SELECT by the global query filter.
 
     ``?permanent=true`` runs the legacy hard-delete path (super-admin only).
+
+    Two-person approval (#62): when the ``governance.approvals`` module is on
+    and a ``delete:ip_space`` policy matches, this returns ``202 Accepted``
+    with a pending change-request instead of executing. Module-off / no
+    policy → executes inline via ``operation.apply`` exactly as before.
     """
-    space = await db.get(IPSpace, space_id)
-    if space is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
-
-    if permanent:
-        # Permanent deletion is destructive — gate on superadmin.
-        from app.api.deps import require_superadmin  # local import for circularity safety
-
-        require_superadmin(current_user)
-        # Subnet.space_id is ondelete=RESTRICT so a naive delete bubbles as 500
-        # when anything is still anchored here. Pre-check blocks and subnets so
-        # the UI gets a clear 409 with a count instead of an opaque server error.
-        subnet_count = (
-            await db.execute(
-                select(func.count()).select_from(Subnet).where(Subnet.space_id == space_id)
-            )
-        ).scalar_one()
-        block_count = (
-            await db.execute(
-                select(func.count()).select_from(IPBlock).where(IPBlock.space_id == space_id)
-            )
-        ).scalar_one()
-        if subnet_count or block_count:
-            parts = []
-            if block_count:
-                parts.append(f"{block_count} block(s)")
-            if subnet_count:
-                parts.append(f"{subnet_count} subnet(s)")
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"IP space {space.name!r} still contains {' and '.join(parts)}. "
-                    "Delete or move them before deleting the space."
-                ),
-            )
-
-        db.add(
-            _audit(
-                current_user,
-                "delete",
-                "ip_space",
-                str(space.id),
-                space.name,
-                old_value={"name": space.name},
-            )
-        )
-        await db.delete(space)
-        await db.commit()
-        return
-
-    # Soft-delete: cascade-stamp the whole subtree under one batch UUID.
-    batch = await collect_soft_delete_batch(db, space)
-    apply_soft_delete(batch, current_user.id)
-    for row in batch.rows:
-        db.add(
-            _audit(
-                current_user,
-                "soft_delete",
-                row.resource_type,
-                str(row.obj.id),
-                row.display,
-                old_value={"deletion_batch_id": str(batch.batch_id)},
-            )
-        )
-    await db.commit()
+    op = get_operation("delete_space")
+    assert op is not None  # registered at import
+    args = DeleteSpaceArgs(space_id=space_id, permanent=permanent)
+    pending = await gate_or_execute(db, current_user, request, operation=op, args=args)
+    if pending is not None:
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
+    await op.apply(db, current_user, args)
+    return None
 
 
 # ── IP Blocks ──────────────────────────────────────────────────────────────────
@@ -2996,85 +2946,32 @@ async def update_block(
     return _block_to_response(block, warn)
 
 
-@router.delete("/blocks/{block_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/blocks/{block_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def delete_block(
     block_id: uuid.UUID,
     current_user: CurrentUser,
     db: DB,
+    request: Request,
     permanent: bool = False,
-) -> None:
+) -> Any:
     """Delete an IP block.
 
     Default soft-delete cascades to child blocks + every subnet (and their
     DHCP scopes) anchored under this block. ``?permanent=true`` is the
     legacy hard-delete path (superadmin only).
+
+    Two-person approval (#62): when the ``governance.approvals`` module is on
+    and a ``delete:ip_block`` policy matches, returns ``202`` with a pending
+    change-request; otherwise executes inline via ``operation.apply``.
     """
-    block = await db.get(IPBlock, block_id)
-    if block is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
-
-    if permanent:
-        from app.api.deps import require_superadmin  # local import for circularity safety
-
-        require_superadmin(current_user)
-        # Refuse if anything is anchored below this block. Child blocks cascade,
-        # which would silently nuke a chunk of the tree. Subnet.block_id is
-        # RESTRICT at the DB level so a subnet-having block would bubble a 500
-        # anyway — but the DB column is also historically nullable (schema
-        # drift), so a naive delete can end up orphaning subnets with
-        # ``block_id=NULL``. Check explicitly and return a useful 409.
-        subnet_count = (
-            await db.execute(
-                select(func.count()).select_from(Subnet).where(Subnet.block_id == block_id)
-            )
-        ).scalar_one()
-        child_block_count = (
-            await db.execute(
-                select(func.count()).select_from(IPBlock).where(IPBlock.parent_block_id == block_id)
-            )
-        ).scalar_one()
-        if subnet_count or child_block_count:
-            parts = []
-            if child_block_count:
-                parts.append(f"{child_block_count} child block(s)")
-            if subnet_count:
-                parts.append(f"{subnet_count} subnet(s)")
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"Block {block.network} still contains {' and '.join(parts)}. "
-                    "Delete or move them before deleting the block."
-                ),
-            )
-
-        db.add(
-            _audit(
-                current_user,
-                "delete",
-                "ip_block",
-                str(block.id),
-                f"{block.network} ({block.name})",
-                old_value={"network": str(block.network)},
-            )
-        )
-        await db.delete(block)
-        await db.commit()
-        return
-
-    batch = await collect_soft_delete_batch(db, block)
-    apply_soft_delete(batch, current_user.id)
-    for row in batch.rows:
-        db.add(
-            _audit(
-                current_user,
-                "soft_delete",
-                row.resource_type,
-                str(row.obj.id),
-                row.display,
-                old_value={"deletion_batch_id": str(batch.batch_id)},
-            )
-        )
-    await db.commit()
+    op = get_operation("delete_block")
+    assert op is not None  # registered at import
+    args = DeleteBlockArgs(block_id=block_id, permanent=permanent)
+    pending = await gate_or_execute(db, current_user, request, operation=op, args=args)
+    if pending is not None:
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
+    await op.apply(db, current_user, args)
+    return None
 
 
 @router.get("/blocks/{block_id}/available-subnets", response_model=list[str])
@@ -4591,14 +4488,15 @@ async def _revoke_subnet_lease_mirrors(db: DB, subnet: Subnet) -> int:
     return revoked
 
 
-@router.delete("/subnets/{subnet_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/subnets/{subnet_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def delete_subnet(
     subnet_id: uuid.UUID,
     current_user: CurrentUser,
     db: DB,
+    request: Request,
     force: bool = False,
     permanent: bool = False,
-) -> None:
+) -> Any:
     """Delete a subnet.
 
     Default soft-delete stamps the subnet (and its DHCP scopes) under one
@@ -4607,186 +4505,21 @@ async def delete_subnet(
     ``permanent=true`` runs the legacy hard-delete path; soft-delete is
     additive — non-emptiness doesn't block it because the operator can
     always restore on second thought.
+
+    Two-person approval (#62): when the ``governance.approvals`` module is on
+    and a ``delete:subnet`` policy matches, returns ``202`` with a pending
+    change-request (the ``force`` / ``permanent`` flags are frozen so the
+    approved replay takes the identical branch). Otherwise executes inline via
+    ``operation.apply`` — same logic, side effects, audit, and 204 as before.
     """
-    from app.models.dns import DNSRecord, DNSZone
-
-    subnet = await db.get(Subnet, subnet_id)
-    if subnet is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
-    _enforce_subnet_token_scope(current_user, subnet_id)
-
-    if not permanent:
-        # #428 — a DHCP-lease-mirrored IPAM row's DDNS A/PTR record must not
-        # outlive the subnet. The soft-delete batch only stamps the subnet +
-        # its scopes (not IPAddress/DNSRecord), so without this the lease
-        # mirrors + their published DNS records would be orphaned: still on
-        # the DNS server, pointing at a now-deleted subnet, invisible to the
-        # sweeps (the subnet is hidden). Revoke the DNS records and drop the
-        # transient mirror rows; if the subnet is restored with live leases,
-        # the lease pipeline re-mirrors + re-publishes them.
-        await _revoke_subnet_lease_mirrors(db, subnet)
-
-        # Soft-delete: cascade-stamp the subnet + its scopes. Non-emptiness
-        # is allowed since the operator can restore via /admin/trash.
-        batch = await collect_soft_delete_batch(db, subnet)
-        apply_soft_delete(batch, current_user.id)
-        for row in batch.rows:
-            db.add(
-                _audit(
-                    current_user,
-                    "soft_delete",
-                    row.resource_type,
-                    str(row.obj.id),
-                    row.display,
-                    old_value={"deletion_batch_id": str(batch.batch_id)},
-                )
-            )
-        await db.commit()
-        return
-
-    from app.api.deps import require_superadmin  # noqa: PLC0415
-
-    require_superadmin(current_user)
-
-    # Refuse to delete a non-empty subnet unless the caller explicitly opts in
-    # via ?force=true. A subnet is considered "non-empty" if it has any user-
-    # owned IP records (anything other than the auto-generated network /
-    # broadcast placeholders, orphan rows, or DHCP-lease-mirrored rows) or a
-    # DHCP scope attached. Forcing still runs the cascade path below, so API
-    # consumers who really need it can still drop the whole subtree.
-    if not force:
-        user_ip_count = (
-            await db.execute(
-                select(func.count(IPAddress.id)).where(
-                    IPAddress.subnet_id == subnet_id,
-                    IPAddress.status.notin_(["network", "broadcast", "orphan"]),
-                    IPAddress.auto_from_lease.is_(False),
-                )
-            )
-        ).scalar_one()
-        scope_count = (
-            await db.execute(
-                select(func.count(DHCPScope.id)).where(DHCPScope.subnet_id == subnet_id)
-            )
-        ).scalar_one()
-        if user_ip_count or scope_count:
-            parts = []
-            if user_ip_count:
-                parts.append(
-                    f"{user_ip_count} allocated IP address" + ("es" if user_ip_count != 1 else "")
-                )
-            if scope_count:
-                parts.append(f"{scope_count} DHCP scope" + ("s" if scope_count != 1 else ""))
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"Subnet is not empty: {', '.join(parts)}. "
-                    "Delete the contents first, or retry with force=true to cascade."
-                ),
-            )
-
-    block_id = subnet.block_id
-
-    # Clean up DHCP artifacts first so downstream servers don't keep
-    # serving leases for a range that no longer exists in IPAM.
-    #
-    #   * windows_dhcp (agentless) → push a remove-scope via WinRM before
-    #     the DB row disappears; failure bubbles as 502 and rolls back.
-    #   * kea (agent-based) → we can't actually reconfigure from the
-    #     DB delete alone. Mark its config_etag dirty and enqueue an
-    #     ``apply_config`` op so the next agent poll rebuilds the
-    #     bundle without the removed scope.
-    #
-    # DHCPScope.subnet_id is ``ondelete=CASCADE`` so the rows themselves
-    # (+ pools / statics via ORM cascade) will be cleaned automatically
-    # when the subnet is deleted.
-    # Under the group-centric model, a scope belongs to a group which
-    # may contain N servers (mixed drivers allowed). Fan out:
-    #   * push_scope_delete walks the group's Windows members and pushes
-    #     the Remove-DhcpServerv4Scope cmdlet to each of them.
-    #   * Every Kea member needs a bundle refresh so the next long-poll
-    #     drops the subnet from its rendered config.
-    scope_rows = (
-        (await db.execute(select(DHCPScope).where(DHCPScope.subnet_id == subnet_id)))
-        .scalars()
-        .all()
-    )
-    agent_servers_to_refresh: dict[uuid.UUID, DHCPServer] = {}
-    for scope in scope_rows:
-        await push_scope_delete(db, scope)  # fans out over Windows members of the group
-        group_servers = (
-            (
-                await db.execute(
-                    select(DHCPServer).where(DHCPServer.server_group_id == scope.group_id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for srv in group_servers:
-            if not is_agentless(srv.driver):
-                agent_servers_to_refresh[srv.id] = srv
-
-    # Clean up DNS artifacts so we don't leave orphaned records/zones behind.
-    # IPAddress rows cascade-delete with the subnet, but DNSRecord.ip_address_id
-    # is ON DELETE SET NULL, and auto-generated reverse zones keep linked_subnet_id
-    # nulled instead of being removed.
-    addr_result = await db.execute(
-        select(IPAddress.dns_record_id).where(
-            IPAddress.subnet_id == subnet_id,
-            IPAddress.dns_record_id.isnot(None),
-        )
-    )
-    record_ids = [rid for rid in addr_result.scalars().all() if rid is not None]
-    if record_ids:
-        await db.execute(delete(DNSRecord).where(DNSRecord.id.in_(record_ids)))
-
-    await db.execute(
-        delete(DNSZone).where(
-            DNSZone.linked_subnet_id == subnet_id,
-            DNSZone.is_auto_generated.is_(True),
-        )
-    )
-
-    db.add(
-        _audit(
-            current_user,
-            "delete",
-            "subnet",
-            str(subnet.id),
-            f"{subnet.network} ({subnet.name})",
-            old_value={"network": str(subnet.network), "name": subnet.name},
-        )
-    )
-    await db.delete(subnet)
-    await db.flush()
-    await _update_block_utilization(db, block_id)
-
-    # Rebuild bundles for any agent-based servers that lost a scope. Done
-    # after the delete so the fresh bundle reflects the post-delete state.
-    for server in agent_servers_to_refresh.values():
-        bundle = await build_config_bundle(db, server)
-        server.config_etag = bundle.etag
-        existing = (
-            await db.execute(
-                select(DHCPConfigOp).where(
-                    DHCPConfigOp.server_id == server.id,
-                    DHCPConfigOp.op_type == "apply_config",
-                    DHCPConfigOp.status == "pending",
-                )
-            )
-        ).scalar_one_or_none()
-        if existing is None:
-            db.add(
-                DHCPConfigOp(
-                    server_id=server.id,
-                    op_type="apply_config",
-                    payload={"etag": bundle.etag},
-                    status="pending",
-                )
-            )
-
-    await db.commit()
+    op = get_operation("delete_subnet")
+    assert op is not None  # registered at import
+    args = DeleteSubnetArgs(subnet_id=subnet_id, force=force, permanent=permanent)
+    pending = await gate_or_execute(db, current_user, request, operation=op, args=args)
+    if pending is not None:
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
+    await op.apply(db, current_user, args)
+    return None
 
 
 # ── Subnet + Block Resize (grow-only) ─────────────────────────────────────────

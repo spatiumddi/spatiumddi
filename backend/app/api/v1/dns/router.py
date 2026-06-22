@@ -10,8 +10,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
@@ -45,6 +45,9 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.services.ai.operations import get_operation
+from app.services.ai.operations_risky import DeleteZoneArgs
+from app.services.approvals.gate import gate_or_execute
 from app.services.dns.delegation import (
     compute_delegation,
     find_parent_zone,
@@ -3793,14 +3796,15 @@ async def rollover_zone_dnssec_key(
     return {"status": "queued", "zone_id": str(zone.id), "key_tag": body.key_tag}
 
 
-@router.delete("/groups/{group_id}/zones/{zone_id}", status_code=204)
+@router.delete("/groups/{group_id}/zones/{zone_id}", status_code=204, response_model=None)
 async def delete_zone(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
     db: DB,
     current_user: SuperAdmin,
+    request: Request,
     permanent: bool = False,
-) -> None:
+) -> Any:
     """Delete a DNS zone.
 
     Default behavior is soft-delete: the zone + every record in it gets
@@ -3813,51 +3817,20 @@ async def delete_zone(
     the write-through first.
 
     ``?permanent=true`` runs the legacy hard-delete path (super-admin only).
+
+    Two-person approval (#62): when the ``governance.approvals`` module is on
+    and a ``delete:dns_zone`` policy matches, returns ``202`` with a pending
+    change-request; otherwise executes inline via ``operation.apply`` exactly
+    as before (route stays SuperAdmin-gated).
     """
-    zone = await _require_zone(group_id, zone_id, db)
-    _reject_if_synthesised_zone(zone, "delete")
-
-    if not permanent:
-        batch = await collect_soft_delete_batch(db, zone)
-        apply_soft_delete(batch, current_user.id)
-        for row in batch.rows:
-            db.add(
-                AuditLog(
-                    user_id=current_user.id,
-                    user_display_name=current_user.display_name,
-                    auth_source=current_user.auth_source,
-                    action="soft_delete",
-                    resource_type=row.resource_type,
-                    resource_id=str(row.obj.id),
-                    resource_display=row.display,
-                    old_value={"deletion_batch_id": str(batch.batch_id)},
-                    result="success",
-                )
-            )
-        # Soft-delete stamps deleted_at; the global filter then drops the
-        # zone from the served bundle, so the agents must re-poll.
-        collect_wake(dns_group_channel(group_id))
-        await db.commit()
-        return
-
-    # Same write-through contract as create: push the delete first, only
-    # drop the DB row if the Windows side agreed.
-    await _push_zone_to_agentless_servers(db, zone, "delete")
-    db.add(
-        AuditLog(
-            user_id=current_user.id,
-            user_display_name=current_user.display_name,
-            auth_source=current_user.auth_source,
-            action="delete",
-            resource_type="dns_zone",
-            resource_id=str(zone.id),
-            resource_display=zone.name,
-            result="success",
-        )
-    )
-    collect_wake(dns_group_channel(group_id))
-    await db.delete(zone)
-    await db.commit()
+    op = get_operation("delete_zone")
+    assert op is not None  # registered at import
+    args = DeleteZoneArgs(group_id=group_id, zone_id=zone_id, permanent=permanent)
+    pending = await gate_or_execute(db, current_user, request, operation=op, args=args)
+    if pending is not None:
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
+    await op.apply(db, current_user, args)
+    return None
 
 
 # ── Zone template wizard ────────────────────────────────────────────────────

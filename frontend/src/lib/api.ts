@@ -7901,6 +7901,144 @@ export const webhooksApi = {
       .then((r) => r.data),
 };
 
+// ── Change requests (two-person approval workflow, #62) ─────────────────────
+//
+// Gated behind the default-OFF ``governance.approvals`` feature module — the
+// whole router 404s when the module is disabled, so every covered mutation
+// executes inline exactly as before (the Sidebar nav entry carries the same
+// module gate so the page is hidden until an operator turns the feature on).
+
+export type ChangeRequestState =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "executed"
+  | "failed"
+  | "expired"
+  | "cancelled";
+
+export interface ChangeRequest {
+  id: string;
+  operation: string;
+  resource_type: string;
+  resource_id: string | null;
+  resource_display: string;
+  args: Record<string, unknown>;
+  preview_text: string;
+  risk_reason: string;
+  state: ChangeRequestState;
+  requested_by_user_id: string | null;
+  requested_by_display: string;
+  decided_by_user_id: string | null;
+  decided_by_display: string | null;
+  decision_note: string | null;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  expires_at: string;
+  decided_at: string | null;
+  executed_at: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface ChangeRequestListParams {
+  state?: ChangeRequestState;
+  resource_type?: string;
+  mine?: boolean;
+  limit?: number;
+  offset?: number;
+}
+
+// Threshold actions an approval policy can gate (mirror the backend
+// ``APPROVAL_POLICY_ACTIONS`` frozenset).
+export const APPROVAL_POLICY_ACTIONS = [
+  "delete",
+  "bulk_delete",
+  "bulk_edit",
+  "bulk_allocate",
+  "factory_reset",
+  "import_commit",
+] as const;
+export type ApprovalPolicyAction = (typeof APPROVAL_POLICY_ACTIONS)[number];
+
+export interface ApprovalPolicy {
+  id: string;
+  name: string;
+  resource_type: string;
+  action: string;
+  min_count: number | null;
+  enabled: boolean;
+  applies_to_superadmin: boolean;
+  ttl_hours: number;
+  is_builtin: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface ApprovalPolicyWrite {
+  name: string;
+  resource_type: string;
+  action: string;
+  min_count?: number | null;
+  enabled: boolean;
+  applies_to_superadmin: boolean;
+  ttl_hours: number;
+}
+
+// The 202 envelope a covered mutation returns (instead of 204) when the
+// operation was queued for approval rather than executed inline.
+export interface ChangeRequestQueued {
+  change_request_id: string;
+  state: "pending";
+  preview_text: string;
+}
+
+export const changeRequestsApi = {
+  list: (params: ChangeRequestListParams = {}) =>
+    api
+      .get<ChangeRequest[]>("/change-requests", { params })
+      .then((r) => r.data),
+  get: (id: string) =>
+    api.get<ChangeRequest>(`/change-requests/${id}`).then((r) => r.data),
+  // No dedicated pending-count endpoint server-side — derive the badge from
+  // a state=pending list (cheap; the queue is small by construction).
+  countPending: () =>
+    api
+      .get<ChangeRequest[]>("/change-requests", {
+        params: { state: "pending", limit: 500 },
+      })
+      .then((r) => r.data.length),
+  approve: (id: string, decisionNote?: string) =>
+    api
+      .post<ChangeRequest>(`/change-requests/${id}/approve`, {
+        decision_note: decisionNote ?? null,
+      })
+      .then((r) => r.data),
+  reject: (id: string, decisionNote?: string) =>
+    api
+      .post<ChangeRequest>(`/change-requests/${id}/reject`, {
+        decision_note: decisionNote ?? null,
+      })
+      .then((r) => r.data),
+  cancel: (id: string, decisionNote?: string) =>
+    api
+      .post<ChangeRequest>(`/change-requests/${id}/cancel`, {
+        decision_note: decisionNote ?? null,
+      })
+      .then((r) => r.data),
+  listPolicies: () =>
+    api.get<ApprovalPolicy[]>("/change-requests/policies").then((r) => r.data),
+  createPolicy: (body: ApprovalPolicyWrite) =>
+    api
+      .post<ApprovalPolicy>("/change-requests/policies", body)
+      .then((r) => r.data),
+  updatePolicy: (id: string, body: ApprovalPolicyWrite) =>
+    api
+      .put<ApprovalPolicy>(`/change-requests/policies/${id}`, body)
+      .then((r) => r.data),
+  deletePolicy: (id: string) => api.delete(`/change-requests/policies/${id}`),
+};
+
 export type MetricsWindow = "1h" | "6h" | "24h" | "7d";
 
 export interface DNSMetricsPoint {

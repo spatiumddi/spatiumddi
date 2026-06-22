@@ -63,6 +63,21 @@ RESOURCE_TYPE_VRF = "vrf"
 # return empty data because the underlying OS surfaces aren't there.
 RESOURCE_TYPE_APPLIANCE = "appliance"
 
+# Two-person approval workflow surface (issue #62). The
+# /api/v1/change-requests/* router gates on ``read`` (queue + history)
+# and the new ``approve`` action (decide a request) against this
+# resource_type. The "Change Approver" builtin role grants both.
+#
+# ``approve`` is a NEW action string deliberately NOT covered by the
+# ``admin`` implication (``_ADMIN_IMPLIES`` lists only read/write/delete/
+# admin): a wildcard/admin grant on ``change_request`` does NOT confer
+# approve. Approve must be granted explicitly — a two-person rule whose
+# approve capability rides along with generic admin isn't a two-person
+# rule. The approve endpoint additionally enforces, server-side, that the
+# approver holds the *underlying operation's* required_permission and is
+# not the requester.
+RESOURCE_TYPE_CHANGE_REQUEST = "change_request"
+
 
 def _action_matches(granted: str, requested: str) -> bool:
     """Return True if a granted `action` string covers the requested action."""

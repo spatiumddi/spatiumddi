@@ -12,15 +12,19 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPServer, DHCPServerGroup
+from app.models.dhcp import DHCPServerGroup
+from app.services.ai.operations import get_operation
+from app.services.ai.operations_risky import DeleteGroupArgs
+from app.services.approvals.gate import gate_or_execute
 
 router = APIRouter(
     prefix="/server-groups",
@@ -218,39 +222,22 @@ async def update_group(
     return _group_to_response(g)
 
 
-@router.delete("/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_group(group_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
-    g = await db.get(DHCPServerGroup, group_id)
-    if g is None:
-        raise HTTPException(status_code=404, detail="Server group not found")
+@router.delete("/{group_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+async def delete_group(
+    group_id: uuid.UUID, db: DB, user: SuperAdmin, request: Request
+) -> JSONResponse | None:
+    """Delete a DHCP server group (refused if it still holds servers).
 
-    # ORM ``cascade="all, delete-orphan"`` on ``servers``/``scopes`` will silently
-    # nuke every child row. Pre-check and return 409 so the user can't wipe a
-    # populated group by mistake.
-    server_count = (
-        await db.execute(
-            select(func.count())
-            .select_from(DHCPServer)
-            .where(DHCPServer.server_group_id == group_id)
-        )
-    ).scalar_one()
-    if server_count:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"DHCP server group {g.name!r} still contains "
-                f"{server_count} server(s). Move them to another group "
-                "(or standalone) before deleting the group."
-            ),
-        )
-
-    write_audit(
-        db,
-        user=user,
-        action="delete",
-        resource_type="dhcp_server_group",
-        resource_id=str(g.id),
-        resource_display=g.name,
-    )
-    await db.delete(g)
-    await db.commit()
+    Two-person approval (#62): when the ``governance.approvals`` module is on
+    and a ``delete:dhcp_server_group`` policy matches, returns ``202`` with a
+    pending change-request; otherwise executes inline via ``operation.apply``
+    exactly as before (route stays SuperAdmin-gated).
+    """
+    op = get_operation("delete_group")
+    assert op is not None  # registered at import
+    args = DeleteGroupArgs(group_id=group_id)
+    pending = await gate_or_execute(db, user, request, operation=op, args=args)
+    if pending is not None:
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
+    await op.apply(db, user, args)
+    return None

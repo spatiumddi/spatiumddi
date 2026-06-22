@@ -83,6 +83,10 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { usePermissions } from "@/hooks/usePermissions";
+import {
+  APPROVAL_QUEUED_MESSAGE,
+  handleApprovalQueued,
+} from "@/lib/approvalQueue";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -6604,7 +6608,15 @@ function EditSubnetModal({
     // operator to tick "…and all its contents will be permanently
     // deleted" — cascade is the right semantics. force=true.
     mutationFn: () => ipamApi.deleteSubnet(subnet.id, true),
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // Two-person approval (#62): a covered delete returns 202 with a
+      // queued change-request instead of deleting. Surface the message,
+      // refresh the approval queue, and leave the subnet in place.
+      if (handleApprovalQueued(resp)) {
+        setDeleteError(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: ["change-requests"] });
+        return;
+      }
       qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
       qc.invalidateQueries({ queryKey: ["blocks", subnet.space_id] });
       onDeleted?.();

@@ -54,6 +54,7 @@ celery_app = Celery(
         "app.tasks.audit_chain_verify",
         "app.tasks.upgrade_orchestrator",
         "app.tasks.time_bound_grant_sweep",
+        "app.tasks.change_request_expiry",
         "app.tasks.acme",
         "app.tasks.tls_certs",
     ],
@@ -112,6 +113,7 @@ celery_app.conf.update(
         "app.tasks.ai_digest.*": {"queue": "default"},
         "app.tasks.audit_chain_verify.*": {"queue": "default"},
         "app.tasks.time_bound_grant_sweep.*": {"queue": "default"},
+        "app.tasks.change_request_expiry.*": {"queue": "default"},
         "app.tasks.acme.*": {"queue": "default"},
         "app.tasks.tls_certs.*": {"queue": "default"},
     },
@@ -488,6 +490,15 @@ celery_app.conf.update(
         # row per expired grant).
         "time-bound-grant-sweep": {
             "task": "app.tasks.time_bound_grant_sweep.sweep_expired_grants",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Every 60 s, flip pending change requests (#62) whose TTL has
+        # elapsed to ``expired`` (terminal) + write the system-actor audit
+        # row. Idempotent — only pending+past-expiry rows match. The approve
+        # endpoint also lazily expires a stale row on read, so a request
+        # never executes past its TTL regardless of this sweep's cadence.
+        "change-request-expiry-sweep": {
+            "task": "app.tasks.change_request_expiry.sweep_expired_change_requests",
             "schedule": schedule(run_every=60.0),
         },
         # Every 60 s, probe every enabled TLS cert target whose

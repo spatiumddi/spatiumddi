@@ -51,6 +51,7 @@ import {
   BarChart3,
   Webhook,
   Workflow,
+  GitPullRequest,
   Monitor,
   ToggleLeft,
   Upload,
@@ -60,7 +61,7 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { versionApi } from "@/lib/api";
+import { changeRequestsApi, versionApi } from "@/lib/api";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
 import logoIcon from "@/assets/logo-icon.svg";
@@ -293,6 +294,12 @@ const adminConfigurationNav = [
 
 const adminNotificationsNav = [
   { label: "Alerts", icon: BellRing, to: "/admin/alerts" },
+  {
+    label: "Change Requests",
+    icon: GitPullRequest,
+    to: "/admin/change-requests",
+    module: "governance.approvals",
+  },
   { label: "Webhooks", icon: Webhook, to: "/admin/webhooks" },
 ];
 
@@ -411,6 +418,7 @@ function NavItem({
   collapsed,
   onNavigate,
   end,
+  badge,
 }: {
   label: string;
   icon: React.ElementType;
@@ -419,6 +427,9 @@ function NavItem({
   collapsed: boolean;
   onNavigate?: () => void;
   end?: boolean;
+  /** Optional count pill rendered after the label (e.g. the pending
+   *  approval-queue size). Only shown expanded when ``badge > 0``. */
+  badge?: number;
 }) {
   return (
     <NavLink
@@ -440,7 +451,12 @@ function NavItem({
       }
     >
       <Icon className="h-4 w-4 flex-shrink-0" />
-      {!collapsed && label}
+      {!collapsed && <span className="flex-1">{label}</span>}
+      {!collapsed && badge != null && badge > 0 && (
+        <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600 dark:text-amber-400">
+          {badge}
+        </span>
+      )}
     </NavLink>
   );
 }
@@ -540,6 +556,17 @@ export function Sidebar({
   const { enabled: moduleEnabled } = useFeatureModules();
   const filterByModule = <T extends { module?: string }>(items: T[]): T[] =>
     items.filter((it) => !it.module || moduleEnabled(it.module));
+
+  // Pending approval-queue count → the Change Requests nav badge. Only
+  // polls when the (default-off) governance.approvals module is on, so a
+  // disabled module fires zero requests.
+  const approvalsOn = moduleEnabled("governance.approvals");
+  const pendingChangeCount = useQuery({
+    queryKey: ["change-requests", "pending-count"],
+    queryFn: changeRequestsApi.countPending,
+    enabled: approvalsOn,
+    refetchInterval: 30000,
+  }).data;
 
   // Integrations live in their own sidebar section, rendered between
   // the main nav and the admin nav, but only when at least one
@@ -812,10 +839,15 @@ export function Sidebar({
               />
             ))}
             <SubNavLabel label="Notifications" collapsed={effectiveCollapsed} />
-            {adminNotificationsNav.map((item) => (
+            {filterByModule(adminNotificationsNav).map((item) => (
               <NavItem
                 key={item.to}
                 {...item}
+                badge={
+                  item.to === "/admin/change-requests"
+                    ? pendingChangeCount
+                    : undefined
+                }
                 collapsed={effectiveCollapsed}
                 onNavigate={mobileOpen ? onMobileClose : undefined}
               />

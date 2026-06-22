@@ -72,6 +72,7 @@ import { CompliancePage } from "@/pages/admin/CompliancePage";
 import { ConformityPage } from "@/pages/admin/ConformityPage";
 import { TrashPage } from "@/pages/admin/TrashPage";
 import { WebhooksPage } from "@/pages/admin/WebhooksPage";
+import { ChangeRequestsPage } from "@/pages/admin/ChangeRequestsPage";
 import { PlatformInsightsPage } from "@/pages/admin/PlatformInsightsPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { useAuth } from "@/hooks/useAuth";
@@ -184,6 +185,7 @@ export default function App() {
         <Route path="admin/domains" element={<DomainsPage />} />
         <Route path="admin/domains/:id" element={<DomainDetailPage />} />
         <Route path="admin/webhooks" element={<WebhooksPage />} />
+        <Route path="admin/change-requests" element={<ChangeRequestsPage />} />
         <Route path="admin/compliance" element={<CompliancePage />} />
         <Route path="admin/conformity" element={<ConformityPage />} />
         <Route path="admin/trash" element={<TrashPage />} />

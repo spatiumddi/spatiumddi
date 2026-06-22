@@ -120,6 +120,9 @@ _RESOURCE_NAMESPACE: dict[str, str] = {
     "firewall_policy": "firewall.policy",
     "firewall_rule": "firewall.rule",
     "firewall_alias": "firewall.alias",
+    # Approvals (#62) — change_request.requested / .approved / .rejected /
+    # .cancelled / .executed / .failed / .expired flow as typed events.
+    "change_request": "change_request",
 }
 
 

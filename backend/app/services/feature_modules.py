@@ -297,6 +297,15 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Security",
         description="Watch external TLS endpoints for expiry / chain validity / SAN drift; auto-discover probe targets from DNS A/AAAA records; alert on approaching expiry, broken chains, unreachable endpoints, and unexpected cert changes. Read-only monitoring — distinct from the ACME client that issues the appliance's own cert.",
     ),
+    # Governance — change-gating + approval workflows. Default-off so
+    # existing installs see zero behaviour change until opted in (#62).
+    ModuleSpec(
+        id="governance.approvals",
+        label="Approval workflows",
+        group="Security",
+        description="Two-person approval gating for high-blast-radius operations (deletes, bulk ops, factory reset, large imports). A risky action submitted by one operator is queued as a change request and only executes after a *different* eligible approver accepts it — the operation then runs under the approver's identity with the audit log carrying both user IDs. Default-off: when disabled (or no policy matches) every covered handler executes inline exactly as today.",
+        default_enabled=False,
+    ),
     # UI — cross-cutting personalisation surfaces. Per-user, never shared.
     ModuleSpec(
         id="ui.saved_views",
