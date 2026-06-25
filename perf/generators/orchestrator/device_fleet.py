@@ -141,6 +141,7 @@ class SubnetInfo:
 class Counters:
     dora_sent: int = 0
     dora_ack: int = 0
+    foreign_ack: int = 0   # ACKs whose IP is outside every seeded subnet (perf #454 — wrong DHCP server answered)
     nak: int = 0
     timeout: int = 0
     decline: int = 0
@@ -288,6 +289,13 @@ class Orchestrator:
 
         self.subnets = _derive_subnets(self.m, self.rp, self.log)
         self.n_subnets = len(self.subnets)
+        # perf #454 — foreign-responder guard. On a shared LAN the site's
+        # production DHCP server can win the broadcast race and ACK from a
+        # different subnet; a lease outside every seeded subnet means we're
+        # measuring the wrong server. Precompute the seeded networks once.
+        import ipaddress as _ipa  # noqa: PLC0415
+        self._seeded_nets = [_ipa.ip_network(s.cidr, strict=False) for s in self.subnets]
+        self._foreign_warned = False
 
         # Disjoint device index range for this shard (sharded over unique_devices).
         self.indices = list(fleet.shard_indices(self.m.scale.unique_devices, self.shard, self.shards))
@@ -339,6 +347,21 @@ class Orchestrator:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        # Multi-homed egress (perf #454). In broadcast topology the DISCOVER goes
+        # to 255.255.255.255; on a box with several NICs (docker bridges, tailscale,
+        # …) the kernel won't necessarily send it out the one facing the appliance.
+        # Bind the socket to the configured device so it does. SO_BINDTODEVICE needs
+        # CAP_NET_RAW (the load-gen already runs as root for the :67/:68 bind).
+        iface = getattr(self.m.target.dhcp, "iface", "") or ""
+        if iface:
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode())
+                self.log.info("dhcp socket bound to device", extra={"fields": {
+                    "event": "socket_bindtodevice", "iface": iface}})
+            except OSError as exc:
+                self.log.error("SO_BINDTODEVICE(%s) failed: %s — broadcast may not "
+                               "reach the appliance on a multi-homed box", iface, exc,
+                               extra={"fields": {"event": "bindtodevice_failed", "iface": iface}})
         # Relay topology: bind to the relay/server port (67) so Kea unicasts replies
         # to giaddr:67 back to us. Broadcast topology: bind to the client port (68).
         bind_port = 67 if self.relay else 68
@@ -472,11 +495,36 @@ class Orchestrator:
             return
         self._send_request_selecting(dev, offered, sid)
 
+    def _ip_in_seeded_subnet(self, ip: str) -> bool:
+        """True if ``ip`` falls within any seeded subnet (perf #454 foreign-responder guard)."""
+        import ipaddress as _ipa  # noqa: PLC0415
+        try:
+            addr = _ipa.ip_address(ip)
+        except ValueError:
+            return False
+        return any(addr in net for net in self._seeded_nets)
+
     def _on_ack(self, dev: Device, reply: dict, now: float) -> None:
         prev_state = dev.state
         new_ip = reply.get("yiaddr")
         latency_ms = (now - dev.tx_at) * 1000.0
         if prev_state in (DState.DISCOVERING,):
+            # perf #454 — foreign-responder guard. If the leased IP is outside
+            # every seeded subnet, a DIFFERENT DHCP server answered (e.g. the
+            # site router on a shared LAN) — we're not testing the appliance's
+            # Kea. Count it and warn loudly (once) so the run isn't silently
+            # measuring the wrong server. Use an isolated VLAN or relay topology.
+            if new_ip and self._seeded_nets and not self._ip_in_seeded_subnet(new_ip):
+                self.counters.foreign_ack += 1
+                if not self._foreign_warned:
+                    self._foreign_warned = True
+                    self.log.error(
+                        "DHCP ACK from a FOREIGN server — leased IP %s is outside "
+                        "every seeded subnet. A non-appliance DHCP server is winning "
+                        "the broadcast race; use an isolated test VLAN or relay "
+                        "topology (perf #454).", new_ip,
+                        extra={"fields": {"event": "foreign_dhcp_responder",
+                                          "leased_ip": new_ip, "server_id": reply.get("server_id")}})
             # DORA ACK — first lease (or re-lease after re-arrival).
             dev.leased_ip = new_ip
             dev.server_id = reply.get("server_id") or dev.server_id

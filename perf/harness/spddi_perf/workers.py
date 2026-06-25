@@ -72,6 +72,12 @@ def child_env() -> dict[str, str]:
     existing = env.get("PYTHONPATH", "")
     parts = [str(HARNESS_DIR)] + ([existing] if existing else [])
     env["PYTHONPATH"] = os.pathsep.join(parts)
+    # Workers are launched with stderr→logfile (the oneshot/longrunning helpers
+    # redirect the child's stdout+stderr into the per-worker logfile). Their
+    # get_logger must therefore NOT also add its own FileHandler to that same
+    # file, or every JSON line lands twice (perf #454). This marker tells
+    # get_logger to stay stderr-only so the redirect is the sole file writer.
+    env["SPDDI_PERF_LOG_VIA_STDERR"] = "1"
     return env
 
 
