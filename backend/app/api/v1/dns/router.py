@@ -53,7 +53,11 @@ from app.services.dns.delegation import (
     find_parent_zone,
     preview_to_dict,
 )
-from app.services.dns.record_ops import enqueue_record_op, enqueue_record_ops_batch
+from app.services.dns.record_ops import (
+    enqueue_record_op,
+    enqueue_record_ops_batch,
+    enqueue_record_ops_bulk,
+)
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns.zone_templates import (
     get_template,
@@ -4601,6 +4605,152 @@ async def bulk_delete_records(
 
     await db.commit()
     return BulkDeleteRecordsResponse(deleted=deleted, skipped=skipped)
+
+
+# Cap on records per bulk-create call. Keeps the single transaction (and the
+# fan-out of one DNSRecordOp row per record per agent-based server) bounded;
+# callers seeding more loop in chunks of this size.
+BULK_CREATE_RECORDS_MAX = 2000
+
+
+class BulkCreateRecordsRequest(BaseModel):
+    """Create many records in one zone in a single transaction.
+
+    The fast-path counterpart to N singular ``POST .../records`` calls. Each
+    singular create runs its own transaction — commit + zone-SOA-serial bump +
+    audit-chain hash — and every create UPDATEs the one zone row, so concurrent
+    singular creates serialize on that row lock (~6 records/s observed while
+    seeding, perf #454). This bumps the serial once, enqueues all record ops in
+    one batch, writes one audit row, and commits once.
+
+    Exact ``(name, record_type, value)`` duplicates *within the submitted
+    batch* are de-duplicated and reported in ``skipped``; pre-existing records
+    in the zone are NOT checked (the caller owns idempotency — the perf seeder,
+    for example, skips re-seeding a zone it already populated).
+    """
+
+    records: list[RecordCreate]
+
+    @field_validator("records")
+    @classmethod
+    def _validate_records(cls, v: list[RecordCreate]) -> list[RecordCreate]:
+        if not v:
+            raise ValueError("records must be a non-empty list")
+        if len(v) > BULK_CREATE_RECORDS_MAX:
+            raise ValueError(f"at most {BULK_CREATE_RECORDS_MAX} records per bulk-create call")
+        return v
+
+
+class BulkCreateRecordsResponse(BaseModel):
+    created: int
+    skipped: list[dict[str, str]]  # each: {name, record_type, value, reason}
+    target_serial: int | None
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/records/bulk-create",
+    response_model=BulkCreateRecordsResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def bulk_create_records(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: BulkCreateRecordsRequest,
+    db: DB,
+    current_user: CurrentUser,
+) -> BulkCreateRecordsResponse:
+    """Bulk-create records in one zone — one serial bump, one commit, one dispatch."""
+    zone = await _require_zone(group_id, zone_id, db)
+    _enforce_zone_token_scope(current_user, zone_id)
+    _reject_if_synthesised_zone(zone, "add records to")
+
+    # Driver gating is per record-type — check each distinct type once.
+    for rtype in {r.record_type for r in body.records}:
+        await _check_driver_gated_record_type(rtype, group_id, db)
+
+    # De-dupe exact (name, type, value) collisions within the batch so a sloppy
+    # payload doesn't insert pointless duplicate rows.
+    seen: set[tuple[str, str, str]] = set()
+    skipped: list[dict[str, str]] = []
+    accepted: list[RecordCreate] = []
+    for r in body.records:
+        key = (r.name, r.record_type, r.value)
+        if key in seen:
+            skipped.append(
+                {
+                    "name": r.name,
+                    "record_type": r.record_type,
+                    "value": r.value,
+                    "reason": "duplicate within batch",
+                }
+            )
+            continue
+        seen.add(key)
+        accepted.append(r)
+
+    if not accepted:
+        return BulkCreateRecordsResponse(created=0, skipped=skipped, target_serial=None)
+
+    records: list[DNSRecord] = []
+    for r in accepted:
+        r.priority, r.weight, r.port = _normalize_record_struct_fields(
+            r.record_type, r.priority, r.weight, r.port
+        )
+        fqdn = f"{r.name}.{zone.name}" if r.name != "@" else zone.name
+        records.append(
+            DNSRecord(
+                zone_id=zone_id,
+                fqdn=fqdn,
+                created_by_user_id=current_user.id,
+                **r.model_dump(),
+            )
+        )
+    db.add_all(records)
+    target_serial = bump_zone_serial(zone)
+    await db.flush()
+
+    ops = [
+        {
+            "op": "create",
+            "record": {
+                "name": rec.name,
+                "type": rec.record_type,
+                "value": rec.value,
+                "ttl": rec.ttl,
+                "priority": rec.priority,
+                "weight": rec.weight,
+                "port": rec.port,
+            },
+            "target_serial": target_serial,
+        }
+        for rec in records
+    ]
+    await enqueue_record_ops_bulk(db, zone, ops)
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="bulk_create",
+            resource_type="dns_record",
+            # One summary row keyed on the zone (the bulk op's target) — a
+            # per-record audit row would reintroduce the audit-chain hash cost
+            # this fast-path exists to avoid. resource_id is NOT NULL.
+            resource_id=str(zone_id),
+            resource_display=f"{len(records)} records in {zone.name}",
+            new_value={
+                "created": len(records),
+                "zone": zone.name,
+                "target_serial": target_serial,
+            },
+            result="success",
+        )
+    )
+    await db.commit()
+    return BulkCreateRecordsResponse(
+        created=len(records), skipped=skipped, target_serial=target_serial
+    )
 
 
 # ── Bulk zone import / export ───────────────────────────────────────────────

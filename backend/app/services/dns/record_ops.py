@@ -279,6 +279,80 @@ async def enqueue_record_ops_batch(
     return await _apply_agentless_batch(db, primary, zone, ops)
 
 
+async def enqueue_record_ops_bulk(
+    db: AsyncSession,
+    zone: DNSZone,
+    ops: list[dict[str, Any]],
+) -> int:
+    """Enqueue many ops for a SINGLE zone with one server-set resolution.
+
+    The seeding / bulk-import fast-path. :func:`enqueue_record_ops_batch`
+    re-resolves the agent server list once *per op* (it loops the singular
+    path), which is fine for a handful of records but quadratic-feeling at
+    seed scale. This resolves the enabled agent-based servers once and inserts
+    all ``DNSRecordOp`` rows in a single ``add_all`` + flush; agentless
+    primaries delegate to the existing batched driver call.
+
+    Returns the number of ops dispatched (0 if no enabled primary).
+    """
+    if not ops:
+        return 0
+
+    primary = await resolve_primary_server(db, zone)
+    if primary is None or not primary.is_enabled:
+        logger.warning(
+            "record_op_bulk_dropped",
+            zone=zone.name,
+            group_id=str(zone.group_id),
+            count=len(ops),
+            reason="no enabled primary configured for zone",
+        )
+        return 0
+
+    if is_agentless(primary.driver):
+        rows = await _apply_agentless_batch(db, primary, zone, ops)
+        return sum(1 for r in rows if r is not None)
+
+    # Agent-based: every enabled agent-based server in the group renders an
+    # independent authoritative copy, so each needs its own op rows. Resolve
+    # the set ONCE (mirrors enqueue_record_op's fan-out query).
+    agent_rows = (
+        (
+            await db.execute(
+                select(DNSServer).where(
+                    DNSServer.group_id == zone.group_id,
+                    DNSServer.is_enabled.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    agent_servers = [s for s in agent_rows if not is_agentless(s.driver)]
+    if not agent_servers:
+        return 0
+    for srv in agent_servers:
+        db.add_all(
+            [
+                DNSRecordOp(
+                    server_id=srv.id,
+                    zone_name=zone.name,
+                    op=o["op"],
+                    record=o["record"],
+                    target_serial=o.get("target_serial"),
+                    state="pending",
+                )
+                for o in ops
+            ]
+        )
+    await db.flush()
+    # #358 — wake every agent in the group so they drain the queued ops on the
+    # next poll instead of the belt-and-braces tick. Flushed after the outer
+    # commit by the request's ``wake_publishing`` dependency.
+    collect_wake(dns_group_channel(zone.group_id))
+    return len(ops)
+
+
 async def _apply_agentless_batch(
     db: AsyncSession,
     server: DNSServer,
