@@ -2210,6 +2210,41 @@ controller + a minimal Phase 4 orchestrator (single shard, small device count) �
 enough to run `perf-smoke` end-to-end and prove every phase transition + artifact
 path.
 
+### 9.3 Interactive TUI console (`spddi-perf tui`) — **implemented**
+
+Shipped alongside the headless suite: an interactive `rich` console modeled on the
+appliance's **Talos-style console dashboard**, acting as a **read-write conductor**
+over the harness (`perf/harness/spddi_perf/tui/`; run via `make perf-tui` or
+`python3 -m spddi_perf.cli tui`). It is the interactive evolution of the read-only
+§6.6 `spatium-warroom.sh` — it adds *control*, not a new control path: Start shells
+out to `spddi_perf.cli run`, Stop trips the kill-switch file, Abort terminates the
+controller process, and the dashboard reads the same run-dir artifacts the headless
+path writes (`state.json`, `setpoints/current.json`, `warroom/*.ndjson`,
+`events.ndjson`, `generators/*.ndjson`). `--render-once` renders a single frame
+without a TTY (testing/screenshots).
+
+Delivered scope:
+- **Manifest picker + pre-flight gate checklist** — choose a manifest, then show the
+  §9 Phase-0 + §4.9 safety probes (renew-timer:900, recursion no;, NTP skew,
+  recursion-leak, in-zone coverage, disk budget) as green/amber/red chips; **block
+  Start until the gates pass**.
+- **F-key control strip** (mirroring the appliance console): F1 Start · F2
+  Throttle · F3 Trigger-prune · F4 Resume · F5 Stop (kill-switch) · F6 Abort — each
+  destructive key opens an arrow-key confirm modal defaulting to **No** (the
+  appliance console's `ConfirmModal` pattern) so a careless Enter can't fire a run.
+- **Live phase ribbon** — current phase, T+ test-clock, and the live setpoint
+  (DORA/s · renew/s · lease-events/s · DNS qps · online), refresh-on-tick.
+- **War-room vitals panes** — sourced from the `warroom/*.ndjson` tails + `state.json`
+  + generator `*.ndjson`: PG conns/cache/locks/deadlocks, Redis, Celery queue depth,
+  the §8.2.4 domain-counts ledger, generator achieved-vs-offered + p99s — each
+  colour-coded against the §6.5 live test-watch thresholds.
+- **Event + watchdog pane** — tails `events.ndjson`; renders the watchdog
+  throttle/abort banner prominently.
+- Built on `rich` (`Live` + a tick loop) like the appliance console; runs **off-box**
+  on lg-0/the monitoring VM. Lands as a `tui` subcommand in `perf/harness/spddi_perf/cli.py`
+  + a `perf/harness/spddi_perf/tui/` package, reusing the war-room `surfaces.py`
+  field mappings so it never drifts from the headless poller.
+
 ---
 
 ## 10. Open questions for the operator

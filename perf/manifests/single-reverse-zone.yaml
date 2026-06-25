@@ -1,0 +1,55 @@
+# Variant: SINGLE reverse zone (H3 hot-row stress, §0.A / §5.3-H3). All PTR serial
+# bumps land on ONE dns_zone row → maximal hot-row UPDATE contention. The deliberate
+# worst-case probe vs the per-octet headline that spreads it. Else = headline.
+schema_version: 1
+run: {name: single-reverse-zone, profile: full, notes: "single reverse zone — dns_zone hot-row contention worst case (H3)"}
+target:
+  node_ip: 10.20.0.10
+  api_base: https://10.20.0.10/api
+  dhcp: {port: 67, topology: relay, giaddr: [10.0.0.1,10.1.0.1,10.2.0.1,10.3.0.1,10.4.0.1,10.5.0.1,10.6.0.1,10.7.0.1]}
+  dns: {port: 53, driver: bind9, recursion: false}
+  appliance: {expected_version: ">=2026.06.19-1", cnpg_instances: 1, redis_kind: sentinel-single}
+scale:
+  unique_devices: 250000
+  peak_active_devices: 150000
+  students: 50000
+  lease_time_s: 7200
+  ddns_enabled: true
+  query_log_enabled: false
+  hostname_fraction: 0.7
+  operator_mutation_stream: {enabled: true, sustained_per_s: 3, burst_per_s: 50}
+seed:
+  ip_block: 10.0.0.0/8
+  subnets: {count: 8, prefix: 16, pool_fraction: 0.90}
+  dns:
+    forward_zones: ["campus.example.edu"]
+    reverse_zone_shape: single        # the variant's point — one zone for all PTRs
+    reverse_zones: ["10.in-addr.arpa"]
+    authoritative_records: 250000
+  statics: 0
+  relay_addresses_per_scope: true
+diurnal:
+  arrival_weights: [0.05,0.03,0.02,0.02,0.03,0.10,0.45,0.95,1.00,0.85,0.80,0.82,0.85,0.80,0.78,0.75,0.70,0.65,0.55,0.45,0.35,0.25,0.15,0.08]
+  dns_qps_sustained_peak: 18000
+  dns_qps_burst_ceiling: 120000
+  dora_per_s_peak: 12.5
+phases:
+  - {name: baseline_t0, minutes: 10,  load: idle}
+  - {name: ramp,        minutes: 75,  load: ramp, from: idle, to: steady}
+  - {name: steady,      minutes: 120, load: steady}
+  - {name: surge_ramp,  minutes: 30,  load: ramp, from: steady, to: peak}
+  - {name: peak,        minutes: 90,  load: peak, probe_ceiling: true}
+  - {name: drain,       minutes: 15,  load: ramp, from: steady, to: idle, wait_convergence: true}
+slo: {slo_thresholds_version: v1-proposed, dhcp_ack_p99_ms: 50, dns_resolve_p99_ms: 20, lease_to_ipam_to_dns_p95_s: 10, api_5xx_rate_max: 0.005}
+guardrails:
+  kill_switch_file: run/STOP
+  max_dora_per_s: 400
+  max_dns_qps: 150000
+  max_lease_events_per_s: 400
+  watchdog: {poll_interval_s: 5, throttle_before_abort: true, abort_on: {health_platform_component_down: true, pg_connections_pct_of_max: 0.95, pg_longest_txn_s: 120, redis_used_memory_pct: 0.90, celery_queue_depth: 50000}}
+observability:
+  superadmin_token_env: SPDDI_PERF_ADMIN_TOKEN
+  psql_dsn_env: SPDDI_PERF_PSQL_DSN
+  enable_pg_stat_statements: true
+  poll: {health_platform_s: 5, postgres_overview_s: 15, postgres_tables_s: 30, redis_overview_s: 15, metrics_timeseries_s: 60, psql_locks_s: 10}
+disk_budget: {est_24h_gb: 28, required_pv_gb: 64}

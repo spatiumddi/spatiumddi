@@ -1,0 +1,259 @@
+; ─────────────────────────────────────────────────────────────────────────────
+; campus-qnames.txt — SAMPLE SpatiumDDI perf DNS query set (self-documenting)
+;
+; Format: one query per line, "<qname> <qtype>" — the input dnsperf/resperf consume
+;   with  -d <this-file>.  Comment lines start with ';' or '#'.
+;
+; This is a small COMMITTED sample so the file format is self-documenting.  The REAL
+;   run files (millions of lines, Zipfian s≈1.0 popularity) are produced by
+;   gen_dns_queryset.py into <run>/generators/dns/queries.{steady,cold}.txt
+;
+; §4.9 HARD SAFETY CONSTRAINT — every qname below is a suffix-match of a SEEDED zone
+;   (campus.example.edu or N.10.in-addr.arpa) so recursion-OFF BIND answers
+;   AUTHORITATIVELY (NOERROR / NXDOMAIN), never REFUSED.  An out-of-zone name would
+;   REFUSED → leak to the public internet — a BUG.  gen_dns_queryset.py validates
+;   every generated qname and ABORTS on any out-of-zone name (§4.9 Layer 2).
+;
+; §1.7 record-type mix below: A 55 / AAAA 10 / PTR 20 / SRV 5 / MX+TXT 5 / SOA+NS 3
+;   / deliberate-miss 2.  Names derive from the deterministic device fleet
+;   (spddi_perf.fleet) the DHCP generator drives — "lease then query by name" works
+;   by construction (§4.5).  Generated label shape = dhcp-<3rd>-<4th> (ddns.py:162).
+; ─────────────────────────────────────────────────────────────────────────────
+
+; --- A 55% — seeded infra (www/vpn/mail/portal/ns) — NOERROR ---
+www.campus.example.edu A
+vpn.campus.example.edu A
+mail.campus.example.edu A
+portal.campus.example.edu A
+ns1.campus.example.edu A
+ns2.campus.example.edu A
+
+; --- A 55% — per-device client hostnames dev-NNNNNNN (DDNS forward) — NOERROR/NXDOMAIN ---
+dev-0000170.campus.example.edu A
+dev-0000177.campus.example.edu A
+dev-0000190.campus.example.edu A
+dev-0000171.campus.example.edu A
+dev-0000064.campus.example.edu A
+dev-0000182.campus.example.edu A
+dev-0000002.campus.example.edu A
+dev-0000027.campus.example.edu A
+dev-0000119.campus.example.edu A
+dev-0000188.campus.example.edu A
+dev-0000065.campus.example.edu A
+dev-0000102.campus.example.edu A
+dev-0000051.campus.example.edu A
+dev-0000043.campus.example.edu A
+dev-0000085.campus.example.edu A
+dev-0000133.campus.example.edu A
+dev-0000148.campus.example.edu A
+dev-0000030.campus.example.edu A
+dev-0000080.campus.example.edu A
+dev-0000161.campus.example.edu A
+dev-0000143.campus.example.edu A
+dev-0000078.campus.example.edu A
+dev-0000180.campus.example.edu A
+dev-0000000.campus.example.edu A
+dev-0000015.campus.example.edu A
+dev-0000096.campus.example.edu A
+dev-0000073.campus.example.edu A
+dev-0000093.campus.example.edu A
+dev-0000090.campus.example.edu A
+dev-0000151.campus.example.edu A
+dev-0000154.campus.example.edu A
+dev-0000195.campus.example.edu A
+dev-0000166.campus.example.edu A
+dev-0000089.campus.example.edu A
+dev-0000101.campus.example.edu A
+dev-0000070.campus.example.edu A
+dev-0000115.campus.example.edu A
+dev-0000031.campus.example.edu A
+dev-0000183.campus.example.edu A
+dev-0000128.campus.example.edu A
+dev-0000153.campus.example.edu A
+dev-0000125.campus.example.edu A
+dev-0000013.campus.example.edu A
+dev-0000091.campus.example.edu A
+dev-0000172.campus.example.edu A
+dev-0000062.campus.example.edu A
+dev-0000174.campus.example.edu A
+dev-0000169.campus.example.edu A
+dev-0000111.campus.example.edu A
+dev-0000069.campus.example.edu A
+
+; --- A 55% — generated dhcp-<3rd>-<4th> labels over leased space (ddns.py:162) — NOERROR/NXDOMAIN ---
+dhcp-0-16.campus.example.edu A
+dhcp-0-21.campus.example.edu A
+dhcp-0-18.campus.example.edu A
+dhcp-0-21.campus.example.edu A
+dhcp-0-18.campus.example.edu A
+dhcp-0-19.campus.example.edu A
+dhcp-0-21.campus.example.edu A
+dhcp-0-17.campus.example.edu A
+dhcp-0-22.campus.example.edu A
+dhcp-0-19.campus.example.edu A
+dhcp-0-20.campus.example.edu A
+dhcp-0-17.campus.example.edu A
+dhcp-0-20.campus.example.edu A
+dhcp-0-18.campus.example.edu A
+dhcp-0-17.campus.example.edu A
+dhcp-0-22.campus.example.edu A
+dhcp-0-17.campus.example.edu A
+dhcp-0-17.campus.example.edu A
+dhcp-0-16.campus.example.edu A
+dhcp-0-20.campus.example.edu A
+dhcp-0-20.campus.example.edu A
+dhcp-0-22.campus.example.edu A
+dhcp-0-19.campus.example.edu A
+dhcp-0-20.campus.example.edu A
+dhcp-0-16.campus.example.edu A
+dhcp-0-16.campus.example.edu A
+dhcp-0-19.campus.example.edu A
+dhcp-0-21.campus.example.edu A
+dhcp-0-22.campus.example.edu A
+dhcp-0-21.campus.example.edu A
+dhcp-0-17.campus.example.edu A
+dhcp-0-16.campus.example.edu A
+dhcp-0-16.campus.example.edu A
+dhcp-0-20.campus.example.edu A
+dhcp-0-19.campus.example.edu A
+dhcp-0-17.campus.example.edu A
+dhcp-0-17.campus.example.edu A
+dhcp-0-21.campus.example.edu A
+dhcp-0-18.campus.example.edu A
+dhcp-0-22.campus.example.edu A
+dhcp-0-16.campus.example.edu A
+dhcp-0-20.campus.example.edu A
+dhcp-0-18.campus.example.edu A
+dhcp-0-20.campus.example.edu A
+dhcp-0-21.campus.example.edu A
+dhcp-0-19.campus.example.edu A
+dhcp-0-19.campus.example.edu A
+dhcp-0-16.campus.example.edu A
+dhcp-0-21.campus.example.edu A
+dhcp-0-22.campus.example.edu A
+
+; --- AAAA 10% — same forward names (v6) — NOERROR / NOERROR-empty ---
+www.campus.example.edu AAAA
+vpn.campus.example.edu AAAA
+mail.campus.example.edu AAAA
+portal.campus.example.edu AAAA
+ns1.campus.example.edu AAAA
+ns2.campus.example.edu AAAA
+dev-0000170.campus.example.edu AAAA
+dev-0000177.campus.example.edu AAAA
+dev-0000190.campus.example.edu AAAA
+dev-0000171.campus.example.edu AAAA
+dev-0000064.campus.example.edu AAAA
+dev-0000182.campus.example.edu AAAA
+dev-0000002.campus.example.edu AAAA
+dev-0000027.campus.example.edu AAAA
+dev-0000119.campus.example.edu AAAA
+dev-0000188.campus.example.edu AAAA
+dev-0000065.campus.example.edu AAAA
+dev-0000102.campus.example.edu AAAA
+dev-0000051.campus.example.edu AAAA
+dev-0000043.campus.example.edu AAAA
+dhcp-0-16.campus.example.edu AAAA
+dhcp-0-21.campus.example.edu AAAA
+dhcp-0-18.campus.example.edu AAAA
+dhcp-0-21.campus.example.edu AAAA
+dhcp-0-18.campus.example.edu AAAA
+dhcp-0-19.campus.example.edu AAAA
+
+; --- PTR 20% — in-addr.arpa for leased IPs (dig -x form) — NOERROR/NXDOMAIN ---
+16.0.0.10.in-addr.arpa PTR
+16.0.1.10.in-addr.arpa PTR
+16.0.2.10.in-addr.arpa PTR
+16.0.3.10.in-addr.arpa PTR
+16.0.4.10.in-addr.arpa PTR
+16.0.5.10.in-addr.arpa PTR
+16.0.6.10.in-addr.arpa PTR
+16.0.7.10.in-addr.arpa PTR
+17.0.0.10.in-addr.arpa PTR
+17.0.1.10.in-addr.arpa PTR
+17.0.2.10.in-addr.arpa PTR
+17.0.3.10.in-addr.arpa PTR
+17.0.4.10.in-addr.arpa PTR
+17.0.5.10.in-addr.arpa PTR
+17.0.6.10.in-addr.arpa PTR
+17.0.7.10.in-addr.arpa PTR
+18.0.0.10.in-addr.arpa PTR
+18.0.1.10.in-addr.arpa PTR
+18.0.2.10.in-addr.arpa PTR
+18.0.3.10.in-addr.arpa PTR
+18.0.4.10.in-addr.arpa PTR
+18.0.5.10.in-addr.arpa PTR
+18.0.6.10.in-addr.arpa PTR
+18.0.7.10.in-addr.arpa PTR
+19.0.0.10.in-addr.arpa PTR
+19.0.1.10.in-addr.arpa PTR
+19.0.2.10.in-addr.arpa PTR
+19.0.3.10.in-addr.arpa PTR
+19.0.4.10.in-addr.arpa PTR
+19.0.5.10.in-addr.arpa PTR
+19.0.6.10.in-addr.arpa PTR
+19.0.7.10.in-addr.arpa PTR
+20.0.0.10.in-addr.arpa PTR
+20.0.1.10.in-addr.arpa PTR
+20.0.2.10.in-addr.arpa PTR
+20.0.3.10.in-addr.arpa PTR
+20.0.4.10.in-addr.arpa PTR
+20.0.5.10.in-addr.arpa PTR
+20.0.6.10.in-addr.arpa PTR
+20.0.7.10.in-addr.arpa PTR
+21.0.0.10.in-addr.arpa PTR
+21.0.1.10.in-addr.arpa PTR
+21.0.2.10.in-addr.arpa PTR
+21.0.3.10.in-addr.arpa PTR
+21.0.4.10.in-addr.arpa PTR
+21.0.5.10.in-addr.arpa PTR
+21.0.6.10.in-addr.arpa PTR
+21.0.7.10.in-addr.arpa PTR
+22.0.0.10.in-addr.arpa PTR
+22.0.1.10.in-addr.arpa PTR
+22.0.2.10.in-addr.arpa PTR
+22.0.3.10.in-addr.arpa PTR
+22.0.4.10.in-addr.arpa PTR
+22.0.5.10.in-addr.arpa PTR
+22.0.6.10.in-addr.arpa PTR
+22.0.7.10.in-addr.arpa PTR
+23.0.0.10.in-addr.arpa PTR
+23.0.1.10.in-addr.arpa PTR
+23.0.2.10.in-addr.arpa PTR
+23.0.3.10.in-addr.arpa PTR
+
+; --- SRV 5% — seeded _ldap._tcp / _kerberos._udp / _sip._tcp — NOERROR ---
+_ldap._tcp.campus.example.edu SRV
+_kerberos._udp.campus.example.edu SRV
+_sip._tcp.campus.example.edu SRV
+
+; --- MX + TXT 5% — seeded mail / SPF / DKIM — NOERROR ---
+mail.campus.example.edu MX
+campus.example.edu TXT
+default._domainkey.campus.example.edu TXT
+
+; --- SOA + NS 3% — zone apexes — NOERROR ---
+campus.example.edu SOA
+campus.example.edu NS
+0.10.in-addr.arpa SOA
+0.10.in-addr.arpa NS
+1.10.in-addr.arpa SOA
+1.10.in-addr.arpa NS
+2.10.in-addr.arpa SOA
+2.10.in-addr.arpa NS
+
+; --- deliberate-miss 2% — RANDOM LABELS *UNDER* A SEEDED ZONE — NXDOMAIN ONLY (never REFUSED) ---
+poig8f1cbfno.0.10.in-addr.arpa A
+9m80o2ra.1vrjnvgfyg.7.10.in-addr.arpa A
+c38hyf9sxmec.4.10.in-addr.arpa A
+ogyr3xkxw.2.10.in-addr.arpa A
+ek8pk3yr9oud.cuzrenun5z3.2.10.in-addr.arpa A
+p98q1zxoi6.1.10.in-addr.arpa A
+hjk1eyy3.6.10.in-addr.arpa A
+ah8rvhs1k3aq6l6g.7.10.in-addr.arpa A
+mjxk87au5bhxtpdp.f5e8ii49k.3.10.in-addr.arpa A
+n8mtzx272hpoev.9ooaedoe.3.10.in-addr.arpa A
+6pr5n8i4p.campus.example.edu A
+gg1w103dgdz.6.10.in-addr.arpa A
+mm82i1lr3pe.4.10.in-addr.arpa A
+d8afpk054.zdkyayq3s19.6.10.in-addr.arpa A

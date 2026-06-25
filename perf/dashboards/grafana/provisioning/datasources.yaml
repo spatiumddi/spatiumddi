@@ -1,0 +1,22 @@
+# Grafana datasource provisioning for the perf war-room (§6.4).
+# Mount this file at /etc/grafana/provisioning/datasources/datasources.yaml
+# (the docker-compose in ../README.md does this). Grafana auto-creates the
+# Prometheus datasource on boot — no click-ops.
+#
+# The off-box Prometheus (prometheus/prometheus.yml) is the only datasource.
+# PROMETHEUS_URL defaults to the docker-compose service name; override via env
+# if Prometheus runs elsewhere on the monitoring VM.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: spddi-prom            # warroom.json's templating datasource var pins this uid
+    type: prometheus
+    access: proxy
+    url: ${PROMETHEUS_URL:-http://prometheus:9090}
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: 15s        # matches the steady scrape_interval (§6.0)
+      httpMethod: POST

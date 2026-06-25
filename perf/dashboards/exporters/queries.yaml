@@ -1,0 +1,201 @@
+# postgres_exporter custom queries for the SpatiumDDI perf war-room (§6.2 row 4
+# DATABASE + §5.4 instrumentation). Mounted into prometheuscommunity/
+# postgres-exporter as /etc/postgres_exporter/queries.yaml and referenced via
+# --extend.query-path (see postgres_exporter.yaml).
+#
+# These are the criterion-(a) series the native /admin/postgres/* surface does
+# NOT expose (locks, deadlocks, per-table dead-tuple ratio, pg_stat_statements
+# top, temp spill, WAL rate). Per §6.3/§5.4 observer discipline, the deep DB
+# series come from HERE (one source per metric), not from the api-pool-routed
+# /admin/postgres path which would double-load the SUT.
+#
+# Every query runs as the dedicated read-only `pg_monitor` role (see README for
+# the GRANT). pg_stat_statements must be pre-loaded in CNPG parameters +
+# `CREATE EXTENSION` at provisioning (§5.4 pre-flight) — the pg_stat_statements
+# query degrades to zero rows (not an error) if the extension is absent.
+#
+# Focus-table set (§5.4, verified against backend/app/models/*.py):
+#   dhcp_lease, ip_address, dhcp_lease_history, dns_record, dns_record_op,
+#   dns_zone, dns_query_log_entry, dhcp_log_entry, audit_log,
+#   dns_server_zone_state
+# Grounded:
+#   audit_log              models/audit.py:28
+#   dns_server_zone_state  models/dns.py:46
+#   dns_record_op          models/dns.py:317  (state ∈ pending|applied|failed, record_ops.py:59/82/96)
+#   dns_zone               models/dns.py:585  (last_serial col, models/dns.py:679 — the H3 hot row)
+#   dns_record             models/dns.py:746
+#   dhcp_lease             models/dhcp.py:633
+#   dhcp_lease_history     models/dhcp.py:705
+#   ip_address             models/ipam.py:771
+#   dns_query_log_entry    models/metrics or logs model (__tablename__ dns_query_log_entry)
+#   dhcp_log_entry         (__tablename__ dhcp_log_entry)
+
+# ── Per-table tuple + autovacuum freshness (§6.2 D4: dead-ratio ramp w/o reset =
+# autovacuum losing; D5: per-table size growth, dns_record_op monotonic-no-prune) ──
+spddi_table_stats:
+  master: false
+  cache_seconds: 30          # §5.4: 30s steady cadence so the observer doesn't contend
+  query: |
+    SELECT
+      relname AS table,
+      n_live_tup        AS live_tup,
+      n_dead_tup        AS dead_tup,
+      n_tup_ins         AS tup_ins,
+      n_tup_upd         AS tup_upd,
+      n_tup_del         AS tup_del,
+      n_tup_hot_upd     AS tup_hot_upd,
+      COALESCE(EXTRACT(EPOCH FROM (now() - last_autovacuum)), -1)::float8  AS last_autovacuum_age_s,
+      COALESCE(EXTRACT(EPOCH FROM (now() - last_autoanalyze)), -1)::float8 AS last_autoanalyze_age_s,
+      vacuum_count      AS vacuum_count,
+      autovacuum_count  AS autovacuum_count,
+      pg_total_relation_size(relid) AS total_bytes
+    FROM pg_stat_user_tables
+    WHERE relname IN (
+      'dhcp_lease','ip_address','dhcp_lease_history','dns_record','dns_record_op',
+      'dns_zone','dns_query_log_entry','dhcp_log_entry','audit_log','dns_server_zone_state'
+    )
+  metrics:
+    - table:                 { usage: "LABEL", description: "Focus table name" }
+    - live_tup:              { usage: "GAUGE", description: "Estimated live tuples" }
+    - dead_tup:              { usage: "GAUGE", description: "Estimated dead tuples (autovacuum debt)" }
+    - tup_ins:               { usage: "COUNTER", description: "Tuples inserted since stats reset" }
+    - tup_upd:               { usage: "COUNTER", description: "Tuples updated since stats reset" }
+    - tup_del:               { usage: "COUNTER", description: "Tuples deleted since stats reset" }
+    - tup_hot_upd:           { usage: "COUNTER", description: "HOT updates (no index churn)" }
+    - last_autovacuum_age_s: { usage: "GAUGE", description: "Seconds since last autovacuum (-1 = never)" }
+    - last_autoanalyze_age_s: { usage: "GAUGE", description: "Seconds since last autoanalyze (-1 = never)" }
+    - vacuum_count:          { usage: "COUNTER", description: "Manual VACUUM count" }
+    - autovacuum_count:      { usage: "COUNTER", description: "Autovacuum count" }
+    - total_bytes:           { usage: "GAUGE", description: "Table+index+TOAST bytes" }
+
+# ── Lock waits (§6.2 D6: sustained lock-wait > 0 = contention; H3 dns_zone hot row,
+# H8 sweep lock spike). Counts ungranted locks grouped by mode + locked relation. ──
+spddi_locks:
+  master: false
+  cache_seconds: 30
+  query: |
+    SELECT
+      mode AS lock_mode,
+      COALESCE(c.relname, '<non-relation>') AS relation,
+      count(*) AS waiting
+    FROM pg_locks l
+    LEFT JOIN pg_class c ON c.oid = l.relation
+    WHERE NOT l.granted
+    GROUP BY 1, 2
+  metrics:
+    - lock_mode: { usage: "LABEL", description: "Lock mode requested" }
+    - relation:  { usage: "LABEL", description: "Locked relation (or <non-relation> for advisory)" }
+    - waiting:   { usage: "GAUGE", description: "Number of backends WAITING on this lock (ungranted)" }
+
+# ── Deadlocks + temp spill + commit/rollback (§6.2 D6 any deadlock = RED;
+# D3 temp_bytes = work_mem spill). pg_stat_database for the SUT database. ──
+spddi_database:
+  master: false
+  cache_seconds: 30
+  query: |
+    SELECT
+      datname AS datname,
+      deadlocks      AS deadlocks,
+      temp_files     AS temp_files,
+      temp_bytes     AS temp_bytes,
+      xact_commit    AS xact_commit,
+      xact_rollback  AS xact_rollback,
+      blks_hit       AS blks_hit,
+      blks_read      AS blks_read,
+      tup_returned   AS tup_returned,
+      tup_fetched    AS tup_fetched
+    FROM pg_stat_database
+    WHERE datname = current_database()
+  metrics:
+    - datname:       { usage: "LABEL",   description: "Database name" }
+    - deadlocks:     { usage: "COUNTER", description: "Deadlocks detected (ANY increase = criterion-a fail, §6.2 D6)" }
+    - temp_files:    { usage: "COUNTER", description: "Temp files created (work_mem spill)" }
+    - temp_bytes:    { usage: "COUNTER", description: "Temp bytes written (work_mem spill, §6.2 D3)" }
+    - xact_commit:   { usage: "COUNTER", description: "Committed transactions" }
+    - xact_rollback: { usage: "COUNTER", description: "Rolled-back transactions" }
+    - blks_hit:      { usage: "COUNTER", description: "Buffer cache hits" }
+    - blks_read:     { usage: "COUNTER", description: "Disk block reads" }
+    - tup_returned:  { usage: "COUNTER", description: "Tuples returned by scans" }
+    - tup_fetched:   { usage: "COUNTER", description: "Tuples fetched by index" }
+
+# ── Connections by state (§6.2 D1: idle-in-tx climbing = the real pool-killer).
+# The single CNPG backend owns all 200 connections (§2.1). idle in transaction
+# is the canonical stuck-pool / forgotten-BEGIN signal (admin/postgres.py:300). ──
+spddi_conns_by_state:
+  master: false
+  cache_seconds: 15
+  query: |
+    SELECT
+      COALESCE(state, 'unknown') AS state,
+      count(*) AS conns
+    FROM pg_stat_activity
+    WHERE datname = current_database()
+    GROUP BY 1
+  metrics:
+    - state: { usage: "LABEL", description: "Connection state" }
+    - conns: { usage: "GAUGE", description: "Backends in this state on the SUT database" }
+
+# ── Longest transaction + WAL position (§6.2 D8 WAL rate via rate(); D10 longest
+# txn age). overview cache_hit/active conns also come via /admin but the deep WAL
+# delta is sourced here to keep one source per metric. ──
+spddi_overview:
+  master: false
+  cache_seconds: 15
+  query: |
+    SELECT
+      pg_database_size(current_database()) AS db_size_bytes,
+      pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') AS wal_bytes,
+      COALESCE((
+        SELECT EXTRACT(EPOCH FROM (now() - min(xact_start)))::float8
+        FROM pg_stat_activity
+        WHERE xact_start IS NOT NULL
+          AND pid <> pg_backend_pid()
+          AND datname = current_database()
+      ), 0)::float8 AS longest_txn_age_s,
+      (SELECT count(*) FROM pg_stat_activity WHERE datname = current_database())::int AS active_connections,
+      current_setting('max_connections')::int AS max_connections
+  metrics:
+    - db_size_bytes:      { usage: "GAUGE", description: "Database size in bytes (§6.2 D5 / disk projection)" }
+    - wal_bytes:          { usage: "COUNTER", description: "WAL bytes since 0/0 — rate() = WAL rate (§6.2 D8)" }
+    - longest_txn_age_s:  { usage: "GAUGE", description: "Age of the longest open transaction (§6.2 D10)" }
+    - active_connections: { usage: "GAUGE", description: "Active backends on the SUT db (§6.2 D2 vs 200)" }
+    - max_connections:    { usage: "GAUGE", description: "Postgres max_connections (the 200 ceiling line)" }
+
+# ── pg_stat_statements top-by-total-time (§6.2 D9: the per-zone DNSRecord N+1 /
+# sweep subnet-scan rising). Degrades to zero rows if the extension is absent
+# (the LEFT-JOIN-to-extension guard returns no rows, never errors). ──
+spddi_statements:
+  master: false
+  cache_seconds: 30
+  query: |
+    SELECT
+      left(regexp_replace(s.query, '\s+', ' ', 'g'), 120) AS queryid,
+      s.calls AS calls,
+      s.total_exec_time AS total_exec_time_ms,
+      s.mean_exec_time  AS mean_exec_time_ms,
+      s.rows AS rows
+    FROM pg_stat_statements s
+    JOIN pg_extension e ON e.extname = 'pg_stat_statements'
+    WHERE s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+    ORDER BY s.total_exec_time DESC
+    LIMIT 20
+  metrics:
+    - queryid:            { usage: "LABEL",   description: "Normalised query text (first 120 chars)" }
+    - calls:              { usage: "COUNTER", description: "Calls" }
+    - total_exec_time_ms: { usage: "COUNTER", description: "Total exec time (ms) — top consumers" }
+    - mean_exec_time_ms:  { usage: "GAUGE",   description: "Mean exec time (ms)" }
+    - rows:               { usage: "COUNTER", description: "Rows returned/affected" }
+
+# ── dns_record_op pending/applied/failed (§6.2 D5 / §6.5 SOAK: dns_record_op
+# monotonic growth — verified no prune today, §5.5 tag H. Pending backlog is the
+# DDNS convergence-lag signal; total row count is the unbounded-growth check). ──
+spddi_record_ops:
+  master: false
+  cache_seconds: 30
+  query: |
+    SELECT state, count(*) AS ops
+    FROM dns_record_op
+    GROUP BY state
+  metrics:
+    - state: { usage: "LABEL", description: "dns_record_op state (pending|applied|failed)" }
+    - ops:   { usage: "GAUGE", description: "Rows in this state (applied grows unbounded — no prune, §5.5 H)" }

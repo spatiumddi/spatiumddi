@@ -1,0 +1,148 @@
+{#-
+  SpatiumDDI 24h performance-run report template (docs/PERFORMANCE_TESTING.md §8.4).
+  Rendered by perf/harness/spddi_perf/collect.py with Jinja2 (StrictUndefined,
+  trim_blocks, lstrip_blocks). The `badge` filter maps a verdict token to a label.
+
+  collect.py ships an identical builtin renderer (_render_markdown_builtin) so the
+  report is produced even when Jinja2 isn't installed on the box; keep the two in
+  sync. Context keys: run_id, profile, generated_at, slo_thresholds_version,
+  incomplete, criteria{a,b,c,d:{name,verdict,summary,rows[]}}, overall{verdict,note},
+  deltas{row_count_ledger,table_delta,db_size}, bottleneck, comparison, manifest,
+  present_surfaces, profile_key.
+-#}
+# SpatiumDDI 24h Performance Run — `{{ run_id }}`
+{% if incomplete %}
+
+> ⚠️ **INCOMPLETE** — core surfaces missing; this is a partial report (a crashed run is still evidence, §8.4).
+{% endif %}
+
+**Profile:** `{{ profile }}` ({{ "{:,}".format(manifest.unique_devices) }} devices, {{ manifest.lease_time_s }}s lease, T1={{ manifest.t1_seconds }}s, DDNS {{ "on" if manifest.ddns_enabled else "off" }}, qlog {{ "on" if manifest.query_log_enabled else "off" }}, {{ manifest.dns_driver }}, {{ manifest.reverse_zone_shape }} reverse)
+
+**Generated:** {{ generated_at }} · **SLO thresholds:** `{{ slo_thresholds_version }}`
+
+## Executive verdict
+
+```
+RUN {{ run_id }}  ({{ profile }})
+──────────────────────────────────────────────────────────────────────────────
+(a) DB never bottlenecks ...... {{ "%-14s"|format(criteria.a.verdict) }} ({{ criteria.a.summary }})
+(b) Latency SLOs ............... {{ "%-14s"|format(criteria.b.verdict) }} ({{ criteria.b.summary }})
+(c) Max sustainable throughput  {{ "%-14s"|format(criteria.c.verdict) }} ({{ criteria.c.summary }})
+(d) 24h soak stability ........ {{ "%-14s"|format(criteria.d.verdict) }} ({{ criteria.d.summary }})
+──────────────────────────────────────────────────────────────────────────────
+OVERALL: {{ overall.verdict }} — {{ overall.note }}
+```
+
+## Consolidated SLO table (§8.3)
+{% for cid, cinfo in criteria.items() %}
+
+### Criterion ({{ cid }}) — {{ cinfo.name }} · **{{ cinfo.verdict }}**
+
+| # | SLO | Measured | Threshold | Verdict |
+|---|-----|----------|-----------|---------|
+{% for r in cinfo.rows %}
+| {{ r.id }} | {{ r.slo|replace("|", "\\|") }} | {{ r.measured|string|replace("|", "\\|") }} | {{ r.threshold|string|replace("|", "\\|") }} | {{ r.verdict|badge }} |
+{% endfor %}
+{% endfor %}
+
+## Bottleneck finding (first-to-give + ready §5 mitigation)
+
+- **First-to-give component:** {{ bottleneck.first_to_give }}
+- **Evidence:** {{ bottleneck.evidence }}
+- **Ready mitigation [{{ bottleneck.mitigation_tag }}]:** {{ bottleneck.mitigation }}
+
+**Soak-growth finding — `{{ bottleneck.soak_growth_finding.table }}`** ({{ bottleneck.soak_growth_finding.verdict }}): {{ bottleneck.soak_growth_finding.fact }}
+- Measured: {{ bottleneck.soak_growth_finding.measured }}
+- Ready mitigation [{{ bottleneck.soak_growth_finding.mitigation_tag }}]: {{ bottleneck.soak_growth_finding.mitigation }}
+
+## t0 ↔ tEnd deltas
+{% if deltas.row_count_ledger %}
+
+**Row-count ledger (§8.2.4)**
+
+| Count | t0 | tEnd | Δ |
+|-------|----|------|---|
+{% for k, v in deltas.row_count_ledger.items() %}
+| {{ k }} | {{ "{:,}".format(v.t0) }} | {{ "{:,}".format(v.tEnd) }} | {{ "{:+,}".format(v.delta) }} |
+{% endfor %}
+{% else %}
+
+_No domain-counts ledger captured._
+{% endif %}
+{% if deltas.table_delta %}
+
+**Per-table live/dead-tup + autovacuum (pg_stat_user_tables)**
+
+| Table | live t0→tEnd | dead t0→tEnd | autovac t0→tEnd |
+|-------|-------------|-------------|-----------------|
+{% for t, v in deltas.table_delta.items() %}
+| {{ t }} | {{ v.live_tup.t0 }}→{{ v.live_tup.tEnd }} | {{ v.dead_tup.t0 }}→{{ v.dead_tup.tEnd }} | {{ v.autovacuum_count.t0 }}→{{ v.autovacuum_count.tEnd }} |
+{% endfor %}
+{% endif %}
+{% if deltas.db_size %}
+
+**DB size:** {{ "%.2f"|format(deltas.db_size.t0_bytes / 1e9) }} → {{ "%.2f"|format(deltas.db_size.tEnd_bytes / 1e9) }} GB (Δ {{ "%+.2f"|format(deltas.db_size.delta_bytes / 1e9) }} GB)
+{% endif %}
+{% if comparison %}
+
+## Regression comparison (§8.5)
+{% if comparison.refused %}
+
+> ⛔ **Comparison refused** — {{ comparison.reason }}.
+{% for a, vv in (comparison.axis_diffs or {}).items() %}
+  - `{{ a }}`: baseline `{{ vv.baseline }}` vs new `{{ vv.new }}`
+{% endfor %}
+{% else %}
+
+**Baseline:** `{{ comparison.baseline_run_id }}` → **New:** `{{ comparison.new_run_id }}`
+
+**Gate: {{ comparison.gate }}** (band ±{{ (comparison.regression_band * 100)|int }}%)
+{% if comparison.block_reasons %}
+
+_BLOCK:_ {{ comparison.block_reasons|join("; ") }}
+{% endif %}
+{% if comparison.warn_reasons %}
+
+_WARN:_ {{ comparison.warn_reasons|join("; ") }}
+{% endif %}
+{% set changed = [] %}
+{% for r in comparison.row_diffs %}
+{% if r.get("gate") %}{% set _ = changed.append(r) %}{% endif %}
+{% endfor %}
+{% if changed %}
+
+| # | baseline | new | Δ% | gate |
+|---|----------|-----|----|------|
+{% for r in changed %}
+| {{ r.id }} | {{ r.baseline_verdict }} | {{ r.new_verdict }} | {{ r.get("delta_pct", "—") }} | {{ r.get("gate") }} |
+{% endfor %}
+{% endif %}
+{% endif %}
+{% endif %}
+
+## Profile & provenance
+
+| Field | Value |
+|-------|-------|
+{% for k, v in manifest.items() %}
+{% if k != "slo" %}
+| {{ k }} | {{ v }} |
+{% endif %}
+{% endfor %}
+
+**Profile key (regression axes):** {{ profile_key.items()|map("join", "=")|join(", ") }}
+
+**Surfaces present:** {{ present_surfaces|join(", ") if present_surfaces else "(none)" }}
+
+## Open questions surfaced by this run
+{% set nodata = [] %}
+{% for cinfo in criteria.values() %}
+{% for r in cinfo.rows %}
+{% if r.verdict == "NO_DATA" %}{{ nodata.append(r.id) or "" }}{% endif %}
+{% endfor %}
+{% endfor %}
+{% if nodata %}
+- NO-DATA rows needing a source next run: {{ nodata|join(", ") }}
+{% endif %}
+- DDNS short-circuit ratio on renewals (the load-bearing fact §5.2): see orchestrator ddns_short_circuit_ratio — a broken short-circuit turns every renewal into 6 DNS writes and collapses the ceiling.
+- `[tune-after-baseline]` thresholds exercised — promote to `v2-measured` (§8.3.1) once the idle floor is established.

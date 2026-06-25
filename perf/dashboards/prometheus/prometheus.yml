@@ -1,0 +1,149 @@
+# SpatiumDDI perf-suite — OFF-BOX Prometheus scrape config.
+#
+# Runs on the monitoring VM (lg-0), NEVER on the appliance (§6.0/§6.4). It
+# *pulls*; the SUT never runs Prometheus/Grafana. Targets are:
+#   - node-exporter           (host CPU/mem/disk/net — §6.1 Layer 5)  :9100
+#   - kube-state-metrics      (pod restarts / OOM / status — Layer 5) :8080
+#   - postgres_exporter       (the criterion-(a) DB panel — Layer 4)  :9187
+#   - redis_exporter          (queue LLEN + mem/evict — Layer 3)      :9121
+#   - cAdvisor (kubelet)      (per-pod CPU/mem — Layer 5)             :10250 /metrics/cadvisor
+#   - node-exporter textfile  (perfdhcp/dnsperf/orchestrator stats — Layer 1)
+#   - the off-box JSON poller (native /admin + /health rollups — §6.3)
+#   - this Prometheus itself  (scrape-self health)
+#
+# Steady soak scrape = 15s. The §6.0/§6.4 CEILING ceiling is 10s — flip the two
+# `scrape_interval: 10s` overrides commented in the ceiling jobs (or run a second
+# Prometheus) only during the §1.8 T+16..17 ceiling window; 10s on every job for
+# 24h bloats the off-box TSDB without buying steady-state resolution.
+#
+# Run with --web.enable-admin-api so the §8.2.1 end-of-run TSDB snapshot works:
+#   prometheus --config.file=prometheus.yml \
+#              --storage.tsdb.path=/var/lib/prometheus \
+#              --storage.tsdb.retention.time=30d \
+#              --web.enable-admin-api          # ← REQUIRED for `POST /api/v1/admin/tsdb/snapshot`
+#
+# All ${VAR} placeholders are resolved by docker-compose env-interpolation
+# (see ../README.md) or by hand-editing before launch. NODE_IP is the single
+# appliance node IP (k3s AIO, hostNetwork data plane — §2.2). The on-node
+# exporters are reached either via the node IP (hostNetwork: node-exporter,
+# cAdvisor) or via a kubectl port-forward / NodePort tunnel the README documents
+# (ClusterIP: KSM, postgres_exporter, redis_exporter).
+
+global:
+  scrape_interval: 15s          # §6.0 steady soak default
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: spddi-perf-warroom
+    run_role: off-box-monitoring
+
+# No alertmanager / no rule files in the baseline — the war-room board carries
+# the thresholds inline (§6.2 "bad looks like"). Recording/alerting rules are a
+# deferred follow-up (see README "Deferred").
+
+scrape_configs:
+
+  # ── self ───────────────────────────────────────────────────────────────────
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels: { layer: monitoring }
+
+  # ── Layer 5: host (node-exporter, hostNetwork DaemonSet on the node) ─────────
+  # Enable on the appliance via the spatiumddi-appliance chart:
+  #   observability.nodeExporter.enabled=true   (values.yaml:167-177)
+  # node-exporter listens :9100 on the host network → reach it on the node IP.
+  - job_name: node-exporter
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["${NODE_IP}:9100"]
+        labels: { layer: host, instance_role: appliance }
+
+  # node-exporter textfile collector (§6.1 Layer 1 — the per-second client-side
+  # truth). perfdhcp / dnsperf / the orchestrator write *.prom files into the
+  # textfile dir; node-exporter re-exposes them under the SAME :9100 endpoint,
+  # so this job is the SAME target as node-exporter above. We DO NOT add a
+  # second scrape — node-exporter merges --collector.textfile.directory output
+  # into its own /metrics. Kept here only as documentation of the data path.
+  #   node-exporter ... --collector.textfile.directory=/var/lib/node_exporter/textfile
+  # Generator .prom series the war-room board reads (textfile-collected):
+  #   spddi_gen_dhcp_offered_dora_per_s, spddi_gen_dhcp_achieved_dora_per_s,
+  #   spddi_gen_dhcp_ack_latency_ms{quantile}, spddi_gen_dhcp_outcomes_total{outcome},
+  #   spddi_gen_dns_offered_qps, spddi_gen_dns_achieved_qps,
+  #   spddi_gen_dns_resolve_latency_ms{quantile}, spddi_gen_dns_rcode_total{rcode},
+  #   spddi_gen_propagation_lag_s{leg,quantile},
+  #   spddi_gen_api_mutation_latency_ms{quantile}, spddi_gen_api_mutation_5xx_total,
+  #   spddi_gen_scheduler_lag_s{shard,quantile}, spddi_gen_active_online_devices
+
+  # ── Layer 5: kube-state-metrics (pod restarts / OOM / phase) ─────────────────
+  # Enable: observability.kubeStateMetrics.enabled=true (values.yaml:149-162).
+  # ClusterIP :8080 — reach via port-forward / NodePort (see README §"Reaching
+  # ClusterIP exporters"). KSM_ADDR default assumes a local port-forward.
+  - job_name: kube-state-metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["${KSM_ADDR}"]    # e.g. 127.0.0.1:8080 via `kubectl -n ${SUT_NAMESPACE} port-forward svc/kube-state-metrics 8080:8080`
+        labels: { layer: host }
+
+  # ── Layer 5: cAdvisor via kubelet (per-pod CPU/mem — no new pod, §6.2/§6.4) ──
+  # The kubelet exposes cAdvisor at https://<node>:10250/metrics/cadvisor. It is
+  # authenticated — Prometheus presents the off-box ServiceAccount bearer token
+  # (mounted by the README's setup) + skips TLS verify against the kubelet's
+  # self-signed serving cert (data plane is self-signed throughout — §2.2).
+  - job_name: cadvisor
+    scrape_interval: 15s
+    scheme: https
+    metrics_path: /metrics/cadvisor
+    tls_config:
+      insecure_skip_verify: true      # kubelet serving cert is self-signed (§2.2)
+    authorization:
+      type: Bearer
+      credentials_file: ${KUBELET_TOKEN_FILE}   # SA token with nodes/metrics access (README)
+    static_configs:
+      - targets: ["${NODE_IP}:10250"]
+        labels: { layer: host }
+
+  # ── Layer 4: postgres_exporter (THE criterion-(a) DB panel) ──────────────────
+  # Minimal Deployment in the SUT namespace (exporters/postgres_exporter.yaml),
+  # dedicated read-only pg_monitor role + custom queries (exporters/queries.yaml).
+  # ClusterIP :9187 — reach via port-forward / NodePort (PG_EXPORTER_ADDR).
+  - job_name: postgres-exporter
+    scrape_interval: 15s
+    # CEILING window: uncomment to tighten to 10s during T+16..17 (§6.0).
+    # scrape_interval: 10s
+    static_configs:
+      - targets: ["${PG_EXPORTER_ADDR}"]   # e.g. 127.0.0.1:9187 via port-forward svc/postgres-exporter
+        labels: { layer: database }
+
+  # ── Layer 3: redis_exporter (queue LLEN + mem/evict + wake-bus mem) ──────────
+  # Minimal Deployment (exporters/redis_exporter.yaml), --check-keys for the
+  # Celery queue LLENs (ipam/dns/dhcp/default — §6.1 Layer 3, the canonical
+  # soak-backlog signal; no native endpoint, §2.4). ClusterIP :9121.
+  - job_name: redis-exporter
+    scrape_interval: 15s
+    # scrape_interval: 10s   # CEILING window override
+    static_configs:
+      - targets: ["${REDIS_EXPORTER_ADDR}"]   # e.g. 127.0.0.1:9121 via port-forward svc/redis-exporter
+        labels: { layer: control_plane }
+
+  # ── §6.3 JSON poller (native /admin + /health rollups, off-box) ──────────────
+  # The off-box JSON poller (warroom/poller.py, separate component) re-exposes
+  # the product's native surfaces as Prometheus gauges on :9101. This is the
+  # SOURCE for the platform dots + wake-bus + 60s timeseries ONLY — the deep DB
+  # series come from postgres_exporter, NOT the /admin/postgres path (§6.3 note,
+  # avoids double-loading the api pool/CNPG under test).
+  # Series emitted (grounded — see ../README.md "JSON poller series → API"):
+  #   spatium_platform_component_up{component}
+  #   spatium_pg_active_connections / _max_connections / _cache_hit_ratio /
+  #     _wal_bytes / _longest_txn_age_s / _db_size_bytes
+  #   spatium_pg_conns_by_state{state}
+  #   spatium_pg_table_dead_tup / _live_tup / _last_autovacuum_age_s / _bytes {table}
+  #   spatium_redis_used_memory / _evicted_keys / _ops_per_sec / _hit_ratio
+  #   spatium_wakebus_subscribers / _publishes_total{class}
+  #   spatium_dns_qps / _servfail / _nxdomain
+  #   spatium_dhcp_discover_rate / _offer_rate / _request_rate / _ack_rate / _nak_rate
+  - job_name: spddi-json-poller
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["${JSON_POLLER_ADDR}"]   # e.g. 127.0.0.1:9101 (lg-0 local)
+        labels: { layer: native_rollup }

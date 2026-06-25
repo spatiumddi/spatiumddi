@@ -1,0 +1,136 @@
+# redis_exporter — Celery queue-depth + Redis health for the perf war-room.
+#
+# ON-NODE exporter, TIGHTLY capped (§6.4): ≤20m CPU / 64Mi, Burstable QoS so it
+# evicts before the SUT (§6.0). Surfaces the §6.1 Layer 3 signals:
+#   - Celery queue LLEN ipam/dns/dhcp/default (the canonical soak-backlog signal,
+#     §6.2 row 3 / §6.5 SOAK — no native endpoint exists, §2.4) via --check-keys
+#   - used_memory / maxmemory(256mb) / evicted_keys / ops / hit-ratio
+#
+# --check-keys=ipam,dns,dhcp,default makes the exporter sample each key and, for
+# list-typed keys, export redis_key_size{key="ipam"} = LLEN. Celery stores its
+# default broker queues as Redis LISTs named after the queue (queues
+# ipam,dns,dhcp,default — values.yaml:258-259 worker queue list). If a queue key
+# is missing (empty queue → key deleted), redis_key_size is simply absent → the
+# board's PromQL coalesces it to 0.
+#
+# Connects to the single Redis (sentinel kind, 1 replica, maxmemory 256mb — §2.1).
+# On the umbrella/appliance chart the master is reachable via the redis Service;
+# the README documents resolving the address + the password Secret. The exporter
+# itself only needs read INFO + key sampling — give it the existing Redis
+# password via REDIS_PASSWORD (never hardcode — non-negotiable #6).
+#
+# Deploy INTO THE SUT NAMESPACE:
+#   kubectl -n <SUT_NAMESPACE> apply -f exporters/redis_exporter.yaml
+
+---
+# Redis connection for the exporter. Create this Secret yourself (TEMPLATE).
+# REDIS_ADDR points at the Redis master Service; REDIS_PASSWORD is the existing
+# Redis auth password. The README has the kubectl create secret one-liner that
+# copies the password out of the chart's redis Secret.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: perf-redis-exporter-conn
+  labels:
+    app.kubernetes.io/name: redis-exporter
+    app.kubernetes.io/part-of: spddi-perf-warroom
+type: Opaque
+stringData:
+  # redis://host:port — REPLACE host. For a Sentinel deployment point this at
+  # the current master Service (the exporter does not do Sentinel discovery in
+  # the minimal setup; the README covers the sentinel variant).
+  REDIS_ADDR: "redis://REPLACE_REDIS_HOST:6379"
+  REDIS_PASSWORD: "REPLACE_ME"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-exporter
+  labels:
+    app.kubernetes.io/name: redis-exporter
+    app.kubernetes.io/component: exporter
+    app.kubernetes.io/part-of: spddi-perf-warroom
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis-exporter
+        app.kubernetes.io/component: exporter
+        app.kubernetes.io/part-of: spddi-perf-warroom
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 59000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis-exporter
+          image: oliver006/redis_exporter:v1.62.0-alpine
+          args:
+            # The four Celery broker queue lists → redis_key_size{key=...} = LLEN.
+            - "--check-keys=ipam,dns,dhcp,default"
+            - "--web.listen-address=:9121"
+          env:
+            - name: REDIS_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: perf-redis-exporter-conn
+                  key: REDIS_ADDR
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: perf-redis-exporter-conn
+                  key: REDIS_PASSWORD
+          ports:
+            - name: metrics
+              containerPort: 9121
+          resources:
+            # §6.4 TIGHT cap — Burstable QoS so this evicts before the SUT.
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              cpu: 20m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 30
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-exporter
+  labels:
+    app.kubernetes.io/name: redis-exporter
+    app.kubernetes.io/part-of: spddi-perf-warroom
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9121"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis-exporter
+  ports:
+    - name: metrics
+      port: 9121
+      targetPort: metrics
+      protocol: TCP

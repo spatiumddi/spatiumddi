@@ -1,0 +1,146 @@
+# postgres_exporter — the criterion-(a) DB exporter for the perf war-room.
+#
+# ON-NODE exporter, but TIGHTLY capped (§6.4): ≤30m CPU / 64Mi, Burstable QoS
+# (requests < limits) so it EVICTS BEFORE the SUT pods under memory pressure —
+# the observer must never steal the budget it's measuring (§6.0).
+#
+# Connects to the single CNPG instance (§2.1) as a dedicated read-only
+# `pg_monitor` role (NEVER the app/superuser role — §6.2 + non-negotiable #3/#6).
+# Custom queries (locks/deadlocks/per-table tuples/pg_stat_statements top) come
+# from queries.yaml via --extend.query-path.
+#
+# Deploy INTO THE SUT NAMESPACE (the appliance uses `spatium`):
+#   kubectl -n <SUT_NAMESPACE> apply -f exporters/queries.yaml-as-configmap   # see README
+#   kubectl -n <SUT_NAMESPACE> apply -f exporters/postgres_exporter.yaml
+#
+# The DATA_SOURCE_NAME points at the CNPG read/write service. On the umbrella
+# chart that is `<release>-spatiumddi-postgresql-rw:5432`; on the k8s/ha manifest
+# it is `postgres-rw:5432` (CNPG auto-creates -rw/-ro/-r services,
+# charts/spatiumddi/templates/cnpg-cluster.yaml:14). Edit PG_HOST in the Secret
+# below to match your install (README "Wiring the exporters").
+#
+# The README documents the pg_monitor role GRANT. We read the role's password
+# from a Secret you create (NEVER hardcode — non-negotiable #6); see README.
+
+---
+# Read-only credentials for the dedicated pg_monitor role. Create this Secret
+# yourself (do NOT commit a real password — this is a TEMPLATE). The README has
+# the exact CREATE ROLE + GRANT and the kubectl create secret one-liner.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: perf-postgres-exporter-dsn
+  labels:
+    app.kubernetes.io/name: postgres-exporter
+    app.kubernetes.io/part-of: spddi-perf-warroom
+type: Opaque
+stringData:
+  # libpq URI for the read-only monitor role. sslmode=require because CNPG
+  # serves TLS; the exporter does not need to verify (in-cluster, self-signed).
+  # REPLACE the password placeholder + PG_HOST before applying.
+  DATA_SOURCE_NAME: "postgresql://spddi_perf_monitor:REPLACE_ME@PG_HOST:5432/spatiumddi?sslmode=require"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter
+  labels:
+    app.kubernetes.io/name: postgres-exporter
+    app.kubernetes.io/component: exporter
+    app.kubernetes.io/part-of: spddi-perf-warroom
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres-exporter
+        app.kubernetes.io/component: exporter
+        app.kubernetes.io/part-of: spddi-perf-warroom
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Schedule off the data plane where possible, but never block scheduling:
+      # this is a Burstable observer that must yield to the SUT.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres-exporter
+          image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
+          args:
+            - "--extend.query-path=/etc/postgres_exporter/queries.yaml"
+            # Disable the default settings collector's superuser-only queries so
+            # the pg_monitor role is sufficient (§6.2 dedicated read-only role).
+            - "--no-collector.stat_bgwriter"
+            - "--web.listen-address=:9187"
+          env:
+            - name: DATA_SOURCE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: perf-postgres-exporter-dsn
+                  key: DATA_SOURCE_NAME
+            # Limit auto-discovery to the SUT db so the exporter doesn't probe
+            # CNPG's internal databases.
+            - name: PG_EXPORTER_EXCLUDE_DATABASES
+              value: "template0,template1,postgres"
+          ports:
+            - name: metrics
+              containerPort: 9187
+          resources:
+            # §6.4 TIGHT cap — Burstable QoS (requests < limits) so this evicts
+            # before the SUT. Total added on-node budget ≤ ~110m / ~256Mi.
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 30m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: queries
+              mountPath: /etc/postgres_exporter
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: queries
+          configMap:
+            name: perf-postgres-exporter-queries   # created from queries.yaml (README)
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-exporter
+  labels:
+    app.kubernetes.io/name: postgres-exporter
+    app.kubernetes.io/part-of: spddi-perf-warroom
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9187"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres-exporter
+  ports:
+    - name: metrics
+      port: 9187
+      targetPort: metrics
+      protocol: TCP
