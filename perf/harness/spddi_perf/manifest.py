@@ -31,6 +31,12 @@ class DhcpTarget:
     port: int = 67
     topology: str = "broadcast"      # "relay" | "broadcast" (Phase-0 decision, §3.1.2)
     giaddr: list[str] = field(default_factory=list)  # one per subnet when relay
+    # Egress interface for the broadcast DISCOVER (perf #454). On a multi-homed
+    # load-gen box ``255.255.255.255`` won't necessarily leave the NIC facing the
+    # appliance, so the orchestrator binds the socket to this device
+    # (SO_BINDTODEVICE). Empty = let the kernel route (single-homed boxes).
+    # ``SPDDI_PERF_DHCP_IFACE`` overrides at runtime.
+    iface: str = ""
 
 
 @dataclass
@@ -181,7 +187,8 @@ def _as_target(d: dict[str, Any]) -> Target:
         node_ip=d.get("node_ip", ""),
         api_base=d.get("api_base", ""),
         dhcp=DhcpTarget(port=dhcp.get("port", 67), topology=dhcp.get("topology", "broadcast"),
-                        giaddr=list(dhcp.get("giaddr", []) or [])),
+                        giaddr=list(dhcp.get("giaddr", []) or []),
+                        iface=os.environ.get("SPDDI_PERF_DHCP_IFACE", dhcp.get("iface", "")) or ""),
         dns=DnsTarget(port=dns.get("port", 53), driver=dns.get("driver", "bind9"),
                       recursion=bool(dns.get("recursion", False))),
         appliance=d.get("appliance", {}) or {},

@@ -63,15 +63,30 @@ The supervisor brings up bind9 + kea on its next heartbeat (~30–60 s). Verify:
 K get pods -n spatium -o wide | grep -E 'bind9|kea'         # both Running, IP = node IP (hostNetwork)
 $SSH 'echo <ssh-pass> | sudo -S ss -lntu' | grep -E ':53 |:67 '   # node IP listening on :53/:67
 dig +short @$APP version.bind CH TXT                        # bind answers
-dig +short @$APP google.com A                               # → SERVFAIL/empty (recursion OFF; NOT a real answer = no leak)
+dig +short @$APP google.com A                               # → SERVFAIL/REFUSED/empty (recursion OFF; a real IP = LEAK)
 K exec -n spatium ds/dns-bind9 -- grep -iE 'recursion|allow-recursion' /etc/bind/named.conf.options
-#   → "recursion no;" + "allow-recursion { none; };"   (the §4.9 safety property)
+#   → "recursion no;"   (the §4.9 safety property)
 ```
 The appliance capabilities must advertise `can_run_dns_bind9` / `can_run_dhcp` (they
 do on a full appliance); the role PUT 422s otherwise.
 
-> **Recursion note:** this bind returns **SERVFAIL** (not REFUSED) for out-of-zone
-> names. Both mean "did not resolve" — the §4.9 recursion-leak pre-flight should treat
+> **⚠️ Recursion (perf #454).** The rendered `recursion no;` is driven by the bind9
+> server **options** (`DNSServerOptions.recursion_enabled`), and historically the
+> group's `is_recursive=false` did NOT propagate to it — so a group created per §1
+> above could still render `recursion yes;` and resolve the public internet (a §4.9
+> leak). Fixed so `is_recursive=false` now forces recursion off. **Always verify with
+> the `dig google.com` above** — a real A record back means recursion is still on.
+> Belt-and-braces (and the fix for appliances on a pre-#454 backend), force it off via
+> the options endpoint:
+>
+> ```bash
+> curl -sk -X PUT https://$APP/api/v1/dns/groups/$DNS_GID/options \
+>   -H "Authorization: Bearer $(tok)" -H 'Content-Type: application/json' \
+>   -d '{"recursion_enabled": false, "allow_recursion": []}'
+> ```
+>
+> This bind returns **REFUSED/SERVFAIL** (not a real answer) for out-of-zone names
+> once recursion is off — both mean "did not resolve". The §4.9 pre-flight treats
 > *only* a real external answer (NOERROR + an A record) as a leak.
 
 ## 3. Expose Postgres + Redis off-box (NodePorts)

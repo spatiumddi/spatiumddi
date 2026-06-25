@@ -72,7 +72,9 @@ ENV_DNS_GROUP_ID = "SPDDI_PERF_DNS_GROUP_ID"
 ENV_DHCP_GROUP_ID = "SPDDI_PERF_DHCP_GROUP_ID"
 
 RECORD_CHUNK = 200          # records logged per progress line
-RECORD_WORKERS = 16         # concurrent POSTs for the bulk record load
+RECORD_WORKERS = 16         # concurrent POSTs for the per-record fallback load
+BULK_BATCH = 1000           # records per records/bulk-create call (endpoint cap is 2000)
+BULK_WORKERS = 6            # concurrent bulk-create batches (perf #454 fast-path)
 
 
 # ---------------------------------------------------------------------------
@@ -264,11 +266,90 @@ class _BulkLoader:
                     self.aborted = True
                     log_event(self.log, 40, "bulk_load_auth_abort", error=msg[:200])
 
+    def _bulk_post(self, zone_id: str, batch: list[dict[str, Any]]) -> int | None:
+        """POST one ``records/bulk-create`` batch. Returns the created count, or
+        ``None`` if the endpoint is absent (404 — appliance predates perf #454),
+        signalling the caller to fall back to the per-record path."""
+        # POST /v1/dns/groups/{gid}/zones/{zid}/records/bulk-create — dns/router.py
+        path = f"/v1/dns/groups/{self.group_id}/zones/{zone_id}/records/bulk-create"
+        body = {"records": [
+            {"name": r["name"], "record_type": r["record_type"], "value": r["value"]}
+            for r in batch
+        ]}
+        try:
+            resp = self.api.json("POST", path, json=body, ok=(201,))
+            return int(resp.get("created", 0))
+        except ApiError as exc:
+            if exc.status_code == 404:
+                return None  # endpoint not deployed — fall back to per-record
+            msg = str(exc)
+            with self._lock:
+                self.failed += len(batch)
+                if len(self._first_errors) < 5:
+                    self._first_errors.append(msg[:200])
+                if not self.aborted and exc.status_code in (401, 403):
+                    self.aborted = True
+                    log_event(self.log, 40, "bulk_load_auth_abort", error=msg[:200])
+            return 0
+
     def load(self, items: list[tuple[str, dict[str, Any]]]) -> None:
-        """Load ``(zone_id, record)`` pairs concurrently with progress logging."""
+        """Load ``(zone_id, record)`` pairs with progress logging.
+
+        Fast-path (perf #454): group by zone and POST in ``records/bulk-create``
+        batches — one transaction / serial-bump / commit per batch instead of
+        per record (~6 rec/s → orders of magnitude faster). Probes the endpoint
+        with the first batch; on 404 (older appliance) falls back to the legacy
+        concurrent per-record POST loop so the seeder still works either way.
+        """
         total = len(items)
         if not total:
             return
+
+        # Group by zone so each bulk batch targets a single zone.
+        by_zone: dict[str, list[dict[str, Any]]] = {}
+        for zid, rec in items:
+            by_zone.setdefault(zid, []).append(rec)
+        batches: list[tuple[str, list[dict[str, Any]]]] = []
+        for zid, recs in by_zone.items():
+            for i in range(0, len(recs), BULK_BATCH):
+                batches.append((zid, recs[i:i + BULK_BATCH]))
+
+        t0 = time.time()
+        done = 0
+
+        # Probe the endpoint synchronously with the first batch.
+        zid0, batch0 = batches[0]
+        probe = self._bulk_post(zid0, batch0)
+        if probe is None:
+            log_event(self.log, logging.INFO, "bulk_create_unavailable",
+                      note="records/bulk-create returned 404 — falling back to per-record POST")
+            self._load_per_record(items)
+            return
+        with self._lock:
+            self.created += probe
+        done += len(batch0)
+        log_event(self.log, logging.INFO, "bulk_record_progress", done=done, total=total,
+                  created=self.created, failed=self.failed,
+                  rate_per_s=round(done / max(1e-6, time.time() - t0), 1))
+
+        # Remaining batches concurrently.
+        with cf.ThreadPoolExecutor(max_workers=BULK_WORKERS) as ex:
+            futs = {ex.submit(self._bulk_post, zid, b): len(b) for zid, b in batches[1:]}
+            for fut in cf.as_completed(futs):
+                n = futs[fut]
+                created = fut.result()
+                with self._lock:
+                    if created:
+                        self.created += created
+                done += n
+                if done % max(BULK_BATCH, RECORD_CHUNK) < n or done == total:
+                    log_event(self.log, logging.INFO, "bulk_record_progress", done=done,
+                              total=total, created=self.created, failed=self.failed,
+                              rate_per_s=round(done / max(1e-6, time.time() - t0), 1))
+
+    def _load_per_record(self, items: list[tuple[str, dict[str, Any]]]) -> None:
+        """Legacy fallback: one POST per record (used when bulk-create is 404)."""
+        total = len(items)
         done = 0
         t0 = time.time()
         with cf.ThreadPoolExecutor(max_workers=RECORD_WORKERS) as ex:

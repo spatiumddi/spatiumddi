@@ -79,7 +79,12 @@ def get_logger(
     stream.setFormatter(fmt)
     logger.addHandler(stream)
 
-    if logfile:
+    # Workers run under the controller with their stderr already teed to this same
+    # logfile (workers.child_env sets SPDDI_PERF_LOG_VIA_STDERR). Adding a
+    # FileHandler too would write every line twice (perf #454), so the marker
+    # makes us stay stderr-only. The foreground controller (no marker) still gets
+    # both its terminal (stderr) and its own logfile.
+    if logfile and not os.environ.get("SPDDI_PERF_LOG_VIA_STDERR"):
         Path(logfile).parent.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(logfile)
         fh.setFormatter(fmt)

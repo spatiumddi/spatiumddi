@@ -317,10 +317,18 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             continue
         tsig_keys.append({"name": k.name, "secret": secret, "algorithm": k.algorithm})
 
+    # The DNS group's ``is_recursive=False`` is the high-level authoritative-only
+    # intent (§4.9 DNS safety); it MUST force ``recursion no;`` regardless of the
+    # per-group server options. Previously only ``DNSServerOptions.recursion_enabled``
+    # (default True) drove the render, so a group created with ``is_recursive=False``
+    # silently stayed an open recursive resolver (perf #454). AND the two so the
+    # group flag can only ever tighten, never loosen, recursion.
+    group_is_recursive = bool(getattr(grp, "is_recursive", True)) if grp else True
+    opts_recursion_enabled = getattr(opts, "recursion_enabled", True) if opts else True
     options_block = {
         "forwarders": getattr(opts, "forwarders", []) if opts else [],
         "forward_policy": getattr(opts, "forward_policy", "first") if opts else "first",
-        "recursion_enabled": getattr(opts, "recursion_enabled", True) if opts else True,
+        "recursion_enabled": opts_recursion_enabled and group_is_recursive,
         "dnssec_validation": (getattr(opts, "dnssec_validation", "auto") if opts else "auto"),
         "allow_query": getattr(opts, "allow_query", ["any"]) if opts else ["any"],
         "allow_transfer": (getattr(opts, "allow_transfer", ["none"]) if opts else ["none"]),
