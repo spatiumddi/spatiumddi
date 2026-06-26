@@ -6812,9 +6812,7 @@ export interface NewDeviceBlockResult {
 
 export const newDeviceApi = {
   summary: () =>
-    api
-      .get<NewDeviceSummary>("/new-devices/summary")
-      .then((r) => r.data),
+    api.get<NewDeviceSummary>("/new-devices/summary").then((r) => r.data),
 
   listSightings: (params?: {
     classification?: NewDeviceClassification;
@@ -6831,9 +6829,12 @@ export const newDeviceApi = {
 
   acknowledge: (sightingId: string, note?: string) =>
     api
-      .post<NewDeviceSighting>(`/new-devices/sightings/${sightingId}/acknowledge`, {
-        note,
-      })
+      .post<NewDeviceSighting>(
+        `/new-devices/sightings/${sightingId}/acknowledge`,
+        {
+          note,
+        },
+      )
       .then((r) => r.data),
 
   baseline: () =>
@@ -6857,13 +6858,13 @@ export const newDeviceApi = {
 
   addVirtDefaults: () =>
     api
-      .post<{ added: number; skipped: number }>(
-        "/new-devices/allowlist/virt-defaults",
-      )
+      .post<{
+        added: number;
+        skipped: number;
+      }>("/new-devices/allowlist/virt-defaults")
       .then((r) => r.data),
 
-  deleteAllowlist: (id: string) =>
-    api.delete(`/new-devices/allowlist/${id}`),
+  deleteAllowlist: (id: string) => api.delete(`/new-devices/allowlist/${id}`),
 
   block: (data: {
     mac_address: string;

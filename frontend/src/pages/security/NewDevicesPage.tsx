@@ -1,9 +1,5 @@
 import { useMemo, useState } from "react";
-import {
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   RefreshCw,
   ShieldCheck,
@@ -180,7 +176,9 @@ export function NewDevicesPage() {
       );
       const failed = results.filter((r) => r.status === "rejected").length;
       if (failed > 0)
-        throw new Error(`${failed} of ${selectedRows.length} failed to acknowledge`);
+        throw new Error(
+          `${failed} of ${selectedRows.length} failed to acknowledge`,
+        );
     },
     onSuccess: () => {
       invalidateAll();
@@ -252,10 +250,7 @@ export function NewDevicesPage() {
           value={moduleSummary?.acknowledged_count}
         />
         <SummaryCard label="Known" value={moduleSummary?.known_count} />
-        <SummaryCard
-          label="Allowlist"
-          value={moduleSummary?.allowlist_count}
-        />
+        <SummaryCard label="Allowlist" value={moduleSummary?.allowlist_count} />
         <SummaryCard
           label="New (24h)"
           value={moduleSummary?.new_last_24h}
@@ -338,9 +333,7 @@ export function NewDevicesPage() {
       {/* Bulk toolbar — slides in when rows are selected. */}
       {someSelected && (
         <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/40 px-3 py-2">
-          <span className="text-sm font-medium">
-            {selected.size} selected
-          </span>
+          <span className="text-sm font-medium">{selected.size} selected</span>
           <div className="ml-auto flex flex-wrap items-center gap-2">
             <HeaderButton
               icon={ShieldCheck}
