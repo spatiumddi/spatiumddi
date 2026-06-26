@@ -313,6 +313,15 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="UI",
         description='Per-user named filter/sort/column presets on list pages — "All subnets in DC1 over 80% utilization, sorted by name" becomes a one-click view. Personal-only; no cross-user visibility.',
     ),
+    # Security — arpwatch-style new-device detection. Default-off: watching is
+    # noisy and needs a baseline import before it is useful (#459).
+    ModuleSpec(
+        id="security.new_device_watch",
+        label="New device watch",
+        group="Security",
+        description="Alert the moment a previously-unseen MAC address appears on the network (arpwatch-style), across DHCP leases, SNMP ARP/FDB, and an opt-in L2 sniffer. Maintain an allowlist of trusted MACs (or OUI prefixes for VMs/containers), acknowledge or block from a review queue, and fire a real-time device.first_seen event. Default-off: enable, run a baseline import to mark the existing fleet as known, then arm.",
+        default_enabled=False,
+    ),
 )
 
 # Map a feature_module id to the ``PlatformSettings`` column whose

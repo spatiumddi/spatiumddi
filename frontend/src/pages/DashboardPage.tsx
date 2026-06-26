@@ -56,6 +56,7 @@ import {
   conformityApi,
   dashboardsApi,
   tlsCertsApi,
+  newDeviceApi,
   type IPSpace,
   type Subnet,
   type DNSServer,
@@ -1473,6 +1474,10 @@ export function DashboardPage() {
                 overallUtil >= 95 ? "bad" : overallUtil >= 80 ? "warn" : "good"
               }
             />
+
+            {/* New-device watch (#459) — renders nothing when the
+                security.new_device_watch module is off. */}
+            <NewDevicesKpi />
           </div>
         )}
 
@@ -2825,6 +2830,43 @@ function CertsExpiringKpi() {
       </p>
       <p className="text-[11px] text-muted-foreground">
         of {items.length} monitored · click to review
+      </p>
+    </Link>
+  );
+}
+
+// New devices seen in the last 24h (#459). Self-contained + gated on the
+// (default-off) ``security.new_device_watch`` feature module so it renders
+// nothing — and fires no query — when the module is turned off.
+function NewDevicesKpi() {
+  const { enabled, ready } = useFeatureModules();
+  const moduleOn = enabled("security.new_device_watch");
+
+  const { data } = useQuery({
+    queryKey: ["new-devices", "summary", "kpi"],
+    queryFn: () => newDeviceApi.summary(),
+    enabled: ready && moduleOn,
+    staleTime: 30_000,
+  });
+
+  if (ready && !moduleOn) return null;
+
+  const last24h = data?.new_last_24h ?? 0;
+  const cls = TONE_CLASS[last24h > 0 ? "bad" : "good"];
+
+  return (
+    <Link
+      to="/security/new-devices"
+      className="rounded-lg border bg-card p-4 transition-colors hover:bg-accent/40"
+    >
+      <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
+        New devices (24h)
+      </p>
+      <p className={cn("mt-2 text-3xl font-bold tabular-nums", cls.value)}>
+        {last24h}
+      </p>
+      <p className="text-[11px] text-muted-foreground">
+        {data?.new_count ?? 0} awaiting review · click to triage
       </p>
     </Link>
   );

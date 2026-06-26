@@ -30,6 +30,7 @@ import {
   Settings,
   Tags,
   ShieldCheck,
+  ShieldQuestion,
   ScrollText,
   BellRing,
   Sparkles,
@@ -203,6 +204,12 @@ const networkInfrastructureNav = [
 
 const toolsNav = [
   { label: "CIDR Calculator", icon: Calculator, to: "/tools/cidr" },
+  {
+    label: "New Devices",
+    icon: ShieldQuestion,
+    to: "/security/new-devices",
+    module: "security.new_device_watch",
+  },
   { label: "Nmap", icon: Search, to: "/tools/nmap", module: "tools.nmap" },
   {
     label: "Network Tools",

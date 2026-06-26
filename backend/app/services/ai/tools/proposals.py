@@ -23,9 +23,12 @@ from app.models.ai import AIOperationProposal
 from app.models.auth import User
 from app.services.ai import operations
 from app.services.ai.operations import (
+    AcknowledgeDeviceArgs,
     AllocateMulticastGroupsArgs,
     AllocateSubnetArgs,
+    AllowlistMacArgs,
     ArchiveSessionArgs,
+    BlockMacArgs,
     CreateAddressSetArgs,
     CreateAlertRuleArgs,
     CreateDHCPStaticArgs,
@@ -845,3 +848,64 @@ async def propose_commit_dhcp_import(
     db: AsyncSession, user: User, args: CommitDHCPImportArgs
 ) -> dict[str, Any]:
     return await _propose_via(db=db, user=user, operation_name="commit_dhcp_import", args=args)
+
+
+# ── New-device watch proposals (issue #459) ──────────────────────────────────
+
+
+@register_tool(
+    name="propose_acknowledge_device",
+    description=(
+        "Prepare a proposal to acknowledge (dismiss) a new-device sighting so it "
+        "stops raising the new_mac_seen alert. Pass the sighting_id from "
+        "find_new_devices. Operator must click Approve. Returns a kind='proposal' "
+        "card; never call twice for the same change."
+    ),
+    args_model=AcknowledgeDeviceArgs,
+    writes=False,
+    category="ipam",
+    default_enabled=True,
+    module="security.new_device_watch",
+)
+async def propose_acknowledge_device(
+    db: AsyncSession, user: User, args: AcknowledgeDeviceArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="acknowledge_device", args=args)
+
+
+@register_tool(
+    name="propose_allowlist_mac",
+    description=(
+        "Prepare a proposal to add a MAC (or OUI prefix like '00:50:56' for a "
+        "whole vendor) to the trusted allowlist so it never raises a new-device "
+        "alert and matching sightings become 'known'. Operator must click "
+        "Approve. Returns a kind='proposal' card; never call twice."
+    ),
+    args_model=AllowlistMacArgs,
+    writes=False,
+    category="ipam",
+    default_enabled=True,
+    module="security.new_device_watch",
+)
+async def propose_allowlist_mac(
+    db: AsyncSession, user: User, args: AllowlistMacArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="allowlist_mac", args=args)
+
+
+@register_tool(
+    name="propose_block_mac",
+    description=(
+        "Prepare a proposal to block a MAC from getting a DHCP lease (creates a "
+        "dhcp_mac_block in one or every server group) — arpwatch with teeth. Pass "
+        "mac_address and optionally group_id. Operator must click Approve. "
+        "Returns a kind='proposal' card; never call twice."
+    ),
+    args_model=BlockMacArgs,
+    writes=False,
+    category="dhcp",
+    default_enabled=True,
+    module="security.new_device_watch",
+)
+async def propose_block_mac(db: AsyncSession, user: User, args: BlockMacArgs) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="block_mac", args=args)

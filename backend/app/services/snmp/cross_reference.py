@@ -91,6 +91,10 @@ async def cross_reference_arp(
 
     by_ip: dict[str, IPAddress] = {str(r.address): r for r in existing_rows}
 
+    # New-device-watch sightings for rows created in this pass (issue #459);
+    # recorded after the loop once the rows have ids.
+    newly_discovered: list[tuple[IPAddress, str]] = []
+
     for arp in arp_list:
         ip_str = arp.ip_address
         existing = by_ip.get(ip_str)
@@ -108,7 +112,7 @@ async def cross_reference_arp(
                     record_mac_observation,
                 )
 
-                await record_mac_observation(db, existing.id, arp.mac_address)
+                await record_mac_observation(db, existing.id, arp.mac_address, source="snmp")
             counts["updated"] += 1
             continue
 
@@ -146,6 +150,22 @@ async def cross_reference_arp(
         )
         db.add(new_row)
         counts["created"] += 1
+        if arp.mac_address:
+            newly_discovered.append((new_row, arp.mac_address))
+
+    # New-device watch (issue #459): log a MAC sighting for each newly-created
+    # discovered row too, so a host seen only via SNMP ARP on a never-tracked IP
+    # still classifies + surfaces in the review queue / new_mac_seen alert.
+    # Flush first so the rows have ids for the FK.
+    if newly_discovered:
+        from app.services.ipam.discovery import (  # noqa: PLC0415
+            record_mac_observation,
+        )
+
+        await db.flush()
+        for new_row, mac in newly_discovered:
+            if new_row.id is not None:
+                await record_mac_observation(db, new_row.id, mac, source="snmp")
 
     return counts
 

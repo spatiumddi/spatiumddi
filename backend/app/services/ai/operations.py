@@ -32,7 +32,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.address_set import AddressSet, validate_address_set_shape
@@ -3233,5 +3233,265 @@ register(
         apply=_apply_reject_change_request,
         category="ops",
         required_permission=("approve", "change_request"),
+    )
+)
+
+
+# ── New-device watch operations (issue #459) ─────────────────────────────────
+
+
+class AcknowledgeDeviceArgs(BaseModel):
+    """Args for the ``acknowledge_device`` operation."""
+
+    sighting_id: UUID = Field(description="UUID of the ip_mac_history sighting to acknowledge")
+
+
+async def _preview_acknowledge_device(
+    db: AsyncSession, user: User, args: AcknowledgeDeviceArgs
+) -> PreviewResult:
+    from app.models.ipam import IpMacHistory  # noqa: PLC0415
+
+    row = await db.get(IpMacHistory, args.sighting_id)
+    if row is None:
+        return PreviewResult(ok=False, detail=f"Sighting {args.sighting_id} not found")
+    ip = await db.get(IPAddress, row.ip_address_id)
+    where = str(ip.address) if ip else "an IP"
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=f"Acknowledge new device {row.mac_address} on {where} "
+        f"(currently '{row.classification}') — it stops raising the new-device alert.",
+    )
+
+
+async def _apply_acknowledge_device(
+    db: AsyncSession, user: User, args: AcknowledgeDeviceArgs
+) -> dict[str, Any]:
+    from app.api.v1.dhcp._audit import write_audit  # noqa: PLC0415
+    from app.services.ipam.new_device import acknowledge_sighting  # noqa: PLC0415
+
+    enforce_operation_permission(user, _OPERATIONS["acknowledge_device"])
+    row = await acknowledge_sighting(db, args.sighting_id, user)
+    if row is None:
+        raise ValueError(f"Sighting {args.sighting_id} not found")
+    write_audit(
+        db,
+        user=user,
+        action="acknowledged",
+        resource_type="ip_mac_observation",
+        resource_id=f"{row.ip_address_id}:{row.mac_address}",
+        resource_display=str(row.mac_address),
+        new_value={"mac_address": str(row.mac_address), "via": "ai_proposal"},
+    )
+    await db.commit()
+    return {"sighting_id": str(row.id), "classification": row.classification}
+
+
+register(
+    Operation(
+        name="acknowledge_device",
+        description=(
+            "Acknowledge (dismiss) a new-device sighting so it stops raising the "
+            "new_mac_seen alert. Always route via propose_acknowledge_device."
+        ),
+        args_model=AcknowledgeDeviceArgs,
+        preview=_preview_acknowledge_device,
+        apply=_apply_acknowledge_device,
+        category="ipam",
+        required_permission=("write", "ip_address"),
+    )
+)
+
+
+class AllowlistMacArgs(BaseModel):
+    """Args for the ``allowlist_mac`` operation."""
+
+    mac_address: str | None = Field(default=None, description="Exact MAC to trust")
+    oui_prefix: str | None = Field(
+        default=None, description="OUI prefix (e.g. '00:50:56' or '005056') to trust a whole vendor"
+    )
+    note: str = Field(default="", description="Why this MAC/vendor is trusted")
+
+
+async def _preview_allowlist_mac(
+    db: AsyncSession, user: User, args: AllowlistMacArgs
+) -> PreviewResult:
+    from app.services.ipam.new_device import normalize_oui_prefix  # noqa: PLC0415
+
+    prefix = normalize_oui_prefix(args.oui_prefix)
+    if not args.mac_address and not prefix:
+        return PreviewResult(ok=False, detail="Provide a mac_address or an oui_prefix")
+    target = args.mac_address or f"OUI {prefix}"
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=f"Trust {target} — it (and matching sightings) become 'known' "
+        f"and never raise a new-device alert.",
+    )
+
+
+async def _apply_allowlist_mac(
+    db: AsyncSession, user: User, args: AllowlistMacArgs
+) -> dict[str, Any]:
+    from app.api.v1.dhcp._audit import write_audit  # noqa: PLC0415
+    from app.services.ipam.new_device import add_allowlist_entry  # noqa: PLC0415
+
+    enforce_operation_permission(user, _OPERATIONS["allowlist_mac"])
+    try:
+        row, reclassified = await add_allowlist_entry(
+            db,
+            mac_address=args.mac_address,
+            oui_prefix=args.oui_prefix,
+            note=args.note,
+            user=user,
+        )
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    await db.flush()
+    write_audit(
+        db,
+        user=user,
+        action="create",
+        resource_type="mac_allowlist",
+        resource_id=str(row.id),
+        resource_display=str(row.mac_address or row.oui_prefix),
+        new_value={
+            "mac_address": str(row.mac_address) if row.mac_address else None,
+            "oui_prefix": row.oui_prefix,
+            "reclassified_count": reclassified,
+            "via": "ai_proposal",
+        },
+    )
+    await db.commit()
+    return {"id": str(row.id), "reclassified_count": reclassified}
+
+
+register(
+    Operation(
+        name="allowlist_mac",
+        description=(
+            "Add a MAC (or OUI prefix) to the trusted allowlist so it never "
+            "raises a new-device alert and matching sightings become 'known'. "
+            "Always route via propose_allowlist_mac."
+        ),
+        args_model=AllowlistMacArgs,
+        preview=_preview_allowlist_mac,
+        apply=_apply_allowlist_mac,
+        category="ipam",
+        required_permission=("write", "ip_address"),
+    )
+)
+
+
+class BlockMacArgs(BaseModel):
+    """Args for the ``block_mac`` operation."""
+
+    mac_address: str = Field(description="MAC to block from getting a DHCP lease")
+    group_id: UUID | None = Field(
+        default=None, description="DHCP server group to block in (default: every group)"
+    )
+    reason: str = Field(default="other", description="Block reason code")
+    description: str = Field(default="", description="Free-form note")
+
+
+async def _block_target_groups(db: AsyncSession, args: BlockMacArgs) -> list[UUID]:
+    from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
+
+    if args.group_id is not None:
+        return [args.group_id]
+    return list((await db.execute(select(DHCPServerGroup.id))).scalars().all())
+
+
+async def _preview_block_mac(db: AsyncSession, user: User, args: BlockMacArgs) -> PreviewResult:
+    from app.models.dhcp import DHCPLease, DHCPServerGroup  # noqa: PLC0415
+
+    if args.group_id is not None and await db.get(DHCPServerGroup, args.group_id) is None:
+        return PreviewResult(ok=False, detail=f"DHCP server group {args.group_id} not found")
+    groups = await _block_target_groups(db, args)
+    if not groups:
+        return PreviewResult(ok=False, detail="No DHCP server groups to block in")
+    active = (
+        await db.execute(
+            select(func.count())
+            .select_from(DHCPLease)
+            .where(DHCPLease.mac_address == args.mac_address, DHCPLease.state == "active")
+        )
+    ).scalar_one()
+    warn = f" Note: {active} active lease(s) currently held by this MAC." if active else ""
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=f"Block {args.mac_address} from DHCP in {len(groups)} group(s)." + warn,
+    )
+
+
+async def _apply_block_mac(db: AsyncSession, user: User, args: BlockMacArgs) -> dict[str, Any]:
+    from app.api.v1.dhcp._audit import write_audit  # noqa: PLC0415
+    from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
+    from app.models.dhcp import DHCPMACBlock  # noqa: PLC0415
+
+    enforce_operation_permission(user, _OPERATIONS["block_mac"])
+    groups = await _block_target_groups(db, args)
+    if not groups:
+        raise ValueError("No DHCP server groups to block in")
+    already = {
+        r[0]
+        for r in (
+            await db.execute(
+                select(DHCPMACBlock.group_id).where(
+                    DHCPMACBlock.mac_address == args.mac_address,
+                    DHCPMACBlock.group_id.in_(groups),
+                )
+            )
+        ).all()
+    }
+    blocked: list[str] = []
+    for gid in groups:
+        if gid in already:
+            continue
+        db.add(
+            DHCPMACBlock(
+                group_id=gid,
+                mac_address=args.mac_address,
+                reason=args.reason,
+                description=args.description or "Blocked from new-device review (#459)",
+                enabled=True,
+                created_by_user_id=user.id,
+                updated_by_user_id=user.id,
+            )
+        )
+        collect_wake(dhcp_group_channel(gid))
+        blocked.append(str(gid))
+    if blocked:
+        write_audit(
+            db,
+            user=user,
+            action="create",
+            resource_type="dhcp_mac_block",
+            resource_id=args.mac_address,
+            resource_display=args.mac_address,
+            new_value={
+                "mac_address": args.mac_address,
+                "blocked_groups": len(blocked),
+                "via": "ai_proposal",
+            },
+        )
+    await db.commit()
+    return {"mac_address": args.mac_address, "blocked_group_ids": blocked}
+
+
+register(
+    Operation(
+        name="block_mac",
+        description=(
+            "Block a MAC from getting a DHCP lease (creates a dhcp_mac_block in "
+            "one or every server group) — arpwatch with teeth. Always route via "
+            "propose_block_mac."
+        ),
+        args_model=BlockMacArgs,
+        preview=_preview_block_mac,
+        apply=_apply_block_mac,
+        category="dhcp",
+        required_permission=("write", "dhcp_mac_block"),
     )
 )

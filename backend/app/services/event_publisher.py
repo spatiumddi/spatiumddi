@@ -211,6 +211,14 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     # wire a dedicated alert / SIEM rule on. Special-map-only (like
     # change_request): no _RESOURCE_NAMESPACE entry for ``approval_control``.
     ("approvals.break_glass", "approval_control"): "governance.break_glass",
+    # New-device watch (issue #459). A never-before-seen MAC was observed
+    # (``device.first_seen``) or an operator dismissed one (``device.acknowledged``).
+    # Special-map-only (like change_request): ``ip_mac_observation`` has no
+    # _RESOURCE_NAMESPACE entry, so these names are authoritative here AND
+    # unioned into the event-type catalog. first_seen is the real-time
+    # "something new joined" signal external automation/SIEM subscribes to.
+    ("first_seen", "ip_mac_observation"): "device.first_seen",
+    ("acknowledged", "ip_mac_observation"): "device.acknowledged",
 }
 
 

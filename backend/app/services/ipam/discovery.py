@@ -46,6 +46,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPPool, DHCPScope
 from app.models.ipam import IPAddress, Subnet
+from app.services.ipam.new_device import (
+    MacObservationResult,
+    classify_mac,
+    is_locally_administered,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -397,28 +402,63 @@ async def reconcile_subnet(db: AsyncSession, subnet: Subnet, sweep: SweepResult)
 
 
 async def record_mac_observation(
-    db: AsyncSession, ip_id: uuid.UUID, mac_address: str | None
-) -> None:
+    db: AsyncSession,
+    ip_id: uuid.UUID,
+    mac_address: str | None,
+    *,
+    source: str = "sweep",
+) -> MacObservationResult | None:
     """Upsert an observed ``(ip_id, mac)`` into ``ip_mac_history`` (issue #369).
 
-    Called from the ping/ARP sweep + SNMP ARP cross-reference for EVERY MAC
-    observed on the wire — not just when the IPAddress row's canonical
-    ``mac_address`` is empty. That's what lets the ``unknown_mac_in_static_range``
-    hygiene alert compare the operator-recorded MAC against what's actually
-    answering: a differing recent history row is a squat. Mirrors the router's
-    ``_record_mac_history`` upsert (kept separate to avoid a router→service
-    import cycle). No-op on a missing MAC.
+    Called from the ping/ARP sweep + SNMP ARP cross-reference + DHCP lease
+    events + L2 sniff for EVERY MAC observed on the wire — not just when the
+    IPAddress row's canonical ``mac_address`` is empty. That's what lets the
+    ``unknown_mac_in_static_range`` hygiene alert compare the operator-recorded
+    MAC against what's actually answering: a differing recent history row is a
+    squat.
+
+    New-device watch (issue #459): on the *first-ever* sighting of a ``(ip, mac)``
+    pair the row is stamped with a :func:`~app.services.ipam.new_device.classify_mac`
+    classification (``new`` / ``known``), the ``source`` path, and an
+    ``is_randomized`` flag. Subsequent sightings only bump ``last_seen`` + the
+    ``source`` and never downgrade an operator-set ``acknowledged`` / ``known``
+    classification. Returns a :class:`MacObservationResult` describing the
+    outcome (so the caller can fire a ``device.first_seen`` event), or ``None``
+    on a missing MAC.
+
+    ``source`` is one of ``sweep`` / ``snmp`` / ``dhcp_lease`` / ``l2_sniff``.
     """
     if not mac_address:
-        return
-    await db.execute(
-        text("""
-            INSERT INTO ip_mac_history (id, ip_address_id, mac_address, first_seen, last_seen)
-            VALUES (gen_random_uuid(), :ip_id, CAST(:mac AS macaddr), now(), now())
-            ON CONFLICT (ip_address_id, mac_address)
-            DO UPDATE SET last_seen = now()
-            """),
-        {"ip_id": str(ip_id), "mac": mac_address},
+        return None
+
+    classification = await classify_mac(db, mac_address)
+    is_randomized = is_locally_administered(mac_address)
+    row = (
+        await db.execute(
+            text("""
+                INSERT INTO ip_mac_history
+                    (id, ip_address_id, mac_address, first_seen, last_seen,
+                     classification, source, is_randomized)
+                VALUES (gen_random_uuid(), :ip_id, CAST(:mac AS macaddr), now(), now(),
+                        :classification, :source, :is_randomized)
+                ON CONFLICT (ip_address_id, mac_address)
+                DO UPDATE SET last_seen = now(), source = :source
+                RETURNING (xmax = 0) AS inserted, classification
+                """),
+            {
+                "ip_id": str(ip_id),
+                "mac": mac_address,
+                "classification": classification,
+                "source": source,
+                "is_randomized": is_randomized,
+            },
+        )
+    ).one()
+    return MacObservationResult(
+        mac_address=mac_address,
+        classification=row.classification,
+        is_new_row=bool(row.inserted),
+        is_randomized=is_randomized,
     )
 
 
