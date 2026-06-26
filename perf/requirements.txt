@@ -1,0 +1,19 @@
+# SpatiumDDI performance test suite — load-gen / monitoring box dependencies.
+# Install on the OFF-BOX load-gen + monitoring VMs (never on the appliance under test).
+#   python3 -m venv .venv && . .venv/bin/activate && pip install -r perf/requirements.txt
+#
+# System packages (NOT pip — install via apt on the load-gen box):
+#   kea         -> /usr/sbin/perfdhcp      (raw DHCPv4 ceiling probe, §3.1)
+#   dnsperf     -> dnsperf + resperf       (raw DNS qps ceiling, §4.3)
+#   flamethrower                            (DNS cross-check / cache-buster, §4.3)
+#   tcpdump / nftables                      (egress-watch safety gate, §4.9)
+#   chrony                                  (in-lab NTP client, §4.9)
+
+PyYAML>=6.0            # manifest parsing
+httpx>=0.27            # seeder + war-room native API polling (verify=False to self-signed)
+dnspython>=2.6         # orchestrator per-device DNS streams + propagation dig-probe
+Jinja2>=3.1            # report rendering
+redis>=5.0             # war-room: Celery queue depth (LLEN) + wake-bus
+psycopg[binary]>=3.2   # war-room: direct psql probe (pg_locks / deadlocks / pg_stat_*)
+hdrhistogram>=0.10     # full-fidelity latency percentiles (DHCP ACK / DNS resolve)
+rich>=13.0             # the interactive TUI console (`spddi-perf tui`, §9.3)

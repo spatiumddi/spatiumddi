@@ -471,3 +471,8 @@ appliance-stamp-dev:
 	  echo "APPLIANCE_VERSION=\"$(SPATIUMDDI_VERSION)\""; \
 	} > $$f; \
 	echo "→ Stamped appliance-release: $$(cat $$f | grep APPLIANCE_VERSION)"
+
+# ── Performance test suite (perf/) ───────────────────────────────────────────────
+# Off-box load + soak harness. Targets live in perf/Makefile.inc (perf-*).
+# `make perf-help` for the list. See docs/PERFORMANCE_TESTING.md.
+-include perf/Makefile.inc

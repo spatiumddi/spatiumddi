@@ -1,0 +1,23 @@
+# Grafana dashboard provider for the perf war-room (§6.4).
+# Mount at /etc/grafana/provisioning/dashboards/dashboards.yaml. Grafana scans
+# the path below on boot + every updateIntervalSeconds and auto-loads any
+# dashboard JSON there — so warroom.json is live the moment Grafana starts, no
+# manual import.
+#
+# The docker-compose in ../README.md mounts grafana/dashboards/ at
+# /var/lib/grafana/dashboards.
+
+apiVersion: 1
+
+providers:
+  - name: spddi-perf-warroom
+    orgId: 1
+    folder: "SpatiumDDI Perf"
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
