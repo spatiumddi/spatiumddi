@@ -365,7 +365,7 @@ suggestion, free-space treemap.
 
 #### Workflow & RBAC
 
-- ⬜ [**Approval workflows for risky ops**](https://github.com/spatiumddi/spatiumddi/issues/62)
+- 🟡 [**Approval workflows for risky ops**](https://github.com/spatiumddi/spatiumddi/issues/62) — **P1 shipped 2026.06.25-1** (two-person rule over the 6 delete handlers behind the default-off `governance.approvals` module + a self-governance lock; lifecycle API + Change Requests admin page + 4 MCP tools + Change Approver builtin role). P2 (bulk ops / factory reset / import gating + approval notifications) still ⬜.
 - ⬜ [**Resource locking**](https://github.com/spatiumddi/spatiumddi/issues/63)
 - ⬜ [**Per-resource ACLs**](https://github.com/spatiumddi/spatiumddi/issues/64)
 - ⬜ [**Time-bound permissions**](https://github.com/spatiumddi/spatiumddi/issues/65)
