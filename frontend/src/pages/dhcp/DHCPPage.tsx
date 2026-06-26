@@ -47,6 +47,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { HeaderButton } from "@/components/ui/header-button";
+import { Pager } from "@/components/ui/pager";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
@@ -1717,28 +1718,46 @@ function LeasesTab({ server }: { server: DHCPServer }) {
   const [state, setState] = useState<string>("");
   const [subnetId, setSubnetId] = useState<string>("");
   const [deviceClass, setDeviceClass] = useState<string>("");
-  const limit = 500;
+  const [search, setSearch] = useState<string>("");
+  const [page, setPage] = useState(1);
+  const pageSize = 100;
 
   const { data: subnets = [] } = useQuery({
     queryKey: ["subnets"],
     queryFn: () => ipamApi.listSubnets(),
   });
 
+  // Server-side pagination + search (#455). `search` (ip / mac / hostname) and
+  // `state` filter on the server so a busy server's older leases are reachable
+  // past page 1; subnet + device-class stay client-side refinements over the
+  // current page.
+  const params = useMemo(() => {
+    const p: {
+      page: number;
+      page_size: number;
+      search?: string;
+      state?: string;
+    } = { page, page_size: pageSize };
+    if (search.trim()) p.search = search.trim();
+    if (state) p.state = state;
+    return p;
+  }, [page, search, state]);
+
   const { data, isFetching, refetch } = useQuery({
-    queryKey: ["dhcp-leases", server.id, limit],
-    queryFn: () => dhcpApi.getLeases(server.id, { limit }),
+    queryKey: ["dhcp-leases", server.id, params],
+    queryFn: () => dhcpApi.getLeases(server.id, params),
   });
 
-  const allLeases = data ?? [];
-  // Distinct fingerbank device classes present in the current result set —
-  // drives the device-class filter (#373), same client-side style as state/subnet.
+  const allLeases = data?.items ?? [];
+  const total = data?.total ?? 0;
+  // Distinct fingerbank device classes on the current page — drives the
+  // device-class refinement (#373), client-side over the visible page.
   const deviceClasses = Array.from(
     new Set(
       allLeases.map((l) => l.device_class).filter((c): c is string => !!c),
     ),
   ).sort();
   const leases = allLeases.filter((l) => {
-    if (state && l.state !== state) return false;
     if (subnetId && l.scope_id !== subnetId) return false;
     if (deviceClass && l.device_class !== deviceClass) return false;
     return true;
@@ -1747,10 +1766,22 @@ function LeasesTab({ server }: { server: DHCPServer }) {
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-3">
+        <input
+          className="rounded-md border bg-background px-2 py-1 text-xs"
+          placeholder="Search ip / mac / hostname…"
+          value={search}
+          onChange={(e) => {
+            setSearch(e.target.value);
+            setPage(1);
+          }}
+        />
         <select
           className="rounded-md border bg-background px-2 py-1 text-xs"
           value={state}
-          onChange={(e) => setState(e.target.value)}
+          onChange={(e) => {
+            setState(e.target.value);
+            setPage(1);
+          }}
         >
           <option value="">All states</option>
           <option value="active">Active</option>
@@ -1923,11 +1954,19 @@ function LeasesTab({ server }: { server: DHCPServer }) {
           </tbody>
         </table>
       </div>
-      {allLeases.length >= limit && (
-        <p className="text-xs text-muted-foreground">
-          Showing first {limit} leases — narrow filters to refine.
-        </p>
-      )}
+      <div className="flex items-center justify-between text-xs text-muted-foreground">
+        <span>
+          {total.toLocaleString()} lease{total === 1 ? "" : "s"}
+          {(subnetId || deviceClass) && " (page filtered)"}
+          {isFetching && " · loading…"}
+        </span>
+        <Pager
+          page={page}
+          total={total}
+          pageSize={pageSize}
+          onChange={setPage}
+        />
+      </div>
     </div>
   );
 }

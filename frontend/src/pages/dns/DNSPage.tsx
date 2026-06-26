@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
@@ -56,6 +56,7 @@ import {
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { Pager } from "@/components/ui/pager";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import {
@@ -2774,6 +2775,13 @@ function ZoneDetailView({
   const [showImport, setShowImport] = useState(false);
   const [showRecFilters, setShowRecFilters] = useState(false);
   const [recFilter, setRecFilter] = useState({ name: "", type: "", value: "" });
+  // Server-side pagination + search (#455): a large zone (20k+ records) no
+  // longer ships its whole record set per poll. `recordSearch` matches
+  // name / fqdn / value / type on the server; the per-column recFilter below
+  // stays a client-side refinement over the current page.
+  const [recordSearch, setRecordSearch] = useState("");
+  const [recordPage, setRecordPage] = useState(1);
+  const recordPageSize = 100;
   // Search-landing highlight — ``highlightRecordId`` is passed down
   // by DNSPage, which captured it from ``location.state`` before
   // ``setSelection`` fired its ``setSearchParams(..., { replace: true })``
@@ -2835,10 +2843,20 @@ function ZoneDetailView({
     queryKey: ["dns-views", group.id],
     queryFn: () => dnsApi.listViews(group.id),
   });
-  const { data: records = [], isFetching } = useQuery({
-    queryKey: ["dns-records", zone.id],
-    queryFn: () => dnsApi.listRecords(group.id, zone.id),
+  const recordParams = useMemo(() => {
+    const p: { page: number; page_size: number; search?: string } = {
+      page: recordPage,
+      page_size: recordPageSize,
+    };
+    if (recordSearch.trim()) p.search = recordSearch.trim();
+    return p;
+  }, [recordPage, recordSearch]);
+  const { data: recordsPage, isFetching } = useQuery({
+    queryKey: ["dns-records", zone.id, recordParams],
+    queryFn: () => dnsApi.listRecords(group.id, zone.id, recordParams),
   });
+  const records = recordsPage?.items ?? [];
+  const recordsTotal = recordsPage?.total ?? 0;
 
   // TLS cert targets linked to this zone (#118). Powers the Certs
   // sub-tab + the per-record state pill on A/AAAA rows. Gated on the
@@ -3218,7 +3236,7 @@ function ZoneDetailView({
                 : "border-transparent text-muted-foreground hover:text-foreground")
             }
           >
-            Records ({records.length})
+            Records ({recordsTotal.toLocaleString()})
           </button>
           <button
             type="button"
@@ -3313,6 +3331,23 @@ function ZoneDetailView({
       {/* Records table */}
       {!isForward && zoneView === "records" && (
         <div className="flex-1 overflow-auto">
+          <div className="flex items-center gap-2 px-5 py-2">
+            <input
+              className="w-72 rounded-md border bg-background px-2 py-1 text-xs"
+              placeholder="Search name / value / type…"
+              value={recordSearch}
+              onChange={(e) => {
+                setRecordSearch(e.target.value);
+                setRecordPage(1);
+              }}
+            />
+            <span className="text-xs text-muted-foreground">
+              {recordsTotal.toLocaleString()}{" "}
+              {recordsTotal === 1 ? "record" : "records"}
+              {hasRecFilter && " · page filtered"}
+              {isFetching && " · loading…"}
+            </span>
+          </div>
           {isFetching && records.length === 0 && (
             <p className="px-5 py-4 text-sm text-muted-foreground">Loading…</p>
           )}
@@ -3662,6 +3697,14 @@ function ZoneDetailView({
               </table>
             </div>
           )}
+          <div className="px-5 py-2">
+            <Pager
+              page={recordPage}
+              total={recordsTotal}
+              pageSize={recordPageSize}
+              onChange={setRecordPage}
+            />
+          </div>
         </div>
       )}
 
@@ -5734,10 +5777,26 @@ function RecordsTab({
   onSelectZone: (z: DNSZone) => void;
 }) {
   const qc = useQueryClient();
-  const { data: records = [], isLoading } = useQuery({
-    queryKey: ["dns-group-records", group.id],
-    queryFn: () => dnsApi.listGroupRecords(group.id),
+  // Server-side pagination + search (#455). `groupRecordSearch` matches
+  // name / fqdn / value / type / zone on the server; the per-column filters
+  // below stay client-side refinements over the current page.
+  const [groupRecordSearch, setGroupRecordSearch] = useState("");
+  const [groupRecordPage, setGroupRecordPage] = useState(1);
+  const groupRecordPageSize = 100;
+  const groupRecordParams = useMemo(() => {
+    const p: { page: number; page_size: number; search?: string } = {
+      page: groupRecordPage,
+      page_size: groupRecordPageSize,
+    };
+    if (groupRecordSearch.trim()) p.search = groupRecordSearch.trim();
+    return p;
+  }, [groupRecordPage, groupRecordSearch]);
+  const { data: groupRecordsPage, isLoading } = useQuery({
+    queryKey: ["dns-group-records", group.id, groupRecordParams],
+    queryFn: () => dnsApi.listGroupRecords(group.id, groupRecordParams),
   });
+  const records = groupRecordsPage?.items ?? [];
+  const recordsTotal = groupRecordsPage?.total ?? 0;
   const { data: zones = [] } = useQuery({
     queryKey: ["dns-zones", group.id],
     queryFn: () => dnsApi.listZones(group.id),
@@ -5977,12 +6036,23 @@ function RecordsTab({
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <p className="text-xs text-muted-foreground">
-          {filtered.length.toLocaleString()} of{" "}
-          {records.length.toLocaleString()}{" "}
-          {records.length === 1 ? "record" : "records"}
-        </p>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <input
+            className="w-72 rounded-md border bg-background px-2 py-1 text-xs"
+            placeholder="Search name / value / type / zone…"
+            value={groupRecordSearch}
+            onChange={(e) => {
+              setGroupRecordSearch(e.target.value);
+              setGroupRecordPage(1);
+            }}
+          />
+          <p className="text-xs text-muted-foreground">
+            {filtered.length.toLocaleString()} of{" "}
+            {recordsTotal.toLocaleString()}{" "}
+            {recordsTotal === 1 ? "record" : "records"}
+          </p>
+        </div>
         {hasActiveFilter && (
           <button
             onClick={clearFilters}
@@ -6052,7 +6122,7 @@ function RecordsTab({
                   colSpan={8}
                   className="px-4 py-8 text-center text-sm text-muted-foreground"
                 >
-                  {records.length === 0
+                  {recordsTotal === 0
                     ? "No records in this group yet."
                     : "No records match the active filters."}
                 </td>
@@ -6146,6 +6216,12 @@ function RecordsTab({
           </tbody>
         </table>
       </div>
+      <Pager
+        page={groupRecordPage}
+        total={recordsTotal}
+        pageSize={groupRecordPageSize}
+        onChange={setGroupRecordPage}
+      />
 
       {editing && (
         <RecordModal
