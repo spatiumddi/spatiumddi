@@ -129,7 +129,13 @@ def launch(name: str, *, run_id: str, run_root: str, manifest: str,
         _log.warning("worker %s not launched — script not found at %s", name, spec.script)
         return None
     argv = _argv(spec, run_id=run_id, run_root=run_root, manifest=manifest, **extra)
-    out = open(logfile, "a") if logfile else None
-    proc = subprocess.Popen(argv, env=child_env(), stdout=out, stderr=subprocess.STDOUT)
+    # Open the logfile inside a context manager so the parent-side fd is always
+    # closed (even if Popen raises). The child keeps its own duplicated descriptor
+    # for the stdout/stderr redirect, so functionality is unchanged.
+    if logfile:
+        with open(logfile, "a") as out:
+            proc = subprocess.Popen(argv, env=child_env(), stdout=out, stderr=subprocess.STDOUT)
+    else:
+        proc = subprocess.Popen(argv, env=child_env(), stdout=None, stderr=subprocess.STDOUT)
     _log.info("launched worker %s pid=%s", name, proc.pid)
     return proc

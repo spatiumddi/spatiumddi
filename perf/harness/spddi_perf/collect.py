@@ -1791,15 +1791,17 @@ def render_html(markdown_text: str) -> str:
     out: list[str] = [
         "<!doctype html><html><head><meta charset='utf-8'>",
         "<title>SpatiumDDI perf report</title>",
-        "<style>body{font:14px/1.5 system-ui,sans-serif;max-width:1100px;margin:2rem auto;"
-        "padding:0 1rem;color:#1a1a1a}h1,h2,h3{line-height:1.2}code,pre{font-family:"
-        "ui-monospace,monospace}pre{background:#f5f5f5;padding:1rem;overflow:auto;"
-        "border-radius:6px}table{border-collapse:collapse;width:100%;margin:1rem 0}"
-        "th,td{border:1px solid #ddd;padding:6px 10px;text-align:left;font-size:13px}"
-        "th{background:#fafafa}blockquote{border-left:4px solid #f0ad4e;margin:1rem 0;"
-        "padding:.5rem 1rem;background:#fff8e1}@media(prefers-color-scheme:dark){"
-        "body{background:#0d1117;color:#c9d1d9}pre,th{background:#161b22}"
-        "th,td{border-color:#30363d}blockquote{background:#1c1810}}</style></head><body>",
+        (
+            "<style>body{font:14px/1.5 system-ui,sans-serif;max-width:1100px;margin:2rem auto;"
+            + "padding:0 1rem;color:#1a1a1a}h1,h2,h3{line-height:1.2}code,pre{font-family:"
+            + "ui-monospace,monospace}pre{background:#f5f5f5;padding:1rem;overflow:auto;"
+            + "border-radius:6px}table{border-collapse:collapse;width:100%;margin:1rem 0}"
+            + "th,td{border:1px solid #ddd;padding:6px 10px;text-align:left;font-size:13px}"
+            + "th{background:#fafafa}blockquote{border-left:4px solid #f0ad4e;margin:1rem 0;"
+            + "padding:.5rem 1rem;background:#fff8e1}@media(prefers-color-scheme:dark){"
+            + "body{background:#0d1117;color:#c9d1d9}pre,th{background:#161b22}"
+            + "th,td{border-color:#30363d}blockquote{background:#1c1810}}</style></head><body>"
+        ),
     ]
     lines = markdown_text.split("\n")
     i = 0

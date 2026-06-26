@@ -224,8 +224,10 @@ class ApiMutationStream:
             if r.status_code == 200:
                 self._editable_ips = [
                     row["id"] for row in r.json() if not row.get("auto_from_lease")][:500]
-        except Exception:
-            pass
+        except Exception as exc:
+            # Non-fatal: a failed refresh just reuses the previous editable pool
+            # next tick. Log at debug so it's diagnosable without adding noise.
+            self.log.debug("editable-IP refresh failed: %s", exc)
 
     async def _m_bulk_allocate(self, client) -> None:
         # Stamp a small contiguous range (cap 1024/call, router.py:7155). Roll a /24
@@ -327,7 +329,9 @@ class ApiMutationStream:
             try:
                 loop.add_signal_handler(sig, self._stop.set)
             except (NotImplementedError, RuntimeError):
-                pass
+                # add_signal_handler isn't available on every platform / non-main
+                # thread; shutdown still flows through the _stop event via other paths.
+                self.log.debug("signal handler unavailable for %s", sig)
         async with httpx.AsyncClient(
                 verify=self.verify, timeout=15.0, headers=self._headers()) as client:
             await self._discover_targets(client)
@@ -391,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         asyncio.run(ApiMutationStream(args).run())
     except KeyboardInterrupt:
+        # Intentional: swallow Ctrl-C for a clean CLI exit without a traceback.
         pass
     return 0
 

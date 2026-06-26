@@ -365,6 +365,10 @@ class Orchestrator:
         # Relay topology: bind to the relay/server port (67) so Kea unicasts replies
         # to giaddr:67 back to us. Broadcast topology: bind to the client port (68).
         bind_port = 67 if self.relay else 68
+        # 0.0.0.0 is required, not a misconfiguration: a simulated client has no
+        # lease yet, so it must listen on the wildcard address to receive the
+        # broadcast OFFER/ACK. SO_BINDTODEVICE above already pins the socket to the
+        # appliance-facing NIC on multi-homed hosts, so this is not "all interfaces".
         try:
             s.bind(("0.0.0.0", bind_port))
         except PermissionError:
@@ -857,6 +861,8 @@ class Orchestrator:
                             if row.get("address") == ip:
                                 return time.monotonic()
                 except httpx.HTTPError:
+                    # Transient API/network errors are expected while the IPAM mirror
+                    # propagates; fall through to the sleep below and retry until deadline.
                     pass
                 await asyncio.sleep(0.5)
         return None
@@ -876,6 +882,8 @@ class Orchestrator:
                         if str(item) == ip:
                             return time.monotonic()
             except Exception:
+                # Transient DNS errors (NXDOMAIN/timeout) are expected during
+                # propagation; fall through to the sleep below and retry until deadline.
                 pass
             await asyncio.sleep(0.25)
         return None
@@ -960,7 +968,9 @@ class Orchestrator:
             try:
                 loop.add_signal_handler(sig, self._stop.set)
             except (NotImplementedError, RuntimeError):
-                pass
+                # add_signal_handler isn't available on every platform / loop;
+                # the _stop event still drives shutdown via other paths.
+                self.log.debug("signal handler unavailable for %s", sig)
         tasks = [
             asyncio.ensure_future(self._recv_loop()),
             asyncio.ensure_future(self._scheduler_loop()),
@@ -995,8 +1005,9 @@ class Orchestrator:
         if self._sock:
             try:
                 self._sock.close()
-            except OSError:
-                pass
+            except OSError as exc:
+                # Best-effort close during teardown; a socket error here is non-fatal.
+                self.log.debug("socket close failed during finalize: %s", exc)
         self.log.info("orchestrator shard stopped",
                       extra={"fields": {"event": "stop", "shard": self.shard,
                                         **summary["counters"]}})
@@ -1020,6 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         asyncio.run(orch.run())
     except KeyboardInterrupt:
+        # Intentional: swallow Ctrl-C for a clean shutdown without a traceback.
         pass
     return 0
 
