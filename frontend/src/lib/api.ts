@@ -4784,6 +4784,17 @@ export interface TSIGKeyUpdate {
   notes?: string;
 }
 
+// Generic server-side pagination envelope (#455). Matches the backend
+// `app.api.pagination.Page[T]` shape; adopted by list endpoints that can grow
+// unbounded (DNS records, DHCP leases, …) so the UI pages instead of pulling
+// the whole table.
+export interface Page<T> {
+  items: T[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
 export interface DNSRecord {
   id: string;
   zone_id: string;
@@ -5213,14 +5224,32 @@ export const dnsApi = {
       })
       .then((r) => r.data),
 
-  // Records
-  listGroupRecords: (groupId: string) =>
+  // Records — server-side paginated (#455)
+  listGroupRecords: (
+    groupId: string,
+    params?: {
+      search?: string;
+      record_type?: string;
+      page?: number;
+      page_size?: number;
+    },
+  ) =>
     api
-      .get<DNSGroupRecord[]>(`/dns/groups/${groupId}/records`)
+      .get<Page<DNSGroupRecord>>(`/dns/groups/${groupId}/records`, { params })
       .then((r) => r.data),
-  listRecords: (groupId: string, zoneId: string, params?: { tag?: string[] }) =>
+  listRecords: (
+    groupId: string,
+    zoneId: string,
+    params?: {
+      tag?: string[];
+      search?: string;
+      record_type?: string;
+      page?: number;
+      page_size?: number;
+    },
+  ) =>
     api
-      .get<DNSRecord[]>(`/dns/groups/${groupId}/zones/${zoneId}/records`, {
+      .get<Page<DNSRecord>>(`/dns/groups/${groupId}/zones/${zoneId}/records`, {
         params,
       })
       .then((r) => r.data),
@@ -6174,6 +6203,9 @@ export interface DHCPLeaseSyncResult {
   mac_blocks_added?: number;
   mac_blocks_removed?: number;
   errors: string[];
+  // Present on the agent-based (Kea) no-op path: explains that leases stream
+  // live and config converges via the agent, so there was nothing to pull.
+  note?: string | null;
 }
 
 export interface DHCPOption {
@@ -6485,9 +6517,18 @@ export const dhcpApi = {
       .then((r) => r.data),
   resumeServer: (id: string) =>
     api.post<DHCPServer>(`/dhcp/servers/${id}/resume`).then((r) => r.data),
-  getLeases: (id: string, params?: { limit?: number }) =>
+  getLeases: (
+    id: string,
+    params?: {
+      search?: string;
+      state?: string;
+      device_class?: string;
+      page?: number;
+      page_size?: number;
+    },
+  ) =>
     api
-      .get<DHCPLease[]>(`/dhcp/servers/${id}/leases`, { params })
+      .get<Page<DHCPLease>>(`/dhcp/servers/${id}/leases`, { params })
       .then((r) => r.data),
 
   // Per-server detail (powers the DHCP ServerDetailModal — issue #181)

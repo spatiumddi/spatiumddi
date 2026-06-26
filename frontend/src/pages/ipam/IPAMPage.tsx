@@ -7128,7 +7128,12 @@ function DhcpSyncSummaryBody({
                 <span className="text-xs text-destructive">Failed</span>
               )}
             </div>
-            {s.status === "done" && (
+            {s.status === "done" && s.result.note && (
+              <p className="mt-2 rounded border border-sky-500/40 bg-sky-500/10 p-2 text-[11px] text-sky-700 dark:text-sky-300">
+                {s.result.note}
+              </p>
+            )}
+            {s.status === "done" && !s.result.note && (
               <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
                 <CounterRow
                   label="Active leases"

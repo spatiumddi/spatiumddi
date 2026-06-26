@@ -14,10 +14,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Page, paginate
 from app.core.agent_wake import collect_wake, dns_group_channel, dns_server_channel
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.permissions import (
@@ -4191,19 +4192,31 @@ class GroupRecordResponse(BaseModel):
 
 @router.get(
     "/groups/{group_id}/records",
-    response_model=list[GroupRecordResponse],
+    response_model=Page[GroupRecordResponse],
 )
 async def list_group_records(
-    group_id: uuid.UUID, db: DB, _: CurrentUser
-) -> list[GroupRecordResponse]:
-    """Every record across every zone in the group, with zone + view context."""
+    group_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    search: str | None = Query(
+        None, description="substring over name / fqdn / value / type / zone"
+    ),
+    record_type: str | None = Query(None, description="exact record type filter (A, MX, …)"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+) -> Page[GroupRecordResponse]:
+    """Every record across every zone in the group, with zone + view context,
+    server-side paginated (#455). ``search`` matches name / fqdn / value / type
+    / zone name; ``record_type`` is an exact filter for the type dropdown.
+    """
     await _require_group(group_id, db)
 
     zones = list(
         (await db.execute(select(DNSZone).where(DNSZone.group_id == group_id))).scalars().all()
     )
+    empty: Page[GroupRecordResponse] = Page(items=[], total=0, page=page, page_size=page_size)
     if not zones:
-        return []
+        return empty
     zone_by_id = {z.id: z for z in zones}
 
     views = list(
@@ -4211,17 +4224,27 @@ async def list_group_records(
     )
     view_name_by_id = {v.id: v.name for v in views}
 
-    records = list(
-        (
-            await db.execute(
-                select(DNSRecord)
-                .where(DNSRecord.zone_id.in_(list(zone_by_id.keys())))
-                .order_by(DNSRecord.fqdn, DNSRecord.record_type)
-            )
-        )
-        .scalars()
-        .all()
-    )
+    stmt = select(DNSRecord).where(DNSRecord.zone_id.in_(list(zone_by_id.keys())))
+    if record_type:
+        stmt = stmt.where(func.upper(DNSRecord.record_type) == record_type.upper())
+    if search and search.strip():
+        term = search.strip()
+        like = f"%{term}%"
+        # Zone names live on the (few) DNSZone rows already in memory — resolve
+        # the matching zone ids here so the record query stays a single filter.
+        zone_hits = [zid for zid, z in zone_by_id.items() if term.lower() in z.name.lower()]
+        conds = [
+            DNSRecord.name.ilike(like),
+            DNSRecord.fqdn.ilike(like),
+            DNSRecord.value.ilike(like),
+            DNSRecord.record_type.ilike(like),
+        ]
+        if zone_hits:
+            conds.append(DNSRecord.zone_id.in_(zone_hits))
+        stmt = stmt.where(or_(*conds))
+    stmt = stmt.order_by(DNSRecord.fqdn, DNSRecord.record_type)
+    records, total = await paginate(db, stmt, page=page, page_size=page_size)
+
     out: list[GroupRecordResponse] = []
     for rec in records:
         zone = zone_by_id.get(rec.zone_id)
@@ -4249,27 +4272,55 @@ async def list_group_records(
                 modified_at=rec.modified_at,
             )
         )
-    return out
+    return Page[GroupRecordResponse](items=out, total=total, page=page, page_size=page_size)
 
 
-@router.get("/groups/{group_id}/zones/{zone_id}/records", response_model=list[RecordResponse])
+@router.get(
+    "/groups/{group_id}/zones/{zone_id}/records",
+    response_model=Page[RecordResponse],
+)
 async def list_records(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
     db: DB,
     _: CurrentUser,
     tag: list[str] = Query(default_factory=list),
-) -> list[DNSRecord]:
+    search: str | None = Query(None, description="substring over name / fqdn / value / type"),
+    record_type: str | None = Query(None, description="exact record type filter (A, MX, …)"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+) -> Page[RecordResponse]:
+    """Records in a zone, server-side paginated (#455).
+
+    A large zone (the perf seed reaches 20k+ records) used to return its whole
+    record set on every poll. ``search`` matches name / fqdn / value / type so
+    a row is findable without paging; ``record_type`` is an exact filter for
+    the type dropdown.
+    """
     await _require_zone(group_id, zone_id, db)
     _enforce_zone_token_scope(_, zone_id)
-    stmt = (
-        select(DNSRecord)
-        .where(DNSRecord.zone_id == zone_id)
-        .order_by(DNSRecord.name, DNSRecord.record_type)
-    )
+    stmt = select(DNSRecord).where(DNSRecord.zone_id == zone_id)
+    if record_type:
+        stmt = stmt.where(func.upper(DNSRecord.record_type) == record_type.upper())
+    if search and search.strip():
+        like = f"%{search.strip()}%"
+        stmt = stmt.where(
+            or_(
+                DNSRecord.name.ilike(like),
+                DNSRecord.fqdn.ilike(like),
+                DNSRecord.value.ilike(like),
+                DNSRecord.record_type.ilike(like),
+            )
+        )
     stmt = apply_tag_filter(stmt, DNSRecord.tags, tag)
-    result = await db.execute(stmt)
-    return list(result.scalars().all())
+    stmt = stmt.order_by(DNSRecord.name, DNSRecord.record_type)
+    rows, total = await paginate(db, stmt, page=page, page_size=page_size)
+    return Page[RecordResponse](
+        items=[RecordResponse.model_validate(r) for r in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.post(

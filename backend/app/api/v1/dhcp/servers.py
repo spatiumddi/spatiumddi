@@ -6,13 +6,20 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, field_validator
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, cast, func, or_, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Page, paginate
 from app.api.v1.dhcp._audit import write_audit
-from app.core.agent_wake import collect_wake, dhcp_group_channel, dhcp_server_channel
+from app.core.agent_wake import (
+    collect_wake,
+    dhcp_group_channel,
+    dhcp_server_channel,
+    dhcp_wake_channels,
+    publish_wake,
+)
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
 from app.drivers.dhcp import is_agentless, is_read_only
@@ -284,6 +291,10 @@ class SyncLeasesResponse(BaseModel):
     mac_blocks_added: int = 0
     mac_blocks_removed: int = 0
     errors: list[str]
+    # Set on the agent-based no-op path (Kea): a human-readable explanation
+    # that there was nothing to pull and the agent was nudged to re-poll its
+    # config. ``None`` for the normal agentless lease-pull path.
+    note: str | None = None
 
 
 @router.get("", response_model=list[ServerResponse])
@@ -583,9 +594,29 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
     if s is None:
         raise HTTPException(status_code=404, detail="Server not found")
     if not is_agentless(s.driver):
-        raise HTTPException(
-            status_code=400,
-            detail=f"driver {s.driver!r} is agent-based; leases arrive via the agent",
+        # Agent-based drivers (Kea) stream lease events continuously and pick
+        # up scope/config changes through the ConfigBundle long-poll, so there
+        # is nothing to *pull*. Returning 400 here made the IPAM "Sync → DHCP"
+        # action look broken for operators whose subnet is backed by a Kea
+        # appliance (#453) — the modal fans this endpoint out to every server
+        # behind the subnet, agent-based ones included. Instead, nudge the
+        # agent to re-poll its config now so the subnet/scope definition
+        # converges immediately, and return a no-op result with an explanatory
+        # note rather than an error.
+        await publish_wake(*dhcp_wake_channels(s))
+        return SyncLeasesResponse(
+            server_leases=0,
+            imported=0,
+            refreshed=0,
+            ipam_created=0,
+            ipam_refreshed=0,
+            out_of_scope=0,
+            errors=[],
+            note=(
+                f"{s.driver} is agent-based: leases stream live from the agent and the "
+                "scope/subnet definition converges automatically via the agent's config "
+                "poll. Nudged the agent to re-poll now."
+            ),
         )
     result = await pull_leases_from_server(db, s, apply=True)
 
@@ -996,31 +1027,48 @@ async def get_server_rendered_config(
     )
 
 
-@router.get("/{server_id}/leases", response_model=list[LeaseResponse])
+@router.get("/{server_id}/leases", response_model=Page[LeaseResponse])
 async def list_leases(
     server_id: uuid.UUID,
     db: DB,
     _: CurrentUser,
-    limit: int = 500,
+    search: str | None = Query(None, description="substring over ip / mac / hostname"),
+    state: str | None = Query(None, description="exact lease state filter"),
     device_class: str | None = None,
-) -> list[DHCPLease]:
-    """List leases, enriched with OUI vendor + fingerbank device class (#373).
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+) -> Page[LeaseResponse]:
+    """Leases for a server, server-side paginated (#455), enriched with OUI
+    vendor + fingerbank device class (#373).
 
-    ``device_class`` filters server-side to leases whose joined fingerbank
-    classification matches (so the ``limit`` applies to matching rows). When
-    fingerprinting is off / unconfigured the device fields are simply blank.
+    A busy server's older leases used to be unreachable past the most-recent N.
+    ``search`` matches ip / mac / hostname; ``state`` and ``device_class`` are
+    exact filters (the latter joins the fingerprint table so the page lands on
+    matching rows). When fingerprinting is off the device fields are blank.
     """
     s = await db.get(DHCPServer, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="Server not found")
     q = select(DHCPLease).where(DHCPLease.server_id == server_id)
     if device_class:
-        # Inner-join the fingerprint table so the limit lands on matching rows.
+        # Inner-join the fingerprint table so the page lands on matching rows.
         q = q.join(DHCPFingerprint, DHCPFingerprint.mac_address == DHCPLease.mac_address).where(
             DHCPFingerprint.fingerbank_device_class == device_class
         )
-    q = q.order_by(DHCPLease.last_seen_at.desc()).limit(min(limit, 5000))
-    rows = list((await db.execute(q)).scalars().all())
+    if state:
+        q = q.where(DHCPLease.state == state)
+    if search and search.strip():
+        like = f"%{search.strip()}%"
+        # ip_address / mac_address are INET / MACADDR — cast to text for ilike.
+        q = q.where(
+            or_(
+                cast(DHCPLease.ip_address, String).ilike(like),
+                cast(DHCPLease.mac_address, String).ilike(like),
+                DHCPLease.hostname.ilike(like),
+            )
+        )
+    q = q.order_by(DHCPLease.last_seen_at.desc())
+    rows, total = await paginate(db, q, page=page, page_size=page_size)
 
     vendors = await bulk_lookup_vendors(
         db, [str(lease.mac_address) if lease.mac_address else None for lease in rows]
@@ -1048,7 +1096,12 @@ async def list_leases(
             fp.fingerbank_manufacturer if fp else None
         )
         lease.fingerbank_score = fp.fingerbank_score if fp else None  # type: ignore[attr-defined]
-    return rows
+    return Page[LeaseResponse](
+        items=[LeaseResponse.model_validate(lease) for lease in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 # --- Per-server stats (#195) ------------------------------------------------
