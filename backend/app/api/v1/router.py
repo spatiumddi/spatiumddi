@@ -46,6 +46,7 @@ from app.api.v1.logs import logs_router
 from app.api.v1.metrics import router as metrics_router
 from app.api.v1.multicast import router as multicast_router
 from app.api.v1.network import router as network_router
+from app.api.v1.new_devices import router as new_devices_router
 from app.api.v1.nmap import router as nmap_router
 from app.api.v1.opnsense import router as opnsense_router
 from app.api.v1.overlays import router as overlays_router
@@ -251,6 +252,10 @@ api_v1_router.include_router(
     network_router,
     tags=["network"],
     dependencies=[Depends(require_module("network.device"))],
+)
+api_v1_router.include_router(
+    new_devices_router,
+    dependencies=[Depends(require_module("security.new_device_watch"))],
 )
 api_v1_router.include_router(
     nmap_router,

@@ -317,6 +317,63 @@ sweep only refreshes their `last_seen_at`. Subnets larger than a /20
 `stale_minutes` (default 24 h) is the window after which a row's
 `last_seen_at` counts as stale.
 
+### New-device detection — arpwatch-style (issue #459)
+
+Behind the default-**off** `security.new_device_watch` feature module
+(group **Security**), SpatiumDDI alerts the moment a **never-before-seen
+MAC** appears on the network — the classic arpwatch "new station"
+behaviour, for operators who want a real-time heads-up on anything that
+joins.
+
+**One store, not two.** Rather than a parallel sighting table, the
+feature extends the existing `ip_mac_history` observation log (the same
+store that feeds the `unknown_mac_in_static_range` alert above) with a
+classification layer:
+
+| Column | Meaning |
+|---|---|
+| `classification` | `new` (never seen — raises the alert) · `acknowledged` (operator dismissed this `(ip, mac)`) · `known` (allowlisted, or on an allocated/reserved/static IP) |
+| `source` | which path first/last saw it — `sweep` · `snmp` · `dhcp_lease` · `l2_sniff` |
+| `is_randomized` | the MAC's locally-administered (privacy-randomised) bit is set — flagged, and skipped by the default alert so reconnecting phones don't storm |
+
+**Detection sources** (all route through
+`record_mac_observation`, which classifies on first sight):
+
+1. **DHCP leases** — the agent's lease-event stream (zero-effort, the
+   lowest-friction source).
+2. **SNMP ARP/FDB** — the existing device-poll cross-reference
+   (agentless).
+3. **L2 sniff** — an opt-in arpwatch-style ARP/ND sniffer on the DHCP
+   agent (`DHCP_MAC_SIGHTING_ENABLED=1`, needs `cap_add: NET_RAW`),
+   catching devices that never DHCP (static IP, link-local). Ships to
+   `POST /api/v1/dhcp/agents/mac-sightings`.
+
+**Allowlist.** A `mac_allowlist` table of trusted MACs (or **OUI
+prefixes** for VMs/containers — `POST /new-devices/allowlist/virt-defaults`
+seeds the well-known virtualisation OUIs) that never alert and reclassify
+matching sightings to `known`. Keyed on the MAC, so it survives the
+cascade-delete of any IP it was first seen on.
+
+**Alert + events.** The `new_mac_seen` alert rule (seeded disabled) opens
+one `AlertEvent` per `(ip, mac)` sighting classified `new`, auto-resolving
+once acknowledged / allowlisted or aged out (set its `classification` to
+`"all"` to include randomised MACs). Genuinely-new devices also fire a
+real-time `device.first_seen` typed webhook event (and
+`device.acknowledged` on dismissal) on **ingest** — sub-minute, ahead of
+the 60 s alert tick.
+
+**Operator surface.** `GET /new-devices/{summary,sightings,allowlist}` +
+acknowledge / baseline-import / allowlist / block actions
+(`/api/v1/new-devices`, gated on `read`/`write` `ip_address`). The
+**Tools → New Devices** review queue lists sightings with one-click
+**Acknowledge / Add to allowlist / Block** (block creates a
+`DHCPMACBlock` — arpwatch with teeth). Run a **baseline import** when
+arming the feature to mark the existing fleet as `known` so day-one isn't
+a wall of alerts. Operator-Copilot tools: `find_new_devices` /
+`count_new_devices` / `find_mac_allowlist` (read) +
+`propose_acknowledge_device` / `propose_allowlist_mac` /
+`propose_block_mac` (Apply-gated writes).
+
 ### Stale-IP Report (issue #45)
 
 A cross-subnet "address-space hygiene" view that reads the discovery

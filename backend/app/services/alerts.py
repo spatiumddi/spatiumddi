@@ -192,6 +192,16 @@ RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE = "unknown_mac_in_static_range"
 RULE_TYPE_ROGUE_DHCP = "rogue_dhcp"
 _ROGUE_DHCP_RECENCY_DAYS = 1
 
+# New-device (arpwatch) detection — issue #459. Subject = ip_mac_observation
+# (composite ``ip_id:mac``). Fires on ip_mac_history rows classified ``new``
+# (a MAC never seen before, not allowlisted, not on the known fleet) observed
+# within ``threshold_days`` (default 7). Locally-administered (randomised) MACs
+# are excluded by default to avoid a reconnection storm — set the rule's
+# ``classification`` to ``"all"`` to include them. Auto-resolves once the MAC is
+# acknowledged / allowlisted (reclassified) or ages out of the window.
+RULE_TYPE_NEW_MAC_SEEN = "new_mac_seen"
+_NEW_MAC_SEEN_RECENCY_DAYS = 7
+
 # TLS certificate monitoring — issue #118. Subject = tls_cert (one per
 # tls_cert_target). ``tls_cert_expiring`` is a standard escalating-expiry
 # rule (info → warning → critical as not_after nears, like domain_expiring);
@@ -241,6 +251,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_STALE_RESERVATION,
         RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE,
         RULE_TYPE_ROGUE_DHCP,
+        RULE_TYPE_NEW_MAC_SEEN,
         RULE_TYPE_TLS_CERT_EXPIRING,
         RULE_TYPE_TLS_CERT_CHAIN_INVALID,
         RULE_TYPE_TLS_CERT_UNREACHABLE,
@@ -716,6 +727,54 @@ async def _matching_rogue_dhcp_subjects(
             f"misconfigured DHCP server, or acknowledge it if expected."
         )
         matches.append((str(r.id), display, message))
+    return matches
+
+
+async def _matching_new_mac_seen_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """ip_mac_history rows classified ``new`` + first seen within the recency
+    window (issue #459) — a MAC never seen before, not allowlisted, not on the
+    known fleet. One event per ``(ip, mac)`` pair so two MACs on one IP both
+    surface. Auto-resolves once acknowledged / allowlisted (reclassified) or the
+    sighting ages out of the window.
+
+    Locally-administered (randomised) MACs are excluded unless the rule's
+    ``classification`` is ``"all"`` — modern phones rotate them per network and
+    would otherwise storm the operator on every reconnect.
+    """
+    days = rule.threshold_days if rule.threshold_days is not None else _NEW_MAC_SEEN_RECENCY_DAYS
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, days))
+    include_randomized = (rule.classification or "").lower() == "all"
+    conds = [
+        IpMacHistory.classification == "new",
+        IpMacHistory.first_seen >= cutoff,
+    ]
+    if not include_randomized:
+        conds.append(IpMacHistory.is_randomized.is_(False))
+    rows = (
+        await db.execute(
+            select(
+                IPAddress, IpMacHistory.mac_address, IpMacHistory.first_seen, IpMacHistory.source
+            )
+            .join(IpMacHistory, IpMacHistory.ip_address_id == IPAddress.id)
+            .where(*conds)
+            .order_by(IpMacHistory.first_seen.desc())
+            .limit(_IP_HYGIENE_MAX_EVENTS)
+        )
+    ).all()
+    matches: list[tuple[str, str, str]] = []
+    for ip_row, obs_mac, first_at, source in rows:
+        subject_id = f"{ip_row.id}:{obs_mac}"
+        display = f"{ip_row.address} ({obs_mac})"
+        message = (
+            f"New device: MAC {obs_mac} first seen on {ip_row.address} at "
+            f"{first_at.isoformat()} (source: {source}). Not previously known, "
+            f"allowlisted, or part of the allocated fleet — acknowledge, add to "
+            f"the allowlist, or block it."
+        )
+        matches.append((subject_id, display, message))
     return matches
 
 
@@ -2687,6 +2746,50 @@ async def seed_rogue_dhcp_alert_rule() -> None:
         await session.commit()
 
 
+async def seed_new_mac_seen_alert_rule() -> None:
+    """Seed the singleton ``new_mac_seen`` rule (issue #459), DISABLED by default.
+
+    The companion to the ``security.new_device_watch`` feature module: noisy
+    until the operator runs a baseline import to mark the existing fleet as
+    ``known``, so it seeds off and discoverable in the Alerts UI. Keyed on
+    ``rule_type`` — an operator who enables / renames it is never overridden.
+    Excludes locally-administered (randomised) MACs by default (``classification``
+    left NULL; set to ``"all"`` to include them).
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_NEW_MAC_SEEN)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name="New device on the network",
+                description=(
+                    "Fires when a MAC address never seen before appears on the "
+                    "network (via a DHCP lease, SNMP ARP/FDB, the ping/ARP sweep, "
+                    "or the opt-in L2 sniffer) and is not allowlisted or part of "
+                    "the allocated fleet. Auto-resolves when the MAC is "
+                    "acknowledged, allowlisted, or ages out of the window. "
+                    "Enable once new-device watch (security.new_device_watch) is "
+                    "on and you've run a baseline import. Randomised (privacy) "
+                    "MACs are skipped by default."
+                ),
+                rule_type=RULE_TYPE_NEW_MAC_SEEN,
+                threshold_days=_NEW_MAC_SEEN_RECENCY_DAYS,
+                severity="info",
+                enabled=False,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def seed_builtin_compliance_alert_rules() -> None:
     """Insert the three disabled compliance-change rules on first
     boot. Idempotent — only inserts a row when no rule with the same
@@ -2976,6 +3079,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_rogue_dhcp_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "dhcp_responder"
+            elif rule.rule_type == RULE_TYPE_NEW_MAC_SEEN:
+                base = await _matching_new_mac_seen_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "ip_mac_observation"
             elif rule.rule_type == RULE_TYPE_SERVER_UNREACHABLE:
                 base = await _matching_server_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]

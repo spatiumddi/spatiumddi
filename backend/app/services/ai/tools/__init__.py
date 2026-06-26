@@ -32,6 +32,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     nettools,
     network,
     network_modeling,
+    new_devices,
     nmap,
     ntp,
     observability,

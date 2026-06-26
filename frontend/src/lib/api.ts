@@ -6756,6 +6756,127 @@ export const dhcpApi = {
     api.delete(`/dhcp/mac-blocks/${blockId}`),
 };
 
+// ── New-device watch (issue #459) ──────────────────────────────────────
+// arpwatch-style first-seen MAC tracking. The whole surface is gated by
+// the (default-off) ``security.new_device_watch`` feature module — every
+// endpoint 404s when the module is off, so callers must gate their
+// queries on ``useFeatureModules().enabled("security.new_device_watch")``.
+
+export type NewDeviceClassification = "new" | "acknowledged" | "known";
+export type NewDeviceSource = "dhcp_lease" | "snmp" | "sweep" | "l2_sniff";
+
+export interface NewDeviceSummary {
+  new_count: number;
+  new_randomized_count: number;
+  new_last_24h: number;
+  acknowledged_count: number;
+  known_count: number;
+  allowlist_count: number;
+}
+
+export interface NewDeviceSighting {
+  id: string;
+  ip_address_id: string;
+  ip_address: string;
+  subnet_id: string | null;
+  subnet_name: string | null;
+  mac_address: string;
+  oui_vendor: string | null;
+  classification: NewDeviceClassification;
+  source: NewDeviceSource;
+  is_randomized: boolean;
+  first_seen: string;
+  last_seen: string;
+  acknowledged_at: string | null;
+}
+
+export interface NewDeviceAllowlistEntry {
+  id: string;
+  mac_address: string | null;
+  oui_prefix: string | null;
+  note: string;
+  is_builtin: boolean;
+  created_at: string;
+}
+
+export interface NewDeviceAllowlistResult {
+  entry: NewDeviceAllowlistEntry;
+  reclassified_count: number;
+}
+
+export interface NewDeviceBlockResult {
+  mac_address: string;
+  blocked_group_ids: string[];
+  already_blocked_group_ids: string[];
+}
+
+export const newDeviceApi = {
+  summary: () =>
+    api.get<NewDeviceSummary>("/new-devices/summary").then((r) => r.data),
+
+  listSightings: (params?: {
+    classification?: NewDeviceClassification;
+    subnet_id?: string;
+    since_hours?: number;
+    include_randomized?: boolean;
+    search?: string;
+    page?: number;
+    page_size?: number;
+  }) =>
+    api
+      .get<Page<NewDeviceSighting>>("/new-devices/sightings", { params })
+      .then((r) => r.data),
+
+  acknowledge: (sightingId: string, note?: string) =>
+    api
+      .post<NewDeviceSighting>(
+        `/new-devices/sightings/${sightingId}/acknowledge`,
+        {
+          note,
+        },
+      )
+      .then((r) => r.data),
+
+  baseline: () =>
+    api
+      .post<{ reclassified_count: number }>("/new-devices/baseline")
+      .then((r) => r.data),
+
+  listAllowlist: () =>
+    api
+      .get<NewDeviceAllowlistEntry[]>("/new-devices/allowlist")
+      .then((r) => r.data),
+
+  addAllowlist: (data: {
+    mac_address?: string;
+    oui_prefix?: string;
+    note?: string;
+  }) =>
+    api
+      .post<NewDeviceAllowlistResult>("/new-devices/allowlist", data)
+      .then((r) => r.data),
+
+  addVirtDefaults: () =>
+    api
+      .post<{
+        added: number;
+        skipped: number;
+      }>("/new-devices/allowlist/virt-defaults")
+      .then((r) => r.data),
+
+  deleteAllowlist: (id: string) => api.delete(`/new-devices/allowlist/${id}`),
+
+  block: (data: {
+    mac_address: string;
+    group_id?: string;
+    reason?: string;
+    description?: string;
+  }) =>
+    api
+      .post<NewDeviceBlockResult>("/new-devices/block", data)
+      .then((r) => r.data),
+};
+
 export interface DHCPPool {
   id: string;
   scope_id: string;

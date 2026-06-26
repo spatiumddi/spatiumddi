@@ -24,6 +24,7 @@ from .ha_status import HAStatusPoller
 from .heartbeat import HeartbeatClient
 from .leases import LeaseWatcher
 from .log_shipper import LogShipper
+from .mac_sighting import MacSightingShipper
 from .metrics import MetricsPoller
 from .peer_resolve import PeerResolveWatcher
 from .sync import SyncLoop
@@ -78,6 +79,16 @@ def run(cfg: AgentConfig) -> int:
         rogue_probe = RogueProbeShipper(cfg, token_ref)
         log.info("dhcp_rogue_probe_enabled")
 
+    # Arpwatch-style L2 sighting sniffer (issue #459, Phase 3) — opt-in for the
+    # same CAP_NET_RAW + scapy reasons as fingerprinting. Observes source MACs
+    # on the wire (ARP + IPv6 ND) even for devices that never do DHCP, and ships
+    # first-sightings so the control plane can flag them as new devices.
+    mac_sighting_enabled = os.environ.get("DHCP_MAC_SIGHTING_ENABLED", "0") == "1"
+    mac_sighting_shipper: MacSightingShipper | None = None
+    if mac_sighting_enabled:
+        mac_sighting_shipper = MacSightingShipper(cfg, token_ref)
+        log.info("dhcp_mac_sighting_enabled")
+
     threads = [
         threading.Thread(target=syncer.run, name="sync", daemon=True),
         threading.Thread(target=heartbeat.run, name="heartbeat", daemon=True),
@@ -99,6 +110,14 @@ def run(cfg: AgentConfig) -> int:
         threads.append(
             threading.Thread(target=rogue_probe.run, name="rogue-probe", daemon=True)
         )
+    if mac_sighting_shipper is not None:
+        threads.append(
+            threading.Thread(
+                target=mac_sighting_shipper.run,
+                name="mac-sighting",
+                daemon=True,
+            )
+        )
     for t in threads:
         t.start()
 
@@ -118,6 +137,8 @@ def run(cfg: AgentConfig) -> int:
             fingerprint_shipper.stop()
         if rogue_probe is not None:
             rogue_probe.stop()
+        if mac_sighting_shipper is not None:
+            mac_sighting_shipper.stop()
 
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)

@@ -46,6 +46,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPPool, DHCPScope
 from app.models.ipam import IPAddress, Subnet
+from app.services.ipam.new_device import (
+    MacObservationResult,
+    classify_mac,
+    is_locally_administered,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -345,6 +350,10 @@ async def reconcile_subnet(db: AsyncSession, subnet: Subnet, sweep: SweepResult)
     )
     by_ip: dict[str, IPAddress] = {str(r.address): r for r in existing_rows}
 
+    # New-device watch (issue #459): sightings for rows created in this pass,
+    # recorded after the loop once the rows have ids (mirrors the SNMP path).
+    newly_discovered: list[tuple[IPAddress, str]] = []
+
     for ip in sweep.alive:
         try:
             ip_int = int(ipaddress.ip_address(ip))
@@ -378,17 +387,27 @@ async def reconcile_subnet(db: AsyncSession, subnet: Subnet, sweep: SweepResult)
             counts["skipped_pool"] += 1
             continue
 
-        db.add(
-            IPAddress(
-                subnet_id=subnet.id,
-                address=ip,
-                status="discovered",
-                mac_address=sweep.arp.get(ip),
-                last_seen_at=now,
-                last_seen_method=method,
-            )
+        new_row = IPAddress(
+            subnet_id=subnet.id,
+            address=ip,
+            status="discovered",
+            mac_address=sweep.arp.get(ip),
+            last_seen_at=now,
+            last_seen_method=method,
         )
+        db.add(new_row)
         counts["created"] += 1
+        if ip in sweep.arp:
+            newly_discovered.append((new_row, sweep.arp[ip]))
+
+    # Log a MAC sighting for each newly-created discovered row too (#459), so a
+    # never-before-tracked host found by the sweep classifies + surfaces in the
+    # new-device review queue / new_mac_seen alert — not just existing rows.
+    if newly_discovered:
+        await db.flush()
+        for new_row, mac in newly_discovered:
+            if new_row.id is not None:
+                await record_mac_observation(db, new_row.id, mac)
 
     return counts
 
@@ -397,28 +416,63 @@ async def reconcile_subnet(db: AsyncSession, subnet: Subnet, sweep: SweepResult)
 
 
 async def record_mac_observation(
-    db: AsyncSession, ip_id: uuid.UUID, mac_address: str | None
-) -> None:
+    db: AsyncSession,
+    ip_id: uuid.UUID,
+    mac_address: str | None,
+    *,
+    source: str = "sweep",
+) -> MacObservationResult | None:
     """Upsert an observed ``(ip_id, mac)`` into ``ip_mac_history`` (issue #369).
 
-    Called from the ping/ARP sweep + SNMP ARP cross-reference for EVERY MAC
-    observed on the wire — not just when the IPAddress row's canonical
-    ``mac_address`` is empty. That's what lets the ``unknown_mac_in_static_range``
-    hygiene alert compare the operator-recorded MAC against what's actually
-    answering: a differing recent history row is a squat. Mirrors the router's
-    ``_record_mac_history`` upsert (kept separate to avoid a router→service
-    import cycle). No-op on a missing MAC.
+    Called from the ping/ARP sweep + SNMP ARP cross-reference + DHCP lease
+    events + L2 sniff for EVERY MAC observed on the wire — not just when the
+    IPAddress row's canonical ``mac_address`` is empty. That's what lets the
+    ``unknown_mac_in_static_range`` hygiene alert compare the operator-recorded
+    MAC against what's actually answering: a differing recent history row is a
+    squat.
+
+    New-device watch (issue #459): on the *first-ever* sighting of a ``(ip, mac)``
+    pair the row is stamped with a :func:`~app.services.ipam.new_device.classify_mac`
+    classification (``new`` / ``known``), the ``source`` path, and an
+    ``is_randomized`` flag. Subsequent sightings only bump ``last_seen`` + the
+    ``source`` and never downgrade an operator-set ``acknowledged`` / ``known``
+    classification. Returns a :class:`MacObservationResult` describing the
+    outcome (so the caller can fire a ``device.first_seen`` event), or ``None``
+    on a missing MAC.
+
+    ``source`` is one of ``sweep`` / ``snmp`` / ``dhcp_lease`` / ``l2_sniff``.
     """
     if not mac_address:
-        return
-    await db.execute(
-        text("""
-            INSERT INTO ip_mac_history (id, ip_address_id, mac_address, first_seen, last_seen)
-            VALUES (gen_random_uuid(), :ip_id, CAST(:mac AS macaddr), now(), now())
-            ON CONFLICT (ip_address_id, mac_address)
-            DO UPDATE SET last_seen = now()
-            """),
-        {"ip_id": str(ip_id), "mac": mac_address},
+        return None
+
+    classification = await classify_mac(db, mac_address)
+    is_randomized = is_locally_administered(mac_address)
+    row = (
+        await db.execute(
+            text("""
+                INSERT INTO ip_mac_history
+                    (id, ip_address_id, mac_address, first_seen, last_seen,
+                     classification, source, is_randomized)
+                VALUES (gen_random_uuid(), :ip_id, CAST(:mac AS macaddr), now(), now(),
+                        :classification, :source, :is_randomized)
+                ON CONFLICT (ip_address_id, mac_address)
+                DO UPDATE SET last_seen = now(), source = :source
+                RETURNING (xmax = 0) AS inserted, classification
+                """),
+            {
+                "ip_id": str(ip_id),
+                "mac": mac_address,
+                "classification": classification,
+                "source": source,
+                "is_randomized": is_randomized,
+            },
+        )
+    ).one()
+    return MacObservationResult(
+        mac_address=mac_address,
+        classification=row.classification,
+        is_new_row=bool(row.inserted),
+        is_randomized=is_randomized,
     )
 
 

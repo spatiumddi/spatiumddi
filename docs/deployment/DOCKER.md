@@ -326,6 +326,38 @@ control plane to enable enrichment; without a key the agent still
 ships raw signatures, fingerbank lookups just don't run. See
 `docs/features/DHCP.md §15` for the full design and privacy notes.
 
+#### Optional: arpwatch-style new-device detection
+
+To enable Phase 3 new-device detection (issue #459), the agent runs
+an additional opt-in L2 sniffer that observes source MACs on the wire
+via **ARP + IPv6 Neighbor Discovery** — so it catches statically
+addressed and link-local-only hosts that never touch the DHCP server,
+not just DHCP clients. First-sightings ship to the control plane,
+which classifies them and surfaces unknowns in the new-device-watch
+review queue.
+
+It shares the same `NET_RAW` capability as passive fingerprinting (no
+new capability is required) and is gated on its own env toggle:
+
+```yaml
+services:
+  dhcp-kea:
+    cap_add:
+      - NET_RAW
+    environment:
+      DHCP_MAC_SIGHTING_ENABLED: "1"
+      # Optional — interface name for the sniffer. Default "any"
+      # works for host-networked containers; bridge-networked
+      # containers should set this explicitly.
+      DHCP_MAC_SIGHTING_IFACE: "any"
+```
+
+Like fingerprinting, this is **default-off** — flip the toggle (and
+grant `NET_RAW` if you haven't already) to arm it. The control-plane
+endpoint is a no-op until the new-device-watch feature module is
+enabled server-side, so a locally-armed agent that hasn't been wired
+up on the control plane just ships into a black hole at no cost.
+
 ### DNS-only VM
 
 Pick the compose file that matches the driver on the control plane's

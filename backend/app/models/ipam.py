@@ -4,6 +4,7 @@ from datetime import date, datetime
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -1021,6 +1022,14 @@ class IpMacHistory(UUIDPrimaryKeyMixin, Base):
 
     Keyed on (ip_address_id, mac_address); last_seen bumped each touch.
     Cascades on IP delete.
+
+    Doubles as the new-device-watch sighting store (issue #459): each row's
+    ``classification`` distinguishes a never-before-seen MAC (``new``) from one
+    the operator has acknowledged (``acknowledged``) or that is part of the
+    known fleet / allowlist (``known``). ``source`` records which ingestion path
+    first/last touched it; ``is_randomized`` flags a locally-administered
+    (privacy-randomised) MAC so the ``new_mac_seen`` alert can skip it by
+    default and avoid a reconnection storm.
     """
 
     __tablename__ = "ip_mac_history"
@@ -1028,6 +1037,7 @@ class IpMacHistory(UUIDPrimaryKeyMixin, Base):
         UniqueConstraint("ip_address_id", "mac_address", name="uq_ip_mac_history_ip_mac"),
         Index("ix_ip_mac_history_ip_address_id", "ip_address_id"),
         Index("ix_ip_mac_history_last_seen", "last_seen"),
+        Index("ix_ip_mac_history_classification", "classification"),
     )
 
     ip_address_id: Mapped[uuid.UUID] = mapped_column(
@@ -1041,6 +1051,67 @@ class IpMacHistory(UUIDPrimaryKeyMixin, Base):
     )
     last_seen: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=sa_text("now()")
+    )
+    # new | acknowledged | known  (issue #459)
+    classification: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=sa_text("'new'")
+    )
+    # sweep | snmp | dhcp_lease | l2_sniff  — which path first/last observed it
+    source: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=sa_text("'sweep'")
+    )
+    # Locally-administered (privacy-randomised) MAC — second-least-significant
+    # bit of the first octet is set. Flagged, not alerted, by default.
+    is_randomized: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=sa_text("false")
+    )
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    acknowledged_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class MACAllowlist(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Operator-curated set of trusted MACs that never raise a new-device alert.
+
+    Keyed on the MAC itself (or an OUI prefix for vendor/virtualisation
+    allowlisting, e.g. ``005056`` for VMware), so a trusted device stays quiet
+    wherever it shows up — independent of the ``ip_mac_history`` rows it
+    generates, which cascade-delete with their IP. At least one of
+    ``mac_address`` / ``oui_prefix`` must be set (issue #459).
+    """
+
+    __tablename__ = "mac_allowlist"
+    __table_args__ = (
+        UniqueConstraint("mac_address", name="uq_mac_allowlist_mac"),
+        CheckConstraint(
+            "mac_address IS NOT NULL OR oui_prefix IS NOT NULL",
+            name="ck_mac_allowlist_one_key",
+        ),
+        Index("ix_mac_allowlist_mac", "mac_address"),
+        # Partial-unique so an OUI prefix can't be allowlisted twice (the DB is
+        # the source of truth, not a racy check-then-insert). NULLs are exempt
+        # (rows keyed on mac_address only).
+        Index(
+            "uq_mac_allowlist_oui_prefix",
+            "oui_prefix",
+            unique=True,
+            postgresql_where=sa_text("oui_prefix IS NOT NULL"),
+        ),
+    )
+
+    mac_address: Mapped[str | None] = mapped_column(MACADDR, nullable=True)
+    # 6 hex chars, lower-case, no separators (e.g. "005056"); matches any MAC
+    # whose first three octets equal this prefix.
+    oui_prefix: Mapped[str | None] = mapped_column(String(6), nullable=True)
+    note: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # True for the seeded virtualisation-vendor rows; lets the UI distinguish
+    # platform defaults from operator entries (cloned but not deleted).
+    is_builtin: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=sa_text("false")
+    )
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
 
 

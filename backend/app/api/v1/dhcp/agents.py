@@ -762,12 +762,20 @@ async def agent_lease_events(
         _find_containing_subnet,
         _load_subnet_cache,
     )
+    from app.services.feature_modules import is_module_enabled
 
     server, _ = auth
     now = datetime.now(UTC)
     events = body.leases
     if not events:
         return {"upserted": 0}
+
+    # New-device watch (issue #459) — only log MAC sightings to ip_mac_history
+    # when the operator has opted in; keeps this hot ingestion path (up to 100
+    # events/POST) at its current cost when the feature is off.
+    watch_enabled = await is_module_enabled(db, "security.new_device_watch")
+    # (ipam_row, mac) pairs to classify after the mirror pass flushes ids.
+    to_observe: list[tuple[IPAddress, str]] = []
 
     # ── Bulk preload (avoid the per-event N+1: this is the hottest DHCP
     # ingestion path, up to 100 events/POST). Three queries total instead
@@ -871,6 +879,13 @@ async def agent_lease_events(
                 ipam_row.dhcp_lease_id = str(lease.id) if lease.id else None
             # else: manual/static — leave it alone
 
+            # New-device watch: record the MAC sighting for this lease,
+            # regardless of whether the IPAM row is auto/manual (a new MAC
+            # squatting a static IP is exactly worth flagging). Deferred until
+            # after the flush below so new rows have ids.
+            if watch_enabled and ipam_row is not None and ev.mac_address:
+                to_observe.append((ipam_row, ev.mac_address))
+
             # DDNS — mirrors services/dhcp/pull_leases.py. Only fires on
             # auto-from-lease rows inside DDNS-enabled subnets; errors are
             # logged but never break the lease upsert pass (DNS will
@@ -931,8 +946,162 @@ async def agent_lease_events(
                 await db.delete(ipam_row)
                 ipam_by_key.pop((subnet.id, ev.ip_address), None)
 
+    # ── New-device watch: classify the collected MAC sightings (issue #459) ──
+    # Flush first so freshly-created mirror rows have ids for the FK. Each
+    # genuinely-new device writes a device.first_seen audit row, which the
+    # after-commit publisher turns into a typed event (≤10 s) — the real-time
+    # "something new joined" signal, independent of the 60 s alert tick.
+    if to_observe:
+        from app.api.v1.dhcp._audit import write_audit
+        from app.services.ipam.discovery import record_mac_observation
+
+        await db.flush()
+        for ipam_row, mac in to_observe:
+            if ipam_row.id is None:
+                continue
+            try:
+                result = await record_mac_observation(db, ipam_row.id, mac, source="dhcp_lease")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "dhcp_agent_lease_mac_observation_failed",
+                    server=str(server.id),
+                    ip=str(ipam_row.address),
+                    error=str(exc),
+                )
+                continue
+            if result is not None and result.is_first_seen_new:
+                write_audit(
+                    db,
+                    user=None,
+                    action="first_seen",
+                    resource_type="ip_mac_observation",
+                    resource_id=f"{ipam_row.id}:{result.mac_address}",
+                    resource_display=f"{ipam_row.address} ({result.mac_address})",
+                    new_value={
+                        "mac_address": result.mac_address,
+                        "ip_address": str(ipam_row.address),
+                        "source": "dhcp_lease",
+                        "is_randomized": result.is_randomized,
+                    },
+                )
+
     await db.commit()
     return {"upserted": upserted}
+
+
+class MacSightingEntry(BaseModel):
+    """One first-sighting from the agent's L2 (ARP / ND) sniffer (issue #459).
+
+    ``ip_address`` is the sender protocol address from the ARP / ND frame —
+    required, since the sighting is logged against an IPAM row.
+    """
+
+    mac_address: str
+    ip_address: str
+
+
+class MacSightingBatch(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    sightings: list[MacSightingEntry] = Field(default_factory=list, max_length=500)
+
+
+@router.post("/mac-sightings")
+async def agent_mac_sightings(
+    body: MacSightingBatch,
+    db: DB,
+    auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, int]:
+    """Ingest first-sighting (mac, ip) pairs from the agent's opt-in L2 sniffer.
+
+    arpwatch-style: a MAC seen on the wire even if it never does DHCP (static
+    IP, link-local, rogue). Resolves each IP to a subnet, creates a
+    ``discovered`` IPAM row if there's none yet (like the SNMP ARP path), and
+    records the MAC sighting with ``source='l2_sniff'``. Genuinely-new devices
+    write a ``device.first_seen`` audit row → typed event. No-op (zero writes)
+    when new-device watch is off, so an agent left sniffing costs nothing
+    server-side until the operator arms the feature.
+    """
+    from app.models.ipam import IPAddress
+    from app.services.dhcp.pull_leases import _find_containing_subnet, _load_subnet_cache
+    from app.services.feature_modules import is_module_enabled
+
+    server, _ = auth
+    if not body.sightings:
+        return {"recorded": 0, "new": 0}
+    if not await is_module_enabled(db, "security.new_device_watch"):
+        return {"recorded": 0, "new": 0}
+
+    from app.api.v1.dhcp._audit import write_audit
+    from app.services.ipam.discovery import record_mac_observation
+
+    now = datetime.now(UTC)
+    subnets = await _load_subnet_cache(db)
+    ips = list({s.ip_address for s in body.sightings})
+    existing = (
+        (await db.execute(select(IPAddress).where(IPAddress.address.in_(ips)))).scalars().all()
+    )
+    by_key: dict[tuple[Any, str], IPAddress] = {(r.subnet_id, r.address): r for r in existing}
+
+    # (ipam_row, mac) pairs to classify after the flush assigns new-row ids.
+    to_observe: list[tuple[IPAddress, str]] = []
+    for s in body.sightings:
+        subnet = _find_containing_subnet(s.ip_address, subnets)
+        if subnet is None:
+            continue
+        row = by_key.get((subnet.id, s.ip_address))
+        if row is None:
+            row = IPAddress(
+                subnet_id=subnet.id,
+                address=s.ip_address,
+                status="discovered",
+                mac_address=s.mac_address,
+                last_seen_at=now,
+                last_seen_method="l2_sniff",
+            )
+            db.add(row)
+            by_key[(subnet.id, s.ip_address)] = row
+        else:
+            row.last_seen_at = now
+            row.last_seen_method = "l2_sniff"
+        to_observe.append((row, s.mac_address))
+
+    recorded = 0
+    new_count = 0
+    if to_observe:
+        await db.flush()
+        for row, mac in to_observe:
+            if row.id is None:
+                continue
+            try:
+                result = await record_mac_observation(db, row.id, mac, source="l2_sniff")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "dhcp_agent_mac_sighting_failed",
+                    server=str(server.id),
+                    ip=str(row.address),
+                    error=str(exc),
+                )
+                continue
+            recorded += 1
+            if result is not None and result.is_first_seen_new:
+                new_count += 1
+                write_audit(
+                    db,
+                    user=None,
+                    action="first_seen",
+                    resource_type="ip_mac_observation",
+                    resource_id=f"{row.id}:{result.mac_address}",
+                    resource_display=f"{row.address} ({result.mac_address})",
+                    new_value={
+                        "mac_address": result.mac_address,
+                        "ip_address": str(row.address),
+                        "source": "l2_sniff",
+                        "is_randomized": result.is_randomized,
+                    },
+                )
+    await db.commit()
+    return {"recorded": recorded, "new": new_count}
 
 
 @router.post("/ha-status")
