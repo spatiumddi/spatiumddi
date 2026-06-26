@@ -6174,6 +6174,9 @@ export interface DHCPLeaseSyncResult {
   mac_blocks_added?: number;
   mac_blocks_removed?: number;
   errors: string[];
+  // Present on the agent-based (Kea) no-op path: explains that leases stream
+  // live and config converges via the agent, so there was nothing to pull.
+  note?: string | null;
 }
 
 export interface DHCPOption {

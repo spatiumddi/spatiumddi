@@ -12,7 +12,13 @@ from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
-from app.core.agent_wake import collect_wake, dhcp_group_channel, dhcp_server_channel
+from app.core.agent_wake import (
+    collect_wake,
+    dhcp_group_channel,
+    dhcp_server_channel,
+    dhcp_wake_channels,
+    publish_wake,
+)
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
 from app.drivers.dhcp import is_agentless, is_read_only
@@ -284,6 +290,10 @@ class SyncLeasesResponse(BaseModel):
     mac_blocks_added: int = 0
     mac_blocks_removed: int = 0
     errors: list[str]
+    # Set on the agent-based no-op path (Kea): a human-readable explanation
+    # that there was nothing to pull and the agent was nudged to re-poll its
+    # config. ``None`` for the normal agentless lease-pull path.
+    note: str | None = None
 
 
 @router.get("", response_model=list[ServerResponse])
@@ -583,9 +593,29 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
     if s is None:
         raise HTTPException(status_code=404, detail="Server not found")
     if not is_agentless(s.driver):
-        raise HTTPException(
-            status_code=400,
-            detail=f"driver {s.driver!r} is agent-based; leases arrive via the agent",
+        # Agent-based drivers (Kea) stream lease events continuously and pick
+        # up scope/config changes through the ConfigBundle long-poll, so there
+        # is nothing to *pull*. Returning 400 here made the IPAM "Sync → DHCP"
+        # action look broken for operators whose subnet is backed by a Kea
+        # appliance (#453) — the modal fans this endpoint out to every server
+        # behind the subnet, agent-based ones included. Instead, nudge the
+        # agent to re-poll its config now so the subnet/scope definition
+        # converges immediately, and return a no-op result with an explanatory
+        # note rather than an error.
+        await publish_wake(*dhcp_wake_channels(s))
+        return SyncLeasesResponse(
+            server_leases=0,
+            imported=0,
+            refreshed=0,
+            ipam_created=0,
+            ipam_refreshed=0,
+            out_of_scope=0,
+            errors=[],
+            note=(
+                f"{s.driver} is agent-based: leases stream live from the agent and the "
+                "scope/subnet definition converges automatically via the agent's config "
+                "poll. Nudged the agent to re-poll now."
+            ),
         )
     result = await pull_leases_from_server(db, s, apply=True)
 

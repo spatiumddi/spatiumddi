@@ -2168,6 +2168,12 @@ function ServerDetailView({
       // views refresh once scopes / pools / statics get imported.
       qc.invalidateQueries({ queryKey: ["dhcp-scopes"] });
       const parts: string[] = [];
+      // Agent-based no-op note (Kea) takes the whole banner — there are no
+      // lease counters to report on that path.
+      if (result.note) {
+        setSyncBanner(result.note);
+        return;
+      }
       // Topology line first — only shown when the driver imports scopes.
       if (
         result.scopes_imported ||
