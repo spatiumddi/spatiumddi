@@ -74,6 +74,8 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `application_category` | SaaS application catalog used by `match_kind=application` (#95) |
 | `conformity`      | Conformity policies + results + auditor PDF export (#106) |
 | `manage_packet_capture` | On-demand packet capture (tcpdump) — start / read / download / delete captures (#59). High-sensitivity (captured bytes can contain plaintext creds/PII); granted to `Network Editor`, not `Viewer`. Download is audited. |
+| `address_set`     | Named IP range within a subnet carrying its own RBAC scope — delegates edit of a slice without subnet-wide write (#103). Creating a set / resizing its range additionally requires write on the parent subnet. |
+| `change_request`  | Queued two-person-approval change requests (#62) — `approve` + `read` for the second-person decision (the underlying operation's permission is *also* required server-side). |
 | `*`               | Wildcard — match any resource type                    |
 
 ## Evaluation rules
@@ -137,8 +139,14 @@ on inactive.
 | `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans`, `manage_packet_capture`, `manage_asns`, `vrf`, `circuit`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider` |
 | `Auditor`        | `read` on `conformity`, `audit`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
 | `Compliance Editor` | `admin` on `conformity`, `read` on `audit`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope` — for the team that authors / tunes conformity policies without touching operational config |
+| `Address Set Editor` | `admin` on `address_set` (#103) — delegated edit of a named IP slice within a subnet without subnet-wide write. Grant on a specific address-set id to scope a department admin to just their slice. Creating / resizing a set still requires write on the parent subnet. |
+| `Change Approver`  | `approve` + `read` on `change_request` (#62) — the second-person decision capability in the two-person approval workflow. Approving a specific request *also* requires the underlying operation's permission (e.g. `delete,subnet`), enforced server-side. |
 
 Built-in roles (`is_builtin=True`) can be cloned but not deleted.
+
+> **Feature-module gating.** The `Change Approver` role only matters when
+> the default-off `governance.approvals` feature module is enabled, and
+> `Address Set Editor` when `ipam.address_sets` is enabled.
 
 ## Using the helpers
 

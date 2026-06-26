@@ -26,6 +26,148 @@ _Nothing yet — the next cut starts here._
 
 ---
 
+## 2026.06.25-1 — 2026-06-25
+
+A **governance + scale** release. The headline is two RBAC
+deliverables that let an operator hand out narrow authority without
+giving away the keys: **#62 approval workflows** — a two-person rule
+for high-blast-radius operations (deletes, and a documented path to
+bulk ops / factory reset / large imports), default-off, with a
+self-governance lock so an approver can't quietly rewrite the policy
+that governs them; and **#103 address sets** — named IP ranges inside
+a subnet that carry their own RBAC scope, so editing `.50–.99` can be
+delegated without subnet-wide write. Riding with them: **#449
+permission introspection** (the UI finally knows the caller's own
+effective grants, so it can gray out what they can't touch), **#195
+the DHCP server Stats tab** (the 6th tab carved out when #181
+shipped), **#455 server-side pagination** for the two list endpoints
+that shipped whole result sets (DNS records + DHCP leases), a **#453
+Kea sync fix** (IPAM "Sync → DHCP" no longer 400s on agent-based
+servers), and **#452 a 24-hour university-scale load + soak test
+suite**. The Operator Copilot tool registry grows 198 → 206. All
+three schema changes are additive.
+
+### Added
+
+* **#62 — Approval workflows for risky ops.** A two-person rule for
+  high-blast-radius operations, behind the new default-off
+  ``governance.approvals`` feature module (group Security). A risky
+  action submitted by one operator is queued as a ``change_request``
+  and only executes after a *different* eligible approver accepts it —
+  the operation then replays under the approver's identity with the
+  audit log carrying both user IDs. The 6 delete handlers (subnet /
+  block / space / dns_zone / dhcp_scope / dhcp_server_group) were
+  refactored so the inline path and the approver-replay path are one
+  registered ``Operation.apply()`` (``preview()`` re-validates against
+  stale state). 11 built-in ``approval_policy`` rows seed disabled; a
+  **Change Approver** builtin role + ``change_request`` resource_type +
+  event namespace land alongside. Lifecycle API at
+  ``/api/v1/change-requests`` (list / get / approve / reject / cancel +
+  policies CRUD, module-gated; approve enforces approver ≠ requester,
+  the op's required permission, a fresh ``preview()``, and fails
+  *closed* if the requester row was deleted). Celery sweep expires
+  past-TTL pending rows. A **self-governance lock** (migration
+  ``5443d2756647``) stops an approver from editing the policy that
+  governs the approval controls themselves. Frontend: a **Change
+  Requests** admin page (queue / approve / reject / cancel + policies
+  tab, ``usePermissions``-gated) + 202-handling helper. MCP:
+  ``find_change_requests`` / ``count_change_requests`` /
+  ``propose_approve_change_request`` / ``propose_reject_change_request``.
+  P2 (bulk ops / factory reset / import gating + approval
+  notifications) is a documented follow-up.
+* **#103 — Address sets.** Delegate write over a slice of a subnet
+  without granting subnet-wide write, behind the new
+  ``ipam.address_sets`` feature module (group Network). New
+  ``AddressSet`` model (migration ``e2b9c4f1a7d6``) + ``address_set``
+  resource_type + an **Address Set Editor** builtin role + event
+  namespace. The per-IP write gate
+  (``app.services.ipam.address_set_gate``) is wired into all 8 IPAM
+  mutation chokepoints:
+  an edit is allowed with subnet write **or** write/admin on a
+  containing set; out-of-set single edits 403, bulk loops skip + report.
+  CRUD router at ``/api/v1/address-sets`` (audited, module-gated).
+  Frontend: an **Address Sets** subnet tab + client-side gray-out of
+  rows the caller can't edit. MCP: ``find_address_sets`` /
+  ``count_address_sets`` / ``propose_create_address_set``.
+* **#449 — Permission introspection.** ``GET /auth/me/permissions``
+  returns the caller's own effective grants (role ∪ live time-bound ∪
+  token-narrowed; self-only) via a new
+  ``permissions.effective_grants()`` helper. A ``usePermissions()``
+  hook + pure
+  ``permissionMatch()`` util (backend-identical semantics, fail-closed
+  while loading) + a reusable ``<ResourceIdPicker>`` (RolesPage + the
+  time-bound-grant modal swap the raw UUID input for it).
+* **#195 — DHCP server Stats tab.** The sixth tab on the DHCP server
+  detail modal (the carve-out left at 5/6 when #181 shipped):
+  active-lease count + per-message-type
+  (discover / offer / request / ack / nak / decline / release) counts
+  bucketed over a 1h/6h/24h/7d window, aggregated from the
+  agent-reported ``dhcp_metric_sample`` stream.
+  ``GET /dhcp/servers/{id}/stats`` (read-only) + a new
+  ``app.services.dhcp.stats`` shared by
+  the endpoint and the ``find_dhcp_server_stats`` MCP tool so the two
+  can't drift. Tab gated on ``!isReadOnly`` like Logs / Config.
+* **#455 — Server-side pagination for DNS records + DHCP leases.** A
+  new shared ``Page[T]`` envelope (``app.api.pagination`` —
+  ``{items, total, page, page_size}``) + a ``paginate()`` helper.
+  ``GET /dns/groups/{gid}/zones/{zid}/records``,
+  ``GET /dns/groups/{gid}/records``, and
+  ``GET /dhcp/servers/{id}/leases`` now return
+  ``Page[...]`` (default 100/page, max 1000) with a server-side
+  ``search`` filter + exact ``record_type`` / ``state`` filters.
+  Frontend gets a shared ``<Pager>`` primitive + a search box; existing
+  secondary filters + sort stay as client-side refinements over the
+  current page.
+* **#452 — 24-hour university-scale load + soak test suite.** A new
+  top-level ``perf/`` harness + ``docs/PERFORMANCE_TESTING.md`` design
+  spec that drives the whole DDI stack (Kea + BIND9/PowerDNS + control
+  plane + Postgres/Redis) at university scale (~50k students,
+  200–300k devices/day on a diurnal curve) to prove the database never
+  becomes the bottleneck. Controller + setpoint bus + phase engine +
+  device-fleet FSM + perfdhcp/dnsperf ceiling wrappers + a pg war-room
+  poller + smoke / 24h / variant manifests. Runs **off** the appliance;
+  authoritative-only DNS (recursion OFF, zero egress) is a hard
+  constraint.
+
+### Changed
+
+* **Operator Copilot tool registry 198 → 206.** Eight new tools land
+  with the features above (``find_dhcp_server_stats``;
+  ``find_address_sets`` / ``count_address_sets`` /
+  ``propose_create_address_set``; ``find_change_requests`` /
+  ``count_change_requests`` / ``propose_approve_change_request`` /
+  ``propose_reject_change_request``).
+* The DHCP leases endpoint's old ``limit`` (500/5000) is replaced by
+  real pagination, so the per-page fingerbank/OUI enrichment now runs
+  on the page, not the first 500 rows.
+
+### Fixed
+
+* **#453 — IPAM Sync → DHCP no longer 400s on agent-based Kea.** The
+  subnet "Sync → DHCP" modal fans ``POST /dhcp/servers/{id}/sync-leases``
+  out to every server backing the subnet; ``sync-leases`` is an
+  agentless-only (Windows DHCP) operation and used to hard-reject
+  agent-based Kea with a 400, which read as a broken sync. Agent-based
+  drivers stream lease events + converge via the ConfigBundle long-poll,
+  so there's nothing to pull — the endpoint now returns a no-op
+  ``SyncLeasesResponse`` with an explanatory ``note`` (and nudges the
+  agent to re-poll its config) instead of erroring. The note renders as
+  an info line in both the IPAM sync modal and the DHCP server-detail
+  banner.
+
+### Migrations
+
+Three new additive migrations; chain head ``5443d2756647``.
+
+* **#103 — Address sets** (``e2b9c4f1a7d6``). The ``address_set``
+  table.
+* **#62 — Change requests** (``2c24fe41a7ed``). ``change_request`` +
+  ``approval_policy`` storage; 11 built-in policies seeded disabled.
+* **#62 — Self-governance lock** (``5443d2756647``). Protects the
+  approval-control surface from being rewritten by its own approvers.
+
+---
+
 ## 2026.06.19-1 — 2026-06-19
 
 A **certificates + DNS-hardening** release. Three headlines land
