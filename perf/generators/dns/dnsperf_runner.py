@@ -218,6 +218,8 @@ def parse_resperf_csv(csv_path: Path) -> dict:
                 try:
                     return float(d[k])
                 except ValueError:
+                    # Non-numeric cell (e.g. a header re-emitted mid-CSV); skip
+                    # it and try the next candidate key.
                     pass
         return None
 

@@ -86,6 +86,8 @@ def _resolve_poll(m: spddi_perf.manifest.Manifest) -> dict[str, float]:
             try:
                 poll[k] = float(v)
             except (TypeError, ValueError):
+                # Malformed override in the manifest; keep the DEFAULT_POLL value
+                # for this key rather than failing the whole poller config.
                 pass
     return poll
 

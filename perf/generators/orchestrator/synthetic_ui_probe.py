@@ -201,7 +201,9 @@ class SyntheticUiProbe:
             try:
                 loop.add_signal_handler(sig, self._stop.set)
             except (NotImplementedError, RuntimeError):
-                pass
+                # add_signal_handler isn't available on every platform / non-main
+                # thread; shutdown still flows through the _stop event via other paths.
+                self.log.debug("signal handler unavailable for %s", sig)
         async with httpx.AsyncClient(
                 verify=self.verify, timeout=30.0, headers=self._headers()) as client:
             await self._discover(client)
@@ -236,6 +238,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         asyncio.run(SyntheticUiProbe(args).run())
     except KeyboardInterrupt:
+        # Intentional: swallow Ctrl-C for a clean CLI exit without a traceback.
         pass
     return 0
 

@@ -40,6 +40,8 @@ def _tail_ndjson(path: Path, n: int) -> list[dict]:
             try:
                 out.append(json.loads(line))
             except json.JSONDecodeError:
+                # Tolerate a partially-written final line while a worker is mid-flush;
+                # skip the malformed record and keep the rest of the tail.
                 pass
     return out
 

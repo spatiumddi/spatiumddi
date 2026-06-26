@@ -177,6 +177,7 @@ def map_pg_tables(payload: dict[str, Any], *, now_iso: str | None = None) -> dic
         try:
             ref = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
         except ValueError:
+            # Unparseable timestamp; fall back to the wall-clock `ref` set above.
             pass
     tables: dict[str, dict[str, Any]] = {}
     for r in payload.get("rows", []) or []:
