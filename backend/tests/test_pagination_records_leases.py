@@ -101,9 +101,9 @@ async def test_zone_records_paginate_and_filter(
     p1 = {i["id"] for i in r.json()["items"]}
     p2 = {
         i["id"]
-        for i in (
-            await client.get(base, headers=h, params={"page_size": 10, "page": 2})
-        ).json()["items"]
+        for i in (await client.get(base, headers=h, params={"page_size": 10, "page": 2})).json()[
+            "items"
+        ]
     }
     assert p1.isdisjoint(p2)
 
@@ -124,9 +124,7 @@ async def test_zone_records_paginate_and_filter(
 
 
 @pytest.mark.asyncio
-async def test_zone_records_page_size_bounds(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_zone_records_page_size_bounds(client: AsyncClient, db_session: AsyncSession) -> None:
     h = await _admin_headers(db_session)
     grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
     db_session.add(grp)
@@ -233,9 +231,7 @@ async def test_leases_paginate_search_and_state(
 
 
 @pytest.mark.asyncio
-async def test_leases_missing_server_404(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_leases_missing_server_404(client: AsyncClient, db_session: AsyncSession) -> None:
     h = await _admin_headers(db_session)
     await db_session.commit()
     r = await client.get(f"/api/v1/dhcp/servers/{uuid.uuid4()}/leases", headers=h)
