@@ -1816,14 +1816,24 @@ function LeasesTab({ server }: { server: DHCPServer }) {
             ))}
           </select>
         )}
-        <button
-          onClick={() => refetch()}
-          className="ml-auto flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
-          disabled={isFetching}
-        >
-          <RefreshCw className={cn("h-3 w-3", isFetching && "animate-spin")} />
-          Refresh
-        </button>
+        <div className="ml-auto flex items-center gap-3">
+          <Pager
+            page={page}
+            total={total}
+            pageSize={pageSize}
+            onChange={setPage}
+          />
+          <button
+            onClick={() => refetch()}
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+            disabled={isFetching}
+          >
+            <RefreshCw
+              className={cn("h-3 w-3", isFetching && "animate-spin")}
+            />
+            Refresh
+          </button>
+        </div>
       </div>
       <div className="rounded-lg border overflow-auto">
         <table className="w-full text-sm">

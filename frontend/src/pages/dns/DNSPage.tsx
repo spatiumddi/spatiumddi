@@ -3347,6 +3347,14 @@ function ZoneDetailView({
               {hasRecFilter && " · page filtered"}
               {isFetching && " · loading…"}
             </span>
+            <div className="ml-auto">
+              <Pager
+                page={recordPage}
+                total={recordsTotal}
+                pageSize={recordPageSize}
+                onChange={setRecordPage}
+              />
+            </div>
           </div>
           {isFetching && records.length === 0 && (
             <p className="px-5 py-4 text-sm text-muted-foreground">Loading…</p>
@@ -6053,15 +6061,23 @@ function RecordsTab({
             {recordsTotal === 1 ? "record" : "records"}
           </p>
         </div>
-        {hasActiveFilter && (
-          <button
-            onClick={clearFilters}
-            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
-          >
-            <X className="h-3 w-3" />
-            Clear filters
-          </button>
-        )}
+        <div className="flex items-center gap-2">
+          <Pager
+            page={groupRecordPage}
+            total={recordsTotal}
+            pageSize={groupRecordPageSize}
+            onChange={setGroupRecordPage}
+          />
+          {hasActiveFilter && (
+            <button
+              onClick={clearFilters}
+              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+            >
+              <X className="h-3 w-3" />
+              Clear filters
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="overflow-hidden rounded-lg border">
