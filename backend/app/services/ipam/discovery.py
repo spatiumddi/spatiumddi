@@ -350,6 +350,10 @@ async def reconcile_subnet(db: AsyncSession, subnet: Subnet, sweep: SweepResult)
     )
     by_ip: dict[str, IPAddress] = {str(r.address): r for r in existing_rows}
 
+    # New-device watch (issue #459): sightings for rows created in this pass,
+    # recorded after the loop once the rows have ids (mirrors the SNMP path).
+    newly_discovered: list[tuple[IPAddress, str]] = []
+
     for ip in sweep.alive:
         try:
             ip_int = int(ipaddress.ip_address(ip))
@@ -383,17 +387,27 @@ async def reconcile_subnet(db: AsyncSession, subnet: Subnet, sweep: SweepResult)
             counts["skipped_pool"] += 1
             continue
 
-        db.add(
-            IPAddress(
-                subnet_id=subnet.id,
-                address=ip,
-                status="discovered",
-                mac_address=sweep.arp.get(ip),
-                last_seen_at=now,
-                last_seen_method=method,
-            )
+        new_row = IPAddress(
+            subnet_id=subnet.id,
+            address=ip,
+            status="discovered",
+            mac_address=sweep.arp.get(ip),
+            last_seen_at=now,
+            last_seen_method=method,
         )
+        db.add(new_row)
         counts["created"] += 1
+        if ip in sweep.arp:
+            newly_discovered.append((new_row, sweep.arp[ip]))
+
+    # Log a MAC sighting for each newly-created discovered row too (#459), so a
+    # never-before-tracked host found by the sweep classifies + surfaces in the
+    # new-device review queue / new_mac_seen alert — not just existing rows.
+    if newly_discovered:
+        await db.flush()
+        for new_row, mac in newly_discovered:
+            if new_row.id is not None:
+                await record_mac_observation(db, new_row.id, mac)
 
     return counts
 

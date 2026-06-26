@@ -504,3 +504,54 @@ async def test_mac_sightings_noop_when_module_off(
     assert (
         await db_session.execute(select(IPAddress).where(IPAddress.address == "10.41.1.81"))
     ).scalar_one_or_none() is None
+
+
+async def test_sweep_discovered_new_row_records_sighting(db_session: AsyncSession) -> None:
+    """A never-tracked host found by the ping/ARP sweep gets a sighting too — not
+    just existing rows (regression guard for the new-row branch in #459)."""
+    from app.services.ipam.discovery import SweepResult, reconcile_subnet
+
+    subnet = await _make_subnet(db_session)
+    await db_session.flush()
+    sweep = SweepResult(
+        ping_alive={"10.40.1.200"},
+        arp={"10.40.1.200": "3c:5a:b4:0d:15:c0"},
+    )
+    counts = await reconcile_subnet(db_session, subnet, sweep)
+    await db_session.flush()
+    assert counts["created"] == 1
+
+    new_row = (
+        await db_session.execute(select(IPAddress).where(IPAddress.address == "10.40.1.200"))
+    ).scalar_one()
+    assert new_row.status == "discovered"
+    sighting = (
+        await db_session.execute(
+            select(IpMacHistory).where(IpMacHistory.ip_address_id == new_row.id)
+        )
+    ).scalar_one()
+    assert sighting.mac_address == "3c:5a:b4:0d:15:c0"
+    assert sighting.source == "sweep"
+    assert sighting.classification == "new"
+
+
+async def test_duplicate_allowlist_returns_409(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Allowlisting an already-allowlisted MAC is a clean 409, not a 500."""
+    await _enable_watch(db_session)
+    _u, token = await _superadmin(db_session)
+    await db_session.commit()
+
+    first = await client.post(
+        "/api/v1/new-devices/allowlist",
+        headers=_hdr(token),
+        json={"mac_address": "3c:5a:b4:ab:cd:ef", "note": "trusted"},
+    )
+    assert first.status_code == 201, first.text
+    dup = await client.post(
+        "/api/v1/new-devices/allowlist",
+        headers=_hdr(token),
+        json={"mac_address": "3c:5a:b4:ab:cd:ef", "note": "again"},
+    )
+    assert dup.status_code == 409, dup.text

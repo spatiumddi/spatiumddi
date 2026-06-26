@@ -16,6 +16,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, model_validator
 from sqlalchemy import String, and_, cast, func, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB
 from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Page
@@ -30,6 +31,7 @@ from app.services.ipam.new_device import (
     acknowledge_sighting,
     add_allowlist_entry,
     baseline_import,
+    new_device_counts,
     normalize_oui_prefix,
     remove_allowlist_entry,
 )
@@ -121,46 +123,45 @@ class VirtDefaultsResult(BaseModel):
     skipped: int
 
 
+def _sighting_out(
+    h: IpMacHistory, ip: IPAddress, subnet: Subnet | None, vendors: dict[str, str]
+) -> SightingOut:
+    """Project a ``(IpMacHistory, IPAddress, Subnet)`` row tuple → ``SightingOut``.
+
+    Single source of truth for the wire shape so the list + single-row endpoints
+    can't drift (vendors is the bulk_lookup_vendors result for the page).
+    """
+    return SightingOut(
+        id=h.id,
+        ip_address_id=h.ip_address_id,
+        ip_address=str(ip.address),
+        subnet_id=subnet.id if subnet else None,
+        subnet_name=subnet.name if subnet else None,
+        mac_address=str(h.mac_address),
+        oui_vendor=vendors.get(normalize_mac_key(str(h.mac_address)) or ""),
+        classification=h.classification,
+        source=h.source,
+        is_randomized=h.is_randomized,
+        first_seen=h.first_seen,
+        last_seen=h.last_seen,
+        acknowledged_at=h.acknowledged_at,
+    )
+
+
 # ── Reads ───────────────────────────────────────────────────────────────────
 
 
 @router.get("/summary", response_model=SummaryOut)
 async def get_summary(db: DB, _: ReadUser) -> SummaryOut:
     """Counts for the dashboard KPI + review-queue tabs."""
-    day_ago = datetime.now(UTC) - timedelta(hours=24)
-
-    def _count(*conds: Any) -> Any:
-        return select(func.count()).select_from(IpMacHistory).where(*conds)
-
-    new_count = (
-        await db.execute(
-            _count(IpMacHistory.classification == "new", IpMacHistory.is_randomized.is_(False))
-        )
-    ).scalar_one()
-    new_randomized = (
-        await db.execute(
-            _count(IpMacHistory.classification == "new", IpMacHistory.is_randomized.is_(True))
-        )
-    ).scalar_one()
-    new_24h = (
-        await db.execute(
-            _count(
-                IpMacHistory.classification == "new",
-                IpMacHistory.is_randomized.is_(False),
-                IpMacHistory.first_seen >= day_ago,
-            )
-        )
-    ).scalar_one()
-    ack = (await db.execute(_count(IpMacHistory.classification == "acknowledged"))).scalar_one()
-    known = (await db.execute(_count(IpMacHistory.classification == "known"))).scalar_one()
-    allowlist = (await db.execute(select(func.count()).select_from(MACAllowlist))).scalar_one()
+    c = await new_device_counts(db)
     return SummaryOut(
-        new_count=new_count,
-        new_randomized_count=new_randomized,
-        new_last_24h=new_24h,
-        acknowledged_count=ack,
-        known_count=known,
-        allowlist_count=allowlist,
+        new_count=c["new"],
+        new_randomized_count=c["new_randomized"],
+        new_last_24h=c["new_last_24h"],
+        acknowledged_count=c["acknowledged"],
+        known_count=c["known"],
+        allowlist_count=c["allowlist"],
     )
 
 
@@ -217,24 +218,7 @@ async def list_sightings(
 
     macs: list[str | None] = [str(h.mac_address) for h, _ip, _s in rows]
     vendors = await bulk_lookup_vendors(db, macs)
-    items = [
-        SightingOut(
-            id=h.id,
-            ip_address_id=h.ip_address_id,
-            ip_address=str(ip.address),
-            subnet_id=subnet.id if subnet else None,
-            subnet_name=subnet.name if subnet else None,
-            mac_address=str(h.mac_address),
-            oui_vendor=vendors.get(normalize_mac_key(str(h.mac_address)) or ""),
-            classification=h.classification,
-            source=h.source,
-            is_randomized=h.is_randomized,
-            first_seen=h.first_seen,
-            last_seen=h.last_seen,
-            acknowledged_at=h.acknowledged_at,
-        )
-        for h, ip, subnet in rows
-    ]
+    items = [_sighting_out(h, ip, subnet, vendors) for h, ip, subnet in rows]
     return Page[SightingOut](items=items, total=total, page=page, page_size=page_size)
 
 
@@ -275,21 +259,7 @@ async def _load_sighting_out(db: DB, sighting_id: uuid.UUID) -> SightingOut:
     h, ip, subnet = row
     one_mac: list[str | None] = [str(h.mac_address)]
     vendors = await bulk_lookup_vendors(db, one_mac)
-    return SightingOut(
-        id=h.id,
-        ip_address_id=h.ip_address_id,
-        ip_address=str(ip.address),
-        subnet_id=subnet.id if subnet else None,
-        subnet_name=subnet.name if subnet else None,
-        mac_address=str(h.mac_address),
-        oui_vendor=vendors.get(normalize_mac_key(str(h.mac_address)) or ""),
-        classification=h.classification,
-        source=h.source,
-        is_randomized=h.is_randomized,
-        first_seen=h.first_seen,
-        last_seen=h.last_seen,
-        acknowledged_at=h.acknowledged_at,
-    )
+    return _sighting_out(h, ip, subnet, vendors)
 
 
 @router.post("/sightings/{sighting_id}/acknowledge", response_model=SightingOut)
@@ -342,9 +312,15 @@ async def create_allowlist(body: AllowlistCreate, db: DB, user: WriteUser) -> Al
             note=body.note,
             user=user,
         )
+        await db.flush()
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    await db.flush()
+    except IntegrityError as exc:
+        # Already allowlisted (uq_mac_allowlist_mac / uq_mac_allowlist_oui_prefix).
+        await db.rollback()
+        raise HTTPException(
+            status_code=409, detail="That MAC or OUI prefix is already allowlisted"
+        ) from exc
     write_audit(
         db,
         user=user,

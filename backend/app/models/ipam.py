@@ -1089,7 +1089,15 @@ class MACAllowlist(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             name="ck_mac_allowlist_one_key",
         ),
         Index("ix_mac_allowlist_mac", "mac_address"),
-        Index("ix_mac_allowlist_oui_prefix", "oui_prefix"),
+        # Partial-unique so an OUI prefix can't be allowlisted twice (the DB is
+        # the source of truth, not a racy check-then-insert). NULLs are exempt
+        # (rows keyed on mac_address only).
+        Index(
+            "uq_mac_allowlist_oui_prefix",
+            "oui_prefix",
+            unique=True,
+            postgresql_where=sa_text("oui_prefix IS NOT NULL"),
+        ),
     )
 
     mac_address: Mapped[str | None] = mapped_column(MACADDR, nullable=True)

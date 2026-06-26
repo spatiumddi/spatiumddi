@@ -29,10 +29,10 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import delete, or_, select, text, update
+from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
@@ -146,6 +146,50 @@ async def classify_mac(db: AsyncSession, mac_address: str | None) -> str:
         return CLASSIFICATION_KNOWN
 
     return CLASSIFICATION_NEW
+
+
+# ── Counts (shared by the REST summary endpoint + the MCP count tool) ───────
+
+
+async def new_device_counts(db: AsyncSession) -> dict[str, int]:
+    """Return new-device counts by bucket in a single pass.
+
+    Canonical keys: ``new`` (non-randomised) / ``new_randomized`` /
+    ``new_last_24h`` / ``acknowledged`` / ``known`` / ``allowlist``. One
+    aggregate query over ``ip_mac_history`` (FILTER) + one over the allowlist,
+    so the dashboard summary and the Copilot count tool can't drift.
+    """
+    day_ago = datetime.now(UTC) - timedelta(hours=24)
+    not_random = IpMacHistory.is_randomized.is_(False)
+    is_new = IpMacHistory.classification == CLASSIFICATION_NEW
+    row = (
+        await db.execute(
+            select(
+                func.count().filter(and_(is_new, not_random)).label("new"),
+                func.count()
+                .filter(and_(is_new, IpMacHistory.is_randomized.is_(True)))
+                .label("new_randomized"),
+                func.count()
+                .filter(and_(is_new, not_random, IpMacHistory.first_seen >= day_ago))
+                .label("new_last_24h"),
+                func.count()
+                .filter(IpMacHistory.classification == CLASSIFICATION_ACKNOWLEDGED)
+                .label("acknowledged"),
+                func.count()
+                .filter(IpMacHistory.classification == CLASSIFICATION_KNOWN)
+                .label("known"),
+            )
+        )
+    ).one()
+    allowlist = (await db.execute(select(func.count()).select_from(MACAllowlist))).scalar_one()
+    return {
+        "new": int(row.new),
+        "new_randomized": int(row.new_randomized),
+        "new_last_24h": int(row.new_last_24h),
+        "acknowledged": int(row.acknowledged),
+        "known": int(row.known),
+        "allowlist": int(allowlist),
+    }
 
 
 # ── Operator actions (shared by the REST router + MCP propose_* tools) ──────

@@ -113,7 +113,13 @@ def upgrade() -> None:
         ),
     )
     op.create_index("ix_mac_allowlist_mac", "mac_allowlist", ["mac_address"])
-    op.create_index("ix_mac_allowlist_oui_prefix", "mac_allowlist", ["oui_prefix"])
+    op.create_index(
+        "uq_mac_allowlist_oui_prefix",
+        "mac_allowlist",
+        ["oui_prefix"],
+        unique=True,
+        postgresql_where=sa.text("oui_prefix IS NOT NULL"),
+    )
 
     # ── 3. feature_module seed (non-negotiable #14), default-OFF ─────────
     op.execute(sa.text("""
@@ -125,7 +131,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute(sa.text("DELETE FROM feature_module WHERE id = 'security.new_device_watch'"))
-    op.drop_index("ix_mac_allowlist_oui_prefix", table_name="mac_allowlist")
+    op.drop_index("uq_mac_allowlist_oui_prefix", table_name="mac_allowlist")
     op.drop_index("ix_mac_allowlist_mac", table_name="mac_allowlist")
     op.drop_table("mac_allowlist")
     op.drop_index("ix_ip_mac_history_classification", table_name="ip_mac_history")

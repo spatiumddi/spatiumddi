@@ -12,12 +12,13 @@ from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
 from app.models.ipam import IPAddress, IpMacHistory, MACAllowlist, Subnet
 from app.services.ai.tools.base import register_tool
+from app.services.ipam.new_device import new_device_counts
 from app.services.oui import bulk_lookup_vendors, normalize_mac_key
 
 _MODULE = "security.new_device_watch"
@@ -114,32 +115,16 @@ class CountNewDevicesArgs(BaseModel):
 async def count_new_devices(
     db: AsyncSession, user: User, args: CountNewDevicesArgs
 ) -> dict[str, Any]:
-    day_ago = datetime.now(UTC) - timedelta(hours=24)
-
-    async def _c(*conds: Any) -> int:
-        return int(
-            (
-                await db.execute(select(func.count()).select_from(IpMacHistory).where(*conds))
-            ).scalar_one()
-        )
-
+    # Single source of truth shared with the dashboard summary endpoint so the
+    # two can't drift (one aggregate query under the hood).
+    c = await new_device_counts(db)
     return {
-        "new": await _c(
-            IpMacHistory.classification == "new", IpMacHistory.is_randomized.is_(False)
-        ),
-        "new_randomized": await _c(
-            IpMacHistory.classification == "new", IpMacHistory.is_randomized.is_(True)
-        ),
-        "new_last_24h": await _c(
-            IpMacHistory.classification == "new",
-            IpMacHistory.is_randomized.is_(False),
-            IpMacHistory.first_seen >= day_ago,
-        ),
-        "acknowledged": await _c(IpMacHistory.classification == "acknowledged"),
-        "known": await _c(IpMacHistory.classification == "known"),
-        "allowlist_entries": int(
-            (await db.execute(select(func.count()).select_from(MACAllowlist))).scalar_one()
-        ),
+        "new": c["new"],
+        "new_randomized": c["new_randomized"],
+        "new_last_24h": c["new_last_24h"],
+        "acknowledged": c["acknowledged"],
+        "known": c["known"],
+        "allowlist_entries": c["allowlist"],
     }
 
 
