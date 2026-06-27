@@ -177,12 +177,10 @@ class NetBoxClient:
         assert self._client is not None, "use within 'async with'"
         target = self._abs(url)
         delay = 1.0
-        last_exc: Exception | None = None
         for _ in range(max_tries):
             try:
                 resp = await self._client.get(target, params=params)
             except httpx.HTTPError as exc:
-                last_exc = exc
                 raise NetBoxClientError(f"{target}: {exc}") from exc
 
             status = resp.status_code
@@ -202,9 +200,8 @@ class NetBoxClient:
                 raise NetBoxClientError(f"{target}: HTTP {status} {resp.text[:200]}")
             return resp
 
-        # Exhausted retries on a throttle / transient 5xx.
-        if last_exc is not None:
-            raise NetBoxClientError(f"{target}: {last_exc}")
+        # Exhausted retries on a throttle / transient 5xx (network errors
+        # raise immediately above, so this is only the retry-loop give-up).
         raise NetBoxClientError(
             f"{target}: gave up after {max_tries} retries (throttled / upstream 5xx)"
         )
