@@ -188,6 +188,13 @@ class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         index=True,
     )
 
+    # Provenance for the NetBox one-shot importer (issue #36). ``netbox``
+    # for spaces created by /ipam/import/netbox; NULL for hand-created
+    # rows so the importer never claims ownership of rows it didn't
+    # create. ``imported_at`` is the wall-clock commit timestamp.
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     blocks: Mapped[list["IPBlock"]] = relationship(
         "IPBlock", back_populates="space", cascade="all, delete-orphan"
     )
@@ -396,6 +403,12 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         ForeignKey("ipam_template.id", ondelete="SET NULL"),
         nullable=True,
     )
+
+    # Provenance for the NetBox one-shot importer (issue #36). ``netbox``
+    # for blocks created by /ipam/import/netbox; NULL for hand-created
+    # rows. ``imported_at`` is the wall-clock commit timestamp.
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     space: Mapped[IPSpace] = relationship("IPSpace", back_populates="blocks")
     parent: Mapped["IPBlock | None"] = relationship("IPBlock", remote_side="IPBlock.id")
@@ -755,6 +768,12 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
     )
 
+    # Provenance for the NetBox one-shot importer (issue #36). ``netbox``
+    # for subnets created by /ipam/import/netbox; NULL for hand-created
+    # rows. ``imported_at`` is the wall-clock commit timestamp.
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     space: Mapped[IPSpace] = relationship("IPSpace", back_populates="subnets")
     block: Mapped[IPBlock | None] = relationship("IPBlock", back_populates="subnets")
     router_zone: Mapped[RouterZone | None] = relationship("RouterZone", back_populates="subnets")
@@ -968,6 +987,12 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     user_modified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    # Provenance for the NetBox one-shot importer (issue #36). ``netbox``
+    # for addresses created by /ipam/import/netbox; NULL for hand-created
+    # rows. ``imported_at`` is the wall-clock commit timestamp.
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     subnet: Mapped[Subnet] = relationship("Subnet", back_populates="addresses")
 

@@ -1,8 +1,9 @@
 """Router + VLAN models (first-class VLAN management)."""
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import INET, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -66,6 +67,16 @@ class VLAN(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     vlan_id: Mapped[int] = mapped_column(Integer, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # Provenance for the NetBox one-shot importer (issue #36). ``netbox``
+    # for VLANs created by /ipam/import/netbox; NULL for hand-created
+    # rows. VLAN has neither ``tags`` nor ``custom_fields``, so these
+    # provenance columns are the only NetBox marker the importer can
+    # stamp — re-import idempotency keys on ``(router_id, vlan_id)`` /
+    # ``(router_id, name)`` against the synthetic import router, not a
+    # stored netbox id. ``imported_at`` is the wall-clock commit time.
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Eager-load the parent Router so SubnetResponse.vlan.router_name can be
     # filled without an extra round-trip per subnet row.

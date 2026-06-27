@@ -260,6 +260,13 @@ Import behavior:
 - **Export**: Export zone as RFC 1035 zone file or JSON
 - Bulk import of multiple zones via ZIP of zone files
 
+### NetBox migration import (#36)
+
+For migrating a whole IPAM estate out of a live NetBox install — prefixes / IP
+addresses / VRFs / tenants → Customers / sites / VLANs in one preview → commit
+pass — use the dedicated **NetBox importer** rather than the generic CSV/JSON
+range import above. See `docs/features/MIGRATION.md` § "NetBox → IPAM importer".
+
 ---
 
 ## 8. Discovery / Reconciliation

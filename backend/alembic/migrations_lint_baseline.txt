@@ -29,6 +29,8 @@ backend/alembic/versions/2c4e9d1a7f63_vrf_first_class.py:drop_column:268
 backend/alembic/versions/2c4e9d1a7f63_vrf_first_class.py:drop_constraint_fk:263
 backend/alembic/versions/2c4e9d1a7f63_vrf_first_class.py:drop_constraint_fk:267
 backend/alembic/versions/2c4e9d1a7f63_vrf_first_class.py:drop_table:272
+backend/alembic/versions/30135c361a47_netbox_import.py:drop_column:91
+backend/alembic/versions/30135c361a47_netbox_import.py:drop_column:92
 backend/alembic/versions/30cda233dce9_add_smtp_chat_flavor_to_audit_forward_.py:drop_column:138
 backend/alembic/versions/30cda233dce9_add_smtp_chat_flavor_to_audit_forward_.py:drop_column:139
 backend/alembic/versions/30cda233dce9_add_smtp_chat_flavor_to_audit_forward_.py:drop_column:140
@@ -101,11 +103,11 @@ backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:85
 backend/alembic/versions/a3e7c9d12f80_appliance_resolver_settings.py:drop_column:106
 backend/alembic/versions/a3e7c9d12f80_appliance_resolver_settings.py:drop_column:108
+backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:drop_column:139
+backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:drop_column:140
 backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:drop_column:141
 backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:drop_column:142
 backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:drop_column:143
-backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:drop_column:144
-backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:drop_column:145
 backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:drop_constraint_fk:138
 backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:drop_table:136
 backend/alembic/versions/a3f1d9e07c52_firewall_apply_state.py:drop_column:66

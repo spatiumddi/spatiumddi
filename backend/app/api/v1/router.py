@@ -45,6 +45,7 @@ from app.api.v1.kubernetes import router as kubernetes_router
 from app.api.v1.logs import logs_router
 from app.api.v1.metrics import router as metrics_router
 from app.api.v1.multicast import router as multicast_router
+from app.api.v1.netbox_import.router import router as netbox_import_router
 from app.api.v1.network import router as network_router
 from app.api.v1.new_devices import router as new_devices_router
 from app.api.v1.nmap import router as nmap_router
@@ -247,6 +248,16 @@ api_v1_router.include_router(
     prefix="/multicast",
     tags=["multicast"],
     dependencies=[Depends(require_module("network.multicast"))],
+)
+api_v1_router.include_router(
+    netbox_import_router,
+    prefix="/ipam/import/netbox",
+    tags=["netbox-import"],
+    # 404 when the module is off. NO wake_publishing — NetBox seeds IPAM
+    # rows only and touches no DNS/DHCP agent config bundle, so there's
+    # no agent long-poll to wake (contrast dns_import / dhcp_import which
+    # DO carry wake_publishing).
+    dependencies=[Depends(require_module("ipam.import.netbox"))],
 )
 api_v1_router.include_router(
     network_router,

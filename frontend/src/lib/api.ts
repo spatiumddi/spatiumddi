@@ -5860,6 +5860,217 @@ export const dhcpImportApi = {
       .then((r) => r.data),
 };
 
+// ── NetBox read-only one-shot IPAM importer (issue #36) ─────────────────
+//
+// A live-API migration tool: the operator pastes a NetBox base_url + token
+// per request (creds read-once, never persisted), tests the connection,
+// previews the would-create canonical IR across every entity type, then
+// commits the unmodified previewed plan. Stateless between preview + commit
+// — the UI hands the same PreviewOut straight back as CommitIn.plan. Mirrors
+// the dnsImportApi (connection-test shape) + dhcpImportApi (IPAM-target
+// shape). Wire shapes match backend/app/api/v1/netbox_import/router.py.
+
+export type NetBoxSpaceStrategy = "per_vrf" | "single";
+export type NetBoxImportConflictAction = "skip" | "overwrite";
+
+// Shared connection fields (test-connection + preview bodies).
+export interface NetBoxConnIn {
+  base_url: string;
+  token: string;
+  verify_tls?: boolean;
+}
+
+// Optional scope slice forwarded to the prefix / address / vrf / tenant
+// pulls so the operator can import a slice of a large NetBox.
+export interface NetBoxPreviewFilters {
+  vrf_id?: number | null;
+  tenant_id?: number | null;
+  status?: string | null;
+  family?: 4 | 6 | null;
+  within_include?: string | null;
+}
+
+export interface NetBoxTestOut {
+  ok: boolean;
+  netbox_version: string | null;
+  api_version: string | null;
+  counts: Record<string, number> | null;
+}
+
+// ── The 8 Imported*Out canonical-IR row shapes ───────────────────────
+export interface NetBoxImportedCustomer {
+  name: string;
+  notes: string;
+  custom_fields: Record<string, unknown>;
+  tags: Record<string, unknown>;
+  netbox_id: number | null;
+}
+
+export interface NetBoxImportedSite {
+  name: string;
+  code: string | null;
+  parent_code: string | null;
+  kind: string;
+  region: string | null;
+  notes: string;
+  tags: Record<string, unknown>;
+  netbox_id: number | null;
+}
+
+export interface NetBoxImportedVRF {
+  name: string;
+  rd: string | null;
+  import_targets: string[];
+  export_targets: string[];
+  description: string;
+  customer_name: string | null;
+  custom_fields: Record<string, unknown>;
+  tags: Record<string, unknown>;
+  netbox_id: number | null;
+}
+
+export interface NetBoxImportedSpace {
+  name: string;
+  vrf_name: string | null;
+  is_default: boolean;
+  customer_name: string | null;
+  description: string;
+  tags: Record<string, unknown>;
+}
+
+export interface NetBoxImportedVLAN {
+  vid: number;
+  name: string;
+  description: string;
+  netbox_id: number | null;
+}
+
+export interface NetBoxImportedBlock {
+  network: string;
+  name: string;
+  description: string;
+  space_name: string | null;
+  parent_cidr: string | null;
+  customer_name: string | null;
+  site_code: string | null;
+  custom_fields: Record<string, unknown>;
+  tags: Record<string, unknown>;
+  netbox_id: number | null;
+}
+
+export interface NetBoxImportedSubnet {
+  network: string;
+  name: string;
+  description: string;
+  space_name: string | null;
+  status: string;
+  vlan_vid: number | null;
+  customer_name: string | null;
+  site_code: string | null;
+  subnet_role: string | null;
+  kind: string;
+  custom_fields: Record<string, unknown>;
+  tags: Record<string, unknown>;
+  netbox_id: number | null;
+}
+
+export interface NetBoxImportedAddress {
+  address: string;
+  status: string;
+  role: string | null;
+  hostname: string | null;
+  fqdn: string | null;
+  description: string;
+  subnet_cidr: string | null;
+  space_name: string | null;
+  custom_fields: Record<string, unknown>;
+  tags: Record<string, unknown>;
+  netbox_id: number | null;
+}
+
+export interface NetBoxEntityConflict {
+  kind: string;
+  key: string;
+  existing_id: string;
+  reason: string;
+  action: NetBoxImportConflictAction;
+}
+
+// PreviewOut — also the commit request payload's ``plan`` field, so the
+// UI hands back the same shape it received.
+export interface NetBoxImportPreview {
+  source: "netbox";
+  customers: NetBoxImportedCustomer[];
+  sites: NetBoxImportedSite[];
+  vrfs: NetBoxImportedVRF[];
+  spaces: NetBoxImportedSpace[];
+  vlans: NetBoxImportedVLAN[];
+  blocks: NetBoxImportedBlock[];
+  subnets: NetBoxImportedSubnet[];
+  addresses: NetBoxImportedAddress[];
+  conflicts: NetBoxEntityConflict[];
+  warnings: string[];
+  counts: Record<string, number>;
+}
+
+export interface NetBoxImportConflictDecision {
+  action: NetBoxImportConflictAction;
+}
+
+export interface NetBoxCommitEntity {
+  kind: string;
+  key: string;
+  action_taken: "created" | "overwrote" | "skipped" | "failed";
+  entity_id: string | null;
+  error: string | null;
+}
+
+export interface NetBoxImportCommitResult {
+  source: string;
+  entities: NetBoxCommitEntity[];
+  warnings: string[];
+  customers_created: number;
+  sites_created: number;
+  vrfs_created: number;
+  spaces_created: number;
+  vlans_created: number;
+  blocks_created: number;
+  subnets_created: number;
+  addresses_created: number;
+  total_created: number;
+  total_overwrote: number;
+  total_skipped: number;
+  total_failed: number;
+}
+
+export const netboxImportApi = {
+  // Connection probe — base URL + token; token read-once, never persisted.
+  testConnection: (body: NetBoxConnIn) =>
+    api
+      .post<NetBoxTestOut>("/ipam/import/netbox/test-connection", body)
+      .then((r) => r.data),
+  preview: (
+    body: NetBoxConnIn & {
+      space_strategy: NetBoxSpaceStrategy;
+      target_space_id?: string | null;
+      filters?: NetBoxPreviewFilters | null;
+    },
+  ) =>
+    api
+      .post<NetBoxImportPreview>("/ipam/import/netbox/preview", body)
+      .then((r) => r.data),
+  commit: (body: {
+    plan: NetBoxImportPreview;
+    conflict_actions: Record<string, NetBoxImportConflictDecision>;
+    space_strategy: NetBoxSpaceStrategy;
+    target_space_id?: string | null;
+    default_router_name?: string;
+  }) =>
+    api
+      .post<NetBoxImportCommitResult>("/ipam/import/netbox/commit", body)
+      .then((r) => r.data),
+};
+
 export const dnsBlocklistApi = {
   list: () => api.get<DNSBlockList[]>("/dns/blocklists").then((r) => r.data),
   catalog: () =>

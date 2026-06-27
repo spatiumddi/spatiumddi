@@ -19,8 +19,9 @@ operators want to re-tag, not lose data.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import ForeignKey, Index, String, Text, UniqueConstraint, text
+from sqlalchemy import DateTime, ForeignKey, Index, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -79,6 +80,12 @@ class Customer(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     custom_fields: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default="{}"
     )
+
+    # Provenance for the NetBox one-shot importer (issue #36). ``netbox``
+    # for customers (NetBox tenants) created by /ipam/import/netbox; NULL
+    # for hand-created rows. ``imported_at`` is the wall-clock commit time.
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Site(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -143,6 +150,12 @@ class Site(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+
+    # Provenance for the NetBox one-shot importer (issue #36). ``netbox``
+    # for sites (NetBox sites/regions) created by /ipam/import/netbox; NULL
+    # for hand-created rows. ``imported_at`` is the wall-clock commit time.
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Provider(UUIDPrimaryKeyMixin, TimestampMixin, Base):

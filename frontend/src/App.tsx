@@ -51,8 +51,7 @@ import { LogsPage } from "@/pages/LogsPage";
 import { ReportsPage } from "@/pages/ReportsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
-import { DNSImportPage } from "@/pages/admin/DNSImportPage";
-import { DHCPImportPage } from "@/pages/admin/DHCPImportPage";
+import { ImportPage } from "@/pages/admin/ImportPage";
 import { BackupPage } from "@/pages/admin/BackupPage";
 import { DiagnosticsErrorsPage } from "@/pages/admin/DiagnosticsErrorsPage";
 import { AIProvidersPage } from "@/pages/admin/AIProvidersPage";
@@ -167,8 +166,23 @@ export default function App() {
         <Route path="admin/groups" element={<GroupsPage />} />
         <Route path="admin/roles" element={<RolesPage />} />
         <Route path="admin/audit" element={<AuditPage />} />
-        <Route path="admin/dns-import" element={<DNSImportPage />} />
-        <Route path="admin/dhcp-import" element={<DHCPImportPage />} />
+        {/* Configuration → Import hub (#36): one shell with a left sub-nav.
+            The legacy per-importer routes render the same shell with the
+            matching initialTab so existing deep-links keep working (notably
+            the DNS page's navigate("/admin/dns-import", {state: cloudServerId}). */}
+        <Route path="admin/import" element={<ImportPage />} />
+        <Route
+          path="admin/dns-import"
+          element={<ImportPage initialTab="dns" />}
+        />
+        <Route
+          path="admin/dhcp-import"
+          element={<ImportPage initialTab="dhcp" />}
+        />
+        <Route
+          path="admin/netbox-import"
+          element={<ImportPage initialTab="netbox" />}
+        />
         <Route path="admin/backup" element={<BackupPage />} />
         <Route
           path="admin/diagnostics/errors"

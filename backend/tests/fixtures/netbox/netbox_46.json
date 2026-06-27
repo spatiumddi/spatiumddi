@@ -1,0 +1,322 @@
+{
+  "_comment": "Recorded NetBox 4.6-shaped REST read responses (issue #36 test fixtures). Keys are the relative endpoint paths the importer pulls; each value is the de-paginated 'results' list. FKs serialize as brief {id,url,display,name,slug,...}; choice fields (status/role/family) as {value,label}; prefixes/VLANs carry the 4.2+ scope_type/scope_id/scope shape. This single install models: 2 VRFs (cust-a / cust-b) with the SAME 10.50.0.0/24 prefix in each (overlap that must coexist in 2 spaces), 1 tenant (Acme) -> Customer, a region->site tree, an aggregate, a container/leaf/enclosing-active prefix mix, a multicast prefix, VLANs (incl. a vid clash + a name clash), and addresses.",
+  "/api/ipam/rirs/": [
+    {"id": 1, "url": "https://nb/api/ipam/rirs/1/", "display": "RFC1918", "name": "RFC1918", "slug": "rfc1918"}
+  ],
+  "/api/ipam/roles/": [
+    {"id": 11, "url": "https://nb/api/ipam/roles/11/", "display": "Management", "name": "Management", "slug": "management"},
+    {"id": 12, "url": "https://nb/api/ipam/roles/12/", "display": "Lab", "name": "Lab", "slug": "lab"}
+  ],
+  "/api/tenancy/tenants/": [
+    {
+      "id": 100,
+      "url": "https://nb/api/tenancy/tenants/100/",
+      "display": "Acme Corp",
+      "name": "Acme Corp",
+      "slug": "acme-corp",
+      "description": "Primary tenant",
+      "group": {"id": 5, "url": "https://nb/api/tenancy/tenant-groups/5/", "display": "Customers", "name": "Customers", "slug": "customers"},
+      "custom_fields": {"cost_center": "CC-42", "unset_field": null},
+      "tags": []
+    }
+  ],
+  "/api/dcim/regions/": [
+    {
+      "id": 200,
+      "url": "https://nb/api/dcim/regions/200/",
+      "display": "EMEA",
+      "name": "EMEA",
+      "slug": "emea",
+      "parent": null,
+      "description": "Europe / Middle East / Africa",
+      "_depth": 0
+    },
+    {
+      "id": 201,
+      "url": "https://nb/api/dcim/regions/201/",
+      "display": "London",
+      "name": "London",
+      "slug": "london",
+      "parent": {"id": 200, "url": "https://nb/api/dcim/regions/200/", "display": "EMEA", "name": "EMEA", "slug": "emea"},
+      "description": "",
+      "_depth": 1
+    }
+  ],
+  "/api/dcim/site-groups/": [
+    {"id": 300, "url": "https://nb/api/dcim/site-groups/300/", "display": "Corporate", "name": "Corporate", "slug": "corporate", "parent": null, "_depth": 0}
+  ],
+  "/api/dcim/sites/": [
+    {
+      "id": 400,
+      "url": "https://nb/api/dcim/sites/400/",
+      "display": "DC-London-1",
+      "name": "DC-London-1",
+      "slug": "dc-london-1",
+      "status": {"value": "active", "label": "Active"},
+      "region": {"id": 201, "url": "https://nb/api/dcim/regions/201/", "display": "London", "name": "London", "slug": "london"},
+      "group": {"id": 300, "url": "https://nb/api/dcim/site-groups/300/", "display": "Corporate", "name": "Corporate", "slug": "corporate"},
+      "tenant": {"id": 100, "url": "https://nb/api/tenancy/tenants/100/", "display": "Acme Corp", "name": "Acme Corp", "slug": "acme-corp"},
+      "physical_address": "1 London Wall, EC2Y 5EA",
+      "description": "Primary DC",
+      "custom_fields": {},
+      "tags": []
+    }
+  ],
+  "/api/ipam/vrfs/": [
+    {
+      "id": 500,
+      "url": "https://nb/api/ipam/vrfs/500/",
+      "display": "cust-a",
+      "name": "cust-a",
+      "rd": "65000:1",
+      "description": "Customer A VRF",
+      "tenant": {"id": 100, "url": "https://nb/api/tenancy/tenants/100/", "display": "Acme Corp", "name": "Acme Corp", "slug": "acme-corp"},
+      "enforce_unique": true,
+      "import_targets": [
+        {"id": 9001, "url": "https://nb/api/ipam/route-targets/9001/", "display": "65000:1", "name": "65000:1"}
+      ],
+      "export_targets": [
+        {"id": 9001, "url": "https://nb/api/ipam/route-targets/9001/", "display": "65000:1", "name": "65000:1"},
+        {"id": 9002, "url": "https://nb/api/ipam/route-targets/9002/", "display": "65000:100", "name": "65000:100"}
+      ],
+      "custom_fields": {},
+      "tags": []
+    },
+    {
+      "id": 501,
+      "url": "https://nb/api/ipam/vrfs/501/",
+      "display": "cust-b",
+      "name": "cust-b",
+      "rd": "65000:2",
+      "description": "Customer B VRF",
+      "tenant": null,
+      "enforce_unique": true,
+      "import_targets": [],
+      "export_targets": [],
+      "custom_fields": {},
+      "tags": []
+    }
+  ],
+  "/api/ipam/route-targets/": [
+    {"id": 9001, "url": "https://nb/api/ipam/route-targets/9001/", "display": "65000:1", "name": "65000:1", "tenant": null, "description": ""},
+    {"id": 9002, "url": "https://nb/api/ipam/route-targets/9002/", "display": "65000:100", "name": "65000:100", "tenant": null, "description": ""}
+  ],
+  "/api/ipam/aggregates/": [
+    {
+      "id": 600,
+      "url": "https://nb/api/ipam/aggregates/600/",
+      "display": "10.0.0.0/8",
+      "prefix": "10.0.0.0/8",
+      "rir": {"id": 1, "url": "https://nb/api/ipam/rirs/1/", "display": "RFC1918", "name": "RFC1918", "slug": "rfc1918"},
+      "tenant": {"id": 100, "url": "https://nb/api/tenancy/tenants/100/", "display": "Acme Corp", "name": "Acme Corp", "slug": "acme-corp"},
+      "description": "RFC1918 supernet",
+      "custom_fields": {},
+      "tags": []
+    }
+  ],
+  "/api/ipam/prefixes/": [
+    {
+      "id": 700,
+      "url": "https://nb/api/ipam/prefixes/700/",
+      "display": "10.10.0.0/16",
+      "prefix": "10.10.0.0/16",
+      "status": {"value": "container", "label": "Container"},
+      "vrf": {"id": 500, "url": "https://nb/api/ipam/vrfs/500/", "display": "cust-a", "name": "cust-a"},
+      "scope_type": "dcim.site",
+      "scope_id": 400,
+      "scope": {"id": 400, "url": "https://nb/api/dcim/sites/400/", "display": "DC-London-1", "name": "DC-London-1", "slug": "dc-london-1"},
+      "tenant": {"id": 100, "url": "https://nb/api/tenancy/tenants/100/", "display": "Acme Corp", "name": "Acme Corp", "slug": "acme-corp"},
+      "vlan": null,
+      "role": null,
+      "is_pool": false,
+      "description": "container in cust-a",
+      "custom_fields": {},
+      "tags": []
+    },
+    {
+      "id": 701,
+      "url": "https://nb/api/ipam/prefixes/701/",
+      "display": "10.10.20.0/24",
+      "prefix": "10.10.20.0/24",
+      "status": {"value": "active", "label": "Active"},
+      "vrf": {"id": 500, "url": "https://nb/api/ipam/vrfs/500/", "display": "cust-a", "name": "cust-a"},
+      "scope_type": "dcim.site",
+      "scope_id": 400,
+      "scope": {"id": 400, "url": "https://nb/api/dcim/sites/400/", "display": "DC-London-1", "name": "DC-London-1", "slug": "dc-london-1"},
+      "tenant": {"id": 100, "url": "https://nb/api/tenancy/tenants/100/", "display": "Acme Corp", "name": "Acme Corp", "slug": "acme-corp"},
+      "vlan": {"id": 800, "url": "https://nb/api/ipam/vlans/800/", "display": "100 (data)", "name": "data", "vid": 100},
+      "role": {"id": 11, "url": "https://nb/api/ipam/roles/11/", "display": "Management", "name": "Management", "slug": "management"},
+      "is_pool": true,
+      "description": "leaf in cust-a with vlan",
+      "custom_fields": {"net_owner": "neteng"},
+      "tags": []
+    },
+    {
+      "id": 702,
+      "url": "https://nb/api/ipam/prefixes/702/",
+      "display": "10.50.0.0/24",
+      "prefix": "10.50.0.0/24",
+      "status": {"value": "active", "label": "Active"},
+      "vrf": {"id": 500, "url": "https://nb/api/ipam/vrfs/500/", "display": "cust-a", "name": "cust-a"},
+      "scope_type": null,
+      "scope_id": null,
+      "scope": null,
+      "tenant": null,
+      "vlan": null,
+      "role": {"id": 12, "url": "https://nb/api/ipam/roles/12/", "display": "Lab", "name": "Lab", "slug": "lab"},
+      "is_pool": false,
+      "description": "shared CIDR in cust-a",
+      "custom_fields": {},
+      "tags": []
+    },
+    {
+      "id": 703,
+      "url": "https://nb/api/ipam/prefixes/703/",
+      "display": "10.50.0.0/24",
+      "prefix": "10.50.0.0/24",
+      "status": {"value": "active", "label": "Active"},
+      "vrf": {"id": 501, "url": "https://nb/api/ipam/vrfs/501/", "display": "cust-b", "name": "cust-b"},
+      "scope_type": null,
+      "scope_id": null,
+      "scope": null,
+      "tenant": null,
+      "vlan": null,
+      "role": null,
+      "is_pool": false,
+      "description": "shared CIDR in cust-b",
+      "custom_fields": {},
+      "tags": []
+    },
+    {
+      "id": 704,
+      "url": "https://nb/api/ipam/prefixes/704/",
+      "display": "239.1.0.0/24",
+      "prefix": "239.1.0.0/24",
+      "status": {"value": "active", "label": "Active"},
+      "vrf": null,
+      "scope_type": null,
+      "scope_id": null,
+      "scope": null,
+      "tenant": null,
+      "vlan": null,
+      "role": null,
+      "is_pool": false,
+      "description": "multicast scope",
+      "custom_fields": {},
+      "tags": []
+    }
+  ],
+  "/api/ipam/ip-ranges/": [
+    {
+      "id": 750,
+      "url": "https://nb/api/ipam/ip-ranges/750/",
+      "display": "10.10.20.50-10.10.20.99/24",
+      "start_address": "10.10.20.50/24",
+      "end_address": "10.10.20.99/24",
+      "vrf": {"id": 500, "url": "https://nb/api/ipam/vrfs/500/", "display": "cust-a", "name": "cust-a"},
+      "status": {"value": "active", "label": "Active"},
+      "description": "DHCP pool (metadata only)"
+    }
+  ],
+  "/api/ipam/ip-addresses/": [
+    {
+      "id": 900,
+      "url": "https://nb/api/ipam/ip-addresses/900/",
+      "display": "10.10.20.5/24",
+      "address": "10.10.20.5/24",
+      "status": {"value": "active", "label": "Active"},
+      "role": {"value": "vip", "label": "VIP"},
+      "dns_name": "host5.acme.example",
+      "vrf": {"id": 500, "url": "https://nb/api/ipam/vrfs/500/", "display": "cust-a", "name": "cust-a"},
+      "tenant": {"id": 100, "url": "https://nb/api/tenancy/tenants/100/", "display": "Acme Corp", "name": "Acme Corp", "slug": "acme-corp"},
+      "description": "a vip",
+      "assigned_object": {
+        "id": 1,
+        "name": "eth0",
+        "device": {"id": 1, "name": "rtr-london-1"}
+      },
+      "custom_fields": {},
+      "tags": []
+    },
+    {
+      "id": 901,
+      "url": "https://nb/api/ipam/ip-addresses/901/",
+      "display": "10.10.20.6/24",
+      "address": "10.10.20.6/24",
+      "status": {"value": "dhcp", "label": "DHCP"},
+      "role": {"value": "loopback", "label": "Loopback"},
+      "dns_name": "",
+      "vrf": {"id": 500, "url": "https://nb/api/ipam/vrfs/500/", "display": "cust-a", "name": "cust-a"},
+      "tenant": null,
+      "description": "",
+      "assigned_object": null,
+      "custom_fields": {},
+      "tags": []
+    }
+  ],
+  "/api/ipam/vlan-groups/": [
+    {"id": 850, "url": "https://nb/api/ipam/vlan-groups/850/", "display": "Lab VLANs", "name": "Lab VLANs", "slug": "lab-vlans", "min_vid": 1, "max_vid": 4094, "vid_ranges": [[1, 4094]]}
+  ],
+  "/api/ipam/vlans/": [
+    {
+      "id": 800,
+      "url": "https://nb/api/ipam/vlans/800/",
+      "display": "100 (data)",
+      "vid": 100,
+      "name": "data",
+      "status": {"value": "active", "label": "Active"},
+      "scope_type": "dcim.site",
+      "scope_id": 400,
+      "scope": {"id": 400, "url": "https://nb/api/dcim/sites/400/", "display": "DC-London-1", "name": "DC-London-1", "slug": "dc-london-1"},
+      "group": {"id": 850, "url": "https://nb/api/ipam/vlan-groups/850/", "display": "Lab VLANs", "name": "Lab VLANs", "slug": "lab-vlans"},
+      "role": null,
+      "tenant": null,
+      "description": "data vlan"
+    },
+    {
+      "id": 801,
+      "url": "https://nb/api/ipam/vlans/801/",
+      "display": "200 (voice)",
+      "vid": 200,
+      "name": "voice",
+      "status": {"value": "active", "label": "Active"},
+      "scope_type": "dcim.site",
+      "scope_id": 400,
+      "scope": {"id": 400, "url": "https://nb/api/dcim/sites/400/", "display": "DC-London-1", "name": "DC-London-1", "slug": "dc-london-1"},
+      "group": null,
+      "role": null,
+      "tenant": null,
+      "description": "voice vlan"
+    },
+    {
+      "id": 802,
+      "url": "https://nb/api/ipam/vlans/802/",
+      "display": "100 (data-dup)",
+      "vid": 100,
+      "name": "data-dup",
+      "status": {"value": "active", "label": "Active"},
+      "scope_type": null,
+      "scope_id": null,
+      "scope": null,
+      "group": null,
+      "role": null,
+      "tenant": null,
+      "description": "vid clash with vlan 800"
+    },
+    {
+      "id": 803,
+      "url": "https://nb/api/ipam/vlans/803/",
+      "display": "300 (data)",
+      "vid": 300,
+      "name": "data",
+      "status": {"value": "active", "label": "Active"},
+      "scope_type": null,
+      "scope_id": null,
+      "scope": null,
+      "group": null,
+      "role": null,
+      "tenant": null,
+      "description": "name clash with vlan 800"
+    }
+  ]
+}

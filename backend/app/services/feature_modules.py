@@ -206,6 +206,21 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="DHCP",
         description="One-shot import from Kea / Windows DHCP / ISC dhcpd.conf into SpatiumDDI's native scopes + pools + reservations + classes. Settings → Import → DHCP surface; sources gate behind their own credential / file-upload step.",
     ),
+    # IPAM — NetBox read-only one-shot migration importer (issue #36).
+    # Sister to ``dns.import`` / ``dhcp.import``: pulls prefixes / IP
+    # addresses / VLANs / VRFs / tenants / sites out of a live NetBox
+    # install and stamps them into native IPAM rows
+    # (``import_source="netbox"``). One-shot migration tooling, NOT a
+    # continuous reconciler (contrast the ``integrations.*`` mirrors).
+    # Default-enabled — same rationale as the DNS / DHCP importers: no
+    # blast radius from the toggle (endpoints are RBAC-gated + superadmin
+    # separately), operators flip it off to hide the surface.
+    ModuleSpec(
+        id="ipam.import.netbox",
+        label="NetBox import",
+        group="IPAM",
+        description="One-shot migration import of prefixes / IP addresses / VLANs / VRFs / tenants / sites from a NetBox instance into native IPAM rows. Settings → Import → NetBox surface; connection + token are supplied per-import (never persisted).",
+    ),
     # Integrations — read-only mirrors of external orchestrators.
     # Default-disabled: each one needs operator-supplied credentials
     # before it does anything useful, and the kickoff lives behind

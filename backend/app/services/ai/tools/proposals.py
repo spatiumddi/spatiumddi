@@ -490,6 +490,7 @@ async def propose_archive_session(
 from app.services.ai.operations_writes import (  # noqa: E402
     CommitDHCPImportArgs,
     CommitDNSImportArgs,
+    CommitNetboxImportArgs,
     CreateConformityPolicyArgs,
     CreateMulticastDomainArgs,
     CreateWebhookArgs,
@@ -848,6 +849,31 @@ async def propose_commit_dhcp_import(
     db: AsyncSession, user: User, args: CommitDHCPImportArgs
 ) -> dict[str, Any]:
     return await _propose_via(db=db, user=user, operation_name="commit_dhcp_import", args=args)
+
+
+# ── NetBox IPAM import — live-pull one-shot commit (#36) ──────────────
+
+
+@register_tool(
+    name="propose_commit_netbox_import",
+    description=(
+        "Prepare a one-shot NetBox import into IPAM. Pass base_url + "
+        "token (+ verify_tls, space_strategy 'per_vrf'/'single', optional "
+        "target_space_id and scope filters vrf_id / tenant_id / status / "
+        "family / within_include). Preview shows entity counts + conflicts "
+        "(conflicts are SKIPPED on apply); operator clicks Approve to "
+        "commit. Superadmin; makes an off-prem pull and creates IPAM rows."
+    ),
+    args_model=CommitNetboxImportArgs,
+    writes=False,
+    category="ipam",
+    default_enabled=False,
+    module="ipam.import.netbox",
+)
+async def propose_commit_netbox_import(
+    db: AsyncSession, user: User, args: CommitNetboxImportArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="commit_netbox_import", args=args)
 
 
 # ── New-device watch proposals (issue #459) ──────────────────────────────────

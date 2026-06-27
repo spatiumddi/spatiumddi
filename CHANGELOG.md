@@ -22,7 +22,34 @@ the formatter handles the rest.
 
 ## Unreleased
 
-_Nothing yet — the next cut starts here._
+A **migration tooling** start: a one-shot importer that pulls an
+existing IPAM estate out of a live NetBox install into native rows, so
+an operator can evaluate SpatiumDDI without retyping their inventory.
+
+### Added
+
+* **#36 — NetBox → IPAM one-shot importer.** A read-only **migration**
+  importer (not a continuous reconciler — no target row, no beat sweep,
+  no absence-delete) that live-pulls prefixes / IP addresses / VRFs /
+  tenants→Customers / sites / VLANs out of a NetBox install (REST
+  v3.x–4.6+) and stamps them into native IPAM rows. Stateless
+  **test → preview → commit** flow at
+  ``/api/v1/ipam/import/netbox/{test-connection,preview,commit}`` — the
+  UI hands the unmodified ``PreviewOut`` straight back as the commit
+  body, conflicts are re-detected fresh against current state, and each
+  entity writes in its own savepoint so a failure on entity N never
+  rolls back 1..N-1. Two space strategies: ``per_vrf`` (one ``IPSpace``
+  per VRF + a Global space) or ``single`` (collapse into a chosen
+  ``target_space_id``). Provenance ``import_source="netbox"`` +
+  ``imported_at`` + ``netbox_id`` (in ``custom_fields`` / ``tags``)
+  makes a re-run idempotent — conflicts default to **skip**, set
+  **overwrite** to refresh. Connection ``base_url`` + ``token`` are
+  supplied per-request and **never persisted**; superadmin-only, behind
+  the **default-on** ``ipam.import.netbox`` feature module. Service in
+  ``backend/app/services/netbox_import/`` (migration ``30135c361a47``).
+  The Operator Copilot tool registry grows by 2 —
+  ``find_netbox_import_preview`` (read) + ``propose_commit_netbox_import``
+  (write proposal).
 
 ---
 
