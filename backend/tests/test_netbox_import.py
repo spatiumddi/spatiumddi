@@ -287,9 +287,13 @@ async def test_preview_counts_per_vrf(
     assert space_names == {"cust-a", "cust-b", GLOBAL_SPACE_NAME}
 
     # Aggregate 10.0.0.0/8 + the container prefix 10.10.0.0/16 → 2 blocks.
-    block_cidrs = {b.network for b in preview.blocks}
-    assert "10.0.0.0/8" in block_cidrs
-    assert "10.10.0.0/16" in block_cidrs
+    by_cidr = {b.network: b.name for b in preview.blocks}
+    assert "10.0.0.0/8" in by_cidr
+    assert "10.10.0.0/16" in by_cidr
+    # Real source blocks are named by their description/CIDR — the ``auto:``
+    # prefix is reserved for committer-synthesized wrapper blocks.
+    assert not by_cidr["10.0.0.0/8"].startswith("auto:")
+    assert not by_cidr["10.10.0.0/16"].startswith("auto:")
 
     # leaf prefixes: 10.10.20.0/24 (cust-a), 10.50.0.0/24 ×2 (cust-a, cust-b),
     # 239.1.0.0/24 (multicast) → 4 subnets.
@@ -379,6 +383,11 @@ async def test_commit_creates_rows_with_provenance(
     assert result.vrfs_created == 2
     assert result.spaces_created == 3  # cust-a + cust-b + Global
     assert result.subnets_created == 4
+    # 2 source blocks (aggregate 10.0.0.0/8 + container 10.10.0.0/16) + 3
+    # synthesized wrapper blocks for the un-enclosed leaf subnets
+    # (10.50.0.0/24 ×2 + the multicast 239.1.0.0/24) — all counted in the
+    # ledger, not just the explicit source blocks.
+    assert result.blocks_created == 5
     assert result.addresses_created >= 1  # multicast addr-in-subnet may skip; vips land
 
     # Provenance on a created subnet.

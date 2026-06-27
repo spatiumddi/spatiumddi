@@ -276,7 +276,9 @@ def map_aggregate(aggregate: dict[str, Any], *, space_name: str) -> ImportedBloc
     tenant_name = tenant.get("name") if isinstance(tenant, dict) else None
     return ImportedBlock(
         network=str(net),
-        name=f"auto:{net}",
+        # Real NetBox aggregate → name by description, else the CIDR. The
+        # ``auto:`` prefix is reserved for committer-synthesized wrapper blocks.
+        name=str(aggregate.get("description") or "").strip() or str(net),
         description=str(aggregate.get("description") or ""),
         space_name=space_name,
         parent_cidr=None,
@@ -441,7 +443,9 @@ def map_prefix_block(prefix: dict[str, Any], *, space_name: str | None) -> Impor
     site_code = site.get("slug") if isinstance(site, dict) else None
     return ImportedBlock(
         network=str(net),
-        name=str(prefix.get("description") or "") or f"auto:{net}",
+        # Real NetBox container / enclosing prefix → name by description, else
+        # the CIDR. ``auto:`` is reserved for synthesized wrapper blocks.
+        name=str(prefix.get("description") or "").strip() or str(net),
         description=str(prefix.get("description") or ""),
         space_name=space_name,
         parent_cidr=None,  # the committer resolves nesting largest-first

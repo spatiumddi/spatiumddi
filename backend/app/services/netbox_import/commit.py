@@ -1182,7 +1182,11 @@ async def _commit_subnet(
     customer_id: uuid.UUID | None,
     site_id: uuid.UUID | None,
     vlan_id: uuid.UUID | None,
-) -> tuple[CommitEntityResult, uuid.UUID | None]:
+) -> tuple[CommitEntityResult, uuid.UUID | None, list[CommitEntityResult]]:
+    # The 3rd return is extra ledger entities (a synthesized wrapper block,
+    # when one was created with this subnet) so blocks_created counts it — but
+    # only on the success path, since the wrapper shares the subnet's commit
+    # and would roll back with it on failure.
     cidr = _canonical_cidr(imported.network)
     key = _subnet_key(imported.space_name, cidr)
     net = _parse_net(cidr)
@@ -1192,6 +1196,7 @@ async def _commit_subnet(
                 kind="subnet", key=key, action_taken="failed", error="unparseable CIDR"
             ),
             None,
+            [],
         )
 
     existing = await _find_subnet(db, space_id, cidr)
@@ -1202,6 +1207,7 @@ async def _commit_subnet(
                     kind="subnet", key=key, action_taken="skipped", entity_id=str(existing.id)
                 ),
                 existing.id,
+                [],
             )
         existing.import_source = _SOURCE
         existing.imported_at = now
@@ -1224,6 +1230,7 @@ async def _commit_subnet(
                 kind="subnet", key=key, action_taken="overwrote", entity_id=str(existing.id)
             ),
             existing.id,
+            [],
         )
 
     # Space-wide overlap guard before we create anything.
@@ -1231,9 +1238,18 @@ async def _commit_subnet(
 
     # Resolve the parent block; auto-create an ``auto:<cidr>`` wrapper if
     # none encloses (Subnet.block_id is mandatory).
+    wrapper_entities: list[CommitEntityResult] = []
     block_id = await _find_parent_block_id(db, space_id, net)
     if block_id is None:
         block_id = await _auto_wrapper_block(db, space_id=space_id, net=net, actor=actor, now=now)
+        wrapper_entities.append(
+            CommitEntityResult(
+                kind="ip_block",
+                key=_block_key(imported.space_name, cidr),
+                action_taken="created",
+                entity_id=str(block_id),
+            )
+        )
 
     total = net.num_addresses
     row = Subnet(
@@ -1271,6 +1287,7 @@ async def _commit_subnet(
     return (
         CommitEntityResult(kind="subnet", key=key, action_taken="created", entity_id=str(row.id)),
         row.id,
+        wrapper_entities,
     )
 
 
@@ -1613,7 +1630,7 @@ async def commit_import(
         site_id = site_code_to_id.get(sub.site_code) if sub.site_code else None
         vlan_id = vlan_vid_to_id.get(sub.vlan_vid) if sub.vlan_vid is not None else None
         try:
-            res, _sid = await _commit_subnet(
+            res, _sid, wrapper_entities = await _commit_subnet(
                 db,
                 sub,
                 action=_action(key),
@@ -1624,6 +1641,9 @@ async def commit_import(
                 site_id=site_id,
                 vlan_id=vlan_id,
             )
+            # Wrapper block(s) committed together with the subnet — record them
+            # before the subnet row so blocks_created reflects reality.
+            result.entities.extend(wrapper_entities)
         except Exception as exc:  # noqa: BLE001
             await db.rollback()
             res = CommitEntityResult(kind="subnet", key=key, action_taken="failed", error=str(exc))
