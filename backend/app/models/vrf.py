@@ -20,7 +20,9 @@ follow-up migration; until then both surfaces co-exist and the
 
 from __future__ import annotations
 
-from sqlalchemy import ForeignKey, String, Text
+from datetime import datetime
+
+from sqlalchemy import DateTime, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -94,6 +96,12 @@ class VRF(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+
+    # Provenance for the NetBox one-shot importer (issue #36). ``netbox``
+    # for VRFs created by /ipam/import/netbox; NULL for hand-created
+    # rows. ``imported_at`` is the wall-clock commit timestamp.
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 __all__ = ["VRF"]

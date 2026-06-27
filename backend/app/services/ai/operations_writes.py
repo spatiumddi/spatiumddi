@@ -1592,3 +1592,138 @@ register(
         category="dhcp",
     )
 )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# NetBox IPAM import (commit) — live-pull one-shot migration (#36)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Sister to the DNS / DHCP config-import commits above. The Operation does
+# the off-prem pull + one-shot commit in one apply(); the preview shows the
+# would-import counts. NetBox seeds IPAM rows only (spaces / blocks /
+# subnets / addresses / VRFs / VLANs / customers / sites), so there's no
+# agent config bundle to wake (contrast the DNS / DHCP imports).
+
+
+class CommitNetboxImportArgs(BaseModel):
+    base_url: str = Field(description="NetBox base URL, e.g. https://netbox.example.com")
+    token: str = Field(description="NetBox API token (not persisted).")
+    verify_tls: bool = True
+    space_strategy: Literal["per_vrf", "single"] = Field(
+        default="per_vrf",
+        description=(
+            "'per_vrf' synthesises one IPSpace per VRF + a Global space; "
+            "'single' collapses everything into target_space_id."
+        ),
+    )
+    target_space_id: uuid.UUID | None = Field(
+        default=None, description="Target IP space when space_strategy='single'."
+    )
+    # Optional scope filters — kept flat for a clean MCP schema.
+    vrf_id: int | None = Field(default=None, description="NetBox VRF id to scope the pull to.")
+    tenant_id: int | None = Field(
+        default=None, description="NetBox tenant id to scope the pull to."
+    )
+    status: str | None = Field(default=None, description="NetBox prefix/address status slug.")
+    family: Literal[4, 6] | None = Field(default=None, description="Address family filter (4 / 6).")
+    within_include: str | None = Field(
+        default=None, description="Only prefixes within (and including) this CIDR."
+    )
+
+
+async def _netbox_import_pull(db: AsyncSession, args: CommitNetboxImportArgs) -> Any:
+    """Live-pull the NetBox install into an ImportPreview (conflicts are
+    attached by the service's own preview orchestrator). Raises ValueError
+    with operator-facing text on any failure."""
+    from app.services.netbox_import import (  # noqa: PLC0415
+        NetBoxClientError,
+        preview_netbox_import,
+    )
+
+    try:
+        preview = await preview_netbox_import(
+            db,
+            base_url=args.base_url,
+            token=args.token,
+            verify_tls=args.verify_tls,
+            space_strategy=args.space_strategy,
+            target_space_id=args.target_space_id,
+            filters={
+                "vrf_id": args.vrf_id,
+                "tenant_id": args.tenant_id,
+                "status": args.status,
+                "family": args.family,
+                "within_include": args.within_include,
+            },
+        )
+    except NetBoxClientError as exc:
+        raise ValueError(str(exc)) from exc
+    return preview
+
+
+def _netbox_preview_text(preview: Any) -> str:
+    conflicts = len(preview.conflicts)
+    return (
+        f"Import {len(preview.subnets)} subnet(s) / {len(preview.addresses)} address(es) / "
+        f"{len(preview.blocks)} block(s) / {len(preview.vrfs)} VRF(s) from {preview.source}"
+        + (f"; {conflicts} conflict(s) will be SKIPPED" if conflicts else "")
+    )
+
+
+async def _preview_commit_netbox_import(
+    db: AsyncSession, user: User, args: CommitNetboxImportArgs
+) -> PreviewResult:
+    if (block := _superadmin_preview_block(user)) is not None:
+        return block
+    if args.space_strategy == "single" and args.target_space_id is None:
+        return PreviewResult(ok=False, detail="space_strategy='single' requires target_space_id")
+    try:
+        preview = await _netbox_import_pull(db, args)
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
+    if not (preview.subnets or preview.addresses or preview.blocks):
+        return PreviewResult(ok=False, detail="No IPAM rows found to import from NetBox")
+    return PreviewResult(ok=True, detail="ready", preview_text=_netbox_preview_text(preview))
+
+
+async def _apply_commit_netbox_import(
+    db: AsyncSession, user: User, args: CommitNetboxImportArgs
+) -> dict[str, Any]:
+    _require_superadmin(user)
+    from app.services.netbox_import import commit_import  # noqa: PLC0415
+
+    preview = await _netbox_import_pull(db, args)
+    if not (preview.subnets or preview.addresses or preview.blocks):
+        raise ValueError("No IPAM rows found to import from NetBox")
+    result = await commit_import(
+        db,
+        preview=preview,
+        conflict_actions={},
+        space_strategy=args.space_strategy,
+        target_space_id=args.target_space_id,
+        actor=user,
+    )
+    return {
+        "customers_created": result.customers_created,
+        "sites_created": result.sites_created,
+        "vrfs_created": result.vrfs_created,
+        "spaces_created": result.spaces_created,
+        "vlans_created": result.vlans_created,
+        "blocks_created": result.blocks_created,
+        "subnets_created": result.subnets_created,
+        "addresses_created": result.addresses_created,
+        "total_skipped": result.total_skipped,
+        "total_failed": result.total_failed,
+    }
+
+
+register(
+    Operation(
+        name="commit_netbox_import",
+        description="Live-pull + one-shot import of NetBox IPAM into native rows.",
+        args_model=CommitNetboxImportArgs,
+        preview=_preview_commit_netbox_import,
+        apply=_apply_commit_netbox_import,
+        category="ipam",
+    )
+)

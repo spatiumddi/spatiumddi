@@ -297,6 +297,15 @@ const adminConfigurationNav = [
     icon: LayoutTemplate,
     to: "/admin/ipam/templates",
   },
+  // NetBox read-only one-shot IPAM importer (issue #36) — sister to
+  // DHCP Import / DNS Import. Module-gated so operators who don't need
+  // the surface can hide it via Settings → Features.
+  {
+    label: "NetBox Import",
+    icon: Upload,
+    to: "/admin/netbox-import",
+    module: "ipam.import.netbox",
+  },
 ];
 
 const adminNotificationsNav = [

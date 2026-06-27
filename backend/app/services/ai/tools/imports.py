@@ -23,8 +23,10 @@ from app.models.auth import User
 from app.services.ai.operations_writes import (
     CommitDHCPImportArgs,
     CommitDNSImportArgs,
+    CommitNetboxImportArgs,
     _dhcp_import_pull,
     _dns_import_pull,
+    _netbox_import_pull,
 )
 from app.services.ai.tools.base import register_tool
 
@@ -115,6 +117,56 @@ async def find_dhcp_import_preview(
                 "reservations": len(s.reservations),
             }
             for s in preview.scopes[:100]
+        ],
+        "warnings": list(preview.warnings)[:20],
+    }
+
+
+@register_tool(
+    name="find_netbox_import_preview",
+    description=(
+        "Preview what a one-shot NetBox import would bring into IPAM "
+        "without importing anything. Pass base_url + token (+ verify_tls, "
+        "space_strategy 'per_vrf'/'single', optional target_space_id and "
+        "scope filters vrf_id / tenant_id / status / family / "
+        "within_include). Returns counts of spaces / VRFs / blocks / "
+        "subnets / addresses / VLANs / customers / sites + per-entity "
+        "conflicts. Use before propose_commit_netbox_import. Superadmin; "
+        "makes an off-prem pull."
+    ),
+    args_model=CommitNetboxImportArgs,
+    category="ipam",
+    default_enabled=False,
+    module="ipam.import.netbox",
+)
+async def find_netbox_import_preview(
+    db: AsyncSession, user: User, args: CommitNetboxImportArgs
+) -> dict[str, Any]:
+    gate = _superadmin_gate(user)
+    if gate is not None:
+        return gate
+    try:
+        preview = await _netbox_import_pull(db, args)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return {
+        "source": preview.source,
+        "customer_count": len(preview.customers),
+        "site_count": len(preview.sites),
+        "vrf_count": len(preview.vrfs),
+        "space_count": len(preview.spaces),
+        "vlan_count": len(preview.vlans),
+        "block_count": len(preview.blocks),
+        "subnet_count": len(preview.subnets),
+        "address_count": len(preview.addresses),
+        "conflict_count": len(preview.conflicts),
+        "subnets": [
+            {
+                "network": s.network,
+                "kind": s.kind,
+                "space_name": s.space_name,
+            }
+            for s in preview.subnets[:100]
         ],
         "warnings": list(preview.warnings)[:20],
     }

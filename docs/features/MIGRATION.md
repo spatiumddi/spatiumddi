@@ -1,30 +1,30 @@
-# Migration — importing existing DNS + DHCP estates
+# Migration — importing existing DNS + DHCP + IPAM estates
 
-> **One-shot import, not ongoing sync.** Both importers exist so an
-> operator can load a real DNS / DHCP estate into a sandbox SpatiumDDI
-> without retyping every zone, record, scope, pool, and reservation.
-> Once imported, **SpatiumDDI is the source of truth** for the imported
-> objects. There is no conflict-resolution loop and no scheduled
-> re-pull. Operators who want a running read-only mirror are served by
-> the Windows DNS / Windows DHCP Path A drivers and the integration
-> shelf instead.
+> **One-shot import, not ongoing sync.** These importers exist so an
+> operator can load a real DNS / DHCP / IPAM estate into a sandbox
+> SpatiumDDI without retyping every zone, record, scope, pool,
+> reservation, prefix, and address. Once imported, **SpatiumDDI is the
+> source of truth** for the imported objects. There is no
+> conflict-resolution loop and no scheduled re-pull. Operators who want
+> a running read-only mirror are served by the Windows DNS / Windows
+> DHCP Path A drivers and the integration shelf instead.
 
-Two sibling importers share one design — a per-source parser feeding a
-shared canonical intermediate representation (IR), then a
-source-agnostic two-phase **preview → commit** pipeline. Both live
+Three sibling importers share one design — a per-source parser feeding
+a shared canonical intermediate representation (IR), then a
+source-agnostic two-phase **preview → commit** pipeline. Each lives
 behind a togglable feature module so operators who don't need the
 surface can hide it (Settings → Features).
 
-| | DNS importer (#128) | DHCP importer (#129) |
-|---|---|---|
-| Feature module | `dns.import` | `dhcp.import` |
-| Admin surface | DNS Import (sidebar) | DHCP Import (sidebar) |
-| Sources | BIND9 archive · Windows DNS live-pull · PowerDNS REST · Cloud DNS live-pull (Cloudflare / Route 53 / Azure DNS / Google Cloud DNS) | Kea JSON file · Windows DHCP live-pull · ISC `dhcpd.conf` |
-| Target | DNS server group (+ optional view) | DHCP server group (+ IPAM linkage) |
-| Provenance columns | `dns_zone` / `dns_record` `import_source` + `imported_at` | `dhcp_scope` / `dhcp_pool` / `dhcp_static_assignment` / `dhcp_client_class` `import_source` + `imported_at` |
-| Conflict actions | skip / overwrite / rename (per zone) | skip / overwrite (per scope) |
-| API prefix | `/api/v1/dns/import/{source}/…` | `/api/v1/dhcp/import/{source}/…` |
-| RBAC | superadmin | superadmin |
+| | DNS importer (#128) | DHCP importer (#129) | NetBox / IPAM importer (#36) |
+|---|---|---|---|
+| Feature module | `dns.import` | `dhcp.import` | `ipam.import.netbox` |
+| Admin surface | DNS Import (sidebar) | DHCP Import (sidebar) | Import → NetBox |
+| Sources | BIND9 archive · Windows DNS live-pull · PowerDNS REST · Cloud DNS live-pull (Cloudflare / Route 53 / Azure DNS / Google Cloud DNS) | Kea JSON file · Windows DHCP live-pull · ISC `dhcpd.conf` | NetBox REST live-pull (v3.x–4.6+) |
+| Target | DNS server group (+ optional view) | DHCP server group (+ IPAM linkage) | native IPAM rows (space / block / subnet / address + VRF / VLAN / Customer / Site) |
+| Provenance columns | `dns_zone` / `dns_record` `import_source` + `imported_at` | `dhcp_scope` / `dhcp_pool` / `dhcp_static_assignment` / `dhcp_client_class` `import_source` + `imported_at` | IPAM / network rows `import_source` + `imported_at` + `netbox_id` (in `custom_fields` / `tags`) |
+| Conflict actions | skip / overwrite / rename (per zone) | skip / overwrite (per scope) | skip / overwrite (per entity) |
+| API prefix | `/api/v1/dns/import/{source}/…` | `/api/v1/dhcp/import/{source}/…` | `/api/v1/ipam/import/netbox/…` |
+| RBAC | superadmin | superadmin | superadmin |
 
 The provenance columns are nullable + non-default: pre-existing,
 hand-created rows look "not imported" to the matcher, so a re-import
@@ -177,10 +177,99 @@ configs" for parser internals.
 
 ---
 
+## NetBox → IPAM importer (#36)
+
+A one-shot **migration** importer — *not* a continuous reconciler.
+There is no `netbox_target` row, no beat sweep, and no absence-delete:
+the operator live-pulls a NetBox install once, reviews the plan, and
+commits it into native IPAM. (Operators who want an ongoing read-only
+mirror belong on the integration shelf, not here.) The service package
+is `backend/app/services/netbox_import/`; the router lives at
+`/api/v1/ipam/import/netbox/`.
+
+### What it imports
+
+| NetBox source | → SpatiumDDI |
+|---|---|
+| `/api/ipam/vrfs/` | `VRF` (name / rd / import + export targets / tenant→customer) |
+| `/api/tenancy/tenants/` | `Customer` (ownership FK, **not** the space boundary) |
+| `/api/dcim/sites/` (+ regions) | `Site` (region is the single parent axis; site-groups fold into `tags`) |
+| `/api/ipam/aggregates/` | top-level `IPBlock` |
+| `/api/ipam/prefixes/` | `IPBlock` (container) **or** `Subnet` (leaf), by NetBox `status` |
+| `/api/ipam/ip-addresses/` | `IPAddress` (mask stripped, `dns_name` → fqdn) |
+| `/api/ipam/vlans/` | `VLAN` under a synthesized router |
+
+DCIM devices / racks / cables / interfaces, circuits, and write-back to
+NetBox are **out of scope** — the `assigned_object` on an IP is read
+for hostname enrichment only, never imported as its own row.
+
+### Flow — test → preview → commit
+
+1. **Test connection.** `POST …/test-connection` probes
+   `GET /api/status/`, validates the token (NetBox 4.5+ exposes a cheap
+   `authentication-check`), and returns the daemon version + object
+   counts so the operator confirms scale before a large pull.
+2. **Preview.** `POST …/preview` live-pulls every in-scope endpoint,
+   maps onto the canonical IR, and flags every entity whose key already
+   exists in the target. Side-effect-free — no DB writes, no audit
+   rows. Optional `filters` (vrf / tenant / status / family /
+   within-include) slice a large NetBox; re-run freely while iterating.
+3. **Commit.** `POST …/commit` replays the **unmodified** previewed
+   plan (the UI hands the same `PreviewOut` shape straight back as
+   `CommitIn.plan`, so the server is stateless between the two calls).
+   Conflicts are **re-detected fresh** against current state; each
+   entity writes in its **own savepoint**, so a FK / overlap error on
+   entity N never rolls back 1..N-1, and the result ledger carries one
+   `created` / `overwrote` / `skipped` / `failed` row per attempt. Each
+   committed entity gets one `audit_log` row tagged
+   `import_source=netbox`. There is **no agent wake** — NetBox seeds
+   IPAM rows only and touches no DNS / DHCP config bundle.
+
+### Space strategy — `per_vrf` vs `single`
+
+The crux decision is which IP space each prefix / address lands in:
+
+- **`per_vrf`** (default) — synthesise one `IPSpace` per NetBox VRF
+  (named after the VRF), plus a **Global** space for everything with no
+  VRF. Each block / subnet / address resolves its space from its VRF.
+- **`single`** — collapse every imported row into one operator-chosen
+  `target_space_id`; no `ImportedSpace` rows are synthesised. The
+  preview **warns** and the commit **422s** if `target_space_id` is
+  missing under this strategy.
+
+### Provenance + idempotent re-run
+
+Every created (or overwritten) row is stamped `import_source="netbox"`
++ `imported_at` + the NetBox primary key (`netbox_id`, carried in
+`custom_fields` for rows that have a custom-fields column, or `tags`
+for those that don't — `Site` / `VLAN`). On a re-run the matcher keys
+off `(import_source="netbox", netbox_id)`, so a second commit
+re-detects conflicts against the live DB and defaults every conflicting
+entity to **skip** — a double-"Commit" never duplicates or tramples.
+To intentionally refresh, set the entity's per-conflict action to
+**overwrite**. Pre-existing, hand-created rows look "not imported" to
+the matcher, so the importer never claims ownership of a row it didn't
+create.
+
+### Connection + token
+
+The NetBox `base_url` + API `token` (v1 `Token` or v2 `Bearer nbt_…`,
+auto-detected) are supplied **in the request body** on every call and
+**read once — never persisted**. The token should be read-only on the
+NetBox side; an advisory SSRF guard logs the resolved target IP (a
+co-located / LAN NetBox is a legitimate source, so it is not
+hard-blocked). The surface is superadmin-only; the feature module
+`ipam.import.netbox` is **default-on** (importers are default-on for
+discovery per non-negotiable #13/#14 — only continuous integration
+*mirrors* default off).
+
+---
+
 ## Re-running an import
 
-Both importers are safe to re-run. A second commit of the same source
-re-detects conflicts against the live DB and defaults every conflicting
-object to **skip**, so a fat-fingered "Commit" twice doesn't duplicate
-or trample. To intentionally refresh an imported object, set its
-conflict action to **overwrite** (DNS also offers **rename**).
+All three importers are safe to re-run. A second commit of the same
+source re-detects conflicts against the live DB and defaults every
+conflicting object to **skip**, so a fat-fingered "Commit" twice
+doesn't duplicate or trample. To intentionally refresh an imported
+object, set its conflict action to **overwrite** (DNS also offers
+**rename**; NetBox keys re-runs off the stored `netbox_id`).
