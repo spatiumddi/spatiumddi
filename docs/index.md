@@ -15,6 +15,7 @@ Open-source DDI platform — unified DNS, DHCP, and IP Address Management.
 ## Architecture & Design
 
 - [Architecture](ARCHITECTURE.md) — system topology, component relationships, HA design
+- [Deployment Topologies](deployment/TOPOLOGIES.md) — six reference production layouts with sizing notes
 - [Data Model](DATA_MODEL.md) — database models, relationships, field definitions
 - [API Conventions](API.md) — REST API conventions, pagination, error format
 - [Development Guide](DEVELOPMENT.md) — coding standards, test requirements, CI
@@ -28,15 +29,15 @@ Open-source DDI platform — unified DNS, DHCP, and IP Address Management.
 - [DHCP](features/DHCP.md) — servers, scopes, pools, static assignments, leases, Windows DHCP (Path A)
 - [Auth & Permissions](features/AUTH.md) — LDAP, OIDC, SAML, RADIUS, TACACS+, roles, API tokens
 - [ACME DNS-01 Provider](features/ACME.md) — acme-dns-compatible surface for LE / public-CA cert issuance against SpatiumDDI-managed zones
-- [Integrations](features/INTEGRATIONS.md) — read-only Kubernetes + Docker + Proxmox VE mirrors into IPAM; per-integration setup, mirror semantics, dashboard surface, roadmap
+- [Integrations](features/INTEGRATIONS.md) — read-only Kubernetes + Docker + Proxmox VE + Tailscale + Cloud (AWS/Azure/GCP) mirrors into IPAM; per-integration setup, mirror semantics, dashboard surface, roadmap
 - [System Admin](features/SYSTEM_ADMIN.md) — config, health dashboard, backup/restore
 
 ## Deployment
 
 - [Docker Compose](deployment/DOCKER.md) — quick start, profiles, TLS, HA
 - [Windows Server](deployment/WINDOWS.md) — connecting to Windows DNS / DHCP over WinRM + RFC 2136
-- [Kubernetes](deployment/KUBERNETES.md) — Helm chart, operators, HPA
-- [Bare Metal](deployment/BAREMETAL.md) — Ansible playbooks, systemd
+- [Kubernetes](deployment/KUBERNETES.md) — umbrella Helm chart, HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA
+- [Bare Metal](deployment/BAREMETAL.md) — Docker Compose on a host, Patroni HA Postgres overlay, OS appliance path
 - [OS Appliance](deployment/APPLIANCE.md) — appliance image build
 - [DNS Agent](deployment/DNS_AGENT.md) — agent protocol, auto-registration, config sync
 

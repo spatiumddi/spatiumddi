@@ -28,7 +28,7 @@ is operator-configurable via
 
 Read-only diagnostic surface so operators can see what their
 control plane is doing without standing up a separate Prometheus
-/ pgwatch / Grafana pipeline. Two tabs:
+/ pgwatch / Grafana pipeline. Five tabs:
 
 - **Postgres** — version + DB size, cache hit ratio, current WAL
   position, active vs max connections, longest-running
@@ -36,6 +36,8 @@ control plane is doing without standing up a separate Prometheus
   per-table size with autovacuum lag, connections grouped by
   state with idle-in-transaction tinted amber, slow queries from
   `pg_stat_statements` if the extension is installed.
+- **Redis** — overview, keyspace breakdown, and the agent-wake
+  pub/sub bus state.
 - **Containers** — per-container CPU% (computed the same way
   `docker stats` does), memory used / limit / %, network rx /
   tx, block-IO read / write. Default-filtered to the
@@ -43,9 +45,13 @@ control plane is doing without standing up a separate Prometheus
   container on the host. Reports `available=false` with a
   one-line setup hint when `/var/run/docker.sock` isn't mounted
   into the api container.
+- **Conformity** — promoted from the Compliance surface; shows
+  the latest conformity-evaluation rollup.
+- **Copilot Usage** — Operator Copilot token / cost observability.
 
-Backend at `app/api/v1/admin/postgres.py` (4 endpoints) +
-`app/api/v1/admin/containers.py` (1 endpoint). Both
+Backend at `app/api/v1/admin/postgres.py` (5 endpoints) +
+`app/api/v1/admin/containers.py` (1 endpoint) +
+`app/api/v1/admin/redis.py` (3 endpoints). All
 superadmin-gated.
 
 ---
@@ -245,7 +251,7 @@ Dashboard tiles showing platform-wide stats:
 
 ### 2.9 Backup and Restore
 
-The Backup admin page (`/admin/backup`) ships two tabs: **Manual** (build-and-download / restore-from-file) and **Destinations** (configured remote targets, scheduling, restore-from-destination). Everything described here is reachable from the UI; the same surface is exposed via REST under `/api/v1/backup` and `/api/v1/backup/targets` so operators can drive it from automation.
+The Backup admin page (`/admin/backup`) ships three tabs: **Manual** (build-and-download / restore-from-file), **Destinations** (configured remote targets, scheduling, restore-from-destination), and **Factory Reset** (per-section wipe back to defaults). Everything described here is reachable from the UI; the same surface is exposed via REST under `/api/v1/backup` and `/api/v1/backup/targets` so operators can drive it from automation.
 
 #### What's in the archive
 
@@ -268,7 +274,7 @@ The passphrase is **not** the destination's auth credential — every destinatio
 
 #### Destination kinds
 
-All seven destination kinds register in the same driver registry; the UI's destination picker reflects on `GET /backup/targets/kinds` so adding a new kind requires no frontend changes.
+All eight destination kinds register in the same driver registry; the UI's destination picker reflects on `GET /backup/targets/kinds` so adding a new kind requires no frontend changes.
 
 | Kind | Tier | Notes |
 |---|---|---|
@@ -279,6 +285,7 @@ All seven destination kinds register in the same driver registry; the UI's desti
 | `smb` | 2 | Windows / Samba shares (`smbprotocol`); NTLM auth, optional SMB3 encryption toggle |
 | `ftp` | 2 | Plain FTP / FTPS-explicit / FTPS-implicit; passive + active; `verify_tls` toggle for self-signed labs |
 | `gcs` | 2 | Google Cloud Storage; service-account JSON key (encrypted at rest) — no ADC by design |
+| `webdav` | 3 | WebDAV servers (Nextcloud, ownCloud, Apache `mod_dav`, IIS WebDAV, any RFC 4918 server) over `httpx` PUT / GET / PROPFIND / DELETE — no SDK dependency |
 
 Every driver implements the same four operations: `write` / `list_archives` / `delete` / `download` + a `test_connection` probe (writes a 16-byte random payload, head/stats it, deletes it — same shape as the DNS / DHCP server probes).
 
@@ -301,13 +308,13 @@ Set exactly one of `retention_keep_last_n` / `retention_keep_days`, or neither f
 |---|---|
 | Build + download a fresh archive | `POST /backup/create-and-download` (StreamingResponse, browser saves the zip directly) |
 | Restore from a laptop-uploaded archive | `POST /backup/restore` (multipart upload) |
-| Run a configured target now | `POST /backup/targets/{id}/run` |
+| Run a configured target now | `POST /backup/targets/{id}/run-now` |
 | Test a configured target's connection | `POST /backup/targets/{id}/test` |
 | List archives at a configured target | `GET /backup/targets/{id}/archives` |
 | Restore from any archive at a target | `POST /backup/targets/{id}/archives/restore` |
 | Download an archive from a target through the proxy | `GET /backup/targets/{id}/archives/{filename}/download` |
 
-The proxy-download endpoint streams `driver.download(filename)` straight back to the operator's browser, so SCP / S3 / Azure / SMB / FTP / GCS archives can be pulled to a laptop without giving the operator the destination credentials.
+The proxy-download endpoint streams `driver.download(filename)` straight back to the operator's browser, so SCP / S3 / Azure / SMB / FTP / GCS / WebDAV archives can be pulled to a laptop without giving the operator the destination credentials.
 
 #### Restore — what the server does
 
@@ -321,7 +328,7 @@ Same code path is hit whether the archive comes from an upload or a destination 
    - Phase 1 archives (plain SQL) → `psql --single-transaction --set=ON_ERROR_STOP=1`.
    - Selective restore (operator ticked specific sections) → `TRUNCATE … RESTART IDENTITY CASCADE` for the selected sections' tables, then `pg_restore --data-only --disable-triggers --table=…` for just those tables. `platform_internal` (alembic_version + oui_vendor) always rides along.
 5. **Alembic upgrade-on-restore.** If the archive's `schema_version` is older than this install's expected head, `alembic upgrade head` runs against the freshly-restored database. Same head → no-op. Source head not in this install's chain → restore succeeds, operator gets a clear `"upgrade SpatiumDDI on this destination, then re-run the restore"` warning. The restore returns a `migration` block with `state` (`up_to_date` / `upgraded` / `incompatible_newer` / `unknown` / `failed`), `source_head`, `local_head`, `migrations_applied`.
-6. **Cross-install secret rewrap.** Walks every Fernet-encrypted column (22 columns across 16 tables) plus the `__enc__:`-prefixed fields inside `backup_target.config` JSONB; decrypts each with the source key recovered from `secrets.enc`, re-encrypts with the destination's local key, UPDATEs in place. Same-install restores short-circuit with `same_install=true`. The operator no longer has to copy the recovered `SECRET_KEY` into the destination's `.env` manually — it just works.
+6. **Cross-install secret rewrap.** Walks every Fernet-encrypted column (19 columns across 15 tables) plus the `__enc__:`-prefixed fields inside `backup_target.config` JSONB; decrypts each with the source key recovered from `secrets.enc`, re-encrypts with the destination's local key, UPDATEs in place. Same-install restores short-circuit with `same_install=true`. The operator no longer has to copy the recovered `SECRET_KEY` into the destination's `.env` manually — it just works.
 7. **Audit row.** Inserts a `backup_restored` row into the `audit_log` table on a fresh session — this row sits in the *restored* database (the trail of evidence survives the wipe), and carries the manifest, pre-restore safety path, migration counters, and rewrap counters.
 
 The restore endpoint is superadmin-only. Operators must type the literal phrase `RESTORE-FROM-BACKUP` server-side to confirm, so accidental drag-and-drops don't nuke the install. Selective restore is opt-in via the section checklist on the restore modal.
@@ -343,7 +350,7 @@ The restore response carries a `rewrap` block:
   "rewrapped_jsonb_fields": 0,      // backup_target.config __enc__: rewraps
   "skipped_idempotent_rows": 0,     // already-dest-key-decryptable (re-run / post-restore-created)
   "failed_rows": 0,                 // couldn't decrypt with either key — operator re-enters by hand
-  "columns_visited": 22,
+  "columns_visited": 19,
   "failures": []                    // first 10 failures with table / column / pk / reason
 }
 ```
@@ -462,37 +469,132 @@ This allows a small deployment where one VM runs DHCP + DNS agents simultaneousl
 
 ## 5. Maintenance Mode
 
-Superadmins can put the system into maintenance mode:
-- API returns `503 Service Unavailable` with a configurable message
-- Frontend shows a maintenance page
-- Agent connections are maintained (DHCP/DNS continue from cache)
-- Bypass available for superadmin users (via `?bypass_maintenance=<token>`)
+Maintenance mode (issue #57) is a system-wide **read-only switch**, implemented as an ASGI middleware in [`backend/app/core/maintenance_mode.py`](../../backend/app/core/maintenance_mode.py) (`MaintenanceModeMiddleware`, wired in `app/main.py`). It is toggled by writing `PlatformSettings.maintenance_mode_enabled` / `maintenance_message` through the settings router (`PUT /api/v1/settings`); `maintenance_started_at` is server-stamped on enable and cleared on disable (it is never operator-set directly).
+
+When maintenance mode is **on**:
+
+- **Mutating requests** (`POST` / `PUT` / `PATCH` / `DELETE`) are answered with `503 Service Unavailable`, a `Retry-After: 120` header, and a structured body carrying `maintenance: true`, the configured `message`, and `started_at`.
+- **Read requests** (`GET` / `HEAD` / `OPTIONS` / …) always pass through — the platform stays fully browsable.
+- The frontend renders a maintenance banner / page from the same flag.
+- **Agent connections are maintained.** The DNS / DHCP / supervisor agent endpoints are on the exempt allow-list (see below), so a maintenance window never severs an agent's config-caching path (non-negotiable #5) — DHCP / DNS keep serving from cache.
+
+### Exempt paths
+
+A mutating request to any of these prefixes flows through even while maintenance mode is on, so the operator can recover and agents stay connected:
+
+| Prefix | Why |
+|---|---|
+| `/api/v1/auth` | Admins must be able to log in to recover |
+| `/api/v1/settings` | The maintenance toggle itself lives here |
+| `/health`, `/metrics` | Liveness / readiness probes + Prometheus scrape |
+| `/api/v1/dns/agents`, `/api/v1/dhcp/agents` | Agent register / heartbeat / long-poll / op-ack |
+| `/api/v1/appliance/supervisor` | Supervisor register / poll / heartbeat / k8s-proxy |
+| `/api/v1/appliance/self-register-bootstrap` | Local-supervisor self-bootstrap pairing |
+
+### Superadmin bypass
+
+There is **no** `?bypass_maintenance=<token>` query parameter. The bypass is keyed off the request's `Authorization: Bearer …` credential: the middleware decodes the bearer (a JWT session token or an `sddi_`-prefixed API token), resolves the owning user, and lets the request through only when that user is an **effective superadmin**. Any failure — missing or invalid token, unknown / inactive user, revoked or expired session, an API token whose `scopes` don't cover this method+path — yields no bypass and the request still gets the 503. This lets an admin flip the switch back off and run recovery tasks while everyone else is held read-only.
+
+Performance: the middleware reads the flag from a short-TTL process-local cache. When maintenance mode is off (the common case) a mutating request passes straight through with no bearer decode and no DB round-trip; the toggle endpoint calls `invalidate_cache()` so the flipping worker sees the change immediately and other workers converge within the cache TTL.
 
 ---
 
-## 6. Platform Settings (Miscellaneous)
+## 6. Platform Settings
+
+`PlatformSettings` is a singleton table (always exactly one row, `id=1`), defined in [`backend/app/models/settings.py`](../../backend/app/models/settings.py). It backs the `/api/v1/settings` surface (`GET` + `PUT`). The model carries a large number of flat columns spanning branding, security, IPAM/DNS/DHCP defaults, scheduled-task gating, integrations, and per-appliance host-config (SNMP, NTP, APT, syslog, SSH, resolver, …). Below is a representative slice — every field named here is a real column; see the model for the full set.
+
+**Branding**
 
 ```
-PlatformSettings (singleton table)
-  app_title: str (default "SpatiumDDI")
-  app_logo_url: str (nullable)
-  session_timeout_minutes: int (default 60)
-  max_api_token_age_days: int (default 365)
-  password_policy: JSONB {
-    min_length, require_uppercase, require_number, require_special,
-    max_age_days, history_count
-  }
-  ip_allocation_strategy: enum(sequential, random)
-  default_lease_time: int
-  discovery_scan_enabled: bool
-  discovery_scan_interval_minutes: int
-  utilization_warn_threshold: int (default 80)
-  utilization_critical_threshold: int (default 95)
-  subnet_tree_default_expanded_depth: int (default 2)
-  auto_logout_minutes: int (default 60)   -- idle session timeout; 0 = disabled
-  github_release_check_enabled: bool (default true)
-  github_release_check_interval_hours: int (default 24)
+app_title: str (default "SpatiumDDI")
+app_base_url: str (default "") -- used to build OIDC/SAML redirect URLs; empty = derive from request
 ```
+
+**IP allocation**
+
+```
+ip_allocation_strategy: str (default "sequential")  -- sequential | random
+```
+
+**Session / security**
+
+```
+session_timeout_minutes: int (default 60)
+auto_logout_minutes: int (default 0)  -- idle session timeout; 0 = disabled
+```
+
+**Password policy** (issue #70 — flat columns, not a JSONB blob; validator + history in `app.services.password_policy`)
+
+```
+password_min_length: int (default 12)
+password_require_uppercase: bool (default true)
+password_require_lowercase: bool (default true)
+password_require_digit: bool (default true)
+password_require_symbol: bool (default false)
+password_history_count: int (default 5)   -- 0 disables history checking
+password_max_age_days: int (default 0)     -- 0 disables forced rotation
+```
+
+**Account lockout** (issue #71)
+
+```
+lockout_threshold: int (default 0)          -- 0 disables lockout
+lockout_duration_minutes: int (default 15)
+lockout_reset_minutes: int (default 15)
+```
+
+**Utilization thresholds**
+
+```
+utilization_warn_threshold: int (default 80)
+utilization_critical_threshold: int (default 95)
+utilization_max_prefix_ipv4: int (default 29)   -- exclude PTP/single-host subnets from reporting
+utilization_max_prefix_ipv6: int (default 126)
+subnet_tree_default_expanded_depth: int (default 2)
+```
+
+**Release checking**
+
+```
+github_release_check_enabled: bool (default true)
+-- result columns written by the daily beat task:
+latest_version: str | null
+update_available: bool (default false)
+latest_release_url: str | null
+latest_checked_at: timestamp | null
+latest_check_error: str | null
+```
+
+**DNS / DHCP defaults**
+
+```
+dns_default_ttl: int (default 3600)
+dns_default_zone_type: str (default "primary")
+dns_recursive_by_default: bool (default true)
+dhcp_default_dns_servers: str[]
+dhcp_default_domain_name: str (default "")
+dhcp_default_lease_time: int (default 86400)
+```
+
+**Scheduled-task gating** (the Celery beat tick reads these every run, so cadence changes take effect without restarting beat)
+
+```
+dns_auto_sync_enabled / dns_auto_sync_interval_minutes / dns_auto_sync_delete_stale
+reverse_dns_enabled / reverse_dns_interval_minutes        -- PTR auto-population (issue #41)
+dhcp_pull_leases_enabled / dhcp_pull_leases_interval_seconds
+oui_lookup_enabled / oui_update_interval_hours
+soft_delete_purge_days (default 30)                       -- trash purge sweep
+```
+
+**Maintenance mode** (issue #57 — see [§5](#5-maintenance-mode))
+
+```
+maintenance_mode_enabled: bool (default false)
+maintenance_message: str (default "")
+maintenance_started_at: timestamp | null  -- server-stamped on enable, never operator-set directly
+```
+
+Other notable areas on the model (each a small cluster of columns): integration toggles (`integration_kubernetes_enabled`, `integration_docker_enabled`, …), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled`, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
 
 ---
 
@@ -506,7 +608,7 @@ Examples: `2026.04.13-1`, `2026.04.13-2` (hotfix same day)
 
 The version is injected at build time and exposed via:
 - UI header (e.g., `v2026.04.13-1`)
-- `GET /api/v1/version` — returns `{ "version": "...", "commit": "..." }`
+- `GET /api/v1/version` — returns `{ "version": "...", "update_available": ..., "latest_version": ... }`
 
 ### GitHub Release Check
 
@@ -515,17 +617,19 @@ When `github_release_check_enabled` is true, SpatiumDDI periodically polls the G
 - A notification is sent to configured notification channels if `notify_on_new_release` is enabled
 - Superadmins can dismiss the banner or snooze for N days
 
-The check is performed by the Celery beat scheduler (task: `system.check_github_release`). No personal data is sent — only a GET request to the public GitHub API.
+The check is performed by the Celery beat scheduler (task: `app.tasks.update_check.check_github_release`). No personal data is sent — only a GET request to the public GitHub API.
 
 ```python
 # API model
 GET /api/v1/version
 → {
     "version": "2026.04.13-1",
-    "commit": "abc1234",
-    "update_available": true,          # null if check is disabled or failed
-    "latest_version": "2026.05.01-1",  # null if up to date or check failed
-    "latest_release_url": "https://github.com/spatiumddi/spatiumddi/releases/tag/2026.05.01-1"
+    "update_available": true,
+    "latest_version": "2026.05.01-1",  # null if up to date, check disabled, or check failed
+    "latest_release_url": "https://github.com/spatiumddi/spatiumddi/releases/tag/2026.05.01-1",
+    "latest_checked_at": "2026-04-13T02:00:00Z",  # null if never checked
+    "release_check_enabled": true,
+    "latest_check_error": null         # most recent error, if any
   }
 ```
 

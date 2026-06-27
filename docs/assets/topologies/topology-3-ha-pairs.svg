@@ -103,7 +103,7 @@
           fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.5"/>
     <text x="80" y="410" font-size="13" font-weight="600" fill="#0f172a">Configured via the UI</text>
     <text x="80" y="436" font-size="12" fill="#334155">
-      <tspan font-weight="600">DNS Server Group</tspan> — list every member; records render to all. Per-server zone-state pill</tspan>
+      <tspan font-weight="600">DNS Server Group</tspan> — list every member; records render to all. Per-server zone-state pill
     </text>
     <text x="80" y="454" font-size="12" fill="#334155">on the zone page exposes any slave that hasn't transferred.</text>
 

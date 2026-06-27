@@ -27,7 +27,7 @@ We aim to acknowledge reports within **48 hours** and provide an initial assessm
 
 - **All auth enforced server-side** — the API validates every request independently of the UI
 - **Passwords hashed with bcrypt** — never stored in plaintext
-- **JWT access tokens** — short-lived (configurable, default 30 min); refresh tokens hashed before storage
+- **JWT access tokens** — short-lived (configurable, default 15 min); refresh tokens hashed before storage
 - **Append-only audit log** — every mutation is recorded before the response is returned
 - **No hardcoded secrets** — all credentials via environment variables or mounted secrets
 - **API tokens hashed with SHA-256** — only the prefix is stored for identification

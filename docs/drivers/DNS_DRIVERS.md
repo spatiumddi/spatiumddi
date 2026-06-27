@@ -2,86 +2,113 @@
 
 ## Overview
 
-DNS drivers implement the `DNSDriverBase` abstract class. They are responsible for translating SpatiumDDI's internal DNS model into operations on real DNS servers. The critical constraint: **no DNS driver may restart the DNS daemon** as part of normal record or zone operations.
+DNS drivers implement the `DNSDriver` abstract base class in [`app/drivers/dns/base.py`](../../backend/app/drivers/dns/base.py). They are responsible for translating SpatiumDDI's internal DNS model into backend-neutral config + per-record ops. The critical constraint: **no DNS driver may restart the DNS daemon** as part of normal record or zone operations.
+
+The control-plane driver is a *thin* translator (CLAUDE.md non-negotiable #10): it takes SpatiumDDI DB models and emits a canonical `ConfigBundle` (plus per-record `RecordChange` ops) in neutral types. For agent-managed drivers (BIND9, PowerDNS) the actual daemon lifecycle — `nsupdate`, `rndc`, the PowerDNS REST API — runs inside the agent container; the control-plane `apply_record_change` is a formulate-only no-op that logs the op. For agentless drivers (Windows DNS, the cloud providers) `apply_record_change` runs synchronously from the control plane.
 
 ---
 
 ## 1. Abstract Base Class
 
-```python
-from abc import ABC, abstractmethod
-from enum import Enum
-from dataclasses import dataclass
-from typing import Literal
+The neutral data shapes and the ABC both live in [`app/drivers/dns/base.py`](../../backend/app/drivers/dns/base.py). The driver speaks only in these frozen dataclasses — `RecordData`, `ZoneData`, `RecordChange`, `RecordChangeResult`, `ConfigBundle`, `ServerOptions`, plus the BIND9 config pieces (`ViewData`, `AclData`, `TsigKey`, `TrustAnchorData`, `DNSSECPolicyData`, `EffectiveBlocklistData`). A couple of the central ones:
 
-@dataclass
-class DNSRecordData:
-    name: str             # Relative to zone (e.g., "host1")
-    record_type: str      # "A", "AAAA", "PTR", "CNAME", etc.
+```python
+@dataclass(frozen=True)
+class RecordData:
+    name: str             # relative label ("@" = apex)
+    record_type: str      # A | AAAA | CNAME | MX | TXT | NS | PTR | SRV | CAA | ...
     value: str
-    ttl: int
+    ttl: int | None = None
     priority: int | None = None   # MX, SRV
     weight: int | None = None     # SRV
     port: int | None = None       # SRV
 
-@dataclass
-class DNSZoneData:
-    name: str             # FQDN with trailing dot (e.g., "example.com.")
-    zone_type: str        # "primary", "secondary"
-    ttl: int
-    refresh: int
-    retry: int
-    expire: int
-    minimum: int
-    primary_ns: str
-    admin_email: str
+@dataclass(frozen=True)
+class RecordChange:
+    op: Literal["create", "update", "delete"]
+    zone_name: str
+    record: RecordData
+    target_serial: int
+    tsig_key_name: str | None = None
+    op_id: str = ""               # caller-supplied UUID for ACK tracking
 
-@dataclass
-class DriverHealth:
-    status: Literal["online", "offline", "degraded"]
-    message: str
-    checked_at: datetime
-    version: str | None = None
-
-class DNSDriverBase(ABC):
-    @abstractmethod
-    async def health_check(self) -> DriverHealth: ...
-
-    @abstractmethod
-    async def get_zones(self) -> list[DNSZoneData]: ...
-
-    @abstractmethod
-    async def create_zone(self, zone: DNSZoneData) -> None: ...
-
-    @abstractmethod
-    async def delete_zone(self, zone_name: str) -> None: ...
-
-    @abstractmethod
-    async def get_records(self, zone_name: str) -> list[DNSRecordData]: ...
-
-    @abstractmethod
-    async def create_record(
-        self, zone_name: str, record: DNSRecordData
-    ) -> None: ...
-
-    @abstractmethod
-    async def update_record(
-        self, zone_name: str, record: DNSRecordData
-    ) -> None: ...
-
-    @abstractmethod
-    async def delete_record(
-        self, zone_name: str, name: str, record_type: str
-    ) -> None: ...
-
-    @abstractmethod
-    async def apply_blocklist(
-        self, rpz_zone: str, domains: list[str], mode: str
-    ) -> None: ...
-
-    # MUST NOT restart the daemon. Use incremental update mechanisms.
-    # Raise NotImplementedError if the driver cannot avoid a restart.
+@dataclass(frozen=True)
+class RecordChangeResult:
+    ok: bool
+    change: RecordChange          # original input echoed back verbatim
+    error: str | None = None
 ```
+
+The ABC itself:
+
+```python
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from typing import Any
+
+class DNSDriver(ABC):
+    """Abstract base class for DNS backend drivers.
+
+    Drivers are pure renderers + single-record appliers. They do not manage
+    daemon lifecycle (the agent does that). They must be stateless and safe
+    to instantiate per call.
+    """
+
+    name: str = "abstract"
+
+    # ── Rendering ──────────────────────────────────────────────────────────
+    @abstractmethod
+    def render_server_config(
+        self, server: Any, options: ServerOptions, *, bundle: ConfigBundle | None = None
+    ) -> str:
+        """Render the daemon's top-level config (e.g. ``named.conf``)."""
+
+    @abstractmethod
+    def render_zone_config(self, zone: ZoneData) -> str:
+        """Render the per-zone stanza to be included in the server config."""
+
+    @abstractmethod
+    def render_zone_file(self, zone: ZoneData, records: list[RecordData]) -> str:
+        """Render an RFC 1035-format zone file."""
+
+    @abstractmethod
+    def render_rpz_zone(self, blocklist: EffectiveBlocklistData) -> str:
+        """Render an RPZ zone file (or equivalent) from an effective blocklist."""
+
+    # ── Runtime (agent-side; control plane only *formulates* these) ────────
+    @abstractmethod
+    async def apply_record_change(self, server: Any, change: RecordChange) -> None:
+        """Apply a single record change to the daemon (loopback RFC 2136 / API)."""
+
+    async def apply_record_changes(
+        self, server: Any, changes: Sequence[RecordChange]
+    ) -> list[RecordChangeResult]:
+        """Apply many record changes in as few round trips as possible.
+
+        Default impl: sequential loop over apply_record_change, catching each
+        per-op exception into a RecordChangeResult(ok=False) so one bad record
+        doesn't abort the batch. BIND9 + PowerDNS inherit it unchanged;
+        Windows DNS overrides it with a real WinRM batch (§3.7)."""
+
+    @abstractmethod
+    async def reload_config(self, server: Any) -> None:
+        """Instruct the daemon to re-read its full config (e.g. ``rndc reconfig``)."""
+
+    @abstractmethod
+    async def reload_zone(self, server: Any, zone_name: str) -> None:
+        """Instruct the daemon to reload a single zone."""
+
+    # ── Validation / introspection ─────────────────────────────────────────
+    @abstractmethod
+    def validate_config(self, bundle: ConfigBundle) -> tuple[bool, list[str]]:
+        """Validate a bundle before apply. Returns (ok, errors)."""
+
+    @abstractmethod
+    def capabilities(self) -> dict[str, Any]:
+        """Return a dict describing what this driver supports."""
+```
+
+`apply_record_changes` is the only concrete method on the ABC — every other method is `@abstractmethod`. There is no `health_check` / `get_zones` / `create_zone` / `create_record` style CRUD surface on the driver: zone reads/writes for agentless drivers go through their own `pull_zones_from_server` / `pull_zone_records` / `apply_zone_change` helpers (§3, §4A), not the ABC. Incremental updates only — drivers must never restart the daemon for normal operations (see the per-driver update-strategy tables below).
 
 ---
 
@@ -283,11 +310,12 @@ In [`app/drivers/dns/__init__.py`](../../backend/app/drivers/dns/__init__.py):
 
 ```python
 AGENTLESS_DRIVERS: frozenset[str] = frozenset(
-    {"windows_dns", "cloudflare", "route53", "azure_dns", "google_dns"}
+    {"windows_dns", "cloudflare", "route53", "azure_dns", "google_dns",
+     "digitalocean", "hetzner", "linode", "vultr"}
 )
 ```
 
-Agentless drivers don't emit a `ConfigBundle`; the API's `record_ops.enqueue_record_op` short-circuits them and calls `apply_record_change` directly instead of queueing for a co-located agent. The four cloud-hosted DNS providers (§4A) joined this set in issue #37.
+Agentless drivers don't emit a `ConfigBundle`; the API's `record_ops.enqueue_record_op` short-circuits them and calls `apply_record_change` directly instead of queueing for a co-located agent. The cloud-hosted DNS providers (§4A) joined this set in issue #37 (the four SDK-backed ones) and issue #327 (the token-only tier: DigitalOcean / Hetzner / Linode / Vultr).
 
 ### 3.5 Write-through pattern
 
@@ -313,8 +341,8 @@ Record CRUD against a Windows DNS server used to round-trip WinRM **per record**
 ```python
 class DNSDriver(ABC):
     async def apply_record_changes(
-        self, changes: Sequence[RecordChange]
-    ) -> Sequence[RecordOpResult]:
+        self, server: Any, changes: Sequence[RecordChange]
+    ) -> list[RecordChangeResult]:
         """Apply many record changes in as few round trips as possible.
 
         Default impl calls apply_record_change in a loop — BIND9
@@ -323,14 +351,14 @@ class DNSDriver(ABC):
 
 BIND9 + any future driver gets the plural interface for free via the default loop.
 
-**Windows batch size — 6 ops per chunk.** The real constraint isn't WinRM's envelope cap (`MaxEnvelopeSize` defaults to 500 KB) but the way `pywinrm.run_ps` ships the script: UTF-16-LE → base64 → `powershell.exe -EncodedCommand <b64>` → **single CMD.EXE command line, hard-capped at 8191 chars by Windows**. Base64 costs ×1.33, UTF-16-LE costs ×2, so each raw script char eats ~2.67 chars of command-line budget.
+**Windows batch sizing — length-measured chunks (issue #426).** The real constraint isn't WinRM's envelope cap (`MaxEnvelopeSize` defaults to 500 KB) but the way `pywinrm.run_ps` ships the script: UTF-16-LE → base64 → `powershell.exe -EncodedCommand <b64>` → **single CMD.EXE command line, hard-capped at ~8191 chars by Windows**. Base64 costs ×1.33, UTF-16-LE costs ×2, so each raw script char eats ~2.67 chars of command-line budget.
 
-The minified wrapper is ~2000 raw chars (all eight supported record types + op dispatch + per-op try/catch + JSON result emit), which costs ~5350 chars of cmdline budget before any ops. Each op adds ~160 raw chars (~430 cmdline chars) once JSON-escaped + encoded. **6 ops fits; 7 trips the limit.** `_WINRM_BATCH_SIZE = 6` is empirically measured in the dev container, documented in the source.
+Rather than a fixed op count, `_pack_record_chunks` greedily packs each chunk and measures the **actual built script** against `MAX_ENCODED_COMMAND` (7800, in [`drivers/_winrm.py`](../../backend/app/drivers/_winrm.py)) via `encoded_command_len`, so a chunk of large TXT (DKIM/SPF/DMARC) records can't silently overflow the cmdline. `_WINRM_MAX_BATCH_OPS = 25` is a coarse sanity cap on top of the length check. A single op that won't fit even alone still ships as a one-op chunk; the dispatcher catches the resulting too-long error and fails just that op. (The previous fixed count of 6 had no length check — a few big TXT records would blow the cap and fail the whole chunk.)
 
 **Script layout.** One invocation carries data-only JSON with short keys (`i/op/z/n/t/v/ttl/pr/w/p`) and a single dispatch wrapper:
 
 ```
-$E='Continue'
+$ErrorActionPreference='Continue'
 $p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('<b64>'))
 $r = @()
 ($p | ConvertFrom-Json) | % {
@@ -361,7 +389,7 @@ $r | ConvertTo-Json -Compress -Depth 3
 | Path | Before | After |
 |---|---|---|
 | Sync DNS / 40 records | ~3 min | ~5 s |
-| Bulk delete / 80 records on one zone | 80 HTTP calls | 1 HTTP call, 14 WinRM round trips (80 / 6) |
+| Bulk delete / 80 records on one zone | 80 HTTP calls | 1 HTTP call, a handful of length-packed WinRM round trips |
 
 ---
 
@@ -381,8 +409,8 @@ The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 4.9.x` with 
 | Create zone | `POST /api/v1/servers/localhost/zones` | LMDB row created; available to query immediately. |
 | Delete zone | `DELETE /api/v1/servers/localhost/zones/<zone>` | LMDB row removed; idempotent. |
 | Reconcile zone (full sync) | `PUT /api/v1/servers/localhost/zones/<zone>` with full rrset list | Used on first sync or on detected drift. |
-| Online DNSSEC sign | `POST .../zones/<zone>/cryptokeys` (KSK + ZSK) + `PUT .../metadata/PRESIGNED` + `PUT .../zones/<zone>/rectify` | Idempotent — re-sign skips when keys exist. |
-| Online DNSSEC unsign | `DELETE .../cryptokeys/<id>` per key + clear `PRESIGNED` | Same idempotent shape. |
+| Online DNSSEC sign | `POST .../zones/<zone>/cryptokeys` (KSK + ZSK) + `PUT .../zones/<zone>/rectify` | Idempotent — re-sign skips when keys exist. No `PRESIGNED` metadata (see §4.5). |
+| Online DNSSEC unsign | `DELETE .../cryptokeys/<id>` per key | Same idempotent shape. |
 | Catalog zone (RFC 9432) producer | Render apex SOA + NS + `version` TXT + per-member SHA-1-hashed PTR via the same rrset PATCH path | Producer-only; consumer waits for pdns 4.10+ (Phase 5 polish). |
 | **Full daemon restart** | ❌ NEVER for normal operations | Only for: image bump, zone-storage backend swap (LMDB → gpgsql). |
 
@@ -410,7 +438,7 @@ class PowerDNSDriver(DNSDriver):
         }
 ```
 
-`alias_records: True`, `lua_records: True`, and `dnssec_inline_signing: True` are the three operator-visible features that BIND9 doesn't ship today. Each is gated server-side by the API's `_DRIVER_GATED_RECORD_TYPES` / `_DRIVER_GATED_OPERATIONS` maps — calling them against a non-PowerDNS group returns 422 with a remediation message ("move to a PowerDNS-only group").
+`alias_records: True` and `lua_records: True` are PowerDNS-only: the `ALIAS` / `LUA` record types are gated server-side by the API's `_DRIVER_GATED_RECORD_TYPES` map to `{powerdns}`, so creating them against a non-PowerDNS group returns 422 with a remediation message ("move to a PowerDNS-only group"). Online DNSSEC sign/unsign is no longer PowerDNS-only — BIND9 ships inline-signing via `dnssec-policy` (§2.5), so `_DRIVER_GATED_OPERATIONS` allows `dnssec_sign`/`dnssec_unsign` on both `{powerdns, bind9}` (and `dnssec_rollover` on `{bind9}`); only the *mechanism* differs (PowerDNS signs online via REST, BIND9 via config-driven inline-signing).
 
 ### 4.4 LUA records
 
@@ -422,10 +450,9 @@ LUA records are PowerDNS's mechanism for computed responses — geo-routing, wei
 
 PowerDNS does the full DNSSEC dance internally:
 
-1. `POST /cryptokeys` with `keytype: ksk` (Algorithm 13 / ECDSAP256SHA256 by default). PowerDNS generates the key and starts publishing DNSKEY rrsets.
+1. `POST /cryptokeys` with `keytype: ksk` (Algorithm 13 / ECDSAP256SHA256, pinned explicitly). PowerDNS generates the key and starts publishing DNSKEY rrsets.
 2. `POST /cryptokeys` with `keytype: zsk` (same algorithm). PowerDNS now signs all rrsets in the zone with the ZSK on every query.
-3. `PUT /metadata/PRESIGNED` set to `0` — confirms the daemon manages signing online (vs. presigned zones loaded from disk).
-4. `PUT /zones/<zone>/rectify` — recomputes NSEC / NSEC3 chain.
+3. `PUT /zones/<zone>/rectify` — recomputes NSEC / NSEC3 chain. The agent deliberately does **not** set the `PRESIGNED` zone metadata: that flag is for externally-signed zones loaded as already-signed, whereas pdns derives online-signing intent from the presence of active/published cryptokeys (and pdns 4.9 rejects setting `PRESIGNED` with "Unsupported metadata kind").
 
 After signing, the agent enumerates DS records via `GET /cryptokeys` and POSTs them back to the control plane through the new `POST /api/v1/dns/agents/dnssec-state` endpoint. The control plane caches them in `dns_zone.dnssec_ds_records` (JSONB) so the operator-facing zone-edit page renders them without round-tripping the agent.
 
@@ -473,7 +500,7 @@ services:
       - dns_powerdns_lmdb:/var/lib/powerdns
 ```
 
-On agent startup, the supervisor checks the LMDB file. If it's empty (fresh install), the entrypoint runs `pdnsutil create-bind-db` to seed an empty store; the long-poll then picks up the first ConfigBundle and reconciles the zones. If the LMDB file is populated (restart on existing volume), `pdns_server` boots straight into serving and the agent reconciles any DB drift on the next ConfigBundle ETag flip.
+On a fresh install the LMDB backend **self-initialises on first `pdns_server` start** — the daemon mmaps the configured `lmdb-filename` (and its sharded siblings) and writes the env header itself, so the entrypoint deliberately does **not** pre-create the file (an empty 0-byte `pdns.lmdb` would be rejected by `mdb_env_open`; the entrypoint only removes a stale 0-byte leftover from a prior bad start). Once pdns is up, the long-poll picks up the first ConfigBundle and reconciles the zones. If the LMDB file is already populated (restart on existing volume), `pdns_server` boots straight into serving and the agent reconciles any DB drift on the next ConfigBundle ETag flip.
 
 LMDB cache survives control-plane outages — non-negotiable #5 in `CLAUDE.md`. The daemon keeps answering queries from the on-disk LMDB store regardless of whether the agent can reach the control plane.
 
@@ -481,7 +508,7 @@ LMDB cache survives control-plane outages — non-negotiable #5 in `CLAUDE.md`. 
 
 ## 4A. Cloud DNS drivers (agentless) — issue #37 Part B
 
-Four cloud-hosted authoritative-DNS providers ship as a driver family: **Cloudflare**, **Amazon Route 53** (`route53`), **Azure DNS** (`azure_dns`), and **Google Cloud DNS** (`google_dns`). SpatiumDDI manages their zones and records exactly like a local BIND9 / PowerDNS / Windows zone — same Zones / Records / group surfaces — except the control plane calls the provider's REST/SDK API directly. There is **no agent**.
+Cloud-hosted authoritative-DNS providers ship as a driver family. The four SDK-backed ones documented in detail here are **Cloudflare**, **Amazon Route 53** (`route53`), **Azure DNS** (`azure_dns`), and **Google Cloud DNS** (`google_dns`); a token-only tier (**DigitalOcean**, **Hetzner**, **Linode**, **Vultr**) followed in issue #327 with the same agentless `CloudDNSDriverBase` shape. SpatiumDDI manages their zones and records exactly like a local BIND9 / PowerDNS / Windows zone — same Zones / Records / group surfaces — except the control plane calls the provider's REST/SDK API directly. There is **no agent**.
 
 These are infrastructure-DNS drivers, distinct from the *Cloud (AWS / Azure / GCP)* read-only infrastructure mirror (issue #37 Part A, in [INTEGRATIONS.md](../features/INTEGRATIONS.md)). A cloud DNS server is added through the normal Add DNS server flow and lives in a `DNSServerGroup`; it has no `CloudEndpoint` row.
 
@@ -550,15 +577,22 @@ _DRIVERS: dict[str, type[DNSDriver]] = {
     "route53": Route53DNSDriver,
     "azure_dns": AzureDNSDriver,
     "google_dns": GoogleCloudDNSDriver,
+    # Token-only providers (issue #327) — single API token, plain JSON.
+    "digitalocean": DigitalOceanDNSDriver,
+    "hetzner": HetznerDNSDriver,
+    "linode": LinodeDNSDriver,
+    "vultr": VultrDNSDriver,
 }
 
 # Drivers whose record ops run from the control plane directly, no agent.
 AGENTLESS_DRIVERS: frozenset[str] = frozenset(
-    {"windows_dns", "cloudflare", "route53", "azure_dns", "google_dns"}
+    {"windows_dns", "cloudflare", "route53", "azure_dns", "google_dns",
+     "digitalocean", "hetzner", "linode", "vultr"}
 )
 # The cloud subset (used by the cloud import + sync-from-server widening).
 CLOUD_DNS_DRIVERS: frozenset[str] = frozenset(
-    {"cloudflare", "route53", "azure_dns", "google_dns"}
+    {"cloudflare", "route53", "azure_dns", "google_dns",
+     "digitalocean", "hetzner", "linode", "vultr"}
 )
 
 def get_driver(server_type: str) -> DNSDriver:
@@ -597,14 +631,20 @@ Both BIND9 and PowerDNS drivers are supported indefinitely. PowerDNS landed in i
 
 ## 6. Error Handling
 
-All driver methods must:
-- Raise `DriverConnectionError` for network/auth failures
-- Raise `DriverOperationError` for successful connection but failed operation
-- Never swallow errors silently
-- Log the full error details at `ERROR` level before raising
-- Be safe to retry (idempotent where possible)
+There is no dedicated driver-exception hierarchy. Drivers raise plain exceptions and let the caller decide how to surface them:
 
-The service layer handles retry logic via Celery task retries — drivers are not responsible for retry.
+- **BIND9 / Windows DNS** raise stdlib `RuntimeError` / `ValueError` on bad input or a hard failure (e.g. `BIND9Driver.apply_record_change` raises `RuntimeError` when no TSIG key is configured rather than ever sending an unsigned update; the Windows PowerShell helpers `raise ValueError` on an unsupported op / record type).
+- **Cloud drivers** (`CloudDNSDriverBase` and its subclasses) raise `CloudDNSError` ([`drivers/dns/_cloud_base.py`](../../backend/app/drivers/dns/_cloud_base.py)) — each provider's `_unwrap` / `_wrap_errors` / `_wrap_call` helper normalises the raw SDK/HTTP fault into an operator-facing `CloudDNSError` message first (§4A.5).
+
+Rules every driver follows:
+
+- **Never swallow errors silently.** A single record op either succeeds or raises; the caller is responsible for isolation (see below).
+- **Log via structlog**, not bare strings — `logger.info("powerdns.apply_record_change.formulated", server=…, zone=…, op=…)` is the house style; errors carry the failing op's identifying fields.
+- **Be idempotent where possible** — re-running create/update/delete against an already-converged server is a no-op (e.g. cloud `DELETE` of a non-existent rrset is treated as success; PowerDNS re-sign skips when keys exist).
+
+**Per-op isolation lives in `apply_record_changes`, not in the driver methods.** The default batch loop on `DNSDriver` (§1) catches each per-op exception and records it as `RecordChangeResult(ok=False, error=str(exc))` so one bad record never poisons the rest of the batch. Whole-batch failures (connection refused, auth, a malformed generated script) still propagate by raising from the driver.
+
+The service layer turns those outcomes into persisted state. [`services/dns/record_ops.py`](../../backend/app/services/dns/record_ops.py) writes a `DNSRecordOp` row per op, marking it `state="applied"` (clearing `last_error`) on success or `state="failed"` with the truncated `last_error` on exception, so operators get a per-op audit trail either way. A whole-batch exception marks every row in the batch `failed` with the same error. Retry, where applicable, is the caller's concern (e.g. Celery task retries on the agent push path) — the driver itself does not retry.
 
 ---
 
@@ -624,6 +664,6 @@ Same agent caching model as DHCP (see DHCP spec). For DNS:
 
 ### PowerDNS Cache
 - LMDB file at `/var/lib/powerdns/pdns.lmdb` IS the cache — `pdns_server` serves from it natively
-- Agent tracks the last-applied `ConfigBundle` ETag in `/var/lib/spatium-dns-agent/state.json`
+- Agent tracks the last-applied `ConfigBundle` ETag in `/var/lib/spatium-dns-agent/config/current.etag` (alongside the cached bundle in `config/current.json`)
 - On reconnect: long-poll picks up any new ETag, the agent reconciles by GET-ing PowerDNS's current zone list and PATCHing the rrset diff against the new ConfigBundle. Same convergence shape as BIND9.
 

@@ -141,9 +141,12 @@ the reference topologies are in
 - **Redis HA = Sentinel.** Each member pairs a redis-server + a sentinel
   sidecar; app / worker / beat resolve the master via a `sentinel://`
   URL. `sentinel.replicas` scales with the member count.
-- **MetalLB, v0.16.0, L2 mode** (air-gap baked: controller + speaker
-  only, `frrk8s.enabled=false`). Provides the control-plane VIP; BGP
-  templates render spec-only for the anycast-DNS follow-up.
+- **MetalLB, v0.15.3, L2 mode** (air-gap baked: controller + speaker
+  only, `frrk8s.enabled=false`; pinned to the full v0.15.3 release —
+  chart + images + CRDs — because v0.16.0 regressed the speaker's
+  ServiceL2Status reconciler into an apiserver-flooding loop, metallb#3063).
+  Provides the control-plane VIP; BGP templates render spec-only for the
+  anycast-DNS follow-up.
 - **One TLS cert, cluster-wide**, in the `spatium-appliance-tls` Secret,
   mounted by every frontend replica. The self-signed default uses stable
   host identity (never the pod) and **auto-grows its SANs to cover every
@@ -615,7 +618,7 @@ containers stay Alpine-based** — only the appliance host OS shifts.
 
 ---
 
-### Option B: Debian 12 "Bookworm" Stable
+### Option B (selected): Debian 13 "Trixie" Stable
 
 **Pros:**
 - Widest hardware driver support (NIC drivers, storage controllers, etc.)
@@ -793,7 +796,7 @@ The `spatiumddi-firstboot.service` systemd unit runs after
    BOOTSTRAP_PAIRING_CODE) on first run only — preserved across
    reboots. ``BOOTSTRAP_PAIRING_CODE`` carries the operator-supplied
    8-digit code from the installer through to the agent containers
-   on Phase 6 role-split agent appliances (see §10).
+   on Phase 6 role-split agent appliances (see §9).
 2. **(Pre-#183)** `docker-compose pull` (first run) + `docker-compose up -d`.
    **(Post-#183)** Writes the variant-specific bootstrap HelmChart
    manifest into `/var/lib/rancher/k3s/server/manifests/`; k3s's
@@ -986,7 +989,7 @@ get a consistent stamp at first boot.
 
 **Build-time slot image:** `make appliance-slot-image`
 extracts the root partition from the freshly-built appliance
-raw, repacks it as a 4 GiB ext4 `spatiumddi-appliance-slot-
+raw, repacks it as an 8 GiB ext4 `spatiumddi-appliance-slot-
 amd64.raw.xz` with the kernel + initrd baked in + the image-
 baseline fstab + a snapshotted `/usr/lib/etc.image/`. Every
 GitHub release attaches the slot image + its SHA-256 sidecar
@@ -1259,20 +1262,21 @@ Applied to both Alpine and Debian appliance images:
 ## 8. Environment Variables for Appliance
 
 ```bash
-OPENIPAM_FIRSTBOOT=true          # Set to false after first-boot wizard completes
-OPENIPAM_APPLIANCE_MODE=true     # Enables appliance-specific UI flows
-OPENIPAM_UPDATE_CHANNEL=stable
-OPENIPAM_LICENSE_ACCEPTED=false  # Must be true to complete first-boot
+SPATIUMDDI_FIRSTBOOT=true          # Set to false after first-boot wizard completes
+SPATIUMDDI_APPLIANCE_MODE=true     # Enables appliance-specific UI flows
+SPATIUMDDI_UPDATE_CHANNEL=stable
+SPATIUMDDI_LICENSE_ACCEPTED=false  # Must be true to complete first-boot
 ```
 
 ---
 
-## 10. Joining an agent appliance to a control plane
+## 9. Joining an agent appliance to a control plane
 
-Phase 6 role-split appliances (``dns-agent-bind9`` / ``dns-agent-powerdns``
-/ ``dhcp-agent``) need a control-plane URL + a bootstrap secret on
-first boot. The installer wizard offers two methods at the
-**Bootstrap method** prompt:
+An **Appliance**-role install (and the legacy Phase 6 role-split
+variants — ``dns-agent-bind9`` / ``dns-agent-powerdns`` / ``dhcp-agent``,
+superseded by #170 but still accepted from a not-yet-reinstalled box)
+needs a control-plane URL + a bootstrap secret on first boot. The
+installer wizard offers two methods at the **Bootstrap method** prompt:
 
 > **Use the VIP for the control-plane URL on HA clusters.** When the
 > installer asks where this appliance registers, point it at the
@@ -1298,10 +1302,12 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
 > supervisor idles (#407).
 
 1. On the control plane, open **Appliance → Pairing**.
-2. Click **New pairing code**, pick the agent kind (DNS / DHCP /
-   DNS+DHCP for combined boxes), optionally pre-assign a server
-   group, set the expiry (default 15 min, max 1 h), click
-   **Generate code**.
+2. Click **New pairing code**. Codes are now kind-agnostic (the
+   per-role ``deployment_kind`` coupling was dropped under #170
+   Wave A3 — roles are assigned post-approval from the Fleet tab,
+   not baked into the code). Pick ephemeral (single-use, default
+   15 min expiry) or persistent (multi-claim, optional ``max_claims``),
+   then click **Generate code**.
 3. The 8 digits appear in a large monospace box with a live
    countdown + copy button. Write them down or copy them to a
    second device.
@@ -1329,10 +1335,13 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
    /  ``Registering…`` (yellow), or ``Pair failed — regenerate
    code on control plane`` (red).
 
-Codes are single-use + time-bound. ``deployment_kind="both"`` returns
-both DNS + DHCP bootstrap keys in one consume call — useful for a
-combined BIND9 + Kea agent box (future ``agent`` install role,
-issue #170).
+Ephemeral codes are single-use + time-bound; persistent codes are
+multi-claim with an optional ``max_claims`` cap. A combined BIND9 + Kea
+box doesn't need a special code kind any more — the supervisor pairs
+once with any code, and the operator assigns both the DNS and DHCP
+roles to it post-approval from the Fleet tab (the per-role
+``dns_agent_key`` / ``dhcp_agent_key`` then ride the heartbeat
+response).
 
 ### Bootstrap key (advanced)
 
@@ -1354,7 +1363,7 @@ re-confirm + audit row).
 
 ---
 
-## 11. Host migration framework (#395)
+## 10. Host migration framework (#395)
 
 ### The gap it closes
 

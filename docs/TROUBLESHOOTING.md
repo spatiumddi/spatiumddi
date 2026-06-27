@@ -264,14 +264,18 @@ EOF
 
 ## Subnet delete is refused
 
-**Symptom** — `DELETE /api/v1/ipam/subnets/{id}` returns `409 Conflict`
+**Symptom** — A **permanent** subnet delete
+(`DELETE /api/v1/ipam/subnets/{id}?permanent=true`) returns `409 Conflict`
 with a body like *"Subnet is not empty: N allocated IP addresses,
 M DHCP scopes. Delete the contents first, or retry with force=true to
 cascade."*
 
-This is deliberate. A non-empty subnet delete used to cascade silently
-and wipe IPAM rows + DHCP scopes out from under running services. The
-server now refuses the delete unless you either:
+This is deliberate. A non-empty permanent delete used to cascade silently
+and wipe IPAM rows + DHCP scopes out from under running services. Note the
+**default** `DELETE /api/v1/ipam/subnets/{id}` (no `permanent`) is now a
+*soft*-delete — it never refuses, and the subnet (and its DHCP scopes)
+stays restorable from `/admin/trash`. The non-empty check only guards the
+permanent (hard) delete path, which refuses unless you either:
 
 - Remove the contents first (unassign every non-system IP, detach any
   DHCP scopes), then retry; or

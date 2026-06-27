@@ -2,7 +2,22 @@
 
 ## Overview
 
-SpatiumDDI provides a fully integrated observability stack: structured logging shipped to a centralized store, a **built-in log viewer in the admin UI**, Prometheus metrics, health endpoints, and a Grafana dashboard bundle. No external observability tooling is required for basic operations, but all outputs are compatible with standard enterprise stacks (ELK, Loki, Datadog, Splunk).
+SpatiumDDI's **shipped** observability consists of: structured NDJSON
+logging to stdout (§ 1), a **built-in `/logs` viewer** over agent-pushed
+DNS/DHCP logs and on-demand Windows reads (§ 3–4½), an append-only audit
+log with external forwarding (§ 5), an API-request Prometheus family at
+`/metrics` (§ 6), an agent-driven dashboard time-series path (§ 6), and
+health endpoints (§ 7). All stdout output is compatible with standard
+enterprise stacks (ELK, Loki, Datadog, Splunk) that you point at the
+container streams.
+
+> **What is *not* bundled.** Several pieces below are **design intent,
+> not shipped code** and are flagged inline as planned: a centralized
+> log store + collector (Loki / Grafana / Vector / Promtail — § 2), a
+> generic control-plane log-explorer API (§ 3), the IPAM / DHCP / DNS /
+> Celery / Database Prometheus metric families (§ 6), and the product
+> Grafana dashboard bundle (§ 8). No Loki / Grafana / Vector / Promtail
+> service ships in any `docker-compose*.yml` or in `charts/`.
 
 ### Native admin surfaces (since `2026.04.26-1`)
 
@@ -134,81 +149,86 @@ All services use `structlog` configured to emit **newline-delimited JSON** (NDJS
 
 ## 2. Centralized Log Management
 
-All service logs are shipped to a central log store. The log store is configurable.
+> **Status: planned / not yet shipped.** No log collector, log store,
+> or "log store query" API ships in the repo today. There is **no**
+> Loki / Grafana / Vector / Promtail / Fluentd service in any
+> `docker-compose*.yml` or in `charts/`, and nothing reads from a
+> central store. What ships instead is described in sections 3–4½:
+> every service logs **NDJSON to stdout** (section 1), and operators
+> who want centralized retention point their own collector at those
+> streams (Loki / Elasticsearch / Datadog / Splunk via standard
+> Docker / Kubernetes log shipping). The pipeline below is the
+> design target, not a bundled deliverable.
 
-### Log Pipeline
+### Log Pipeline (planned)
 
 ```
 Each service (API, Worker, Agents, DHCP, DNS)
-        ↓ stdout (NDJSON)
-Log Collector (Vector / Promtail / Fluentd — one sidecar or DaemonSet)
+        ↓ stdout (NDJSON)        ← shipped
+Log Collector (Vector / Promtail / Fluentd)   ← operator-supplied, not bundled
         ↓
-Central Log Store (choose one):
-  - Grafana Loki (bundled option — recommended for self-hosted)
+Central Log Store (operator's choice):
+  - Grafana Loki
   - Elasticsearch (for existing ELK stacks)
-  - External (Datadog, Splunk, Cloudwatch — via syslog forwarding)
-        ↓
-SpatiumDDI Log Viewer API (reads from log store)
-        ↓
-Built-in Log Viewer UI
+  - External (Datadog, Splunk, Cloudwatch)
 ```
 
-### Bundled Log Store: Grafana Loki
+The shipped log surface (sections 3–4½) reads from PostgreSQL tables
+the agents push into (BIND9 query log, Kea activity) and from Windows
+servers over WinRM — **not** from a central log store. A store-backed
+log-viewer API is not implemented.
 
-The default Docker Compose and Helm chart include:
-- **Loki** (log aggregation)
-- **Grafana** (dashboards + log exploration — optional, for power users)
-- **Vector** (log collector / shipper — lightweight, replaces Fluentd/Logstash)
+### Bundled Log Store (planned)
 
-The built-in UI log viewer queries Loki directly via its HTTP API — no Grafana required for basic use.
+If a bundled store lands, the intended shape is **Loki** (aggregation) +
+**Grafana** (optional dashboards / log exploration) + **Vector** (collector
+/ shipper). None of these ship today; treat this as a design note.
 
 ### Log Retention
 
-Default: 30 days (configurable in Loki config or log store settings).
-For compliance environments: ship to long-term S3/GCS/Azure Blob via Loki's object storage backend.
+For the **shipped** surfaces, retention is per-table and short — the
+agent-pushed query/activity logs are pruned at 24 h (see § 4½.3) since
+they're operator triage, not analytics. The audit log (§ 5) lives in
+PostgreSQL and is not auto-pruned. Long-term log retention belongs in
+an external store (Loki / a SIEM) fed from the stdout streams.
 
 ---
 
-## 3. Built-in Log Viewer (Admin UI)
+## 3. Built-in Log Viewer (shipped)
 
-The admin UI includes a **Log Explorer** page at `/admin/logs`.
+The shipped log viewer lives at **`/logs`**
+(`frontend/src/pages/LogsPage.tsx`), backed by the router at
+`backend/app/api/v1/logs/router.py`. It is **not** a generic
+"control-plane application log explorer" — there is no `/admin/logs`
+page and no generic `GET /api/v1/logs?service=&level=` query API. The
+control-plane API / worker / beat processes log NDJSON to stdout
+(section 1); to browse those, read the container streams
+(`docker compose logs -f api worker`) or ship them to an external
+store of your choice.
 
-### Features
+What the `/logs` page actually surfaces is four data-source tabs over
+two transports — agent-pushed DNS/DHCP logs and on-demand Windows
+server reads:
 
-**Filtering:**
-- Service filter (multi-select: api, worker, agent, dhcp, dns)
-- Level filter (debug/info/warning/error/critical)
-- Time range picker (preset: last 15m, 1h, 6h, 24h, 7d — or custom range)
-- Free-text search (searches `event` and all string fields)
-- Filter by `user_id`, `request_id`, `subnet_id`, `server_id`, `ip_address`
+| Tab | Source | Transport | Detail |
+|---|---|---|---|
+| **DNS Queries** | BIND9 / PowerDNS query log | agent push → DB | § 4½.1 |
+| **DHCP Activity** | Kea DHCPv4 activity | agent push → DB | § 4½.2 |
+| **Event Log** | Windows DNS / DHCP Event Log | WinRM read-through | § 4.1 |
+| **DHCP Audit** | Windows DHCP per-lease CSV trail | WinRM read-through | § 4.2 |
 
-**Display:**
-- Reverse chronological order (newest first)
-- Expandable log lines (click to see full JSON)
-- Color-coded log levels
-- Highlight matching search terms
-- "Copy as JSON" per log line
-- "Follow" mode (live tail, polls every 2 seconds)
+Each tab does its own server-side filtering, auto-fetches on mount and
+on filter change, and has an explicit Refresh button (§ 4.3). The
+agent tabs read from narrow PostgreSQL tables (§ 4½.3); the Windows
+tabs are on-demand reads with no log-shipping. The endpoints are the
+`POST /api/v1/logs/{query,dhcp-audit,dns-queries,dhcp-activity}` family
+plus `GET /api/v1/logs/{sources,agent-sources}` — see sections 4 and
+4½ for the full surface.
 
-**Export:**
-- Download filtered log range as NDJSON or CSV
-
-### Log Viewer API
-
-The backend exposes a log query API that the UI consumes:
-
-```
-GET /api/v1/logs?
-  service=api,worker
-  &level=warning,error
-  &from=2024-01-15T00:00:00Z
-  &to=2024-01-15T23:59:59Z
-  &search=subnet_created
-  &limit=200
-  &cursor=<pagination_cursor>
-```
-
-This API translates to the appropriate query language for the configured log store (LogQL for Loki, KQL for Elasticsearch). If no centralized store is configured, it reads from local container stdout via Docker log API (limited functionality).
+> **Planned (not shipped):** a unified explorer over the control-plane
+> NDJSON streams (service / level / free-text filtering, live tail,
+> NDJSON/CSV export) backed by a log-store query API. Today those
+> streams are stdout-only.
 
 ---
 
@@ -462,10 +482,12 @@ Distinct from audit-forward: this is a curated **typed-event
 surface** for downstream automation, not raw audit rows. Operators
 configure subscriptions at `Admin → Webhooks` (`/admin/webhooks`).
 
-**Vocabulary.** 96 typed events generated from a resource × verb
-cross-product — e.g. `space.created`, `subnet.bulk_allocate`,
+**Vocabulary.** A curated set of typed events generated from a
+resource × verb cross-product (plus a handful of special-cased
+names) — e.g. `space.created`, `subnet.bulk_allocate`,
 `dns.zone.updated`, `dhcp.scope.deleted`, `auth.user.created`,
-`integration.kubernetes.created`. Subscriptions with no event-type
+`integration.kubernetes.created`. The live list is served by
+`GET /api/v1/webhooks/event-types`. Subscriptions with no event-type
 filter match everything.
 
 **Pipeline.** Audit-row commit triggers an `EventOutbox` write per
@@ -509,19 +531,37 @@ de-duplicate on `event_id` (= `AuditLog.id`).
 
 ## 6. Prometheus Metrics
 
-Exposed on each service at `:9090/metrics` (separate from the API port).
+The API service exposes a Prometheus scrape endpoint at `/metrics` on
+the main API port (gated by the `prometheus_metrics_enabled` setting,
+default on; registered in `backend/app/main.py`).
 
-### API Service Metrics
+> **Implemented today:** only the **API-request family** below, defined
+> and emitted in `backend/app/metrics.py` via a Starlette middleware on
+> every request. The IPAM / DHCP / DNS / Celery / Database families that
+> follow are **planned, not emitted** — no collector or exporter
+> populates them, and scraping `/metrics` returns the request family
+> (plus the default `prometheus_client` process / GC metrics) only. The
+> two `spatiumddi_auth_*` counters are *declared* in `metrics.py` but
+> not yet incremented by any call site, so they read zero. For the
+> shipped, agent-driven dashboard metrics path, see
+> **Built-in Dashboard Time-Series** below — that one is real.
+
+### API Service Metrics (implemented)
 
 ```
 spatiumddi_api_requests_total{method, path_template, status_code}
 spatiumddi_api_request_duration_seconds{method, path_template} (histogram)
 spatiumddi_api_active_requests (gauge)
-spatiumddi_auth_login_total{method, result}   # method=local/ldap/oidc
-spatiumddi_auth_token_usage_total{scope}
 ```
 
-### IPAM Metrics
+Plus two counters declared but not yet wired to a call site (read zero):
+
+```
+spatiumddi_auth_login_total{method, result}   # planned — method=local/ldap/oidc
+spatiumddi_auth_token_usage_total{scope}       # planned
+```
+
+### IPAM Metrics (planned — not emitted)
 
 ```
 spatiumddi_subnet_utilization_percent{subnet_id, subnet_network, space_id}
@@ -529,7 +569,7 @@ spatiumddi_ip_addresses_total{subnet_id, status}
 spatiumddi_subnets_total{space_id, status}
 ```
 
-### DHCP Metrics
+### DHCP Metrics (planned — not emitted)
 
 ```
 spatiumddi_dhcp_leases_active{server_id, scope_id}
@@ -539,7 +579,7 @@ spatiumddi_dhcp_sync_duration_seconds{server_id}
 spatiumddi_dhcp_server_status{server_id}   # 1=online, 0=offline
 ```
 
-### DNS Metrics
+### DNS Metrics (planned — not emitted)
 
 ```
 spatiumddi_dns_sync_last_success_timestamp{server_id}
@@ -549,7 +589,7 @@ spatiumddi_dns_blocklist_entries_total{list_id}
 spatiumddi_dns_server_status{server_id}
 ```
 
-### Built-in Dashboard Time-Series (agent-driven)
+### Built-in Dashboard Time-Series (agent-driven) — shipped
 
 For operators who don't run Prometheus, SpatiumDDI ships a minimal
 self-contained time-series path used by the built-in dashboard
@@ -584,7 +624,7 @@ need `Get-DnsServerStatistics` / `Get-DhcpServerv4Statistics` calls
 over WinRM). The dashboard card shows "no data yet" rather than an
 error in that case.
 
-### Celery / Worker Metrics
+### Celery / Worker Metrics (planned — not emitted)
 
 ```
 spatiumddi_celery_tasks_total{task_name, state}   # state=success/failure/retry
@@ -593,13 +633,23 @@ spatiumddi_celery_queue_length{queue_name}
 spatiumddi_celery_workers_active (gauge)
 ```
 
-### Database Metrics
+> Worker / beat health is currently surfaced through the
+> `GET /health/platform` rollup (§ 7) and the Platform Insights admin
+> surface, not through Prometheus metrics.
+
+### Database Metrics (planned — not emitted)
 
 ```
 spatiumddi_db_pool_connections{state}   # state=checked_out/idle/overflow
 spatiumddi_db_query_duration_seconds{operation} (histogram)
 spatiumddi_db_replication_lag_seconds{replica}
 ```
+
+> Postgres diagnostics (DB size, cache hit, WAL position, slow
+> queries, connection state) ship today through the **Platform
+> Insights** admin surface (`/admin/platform-insights`, described in
+> the Overview), which queries Postgres `pg_stat_*` views directly
+> rather than exporting Prometheus metrics.
 
 ---
 
@@ -649,7 +699,20 @@ All services expose:
 
 ## 8. Bundled Grafana Dashboards
 
-Pre-built dashboards shipped with the project (in `deploy/grafana/dashboards/`):
+> **Status: planned / not shipped as a product bundle.** No
+> operator-facing Grafana dashboard set ships with the product, and
+> the dashboards below depend on the planned (un-emitted) metric
+> families in § 6. What *does* exist is a single **perf-testing**
+> "war room" dashboard at
+> [`perf/dashboards/grafana/dashboards/warroom.json`](../perf/dashboards/grafana/dashboards/warroom.json)
+> (with provisioning under `perf/dashboards/grafana/provisioning/` and
+> a matching scrape config at `perf/dashboards/prometheus/prometheus.yml`).
+> That stack is for the load/soak test harness under `perf/`, not for
+> production observability, and it scrapes the perf exporters rather
+> than the product `/metrics` endpoint's request family.
+
+The intended product dashboard bundle, once the § 6 metric families
+are emitted, would be:
 
 | Dashboard | Contents |
 |---|---|
@@ -659,6 +722,9 @@ Pre-built dashboards shipped with the project (in `deploy/grafana/dashboards/`):
 | **DNS Health** | Server status, zone counts, sync lag, blocklist hit rate |
 | **System Health** | DB connections, replication lag, Redis memory, Celery queues |
 | **Audit Activity** | Actions per hour, top users, failed auth attempts |
+
+Until then, the **shipped** in-product equivalents are the Dashboard
+sub-tabs and Platform Insights surfaces described in the Overview.
 
 ---
 
@@ -704,7 +770,9 @@ the policy edit modal at `/admin/conformity`.
 
 ### 9.2 Prometheus alerting rules (external)
 
-Pre-built Prometheus alerting rules (in `deploy/prometheus/alerts/`):
+Reference Prometheus alerting rules for the `spatiumddi_*` metrics
+(a perf-testing Prometheus config already lives under
+`perf/dashboards/prometheus/`):
 
 | Alert | Condition | Severity |
 |---|---|---|

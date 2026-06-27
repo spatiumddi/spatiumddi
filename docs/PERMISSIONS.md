@@ -133,14 +133,15 @@ on inactive.
 | -------------- | ------------------------------------------------------------ |
 | `Superadmin`   | `[{"action": "*", "resource_type": "*"}]`                    |
 | `Viewer`       | `[{"action": "read", "resource_type": "*"}]`                 |
-| `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `vlan`, `nat_mapping`, `custom_field`, `manage_ipam_templates`, `customer`, `site`, `provider`, `network_service` |
+| `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `address_set`, `vlan`, `nat_mapping`, `custom_field`, `manage_ipam_templates`, `customer`, `site`, `provider`, `network_service` |
 | `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`, `manage_dns_pools` |
 | `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block` |
-| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans`, `manage_packet_capture`, `manage_asns`, `vrf`, `circuit`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider` |
-| `Auditor`        | `read` on `conformity`, `audit`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
+| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans`, `manage_packet_capture`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert` |
+| `Auditor`        | `read` on `conformity`, `audit`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope`, `tls_cert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
 | `Compliance Editor` | `admin` on `conformity`, `read` on `audit`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope` — for the team that authors / tunes conformity policies without touching operational config |
 | `Address Set Editor` | `admin` on `address_set` (#103) — delegated edit of a named IP slice within a subnet without subnet-wide write. Grant on a specific address-set id to scope a department admin to just their slice. Creating / resizing a set still requires write on the parent subnet. |
 | `Change Approver`  | `approve` + `read` on `change_request` (#62) — the second-person decision capability in the two-person approval workflow. Approving a specific request *also* requires the underlying operation's permission (e.g. `delete,subnet`), enforced server-side. |
+| `Appliance Operator` | `admin` on `appliance` (#134) — full control of the SpatiumDDI OS appliance management surface (TLS cert upload, release manager, container start/stop/restart + live logs, host network + firewall config, maintenance mode, diagnostic bundle download) for ops staff who manage the appliance lifecycle without full superadmin over the DDI data plane. |
 
 Built-in roles (`is_builtin=True`) can be cloned but not deleted.
 
