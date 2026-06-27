@@ -323,7 +323,7 @@ Mirror rows provenance via the `cloud_endpoint_id` FK on `IPBlock` / `Subnet` / 
 
 When **any** integration toggle is on, the dashboard renders an **Integrations panel** below the service health strip with:
 
-- One column per enabled integration (Kubernetes / Docker / Proxmox / Tailscale / UniFi / Cloud), header linking to the full admin page.
+- One column per enabled integration (Kubernetes / Docker / Proxmox / Tailscale / UniFi / Cloud / OPNsense), header linking to the full admin page.
 - Per-row: status dot (green = synced recently, amber = stalled > 3× sync interval, red = `last_sync_error`, gray = disabled or never synced), name, endpoint, node / container count, humanized last-synced age.
 - `last_sync_error` is exposed as the row tooltip so operators can triage without leaving the dashboard.
 
@@ -331,7 +331,7 @@ When **any** integration toggle is on, the dashboard renders an **Integrations p
 
 ## Roadmap — additional integrations
 
-Tier 1 remaining (tracked in [CLAUDE.md §Future Phases § Additional integration candidates](../../CLAUDE.md)): **UniFi Network Application**, **OPNsense**, **pfSense**. All target the same homelab / SMB audience and fit the Kubernetes/Docker/Proxmox/Tailscale reconciler shape. See CLAUDE.md for per-integration scope notes.
+Tier 1 status (tracked in [CLAUDE.md §Integration roadmap](../../CLAUDE.md)): **UniFi Network Application** and **OPNsense** have shipped as read-only mirrors (gated by the `integrations.unifi` / `integrations.opnsense` feature modules); **pfSense** remains. All target the same homelab / SMB audience and fit the Kubernetes/Docker/Proxmox/Tailscale reconciler shape. See CLAUDE.md for per-integration scope notes.
 
 Tier 2 (narrower): MikroTik RouterOS 7, Incus / LXD, HashiCorp Nomad, NetBox one-shot import.
 

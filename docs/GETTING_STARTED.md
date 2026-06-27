@@ -86,7 +86,7 @@ Zones come in two flavours, and the order matters a little:
 1. **Forward zones first.** Create `corp.example.com`, `lab.example.com`, etc. These are what your A/AAAA records live in.
 2. **Reverse zones second.** These back PTR records. You can either:
    - Create them manually now (`0.20.10.in-addr.arpa` for `10.20.0.0/16` — standard RFC 2317 layout), or
-   - Let SpatiumDDI auto-create them when you create the subnet in step 8 (tick the "auto-create reverse zone" box on the subnet form).
+   - Let SpatiumDDI auto-create them when you create the subnet in step 8 — the matching `in-addr.arpa` (or `ip6.arpa`) zone is created automatically once the subnet has an effective DNS group/zone, unless you opt out with `skip_reverse_zone`.
 
 Zones that SpatiumDDI didn't create itself can be imported by clicking **Sync with Servers** on the group — anything present on the wire but not in the DB is auto-imported as `is_auto_generated=False` (so it won't be touched by stale-record cleanup).
 
@@ -106,7 +106,7 @@ Same pattern as DNS. Do this before you start pinning subnets to DHCP servers.
 
    See [WINDOWS.md](deployment/WINDOWS.md) for Windows DHCP Server prerequisites.
 
-3. Toggle **DHCP Lease Sync** on in Settings once you have at least one agentless server — the Celery beat task (default: every 5 min) pulls leases.
+3. Toggle **DHCP Lease Sync** on in Settings once you have at least one agentless server — the Celery beat task pulls leases on a short polling interval (15 s by default, tunable in Settings, 10 s minimum).
 
 ---
 
@@ -144,7 +144,7 @@ On the subnet create form:
 - **DNS server group** — leave blank to inherit from block/space. Pin it here to override.
 - **DHCP server group** — same. Pin it here if this subnet needs a different DHCP server than its parents.
 - **DNS inherit settings** / **DHCP inherit settings** — toggle these back on if you pinned something and want to return to inheritance.
-- **Auto-create reverse zone?** — if checked, SpatiumDDI creates the right `in-addr.arpa` (or `ip6.arpa`) zone on the effective DNS group.
+- **Reverse zone** — SpatiumDDI auto-creates the right `in-addr.arpa` (or `ip6.arpa`) zone on the effective DNS group once the subnet has one; opt out with `skip_reverse_zone`.
 
 **Important:** subnets and blocks respect inheritance independently for DNS and DHCP. If you want a subnet to inherit DNS from its parent but use a different DHCP group, that works — toggle `dns_inherit_settings` on, `dhcp_inherit_settings` off, and pin the DHCP group.
 
@@ -167,16 +167,16 @@ For Windows DHCP servers in Path A (read-only) you can't create scopes from Spat
 
 Now the fun part. In the subnet view:
 
-- Click **Allocate** (or **Next free IP**) to auto-pick the next available address.
+- Click **Allocate IP** and pick **Next available** to auto-pick the next free address.
 - Or click any row in the IP grid and fill in hostname, status, tags.
 
 When you save an IP with a hostname + DNS zone:
 
 1. SpatiumDDI creates an A/AAAA record in the forward zone.
 2. SpatiumDDI creates a PTR record in the reverse zone (if one is linked).
-3. For BIND9, the update goes over RFC 2136; for Windows, the update goes over RFC 2136 (Path A) or is idempotent-pushed via WinRM (Path B).
+3. For BIND9, the update goes over RFC 2136; for Windows, record writes go over RFC 2136 in both Path A and Path B (WinRM in Path B is used only for zone create/delete and server-side reads, not for hot record writes).
 
-If anything ever drifts between IPAM and your DNS servers, there's a manual **Check DNS Sync** button on the subnet/block/space header, and two scheduled reconciliation jobs you can enable in Settings:
+If anything ever drifts between IPAM and your DNS servers, the **Sync DNS** option (under the `[Sync ▾]` menu on the subnet/block/space header) opens a drift report, and two scheduled reconciliation jobs you can enable in Settings:
 
 | Job | What it reconciles |
 |---|---|
@@ -220,9 +220,9 @@ If allocating your first IP doesn't produce a DNS record, check in this order:
 3. **Group has at least one enabled server?** — a group with zero `is_enabled=True` servers won't push anything.
 4. **Server is healthy?** — hit **Sync with Servers** and watch the per-server status column.
 5. **For Windows Path A**, is the zone set to "Nonsecure and secure" updates? — secure-only rejects our unsigned RFC 2136 updates.
-6. **For Windows Path B**, are credentials stored?** — the server detail page shows "WinRM credentials: configured" or "not configured". If not configured, record writes fall back to RFC 2136.
+6. **For Windows Path B, are credentials stored?** — the server detail page shows whether WinRM credentials are configured. Credentials unlock zone create/delete and server-side reads; record writes ride RFC 2136 in both paths, so check that the zone allows nonsecure updates regardless.
 
-If a record is expected but missing, the subnet's **Check DNS Sync** drift report will tell you exactly what's missing and let you apply it with one click.
+If a record is expected but missing, the subnet's **Sync DNS** drift report will tell you exactly what's missing and let you apply it with one click.
 
 ---
 

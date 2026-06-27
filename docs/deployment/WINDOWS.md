@@ -7,7 +7,7 @@ title: Windows Server Setup
 
 SpatiumDDI can manage Windows Server DNS and DHCP agentlessly — no software installed on the Windows side. DNS has two tiers (RFC 2136 always-on, WinRM unlocks more); DHCP has one tier today (WinRM read-only lease mirroring).
 
-This page is the **Windows-side checklist**. The SpatiumDDI-side config is covered in [features/DNS.md §13](../features/DNS.md#13-windows-dns-path-a--b) and [features/DHCP.md §15](../features/DHCP.md#15-windows-dhcp-path-a-read-only).
+This page is the **Windows-side checklist**. The SpatiumDDI-side config is covered in [features/DNS.md §13](../features/DNS.md#13-windows-dns--path-a--b) and [features/DHCP.md §15](../features/DHCP.md#15-windows-dhcp--path-a-read-only).
 
 > **You do not install anything on the Windows server.** Everything runs remotely over WinRM (DNS zone management + DHCP reads) or RFC 2136 / dnspython over UDP/TCP 53 (DNS record writes + AXFR).
 
@@ -169,9 +169,9 @@ Only read-only today — SpatiumDDI polls leases and mirrors them into IPAM, but
 - **DHCP → Server Groups → Add Server**
 - **Driver** — `windows_dhcp`
 - **WinRM credentials** — same shape as the DNS Path B credentials.
-- **Test Connection** runs `Get-DhcpServerSetting` to verify.
+- **Test Connection** runs `(Get-DhcpServerVersion).ToString()` to verify.
 
-Then enable **DHCP Lease Sync** in **Settings**. Beat fires every 60s; the task gates on the enabled toggle + interval (default 5 minutes), so you can change cadence without restarting anything.
+Then enable **DHCP Lease Sync** in **Settings**. Beat ticks every 10s; the task gates on the enabled toggle + a per-server interval stored in seconds (default 15s, floored at 10s), so you can change cadence without restarting anything.
 
 Each lease upserts by `(server_id, ip_address)` and mirrors into IPAM as a row with `status="dhcp"` and `auto_from_lease=True` — the existing lease-cleanup sweep handles expiry uniformly.
 

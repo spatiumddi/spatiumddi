@@ -1,6 +1,6 @@
 # DNS Feature Specification
 
-> **Implementation status (2026-04-28):** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); **curated 14-source RPZ blocklist catalog** with one-click subscribe; per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); **conditional forwarders as a first-class zone type**; **zone delegation wizard** (auto-stamps NS + glue records in the parent zone); **four starter zone-template wizards** (Email / Active Directory / Web / k8s external-dns target); **operator-managed TSIG keys** with Fernet-encrypted secrets and one-shot reveal modal; query logging + **clickable analytics strip** (top qnames + top clients + qtype distribution); **multi-resolver propagation check** (Cloudflare / Google / Quad9 / OpenDNS in parallel); **BIND9 catalog zones (RFC 9432)** with producer / consumer roles auto-derived from the group's primary; per-server zone serial reporting + drift pill; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill; **Windows DNS driver shipped** — Path A (agentless, RFC 2136) and Path B (agentless, WinRM + PowerShell for zone CRUD and zone-record pull that sidesteps AXFR); group-level "Sync with Servers" button performs bi-directional zone reconciliation; **BIND9 Response Rate Limiting (RRL) + amplification toggles** (responses-per-second / window / slip / qps-scale / exempt-clients / log-only dry-run + minimal-responses / tcp-clients / clients-per-query; group-level, default-off — issue #146 Phase 1). **Deferred:** DNSSEC (KSK / ZSK rollover, NSEC3, DS handoff), DoT / DoH listener (gated on the embedded ACME client), secondary-zone (AXFR/IXFR) full support, GSS-TSIG (Kerberos-signed RFC 2136), Windows DNS Path B record-level writes.
+> **Implementation status (snapshot):** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); **curated 14-source RPZ blocklist catalog** with one-click subscribe; per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); **conditional forwarders as a first-class zone type**; **zone delegation wizard** (auto-stamps NS + glue records in the parent zone); **four starter zone-template wizards** (Email / Active Directory / Web / k8s external-dns target); **operator-managed TSIG keys** with Fernet-encrypted secrets and one-shot reveal modal; query logging + **clickable analytics strip** (top qnames + top clients + qtype distribution); **multi-resolver propagation check** (Cloudflare / Google / Quad9 / OpenDNS in parallel); **BIND9 catalog zones (RFC 9432)** with producer / consumer roles auto-derived from the group's primary; per-server zone serial reporting + drift pill; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill; **Windows DNS driver shipped** — Path A (agentless, RFC 2136) and Path B (agentless, WinRM + PowerShell for zone CRUD and zone-record pull that sidesteps AXFR); group-level "Sync with Servers" button performs bi-directional zone reconciliation; **BIND9 Response Rate Limiting (RRL) + amplification toggles** (responses-per-second / window / slip / qps-scale / exempt-clients / log-only dry-run + minimal-responses / tcp-clients / clients-per-query; group-level, default-off — issue #146 Phase 1); **BIND9 + PowerDNS DNSSEC** — inline-signing policies, DS export, manual rollover (issue #49 — see §3.3a). **Deferred:** DoT / DoH listener, secondary-zone (AXFR/IXFR) full support, GSS-TSIG (Kerberos-signed RFC 2136), Windows DNS Path B record-level writes.
 
 ## Overview
 
@@ -19,7 +19,7 @@ SpatiumDDI manages DNS servers as first-class resources. It acts as the **author
 
 ## 0. Driver choice — BIND9, PowerDNS, or Windows DNS
 
-SpatiumDDI ships three authoritative DNS drivers. Pick **per server group** — every server inside a group runs the same driver, but mixed installs (one group on BIND, another on PowerDNS, a third on Windows) are first-class. The driver registry is in [`drivers/dns/registry.py`](../../backend/app/drivers/dns/registry.py); the per-driver internals are in [`docs/drivers/DNS_DRIVERS.md`](../drivers/DNS_DRIVERS.md).
+SpatiumDDI ships three authoritative DNS drivers. Pick **per server group** — every server inside a group runs the same driver, but mixed installs (one group on BIND, another on PowerDNS, a third on Windows) are first-class. The driver registry is in [`drivers/dns/__init__.py`](../../backend/app/drivers/dns/__init__.py); the per-driver internals are in [`docs/drivers/DNS_DRIVERS.md`](../drivers/DNS_DRIVERS.md).
 
 | Capability | BIND9 | PowerDNS | Windows DNS |
 |---|:---:|:---:|:---:|
@@ -51,9 +51,11 @@ The Operator Copilot's `propose_create_dns_zone` tool accepts an explicit `drive
 
 **Add DNS server** also offers four cloud-hosted authoritative-DNS providers as driver choices: **Cloudflare**, **Amazon Route 53**, **Azure DNS**, and **Google Cloud DNS**. Once added, their zones and records are managed exactly like a local BIND9 / PowerDNS zone — same Zones / Records / group surfaces, same CRUD — but the control plane drives the provider's REST/SDK API directly instead of an agent (an *agentless* driver, the same shape as Windows DNS Path B). A cloud DNS server lives in a normal `DNSServerGroup`; credentials are a provider-specific dict (Cloudflare API token, Route 53 access keys, an Azure service-principal triple + subscription / resource group, or a GCP service-account JSON + project id) entered in the Add DNS server modal and Fernet-encrypted in `DNSServer.credentials_encrypted`.
 
-The modal renders a per-driver **in-modal setup guide** for the required credential fields and a **Test** button that does a cheap auth + list-zones probe before save. Online DNSSEC is supported on Cloudflare / Route 53 / Google Cloud DNS but **not** Azure DNS. Full per-driver internals (credential shapes, capability matrix, per-provider wrinkles) are in [DNS_DRIVERS.md §4A](../drivers/DNS_DRIVERS.md).
+The modal renders a per-driver **in-modal setup guide** for the required credential fields and a **Test** button that does a cheap auth + list-zones probe before save. No cloud driver advertises *online* DNSSEC sign/unsign — cloud DNSSEC is a provider-level zone toggle, not the per-record online signing SpatiumDDI's `dnssec_sign`/`unsign` ops model, so those operations stay gated to BIND9 / PowerDNS (#29 follow-up). Full per-driver internals (credential shapes, capability matrix, per-provider wrinkles) are in [DNS_DRIVERS.md §4A](../drivers/DNS_DRIVERS.md).
 
 **Bringing existing zones in.** A cloud account that already hosts zones imports through the DNS importer's cloud source (preview → commit; see [MIGRATION.md](MIGRATION.md)). After that, ongoing drift is reconciled the same way as any other server — the **sync-from-server** path pulls the provider's live zone/record state via the driver's `pull_zones_from_server` / `pull_zone_records` reads.
+
+A **token-only tier** (DigitalOcean / Hetzner / Linode / Vultr, issue #327) ships alongside the four headline providers as agentless first-class drivers with the same import-existing-zones flow.
 
 These cloud-DNS drivers are distinct from the *Cloud (AWS / Azure / GCP)* read-only **infrastructure** mirror (issue #37 Part A — VPCs / subnets / instance IPs into IPAM; see [INTEGRATIONS.md](INTEGRATIONS.md)). One is authoritative-DNS management; the other is an IPAM reconciler. They share a provider vocabulary, not a code path.
 
@@ -75,7 +77,7 @@ DNSServerGroup
 
 DNSServer
   id, group_id, name
-  driver: enum(bind9)
+  driver: enum(bind9, powerdns, windows_dns, cloudflare, route53, azuredns, googledns, digitalocean, hetzner, linode, vultr)
   host, port
   credentials (encrypted)
   roles: [enum(authoritative, recursive, forwarder)]  -- server can have multiple roles
@@ -96,7 +98,8 @@ A server may belong to only one group but may have **multiple roles** (e.g., bot
 
 ## 2. DNS Views (Split-Horizon)
 
-Views allow the same zone name to return **different data** depending on the source IP of the DNS query. This is a native BIND9 feature; 
+Views allow the same zone name to return **different data** depending on the source IP of the DNS query. This is a native BIND9 feature.
+
 ### View Model
 
 ```
@@ -127,7 +130,7 @@ DNSView
 
 ## 3. DNS Server Options & ACLs
 
-Server-level options control how each DNS server (or server group) behaves globally — independent of any individual zone. These map to BIND9 `options {}` / `view {}` blocks `recursor.conf` /  All settings are stored in the `DNSServerOptions` model and pushed to the server by the driver on change.
+Server-level options control how each DNS server (or server group) behaves globally — independent of any individual zone. These map to BIND9 `options {}` / `view {}` blocks. All settings are stored in the `DNSServerOptions` model and pushed to the server by the driver on change.
 
 ### 3.1 Forwarders
 
@@ -398,8 +401,6 @@ The driver is responsible for generating the correct BIND9 config that reflects 
 
 ## 4. DNS Zone Tree
 
-
-
 Zones are displayed and managed in a **tree hierarchy** that mirrors the DNS namespace naturally.
 
 ```
@@ -447,7 +448,9 @@ When a subnet is created or edited, the UI prompts: *"Auto-create reverse zone f
 
 ### Supported Record Types
 
-`A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `PTR`, `SRV`, `CAA`, `TLSA`, `SSHFP`, `NAPTR`, `LOC`
+`A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `PTR`, `SRV`, `CAA`, `TLSA`, `SSHFP`, `NAPTR`, `LOC`, `SVCB`, `HTTPS`, `DNAME`
+
+Plus the PowerDNS-only `ALIAS` (CNAME-at-apex) and `LUA` (computed responses) types, which are driver-gated — see §0 and `_DRIVER_GATED_RECORD_TYPES` in `backend/app/api/v1/dns/router.py`.
 
 ### Record Model
 
@@ -475,7 +478,6 @@ DNSRecord
 > how the SpatiumDDI-shipped agent applies record ops over loopback and
 > reports zone-serial telemetry back to the control plane.
 
-
 **BIND9:**
 - Record add/modify/delete → RFC 2136 `nsupdate` via `dnspython`
 - Zone creation/deletion → `rndc addzone` / `rndc delzone`
@@ -483,9 +485,10 @@ DNSRecord
 - **A full `named` restart is never required** for normal operations
 - Serial is auto-incremented on every change (YYYYMMDDNN format)
 
-- All operations via ..`)
+**PowerDNS:**
+- Record add/modify/delete → `PATCH /api/v1/servers/localhost/zones/<zone>` rrset patch via the REST API
 - Record changes are atomic and immediate — no restart, no reload
-- Zone creation/deletion via API
+- Zone creation/deletion via the REST API; PowerDNS handles the serial bump internally
 
 ### Driver Method: `apply_record_change()`
 
@@ -505,7 +508,7 @@ async def apply_record_change(
 
 ## 7. Dynamic DNS (DDNS) — DHCP Lease → DNS Record
 
-> **Implementation status (2026-04-18, post 2026.04.18-1):** Subnet-level opt-in DDNS has shipped. When a lease lands via the agentless pull path (Windows DHCP today), SpatiumDDI resolves a hostname per the subnet's policy and publishes A/AAAA + PTR via the same RFC 2136 / WinRM path static allocations use. Agent-side lease-event DDNS (Kea) is the planned follow-up.
+> **Implementation status:** Subnet-level opt-in DDNS has shipped. When a lease lands via the agentless pull path (Windows DHCP) *or* an agent lease event (Kea), SpatiumDDI resolves a hostname per the subnet's policy and publishes A/AAAA + PTR via the same RFC 2136 / WinRM path static allocations use. The Kea path runs through `apply_ddns_for_lease` in the `POST /api/v1/dhcp/agents/lease-events` handler.
 
 ### Architecture
 
@@ -516,8 +519,8 @@ DDNS is a thin layer on top of the IPAM → DNS sync pipeline. The DNS side is i
 │  Lease source            │
 │  ─ agentless pull        │  → upserts DHCPLease + mirrors into IPAM
 │    (Windows DHCP)         │    as auto_from_lease=True
-│  ─ agent lease event      │
-│    (Kea — planned)        │
+│  ─ agent lease event      │  → Kea (POST /agents/lease-events)
+│    (Kea)                  │
 └───────────┬──────────────┘
             │ ipam_row
             ▼
@@ -540,7 +543,7 @@ On lease expiry, `dhcp_lease_cleanup` sweeps the DHCPLease row past its grace pe
 
 ### Subnet-level configuration
 
-DDNS is opt-in per subnet — there's no inheritance from block / space (by design for MVP; the knob is usually different per subnet anyway).
+DDNS is opt-in per subnet. A subnet can also inherit its DDNS settings from its enclosing block / space: `IPSpace` and `IPBlock` carry the same four DDNS fields, and when `ddns_inherit_settings` is true `resolve_effective_ddns` (in `backend/app/services/dns/ddns.py`) walks subnet → block → space to find the effective values.
 
 | Field | Default | Purpose |
 |---|---|---|
@@ -587,8 +590,6 @@ DDNS is safe to call repeatedly. If the resolved hostname matches what's already
 
 ### Not-yet (planned follow-ups)
 
-- **Kea lease-event DDNS.** Today the agent mirrors leases into IPAM but doesn't call `apply_ddns_for_lease`. Wiring ~10 lines in the agent's lease-event handler is the next piece.
-- **Block/space inheritance** of DDNS settings (matches the DNS-group / DHCP-group inheritance pattern).
 - **Grace period** on revoke — today we delete A + PTR immediately when the lease-cleanup sweep removes the IPAM row. A short grace where we drop the TTL to 30 s first would help mid-transition clients.
 
 ---
@@ -841,62 +842,64 @@ most of these feed the IPAM / DNS / DHCP UI error banners directly.
 
 - **Duplicate zone name inside a group/view.** `(group_id, view_id,
   name)` is a unique constraint; create/update returns `409` with
-  *"A zone with that name already exists in this group/view."* at
-  `backend/app/api/v1/dns/router.py:1915`.
+  *"A zone with that name already exists in this group/view."* in
+  `backend/app/api/v1/dns/router.py`.
 - **`zone_type` enum.** One of `primary` / `secondary` / `stub` /
-  `forward`. Pydantic validator at
-  `backend/app/api/v1/dns/router.py:503`.
+  `forward`. Pydantic validator in
+  `backend/app/api/v1/dns/router.py`.
 - **`color` enum.** Must be in `VALID_ZONE_COLORS` (`slate`, `red`,
   `amber`, `emerald`, `cyan`, `blue`, `violet`, `pink`). Free-form
   hex is deliberately not accepted so both themes stay legible.
-  `backend/app/api/v1/dns/router.py:512`.
+  `backend/app/api/v1/dns/router.py`.
 - **`notify_enabled` enum.** One of `yes` / `no` / `explicit` /
-  `master-only`. `backend/app/api/v1/dns/router.py:562`.
+  `master-only`. `backend/app/api/v1/dns/router.py`.
 - **Windows zone push-before-commit.** When a zone is created / deleted
   on a group that has an agentless `windows_dns` server with
   credentials, the WinRM push happens first — a WinRM failure rolls
   back the DB transaction and returns `502` so the operator never
   sees a SpatiumDDI zone that doesn't exist on the real DC.
-  `backend/app/api/v1/dns/router.py:2087`.
+  `backend/app/api/v1/dns/router.py`.
 
 ### Records
 
 - **`record_type` enum.** Must be in `VALID_RECORD_TYPES` — A, AAAA,
-  CNAME, MX, TXT, NS, PTR, SRV, CAA, TLSA, SSHFP, NAPTR, LOC.
-  `backend/app/api/v1/dns/router.py:614`.
+  CNAME, MX, TXT, NS, PTR, SRV, CAA, TLSA, SSHFP, NAPTR, LOC, SVCB,
+  HTTPS, DNAME, plus the PowerDNS-only ALIAS / LUA types.
+  `backend/app/api/v1/dns/router.py`.
 
 ### Servers & server groups
 
-- **Duplicate server-group name.** `409` at
-  `backend/app/api/v1/dns/router.py:660`.
+- **Duplicate server-group name.** `409` in
+  `backend/app/api/v1/dns/router.py`.
 - **Duplicate server name within a group.** `(group_id, name)` is
-  unique — same name is fine across different groups. `409` at
-  `backend/app/api/v1/dns/router.py:801`.
+  unique — same name is fine across different groups. `409` in
+  `backend/app/api/v1/dns/router.py`.
 - **`group_type` enum.** `VALID_GROUP_TYPES` —
-  `backend/app/api/v1/dns/router.py:97`.
-- **`driver` enum.** Must be `bind9` or `windows_dns` (plus
-  `stub_resolver` for tests). `422` at
-  `backend/app/api/v1/dns/router.py:175`.
+  `backend/app/api/v1/dns/router.py`.
+- **`driver` enum.** Must be one of the registered drivers
+  (`VALID_DRIVERS`, derived from the driver registry — `bind9` /
+  `powerdns` / `windows_dns` / the cloud + token-only providers, plus
+  `stub_resolver` for tests). `422` in
+  `backend/app/api/v1/dns/router.py`.
 - **Windows credentials must be complete on first set.** Creating a
   `windows_dns` server with Path B credentials requires both
   `username` and `password`; an incomplete pair returns `400`. Later
   updates may include just one field.
-  `backend/app/api/v1/dns/router.py:827` (create) and
-  `:891` (update).
+  `backend/app/api/v1/dns/router.py`.
 
 ### ACLs & views
 
 - **Duplicate ACL name within a group.** `(group_id, name)` unique.
-  `409` at `backend/app/api/v1/dns/router.py:1717`.
-- **Duplicate view name within a group.** Same pattern. `409` at
-  `backend/app/api/v1/dns/router.py:1819`.
+  `409` in `backend/app/api/v1/dns/router.py`.
+- **Duplicate view name within a group.** Same pattern. `409` in
+  `backend/app/api/v1/dns/router.py`.
 
 ### Server options
 
-- **`forward_policy` enum.** `first` or `only`. Validator at
-  `backend/app/api/v1/dns/router.py:329`.
-- **`dnssec_validation` enum.** `auto`, `yes`, or `no`. Validator at
-  `backend/app/api/v1/dns/router.py:336`.
+- **`forward_policy` enum.** `first` or `only`. Validator in
+  `backend/app/api/v1/dns/router.py`.
+- **`dnssec_validation` enum.** `auto`, `yes`, or `no`. Validator in
+  `backend/app/api/v1/dns/router.py`.
 
 ## 16. Multi-group / split-horizon publishing at the IPAM layer (issue #25)
 

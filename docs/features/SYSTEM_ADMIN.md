@@ -28,7 +28,7 @@ is operator-configurable via
 
 Read-only diagnostic surface so operators can see what their
 control plane is doing without standing up a separate Prometheus
-/ pgwatch / Grafana pipeline. Two tabs:
+/ pgwatch / Grafana pipeline. Five tabs:
 
 - **Postgres** — version + DB size, cache hit ratio, current WAL
   position, active vs max connections, longest-running
@@ -36,6 +36,8 @@ control plane is doing without standing up a separate Prometheus
   per-table size with autovacuum lag, connections grouped by
   state with idle-in-transaction tinted amber, slow queries from
   `pg_stat_statements` if the extension is installed.
+- **Redis** — overview, keyspace breakdown, and the agent-wake
+  pub/sub bus state.
 - **Containers** — per-container CPU% (computed the same way
   `docker stats` does), memory used / limit / %, network rx /
   tx, block-IO read / write. Default-filtered to the
@@ -43,9 +45,13 @@ control plane is doing without standing up a separate Prometheus
   container on the host. Reports `available=false` with a
   one-line setup hint when `/var/run/docker.sock` isn't mounted
   into the api container.
+- **Conformity** — promoted from the Compliance surface; shows
+  the latest conformity-evaluation rollup.
+- **Copilot Usage** — Operator Copilot token / cost observability.
 
-Backend at `app/api/v1/admin/postgres.py` (4 endpoints) +
-`app/api/v1/admin/containers.py` (1 endpoint). Both
+Backend at `app/api/v1/admin/postgres.py` (5 endpoints) +
+`app/api/v1/admin/containers.py` (1 endpoint) +
+`app/api/v1/admin/redis.py` (3 endpoints). All
 superadmin-gated.
 
 ---
@@ -245,7 +251,7 @@ Dashboard tiles showing platform-wide stats:
 
 ### 2.9 Backup and Restore
 
-The Backup admin page (`/admin/backup`) ships two tabs: **Manual** (build-and-download / restore-from-file) and **Destinations** (configured remote targets, scheduling, restore-from-destination). Everything described here is reachable from the UI; the same surface is exposed via REST under `/api/v1/backup` and `/api/v1/backup/targets` so operators can drive it from automation.
+The Backup admin page (`/admin/backup`) ships three tabs: **Manual** (build-and-download / restore-from-file), **Destinations** (configured remote targets, scheduling, restore-from-destination), and **Factory Reset** (per-section wipe back to defaults). Everything described here is reachable from the UI; the same surface is exposed via REST under `/api/v1/backup` and `/api/v1/backup/targets` so operators can drive it from automation.
 
 #### What's in the archive
 
@@ -268,7 +274,7 @@ The passphrase is **not** the destination's auth credential — every destinatio
 
 #### Destination kinds
 
-All seven destination kinds register in the same driver registry; the UI's destination picker reflects on `GET /backup/targets/kinds` so adding a new kind requires no frontend changes.
+All eight destination kinds register in the same driver registry; the UI's destination picker reflects on `GET /backup/targets/kinds` so adding a new kind requires no frontend changes.
 
 | Kind | Tier | Notes |
 |---|---|---|
@@ -279,6 +285,7 @@ All seven destination kinds register in the same driver registry; the UI's desti
 | `smb` | 2 | Windows / Samba shares (`smbprotocol`); NTLM auth, optional SMB3 encryption toggle |
 | `ftp` | 2 | Plain FTP / FTPS-explicit / FTPS-implicit; passive + active; `verify_tls` toggle for self-signed labs |
 | `gcs` | 2 | Google Cloud Storage; service-account JSON key (encrypted at rest) — no ADC by design |
+| `webdav` | 3 | WebDAV servers (Nextcloud, ownCloud, Apache `mod_dav`, IIS WebDAV, any RFC 4918 server) over `httpx` PUT / GET / PROPFIND / DELETE — no SDK dependency |
 
 Every driver implements the same four operations: `write` / `list_archives` / `delete` / `download` + a `test_connection` probe (writes a 16-byte random payload, head/stats it, deletes it — same shape as the DNS / DHCP server probes).
 
@@ -301,13 +308,13 @@ Set exactly one of `retention_keep_last_n` / `retention_keep_days`, or neither f
 |---|---|
 | Build + download a fresh archive | `POST /backup/create-and-download` (StreamingResponse, browser saves the zip directly) |
 | Restore from a laptop-uploaded archive | `POST /backup/restore` (multipart upload) |
-| Run a configured target now | `POST /backup/targets/{id}/run` |
+| Run a configured target now | `POST /backup/targets/{id}/run-now` |
 | Test a configured target's connection | `POST /backup/targets/{id}/test` |
 | List archives at a configured target | `GET /backup/targets/{id}/archives` |
 | Restore from any archive at a target | `POST /backup/targets/{id}/archives/restore` |
 | Download an archive from a target through the proxy | `GET /backup/targets/{id}/archives/{filename}/download` |
 
-The proxy-download endpoint streams `driver.download(filename)` straight back to the operator's browser, so SCP / S3 / Azure / SMB / FTP / GCS archives can be pulled to a laptop without giving the operator the destination credentials.
+The proxy-download endpoint streams `driver.download(filename)` straight back to the operator's browser, so SCP / S3 / Azure / SMB / FTP / GCS / WebDAV archives can be pulled to a laptop without giving the operator the destination credentials.
 
 #### Restore — what the server does
 
@@ -321,7 +328,7 @@ Same code path is hit whether the archive comes from an upload or a destination 
    - Phase 1 archives (plain SQL) → `psql --single-transaction --set=ON_ERROR_STOP=1`.
    - Selective restore (operator ticked specific sections) → `TRUNCATE … RESTART IDENTITY CASCADE` for the selected sections' tables, then `pg_restore --data-only --disable-triggers --table=…` for just those tables. `platform_internal` (alembic_version + oui_vendor) always rides along.
 5. **Alembic upgrade-on-restore.** If the archive's `schema_version` is older than this install's expected head, `alembic upgrade head` runs against the freshly-restored database. Same head → no-op. Source head not in this install's chain → restore succeeds, operator gets a clear `"upgrade SpatiumDDI on this destination, then re-run the restore"` warning. The restore returns a `migration` block with `state` (`up_to_date` / `upgraded` / `incompatible_newer` / `unknown` / `failed`), `source_head`, `local_head`, `migrations_applied`.
-6. **Cross-install secret rewrap.** Walks every Fernet-encrypted column (22 columns across 16 tables) plus the `__enc__:`-prefixed fields inside `backup_target.config` JSONB; decrypts each with the source key recovered from `secrets.enc`, re-encrypts with the destination's local key, UPDATEs in place. Same-install restores short-circuit with `same_install=true`. The operator no longer has to copy the recovered `SECRET_KEY` into the destination's `.env` manually — it just works.
+6. **Cross-install secret rewrap.** Walks every Fernet-encrypted column (19 columns across 15 tables) plus the `__enc__:`-prefixed fields inside `backup_target.config` JSONB; decrypts each with the source key recovered from `secrets.enc`, re-encrypts with the destination's local key, UPDATEs in place. Same-install restores short-circuit with `same_install=true`. The operator no longer has to copy the recovered `SECRET_KEY` into the destination's `.env` manually — it just works.
 7. **Audit row.** Inserts a `backup_restored` row into the `audit_log` table on a fresh session — this row sits in the *restored* database (the trail of evidence survives the wipe), and carries the manifest, pre-restore safety path, migration counters, and rewrap counters.
 
 The restore endpoint is superadmin-only. Operators must type the literal phrase `RESTORE-FROM-BACKUP` server-side to confirm, so accidental drag-and-drops don't nuke the install. Selective restore is opt-in via the section checklist on the restore modal.
@@ -343,7 +350,7 @@ The restore response carries a `rewrap` block:
   "rewrapped_jsonb_fields": 0,      // backup_target.config __enc__: rewraps
   "skipped_idempotent_rows": 0,     // already-dest-key-decryptable (re-run / post-restore-created)
   "failed_rows": 0,                 // couldn't decrypt with either key — operator re-enters by hand
-  "columns_visited": 22,
+  "columns_visited": 19,
   "failures": []                    // first 10 failures with table / column / pk / reason
 }
 ```
@@ -506,7 +513,7 @@ Examples: `2026.04.13-1`, `2026.04.13-2` (hotfix same day)
 
 The version is injected at build time and exposed via:
 - UI header (e.g., `v2026.04.13-1`)
-- `GET /api/v1/version` — returns `{ "version": "...", "commit": "..." }`
+- `GET /api/v1/version` — returns `{ "version": "...", "update_available": ..., "latest_version": ... }`
 
 ### GitHub Release Check
 
@@ -515,17 +522,19 @@ When `github_release_check_enabled` is true, SpatiumDDI periodically polls the G
 - A notification is sent to configured notification channels if `notify_on_new_release` is enabled
 - Superadmins can dismiss the banner or snooze for N days
 
-The check is performed by the Celery beat scheduler (task: `system.check_github_release`). No personal data is sent — only a GET request to the public GitHub API.
+The check is performed by the Celery beat scheduler (task: `app.tasks.update_check.check_github_release`). No personal data is sent — only a GET request to the public GitHub API.
 
 ```python
 # API model
 GET /api/v1/version
 → {
     "version": "2026.04.13-1",
-    "commit": "abc1234",
-    "update_available": true,          # null if check is disabled or failed
-    "latest_version": "2026.05.01-1",  # null if up to date or check failed
-    "latest_release_url": "https://github.com/spatiumddi/spatiumddi/releases/tag/2026.05.01-1"
+    "update_available": true,
+    "latest_version": "2026.05.01-1",  # null if up to date, check disabled, or check failed
+    "latest_release_url": "https://github.com/spatiumddi/spatiumddi/releases/tag/2026.05.01-1",
+    "latest_checked_at": "2026-04-13T02:00:00Z",  # null if never checked
+    "release_check_enabled": true,
+    "latest_check_error": null         # most recent error, if any
   }
 ```
 

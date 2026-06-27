@@ -1,6 +1,6 @@
 # IPAM Feature Specification
 
-> **Implementation status (post-`2026.04.28-2`):** Full hierarchical CRUD (spaces, blocks with nesting, subnets, addresses); next-available allocation that skips dynamic DHCP pool ranges; orphan soft-delete + bulk orphan purge modal; block utilization rollup via recursive CTE; block/subnet overlap validation via PostgreSQL `cidr &&` operator; **grow-only subnet + block resize** with blast-radius preview, cross-subtree overlap scan, typed-CIDR confirmation gate, and pg advisory lock during commit; **subnet planner** at `/ipam/plans` (draggable multi-level CIDR design saved as `SubnetPlan` rows, validated live, applied transactionally); **planning tools** — CIDR calculator at `/tools/cidr`, address planner that packs `{count, prefix_len}` requests into block free space, aggregation suggestion banner for clean-merge opportunities, free-space treemap toggleable from the Allocation map header; block-detail bulk-select reaches parity with the space view (child blocks selectable + bulk-deletable alongside subnets); DNS assignment inheritance (space → block → subnet) with dual-listbox picker for additional zones and shared `ZoneOptions` primary/additional separator across Create / Edit / Bulk-edit flows; DNS sync check (subnet / block / space scope) reconciling missing, mismatched, and stale records, with a `[Sync ▾]` dropdown (DNS / DHCP / All) on the subnet header plus result modals for each; **scheduled IPAM ↔ DNS auto-sync** (opt-in Celery beat task gated on `PlatformSettings.dns_auto_sync_enabled`); reverse-zone auto-create + backfill; IP aliases (CNAME/A tied to the IP, auto-cleaned on purge) with single-step delete confirmation + query-invalidation fix for the subnet Aliases tab; VLAN association (router + VLAN columns); DHCP scope/pool/static linkage with per-IP pool-membership badge, **pool boundary rows in the IP listing**, and **dynamic-pool allocation gates** (422 on manual allocation, skipped by `/next-ip`); static DHCP creation flow integrated into Allocate IP; drag-drop reparenting; **bulk-edit IPs with per-field opt-in toggles** (status, description, tags-merge-or-replace, custom-fields merge, DNS zone); **IP assignment collision warnings** (FQDN + MAC collisions across any subnet; 409 with `force`-flag reconfirm); import/export (CSV/JSON/XLSX) with UTC-timestamped filenames + **subnet-scoped IP address importer**; custom fields per resource type with inherited-value placeholders on Edit Subnet / Edit Block modals; global search (Cmd+K); **mobile-responsive layout** (sidebar drawer, horizontally scrollable tables, modals cap at `95vw`); every modal is draggable (`bg-black/20` backdrop, Esc close). **Partial IPv6:** storage, UI, subnet create, AAAA/PTR sync, `/blocks/{id}/available-subnets` up to `/128`, and per-block "Find by size" with family-aware prefix options all land — remaining TODOs are EUI-64 / hash-based `/128` allocation for `/next-address` (returns 409 on v6 today).
+> **Implementation status (post-`2026.04.28-2`):** Full hierarchical CRUD (spaces, blocks with nesting, subnets, addresses); next-available allocation that skips dynamic DHCP pool ranges; orphan soft-delete + bulk orphan purge modal; block utilization rollup via recursive CTE; block/subnet overlap validation via PostgreSQL `cidr &&` operator; **grow-only subnet + block resize** with blast-radius preview, cross-subtree overlap scan, typed-CIDR confirmation gate, and pg advisory lock during commit; **subnet planner** at `/ipam/plans` (draggable multi-level CIDR design saved as `SubnetPlan` rows, validated live, applied transactionally); **planning tools** — CIDR calculator at `/tools/cidr`, address planner that packs `{count, prefix_len}` requests into block free space, aggregation suggestion banner for clean-merge opportunities, free-space treemap toggleable from the Allocation map header; block-detail bulk-select reaches parity with the space view (child blocks selectable + bulk-deletable alongside subnets); DNS assignment inheritance (space → block → subnet) with dual-listbox picker for additional zones and shared `ZoneOptions` primary/additional separator across Create / Edit / Bulk-edit flows; DNS sync check (subnet / block / space scope) reconciling missing, mismatched, and stale records, with a `[Sync ▾]` dropdown (DNS / DHCP / All) on the subnet header plus result modals for each; **scheduled IPAM ↔ DNS auto-sync** (opt-in Celery beat task gated on `PlatformSettings.dns_auto_sync_enabled`); reverse-zone auto-create + backfill; IP aliases (CNAME/A tied to the IP, auto-cleaned on purge) with single-step delete confirmation + query-invalidation fix for the subnet Aliases tab; VLAN association (router + VLAN columns); DHCP scope/pool/static linkage with per-IP pool-membership badge, **pool boundary rows in the IP listing**, and **dynamic-pool allocation gates** (422 on manual allocation, skipped by `/next-ip`); static DHCP creation flow integrated into Allocate IP; drag-drop reparenting; **bulk-edit IPs with per-field opt-in toggles** (status, description, tags-merge-or-replace, custom-fields merge, DNS zone); **IP assignment collision warnings** (FQDN + MAC collisions across any subnet; 409 with `force`-flag reconfirm); import/export (CSV/JSON/XLSX) with UTC-timestamped filenames + **subnet-scoped IP address importer**; custom fields per resource type with inherited-value placeholders on Edit Subnet / Edit Block modals; global search (Cmd+K); **mobile-responsive layout** (sidebar drawer, horizontally scrollable tables, modals cap at `95vw`); every modal is draggable (`bg-black/20` backdrop, Esc close). **IPv6:** storage, UI, subnet create, AAAA/PTR sync, `/blocks/{id}/available-subnets` up to `/128`, per-block "Find by size" with family-aware prefix options, next-available allocation (`sequential` / `random` / `eui64` strategies, defaulting to `Subnet.ipv6_allocation_policy`), and Kea Dhcp6 scope rendering with v6 option-name translation all land.
 
 ## Overview
 
@@ -182,15 +182,14 @@ IPAddress
 
 ```json
 {
-  "strategy": "sequential",    // or "random"
-  "skip_gateway": true,
+  "strategy": "sequential",    // "random", or "eui64" (IPv6)
   "hostname": "app-server-01",
   "description": "New app server",
   "custom_fields": { "ticket": "INC-12345" }
 }
 ```
 
-Returns the allocated IPAddress. Allocation is atomic (uses DB-level `SELECT ... FOR UPDATE` to prevent race conditions).
+Returns the allocated IPAddress. Allocation is atomic (uses DB-level `SELECT ... FOR UPDATE` on the subnet row to prevent race conditions). The picker skips network/broadcast placeholders and any IP inside a dynamic DHCP pool.
 
 ---
 
@@ -775,16 +774,17 @@ Backed by:
 - `GET /api/v1/ipam/blocks/{id}/effective-fields` (new — parity endpoint
   added in Wave D).
 
-### ✅ 15.6 Partial IPv6 Support
+### ✅ 15.6 IPv6 Support
 
-Storage and most UI paths support IPv6 today. Specifically:
+Storage, allocation, and the UI paths support IPv6 today. Specifically:
 
 - `Subnet.total_ips` widened to `BigInteger` (migration `e3c7b91f2a45`)
   so a `/64` (`2⁶⁴` addresses) fits; `_total_ips()` clamps at `2⁶³ − 1`
   for anything larger.
 - `DHCPScope.address_family` column (migration `d7a2b6e9f134`). The Kea
   driver renders either a `Dhcp4` or `Dhcp6` config block from the same
-  scope rows. Dhcp6 option-name translation is still a TODO.
+  scope rows, with v6 option-name translation via `_KEA_OPTION_NAMES_V6`
+  (v4-only options are dropped from v6 scopes with a warning).
 - Subnet create skips the v6 broadcast row; `_sync_dns_record` emits AAAA
   forward records + PTR in `ip6.arpa` reverse zones.
 - `GET /api/v1/ipam/blocks/{id}/available-subnets` accepts `/8`–`/128`
@@ -794,12 +794,15 @@ Storage and most UI paths support IPv6 today. Specifically:
   prefixes strictly longer than the selected block's prefix.
 - Create-block and create-subnet placeholder text includes an IPv6
   example (`e.g. 10.0.0.0/8 or 2001:db8::/32`).
-
-**Remaining IPv6 TODOs:**
-- `POST /api/v1/ipam/addresses/next-address` returns 409 on v6 subnets.
-  Still needs an EUI-64 / hash-based `/128` allocation strategy.
-- Kea Dhcp6 option-name translation in `backend/app/drivers/dhcp/kea.py`.
-- Automated v6-specific test coverage.
+- Next-available allocation works on v6 subnets: `POST /api/v1/ipam/subnets/{id}/next`
+  honours `sequential` / `random` / `eui64` strategies, defaulting to
+  `Subnet.ipv6_allocation_policy`. EUI-64 derives per RFC 4291 §2.5.1
+  (`_eui64_from_mac`); random uses a CSPRNG suffix with collision retry
+  and skips the all-zero subnet-router anycast address. `_pick_next_available_ip`
+  drives both the commit path and `GET /api/v1/ipam/subnets/{id}/next-ip-preview`
+  (which accepts `?mac_address=` to preview the EUI-64 candidate). Unit
+  coverage lives in `backend/tests/test_ipv6_allocation.py`, pinning the
+  RFC 4291 Appendix A worked example.
 
 ### ✅ 15.7 IP Alias Refresh + Delete Confirmation
 
@@ -1253,10 +1256,10 @@ the IPAM Editor builtin role.
 
 ### ✅ 15.21 Block move across IP spaces (issue #27)
 
-`POST /ipam/blocks/{id}/move` accepts a target `space_id` + a
-typed-name confirmation. Pre-flight validates target space exists,
-no CIDR overlap in the target tree, every dependent row (DNS
-records, DHCP scopes, addresses with custom-field inheritance)
+`POST /ipam/blocks/{id}/move/preview` + `/move/commit` accept a
+target `space_id` + a typed-name confirmation. Pre-flight validates
+target space exists, no CIDR overlap in the target tree, every
+dependent row (DNS records, DHCP scopes, addresses with custom-field inheritance)
 survives the move. `MoveBlockModal` walks the operator through
 the consequences with a chevron-revealed list of affected resources
 before the typed-name confirm unlocks Move.
@@ -1291,68 +1294,66 @@ already wires this up for every delete / allocate / create flow.
 ### Delete guards
 
 - **IP space delete refused when non-empty.** A space with any blocks
-  or subnets can't be dropped; clear them first. `409` at
-  `backend/app/api/v1/ipam/router.py:1592`.
+  or subnets can't be dropped; clear them first. `409` in
+  `backend/app/api/v1/ipam/router.py`.
 - **Block delete refused when non-empty.** A block with child blocks
   *or* subnets returns `409` with a breakdown (*"Block 10.0.0.0/8
   still contains 3 child block(s) and 5 subnet(s)"*).
-  `backend/app/api/v1/ipam/router.py:1824`.
+  `backend/app/api/v1/ipam/router.py`.
 - **Subnet delete refused when non-empty.** A subnet with user-owned
   IPs (anything other than `network`, `broadcast`, `orphan`, or
   DHCP-lease-mirrored `auto_from_lease` rows) or any DHCP scope
   attached is rejected with `409`. Pass `?force=true` to cascade;
   the same pre-delete cleanup (WinRM remove-scope, Kea bundle
   rebuild) still runs so nothing is orphaned on a running server.
-  `backend/app/api/v1/ipam/router.py:2492`.
+  `backend/app/api/v1/ipam/router.py`.
 
 ### Block hierarchy
 
 - **Block cannot be its own parent.** `parent_block_id` must not
-  equal the block's own id. `422` at
-  `backend/app/api/v1/ipam/router.py:1706`.
+  equal the block's own id. `422` in
+  `backend/app/api/v1/ipam/router.py`.
 - **Reparenting can't create a cycle.** Moving a block into one of
   its own descendants is caught before commit; same rule applies via
   drag-and-drop in the UI (checked client-side too, but the server
-  is authoritative). `422` at
-  `backend/app/api/v1/ipam/router.py:1725`.
+  is authoritative). `422`.
 - **Block must fit inside its parent block.** Child CIDR must be
   fully contained in the parent's CIDR. Enforced on create + on
-  reparent. `422` at `:1717`.
+  reparent. `422`.
 - **Block overlap at the same level.** Sibling blocks in the same
   space cannot have overlapping CIDRs (duplicates or otherwise).
-  Checked via `_assert_no_block_overlap`. `422` at `:1654`.
+  Checked via `_assert_no_block_overlap`. `422`.
 
 ### Subnets
 
-- **Subnet must fit inside its parent block.** `422` at `:2303`.
+- **Subnet must fit inside its parent block.** `422`.
 - **Subnet overlap within a space.** Two subnets in the same IP space
   cannot overlap, regardless of which block they sit under. Checked
-  via `_assert_no_overlap`. `422` at `:2047`.
+  via `_assert_no_overlap`. `422`.
 - **Gateway must be a valid IP inside the subnet.** Malformed IPs
-  return `422` at `:2054`; a parseable IP outside the CIDR returns
-  `422` at `:2056`.
+  return `422`; a parseable IP outside the CIDR returns `422`.
 - **VLAN reference must resolve.** A `vlan_ref_id` that doesn't
-  point to an existing VLAN returns `404` at `:2067`.
+  point to an existing VLAN returns `404`.
 - **VLAN ID must match the referenced VLAN.** If both `vlan_id` and
   `vlan_ref_id` are supplied, the tag must match the referenced
-  VLAN's tag. `422` at `:2071`.
+  VLAN's tag. `422`.
 
 ### IP allocation
 
-- **IP must be inside the subnet's CIDR.** `422` at `:3497`. Same
+- **IP must be inside the subnet's CIDR.** `422`. Same
   check applies in the import path.
 - **IP inside a dynamic DHCP pool is refused.** Manual allocation
   inside an active `dynamic` pool is blocked — DHCP owns those
   addresses. Move the pool to `reserved` / `excluded` or shrink it
-  first. `422` at `:3507`. `GET /subnets/{id}/next-ip-preview`
+  first. `422`. `GET /subnets/{id}/next-ip-preview`
   honours the same skip.
 - **IP already allocated in the subnet.** Duplicate address in the
-  same subnet returns `409` at `:3531`.
+  same subnet returns `409`.
 - **Malformed IP.** Non-parseable address in create / import paths
-  returns `422` at `:3493`.
+  returns `422`.
 - **`static_dhcp` status requires a MAC.** Creating an IP with
   `status="static_dhcp"` without a `mac_address` is rejected — a
-  static reservation needs something to match on. `422` at `:3518`.
+  static reservation needs something to match on. `422`.
 - **Collision warnings are soft, not hard.** Duplicate hostname +
   forward zone, or duplicate MAC across subnets, returns `409` with
   `{"warnings": [...], "requires_confirmation": True}`; the client
@@ -1366,33 +1367,30 @@ value and the allowed set. Kept compact because the error messages
 speak for themselves.
 
 - `IPSpace.color` → `VALID_SPACE_COLORS` (same 8 swatches as zone
-  colour). `backend/app/api/v1/ipam/router.py:965`.
-- `Subnet.status` → allowed set (`active`, `deprecated`, etc). `:1146`.
-- `Subnet.ddns_hostname_policy` → see `docs/features/DHCP.md §13`.
-  `:1121`.
-- `NextIPRequest.strategy` → `sequential` or `random`. `:1437`.
-- Alias `record_type` → `CNAME` or `A`. `:1302`. Alias rows with no
-  `name` are also rejected. `:1310`.
+  colour). `backend/app/api/v1/ipam/router.py`.
+- `Subnet.status` → allowed set (`active`, `deprecated`, etc).
+- `Subnet.ddns_hostname_policy` → see `docs/features/DHCP.md` § 13.
+- `NextIPRequest.strategy` → `sequential`, `random`, or `eui64`.
+- Alias `record_type` → `CNAME` or `A`. Alias rows with no
+  `name` are also rejected.
 
 ### CIDR form
 
-- **Invalid CIDR notation.** Malformed CIDR strings are rejected at
-  `:1139`.
+- **Invalid CIDR notation.** Malformed CIDR strings are rejected.
 - **CIDR with host bits set.** Non-strict CIDRs (e.g. `10.0.0.1/24`)
   are rejected with a message suggesting the normalised form
-  (`10.0.0.0/24`). `:1135`.
+  (`10.0.0.0/24`).
 - **Prefix length can't exceed the address family.** `/33+` for IPv4
   and `/129+` for IPv6 are rejected in the available-subnets query.
-  `:1871`.
 - **Available-subnets `prefix_len` must be strictly smaller than the
   block.** Asking for a `/24` inside a `/24` returns `422` — there's
-  nothing to divide. `:1879`.
+  nothing to divide.
 
 ### Import / DNS linkage
 
 - **IPAM import payload shape.** `POST /import/...` rejects requests
-  without a top-level `payload` object. `422` at
-  `backend/app/api/v1/ipam/io_router.py:117`.
+  without a top-level `payload` object. `422` in
+  `backend/app/api/v1/ipam/io_router.py`.
 - **DNS zone link must resolve.** Setting `dns_zone_id` on a subnet
   requires the zone to exist *in the subnet's configured view* —
-  linking a zone from a different view returns `404` at `:4220`.
+  linking a zone from a different view returns `404`.

@@ -33,7 +33,7 @@ appliance-host concern. Slot telemetry, slot-upgrade trigger writes,
 reboot trigger, SNMP / chrony reload triggers, deployment-kind
 detection. The DNS service container drops the four host bind mounts
 (`/etc/spatiumddi-host`, `/boot/efi-host`,
-`/var/lib/spatiumddi/release-state`, `/run/udev`); the supervisor
+`/var/lib/spatiumddi-host/release-state`, `/run/udev`); the supervisor
 mounts them instead and is the single producer of host-side state.
 
 **Service heartbeats** (`POST /dns/agents/heartbeat`) no longer
@@ -41,13 +41,13 @@ carry the slot / deployment / upgrade-state block. The supervisor's
 new `POST /api/v1/appliance/supervisor/heartbeat` is the single
 producer of appliance-row telemetry now.
 
-**Installer wizard** for fresh installs uses the new **Application**
-role (one of three: Full stack / Frontend / core / Application).
-Operators no longer pick `dns-agent-bind9` / `dns-agent-powerdns` at
-the installer prompt; the control plane assigns roles after admin
-approval in the Fleet tab. The legacy `dns-agent-*` role names alias
-to `application` in firstboot so existing in-field appliances keep
-booting through a slot upgrade.
+**Installer wizard** for fresh installs uses the **Appliance**
+role (was "Application" pre-#272; one of Full stack / Frontend / core /
+Appliance). Operators no longer pick `dns-agent-bind9` /
+`dns-agent-powerdns` at the installer prompt; the control plane assigns
+roles after admin approval in the Fleet tab. The legacy `dns-agent-*`
+role names alias to the appliance role in firstboot so existing
+in-field appliances keep booting through a slot upgrade.
 
 The rest of this document — driver protocol, config layout, etc. —
 is unchanged and still authoritative for the service-container half
@@ -73,19 +73,20 @@ of the split.
 
 **One image per DNS flavor, agent baked in as a second process, supervised by a lightweight init (`tini` + a small Python supervisor).**
 
-Two images ship in Phase 2:
+The agent images that ship:
 
 | Image | Processes | Purpose |
 |---|---|---|
 | `ghcr.io/spatiumddi/dns-bind9` | `named` + `spatium-dns-agent` | Authoritative and/or recursive BIND9 |
+| `ghcr.io/spatiumddi/dns-powerdns` | `pdns_server` + `spatium-dns-agent` | Authoritative PowerDNS (LMDB backend) |
 
-The **agent is the same Python codebase** (`spatium_dns_agent`) in both images; the DNS daemon differs. The agent abstracts daemon specifics internally (symmetric to the control-plane driver, but on the container side).
+The **agent is the same Python codebase** (`spatium_dns_agent`) in every image; the DNS daemon differs. The agent abstracts daemon specifics internally (symmetric to the control-plane driver, but on the container side).
 
 ### Rationale
 
 - **Single image per flavor** keeps operational surface small and lets the agent run `rndc`, write `named.conf`, manage the  SQLite/pgsql backend, and own the daemon lifecycle locally — none of which a detached sidecar can do without shared volumes and ambient capabilities.
 - **Not a standalone sidecar** because BIND9 config-file edits + `rndc reconfig` require filesystem and UNIX socket co-location. A sidecar model adds complexity (shared PID namespace, shared volumes) with no benefit at our scale.
-- **Not a single universal image** because BIND9 have wildly different footprints (Alpine `bind` + `bind-tools` ≈ 30 MB; Bundling both bloats images and attack surface.
+- **Not a single universal image** because the daemons have different footprints and dependencies. Bundling every flavor into one image bloats it and widens the attack surface.
 
 ### Alternatives considered
 
@@ -120,8 +121,8 @@ with ``BOOTSTRAP_PAIRING_CODE=<digits>`` were 404-looping forever
 against the gone endpoint. The container entrypoint now requires
 ``DNS_AGENT_KEY`` non-empty.
 
-See ``docs/deployment/APPLIANCE.md §10`` for the Application-
-appliance pairing-code workflow.
+See ``docs/deployment/APPLIANCE.md §9`` for the appliance
+pairing-code workflow.
 
 ### Flow
 
@@ -190,8 +191,8 @@ Three channels:
 
 | Channel | Direction | Transport | Purpose |
 |---|---|---|---|
-| **Config long-poll** | Agent → CP | `GET /dns/agents/{id}/config?etag=<current>` (30 s hold) | Full config bundle (views, ACLs, options, zone list). Returns `304` if unchanged, `200` with new bundle + new etag on change. |
-| **Heartbeat** | Agent → CP | `POST /dns/agents/{id}/heartbeat` (30 s interval) | Liveness, daemon status, version, queued-change ACK, token rotation. |
+| **Config long-poll** | Agent → CP | `GET /dns/agents/config` with `If-None-Match: <etag>` (long hold) | Full config bundle (views, ACLs, options, zone list). Returns `304` if unchanged, `200` with new bundle + new etag on change. The agent is identified by its JWT, not a path id. |
+| **Heartbeat** | Agent → CP | `POST /dns/agents/heartbeat` (30 s interval) | Liveness, daemon status, version, queued-change ACK, token rotation. |
 
 **Why not push / webhook from control plane to agent?**
 - Requires agent to expose an HTTPS listener, open an inbound port, and obtain a valid TLS cert. Non-negotiable #6 and general operational cost.
@@ -278,10 +279,10 @@ ops/
 
 | Endpoint | Direction | Cadence |
 |---|---|---|
-| `POST /dns/agents/{id}/heartbeat` | agent → CP | every 30 s (jittered ±3 s) |
-| `GET  /dns/agents/{id}/config` | agent → CP | continuous long-poll (30 s hold) |
-| `POST /dns/agents/{id}/ops/{op_id}/ack` | agent → CP | piggybacked on heartbeat; separate endpoint reserved for out-of-band recovery |
-| `GET  /dns/agents/{id}/diagnostics` | admin UI → CP → agent | pull-through for logs / `rndc status` (Phase 3) |
+| `POST /dns/agents/heartbeat` | agent → CP | every 30 s (jittered ±3 s) |
+| `GET  /dns/agents/config` | agent → CP | continuous long-poll |
+| `POST /dns/agents/ops/{op_id}/ack` | agent → CP | piggybacked on heartbeat; separate endpoint reserved for out-of-band recovery |
+| `POST /dns/agents/admin/rendered-config`, `POST /dns/agents/admin/rndc-status` | admin UI → CP → agent | pull-through for rendered config / `rndc status` |
 
 ### Stale / unhealthy surfacing
 
@@ -327,8 +328,8 @@ If failed after N retries (default 5, expo-backoff): state=failed, alert.
 
 - **Control plane bumps the logical serial** when constructing the op: `YYYYMMDDNN` format, monotonically increasing per zone, persisted on `DNSZone.last_serial`.
 - The op carries the target serial. The agent's `nsupdate` script explicitly deletes + re-adds the SOA with the target serial in the same update transaction (atomic under RFC 2136).
-- F, the API zone `PATCH` includes the `serial` field.
-- **Secondary servers** (same group, different `DNSServer` rows) do **not** receive record ops — the primary notifies them natively (BIND9 `notify`. The agent on a secondary only syncs config (ACLs, views, zone definitions), never individual records.
+- The API zone `PATCH` includes the `serial` field.
+- **Secondary servers** (same group, different `DNSServer` rows) do **not** receive record ops — the primary notifies them natively (BIND9 `notify`). The agent on a secondary only syncs config (ACLs, views, zone definitions), never individual records.
 
 ### Primary/secondary coordination
 
@@ -355,24 +356,24 @@ If failed after N retries (default 5, expo-backoff): state=failed, alert.
 
 ### Base
 
-**Alpine 3.20** (per CLAUDE.md) for both images. Multi-arch: `linux/amd64`, `linux/arm64/v8` via `docker buildx`.
+**Alpine 3.22** for every agent image. Multi-arch: `linux/amd64`, `linux/arm64/v8` via `docker buildx`.
 
 ### `dns-bind9` image
 
 ```
-FROM alpine:3.20 AS runtime
-RUN apk add --no-cache bind bind-tools tini python3 py3-pip ca-certificates tzdata
+FROM alpine:3.22 AS runtime
+RUN apk add --no-cache bind bind-tools tini python3 py3-pip libcap ca-certificates tzdata
 # Agent
 COPY --from=agent-build /install /usr/local
-COPY entrypoint.py /usr/local/bin/spatium-dns-entrypoint
+COPY entrypoint.sh /usr/local/bin/spatium-dns-entrypoint
 RUN addgroup -S spatium && adduser -S -G spatium spatium \
  && mkdir -p /var/lib/spatium-dns-agent && chown spatium:spatium /var/lib/spatium-dns-agent
 VOLUME ["/var/lib/spatium-dns-agent", "/var/cache/bind"]
 EXPOSE 53/udp 53/tcp
-ENTRYPOINT ["/sbin/tini", "--", "spatium-dns-entrypoint"]
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/spatium-dns-entrypoint"]
 ```
 
-Entrypoint (`entrypoint.py`) responsibilities:
+Entrypoint (`entrypoint.sh`) responsibilities:
 
 1. Load/generate `agent-id`.
 2. Bootstrap / token refresh against control plane.
@@ -380,13 +381,10 @@ Entrypoint (`entrypoint.py`) responsibilities:
 4. Validate with `named-checkconf`.
 5. `exec` a supervisor that runs two children: `named -g -u named` and the agent's sync loop. If either exits, kill the other and exit non-zero (let the orchestrator restart the container).
 
-
-```
-FROM alpine:3.20
-                      tini python3 py3-pip ca-certificates tzdata
-# ... agent install same as above ...
-EXPOSE 53/udp 53/tcp 8081/tcp  # 8081 bound to 127.0.0.1 only
-```
+The `dns-powerdns` image follows the same shape — it swaps `bind`/`named`
+for `pdns_server` (LMDB backend) but ships the same `spatium_dns_agent`
+codebase and the same `spatium-dns-entrypoint`, and exposes the same
+`53/udp 53/tcp`.
 
 
 ### Volumes
@@ -394,9 +392,9 @@ EXPOSE 53/udp 53/tcp 8081/tcp  # 8081 bound to 127.0.0.1 only
 | Path | Purpose | Typical size |
 |---|---|---|
 | `/var/lib/spatium-dns-agent` | Agent state, config cache, TSIG, tokens | <10 MB |
-| `/var/cache/bind` (bind9image) | Zone files, journals | grows with zone count |
+| `/var/cache/bind` (bind9 image) | Zone files, journals | grows with zone count |
 
-All three must survive restarts → named volumes in Compose / PVCs in K8s.
+Both must survive restarts → named volumes in Compose / PVCs in K8s.
 
 ---
 
@@ -477,7 +475,7 @@ dns-bind9-primary:
 | `backend/app/models/dns.py` | Extend with: `DNSServer.agent_id`, `fingerprint`, `pending_approval`, `is_primary`; new `RecordOp` model. |
 | `backend/alembic/versions/<new>_dns_agent_ops.py` | Migration for the above. |
 | `backend/app/tasks/dns.py` | Celery beat `dns_agent_stale_sweep`. |
-| `backend/app/core/config.py` | Settings: `DNS_AGENT_TOKEN_TTL`, `DNS_AGENT_LONGPOLL_TIMEOUT`, `require_agent_approval`. |
+| `backend/app/config.py` | Settings: `DNS_AGENT_TOKEN_TTL`, `DNS_AGENT_LONGPOLL_TIMEOUT`, `require_agent_approval`. |
 
 ### Agent (new codebase)
 
@@ -497,7 +495,7 @@ dns-bind9-primary:
 | Path | Purpose |
 |---|---|
 | `agent/dns/images/bind9/Dockerfile` | Alpine + BIND9 + agent, multi-arch. |
-| `agent/dns/images/bind9/entrypoint.py` | Process-1 entrypoint. |
+| `agent/dns/images/bind9/entrypoint.sh` | Process-1 entrypoint. |
 | `.github/workflows/build-dns-images.yml` | buildx, amd64+arm64, push to `ghcr.io/spatiumddi/*`. |
 
 ### Kubernetes
@@ -541,4 +539,4 @@ dns-bind9-primary:
 - **mTLS vs JWT**: reconsider in Phase 4 once we have an internal CA story.
 - **IPv6-only deployments**: agent must support AAAA-only control-plane URL; fine in theory, test in Phase 3.
 - **Windows DNS integration**: explicitly out of scope for the agent model — Windows servers are managed via WinRM from the control plane (different driver branch, see roadmap).
-- **DNSSEC signing (online vs bump-in-the-wire)**: BIND9 inline-signing is assumed; Key storage and rotation design is a separate doc (`docs/features/DNS_DNSSEC.md`, Phase 3).
+- **DNSSEC signing (online vs bump-in-the-wire)**: BIND9 inline-signing is assumed; key storage and rotation design now lives alongside the driver docs (`docs/drivers/DNS_DRIVERS.md` §2.5).

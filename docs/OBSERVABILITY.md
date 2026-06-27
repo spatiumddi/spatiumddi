@@ -155,7 +155,7 @@ Built-in Log Viewer UI
 
 ### Bundled Log Store: Grafana Loki
 
-The default Docker Compose and Helm chart include:
+The intended bundled log-store option is built around:
 - **Loki** (log aggregation)
 - **Grafana** (dashboards + log exploration — optional, for power users)
 - **Vector** (log collector / shipper — lightweight, replaces Fluentd/Logstash)
@@ -462,10 +462,12 @@ Distinct from audit-forward: this is a curated **typed-event
 surface** for downstream automation, not raw audit rows. Operators
 configure subscriptions at `Admin → Webhooks` (`/admin/webhooks`).
 
-**Vocabulary.** 96 typed events generated from a resource × verb
-cross-product — e.g. `space.created`, `subnet.bulk_allocate`,
+**Vocabulary.** A curated set of typed events generated from a
+resource × verb cross-product (plus a handful of special-cased
+names) — e.g. `space.created`, `subnet.bulk_allocate`,
 `dns.zone.updated`, `dhcp.scope.deleted`, `auth.user.created`,
-`integration.kubernetes.created`. Subscriptions with no event-type
+`integration.kubernetes.created`. The live list is served by
+`GET /api/v1/webhooks/event-types`. Subscriptions with no event-type
 filter match everything.
 
 **Pipeline.** Audit-row commit triggers an `EventOutbox` write per
@@ -509,7 +511,11 @@ de-duplicate on `event_id` (= `AuditLog.id`).
 
 ## 6. Prometheus Metrics
 
-Exposed on each service at `:9090/metrics` (separate from the API port).
+The API service exposes a Prometheus scrape endpoint at `/metrics` on
+the main API port (gated by the `prometheus_metrics_enabled` setting,
+default on). The metric families below describe the intended full
+surface; the API-request family is implemented today (see
+`backend/app/metrics.py`).
 
 ### API Service Metrics
 
@@ -649,7 +655,9 @@ All services expose:
 
 ## 8. Bundled Grafana Dashboards
 
-Pre-built dashboards shipped with the project (in `deploy/grafana/dashboards/`):
+Pre-built Grafana dashboards are part of the intended observability
+bundle (a perf-testing dashboard set already lives under
+`perf/dashboards/grafana/`):
 
 | Dashboard | Contents |
 |---|---|
@@ -704,7 +712,9 @@ the policy edit modal at `/admin/conformity`.
 
 ### 9.2 Prometheus alerting rules (external)
 
-Pre-built Prometheus alerting rules (in `deploy/prometheus/alerts/`):
+Reference Prometheus alerting rules for the `spatiumddi_*` metrics
+(a perf-testing Prometheus config already lives under
+`perf/dashboards/prometheus/`):
 
 | Alert | Condition | Severity |
 |---|---|---|

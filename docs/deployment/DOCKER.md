@@ -9,7 +9,7 @@
 
 - Docker Engine 25+ and Docker Compose v2.20+
 - 2 GB RAM minimum (4 GB recommended)
-- Ports 80 (frontend) and optionally 8000 (API direct access) free on the host
+- Ports 8077 (frontend, `HTTP_PORT`) and optionally 8000 (API direct access, `API_PORT`) free on the host
 
 ---
 
@@ -17,7 +17,7 @@
 
 | Port | Service | Protocol | Notes |
 |---|---|---|---|
-| 80 | Frontend (nginx) | HTTP | Configurable via `HTTP_PORT` env var |
+| 8077 | Frontend (nginx) | HTTP | Host-published default; configurable via `HTTP_PORT` env var (container listens on 80) |
 | 443 | Frontend (nginx) | HTTPS | When TLS is configured (see §5) |
 | 8000 | API (uvicorn) | HTTP | Configurable via `API_PORT` env var; internal only in production |
 | 5432 | PostgreSQL | TCP | Internal only — never expose externally |
@@ -56,7 +56,7 @@ The API automatically creates a default admin user on first startup if no users 
 - **Password:** `admin`
 - **Force password change:** Yes — you will be redirected to the change-password page on first login.
 
-Access the UI at `http://your-host-or-ip/` (or `http://localhost/` if running locally).
+Access the UI at `http://your-host-or-ip:8077/` (or `http://localhost:8077/` if running locally). The host port is set by `HTTP_PORT` (default `8077`).
 
 ---
 
@@ -66,12 +66,12 @@ Access the UI at `http://your-host-or-ip/` (or `http://localhost/` if running lo
 |---|---|---|
 | `POSTGRES_PASSWORD` | `changeme` | PostgreSQL password — **must change** |
 | `SECRET_KEY` | (none) | JWT signing key — **must change** (use `openssl rand -hex 32`) |
-| `HTTP_PORT` | `80` | Host port for the frontend |
+| `HTTP_PORT` | `8077` | Host port for the frontend |
 | `API_PORT` | `8000` | Host port for the API (set to `127.0.0.1:8000:8000` to restrict to localhost) |
 | `DATABASE_URL` | auto-constructed | Override only if using an external PostgreSQL |
 | `REDIS_URL` | `redis://redis:6379/0` | Override to point at an external Redis |
 | `DEBUG` | `false` | Enable FastAPI debug mode |
-| `ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | JWT access token lifetime |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `15` | JWT access token lifetime |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh token lifetime |
 
 ---
@@ -105,11 +105,6 @@ asyncio.run(reset())
 EOF
 ```
 
-Or use the management script (once it is written — Phase 4):
-```bash
-docker compose exec api python -m spatiumddi.cli reset-password admin
-```
-
 ---
 
 ## 5. TLS / HTTPS
@@ -127,7 +122,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/spatiumddi.example.com/privkey.pem;
 
     location / {
-        proxy_pass         http://localhost:80;
+        proxy_pass         http://localhost:8077;
         proxy_set_header   Host $host;
         proxy_set_header   X-Real-IP $remote_addr;
         proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -140,7 +135,7 @@ server {
 
 ```caddyfile
 spatiumddi.example.com {
-    reverse_proxy localhost:80
+    reverse_proxy localhost:8077
 }
 ```
 
@@ -163,16 +158,16 @@ services:
 
 ### ACME / DNS Challenge (for IPAM-integrated certificate management)
 
-SpatiumDDI's DNS module exposes an API endpoint (`POST /api/v1/dns/acme-challenge`) for creating and removing ACME DNS-01 challenge TXT records. This allows ACME clients (certbot, acme.sh) to complete DNS challenges using SpatiumDDI as the DNS backend:
+SpatiumDDI ships an [acme-dns](https://github.com/joohoi/acme-dns)-compatible HTTP surface under `/api/v1/acme/` for creating and removing ACME DNS-01 challenge TXT records. External ACME clients (certbot, lego, acme.sh) can complete DNS challenges using SpatiumDDI as the DNS backend by CNAME-ing `_acme-challenge.<their-domain>` to a SpatiumDDI-managed subdomain and updating the TXT record over the acme-dns protocol:
 
 ```bash
-# Example with acme.sh using the SpatiumDDI DNS hook
-export SPATIUMDDI_URL=https://spatiumddi.example.com
-export SPATIUMDDI_API_TOKEN=your-api-token
-acme.sh --issue --dns dns_spatiumddi -d your-domain.example.com
+# Example with lego (supports acme-dns out of the box)
+export ACME_DNS_API_BASE=https://spatiumddi.example.com/api/v1/acme
+export ACME_DNS_STORAGE_PATH=./acme-dns-accounts.json
+lego --email you@example.com --dns acme-dns -d your-domain.example.com run
 ```
 
-See `docs/features/DNS.md` for the full ACME API specification.
+See [`docs/features/ACME.md`](../features/ACME.md) for the full ACME provider specification.
 
 ---
 
@@ -271,7 +266,7 @@ For real production use you generally don't want the Kea DHCP agent and the BIND
 | File | Purpose |
 |---|---|
 | `docker-compose.agent-dhcp.yml`         | Kea DHCP agent(s) only — no control plane |
-| `docker-compose.agent-dns-bind9.yml`    | BIND9 DNS agent only — no control plane (renamed from `docker-compose.agent-dns.yml` in `2026.05.07-2`) |
+| `docker-compose.agent-dns-bind9.yml`    | BIND9 DNS agent only — no control plane (renamed from `docker-compose.agent-dns.yml` in `2026.05.11-1`) |
 | `docker-compose.agent-dns-powerdns.yml` | PowerDNS DNS agent only — no control plane (issue #127) |
 
 The agent containers long-poll the remote control plane's API and cache the last-known-good config locally (non-negotiable #5), so the DHCP / DNS services keep serving even if the control plane is briefly unreachable.
@@ -279,15 +274,15 @@ The agent containers long-poll the remote control plane's API and cache the last
 ### Prerequisites
 
 1. Control plane already running somewhere reachable (e.g. `https://spatium.example.com`).
-2. Generate an agent key and register it on the control plane before starting the agent. Settings → Agent Keys (or `POST /api/v1/agent-keys`) — the control plane rejects bootstrap attempts with an unknown key.
-3. If the control plane uses a self-signed cert, either mount a CA bundle at `/etc/ssl/certs/spatium-ca.crt` and set `TLS_CA_PATH`, or (lab-only) leave `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`.
+2. The pre-shared agent bootstrap key from the control plane. These are the `DNS_AGENT_KEY` / `DHCP_AGENT_KEY` env values the control plane was started with; reveal them from the UI at **Settings → Security → Agent bootstrap keys** (`POST /api/v1/admin/agent-keys/reveal`, superadmin + password-confirm). The agent must present this same key — the control plane rejects bootstrap attempts with an unknown key. The agent exchanges the pre-shared key for a rotating JWT on first contact and caches it locally, so it only needs the bootstrap key once.
+3. If the control plane uses a self-signed cert, either mount a CA bundle at `/etc/ssl/spatium-ca.crt` and set `TLS_CA_PATH`, or (lab-only) leave `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`.
 
 ### DHCP-only VM
 
 ```bash
 # On the DHCP VM (separate host from the control plane):
 export SPATIUM_API_URL=https://spatium.example.com
-export SPATIUM_AGENT_KEY=$(openssl rand -hex 32)
+export SPATIUM_AGENT_KEY=<DHCP_AGENT_KEY from the control plane>   # see Prerequisites
 export DHCP_HOSTNAME=dhcp-kea-east    # unique across the deployment
 
 # Single Kea node:
@@ -324,7 +319,7 @@ sniffing privileges on installs that aren't using it. Set the
 fingerbank API key in **Settings → IPAM → Device Profiling** on the
 control plane to enable enrichment; without a key the agent still
 ships raw signatures, fingerbank lookups just don't run. See
-`docs/features/DHCP.md §15` for the full design and privacy notes.
+[`docs/features/DHCP.md`](../features/DHCP.md) §17 for the full design and privacy notes.
 
 #### Optional: arpwatch-style new-device detection
 
@@ -365,7 +360,7 @@ DNSServerGroup:
 
 ```bash
 export CONTROL_PLANE_URL=https://spatium.example.com
-export DNS_AGENT_KEY=$(openssl rand -hex 32)
+export DNS_AGENT_KEY=<DNS_AGENT_KEY from the control plane>   # see Prerequisites
 
 # BIND9 (default, ubiquitous, RNDC + RFC 2136 DDNS):
 export DNS_HOSTNAME=dns-bind9-east
@@ -393,7 +388,7 @@ the control plane.
 
 ### Host vs bridge networking
 
-Default ports in both files map to non-53 / non-67 host ports (1053/udp+tcp for DNS, 6767/udp for DHCP) so the containers don't collide with systemd-resolved or a running dhcp client on the host. The DNS default was 5353 prior to release `2026.05.08-1`; it changed to 1053 because 5353 is the well-known mDNS port that avahi (default-on in Ubuntu desktop, Fedora, most lab distros) already binds. Existing deployments that want to keep the old port can set `DNS_HOST_PORT=5353` in `.env`.
+Default ports in both files map to non-53 / non-67 host ports (1053/udp+tcp for DNS, 6767/udp for DHCP) so the containers don't collide with systemd-resolved or a running dhcp client on the host. The DNS default was 5353 prior to release `2026.05.11-1`; it changed to 1053 because 5353 is the well-known mDNS port that avahi (default-on in Ubuntu desktop, Fedora, most lab distros) already binds. Existing deployments that want to keep the old port can set `DNS_HOST_PORT=5353` in `.env`.
 
 For **real DNS / DHCP serving** you want `network_mode: host` so the daemon binds 53 / 67 directly and, for DHCP, receives L2 broadcasts on the host NIC. Add to the service definition:
 

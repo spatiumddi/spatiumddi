@@ -1,9 +1,12 @@
 # Performance Testing — 24h University-Scale Load + Soak Plan
 
-> **Status:** planning document (no implementation yet). This is the design we
-> build the `perf/` suite from — detailed enough to start without re-deriving
-> anything. It is deliberately not added to the `CLAUDE.md` document map; it is a
-> standalone plan.
+> **Status:** design spec for the `perf/` suite. The harness this document
+> describes has **shipped** (the top-level `perf/` directory — controller, setpoint
+> bus, phase engine, device-fleet orchestrator, generators, seeder, war-room poller,
+> manifests, and the `spddi-perf tui` console); this remains the authoritative
+> design reference for what it does and how to run it — detailed enough to operate
+> or extend without re-deriving anything. It is deliberately not added to the
+> `CLAUDE.md` document map; it is a standalone plan.
 >
 > **What this is.** A complete plan for a **24-hour load + soak test of the whole
 > SpatiumDDI suite** (DHCP via Kea, DNS via BIND9, IPAM control plane on

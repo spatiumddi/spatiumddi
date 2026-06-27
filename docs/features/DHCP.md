@@ -1,6 +1,6 @@
 # DHCP Feature Specification
 
-> **Implementation status (2026-04-28):** Kea driver, agent runtime, container image, backend API, and frontend UI shipped in the `2026.04.16-1` release. Pool overlap validation, existing-IP warning, resize, static ↔ IPAM sync (including DNS forward/reverse), lease → IPAM mirror (with auto-cleanup on expiry), DHCP Pool membership column in the IPAM subnet view, per-scope DHCP defaults prefilled from Settings. **Windows DHCP driver shipped** — Path A (agentless, WinRM + PowerShell, read-only lease monitoring + per-object scope / pool / reservation CRUD). **DDNS pipeline shipped for both paths** — agentless lease pull (2026-04-19) and agent-side Kea lease events (2026-04-21). **Group-centric Kea HA shipped** (`2026.04.21-2`) — load-balanced or hot-standby pairs with self-healing peer-IP drift, supervised daemons, and live `status-get` reporting. **Scope authoring helpers (`2026.04.28-2`):** 95-entry RFC 2132 + IANA option-code library with autocomplete on the custom-options row, plus named group-scoped option templates (e.g. "VoIP phones", "PXE BIOS clients") with a one-click "Apply template…" picker on the scope create / edit modal. **Still deferred:** PXE / iPXE first-class fields, Option 82 (relay agent info) class matching, DHCP fingerprinting, lease histogram by hour, reconciliation report, lease import. NTP (DHCP option 42) is a first-class option.
+> **Implementation status (2026-04-28):** Kea driver, agent runtime, container image, backend API, and frontend UI shipped in the `2026.04.16-1` release. Pool overlap validation, existing-IP warning, resize, static ↔ IPAM sync (including DNS forward/reverse), lease → IPAM mirror (with auto-cleanup on expiry), DHCP Pool membership column in the IPAM subnet view, per-scope DHCP defaults prefilled from Settings. **Windows DHCP driver shipped** — Path A (agentless, WinRM + PowerShell, read-only lease monitoring + per-object scope / pool / reservation CRUD). **DDNS pipeline shipped for both paths** — agentless lease pull (2026-04-19) and agent-side Kea lease events (2026-04-21). **Group-centric Kea HA shipped** (`2026.04.21-2`) — load-balanced or hot-standby pairs with self-healing peer-IP drift, supervised daemons, and live `status-get` reporting. **Scope authoring helpers (`2026.04.28-2`):** 95-entry RFC 2132 + IANA option-code library with autocomplete on the custom-options row, plus named group-scoped option templates (e.g. "VoIP phones", "PXE BIOS clients") with a one-click "Apply template…" picker on the scope create / edit modal. **PXE / iPXE provisioning profiles** (issue #51) and **passive DHCP fingerprinting** (Phase 2 device profiling) have since shipped — see §17 and §18. **Still deferred:** Option 82 (relay agent info) class matching, lease histogram by hour, reconciliation report, lease import. NTP (DHCP option 42) is a first-class option.
 
 ## Overview
 
@@ -749,7 +749,7 @@ rule here has been surfaced to an operator, not just silently logged.
   to the server group — every member renders the same classes. `409` at
   `backend/app/api/v1/dhcp/client_classes.py`.
 
-## 15. Passive DHCP Fingerprinting (Phase 2 device profiling)
+## 17. Passive DHCP Fingerprinting (Phase 2 device profiling)
 
 Auto-populate "what is this thing?" for every DHCP-leasing client by
 sniffing each DISCOVER / REQUEST and looking the resulting
@@ -841,7 +841,7 @@ The same surface lets operators force a re-lookup if they think the
 fingerbank result is wrong (the dispatched task ignores the cache
 window for that one MAC).
 
-## 16. PXE / iPXE provisioning profiles (issue #51)
+## 18. PXE / iPXE provisioning profiles (issue #51)
 
 Operator-curated `pxe_profile` rows wrap the per-architecture TFTP
 boot story so the same scope can serve legacy PXE BIOS, EFI x86_64,

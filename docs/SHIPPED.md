@@ -1026,8 +1026,8 @@ Mirrors CLAUDE.md's three mixed sections:
     translate at the SDK boundary. OpenAI-compat driver
     covers OpenAI / Ollama / OpenWebUI / vLLM / LM Studio /
     llama.cpp server / LocalAI / Together / Groq / Fireworks.
-    Tool registry mirrors the driver registry shape. 18
-    read-only tools cover the common operator asks
+    Tool registry mirrors the driver registry shape. A
+    set of read-only tools covers the common operator asks
     (`list_subnets`, `get_subnet`, `list_ips`, `get_ip`,
     `list_zones`, `list_records`, `list_dhcp_scopes`,
     `list_leases`, `list_alerts`, `list_audit`,

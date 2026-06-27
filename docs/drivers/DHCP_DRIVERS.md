@@ -48,39 +48,42 @@ Key methods on [`DHCPDriver`](../../backend/app/drivers/dhcp/base.py):
 
 ```python
 class DHCPDriver(ABC):
-    name: ClassVar[str]
+    name: str = "abstract"
 
     # Rendering (agented drivers).
     @abstractmethod
-    def render_config(self, server: Any, bundle: ConfigBundle) -> str: ...
+    def render_config(self, bundle: ConfigBundle) -> str: ...
 
     # Applying on the server host (agent-side).
     @abstractmethod
-    async def apply_config(self, server: Any, config: str) -> None: ...
+    async def apply_config(self, server: Any, bundle: ConfigBundle) -> None: ...
     @abstractmethod
     async def reload(self, server: Any) -> None: ...
     @abstractmethod
     async def restart(self, server: Any) -> None: ...
     @abstractmethod
-    async def validate_config(self, config: str) -> tuple[bool, str]: ...
+    def validate_config(self, bundle: ConfigBundle) -> tuple[bool, list[str]]: ...
 
-    # Reads (all drivers).
+    # Reads.
     @abstractmethod
-    async def get_leases(self, server: Any) -> list[LeaseData]: ...
+    async def get_leases(self, server: Any) -> list[dict[str, Any]]: ...
     @abstractmethod
-    async def get_scopes(self, server: Any) -> list[ScopeData]: ...
+    async def health_check(self, server: Any) -> tuple[bool, str]: ...
+    @abstractmethod
+    def capabilities(self) -> dict[str, Any]: ...
 
-    # Write-through (Path B / optional per-object CRUD).
-    async def apply_scope(self, server: Any, scope: ScopeDef) -> None: ...
-    async def remove_scope(self, server: Any, subnet_cidr: str) -> None: ...
-    async def apply_reservation(self, server: Any, subnet_cidr: str,
-                                 reservation: StaticAssignmentDef) -> None: ...
-    async def remove_reservation(self, server: Any, subnet_cidr: str,
-                                  mac_address: str) -> None: ...
-    async def apply_exclusion(self, server: Any, subnet_cidr: str,
-                               pool: PoolDef) -> None: ...
-    async def remove_exclusion(self, server: Any, subnet_cidr: str,
-                                start_ip: str, end_ip: str) -> None: ...
+    # Optional per-object write APIs (Windows DHCP today). The default
+    # batch impls below loop over the singular methods, which only the
+    # Windows driver overrides; non-Windows drivers raise NotImplementedError.
+    async def apply_reservations(self, server: Any, *,
+                                 items: Sequence[ReservationItem]
+                                 ) -> list[ReservationResult]: ...
+    async def remove_reservations(self, server: Any, *,
+                                  items: Sequence[RemoveReservationItem]
+                                  ) -> list[ReservationResult]: ...
+    async def apply_exclusions(self, server: Any, *,
+                               items: Sequence[ExclusionItem]
+                               ) -> list[ExclusionResult]: ...
 ```
 
 Neutral data classes (`ScopeDef`, `PoolDef`, `StaticAssignmentDef`, `ClientClassDef`, `ConfigBundle`) are frozen dataclasses — hashing them gives the ETag that drives long-poll.
@@ -106,7 +109,7 @@ Kea runs an HTTP Control Agent on `localhost:8544` (inside the agent pod/contain
 2. POSTing to `config-test` before `config-set` to catch validation errors early.
 3. Calling `config-reload` which re-reads the file without dropping in-flight leases.
 
-The IPv6 path renders a `Dhcp6` tree in parallel to `Dhcp4`. Dhcp6 option-name translation is marked TODO in the driver — today it passes option codes through unchanged.
+The IPv6 path renders a `Dhcp6` tree in parallel to `Dhcp4`. Dhcp6 option-name translation lands via `_KEA_OPTION_NAMES_V6` in both `backend/app/drivers/dhcp/kea.py` and the agent's `render_kea._options_from_mapping_v6`; v4-only options (`routers`, `broadcast-address`, `mtu`, `time-offset`, tftp-*) are dropped from v6 scopes with a warning.
 
 ### Wire shape from control plane → renderer
 
@@ -164,9 +167,9 @@ Kea's built-in `libdhcp_ha.so` hook handles pool coordination between paired ser
 
 Identical pattern to the DNS agent ([`DNS_AGENT.md`](../deployment/DNS_AGENT.md)):
 
-1. Agent starts with `DHCP_AGENT_KEY` (PSK) in its environment.
-2. Calls `POST /api/v1/dhcp/agents/bootstrap` with PSK → receives a per-server rotating JWT.
-3. Long-polls `GET /api/v1/dhcp/agents/config?etag=<last>` with JWT.
+1. Agent starts with `SPATIUM_AGENT_KEY` (PSK) in its environment; the control plane validates it against its own `DHCP_AGENT_KEY`.
+2. Calls `POST /api/v1/dhcp/agents/register` with the PSK in the `X-DHCP-Agent-Key` header → receives a per-server rotating JWT (`agent_token`).
+3. Long-polls `GET /api/v1/dhcp/agents/config` with the JWT and an `If-None-Match` ETag.
 4. On 401 or 404, re-bootstraps from the PSK.
 5. Caches the last-good bundle under `/var/lib/spatium-dhcp-agent/`.
 
@@ -188,7 +191,7 @@ Located at [`app/drivers/dhcp/windows.py`](../../backend/app/drivers/dhcp/window
 | `render_config` | ❌ | Raises `NotImplementedError`. Windows DHCP is cmdlet-driven, not config-file-driven. |
 | `apply_config` / `reload` / `restart` / `validate_config` | ❌ | Raise `NotImplementedError`. |
 
-The `/sync` endpoint (bundle push) rejects read-only drivers; the `/sync-leases-now` endpoint and per-object CRUD drive all writes instead.
+The `/sync` endpoint (bundle push) rejects read-only drivers; the `/{server_id}/sync-leases` endpoint and per-object CRUD drive all writes instead.
 
 ### Credentials
 
@@ -234,7 +237,7 @@ WinRM transport is `pywinrm` (`winrm.Session`), wrapped in `asyncio.to_thread` b
 
 ### Lease → IPAM mirror
 
-Leases drive a scheduled Celery beat task ([`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`](../../backend/app/tasks/dhcp_pull_leases.py)). Beat fires every 60s; the task gates on `PlatformSettings.dhcp_pull_leases_enabled` / `_interval_minutes`, so the UI can change cadence without restarting beat.
+Leases drive a scheduled Celery beat task ([`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`](../../backend/app/tasks/dhcp_pull_leases.py)). Beat fires every 60s; the task gates on `PlatformSettings.dhcp_pull_leases_enabled` / `dhcp_pull_leases_interval_seconds`, so the UI can change cadence without restarting beat.
 
 Per poll cycle:
 
@@ -245,7 +248,7 @@ Per poll cycle:
 5. **Absence-delete** — any active `DHCPLease` row for this server whose IP didn't come back in the wire response is deleted along with its `auto_from_lease=True` IPAM mirror. The driver's `get_leases()` returns only currently-active leases, so absence means the server deleted it (admin purged / client released / etc.). `PullLeasesResult` gains `removed` + `ipam_revoked` counters; both flow into the scheduled-task audit row and the manual sync response. See [features/DHCP.md §15.3](../features/DHCP.md) for the rationale.
 6. The time-based `dhcp_lease_cleanup` sweep still handles leases that drift past `expires_at` between polls. The two mechanisms overlap harmlessly.
 
-### 4.5 Batched WinRM writes
+### Batched WinRM writes
 
 Per-object writes against Windows DHCP used to round-trip WinRM **per reservation / exclusion** — a bulk delete of 200 reservations took minutes. The driver now groups writes into a single PowerShell script per `(server, scope)` chunk.
 
@@ -254,16 +257,16 @@ Per-object writes against Windows DHCP used to round-trip WinRM **per reservatio
 ```python
 class DHCPDriver(ABC):
     async def apply_reservations(
-        self, scope_id: str, reservations: Sequence[Reservation]
-    ) -> Sequence[OpResult]: ...
+        self, server: Any, *, items: Sequence[ReservationItem]
+    ) -> list[ReservationResult]: ...
 
     async def remove_reservations(
-        self, scope_id: str, reservations: Sequence[Reservation]
-    ) -> Sequence[OpResult]: ...
+        self, server: Any, *, items: Sequence[RemoveReservationItem]
+    ) -> list[ReservationResult]: ...
 
     async def apply_exclusions(
-        self, scope_id: str, exclusions: Sequence[Exclusion]
-    ) -> Sequence[OpResult]: ...
+        self, server: Any, *, items: Sequence[ExclusionItem]
+    ) -> list[ExclusionResult]: ...
 ```
 
 Default ABC impls call the singular method in a loop — Kea inherits the plural interface without changes.
@@ -287,7 +290,7 @@ For WinRM drivers, `pywinrm` errors get caught and re-raised as `DriverConnectio
 
 ---
 
-## 7. Adding a new driver
+## 6. Adding a new driver
 
 1. Subclass `DHCPDriver`. Implement all abstract methods. If read-only, raise `NotImplementedError` on writes.
 2. Register in `app/drivers/dhcp/registry.py`:
@@ -297,11 +300,11 @@ For WinRM drivers, `pywinrm` errors get caught and re-raised as `DriverConnectio
 3. If agentless, add to `AGENTLESS_DRIVERS`. If read-only, add to `READ_ONLY_DRIVERS`.
 4. Add the driver name to the enum in `DHCPServer.driver` (Alembic migration).
 5. Update the UI's server create modal to render the right credential fields (see how `windows_dhcp` conditionally shows WinRM fields in `frontend/src/pages/dhcp/CreateServerModal.tsx`).
-6. Add a "Test Connection" PowerShell / API probe at `POST /dhcp/test-credentials` so operators can validate before saving.
+6. Add a "Test Connection" PowerShell / API probe (e.g. `POST /dhcp/servers/test-windows-credentials`) so operators can validate before saving.
 
 ---
 
-## 8. Importing existing daemon configs (issue #129)
+## 7. Importing existing daemon configs (issue #129)
 
 The **DHCP configuration importer** is separate from the driver
 abstraction: drivers *render + push* config to managed servers; the
@@ -321,7 +324,7 @@ per-scope savepoint pattern.
 
 - `kea_parser.py` — strips Kea's JSON-with-comments (`//`, `#`,
   `/* */`) string-aware, then walks `Dhcp4.subnet4` / `Dhcp6.subnet6`.
-  Inverts the Kea driver's option-name map (`shared/options.py` builds
+  Inverts the Kea driver's option-name map (`options.py` builds
   the inverse of `_KEA_OPTION_NAMES` / `_KEA_OPTION_NAMES_V6`). Pools
   parse both `"a - b"` and CIDR forms; `code:NN` option-data round-trips
   the same way the driver renders it. DUID-only v6 reservations are

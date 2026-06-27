@@ -85,14 +85,14 @@ machines. Agents long-poll the control plane's API.
 
 ```bash
 # On vm-dns (BIND9 — pick `agent-dns-powerdns.yml` instead for PowerDNS):
-export SPATIUM_API_URL=https://spatium-cp.corp.local
-export SPATIUM_AGENT_KEY=<paste-from-Settings→Agent Keys>
+export CONTROL_PLANE_URL=https://spatium-cp.corp.local
+export DNS_AGENT_KEY=<paste-from-Settings→Security→Agent bootstrap keys>
 export DNS_HOSTNAME=vm-dns.corp.local
 docker compose -f docker-compose.agent-dns-bind9.yml up -d
 
 # On vm-dhcp:
 export SPATIUM_API_URL=https://spatium-cp.corp.local
-export SPATIUM_AGENT_KEY=<paste-from-Settings→Agent Keys>
+export SPATIUM_AGENT_KEY=<paste-from-Settings→Security→Agent bootstrap keys>
 export DHCP_HOSTNAME=vm-dhcp.corp.local
 docker compose -f docker-compose.agent-dhcp.yml up -d
 ```
@@ -163,14 +163,13 @@ DNS / DHCP agents per Topology 2 / 3 above, pointing at the LB URL.
 
 **What's in the repo for this:**
 
-- `k8s/ha/cnpg-cluster.yaml` — CloudNativePG manifest (K8s analogue of
+- `k8s/ha/postgres-cluster.yaml` — CloudNativePG manifest (K8s analogue of
   Patroni). Three-node primary + 2 replicas with auto-failover.
 - `k8s/ha/redis-sentinel.yaml` — Redis Sentinel manifest.
-- `k8s/ha/patroni-compose.yml` — Patroni reference for Docker Compose
+- `k8s/ha/postgres-docker-compose.yaml` — Patroni reference for Docker Compose
   (use this if you're not on K8s yet but want a real HA database).
-- `charts/spatiumddi` — umbrella Helm chart that pulls in the above
-  via subcharts when `postgresHa.enabled=true` /
-  `redisHa.enabled=true`.
+- `charts/spatiumddi` — umbrella Helm chart that selects the HA shapes
+  via `postgresql.kind=cnpg` / `redis.kind=sentinel`.
 
 The API is stateless — no in-memory session state — so a request
 hitting either api host gets the same answer. Sticky LB only matters
@@ -218,8 +217,8 @@ domain as its clients.
   request — workable but noticeably slower than local. Pick a region
   near your operators.
 - TLS certificate management for `spatium.example.com` belongs to the
-  cloud-side LB. Use ACME (the embedded ACME client lands in Phase 4) or
-  bring-your-own.
+  cloud-side LB. Use ACME (the embedded ACME / Let's Encrypt client
+  shipped in #438) or bring-your-own.
 - Audit-forward / SMTP / webhook events fire from the cloud-side
   control plane. Make sure your network policy lets them out — most
   setups don't have to think about this.
@@ -250,15 +249,16 @@ endpoints) / optional DNS+DHCP agent StatefulSets.
 The chart's relevant values:
 
 ```yaml
-postgresHa.enabled: true        # uses CloudNativePG subchart
-redisHa.enabled: true           # uses Bitnami redis subchart with sentinel
+postgresql.kind: cnpg           # HA Postgres via the CloudNativePG operator
+redis.kind: sentinel            # HA Redis via the in-chart sentinel shape
 api.replicas: 3
 worker.replicas: 4
 worker.netRawCapability: true   # for passive DHCP fingerprinting
-beat.enabled: true              # exactly one
 dnsAgents.enabled: true         # spawns the bind9 StatefulSet
 dhcpAgents.enabled: true        # spawns the kea StatefulSet (group-centric HA)
 ```
+
+Beat is always a single-replica singleton — there's no toggle for it.
 
 See [`../../k8s/README.md`](../../k8s/README.md) for the Helm-vs-raw-manifest
 walkthrough, the RWX PVC overlay needed for `local_volume` backup
@@ -382,7 +382,7 @@ Replacing a BIND9 group with a PowerDNS group on the same zones is a four-step r
 
 **3. Promote PowerDNS to primary.** In the UI, edit each zone and switch its `group_id` to the PowerDNS group. The control plane: (a) write-through-PATCHes the zone to PowerDNS as primary, (b) drops the catalog secondary and creates a primary entry, (c) rebuilds the SOA. BIND can stay on the zone as a plain catalog secondary (read-only) for a soft cutover, or be removed entirely. DDNS / IPAM auto-sync continue uninterrupted because they target the zone by ID, not by driver.
 
-**4. Sign zones (optional).** With the zones now on PowerDNS, signed zones are a single click — open the zone-edit modal, hit **Sign zone** in the DNSSEC card. PowerDNS generates KSK + ZSK, sets `PRESIGNED=1`, rectifies the zone, and the agent reports DS records back to the control plane. **Re-publish DS records to your registrar** — that's the only out-of-band step. The DNSSEC card has a per-DS copy-to-clipboard button. See [issue #127 Phase 3c](https://github.com/spatiumddi/spatiumddi/issues/127) for the full flow.
+**4. Sign zones (optional).** With the zones now on PowerDNS, signed zones are a single click — open the zone-edit modal, hit **Sign zone** in the DNSSEC card. PowerDNS generates KSK + ZSK (online signing), rectifies the zone, and the agent reports DS records back to the control plane. **Re-publish DS records to your registrar** — that's the only out-of-band step. The DNSSEC card has a per-DS copy-to-clipboard button. See [issue #127 Phase 3c](https://github.com/spatiumddi/spatiumddi/issues/127) for the full flow.
 
 **Rollback recipe.** If something goes wrong between step 2 and step 3, the BIND group is still authoritative — flip the zones back via the UI. If something goes wrong after step 3, the catalog-driven secondary on BIND is still serving the last-known-good zone state; promote it back to primary by switching the zone's group back to BIND. The IPAM ↔ DNS reconciler will pick up any record drift on the next 60-s sync cycle and re-stamp the zone.
 
@@ -406,8 +406,9 @@ Replacing a BIND9 group with a PowerDNS group on the same zones is a four-step r
 You can move between topologies without re-installing. Going from
 Topology 1 → 2 → 3 → 4 is purely additive: new VMs join the existing
 control plane via the agent-key bootstrap. The database doesn't
-move; you just point more agents at the same API URL and add their
-`agent_key` rows in **Settings → Agents**. On the OS appliance, the
+move; you just point more agents at the same API URL with the
+bootstrap key from **Settings → Security → Agent bootstrap keys**,
+and each agent registers itself on first boot. On the OS appliance, the
 1 → 3 → 5 control-plane scale (Topology 7) is likewise additive — you
 **promote** more appliances from the Fleet UI, no reinstall and no
 database move.
@@ -426,7 +427,7 @@ stateless. A few shape notes:
   SMB / FTP / WebDAV for distributed installs.
 - **Restore** runs via `pg_restore` against the live Postgres. In
   Topology 4+ point this at the **primary** (Patroni HAProxy port
-  5432, not the read-replica port). The api containers' SQLAlchemy
+  5000, not the read-only port 5001). The api containers' SQLAlchemy
   pool gets disposed during restore, so transient 503s during the
   restore window are expected — see the `pool_pre_ping=True` +
   transient-DB handler in `app/db.py`.

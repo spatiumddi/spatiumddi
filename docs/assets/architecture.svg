@@ -180,7 +180,7 @@
   <g>
     <rect x="956" y="364" width="182" height="106" rx="9" class="card" fill="url(#g-worker)"/>
     <text x="1047" y="390" text-anchor="middle" class="card-title">Tool Registry</text>
-    <text x="1047" y="410" text-anchor="middle" class="card-sub">183 tools</text>
+    <text x="1047" y="410" text-anchor="middle" class="card-sub">hundreds of tools</text>
     <text x="1047" y="428" text-anchor="middle" class="card-sub-dim">IPAM / DNS / DHCP / Net</text>
     <text x="1047" y="444" text-anchor="middle" class="card-sub-dim">admin / appliance / …</text>
     <text x="1047" y="460" text-anchor="middle" class="card-sub-dim">Apply-gated writes</text>

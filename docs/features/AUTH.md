@@ -1,12 +1,12 @@
 # Auth & Permissions
 
-> **Implementation status (Unreleased, post-`2026.04.16-2`):** Local auth
-> (JWT + rotating refresh token), five external identity provider types
-> configured at runtime from the admin UI (LDAP, OIDC, SAML, RADIUS,
-> TACACS+), failover to backup servers on LDAP / RADIUS / TACACS+,
-> group-based RBAC enforced on every API router, and five builtin roles
-> seeded at startup. Deferred: API tokens, forced password-change policy,
-> SCIM provisioning.
+> **Implementation status (shipped):** Local auth
+> (JWT + rotating refresh token), TOTP MFA, API tokens with scopes,
+> five external identity provider types configured at runtime from the
+> admin UI (LDAP, OIDC, SAML, RADIUS, TACACS+), failover to backup
+> servers on LDAP / RADIUS / TACACS+, group-based RBAC enforced on every
+> API router, and a set of builtin roles seeded at startup (see
+> `PERMISSIONS.md`). Deferred: SCIM provisioning.
 
 ## Overview
 
@@ -18,8 +18,8 @@ SpatiumDDI's auth stack has three layers:
    local `User` and replaces their group membership from the provider's
    group mappings. A login with **no** group mapping match is rejected.
 2. **Session** — the login handler issues a short-lived JWT access token
-   (15 min default) and a long-lived rotating refresh token stored as a
-   bcrypt-hashed row in `user_session`.
+   (15 min default) and a longer-lived rotating refresh token stored as a
+   hashed row in `user_session`.
 3. **Authorization** — every API router uses a permission helper
    (`require_permission` / `require_resource_permission` /
    `require_any_permission`) to check that the caller's groups carry a
@@ -51,8 +51,8 @@ SpatiumDDI's auth stack has three layers:
 - Passwords are `bcrypt` hashed. New users default `force_password_change=True`
   so the UI redirects them to `/change-password` before they can do anything
   else.
-- Access token expires in 15 min. Refresh token expires in 30 days and
-  rotates on every use.
+- Access token expires in 15 min. Refresh token expires in 7 days
+  (`refresh_token_expire_days` default) and rotates on every use.
 - `admin` / `admin` is seeded on first start with `force_password_change=True`.
   Reset the password from the CLI with the one-liner in the README.
 
@@ -67,7 +67,9 @@ community) with a TOTP code, since those reveals demand a credential the
 session alone doesn't prove and an SSO account has no local password.
 
 - **Enrolment**: Settings → Security → "Enable MFA" generates a fresh
-  TOTP secret stored Fernet-encrypted in `user_mfa_secret`. The
+  TOTP secret stored Fernet-encrypted in the `User.totp_secret_encrypted`
+  column (recovery codes in `recovery_codes_encrypted`, `totp_enabled`
+  flag flips true only after the first valid code). The
   backend emits the `otpauth://` provisioning URI via
   `pyotp.TOTP(secret).provisioning_uri(...)`; the frontend renders
   the QR code client-side from that URI. The operator scans with
@@ -77,12 +79,14 @@ session alone doesn't prove and an SSO account has no local password.
 - **Login flow**: when MFA is enabled, the `POST /auth/login` response
   carries a short-lived **pre-token** instead of the full access token.
   The UI prompts for either a 6-digit TOTP code or a backup code and
-  exchanges the pre-token via `POST /auth/login/mfa-verify` for the
+  exchanges the pre-token via `POST /auth/login/mfa` for the
   real `{access_token, refresh_token}` pair. Backup codes are
   invalidated on use.
-- **Admin force-disable**: a superadmin can clear another user's MFA
-  via `DELETE /users/{id}/mfa`. The action lands in the audit log and
-  the affected user can re-enrol from scratch.
+- **Disable**: a user clears their own MFA via `POST /auth/mfa/disable`
+  (local users supply their password AND a current TOTP code;
+  password-less external-auth users supply just the current TOTP code).
+  The action lands in the audit log (`action="mfa.disabled"`) and the
+  user can re-enrol from scratch.
 - **Re-confirming sensitive reveals (#408)**: the secret-reveal
   endpoints (agent keys / SNMP community / appliance kubeconfig / pairing
   codes) re-verify the operator right before handing back the cleartext,
@@ -171,7 +175,7 @@ Key config fields:
 |---|---|
 | `discovery_url` | e.g. `https://accounts.google.com/.well-known/openid-configuration` |
 | `client_id` | From the IdP. |
-| `scopes` | Array. Defaults to `["openid", "profile", "email", "groups"]`. |
+| `scopes` | Array. Defaults to `["openid", "profile", "email"]`. |
 | `claim_username` / `claim_email` / `claim_display_name` / `claim_groups` | Claim names to pull from the ID token. |
 
 Secrets: `client_secret`.
@@ -276,9 +280,11 @@ exhaust=True)`:
 
 ## Test-connection probe
 
-Every provider type exposes `backend/app/core/auth/{type}.test_connection(provider)`
-which returns `{ok, message, details}` without raising. The admin UI's
-"Test" button hits `POST /api/v1/auth-providers/{id}/test` to run the
+Every provider type exposes a probe under `backend/app/core/auth/` that
+returns `{ok, message, details}` without raising — `test_connection` for
+LDAP / RADIUS / TACACS+, `probe_discovery` for OIDC, and `probe_metadata`
+for SAML. The admin UI's "Test" button hits
+`POST /api/v1/auth-providers/{id}/test` to run the
 probe. For LDAP + OIDC + SAML the probe does a real service bind /
 discovery fetch / metadata fetch; for RADIUS + TACACS+ it sends a stub
 Access-Request — a `Reject` for the bogus credentials still proves the
@@ -338,27 +344,35 @@ permission for. Tokens are indistinguishable from JWTs on the wire
 (both use `Authorization: Bearer …`); the auth middleware peeks at
 the prefix to pick the validation path.
 
-**Scopes (issue #74).** `APIToken.scopes` is a JSONB list of
-permission strings at resource-type granularity:
+**Scopes (issue #74).** `APIToken.scopes` is a JSONB list drawn from
+a closed coarse-grained vocabulary (`backend/app/services/api_token_scopes.py`),
+checked against `TOKEN_SCOPE_VOCABULARY` at create time so a typo is
+rejected with `422` rather than silently locking the operator out:
 
-- `subnet:read` / `subnet:admin` — read or full-CRUD on a single
-  resource type
-- `dns_zone:read` etc.
-- `*` — full inheritance (token can do everything the owning user
-  can do; equivalent to the pre-#74 behaviour)
+- `read` — restricts the token to safe-method requests
+  (`GET` / `HEAD` / `OPTIONS`); any mutation `401`s.
+- `ipam:write` — allows mutations under `/api/v1/ipam/*`, `/vlans*`,
+  `/vrfs*`, `/network-devices*`.
+- `dns:write` — allows mutations under `/api/v1/dns/*`, `/dns-pools*`.
+- `dhcp:write` — allows mutations under `/api/v1/dhcp/*`.
+- `agent` — allows only the agent push surface
+  (`/api/v1/dns/agents/*`, `/api/v1/dhcp/agents/*`).
 
-Empty scope set is treated as `["*"]` for backward compatibility on
-tokens minted before the column existed; new tokens default to
-explicit operator-picked scopes via the chip selector in the create
-modal.
+Multiple scopes compose by **union** (any single match passes). An
+**empty** scope set means no scope restriction at all (the token still
+inherits the owning user's RBAC, which is the only gate) — equivalent
+to the pre-#74 behaviour. New tokens pick scopes via a chip selector in
+the create modal.
 
-Authorization is the **intersection** of scope and user permission:
-a `subnet:read` token owned by an IPAM Editor can list subnets but
-cannot create one; the same scope owned by a Viewer can also only
-read because the user lacks admin to begin with.
+Scope enforcement runs **before** RBAC: a non-empty scope set narrows the
+token, and the owning user's RBAC still applies on top, so a `read`-scoped
+token owned by an IPAM Editor can list subnets but cannot create one. A
+per-token resource-instance binding (`resource_grants`, #374) can narrow
+further to specific `{action, resource_type, resource_id}` grants, validated
+at create time to be a subset of what the issuing user holds.
 
-**Wire format.** Raw tokens start with `sddi_` followed by 40
-url-safe base64 characters. Operators typically see only the first
+**Wire format.** Raw tokens start with `sddi_` followed by 40 bytes of
+url-safe base64 entropy (`secrets.token_urlsafe(40)`). Operators typically see only the first
 10 characters (`sddi_AbCdE`) in the UI as an identifier — this is
 the `APIToken.prefix` column, sufficient to pick a token out of a
 list without leaking entropy to an observer.
@@ -395,8 +409,6 @@ so clients can detect "refresh me" vs "reconfigure me".
 
 ## Open items
 
-- **Forced-password policy** — `force_password_change=True` is honoured
-  on first login; a broader policy (age, rotation, history) is Phase 4.
 - **SCIM provisioning** — not planned for Phase 1.
 - **Per-provider signing key rotation** — manual today; automate in a
   later wave.
@@ -449,8 +461,11 @@ rather than swallowing the failure. Permission-related rejections
 ### Password management
 
 - **Password length floor.** New / changed passwords must be ≥ 8
-  characters. Pydantic validator at
-  `backend/app/api/v1/auth/router.py:91` — `422`.
+  characters at the Pydantic-validator baseline (`422`). The full
+  configurable policy (length / character classes / history / age,
+  issue #70) runs server-side against `PlatformSettings` and returns
+  `400` with a per-rule error list. `backend/app/api/v1/auth/router.py`,
+  `backend/app/services/password_policy.py`.
 - **Current password required.** Change-password endpoints verify
   `current_password` before accepting the new value; a mismatch
   returns `400` rather than silently succeeding.
@@ -462,8 +477,8 @@ rather than swallowing the failure. Permission-related rejections
   `name` are rejected with `409`, regardless of type.
   `backend/app/api/v1/auth_providers/router.py:189`.
 - **Invalid provider type.** `type` must be one of the values in
-  `PROVIDER_TYPES` (`local`, `ldap`, `oidc`, `saml`, `radius`,
-  `tacacs_plus`). `backend/app/api/v1/auth_providers/router.py:63`.
+  `PROVIDER_TYPES` (`ldap`, `oidc`, `saml`, `radius`, `tacacs`).
+  `backend/app/api/v1/auth_providers/router.py:63`.
 - **Group mapping target must exist.** `AuthGroupMapping` rows reject
   `internal_group_id` values that don't resolve to an existing
   `Group`. `backend/app/api/v1/auth_providers/router.py:534`.
