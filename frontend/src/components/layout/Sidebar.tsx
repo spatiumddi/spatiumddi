@@ -273,21 +273,16 @@ const adminConfigurationNav = [
     module: "ai.copilot",
   },
   { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
-  // DHCP configuration importer (issue #129). Module-gated so
-  // operators who don't need the surface can hide it via Settings →
-  // Features. Listed before DNS Import to keep this nav alphabetical.
+  // Import hub (#36) — the one-shot DHCP (#129) / DNS (#128) / NetBox (#36)
+  // importers share a single Configuration entry with a left sub-nav (see
+  // ImportPage), mirroring Appliance → Fleet. ``anyModule`` hides the entry
+  // only when ALL three importer modules are off; the sub-nav inside gates
+  // each family individually.
   {
-    label: "DHCP Import",
+    label: "Import",
     icon: Upload,
-    to: "/admin/dhcp-import",
-    module: "dhcp.import",
-  },
-  // DNS configuration importer (issue #128) — sister to DHCP Import.
-  {
-    label: "DNS Import",
-    icon: Upload,
-    to: "/admin/dns-import",
-    module: "dns.import",
+    to: "/admin/import",
+    anyModule: ["dhcp.import", "dns.import", "ipam.import.netbox"],
   },
   // ``Features`` lives in the footer next to Settings — it's a
   // platform-wide control, not a per-area config, and ops teams expect
@@ -296,15 +291,6 @@ const adminConfigurationNav = [
     label: "IPAM Templates",
     icon: LayoutTemplate,
     to: "/admin/ipam/templates",
-  },
-  // NetBox read-only one-shot IPAM importer (issue #36) — sister to
-  // DHCP Import / DNS Import. Module-gated so operators who don't need
-  // the surface can hide it via Settings → Features.
-  {
-    label: "NetBox Import",
-    icon: Upload,
-    to: "/admin/netbox-import",
-    module: "ipam.import.netbox",
   },
 ];
 
@@ -570,8 +556,16 @@ export function Sidebar({
   // Loading / error state defaults to "everything visible" so the
   // sidebar never blinks empty on a slow network.
   const { enabled: moduleEnabled } = useFeatureModules();
-  const filterByModule = <T extends { module?: string }>(items: T[]): T[] =>
-    items.filter((it) => !it.module || moduleEnabled(it.module));
+  const filterByModule = <T extends { module?: string; anyModule?: string[] }>(
+    items: T[],
+  ): T[] =>
+    items.filter(
+      (it) =>
+        (!it.module || moduleEnabled(it.module)) &&
+        // ``anyModule`` keeps a consolidated entry (e.g. Import) visible as
+        // long as at least one of its underlying modules is enabled.
+        (!it.anyModule || it.anyModule.some((m) => moduleEnabled(m))),
+    );
 
   // Pending approval-queue count → the Change Requests nav badge. Only
   // polls when the (default-off) governance.approvals module is on, so a
