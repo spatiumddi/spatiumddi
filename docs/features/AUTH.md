@@ -428,35 +428,35 @@ rather than swallowing the failure. Permission-related rejections
 ### Login & session
 
 - **Invalid credentials.** Local password verification failure returns
-  `401`. Enforced at `backend/app/api/v1/auth/router.py:305`.
+  `401`. Enforced at `backend/app/api/v1/auth/router.py`.
 - **Account disabled.** Login is refused with `403` when
   `user.is_active` is false — regardless of auth source.
-  `backend/app/api/v1/auth/router.py:313`.
+  `backend/app/api/v1/auth/router.py`.
 - **Empty external ID from IdP.** External login (LDAP / OIDC / SAML /
   RADIUS / TACACS+) with no stable external identifier in the IdP
   response is rejected — we won't create a `User` row we can't
-  correlate later. `backend/app/core/auth/user_sync.py:78`.
+  correlate later. `backend/app/core/auth/user_sync.py`.
 - **No group-mapping match.** An external user whose IdP group claim
   doesn't match any `AuthGroupMapping` row for that provider is
   rejected with `401`, even if the IdP authenticated them. This is
   deliberately strict — there is no implicit "default group" fallback.
-  `backend/app/core/auth/user_sync.py:83`.
+  `backend/app/core/auth/user_sync.py`.
 - **Auto-create disabled.** First external login for a new subject is
   refused with `401` if `provider.auto_create_users=False`. An
   administrator must create the `User` row manually.
-  `backend/app/core/auth/user_sync.py:112`.
+  `backend/app/core/auth/user_sync.py`.
 - **Username collision across auth sources.** An external user whose
   `external_id` is new but whose preferred username already belongs to
   a user on a different `auth_source` is rejected to prevent silently
   hijacking an existing account.
-  `backend/app/core/auth/user_sync.py:102`.
+  `backend/app/core/auth/user_sync.py`.
 - **Refresh token invalid or expired.** Refresh is rejected with `401`
   when the token is not in the sessions table, has been revoked, or
-  has passed `expires_at`. `backend/app/api/v1/auth/router.py:353`.
+  has passed `expires_at`. `backend/app/api/v1/auth/router.py`.
 - **User deactivated mid-session.** A refresh request from a disabled
   user returns `401` even if the refresh token itself is still valid
   — deactivating a user revokes their session on the next refresh.
-  `backend/app/api/v1/auth/router.py:359`.
+  `backend/app/api/v1/auth/router.py`.
 
 ### Password management
 
@@ -469,16 +469,16 @@ rather than swallowing the failure. Permission-related rejections
 - **Current password required.** Change-password endpoints verify
   `current_password` before accepting the new value; a mismatch
   returns `400` rather than silently succeeding.
-  `backend/app/api/v1/auth/router.py:396`.
+  `backend/app/api/v1/auth/router.py`.
 
 ### Auth providers
 
 - **Duplicate provider name.** Two `AuthProvider` rows with the same
   `name` are rejected with `409`, regardless of type.
-  `backend/app/api/v1/auth_providers/router.py:189`.
+  `backend/app/api/v1/auth_providers/router.py`.
 - **Invalid provider type.** `type` must be one of the values in
   `PROVIDER_TYPES` (`ldap`, `oidc`, `saml`, `radius`, `tacacs`).
-  `backend/app/api/v1/auth_providers/router.py:63`.
+  `backend/app/api/v1/auth_providers/router.py`.
 - **Group mapping target must exist.** `AuthGroupMapping` rows reject
   `internal_group_id` values that don't resolve to an existing
-  `Group`. `backend/app/api/v1/auth_providers/router.py:534`.
+  `Group`. `backend/app/api/v1/auth_providers/router.py`.

@@ -1123,8 +1123,8 @@ EOF
 | Method | Use case | Status |
 |---|---|---|
 | **Docker Compose** | Dev, small single-host production | ✅ Supported |
-| **Kubernetes + Helm** | Multi-node production, scalable | ✅ Umbrella chart (`charts/spatiumddi`, published OCI to `ghcr.io/spatiumddi/charts/spatiumddi`) |
-| **Bare metal / VM (Ansible)** | On-prem without containers | 📋 Planned |
+| **Kubernetes + Helm** | Multi-node production, scalable | ✅ Umbrella chart (`charts/spatiumddi`, published OCI to `ghcr.io/spatiumddi/charts/spatiumddi`). See [`docs/deployment/KUBERNETES.md`](docs/deployment/KUBERNETES.md) |
+| **Bare metal / VM (Ansible)** | On-prem without containers | 📋 Planned — no Ansible playbooks yet. For bare-metal today use Docker Compose on a host or the OS appliance: see [`docs/deployment/BAREMETAL.md`](docs/deployment/BAREMETAL.md) |
 | **OS Appliance (ISO / qcow2)** | Easiest deploy, air-gapped, dedicated `/appliance` management hub | 🔄 Beta — Debian 13 + embedded [k3s](https://k3s.io/) + full stack as HelmChart CRs, hybrid USB/CD, installer wizard, atomic A/B slot upgrades, in-UI TLS / releases / pods / logs / diagnostics / maintenance. Build with `make appliance-dev-iso`. See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) + issues [#134](https://github.com/spatiumddi/spatiumddi/issues/134) / [#183](https://github.com/spatiumddi/spatiumddi/issues/183) |
 
 ---
@@ -1136,6 +1136,10 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 | Document | Description |
 |---|---|
 | [Getting Started](docs/GETTING_STARTED.md) | Recommended setup order — from server groups down to allocating an IP |
+| [Architecture](docs/ARCHITECTURE.md) | System topology, control plane / data plane split, agent contract, HA design |
+| [Data Model](docs/DATA_MODEL.md) | Database models grouped by domain, key relationships, shared conventions |
+| [REST API](docs/API.md) | API conventions — pagination, filtering, error format, auth, versioning |
+| [Development Guide](docs/DEVELOPMENT.md) | Coding standards, lint/test stack, CI gate, migration workflow |
 | [IPAM Features](docs/features/IPAM.md) | IP space, block, subnet, address management |
 | [DHCP Features](docs/features/DHCP.md) | DHCP server management — Kea, Windows DHCP |
 | [DNS Features](docs/features/DNS.md) | DNS zones, views, server groups, blocking lists, Windows DNS, PowerDNS, Cloud DNS |
@@ -1152,6 +1156,8 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 | [DNS Driver Spec](docs/drivers/DNS_DRIVERS.md) | BIND9 + PowerDNS + Windows DNS + cloud (Route 53 / Azure DNS / Cloudflare / Google) driver internals |
 | [DHCP Driver Spec](docs/drivers/DHCP_DRIVERS.md) | Kea + Windows DHCP driver internals |
 | [Docker Compose](docs/deployment/DOCKER.md) | Compose setup, ports, first-time setup, TLS, HA, password reset |
+| [Kubernetes](docs/deployment/KUBERNETES.md) | Umbrella Helm chart walkthrough — HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA |
+| [Bare Metal](docs/deployment/BAREMETAL.md) | Bare-metal / VM paths — Docker Compose on a host, Patroni HA Postgres overlay, OS appliance |
 | [Appliance Deployment](docs/deployment/APPLIANCE.md) | OS appliance ISO — base OS selection, build pipeline, first-boot orchestration, `/appliance` management hub spec |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Recovery recipes — deleted agent rows, password reset, subnet-delete refused |
 

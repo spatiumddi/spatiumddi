@@ -469,37 +469,132 @@ This allows a small deployment where one VM runs DHCP + DNS agents simultaneousl
 
 ## 5. Maintenance Mode
 
-Superadmins can put the system into maintenance mode:
-- API returns `503 Service Unavailable` with a configurable message
-- Frontend shows a maintenance page
-- Agent connections are maintained (DHCP/DNS continue from cache)
-- Bypass available for superadmin users (via `?bypass_maintenance=<token>`)
+Maintenance mode (issue #57) is a system-wide **read-only switch**, implemented as an ASGI middleware in [`backend/app/core/maintenance_mode.py`](../../backend/app/core/maintenance_mode.py) (`MaintenanceModeMiddleware`, wired in `app/main.py`). It is toggled by writing `PlatformSettings.maintenance_mode_enabled` / `maintenance_message` through the settings router (`PUT /api/v1/settings`); `maintenance_started_at` is server-stamped on enable and cleared on disable (it is never operator-set directly).
+
+When maintenance mode is **on**:
+
+- **Mutating requests** (`POST` / `PUT` / `PATCH` / `DELETE`) are answered with `503 Service Unavailable`, a `Retry-After: 120` header, and a structured body carrying `maintenance: true`, the configured `message`, and `started_at`.
+- **Read requests** (`GET` / `HEAD` / `OPTIONS` / …) always pass through — the platform stays fully browsable.
+- The frontend renders a maintenance banner / page from the same flag.
+- **Agent connections are maintained.** The DNS / DHCP / supervisor agent endpoints are on the exempt allow-list (see below), so a maintenance window never severs an agent's config-caching path (non-negotiable #5) — DHCP / DNS keep serving from cache.
+
+### Exempt paths
+
+A mutating request to any of these prefixes flows through even while maintenance mode is on, so the operator can recover and agents stay connected:
+
+| Prefix | Why |
+|---|---|
+| `/api/v1/auth` | Admins must be able to log in to recover |
+| `/api/v1/settings` | The maintenance toggle itself lives here |
+| `/health`, `/metrics` | Liveness / readiness probes + Prometheus scrape |
+| `/api/v1/dns/agents`, `/api/v1/dhcp/agents` | Agent register / heartbeat / long-poll / op-ack |
+| `/api/v1/appliance/supervisor` | Supervisor register / poll / heartbeat / k8s-proxy |
+| `/api/v1/appliance/self-register-bootstrap` | Local-supervisor self-bootstrap pairing |
+
+### Superadmin bypass
+
+There is **no** `?bypass_maintenance=<token>` query parameter. The bypass is keyed off the request's `Authorization: Bearer …` credential: the middleware decodes the bearer (a JWT session token or an `sddi_`-prefixed API token), resolves the owning user, and lets the request through only when that user is an **effective superadmin**. Any failure — missing or invalid token, unknown / inactive user, revoked or expired session, an API token whose `scopes` don't cover this method+path — yields no bypass and the request still gets the 503. This lets an admin flip the switch back off and run recovery tasks while everyone else is held read-only.
+
+Performance: the middleware reads the flag from a short-TTL process-local cache. When maintenance mode is off (the common case) a mutating request passes straight through with no bearer decode and no DB round-trip; the toggle endpoint calls `invalidate_cache()` so the flipping worker sees the change immediately and other workers converge within the cache TTL.
 
 ---
 
-## 6. Platform Settings (Miscellaneous)
+## 6. Platform Settings
+
+`PlatformSettings` is a singleton table (always exactly one row, `id=1`), defined in [`backend/app/models/settings.py`](../../backend/app/models/settings.py). It backs the `/api/v1/settings` surface (`GET` + `PUT`). The model carries a large number of flat columns spanning branding, security, IPAM/DNS/DHCP defaults, scheduled-task gating, integrations, and per-appliance host-config (SNMP, NTP, APT, syslog, SSH, resolver, …). Below is a representative slice — every field named here is a real column; see the model for the full set.
+
+**Branding**
 
 ```
-PlatformSettings (singleton table)
-  app_title: str (default "SpatiumDDI")
-  app_logo_url: str (nullable)
-  session_timeout_minutes: int (default 60)
-  max_api_token_age_days: int (default 365)
-  password_policy: JSONB {
-    min_length, require_uppercase, require_number, require_special,
-    max_age_days, history_count
-  }
-  ip_allocation_strategy: enum(sequential, random)
-  default_lease_time: int
-  discovery_scan_enabled: bool
-  discovery_scan_interval_minutes: int
-  utilization_warn_threshold: int (default 80)
-  utilization_critical_threshold: int (default 95)
-  subnet_tree_default_expanded_depth: int (default 2)
-  auto_logout_minutes: int (default 60)   -- idle session timeout; 0 = disabled
-  github_release_check_enabled: bool (default true)
-  github_release_check_interval_hours: int (default 24)
+app_title: str (default "SpatiumDDI")
+app_base_url: str (default "") -- used to build OIDC/SAML redirect URLs; empty = derive from request
 ```
+
+**IP allocation**
+
+```
+ip_allocation_strategy: str (default "sequential")  -- sequential | random
+```
+
+**Session / security**
+
+```
+session_timeout_minutes: int (default 60)
+auto_logout_minutes: int (default 0)  -- idle session timeout; 0 = disabled
+```
+
+**Password policy** (issue #70 — flat columns, not a JSONB blob; validator + history in `app.services.password_policy`)
+
+```
+password_min_length: int (default 12)
+password_require_uppercase: bool (default true)
+password_require_lowercase: bool (default true)
+password_require_digit: bool (default true)
+password_require_symbol: bool (default false)
+password_history_count: int (default 5)   -- 0 disables history checking
+password_max_age_days: int (default 0)     -- 0 disables forced rotation
+```
+
+**Account lockout** (issue #71)
+
+```
+lockout_threshold: int (default 0)          -- 0 disables lockout
+lockout_duration_minutes: int (default 15)
+lockout_reset_minutes: int (default 15)
+```
+
+**Utilization thresholds**
+
+```
+utilization_warn_threshold: int (default 80)
+utilization_critical_threshold: int (default 95)
+utilization_max_prefix_ipv4: int (default 29)   -- exclude PTP/single-host subnets from reporting
+utilization_max_prefix_ipv6: int (default 126)
+subnet_tree_default_expanded_depth: int (default 2)
+```
+
+**Release checking**
+
+```
+github_release_check_enabled: bool (default true)
+-- result columns written by the daily beat task:
+latest_version: str | null
+update_available: bool (default false)
+latest_release_url: str | null
+latest_checked_at: timestamp | null
+latest_check_error: str | null
+```
+
+**DNS / DHCP defaults**
+
+```
+dns_default_ttl: int (default 3600)
+dns_default_zone_type: str (default "primary")
+dns_recursive_by_default: bool (default true)
+dhcp_default_dns_servers: str[]
+dhcp_default_domain_name: str (default "")
+dhcp_default_lease_time: int (default 86400)
+```
+
+**Scheduled-task gating** (the Celery beat tick reads these every run, so cadence changes take effect without restarting beat)
+
+```
+dns_auto_sync_enabled / dns_auto_sync_interval_minutes / dns_auto_sync_delete_stale
+reverse_dns_enabled / reverse_dns_interval_minutes        -- PTR auto-population (issue #41)
+dhcp_pull_leases_enabled / dhcp_pull_leases_interval_seconds
+oui_lookup_enabled / oui_update_interval_hours
+soft_delete_purge_days (default 30)                       -- trash purge sweep
+```
+
+**Maintenance mode** (issue #57 — see [§5](#5-maintenance-mode))
+
+```
+maintenance_mode_enabled: bool (default false)
+maintenance_message: str (default "")
+maintenance_started_at: timestamp | null  -- server-stamped on enable, never operator-set directly
+```
+
+Other notable areas on the model (each a small cluster of columns): integration toggles (`integration_kubernetes_enabled`, `integration_docker_enabled`, …), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled`, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
 
 ---
 

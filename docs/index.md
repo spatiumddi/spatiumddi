@@ -14,10 +14,11 @@ Open-source DDI platform — unified DNS, DHCP, and IP Address Management.
 
 ## Architecture & Design
 
-- [Deployment Topologies](deployment/TOPOLOGIES.md) — reference topologies, component relationships, HA design
-- Data Model — database models, relationships, field definitions
-- API Conventions — REST API conventions, pagination, error format
-- Development Guide — coding standards, test requirements, CI
+- [Architecture](ARCHITECTURE.md) — system topology, component relationships, HA design
+- [Deployment Topologies](deployment/TOPOLOGIES.md) — six reference production layouts with sizing notes
+- [Data Model](DATA_MODEL.md) — database models, relationships, field definitions
+- [API Conventions](API.md) — REST API conventions, pagination, error format
+- [Development Guide](DEVELOPMENT.md) — coding standards, test requirements, CI
 - [Observability](OBSERVABILITY.md) — logging, metrics, health dashboard
 - [Permissions](PERMISSIONS.md) — RBAC grammar, builtin roles, scope delegation
 
@@ -35,8 +36,8 @@ Open-source DDI platform — unified DNS, DHCP, and IP Address Management.
 
 - [Docker Compose](deployment/DOCKER.md) — quick start, profiles, TLS, HA
 - [Windows Server](deployment/WINDOWS.md) — connecting to Windows DNS / DHCP over WinRM + RFC 2136
-- [Kubernetes](../k8s/README.md) — Helm chart, manifests, HA PostgreSQL + Redis Sentinel
-- Bare Metal — Ansible playbooks, systemd
+- [Kubernetes](deployment/KUBERNETES.md) — umbrella Helm chart, HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA
+- [Bare Metal](deployment/BAREMETAL.md) — Docker Compose on a host, Patroni HA Postgres overlay, OS appliance path
 - [OS Appliance](deployment/APPLIANCE.md) — appliance image build
 - [DNS Agent](deployment/DNS_AGENT.md) — agent protocol, auto-registration, config sync
 

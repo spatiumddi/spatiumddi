@@ -31,10 +31,10 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `CLAUDE.md` | Index, conventions, non-negotiables, **pending** roadmap |
 | `docs/SHIPPED.md` | Full design context for shipped roadmap items (migration ids, file paths, deferred follow-ups) — moved out of CLAUDE.md to keep the working list scannable |
 | `docs/GETTING_STARTED.md` | Recommended setup order — server groups → zones / scopes → subnets → addresses |
-| `docs/ARCHITECTURE.md` | System topology, component relationships, HA design *(planned — not yet written)* |
-| `docs/DATA_MODEL.md` | All database models, relationships, field definitions *(planned — not yet written)* |
-| `docs/API.md` | REST API conventions, pagination, error format, versioning *(planned — not yet written)* |
-| `docs/DEVELOPMENT.md` | Coding standards, test requirements, CI pipeline *(planned — not yet written)* |
+| `docs/ARCHITECTURE.md` | System topology, component relationships, HA design |
+| `docs/DATA_MODEL.md` | All database models, relationships, field definitions |
+| `docs/API.md` | REST API conventions, pagination, error format, versioning |
+| `docs/DEVELOPMENT.md` | Coding standards, test requirements, CI pipeline |
 | `docs/OBSERVABILITY.md` | Logging (centralized + UI viewer), metrics, health dashboard, alerting |
 | `docs/TROUBLESHOOTING.md` | Recovery recipes: accidentally deleted agent rows, password reset, subnet delete refused |
 | `docs/features/IPAM.md` | IP Space/Block/Subnet/Address management, VLAN/VXLAN, custom fields, import/export, tree UI |
@@ -50,8 +50,8 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/deployment/DNS_AGENT.md` | DNS agent/container architecture — image layout, auto-registration, config sync, K8s shape |
 | `docs/deployment/DOCKER.md` | Docker Compose setup, ports, first-time setup, TLS, HA, password reset |
 | `docs/deployment/TOPOLOGIES.md` | Six reference deployment topologies — single VM, separated agents, DNS+DHCP HA, HA control plane (Patroni / Redis Sentinel), hybrid cloud, K8s — with SVG diagrams + sizing notes |
-| `docs/deployment/KUBERNETES.md` | Helm chart, operators, HPA, Ingress *(planned — not yet written; see `k8s/README.md` + `charts/spatiumddi/README.md`)* |
-| `docs/deployment/BAREMETAL.md` | Ansible playbooks, systemd services, Patroni *(planned — not yet written)* |
+| `docs/deployment/KUBERNETES.md` | Umbrella Helm chart walkthrough — HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA (see also `k8s/README.md` + `charts/spatiumddi/README.md`) |
+| `docs/deployment/BAREMETAL.md` | Bare-metal/VM paths — Docker Compose on a host, Patroni HA Postgres overlay, OS appliance (no Ansible playbooks; that path is planned, not implemented) |
 | `docs/deployment/WINDOWS.md` | Windows Server prerequisites — WinRM, service accounts (DnsAdmins / DHCP Users), firewall, zone dynamic-updates; shared by Windows DNS + Windows DHCP |
 | `k8s/README.md` | Kubernetes manifest usage, HA PostgreSQL (CloudNativePG), Redis Sentinel |
 | `k8s/base/` | Core K8s manifests (namespace, API, worker, frontend, migrate job) |
@@ -145,7 +145,7 @@ Three patterns recur across the DNS and DHCP subsystems. Know these before addin
 
 2. **ConfigBundle + ETag long-poll.** The control plane assembles a `ConfigBundle` from DB state and hashes it to a sha256 ETag (`backend/app/services/{dns,dhcp}/config_bundle.py`). The agent long-polls `/config` with its last-seen ETag; the server blocks until the ETag changes (or timeout) and only then returns a new bundle. When you add a field that affects rendered config, verify it flows into the bundle so the ETag shifts — otherwise agents will not pick up the change. **Redis wake (#358):** the long-poll no longer blind-polls the DB every 2 s — it waits on a Redis pub/sub channel (`backend/app/core/agent_wake.py`) that config-mutating handlers publish to *after commit* (DNS records via the `enqueue_record_op` chokepoint + the `wake_publishing` router dependency that flushes `collect_wake`; DHCP/structural handlers call `collect_wake` directly; Celery workers call `publish_wake` over `settings.redis_url`). So when you add a new config-mutating endpoint, also `collect_wake(...)` the affected `dns_group`/`dhcp_group`/`dhcp_server` channel (or it converges only on the 12 s `WAKE_TICK_SECONDS` safety tick). The ETag compare stays the source of truth — the wake is advisory; if Redis is down the loop falls back to the 2 s poll, so the wake is never the sole delivery path (non-negotiable #5). **Supervisor heartbeat (#358 Phase 1):** the same bus also wakes the supervisor heartbeat long-poll — per-appliance desired-state changes (fleet upgrade / reboot / role-assign via `update_appliance_roles`, per-appliance firewall, plus the shared `HOSTCONFIG_ALL` broadcast) `publish_wake(appliance_channel(id))` after commit, and the heartbeat holds on `appliance_wake_channels(row) + [HOSTCONFIG_ALL]` when the supervisor opts in via `wait_seconds` (HTTP-only on the agent side — remote supervisors that can't reach `sentinel://` just fall back to the heartbeat interval). So a new per-appliance desired-state endpoint should also `publish_wake(appliance_channel(id))` after its commit. Phases 2–3 (the fleet-scale broker threshold + the Mosquitto escalation seam, both deferred) are written up in `docs/OBSERVABILITY.md` — Redis stays the transport until the documented threshold is crossed.
 
-3. **Agent bootstrap + reconnection.** The agent joins with a pre-shared key (`DNS_AGENT_KEY` / `DHCP_AGENT_KEY`), exchanges it for a rotating JWT, and caches the JWT on disk. On **401 or 404** the agent re-bootstraps from the PSK (the 404 case covers stale server rows after a control-plane reset). The local config cache under `/var/lib/spatium-{dns,dhcp}-agent/` lets the service keep running if the control plane is unreachable (non-negotiable #5).
+3. **Agent bootstrap + reconnection.** The agent joins with a pre-shared key (the DNS agent reads `DNS_AGENT_KEY`; the DHCP agent reads `SPATIUM_AGENT_KEY` — `DHCP_AGENT_KEY` is the control-plane-side env that gets interpolated into the agent's `SPATIUM_AGENT_KEY` at deploy time), exchanges it for a rotating JWT, and caches the JWT on disk. On **401 or 404** the agent re-bootstraps from the PSK (the 404 case covers stale server rows after a control-plane reset). The local config cache under `/var/lib/spatium-{dns,dhcp}-agent/` lets the service keep running if the control plane is unreachable (non-negotiable #5).
 
 ---
 
@@ -262,7 +262,7 @@ than getting hoisted here. Pure-greenfield ideas from the
 2026.04.26 brainstorm pass live in their own categorised section
 further down.
 
-- ⬜ [**Windows DNS — Path B (WinRM + PowerShell, full CRUD)**](https://github.com/spatiumddi/spatiumddi/issues/21)
+- ✅ [**Windows DNS — Path B (WinRM + PowerShell)**](https://github.com/spatiumddi/spatiumddi/issues/21) — shipped: agentless WinRM + PowerShell path in `backend/app/drivers/dns/windows.py` (enabled per-server when `DNSServer.credentials_encrypted` is set) drives zone CRUD (`Add-DnsServerPrimaryZone` / `Remove-...`), an AXFR-free record pull (`Get-DnsServerResourceRecord`), and server-level probes over the `DnsServer` module. Record-level writes still ride RFC 2136 to avoid the PowerShell-per-record cost; GSS-TSIG for "Secure only" AD zones remains deferred. See [`docs/features/DNS.md`](docs/features/DNS.md) §13.
 - ⬜ [**Windows DHCP — Path B (WinRM + PowerShell, full CRUD)**](https://github.com/spatiumddi/spatiumddi/issues/22)
 - ⬜ [**IP discovery**](https://github.com/spatiumddi/spatiumddi/issues/23)
 - ⬜ [**DNS Views — end-to-end split-horizon wiring**](https://github.com/spatiumddi/spatiumddi/issues/24)
@@ -283,8 +283,8 @@ Proxmox, Tailscale Phase 1+2) live in
 the brainstorm section follows a different shape — bidirectional
 write surface, not a read-only pull mirror.
 
-- ⬜ [**UniFi Network Application**](https://github.com/spatiumddi/spatiumddi/issues/30)
-- ⬜ [**OPNsense (tier 1 — firewall-of-choice for labs)**](https://github.com/spatiumddi/spatiumddi/issues/31)
+- ✅ [**UniFi Network Application**](https://github.com/spatiumddi/spatiumddi/issues/30) — read-only mirror of UniFi networks + clients into IPAM (local + cloud-hosted controllers) behind the `integrations.unifi` feature module (`backend/app/services/unifi/`, model `models/unifi.py`, task `tasks/unifi_sync.py`, router `api/v1/unifi/`).
+- ✅ [**OPNsense (tier 1 — firewall-of-choice for labs)**](https://github.com/spatiumddi/spatiumddi/issues/31) — read-only mirror of OPNsense interfaces + DHCP leases + reservations into IPAM behind the `integrations.opnsense` feature module (`backend/app/services/opnsense/`, model `models/opnsense.py`, task `tasks/opnsense_sync.py`, router `api/v1/opnsense/`).
 - ⬜ [**pfSense (tier 1 — paired with OPNsense)**](https://github.com/spatiumddi/spatiumddi/issues/32)
 - ⬜ [**MikroTik RouterOS 7 (tier 2)**](https://github.com/spatiumddi/spatiumddi/issues/33)
 - ⬜ [**Incus / LXD (tier 2 — Docker-adjacent)**](https://github.com/spatiumddi/spatiumddi/issues/34)

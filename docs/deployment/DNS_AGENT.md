@@ -329,13 +329,55 @@ If failed after N retries (default 5, expo-backoff): state=failed, alert.
 - **Control plane bumps the logical serial** when constructing the op: `YYYYMMDDNN` format, monotonically increasing per zone, persisted on `DNSZone.last_serial`.
 - The op carries the target serial. The agent's `nsupdate` script explicitly deletes + re-adds the SOA with the target serial in the same update transaction (atomic under RFC 2136).
 - The API zone `PATCH` includes the `serial` field.
-- **Secondary servers** (same group, different `DNSServer` rows) do **not** receive record ops — the primary notifies them natively (BIND9 `notify`). The agent on a secondary only syncs config (ACLs, views, zone definitions), never individual records.
+- Every enabled agent-based server in the zone's group receives the record op — see "Group coordination" below. No server is skipped on the assumption that another server will hand it the data via transfer.
 
-### Primary/secondary coordination
+### Group coordination (per-server-master fan-out — the default)
 
-- A `DNSServer.roles` array already exists. Extend semantics: within a group, exactly one server is `is_primary=true` per zone (new column on a `DNSZoneAssignment` join, or on `DNSServer.is_primary` for the simple case).
-- Record ops target the primary only. Secondaries receive NOTIFY + AXFR/IXFR from the primary (standard DNS). SpatiumDDI does not proxy records to secondaries.
-- If the primary agent is unreachable, ops queue in `RecordOp(state=pending)` and drain when it returns; the UI shows a "N record updates pending" banner on the zone.
+Under the post-#170 model (see §3), **every** enabled agent-based
+server in a `DNSServerGroup` runs an **independent authoritative copy**
+of each zone — the agent renders it as `type master` in `named.conf`
+(`agent/dns/spatium_dns_agent/drivers/bind9.py`). There is no
+primary→secondary push; SpatiumDDI is the source of truth and fans the
+data out to every server directly.
+
+- A record change enqueues **one `DNSRecordOp` row per enabled
+  agent-based server in the group** (`enqueue_record_op` in
+  [`backend/app/services/dns/record_ops.py`](../../backend/app/services/dns/record_ops.py)).
+  Each agent pulls its own queued ops via the config long-poll and
+  applies them through loopback `nsupdate` against its local daemon.
+- `DNSServer.is_primary` does **not** mean "the only writer" for
+  agent-based groups. It only orders the fan-out and identifies the
+  server whose op the typed-event audit path reports back; every
+  server still gets the write. (Pre-#170 the queue went to the
+  `is_primary=True` server only, which silently left every other
+  agent's on-disk zone files frozen at the bundle they received on
+  initial register.)
+- If one agent is unreachable, its ops sit in `DNSRecordOp(state="pending")`
+  and drain when it returns; the other servers in the group apply
+  immediately. The op state is per-server, so partial convergence is
+  visible per `server_id`.
+
+> **Optional native secondary path.** A zone may instead be declared a
+> `secondary` / `slave` / `stub` zone (issue #336) with an explicit
+> `masters` list, in which case the daemon AXFRs the zone from those
+> masters and the agent emits no zone file. That is an opt-in per-zone
+> setting — *not* the default coordination model — and is the standard
+> way to back a non-SpatiumDDI master.
+
+### Agentless / Windows DNS — the single-writer alternative
+
+For **agentless** drivers (`windows_dns` plus the cloud-hosted DNS
+drivers — see `AGENTLESS_DRIVERS` in
+[`backend/app/drivers/dns/__init__.py`](../../backend/app/drivers/dns/__init__.py))
+there is no agent and no loopback `nsupdate`. Here the
+`is_primary=True` server is the **single writer**: `enqueue_record_op`
+detects the agentless driver and applies the op **immediately from the
+control plane** via the driver (WinRM / PowerShell for Windows DNS,
+provider REST for cloud DNS), landing the `DNSRecordOp` row directly as
+`applied` or `failed` rather than queuing it for a long-poll. Any
+native secondaries behind a Windows or cloud primary are coordinated by
+that platform's own NOTIFY/AXFR — SpatiumDDI neither proxies records to
+them nor manages that transfer.
 
 ---
 
@@ -402,25 +444,50 @@ Both must survive restarts → named volumes in Compose / PVCs in K8s.
 
 ### Decision
 
-**One `StatefulSet` per `DNSServer` row**, not per group. Headless `Service` per StatefulSet (ClusterIP=None) plus an externally-exposed `Service` of type `LoadBalancer` or `NodePort` for DNS traffic (UDP/TCP 53).
+**One `StatefulSet` per `DNSServer` row** (umbrella chart,
+`charts/spatiumddi/templates/dns-agent.yaml`), not per group. Headless
+`Service` per StatefulSet (ClusterIP=None) plus an externally-exposed
+`Service` of type `LoadBalancer` or `NodePort` for DNS traffic (UDP/TCP
+53). On the appliance chart
+(`charts/spatiumddi-appliance/templates/dns-bind9.yaml`) the same
+service-container runs as a per-role-labelled `DaemonSet` instead.
 
 ### Rationale
 
-- DNS servers have **stable identity** (primary vs secondary, TSIG keys scoped per server, persistent zone files). That matches StatefulSet semantics.
-- Multiple DNS servers in one group are not interchangeable replicas — primary vs secondary roles matter for AXFR/NOTIFY. **Not a Deployment**, because Deployment replicas are fungible.
-- **Not a DaemonSet**, because we do not want a DNS server on every node; placement is explicit.
+- DNS servers have **stable identity** (own TSIG keys, own
+  agent token, own persistent zone files + config cache). That matches
+  StatefulSet semantics.
+- **Each server is an independent authoritative copy.** Per the
+  per-server-master fan-out model (§5), every agent in a group renders
+  the zone as `type master` and receives its own `DNSRecordOp` queue
+  from the control plane — there is no primary→secondary AXFR/NOTIFY
+  between them, and the control plane is the single source of truth.
+  The `role` value on a server is a cosmetic label
+  (`spatiumddi.org/dns-role`, default `primary`; passed to the agent as
+  `AGENT_ROLES`); it does **not** wire up DNS-level replication.
+- **Not a Deployment**, because each server keeps per-replica
+  persistent state (zone files, TSIG, agent identity) — replicas are
+  not fungible.
+- **Not a DaemonSet** in the umbrella chart, because placement is
+  explicit (the appliance chart *does* use a DaemonSet, gated on a
+  per-role node label).
 - Shape:
 
 ```
 DNSServerGroup "internal-resolvers"
- ├── StatefulSet/dns-internal-ns1  (replicas=1, role=primary)
+ ├── StatefulSet/dns-internal-ns1  (replicas=1, type master, own record-op queue)
  │    └── Service/dns-internal-ns1 (LoadBalancer, 53/udp+tcp)
- └── StatefulSet/dns-internal-ns2  (replicas=1, role=secondary)
+ └── StatefulSet/dns-internal-ns2  (replicas=1, type master, own record-op queue)
       └── Service/dns-internal-ns2 (LoadBalancer, 53/udp+tcp)
 ```
 
-- Primary/secondary coordination uses **native DNS NOTIFY + AXFR/IXFR** over the cluster network. The agent on the secondary knows the primary's in-cluster DNS name (`dns-internal-ns1.spatiumddi.svc.cluster.local`) via its config bundle.
-- Anti-affinity rules ensure ns1 and ns2 land on different nodes.
+- Every record change fans out to **both** ns1 and ns2 as separate
+  `DNSRecordOp` rows; each agent applies via loopback `nsupdate`
+  against its own daemon. There is no in-cluster zone transfer between
+  them to coordinate. (A zone explicitly declared `secondary` with a
+  `masters` list — issue #336 — is the opt-in exception that AXFRs from
+  a non-SpatiumDDI master.)
+- Pod anti-affinity prefers landing ns1 and ns2 on different nodes.
 
 ### Helm chart structure (Phase 2 deliverable)
 
@@ -441,24 +508,33 @@ The SpatiumDDI control-plane operator (Phase 3 stretch) can render this from the
 
 ### Docker Compose shape
 
-One service per DNS server. Example added to `docker-compose.yml`:
+One service per DNS server. Two servers in the same `AGENT_GROUP` are
+independent `type master` copies that each get the group's record-op
+fan-out — there is no primary/secondary distinction at the Compose
+level. Example added to `docker-compose.yml`:
 
 ```yaml
-dns-bind9-primary:
+dns-bind9-ns1:
   image: ghcr.io/spatiumddi/dns-bind9:${SPATIUM_VERSION}
   environment:
     CONTROL_PLANE_URL: http://api:8000
     DNS_AGENT_KEY: ${DNS_AGENT_KEY}
-    AGENT_HOSTNAME: dns-bind9-primary
-    AGENT_ROLE: primary
+    AGENT_HOSTNAME: dns-bind9-ns1
     AGENT_GROUP: default
+    AGENT_ROLES: authoritative   # cosmetic label; does not wire up replication
   volumes:
-    - dns-bind9-primary-state:/var/lib/spatium-dns-agent
-    - dns-bind9-primary-cache:/var/cache/bind
+    - dns-bind9-ns1-state:/var/lib/spatium-dns-agent
+    - dns-bind9-ns1-cache:/var/cache/bind
   ports:
     - "53:53/udp"
     - "53:53/tcp"
 ```
+
+> The agent reads `AGENT_ROLES` (default `authoritative`), `AGENT_GROUP`,
+> and `AGENT_HOSTNAME` / `SERVER_NAME` from the environment
+> (`agent/dns/spatium_dns_agent/config.py`). The role is a label only —
+> the control plane fans record ops out to every enabled agent-based
+> server in the group regardless of role.
 
 ---
 
@@ -511,7 +587,7 @@ dns-bind9-primary:
 
 | File | Change |
 |---|---|
-| `docker-compose.yml` | Add optional `dns-bind9-primary` + `dns-bind9-secondary` services under a `dns` Compose profile. |
+| `docker-compose.yml` | Add optional `dns-bind9-ns1` (+ `dns-bind9-ns2`) services under a `dns` Compose profile — independent `type master` copies in one `AGENT_GROUP`, no primary/secondary roles. |
 | `.env.example` | `DNS_AGENT_KEY=` (with `openssl rand -hex 32` hint). |
 
 ### Docs
@@ -530,7 +606,7 @@ dns-bind9-primary:
 2. Creating an A record via the UI results in the record being resolvable via `dig @<container-ip> ...` within 2 s.
 3. Killing the control plane (`docker compose stop api worker`) does not interrupt DNS resolution; restarting it within 1 h resumes sync with no record loss.
 4. The container image passes `trivy` with no high/critical CVEs at build time.
-5. Helm chart deploys a 2-server group (primary + secondary) in `kind`; AXFR between them is observed in logs.
+5. Helm chart deploys a 2-server group in `kind`; both servers render the zone as `type master` and a record created via the UI is resolvable against **each** server's `Service` (per-server record-op fan-out, no inter-server AXFR required).
 
 ---
 

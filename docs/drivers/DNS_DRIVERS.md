@@ -2,86 +2,113 @@
 
 ## Overview
 
-DNS drivers implement the `DNSDriverBase` abstract class. They are responsible for translating SpatiumDDI's internal DNS model into operations on real DNS servers. The critical constraint: **no DNS driver may restart the DNS daemon** as part of normal record or zone operations.
+DNS drivers implement the `DNSDriver` abstract base class in [`app/drivers/dns/base.py`](../../backend/app/drivers/dns/base.py). They are responsible for translating SpatiumDDI's internal DNS model into backend-neutral config + per-record ops. The critical constraint: **no DNS driver may restart the DNS daemon** as part of normal record or zone operations.
+
+The control-plane driver is a *thin* translator (CLAUDE.md non-negotiable #10): it takes SpatiumDDI DB models and emits a canonical `ConfigBundle` (plus per-record `RecordChange` ops) in neutral types. For agent-managed drivers (BIND9, PowerDNS) the actual daemon lifecycle — `nsupdate`, `rndc`, the PowerDNS REST API — runs inside the agent container; the control-plane `apply_record_change` is a formulate-only no-op that logs the op. For agentless drivers (Windows DNS, the cloud providers) `apply_record_change` runs synchronously from the control plane.
 
 ---
 
 ## 1. Abstract Base Class
 
-```python
-from abc import ABC, abstractmethod
-from enum import Enum
-from dataclasses import dataclass
-from typing import Literal
+The neutral data shapes and the ABC both live in [`app/drivers/dns/base.py`](../../backend/app/drivers/dns/base.py). The driver speaks only in these frozen dataclasses — `RecordData`, `ZoneData`, `RecordChange`, `RecordChangeResult`, `ConfigBundle`, `ServerOptions`, plus the BIND9 config pieces (`ViewData`, `AclData`, `TsigKey`, `TrustAnchorData`, `DNSSECPolicyData`, `EffectiveBlocklistData`). A couple of the central ones:
 
-@dataclass
-class DNSRecordData:
-    name: str             # Relative to zone (e.g., "host1")
-    record_type: str      # "A", "AAAA", "PTR", "CNAME", etc.
+```python
+@dataclass(frozen=True)
+class RecordData:
+    name: str             # relative label ("@" = apex)
+    record_type: str      # A | AAAA | CNAME | MX | TXT | NS | PTR | SRV | CAA | ...
     value: str
-    ttl: int
+    ttl: int | None = None
     priority: int | None = None   # MX, SRV
     weight: int | None = None     # SRV
     port: int | None = None       # SRV
 
-@dataclass
-class DNSZoneData:
-    name: str             # FQDN with trailing dot (e.g., "example.com.")
-    zone_type: str        # "primary", "secondary"
-    ttl: int
-    refresh: int
-    retry: int
-    expire: int
-    minimum: int
-    primary_ns: str
-    admin_email: str
+@dataclass(frozen=True)
+class RecordChange:
+    op: Literal["create", "update", "delete"]
+    zone_name: str
+    record: RecordData
+    target_serial: int
+    tsig_key_name: str | None = None
+    op_id: str = ""               # caller-supplied UUID for ACK tracking
 
-@dataclass
-class DriverHealth:
-    status: Literal["online", "offline", "degraded"]
-    message: str
-    checked_at: datetime
-    version: str | None = None
-
-class DNSDriverBase(ABC):
-    @abstractmethod
-    async def health_check(self) -> DriverHealth: ...
-
-    @abstractmethod
-    async def get_zones(self) -> list[DNSZoneData]: ...
-
-    @abstractmethod
-    async def create_zone(self, zone: DNSZoneData) -> None: ...
-
-    @abstractmethod
-    async def delete_zone(self, zone_name: str) -> None: ...
-
-    @abstractmethod
-    async def get_records(self, zone_name: str) -> list[DNSRecordData]: ...
-
-    @abstractmethod
-    async def create_record(
-        self, zone_name: str, record: DNSRecordData
-    ) -> None: ...
-
-    @abstractmethod
-    async def update_record(
-        self, zone_name: str, record: DNSRecordData
-    ) -> None: ...
-
-    @abstractmethod
-    async def delete_record(
-        self, zone_name: str, name: str, record_type: str
-    ) -> None: ...
-
-    @abstractmethod
-    async def apply_blocklist(
-        self, rpz_zone: str, domains: list[str], mode: str
-    ) -> None: ...
-
-    # MUST NOT restart the daemon. Use incremental update mechanisms.
-    # Raise NotImplementedError if the driver cannot avoid a restart.
+@dataclass(frozen=True)
+class RecordChangeResult:
+    ok: bool
+    change: RecordChange          # original input echoed back verbatim
+    error: str | None = None
 ```
+
+The ABC itself:
+
+```python
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from typing import Any
+
+class DNSDriver(ABC):
+    """Abstract base class for DNS backend drivers.
+
+    Drivers are pure renderers + single-record appliers. They do not manage
+    daemon lifecycle (the agent does that). They must be stateless and safe
+    to instantiate per call.
+    """
+
+    name: str = "abstract"
+
+    # ── Rendering ──────────────────────────────────────────────────────────
+    @abstractmethod
+    def render_server_config(
+        self, server: Any, options: ServerOptions, *, bundle: ConfigBundle | None = None
+    ) -> str:
+        """Render the daemon's top-level config (e.g. ``named.conf``)."""
+
+    @abstractmethod
+    def render_zone_config(self, zone: ZoneData) -> str:
+        """Render the per-zone stanza to be included in the server config."""
+
+    @abstractmethod
+    def render_zone_file(self, zone: ZoneData, records: list[RecordData]) -> str:
+        """Render an RFC 1035-format zone file."""
+
+    @abstractmethod
+    def render_rpz_zone(self, blocklist: EffectiveBlocklistData) -> str:
+        """Render an RPZ zone file (or equivalent) from an effective blocklist."""
+
+    # ── Runtime (agent-side; control plane only *formulates* these) ────────
+    @abstractmethod
+    async def apply_record_change(self, server: Any, change: RecordChange) -> None:
+        """Apply a single record change to the daemon (loopback RFC 2136 / API)."""
+
+    async def apply_record_changes(
+        self, server: Any, changes: Sequence[RecordChange]
+    ) -> list[RecordChangeResult]:
+        """Apply many record changes in as few round trips as possible.
+
+        Default impl: sequential loop over apply_record_change, catching each
+        per-op exception into a RecordChangeResult(ok=False) so one bad record
+        doesn't abort the batch. BIND9 + PowerDNS inherit it unchanged;
+        Windows DNS overrides it with a real WinRM batch (§3.7)."""
+
+    @abstractmethod
+    async def reload_config(self, server: Any) -> None:
+        """Instruct the daemon to re-read its full config (e.g. ``rndc reconfig``)."""
+
+    @abstractmethod
+    async def reload_zone(self, server: Any, zone_name: str) -> None:
+        """Instruct the daemon to reload a single zone."""
+
+    # ── Validation / introspection ─────────────────────────────────────────
+    @abstractmethod
+    def validate_config(self, bundle: ConfigBundle) -> tuple[bool, list[str]]:
+        """Validate a bundle before apply. Returns (ok, errors)."""
+
+    @abstractmethod
+    def capabilities(self) -> dict[str, Any]:
+        """Return a dict describing what this driver supports."""
+```
+
+`apply_record_changes` is the only concrete method on the ABC — every other method is `@abstractmethod`. There is no `health_check` / `get_zones` / `create_zone` / `create_record` style CRUD surface on the driver: zone reads/writes for agentless drivers go through their own `pull_zones_from_server` / `pull_zone_records` / `apply_zone_change` helpers (§3, §4A), not the ABC. Incremental updates only — drivers must never restart the daemon for normal operations (see the per-driver update-strategy tables below).
 
 ---
 
@@ -604,14 +631,20 @@ Both BIND9 and PowerDNS drivers are supported indefinitely. PowerDNS landed in i
 
 ## 6. Error Handling
 
-All driver methods must:
-- Raise `DriverConnectionError` for network/auth failures
-- Raise `DriverOperationError` for successful connection but failed operation
-- Never swallow errors silently
-- Log the full error details at `ERROR` level before raising
-- Be safe to retry (idempotent where possible)
+There is no dedicated driver-exception hierarchy. Drivers raise plain exceptions and let the caller decide how to surface them:
 
-The service layer handles retry logic via Celery task retries — drivers are not responsible for retry.
+- **BIND9 / Windows DNS** raise stdlib `RuntimeError` / `ValueError` on bad input or a hard failure (e.g. `BIND9Driver.apply_record_change` raises `RuntimeError` when no TSIG key is configured rather than ever sending an unsigned update; the Windows PowerShell helpers `raise ValueError` on an unsupported op / record type).
+- **Cloud drivers** (`CloudDNSDriverBase` and its subclasses) raise `CloudDNSError` ([`drivers/dns/_cloud_base.py`](../../backend/app/drivers/dns/_cloud_base.py)) — each provider's `_unwrap` / `_wrap_errors` / `_wrap_call` helper normalises the raw SDK/HTTP fault into an operator-facing `CloudDNSError` message first (§4A.5).
+
+Rules every driver follows:
+
+- **Never swallow errors silently.** A single record op either succeeds or raises; the caller is responsible for isolation (see below).
+- **Log via structlog**, not bare strings — `logger.info("powerdns.apply_record_change.formulated", server=…, zone=…, op=…)` is the house style; errors carry the failing op's identifying fields.
+- **Be idempotent where possible** — re-running create/update/delete against an already-converged server is a no-op (e.g. cloud `DELETE` of a non-existent rrset is treated as success; PowerDNS re-sign skips when keys exist).
+
+**Per-op isolation lives in `apply_record_changes`, not in the driver methods.** The default batch loop on `DNSDriver` (§1) catches each per-op exception and records it as `RecordChangeResult(ok=False, error=str(exc))` so one bad record never poisons the rest of the batch. Whole-batch failures (connection refused, auth, a malformed generated script) still propagate by raising from the driver.
+
+The service layer turns those outcomes into persisted state. [`services/dns/record_ops.py`](../../backend/app/services/dns/record_ops.py) writes a `DNSRecordOp` row per op, marking it `state="applied"` (clearing `last_error`) on success or `state="failed"` with the truncated `last_error` on exception, so operators get a per-op audit trail either way. A whole-batch exception marks every row in the batch `failed` with the same error. Retry, where applicable, is the caller's concern (e.g. Celery task retries on the agent push path) — the driver itself does not retry.
 
 ---
 

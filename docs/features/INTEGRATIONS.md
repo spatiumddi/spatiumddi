@@ -232,6 +232,59 @@ Shipped as Option 2 from the original plan (synthetic `DNSZone` materialised by 
 
 ---
 
+## UniFi Network Application
+
+**Phase status**: read-only mirror shipped. Gated behind the `integrations.unifi` feature module (**default off** — Settings → Features).
+
+One `UnifiController` row per UniFi Network controller. A controller can be a **local** console (direct HTTPS to `https://<host>:<port>/proxy/network/...`) or a **cloud-hosted** console reached through `api.ui.com` and the cloud-connector path. The reconciler picks the transport from `mode` and constructs the same logical paths underneath.
+
+Per-controller config (`UnifiController` rows):
+
+| Field | Notes |
+|---|---|
+| `mode` | `local` or `cloud`. Local talks directly to the controller; cloud wraps every call in the `api.ui.com` connector path. |
+| `host` + `port` | Controller hostname / IP + port (default `443`). Used for `mode=local`. |
+| `cloud_host_id` | Console host id from the Site Manager URL (`unifi.ui.com/consoles/<host_id>/…`). Used for `mode=cloud`. |
+| `verify_tls` | Default `true`. Disable for self-signed local consoles, or paste the controller CA in the field below. |
+| `ca_bundle_pem` | Optional. Trusted in addition to the system store when `verify_tls=true`. |
+| `auth_kind` | `api_key` (modern UniFi OS ≥ 4.x; `X-API-Key` header — required for `mode=cloud`) or `user_password` (legacy local controllers; cookie + CSRF login). |
+| `api_key` | Fernet-encrypted at rest. |
+| `username` + `password` | Fernet-encrypted at rest. Only used for `auth_kind=user_password`, `mode=local`. |
+| `ipam_space_id` | Required. |
+| `dns_group_id` | Optional. |
+| `mirror_networks` | Default `true`. Off mirrors nothing useful — a controller without subnets is the whole point. |
+| `mirror_clients` | Default `true`. Active (connected) clients → IPAM addresses. |
+| `mirror_fixed_ips` | Default `true`. DHCP fixed-IP reservations → `reserved` rows. |
+| `site_allowlist` | `[]` = mirror every site. A non-empty list narrows by site short-name or human description. |
+| `network_allowlist` | Per-site VLAN allowlist `{"<site>": [10, 20]}` — keeps guest SSIDs out of IPAM without disabling whole sites. A site missing from the map mirrors all its networks. |
+| `include_wired` / `include_wireless` | Default `true` each. Gate which connected clients mirror. |
+| `include_vpn` | Default `false` — VPN clients (L2TP / OpenVPN / WireGuard / Teleport) are usually managed elsewhere and would churn as stale rows. |
+| `sync_interval_seconds` | Default `60`. The reconciler clamps `mode=cloud` to a 60 s floor so it doesn't hammer the rate-limited `api.ui.com`. |
+
+> SpatiumDDI reads UniFi's **legacy controller API** (`/proxy/network/api/...`) as the rich-data source — the public Integration API deliberately omits MAC, hostname, `network_id`, OUI, fixed IP, DHCP scope, etc., none of which can be synthesised. Both APIs ride the same TLS connection, so this is a per-call routing choice, not a separate auth/transport.
+
+### Mirror semantics
+
+- **Networks** (`rest/networkconf`) with an IPAM-relevant `purpose` (`corporate` / `guest` / `remote-user-vpn`) and a parseable `ip_subnet` → one `Subnet` per network, gateway from the network's declared subnet. `wan`, `vpn`, and `site-vpn` networks are skipped (no L3 LAN to mirror). The same CIDR seen on two sites keeps the first one — narrow `site_allowlist` if you run overlapping IP plans across sites.
+- **VLAN tags** → the reconciler creates one `Router` per controller (`vendor="Ubiquiti"`, `model="UniFi Network Controller"`) plus one `VLAN` row per 802.1Q tag, and stamps each tagged subnet's `vlan_ref_id` + `vlan_id` so the IPAM page's VLAN column lights up automatically. Untagged networks mirror as subnets with no VLAN linkage.
+- **Active clients** (`stat/sta`) → `IPAddress` with `status="unifi-client"`, hostname from the client name / hostname, MAC carried through, description noting wired / wireless / guest / OUI.
+- **DHCP fixed-IP reservations** (`rest/user`) → `IPAddress` with `status="reserved"`.
+- **Smart parent block**: a mirrored CIDR with no enclosing operator block gets the canonical RFC 1918 / CGNAT supernet auto-created as an unowned top-level block (shared by all integrations).
+
+### Lock semantics
+
+Same ownership shape as Proxmox / Tailscale / Cloud: pre-existing operator rows at a desired address are adopted (FK stamped, `user_modified_at` set so soft fields lock); rows owned by another integration — or another UniFi controller — are skipped with a warning rather than claimed; locked rows whose upstream client disappears release the FK (appear as "manually managed") instead of being deleted. The reconciler always corrects the factual `subnet_id` and VLAN linkage (a network property, not an operator preference). A per-site fetch failure (e.g. a `429` from the rate-limited `stat/sta` call) aborts the whole pass rather than mass-deleting that site's rows.
+
+### Setup
+
+The admin page at `/unifi` ships a copy-paste guide (expand **Setup guide** when creating a controller). On a local UniFi OS console, generate the key under the controller's **Settings → Integrations → Create API Key** (the key displays once). For cloud-hosted consoles (UniFi Site Manager), generate the key at `unifi.ui.com → Settings → API` and capture the console host id from the URL bar into **Cloud host id**. **Test Connection** (`POST /controllers/test`) probes `self/sites` + the integration `info` endpoint, reports the controller version + site count, and distinguishes 401 / 403 / 404 / TLS / network errors with human-readable messages.
+
+### Discovery modal
+
+The reconciler writes a `last_discovery` JSONB snapshot on every successful sync — a per-site rollup (`site_total`, `network_total` / `network_mirrored`, `client_total` / `client_mirrored`, `addresses_skipped_no_subnet`) plus a per-site row list (networks / mirrored / clients per site). Same magnifier-icon-button shape as the Proxmox / Cloud Discovery modals; disabled until the controller has synced at least once.
+
+---
+
 ## Cloud (AWS / Azure / GCP)
 
 **Phase status**: Part A shipped (read-only infrastructure mirror). Cloud DNS — the agentless authoritative-DNS driver family for Cloudflare / Route 53 / Azure DNS / Google Cloud DNS — is **Part B** and is *not* part of this integration; it ships through the Add DNS server flow instead (see [DNS.md](DNS.md) and [DNS_DRIVERS.md](../drivers/DNS_DRIVERS.md)).
@@ -316,6 +369,55 @@ Mirror rows provenance via the `cloud_endpoint_id` FK on `IPBlock` / `Subnet` / 
 - **Read-only.** SpatiumDDI never writes back to the cloud — no instance / network / DNS mutation, no tagging.
 - **Cloudflare is not a Part A provider.** It has no VPC / instance concept; it appears only as a Part B cloud-DNS driver.
 - **No per-resource management surface** (start / stop / console) — outside the read-only-mirror scope.
+
+---
+
+## OPNsense
+
+**Phase status**: read-only mirror shipped. Gated behind the `integrations.opnsense` feature module (**default off** — Settings → Features).
+
+One `OPNsenseRouter` row points SpatiumDDI at a single OPNsense firewall's REST API. The reconciler mirrors the firewall's interface CIDRs (LAN / OPT* / VLANs) as IPAM subnets and its DHCPv4 leases + static reservations (optionally the ARP table) as IP addresses.
+
+Per-firewall config (`OPNsenseRouter` rows):
+
+| Field | Notes |
+|---|---|
+| `host` + `port` | Firewall hostname / IP (no scheme) + port (default `443`). The client builds `https://{host}:{port}/api/...`. |
+| `verify_tls` | Default `true`. Disable for self-signed lab boxes, or paste the CA below. |
+| `ca_bundle_pem` | Optional. Trusted in addition to the system store when `verify_tls=true`. |
+| `api_key` | The HTTP Basic-auth **username**. Stored in plaintext (like Proxmox's `token_id` — it's not the secret). |
+| `api_secret` | The HTTP Basic-auth **password**. Fernet-encrypted at rest. |
+| `ipam_space_id` | Required. |
+| `dns_group_id` | Optional. |
+| `mirror_dhcp_leases` | Default `true`. DHCPv4 leases → `dhcp` rows. |
+| `mirror_static_mappings` | Default `true`. Static DHCP reservations → `reserved` rows. |
+| `mirror_arp` | Default `false` — the ARP table is noisier (every device the firewall has seen on the wire). |
+| `sync_interval_seconds` | Default `60`, floor `30`. Swept by `sweep_opnsense_routers` on a 30 s beat tick. |
+
+OPNsense API keys are minted per-user under **System → Access → Users → API keys**; auth is always HTTP Basic with the key as username and the secret as password.
+
+### Mirror semantics
+
+- **Interfaces are real LANs.** Unlike Kubernetes pod CIDRs (routed overlays with no broadcast), OPNsense LAN / OPT* / VLAN interfaces are genuine subnets: the firewall's interface IP is the gateway and the broadcast is real. So subnets are created with normal LAN semantics (gateway reserved, network + broadcast excluded from usable hosts). Interface config comes from `diagnostics/interface/getInterfaceConfig`; VLAN labels from `interfaces/vlan_settings/get` decorate the subnet description.
+- **Interface gateway IP** → one `reserved` `IPAddress` per subnet under the firewall's identity.
+- **DHCPv4 leases** (`dhcpv4/leases/searchLease`) → `IPAddress` with `status="dhcp"` + `auto_from_lease=True` (Kea-shape parity), description noting the lease state.
+- **Static reservations** (`dhcpv4/settings/getReservation`) → `IPAddress` with `status="reserved"`. Added before leases so an IP that has both prefers the richer reservation description.
+- **ARP table** (`diagnostics/interface/getArp`, opt-in) → `IPAddress` with `status="opnsense-arp"`, lowest priority.
+- **Smart parent block**: a mirrored CIDR with no enclosing operator block gets the canonical RFC 1918 / CGNAT supernet auto-created as an unowned top-level block (shared by all integrations).
+
+### Lock semantics
+
+Same ownership shape as the other integrations: pre-existing operator rows at a desired address are adopted (FK stamped, `user_modified_at` set so soft fields lock); rows owned by another OPNsense firewall or another integration are skipped with a warning; locked rows whose upstream entry disappears release the FK (appear as "manually managed") instead of being deleted. An operator subnet at an exact-CIDR match is reused untouched (`subnets_matched`); a router-owned subnet that still has non-OPNsense addresses living in it is un-claimed rather than cascade-deleted. The reconciler always corrects the factual `subnet_id`.
+
+### Setup — read-only API key
+
+The admin page at `/opnsense` ships a copy-paste guide (expand **Setup guide**). In the OPNsense web UI:
+
+1. Create a dedicated read-only user (**System → Access → Users → +**), e.g. `spatiumddi` with no shell access.
+2. Grant it read access — the built-in **GUI – All pages (read only)** privilege is simplest, or scope it to Diagnostics + DHCPv4 + Interfaces for least privilege.
+3. Edit the user → **API keys → +** to generate a key / secret pair. OPNsense downloads an `apikey.txt` with `key=` and `secret=` lines.
+
+Paste `key` into **API Key** and `secret` into **API Secret**. **Test Connection** (`POST /routers/test`) verifies HTTPS reachability + auth + firmware version before save.
 
 ---
 
