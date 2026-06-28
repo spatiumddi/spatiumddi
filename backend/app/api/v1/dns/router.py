@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import ipaddress
 import re
 import uuid
 import zipfile
@@ -676,8 +677,6 @@ def _validate_masters_format(v: list[str] | None) -> list[str]:
     carrying named-config metacharacters (``;`` ``{`` ``}`` whitespace, etc.)
     so a crafted value can't be injected into the rendered server config
     (issue #336 — config-injection hardening)."""
-    import ipaddress  # noqa: PLC0415
-
     cleaned: list[str] = []
     for raw in v or []:
         entry = str(raw).strip()
@@ -1012,6 +1011,45 @@ def _normalize_record_struct_fields(
             detail=f"{rtype} records do not take {', '.join(extra)}",
         )
     return None, None, None
+
+
+def _validate_address_record_value(record_type: str, value: str) -> None:
+    """Reject A / AAAA values that aren't a single valid IP address (#467).
+
+    Each ``DNSRecord`` row holds exactly one address, and the BIND9 / PowerDNS
+    drivers render one RR line per row. So a value like ``10.0.0.1, 10.0.0.2``
+    is silently stored verbatim and emitted as malformed rdata that breaks the
+    zone load. To point one hostname at several IPs an operator adds one A
+    record per IP (RFC 1035 round-robin) or uses a DNS Pool for health-checked
+    failover — never a comma-separated list in one record.
+
+    Raises ``HTTPException(422)`` with that guidance on a non-single-IP value.
+    """
+    rtype = record_type.upper()
+    if rtype not in ("A", "AAAA"):
+        return
+    candidate = value.strip()
+    family_ok = True
+    try:
+        parsed = ipaddress.ip_address(candidate)
+    except ValueError:
+        family_ok = False
+    else:
+        family_ok = (rtype == "A" and parsed.version == 4) or (
+            rtype == "AAAA" and parsed.version == 6
+        )
+    if family_ok:
+        return
+    fam = "IPv4" if rtype == "A" else "IPv6"
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            f"{rtype} record value must be a single {fam} address. To point one "
+            "name at several IPs, add one record per address (round-robin) or "
+            "use a DNS Pool for health-checked failover — not a comma-separated "
+            "list in one record."
+        ),
+    )
 
 
 # ── Server Group endpoints ──────────────────────────────────────────────────
@@ -4344,6 +4382,7 @@ async def create_record(
     body.priority, body.weight, body.port = _normalize_record_struct_fields(
         body.record_type, body.priority, body.weight, body.port
     )
+    _validate_address_record_value(body.record_type, body.value)
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
 
     record = DNSRecord(
@@ -4412,6 +4451,7 @@ async def update_record(
     record.priority, record.weight, record.port = _normalize_record_struct_fields(
         record.record_type, record.priority, record.weight, record.port
     )
+    _validate_address_record_value(record.record_type, record.value)
     if "name" in changes and zone:
         record.fqdn = f"{record.name}.{zone.name}" if record.name != "@" else zone.name
     target_serial = bump_zone_serial(zone) if zone is not None else None
@@ -4747,6 +4787,7 @@ async def bulk_create_records(
         r.priority, r.weight, r.port = _normalize_record_struct_fields(
             r.record_type, r.priority, r.weight, r.port
         )
+        _validate_address_record_value(r.record_type, r.value)
         fqdn = f"{r.name}.{zone.name}" if r.name != "@" else zone.name
         records.append(
             DNSRecord(
