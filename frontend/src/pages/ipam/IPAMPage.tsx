@@ -4055,6 +4055,12 @@ function SubnetDetail({
   const [viewingAddress, setViewingAddress] = useState<IPAddress | null>(null);
   const [scanFromDetail, setScanFromDetail] = useState<IPAddress | null>(null);
   const [showFilters, setShowFilters] = useState(false);
+  // Per-user sticky toggle to hide the protocol-reserved rows
+  // (network / broadcast / gateway) that pad every subnet table.
+  const [hideReserved, setHideReserved] = useSessionState<boolean>(
+    "ipam-hide-reserved",
+    false,
+  );
   const [activeSubnetTab, setActiveSubnetTab] = useState<
     "addresses" | "dhcp" | "aliases" | "nat" | "trend" | "address-sets"
   >("addresses");
@@ -4367,6 +4373,11 @@ function SubnetDetail({
         rows.push({ kind: "pool-boundary", pool: p, boundary: "end" });
       }
     }
+    if (hideReserved)
+      return rows.filter((r) => {
+        if (r.kind !== "ip") return true;
+        return !["network", "broadcast", "reserved"].includes(r.addr.status);
+      });
     return rows;
   })();
 
@@ -4845,13 +4856,24 @@ function SubnetDetail({
             </div>
           ) : (
             <>
-              <div className="mb-2 px-1">
-                <TagFilterChips
-                  value={addressTagFilters}
-                  onChange={setAddressTagFilters}
-                  placeholder="Filter addresses by tag — try env or env:prod…"
-                  aria-label="Filter addresses by tag"
-                />
+              <div className="mb-2 flex items-center gap-2 px-1">
+                <div className="min-w-0 flex-1">
+                  <TagFilterChips
+                    value={addressTagFilters}
+                    onChange={setAddressTagFilters}
+                    placeholder="Filter addresses by tag — try env or env:prod…"
+                    aria-label="Filter addresses by tag"
+                  />
+                </div>
+                <label className="flex flex-shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground hover:text-foreground">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5"
+                    checked={hideReserved}
+                    onChange={(e) => setHideReserved(e.target.checked)}
+                  />
+                  Hide reserved rows
+                </label>
               </div>
               {/* No nested overflow wrapper — Chrome/WebKit treat
                   ``overflow-x: auto`` as establishing a Y-scroll
