@@ -20,11 +20,21 @@ the formatter handles the rest.
 
 ---
 
-## Unreleased
+## 2026.06.28-1 — 2026-06-28
 
-A **migration tooling** start: a one-shot importer that pulls an
-existing IPAM estate out of a live NetBox install into native rows, so
-an operator can evaluate SpatiumDDI without retyping their inventory.
+A **migration + onboarding** release. Two headline ways to bring an
+existing network into SpatiumDDI and watch it: a one-shot **NetBox
+importer** that pulls a live IPAM estate into native rows so an
+operator can evaluate without retyping their inventory, and
+**arpwatch-style new-device detection** that alerts the moment a
+never-before-seen MAC appears, with a trusted-MAC allowlist and
+one-click block. Riding with them, a broad **IPAM UX overhaul** across
+two review rounds — inline cell editing, a tree quick-filter, an
+accessibility pass (modal focus-trap + ARIA tree), block-level
+utilization, a mobile card view, and level-invariant header toolbars —
+plus a **DNS A/AAAA guardrail** that stops a comma-separated value from
+silently breaking a zone load. The Operator Copilot tool registry grows
+by 8 (NetBox importer +2, new-device watch +6) to 215.
 
 ### Added
 
@@ -50,6 +60,90 @@ an operator can evaluate SpatiumDDI without retyping their inventory.
   The Operator Copilot tool registry grows by 2 —
   ``find_netbox_import_preview`` (read) + ``propose_commit_netbox_import``
   (write proposal).
+
+* **#459 — arpwatch-style new-device detection.** Alert the moment a
+  never-before-seen MAC appears on the network, with a trusted-MAC
+  allowlist and one-click block — behind the **default-off**
+  ``security.new_device_watch`` feature module, mirroring the rogue-DHCP
+  pipeline (observe → classify → upsert → alert). Extends the existing
+  ``ip_mac_history`` observation store (not a parallel table) with a
+  ``new`` / ``acknowledged`` / ``known`` classification + source +
+  ``is_randomized`` + ack trail, plus a new ``mac_allowlist`` (MAC or
+  OUI prefix). Three ingestion paths, all through
+  ``record_mac_observation``: the DHCP lease-events handler, SNMP
+  ARP/FDB cross-reference, and an opt-in L2 ARP/ND sniffer on the DHCP
+  agent (``DHCP_MAC_SIGHTING_ENABLED`` + ``NET_RAW`` →
+  ``POST /api/v1/dhcp/agents/mac-sightings``). A ``new_mac_seen`` alert
+  rule (seeded disabled) opens one event per ``(ip, mac)`` —
+  randomised, locally-administered MACs excluded by default; plus
+  ``device.first_seen`` / ``device.acknowledged`` typed webhook events
+  fired on ingest, ahead of the 60 s alert tick. Operator surface at
+  ``/api/v1/new-devices`` (summary / sightings / acknowledge /
+  baseline-import / allowlist CRUD / block, where block writes a
+  ``DHCPMACBlock``), a **Tools → New Devices** review queue, and a "new
+  devices 24h" dashboard KPI. Six Copilot tools (``find_new_devices`` /
+  ``count_new_devices`` / ``find_mac_allowlist`` +
+  ``propose_acknowledge_device`` / ``propose_allowlist_mac`` /
+  ``propose_block_mac``). Migration ``a3f1d6c92b58``.
+
+* **#465 — IPAM inline editing, tree quick-filter, and help layer.**
+  Double-click a hostname / description / status in the subnet IP table
+  to edit it in place — gated on the row's write permission, with a
+  click-vs-double-click timer so a single click still opens the detail
+  sheet. A new tree quick-filter narrows every IP space to blocks /
+  subnets whose CIDR or name matches (and the space's own name),
+  keeping ancestor paths, revealing a matched block's whole subtree,
+  and hiding non-matching spaces. Plus an opt-in **Help (?)** layer
+  (progressive disclosure) that reveals a glossary of the IPAM visual
+  vocabulary, and the **NetBox import-provenance chip** is now
+  dismissable.
+
+### Changed
+
+* **#465 — IPAM accessibility, block-level utilization, and consistent
+  toolbars.** A shared ``StatusTag`` primitive carries icon + text +
+  colour so status is never conveyed by colour alone (WCAG 1.4.1). The
+  shared modal gains a focus-trap + ``role="dialog"`` + focus-return,
+  and the IP-space tree gains ``role="tree"`` / ``treeitem`` /
+  ``aria-expanded``. Block rows now show real **Used IPs** + size + a
+  utilization bar (the backend caches ``allocated_ips`` / ``total_ips``
+  on ``ip_block``; huge IPv6 blocks read as uncountable), and a
+  ``BLOCK`` / ``SUBNET`` row-type badge labels the mixed tables. The
+  Space + Block headers move their structural actions behind a
+  **Tools ▾** menu to match the Subnet header, and the **Ask AI**
+  action is demoted into it. Under the ``sm`` breakpoint the IP table
+  becomes a tappable card list for on-call phone use, and the tree
+  caps very large sibling groups with a "Show N more…" reveal.
+  Migration ``b7c2f1a9d4e6``.
+
+### Fixed
+
+* **#465 — IPAM UX correctness.** Select-all no longer picks rows that
+  the "Hide network/broadcast" toggle is hiding; inline edits and the
+  provenance-chip dismiss now surface backend errors instead of
+  silently reverting; ``isProvenanceKey`` matches an exact importer-key
+  allowlist so an operator's own ``netbox_*`` custom field can't be
+  swept into the chip and dropped; and the tree-row utilization dot plus
+  a stray ``0`` rendered in the IP detail modal are corrected.
+
+* **#467 — A/AAAA records reject multi-IP values.** Adding an A / AAAA
+  record with a comma-separated value (e.g. ``10.0.0.1, 10.0.0.2``) was
+  stored verbatim and rendered as malformed rdata that silently broke
+  the zone load. The API now rejects any A / AAAA value that isn't a
+  single IP of the matching family with a 422 + guidance (one record
+  per IP for round-robin, or DNS Pools for health-checked failover) on
+  create / update / bulk-create, and the record modal shows the same
+  hint inline. Other record types are untouched.
+
+### Migrations
+
+Three additive migrations (each backfills in place; downgrades are
+baselined for the shape linter). Chain order:
+``a3f1d6c92b58`` (#459 — new-device classification on ``ip_mac_history``
++ ``mac_allowlist``) → ``30135c361a47`` (#36 — ``import_source`` /
+``imported_at`` on the IPAM tables + the ``ipam.import.netbox`` module
+row) → ``b7c2f1a9d4e6`` (#465 — cached ``allocated_ips`` / ``total_ips``
+on ``ip_block``).
 
 ---
 
