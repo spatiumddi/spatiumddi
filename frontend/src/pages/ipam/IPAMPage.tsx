@@ -11247,6 +11247,7 @@ function BlockTreeRow({
   onCreateChildBlock,
   onAllocateIp,
   depth,
+  forceExpand = false,
 }: {
   node: BlockNode;
   selectedSubnetId: string | null;
@@ -11260,8 +11261,12 @@ function BlockTreeRow({
   onCreateChildBlock: (parentBlockId: string) => void;
   onAllocateIp?: (s: Subnet) => void;
   depth: number;
+  // Forced open by the tree quick-filter so every matching path is visible
+  // regardless of the operator's saved expand/collapse state.
+  forceExpand?: boolean;
 }) {
   const [expanded, setExpanded] = useState(true);
+  const isExpanded = forceExpand || expanded;
   const hasContent = node.children.length > 0 || node.subnets.length > 0;
   const isSelected = selectedBlockId === node.block.id;
   const {
@@ -11288,7 +11293,7 @@ function BlockTreeRow({
       role="treeitem"
       aria-label={node.block.network}
       aria-selected={isSelected}
-      aria-expanded={hasContent ? expanded : undefined}
+      aria-expanded={hasContent ? isExpanded : undefined}
     >
       {/* Block header row */}
       <ContextMenu>
@@ -11312,14 +11317,14 @@ function BlockTreeRow({
                   setExpanded((v) => !v);
                 }}
                 className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm border border-border bg-background text-[10px] font-bold text-muted-foreground hover:border-primary hover:text-primary"
-                title={expanded ? "Collapse" : "Expand"}
+                title={isExpanded ? "Collapse" : "Expand"}
                 aria-label={
-                  expanded
+                  isExpanded
                     ? `Collapse ${node.block.network}`
                     : `Expand ${node.block.network}`
                 }
               >
-                {expanded ? "−" : "+"}
+                {isExpanded ? "−" : "+"}
               </button>
             ) : (
               <div className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm border border-border/30 bg-background text-[10px] text-muted-foreground/30">
@@ -11385,7 +11390,7 @@ function BlockTreeRow({
           reads sequentially — a supernet block (e.g. 10.255.0.0/24)
           with subnets inside it lands alongside its IP-adjacent peers
           rather than being bucketed to the top or bottom. */}
-      {expanded && hasContent && (
+      {isExpanded && hasContent && (
         <div
           role="group"
           className="ml-[9px] pl-3 border-l border-border/40 space-y-0.5"
@@ -11395,6 +11400,7 @@ function BlockTreeRow({
               <BlockTreeRow
                 key={`b:${item.node.block.id}`}
                 node={item.node}
+                forceExpand={forceExpand}
                 selectedSubnetId={selectedSubnetId}
                 selectedBlockId={selectedBlockId}
                 onSelectBlock={onSelectBlock}
@@ -13741,6 +13747,7 @@ function SpaceSection({
   onSelectSpace,
   onSelectSubnet,
   onSelectBlock,
+  filter = "",
 }: {
   space: IPSpace;
   selectedSubnetId: string | null;
@@ -13749,11 +13756,17 @@ function SpaceSection({
   onSelectSpace: () => void;
   onSelectSubnet: (subnet: Subnet | null) => void;
   onSelectBlock: (b: IPBlock) => void;
+  // Tree quick-filter — case-insensitive substring over network + name.
+  // When set, non-matching nodes are hidden, ancestors of matches are kept
+  // so the path renders, and the whole space auto-expands.
+  filter?: string;
 }) {
   const [expanded, setExpanded] = useSessionState<boolean>(
     `spatium.ipam.expandedSpace.${space.id}`,
     true,
   );
+  const filterQ = filter.trim().toLowerCase();
+  const filtering = filterQ.length > 0;
   const [showCreateSubnet, setShowCreateSubnet] = useState<
     string | true | false
   >(false); // string = default block_id
@@ -13773,14 +13786,55 @@ function SpaceSection({
   const { data: subnets, isLoading } = useQuery({
     queryKey: ["subnets", space.id],
     queryFn: () => ipamApi.listSubnets({ space_id: space.id }),
-    enabled: expanded,
+    enabled: expanded || filtering,
   });
 
   const { data: blocks } = useQuery({
     queryKey: ["blocks", space.id],
     queryFn: () => ipamApi.listBlocks(space.id),
-    enabled: expanded,
+    enabled: expanded || filtering,
   });
+
+  // Apply the quick-filter: keep matching subnets/blocks plus every ancestor
+  // block of a match (so the tree path stays intact). Returns the originals
+  // untouched when no filter is active.
+  const { treeBlocks, treeSubnets, matchCount } = useMemo(() => {
+    const allBlocks = blocks ?? [];
+    const allSubnets = subnets ?? [];
+    if (!filtering) {
+      return {
+        treeBlocks: allBlocks,
+        treeSubnets: allSubnets,
+        matchCount: allBlocks.length + allSubnets.length,
+      };
+    }
+    const hit = (network: string, name?: string | null) =>
+      network.toLowerCase().includes(filterQ) ||
+      (name ?? "").toLowerCase().includes(filterQ);
+    const byId = new Map(allBlocks.map((b) => [b.id, b]));
+    const keep = new Set<string>();
+    const addAncestors = (parentId: string | null | undefined) => {
+      let cur = parentId ?? null;
+      while (cur && !keep.has(cur)) {
+        keep.add(cur);
+        cur = byId.get(cur)?.parent_block_id ?? null;
+      }
+    };
+    const keptSubnets = allSubnets.filter((s) => hit(s.network, s.name));
+    for (const s of keptSubnets) addAncestors(s.block_id);
+    for (const b of allBlocks) {
+      if (hit(b.network, b.name)) {
+        keep.add(b.id);
+        addAncestors(b.parent_block_id);
+      }
+    }
+    const keptBlocks = allBlocks.filter((b) => keep.has(b.id));
+    return {
+      treeBlocks: keptBlocks,
+      treeSubnets: keptSubnets,
+      matchCount: keptBlocks.length + keptSubnets.length,
+    };
+  }, [blocks, subnets, filtering, filterQ]);
 
   const [subnetDeleteError, setSubnetDeleteError] = useState<string | null>(
     null,
@@ -13920,6 +13974,10 @@ function SpaceSection({
 
   // (block_id is now required; all subnets appear under their block)
 
+  // Hide a whole space from the sidebar when a quick-filter is active and
+  // nothing inside it matches — keeps the filtered tree to just the hits.
+  if (filtering && matchCount === 0) return null;
+
   return (
     <div>
       {/* Space header */}
@@ -13981,7 +14039,7 @@ function SpaceSection({
       </ContextMenu>
 
       {/* Tree with vertical connecting line */}
-      {expanded && (
+      {(expanded || filtering) && (
         <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
           <div
             role="tree"
@@ -13994,13 +14052,15 @@ function SpaceSection({
               </p>
             )}
 
-            {/* Block tree (recursive) */}
+            {/* Block tree (recursive) — filtered + force-expanded when a
+                quick-filter is active. */}
             {blocks &&
               subnets &&
-              buildBlockTree(blocks, subnets, null).map((node) => (
+              buildBlockTree(treeBlocks, treeSubnets, null).map((node) => (
                 <BlockTreeRow
                   key={node.block.id}
                   node={node}
+                  forceExpand={filtering}
                   selectedSubnetId={selectedSubnetId}
                   selectedBlockId={selectedBlockId}
                   onSelectBlock={onSelectBlock}
@@ -14143,6 +14203,8 @@ export function IPAMPage() {
   const [selectedBlock, setSelectedBlock] = useState<IPBlock | null>(null);
   const [showCreateSpace, setShowCreateSpace] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  // Tree quick-filter (network / name substring across every space).
+  const [treeFilter, setTreeFilter] = useState("");
   const qc = useQueryClient();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -14365,6 +14427,32 @@ export function IPAMPage() {
           </div>
         </div>
 
+        {/* Tree quick-filter — narrows every space's tree to matching
+            blocks / subnets (by CIDR or name) and force-expands the path. */}
+        <div className="border-b px-2 py-1.5">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground/60" />
+            <input
+              value={treeFilter}
+              onChange={(e) => setTreeFilter(e.target.value)}
+              placeholder="Filter tree — CIDR or name…"
+              aria-label="Filter the IP space tree by CIDR or name"
+              className="w-full rounded-md border bg-background py-1 pl-7 pr-7 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+            />
+            {treeFilter && (
+              <button
+                type="button"
+                onClick={() => setTreeFilter("")}
+                aria-label="Clear tree filter"
+                title="Clear filter"
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground/60 hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+        </div>
+
         <div className="flex-1 overflow-y-auto p-2 space-y-1">
           {isLoading && (
             <p className="px-2 py-3 text-xs text-muted-foreground">Loading…</p>
@@ -14391,6 +14479,7 @@ export function IPAMPage() {
               onSelectSpace={() => selectSpace(space)}
               onSelectSubnet={selectSubnet}
               onSelectBlock={selectBlock}
+              filter={treeFilter}
             />
           ))}
         </div>
