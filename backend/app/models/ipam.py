@@ -244,8 +244,14 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
-    # Computed / cached
+    # Computed / cached. ``allocated_ips`` is the recursive sum of descendant
+    # subnets' allocated_ips; ``total_ips`` is the block's CIDR size clamped to
+    # BIGINT (a huge IPv6 block reads as "uncountable" in the UI, like a /64
+    # subnet). Both are populated by ``_update_block_utilization`` alongside
+    # ``utilization_percent`` so block rows can show Used IPs, not just a bar.
     utilization_percent: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    allocated_ips: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    total_ips: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
 
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     custom_fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)

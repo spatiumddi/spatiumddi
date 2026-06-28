@@ -239,6 +239,8 @@ export interface IPBlock {
   name: string;
   description: string;
   utilization_percent: number;
+  allocated_ips?: number;
+  total_ips?: number;
   tags: Record<string, unknown>;
   custom_fields: Record<string, unknown>;
   dns_group_ids: string[] | null;

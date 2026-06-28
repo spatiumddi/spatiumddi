@@ -304,6 +304,10 @@ async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> No
     block.utilization_percent = (
         round(float(allocated) / block_total * 100, 2) if block_total > 0 else 0.0
     )
+    # Cache the raw counts too so block rows can render Used IPs (not just a
+    # utilization bar). total_ips clamps to BIGINT for huge IPv6 blocks.
+    block.allocated_ips = int(allocated)
+    block.total_ips = min(block_total, _BIGINT_MAX)
 
     # Walk up the tree and update each ancestor
     if block.parent_block_id:
@@ -1686,6 +1690,8 @@ class IPBlockResponse(BaseModel):
     name: str
     description: str
     utilization_percent: float
+    allocated_ips: int = 0
+    total_ips: int = 0
     tags: dict[str, Any]
     custom_fields: dict[str, Any]
     dns_group_ids: list[str] | None
@@ -2613,6 +2619,8 @@ def _block_to_response(block: IPBlock, vrf_warning: str | None) -> dict[str, Any
         "name": block.name,
         "description": block.description,
         "utilization_percent": block.utilization_percent,
+        "allocated_ips": block.allocated_ips,
+        "total_ips": block.total_ips,
         "tags": dict(block.tags or {}),
         "custom_fields": dict(block.custom_fields or {}),
         "dns_group_ids": block.dns_group_ids,

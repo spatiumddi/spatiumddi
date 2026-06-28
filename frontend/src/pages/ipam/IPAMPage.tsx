@@ -471,6 +471,30 @@ function BlockNameTag({
   return <span className={className}>{name}</span>;
 }
 
+// Row-type tag for the mixed block + subnet tables. The two row kinds share
+// columns and blocks legitimately leave several blank (a block has no
+// Router / VLAN / Status), which reads as "missing data" without a cue. This
+// tag labels each row so the em-dashes read as "not applicable here". (#465)
+function RowTypeBadge({ kind }: { kind: "block" | "subnet" }) {
+  return (
+    <span
+      title={
+        kind === "block"
+          ? "IP block — a container that holds child blocks / subnets"
+          : "Subnet — holds individual IP addresses"
+      }
+      className={cn(
+        "inline-flex flex-shrink-0 items-center rounded px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide",
+        kind === "block"
+          ? "bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300"
+          : "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300",
+      )}
+    >
+      {kind}
+    </span>
+  );
+}
+
 // Double-click-to-edit cell for the IP table. Swallows single clicks so it
 // doesn't trigger the row's open-detail handler; Enter/blur commit, Escape
 // cancels. `display` is what shows when not editing; `value` seeds the input.
@@ -12396,6 +12420,7 @@ function BlockDetailView({
                             <span className="inline-flex items-center gap-1.5 font-mono font-semibold text-foreground">
                               <Layers className="h-3.5 w-3.5 flex-shrink-0 text-violet-500" />
                               {b.network}
+                              <RowTypeBadge kind="block" />
                             </span>
                           </td>
                           <td className="px-4 py-2 text-muted-foreground">
@@ -12411,20 +12436,25 @@ function BlockDetailView({
                           <td className="px-4 py-2 text-muted-foreground/40">
                             —
                           </td>
-                          <td className="px-4 py-2 text-muted-foreground/40">
-                            —
+                          <td className="px-4 py-2 tabular-nums text-muted-foreground">
+                            <UsedIps
+                              allocated={b.allocated_ips ?? 0}
+                              total={b.total_ips ?? cidrSize(b.network)}
+                            />
                           </td>
                           <td className="px-4 py-2">
-                            {b.utilization_percent > 0 ? (
-                              <UtilizationBar percent={b.utilization_percent} />
-                            ) : (
-                              <span className="text-muted-foreground/40">
-                                —
-                              </span>
-                            )}
+                            <UtilizationBar
+                              percent={b.utilization_percent}
+                              uncountable={isUncountable(
+                                b.total_ips ?? cidrSize(b.network),
+                              )}
+                            />
                           </td>
                           <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                            {cidrSize(b.network).toLocaleString()}
+                            {subnetSizeLabel(
+                              b.total_ips ?? cidrSize(b.network),
+                              b.network,
+                            )}
                           </td>
                           <td className="px-4 py-2 text-muted-foreground/40">
                             —
@@ -12470,6 +12500,7 @@ function BlockDetailView({
                             <span className="inline-flex items-center gap-1.5 font-mono font-medium">
                               <Network className="h-3.5 w-3.5 flex-shrink-0 text-blue-500" />
                               {s.network}
+                              <RowTypeBadge kind="subnet" />
                             </span>
                           </td>
                           <td className="px-4 py-2 text-muted-foreground">
@@ -13301,6 +13332,7 @@ function SpaceTableView({
                           <span className="inline-flex items-center gap-1.5 font-mono font-semibold text-foreground">
                             <Layers className="h-3.5 w-3.5 flex-shrink-0 text-violet-500" />
                             {b.network}
+                            <RowTypeBadge kind="block" />
                           </span>
                         </td>
                         <td className="px-4 py-2 text-muted-foreground">
@@ -13314,18 +13346,20 @@ function SpaceTableView({
                         <td className="px-4 py-2 text-muted-foreground/40">
                           —
                         </td>
-                        <td className="px-4 py-2 text-muted-foreground/40">
-                          —
+                        <td className="px-4 py-2 tabular-nums text-muted-foreground">
+                          <UsedIps
+                            allocated={b.allocated_ips ?? 0}
+                            total={b.total_ips ?? size}
+                          />
                         </td>
                         <td className="px-4 py-2">
-                          {b.utilization_percent > 0 ? (
-                            <UtilizationBar percent={b.utilization_percent} />
-                          ) : (
-                            <span className="text-muted-foreground/40">—</span>
-                          )}
+                          <UtilizationBar
+                            percent={b.utilization_percent}
+                            uncountable={isUncountable(b.total_ips ?? size)}
+                          />
                         </td>
                         <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                          {size.toLocaleString()}
+                          {subnetSizeLabel(b.total_ips ?? size, b.network)}
                         </td>
                         <td className="px-4 py-2 text-muted-foreground/40">
                           —
@@ -13368,6 +13402,7 @@ function SpaceTableView({
                           <span className="inline-flex items-center gap-1.5 font-mono font-medium">
                             <Network className="h-3.5 w-3.5 flex-shrink-0 text-blue-500" />
                             {s.network}
+                            <RowTypeBadge kind="subnet" />
                           </span>
                         </td>
                         <td className="px-4 py-2 text-muted-foreground">
