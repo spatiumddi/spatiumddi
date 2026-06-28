@@ -327,12 +327,42 @@ function UtilizationDot({ percent }: { percent: number }) {
       : percent >= 80
         ? "bg-amber-400"
         : "bg-green-500";
+  const tip = `${percent.toFixed(0)}% utilized`;
   return (
     <span
-      title={`${percent.toFixed(0)}% utilized`}
+      title={tip}
+      aria-label={tip}
       className={cn("inline-block h-2 w-2 flex-shrink-0 rounded-full", color)}
     />
   );
+}
+
+// Synthesized wrapper blocks are named "auto:<cidr>" by the importers, which
+// just duplicates the Network column. Render a compact "auto" badge instead of
+// the redundant string; realBlockName() strips it for plain-text label sites.
+function realBlockName(name?: string | null): string {
+  return name && !name.startsWith("auto:") ? name : "";
+}
+
+function BlockNameTag({
+  name,
+  className,
+}: {
+  name?: string | null;
+  className?: string;
+}) {
+  if (!name) return null;
+  if (name.startsWith("auto:")) {
+    return (
+      <span
+        title="Auto-created wrapper block (name derived from its CIDR)"
+        className="inline-flex items-center rounded bg-muted px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide text-muted-foreground/70"
+      >
+        auto
+      </span>
+    );
+  }
+  return <span className={className}>{name}</span>;
 }
 
 function CopyButton({ text }: { text: string }) {
@@ -10113,7 +10143,7 @@ function flattenBlocks(
   return nodes.flatMap(({ block, children }) => [
     {
       id: block.id,
-      label: `${"  ".repeat(depth)}${block.network}${block.name ? ` — ${block.name}` : ""}`,
+      label: `${"  ".repeat(depth)}${block.network}${realBlockName(block.name) ? ` — ${realBlockName(block.name)}` : ""}`,
     },
     ...flattenBlocks(children, depth + 1),
   ]);
@@ -10881,11 +10911,10 @@ function BlockTreeRow({
               <span className="font-mono font-medium flex-1 truncate">
                 {node.block.network}
               </span>
-              {node.block.name && (
-                <span className="truncate text-[10px] opacity-60 mr-1">
-                  {node.block.name}
-                </span>
-              )}
+              <BlockNameTag
+                name={node.block.name}
+                className="truncate text-[10px] opacity-60 mr-1"
+              />
               <CustomerChip customerId={node.block.customer_id} />
               <SiteChip siteId={node.block.site_id} />
             </button>
@@ -11182,7 +11211,7 @@ function BlockDetailView({
       }),
     ),
     {
-      label: block.network + (block.name ? ` (${block.name})` : ""),
+      label: block.network + (realBlockName(block.name) ? ` (${realBlockName(block.name)})` : ""),
       variant: "block",
     },
   ];
@@ -11292,9 +11321,10 @@ function BlockDetailView({
           <span className="font-mono text-xl font-bold tracking-tight">
             {block.network}
           </span>
-          {block.name && (
-            <span className="text-sm text-muted-foreground">{block.name}</span>
-          )}
+          <BlockNameTag
+            name={block.name}
+            className="text-sm text-muted-foreground"
+          />
           {block.description && (
             <span className="text-xs text-muted-foreground/70">
               · {block.description}
@@ -11446,7 +11476,7 @@ function BlockDetailView({
           scope={{
             kind: "block",
             id: block.id,
-            label: block.network + (block.name ? ` (${block.name})` : ""),
+            label: block.network + (realBlockName(block.name) ? ` (${realBlockName(block.name)})` : ""),
           }}
           onClose={() => setShowDnsSync(false)}
         />
