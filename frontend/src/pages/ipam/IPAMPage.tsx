@@ -4112,13 +4112,20 @@ function HeaderMenu({
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const real = items.filter(
-    (i): i is { label: string; icon?: LucideIcon; onClick: () => void; title?: string } =>
-      !!i && !!i.onClick,
+    (
+      i,
+    ): i is {
+      label: string;
+      icon?: LucideIcon;
+      onClick: () => void;
+      title?: string;
+    } => !!i && !!i.onClick,
   );
   useEffect(() => {
     if (!open) return;
     const onDocMouseDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+      if (ref.current && !ref.current.contains(e.target as Node))
+        setOpen(false);
     };
     document.addEventListener("mousedown", onDocMouseDown);
     return () => document.removeEventListener("mousedown", onDocMouseDown);
@@ -14377,7 +14384,9 @@ function IpamHelpLegend() {
   ];
   return (
     <div className="border-b bg-muted/20 px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
-      <p className="mb-1.5 font-semibold text-foreground">What the icons mean</p>
+      <p className="mb-1.5 font-semibold text-foreground">
+        What the icons mean
+      </p>
       <ul className="space-y-1.5">
         <li className="flex items-center gap-1.5">
           <Layers className="h-3 w-3 flex-shrink-0 text-violet-500" />
@@ -14395,7 +14404,9 @@ function IpamHelpLegend() {
         </li>
         <li className="flex items-center gap-1.5">
           <StatusTag status="allocated" />
-          <span>Status — the IP's lifecycle (icon + colour, never colour alone)</span>
+          <span>
+            Status — the IP's lifecycle (icon + colour, never colour alone)
+          </span>
         </li>
         <li className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <span className="font-medium text-foreground">Seen</span>
@@ -14410,8 +14421,8 @@ function IpamHelpLegend() {
         <li className="flex items-center gap-1.5">
           <span className="inline-block h-2 w-2 flex-shrink-0 rounded-full bg-green-500" />
           <span>
-            Utilization — green &lt;80%, amber 80–95%, red ≥95% (an em-dash means
-            an IPv6 prefix too large to count)
+            Utilization — green &lt;80%, amber 80–95%, red ≥95% (an em-dash
+            means an IPv6 prefix too large to count)
           </span>
         </li>
         <li className="flex items-center gap-1.5">
@@ -14634,9 +14645,7 @@ export function IPAMPage() {
               onClick={() => setHelpMode((v) => !v)}
               className={cn(
                 "rounded p-1 hover:text-foreground",
-                helpMode
-                  ? "text-primary"
-                  : "text-muted-foreground",
+                helpMode ? "text-primary" : "text-muted-foreground",
               )}
               title={helpMode ? "Hide help" : "Show help — explain the icons"}
               aria-label="Toggle IPAM help layer"

@@ -101,9 +101,9 @@ export function useFocusTrap<T extends HTMLElement>() {
     const previouslyFocused = document.activeElement as HTMLElement | null;
 
     const focusables = () =>
-      Array.from(
-        node.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
-      ).filter((el) => el.offsetParent !== null);
+      Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+        (el) => el.offsetParent !== null,
+      );
 
     // Respect an existing autoFocus inside the dialog; otherwise focus the
     // dialog container itself (tabindex -1) so screen readers announce it and
