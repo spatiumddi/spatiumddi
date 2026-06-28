@@ -323,6 +323,12 @@ function ImportedChip({
 
 const COUNTABLE_MAX = Number.MAX_SAFE_INTEGER;
 
+// Max rows rendered in a single tree sibling group before a "Show N more…"
+// reveal. Bounds the DOM for a pathologically large group (a /16 split into
+// thousands of /24s) without windowing the dnd-kit tree. Never applied while
+// the quick-filter is active.
+const TREE_GROUP_CAP = 300;
+
 // IPv6 subnets (a /64 is 2^64 addresses) overflow the BIGINT total_ips column,
 // which the API clamps to ~9.2e18. A raw "N / 9,223,372,036,854,776,000" ratio
 // and a 0% bar are meaningless, so we present such prefixes as uncountable.
@@ -11266,6 +11272,7 @@ function BlockTreeRow({
   forceExpand?: boolean;
 }) {
   const [expanded, setExpanded] = useState(true);
+  const [showAllChildren, setShowAllChildren] = useState(false);
   const isExpanded = forceExpand || expanded;
   const hasContent = node.children.length > 0 || node.subnets.length > 0;
   const isSelected = selectedBlockId === node.block.id;
@@ -11390,48 +11397,64 @@ function BlockTreeRow({
           reads sequentially — a supernet block (e.g. 10.255.0.0/24)
           with subnets inside it lands alongside its IP-adjacent peers
           rather than being bucketed to the top or bottom. */}
-      {isExpanded && hasContent && (
-        <div
-          role="group"
-          className="ml-[9px] pl-3 border-l border-border/40 space-y-0.5"
-        >
-          {sortedTreeItems(node).map((item) =>
-            item.kind === "block" ? (
-              <BlockTreeRow
-                key={`b:${item.node.block.id}`}
-                node={item.node}
-                forceExpand={forceExpand}
-                selectedSubnetId={selectedSubnetId}
-                selectedBlockId={selectedBlockId}
-                onSelectBlock={onSelectBlock}
-                onSelectSubnet={onSelectSubnet}
-                onDeleteSubnet={onDeleteSubnet}
-                onDeleteBlock={onDeleteBlock}
-                onEditBlock={onEditBlock}
-                onCreateSubnet={onCreateSubnet}
-                onCreateChildBlock={onCreateChildBlock}
-                onAllocateIp={onAllocateIp}
-                depth={depth + 1}
-              />
-            ) : (
-              <SubnetRow
-                key={`s:${item.subnet.id}`}
-                subnet={item.subnet}
-                isSelected={selectedSubnetId === item.subnet.id}
-                onSelect={() => onSelectSubnet(item.subnet)}
-                onDelete={() => onDeleteSubnet(item.subnet)}
-                onEdited={(updated) => onSelectSubnet(updated)}
-                onAllocateIp={onAllocateIp}
-              />
-            ),
-          )}
-          {node.children.length === 0 && node.subnets.length === 0 && (
-            <p className="py-0.5 pl-2 text-xs text-muted-foreground/40">
-              Empty
-            </p>
-          )}
-        </div>
-      )}
+      {isExpanded &&
+        hasContent &&
+        (() => {
+          const items = sortedTreeItems(node);
+          // Bound the DOM for a pathologically large sibling group (e.g. a /16
+          // split into thousands of /24s) — render the first TREE_GROUP_CAP and
+          // reveal the rest on demand. Never cap while filtering (forceExpand),
+          // so every match stays visible.
+          const capped =
+            !forceExpand && !showAllChildren && items.length > TREE_GROUP_CAP;
+          const shown = capped ? items.slice(0, TREE_GROUP_CAP) : items;
+          return (
+            <div
+              role="group"
+              className="ml-[9px] pl-3 border-l border-border/40 space-y-0.5"
+            >
+              {shown.map((item) =>
+                item.kind === "block" ? (
+                  <BlockTreeRow
+                    key={`b:${item.node.block.id}`}
+                    node={item.node}
+                    forceExpand={forceExpand}
+                    selectedSubnetId={selectedSubnetId}
+                    selectedBlockId={selectedBlockId}
+                    onSelectBlock={onSelectBlock}
+                    onSelectSubnet={onSelectSubnet}
+                    onDeleteSubnet={onDeleteSubnet}
+                    onDeleteBlock={onDeleteBlock}
+                    onEditBlock={onEditBlock}
+                    onCreateSubnet={onCreateSubnet}
+                    onCreateChildBlock={onCreateChildBlock}
+                    onAllocateIp={onAllocateIp}
+                    depth={depth + 1}
+                  />
+                ) : (
+                  <SubnetRow
+                    key={`s:${item.subnet.id}`}
+                    subnet={item.subnet}
+                    isSelected={selectedSubnetId === item.subnet.id}
+                    onSelect={() => onSelectSubnet(item.subnet)}
+                    onDelete={() => onDeleteSubnet(item.subnet)}
+                    onEdited={(updated) => onSelectSubnet(updated)}
+                    onAllocateIp={onAllocateIp}
+                  />
+                ),
+              )}
+              {capped && (
+                <button
+                  type="button"
+                  onClick={() => setShowAllChildren(true)}
+                  className="w-full rounded px-2 py-1 text-left text-xs text-primary hover:bg-muted/40"
+                >
+                  Show {(items.length - TREE_GROUP_CAP).toLocaleString()} more…
+                </button>
+              )}
+            </div>
+          );
+        })()}
     </div>
   );
 }
@@ -13767,6 +13790,7 @@ function SpaceSection({
   );
   const filterQ = filter.trim().toLowerCase();
   const filtering = filterQ.length > 0;
+  const [showAllTop, setShowAllTop] = useState(false);
   const [showCreateSubnet, setShowCreateSubnet] = useState<
     string | true | false
   >(false); // string = default block_id
@@ -14053,29 +14077,52 @@ function SpaceSection({
             )}
 
             {/* Block tree (recursive) — filtered + force-expanded when a
-                quick-filter is active. */}
+                quick-filter is active, and capped to TREE_GROUP_CAP top-level
+                rows with a reveal (never capped while filtering). */}
             {blocks &&
               subnets &&
-              buildBlockTree(treeBlocks, treeSubnets, null).map((node) => (
-                <BlockTreeRow
-                  key={node.block.id}
-                  node={node}
-                  forceExpand={filtering}
-                  selectedSubnetId={selectedSubnetId}
-                  selectedBlockId={selectedBlockId}
-                  onSelectBlock={onSelectBlock}
-                  onSelectSubnet={onSelectSubnet}
-                  onDeleteSubnet={(s) => setSubnetToDelete(s)}
-                  onDeleteBlock={(b) => setBlockToDelete(b)}
-                  onEditBlock={(b) => setEditBlock(b)}
-                  onCreateSubnet={(blockId) => setShowCreateSubnet(blockId)}
-                  onCreateChildBlock={(parentId) =>
-                    setShowCreateBlock(parentId)
-                  }
-                  onAllocateIp={(s) => onSelectSubnet(s)}
-                  depth={0}
-                />
-              ))}
+              (() => {
+                const top = buildBlockTree(treeBlocks, treeSubnets, null);
+                const capped =
+                  !filtering && !showAllTop && top.length > TREE_GROUP_CAP;
+                const shown = capped ? top.slice(0, TREE_GROUP_CAP) : top;
+                return (
+                  <>
+                    {shown.map((node) => (
+                      <BlockTreeRow
+                        key={node.block.id}
+                        node={node}
+                        forceExpand={filtering}
+                        selectedSubnetId={selectedSubnetId}
+                        selectedBlockId={selectedBlockId}
+                        onSelectBlock={onSelectBlock}
+                        onSelectSubnet={onSelectSubnet}
+                        onDeleteSubnet={(s) => setSubnetToDelete(s)}
+                        onDeleteBlock={(b) => setBlockToDelete(b)}
+                        onEditBlock={(b) => setEditBlock(b)}
+                        onCreateSubnet={(blockId) =>
+                          setShowCreateSubnet(blockId)
+                        }
+                        onCreateChildBlock={(parentId) =>
+                          setShowCreateBlock(parentId)
+                        }
+                        onAllocateIp={(s) => onSelectSubnet(s)}
+                        depth={0}
+                      />
+                    ))}
+                    {capped && (
+                      <button
+                        type="button"
+                        onClick={() => setShowAllTop(true)}
+                        className="w-full rounded px-2 py-1 text-left text-xs text-primary hover:bg-muted/40"
+                      >
+                        Show {(top.length - TREE_GROUP_CAP).toLocaleString()}{" "}
+                        more…
+                      </button>
+                    )}
+                  </>
+                );
+              })()}
 
             {!isLoading && !subnets?.length && !blocks?.length && (
               <p className="py-1 pl-2 text-xs text-muted-foreground">
