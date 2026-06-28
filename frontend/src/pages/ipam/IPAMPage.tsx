@@ -214,7 +214,64 @@ function RoleBadge({ role }: { role: string }) {
   );
 }
 
-function UtilizationBar({ percent }: { percent: number }) {
+const COUNTABLE_MAX = Number.MAX_SAFE_INTEGER;
+
+// IPv6 subnets (a /64 is 2^64 addresses) overflow the BIGINT total_ips column,
+// which the API clamps to ~9.2e18. A raw "N / 9,223,372,036,854,776,000" ratio
+// and a 0% bar are meaningless, so we present such prefixes as uncountable.
+function isUncountable(total: number): boolean {
+  return total > COUNTABLE_MAX;
+}
+
+// Human size for a subnet's address count: exact for countable prefixes,
+// 2^bits power-notation for uncountable IPv6 (falls back gracefully).
+function subnetSizeLabel(total: number, network?: string): string {
+  if (!isUncountable(total)) return total.toLocaleString();
+  if (network && network.includes("/")) {
+    const prefix = Number(network.split("/")[1]);
+    if (Number.isFinite(prefix)) {
+      const bits = (network.includes(":") ? 128 : 32) - prefix;
+      if (bits >= 0) return `2^${bits}`;
+    }
+  }
+  return "huge";
+}
+
+// Allocated / total cell — suppresses the meaningless huge denominator for
+// uncountable IPv6 prefixes.
+function UsedIps({ allocated, total }: { allocated: number; total: number }) {
+  if (isUncountable(total)) {
+    return (
+      <span title="IPv6 address space too large to enumerate">
+        {allocated.toLocaleString()}{" "}
+        <span className="text-muted-foreground">/ ∞</span>
+      </span>
+    );
+  }
+  return (
+    <>
+      {allocated.toLocaleString()} / {total.toLocaleString()}
+    </>
+  );
+}
+
+function UtilizationBar({
+  percent,
+  uncountable = false,
+}: {
+  percent: number;
+  uncountable?: boolean;
+}) {
+  if (uncountable) {
+    return (
+      <span
+        className="text-xs text-muted-foreground"
+        title="Utilization is not meaningful for an IPv6 subnet this large"
+      >
+        —
+      </span>
+    );
+  }
   const color =
     percent >= 95
       ? "bg-red-500"
@@ -4500,17 +4557,22 @@ function SubnetDetail({
           )}
           <div className="flex items-center gap-1.5">
             <span className="text-xs text-muted-foreground">Total IPs</span>
-            <span className="text-xs font-medium">{subnet.total_ips}</span>
+            <span className="text-xs font-medium">
+              {subnetSizeLabel(subnet.total_ips, subnet.network)}
+            </span>
           </div>
           <div className="flex items-center gap-1.5">
             <span className="text-xs text-muted-foreground">Allocated</span>
             <span className="text-xs font-medium">
-              {subnet.allocated_ips} / {subnet.total_ips}
+              <UsedIps allocated={subnet.allocated_ips} total={subnet.total_ips} />
             </span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-xs text-muted-foreground">Utilization</span>
-            <UtilizationBar percent={subnet.utilization_percent} />
+            <UtilizationBar
+              percent={subnet.utilization_percent}
+              uncountable={isUncountable(subnet.total_ips)}
+            />
           </div>
           {Object.entries(subnet.custom_fields ?? {}).map(([k, v]) => (
             <div key={k} className="flex items-center gap-1.5">
@@ -11942,13 +12004,13 @@ function BlockDetailView({
                             )}
                           </td>
                           <td className="px-4 py-2 tabular-nums text-muted-foreground">
-                            {s.allocated_ips} / {s.total_ips}
+                            <UsedIps allocated={s.allocated_ips} total={s.total_ips} />
                           </td>
                           <td className="px-4 py-2">
-                            <UtilizationBar percent={s.utilization_percent} />
+                            <UtilizationBar percent={s.utilization_percent} uncountable={isUncountable(s.total_ips)} />
                           </td>
                           <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                            {s.total_ips.toLocaleString()}
+                            {subnetSizeLabel(s.total_ips, s.network)}
                           </td>
                           <td className="px-4 py-2">
                             <StatusBadge status={s.status} />
@@ -12827,13 +12889,13 @@ function SpaceTableView({
                           )}
                         </td>
                         <td className="px-4 py-2 tabular-nums text-muted-foreground">
-                          {s.allocated_ips} / {s.total_ips}
+                          <UsedIps allocated={s.allocated_ips} total={s.total_ips} />
                         </td>
                         <td className="px-4 py-2">
-                          <UtilizationBar percent={s.utilization_percent} />
+                          <UtilizationBar percent={s.utilization_percent} uncountable={isUncountable(s.total_ips)} />
                         </td>
                         <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                          {s.total_ips.toLocaleString()}
+                          {subnetSizeLabel(s.total_ips, s.network)}
                         </td>
                         <td className="px-4 py-2">
                           <StatusBadge status={s.status} />

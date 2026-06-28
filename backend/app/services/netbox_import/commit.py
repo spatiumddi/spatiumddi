@@ -1435,7 +1435,7 @@ async def commit_import(
     conflict_actions: dict[str, ConflictAction],
     space_strategy: str = "per_vrf",
     target_space_id: uuid.UUID | None = None,
-    default_router_name: str = "NetBox import",
+    default_router_name: str = "Imported VLANs (NetBox)",
     actor: User,
 ) -> CommitResult:
     """Apply ``preview`` to the DB, one entity per savepoint.
