@@ -214,11 +214,46 @@ function RoleBadge({ role }: { role: string }) {
   );
 }
 
-// Import-provenance custom-field keys (stamped by the NetBox / cloud importers).
-// Collapse these into a single "Imported from …" chip instead of leaking raw
-// key/value pairs (netbox_id, netbox_is_pool, import_source, …) into the UI.
+// Import-provenance custom-field keys (stamped by the NetBox / cloud importers
+// — the canonical list is backend/app/services/netbox_import/mapping.py). We
+// collapse exactly these into a single "Imported from …" chip instead of
+// leaking raw key/value pairs into the UI.
+//
+// This is a precise allowlist on purpose. A broad `^netbox`/`^import` prefix
+// would also swallow — and, on chip-dismiss, permanently delete — a
+// NetBox-origin custom field an operator deliberately named e.g. `netbox_url`
+// or `import_notes`: `_merge_custom_fields` copies NetBox's own custom fields
+// in verbatim, so they sit alongside the keys we stamp. New importers add
+// their keys here.
+const PROVENANCE_KEYS = new Set<string>([
+  "netbox_id",
+  "netbox_slug",
+  "netbox_role",
+  "netbox_rir",
+  "netbox_is_pool",
+  "netbox_vlan_id",
+  "netbox_managed_by",
+  "netbox_enforce_unique",
+  "netbox_tenant_group",
+  "import_source",
+  "imported_at",
+]);
 function isProvenanceKey(k: string): boolean {
-  return /^(netbox|import_)/.test(k) || k === "imported_at";
+  return PROVENANCE_KEYS.has(k);
+}
+
+// Split a custom_fields dict into its import-provenance subset (`prov`) and the
+// rest (`keep`). Both the subnet- and block-detail headers use this — one pass
+// instead of the two inline filters each previously ran.
+function splitProvenance(
+  customFields: Record<string, unknown> | null | undefined,
+): { prov: Record<string, unknown>; keep: Record<string, unknown> } {
+  const prov: Record<string, unknown> = {};
+  const keep: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(customFields ?? {})) {
+    (isProvenanceKey(k) ? prov : keep)[k] = v;
+  }
+  return { prov, keep };
 }
 
 // Collapsed import-provenance chip with a dismiss (×) that clears the
@@ -240,6 +275,7 @@ function ImportedChip({
 }) {
   const qc = useQueryClient();
   const [confirming, setConfirming] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
   const fromNetbox =
     Object.keys(fields).some((k) => k.startsWith("netbox")) ||
     String(fields["import_source"] ?? "")
@@ -262,8 +298,12 @@ function ImportedChip({
       onUpdated(updated);
       qc.invalidateQueries({ queryKey: ["blocks"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      setErr(null);
       setConfirming(false);
     },
+    // Surface a failed clear (403 RBAC / 422) in the modal instead of
+    // silently leaving the Remove button re-enabled with no feedback.
+    onError: (e) => setErr(formatApiError(e)),
   });
   return (
     <>
@@ -274,7 +314,10 @@ function ImportedChip({
         {label}
         <button
           type="button"
-          onClick={() => setConfirming(true)}
+          onClick={() => {
+            setErr(null);
+            setConfirming(true);
+          }}
           aria-label={`Remove import metadata from this ${kind}`}
           title="Remove import metadata"
           className="ml-0.5 rounded px-0.5 leading-none text-sky-700/60 hover:bg-sky-200 hover:text-sky-900 dark:text-sky-400/60 dark:hover:bg-sky-800/60"
@@ -287,11 +330,14 @@ function ImportedChip({
         title="Remove import metadata?"
         confirmLabel="Remove"
         loading={clearMut.isPending}
-        message={`This clears the import-provenance fields (${Object.keys(
-          fields,
-        ).join(
-          ", ",
-        )}) from this ${kind}, so the "${label}" chip disappears. The ${kind} itself and its other fields are unchanged.`}
+        message={
+          <>
+            {`This clears the import-provenance fields (${Object.keys(fields).join(
+              ", ",
+            )}) from this ${kind}, so the "${label}" chip disappears. The ${kind} itself and its other fields are unchanged.`}
+            {err && <span className="mt-2 block text-destructive">{err}</span>}
+          </>
+        }
         onConfirm={() => clearMut.mutate()}
         onClose={() => setConfirming(false)}
       />
@@ -378,7 +424,25 @@ function UtilizationBar({
   );
 }
 
-function UtilizationDot({ percent }: { percent: number }) {
+function UtilizationDot({
+  percent,
+  uncountable = false,
+}: {
+  percent: number;
+  uncountable?: boolean;
+}) {
+  if (uncountable) {
+    // Parity with UtilizationBar — a clamped IPv6 subnet computes ≈0%, so a
+    // green dot would falsely read "empty". Render a neutral dot instead.
+    const tip = "Utilization is not meaningful for an IPv6 subnet this large";
+    return (
+      <span
+        title={tip}
+        aria-label={tip}
+        className="inline-block h-2 w-2 flex-shrink-0 rounded-full bg-muted-foreground/30"
+      />
+    );
+  }
   const color =
     percent >= 95
       ? "bg-red-500"
@@ -400,6 +464,14 @@ function UtilizationDot({ percent }: { percent: number }) {
 // the redundant string; realBlockName() strips it for plain-text label sites.
 function realBlockName(name?: string | null): string {
   return name && !name.startsWith("auto:") ? name : "";
+}
+
+// "network (name)" when the block carries a real (non-auto) name, else just the
+// network. Used by the breadcrumb + DNS-sync scope label so realBlockName isn't
+// evaluated twice per label.
+function blockLabel(network: string, name?: string | null): string {
+  const n = realBlockName(name);
+  return n ? `${network} (${n})` : network;
 }
 
 function BlockNameTag({
@@ -426,17 +498,40 @@ function BlockNameTag({
 // Double-click-to-edit cell for the IP table. Swallows single clicks so it
 // doesn't trigger the row's open-detail handler; Enter/blur commit, Escape
 // cancels. `display` is what shows when not editing; `value` seeds the input.
+// One shared timer for click-vs-double-click discrimination on inline-editable
+// cells. A single click opens the row detail (consistent with the rest of the
+// row), a double-click edits — but a double-click fires `click` twice then
+// `dblclick`, so we defer the single-click action briefly and cancel it when a
+// double-click lands. User interaction is serial, so one module-level timer is
+// safe and keeps these cells hook-free for the discrimination logic.
+let _inlineClickTimer: ReturnType<typeof setTimeout> | null = null;
+function deferRowActivate(fn: () => void) {
+  if (_inlineClickTimer) clearTimeout(_inlineClickTimer);
+  _inlineClickTimer = setTimeout(() => {
+    _inlineClickTimer = null;
+    fn();
+  }, 220);
+}
+function cancelRowActivate() {
+  if (_inlineClickTimer) {
+    clearTimeout(_inlineClickTimer);
+    _inlineClickTimer = null;
+  }
+}
+
 function InlineEditableText({
   value,
   placeholder,
   display,
   onSave,
+  onActivate,
   disabled = false,
 }: {
   value: string;
   placeholder: string;
   display: React.ReactNode;
   onSave: (next: string) => void;
+  onActivate?: () => void;
   disabled?: boolean;
 }) {
   const [editing, setEditing] = useState(false);
@@ -472,13 +567,17 @@ function InlineEditableText({
   }
   return (
     <span
-      onClick={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (onActivate) deferRowActivate(onActivate);
+      }}
       onDoubleClick={(e) => {
         e.stopPropagation();
+        cancelRowActivate();
         setDraft(value);
         setEditing(true);
       }}
-      title="Double-click to edit"
+      title="Click to open · double-click to edit"
       className="cursor-text"
     >
       {display}
@@ -2723,10 +2822,12 @@ function InlineStatusSelect({
   status,
   disabled = false,
   onSave,
+  onActivate,
 }: {
   status: string;
   disabled?: boolean;
   onSave: (next: string) => void;
+  onActivate?: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   if (disabled) return <StatusBadge status={status} />;
@@ -2765,12 +2866,16 @@ function InlineStatusSelect({
   }
   return (
     <span
-      onClick={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (onActivate) deferRowActivate(onActivate);
+      }}
       onDoubleClick={(e) => {
         e.stopPropagation();
+        cancelRowActivate();
         setEditing(true);
       }}
-      title="Double-click to change status"
+      title="Click to open · double-click to change status"
       className="cursor-pointer"
     >
       <StatusBadge status={status} />
@@ -4239,17 +4344,33 @@ function SubnetDetail({
   const [viewingAddress, setViewingAddress] = useState<IPAddress | null>(null);
   const [scanFromDetail, setScanFromDetail] = useState<IPAddress | null>(null);
   const [showFilters, setShowFilters] = useState(false);
-  // Per-user sticky toggle to hide the protocol-reserved rows
-  // (network / broadcast / gateway) that pad every subnet table.
+  // Per-user sticky toggle to hide the protocol-padding rows (network /
+  // broadcast) that auto-pad every subnet table. Operator-set "reserved"
+  // allocations stay visible — they are real entries, not padding.
   const [hideReserved, setHideReserved] = useSessionState<boolean>(
     "ipam-hide-reserved",
     false,
   );
-  // Inline (double-click) edits of hostname / description on the IP table.
+  // Rows the "Hide network/broadcast" toggle removes. Defined once so the
+  // Select-all `selectable` set can exclude exactly what the table hides —
+  // otherwise Select-all would pick hidden rows and a bulk delete/edit would
+  // hit addresses the operator can't see (#465 review).
+  const isPaddingRow = (a: { status: string }) =>
+    a.status === "network" || a.status === "broadcast";
+  // Surfaced banner for a rejected inline edit (collision 409 / static_dhcp
+  // needs-MAC 422 / DHCP-lease 409 / RBAC 403) — without it the cell silently
+  // reverts on refetch and the operator thinks the edit saved.
+  const [inlineEditError, setInlineEditError] = useState<string | null>(null);
+  // Inline (double-click) edits of hostname / description / status on the IP
+  // table.
   const inlineEditMut = useMutation({
     mutationFn: ({ id, data }: { id: string; data: Partial<IPAddress> }) =>
       ipamApi.updateAddress(id, data),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["addresses"] }),
+    onSuccess: () => {
+      setInlineEditError(null);
+      qc.invalidateQueries({ queryKey: ["addresses"] });
+    },
+    onError: (e) => setInlineEditError(formatApiError(e)),
   });
   const [activeSubnetTab, setActiveSubnetTab] = useState<
     "addresses" | "dhcp" | "aliases" | "nat" | "trend" | "address-sets"
@@ -4564,10 +4685,7 @@ function SubnetDetail({
       }
     }
     if (hideReserved)
-      return rows.filter((r) => {
-        if (r.kind !== "ip") return true;
-        return !["network", "broadcast", "reserved"].includes(r.addr.status);
-      });
+      return rows.filter((r) => r.kind !== "ip" || !isPaddingRow(r.addr));
     return rows;
   })();
 
@@ -4834,11 +4952,7 @@ function SubnetDetail({
             />
           </div>
           {(() => {
-            const all = (subnet.custom_fields ?? {}) as Record<string, unknown>;
-            const prov = Object.fromEntries(
-              Object.entries(all).filter(([k]) => isProvenanceKey(k)),
-            );
-            const rest = Object.entries(all).filter(([k]) => !isProvenanceKey(k));
+            const { prov, keep } = splitProvenance(subnet.custom_fields);
             return (
               <>
                 {Object.keys(prov).length > 0 && (
@@ -4848,12 +4962,12 @@ function SubnetDetail({
                       fields={prov}
                       kind="subnet"
                       id={subnet.id}
-                      keep={Object.fromEntries(rest)}
+                      keep={keep}
                       onUpdated={(u) => onSubnetEdited(u as Subnet)}
                     />
                   </div>
                 )}
-                {rest.map(([k, v]) => (
+                {Object.entries(keep).map(([k, v]) => (
                   <div key={k} className="flex items-center gap-1.5">
                     <span className="text-xs text-muted-foreground">{k}</span>
                     <span className="text-xs font-medium">{String(v)}</span>
@@ -5068,9 +5182,22 @@ function SubnetDetail({
                     checked={hideReserved}
                     onChange={(e) => setHideReserved(e.target.checked)}
                   />
-                  Hide reserved rows
+                  Hide network/broadcast
                 </label>
               </div>
+              {inlineEditError && (
+                <div className="mb-2 flex items-start gap-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+                  <span className="flex-1">{inlineEditError}</span>
+                  <button
+                    type="button"
+                    onClick={() => setInlineEditError(null)}
+                    aria-label="Dismiss error"
+                    className="shrink-0 rounded px-1 leading-none hover:bg-destructive/20"
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
               {/* No nested overflow wrapper — Chrome/WebKit treat
                   ``overflow-x: auto`` as establishing a Y-scroll
                   context too (CSS spec: paired axis can't be
@@ -5093,7 +5220,9 @@ function SubnetDetail({
                           (a: IPAddress) =>
                             a.status !== "network" &&
                             a.status !== "broadcast" &&
-                            !a.auto_from_lease,
+                            !a.auto_from_lease &&
+                            // Never select a row the table is currently hiding.
+                            !(hideReserved && isPaddingRow(a)),
                         );
                         const allSelected =
                           selectable.length > 0 &&
@@ -5541,11 +5670,12 @@ function SubnetDetail({
                                 <InlineEditableText
                                   value={addr.hostname ?? ""}
                                   placeholder="hostname"
-                                  disabled={isReadOnly(addr.status)}
+                                  disabled={!canEdit}
+                                  onActivate={() => setViewingAddress(addr)}
                                   onSave={(v) =>
                                     inlineEditMut.mutate({
                                       id: addr.id,
-                                      data: { hostname: v.trim() },
+                                      data: { hostname: v.trim() || null },
                                     })
                                   }
                                   display={
@@ -5625,7 +5755,8 @@ function SubnetDetail({
                               <InlineEditableText
                                 value={addr.description ?? ""}
                                 placeholder="description"
-                                disabled={isReadOnly(addr.status)}
+                                disabled={!canEdit}
+                                onActivate={() => setViewingAddress(addr)}
                                 onSave={(v) =>
                                   inlineEditMut.mutate({
                                     id: addr.id,
@@ -5688,7 +5819,8 @@ function SubnetDetail({
                               <span className="inline-flex items-center">
                                 <InlineStatusSelect
                                   status={addr.status}
-                                  disabled={isReadOnly(addr.status)}
+                                  disabled={!canEdit}
+                                  onActivate={() => setViewingAddress(addr)}
                                   onSave={(v) =>
                                     inlineEditMut.mutate({
                                       id: addr.id,
@@ -9658,7 +9790,10 @@ function SubnetRow({
           </div>
           <CustomerChip customerId={subnet.customer_id} />
           <SiteChip siteId={subnet.site_id} />
-          <UtilizationDot percent={subnet.utilization_percent} />
+          <UtilizationDot
+            percent={subnet.utilization_percent}
+            uncountable={isUncountable(subnet.total_ips)}
+          />
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
@@ -10397,13 +10532,16 @@ function flattenBlocks(
   nodes: BlockNode[],
   depth = 0,
 ): { id: string; label: string }[] {
-  return nodes.flatMap(({ block, children }) => [
-    {
-      id: block.id,
-      label: `${"  ".repeat(depth)}${block.network}${realBlockName(block.name) ? ` — ${realBlockName(block.name)}` : ""}`,
-    },
-    ...flattenBlocks(children, depth + 1),
-  ]);
+  return nodes.flatMap(({ block, children }) => {
+    const n = realBlockName(block.name);
+    return [
+      {
+        id: block.id,
+        label: `${"  ".repeat(depth)}${block.network}${n ? ` — ${n}` : ""}`,
+      },
+      ...flattenBlocks(children, depth + 1),
+    ];
+  });
 }
 
 // ─── Create Block Modal ───────────────────────────────────────────────────────
@@ -11468,7 +11606,7 @@ function BlockDetailView({
       }),
     ),
     {
-      label: block.network + (realBlockName(block.name) ? ` (${realBlockName(block.name)})` : ""),
+      label: blockLabel(block.network, block.name),
       variant: "block",
     },
   ];
@@ -11591,11 +11729,7 @@ function BlockDetailView({
         {/* Custom field values — import provenance collapsed into one chip */}
         {Object.keys(block.custom_fields ?? {}).length > 0 &&
           (() => {
-            const all = block.custom_fields as Record<string, unknown>;
-            const prov = Object.fromEntries(
-              Object.entries(all).filter(([k]) => isProvenanceKey(k)),
-            );
-            const rest = Object.entries(all).filter(([k]) => !isProvenanceKey(k));
+            const { prov, keep } = splitProvenance(block.custom_fields);
             return (
               <div className="flex flex-wrap items-center gap-x-6 gap-y-1 border-t bg-muted/20 px-6 py-2">
                 {Object.keys(prov).length > 0 && (
@@ -11603,11 +11737,11 @@ function BlockDetailView({
                     fields={prov}
                     kind="block"
                     id={block.id}
-                    keep={Object.fromEntries(rest)}
+                    keep={keep}
                     onUpdated={(u) => setBlock(u as IPBlock)}
                   />
                 )}
-                {rest.map(([k, v]) => (
+                {Object.entries(keep).map(([k, v]) => (
                   <div key={k} className="flex items-center gap-1.5">
                     <span className="text-xs text-muted-foreground">{k}</span>
                     <span className="text-xs font-medium">{String(v)}</span>
@@ -11741,7 +11875,7 @@ function BlockDetailView({
           scope={{
             kind: "block",
             id: block.id,
-            label: block.network + (realBlockName(block.name) ? ` (${realBlockName(block.name)})` : ""),
+            label: blockLabel(block.network, block.name),
           }}
           onClose={() => setShowDnsSync(false)}
         />
