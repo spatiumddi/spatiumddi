@@ -13967,7 +13967,27 @@ function SpaceSection({
       network.toLowerCase().includes(filterQ) ||
       (name ?? "").toLowerCase().includes(filterQ);
     const byId = new Map(allBlocks.map((b) => [b.id, b]));
-    const keep = new Set<string>();
+    // When a BLOCK matches, reveal its whole subtree (child blocks + their
+    // subnets) so a matched container doesn't render as an empty leaf —
+    // searching for a block means "show me what's in it".
+    const childrenByParent = new Map<string, IPBlock[]>();
+    for (const b of allBlocks) {
+      if (!b.parent_block_id) continue;
+      const arr = childrenByParent.get(b.parent_block_id);
+      if (arr) arr.push(b);
+      else childrenByParent.set(b.parent_block_id, [b]);
+    }
+    const inMatchedSubtree = new Set<string>();
+    const stack = allBlocks
+      .filter((b) => hit(b.network, b.name))
+      .map((b) => b.id);
+    while (stack.length) {
+      const id = stack.pop() as string;
+      if (inMatchedSubtree.has(id)) continue;
+      inMatchedSubtree.add(id);
+      for (const c of childrenByParent.get(id) ?? []) stack.push(c.id);
+    }
+    const keep = new Set<string>(inMatchedSubtree);
     const addAncestors = (parentId: string | null | undefined) => {
       let cur = parentId ?? null;
       while (cur && !keep.has(cur)) {
@@ -13975,14 +13995,16 @@ function SpaceSection({
         cur = byId.get(cur)?.parent_block_id ?? null;
       }
     };
-    const keptSubnets = allSubnets.filter((s) => hit(s.network, s.name));
+    // A subnet is kept if it matches by text, or it sits inside a matched
+    // block's subtree.
+    const keptSubnets = allSubnets.filter(
+      (s) =>
+        hit(s.network, s.name) ||
+        (s.block_id != null && inMatchedSubtree.has(s.block_id)),
+    );
     for (const s of keptSubnets) addAncestors(s.block_id);
-    for (const b of allBlocks) {
-      if (hit(b.network, b.name)) {
-        keep.add(b.id);
-        addAncestors(b.parent_block_id);
-      }
-    }
+    for (const id of inMatchedSubtree)
+      addAncestors(byId.get(id)?.parent_block_id);
     const keptBlocks = allBlocks.filter((b) => keep.has(b.id));
     return {
       treeBlocks: keptBlocks,
