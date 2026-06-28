@@ -76,3 +76,70 @@ export function useDraggableModal(onClose: () => void) {
     },
   };
 }
+
+const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * Modal accessibility: **initial focus + focus trap + focus return**. Attach
+ * the returned ref to the dialog container (the element that also carries
+ * ``role="dialog"`` + ``aria-modal="true"``).
+ *
+ * On open it remembers the previously-focused element and — unless a control
+ * inside already grabbed focus via ``autoFocus`` (e.g. ConfirmModal's password
+ * field) — moves focus into the dialog. Tab / Shift+Tab cycle within the
+ * dialog so keyboard focus can't escape to the page behind. On close focus
+ * returns to wherever it was, so the operator's place in the page is kept.
+ *
+ * Lives next to ``useDraggableModal`` so every modal can opt in with one line.
+ */
+export function useFocusTrap<T extends HTMLElement>() {
+  const ref = useRef<T>(null);
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+
+    const focusables = () =>
+      Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+        (el) => el.offsetParent !== null,
+      );
+
+    // Respect an existing autoFocus inside the dialog; otherwise focus the
+    // dialog container itself (tabindex -1) so screen readers announce it and
+    // the operator tabs into the content — never auto-landing on the close X.
+    if (!node.contains(document.activeElement)) {
+      node.setAttribute("tabindex", "-1");
+      node.focus();
+    }
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Tab") return;
+      const items = focusables();
+      if (items.length === 0) {
+        e.preventDefault();
+        node.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey) {
+        if (active === first || !node.contains(active)) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || !node.contains(active)) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    node.addEventListener("keydown", onKeyDown);
+    return () => {
+      node.removeEventListener("keydown", onKeyDown);
+      // Return focus to where it was before the modal opened (if still in DOM).
+      previouslyFocused?.focus?.();
+    };
+  }, []);
+  return ref;
+}

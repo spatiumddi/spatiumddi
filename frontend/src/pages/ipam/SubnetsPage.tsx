@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { ipamApi, type Subnet } from "@/lib/api";
+import { StatusTag } from "@/components/ui/status-tag";
 import { zebraBodyCls } from "@/lib/utils";
 
 export function SubnetsPage() {
@@ -58,19 +59,7 @@ export function SubnetsPage() {
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const colors: Record<string, string> = {
-    active: "bg-green-100 text-green-800",
-    deprecated: "bg-yellow-100 text-yellow-800",
-    reserved: "bg-blue-100 text-blue-800",
-    quarantine: "bg-red-100 text-red-800",
-  };
-  return (
-    <span
-      className={`rounded-full px-2 py-0.5 text-xs font-medium ${colors[status] ?? "bg-muted text-muted-foreground"}`}
-    >
-      {status}
-    </span>
-  );
+  return <StatusTag status={status} />;
 }
 
 function UtilizationBar({ percent }: { percent: number }) {

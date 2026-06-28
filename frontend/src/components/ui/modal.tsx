@@ -2,7 +2,11 @@ import { type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { MODAL_BACKDROP_CLS, useDraggableModal } from "./use-draggable-modal";
+import {
+  MODAL_BACKDROP_CLS,
+  useDraggableModal,
+  useFocusTrap,
+} from "./use-draggable-modal";
 
 /** Tab strip for breaking long modals into themed sub-sections.
  *
@@ -81,6 +85,7 @@ export function Modal({
   wide?: boolean;
 }) {
   const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
+  const trapRef = useFocusTrap<HTMLDivElement>();
 
   // Portal to <body> so nested modals (e.g. the IPSpacePicker quick-create
   // popping up from inside the UniFi / Proxmox / Docker / Kubernetes /
@@ -92,13 +97,17 @@ export function Modal({
   const node = (
     <div className={MODAL_BACKDROP_CLS}>
       <div
+        ref={trapRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
         className={cn(
           // Flex column with header pinned + body scroll so the
           // ``Appliance · <name>`` title + close button stay visible
           // while the operator scrolls through long drilldown bodies.
           // Without flex-column, ``overflow-y-auto`` on the outer
           // container scrolled the header out of view.
-          "flex w-full flex-col rounded-lg border bg-card shadow-lg max-h-[90vh] max-w-[95vw]",
+          "flex w-full flex-col rounded-lg border bg-card shadow-lg max-h-[90vh] max-w-[95vw] focus:outline-none",
           wide ? "sm:max-w-2xl" : "sm:max-w-md",
         )}
         style={dialogStyle}
@@ -113,6 +122,7 @@ export function Modal({
           <h2 className="text-base font-semibold">{title}</h2>
           <button
             onClick={onClose}
+            aria-label="Close dialog"
             className="cursor-pointer rounded p-1 text-muted-foreground hover:text-foreground"
           >
             <X className="h-4 w-4" />

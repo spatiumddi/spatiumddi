@@ -29,6 +29,9 @@ import {
   Search,
   Radar,
   Wrench,
+  Sparkles,
+  HelpCircle,
+  type LucideIcon,
   Scissors,
   GitMerge,
   Maximize2,
@@ -90,6 +93,7 @@ import {
 } from "@/lib/approvalQueue";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
+import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
@@ -111,7 +115,8 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { matchesAllTagChips } from "@/components/tag-filter-utils";
-import { AskAIButton } from "@/components/copilot/AskAIButton";
+import { askAI } from "@/components/copilot/askAI";
+import { useAiAvailable } from "@/components/copilot/useAiAvailable";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import {
   ImportModal,
@@ -151,42 +156,13 @@ import {
 
 // ─── Status Badge ────────────────────────────────────────────────────────────
 
+// Thin wrapper over the shared <StatusTag> (icon + text + color). Kept as a
+// local name because the IPAM file references StatusBadge in dozens of places;
+// the icon+color source of truth now lives in components/ui/status-tag.tsx.
+// ``discovered`` is passive observation only — the Seen column's recency dot
+// tells the operator whether the row is currently up; this badge labels source.
 function StatusBadge({ status }: { status: string }) {
-  const colors: Record<string, string> = {
-    active:
-      "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400",
-    reserved:
-      "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400",
-    deprecated:
-      "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400",
-    quarantine: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400",
-    allocated:
-      "bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-400",
-    available:
-      "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400",
-    dhcp: "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400",
-    static_dhcp:
-      "bg-teal-100 text-teal-800 dark:bg-teal-900/30 dark:text-teal-400",
-    network: "bg-zinc-100 text-zinc-500 dark:bg-zinc-800/50 dark:text-zinc-400",
-    broadcast:
-      "bg-zinc-100 text-zinc-500 dark:bg-zinc-800/50 dark:text-zinc-400",
-    orphan:
-      "bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-400",
-    // ``discovered`` — passive observation only, no operator intent.
-    // The Seen column's recency dot tells the operator whether the
-    // row is currently up; the badge here just labels the source.
-    discovered: "bg-sky-100 text-sky-800 dark:bg-sky-900/30 dark:text-sky-400",
-  };
-  return (
-    <span
-      className={cn(
-        "rounded-full px-2 py-0.5 text-xs font-medium",
-        colors[status] ?? "bg-muted text-muted-foreground",
-      )}
-    >
-      {status}
-    </span>
-  );
+  return <StatusTag status={status} />;
 }
 
 // Compact role badge — paired with StatusBadge in the IP table.
@@ -349,6 +325,12 @@ function ImportedChip({
 
 const COUNTABLE_MAX = Number.MAX_SAFE_INTEGER;
 
+// Max rows rendered in a single tree sibling group before a "Show N more…"
+// reveal. Bounds the DOM for a pathologically large group (a /16 split into
+// thousands of /24s) without windowing the dnd-kit tree. Never applied while
+// the quick-filter is active.
+const TREE_GROUP_CAP = 300;
+
 // IPv6 subnets (a /64 is 2^64 addresses) overflow the BIGINT total_ips column,
 // which the API clamps to ~9.2e18. A raw "N / 9,223,372,036,854,776,000" ratio
 // and a 0% bar are meaningless, so we present such prefixes as uncountable.
@@ -495,6 +477,30 @@ function BlockNameTag({
     );
   }
   return <span className={className}>{name}</span>;
+}
+
+// Row-type tag for the mixed block + subnet tables. The two row kinds share
+// columns and blocks legitimately leave several blank (a block has no
+// Router / VLAN / Status), which reads as "missing data" without a cue. This
+// tag labels each row so the em-dashes read as "not applicable here". (#465)
+function RowTypeBadge({ kind }: { kind: "block" | "subnet" }) {
+  return (
+    <span
+      title={
+        kind === "block"
+          ? "IP block — a container that holds child blocks / subnets"
+          : "Subnet — holds individual IP addresses"
+      }
+      className={cn(
+        "inline-flex flex-shrink-0 items-center rounded px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide",
+        kind === "block"
+          ? "bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300"
+          : "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300",
+      )}
+    >
+      {kind}
+    </span>
+  );
 }
 
 // Double-click-to-edit cell for the IP table. Swallows single clicks so it
@@ -3952,6 +3958,7 @@ function ToolsMenu({
   onResize,
   onScan,
   onSplit,
+  onAskAi,
 }: {
   onBulkAllocate: () => void;
   onCleanOrphans: () => void;
@@ -3960,9 +3967,14 @@ function ToolsMenu({
   onResize: () => void;
   onScan: () => void;
   onSplit: () => void;
+  // Optional "Ask AI about this" entry — demoted here from a header
+  // primary action (no persona defended its prominence, #465). Only
+  // rendered when an AI provider is configured.
+  onAskAi?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const aiAvailable = useAiAvailable();
 
   useEffect(() => {
     if (!open) return;
@@ -4062,6 +4074,91 @@ function ToolsMenu({
           >
             <Scissors className="h-3.5 w-3.5" /> Split…
           </button>
+          {onAskAi && aiAvailable && (
+            <button
+              type="button"
+              onClick={() => {
+                setOpen(false);
+                onAskAi();
+              }}
+              className={cn(itemCls, "border-t")}
+            >
+              <Sparkles className="h-3.5 w-3.5 text-primary" /> Ask AI about
+              this…
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Generic header overflow menu — gives the Block / Space headers the same
+// "secondary actions live behind a Tools ▾ dropdown" grammar the Subnet header
+// uses, instead of a flat row of buttons (#465 level-invariant toolbar). Items
+// with no handler are skipped so call sites can conditionally include entries.
+function HeaderMenu({
+  label = "Tools",
+  items,
+}: {
+  label?: string;
+  items: Array<{
+    label: string;
+    icon?: LucideIcon;
+    onClick?: () => void;
+    title?: string;
+  } | null>;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const real = items.filter(
+    (
+      i,
+    ): i is {
+      label: string;
+      icon?: LucideIcon;
+      onClick: () => void;
+      title?: string;
+    } => !!i && !!i.onClick,
+  );
+  useEffect(() => {
+    if (!open) return;
+    const onDocMouseDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node))
+        setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocMouseDown);
+    return () => document.removeEventListener("mousedown", onDocMouseDown);
+  }, [open]);
+  if (real.length === 0) return null;
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+      >
+        <Wrench className="h-3.5 w-3.5" />
+        {label}
+        <ChevronDown className="h-3.5 w-3.5" />
+      </button>
+      {open && (
+        <div className="absolute right-0 z-20 mt-1 w-52 overflow-hidden rounded-md border bg-popover shadow-md">
+          {real.map((it) => (
+            <button
+              key={it.label}
+              type="button"
+              title={it.title}
+              onClick={() => {
+                setOpen(false);
+                it.onClick();
+              }}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted"
+            >
+              {it.icon && <it.icon className="h-3.5 w-3.5" />}
+              {it.label}
+            </button>
+          ))}
         </div>
       )}
     </div>
@@ -4819,26 +4916,28 @@ function SubnetDetail({
               onResize={() => setShowResizeSubnet(true)}
               onScan={() => setShowSubnetScan(true)}
               onSplit={() => setShowSplitSubnet(true)}
-            />
-            <AskAIButton
-              context={[
-                `Subnet ${subnet.network}`,
-                subnet.name ? `name: ${subnet.name}` : null,
-                subnet.description
-                  ? `description: ${subnet.description}`
-                  : null,
-                spaceName ? `space: ${spaceName}` : null,
-                block ? `block: ${block.network}` : null,
-                subnet.vlan_id != null ? `VLAN: ${subnet.vlan_id}` : null,
-                subnet.gateway ? `gateway: ${subnet.gateway}` : null,
-                `utilization: ${(subnet.utilization_percent ?? 0).toFixed(1)}%`,
-                `${subnet.allocated_ips ?? 0} of ${subnet.total_ips ?? 0} IPs allocated`,
-                `subnet_id: ${subnet.id}`,
-              ]
-                .filter(Boolean)
-                .join(", ")}
-              tooltip="Ask AI about this subnet"
-              prompt="Tell me about this subnet — utilisation, recent changes, and anything I should worry about."
+              onAskAi={() =>
+                askAI({
+                  context: [
+                    `Subnet ${subnet.network}`,
+                    subnet.name ? `name: ${subnet.name}` : null,
+                    subnet.description
+                      ? `description: ${subnet.description}`
+                      : null,
+                    spaceName ? `space: ${spaceName}` : null,
+                    block ? `block: ${block.network}` : null,
+                    subnet.vlan_id != null ? `VLAN: ${subnet.vlan_id}` : null,
+                    subnet.gateway ? `gateway: ${subnet.gateway}` : null,
+                    `utilization: ${(subnet.utilization_percent ?? 0).toFixed(1)}%`,
+                    `${subnet.allocated_ips ?? 0} of ${subnet.total_ips ?? 0} IPs allocated`,
+                    `subnet_id: ${subnet.id}`,
+                  ]
+                    .filter(Boolean)
+                    .join(", "),
+                  prompt:
+                    "Tell me about this subnet — utilisation, recent changes, and anything I should worry about.",
+                })
+              }
             />
             <ServicesUsingButton
               kind="subnet"
@@ -5212,7 +5311,54 @@ function SubnetDetail({
                   defeat the sticky thead by anchoring it to a
                   non-scrolling intermediate parent. The outer
                   ``flex-1 overflow-auto`` handles both axes. */}
-              <table className="w-full min-w-[640px] text-sm">
+              {/* Mobile "on-call mode" — the 10-column table is unusable on a
+                  phone, so under sm we render each IP as a tappable card with
+                  the triage essentials (address · status · host · seen). The
+                  full table takes over at sm+. Pool/gap marker rows are skipped
+                  on mobile. */}
+              <div className="space-y-1.5 px-1 pb-2 sm:hidden">
+                {tableRows.filter((r) => r.kind === "ip").length === 0 && (
+                  <p className="px-2 py-3 text-xs text-muted-foreground">
+                    No addresses to show.
+                  </p>
+                )}
+                {tableRows.map((row) => {
+                  if (row.kind !== "ip") return null;
+                  const addr = row.addr;
+                  const host = addr.fqdn || addr.hostname || "";
+                  return (
+                    <button
+                      key={`m-${addr.id}`}
+                      type="button"
+                      onClick={() => setViewingAddress(addr)}
+                      className="flex w-full flex-col gap-1 rounded-md border bg-card p-2.5 text-left active:bg-muted/50"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-mono text-sm font-medium">
+                          {addr.address}
+                        </span>
+                        <StatusTag status={addr.status} />
+                      </div>
+                      <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                        <span className="truncate">
+                          {host || (
+                            <span className="text-muted-foreground/40">
+                              no hostname
+                            </span>
+                          )}
+                        </span>
+                        <SeenDot
+                          lastSeenAt={addr.last_seen_at}
+                          lastSeenMethod={addr.last_seen_method}
+                          withLabel
+                        />
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <table className="hidden w-full min-w-[640px] text-sm sm:table">
                 {/* Sticky header — pinned to the parent
                       ``flex-1 overflow-auto`` scroll container so the
                       column headers stay visible while scrolling a
@@ -9774,6 +9920,9 @@ function SubnetRow({
           {...attributes}
           {...listeners}
           onClick={onSelect}
+          role="treeitem"
+          aria-label={subnet.network}
+          aria-selected={isSelected}
           className={cn(
             "group flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1.5 text-sm",
             isSelected
@@ -11225,6 +11374,7 @@ function BlockTreeRow({
   onCreateChildBlock,
   onAllocateIp,
   depth,
+  forceExpand = false,
 }: {
   node: BlockNode;
   selectedSubnetId: string | null;
@@ -11238,8 +11388,13 @@ function BlockTreeRow({
   onCreateChildBlock: (parentBlockId: string) => void;
   onAllocateIp?: (s: Subnet) => void;
   depth: number;
+  // Forced open by the tree quick-filter so every matching path is visible
+  // regardless of the operator's saved expand/collapse state.
+  forceExpand?: boolean;
 }) {
   const [expanded, setExpanded] = useState(true);
+  const [showAllChildren, setShowAllChildren] = useState(false);
+  const isExpanded = forceExpand || expanded;
   const hasContent = node.children.length > 0 || node.subnets.length > 0;
   const isSelected = selectedBlockId === node.block.id;
   const {
@@ -11262,7 +11417,12 @@ function BlockTreeRow({
   };
 
   return (
-    <div>
+    <div
+      role="treeitem"
+      aria-label={node.block.network}
+      aria-selected={isSelected}
+      aria-expanded={hasContent ? isExpanded : undefined}
+    >
       {/* Block header row */}
       <ContextMenu>
         <ContextMenuTrigger asChild>
@@ -11285,9 +11445,14 @@ function BlockTreeRow({
                   setExpanded((v) => !v);
                 }}
                 className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm border border-border bg-background text-[10px] font-bold text-muted-foreground hover:border-primary hover:text-primary"
-                title={expanded ? "Collapse" : "Expand"}
+                title={isExpanded ? "Collapse" : "Expand"}
+                aria-label={
+                  isExpanded
+                    ? `Collapse ${node.block.network}`
+                    : `Expand ${node.block.network}`
+                }
               >
-                {expanded ? "−" : "+"}
+                {isExpanded ? "−" : "+"}
               </button>
             ) : (
               <div className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm border border-border/30 bg-background text-[10px] text-muted-foreground/30">
@@ -11353,44 +11518,64 @@ function BlockTreeRow({
           reads sequentially — a supernet block (e.g. 10.255.0.0/24)
           with subnets inside it lands alongside its IP-adjacent peers
           rather than being bucketed to the top or bottom. */}
-      {expanded && hasContent && (
-        <div className="ml-[9px] pl-3 border-l border-border/40 space-y-0.5">
-          {sortedTreeItems(node).map((item) =>
-            item.kind === "block" ? (
-              <BlockTreeRow
-                key={`b:${item.node.block.id}`}
-                node={item.node}
-                selectedSubnetId={selectedSubnetId}
-                selectedBlockId={selectedBlockId}
-                onSelectBlock={onSelectBlock}
-                onSelectSubnet={onSelectSubnet}
-                onDeleteSubnet={onDeleteSubnet}
-                onDeleteBlock={onDeleteBlock}
-                onEditBlock={onEditBlock}
-                onCreateSubnet={onCreateSubnet}
-                onCreateChildBlock={onCreateChildBlock}
-                onAllocateIp={onAllocateIp}
-                depth={depth + 1}
-              />
-            ) : (
-              <SubnetRow
-                key={`s:${item.subnet.id}`}
-                subnet={item.subnet}
-                isSelected={selectedSubnetId === item.subnet.id}
-                onSelect={() => onSelectSubnet(item.subnet)}
-                onDelete={() => onDeleteSubnet(item.subnet)}
-                onEdited={(updated) => onSelectSubnet(updated)}
-                onAllocateIp={onAllocateIp}
-              />
-            ),
-          )}
-          {node.children.length === 0 && node.subnets.length === 0 && (
-            <p className="py-0.5 pl-2 text-xs text-muted-foreground/40">
-              Empty
-            </p>
-          )}
-        </div>
-      )}
+      {isExpanded &&
+        hasContent &&
+        (() => {
+          const items = sortedTreeItems(node);
+          // Bound the DOM for a pathologically large sibling group (e.g. a /16
+          // split into thousands of /24s) — render the first TREE_GROUP_CAP and
+          // reveal the rest on demand. Never cap while filtering (forceExpand),
+          // so every match stays visible.
+          const capped =
+            !forceExpand && !showAllChildren && items.length > TREE_GROUP_CAP;
+          const shown = capped ? items.slice(0, TREE_GROUP_CAP) : items;
+          return (
+            <div
+              role="group"
+              className="ml-[9px] pl-3 border-l border-border/40 space-y-0.5"
+            >
+              {shown.map((item) =>
+                item.kind === "block" ? (
+                  <BlockTreeRow
+                    key={`b:${item.node.block.id}`}
+                    node={item.node}
+                    forceExpand={forceExpand}
+                    selectedSubnetId={selectedSubnetId}
+                    selectedBlockId={selectedBlockId}
+                    onSelectBlock={onSelectBlock}
+                    onSelectSubnet={onSelectSubnet}
+                    onDeleteSubnet={onDeleteSubnet}
+                    onDeleteBlock={onDeleteBlock}
+                    onEditBlock={onEditBlock}
+                    onCreateSubnet={onCreateSubnet}
+                    onCreateChildBlock={onCreateChildBlock}
+                    onAllocateIp={onAllocateIp}
+                    depth={depth + 1}
+                  />
+                ) : (
+                  <SubnetRow
+                    key={`s:${item.subnet.id}`}
+                    subnet={item.subnet}
+                    isSelected={selectedSubnetId === item.subnet.id}
+                    onSelect={() => onSelectSubnet(item.subnet)}
+                    onDelete={() => onDeleteSubnet(item.subnet)}
+                    onEdited={(updated) => onSelectSubnet(updated)}
+                    onAllocateIp={onAllocateIp}
+                  />
+                ),
+              )}
+              {capped && (
+                <button
+                  type="button"
+                  onClick={() => setShowAllChildren(true)}
+                  className="w-full rounded px-2 py-1 text-left text-xs text-primary hover:bg-muted/40"
+                >
+                  Show {(items.length - TREE_GROUP_CAP).toLocaleString()} more…
+                </button>
+              )}
+            </div>
+          );
+        })()}
     </div>
   );
 }
@@ -11667,40 +11852,46 @@ function BlockDetailView({
                   Sync DNS
                 </HeaderButton>
                 <ExportButton scope={{ block_id: block.id }} label="Export" />
-                {space && (
-                  <HeaderButton
-                    icon={Search}
-                    onClick={() => setShowFindFree(true)}
-                    title="Find unused CIDRs in this block"
-                  >
-                    Find Free…
-                  </HeaderButton>
-                )}
                 <ServicesUsingButton
                   kind="ip_block"
                   resourceId={block.id}
                   label={block.network}
                 />
+                {/* Structural / less-frequent actions grouped behind a Tools ▾
+                    dropdown, mirroring the Subnet header's grammar instead of a
+                    flat button row (#465). */}
+                <HeaderMenu
+                  items={[
+                    space
+                      ? {
+                          label: "Find Free…",
+                          icon: Search,
+                          onClick: () => setShowFindFree(true),
+                          title: "Find unused CIDRs in this block",
+                        }
+                      : null,
+                    {
+                      label: "Resize…",
+                      icon: Maximize2,
+                      onClick: () => setShowResizeBlock(true),
+                      title:
+                        "Grow this block to a larger CIDR (e.g. /16 → /15). Shrinking is not supported.",
+                    },
+                    {
+                      label: "Move…",
+                      onClick: () => setShowMoveBlock(true),
+                      title:
+                        "Move this block (and everything under it) to a different IP space.",
+                    },
+                    {
+                      label: "Add child block…",
+                      icon: Layers,
+                      onClick: () => setShowCreateChildBlock(true),
+                    },
+                  ]}
+                />
                 <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
                   Edit
-                </HeaderButton>
-                <HeaderButton
-                  onClick={() => setShowResizeBlock(true)}
-                  title="Grow this block to a larger CIDR (e.g. /16 → /15). Shrinking is not supported."
-                >
-                  Resize…
-                </HeaderButton>
-                <HeaderButton
-                  onClick={() => setShowMoveBlock(true)}
-                  title="Move this block (and everything under it) to a different IP space."
-                >
-                  Move…
-                </HeaderButton>
-                <HeaderButton
-                  icon={Layers}
-                  onClick={() => setShowCreateChildBlock(true)}
-                >
-                  Add Block
                 </HeaderButton>
                 <HeaderButton
                   variant="primary"
@@ -12385,6 +12576,7 @@ function BlockDetailView({
                             <span className="inline-flex items-center gap-1.5 font-mono font-semibold text-foreground">
                               <Layers className="h-3.5 w-3.5 flex-shrink-0 text-violet-500" />
                               {b.network}
+                              <RowTypeBadge kind="block" />
                             </span>
                           </td>
                           <td className="px-4 py-2 text-muted-foreground">
@@ -12400,20 +12592,25 @@ function BlockDetailView({
                           <td className="px-4 py-2 text-muted-foreground/40">
                             —
                           </td>
-                          <td className="px-4 py-2 text-muted-foreground/40">
-                            —
+                          <td className="px-4 py-2 tabular-nums text-muted-foreground">
+                            <UsedIps
+                              allocated={b.allocated_ips ?? 0}
+                              total={b.total_ips ?? cidrSize(b.network)}
+                            />
                           </td>
                           <td className="px-4 py-2">
-                            {b.utilization_percent > 0 ? (
-                              <UtilizationBar percent={b.utilization_percent} />
-                            ) : (
-                              <span className="text-muted-foreground/40">
-                                —
-                              </span>
-                            )}
+                            <UtilizationBar
+                              percent={b.utilization_percent}
+                              uncountable={isUncountable(
+                                b.total_ips ?? cidrSize(b.network),
+                              )}
+                            />
                           </td>
                           <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                            {cidrSize(b.network).toLocaleString()}
+                            {subnetSizeLabel(
+                              b.total_ips ?? cidrSize(b.network),
+                              b.network,
+                            )}
                           </td>
                           <td className="px-4 py-2 text-muted-foreground/40">
                             —
@@ -12459,6 +12656,7 @@ function BlockDetailView({
                             <span className="inline-flex items-center gap-1.5 font-mono font-medium">
                               <Network className="h-3.5 w-3.5 flex-shrink-0 text-blue-500" />
                               {s.network}
+                              <RowTypeBadge kind="subnet" />
                             </span>
                           </td>
                           <td className="px-4 py-2 text-muted-foreground">
@@ -13033,21 +13231,25 @@ function SpaceTableView({
               Sync DNS
             </HeaderButton>
             <ExportButton scope={{ space_id: space.id }} label="Export" />
-            <HeaderButton
-              icon={Search}
-              onClick={() => setShowFindFree(true)}
-              title="Find unused CIDRs in this space"
-            >
-              Find Free…
-            </HeaderButton>
+            {/* Structural actions behind a Tools ▾ dropdown — same grammar as
+                the Block + Subnet headers (#465). */}
+            <HeaderMenu
+              items={[
+                {
+                  label: "Find Free…",
+                  icon: Search,
+                  onClick: () => setShowFindFree(true),
+                  title: "Find unused CIDRs in this space",
+                },
+                {
+                  label: "Add block…",
+                  icon: Layers,
+                  onClick: () => setShowCreateBlock(true),
+                },
+              ]}
+            />
             <HeaderButton icon={Pencil} onClick={() => setShowEditSpace(true)}>
               Edit Space
-            </HeaderButton>
-            <HeaderButton
-              icon={Layers}
-              onClick={() => setShowCreateBlock(true)}
-            >
-              Add Block
             </HeaderButton>
             <HeaderButton
               variant="primary"
@@ -13290,6 +13492,7 @@ function SpaceTableView({
                           <span className="inline-flex items-center gap-1.5 font-mono font-semibold text-foreground">
                             <Layers className="h-3.5 w-3.5 flex-shrink-0 text-violet-500" />
                             {b.network}
+                            <RowTypeBadge kind="block" />
                           </span>
                         </td>
                         <td className="px-4 py-2 text-muted-foreground">
@@ -13303,18 +13506,20 @@ function SpaceTableView({
                         <td className="px-4 py-2 text-muted-foreground/40">
                           —
                         </td>
-                        <td className="px-4 py-2 text-muted-foreground/40">
-                          —
+                        <td className="px-4 py-2 tabular-nums text-muted-foreground">
+                          <UsedIps
+                            allocated={b.allocated_ips ?? 0}
+                            total={b.total_ips ?? size}
+                          />
                         </td>
                         <td className="px-4 py-2">
-                          {b.utilization_percent > 0 ? (
-                            <UtilizationBar percent={b.utilization_percent} />
-                          ) : (
-                            <span className="text-muted-foreground/40">—</span>
-                          )}
+                          <UtilizationBar
+                            percent={b.utilization_percent}
+                            uncountable={isUncountable(b.total_ips ?? size)}
+                          />
                         </td>
                         <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                          {size.toLocaleString()}
+                          {subnetSizeLabel(b.total_ips ?? size, b.network)}
                         </td>
                         <td className="px-4 py-2 text-muted-foreground/40">
                           —
@@ -13357,6 +13562,7 @@ function SpaceTableView({
                           <span className="inline-flex items-center gap-1.5 font-mono font-medium">
                             <Network className="h-3.5 w-3.5 flex-shrink-0 text-blue-500" />
                             {s.network}
+                            <RowTypeBadge kind="subnet" />
                           </span>
                         </td>
                         <td className="px-4 py-2 text-muted-foreground">
@@ -13695,6 +13901,7 @@ function SpaceSection({
   onSelectSpace,
   onSelectSubnet,
   onSelectBlock,
+  filter = "",
 }: {
   space: IPSpace;
   selectedSubnetId: string | null;
@@ -13703,11 +13910,24 @@ function SpaceSection({
   onSelectSpace: () => void;
   onSelectSubnet: (subnet: Subnet | null) => void;
   onSelectBlock: (b: IPBlock) => void;
+  // Tree quick-filter — case-insensitive substring over network + name.
+  // When set, non-matching nodes are hidden, ancestors of matches are kept
+  // so the path renders, and the whole space auto-expands.
+  filter?: string;
 }) {
   const [expanded, setExpanded] = useSessionState<boolean>(
     `spatium.ipam.expandedSpace.${space.id}`,
     true,
   );
+  const filterQ = filter.trim().toLowerCase();
+  const filtering = filterQ.length > 0;
+  // A match on the space's own name/description reveals the entire space
+  // (rather than hiding it because no inner block/subnet happened to match).
+  const spaceMatches =
+    filtering &&
+    (space.name.toLowerCase().includes(filterQ) ||
+      (space.description ?? "").toLowerCase().includes(filterQ));
+  const [showAllTop, setShowAllTop] = useState(false);
   const [showCreateSubnet, setShowCreateSubnet] = useState<
     string | true | false
   >(false); // string = default block_id
@@ -13727,14 +13947,79 @@ function SpaceSection({
   const { data: subnets, isLoading } = useQuery({
     queryKey: ["subnets", space.id],
     queryFn: () => ipamApi.listSubnets({ space_id: space.id }),
-    enabled: expanded,
+    enabled: expanded || filtering,
   });
 
   const { data: blocks } = useQuery({
     queryKey: ["blocks", space.id],
     queryFn: () => ipamApi.listBlocks(space.id),
-    enabled: expanded,
+    enabled: expanded || filtering,
   });
+
+  // Apply the quick-filter: keep matching subnets/blocks plus every ancestor
+  // block of a match (so the tree path stays intact). Returns the originals
+  // untouched when no filter is active.
+  const { treeBlocks, treeSubnets, matchCount } = useMemo(() => {
+    const allBlocks = blocks ?? [];
+    const allSubnets = subnets ?? [];
+    // No filter, or the space name itself matched → show the whole space
+    // unfiltered.
+    if (!filtering || spaceMatches) {
+      return {
+        treeBlocks: allBlocks,
+        treeSubnets: allSubnets,
+        matchCount: allBlocks.length + allSubnets.length,
+      };
+    }
+    const hit = (network: string, name?: string | null) =>
+      network.toLowerCase().includes(filterQ) ||
+      (name ?? "").toLowerCase().includes(filterQ);
+    const byId = new Map(allBlocks.map((b) => [b.id, b]));
+    // When a BLOCK matches, reveal its whole subtree (child blocks + their
+    // subnets) so a matched container doesn't render as an empty leaf —
+    // searching for a block means "show me what's in it".
+    const childrenByParent = new Map<string, IPBlock[]>();
+    for (const b of allBlocks) {
+      if (!b.parent_block_id) continue;
+      const arr = childrenByParent.get(b.parent_block_id);
+      if (arr) arr.push(b);
+      else childrenByParent.set(b.parent_block_id, [b]);
+    }
+    const inMatchedSubtree = new Set<string>();
+    const stack = allBlocks
+      .filter((b) => hit(b.network, b.name))
+      .map((b) => b.id);
+    while (stack.length) {
+      const id = stack.pop() as string;
+      if (inMatchedSubtree.has(id)) continue;
+      inMatchedSubtree.add(id);
+      for (const c of childrenByParent.get(id) ?? []) stack.push(c.id);
+    }
+    const keep = new Set<string>(inMatchedSubtree);
+    const addAncestors = (parentId: string | null | undefined) => {
+      let cur = parentId ?? null;
+      while (cur && !keep.has(cur)) {
+        keep.add(cur);
+        cur = byId.get(cur)?.parent_block_id ?? null;
+      }
+    };
+    // A subnet is kept if it matches by text, or it sits inside a matched
+    // block's subtree.
+    const keptSubnets = allSubnets.filter(
+      (s) =>
+        hit(s.network, s.name) ||
+        (s.block_id != null && inMatchedSubtree.has(s.block_id)),
+    );
+    for (const s of keptSubnets) addAncestors(s.block_id);
+    for (const id of inMatchedSubtree)
+      addAncestors(byId.get(id)?.parent_block_id);
+    const keptBlocks = allBlocks.filter((b) => keep.has(b.id));
+    return {
+      treeBlocks: keptBlocks,
+      treeSubnets: keptSubnets,
+      matchCount: keptBlocks.length + keptSubnets.length,
+    };
+  }, [blocks, subnets, filtering, filterQ, spaceMatches]);
 
   const [subnetDeleteError, setSubnetDeleteError] = useState<string | null>(
     null,
@@ -13874,6 +14159,10 @@ function SpaceSection({
 
   // (block_id is now required; all subnets appear under their block)
 
+  // Hide a whole space from the sidebar when a quick-filter is active and
+  // nothing inside it matches — keeps the filtered tree to just the hits.
+  if (filtering && matchCount === 0 && !spaceMatches) return null;
+
   return (
     <div>
       {/* Space header */}
@@ -13935,37 +14224,66 @@ function SpaceSection({
       </ContextMenu>
 
       {/* Tree with vertical connecting line */}
-      {expanded && (
+      {(expanded || filtering) && (
         <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
-          <div className="ml-[9px] pl-2 border-l border-border/40 space-y-0.5">
+          <div
+            role="tree"
+            aria-label={`${space.name} — blocks and subnets`}
+            className="ml-[9px] pl-2 border-l border-border/40 space-y-0.5"
+          >
             {isLoading && (
               <p className="py-1 pl-2 text-xs text-muted-foreground">
                 Loading…
               </p>
             )}
 
-            {/* Block tree (recursive) */}
+            {/* Block tree (recursive) — filtered + force-expanded when a
+                quick-filter is active, and capped to TREE_GROUP_CAP top-level
+                rows with a reveal (never capped while filtering). */}
             {blocks &&
               subnets &&
-              buildBlockTree(blocks, subnets, null).map((node) => (
-                <BlockTreeRow
-                  key={node.block.id}
-                  node={node}
-                  selectedSubnetId={selectedSubnetId}
-                  selectedBlockId={selectedBlockId}
-                  onSelectBlock={onSelectBlock}
-                  onSelectSubnet={onSelectSubnet}
-                  onDeleteSubnet={(s) => setSubnetToDelete(s)}
-                  onDeleteBlock={(b) => setBlockToDelete(b)}
-                  onEditBlock={(b) => setEditBlock(b)}
-                  onCreateSubnet={(blockId) => setShowCreateSubnet(blockId)}
-                  onCreateChildBlock={(parentId) =>
-                    setShowCreateBlock(parentId)
-                  }
-                  onAllocateIp={(s) => onSelectSubnet(s)}
-                  depth={0}
-                />
-              ))}
+              (() => {
+                const top = buildBlockTree(treeBlocks, treeSubnets, null);
+                const capped =
+                  !filtering && !showAllTop && top.length > TREE_GROUP_CAP;
+                const shown = capped ? top.slice(0, TREE_GROUP_CAP) : top;
+                return (
+                  <>
+                    {shown.map((node) => (
+                      <BlockTreeRow
+                        key={node.block.id}
+                        node={node}
+                        forceExpand={filtering && !spaceMatches}
+                        selectedSubnetId={selectedSubnetId}
+                        selectedBlockId={selectedBlockId}
+                        onSelectBlock={onSelectBlock}
+                        onSelectSubnet={onSelectSubnet}
+                        onDeleteSubnet={(s) => setSubnetToDelete(s)}
+                        onDeleteBlock={(b) => setBlockToDelete(b)}
+                        onEditBlock={(b) => setEditBlock(b)}
+                        onCreateSubnet={(blockId) =>
+                          setShowCreateSubnet(blockId)
+                        }
+                        onCreateChildBlock={(parentId) =>
+                          setShowCreateBlock(parentId)
+                        }
+                        onAllocateIp={(s) => onSelectSubnet(s)}
+                        depth={0}
+                      />
+                    ))}
+                    {capped && (
+                      <button
+                        type="button"
+                        onClick={() => setShowAllTop(true)}
+                        className="w-full rounded px-2 py-1 text-left text-xs text-primary hover:bg-muted/40"
+                      >
+                        Show {(top.length - TREE_GROUP_CAP).toLocaleString()}{" "}
+                        more…
+                      </button>
+                    )}
+                  </>
+                );
+              })()}
 
             {!isLoading && !subnets?.length && !blocks?.length && (
               <p className="py-1 pl-2 text-xs text-muted-foreground">
@@ -14084,6 +14402,70 @@ function getBlockAncestors(block: IPBlock, allBlocks: IPBlock[]): IPBlock[] {
   return ancestors;
 }
 
+// Opt-in glossary for the IPAM visual vocabulary (progressive disclosure,
+// #465). Hidden by default — toggled by the Help button so the dense view
+// stays uncluttered for experts while newcomers can decode the icons.
+function IpamHelpLegend() {
+  const seen: Array<[string, string]> = [
+    ["alive", "bg-emerald-500"],
+    ["stale", "bg-amber-500"],
+    ["cold", "bg-rose-500"],
+    ["never", "bg-zinc-300 dark:bg-zinc-600"],
+  ];
+  return (
+    <div className="border-b bg-muted/20 px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
+      <p className="mb-1.5 font-semibold text-foreground">
+        What the icons mean
+      </p>
+      <ul className="space-y-1.5">
+        <li className="flex items-center gap-1.5">
+          <Layers className="h-3 w-3 flex-shrink-0 text-violet-500" />
+          <span>
+            <span className="font-medium text-foreground">Block</span> — a
+            container that holds child blocks / subnets
+          </span>
+        </li>
+        <li className="flex items-center gap-1.5">
+          <Network className="h-3 w-3 flex-shrink-0 text-blue-500" />
+          <span>
+            <span className="font-medium text-foreground">Subnet</span> — holds
+            individual IP addresses
+          </span>
+        </li>
+        <li className="flex items-center gap-1.5">
+          <StatusTag status="allocated" />
+          <span>
+            Status — the IP's lifecycle (icon + colour, never colour alone)
+          </span>
+        </li>
+        <li className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span className="font-medium text-foreground">Seen</span>
+          <span>on the wire (separate from status):</span>
+          {seen.map(([label, cls]) => (
+            <span key={label} className="inline-flex items-center gap-1">
+              <span className={cn("h-2 w-2 rounded-full", cls)} />
+              {label}
+            </span>
+          ))}
+        </li>
+        <li className="flex items-center gap-1.5">
+          <span className="inline-block h-2 w-2 flex-shrink-0 rounded-full bg-green-500" />
+          <span>
+            Utilization — green &lt;80%, amber 80–95%, red ≥95% (an em-dash
+            means an IPv6 prefix too large to count)
+          </span>
+        </li>
+        <li className="flex items-center gap-1.5">
+          <span className="flex-shrink-0 rounded border border-dashed border-emerald-500/60 px-1 text-emerald-600 dark:text-emerald-400">
+            free
+          </span>
+          <span>Dashed gap row — unused addresses; click it to allocate</span>
+        </li>
+      </ul>
+    </div>
+  );
+}
+
 // ─── Main IPAM Page ───────────────────────────────────────────────────────────
 
 export function IPAMPage() {
@@ -14093,6 +14475,15 @@ export function IPAMPage() {
   const [selectedBlock, setSelectedBlock] = useState<IPBlock | null>(null);
   const [showCreateSpace, setShowCreateSpace] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  // Tree quick-filter (network / name substring across every space).
+  const [treeFilter, setTreeFilter] = useState("");
+  // Progressive disclosure: dense by default, opt-in help layer. When on, a
+  // glossary of the IPAM visual vocabulary appears so newcomers aren't lost
+  // while experts keep the uncluttered default (#465). Sticky per-user.
+  const [helpMode, setHelpMode] = useSessionState<boolean>(
+    "ipam-help-mode",
+    false,
+  );
   const qc = useQueryClient();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -14281,6 +14672,18 @@ export function IPAMPage() {
           <span className="text-sm font-semibold">IP Spaces</span>
           <div className="flex gap-1">
             <button
+              onClick={() => setHelpMode((v) => !v)}
+              className={cn(
+                "rounded p-1 hover:text-foreground",
+                helpMode ? "text-primary" : "text-muted-foreground",
+              )}
+              title={helpMode ? "Hide help" : "Show help — explain the icons"}
+              aria-label="Toggle IPAM help layer"
+              aria-pressed={helpMode}
+            >
+              <HelpCircle className="h-3.5 w-3.5" />
+            </button>
+            <button
               onClick={() => {
                 // Force refetch — bare invalidate only marks queries stale,
                 // which isn't enough when the user pressed Refresh after
@@ -14315,6 +14718,34 @@ export function IPAMPage() {
           </div>
         </div>
 
+        {/* Tree quick-filter — narrows every space's tree to matching
+            blocks / subnets (by CIDR or name) and force-expands the path. */}
+        <div className="border-b px-2 py-1.5">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground/60" />
+            <input
+              value={treeFilter}
+              onChange={(e) => setTreeFilter(e.target.value)}
+              placeholder="Filter tree — CIDR or name…"
+              aria-label="Filter the IP space tree by CIDR or name"
+              className="w-full rounded-md border bg-background py-1 pl-7 pr-7 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+            />
+            {treeFilter && (
+              <button
+                type="button"
+                onClick={() => setTreeFilter("")}
+                aria-label="Clear tree filter"
+                title="Clear filter"
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground/60 hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        {helpMode && <IpamHelpLegend />}
+
         <div className="flex-1 overflow-y-auto p-2 space-y-1">
           {isLoading && (
             <p className="px-2 py-3 text-xs text-muted-foreground">Loading…</p>
@@ -14341,6 +14772,7 @@ export function IPAMPage() {
               onSelectSpace={() => selectSpace(space)}
               onSelectSubnet={selectSubnet}
               onSelectBlock={selectBlock}
+              filter={treeFilter}
             />
           ))}
         </div>
