@@ -13921,6 +13921,12 @@ function SpaceSection({
   );
   const filterQ = filter.trim().toLowerCase();
   const filtering = filterQ.length > 0;
+  // A match on the space's own name/description reveals the entire space
+  // (rather than hiding it because no inner block/subnet happened to match).
+  const spaceMatches =
+    filtering &&
+    (space.name.toLowerCase().includes(filterQ) ||
+      (space.description ?? "").toLowerCase().includes(filterQ));
   const [showAllTop, setShowAllTop] = useState(false);
   const [showCreateSubnet, setShowCreateSubnet] = useState<
     string | true | false
@@ -13956,7 +13962,9 @@ function SpaceSection({
   const { treeBlocks, treeSubnets, matchCount } = useMemo(() => {
     const allBlocks = blocks ?? [];
     const allSubnets = subnets ?? [];
-    if (!filtering) {
+    // No filter, or the space name itself matched → show the whole space
+    // unfiltered.
+    if (!filtering || spaceMatches) {
       return {
         treeBlocks: allBlocks,
         treeSubnets: allSubnets,
@@ -14011,7 +14019,7 @@ function SpaceSection({
       treeSubnets: keptSubnets,
       matchCount: keptBlocks.length + keptSubnets.length,
     };
-  }, [blocks, subnets, filtering, filterQ]);
+  }, [blocks, subnets, filtering, filterQ, spaceMatches]);
 
   const [subnetDeleteError, setSubnetDeleteError] = useState<string | null>(
     null,
@@ -14153,7 +14161,7 @@ function SpaceSection({
 
   // Hide a whole space from the sidebar when a quick-filter is active and
   // nothing inside it matches — keeps the filtered tree to just the hits.
-  if (filtering && matchCount === 0) return null;
+  if (filtering && matchCount === 0 && !spaceMatches) return null;
 
   return (
     <div>
@@ -14245,7 +14253,7 @@ function SpaceSection({
                       <BlockTreeRow
                         key={node.block.id}
                         node={node}
-                        forceExpand={filtering}
+                        forceExpand={filtering && !spaceMatches}
                         selectedSubnetId={selectedSubnetId}
                         selectedBlockId={selectedBlockId}
                         onSelectBlock={onSelectBlock}
