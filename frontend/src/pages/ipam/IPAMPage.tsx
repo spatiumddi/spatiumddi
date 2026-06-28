@@ -221,7 +221,25 @@ function isProvenanceKey(k: string): boolean {
   return /^(netbox|import_)/.test(k) || k === "imported_at";
 }
 
-function ImportedChip({ fields }: { fields: Record<string, unknown> }) {
+// Collapsed import-provenance chip with a dismiss (×) that clears the
+// netbox_*/import_* keys from the resource's custom_fields. `fields` is the
+// provenance subset (for the label/tooltip); `keep` is the custom_fields dict
+// WITHOUT the provenance keys (what we PUT back when the operator removes it).
+function ImportedChip({
+  fields,
+  kind,
+  id,
+  keep,
+  onUpdated,
+}: {
+  fields: Record<string, unknown>;
+  kind: "block" | "subnet";
+  id: string;
+  keep: Record<string, unknown>;
+  onUpdated: (updated: IPBlock | Subnet) => void;
+}) {
+  const qc = useQueryClient();
+  const [confirming, setConfirming] = useState(false);
   const fromNetbox =
     Object.keys(fields).some((k) => k.startsWith("netbox")) ||
     String(fields["import_source"] ?? "")
@@ -231,13 +249,53 @@ function ImportedChip({ fields }: { fields: Record<string, unknown> }) {
   const detail = Object.entries(fields)
     .map(([k, v]) => `${k}: ${String(v)}`)
     .join(" · ");
+  const clearMut = useMutation<IPBlock | Subnet, Error, void>({
+    mutationFn: () =>
+      kind === "block"
+        ? ipamApi.updateBlock(id, { custom_fields: keep })
+        : ipamApi.updateSubnet(id, { custom_fields: keep }),
+    onSuccess: (updated) => {
+      // Update the displayed detail object immediately. The chip renders
+      // from the detail view's local copy of the block/subnet, which query
+      // invalidation alone does not refresh — without this the chip only
+      // disappeared after a full page reload.
+      onUpdated(updated);
+      qc.invalidateQueries({ queryKey: ["blocks"] });
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      setConfirming(false);
+    },
+  });
   return (
-    <span
-      className="inline-flex items-center gap-1 rounded bg-sky-100 px-1.5 py-0.5 text-[11px] font-medium text-sky-700 dark:bg-sky-900/30 dark:text-sky-400"
-      title={detail}
-    >
-      {label}
-    </span>
+    <>
+      <span
+        className="inline-flex items-center gap-1 rounded bg-sky-100 px-1.5 py-0.5 text-[11px] font-medium text-sky-700 dark:bg-sky-900/30 dark:text-sky-400"
+        title={detail}
+      >
+        {label}
+        <button
+          type="button"
+          onClick={() => setConfirming(true)}
+          aria-label={`Remove import metadata from this ${kind}`}
+          title="Remove import metadata"
+          className="ml-0.5 rounded px-0.5 leading-none text-sky-700/60 hover:bg-sky-200 hover:text-sky-900 dark:text-sky-400/60 dark:hover:bg-sky-800/60"
+        >
+          ×
+        </button>
+      </span>
+      <ConfirmModal
+        open={confirming}
+        title="Remove import metadata?"
+        confirmLabel="Remove"
+        loading={clearMut.isPending}
+        message={`This clears the import-provenance fields (${Object.keys(
+          fields,
+        ).join(
+          ", ",
+        )}) from this ${kind}, so the "${label}" chip disappears. The ${kind} itself and its other fields are unchanged.`}
+        onConfirm={() => clearMut.mutate()}
+        onClose={() => setConfirming(false)}
+      />
+    </>
   );
 }
 
@@ -4786,7 +4844,13 @@ function SubnetDetail({
                 {Object.keys(prov).length > 0 && (
                   <div className="flex items-center gap-1.5">
                     <span className="text-xs text-muted-foreground">Source</span>
-                    <ImportedChip fields={prov} />
+                    <ImportedChip
+                      fields={prov}
+                      kind="subnet"
+                      id={subnet.id}
+                      keep={Object.fromEntries(rest)}
+                      onUpdated={(u) => onSubnetEdited(u as Subnet)}
+                    />
                   </div>
                 )}
                 {rest.map(([k, v]) => (
@@ -11534,7 +11598,15 @@ function BlockDetailView({
             const rest = Object.entries(all).filter(([k]) => !isProvenanceKey(k));
             return (
               <div className="flex flex-wrap items-center gap-x-6 gap-y-1 border-t bg-muted/20 px-6 py-2">
-                {Object.keys(prov).length > 0 && <ImportedChip fields={prov} />}
+                {Object.keys(prov).length > 0 && (
+                  <ImportedChip
+                    fields={prov}
+                    kind="block"
+                    id={block.id}
+                    keep={Object.fromEntries(rest)}
+                    onUpdated={(u) => setBlock(u as IPBlock)}
+                  />
+                )}
                 {rest.map(([k, v]) => (
                   <div key={k} className="flex items-center gap-1.5">
                     <span className="text-xs text-muted-foreground">{k}</span>
