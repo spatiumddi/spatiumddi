@@ -2430,6 +2430,7 @@ function RecordModal({
   // SRV carries priority + weight + port (RFC 2782); MX carries only a
   // priority (the preference). Everything else carries none. (#424)
   const isSrv = type === "SRV";
+  const isAddress = type === "A" || type === "AAAA";
   const usesPriority = type === "MX" || isSrv;
 
   const mut = useMutation({
@@ -2568,6 +2569,14 @@ function RecordModal({
             <p className="mt-1 text-[11px] text-muted-foreground">
               Value is the <strong>target host</strong> only — set priority,
               weight, and port in the fields below.
+            </p>
+          )}
+          {isAddress && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              One IP per record. To point this name at several IPs, add{" "}
+              <strong>one {type} record per address</strong> — they render as
+              separate lines (RFC 1035 round-robin). For health-checked
+              failover, use a <strong>DNS Pool</strong> (Pools tab) instead.
             </p>
           )}
         </Field>
