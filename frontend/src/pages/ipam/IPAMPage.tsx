@@ -380,6 +380,7 @@ function CopyButton({ text }: { text: string }) {
     <button
       onClick={handleCopy}
       title="Copy to clipboard"
+      aria-label={`Copy ${text} to clipboard`}
       className="ml-1 rounded p-0.5 text-muted-foreground/0 hover:text-muted-foreground group-hover/addr:text-muted-foreground/60 hover:!text-foreground transition-colors"
     >
       {copied ? (
@@ -5577,14 +5578,16 @@ function SubnetDetail({
                                     <button
                                       onClick={() => setEditingAddress(addr)}
                                       className="rounded p-1 text-muted-foreground hover:text-foreground"
-                                      title="Edit"
+                                      title={`Edit ${addr.address}`}
+                                      aria-label={`Edit ${addr.address}`}
                                     >
                                       <Pencil className="h-3.5 w-3.5" />
                                     </button>
                                     <button
                                       onClick={() => setConfirmDeleteAddr(addr)}
                                       className="rounded p-1 text-muted-foreground hover:text-destructive"
-                                      title="Delete"
+                                      title={`Delete ${addr.address}`}
+                                      aria-label={`Delete ${addr.address}`}
                                     >
                                       <Trash2 className="h-3.5 w-3.5" />
                                     </button>
@@ -13895,6 +13898,7 @@ export function IPAMPage() {
               }}
               className="rounded p-1 text-muted-foreground hover:text-foreground"
               title="Refresh"
+              aria-label="Refresh IP spaces"
             >
               <RefreshCw className="h-3.5 w-3.5" />
             </button>
@@ -13903,6 +13907,7 @@ export function IPAMPage() {
               disabled={!spaces || spaces.length === 0}
               className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
               title="Import subnets"
+              aria-label="Import subnets"
             >
               <Upload className="h-3.5 w-3.5" />
             </button>
@@ -13910,6 +13915,7 @@ export function IPAMPage() {
               onClick={() => setShowCreateSpace(true)}
               className="rounded p-1 text-muted-foreground hover:text-foreground"
               title="New IP Space"
+              aria-label="New IP Space"
             >
               <Plus className="h-3.5 w-3.5" />
             </button>
