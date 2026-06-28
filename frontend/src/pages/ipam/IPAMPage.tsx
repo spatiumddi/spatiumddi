@@ -9769,6 +9769,9 @@ function SubnetRow({
           {...attributes}
           {...listeners}
           onClick={onSelect}
+          role="treeitem"
+          aria-label={subnet.network}
+          aria-selected={isSelected}
           className={cn(
             "group flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1.5 text-sm",
             isSelected
@@ -11257,7 +11260,12 @@ function BlockTreeRow({
   };
 
   return (
-    <div>
+    <div
+      role="treeitem"
+      aria-label={node.block.network}
+      aria-selected={isSelected}
+      aria-expanded={hasContent ? expanded : undefined}
+    >
       {/* Block header row */}
       <ContextMenu>
         <ContextMenuTrigger asChild>
@@ -11281,6 +11289,11 @@ function BlockTreeRow({
                 }}
                 className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm border border-border bg-background text-[10px] font-bold text-muted-foreground hover:border-primary hover:text-primary"
                 title={expanded ? "Collapse" : "Expand"}
+                aria-label={
+                  expanded
+                    ? `Collapse ${node.block.network}`
+                    : `Expand ${node.block.network}`
+                }
               >
                 {expanded ? "−" : "+"}
               </button>
@@ -11349,7 +11362,10 @@ function BlockTreeRow({
           with subnets inside it lands alongside its IP-adjacent peers
           rather than being bucketed to the top or bottom. */}
       {expanded && hasContent && (
-        <div className="ml-[9px] pl-3 border-l border-border/40 space-y-0.5">
+        <div
+          role="group"
+          className="ml-[9px] pl-3 border-l border-border/40 space-y-0.5"
+        >
           {sortedTreeItems(node).map((item) =>
             item.kind === "block" ? (
               <BlockTreeRow
@@ -13932,7 +13948,11 @@ function SpaceSection({
       {/* Tree with vertical connecting line */}
       {expanded && (
         <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
-          <div className="ml-[9px] pl-2 border-l border-border/40 space-y-0.5">
+          <div
+            role="tree"
+            aria-label={`${space.name} — blocks and subnets`}
+            className="ml-[9px] pl-2 border-l border-border/40 space-y-0.5"
+          >
             {isLoading && (
               <p className="py-1 pl-2 text-xs text-muted-foreground">
                 Loading…
