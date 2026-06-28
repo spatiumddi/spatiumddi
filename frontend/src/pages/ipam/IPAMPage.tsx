@@ -30,6 +30,7 @@ import {
   Radar,
   Wrench,
   Sparkles,
+  type LucideIcon,
   Scissors,
   GitMerge,
   Maximize2,
@@ -4085,6 +4086,71 @@ function ToolsMenu({
               this…
             </button>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Generic header overflow menu — gives the Block / Space headers the same
+// "secondary actions live behind a Tools ▾ dropdown" grammar the Subnet header
+// uses, instead of a flat row of buttons (#465 level-invariant toolbar). Items
+// with no handler are skipped so call sites can conditionally include entries.
+function HeaderMenu({
+  label = "Tools",
+  items,
+}: {
+  label?: string;
+  items: Array<{
+    label: string;
+    icon?: LucideIcon;
+    onClick?: () => void;
+    title?: string;
+  } | null>;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const real = items.filter(
+    (i): i is { label: string; icon?: LucideIcon; onClick: () => void; title?: string } =>
+      !!i && !!i.onClick,
+  );
+  useEffect(() => {
+    if (!open) return;
+    const onDocMouseDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocMouseDown);
+    return () => document.removeEventListener("mousedown", onDocMouseDown);
+  }, [open]);
+  if (real.length === 0) return null;
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+      >
+        <Wrench className="h-3.5 w-3.5" />
+        {label}
+        <ChevronDown className="h-3.5 w-3.5" />
+      </button>
+      {open && (
+        <div className="absolute right-0 z-20 mt-1 w-52 overflow-hidden rounded-md border bg-popover shadow-md">
+          {real.map((it) => (
+            <button
+              key={it.label}
+              type="button"
+              title={it.title}
+              onClick={() => {
+                setOpen(false);
+                it.onClick();
+              }}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted"
+            >
+              {it.icon && <it.icon className="h-3.5 w-3.5" />}
+              {it.label}
+            </button>
+          ))}
         </div>
       )}
     </div>
@@ -11778,40 +11844,46 @@ function BlockDetailView({
                   Sync DNS
                 </HeaderButton>
                 <ExportButton scope={{ block_id: block.id }} label="Export" />
-                {space && (
-                  <HeaderButton
-                    icon={Search}
-                    onClick={() => setShowFindFree(true)}
-                    title="Find unused CIDRs in this block"
-                  >
-                    Find Free…
-                  </HeaderButton>
-                )}
                 <ServicesUsingButton
                   kind="ip_block"
                   resourceId={block.id}
                   label={block.network}
                 />
+                {/* Structural / less-frequent actions grouped behind a Tools ▾
+                    dropdown, mirroring the Subnet header's grammar instead of a
+                    flat button row (#465). */}
+                <HeaderMenu
+                  items={[
+                    space
+                      ? {
+                          label: "Find Free…",
+                          icon: Search,
+                          onClick: () => setShowFindFree(true),
+                          title: "Find unused CIDRs in this block",
+                        }
+                      : null,
+                    {
+                      label: "Resize…",
+                      icon: Maximize2,
+                      onClick: () => setShowResizeBlock(true),
+                      title:
+                        "Grow this block to a larger CIDR (e.g. /16 → /15). Shrinking is not supported.",
+                    },
+                    {
+                      label: "Move…",
+                      onClick: () => setShowMoveBlock(true),
+                      title:
+                        "Move this block (and everything under it) to a different IP space.",
+                    },
+                    {
+                      label: "Add child block…",
+                      icon: Layers,
+                      onClick: () => setShowCreateChildBlock(true),
+                    },
+                  ]}
+                />
                 <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
                   Edit
-                </HeaderButton>
-                <HeaderButton
-                  onClick={() => setShowResizeBlock(true)}
-                  title="Grow this block to a larger CIDR (e.g. /16 → /15). Shrinking is not supported."
-                >
-                  Resize…
-                </HeaderButton>
-                <HeaderButton
-                  onClick={() => setShowMoveBlock(true)}
-                  title="Move this block (and everything under it) to a different IP space."
-                >
-                  Move…
-                </HeaderButton>
-                <HeaderButton
-                  icon={Layers}
-                  onClick={() => setShowCreateChildBlock(true)}
-                >
-                  Add Block
                 </HeaderButton>
                 <HeaderButton
                   variant="primary"
@@ -13151,21 +13223,25 @@ function SpaceTableView({
               Sync DNS
             </HeaderButton>
             <ExportButton scope={{ space_id: space.id }} label="Export" />
-            <HeaderButton
-              icon={Search}
-              onClick={() => setShowFindFree(true)}
-              title="Find unused CIDRs in this space"
-            >
-              Find Free…
-            </HeaderButton>
+            {/* Structural actions behind a Tools ▾ dropdown — same grammar as
+                the Block + Subnet headers (#465). */}
+            <HeaderMenu
+              items={[
+                {
+                  label: "Find Free…",
+                  icon: Search,
+                  onClick: () => setShowFindFree(true),
+                  title: "Find unused CIDRs in this space",
+                },
+                {
+                  label: "Add block…",
+                  icon: Layers,
+                  onClick: () => setShowCreateBlock(true),
+                },
+              ]}
+            />
             <HeaderButton icon={Pencil} onClick={() => setShowEditSpace(true)}>
               Edit Space
-            </HeaderButton>
-            <HeaderButton
-              icon={Layers}
-              onClick={() => setShowCreateBlock(true)}
-            >
-              Add Block
             </HeaderButton>
             <HeaderButton
               variant="primary"
