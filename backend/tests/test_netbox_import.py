@@ -517,7 +517,7 @@ async def test_commit_prefix_vlan_link(
 
     # The synthetic router exists and holds the deduped VLANs.
     router = (
-        await db_session.execute(select(Router).where(Router.name == "NetBox import"))
+        await db_session.execute(select(Router).where(Router.name == "Imported VLANs (NetBox)"))
     ).scalar_one()
     vlan_100 = (
         await db_session.execute(
@@ -551,7 +551,7 @@ async def test_commit_vlan_clash_skipped_not_500(
     assert result.total_failed == 0, [e.error for e in result.entities if e.error]
 
     router = (
-        await db_session.execute(select(Router).where(Router.name == "NetBox import"))
+        await db_session.execute(select(Router).where(Router.name == "Imported VLANs (NetBox)"))
     ).scalar_one()
     vlans = (
         (await db_session.execute(select(VLAN).where(VLAN.router_id == router.id))).scalars().all()

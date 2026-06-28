@@ -989,13 +989,31 @@ async def _commit_vlan(
     )
 
 
+# Default name(s) the synthetic VLAN router shipped under before
+# ``default_router_name`` was renamed. A re-import must reuse an existing
+# router created under any of these rather than spawn a duplicate.
+_LEGACY_ROUTER_NAMES: tuple[str, ...] = ("NetBox import",)
+
+
 async def _ensure_router(db: AsyncSession, name: str) -> Router:
-    """Find-or-create the synthetic router VLANs hang off (UNIQUE name)."""
-    existing = (
-        (await db.execute(select(Router).where(Router.name == name).limit(1))).scalars().first()
-    )
-    if existing is not None:
-        return existing
+    """Find-or-create the synthetic router VLANs hang off (UNIQUE name).
+
+    Matches the requested ``name`` first, then any legacy alias, so renaming
+    the default no longer orphans a router an earlier import already created
+    (and leaves the imported VLANs hanging off a duplicate).
+    """
+    seen: set[str] = set()
+    for candidate in (name, *_LEGACY_ROUTER_NAMES):
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        existing = (
+            (await db.execute(select(Router).where(Router.name == candidate).limit(1)))
+            .scalars()
+            .first()
+        )
+        if existing is not None:
+            return existing
     row = Router(name=name, description="Synthetic router for NetBox-imported VLANs")
     db.add(row)
     await db.flush()
@@ -1435,7 +1453,7 @@ async def commit_import(
     conflict_actions: dict[str, ConflictAction],
     space_strategy: str = "per_vrf",
     target_space_id: uuid.UUID | None = None,
-    default_router_name: str = "NetBox import",
+    default_router_name: str = "Imported VLANs (NetBox)",
     actor: User,
 ) -> CommitResult:
     """Apply ``preview`` to the DB, one entity per savepoint.

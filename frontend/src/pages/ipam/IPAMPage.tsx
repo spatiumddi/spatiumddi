@@ -214,7 +214,197 @@ function RoleBadge({ role }: { role: string }) {
   );
 }
 
-function UtilizationBar({ percent }: { percent: number }) {
+// Import-provenance custom-field keys (stamped by the NetBox / cloud importers
+// — the canonical list is backend/app/services/netbox_import/mapping.py). We
+// collapse exactly these into a single "Imported from …" chip instead of
+// leaking raw key/value pairs into the UI.
+//
+// This is a precise allowlist on purpose. A broad `^netbox`/`^import` prefix
+// would also swallow — and, on chip-dismiss, permanently delete — a
+// NetBox-origin custom field an operator deliberately named e.g. `netbox_url`
+// or `import_notes`: `_merge_custom_fields` copies NetBox's own custom fields
+// in verbatim, so they sit alongside the keys we stamp. New importers add
+// their keys here.
+const PROVENANCE_KEYS = new Set<string>([
+  "netbox_id",
+  "netbox_slug",
+  "netbox_role",
+  "netbox_rir",
+  "netbox_is_pool",
+  "netbox_vlan_id",
+  "netbox_managed_by",
+  "netbox_enforce_unique",
+  "netbox_tenant_group",
+  "import_source",
+  "imported_at",
+]);
+function isProvenanceKey(k: string): boolean {
+  return PROVENANCE_KEYS.has(k);
+}
+
+// Split a custom_fields dict into its import-provenance subset (`prov`) and the
+// rest (`keep`). Both the subnet- and block-detail headers use this — one pass
+// instead of the two inline filters each previously ran.
+function splitProvenance(
+  customFields: Record<string, unknown> | null | undefined,
+): { prov: Record<string, unknown>; keep: Record<string, unknown> } {
+  const prov: Record<string, unknown> = {};
+  const keep: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(customFields ?? {})) {
+    (isProvenanceKey(k) ? prov : keep)[k] = v;
+  }
+  return { prov, keep };
+}
+
+// Collapsed import-provenance chip with a dismiss (×) that clears the
+// netbox_*/import_* keys from the resource's custom_fields. `fields` is the
+// provenance subset (for the label/tooltip); `keep` is the custom_fields dict
+// WITHOUT the provenance keys (what we PUT back when the operator removes it).
+function ImportedChip({
+  fields,
+  kind,
+  id,
+  keep,
+  onUpdated,
+}: {
+  fields: Record<string, unknown>;
+  kind: "block" | "subnet";
+  id: string;
+  keep: Record<string, unknown>;
+  onUpdated: (updated: IPBlock | Subnet) => void;
+}) {
+  const qc = useQueryClient();
+  const [confirming, setConfirming] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const fromNetbox =
+    Object.keys(fields).some((k) => k.startsWith("netbox")) ||
+    String(fields["import_source"] ?? "")
+      .toLowerCase()
+      .includes("netbox");
+  const label = fromNetbox ? "Imported from NetBox" : "Imported";
+  const detail = Object.entries(fields)
+    .map(([k, v]) => `${k}: ${String(v)}`)
+    .join(" · ");
+  const clearMut = useMutation<IPBlock | Subnet, Error, void>({
+    mutationFn: () =>
+      kind === "block"
+        ? ipamApi.updateBlock(id, { custom_fields: keep })
+        : ipamApi.updateSubnet(id, { custom_fields: keep }),
+    onSuccess: (updated) => {
+      // Update the displayed detail object immediately. The chip renders
+      // from the detail view's local copy of the block/subnet, which query
+      // invalidation alone does not refresh — without this the chip only
+      // disappeared after a full page reload.
+      onUpdated(updated);
+      qc.invalidateQueries({ queryKey: ["blocks"] });
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      setErr(null);
+      setConfirming(false);
+    },
+    // Surface a failed clear (403 RBAC / 422) in the modal instead of
+    // silently leaving the Remove button re-enabled with no feedback.
+    onError: (e) => setErr(formatApiError(e)),
+  });
+  return (
+    <>
+      <span
+        className="inline-flex items-center gap-1 rounded bg-sky-100 px-1.5 py-0.5 text-[11px] font-medium text-sky-700 dark:bg-sky-900/30 dark:text-sky-400"
+        title={detail}
+      >
+        {label}
+        <button
+          type="button"
+          onClick={() => {
+            setErr(null);
+            setConfirming(true);
+          }}
+          aria-label={`Remove import metadata from this ${kind}`}
+          title="Remove import metadata"
+          className="ml-0.5 rounded px-0.5 leading-none text-sky-700/60 hover:bg-sky-200 hover:text-sky-900 dark:text-sky-400/60 dark:hover:bg-sky-800/60"
+        >
+          ×
+        </button>
+      </span>
+      <ConfirmModal
+        open={confirming}
+        title="Remove import metadata?"
+        confirmLabel="Remove"
+        loading={clearMut.isPending}
+        message={
+          <>
+            {`This clears the import-provenance fields (${Object.keys(
+              fields,
+            ).join(
+              ", ",
+            )}) from this ${kind}, so the "${label}" chip disappears. The ${kind} itself and its other fields are unchanged.`}
+            {err && <span className="mt-2 block text-destructive">{err}</span>}
+          </>
+        }
+        onConfirm={() => clearMut.mutate()}
+        onClose={() => setConfirming(false)}
+      />
+    </>
+  );
+}
+
+const COUNTABLE_MAX = Number.MAX_SAFE_INTEGER;
+
+// IPv6 subnets (a /64 is 2^64 addresses) overflow the BIGINT total_ips column,
+// which the API clamps to ~9.2e18. A raw "N / 9,223,372,036,854,776,000" ratio
+// and a 0% bar are meaningless, so we present such prefixes as uncountable.
+function isUncountable(total: number): boolean {
+  return total > COUNTABLE_MAX;
+}
+
+// Human size for a subnet's address count: exact for countable prefixes,
+// 2^bits power-notation for uncountable IPv6 (falls back gracefully).
+function subnetSizeLabel(total: number, network?: string): string {
+  if (!isUncountable(total)) return total.toLocaleString();
+  if (network && network.includes("/")) {
+    const prefix = Number(network.split("/")[1]);
+    if (Number.isFinite(prefix)) {
+      const bits = (network.includes(":") ? 128 : 32) - prefix;
+      if (bits >= 0) return `2^${bits}`;
+    }
+  }
+  return "huge";
+}
+
+// Allocated / total cell — suppresses the meaningless huge denominator for
+// uncountable IPv6 prefixes.
+function UsedIps({ allocated, total }: { allocated: number; total: number }) {
+  if (isUncountable(total)) {
+    return (
+      <span title="IPv6 address space too large to enumerate">
+        {allocated.toLocaleString()}{" "}
+        <span className="text-muted-foreground">/ ∞</span>
+      </span>
+    );
+  }
+  return (
+    <>
+      {allocated.toLocaleString()} / {total.toLocaleString()}
+    </>
+  );
+}
+
+function UtilizationBar({
+  percent,
+  uncountable = false,
+}: {
+  percent: number;
+  uncountable?: boolean;
+}) {
+  if (uncountable) {
+    return (
+      <span
+        className="text-xs text-muted-foreground"
+        title="Utilization is not meaningful for an IPv6 subnet this large"
+      >
+        —
+      </span>
+    );
+  }
   const color =
     percent >= 95
       ? "bg-red-500"
@@ -236,18 +426,164 @@ function UtilizationBar({ percent }: { percent: number }) {
   );
 }
 
-function UtilizationDot({ percent }: { percent: number }) {
+function UtilizationDot({
+  percent,
+  uncountable = false,
+}: {
+  percent: number;
+  uncountable?: boolean;
+}) {
+  if (uncountable) {
+    // Parity with UtilizationBar — a clamped IPv6 subnet computes ≈0%, so a
+    // green dot would falsely read "empty". Render a neutral dot instead.
+    const tip = "Utilization is not meaningful for an IPv6 subnet this large";
+    return (
+      <span
+        title={tip}
+        aria-label={tip}
+        className="inline-block h-2 w-2 flex-shrink-0 rounded-full bg-muted-foreground/30"
+      />
+    );
+  }
   const color =
     percent >= 95
       ? "bg-red-500"
       : percent >= 80
         ? "bg-amber-400"
         : "bg-green-500";
+  const tip = `${percent.toFixed(0)}% utilized`;
   return (
     <span
-      title={`${percent.toFixed(0)}% utilized`}
+      title={tip}
+      aria-label={tip}
       className={cn("inline-block h-2 w-2 flex-shrink-0 rounded-full", color)}
     />
+  );
+}
+
+// Synthesized wrapper blocks are named "auto:<cidr>" by the importers, which
+// just duplicates the Network column. Render a compact "auto" badge instead of
+// the redundant string; realBlockName() strips it for plain-text label sites.
+function realBlockName(name?: string | null): string {
+  return name && !name.startsWith("auto:") ? name : "";
+}
+
+// "network (name)" when the block carries a real (non-auto) name, else just the
+// network. Used by the breadcrumb + DNS-sync scope label so realBlockName isn't
+// evaluated twice per label.
+function blockLabel(network: string, name?: string | null): string {
+  const n = realBlockName(name);
+  return n ? `${network} (${n})` : network;
+}
+
+function BlockNameTag({
+  name,
+  className,
+}: {
+  name?: string | null;
+  className?: string;
+}) {
+  if (!name) return null;
+  if (name.startsWith("auto:")) {
+    return (
+      <span
+        title="Auto-created wrapper block (name derived from its CIDR)"
+        className="inline-flex items-center rounded bg-muted px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide text-muted-foreground/70"
+      >
+        auto
+      </span>
+    );
+  }
+  return <span className={className}>{name}</span>;
+}
+
+// Double-click-to-edit cell for the IP table. Swallows single clicks so it
+// doesn't trigger the row's open-detail handler; Enter/blur commit, Escape
+// cancels. `display` is what shows when not editing; `value` seeds the input.
+// One shared timer for click-vs-double-click discrimination on inline-editable
+// cells. A single click opens the row detail (consistent with the rest of the
+// row), a double-click edits — but a double-click fires `click` twice then
+// `dblclick`, so we defer the single-click action briefly and cancel it when a
+// double-click lands. User interaction is serial, so one module-level timer is
+// safe and keeps these cells hook-free for the discrimination logic.
+let _inlineClickTimer: ReturnType<typeof setTimeout> | null = null;
+function deferRowActivate(fn: () => void) {
+  if (_inlineClickTimer) clearTimeout(_inlineClickTimer);
+  _inlineClickTimer = setTimeout(() => {
+    _inlineClickTimer = null;
+    fn();
+  }, 220);
+}
+function cancelRowActivate() {
+  if (_inlineClickTimer) {
+    clearTimeout(_inlineClickTimer);
+    _inlineClickTimer = null;
+  }
+}
+
+function InlineEditableText({
+  value,
+  placeholder,
+  display,
+  onSave,
+  onActivate,
+  disabled = false,
+}: {
+  value: string;
+  placeholder: string;
+  display: React.ReactNode;
+  onSave: (next: string) => void;
+  onActivate?: () => void;
+  disabled?: boolean;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value);
+  if (disabled) return <>{display}</>;
+  if (editing) {
+    const commit = () => {
+      setEditing(false);
+      if (draft.trim() !== value.trim()) onSave(draft);
+    };
+    return (
+      <input
+        autoFocus
+        value={draft}
+        placeholder={placeholder}
+        aria-label={placeholder}
+        onChange={(e) => setDraft(e.target.value)}
+        onClick={(e) => e.stopPropagation()}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commit();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            setDraft(value);
+            setEditing(false);
+          }
+        }}
+        className="w-full min-w-[6rem] rounded border bg-background px-1 py-0.5 text-xs"
+      />
+    );
+  }
+  return (
+    <span
+      onClick={(e) => {
+        e.stopPropagation();
+        if (onActivate) deferRowActivate(onActivate);
+      }}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        cancelRowActivate();
+        setDraft(value);
+        setEditing(true);
+      }}
+      title="Click to open · double-click to edit"
+      className="cursor-text"
+    >
+      {display}
+    </span>
   );
 }
 
@@ -266,6 +602,7 @@ function CopyButton({ text }: { text: string }) {
     <button
       onClick={handleCopy}
       title="Copy to clipboard"
+      aria-label={`Copy ${text} to clipboard`}
       className="ml-1 rounded p-0.5 text-muted-foreground/0 hover:text-muted-foreground group-hover/addr:text-muted-foreground/60 hover:!text-foreground transition-colors"
     >
       {copied ? (
@@ -1640,6 +1977,7 @@ function AdditionalZonesPicker({
           value={filter}
           onChange={(e) => onFilter(e.target.value)}
           placeholder="Filter…"
+          aria-label="Filter"
           disabled={disabled}
           className="w-full rounded-t-md border border-b-0 bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50"
         />
@@ -2478,6 +2816,74 @@ const IP_STATUS_OPTIONS = [
   "static_dhcp",
   "deprecated",
 ] as const;
+
+// Double-click-to-change status badge on the IP table (sibling of
+// InlineEditableText). Swallows single clicks so it doesn't open the row
+// detail; commit on select, Escape/blur cancels. Disabled on read-only rows.
+function InlineStatusSelect({
+  status,
+  disabled = false,
+  onSave,
+  onActivate,
+}: {
+  status: string;
+  disabled?: boolean;
+  onSave: (next: string) => void;
+  onActivate?: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  if (disabled) return <StatusBadge status={status} />;
+  if (editing) {
+    const known = (IP_STATUS_OPTIONS as readonly string[]).includes(status);
+    const opts = known
+      ? (IP_STATUS_OPTIONS as readonly string[])
+      : [status, ...IP_STATUS_OPTIONS];
+    return (
+      <select
+        autoFocus
+        value={status}
+        aria-label="Status"
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => {
+          const v = e.target.value;
+          setEditing(false);
+          if (v && v !== status) onSave(v);
+        }}
+        onBlur={() => setEditing(false)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            setEditing(false);
+          }
+        }}
+        className="rounded border bg-background px-1 py-0.5 text-xs"
+      >
+        {opts.map((s) => (
+          <option key={s} value={s}>
+            {s}
+          </option>
+        ))}
+      </select>
+    );
+  }
+  return (
+    <span
+      onClick={(e) => {
+        e.stopPropagation();
+        if (onActivate) deferRowActivate(onActivate);
+      }}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        cancelRowActivate();
+        setEditing(true);
+      }}
+      title="Click to open · double-click to change status"
+      className="cursor-pointer"
+    >
+      <StatusBadge status={status} />
+    </span>
+  );
+}
 
 // IP allocate/edit/delete cascades into DNS via ``_sync_dns_record``
 // (auto A + PTR) and can land a DHCP static when ``status='static_dhcp'``.
@@ -3940,6 +4346,34 @@ function SubnetDetail({
   const [viewingAddress, setViewingAddress] = useState<IPAddress | null>(null);
   const [scanFromDetail, setScanFromDetail] = useState<IPAddress | null>(null);
   const [showFilters, setShowFilters] = useState(false);
+  // Per-user sticky toggle to hide the protocol-padding rows (network /
+  // broadcast) that auto-pad every subnet table. Operator-set "reserved"
+  // allocations stay visible — they are real entries, not padding.
+  const [hideReserved, setHideReserved] = useSessionState<boolean>(
+    "ipam-hide-reserved",
+    false,
+  );
+  // Rows the "Hide network/broadcast" toggle removes. Defined once so the
+  // Select-all `selectable` set can exclude exactly what the table hides —
+  // otherwise Select-all would pick hidden rows and a bulk delete/edit would
+  // hit addresses the operator can't see (#465 review).
+  const isPaddingRow = (a: { status: string }) =>
+    a.status === "network" || a.status === "broadcast";
+  // Surfaced banner for a rejected inline edit (collision 409 / static_dhcp
+  // needs-MAC 422 / DHCP-lease 409 / RBAC 403) — without it the cell silently
+  // reverts on refetch and the operator thinks the edit saved.
+  const [inlineEditError, setInlineEditError] = useState<string | null>(null);
+  // Inline (double-click) edits of hostname / description / status on the IP
+  // table.
+  const inlineEditMut = useMutation({
+    mutationFn: ({ id, data }: { id: string; data: Partial<IPAddress> }) =>
+      ipamApi.updateAddress(id, data),
+    onSuccess: () => {
+      setInlineEditError(null);
+      qc.invalidateQueries({ queryKey: ["addresses"] });
+    },
+    onError: (e) => setInlineEditError(formatApiError(e)),
+  });
   const [activeSubnetTab, setActiveSubnetTab] = useState<
     "addresses" | "dhcp" | "aliases" | "nat" | "trend" | "address-sets"
   >("addresses");
@@ -4252,6 +4686,8 @@ function SubnetDetail({
         rows.push({ kind: "pool-boundary", pool: p, boundary: "end" });
       }
     }
+    if (hideReserved)
+      return rows.filter((r) => r.kind !== "ip" || !isPaddingRow(r.addr));
     return rows;
   })();
 
@@ -4500,24 +4936,53 @@ function SubnetDetail({
           )}
           <div className="flex items-center gap-1.5">
             <span className="text-xs text-muted-foreground">Total IPs</span>
-            <span className="text-xs font-medium">{subnet.total_ips}</span>
+            <span className="text-xs font-medium">
+              {subnetSizeLabel(subnet.total_ips, subnet.network)}
+            </span>
           </div>
           <div className="flex items-center gap-1.5">
             <span className="text-xs text-muted-foreground">Allocated</span>
             <span className="text-xs font-medium">
-              {subnet.allocated_ips} / {subnet.total_ips}
+              <UsedIps
+                allocated={subnet.allocated_ips}
+                total={subnet.total_ips}
+              />
             </span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-xs text-muted-foreground">Utilization</span>
-            <UtilizationBar percent={subnet.utilization_percent} />
+            <UtilizationBar
+              percent={subnet.utilization_percent}
+              uncountable={isUncountable(subnet.total_ips)}
+            />
           </div>
-          {Object.entries(subnet.custom_fields ?? {}).map(([k, v]) => (
-            <div key={k} className="flex items-center gap-1.5">
-              <span className="text-xs text-muted-foreground">{k}</span>
-              <span className="text-xs font-medium">{String(v)}</span>
-            </div>
-          ))}
+          {(() => {
+            const { prov, keep } = splitProvenance(subnet.custom_fields);
+            return (
+              <>
+                {Object.keys(prov).length > 0 && (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-muted-foreground">
+                      Source
+                    </span>
+                    <ImportedChip
+                      fields={prov}
+                      kind="subnet"
+                      id={subnet.id}
+                      keep={keep}
+                      onUpdated={(u) => onSubnetEdited(u as Subnet)}
+                    />
+                  </div>
+                )}
+                {Object.entries(keep).map(([k, v]) => (
+                  <div key={k} className="flex items-center gap-1.5">
+                    <span className="text-xs text-muted-foreground">{k}</span>
+                    <span className="text-xs font-medium">{String(v)}</span>
+                  </div>
+                ))}
+              </>
+            );
+          })()}
         </div>
 
         {/* DNS drift banner — only shows when records exist out-of-sync
@@ -4708,13 +5173,38 @@ function SubnetDetail({
             </div>
           ) : (
             <>
-              <div className="mb-2 px-1">
-                <TagFilterChips
-                  value={addressTagFilters}
-                  onChange={setAddressTagFilters}
-                  placeholder="Filter addresses by tag — try env or env:prod…"
-                />
+              <div className="mb-2 flex items-center gap-2 px-1">
+                <div className="min-w-0 flex-1">
+                  <TagFilterChips
+                    value={addressTagFilters}
+                    onChange={setAddressTagFilters}
+                    placeholder="Filter addresses by tag — try env or env:prod…"
+                    aria-label="Filter addresses by tag"
+                  />
+                </div>
+                <label className="flex flex-shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground hover:text-foreground">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5"
+                    checked={hideReserved}
+                    onChange={(e) => setHideReserved(e.target.checked)}
+                  />
+                  Hide network/broadcast
+                </label>
               </div>
+              {inlineEditError && (
+                <div className="mb-2 flex items-start gap-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+                  <span className="flex-1">{inlineEditError}</span>
+                  <button
+                    type="button"
+                    onClick={() => setInlineEditError(null)}
+                    aria-label="Dismiss error"
+                    className="shrink-0 rounded px-1 leading-none hover:bg-destructive/20"
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
               {/* No nested overflow wrapper — Chrome/WebKit treat
                   ``overflow-x: auto`` as establishing a Y-scroll
                   context too (CSS spec: paired axis can't be
@@ -4737,7 +5227,9 @@ function SubnetDetail({
                           (a: IPAddress) =>
                             a.status !== "network" &&
                             a.status !== "broadcast" &&
-                            !a.auto_from_lease,
+                            !a.auto_from_lease &&
+                            // Never select a row the table is currently hiding.
+                            !(hideReserved && isPaddingRow(a)),
                         );
                         const allSelected =
                           selectable.length > 0 &&
@@ -4911,6 +5403,7 @@ function SubnetDetail({
                                   }))
                                 }
                                 placeholder="Filter…"
+                                aria-label="Filter"
                                 className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                               />
                               <div className="relative">
@@ -5181,19 +5674,33 @@ function SubnetDetail({
                             </td>
                             <td className="px-4 py-2">
                               <span className="inline-flex items-center gap-1.5">
-                                {addr.fqdn ? (
-                                  <span className="font-mono text-xs">
-                                    {addr.fqdn}
-                                  </span>
-                                ) : addr.hostname ? (
-                                  <span className="text-muted-foreground">
-                                    {addr.hostname}
-                                  </span>
-                                ) : (
-                                  <span className="text-muted-foreground/40">
-                                    —
-                                  </span>
-                                )}
+                                <InlineEditableText
+                                  value={addr.hostname ?? ""}
+                                  placeholder="hostname"
+                                  disabled={!canEdit}
+                                  onActivate={() => setViewingAddress(addr)}
+                                  onSave={(v) =>
+                                    inlineEditMut.mutate({
+                                      id: addr.id,
+                                      data: { hostname: v.trim() || null },
+                                    })
+                                  }
+                                  display={
+                                    addr.fqdn ? (
+                                      <span className="font-mono text-xs">
+                                        {addr.fqdn}
+                                      </span>
+                                    ) : addr.hostname ? (
+                                      <span className="text-muted-foreground">
+                                        {addr.hostname}
+                                      </span>
+                                    ) : (
+                                      <span className="text-muted-foreground/40">
+                                        —
+                                      </span>
+                                    )
+                                  }
+                                />
                                 {(addr.alias_count ?? 0) > 0 && (
                                   <span
                                     className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400"
@@ -5252,11 +5759,27 @@ function SubnetDetail({
                               )}
                             </td>
                             <td className="px-4 py-2 text-muted-foreground">
-                              {addr.description ?? (
-                                <span className="text-muted-foreground/40">
-                                  —
-                                </span>
-                              )}
+                              <InlineEditableText
+                                value={addr.description ?? ""}
+                                placeholder="description"
+                                disabled={!canEdit}
+                                onActivate={() => setViewingAddress(addr)}
+                                onSave={(v) =>
+                                  inlineEditMut.mutate({
+                                    id: addr.id,
+                                    data: { description: v.trim() },
+                                  })
+                                }
+                                display={
+                                  addr.description ? (
+                                    <>{addr.description}</>
+                                  ) : (
+                                    <span className="text-muted-foreground/40">
+                                      —
+                                    </span>
+                                  )
+                                }
+                              />
                             </td>
                             <td className="px-4 py-2">
                               {(() => {
@@ -5301,7 +5824,17 @@ function SubnetDetail({
                             </td>
                             <td className="px-4 py-2">
                               <span className="inline-flex items-center">
-                                <StatusBadge status={addr.status} />
+                                <InlineStatusSelect
+                                  status={addr.status}
+                                  disabled={!canEdit}
+                                  onActivate={() => setViewingAddress(addr)}
+                                  onSave={(v) =>
+                                    inlineEditMut.mutate({
+                                      id: addr.id,
+                                      data: { status: v },
+                                    })
+                                  }
+                                />
                                 {addr.role ? (
                                   <RoleBadge role={addr.role} />
                                 ) : null}
@@ -5359,10 +5892,11 @@ function SubnetDetail({
                                   an ``allocated`` row can still be cold,
                                   a ``discovered`` row can be alive right
                                   now. Tooltip carries exact age + method. */}
-                            <td className="px-4 py-2 text-center">
+                            <td className="px-4 py-2">
                               <SeenDot
                                 lastSeenAt={addr.last_seen_at}
                                 lastSeenMethod={addr.last_seen_method}
+                                withLabel
                               />
                             </td>
                             {/* Network discovery — switch / port / VLAN
@@ -5415,14 +5949,16 @@ function SubnetDetail({
                                     <button
                                       onClick={() => setEditingAddress(addr)}
                                       className="rounded p-1 text-muted-foreground hover:text-foreground"
-                                      title="Edit"
+                                      title={`Edit ${addr.address}`}
+                                      aria-label={`Edit ${addr.address}`}
                                     >
                                       <Pencil className="h-3.5 w-3.5" />
                                     </button>
                                     <button
                                       onClick={() => setConfirmDeleteAddr(addr)}
                                       className="rounded p-1 text-muted-foreground hover:text-destructive"
-                                      title="Delete"
+                                      title={`Delete ${addr.address}`}
+                                      aria-label={`Delete ${addr.address}`}
                                     >
                                       <Trash2 className="h-3.5 w-3.5" />
                                     </button>
@@ -9261,7 +9797,10 @@ function SubnetRow({
           </div>
           <CustomerChip customerId={subnet.customer_id} />
           <SiteChip siteId={subnet.site_id} />
-          <UtilizationDot percent={subnet.utilization_percent} />
+          <UtilizationDot
+            percent={subnet.utilization_percent}
+            uncountable={isUncountable(subnet.total_ips)}
+          />
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
@@ -10000,13 +10539,16 @@ function flattenBlocks(
   nodes: BlockNode[],
   depth = 0,
 ): { id: string; label: string }[] {
-  return nodes.flatMap(({ block, children }) => [
-    {
-      id: block.id,
-      label: `${"  ".repeat(depth)}${block.network}${block.name ? ` — ${block.name}` : ""}`,
-    },
-    ...flattenBlocks(children, depth + 1),
-  ]);
+  return nodes.flatMap(({ block, children }) => {
+    const n = realBlockName(block.name);
+    return [
+      {
+        id: block.id,
+        label: `${"  ".repeat(depth)}${block.network}${n ? ` — ${n}` : ""}`,
+      },
+      ...flattenBlocks(children, depth + 1),
+    ];
+  });
 }
 
 // ─── Create Block Modal ───────────────────────────────────────────────────────
@@ -10771,11 +11313,10 @@ function BlockTreeRow({
               <span className="font-mono font-medium flex-1 truncate">
                 {node.block.network}
               </span>
-              {node.block.name && (
-                <span className="truncate text-[10px] opacity-60 mr-1">
-                  {node.block.name}
-                </span>
-              )}
+              <BlockNameTag
+                name={node.block.name}
+                className="truncate text-[10px] opacity-60 mr-1"
+              />
               <CustomerChip customerId={node.block.customer_id} />
               <SiteChip siteId={node.block.site_id} />
             </button>
@@ -11072,7 +11613,7 @@ function BlockDetailView({
       }),
     ),
     {
-      label: block.network + (block.name ? ` (${block.name})` : ""),
+      label: blockLabel(block.network, block.name),
       variant: "block",
     },
   ];
@@ -11182,26 +11723,40 @@ function BlockDetailView({
           <span className="font-mono text-xl font-bold tracking-tight">
             {block.network}
           </span>
-          {block.name && (
-            <span className="text-sm text-muted-foreground">{block.name}</span>
-          )}
+          <BlockNameTag
+            name={block.name}
+            className="text-sm text-muted-foreground"
+          />
           {block.description && (
             <span className="text-xs text-muted-foreground/70">
               · {block.description}
             </span>
           )}
         </div>
-        {/* Custom field values */}
-        {Object.keys(block.custom_fields ?? {}).length > 0 && (
-          <div className="flex flex-wrap gap-x-6 gap-y-1 border-t bg-muted/20 px-6 py-2">
-            {Object.entries(block.custom_fields).map(([k, v]) => (
-              <div key={k} className="flex items-center gap-1.5">
-                <span className="text-xs text-muted-foreground">{k}</span>
-                <span className="text-xs font-medium">{String(v)}</span>
+        {/* Custom field values — import provenance collapsed into one chip */}
+        {Object.keys(block.custom_fields ?? {}).length > 0 &&
+          (() => {
+            const { prov, keep } = splitProvenance(block.custom_fields);
+            return (
+              <div className="flex flex-wrap items-center gap-x-6 gap-y-1 border-t bg-muted/20 px-6 py-2">
+                {Object.keys(prov).length > 0 && (
+                  <ImportedChip
+                    fields={prov}
+                    kind="block"
+                    id={block.id}
+                    keep={keep}
+                    onUpdated={(u) => setBlock(u as IPBlock)}
+                  />
+                )}
+                {Object.entries(keep).map(([k, v]) => (
+                  <div key={k} className="flex items-center gap-1.5">
+                    <span className="text-xs text-muted-foreground">{k}</span>
+                    <span className="text-xs font-medium">{String(v)}</span>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-        )}
+            );
+          })()}
         {/* Allocation map */}
         <div className="border-t px-6 py-2">
           <div className="mb-1 flex items-center justify-between">
@@ -11327,7 +11882,7 @@ function BlockDetailView({
           scope={{
             kind: "block",
             id: block.id,
-            label: block.network + (block.name ? ` (${block.name})` : ""),
+            label: blockLabel(block.network, block.name),
           }}
           onClose={() => setShowDnsSync(false)}
         />
@@ -11427,6 +11982,7 @@ function BlockDetailView({
             value={tagFilters}
             onChange={setTagFilters}
             placeholder="Filter subnets + child blocks by tag — try env or env:prod…"
+            aria-label="Filter subnets and child blocks by tag"
           />
           <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
             role:
@@ -11778,6 +12334,7 @@ function BlockDetailView({
                                 }))
                               }
                               placeholder="Filter…"
+                              aria-label="Filter"
                               className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                             />
                           </td>
@@ -11942,13 +12499,19 @@ function BlockDetailView({
                             )}
                           </td>
                           <td className="px-4 py-2 tabular-nums text-muted-foreground">
-                            {s.allocated_ips} / {s.total_ips}
+                            <UsedIps
+                              allocated={s.allocated_ips}
+                              total={s.total_ips}
+                            />
                           </td>
                           <td className="px-4 py-2">
-                            <UtilizationBar percent={s.utilization_percent} />
+                            <UtilizationBar
+                              percent={s.utilization_percent}
+                              uncountable={isUncountable(s.total_ips)}
+                            />
                           </td>
                           <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                            {s.total_ips.toLocaleString()}
+                            {subnetSizeLabel(s.total_ips, s.network)}
                           </td>
                           <td className="px-4 py-2">
                             <StatusBadge status={s.status} />
@@ -12675,6 +13238,7 @@ function SpaceTableView({
                               }))
                             }
                             placeholder="Filter…"
+                            aria-label="Filter"
                             className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                           />
                         </td>
@@ -12827,13 +13391,19 @@ function SpaceTableView({
                           )}
                         </td>
                         <td className="px-4 py-2 tabular-nums text-muted-foreground">
-                          {s.allocated_ips} / {s.total_ips}
+                          <UsedIps
+                            allocated={s.allocated_ips}
+                            total={s.total_ips}
+                          />
                         </td>
                         <td className="px-4 py-2">
-                          <UtilizationBar percent={s.utilization_percent} />
+                          <UtilizationBar
+                            percent={s.utilization_percent}
+                            uncountable={isUncountable(s.total_ips)}
+                          />
                         </td>
                         <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                          {s.total_ips.toLocaleString()}
+                          {subnetSizeLabel(s.total_ips, s.network)}
                         </td>
                         <td className="px-4 py-2">
                           <StatusBadge status={s.status} />
@@ -13721,6 +14291,7 @@ export function IPAMPage() {
               }}
               className="rounded p-1 text-muted-foreground hover:text-foreground"
               title="Refresh"
+              aria-label="Refresh IP spaces"
             >
               <RefreshCw className="h-3.5 w-3.5" />
             </button>
@@ -13729,6 +14300,7 @@ export function IPAMPage() {
               disabled={!spaces || spaces.length === 0}
               className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
               title="Import subnets"
+              aria-label="Import subnets"
             >
               <Upload className="h-3.5 w-3.5" />
             </button>
@@ -13736,6 +14308,7 @@ export function IPAMPage() {
               onClick={() => setShowCreateSpace(true)}
               className="rounded p-1 text-muted-foreground hover:text-foreground"
               title="New IP Space"
+              aria-label="New IP Space"
             >
               <Plus className="h-3.5 w-3.5" />
             </button>

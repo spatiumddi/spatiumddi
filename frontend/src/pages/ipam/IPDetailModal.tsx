@@ -341,7 +341,7 @@ export function IPDetailModal({
             <Field label="Forward DNS zone">
               {addr.forward_zone_id ? (
                 <span className="font-mono text-xs">
-                  {zoneNames[addr.forward_zone_id] ?? addr.forward_zone_id}
+                  {zoneNames[addr.forward_zone_id] ?? "—"}
                 </span>
               ) : (
                 dash(null)
@@ -350,7 +350,7 @@ export function IPDetailModal({
             <Field label="Reverse DNS zone">
               {addr.reverse_zone_id ? (
                 <span className="font-mono text-xs">
-                  {zoneNames[addr.reverse_zone_id] ?? addr.reverse_zone_id}
+                  {zoneNames[addr.reverse_zone_id] ?? "—"}
                 </span>
               ) : (
                 dash(null)
@@ -370,7 +370,8 @@ export function IPDetailModal({
           </div>
 
           {/* Counters row */}
-          {(addr.alias_count || addr.nat_mapping_count) && (
+          {((addr.alias_count ?? 0) > 0 ||
+            (addr.nat_mapping_count ?? 0) > 0) && (
             <div className="flex flex-wrap items-center gap-2 text-[11px]">
               {(addr.alias_count ?? 0) > 0 && (
                 <span className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400">

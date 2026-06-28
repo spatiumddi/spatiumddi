@@ -231,7 +231,7 @@ class CommitIn(BaseModel):
     conflict_actions: dict[str, ConflictDecision] = Field(default_factory=dict)
     space_strategy: Literal["per_vrf", "single"] = "per_vrf"
     target_space_id: uuid.UUID | None = None
-    default_router_name: str = "NetBox import"
+    default_router_name: str = "Imported VLANs (NetBox)"
 
 
 class NetboxTestOut(BaseModel):
