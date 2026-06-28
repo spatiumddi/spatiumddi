@@ -2658,6 +2658,68 @@ const IP_STATUS_OPTIONS = [
   "deprecated",
 ] as const;
 
+// Double-click-to-change status badge on the IP table (sibling of
+// InlineEditableText). Swallows single clicks so it doesn't open the row
+// detail; commit on select, Escape/blur cancels. Disabled on read-only rows.
+function InlineStatusSelect({
+  status,
+  disabled = false,
+  onSave,
+}: {
+  status: string;
+  disabled?: boolean;
+  onSave: (next: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  if (disabled) return <StatusBadge status={status} />;
+  if (editing) {
+    const known = (IP_STATUS_OPTIONS as readonly string[]).includes(status);
+    const opts = known
+      ? (IP_STATUS_OPTIONS as readonly string[])
+      : [status, ...IP_STATUS_OPTIONS];
+    return (
+      <select
+        autoFocus
+        value={status}
+        aria-label="Status"
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => {
+          const v = e.target.value;
+          setEditing(false);
+          if (v && v !== status) onSave(v);
+        }}
+        onBlur={() => setEditing(false)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            setEditing(false);
+          }
+        }}
+        className="rounded border bg-background px-1 py-0.5 text-xs"
+      >
+        {opts.map((s) => (
+          <option key={s} value={s}>
+            {s}
+          </option>
+        ))}
+      </select>
+    );
+  }
+  return (
+    <span
+      onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        setEditing(true);
+      }}
+      title="Double-click to change status"
+      className="cursor-pointer"
+    >
+      <StatusBadge status={status} />
+    </span>
+  );
+}
+
 // IP allocate/edit/delete cascades into DNS via ``_sync_dns_record``
 // (auto A + PTR) and can land a DHCP static when ``status='static_dhcp'``.
 // Every mutation that invalidates ``["addresses", ...]`` below also
@@ -5560,7 +5622,16 @@ function SubnetDetail({
                             </td>
                             <td className="px-4 py-2">
                               <span className="inline-flex items-center">
-                                <StatusBadge status={addr.status} />
+                                <InlineStatusSelect
+                                  status={addr.status}
+                                  disabled={isReadOnly(addr.status)}
+                                  onSave={(v) =>
+                                    inlineEditMut.mutate({
+                                      id: addr.id,
+                                      data: { status: v },
+                                    })
+                                  }
+                                />
                                 {addr.role ? (
                                   <RoleBadge role={addr.role} />
                                 ) : null}
