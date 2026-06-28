@@ -30,6 +30,7 @@ import {
   Radar,
   Wrench,
   Sparkles,
+  HelpCircle,
   type LucideIcon,
   Scissors,
   GitMerge,
@@ -14364,6 +14365,66 @@ function getBlockAncestors(block: IPBlock, allBlocks: IPBlock[]): IPBlock[] {
   return ancestors;
 }
 
+// Opt-in glossary for the IPAM visual vocabulary (progressive disclosure,
+// #465). Hidden by default — toggled by the Help button so the dense view
+// stays uncluttered for experts while newcomers can decode the icons.
+function IpamHelpLegend() {
+  const seen: Array<[string, string]> = [
+    ["alive", "bg-emerald-500"],
+    ["stale", "bg-amber-500"],
+    ["cold", "bg-rose-500"],
+    ["never", "bg-zinc-300 dark:bg-zinc-600"],
+  ];
+  return (
+    <div className="border-b bg-muted/20 px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
+      <p className="mb-1.5 font-semibold text-foreground">What the icons mean</p>
+      <ul className="space-y-1.5">
+        <li className="flex items-center gap-1.5">
+          <Layers className="h-3 w-3 flex-shrink-0 text-violet-500" />
+          <span>
+            <span className="font-medium text-foreground">Block</span> — a
+            container that holds child blocks / subnets
+          </span>
+        </li>
+        <li className="flex items-center gap-1.5">
+          <Network className="h-3 w-3 flex-shrink-0 text-blue-500" />
+          <span>
+            <span className="font-medium text-foreground">Subnet</span> — holds
+            individual IP addresses
+          </span>
+        </li>
+        <li className="flex items-center gap-1.5">
+          <StatusTag status="allocated" />
+          <span>Status — the IP's lifecycle (icon + colour, never colour alone)</span>
+        </li>
+        <li className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span className="font-medium text-foreground">Seen</span>
+          <span>on the wire (separate from status):</span>
+          {seen.map(([label, cls]) => (
+            <span key={label} className="inline-flex items-center gap-1">
+              <span className={cn("h-2 w-2 rounded-full", cls)} />
+              {label}
+            </span>
+          ))}
+        </li>
+        <li className="flex items-center gap-1.5">
+          <span className="inline-block h-2 w-2 flex-shrink-0 rounded-full bg-green-500" />
+          <span>
+            Utilization — green &lt;80%, amber 80–95%, red ≥95% (an em-dash means
+            an IPv6 prefix too large to count)
+          </span>
+        </li>
+        <li className="flex items-center gap-1.5">
+          <span className="flex-shrink-0 rounded border border-dashed border-emerald-500/60 px-1 text-emerald-600 dark:text-emerald-400">
+            free
+          </span>
+          <span>Dashed gap row — unused addresses; click it to allocate</span>
+        </li>
+      </ul>
+    </div>
+  );
+}
+
 // ─── Main IPAM Page ───────────────────────────────────────────────────────────
 
 export function IPAMPage() {
@@ -14375,6 +14436,13 @@ export function IPAMPage() {
   const [showImport, setShowImport] = useState(false);
   // Tree quick-filter (network / name substring across every space).
   const [treeFilter, setTreeFilter] = useState("");
+  // Progressive disclosure: dense by default, opt-in help layer. When on, a
+  // glossary of the IPAM visual vocabulary appears so newcomers aren't lost
+  // while experts keep the uncluttered default (#465). Sticky per-user.
+  const [helpMode, setHelpMode] = useSessionState<boolean>(
+    "ipam-help-mode",
+    false,
+  );
   const qc = useQueryClient();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -14563,6 +14631,20 @@ export function IPAMPage() {
           <span className="text-sm font-semibold">IP Spaces</span>
           <div className="flex gap-1">
             <button
+              onClick={() => setHelpMode((v) => !v)}
+              className={cn(
+                "rounded p-1 hover:text-foreground",
+                helpMode
+                  ? "text-primary"
+                  : "text-muted-foreground",
+              )}
+              title={helpMode ? "Hide help" : "Show help — explain the icons"}
+              aria-label="Toggle IPAM help layer"
+              aria-pressed={helpMode}
+            >
+              <HelpCircle className="h-3.5 w-3.5" />
+            </button>
+            <button
               onClick={() => {
                 // Force refetch — bare invalidate only marks queries stale,
                 // which isn't enough when the user pressed Refresh after
@@ -14622,6 +14704,8 @@ export function IPAMPage() {
             )}
           </div>
         </div>
+
+        {helpMode && <IpamHelpLegend />}
 
         <div className="flex-1 overflow-y-auto p-2 space-y-1">
           {isLoading && (
