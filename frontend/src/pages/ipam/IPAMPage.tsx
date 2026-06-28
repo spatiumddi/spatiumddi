@@ -365,6 +365,69 @@ function BlockNameTag({
   return <span className={className}>{name}</span>;
 }
 
+// Double-click-to-edit cell for the IP table. Swallows single clicks so it
+// doesn't trigger the row's open-detail handler; Enter/blur commit, Escape
+// cancels. `display` is what shows when not editing; `value` seeds the input.
+function InlineEditableText({
+  value,
+  placeholder,
+  display,
+  onSave,
+  disabled = false,
+}: {
+  value: string;
+  placeholder: string;
+  display: React.ReactNode;
+  onSave: (next: string) => void;
+  disabled?: boolean;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value);
+  if (disabled) return <>{display}</>;
+  if (editing) {
+    const commit = () => {
+      setEditing(false);
+      if (draft.trim() !== value.trim()) onSave(draft);
+    };
+    return (
+      <input
+        autoFocus
+        value={draft}
+        placeholder={placeholder}
+        aria-label={placeholder}
+        onChange={(e) => setDraft(e.target.value)}
+        onClick={(e) => e.stopPropagation()}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commit();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            setDraft(value);
+            setEditing(false);
+          }
+        }}
+        className="w-full min-w-[6rem] rounded border bg-background px-1 py-0.5 text-xs"
+      />
+    );
+  }
+  return (
+    <span
+      onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        setDraft(value);
+        setEditing(true);
+      }}
+      title="Double-click to edit"
+      className="cursor-text"
+    >
+      {display}
+    </span>
+  );
+}
+
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   function handleCopy(e: React.MouseEvent) {
@@ -4062,6 +4125,12 @@ function SubnetDetail({
     "ipam-hide-reserved",
     false,
   );
+  // Inline (double-click) edits of hostname / description on the IP table.
+  const inlineEditMut = useMutation({
+    mutationFn: ({ id, data }: { id: string; data: Partial<IPAddress> }) =>
+      ipamApi.updateAddress(id, data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["addresses"] }),
+  });
   const [activeSubnetTab, setActiveSubnetTab] = useState<
     "addresses" | "dhcp" | "aliases" | "nat" | "trend" | "address-sets"
   >("addresses");
@@ -5343,19 +5412,32 @@ function SubnetDetail({
                             </td>
                             <td className="px-4 py-2">
                               <span className="inline-flex items-center gap-1.5">
-                                {addr.fqdn ? (
-                                  <span className="font-mono text-xs">
-                                    {addr.fqdn}
-                                  </span>
-                                ) : addr.hostname ? (
-                                  <span className="text-muted-foreground">
-                                    {addr.hostname}
-                                  </span>
-                                ) : (
-                                  <span className="text-muted-foreground/40">
-                                    —
-                                  </span>
-                                )}
+                                <InlineEditableText
+                                  value={addr.hostname ?? ""}
+                                  placeholder="hostname"
+                                  disabled={isReadOnly(addr.status)}
+                                  onSave={(v) =>
+                                    inlineEditMut.mutate({
+                                      id: addr.id,
+                                      data: { hostname: v.trim() },
+                                    })
+                                  }
+                                  display={
+                                    addr.fqdn ? (
+                                      <span className="font-mono text-xs">
+                                        {addr.fqdn}
+                                      </span>
+                                    ) : addr.hostname ? (
+                                      <span className="text-muted-foreground">
+                                        {addr.hostname}
+                                      </span>
+                                    ) : (
+                                      <span className="text-muted-foreground/40">
+                                        —
+                                      </span>
+                                    )
+                                  }
+                                />
                                 {(addr.alias_count ?? 0) > 0 && (
                                   <span
                                     className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400"
@@ -5414,11 +5496,26 @@ function SubnetDetail({
                               )}
                             </td>
                             <td className="px-4 py-2 text-muted-foreground">
-                              {addr.description ?? (
-                                <span className="text-muted-foreground/40">
-                                  —
-                                </span>
-                              )}
+                              <InlineEditableText
+                                value={addr.description ?? ""}
+                                placeholder="description"
+                                disabled={isReadOnly(addr.status)}
+                                onSave={(v) =>
+                                  inlineEditMut.mutate({
+                                    id: addr.id,
+                                    data: { description: v.trim() },
+                                  })
+                                }
+                                display={
+                                  addr.description ? (
+                                    <>{addr.description}</>
+                                  ) : (
+                                    <span className="text-muted-foreground/40">
+                                      —
+                                    </span>
+                                  )
+                                }
+                              />
                             </td>
                             <td className="px-4 py-2">
                               {(() => {
