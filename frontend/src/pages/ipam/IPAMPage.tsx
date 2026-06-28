@@ -29,6 +29,7 @@ import {
   Search,
   Radar,
   Wrench,
+  Sparkles,
   Scissors,
   GitMerge,
   Maximize2,
@@ -90,6 +91,7 @@ import {
 } from "@/lib/approvalQueue";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
+import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
@@ -111,7 +113,8 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { matchesAllTagChips } from "@/components/tag-filter-utils";
-import { AskAIButton } from "@/components/copilot/AskAIButton";
+import { askAI } from "@/components/copilot/askAI";
+import { useAiAvailable } from "@/components/copilot/useAiAvailable";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import {
   ImportModal,
@@ -151,42 +154,13 @@ import {
 
 // ─── Status Badge ────────────────────────────────────────────────────────────
 
+// Thin wrapper over the shared <StatusTag> (icon + text + color). Kept as a
+// local name because the IPAM file references StatusBadge in dozens of places;
+// the icon+color source of truth now lives in components/ui/status-tag.tsx.
+// ``discovered`` is passive observation only — the Seen column's recency dot
+// tells the operator whether the row is currently up; this badge labels source.
 function StatusBadge({ status }: { status: string }) {
-  const colors: Record<string, string> = {
-    active:
-      "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400",
-    reserved:
-      "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400",
-    deprecated:
-      "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400",
-    quarantine: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400",
-    allocated:
-      "bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-400",
-    available:
-      "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400",
-    dhcp: "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400",
-    static_dhcp:
-      "bg-teal-100 text-teal-800 dark:bg-teal-900/30 dark:text-teal-400",
-    network: "bg-zinc-100 text-zinc-500 dark:bg-zinc-800/50 dark:text-zinc-400",
-    broadcast:
-      "bg-zinc-100 text-zinc-500 dark:bg-zinc-800/50 dark:text-zinc-400",
-    orphan:
-      "bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-400",
-    // ``discovered`` — passive observation only, no operator intent.
-    // The Seen column's recency dot tells the operator whether the
-    // row is currently up; the badge here just labels the source.
-    discovered: "bg-sky-100 text-sky-800 dark:bg-sky-900/30 dark:text-sky-400",
-  };
-  return (
-    <span
-      className={cn(
-        "rounded-full px-2 py-0.5 text-xs font-medium",
-        colors[status] ?? "bg-muted text-muted-foreground",
-      )}
-    >
-      {status}
-    </span>
-  );
+  return <StatusTag status={status} />;
 }
 
 // Compact role badge — paired with StatusBadge in the IP table.
@@ -3952,6 +3926,7 @@ function ToolsMenu({
   onResize,
   onScan,
   onSplit,
+  onAskAi,
 }: {
   onBulkAllocate: () => void;
   onCleanOrphans: () => void;
@@ -3960,9 +3935,14 @@ function ToolsMenu({
   onResize: () => void;
   onScan: () => void;
   onSplit: () => void;
+  // Optional "Ask AI about this" entry — demoted here from a header
+  // primary action (no persona defended its prominence, #465). Only
+  // rendered when an AI provider is configured.
+  onAskAi?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const aiAvailable = useAiAvailable();
 
   useEffect(() => {
     if (!open) return;
@@ -4062,6 +4042,19 @@ function ToolsMenu({
           >
             <Scissors className="h-3.5 w-3.5" /> Split…
           </button>
+          {onAskAi && aiAvailable && (
+            <button
+              type="button"
+              onClick={() => {
+                setOpen(false);
+                onAskAi();
+              }}
+              className={cn(itemCls, "border-t")}
+            >
+              <Sparkles className="h-3.5 w-3.5 text-primary" /> Ask AI about
+              this…
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -4819,26 +4812,28 @@ function SubnetDetail({
               onResize={() => setShowResizeSubnet(true)}
               onScan={() => setShowSubnetScan(true)}
               onSplit={() => setShowSplitSubnet(true)}
-            />
-            <AskAIButton
-              context={[
-                `Subnet ${subnet.network}`,
-                subnet.name ? `name: ${subnet.name}` : null,
-                subnet.description
-                  ? `description: ${subnet.description}`
-                  : null,
-                spaceName ? `space: ${spaceName}` : null,
-                block ? `block: ${block.network}` : null,
-                subnet.vlan_id != null ? `VLAN: ${subnet.vlan_id}` : null,
-                subnet.gateway ? `gateway: ${subnet.gateway}` : null,
-                `utilization: ${(subnet.utilization_percent ?? 0).toFixed(1)}%`,
-                `${subnet.allocated_ips ?? 0} of ${subnet.total_ips ?? 0} IPs allocated`,
-                `subnet_id: ${subnet.id}`,
-              ]
-                .filter(Boolean)
-                .join(", ")}
-              tooltip="Ask AI about this subnet"
-              prompt="Tell me about this subnet — utilisation, recent changes, and anything I should worry about."
+              onAskAi={() =>
+                askAI({
+                  context: [
+                    `Subnet ${subnet.network}`,
+                    subnet.name ? `name: ${subnet.name}` : null,
+                    subnet.description
+                      ? `description: ${subnet.description}`
+                      : null,
+                    spaceName ? `space: ${spaceName}` : null,
+                    block ? `block: ${block.network}` : null,
+                    subnet.vlan_id != null ? `VLAN: ${subnet.vlan_id}` : null,
+                    subnet.gateway ? `gateway: ${subnet.gateway}` : null,
+                    `utilization: ${(subnet.utilization_percent ?? 0).toFixed(1)}%`,
+                    `${subnet.allocated_ips ?? 0} of ${subnet.total_ips ?? 0} IPs allocated`,
+                    `subnet_id: ${subnet.id}`,
+                  ]
+                    .filter(Boolean)
+                    .join(", "),
+                  prompt:
+                    "Tell me about this subnet — utilisation, recent changes, and anything I should worry about.",
+                })
+              }
             />
             <ServicesUsingButton
               kind="subnet"
