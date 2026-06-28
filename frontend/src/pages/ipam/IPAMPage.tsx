@@ -5237,7 +5237,54 @@ function SubnetDetail({
                   defeat the sticky thead by anchoring it to a
                   non-scrolling intermediate parent. The outer
                   ``flex-1 overflow-auto`` handles both axes. */}
-              <table className="w-full min-w-[640px] text-sm">
+              {/* Mobile "on-call mode" — the 10-column table is unusable on a
+                  phone, so under sm we render each IP as a tappable card with
+                  the triage essentials (address · status · host · seen). The
+                  full table takes over at sm+. Pool/gap marker rows are skipped
+                  on mobile. */}
+              <div className="space-y-1.5 px-1 pb-2 sm:hidden">
+                {tableRows.filter((r) => r.kind === "ip").length === 0 && (
+                  <p className="px-2 py-3 text-xs text-muted-foreground">
+                    No addresses to show.
+                  </p>
+                )}
+                {tableRows.map((row) => {
+                  if (row.kind !== "ip") return null;
+                  const addr = row.addr;
+                  const host = addr.fqdn || addr.hostname || "";
+                  return (
+                    <button
+                      key={`m-${addr.id}`}
+                      type="button"
+                      onClick={() => setViewingAddress(addr)}
+                      className="flex w-full flex-col gap-1 rounded-md border bg-card p-2.5 text-left active:bg-muted/50"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-mono text-sm font-medium">
+                          {addr.address}
+                        </span>
+                        <StatusTag status={addr.status} />
+                      </div>
+                      <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                        <span className="truncate">
+                          {host || (
+                            <span className="text-muted-foreground/40">
+                              no hostname
+                            </span>
+                          )}
+                        </span>
+                        <SeenDot
+                          lastSeenAt={addr.last_seen_at}
+                          lastSeenMethod={addr.last_seen_method}
+                          withLabel
+                        />
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <table className="hidden w-full min-w-[640px] text-sm sm:table">
                 {/* Sticky header — pinned to the parent
                       ``flex-1 overflow-auto`` scroll container so the
                       column headers stay visible while scrolling a
