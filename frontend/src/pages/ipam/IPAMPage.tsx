@@ -214,6 +214,33 @@ function RoleBadge({ role }: { role: string }) {
   );
 }
 
+// Import-provenance custom-field keys (stamped by the NetBox / cloud importers).
+// Collapse these into a single "Imported from …" chip instead of leaking raw
+// key/value pairs (netbox_id, netbox_is_pool, import_source, …) into the UI.
+function isProvenanceKey(k: string): boolean {
+  return /^(netbox|import_)/.test(k) || k === "imported_at";
+}
+
+function ImportedChip({ fields }: { fields: Record<string, unknown> }) {
+  const fromNetbox =
+    Object.keys(fields).some((k) => k.startsWith("netbox")) ||
+    String(fields["import_source"] ?? "")
+      .toLowerCase()
+      .includes("netbox");
+  const label = fromNetbox ? "Imported from NetBox" : "Imported";
+  const detail = Object.entries(fields)
+    .map(([k, v]) => `${k}: ${String(v)}`)
+    .join(" · ");
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded bg-sky-100 px-1.5 py-0.5 text-[11px] font-medium text-sky-700 dark:bg-sky-900/30 dark:text-sky-400"
+      title={detail}
+    >
+      {label}
+    </span>
+  );
+}
+
 const COUNTABLE_MAX = Number.MAX_SAFE_INTEGER;
 
 // IPv6 subnets (a /64 is 2^64 addresses) overflow the BIGINT total_ips column,
@@ -1697,6 +1724,7 @@ function AdditionalZonesPicker({
           value={filter}
           onChange={(e) => onFilter(e.target.value)}
           placeholder="Filter…"
+          aria-label="Filter"
           disabled={disabled}
           className="w-full rounded-t-md border border-b-0 bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50"
         />
@@ -4574,12 +4602,29 @@ function SubnetDetail({
               uncountable={isUncountable(subnet.total_ips)}
             />
           </div>
-          {Object.entries(subnet.custom_fields ?? {}).map(([k, v]) => (
-            <div key={k} className="flex items-center gap-1.5">
-              <span className="text-xs text-muted-foreground">{k}</span>
-              <span className="text-xs font-medium">{String(v)}</span>
-            </div>
-          ))}
+          {(() => {
+            const all = (subnet.custom_fields ?? {}) as Record<string, unknown>;
+            const prov = Object.fromEntries(
+              Object.entries(all).filter(([k]) => isProvenanceKey(k)),
+            );
+            const rest = Object.entries(all).filter(([k]) => !isProvenanceKey(k));
+            return (
+              <>
+                {Object.keys(prov).length > 0 && (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-muted-foreground">Source</span>
+                    <ImportedChip fields={prov} />
+                  </div>
+                )}
+                {rest.map(([k, v]) => (
+                  <div key={k} className="flex items-center gap-1.5">
+                    <span className="text-xs text-muted-foreground">{k}</span>
+                    <span className="text-xs font-medium">{String(v)}</span>
+                  </div>
+                ))}
+              </>
+            );
+          })()}
         </div>
 
         {/* DNS drift banner — only shows when records exist out-of-sync
@@ -4775,6 +4820,7 @@ function SubnetDetail({
                   value={addressTagFilters}
                   onChange={setAddressTagFilters}
                   placeholder="Filter addresses by tag — try env or env:prod…"
+                  aria-label="Filter addresses by tag"
                 />
               </div>
               {/* No nested overflow wrapper — Chrome/WebKit treat
@@ -4973,6 +5019,7 @@ function SubnetDetail({
                                   }))
                                 }
                                 placeholder="Filter…"
+          aria-label="Filter"
                                 className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                               />
                               <div className="relative">
@@ -5421,10 +5468,11 @@ function SubnetDetail({
                                   an ``allocated`` row can still be cold,
                                   a ``discovered`` row can be alive right
                                   now. Tooltip carries exact age + method. */}
-                            <td className="px-4 py-2 text-center">
+                            <td className="px-4 py-2">
                               <SeenDot
                                 lastSeenAt={addr.last_seen_at}
                                 lastSeenMethod={addr.last_seen_method}
+                                withLabel
                               />
                             </td>
                             {/* Network discovery — switch / port / VLAN
@@ -11253,17 +11301,26 @@ function BlockDetailView({
             </span>
           )}
         </div>
-        {/* Custom field values */}
-        {Object.keys(block.custom_fields ?? {}).length > 0 && (
-          <div className="flex flex-wrap gap-x-6 gap-y-1 border-t bg-muted/20 px-6 py-2">
-            {Object.entries(block.custom_fields).map(([k, v]) => (
-              <div key={k} className="flex items-center gap-1.5">
-                <span className="text-xs text-muted-foreground">{k}</span>
-                <span className="text-xs font-medium">{String(v)}</span>
+        {/* Custom field values — import provenance collapsed into one chip */}
+        {Object.keys(block.custom_fields ?? {}).length > 0 &&
+          (() => {
+            const all = block.custom_fields as Record<string, unknown>;
+            const prov = Object.fromEntries(
+              Object.entries(all).filter(([k]) => isProvenanceKey(k)),
+            );
+            const rest = Object.entries(all).filter(([k]) => !isProvenanceKey(k));
+            return (
+              <div className="flex flex-wrap items-center gap-x-6 gap-y-1 border-t bg-muted/20 px-6 py-2">
+                {Object.keys(prov).length > 0 && <ImportedChip fields={prov} />}
+                {rest.map(([k, v]) => (
+                  <div key={k} className="flex items-center gap-1.5">
+                    <span className="text-xs text-muted-foreground">{k}</span>
+                    <span className="text-xs font-medium">{String(v)}</span>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-        )}
+            );
+          })()}
         {/* Allocation map */}
         <div className="border-t px-6 py-2">
           <div className="mb-1 flex items-center justify-between">
@@ -11489,6 +11546,7 @@ function BlockDetailView({
             value={tagFilters}
             onChange={setTagFilters}
             placeholder="Filter subnets + child blocks by tag — try env or env:prod…"
+            aria-label="Filter subnets and child blocks by tag"
           />
           <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
             role:
@@ -11840,6 +11898,7 @@ function BlockDetailView({
                                 }))
                               }
                               placeholder="Filter…"
+          aria-label="Filter"
                               className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                             />
                           </td>
@@ -12737,6 +12796,7 @@ function SpaceTableView({
                               }))
                             }
                             placeholder="Filter…"
+          aria-label="Filter"
                             className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                           />
                         </td>

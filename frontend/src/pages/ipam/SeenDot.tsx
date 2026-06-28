@@ -38,10 +38,12 @@ export function SeenDot({
   lastSeenAt,
   lastSeenMethod,
   size = "sm",
+  withLabel = false,
 }: {
   lastSeenAt: string | null | undefined;
   lastSeenMethod?: string | null;
   size?: "sm" | "md";
+  withLabel?: boolean;
 }) {
   const state = getSeenState(lastSeenAt);
   const dotCls = {
@@ -59,7 +61,7 @@ export function SeenDot({
     if (state === "stale") return `Stale — last seen ${rel}${via}`;
     return `Cold — last seen ${rel}${via}`;
   })();
-  return (
+  const dot = (
     <span
       className={cn(
         "inline-flex items-center justify-center rounded-full",
@@ -67,7 +69,16 @@ export function SeenDot({
         dotCls,
       )}
       title={tip}
-      aria-label={tip}
+      aria-label={withLabel ? undefined : tip}
     />
+  );
+  if (!withLabel) return dot;
+  // In-cell text label so the state does not rely on colour alone (WCAG 1.4.1)
+  // and survives on touch where there is no hover tooltip.
+  return (
+    <span className="inline-flex items-center gap-1.5" title={tip}>
+      {dot}
+      <span className="text-xs capitalize text-muted-foreground">{state}</span>
+    </span>
   );
 }
