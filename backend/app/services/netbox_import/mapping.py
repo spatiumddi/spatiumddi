@@ -431,8 +431,12 @@ def map_prefix_block(prefix: dict[str, Any], *, space_name: str | None) -> Impor
     if net is None:
         return None
     cf = _merge_custom_fields(prefix.get("custom_fields"), prefix.get("id"))
-    if prefix.get("is_pool") is not None:
-        cf["netbox_is_pool"] = prefix["is_pool"]
+    # Only stamp the meaningful True case — ``netbox_is_pool: false`` is just
+    # noise. (Translating a NetBox pool prefix into SpatiumDDI reservation
+    # behaviour is a deliberate semantic change left for its own pass; here we
+    # only preserve the flag as provenance when set.)
+    if prefix.get("is_pool"):
+        cf["netbox_is_pool"] = True
     _subnet_role, raw_role = _prefix_role(prefix)
     role_value = _subnet_role or raw_role
     if role_value:
@@ -464,8 +468,12 @@ def map_prefix_subnet(prefix: dict[str, Any], *, space_name: str | None) -> Impo
     if net is None:
         return None
     cf = _merge_custom_fields(prefix.get("custom_fields"), prefix.get("id"))
-    if prefix.get("is_pool") is not None:
-        cf["netbox_is_pool"] = prefix["is_pool"]
+    # Only stamp the meaningful True case — ``netbox_is_pool: false`` is just
+    # noise. (Translating a NetBox pool prefix into SpatiumDDI reservation
+    # behaviour is a deliberate semantic change left for its own pass; here we
+    # only preserve the flag as provenance when set.)
+    if prefix.get("is_pool"):
+        cf["netbox_is_pool"] = True
     subnet_role, raw_role = _prefix_role(prefix)
     if raw_role:
         cf.setdefault("netbox_role", raw_role)
