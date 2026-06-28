@@ -332,7 +332,9 @@ function ImportedChip({
         loading={clearMut.isPending}
         message={
           <>
-            {`This clears the import-provenance fields (${Object.keys(fields).join(
+            {`This clears the import-provenance fields (${Object.keys(
+              fields,
+            ).join(
               ", ",
             )}) from this ${kind}, so the "${label}" chip disappears. The ${kind} itself and its other fields are unchanged.`}
             {err && <span className="mt-2 block text-destructive">{err}</span>}
@@ -4941,7 +4943,10 @@ function SubnetDetail({
           <div className="flex items-center gap-1.5">
             <span className="text-xs text-muted-foreground">Allocated</span>
             <span className="text-xs font-medium">
-              <UsedIps allocated={subnet.allocated_ips} total={subnet.total_ips} />
+              <UsedIps
+                allocated={subnet.allocated_ips}
+                total={subnet.total_ips}
+              />
             </span>
           </div>
           <div className="flex items-center gap-2">
@@ -4957,7 +4962,9 @@ function SubnetDetail({
               <>
                 {Object.keys(prov).length > 0 && (
                   <div className="flex items-center gap-1.5">
-                    <span className="text-xs text-muted-foreground">Source</span>
+                    <span className="text-xs text-muted-foreground">
+                      Source
+                    </span>
                     <ImportedChip
                       fields={prov}
                       kind="subnet"
@@ -5396,7 +5403,7 @@ function SubnetDetail({
                                   }))
                                 }
                                 placeholder="Filter…"
-          aria-label="Filter"
+                                aria-label="Filter"
                                 className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                               />
                               <div className="relative">
@@ -12327,7 +12334,7 @@ function BlockDetailView({
                                 }))
                               }
                               placeholder="Filter…"
-          aria-label="Filter"
+                              aria-label="Filter"
                               className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                             />
                           </td>
@@ -12492,10 +12499,16 @@ function BlockDetailView({
                             )}
                           </td>
                           <td className="px-4 py-2 tabular-nums text-muted-foreground">
-                            <UsedIps allocated={s.allocated_ips} total={s.total_ips} />
+                            <UsedIps
+                              allocated={s.allocated_ips}
+                              total={s.total_ips}
+                            />
                           </td>
                           <td className="px-4 py-2">
-                            <UtilizationBar percent={s.utilization_percent} uncountable={isUncountable(s.total_ips)} />
+                            <UtilizationBar
+                              percent={s.utilization_percent}
+                              uncountable={isUncountable(s.total_ips)}
+                            />
                           </td>
                           <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
                             {subnetSizeLabel(s.total_ips, s.network)}
@@ -13225,7 +13238,7 @@ function SpaceTableView({
                               }))
                             }
                             placeholder="Filter…"
-          aria-label="Filter"
+                            aria-label="Filter"
                             className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                           />
                         </td>
@@ -13378,10 +13391,16 @@ function SpaceTableView({
                           )}
                         </td>
                         <td className="px-4 py-2 tabular-nums text-muted-foreground">
-                          <UsedIps allocated={s.allocated_ips} total={s.total_ips} />
+                          <UsedIps
+                            allocated={s.allocated_ips}
+                            total={s.total_ips}
+                          />
                         </td>
                         <td className="px-4 py-2">
-                          <UtilizationBar percent={s.utilization_percent} uncountable={isUncountable(s.total_ips)} />
+                          <UtilizationBar
+                            percent={s.utilization_percent}
+                            uncountable={isUncountable(s.total_ips)}
+                          />
                         </td>
                         <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
                           {subnetSizeLabel(s.total_ips, s.network)}

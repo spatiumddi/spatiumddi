@@ -370,7 +370,8 @@ export function IPDetailModal({
           </div>
 
           {/* Counters row */}
-          {((addr.alias_count ?? 0) > 0 || (addr.nat_mapping_count ?? 0) > 0) && (
+          {((addr.alias_count ?? 0) > 0 ||
+            (addr.nat_mapping_count ?? 0) > 0) && (
             <div className="flex flex-wrap items-center gap-2 text-[11px]">
               {(addr.alias_count ?? 0) > 0 && (
                 <span className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400">
