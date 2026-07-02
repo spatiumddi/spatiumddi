@@ -4,6 +4,7 @@ import contextlib
 import contextvars
 import hashlib
 import ipaddress
+import itertools
 import re
 import string
 import uuid
@@ -15,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -166,9 +168,13 @@ async def _assert_no_overlap(
     exclude_id: uuid.UUID | None = None,
 ) -> None:
     """Raise 409 if the given network overlaps with any existing subnet in the space."""
+    # deleted_at IS NULL: this is raw SQL, so the ORM soft-delete filter
+    # (do_orm_execute in app.db) does NOT apply — a trashed subnet must free
+    # its CIDR for recreate/resize, matching the DHCP-scope fix b67286f (#490).
     q = (
         "SELECT network FROM subnet "
-        "WHERE space_id = CAST(:space_id AS uuid) AND network && CAST(:network AS cidr)"
+        "WHERE space_id = CAST(:space_id AS uuid) AND network && CAST(:network AS cidr) "
+        "AND deleted_at IS NULL"
     )
     params: dict[str, Any] = {"space_id": str(space_id), "network": network}
     if exclude_id:
@@ -204,10 +210,13 @@ async def _assert_no_block_overlap(
     (operator should set ``parent_block_id`` to that sibling
     instead), or any partial overlap.
     """
+    # deleted_at IS NULL: raw SQL bypasses the ORM soft-delete filter, so a
+    # trashed block must free its CIDR for recreate/reparent (#490).
     q = (
         "SELECT id, network FROM ip_block "
         "WHERE space_id = CAST(:space_id AS uuid) "
-        "AND network && CAST(:network AS cidr)"
+        "AND network && CAST(:network AS cidr) "
+        "AND deleted_at IS NULL"
     )
     params: dict[str, Any] = {"space_id": str(space_id), "network": network}
     if parent_block_id is None:
@@ -283,17 +292,22 @@ async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> No
         return
 
     # Sum allocated_ips for all subnets in this block and all descendant blocks
+    # deleted_at IS NULL guards: raw SQL bypasses the ORM soft-delete filter,
+    # so trashed blocks/subnets would otherwise inflate the rollup (#490).
     result = await db.execute(
         text("""
             WITH RECURSIVE descendants AS (
-                SELECT id FROM ip_block WHERE id = CAST(:block_id AS uuid)
+                SELECT id FROM ip_block
+                WHERE id = CAST(:block_id AS uuid) AND deleted_at IS NULL
                 UNION ALL
                 SELECT b.id FROM ip_block b
                     INNER JOIN descendants d ON b.parent_block_id = d.id
+                WHERE b.deleted_at IS NULL
             )
             SELECT COALESCE(SUM(s.allocated_ips), 0)
             FROM subnet s
             WHERE s.block_id IN (SELECT id FROM descendants)
+              AND s.deleted_at IS NULL
         """),
         {"block_id": str(block_id)},
     )
@@ -760,7 +774,10 @@ async def _pick_next_available_ip(
             # useless for /64 but surface the result so the UI can tell
             # the user "no free hosts" rather than spin forever.
             max_search = 65536
-            for host in list(net.hosts())[:max_search]:
+            # islice, not list(...)[:cap]: a /64 has 2**64 hosts, so
+            # materializing the full iterator before slicing OOMs/hangs the
+            # worker while it holds the subnet FOR UPDATE lock (#489).
+            for host in itertools.islice(net.hosts(), max_search):
                 if str(host) in used:
                     continue
                 if dynamic_ranges and _ip_int_in_dynamic_pool(int(host), dynamic_ranges):
@@ -798,10 +815,15 @@ async def _pick_next_available_ip(
             return candidate
         return None
 
-    # ── IPv4 (unchanged) ──────────────────────────────────────────────
+    # ── IPv4 ──────────────────────────────────────────────────────────
     # Cap the linear search at 65k hosts for very large IPv4 subnets.
+    # islice, not list(...)[:cap]: a /8 has ~16.7M hosts and the old
+    # ``list(net.hosts())[:max_search]`` materialized the whole iterator
+    # before slicing, stalling the worker under the subnet lock (#489).
+    # A /16 (65534 hosts) still materializes fully — under the cap — so the
+    # common case is unchanged; only oversized subnets are bounded.
     max_search = 65536
-    hosts = list(net.hosts()) if net.prefixlen >= 16 else list(net.hosts())[:max_search]
+    hosts = list(itertools.islice(net.hosts(), max_search))
 
     if strategy == "random":
         import random  # noqa: PLC0415 — local import mirrors the legacy site
@@ -1298,14 +1320,44 @@ async def _sync_dns_record(
                     ttl,
                 )
             else:
-                changed = existing.name != ip.hostname or existing.value != str(ip.address)
+                old_name = existing.name
+                old_value = existing.value
+                name_changed = old_name != ip.hostname
+                value_changed = old_value != str(ip.address)
+                if name_changed:
+                    # A rename is delete-at-old-name + create-at-new-name at
+                    # the driver level: the agent's "update" op replaces the
+                    # RRset AT a given name and never removes the old name, so
+                    # a bare update would leave the old name (e.g. web01) live
+                    # on the server after renaming to web02 (#492). Emit the
+                    # delete for the old RRset before recreating under the new
+                    # name.
+                    await _enqueue_dns_op(
+                        db,
+                        target_zone,
+                        "delete",
+                        old_name,
+                        forward_rtype,
+                        old_value,
+                        existing.ttl,
+                    )
                 existing.name = ip.hostname
                 existing.fqdn = target_fqdn
                 existing.value = str(ip.address)
                 if desired_zone_id == effective_zone_id:
                     ip.dns_record_id = existing.id
                     ip.forward_zone_id = effective_zone_id
-                if changed:
+                if name_changed:
+                    await _enqueue_dns_op(
+                        db,
+                        target_zone,
+                        "create",
+                        ip.hostname,
+                        forward_rtype,
+                        str(ip.address),
+                        existing.ttl,
+                    )
+                elif value_changed:
                     await _enqueue_dns_op(
                         db,
                         target_zone,
@@ -2465,7 +2517,20 @@ async def create_space(body: IPSpaceCreate, current_user: CurrentUser, db: DB) -
         )
     space = IPSpace(**body.model_dump())
     db.add(space)
-    await db.flush()
+    # The pre-check above (an ORM SELECT) can't see a soft-deleted space and a
+    # concurrent create can race it, so translate the name unique-violation
+    # into a clean 409 (#491). Any other integrity failure is unexpected — roll
+    # back and let it surface as a 500 rather than masking it.
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        await db.rollback()
+        if "ix_ip_space_name" not in str(exc.orig):
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"An IP space named {body.name!r} already exists",
+        ) from exc
     db.add(
         _audit(
             current_user,
@@ -2506,13 +2571,42 @@ async def update_space(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
     old = {"name": space.name, "description": space.description, "tags": space.tags}
-    changes = body.model_dump(exclude_none=True, exclude={"dhcp_server_group_id"})
+    # Rename uniqueness pre-check (#491): the partial unique index on name
+    # would otherwise raise a raw IntegrityError → 500 on a colliding rename.
+    if body.name is not None and body.name != space.name:
+        clash = await db.execute(
+            select(IPSpace.id).where(IPSpace.name == body.name, IPSpace.id != space_id)
+        )
+        if clash.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"An IP space named {body.name!r} already exists",
+            )
+    # Nullable columns the operator must be able to clear; excluded from the
+    # exclude_none dump and applied explicitly below so a null clears them
+    # rather than being silently dropped (#502).
+    _space_nullable_clearable = (
+        "dns_zone_id",
+        "vrf_id",
+        "asn_id",
+        "customer_id",
+        "ddns_domain_override",
+        "ddns_ttl",
+    )
+    changes = body.model_dump(
+        exclude_none=True, exclude={"dhcp_server_group_id", *_space_nullable_clearable}
+    )
     # ``color`` is nullable and NULL is a meaningful intent ("clear the
     # color"). Re-inject when explicitly set to None in the payload.
     if "color" in body.model_fields_set and body.color is None:
         changes["color"] = None
     for field, value in changes.items():
         setattr(space, field, value)
+    for field in _space_nullable_clearable:
+        if field in body.model_fields_set:
+            val = getattr(body, field)
+            setattr(space, field, val)
+            changes[field] = str(val) if isinstance(val, uuid.UUID) else val
     # Handle DHCP fields explicitly so explicit null (clear) is preserved.
     if "dhcp_server_group_id" in body.model_fields_set:
         space.dhcp_server_group_id = body.dhcp_server_group_id
@@ -2672,6 +2766,10 @@ def _block_to_response(block: IPBlock, vrf_warning: str | None) -> dict[str, Any
         "dns_zone_id": block.dns_zone_id,
         "dns_additional_zone_ids": block.dns_additional_zone_ids,
         "dns_inherit_settings": block.dns_inherit_settings,
+        # Was omitted (#496): IPBlockResponse defaulted it to False on every
+        # read, so enabling split-horizon on a block appeared to save then
+        # showed off on re-open, and re-saving the form wrote False back.
+        "dns_split_horizon": block.dns_split_horizon,
         "dhcp_server_group_id": block.dhcp_server_group_id,
         "dhcp_inherit_settings": block.dhcp_inherit_settings,
         "ddns_enabled": block.ddns_enabled,
@@ -2942,6 +3040,17 @@ async def update_block(
         )
         block.parent_block_id = new_parent_id
 
+    # Nullable columns the operator must be able to clear; excluded from the
+    # exclude_none dump and applied explicitly below so a null clears them
+    # instead of being silently dropped (#502).
+    _block_nullable_clearable = (
+        "vrf_id",
+        "asn_id",
+        "customer_id",
+        "site_id",
+        "ddns_domain_override",
+        "ddns_ttl",
+    )
     changes = body.model_dump(
         exclude_none=True,
         exclude={
@@ -2952,10 +3061,16 @@ async def update_block(
             "dhcp_server_group_id",
             "dhcp_inherit_settings",
             "parent_block_id",
+            *_block_nullable_clearable,
         },
     )
     for field, value in changes.items():
         setattr(block, field, value)
+    for field in _block_nullable_clearable:
+        if field in body.model_fields_set:
+            val = getattr(body, field)
+            setattr(block, field, val)
+            changes[field] = str(val) if isinstance(val, uuid.UUID) else val
     # Handle DNS fields explicitly so boolean False and explicit null are preserved
     dns_fields = {"dns_group_ids", "dns_zone_id", "dns_additional_zone_ids", "dns_inherit_settings"}
     for field in dns_fields & body.model_fields_set:
@@ -3065,7 +3180,8 @@ async def get_available_subnets(
     result = await db.execute(
         text(
             "SELECT network FROM subnet "
-            "WHERE space_id = CAST(:sid AS uuid) AND network && CAST(:net AS cidr)"
+            "WHERE space_id = CAST(:sid AS uuid) AND network && CAST(:net AS cidr) "
+            "AND deleted_at IS NULL"  # raw SQL skips the ORM soft-delete filter (#490)
         ),
         {"sid": str(block.space_id), "net": str(block.network)},
     )
@@ -3616,6 +3732,18 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     if block is None or block.space_id != body.space_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Block not found in this space"
+        )
+
+    # The subnet CIDR must fit inside its parent block. The reparent path in
+    # update_subnet already enforces this, but create didn't — so an
+    # out-of-range child could be inserted, corrupting the block's free-space
+    # math and allocate-subnet accounting (#497).
+    _subnet_net = _parse_network(body.network)
+    _block_net = _parse_network(str(block.network))
+    if _subnet_net.version != _block_net.version or not _subnet_net.subnet_of(_block_net):  # type: ignore[arg-type]
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Subnet {body.network} is not contained within block {block.network}",
         )
 
     # IPAM template pre-fill (issue #26). Mutates ``body`` in place
@@ -4406,6 +4534,13 @@ async def update_subnet(
         # null, so handle it explicitly through the model_fields_set
         # block below — same pattern as the DNS / DHCP fields.
         "decom_date",
+        # Other nullable columns that exclude_none would strip on a clear,
+        # applied explicitly below so a null actually clears them (#502).
+        "gateway",
+        "customer_id",
+        "site_id",
+        "ddns_domain_override",
+        "ddns_ttl",
     }
     changes = body.model_dump(exclude_none=True, exclude=exclude_fields)
     changes_for_audit = body.model_dump(mode="json", exclude_none=True, exclude=exclude_fields)
@@ -4429,6 +4564,15 @@ async def update_subnet(
         changes_for_audit["decom_date"] = (
             body.decom_date.isoformat() if body.decom_date is not None else None
         )
+
+    # Nullable scalars/FKs the operator must be able to clear (#502) — same
+    # explicit model_fields_set treatment as decom_date, because exclude_none
+    # drops a null and the clear would otherwise be a silent no-op.
+    for _field in ("gateway", "customer_id", "site_id", "ddns_domain_override", "ddns_ttl"):
+        if _field in body.model_fields_set:
+            _val = getattr(body, _field)
+            setattr(subnet, _field, _val)
+            changes_for_audit[_field] = str(_val) if isinstance(_val, uuid.UUID) else _val
 
     # Handle add/remove of auto-created network/broadcast/gateway records.
     # Kubernetes-semantics subnets (pod / service CIDRs) are routed
@@ -6415,8 +6559,24 @@ async def update_address(
     # pure extras edit (no hostname / zone change) still triggers the
     # add / delete of the per-zone records.
     extras_changed = "extra_zone_ids" in changes
-    if subnet and ("hostname" in changes or body.dns_zone_id is not None or extras_changed):
-        zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
+    # Distinguish "dns_zone_id omitted" from "explicitly set (incl. null)".
+    # On a hostname-only edit the operator's per-IP zone override must be
+    # preserved — passing zone_id=None would let _sync_dns_record recompute
+    # the subnet's effective zone and silently re-home the record out of the
+    # IP's forward_zone_id (#493). Only honour a caller-supplied zone (or an
+    # explicit null = clear) when dns_zone_id is actually in the payload.
+    dns_zone_explicit = "dns_zone_id" in body.model_fields_set
+    hostname_cleared = "hostname" in changes and not ip.hostname
+    if subnet and hostname_cleared:
+        # Clearing the hostname removes the IP's DNS presence. Route through
+        # "delete" — an "update" early-returns on an empty hostname and would
+        # leave the old A/PTR records live on the server (#502).
+        await _sync_dns_record(db, ip, subnet, action="delete")
+    elif subnet and ("hostname" in changes or dns_zone_explicit or extras_changed):
+        if dns_zone_explicit:
+            zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
+        else:
+            zone_id = ip.forward_zone_id
         await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update")
     elif subnet and restoring:
         await _sync_dns_record(db, ip, subnet, zone_id=ip.forward_zone_id, action="create")
@@ -7291,7 +7451,11 @@ async def bulk_allocate_commit(
                 address=item.address,
                 status=body.status,
                 hostname=item.hostname,
-                description=body.description,
+                # Coalesce: description is `str | None` on the request but the
+                # column is NOT NULL. Passing None to the constructor marks the
+                # attribute set, suppressing the model default="" → NOT NULL
+                # violation → 500, rolling back the whole batch (#498).
+                description=body.description or "",
                 tags=dict(body.tags),
                 custom_fields=dict(body.custom_fields),
                 created_by_user_id=current_user.id,
@@ -8103,6 +8267,13 @@ async def bulk_delete_addresses(
 
     for ip in rows:
         if ip.status in ("network", "broadcast"):
+            skipped.append(ip.id)
+            continue
+        # Dynamic-lease mirrors are owned by the DHCP server. Single-delete
+        # 409s them and bulk-edit skips them; bulk-delete must skip too, or a
+        # permanent delete retracts live DDNS records for an active lease and a
+        # soft delete just gets recreated on the next pull cycle (#499).
+        if ip.auto_from_lease:
             skipped.append(ip.id)
             continue
         if not body.permanent and ip.status == "orphan":

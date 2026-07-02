@@ -5,6 +5,12 @@ Check off each item with its issue number as created. Labels: bugs get `bug` + s
 (`critical`/`high`/`medium`/`low`) + component (`api`/`frontend`/`worker`); improvements get
 `enhancement`; features get `enhancement` + `idea`.
 
+> **Fixes implemented on branch `ipam-review-2026-07-02`:** the critical + all
+> high-severity bugs — #489–#502 (B1–B14). Verified: ruff / black / mypy,
+> eslint, `tsc -b` + vite build, migration-shape linter, single alembic head.
+> DB-backed pytest runs in CI (no Postgres in the dev sandbox). Medium/low bugs,
+> improvements, and features remain open.
+
 ## Bugs
 
 - [x] #489 B1 (critical, api) Next-IP allocation materializes entire host list — DoS. `_pick_next_available_ip` router.py:763 (v6 seq: `list(net.hosts())[:max_search]` on /64 → 2^64 objs; nothing enforces ">= /112") and :804 (v4: both arms fully materialize; /8 = 16.7M objs). Hangs holding subnet FOR UPDATE lock. Fix: itertools.islice.
