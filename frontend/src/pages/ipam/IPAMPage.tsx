@@ -8061,7 +8061,9 @@ const ADDRESS_STATUSES = [
 // how ``new Date(value)`` re-parses it on save.
 function toLocalDatetimeInput(iso: string): string {
   const d = new Date(iso);
-  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000)
+    .toISOString()
+    .slice(0, 16);
 }
 
 function EditAddressModal({
