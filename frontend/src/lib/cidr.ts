@@ -1,5 +1,6 @@
-// Minimal IPv4 CIDR utilities for client-side validation of drag-drop targets.
-// IPv6 is not supported here (matches Phase-1 IPAM scope).
+// CIDR utilities for client-side validation of drag-drop targets. IPv4 uses a
+// fast 32-bit int path; IPv6 containment goes through a BigInt path so a v6
+// re-parent isn't rejected client-side (#513).
 
 function ipToInt(ip: string): number | null {
   const parts = ip.split(".");
@@ -34,14 +35,36 @@ export function parseCidr(cidr: string): ParsedCidr | null {
 
 /**
  * Return true if `child` CIDR is fully contained within `parent` CIDR.
- * (A network is a subnet of itself.) IPv4 only.
+ * (A network is a subnet of itself.) Handles IPv4 and IPv6; a mixed-family
+ * pair is never contained.
  */
 export function cidrContains(parent: string, child: string): boolean {
-  const p = parseCidr(parent);
-  const c = parseCidr(child);
-  if (!p || !c) return false;
-  if (c.prefix < p.prefix) return false;
-  return (c.base & p.mask) >>> 0 === p.base;
+  const pV6 = parent.includes(":");
+  const cV6 = child.includes(":");
+  if (pV6 !== cV6) return false;
+  if (!pV6) {
+    // IPv4 fast path (unchanged).
+    const p = parseCidr(parent);
+    const c = parseCidr(child);
+    if (!p || !c) return false;
+    if (c.prefix < p.prefix) return false;
+    return (c.base & p.mask) >>> 0 === p.base;
+  }
+  // IPv6 — BigInt containment (parseCidr is 32-bit only).
+  const [pIp, pPre] = parent.split("/");
+  const [cIp, cPre] = child.split("/");
+  if (pPre === undefined || cPre === undefined) return false;
+  const pPrefix = Number(pPre);
+  const cPrefix = Number(cPre);
+  if (!Number.isInteger(pPrefix) || !Number.isInteger(cPrefix)) return false;
+  if (pPrefix < 0 || pPrefix > 128 || cPrefix < 0 || cPrefix > 128)
+    return false;
+  if (cPrefix < pPrefix) return false;
+  const mask =
+    pPrefix === 0
+      ? 0n
+      : ((1n << BigInt(pPrefix)) - 1n) << BigInt(128 - pPrefix);
+  return (addressToBigInt(cIp) & mask) === (addressToBigInt(pIp) & mask);
 }
 
 /**
