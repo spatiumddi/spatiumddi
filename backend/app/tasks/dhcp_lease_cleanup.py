@@ -31,6 +31,15 @@ logger = structlog.get_logger(__name__)
 # the agent's lease-event batch interval.
 EXPIRY_GRACE = timedelta(minutes=5)
 
+# How long a lease may sit in ``expired`` before the row itself is hard-deleted.
+# Agent-based (Kea) drivers have no absence-delete reconciler — pull_leases only
+# runs for agentless drivers, and the agent's expired-event branch drops just
+# the IPAM mirror — so expired lease rows would otherwise linger in the DHCP
+# view forever (#478). Kept generous so a recent expiry stays visible for a day;
+# lease *history* is permanent regardless, so deleting the live row loses
+# nothing and a renewal just creates a fresh active row.
+EXPIRED_DELETE_GRACE = timedelta(hours=24)
+
 
 async def _resolve_lease_subnet_id(db: AsyncSession, lease: DHCPLease) -> uuid.UUID | None:
     """Find the IPAM subnet that owns this lease's address.
@@ -64,7 +73,7 @@ async def _resolve_lease_subnet_id(db: AsyncSession, lease: DHCPLease) -> uuid.U
     return best[1] if best else None
 
 
-async def _sweep() -> int:
+async def _sweep() -> tuple[int, int]:
     cutoff = datetime.now(UTC) - EXPIRY_GRACE
     async with task_session() as db:
         # Find any active-marked lease whose actual expiry passed the grace.
@@ -117,12 +126,34 @@ async def _sweep() -> int:
                         )
                 await db.delete(row)
                 cleaned += 1
+
+        # Second pass — hard-delete leases that have sat in ``expired`` past the
+        # longer grace so they stop lingering in the DHCP view (#478). History
+        # was already stamped when the lease flipped to expired, and the mirror
+        # was dropped above / by the agent, so this only removes the dead row.
+        delete_cutoff = datetime.now(UTC) - EXPIRED_DELETE_GRACE
+        stale = await db.execute(
+            select(DHCPLease).where(
+                DHCPLease.state == "expired",
+                DHCPLease.expires_at.is_not(None),
+                DHCPLease.expires_at < delete_cutoff,
+            )
+        )
+        deleted = 0
+        for lease in stale.scalars().all():
+            await db.delete(lease)
+            deleted += 1
+
         await db.commit()
-        return cleaned
+        return cleaned, deleted
 
 
 @celery_app.task(name="app.tasks.dhcp_lease_cleanup.sweep_expired_leases")
 def sweep_expired_leases() -> dict[str, int]:
-    cleaned = asyncio.run(_sweep())
-    logger.info("dhcp_lease_sweep_complete", ipam_rows_removed=cleaned)
-    return {"ipam_rows_removed": cleaned}
+    cleaned, deleted = asyncio.run(_sweep())
+    logger.info(
+        "dhcp_lease_sweep_complete",
+        ipam_rows_removed=cleaned,
+        expired_leases_deleted=deleted,
+    )
+    return {"ipam_rows_removed": cleaned, "expired_leases_deleted": deleted}

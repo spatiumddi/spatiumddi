@@ -235,7 +235,7 @@ async def test_cleanup_revoke_scoped_to_lease_subnet(
 
     monkeypatch.setattr(ddns, "revoke_ddns_for_lease", _noop)
 
-    cleaned = await cleanup._sweep()
+    cleaned, _deleted = await cleanup._sweep()
     assert cleaned == 1
 
     assert (
