@@ -42,7 +42,7 @@ class MissingItem:
     ip_id: uuid.UUID
     ip_address: str
     hostname: str
-    record_type: Literal["A", "PTR"]
+    record_type: Literal["A", "AAAA", "PTR"]
     expected_name: str
     expected_value: str
     zone_id: uuid.UUID
@@ -54,7 +54,7 @@ class MismatchItem:
     record_id: uuid.UUID
     ip_id: uuid.UUID
     ip_address: str
-    record_type: Literal["A", "PTR"]
+    record_type: Literal["A", "AAAA", "PTR"]
     zone_id: uuid.UUID
     zone_name: str
     current_name: str
@@ -382,7 +382,16 @@ async def compute_subnet_dns_drift(
                 )
             continue
 
-        ip_a_records = [r for r in recs_by_ip.get(ip.id, []) if r.record_type == "A"]
+        # Forward record family depends on the IP: AAAA for IPv6, A for IPv4.
+        # Collect BOTH so a stale/mismatched AAAA on a v6 IP is surfaced — the
+        # classifier was A-only, so IPv6 subnets never reported missing/stale
+        # AAAA and "Sync DNS" always looked clean on them (#481).
+        forward_rtype: Literal["A", "AAAA"] = (
+            "AAAA" if ipaddress.ip_address(str(ip.address)).version == 6 else "A"
+        )
+        ip_forward_records = [
+            r for r in recs_by_ip.get(ip.id, []) if r.record_type in ("A", "AAAA")
+        ]
         ip_ptr_records = [r for r in recs_by_ip.get(ip.id, []) if r.record_type == "PTR"]
 
         # The default-named gateway placeholder (`hostname == "gateway"`) is
@@ -390,16 +399,16 @@ async def compute_subnet_dns_drift(
         # ``_sync_dns_record``. Renaming the IP turns forward sync back on.
         is_default_gateway = ip.hostname == "gateway"
 
-        # ── Forward A ────────────────────────────────────────────────────────
+        # ── Forward A / AAAA ─────────────────────────────────────────────────
         if forward_zone and not is_default_gateway:
             exp_name, exp_value = _expected_a(ip.hostname, str(ip.address), forward_zone.name)
-            if not ip_a_records:
+            if not ip_forward_records:
                 report.missing.append(
                     MissingItem(
                         ip_id=ip.id,
                         ip_address=str(ip.address),
                         hostname=ip.hostname,
-                        record_type="A",
+                        record_type=forward_rtype,
                         expected_name=exp_name,
                         expected_value=exp_value,
                         zone_id=forward_zone.id,
@@ -407,14 +416,21 @@ async def compute_subnet_dns_drift(
                     )
                 )
             else:
-                for r in ip_a_records:
-                    if r.zone_id != forward_zone.id or r.name != exp_name or r.value != exp_value:
+                for r in ip_forward_records:
+                    # A wrong-family record (A on a v6 IP or vice-versa) is drift
+                    # too, so diff the type alongside zone/name/value.
+                    if (
+                        r.record_type != forward_rtype
+                        or r.zone_id != forward_zone.id
+                        or r.name != exp_name
+                        or r.value != exp_value
+                    ):
                         report.mismatched.append(
                             MismatchItem(
                                 record_id=r.id,
                                 ip_id=ip.id,
                                 ip_address=str(ip.address),
-                                record_type="A",
+                                record_type=forward_rtype,
                                 zone_id=r.zone_id,
                                 zone_name=forward_zone.name if r.zone_id == forward_zone.id else "",
                                 current_name=r.name,
@@ -424,14 +440,14 @@ async def compute_subnet_dns_drift(
                             )
                         )
         elif is_default_gateway:
-            # Forward A records for default-gateway-named IPs are stale by
+            # Forward A/AAAA records for default-gateway-named IPs are stale by
             # definition (see _sync_dns_record). Surface them so the user
             # can clean up.
-            for r in ip_a_records:
+            for r in ip_forward_records:
                 report.stale.append(
                     StaleItem(
                         record_id=r.id,
-                        record_type="A",
+                        record_type=r.record_type,
                         zone_id=r.zone_id,
                         zone_name=(
                             forward_zone.name
@@ -443,18 +459,18 @@ async def compute_subnet_dns_drift(
                         reason="default-gateway-name",
                     )
                 )
-        elif not forward_zone and ip_a_records:
-            # Forward zone was unassigned (or inherited to null) after A
+        elif not forward_zone and ip_forward_records:
+            # Forward zone was unassigned (or inherited to null) after A/AAAA
             # records were already published. No effective zone to match
             # against → mark them stale so the user can delete them. Same
             # intent as the ``no-forward-zone`` PTR branch below: keeps
             # "Sync DNS" able to clean up after a zone disassociation even
             # though the classifier otherwise has nothing to diff against.
-            for r in ip_a_records:
+            for r in ip_forward_records:
                 report.stale.append(
                     StaleItem(
                         record_id=r.id,
-                        record_type="A",
+                        record_type=r.record_type,
                         zone_id=r.zone_id,
                         zone_name="",
                         name=r.name,

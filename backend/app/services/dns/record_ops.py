@@ -162,28 +162,32 @@ async def enqueue_record_op(
         )
         return None
 
-    # User flipped the primary off — don't push live writes at a paused
-    # server. Record ops will queue silently for agent-based primaries
-    # (and flush when it's re-enabled); for agentless, we drop the op
-    # with a warning rather than hang on a dead WinRM/nsupdate socket.
-    if not primary.is_enabled:
-        logger.warning(
-            "record_op_dropped_server_disabled",
-            zone=zone.name,
-            server=str(primary.id),
-            driver=primary.driver,
-            op=op,
-            name=record.get("name"),
-            type=record.get("type"),
-        )
-        return None
-
     if is_agentless(primary.driver):
+        # User flipped the primary off — for agentless, drop the op with a
+        # warning rather than hang on a dead WinRM / nsupdate socket at a paused
+        # server. (Agent-based groups fall through to the fan-out below, which
+        # queues to whatever agent-based servers ARE enabled.)
+        if not primary.is_enabled:
+            logger.warning(
+                "record_op_dropped_server_disabled",
+                zone=zone.name,
+                server=str(primary.id),
+                driver=primary.driver,
+                op=op,
+                name=record.get("name"),
+                type=record.get("type"),
+            )
+            return None
         return await _apply_agentless(db, primary, zone, op, record, target_serial)
 
-    # Fan out to every enabled, agent-based server in the group. The
-    # query mirrors ``resolve_primary_server`` minus the is_primary
-    # filter; agentless servers are excluded because their write path
+    # Agent-based group: fan out to every ENABLED, agent-based server in the
+    # group, independent of whether the designated primary is currently
+    # disabled. Gating the whole group on the primary's is_enabled (as we used
+    # to) dropped the op for healthy secondaries too — and because the agent's
+    # structural_etag excludes records in a no-views group, re-enabling the
+    # primary later does NOT flush the missed op, so the edit could strand on
+    # every agent (#481). The query mirrors ``resolve_primary_server`` minus the
+    # is_primary filter; agentless servers are excluded because their write path
     # is single-server immediate-apply.
     agent_rows = (
         (
@@ -201,9 +205,16 @@ async def enqueue_record_op(
     )
     agent_servers = [s for s in agent_rows if not is_agentless(s.driver)]
     if not agent_servers:
-        # Shouldn't happen — primary is agent-based, so at least one
-        # row exists. Belt-and-braces in case the primary was just
-        # toggled agentless mid-flight.
+        # Every agent-based server in the group is disabled (incl. the primary).
+        # Nothing can converge right now; log it rather than drop silently.
+        logger.warning(
+            "record_op_dropped_no_enabled_agent",
+            zone=zone.name,
+            group_id=str(zone.group_id),
+            op=op,
+            name=record.get("name"),
+            type=record.get("type"),
+        )
         return None
 
     primary_op: DNSRecordOp | None = None
@@ -259,24 +270,25 @@ async def enqueue_record_ops_batch(
         )
         return [None] * len(ops)
 
-    if not primary.is_enabled:
-        logger.warning(
-            "record_op_batch_dropped_server_disabled",
-            zone=zone.name,
-            server=str(primary.id),
-            driver=primary.driver,
-            count=len(ops),
-        )
-        return [None] * len(ops)
+    if is_agentless(primary.driver):
+        # Agentless: drop at a paused server rather than hang on a dead socket.
+        if not primary.is_enabled:
+            logger.warning(
+                "record_op_batch_dropped_server_disabled",
+                zone=zone.name,
+                server=str(primary.id),
+                driver=primary.driver,
+                count=len(ops),
+            )
+            return [None] * len(ops)
+        return await _apply_agentless_batch(db, primary, zone, ops)
 
-    if not is_agentless(primary.driver):
-        # Agent-based: DB rows only; agent will batch at poll time.
-        return [
-            await enqueue_record_op(db, zone, o["op"], o["record"], o.get("target_serial"))
-            for o in ops
-        ]
-
-    return await _apply_agentless_batch(db, primary, zone, ops)
+    # Agent-based: DB rows only; agent will batch at poll time. Delegates to
+    # enqueue_record_op per op, which fans out to every ENABLED agent-based
+    # server regardless of whether the designated primary is disabled (#481).
+    return [
+        await enqueue_record_op(db, zone, o["op"], o["record"], o.get("target_serial")) for o in ops
+    ]
 
 
 async def enqueue_record_ops_bulk(
@@ -299,19 +311,31 @@ async def enqueue_record_ops_bulk(
         return 0
 
     primary = await resolve_primary_server(db, zone)
-    if primary is None or not primary.is_enabled:
+    if primary is None:
         logger.warning(
             "record_op_bulk_dropped",
             zone=zone.name,
             group_id=str(zone.group_id),
             count=len(ops),
-            reason="no enabled primary configured for zone",
+            reason="no primary configured for zone",
         )
         return 0
 
     if is_agentless(primary.driver):
+        # Agentless: drop at a paused server rather than hang on a dead socket.
+        if not primary.is_enabled:
+            logger.warning(
+                "record_op_bulk_dropped",
+                zone=zone.name,
+                group_id=str(zone.group_id),
+                count=len(ops),
+                reason="agentless primary is disabled",
+            )
+            return 0
         rows = await _apply_agentless_batch(db, primary, zone, ops)
         return sum(1 for r in rows if r is not None)
+    # Agent-based falls through: the fan-out below queues to every ENABLED
+    # agent-based server regardless of whether the primary is disabled (#481).
 
     # Agent-based: every enabled agent-based server in the group renders an
     # independent authoritative copy, so each needs its own op rows. Resolve
