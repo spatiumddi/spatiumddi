@@ -13,8 +13,8 @@ Current single alembic head (before this branch): `b1f7c3a92e04`.
 
 ## Status
 
-- [ ] #503 B15 (api) IPv6 subnet import overflows BIGINT total_ips — importer.py lacks the 2^63-1 clamp (`_total_ips` in resize.py has it). Any /64 import 500s whole commit. `backend/app/services/ipam_io/importer.py` ~L451.
-- [ ] #504 B16 (api) Import robustness cluster: case-insensitive headers ("IP"/"IP Address"), export→import status round-trip rejection, unvalidated mac_address/gateway → 500 mid-commit, strategy="fail" intra-payload dup aborts after side effects. `parser.py`, `importer.py`, `export.py`.
+- [x] #503 B15 (api) IPv6 subnet import overflows BIGINT total_ips — importer.py lacks the 2^63-1 clamp (`_total_ips` in resize.py has it). Any /64 import 500s whole commit. `backend/app/services/ipam_io/importer.py` ~L451.
+- [x] #504 B16 (api) Import robustness cluster: case-insensitive headers ("IP"/"IP Address"), export→import status round-trip rejection, unvalidated mac_address/gateway → 500 mid-commit, strategy="fail" intra-payload dup aborts after side effects. `parser.py`, `importer.py`, `export.py`.
 - [ ] #505 B17 (api) Plan apply bypasses create_subnet invariants: multicast kind, network/broadcast/gateway placeholder rows, reverse-zone auto-create, gateway containment. `backend/app/api/v1/ipam/plans.py` ~L686.
 - [ ] #506 B18 (api) IPv6 subnets never get network/gateway placeholder rows — gate `prefixlen < 31` is v4 logic; should be `< 127`. `router.py` create_subnet auto-address branch (~L3711 pre-merge; re-grep).
 - [ ] #507 B19 (api) GET /subnets/{id}/effective-dns stops at root block; `_resolve_effective_dns` falls through to space → UI shows "no DNS" while records publish into space zone. `router.py` ~L4237 vs the resolver ~L317.
@@ -28,3 +28,5 @@ Current single alembic head (before this branch): `b1f7c3a92e04`.
 - [ ] #515 B27 (worker) Discovery double-dispatch race — last_discovery_at stamped at completion; >60s sweeps re-dispatched each tick; concurrent reconcile collides on unique constraint. `backend/app/tasks/ipam_discovery.py` ~L118.
 
 ## Commit log (fill as we go)
+
+- #503 + #504 → commit (importer BIGINT clamp; parser case-insensitive headers; status round-trip; MAC/gateway validation; intra-payload dup pre-flight)
