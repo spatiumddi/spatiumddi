@@ -28,7 +28,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission
-from app.models.ipam import IPBlock, IPSpace, Subnet, SubnetPlan
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetPlan
+
+_V4_MULTICAST = ipaddress.ip_network("224.0.0.0/4")
+_V6_MULTICAST = ipaddress.ip_network("ff00::/8")
+
+
+def _subnet_kind(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> str:
+    """Mirror create_subnet's #126 discriminator so a planned multicast leaf
+    isn't left ``unicast`` (which would wrongly accept per-IP allocation) (#505)."""
+    mcast = _V4_MULTICAST if isinstance(net, ipaddress.IPv4Network) else _V6_MULTICAST
+    return "multicast" if net.subnet_of(mcast) else "unicast"  # type: ignore[arg-type]
+
 
 router = APIRouter(
     prefix="/plans",
@@ -694,6 +705,24 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
                 total = node_net.num_addresses - 2
             dns_explicit = bool(node.dns_group_id or node.dns_zone_id)
             dhcp_explicit = bool(node.dhcp_server_group_id)
+            node_kind = _subnet_kind(node_net)
+            # Validate the gateway is inside the subnet — create_subnet enforces
+            # this and plan-apply didn't, so a bad gateway could land unchecked
+            # (#505).
+            gateway = node.gateway or None
+            if gateway is not None:
+                try:
+                    gw = ipaddress.ip_address(gateway)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=f"Invalid gateway {gateway!r} on {node.network}",
+                    ) from exc
+                if gw not in node_net:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=f"Gateway {gateway} is not within subnet {node.network}",
+                    )
             subnet = Subnet(
                 space_id=plan.space_id,
                 block_id=parent_block_id,
@@ -703,6 +732,7 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
                 total_ips=total,
                 allocated_ips=0,
                 utilization_percent=0.0,
+                kind=node_kind,
                 dns_group_ids=[node.dns_group_id] if node.dns_group_id else None,
                 dns_zone_id=node.dns_zone_id,
                 dns_inherit_settings=not dns_explicit,
@@ -711,11 +741,47 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
                 ),
                 dhcp_inherit_settings=not dhcp_explicit,
                 vlan_ref_id=(uuid.UUID(node.vlan_ref_id) if node.vlan_ref_id else None),
-                gateway=node.gateway or None,
+                gateway=gateway,
             )
             db.add(subnet)
             await db.flush()
             created_subnets.append(str(subnet.id))
+            # Placeholder network/broadcast/gateway rows, mirroring create_subnet
+            # (#505). Multicast leaves and v4 /31+/32 / v6 /127+/128 get none.
+            is_v6 = isinstance(node_net, ipaddress.IPv6Network)
+            if node_kind != "multicast" and node_net.prefixlen < (127 if is_v6 else 31):
+                db.add(
+                    IPAddress(
+                        subnet_id=subnet.id,
+                        address=str(node_net.network_address),
+                        status="network",
+                        description="Network address",
+                        created_by_user_id=current_user.id,
+                    )
+                )
+                if not is_v6:
+                    db.add(
+                        IPAddress(
+                            subnet_id=subnet.id,
+                            address=str(node_net.broadcast_address),
+                            status="broadcast",
+                            description="Broadcast address",
+                            created_by_user_id=current_user.id,
+                        )
+                    )
+                gw_addr = gateway or str(node_net.network_address + 1)
+                db.add(
+                    IPAddress(
+                        subnet_id=subnet.id,
+                        address=gw_addr,
+                        status="reserved",
+                        description="Gateway",
+                        hostname="gateway",
+                        created_by_user_id=current_user.id,
+                    )
+                )
+                subnet.gateway = gw_addr
+                await db.flush()
 
     await materialise(tree, None, is_root=True)
 

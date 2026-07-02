@@ -3846,7 +3846,16 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     # doesn't apply.
     auto_created: list[str] = []
     is_v6 = isinstance(net, ipaddress.IPv6Network)
-    if net.prefixlen < 31 and not body.skip_auto_addresses and subnet_kind != "multicast":
+    # Threshold is version-aware: a v4 /31+/32 has no network/broadcast concept
+    # (RFC 3021), and the v6 analogue is /127+/128. The old flat ``< 31`` was v4
+    # logic, so EVERY realistic v6 subnet (/48, /64, /112) fell through and got
+    # no network/gateway pseudo-rows despite the branch's IPv6 handling (#506).
+    placeholder_threshold = 127 if is_v6 else 31
+    if (
+        net.prefixlen < placeholder_threshold
+        and not body.skip_auto_addresses
+        and subnet_kind != "multicast"
+    ):
         # Network address (e.g. 10.0.1.0 / 2001:db8::)
         db.add(
             IPAddress(
@@ -4580,8 +4589,10 @@ async def update_subnet(
     # operator can't accidentally stamp placeholder rows on them.
     if body.manage_auto_addresses is not None and not subnet.kubernetes_semantics:
         net = _parse_network(str(subnet.network))
-        if net.prefixlen < 31:
-            is_v6 = isinstance(net, ipaddress.IPv6Network)
+        # Version-aware threshold (see create_subnet, #506): v4 /31+/32 and v6
+        # /127+/128 have no network/broadcast pseudo-rows.
+        is_v6 = isinstance(net, ipaddress.IPv6Network)
+        if net.prefixlen < (127 if is_v6 else 31):
             auto_statuses = {"network", "broadcast"}
             existing_result = await db.execute(
                 select(IPAddress).where(
