@@ -41,12 +41,17 @@ class Settings(BaseSettings):
     # "https://ddi.example.com,https://ipam.example.com"). Default "*"
     # keeps dev / same-origin appliance deployments working out of the
     # box. When left as "*" we serve a wildcard WITHOUT
-    # ``allow_credentials`` (the API authenticates via the Bearer
-    # Authorization header, not cookies, so cross-origin credentials
-    # aren't needed) — that avoids the dangerous "reflect any origin +
-    # allow credentials" combo Starlette produces for ``["*"]`` +
+    # ``allow_credentials`` — that avoids the dangerous "reflect any origin
+    # + allow credentials" combo Starlette produces for ``["*"]`` +
     # ``allow_credentials=True``. Set explicit origins to lock the API
     # down to your frontend(s); credentials are then enabled for them.
+    #
+    # NOTE (#484): API calls authenticate via the Bearer Authorization
+    # header, but the auth endpoints under ``/api/v1/auth`` also set/read the
+    # HttpOnly ``spatium_refresh`` cookie. That cookie only matters for a
+    # cross-ORIGIN frontend, which requires explicit ``cors_origins`` anyway
+    # (wildcard mode disables credentials); the default same-origin
+    # (nginx-proxied) deployment needs no CORS credentials at all.
     #
     # SECURITY (#400 / M6): if ``"*"`` appears MIXED with explicit
     # origins (e.g. ``"*,https://app.example.com"``) we treat the whole

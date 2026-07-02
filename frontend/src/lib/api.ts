@@ -1,4 +1,5 @@
 import axios, { AxiosError, type AxiosInstance } from "axios";
+import { getAccessToken, setAccessToken } from "@/lib/authToken";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
 
@@ -15,14 +16,12 @@ function createClient(): AxiosInstance {
     paramsSerializer: { indexes: null },
   });
 
-  // Attach Bearer token from localStorage on every request.
-  // SECURITY (#400, L1): access + refresh tokens live in
-  // localStorage and are therefore XSS-stealable. The CSP shipped in
-  // #400/L2 is the primary mitigation; the intended structural fix
-  // (refresh token -> HttpOnly cookie, access token in memory only)
-  // is documented in hooks/useAuth.ts and deferred to a follow-up.
+  // Attach the in-memory Bearer token on every request (#484 / #400 L1).
+  // The access token lives ONLY in JS memory (lib/authToken.ts); the refresh
+  // token is an HttpOnly cookie the browser sends automatically on the
+  // path-scoped /auth/refresh + /auth/logout calls — never readable here.
   client.interceptors.request.use((config) => {
-    const token = localStorage.getItem("access_token");
+    const token = getAccessToken();
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
@@ -55,13 +54,18 @@ function createClient(): AxiosInstance {
     reject: (err: unknown) => void;
   }> = [];
 
-  function isRefreshCall(url: string | undefined): boolean {
-    return !!url && url.replace(/^[^/]*\/\//, "").includes("/auth/refresh");
+  // A 401 from a credential endpoint (login / login/mfa / refresh) means bad
+  // credentials or a dead refresh token — NOT an expired access token. It must
+  // never trigger the refresh-and-retry path below: retrying a wrong-password
+  // /auth/login would double-count the failed-login audit row + lockout/
+  // rate-limit budget, and retrying /auth/refresh would loop on itself (#484).
+  function isCredentialEndpoint(url: string | undefined): boolean {
+    const path = url ? url.replace(/^[^/]*\/\//, "") : "";
+    return path.includes("/auth/login") || path.includes("/auth/refresh");
   }
 
   function forceLogin(): void {
-    localStorage.removeItem("access_token");
-    localStorage.removeItem("refresh_token");
+    setAccessToken(null);
     // Skip redirect if we're already on /login so the user doesn't
     // see a white flash when an expired session fires first.
     if (!window.location.pathname.startsWith("/login")) {
@@ -76,20 +80,19 @@ function createClient(): AxiosInstance {
         _retry?: boolean;
       };
 
-      // 401 on the refresh call itself = the refresh token is dead.
-      // Surface the original error so the caller's ``catch`` branch
-      // runs its cleanup + redirect. Don't try to refresh the refresh.
-      if (err.response?.status === 401 && isRefreshCall(originalRequest?.url)) {
+      // 401 on a credential endpoint (login / login/mfa / refresh) = bad
+      // credentials or a dead refresh token. Surface the original error so the
+      // caller's ``catch`` branch runs its cleanup + redirect. Don't refresh:
+      // the refresh call would loop on itself, and a login retry would
+      // double-charge the lockout/audit budget.
+      if (
+        err.response?.status === 401 &&
+        isCredentialEndpoint(originalRequest?.url)
+      ) {
         return Promise.reject(err);
       }
 
       if (err.response?.status === 401 && !originalRequest?._retry) {
-        const refreshToken = localStorage.getItem("refresh_token");
-        if (!refreshToken) {
-          forceLogin();
-          return Promise.reject(err);
-        }
-
         if (isRefreshing) {
           return new Promise((resolve, reject) => {
             refreshQueue.push({
@@ -106,12 +109,19 @@ function createClient(): AxiosInstance {
         originalRequest._retry = true;
         isRefreshing = true;
         try {
-          const res = await client.post("/auth/refresh", {
-            refresh_token: refreshToken,
-          });
-          const { access_token, refresh_token: newRefresh } = res.data;
-          localStorage.setItem("access_token", access_token);
-          localStorage.setItem("refresh_token", newRefresh);
+          // The refresh token rides the HttpOnly cookie automatically; the
+          // rotated refresh token comes back as a new Set-Cookie and the fresh
+          // access token in the JSON body (#484). ``withCredentials`` lets the
+          // cookie flow on a cross-ORIGIN (but same-site) API host when CORS
+          // credentials are enabled; the cookie is SameSite=Strict, so a
+          // genuinely cross-SITE SPA/API split is not supported by design.
+          const res = await client.post(
+            "/auth/refresh",
+            {},
+            { withCredentials: true },
+          );
+          const { access_token } = res.data;
+          setAccessToken(access_token);
           refreshQueue.forEach(({ resolve }) => resolve(access_token));
           refreshQueue = [];
           if (originalRequest?.headers)
@@ -2104,9 +2114,9 @@ export const ipamIoApi = {
 };
 
 export interface LoginResponse {
-  // Set when MFA is NOT required — normal token issuance.
+  // Set when MFA is NOT required — normal token issuance. The refresh token
+  // is delivered out-of-band as an HttpOnly cookie (#484), never in this body.
   access_token: string | null;
-  refresh_token: string | null;
   token_type: string;
   force_password_change: boolean;
   // Set when the user has TOTP enabled (issue #69). The frontend
@@ -4151,7 +4161,7 @@ export async function* streamChatTurn(
   },
   signal?: AbortSignal,
 ): AsyncIterable<{ event: string; data: Record<string, unknown> }> {
-  const token = localStorage.getItem("access_token");
+  const token = getAccessToken();
   const res = await fetch("/api/v1/ai/chat", {
     method: "POST",
     headers: {
@@ -7280,9 +7290,20 @@ export interface MyPermissions {
 }
 
 export const authApi = {
+  // withCredentials on the auth calls so the browser stores (login/mfa/
+  // refresh) and returns (refresh/logout) the HttpOnly refresh cookie on a
+  // cross-ORIGIN same-site API host with CORS credentials enabled (#484). The
+  // cookie is path-scoped to /api/v1/auth, so it never rides ordinary API
+  // requests. NOTE: the cookie is SameSite=Strict — a genuinely cross-SITE
+  // SPA/API split (different registrable domains) can't send it and is out of
+  // scope; the default same-origin (nginx-proxied) deployment is unaffected.
   login: (username: string, password: string) =>
     api
-      .post<LoginResponse>("/auth/login", { username, password })
+      .post<LoginResponse>(
+        "/auth/login",
+        { username, password },
+        { withCredentials: true },
+      )
       .then((r) => r.data),
   /** Complete a TOTP-gated login. Submit either ``code`` (6-digit
    * authenticator) or ``recovery_code``; submitting both 422s. */
@@ -7291,7 +7312,11 @@ export const authApi = {
     body: { code?: string; recovery_code?: string },
   ) =>
     api
-      .post<LoginResponse>("/auth/login/mfa", { mfa_token, ...body })
+      .post<LoginResponse>(
+        "/auth/login/mfa",
+        { mfa_token, ...body },
+        { withCredentials: true },
+      )
       .then((r) => r.data),
   publicProviders: () =>
     api.get<PublicAuthProvider[]>("/auth/providers").then((r) => r.data),
@@ -7300,10 +7325,12 @@ export const authApi = {
    *  before the user even submits. */
   passwordPolicy: () =>
     api.get<PasswordPolicy>("/auth/password-policy").then((r) => r.data),
-  logout: () => api.post("/auth/logout"),
-  refresh: (refreshToken: string) =>
+  logout: () => api.post("/auth/logout", undefined, { withCredentials: true }),
+  /** Exchange the HttpOnly refresh cookie for a fresh access token. No
+   *  argument — the cookie rides the request automatically (#484). */
+  refresh: () =>
     api
-      .post<LoginResponse>("/auth/refresh", { refresh_token: refreshToken })
+      .post<LoginResponse>("/auth/refresh", {}, { withCredentials: true })
       .then((r) => r.data),
   changePassword: (currentPassword: string, newPassword: string) =>
     api.post("/auth/change-password", {
@@ -10321,7 +10348,7 @@ async function* _streamApplianceLogSse(
   url: string,
   signal?: AbortSignal,
 ): AsyncIterable<string> {
-  const token = localStorage.getItem("access_token");
+  const token = getAccessToken();
   const res = await fetch(url, {
     headers: {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -10397,7 +10424,7 @@ export function streamApplianceWorkloadLogs(
 export async function* streamClusterHealth(
   signal?: AbortSignal,
 ): AsyncIterable<ClusterHealthSnapshot> {
-  const token = localStorage.getItem("access_token");
+  const token = getAccessToken();
   const res = await fetch("/api/v1/appliance/cluster/health/stream", {
     headers: {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -12185,7 +12212,7 @@ export async function* streamNmapScan(
   scanId: string,
   signal?: AbortSignal,
 ): AsyncIterable<{ data: string; done: boolean }> {
-  const token = localStorage.getItem("access_token");
+  const token = getAccessToken();
   const url = nmapApi.streamUrl(scanId);
   const res = await fetch(url, {
     headers: {
