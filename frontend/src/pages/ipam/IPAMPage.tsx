@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
+import { CreateScopeModal } from "@/pages/dhcp/CreateScopeModal";
 import {
   useQuery,
   useQueries,
@@ -3008,6 +3009,9 @@ function AddAddressModal({
   // subnet has ``dns_split_horizon`` on (effective).
   const [extraZoneIds, setExtraZoneIds] = useState<string[]>([]);
   const [dhcpScopeId, setDhcpScopeId] = useState<string>("");
+  // Issue #472 — let the operator create a scope inline when none exists yet,
+  // instead of sending them off to the DHCP Pools tab and back.
+  const [showCreateScope, setShowCreateScope] = useState(false);
   const [aliases, setAliases] = useState<
     { name: string; record_type: "CNAME" | "A" }[]
   >([]);
@@ -3489,8 +3493,15 @@ function AddAddressModal({
           <Field label="DHCP Scope">
             {dhcpScopes.length === 0 ? (
               <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
-                No DHCP scope exists for this subnet. Create one from the{" "}
-                <span className="font-medium">DHCP Pools</span> tab first.
+                No DHCP scope exists for this subnet — a reservation needs one.
+                <button
+                  type="button"
+                  onClick={() => setShowCreateScope(true)}
+                  className="ml-1 font-medium text-primary underline hover:no-underline"
+                >
+                  Create a scope
+                </button>{" "}
+                to continue.
               </div>
             ) : (
               <select
@@ -3511,6 +3522,12 @@ function AddAddressModal({
               <p className="mt-1 text-xs text-amber-600">
                 MAC address required to create a static DHCP reservation.
               </p>
+            )}
+            {showCreateScope && (
+              <CreateScopeModal
+                subnetId={subnetId}
+                onClose={() => setShowCreateScope(false)}
+              />
             )}
           </Field>
         )}

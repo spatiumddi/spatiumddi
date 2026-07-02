@@ -31,9 +31,9 @@ export function CreateStaticAssignmentModal({
     queryFn: () => dhcpApi.listPools(scope.id),
   });
 
-  const eligiblePools = pools.filter(
-    (p) => p.pool_type === "reserved" || p.pool_type === "dynamic",
-  );
+  // Reservations may not sit inside a dynamic pool (the backend rejects that in
+  // `_conflict_check`), so only offer reserved-pool ranges as IP hints.
+  const eligiblePools = pools.filter((p) => p.pool_type === "reserved");
 
   const mut = useMutation({
     mutationFn: () => {
@@ -85,8 +85,8 @@ export function CreateStaticAssignmentModal({
             label="IP Address"
             hint={
               eligiblePools.length > 0
-                ? `Must be within a reserved or dynamic pool of this scope.`
-                : "No pools defined yet — any IP in subnet."
+                ? `Use an IP from a reserved pool; IPs inside a dynamic pool are rejected.`
+                : "Any IP within the subnet (outside dynamic pools)."
             }
           >
             <input
