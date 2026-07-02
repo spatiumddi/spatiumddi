@@ -1305,6 +1305,16 @@ async def _sync_dns_record(
                     )
 
     # ── Reverse PTR ─────────────────────────────────────────────────────────
+    # A PTR points AT the forward FQDN. With no effective primary forward zone
+    # ``fqdn`` is None (subnet resolved to no forward zone, or a stale/deleted
+    # primary-zone FK reset it above), so there is no name to point at — skip
+    # the PTR. The forward fan-out above already published to any extra zones
+    # via their own ``target_fqdn``. Without this guard ``ptr_value = fqdn +
+    # "."`` below raises TypeError (None + str) — reachable through the public
+    # create endpoint for a split-horizon IP with extra_zone_ids and no forward
+    # zone, or an IP whose primary forward zone was deleted (issue #480).
+    if fqdn is None:
+        return
     try:
         ip_obj = ipaddress.ip_address(str(ip.address))
     except ValueError:
