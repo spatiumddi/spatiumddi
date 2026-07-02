@@ -166,7 +166,7 @@ Static assignments bind a MAC address (or client identifier) to a specific IP, h
 ```
 DHCPStaticAssignment
   id, scope_id
-  ip_address: inet              -- must be within subnet
+  ip_address: inet              -- expected within subnet (not enforced at the API layer)
   mac_address: macaddr          -- primary identifier
   client_id: str (nullable)     -- DHCP client identifier (alternative to MAC)
   hostname: str
@@ -201,9 +201,9 @@ the scope alone is enough to emit the `subnet4` block that reservations hang off
    below), and set the hostname.
 4. Click **Allocate**. IPAM creates the address row with
    `IPAddress.status = static_dhcp` and mirrors it into the scope as a
-   `DHCPStaticAssignment` (via `POST /dhcp/scopes/{scope_id}/statics`). The Kea
-   agent picks up the new `ConfigBundle` (a group wake fires + the ETag shifts)
-   and renders the host reservation within seconds.
+   `DHCPStaticAssignment` (via `POST /api/v1/dhcp/scopes/{scope_id}/statics`).
+   The Kea agent picks up the new `ConfigBundle` (a group wake fires + the ETag
+   shifts) and renders the host reservation within seconds.
 
 **Viewing existing reservations.** The **DHCP → server group → "Static
 Assignments"** tab lists every reservation across the group's scopes. It is
@@ -212,9 +212,16 @@ surface. Manage reservations from the IPAM Allocate flow above.
 
 **Caveats / common "nothing happened" traps:**
 
-- **A MAC is mandatory to create the Kea reservation.** With `static_dhcp` but a
-  blank MAC, the IPAM row is still created but the reservation is **silently not
-  mirrored** to DHCP (the modal shows only a soft "MAC address required" hint).
+- **A MAC is mandatory — a blank MAC is rejected, not silent.** Allocating a
+  `static_dhcp` address without a `mac_address` returns **422**
+  (`mac_address is required when status is 'static_dhcp'`) from both the
+  `create` and `next-address` endpoints, so **nothing is created** — neither the
+  IPAM row nor the reservation.
+- **`static_dhcp` with a MAC but no scope creates the IPAM row and silently skips
+  the reservation.** If no DHCP scope is selected (e.g. none exists for the
+  subnet yet), the IPAM address is created but the mirror to Kea is **not
+  attempted** — this is the real "I set it static but nothing happened" trap.
+  Create a scope first (see the prerequisite above).
 - **Only fresh allocation creates a reservation.** Flipping an *existing* IP to
   `static_dhcp` via **Edit** (or bulk-edit) updates the IPAM row but does **not**
   create a Kea reservation. Delete and re-allocate, or add it from the Allocate
@@ -231,8 +238,10 @@ up, walk this checklist — each item is a real, mostly-silent drop point:
 
 - **The static was never actually created.** Confirm it exists via
   `GET /api/v1/dhcp/scopes/{scope_id}/statics` or the group's read-only Static
-  Assignments tab. If it's absent, it was skipped at allocation time (blank MAC,
-  non-superadmin 403, or no scope — see the caveats above).
+  Assignments tab. If it's absent, distinguish two cases: the allocation was
+  **rejected** (a blank MAC 422s the whole allocation — nothing was created), or
+  it **succeeded without mirroring** (a MAC was given but no scope was selected,
+  or a non-superadmin hit 403 on the mirror call). See the caveats above.
 - **The scope is inactive.** Only `is_active = true` scopes (and the statics
   under them) are assembled into the config bundle — a disabled scope silently
   drops every reservation it holds.
