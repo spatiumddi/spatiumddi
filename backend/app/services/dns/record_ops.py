@@ -218,6 +218,7 @@ async def enqueue_record_op(
         return None
 
     primary_op: DNSRecordOp | None = None
+    first_op: DNSRecordOp | None = None
     for srv in agent_servers:
         row = DNSRecordOp(
             server_id=srv.id,
@@ -228,6 +229,8 @@ async def enqueue_record_op(
             state="pending",
         )
         db.add(row)
+        if first_op is None:
+            first_op = row
         if srv.id == primary.id:
             primary_op = row
     await db.flush()
@@ -236,7 +239,13 @@ async def enqueue_record_op(
     # tick. Collected here (no commit yet); the request's
     # ``wake_publishing`` dependency flushes it after the outer commit.
     collect_wake(dns_group_channel(zone.group_id))
-    return primary_op
+    # Return the primary's op when the primary is among the enabled servers,
+    # else the first enabled agent's op. The return must be truthy whenever we
+    # actually enqueued something — a disabled primary + enabled secondary still
+    # dispatches a wire op (#481) — so a caller that gates a DB delete on "was a
+    # wire op dispatched?" (e.g. dns bulk-delete) doesn't keep a row whose
+    # record was already removed on-wire.
+    return primary_op or first_op
 
 
 async def enqueue_record_ops_batch(

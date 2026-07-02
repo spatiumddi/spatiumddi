@@ -7041,7 +7041,7 @@ function DriftRow({
       <span
         className={cn(
           "inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium flex-shrink-0",
-          type === "A"
+          type === "A" || type === "AAAA"
             ? "bg-blue-500/15 text-blue-600"
             : type === "PTR"
               ? "bg-cyan-500/15 text-cyan-600"

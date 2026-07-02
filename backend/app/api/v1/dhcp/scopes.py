@@ -34,6 +34,11 @@ router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permiss
 
 VALID_HOSTNAME_POLICIES = {"client", "server_name", "derived", "none"}
 VALID_SYNC_MODES = {"disabled", "on_lease", "on_static_only", "ipam", "learned"}
+# Fields on ScopeUpdate an explicit ``null`` may CLEAR (#475). Every other
+# nullable column keeps its ``exclude_none`` behaviour — a stray null is dropped
+# rather than applied — so a NOT-NULL column can't 500 on ``setattr(None)`` and a
+# partial-body client can't silently wipe a column it didn't mean to touch.
+NULLABLE_CLEARABLE_SCOPE_FIELDS = {"min_lease_time", "max_lease_time"}
 # DHCPv6 operating modes (issue #52). Only meaningful for ipv6 scopes.
 VALID_V6_MODES = {"stateful", "stateless", "slaac"}
 
@@ -443,11 +448,19 @@ async def update_scope(
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
-    # ``exclude_unset`` (not ``exclude_none``) so an explicit null clears a
+    # ``exclude_unset`` (not ``exclude_none``) so an explicit null can clear a
     # nullable column (e.g. resetting min_lease_time / max_lease_time to empty),
-    # while a field the client didn't send stays untouched (#475). ``exclude_none``
-    # silently dropped explicit nulls, so those fields could never be cleared.
-    changes = body.model_dump(exclude_unset=True)
+    # while a field the client didn't send stays untouched (#475). But keep a
+    # null only for the fields we explicitly allow to clear — otherwise an
+    # explicit null on a NOT-NULL column (name / description / is_active) would
+    # 500 on commit, and a null a partial-body client sent for an unmanaged
+    # nullable column would silently wipe it (both were dropped under
+    # ``exclude_none``).
+    changes = {
+        k: v
+        for k, v in body.model_dump(exclude_unset=True).items()
+        if v is not None or k in NULLABLE_CLEARABLE_SCOPE_FIELDS
+    }
     if "enabled" in changes:
         changes["is_active"] = changes.pop("enabled")
     if "hostname_sync_mode" in changes:

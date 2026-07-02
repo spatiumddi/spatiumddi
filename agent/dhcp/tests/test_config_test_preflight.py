@@ -124,3 +124,29 @@ def test_reload_socket_socket_not_ready_retries_then_reports(
     ok = loop._reload_socket(agent_cfg.kea_control_socket, {"Dhcp4": {}}, "dhcp4", 0.0)
     assert ok is False
     assert "socket_unreachable" in loop.heartbeat.daemon_status["reason"]
+
+
+def test_reload_socket_transient_kea_error_retries_then_succeeds(
+    agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # During Kea's startup window config-test can answer with a *transient*
+    # KeaCtrlError that succeeds a moment later; within the retry deadline that
+    # must be retried (not treated as terminal), or the freshly-written config
+    # never reloads and the daemon stays on its launch-time config.
+    loop = _loop(agent_cfg)
+    calls = {"test": 0}
+
+    def flaky_test(sock, doc):  # type: ignore[no-untyped-def]
+        calls["test"] += 1
+        if calls["test"] == 1:
+            raise KeaCtrlError("transient: empty response from kea")
+        # second call succeeds
+
+    reloaded: list[Path] = []
+    monkeypatch.setattr(sync_mod, "config_test", flaky_test)
+    monkeypatch.setattr(sync_mod, "config_reload", lambda s: reloaded.append(s))
+
+    ok = loop._reload_socket(agent_cfg.kea_control_socket, {"Dhcp4": {}}, "dhcp4", 5.0)
+    assert ok is True
+    assert calls["test"] == 2  # retried past the transient KeaCtrlError
+    assert reloaded  # reloaded once config-test passed

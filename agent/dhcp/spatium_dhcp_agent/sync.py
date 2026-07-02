@@ -179,16 +179,15 @@ class SyncLoop:
                 config_test(socket_path, config_doc)
                 config_reload(socket_path)
                 return True
-            except KeaCtrlError as e:
-                # The daemon answered but rejected the config → terminal.
-                log.warning("kea_config_rejected", daemon=daemon, error=str(e))
-                self.heartbeat.daemon_status = {
-                    "status": "degraded",
-                    "reason": f"{daemon}_config_rejected: {e}",
-                }
-                return False
-            except OSError as e:
-                # Control socket not up yet (Kea still starting) → retry.
+            except (KeaCtrlError, OSError) as e:
+                # Retry BOTH classes through the deadline. An OSError is the
+                # control socket not being up yet; and during Kea's startup
+                # window the command channel can answer config-test with a
+                # *transient* KeaCtrlError (empty / non-JSON / not-ready) that a
+                # moment later succeeds — so a rejection is only treated as
+                # terminal once the retry window is exhausted. In the steady-
+                # state apply path reload_retry_timeout is 0, so a genuinely bad
+                # config still reports immediately without a spurious reload.
                 last_err = e
                 if time.monotonic() >= deadline:
                     break
@@ -200,11 +199,20 @@ class SyncLoop:
                 )
                 if self._stop.wait(_BOOTSTRAP_RELOAD_INTERVAL):
                     break
-        log.warning("kea_config_reload_failed", daemon=daemon, error=str(last_err))
-        self.heartbeat.daemon_status = {
-            "status": "degraded",
-            "reason": f"{daemon}_socket_unreachable: {last_err}",
-        }
+        # Deadline exhausted — report the reason that fits the last error: a
+        # config Kea rejected (surface its text) vs a socket we never reached.
+        if isinstance(last_err, KeaCtrlError):
+            log.warning("kea_config_rejected", daemon=daemon, error=str(last_err))
+            self.heartbeat.daemon_status = {
+                "status": "degraded",
+                "reason": f"{daemon}_config_rejected: {last_err}",
+            }
+        else:
+            log.warning("kea_config_reload_failed", daemon=daemon, error=str(last_err))
+            self.heartbeat.daemon_status = {
+                "status": "degraded",
+                "reason": f"{daemon}_socket_unreachable: {last_err}",
+            }
         return False
 
     def _apply_bundle(

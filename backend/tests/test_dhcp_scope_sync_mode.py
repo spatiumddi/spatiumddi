@@ -77,7 +77,9 @@ async def test_canonical_sync_mode_round_trips(
     assert body["hostname_sync_mode"] == "on_lease"
 
     r = await client.put(
-        f"/api/v1/dhcp/scopes/{body['id']}", headers=h, json={"hostname_sync_mode": "disabled"}
+        f"/api/v1/dhcp/scopes/{body['id']}",
+        headers=h,
+        json={"hostname_sync_mode": "disabled"},
     )
     assert r.status_code == 200, r.text
     assert r.json()["hostname_sync_mode"] == "disabled"
@@ -136,6 +138,34 @@ async def test_update_rejects_invalid_sync_mode(
 
     body = await _create(client, h, subnet, grp)
     r = await client.put(
-        f"/api/v1/dhcp/scopes/{body['id']}", headers=h, json={"hostname_sync_mode": "bogus"}
+        f"/api/v1/dhcp/scopes/{body['id']}",
+        headers=h,
+        json={"hostname_sync_mode": "bogus"},
     )
     assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_update_explicit_null_on_notnull_field_is_ignored_not_500(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # exclude_unset lets explicit nulls through; a null on a NOT-NULL column
+    # (name / is_active) or an unmanaged nullable one must be DROPPED, not
+    # applied — else setattr(None) 500s on commit / silently wipes data.
+    token = await _make_token(db_session)
+    subnet, grp = await _subnet_and_group(db_session)
+    await db_session.commit()
+    h = {"Authorization": f"Bearer {token}"}
+
+    body = await _create(client, h, subnet, grp, name="keep-me", description="keep-desc")
+    r = await client.put(
+        f"/api/v1/dhcp/scopes/{body['id']}",
+        headers=h,
+        json={"name": None, "description": None, "is_active": None},
+    )
+    assert r.status_code == 200, r.text
+    scope = await db_session.get(DHCPScope, uuid.UUID(body["id"]))
+    await db_session.refresh(scope)
+    assert scope.name == "keep-me"  # NOT cleared
+    assert scope.description == "keep-desc"
+    assert scope.is_active is True

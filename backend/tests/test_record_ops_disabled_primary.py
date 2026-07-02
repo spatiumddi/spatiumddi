@@ -96,7 +96,12 @@ async def test_bulk_disabled_primary_still_queues_to_enabled_secondary(
     dispatched = await enqueue_record_ops_bulk(
         db_session,
         zone,
-        [{"op": "create", "record": {"name": "web", "type": "A", "value": "10.0.0.50"}}],
+        [
+            {
+                "op": "create",
+                "record": {"name": "web", "type": "A", "value": "10.0.0.50"},
+            }
+        ],
     )
     await db_session.commit()
 
@@ -104,3 +109,20 @@ async def test_bulk_disabled_primary_still_queues_to_enabled_secondary(
     server_ids = {o.server_id for o in await _ops_for_zone(db_session, zone)}
     assert secondary.id in server_ids
     assert primary.id not in server_ids
+
+
+@pytest.mark.asyncio
+async def test_enqueue_returns_truthy_op_when_fanned_out_to_secondary(
+    db_session: AsyncSession,
+) -> None:
+    # The return must be truthy whenever an op was actually enqueued — a caller
+    # that gates a DB delete on "was a wire op dispatched?" (dns bulk-delete)
+    # would otherwise keep a row whose record was already removed on-wire.
+    primary, secondary, zone = await _group_disabled_primary_enabled_secondary(db_session)
+    await db_session.commit()
+
+    op = await enqueue_record_op(
+        db_session, zone, "delete", {"name": "web", "type": "A", "value": "10.0.0.50"}
+    )
+    assert op is not None
+    assert op.server_id == secondary.id  # the enabled agent's op, not the disabled primary's
