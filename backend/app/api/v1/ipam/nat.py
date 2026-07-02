@@ -23,6 +23,7 @@ gets to write a half-formed row. Audit goes through the standard
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from datetime import datetime
 from typing import Annotated, Any
@@ -77,6 +78,18 @@ class NATMappingBase(BaseModel):
         if v not in _VALID_KINDS:
             raise ValueError(f"kind must be one of {sorted(_VALID_KINDS)}")
         return v
+
+    @field_validator("internal_ip", "external_ip")
+    @classmethod
+    def _valid_ip(cls, v: str | None) -> str | None:
+        # Validate here so a malformed literal is a 422, not an asyncpg
+        # DataError → 500 when it reaches the INET column / CAST (#511).
+        if v is None or not v.strip():
+            return None
+        try:
+            return str(ipaddress.ip_address(v.strip()))
+        except ValueError:
+            raise ValueError(f"not a valid IP address: {v!r}") from None
 
     @field_validator("protocol")
     @classmethod
@@ -165,6 +178,17 @@ class NATMappingUpdate(BaseModel):
         if v is not None and v not in _VALID_KINDS:
             raise ValueError(f"kind must be one of {sorted(_VALID_KINDS)}")
         return v
+
+    @field_validator("internal_ip", "external_ip")
+    @classmethod
+    def _valid_ip(cls, v: str | None) -> str | None:
+        # 422 on a malformed literal, not a DataError → 500 at the INET column (#511).
+        if v is None or not v.strip():
+            return None
+        try:
+            return str(ipaddress.ip_address(v.strip()))
+        except ValueError:
+            raise ValueError(f"not a valid IP address: {v!r}") from None
 
     @field_validator("protocol")
     @classmethod
@@ -337,10 +361,20 @@ async def list_nat_mappings(
                 status_code=422, detail=f"kind must be one of {sorted(_VALID_KINDS)}"
             )
         base = base.where(NATMapping.kind == kind)
+    for _label, _val in (("internal_ip", internal_ip), ("external_ip", external_ip)):
+        # Validate the filter literal — comparing the INET column against a
+        # malformed string casts it and raises a DataError → 500 (#511).
+        if _val is not None:
+            try:
+                ipaddress.ip_address(_val.strip())
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422, detail=f"{_label} must be a valid IP address"
+                ) from exc
     if internal_ip is not None:
-        base = base.where(NATMapping.internal_ip == internal_ip)
+        base = base.where(NATMapping.internal_ip == internal_ip.strip())
     if external_ip is not None:
-        base = base.where(NATMapping.external_ip == external_ip)
+        base = base.where(NATMapping.external_ip == external_ip.strip())
     if q:
         like = f"%{q}%"
         base = base.where(
