@@ -5397,7 +5397,12 @@ function SubnetDetail({
                             a.status !== "broadcast" &&
                             !a.auto_from_lease &&
                             // Never select a row the table is currently hiding.
-                            !(hideReserved && isPaddingRow(a)),
+                            !(hideReserved && isPaddingRow(a)) &&
+                            // Only rows the caller can actually write — matches
+                            // the per-row checkbox gate so a delegated operator
+                            // (address sets, #103) can't select rows a bulk op
+                            // would then partially 403 (#514).
+                            permitsWriteIp(a.address),
                         );
                         const allSelected =
                           selectable.length > 0 &&
@@ -5809,7 +5814,11 @@ function SubnetDetail({
                                           if (
                                             a.status === "network" ||
                                             a.status === "broadcast" ||
-                                            a.auto_from_lease
+                                            a.auto_from_lease ||
+                                            // Skip rows the caller can't write so
+                                            // a shift-range can't sweep in
+                                            // un-writable rows (#514).
+                                            !permitsWriteIp(a.address)
                                           )
                                             continue;
                                           ids.push(a.id);

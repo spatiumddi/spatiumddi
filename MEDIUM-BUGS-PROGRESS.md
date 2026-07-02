@@ -24,7 +24,7 @@ Current single alembic head (before this branch): `b1f7c3a92e04`.
 - [x] #511 B23 (api) NAT mappings 500 on malformed IP literals (cast to INET DataError). `backend/app/api/v1/ipam/nat.py` ~L61/290/340.
 - [x] #512 B24 (api) Subnet soft-delete skips collect_wake for DHCP channels (12s tick); permanent delete bulk-drops DNSRecord rows without enqueue_record_op → agentless Windows DNS keeps serving. `backend/app/services/ai/operations_risky.py` ~L246/295.
 - [x] #513 B25 (frontend) IPv6 drag-and-drop re-parent always fails — cidr.ts has no v6 containment, fails closed "does not fit inside". `frontend/src/lib/cidr.ts`; `IPAMPage.tsx` handleDragEnd.
-- [ ] #514 B26 (frontend,rbac) Select-all / shift-range ignore per-row RBAC write gate (address sets) → bulk ops partially 403. `IPAMPage.tsx` select-all + shift-range vs checkbox render.
+- [x] #514 B26 (frontend,rbac) Select-all / shift-range ignore per-row RBAC write gate (address sets) → bulk ops partially 403. `IPAMPage.tsx` select-all + shift-range vs checkbox render.
 - [ ] #515 B27 (worker) Discovery double-dispatch race — last_discovery_at stamped at completion; >60s sweeps re-dispatched each tick; concurrent reconcile collides on unique constraint. `backend/app/tasks/ipam_discovery.py` ~L118.
 
 ## Commit log (fill as we go)
@@ -37,3 +37,4 @@ Current single alembic head (before this branch): `b1f7c3a92e04`.
 - #511 → commit (NAT internal_ip/external_ip field validators on create+update schemas + list-filter query-param validation → 422 not 500)
 - #512 → commit (subnet soft-delete now collect_wakes affected DHCP groups; permanent delete enqueues per-record delete ops through record_ops chokepoint so agentless Windows DNS is retracted. Block/space delete analogs noted as follow-up.)
 - #513 → commit (cidr.ts cidrContains dispatches v4 int-path / v6 BigInt-path; v6 drag-drop re-parent no longer fails closed)
+- #514 → commit (select-all selectable filter + shift-range id list now gate on permitsWriteIp, matching the per-row checkbox — no un-writable rows in a delegated operator's bulk selection)
