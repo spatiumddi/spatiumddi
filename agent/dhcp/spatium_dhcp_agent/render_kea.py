@@ -214,8 +214,15 @@ def _reservation_v6(res: dict[str, Any]) -> dict[str, Any]:
     # host-reservation-identifiers).
     if res.get("duid"):
         out["duid"] = res["duid"]
-    elif "hw_address" in res or "mac" in res:
-        out["hw-address"] = res.get("hw_address") or res.get("mac")
+    else:
+        raw_hw = res.get("hw_address") or res.get("mac")
+        if raw_hw:
+            # Same canonicalization as the v4 path (#476): a non-canonical MAC
+            # emitted verbatim makes Kea reject the whole subnet6 on reload.
+            # Drop an invalid MAC rather than emit it malformed.
+            norm = _normalize_mac_for_kea(str(raw_hw))
+            if norm is not None:
+                out["hw-address"] = norm
     addr = res.get("ip_address") or res.get("ip")
     if addr:
         out["ip-addresses"] = [addr]
@@ -383,8 +390,19 @@ def _build_drop_expression(mac_blocks: list[dict[str, Any]]) -> str:
 
 def _reservation(res: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    if "hw_address" in res or "mac" in res:
-        out["hw-address"] = res.get("hw_address") or res.get("mac")
+    raw_hw = res.get("hw_address") or res.get("mac")
+    if raw_hw:
+        # Canonicalize to Kea's lowercase colon form. A reservation MAC
+        # entered non-canonically (Cisco-dotted ``aabb.ccdd.eeff`` or
+        # run-together ``aabbccddeeff``) would otherwise be emitted verbatim
+        # and make Kea REJECT the whole ``subnet4`` on reload, or silently
+        # fail to match the client on-wire (#476). Same normalization the
+        # DROP-class path already uses. An invalid MAC is dropped with a
+        # warning rather than emitted malformed — leaving the reservation to
+        # match on client-id / duid if present, instead of tanking the config.
+        norm = _normalize_mac_for_kea(str(raw_hw))
+        if norm is not None:
+            out["hw-address"] = norm
     if "client_id" in res:
         out["client-id"] = res["client_id"]
     if "duid" in res:
