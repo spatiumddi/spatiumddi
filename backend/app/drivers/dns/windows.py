@@ -227,9 +227,13 @@ class WindowsDNSDriver(DNSDriver):
         port = getattr(server, "api_port", None) or 53
         rtype = change.record.record_type.upper()
 
-        tsig_name = change.tsig_key_name or getattr(server, "tsig_key_name", None)
-        tsig_secret = getattr(server, "tsig_key_secret", None)
-        tsig_algorithm = getattr(server, "tsig_key_algorithm", "hmac-sha256")
+        # TSIG is not modelled on DNSServer (the getattr shims were always None;
+        # #483). Only change.tsig_key_name is carried today; with no secret the
+        # signed branch is skipped and the update goes out unsigned (Windows AD
+        # zones set to "Nonsecure and secure" accept it).
+        tsig_name = change.tsig_key_name
+        tsig_secret: str | None = None
+        tsig_algorithm = "hmac-sha256"
         if tsig_name and tsig_secret:
             keyring = dns.tsigkeyring.from_text({tsig_name: tsig_secret})
             update = dns.update.Update(

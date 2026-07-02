@@ -197,9 +197,14 @@ class BIND9Driver(DNSDriver):
         import dns.tsigkeyring
         import dns.update
 
-        tsig_name = change.tsig_key_name or getattr(server, "tsig_key_name", None)
-        tsig_secret = getattr(server, "tsig_key_secret", None)
-        tsig_algorithm = getattr(server, "tsig_key_algorithm", "hmac-sha256")
+        # TSIG is not modelled on DNSServer (no tsig_key_* columns — the getattr
+        # shims here were always None; #483). Only change.tsig_key_name is
+        # carried on the ChangeSet today; a secret/algorithm source for this
+        # agentless RFC2136 path was never wired, so it raises below. Agent-
+        # rendered BIND9 uses group-level TSIG on DNSServerGroup via agent_config.
+        tsig_name = change.tsig_key_name
+        tsig_secret: str | None = None
+        tsig_algorithm = "hmac-sha256"
         if not tsig_name or not tsig_secret:
             raise RuntimeError("BIND9Driver.apply_record_change requires a TSIG key on the server")
 

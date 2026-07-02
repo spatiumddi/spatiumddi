@@ -227,15 +227,64 @@ async def _aggregate(db: AsyncSession, subnet_ids: Sequence[uuid.UUID]) -> Drift
         reverse_zone_id=None,
         reverse_zone_name=None,
     )
+    if not subnet_ids:
+        return agg
+
+    # Bulk-load the two biggest per-subnet reads ONCE across every subnet
+    # instead of re-querying inside each compute_subnet_dns_drift call — the
+    # loop was ~2 SELECTs/subnet (IPs + their auto-generated records), i.e.
+    # O(N) round-trips for an N-subnet block (#483). The per-subnet zone
+    # resolution stays inside the callee (its inheritance walks amortize via
+    # the session identity map across sibling subnets).
+    all_ips = list(
+        (await db.execute(select(IPAddress).where(IPAddress.subnet_id.in_(subnet_ids))))
+        .scalars()
+        .all()
+    )
+    ips_by_subnet: dict[uuid.UUID, list[IPAddress]] = {}
+    for ip in all_ips:
+        ips_by_subnet.setdefault(ip.subnet_id, []).append(ip)
+
+    recs_by_ip: dict[uuid.UUID, list[DNSRecord]] = {}
+    all_ip_ids = [ip.id for ip in all_ips]
+    if all_ip_ids:
+        for r in (
+            (
+                await db.execute(
+                    select(DNSRecord).where(
+                        DNSRecord.auto_generated.is_(True),
+                        DNSRecord.ip_address_id.in_(all_ip_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        ):
+            if r.ip_address_id is not None:
+                recs_by_ip.setdefault(r.ip_address_id, []).append(r)
+
     for sid in subnet_ids:
-        sub_report = await compute_subnet_dns_drift(db, sid)
+        sub_ips = ips_by_subnet.get(sid, [])
+        sub_recs = {ip.id: recs_by_ip.get(ip.id, []) for ip in sub_ips}
+        sub_report = await compute_subnet_dns_drift(
+            db, sid, preloaded_ips=sub_ips, preloaded_recs_by_ip=sub_recs
+        )
         agg.missing.extend(sub_report.missing)
         agg.mismatched.extend(sub_report.mismatched)
         agg.stale.extend(sub_report.stale)
     return agg
 
 
-async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> DriftReport:
+async def compute_subnet_dns_drift(
+    db: AsyncSession,
+    subnet_id: uuid.UUID,
+    *,
+    preloaded_ips: list[IPAddress] | None = None,
+    preloaded_recs_by_ip: dict[uuid.UUID, list[DNSRecord]] | None = None,
+) -> DriftReport:
+    # ``preloaded_*`` let ``_aggregate`` batch the IP + auto-record loads once
+    # across a whole block/space instead of re-querying per subnet (#483). When
+    # omitted (the single-subnet call path) we load them here as before.
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise ValueError(f"Subnet {subnet_id} not found")
@@ -252,25 +301,31 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
         reverse_zone_name=reverse_zone.name if reverse_zone else None,
     )
 
-    # All live IPs in the subnet.
-    ips_res = await db.execute(select(IPAddress).where(IPAddress.subnet_id == subnet_id))
-    ips = list(ips_res.scalars().all())
+    # All live IPs in the subnet (batched by the caller, else loaded here).
+    if preloaded_ips is not None:
+        ips = preloaded_ips
+    else:
+        ips_res = await db.execute(select(IPAddress).where(IPAddress.subnet_id == subnet_id))
+        ips = list(ips_res.scalars().all())
 
     # All auto-generated DNS records that point at IPs in this subnet.
-    if ips:
-        rec_res = await db.execute(
-            select(DNSRecord).where(
-                DNSRecord.auto_generated.is_(True),
-                DNSRecord.ip_address_id.in_([ip.id for ip in ips]),
-            )
-        )
-        records = list(rec_res.scalars().all())
+    if preloaded_recs_by_ip is not None:
+        recs_by_ip = preloaded_recs_by_ip
     else:
-        records = []
-    recs_by_ip: dict[uuid.UUID, list[DNSRecord]] = {}
-    for r in records:
-        if r.ip_address_id is not None:
-            recs_by_ip.setdefault(r.ip_address_id, []).append(r)
+        if ips:
+            rec_res = await db.execute(
+                select(DNSRecord).where(
+                    DNSRecord.auto_generated.is_(True),
+                    DNSRecord.ip_address_id.in_([ip.id for ip in ips]),
+                )
+            )
+            records = list(rec_res.scalars().all())
+        else:
+            records = []
+        recs_by_ip = {}
+        for r in records:
+            if r.ip_address_id is not None:
+                recs_by_ip.setdefault(r.ip_address_id, []).append(r)
 
     # Also pick up records that *think* they belong to a subnet IP but the IP
     # was deleted (FK is SET NULL on IPAddress delete) — these are stale.
