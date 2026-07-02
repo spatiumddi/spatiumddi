@@ -387,12 +387,16 @@ async def create_scope(
     )
     db.add(scope)
     # The pre-check above can't see a soft-deleted scope, and even for
-    # live rows a concurrent create can race it, so translate the DB
-    # unique-violation into a clean 409 instead of a raw 500 (#474).
+    # live rows a concurrent create can race it, so translate a
+    # (group, subnet) unique-violation into a clean 409 (#474). Any other
+    # integrity failure (FK / NOT NULL / CHECK) is unexpected — roll back
+    # and let it surface as a 500 rather than masking it as a conflict.
     try:
         await db.flush()
     except IntegrityError as exc:
         await db.rollback()
+        if "uq_dhcp_scope_group_subnet" not in str(exc.orig):
+            raise
         raise HTTPException(
             status_code=409,
             detail="A scope for this group+subnet already exists",
