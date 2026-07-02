@@ -191,24 +191,30 @@ scopes / pools / statics / classes all belong to the group). Create it from
 **DHCP → the server group → Scopes tab → New Scope**. A dynamic pool is optional;
 the scope alone is enough to emit the `subnet4` block that reservations hang off.
 
-**Create the reservation (the only working create path):**
+**Create the reservation — two equivalent paths:**
+
+*From the DHCP page:* **DHCP → the server group → "Static Assignments" tab →
+New static assignment**. Pick the scope (a picker appears when the group has
+more than one), then enter the MAC + IP + hostname and save. Edit and Delete
+live on the per-row right-click menu. Creating / editing / deleting a
+reservation requires a **superadmin**.
+
+*From IPAM (at allocation time):*
 
 1. **IPAM → select the subnet → "Allocate IP"** (the primary header button; also
    reachable from a free-range gap row or the subnet context menu).
 2. In the **Allocate IP Address** modal set **Type / Status = `static_dhcp`**.
    This reveals the **DHCP Scope** picker.
 3. Pick the **DHCP Scope**, enter the **MAC address** (required — see caveat
-   below), and set the hostname.
+   below), and set the hostname. If no scope exists for the subnet yet, the
+   picker offers a **Create a scope** button that opens the scope modal inline.
 4. Click **Allocate**. IPAM creates the address row with
    `IPAddress.status = static_dhcp` and mirrors it into the scope as a
    `DHCPStaticAssignment` (via `POST /api/v1/dhcp/scopes/{scope_id}/statics`).
-   The Kea agent picks up the new `ConfigBundle` (a group wake fires + the ETag
-   shifts) and renders the host reservation within seconds.
 
-**Viewing existing reservations.** The **DHCP → server group → "Static
-Assignments"** tab lists every reservation across the group's scopes. It is
-currently **read-only** (sort + copy IP / MAC / hostname) — it is not a create
-surface. Manage reservations from the IPAM Allocate flow above.
+Either way, the Kea agent picks up the new `ConfigBundle` (a group wake fires +
+the ETag shifts) and renders the host reservation within seconds. The **Static
+Assignments** tab lists every reservation across the group's scopes.
 
 **Caveats / common "nothing happened" traps:**
 
@@ -222,10 +228,10 @@ surface. Manage reservations from the IPAM Allocate flow above.
   subnet yet), the IPAM address is created but the mirror to Kea is **not
   attempted** — this is the real "I set it static but nothing happened" trap.
   Create a scope first (see the prerequisite above).
-- **Only fresh allocation creates a reservation.** Flipping an *existing* IP to
-  `static_dhcp` via **Edit** (or bulk-edit) updates the IPAM row but does **not**
-  create a Kea reservation. Delete and re-allocate, or add it from the Allocate
-  flow.
+- **Editing an existing IPAM row to `static_dhcp` does not create a reservation.**
+  Flipping an *existing* IP to `static_dhcp` via **Edit** (or bulk-edit) updates
+  the IPAM row but does **not** mirror it to Kea. Add the reservation from the
+  DHCP **Static Assignments** tab, or delete and re-allocate via the IPAM flow.
 - **Creating a static currently requires a superadmin.** A non-superadmin who
   allocates a `static_dhcp` IP gets the IPAM row but the mirror call returns 403.
 
@@ -237,8 +243,8 @@ array *inside* the relevant `subnet4`. If a reservation you created never shows
 up, walk this checklist — each item is a real, mostly-silent drop point:
 
 - **The static was never actually created.** Confirm it exists via
-  `GET /api/v1/dhcp/scopes/{scope_id}/statics` or the group's read-only Static
-  Assignments tab. If it's absent, distinguish two cases: the allocation was
+  `GET /api/v1/dhcp/scopes/{scope_id}/statics` or the group's Static Assignments
+  tab. If it's absent, distinguish two cases: the allocation was
   **rejected** (a blank MAC 422s the whole allocation — nothing was created), or
   it **succeeded without mirroring** (a MAC was given but no scope was selected,
   or a non-superadmin hit 403 on the mirror call). See the caveats above.

@@ -58,6 +58,8 @@ import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
 import { CreateOptionTemplateModal } from "./CreateOptionTemplateModal";
+import { CreateStaticAssignmentModal } from "./CreateStaticAssignmentModal";
+import { usePermissions } from "@/hooks/usePermissions";
 import { MacBlocksTab } from "./MacBlocksTab";
 import { PhoneProfilesTab } from "./PhoneProfilesTab";
 import { DeleteConfirmModal, StatusDot } from "./_shared";
@@ -1306,164 +1308,262 @@ function ServerPoolsOrStaticsTab({
     },
   );
 
+  // Static reservations are created/edited here (issue #472). Creation is
+  // group-centric — the operator picks which scope the reservation lands in.
+  // Backend create/update/delete are superadmin-gated, so gate the UI too.
+  const qc = useQueryClient();
+  const { isSuperadmin } = usePermissions();
+  const [showCreate, setShowCreate] = useState(false);
+  const [createScopeId, setCreateScopeId] = useState("");
+  const [editStatic, setEditStatic] = useState<StaticRow | null>(null);
+  const [delStatic, setDelStatic] = useState<StaticRow | null>(null);
+  const createScope =
+    allScopes.find((s) => s.id === createScopeId) ?? allScopes[0] ?? null;
+  const delMut = useMutation({
+    mutationFn: (row: StaticRow) =>
+      dhcpApi.deleteStatic(row.scope.id, row.item.id),
+    onSuccess: (_r, row) => {
+      qc.invalidateQueries({ queryKey: ["dhcp-statics", row.scope.id] });
+      // Delete detaches the linked IPAM row + triggers DNS sync server-side,
+      // so refresh the same IPAM/DNS keys the create/edit modal invalidates.
+      qc.invalidateQueries({ queryKey: ["addresses", row.scope.subnet_id] });
+      qc.invalidateQueries({
+        queryKey: ["subnet-dns-sync", row.scope.subnet_id],
+      });
+      setDelStatic(null);
+    },
+  });
+  const canManageStatics = kind === "statics" && isSuperadmin;
+
   return (
-    <div className="rounded-lg border">
-      {rows.length === 0 ? (
-        <p className="p-6 text-center text-sm text-muted-foreground">
-          No {kind === "pools" ? "pools" : "static assignments"} yet.
-        </p>
-      ) : kind === "pools" ? (
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[640px] text-sm">
-            <thead>
-              <tr className="border-b bg-muted/30 text-xs">
-                <SortableTh
-                  sortKey="scope"
-                  sort={poolSort}
-                  onSort={togglePoolSort}
-                  className="px-3 py-2"
-                >
-                  Scope
-                </SortableTh>
-                <SortableTh
-                  sortKey="name"
-                  sort={poolSort}
-                  onSort={togglePoolSort}
-                  className="px-3 py-2"
-                >
-                  Name
-                </SortableTh>
-                <SortableTh
-                  sortKey="start"
-                  sort={poolSort}
-                  onSort={togglePoolSort}
-                  className="px-3 py-2"
-                >
-                  Start
-                </SortableTh>
-                <SortableTh
-                  sortKey="end"
-                  sort={poolSort}
-                  onSort={togglePoolSort}
-                  className="px-3 py-2"
-                >
-                  End
-                </SortableTh>
-                <SortableTh
-                  sortKey="type"
-                  sort={poolSort}
-                  onSort={togglePoolSort}
-                  className="px-3 py-2"
-                >
-                  Type
-                </SortableTh>
-              </tr>
-            </thead>
-            <tbody className={zebraBodyCls}>
-              {poolRows.map(({ scope, item }) => {
-                const p = item;
-                return (
-                  <tr key={p.id} className="border-b last:border-0">
-                    <td className="px-3 py-2 text-xs">{scope.name}</td>
-                    <td className="px-3 py-2">{p.name || "—"}</td>
-                    <td className="px-3 py-2 font-mono text-xs">
-                      {p.start_ip}
-                    </td>
-                    <td className="px-3 py-2 font-mono text-xs">{p.end_ip}</td>
-                    <td className="px-3 py-2">
-                      <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
-                        {p.pool_type}
-                      </span>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+    <div className="space-y-3">
+      {canManageStatics && allScopes.length > 0 && (
+        <div className="flex items-center justify-end gap-2">
+          {allScopes.length > 1 && (
+            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              Add to scope
+              <select
+                className="rounded-md border bg-background px-2 py-1 text-xs"
+                value={createScope?.id ?? ""}
+                onChange={(e) => setCreateScopeId(e.target.value)}
+              >
+                {allScopes.map((sc) => (
+                  <option key={sc.id} value={sc.id}>
+                    {sc.name || `Scope ${sc.id.slice(0, 8)}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <button
+            onClick={() => setShowCreate(true)}
+            className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+          >
+            <Plus className="h-3 w-3" /> New static assignment
+          </button>
         </div>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[640px] text-sm">
-            <thead>
-              <tr className="border-b bg-muted/30 text-xs">
-                <SortableTh
-                  sortKey="scope"
-                  sort={staticSort}
-                  onSort={toggleStaticSort}
-                  className="px-3 py-2"
-                >
-                  Scope
-                </SortableTh>
-                <SortableTh
-                  sortKey="mac"
-                  sort={staticSort}
-                  onSort={toggleStaticSort}
-                  className="px-3 py-2"
-                >
-                  MAC
-                </SortableTh>
-                <SortableTh
-                  sortKey="ip"
-                  sort={staticSort}
-                  onSort={toggleStaticSort}
-                  className="px-3 py-2"
-                >
-                  IP
-                </SortableTh>
-                <SortableTh
-                  sortKey="hostname"
-                  sort={staticSort}
-                  onSort={toggleStaticSort}
-                  className="px-3 py-2"
-                >
-                  Hostname
-                </SortableTh>
-              </tr>
-            </thead>
-            <tbody className={zebraBodyCls}>
-              {staticRows.map(({ scope, item }) => {
-                const s = item;
-                return (
-                  <ContextMenu key={s.id}>
-                    <ContextMenuTrigger asChild>
-                      <tr className="border-b last:border-0">
-                        <td className="px-3 py-2 text-xs">{scope.name}</td>
-                        <td className="px-3 py-2 font-mono text-xs">
-                          {s.mac_address}
-                        </td>
-                        <td className="px-3 py-2 font-mono text-xs">
-                          {s.ip_address}
-                        </td>
-                        <td className="px-3 py-2">{s.hostname || "—"}</td>
-                      </tr>
-                    </ContextMenuTrigger>
-                    <ContextMenuContent>
-                      <ContextMenuLabel>{s.ip_address}</ContextMenuLabel>
-                      <ContextMenuSeparator />
-                      <ContextMenuItem
-                        onSelect={() => copyToClipboard(s.ip_address)}
-                      >
-                        Copy IP
-                      </ContextMenuItem>
-                      <ContextMenuItem
-                        onSelect={() => copyToClipboard(s.mac_address)}
-                      >
-                        Copy MAC
-                      </ContextMenuItem>
-                      {s.hostname && (
+      )}
+      <div className="rounded-lg border">
+        {rows.length === 0 ? (
+          <p className="p-6 text-center text-sm text-muted-foreground">
+            {kind === "pools"
+              ? "No pools yet."
+              : allScopes.length === 0
+                ? "No DHCP scopes in this group yet — create a scope first, then add reservations here."
+                : "No static assignments yet."}
+          </p>
+        ) : kind === "pools" ? (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[640px] text-sm">
+              <thead>
+                <tr className="border-b bg-muted/30 text-xs">
+                  <SortableTh
+                    sortKey="scope"
+                    sort={poolSort}
+                    onSort={togglePoolSort}
+                    className="px-3 py-2"
+                  >
+                    Scope
+                  </SortableTh>
+                  <SortableTh
+                    sortKey="name"
+                    sort={poolSort}
+                    onSort={togglePoolSort}
+                    className="px-3 py-2"
+                  >
+                    Name
+                  </SortableTh>
+                  <SortableTh
+                    sortKey="start"
+                    sort={poolSort}
+                    onSort={togglePoolSort}
+                    className="px-3 py-2"
+                  >
+                    Start
+                  </SortableTh>
+                  <SortableTh
+                    sortKey="end"
+                    sort={poolSort}
+                    onSort={togglePoolSort}
+                    className="px-3 py-2"
+                  >
+                    End
+                  </SortableTh>
+                  <SortableTh
+                    sortKey="type"
+                    sort={poolSort}
+                    onSort={togglePoolSort}
+                    className="px-3 py-2"
+                  >
+                    Type
+                  </SortableTh>
+                </tr>
+              </thead>
+              <tbody className={zebraBodyCls}>
+                {poolRows.map(({ scope, item }) => {
+                  const p = item;
+                  return (
+                    <tr key={p.id} className="border-b last:border-0">
+                      <td className="px-3 py-2 text-xs">{scope.name}</td>
+                      <td className="px-3 py-2">{p.name || "—"}</td>
+                      <td className="px-3 py-2 font-mono text-xs">
+                        {p.start_ip}
+                      </td>
+                      <td className="px-3 py-2 font-mono text-xs">
+                        {p.end_ip}
+                      </td>
+                      <td className="px-3 py-2">
+                        <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
+                          {p.pool_type}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[640px] text-sm">
+              <thead>
+                <tr className="border-b bg-muted/30 text-xs">
+                  <SortableTh
+                    sortKey="scope"
+                    sort={staticSort}
+                    onSort={toggleStaticSort}
+                    className="px-3 py-2"
+                  >
+                    Scope
+                  </SortableTh>
+                  <SortableTh
+                    sortKey="mac"
+                    sort={staticSort}
+                    onSort={toggleStaticSort}
+                    className="px-3 py-2"
+                  >
+                    MAC
+                  </SortableTh>
+                  <SortableTh
+                    sortKey="ip"
+                    sort={staticSort}
+                    onSort={toggleStaticSort}
+                    className="px-3 py-2"
+                  >
+                    IP
+                  </SortableTh>
+                  <SortableTh
+                    sortKey="hostname"
+                    sort={staticSort}
+                    onSort={toggleStaticSort}
+                    className="px-3 py-2"
+                  >
+                    Hostname
+                  </SortableTh>
+                </tr>
+              </thead>
+              <tbody className={zebraBodyCls}>
+                {staticRows.map(({ scope, item }) => {
+                  const s = item;
+                  return (
+                    <ContextMenu key={s.id}>
+                      <ContextMenuTrigger asChild>
+                        <tr className="border-b last:border-0">
+                          <td className="px-3 py-2 text-xs">{scope.name}</td>
+                          <td className="px-3 py-2 font-mono text-xs">
+                            {s.mac_address}
+                          </td>
+                          <td className="px-3 py-2 font-mono text-xs">
+                            {s.ip_address}
+                          </td>
+                          <td className="px-3 py-2">{s.hostname || "—"}</td>
+                        </tr>
+                      </ContextMenuTrigger>
+                      <ContextMenuContent>
+                        <ContextMenuLabel>{s.ip_address}</ContextMenuLabel>
+                        <ContextMenuSeparator />
                         <ContextMenuItem
-                          onSelect={() => copyToClipboard(s.hostname!)}
+                          onSelect={() => copyToClipboard(s.ip_address)}
                         >
-                          Copy Hostname
+                          Copy IP
                         </ContextMenuItem>
-                      )}
-                    </ContextMenuContent>
-                  </ContextMenu>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+                        <ContextMenuItem
+                          onSelect={() => copyToClipboard(s.mac_address)}
+                        >
+                          Copy MAC
+                        </ContextMenuItem>
+                        {s.hostname && (
+                          <ContextMenuItem
+                            onSelect={() => copyToClipboard(s.hostname!)}
+                          >
+                            Copy Hostname
+                          </ContextMenuItem>
+                        )}
+                        {canManageStatics && (
+                          <>
+                            <ContextMenuSeparator />
+                            <ContextMenuItem
+                              onSelect={() => setEditStatic({ scope, item: s })}
+                            >
+                              Edit…
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                              onSelect={() => setDelStatic({ scope, item: s })}
+                            >
+                              Delete…
+                            </ContextMenuItem>
+                          </>
+                        )}
+                      </ContextMenuContent>
+                    </ContextMenu>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+      {showCreate && createScope && (
+        <CreateStaticAssignmentModal
+          scope={createScope}
+          onClose={() => setShowCreate(false)}
+        />
+      )}
+      {editStatic && (
+        <CreateStaticAssignmentModal
+          scope={editStatic.scope}
+          staticAssignment={editStatic.item}
+          onClose={() => setEditStatic(null)}
+        />
+      )}
+      {delStatic && (
+        <DeleteConfirmModal
+          title="Delete Static Assignment"
+          description={`Delete reservation ${delStatic.item.ip_address} (${delStatic.item.mac_address})?`}
+          onConfirm={() => delMut.mutate(delStatic)}
+          onClose={() => setDelStatic(null)}
+          isPending={delMut.isPending}
+        />
       )}
     </div>
   );
