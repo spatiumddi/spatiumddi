@@ -115,7 +115,7 @@ function createClient(): AxiosInstance {
           // cookie flow on a cross-ORIGIN (but same-site) API host when CORS
           // credentials are enabled; the cookie is SameSite=Strict, so a
           // genuinely cross-SITE SPA/API split is not supported by design.
-          const res = await client.post(
+          const res = await client.post<RefreshResponse>(
             "/auth/refresh",
             {},
             { withCredentials: true },
@@ -2124,6 +2124,16 @@ export interface LoginResponse {
   // with this challenge token + the second factor.
   mfa_required?: boolean;
   mfa_token?: string | null;
+}
+
+// Mirrors the backend `RefreshResponse` (#484): /auth/refresh returns only a
+// fresh access token (the rotated refresh token rides the HttpOnly cookie),
+// with none of LoginResponse's MFA/login-only fields. Typed separately so a
+// refresh caller can't accidentally depend on `mfa_required` / `mfa_token`.
+export interface RefreshResponse {
+  access_token: string;
+  token_type: string;
+  force_password_change: boolean;
 }
 
 export interface MfaStatusResponse {
@@ -7330,7 +7340,7 @@ export const authApi = {
    *  argument — the cookie rides the request automatically (#484). */
   refresh: () =>
     api
-      .post<LoginResponse>("/auth/refresh", {}, { withCredentials: true })
+      .post<RefreshResponse>("/auth/refresh", {}, { withCredentials: true })
       .then((r) => r.data),
   changePassword: (currentPassword: string, newPassword: string) =>
     api.post("/auth/change-password", {

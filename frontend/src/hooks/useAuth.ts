@@ -45,9 +45,12 @@ function bootstrapAuth(): Promise<void> {
       }
     })
     .catch(() => {
-      // No / expired cookie → stay logged out. Leave the store untouched
-      // (it starts null; a concurrent login must not be wiped). A protected
-      // route redirects to /login once ``booted`` is true.
+      // ANY refresh failure — a missing/expired cookie (401) but also a
+      // network error or 5xx — just means "couldn't restore a session on
+      // boot", so we stay logged out. Leave the store untouched (it starts
+      // null; a concurrent login must not be wiped). A protected route
+      // redirects to /login once ``booted`` is true; a real request the user
+      // then makes re-drives auth through the 401 interceptor.
     })
     .finally(() => {
       markBooted();
