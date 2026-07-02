@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_resource_permission, user_has_permission
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetPlan
 
 _V4_MULTICAST = ipaddress.ip_network("224.0.0.0/4")
@@ -624,6 +624,14 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
     conflict is present, returns 409 with the full conflict list and
     nothing is written.
     """
+    # The plans router gates on ``ip_block`` write, but apply also materialises
+    # Subnets — require subnet write too so a block-only grant can't create
+    # subnets through the plan path (#508). Superadmin/wildcard pass.
+    if not user_has_permission(current_user, "write", "subnet"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: applying a plan needs 'write' on 'subnet'",
+        )
     plan = await db.get(SubnetPlan, plan_id)
     if plan is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")

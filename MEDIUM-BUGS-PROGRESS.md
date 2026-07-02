@@ -17,8 +17,8 @@ Current single alembic head (before this branch): `b1f7c3a92e04`.
 - [x] #504 B16 (api) Import robustness cluster: case-insensitive headers ("IP"/"IP Address"), export→import status round-trip rejection, unvalidated mac_address/gateway → 500 mid-commit, strategy="fail" intra-payload dup aborts after side effects. `parser.py`, `importer.py`, `export.py`.
 - [x] #505 B17 (api) Plan apply bypasses create_subnet invariants: multicast kind, network/broadcast/gateway placeholder rows, reverse-zone auto-create, gateway containment. `backend/app/api/v1/ipam/plans.py` ~L686.
 - [x] #506 B18 (api) IPv6 subnets never get network/gateway placeholder rows — gate `prefixlen < 31` is v4 logic; should be `< 127`. `router.py` create_subnet auto-address branch (~L3711 pre-merge; re-grep).
-- [ ] #507 B19 (api) GET /subnets/{id}/effective-dns stops at root block; `_resolve_effective_dns` falls through to space → UI shows "no DNS" while records publish into space zone. `router.py` ~L4237 vs the resolver ~L317.
-- [ ] #508 B20 (api,rbac) Coarse router gate: write:nat_mapping / write:custom_field can create/modify spaces/blocks/subnets (any-of gate, no per-type inline checks on structural handlers). `router.py` gate ~L78; `plans.py` gates ip_block only but creates Subnets.
+- [x] #507 B19 (api) GET /subnets/{id}/effective-dns stops at root block; `_resolve_effective_dns` falls through to space → UI shows "no DNS" while records publish into space zone. `router.py` ~L4237 vs the resolver ~L317.
+- [x] #508 B20 (api,rbac) Coarse router gate: write:nat_mapping / write:custom_field can create/modify spaces/blocks/subnets (any-of gate, no per-type inline checks on structural handlers). `router.py` gate ~L78; `plans.py` gates ip_block only but creates Subnets.
 - [ ] #509 B21 (api,frontend) Bulk-edit staleness: bulk_edit_addresses never recomputes utilization nor clears reserved_until on status change; FE bulk-delete misses ["subnets"] invalidation; subnet detail header snapshot never refreshed. `router.py` bulk_edit_addresses; `IPAMPage.tsx`.
 - [ ] #510 B22 (worker) Device-profiling Celery dispatch before commit — run_scan finds no row, no-ops without retry; queued scan occupies 1 of 4 per-subnet slots forever. `backend/app/services/profiling/auto_profile.py` ~L149/216; `nmap/runner.py` ~L399.
 - [ ] #511 B23 (api) NAT mappings 500 on malformed IP literals (cast to INET DataError). `backend/app/api/v1/ipam/nat.py` ~L61/290/340.
@@ -31,3 +31,4 @@ Current single alembic head (before this branch): `b1f7c3a92e04`.
 
 - #503 + #504 → commit (importer BIGINT clamp; parser case-insensitive headers; status round-trip; MAC/gateway validation; intra-payload dup pre-flight)
 - #505 + #506 → commit (plan-apply: kind + gateway containment + placeholder rows [reverse-zone deferred]; v6 placeholder-row gate <127 in create/update_subnet)
+- #507 + #508 → commit (effective-dns endpoint space fallthrough; per-type write gate on structural handlers + plan-apply subnet-write check)
