@@ -522,7 +522,7 @@ from app.services.ai.operations_writes import (  # noqa: E402
     writes=False,
     category="compliance",
     default_enabled=False,
-    module="compliance",
+    module="compliance.conformity",
 )
 async def propose_create_conformity_policy(
     db: AsyncSession, user: User, args: CreateConformityPolicyArgs
@@ -544,7 +544,7 @@ async def propose_create_conformity_policy(
     writes=False,
     category="compliance",
     default_enabled=False,
-    module="compliance",
+    module="compliance.conformity",
 )
 async def propose_update_conformity_policy(
     db: AsyncSession, user: User, args: UpdateConformityPolicyArgs
@@ -565,7 +565,7 @@ async def propose_update_conformity_policy(
     writes=False,
     category="compliance",
     default_enabled=False,
-    module="compliance",
+    module="compliance.conformity",
 )
 async def propose_evaluate_conformity_policy(
     db: AsyncSession, user: User, args: EvaluateConformityPolicyArgs
@@ -590,7 +590,6 @@ async def propose_evaluate_conformity_policy(
     writes=False,
     category="webhooks",
     default_enabled=False,
-    module="webhooks",
 )
 async def propose_create_webhook(
     db: AsyncSession, user: User, args: CreateWebhookArgs
@@ -610,7 +609,6 @@ async def propose_create_webhook(
     writes=False,
     category="webhooks",
     default_enabled=False,
-    module="webhooks",
 )
 async def propose_update_webhook(
     db: AsyncSession, user: User, args: UpdateWebhookArgs
@@ -630,7 +628,6 @@ async def propose_update_webhook(
     writes=False,
     category="webhooks",
     default_enabled=False,
-    module="webhooks",
 )
 async def propose_test_webhook(
     db: AsyncSession, user: User, args: TestWebhookArgs
@@ -653,7 +650,6 @@ async def propose_test_webhook(
     writes=False,
     category="dns",
     default_enabled=False,
-    module="dns",
 )
 async def propose_sign_zone_dnssec(
     db: AsyncSession, user: User, args: SignZoneDNSSECArgs
@@ -672,7 +668,6 @@ async def propose_sign_zone_dnssec(
     writes=False,
     category="dns",
     default_enabled=False,
-    module="dns",
 )
 async def propose_unsign_zone_dnssec(
     db: AsyncSession, user: User, args: UnsignZoneDNSSECArgs
@@ -755,7 +750,6 @@ async def propose_delete_multicast_domain(
     writes=False,
     category="admin",
     default_enabled=False,
-    module="appliance.snmp",
 )
 async def propose_update_snmp_settings(
     db: AsyncSession, user: User, args: UpdateSNMPSettingsArgs
@@ -774,7 +768,6 @@ async def propose_update_snmp_settings(
     writes=False,
     category="admin",
     default_enabled=False,
-    module="appliance.ntp",
 )
 async def propose_update_ntp_settings(
     db: AsyncSession, user: User, args: UpdateNTPSettingsArgs

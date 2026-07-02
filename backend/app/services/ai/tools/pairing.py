@@ -106,7 +106,6 @@ class FindPairingCodesArgs(BaseModel):
     # (cleartext code never surfaced), no off-prem calls. Admins
     # discover it without opt-in. The superadmin gate is the real auth.
     default_enabled=True,
-    module="appliance.pairing",
 )
 async def find_pairing_codes(
     db: AsyncSession, user: User, args: FindPairingCodesArgs

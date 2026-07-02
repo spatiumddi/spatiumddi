@@ -680,7 +680,6 @@ class FindZoneDNSSECInfoArgs(BaseModel):
     ),
     args_model=FindZoneDNSSECInfoArgs,
     category="dns",
-    module="dns",
 )
 async def find_zone_dnssec_info(
     db: AsyncSession, user: User, args: FindZoneDNSSECInfoArgs
@@ -733,7 +732,6 @@ class FindDNSRateLimitSettingsArgs(BaseModel):
     ),
     args_model=FindDNSRateLimitSettingsArgs,
     category="dns",
-    module="dns",
 )
 async def find_dns_rate_limit_settings(
     db: AsyncSession, user: User, args: FindDNSRateLimitSettingsArgs
@@ -819,7 +817,6 @@ class FindZoneDriftArgs(BaseModel):
     ),
     args_model=FindZoneDriftArgs,
     category="dns",
-    module="dns",
 )
 async def find_dns_zone_drift(
     db: AsyncSession, user: User, args: FindZoneDriftArgs
@@ -869,7 +866,6 @@ class ListDNSSECPoliciesArgs(BaseModel):
     ),
     args_model=ListDNSSECPoliciesArgs,
     category="dns",
-    module="dns",
 )
 async def list_dnssec_policies(
     db: AsyncSession, user: User, args: ListDNSSECPoliciesArgs
@@ -922,7 +918,6 @@ class FindDNSQueryStatsArgs(BaseModel):
     ),
     args_model=FindDNSQueryStatsArgs,
     category="dns",
-    module="dns",
 )
 async def find_dns_query_stats(
     db: AsyncSession, user: User, args: FindDNSQueryStatsArgs

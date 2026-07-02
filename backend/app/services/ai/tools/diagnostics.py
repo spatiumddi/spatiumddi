@@ -110,7 +110,6 @@ class FindInternalErrorsArgs(BaseModel):
     args_model=FindInternalErrorsArgs,
     category="ops",
     default_enabled=False,
-    module="diagnostics",
 )
 async def find_internal_errors(
     db: AsyncSession,
@@ -159,7 +158,6 @@ class CountInternalErrorsArgs(BaseModel):
     args_model=CountInternalErrorsArgs,
     category="ops",
     default_enabled=False,
-    module="diagnostics",
 )
 async def count_internal_errors(
     db: AsyncSession,
@@ -215,7 +213,6 @@ class GetInternalErrorArgs(BaseModel):
     args_model=GetInternalErrorArgs,
     category="ops",
     default_enabled=False,
-    module="diagnostics",
 )
 async def get_internal_error(
     db: AsyncSession,

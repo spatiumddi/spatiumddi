@@ -58,7 +58,6 @@ class FindSNMPSettingsArgs(BaseModel):
     # Default enabled (NN #13) — read-only, no secrets in response,
     # no off-prem calls. Admins discover it without having to opt in.
     default_enabled=True,
-    module="appliance.snmp",
 )
 async def find_snmp_settings(
     db: AsyncSession, user: User, args: FindSNMPSettingsArgs

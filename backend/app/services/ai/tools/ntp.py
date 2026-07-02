@@ -49,7 +49,6 @@ class FindNTPSettingsArgs(BaseModel):
     args_model=FindNTPSettingsArgs,
     category="admin",
     default_enabled=True,
-    module="appliance.ntp",
 )
 async def find_ntp_settings(
     db: AsyncSession, user: User, args: FindNTPSettingsArgs
