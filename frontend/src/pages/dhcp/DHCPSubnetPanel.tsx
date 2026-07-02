@@ -227,7 +227,10 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
 /**
  * Panel shown inside the IPAM SubnetDetail "DHCP" tab. Lists all DHCP scopes
  * defined against the given subnet, lets the user create a new scope, and
- * exposes inline management of pools and static assignments.
+ * exposes inline pool management per scope. Static assignments are NOT managed
+ * here — they are created from the IPAM "Allocate IP" modal (status
+ * `static_dhcp` + scope + MAC) and viewed read-only on the DHCP server group's
+ * "Static Assignments" tab.
  */
 export function DHCPSubnetPanel({ subnetId }: { subnetId: string }) {
   const [showCreate, setShowCreate] = useState(false);

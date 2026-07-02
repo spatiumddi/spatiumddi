@@ -166,7 +166,7 @@ Static assignments bind a MAC address (or client identifier) to a specific IP, h
 ```
 DHCPStaticAssignment
   id, scope_id
-  ip_address: inet              -- must be within subnet
+  ip_address: inet              -- expected within subnet (not enforced at the API layer)
   mac_address: macaddr          -- primary identifier
   client_id: str (nullable)     -- DHCP client identifier (alternative to MAC)
   hostname: str
@@ -178,17 +178,101 @@ DHCPStaticAssignment
 
 ### Static Assignment UI Workflow
 
-1. Navigate to Subnet → DHCP tab → Static Assignments
-2. Add: enter MAC, pick IP from the "available" list (respects reserved pool), set hostname
-3. Or: click an existing IPAddress row → "Convert to Static DHCP Assignment"
-4. On save: IPAM updates IPAddress.status = `static_dhcp`, pushes to DHCP server via driver
+Static assignments are **created from the IPAM side**, at IP-allocation time. A
+static is a child of a DHCP **scope** (it carries `scope_id`), and Kea renders
+reservations per scope — so **a scope for the subnet must exist first**, or there
+is nothing for the reservation to attach to and Kea's `reservations` array stays
+empty.
+
+**Prerequisite — create a scope for the subnet.** A scope lives on a DHCP
+**server group** that has at least one Kea member (DHCP is group-centric —
+scopes / pools / statics / classes all belong to the group). Create it from
+**IPAM → the subnet → "DHCP Pools" tab → Create Scope**, or from
+**DHCP → the server group → Scopes tab → New Scope**. A dynamic pool is optional;
+the scope alone is enough to emit the `subnet4` block that reservations hang off.
+
+**Create the reservation (the only working create path):**
+
+1. **IPAM → select the subnet → "Allocate IP"** (the primary header button; also
+   reachable from a free-range gap row or the subnet context menu).
+2. In the **Allocate IP Address** modal set **Type / Status = `static_dhcp`**.
+   This reveals the **DHCP Scope** picker.
+3. Pick the **DHCP Scope**, enter the **MAC address** (required — see caveat
+   below), and set the hostname.
+4. Click **Allocate**. IPAM creates the address row with
+   `IPAddress.status = static_dhcp` and mirrors it into the scope as a
+   `DHCPStaticAssignment` (via `POST /api/v1/dhcp/scopes/{scope_id}/statics`).
+   The Kea agent picks up the new `ConfigBundle` (a group wake fires + the ETag
+   shifts) and renders the host reservation within seconds.
+
+**Viewing existing reservations.** The **DHCP → server group → "Static
+Assignments"** tab lists every reservation across the group's scopes. It is
+currently **read-only** (sort + copy IP / MAC / hostname) — it is not a create
+surface. Manage reservations from the IPAM Allocate flow above.
+
+**Caveats / common "nothing happened" traps:**
+
+- **A MAC is mandatory — a blank MAC is rejected, not silent.** Allocating a
+  `static_dhcp` address without a `mac_address` returns **422**
+  (`mac_address is required when status is 'static_dhcp'`) from both the
+  `create` and `next-address` endpoints, so **nothing is created** — neither the
+  IPAM row nor the reservation.
+- **`static_dhcp` with a MAC but no scope creates the IPAM row and silently skips
+  the reservation.** If no DHCP scope is selected (e.g. none exists for the
+  subnet yet), the IPAM address is created but the mirror to Kea is **not
+  attempted** — this is the real "I set it static but nothing happened" trap.
+  Create a scope first (see the prerequisite above).
+- **Only fresh allocation creates a reservation.** Flipping an *existing* IP to
+  `static_dhcp` via **Edit** (or bulk-edit) updates the IPAM row but does **not**
+  create a Kea reservation. Delete and re-allocate, or add it from the Allocate
+  flow.
+- **Creating a static currently requires a superadmin.** A non-superadmin who
+  allocates a `static_dhcp` IP gets the IPAM row but the mirror call returns 403.
+
+### Troubleshooting — reservations render empty in Kea
+
+Reservations are emitted **per subnet**, nested inside each `subnet4` / `subnet6`
+object — there is no top-level reservations list, so check the `reservations`
+array *inside* the relevant `subnet4`. If a reservation you created never shows
+up, walk this checklist — each item is a real, mostly-silent drop point:
+
+- **The static was never actually created.** Confirm it exists via
+  `GET /api/v1/dhcp/scopes/{scope_id}/statics` or the group's read-only Static
+  Assignments tab. If it's absent, distinguish two cases: the allocation was
+  **rejected** (a blank MAC 422s the whole allocation — nothing was created), or
+  it **succeeded without mirroring** (a MAC was given but no scope was selected,
+  or a non-superadmin hit 403 on the mirror call). See the caveats above.
+- **The scope is inactive.** Only `is_active = true` scopes (and the statics
+  under them) are assembled into the config bundle — a disabled scope silently
+  drops every reservation it holds.
+- **The scope's subnet was deleted.** If the `Subnet` backing a scope is gone but
+  the scope survived, the scope and all its statics are silently skipped during
+  bundle assembly.
+- **The scope's group has no Kea member.** A server not attached to a group (or a
+  group with zero Kea members) renders an empty bundle — nothing polls for the
+  reservation.
+- **The reservation IP is outside the scope's subnet.** This is **not** validated
+  on create, but Kea rejects the *entire* config at load when a host reservation
+  falls outside its subnet — so one out-of-range IP makes **all** statics on that
+  server silently fail while the agent keeps serving its last-good config. Keep
+  the reserved IP inside the subnet CIDR.
+- **Pure-SLAAC IPv6 scopes emit no reservations by design** — a v6 scope in
+  SLAAC-only mode has no stateful addressing role, so its `reservations` is
+  always empty.
 
 ### Conflict Detection
 
-Before saving a static assignment:
-- Verify IP is not already assigned to another static entry on the same or different scope
-- Verify MAC is not already in another static assignment across all scopes
-- Verify IP falls within a `reserved` or `dynamic` pool (not `excluded`)
+`create_static` / `update_static` reject (never silently) on:
+- **Duplicate MAC within the server group** — a MAC can be reserved only once
+  across every scope in the same group (409).
+- **IP inside a `dynamic` pool on the scope** — the IP must be excluded from any
+  dynamic pool first (409). (Reserved/excluded pools do not block a static.)
+- **Malformed IP** — 422.
+
+Note what is **not** checked here: the reservation IP is **not** validated
+against the scope's subnet CIDR, and IP duplication across statics is not
+rejected at this layer — see the troubleshooting checklist above for why an
+out-of-subnet IP is dangerous.
 
 ---
 
