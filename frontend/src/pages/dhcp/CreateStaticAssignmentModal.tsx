@@ -85,8 +85,8 @@ export function CreateStaticAssignmentModal({
             label="IP Address"
             hint={
               eligiblePools.length > 0
-                ? `Use an IP from a reserved pool; IPs inside a dynamic pool are rejected.`
-                : "Any IP within the subnet (outside dynamic pools)."
+                ? `Any IP in the subnet outside a dynamic pool; reserved-pool ranges are suggested below.`
+                : "Any IP within the subnet (outside a dynamic pool)."
             }
           >
             <input
