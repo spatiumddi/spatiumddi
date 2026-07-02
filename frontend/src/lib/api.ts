@@ -2126,10 +2126,11 @@ export interface LoginResponse {
   mfa_token?: string | null;
 }
 
-// Mirrors the backend `RefreshResponse` (#484): /auth/refresh returns only a
-// fresh access token (the rotated refresh token rides the HttpOnly cookie),
-// with none of LoginResponse's MFA/login-only fields. Typed separately so a
-// refresh caller can't accidentally depend on `mfa_required` / `mfa_token`.
+// Mirrors the backend `RefreshResponse` (#484): /auth/refresh returns a fresh
+// access token plus `token_type` + `force_password_change` (the rotated refresh
+// token rides the HttpOnly cookie), but NONE of LoginResponse's MFA/login-only
+// fields. Typed separately so a refresh caller can't accidentally depend on
+// `mfa_required` / `mfa_token`.
 export interface RefreshResponse {
   access_token: string;
   token_type: string;
