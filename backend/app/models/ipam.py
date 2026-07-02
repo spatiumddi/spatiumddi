@@ -110,8 +110,23 @@ class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     """VRF / isolated routing domain. IPs in different spaces may overlap."""
 
     __tablename__ = "ip_space"
+    __table_args__ = (
+        # Partial unique index (NOT column-level unique=True) so a
+        # soft-deleted space stops occupying its name slot. IPSpace is
+        # soft-deletable; a plain unique index kept the trashed name, so the
+        # ORM create pre-check (auto-filtered to deleted_at IS NULL) couldn't
+        # see it and the INSERT 500'd on the constraint (#491). Scoping
+        # uniqueness to live rows matches the soft-delete semantics — same
+        # pattern as uq_dhcp_scope_group_subnet (b67286f).
+        Index(
+            "ix_ip_space_name",
+            "name",
+            unique=True,
+            postgresql_where=sa_text("deleted_at IS NULL"),
+        ),
+    )
 
-    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)

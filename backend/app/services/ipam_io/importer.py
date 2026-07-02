@@ -158,6 +158,26 @@ def _find_parent_block(
     return candidates[0]
 
 
+def _first_overlap(
+    net: ipaddress.IPv4Network | ipaddress.IPv6Network,
+    others: list[ipaddress.IPv4Network | ipaddress.IPv6Network],
+) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    """First network in ``others`` that overlaps ``net`` but is not identical.
+
+    The importer keys existing subnets/blocks by exact canonical CIDR, so
+    exact matches are handled separately (skip/overwrite/fail). This catches
+    the *partial/containment* overlaps that the exact-match dict misses — e.g.
+    importing 10.0.0.0/23 into a space that already holds 10.0.0.0/24, which
+    the subnet model has no DB constraint to reject (#495).
+    """
+    for other in others:
+        if other.version != net.version:
+            continue
+        if other != net and other.overlaps(net):
+            return other
+    return None
+
+
 # ── Preview ────────────────────────────────────────────────────────────────────
 
 
@@ -178,6 +198,9 @@ async def preview_import(
 
     # Track auto-created blocks in this preview so the summary is consistent.
     planned_block_nets: set[str] = set()
+    # Networks queued to be created in this same payload — so an intra-payload
+    # overlap is caught in preview the way commit catches it (#495).
+    planned_subnet_nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 
     seen_networks: set[str] = set()
     for row in payload.subnets:
@@ -239,6 +262,26 @@ async def preview_import(
 
         existing = existing_subnets.get(canonical)
         if existing is None:
+            # Flag non-exact overlaps here so the preview matches what commit
+            # will reject — otherwise the operator sees a clean "create" for a
+            # row commit turns into an error (#495).
+            clash = _first_overlap(
+                subnet_net,
+                [ipaddress.ip_network(c, strict=False) for c in existing_subnets]
+                + list(planned_subnet_nets),
+            )
+            if clash is not None:
+                preview.errors.append(
+                    DiffRow(
+                        kind="subnet",
+                        action="error",
+                        network=canonical,
+                        reason=f"Overlaps existing subnet {clash}",
+                        details=row,
+                    )
+                )
+                continue
+            planned_subnet_nets.append(subnet_net)
             preview.creates.append(
                 DiffRow(
                     kind="subnet",
@@ -420,9 +463,32 @@ async def commit_import(
                 detail=f"Subnet {canonical} already exists",
             )
 
+        # Reject a non-exact overlap with an existing (or already-imported)
+        # subnet rather than silently creating an overlapping row — the model
+        # has no DB overlap constraint, so this is the only guard (#495).
+        clash = _first_overlap(
+            subnet_net,
+            [ipaddress.ip_network(c, strict=False) for c in existing_subnets],
+        )
+        if clash is not None:
+            result_obj.errors.append(f"{canonical}: overlaps existing subnet {clash}")
+            continue
+
         # Find or auto-create the parent block
         parent = _find_parent_block(subnet_net, existing_blocks)
         if parent is None:
+            # _find_parent_block found no *containing* block; before carving a
+            # new top-level block at this CIDR, make sure it doesn't partially
+            # overlap (or swallow) an existing block (#495).
+            block_clash = _first_overlap(
+                subnet_net,
+                [ipaddress.ip_network(str(b.network), strict=False) for b in existing_blocks],
+            )
+            if block_clash is not None:
+                result_obj.errors.append(
+                    f"{canonical}: auto-parent block would overlap existing block {block_clash}"
+                )
+                continue
             parent = IPBlock(
                 space_id=space.id,
                 parent_block_id=None,

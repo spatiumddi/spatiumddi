@@ -310,7 +310,8 @@ async def _overlap_conflicts_space_subnets(
     q = (
         "SELECT id, network FROM subnet "
         "WHERE space_id = CAST(:space_id AS uuid) "
-        "AND network && CAST(:network AS cidr)"
+        "AND network && CAST(:network AS cidr) "
+        "AND deleted_at IS NULL"  # raw SQL skips the ORM soft-delete filter (#490)
     )
     params: dict[str, Any] = {"space_id": str(space_id), "network": new_cidr}
     if exclude_subnet_id:
@@ -382,7 +383,8 @@ async def _overlap_conflicts_space_blocks_for_subnet(
     q = (
         "SELECT id, network FROM ip_block "
         "WHERE space_id = CAST(:space_id AS uuid) "
-        "AND network && CAST(:network AS cidr)"
+        "AND network && CAST(:network AS cidr) "
+        "AND deleted_at IS NULL"  # raw SQL skips the ORM soft-delete filter (#490)
     )
     params: dict[str, Any] = {"space_id": str(space_id), "network": new_cidr}
     rows = (await db.execute(text(q), params)).fetchall()
@@ -425,7 +427,8 @@ async def _overlap_conflicts_space_blocks(
     q = (
         "SELECT id, network FROM ip_block "
         "WHERE space_id = CAST(:space_id AS uuid) "
-        "AND network && CAST(:network AS cidr)"
+        "AND network && CAST(:network AS cidr) "
+        "AND deleted_at IS NULL"  # raw SQL skips the ORM soft-delete filter (#490)
     )
     params: dict[str, Any] = {"space_id": str(space_id), "network": new_cidr}
     if exclude_block_id:
@@ -469,6 +472,7 @@ async def _overlap_conflicts_space_subnets_for_block(
         "SELECT id, network FROM subnet "
         "WHERE space_id = CAST(:space_id AS uuid) "
         "AND network && CAST(:network AS cidr) "
+        "AND deleted_at IS NULL "  # raw SQL skips the ORM soft-delete filter (#490)
         "AND (block_id IS NULL OR block_id NOT IN ("
         "  WITH RECURSIVE descendants AS ("
         "    SELECT id FROM ip_block WHERE id = CAST(:bid AS uuid)"

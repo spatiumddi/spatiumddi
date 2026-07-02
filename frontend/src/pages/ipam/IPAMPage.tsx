@@ -4773,7 +4773,12 @@ function SubnetDetail({
       // when a pool boundary just got emitted (the boundary already
       // signals the discontinuity) or when the gap falls inside a
       // dynamic pool (DHCP-owned, not operator-allocatable).
-      if (prevIpInt !== null && ipInt - prevIpInt > 1) {
+      //
+      // Also skipped whenever a filter is active: gaps are computed from the
+      // *filtered* list, so a filter that hides allocated rows would fabricate
+      // a clickable "N free" range over addresses that are actually in use —
+      // and the allocate modal it opens would then collide (#501).
+      if (!hasActiveFilter && prevIpInt !== null && ipInt - prevIpInt > 1) {
         const lastWasPool = rows[rows.length - 1]?.kind === "pool-boundary";
         const gapStart = prevIpInt + 1;
         const gapEnd = ipInt - 1;
@@ -7250,7 +7255,9 @@ function EditSubnetModal({
       return ipamApi.updateSubnet(subnet.id, {
         name: name || undefined,
         description,
-        gateway: gateway || undefined,
+        // Explicit null so the operator can clear the gateway (nullable
+        // column); ``|| undefined`` was silently dropped (#502).
+        gateway: gateway || null,
         vlan_ref_id: vlanRefId,
         vxlan_id: vxlanId.trim() ? Number(vxlanId.trim()) : null,
         status,
@@ -7389,16 +7396,15 @@ function EditSubnetModal({
   // ── Delete step 2 ──
   if (deleteStep === 2) {
     return (
-      <Modal title="Confirm Permanent Deletion" onClose={resetDelete}>
+      <Modal title="Delete subnet" onClose={resetDelete}>
         <div className="space-y-4">
-          <p className="text-sm font-medium text-destructive">
-            This action cannot be undone.
-          </p>
           <p className="text-sm text-muted-foreground">
             <strong className="font-mono text-foreground">
               {subnet.network}
             </strong>{" "}
-            and all its contents will be permanently removed.
+            and its DHCP scopes will be moved to Trash. You can restore them
+            together within 30 days from Administration → Trash; after that the
+            nightly purge removes them for good.
           </p>
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
@@ -7407,8 +7413,8 @@ function EditSubnetModal({
               checked={deleteChecked}
               onChange={(e) => setDeleteChecked(e.target.checked)}
             />
-            I understand {subnet.network} and all its contents will be
-            permanently deleted.
+            I understand {subnet.network} and its contents will be moved to
+            Trash.
           </label>
           {deleteError && (
             <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
@@ -7430,7 +7436,7 @@ function EditSubnetModal({
               disabled={!deleteChecked || deleteMutation.isPending}
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
-              {deleteMutation.isPending ? "Deleting…" : "Delete permanently"}
+              {deleteMutation.isPending ? "Deleting…" : "Move to Trash"}
             </button>
           </div>
         </div>
@@ -7660,9 +7666,10 @@ function EditSubnetModal({
       {tab === "danger" && onDeleted && (
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">
-            Deleting a subnet permanently removes every IP address record inside
-            it, plus any DHCP scopes and DNS records derived from them. The
-            deletion is gated by a typed confirm in the next step.
+            Deleting a subnet moves it and its DHCP scopes to Trash (restorable
+            for 30 days); the IP address rows inside it are removed, and any
+            DHCP-lease DNS records are revoked. The deletion is gated by a
+            confirm in the next step.
           </p>
           <button
             onClick={() => setDeleteStep(1)}
@@ -8046,6 +8053,19 @@ const ADDRESS_STATUSES = [
   "dhcp",
 ] as const;
 
+// Format a UTC ISO instant as a ``datetime-local`` value (local wall-clock,
+// ``YYYY-MM-DDTHH:MM``, no TZ suffix). Naively slicing ``toISOString()``
+// yields the *UTC* wall-clock, which the local-time input then misreads — so
+// every open→save cycle drifted the reservation by the browser's UTC offset
+// (#500). Shifting by the offset first makes the sliced string local, matching
+// how ``new Date(value)`` re-parses it on save.
+function toLocalDatetimeInput(iso: string): string {
+  const d = new Date(iso);
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000)
+    .toISOString()
+    .slice(0, 16);
+}
+
 function EditAddressModal({
   address,
   onClose,
@@ -8059,17 +8079,21 @@ function EditAddressModal({
   const [macAddress, setMacAddress] = useState(address.mac_address ?? "");
   const [status, setStatus] = useState(address.status);
   const [role, setRole] = useState<string>(address.role ?? "");
-  // datetime-local needs ``YYYY-MM-DDTHH:MM`` (no seconds, no TZ).
-  // Trim trailing seconds + drop the trailing ``Z`` if present.
+  // datetime-local needs ``YYYY-MM-DDTHH:MM`` in *local* wall-clock (#500).
   const [reservedUntil, setReservedUntil] = useState<string>(
-    address.reserved_until
-      ? new Date(address.reserved_until).toISOString().slice(0, 16)
-      : "",
+    address.reserved_until ? toLocalDatetimeInput(address.reserved_until) : "",
   );
   const [customFields, setCustomFields] = useState<Record<string, unknown>>(
     (address.custom_fields as Record<string, unknown>) ?? {},
   );
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
+  // Whether the operator actually interacted with the zone picker. The
+  // pre-select effect sets dnsZoneId programmatically (not via onChange), so
+  // this stays false until a real selection. It lets the mutation send an
+  // explicit zone (incl. null for "None") only on a deliberate change, while
+  // an untouched save omits dns_zone_id so the backend preserves the IP's
+  // current zone (#493 / bot review of #502).
+  const [dnsZoneTouched, setDnsZoneTouched] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showMacHistory, setShowMacHistory] = useState(false);
   const [pendingWarnings, setPendingWarnings] = useState<
@@ -8151,17 +8175,20 @@ function EditAddressModal({
       ? allGroupZones.filter((z: DNSZone) => explicitZoneIds.includes(z.id))
       : allGroupZones;
 
-  // Pre-select zone from current FQDN or primary zone
+  // Pre-select the IP's *current* forward zone — NOT the subnet's primary.
+  // Defaulting to the primary meant a no-op (or hostname-only) Save re-homed
+  // the A/AAAA record into the primary zone, silently moving it off an
+  // explicitly-chosen additional zone (#493). An IP with no forward zone
+  // stays on the "None" option so an unrelated edit doesn't fabricate a
+  // record; the operator can still pick a zone explicitly to add one.
   useEffect(() => {
     if (!dnsZoneId && availableZones.length > 0) {
-      const primary = effectiveDns?.dns_zone_id;
-      setDnsZoneId(
-        primary && availableZones.some((z: DNSZone) => z.id === primary)
-          ? primary
-          : availableZones[0].id,
-      );
+      const current = address.forward_zone_id;
+      if (current && availableZones.some((z: DNSZone) => z.id === current)) {
+        setDnsZoneId(current);
+      }
     }
-  }, [availableZones.length, effectiveDns?.dns_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [availableZones.length, address.forward_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const selectedZone = availableZones.find((z: DNSZone) => z.id === dnsZoneId);
   const fqdnPreview =
@@ -8180,12 +8207,21 @@ function EditAddressModal({
           ? new Date(reservedUntil).toISOString()
           : null;
       return ipamApi.updateAddress(address.id, {
-        hostname: hostname || undefined,
-        description: description || undefined,
-        mac_address: macAddress || undefined,
+        // Send explicit null/"" so an operator can *clear* a field — the old
+        // ``value || undefined`` was dropped by axios and ignored by the
+        // backend's exclude_unset, making a clear a silent no-op (#502).
+        // hostname + mac are nullable columns → null; description is NOT NULL
+        // → "" clears it.
+        hostname: hostname || null,
+        description,
+        mac_address: macAddress || null,
         status,
         custom_fields: customFields,
-        dns_zone_id: dnsZoneId || undefined,
+        // Send the zone only on a deliberate pick: a real zone moves the
+        // record, "" (the None option) sends null to remove it, and an
+        // untouched picker omits the field so the backend keeps the current
+        // zone (#493 / bot review of #502).
+        dns_zone_id: dnsZoneTouched ? dnsZoneId || null : undefined,
         role: (role || null) as IPRole | null,
         reserved_until: reservedIso,
         force,
@@ -8308,7 +8344,10 @@ function EditAddressModal({
                 <select
                   className={inputCls}
                   value={dnsZoneId}
-                  onChange={(e) => setDnsZoneId(e.target.value)}
+                  onChange={(e) => {
+                    setDnsZoneId(e.target.value);
+                    setDnsZoneTouched(true);
+                  }}
                 >
                   <ZoneOptions
                     zones={availableZones}

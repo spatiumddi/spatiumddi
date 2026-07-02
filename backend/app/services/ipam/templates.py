@@ -38,6 +38,30 @@ class TemplateError(Exception):
         self.status_code = status_code
 
 
+_BIGINT_MAX = 2**63 - 1
+_V4_MULTICAST = ipaddress.ip_network("224.0.0.0/4")
+_V6_MULTICAST = ipaddress.ip_network("ff00::/8")
+
+
+def _total_ips(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> int:
+    """Mirror ``app.api.v1.ipam.router._total_ips`` so carved subnets carry
+    the same ``total_ips`` create_subnet would compute (was left 0 → the
+    utilization bar read 0/0 forever, #494)."""
+    if isinstance(net, ipaddress.IPv6Network):
+        return min(net.num_addresses, _BIGINT_MAX)
+    if net.prefixlen >= 31:
+        return net.num_addresses
+    return net.num_addresses - 2
+
+
+def _subnet_kind(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> str:
+    """Mirror create_subnet's #126 multicast discriminator so a carved
+    multicast leaf isn't left ``unicast`` (which would wrongly accept
+    per-IP allocation, #494)."""
+    mcast = _V4_MULTICAST if isinstance(net, ipaddress.IPv4Network) else _V6_MULTICAST
+    return "multicast" if net.subnet_of(mcast) else "unicast"  # type: ignore[arg-type]
+
+
 _TEMPLATE_FIELDS_COMMON: tuple[str, ...] = (
     "tags",
     "custom_fields",
@@ -347,6 +371,7 @@ async def carve_children(
     parent_net = ipaddress.ip_network(str(block.network), strict=False)
     spec = _validate_child_layout(template.child_layout, parent_net.prefixlen)
     existing = await _existing_subnets_under_block(db, block)
+    existing_nets = [ipaddress.ip_network(c, strict=False) for c in existing]
     results: list[CarvedChild] = []
 
     cursor = int(parent_net.network_address)
@@ -354,30 +379,44 @@ async def carve_children(
     for idx, entry in enumerate(spec, start=1):
         prefix = entry["prefix"]
         size = 1 << ((parent_net.max_prefixlen) - prefix)
-        if cursor + size - 1 > end:
+        # Align the cursor UP to this child's prefix boundary. A /p network
+        # must start on a multiple of its size; the old code snapped the
+        # cursor DOWN (ip_network(..., strict=False)), which for a layout
+        # like [/26, /25] on a /24 rewound the /25 back over the /26 and
+        # created two overlapping subnets (#494). Rounding up leaves a gap
+        # instead — valid, non-overlapping CIDR.
+        aligned = (cursor + size - 1) & ~(size - 1)
+        if aligned + size - 1 > end:
             raise TemplateError(
                 f"child_layout overflows the carrier {block.network}: "
                 f"child[{idx-1}] /{prefix} would extend past the block range."
             )
-        child_net = ipaddress.ip_network(
-            (
-                ipaddress.IPv4Address(cursor)
-                if isinstance(parent_net, ipaddress.IPv4Network)
-                else ipaddress.IPv6Address(cursor)
-            ),
+        aligned_addr = (
+            ipaddress.IPv4Address(aligned)
+            if isinstance(parent_net, ipaddress.IPv4Network)
+            else ipaddress.IPv6Address(aligned)
         )
-        # Snap to the prefix boundary
-        child_net = ipaddress.ip_network(f"{child_net.network_address}/{prefix}", strict=False)
+        child_net = ipaddress.ip_network(f"{aligned_addr}/{prefix}", strict=True)
         cidr = str(child_net)
         rendered_name = (
             _render_child_name(entry["name_template"] or "", network=child_net, index=idx)
             if entry["name_template"]
             else ""
         )
+        cursor = aligned + size
         if cidr in existing:
             results.append(CarvedChild(cidr=cidr, name=rendered_name, skipped=True))
-            cursor += size
             continue
+        # Idempotency is exact-CIDR above; also refuse to carve into a
+        # *different* subnet that already overlaps this range rather than
+        # silently creating an overlap the model has no DB constraint to
+        # catch (#494).
+        clash = next((n for n in existing_nets if n.overlaps(child_net)), None)
+        if clash is not None:
+            raise TemplateError(
+                f"child_layout child /{prefix} at {cidr} overlaps existing "
+                f"subnet {clash} under block {block.network}."
+            )
         # Carved subnets skip the network/broadcast auto-address rows
         # because we're not going through ``create_subnet``. Operator
         # can flesh them out via the IPAM UI afterward; the row exists
@@ -391,10 +430,12 @@ async def carve_children(
             tags=entry["tags"],
             custom_fields=entry["custom_fields"],
             applied_template_id=template.id,
+            total_ips=_total_ips(child_net),
+            kind=_subnet_kind(child_net),
         )
         db.add(sub)
+        existing_nets.append(child_net)
         results.append(CarvedChild(cidr=cidr, name=rendered_name, skipped=False))
-        cursor += size
 
     return results
 
