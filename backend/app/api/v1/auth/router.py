@@ -97,6 +97,11 @@ class LoginRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
+    """Internal carrier for a freshly-minted token pair. The raw refresh
+    token NEVER leaves the server in a JSON body — callers set it as an
+    HttpOnly cookie via ``_set_refresh_cookie`` and return one of the
+    refresh-free response models below (#484 / #400 L1)."""
+
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
@@ -106,10 +111,11 @@ class TokenResponse(BaseModel):
 class LoginResponse(BaseModel):
     """Login response. Two shapes the caller has to handle:
 
-    1. **MFA not required.** ``access_token`` + ``refresh_token`` are
-       set; ``mfa_required`` is False; the caller stashes the tokens
-       and proceeds. Identical to ``TokenResponse``.
-    2. **MFA required.** Tokens are NOT set; ``mfa_required`` is
+    1. **MFA not required.** ``access_token`` is set; ``mfa_required`` is
+       False; the caller keeps it in memory and proceeds. The refresh
+       token is delivered out-of-band as an HttpOnly cookie (#484), never
+       in this body.
+    2. **MFA required.** ``access_token`` is NOT set; ``mfa_required`` is
        True; ``mfa_token`` carries a 5-minute JWT (claim
        ``type=mfa``) that the caller must POST to
        ``/auth/login/mfa`` along with a TOTP code or a recovery
@@ -117,11 +123,20 @@ class LoginResponse(BaseModel):
     """
 
     access_token: str | None = None
-    refresh_token: str | None = None
     token_type: str = "bearer"
     force_password_change: bool = False
     mfa_required: bool = False
     mfa_token: str | None = None
+
+
+class RefreshResponse(BaseModel):
+    """Response for ``/auth/refresh``. The rotated refresh token is set as
+    an HttpOnly cookie on the same response; only the new access token is
+    returned in the body (#484)."""
+
+    access_token: str
+    token_type: str = "bearer"
+    force_password_change: bool = False
 
 
 class MfaLoginRequest(BaseModel):
@@ -189,6 +204,35 @@ class PasswordPolicyResponse(BaseModel):
 
 def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
+
+
+# SECURITY (#484 / #400 L1): the refresh token is delivered ONLY as an
+# HttpOnly + Secure + SameSite=Strict cookie, never in a JSON body or URL
+# fragment, so an XSS foothold in the SPA cannot read it. The access token
+# stays short-lived and lives in JS memory only (see frontend
+# ``lib/authToken.ts``). The cookie is path-scoped to ``/api/v1/auth`` so
+# it rides only the refresh + logout calls, not every API request.
+_REFRESH_COOKIE = "spatium_refresh"
+_REFRESH_COOKIE_PATH = "/api/v1/auth"
+
+
+def _set_refresh_cookie(response: Response, request: Request, raw_refresh: str) -> None:
+    response.set_cookie(
+        _REFRESH_COOKIE,
+        raw_refresh,
+        max_age=settings.refresh_token_expire_days * 86400,
+        httponly=True,
+        samesite="strict",
+        # Mirror the OIDC/SAML flow cookies: only mark Secure when the
+        # request arrived over HTTPS, so plain-HTTP dev on localhost keeps
+        # working while real (TLS-terminated) deployments get the flag.
+        secure=request.url.scheme == "https",
+        path=_REFRESH_COOKIE_PATH,
+    )
+
+
+def _clear_refresh_cookie(response: Response) -> None:
+    response.delete_cookie(_REFRESH_COOKIE, path=_REFRESH_COOKIE_PATH)
 
 
 async def _issue_tokens(db: DB, request: Request, user: User, auth_source: str) -> TokenResponse:
@@ -450,7 +494,7 @@ async def _try_external_password_login(
 
 
 @router.post("/login", response_model=LoginResponse)
-async def login(body: LoginRequest, request: Request, db: DB) -> LoginResponse:
+async def login(body: LoginRequest, request: Request, response: Response, db: DB) -> LoginResponse:
     # Per-IP rate limit (#4) — complements the per-account lockout, which
     # only engages once a valid username is hit. Fails open if Redis is
     # down. 429 with a generic message (no account-existence leak).
@@ -507,9 +551,9 @@ async def login(body: LoginRequest, request: Request, db: DB) -> LoginResponse:
             challenge = create_mfa_challenge_token(str(user.id))
             return LoginResponse(mfa_required=True, mfa_token=challenge)
         tokens = await _issue_tokens(db, request, user, auth_source="local")
+        _set_refresh_cookie(response, request, tokens.refresh_token)
         return LoginResponse(
             access_token=tokens.access_token,
-            refresh_token=tokens.refresh_token,
             force_password_change=tokens.force_password_change,
         )
 
@@ -518,9 +562,9 @@ async def login(body: LoginRequest, request: Request, db: DB) -> LoginResponse:
         db, request, body.username, body.password
     )
     if external_response is not None:
+        _set_refresh_cookie(response, request, external_response.refresh_token)
         return LoginResponse(
             access_token=external_response.access_token,
-            refresh_token=external_response.refresh_token,
             force_password_change=external_response.force_password_change,
         )
 
@@ -538,7 +582,9 @@ async def login(body: LoginRequest, request: Request, db: DB) -> LoginResponse:
 
 
 @router.post("/login/mfa", response_model=LoginResponse)
-async def login_mfa(body: MfaLoginRequest, request: Request, db: DB) -> LoginResponse:
+async def login_mfa(
+    body: MfaLoginRequest, request: Request, response: Response, db: DB
+) -> LoginResponse:
     """Complete a TOTP-gated login. Body carries the challenge token
     minted by ``/login`` plus a 6-digit TOTP code or a one-time recovery
     code. Either is accepted; both = 422.
@@ -647,25 +693,28 @@ async def login_mfa(body: MfaLoginRequest, request: Request, db: DB) -> LoginRes
 
     # ── Success — issue real tokens ────────────────────────────────────────
     tokens = await _issue_tokens(db, request, user, auth_source="local")
+    _set_refresh_cookie(response, request, tokens.refresh_token)
     if used_recovery:
         # The audit row was written before _issue_tokens committed; the
         # _issue_tokens commit covers it. No extra commit needed.
         logger.info("mfa_recovery_used", user_id=str(user.id))
     return LoginResponse(
         access_token=tokens.access_token,
-        refresh_token=tokens.refresh_token,
         force_password_change=tokens.force_password_change,
     )
 
 
-class RefreshRequest(BaseModel):
-    refresh_token: str
-
-
-@router.post("/refresh", response_model=TokenResponse)
-async def refresh_token_endpoint(body: RefreshRequest, db: DB) -> TokenResponse:
-    """Exchange a valid refresh token for a new access token (with token rotation)."""
-    token_hash = hash_refresh_token(body.refresh_token)
+@router.post("/refresh", response_model=RefreshResponse)
+async def refresh_token_endpoint(request: Request, response: Response, db: DB) -> RefreshResponse:
+    """Exchange the HttpOnly refresh cookie for a new access token (with
+    token rotation). The refresh token is read from the cookie set at login
+    — never from the request body — so it stays invisible to JS (#484)."""
+    raw_refresh = request.cookies.get(_REFRESH_COOKIE)
+    if not raw_refresh:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing refresh token"
+        )
+    token_hash = hash_refresh_token(raw_refresh)
 
     result = await db.execute(
         select(UserSession)
@@ -706,10 +755,10 @@ async def refresh_token_endpoint(body: RefreshRequest, db: DB) -> TokenResponse:
     access_token = create_access_token(str(user.id), jti=str(new_session.id))
     await db.commit()
 
+    _set_refresh_cookie(response, request, raw_refresh)
     logger.info("token_refreshed", user_id=str(user.id))
-    return TokenResponse(
+    return RefreshResponse(
         access_token=access_token,
-        refresh_token=raw_refresh,
         force_password_change=user.force_password_change,
     )
 
@@ -830,7 +879,8 @@ async def change_password(
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-async def logout(current_user: CurrentUser, db: DB) -> None:
+async def logout(current_user: CurrentUser, response: Response, db: DB) -> None:
+    _clear_refresh_cookie(response)
     await db.execute(
         update(UserSession)
         .where(UserSession.user_id == current_user.id, UserSession.revoked.is_(False))
@@ -1398,14 +1448,17 @@ async def oidc_callback(
 
     tokens = await _issue_tokens(db, request, user, auth_source=provider.name)
 
+    # Only the short-lived access token rides the URL fragment (invisible to
+    # the server, cleared by the callback page on arrival). The refresh token
+    # is set as an HttpOnly cookie on this redirect, never exposed to JS (#484).
     frag = urlencode(
         {
             "access_token": tokens.access_token,
-            "refresh_token": tokens.refresh_token,
             "force_password_change": str(tokens.force_password_change).lower(),
         }
     )
     response = RedirectResponse(f"{_LOGIN_CALLBACK_PATH}#{frag}", status_code=302)
+    _set_refresh_cookie(response, request, tokens.refresh_token)
     response.delete_cookie(_OIDC_FLOW_COOKIE, path="/api/v1/auth/")
     return response
 
@@ -1472,14 +1525,16 @@ async def saml_callback(
         return _login_error_redirect("saml_rejected")
 
     tokens = await _issue_tokens(db, request, user, auth_source=provider.name)
+    # Only the short-lived access token rides the URL fragment; the refresh
+    # token is set as an HttpOnly cookie on this redirect (#484).
     frag = urlencode(
         {
             "access_token": tokens.access_token,
-            "refresh_token": tokens.refresh_token,
             "force_password_change": str(tokens.force_password_change).lower(),
         }
     )
     response = RedirectResponse(f"{_LOGIN_CALLBACK_PATH}#{frag}", status_code=302)
+    _set_refresh_cookie(response, request, tokens.refresh_token)
     response.delete_cookie(_SAML_FLOW_COOKIE, path="/api/v1/auth/")
     return response
 

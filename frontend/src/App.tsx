@@ -78,7 +78,17 @@ import { SettingsPage } from "@/pages/SettingsPage";
 import { useAuth } from "@/hooks/useAuth";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, bootstrapping } = useAuth();
+  // On a full page reload the in-memory access token is gone; the app runs
+  // one silent /auth/refresh against the HttpOnly cookie (#484). Render a
+  // loader until it resolves so a real session isn't bounced to /login.
+  if (bootstrapping) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background">
+        <p className="text-sm text-muted-foreground">Restoring session…</p>
+      </div>
+    );
+  }
   return isAuthenticated ? <>{children}</> : <Navigate to="/login" replace />;
 }
 

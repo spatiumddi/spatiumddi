@@ -1,13 +1,16 @@
 import { useEffect } from "react";
 import { useNavigate } from "react-router-dom";
+import { markBooted, setAccessToken } from "@/lib/authToken";
 
 /**
- * Landing route that consumes the tokens delivered by the OIDC/SAML callback
- * as a URL hash fragment (#access_token=…&refresh_token=…&force_password_change=…).
+ * Landing route that consumes the access token delivered by the OIDC/SAML
+ * callback as a URL hash fragment (#access_token=…&force_password_change=…).
  *
- * Hash fragments are never sent to the server, so the tokens stay on the
- * client. We lift them into localStorage (same storage the password flow
- * uses) and redirect into the app.
+ * Hash fragments are never sent to the server, so the token stays on the
+ * client. We lift the short-lived access token into JS memory (same store the
+ * password flow uses) and redirect into the app. The refresh token is NOT in
+ * the fragment — the backend set it as an HttpOnly cookie on the redirect
+ * response, invisible to script (#484).
  */
 export function LoginCallbackPage() {
   const navigate = useNavigate();
@@ -16,18 +19,17 @@ export function LoginCallbackPage() {
     const hash = window.location.hash.replace(/^#/, "");
     const params = new URLSearchParams(hash);
     const access = params.get("access_token");
-    const refresh = params.get("refresh_token");
     const forcePwd = params.get("force_password_change") === "true";
 
-    if (!access || !refresh) {
+    if (!access) {
       navigate("/login?error=oidc_no_tokens", { replace: true });
       return;
     }
 
-    localStorage.setItem("access_token", access);
-    localStorage.setItem("refresh_token", refresh);
+    setAccessToken(access);
+    markBooted();
 
-    // Clear the hash so tokens don't linger in the URL bar.
+    // Clear the hash so the token doesn't linger in the URL bar.
     window.history.replaceState(
       null,
       "",
