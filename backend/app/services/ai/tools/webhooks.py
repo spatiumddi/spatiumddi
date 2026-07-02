@@ -69,7 +69,6 @@ class ListWebhooksArgs(BaseModel):
     ),
     args_model=ListWebhooksArgs,
     category="webhooks",
-    module="webhooks",
 )
 async def list_webhooks(
     db: AsyncSession, user: User, args: ListWebhooksArgs
@@ -118,7 +117,6 @@ class GetWebhookEventTypesArgs(BaseModel):
     ),
     args_model=GetWebhookEventTypesArgs,
     category="webhooks",
-    module="webhooks",
 )
 async def get_webhook_event_types(
     db: AsyncSession, user: User, args: GetWebhookEventTypesArgs
@@ -168,7 +166,6 @@ class FindWebhookDeliveriesArgs(BaseModel):
     ),
     args_model=FindWebhookDeliveriesArgs,
     category="webhooks",
-    module="webhooks",
 )
 async def find_webhook_deliveries(
     db: AsyncSession, user: User, args: FindWebhookDeliveriesArgs

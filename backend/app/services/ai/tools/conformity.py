@@ -57,7 +57,7 @@ class ListConformityPoliciesArgs(BaseModel):
     ),
     args_model=ListConformityPoliciesArgs,
     category="compliance",
-    module="compliance",
+    module="compliance.conformity",
 )
 async def list_conformity_policies(
     db: AsyncSession, user: User, args: ListConformityPoliciesArgs
@@ -119,7 +119,7 @@ class FindConformityResultsArgs(BaseModel):
     ),
     args_model=FindConformityResultsArgs,
     category="compliance",
-    module="compliance",
+    module="compliance.conformity",
 )
 async def find_conformity_results(
     db: AsyncSession, user: User, args: FindConformityResultsArgs
@@ -172,7 +172,7 @@ class GetConformitySummaryArgs(BaseModel):
     ),
     args_model=GetConformitySummaryArgs,
     category="compliance",
-    module="compliance",
+    module="compliance.conformity",
 )
 async def get_conformity_summary(
     db: AsyncSession, user: User, args: GetConformitySummaryArgs

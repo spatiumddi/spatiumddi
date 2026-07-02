@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import String, cast, func, or_, select
@@ -30,6 +31,7 @@ from app.drivers.dhcp.windows import test_winrm_credentials
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPServer
 from app.models.dhcp_fingerprint import DHCPFingerprint
+from app.models.ipam import IPAddress, Subnet
 from app.models.metrics import DHCPMetricSample
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.pull_leases import pull_leases_from_server
@@ -53,6 +55,8 @@ router = APIRouter(
 # Sourced from the registry so new drivers (e.g. windows_dhcp) are
 # accepted automatically without having to touch this allowlist.
 VALID_DRIVERS = frozenset(_DHCP_DRIVERS.keys())
+
+logger = structlog.get_logger(__name__)
 
 
 class WindowsCredentialsInput(BaseModel):
@@ -1102,6 +1106,72 @@ async def list_leases(
         page=page,
         page_size=page_size,
     )
+
+
+@router.delete(
+    "/{server_id}/leases/{lease_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def delete_lease(server_id: uuid.UUID, lease_id: uuid.UUID, db: DB, user: SuperAdmin) -> Any:
+    """Manually delete a single lease + its ``auto_from_lease`` IPAM mirror.
+
+    Agent-based (Kea) servers have no absence-delete reconciler (pull_leases is
+    agentless-only), so an ``expired`` lease otherwise lingers in the view until
+    the 24h GC sweep — this lets an operator drop one now (#478). Scoped to the
+    lease's own subnet so an overlapping same-address mirror in another
+    IPSpace/VRF is untouched; stamps ``removed`` history, revokes any DDNS the
+    mirror published, and audits.
+    """
+    lease = await db.get(DHCPLease, lease_id)
+    if lease is None or lease.server_id != server_id:
+        raise HTTPException(status_code=404, detail="Lease not found")
+
+    # Reuse the sweep's scope-FK-first / prefix-match subnet resolver so the
+    # mirror lookup is scoped exactly like the time-based cleanup (#329).
+    from app.tasks.dhcp_lease_cleanup import _resolve_lease_subnet_id
+
+    ip = str(lease.ip_address)
+    mirror_removed = False
+    subnet_id = await _resolve_lease_subnet_id(db, lease)
+    if subnet_id is not None:
+        mirror = (
+            await db.execute(
+                select(IPAddress).where(
+                    IPAddress.subnet_id == subnet_id,
+                    IPAddress.address == lease.ip_address,
+                    IPAddress.auto_from_lease.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        if mirror is not None:
+            subnet = await db.get(Subnet, subnet_id)
+            if subnet is not None:
+                try:
+                    from app.services.dns.ddns import revoke_ddns_for_lease
+
+                    await revoke_ddns_for_lease(db, subnet=subnet, ipam_row=mirror)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("dhcp_lease_delete_ddns_revoke_failed", ip=ip, error=str(exc))
+            await db.delete(mirror)
+            mirror_removed = True
+
+    # Stamp history BEFORE deleting the row (it reads the lease's fields).
+    from app.services.dhcp.lease_history import record_lease_history
+
+    record_lease_history(db, lease, lease_state="removed", expired_at=datetime.now(UTC))
+    await db.delete(lease)
+    write_audit(
+        db,
+        user=user,
+        action="delete",
+        resource_type="dhcp_lease",
+        resource_id=str(lease_id),
+        resource_display=ip,
+        new_value={"ip_address": ip, "mirror_removed": mirror_removed},
+    )
+    await db.commit()
+    return None
 
 
 # --- Per-server stats (#195) ------------------------------------------------

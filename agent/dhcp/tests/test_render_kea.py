@@ -84,6 +84,97 @@ def test_reservations_rendered(bundle: dict) -> None:
     assert resv[0]["hostname"] == "printer1"
 
 
+def _reservation_bundle(reservation: dict) -> dict:
+    return {
+        "etag": "sha256:test",
+        "schema_version": 1,
+        "server": {"name": "dhcp1", "interfaces": ["eth0"]},
+        "global_options": {"lease_time": 7200},
+        "subnets": [
+            {
+                "id": 1,
+                "subnet": "192.0.2.0/24",
+                "pools": [{"pool": "192.0.2.100 - 192.0.2.200"}],
+                "reservations": [reservation],
+                "valid_lifetime": 3600,
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "aabb.ccdd.eeff",  # Cisco-dotted
+        "aabbccddeeff",  # run-together
+        "AA-BB-CC-DD-EE-FF",  # dashed + uppercase
+        "AA:BB:CC:DD:EE:FF",  # colon but uppercase
+    ],
+)
+def test_reservation_mac_normalized_to_kea_form(raw: str) -> None:
+    # #476 — a reservation MAC entered non-canonically must be canonicalized to
+    # Kea's lowercase colon form, else Kea rejects the whole subnet4 on reload
+    # (or silently fails to match the client on-wire).
+    out = render(_reservation_bundle({"hw_address": raw, "ip_address": "192.0.2.50"}))
+    resv = out["Dhcp4"]["subnet4"][0]["reservations"]
+    assert resv[0]["hw-address"] == "aa:bb:cc:dd:ee:ff"
+
+
+def test_reservation_invalid_mac_dropped_not_emitted() -> None:
+    # An unparseable MAC is dropped (with a warning) rather than emitted
+    # malformed — a single bad row must not tank the whole Kea config. The
+    # reservation still matches on client-id (#476).
+    out = render(
+        _reservation_bundle(
+            {
+                "hw_address": "not-a-mac",
+                "ip_address": "192.0.2.50",
+                "client_id": "01:02:03:04",
+            }
+        )
+    )
+    resv = out["Dhcp4"]["subnet4"][0]["reservations"]
+    assert "hw-address" not in resv[0]
+    assert resv[0]["client-id"] == "01:02:03:04"
+
+
+def test_v6_reservation_mac_normalized() -> None:
+    # #476 — the Dhcp6 reservation path (_reservation_v6) normalizes MACs too;
+    # a non-canonical MAC would otherwise make Kea reject the whole subnet6.
+    bundle = {
+        "etag": "x",
+        "server_name": "d",
+        "driver": "kea",
+        "roles": [],
+        "scopes": [
+            {
+                "subnet_cidr": "2001:db8:0:1::/64",
+                "lease_time": 4800,
+                "address_family": "ipv6",
+                "v6_address_mode": "stateful",
+                "pools": [
+                    {
+                        "start_ip": "2001:db8:0:1::1000",
+                        "end_ip": "2001:db8:0:1::2000",
+                        "pool_type": "dynamic",
+                    }
+                ],
+                "statics": [
+                    {
+                        "ip_address": "2001:db8:0:1::50",
+                        "mac_address": "aabb.ccdd.eeff",  # Cisco-dotted
+                        "hostname": "v6host",
+                    }
+                ],
+                "ddns_enabled": False,
+            }
+        ],
+    }
+    out = render(bundle)
+    resv = out["Dhcp6"]["subnet6"][0]["reservations"]
+    assert resv[0]["hw-address"] == "aa:bb:cc:dd:ee:ff"
+
+
 def test_client_classes_rendered(bundle: dict) -> None:
     out = render(bundle)
     cc = out["Dhcp4"]["client-classes"]
@@ -266,7 +357,9 @@ def test_user_drop_class_not_clobbered() -> None:
     bundle = {
         "server": {"name": "t", "interfaces": ["eth0"]},
         "subnets": [{"id": 1, "subnet": "192.0.2.0/24", "pools": []}],
-        "client_classes": [{"name": "DROP", "match_expression": "option[60].hex == 'bad'"}],
+        "client_classes": [
+            {"name": "DROP", "match_expression": "option[60].hex == 'bad'"}
+        ],
         "mac_blocks": [
             {"mac_address": "aa:bb:cc:dd:ee:ff", "reason": "rogue", "description": ""}
         ],
@@ -517,7 +610,11 @@ def test_v4_scope_emits_relay_ip_addresses() -> None:
                 "subnet_cidr": "10.50.0.0/24",
                 "lease_time": 3600,
                 "pools": [
-                    {"start_ip": "10.50.0.10", "end_ip": "10.50.0.50", "pool_type": "dynamic"}
+                    {
+                        "start_ip": "10.50.0.10",
+                        "end_ip": "10.50.0.50",
+                        "pool_type": "dynamic",
+                    }
                 ],
                 "statics": [],
                 "relay_addresses": ["10.50.0.1", "192.0.2.250"],
@@ -575,4 +672,6 @@ def test_legacy_subnets_relay_ips_still_render() -> None:
             {"id": 1, "subnet": "10.60.0.0/24", "pools": [], "relay_ips": ["10.60.0.1"]}
         ],
     }
-    assert render(bundle)["Dhcp4"]["subnet4"][0]["relay"] == {"ip-addresses": ["10.60.0.1"]}
+    assert render(bundle)["Dhcp4"]["subnet4"][0]["relay"] == {
+        "ip-addresses": ["10.60.0.1"]
+    }

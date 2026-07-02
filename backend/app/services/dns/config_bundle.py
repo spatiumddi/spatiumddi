@@ -293,13 +293,11 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         if eff.entries:
             blocklists.append(_to_blocklist_data(eff, "spatium-blocklist.rpz."))
 
-    # TSIG keys: optional; not yet modelled on DNSServer. Drivers handle empty.
+    # TSIG keys are modelled on DNSServerGroup (not DNSServer) and are delivered
+    # to agents by the live ``agent_config.build_config_bundle`` path. This
+    # (vestigial) builder never populated them — the old getattr(server, ...)
+    # shims were always None since DNSServer has no tsig_key_* columns (#483).
     tsig_keys: tuple[TsigKey, ...] = ()
-    tsig_name = getattr(server, "tsig_key_name", None)
-    tsig_secret = getattr(server, "tsig_key_secret", None)
-    tsig_algo = getattr(server, "tsig_key_algorithm", None) or "hmac-sha256"
-    if tsig_name and tsig_secret:
-        tsig_keys = (TsigKey(name=tsig_name, algorithm=tsig_algo, secret=tsig_secret),)
 
     # Collect the custom (non-"default") policies referenced by signed zones
     # so the agent has a ``dnssec-policy { ... }`` block to render for each.

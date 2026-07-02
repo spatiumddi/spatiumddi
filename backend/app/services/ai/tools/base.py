@@ -270,11 +270,15 @@ def effective_tool_names(
     3. If ``provider_enabled`` is non-NULL, intersect with it
        (per-provider narrowing for small-context models).
     4. If ``enabled_modules`` is non-NULL, drop every tool whose
-       ``module`` id isn't in that set. ``module=None`` is always
-       kept. This makes feature-module toggles a hard kill-switch
-       over the AI surface — disabling ``network.customer`` removes
-       the customer find/count tools regardless of any catalog or
-       provider override.
+       ``module`` id is a *known* catalog module that isn't in that
+       set. ``module=None`` is always kept, and an *unknown* module id
+       fails OPEN (tool kept) — mirroring
+       ``feature_modules.is_module_enabled``'s "unknown ⇒ True"
+       defensiveness, so a mistyped / renamed module id can never
+       silently strip a tool from the copilot surface (issue #479).
+       For a known module this is still a hard kill-switch — disabling
+       ``network.customer`` removes the customer find/count tools
+       regardless of any catalog or provider override.
 
     NULL at any layer means "no override at this layer" — the
     behaviour falls through to the wider layer.
@@ -291,10 +295,18 @@ def effective_tool_names(
     if provider_enabled is not None:
         eligible &= set(provider_enabled)
     if enabled_modules is not None:
+        # Gate only on KNOWN catalog modules. ``module=None`` and any
+        # unknown/mistyped module id fail open (tool kept) — see the
+        # docstring; ``is_known`` is imported at call time to avoid an
+        # import cycle with feature_modules (issue #479).
+        from app.services.feature_modules import is_known
+
         modules_by_tool = {t.name: t.module for t in REGISTRY.all()}
-        eligible = {
-            n
-            for n in eligible
-            if modules_by_tool.get(n) is None or modules_by_tool[n] in enabled_modules
-        }
+
+        def _module_allows(mod: str | None) -> bool:
+            if mod is None or not is_known(mod):
+                return True
+            return mod in enabled_modules
+
+        eligible = {n for n in eligible if _module_allows(modules_by_tool.get(n))}
     return eligible

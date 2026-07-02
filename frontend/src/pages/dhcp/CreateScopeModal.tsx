@@ -81,8 +81,11 @@ export function CreateScopeModal({
   const [pxeProfileId, setPxeProfileId] = useState<string>(
     scope?.pxe_profile_id ?? "",
   );
+  // Canonical DB vocabulary (disabled | on_static_only | on_lease). The API
+  // response echoes these, so the <select> below must speak them too or edits
+  // snap back to the first option (#475). Default matches the backend model.
   const [hostnameSync, setHostnameSync] = useState(
-    scope?.hostname_sync_mode ?? "ipam",
+    scope?.hostname_sync_mode ?? "on_static_only",
   );
   const [options, setOptions] = useState<DHCPOption[]>(scope?.options ?? []);
   // DHCPv6 mode (issue #52) — only surfaced/sent for IPv6 scopes.
@@ -619,9 +622,9 @@ export function CreateScopeModal({
             value={hostnameSync}
             onChange={(e) => setHostnameSync(e.target.value)}
           >
-            <option value="none">None</option>
-            <option value="ipam">Write to IPAM on lease</option>
-            <option value="learned">Store as learned hostname</option>
+            <option value="disabled">Don't sync to IPAM</option>
+            <option value="on_static_only">Static reservations only</option>
+            <option value="on_lease">Write to IPAM on every lease</option>
           </select>
         </Field>
 

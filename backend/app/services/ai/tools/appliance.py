@@ -123,7 +123,6 @@ class FindPendingAppliancesArgs(BaseModel):
     args_model=FindPendingAppliancesArgs,
     category="admin",
     default_enabled=True,
-    module="appliance.fleet",
 )
 async def find_pending_appliances(
     db: AsyncSession, user: User, args: FindPendingAppliancesArgs
@@ -190,7 +189,6 @@ class FindApplianceFleetArgs(BaseModel):
     args_model=FindApplianceFleetArgs,
     category="admin",
     default_enabled=True,
-    module="appliance.fleet",
 )
 async def find_appliance_fleet(
     db: AsyncSession, user: User, args: FindApplianceFleetArgs
@@ -244,7 +242,6 @@ class FindControlPlaneVipArgs(BaseModel):
     args_model=FindControlPlaneVipArgs,
     category="admin",
     default_enabled=True,
-    module="appliance.fleet",
 )
 async def find_control_plane_vip(
     db: AsyncSession, user: User, args: FindControlPlaneVipArgs
@@ -304,7 +301,6 @@ class FindK8sPodsArgs(BaseModel):
     args_model=FindK8sPodsArgs,
     category="admin",
     default_enabled=True,
-    module="appliance.cluster",
 )
 async def find_k8s_pods(db: AsyncSession, user: User, args: FindK8sPodsArgs) -> dict[str, Any]:
     if (err := _superadmin_gate(user)) is not None:
@@ -372,7 +368,6 @@ class FindClusterHealthArgs(BaseModel):
     args_model=FindClusterHealthArgs,
     category="admin",
     default_enabled=True,
-    module="appliance.cluster",
 )
 async def find_cluster_health(
     db: AsyncSession, user: User, args: FindClusterHealthArgs
@@ -448,7 +443,6 @@ class FindClusterMetricsArgs(BaseModel):
     args_model=FindClusterMetricsArgs,
     category="admin",
     default_enabled=True,
-    module="appliance.cluster",
 )
 async def find_cluster_metrics(
     db: AsyncSession, user: User, args: FindClusterMetricsArgs
@@ -540,7 +534,6 @@ class FindEtcdSnapshotsArgs(BaseModel):
     args_model=FindEtcdSnapshotsArgs,
     category="admin",
     default_enabled=True,
-    module="appliance.cluster",
 )
 async def find_etcd_snapshots(
     db: AsyncSession, user: User, args: FindEtcdSnapshotsArgs
@@ -622,7 +615,6 @@ class FindUpgradeImagesArgs(BaseModel):
     args_model=FindUpgradeImagesArgs,
     category="admin",
     default_enabled=True,
-    module="appliance.fleet",
 )
 async def find_upgrade_images(
     db: AsyncSession, user: User, args: FindUpgradeImagesArgs
@@ -678,7 +670,6 @@ class FindAvailableUpgradeImagesArgs(BaseModel):
     args_model=FindAvailableUpgradeImagesArgs,
     category="admin",
     default_enabled=False,
-    module="appliance.fleet",
 )
 async def find_available_upgrade_images(
     db: AsyncSession, user: User, args: FindAvailableUpgradeImagesArgs
@@ -734,7 +725,6 @@ class ProposeApproveApplianceArgs(BaseModel):
     args_model=ProposeApproveApplianceArgs,
     category="admin",
     default_enabled=True,
-    module="appliance.fleet",
 )
 async def propose_approve_appliance(
     db: AsyncSession, user: User, args: ProposeApproveApplianceArgs
@@ -804,7 +794,6 @@ class ProposeAssignRoleArgs(BaseModel):
     args_model=ProposeAssignRoleArgs,
     category="admin",
     default_enabled=True,
-    module="appliance.fleet",
 )
 async def propose_assign_role(
     db: AsyncSession, user: User, args: ProposeAssignRoleArgs

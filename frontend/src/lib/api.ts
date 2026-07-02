@@ -403,7 +403,7 @@ export interface DnsSyncMissing {
   ip_id: string;
   ip_address: string;
   hostname: string;
-  record_type: "A" | "PTR";
+  record_type: "A" | "AAAA" | "PTR";
   expected_name: string;
   expected_value: string;
   zone_id: string;
@@ -414,7 +414,7 @@ export interface DnsSyncMismatch {
   record_id: string;
   ip_id: string;
   ip_address: string;
-  record_type: "A" | "PTR";
+  record_type: "A" | "AAAA" | "PTR";
   zone_id: string;
   zone_name: string;
   current_name: string;

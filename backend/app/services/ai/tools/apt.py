@@ -13,8 +13,10 @@ validate-before-swap host runner, and the friendly path is the
 Settings → Appliance → APT form (which has the all-important Validate
 button). Read visibility is the high value-per-token tool here.
 
-Tagged ``module="appliance.apt"`` for parity with the SNMP / NTP host-
-config tools (NN #13).
+``module=None`` (always available) — there is no ``appliance.apt``
+feature module in the catalog; appliance host-config tools are gated at
+the handler level (superadmin / appliance mode), like the SNMP / NTP
+host-config tools (issue #479).
 """
 
 from __future__ import annotations
@@ -54,7 +56,6 @@ class FindAptSettingsArgs(BaseModel):
     category="admin",
     # Default enabled (NN #13) — read-only, no secrets in response.
     default_enabled=True,
-    module="appliance.apt",
 )
 async def find_apt_settings(
     db: AsyncSession, user: User, args: FindAptSettingsArgs

@@ -118,9 +118,16 @@ async def _upsert_ipam_for_static(
 
 
 async def _detach_ipam_for_static(db, st: DHCPStaticAssignment) -> None:
-    """Release the IPAM row back to `allocated` when the static is removed.
+    """Release the IPAM row back to `available` when the static is removed.
 
     Also tears down the forward A (DNS sync with action=delete).
+
+    The row is freed to ``available`` (not ``allocated``): the IP no longer
+    holds a reservation, and — crucially — a leftover ``allocated`` /
+    ``auto_from_lease=False`` row is skipped by the agent's lease-mirror refresh
+    (it only re-mirrors ``available`` or ``auto_from_lease`` rows), so it would
+    shadow a future dynamic lease at that IP AND never be reaped. ``available``
+    lets a new lease reclaim the row (#478).
     """
     from app.api.v1.ipam.router import _sync_dns_record
 
@@ -134,7 +141,7 @@ async def _detach_ipam_for_static(db, st: DHCPStaticAssignment) -> None:
                 pass
         row.static_assignment_id = None
         if row.status == "static_dhcp":
-            row.status = "allocated"
+            row.status = "available"
 
 
 async def _conflict_check(

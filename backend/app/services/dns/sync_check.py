@@ -42,7 +42,7 @@ class MissingItem:
     ip_id: uuid.UUID
     ip_address: str
     hostname: str
-    record_type: Literal["A", "PTR"]
+    record_type: Literal["A", "AAAA", "PTR"]
     expected_name: str
     expected_value: str
     zone_id: uuid.UUID
@@ -54,7 +54,7 @@ class MismatchItem:
     record_id: uuid.UUID
     ip_id: uuid.UUID
     ip_address: str
-    record_type: Literal["A", "PTR"]
+    record_type: Literal["A", "AAAA", "PTR"]
     zone_id: uuid.UUID
     zone_name: str
     current_name: str
@@ -227,15 +227,64 @@ async def _aggregate(db: AsyncSession, subnet_ids: Sequence[uuid.UUID]) -> Drift
         reverse_zone_id=None,
         reverse_zone_name=None,
     )
+    if not subnet_ids:
+        return agg
+
+    # Bulk-load the two biggest per-subnet reads ONCE across every subnet
+    # instead of re-querying inside each compute_subnet_dns_drift call — the
+    # loop was ~2 SELECTs/subnet (IPs + their auto-generated records), i.e.
+    # O(N) round-trips for an N-subnet block (#483). The per-subnet zone
+    # resolution stays inside the callee (its inheritance walks amortize via
+    # the session identity map across sibling subnets).
+    all_ips = list(
+        (await db.execute(select(IPAddress).where(IPAddress.subnet_id.in_(subnet_ids))))
+        .scalars()
+        .all()
+    )
+    ips_by_subnet: dict[uuid.UUID, list[IPAddress]] = {}
+    for ip in all_ips:
+        ips_by_subnet.setdefault(ip.subnet_id, []).append(ip)
+
+    recs_by_ip: dict[uuid.UUID, list[DNSRecord]] = {}
+    all_ip_ids = [ip.id for ip in all_ips]
+    if all_ip_ids:
+        for r in (
+            (
+                await db.execute(
+                    select(DNSRecord).where(
+                        DNSRecord.auto_generated.is_(True),
+                        DNSRecord.ip_address_id.in_(all_ip_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        ):
+            if r.ip_address_id is not None:
+                recs_by_ip.setdefault(r.ip_address_id, []).append(r)
+
     for sid in subnet_ids:
-        sub_report = await compute_subnet_dns_drift(db, sid)
+        sub_ips = ips_by_subnet.get(sid, [])
+        sub_recs = {ip.id: recs_by_ip.get(ip.id, []) for ip in sub_ips}
+        sub_report = await compute_subnet_dns_drift(
+            db, sid, preloaded_ips=sub_ips, preloaded_recs_by_ip=sub_recs
+        )
         agg.missing.extend(sub_report.missing)
         agg.mismatched.extend(sub_report.mismatched)
         agg.stale.extend(sub_report.stale)
     return agg
 
 
-async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> DriftReport:
+async def compute_subnet_dns_drift(
+    db: AsyncSession,
+    subnet_id: uuid.UUID,
+    *,
+    preloaded_ips: list[IPAddress] | None = None,
+    preloaded_recs_by_ip: dict[uuid.UUID, list[DNSRecord]] | None = None,
+) -> DriftReport:
+    # ``preloaded_*`` let ``_aggregate`` batch the IP + auto-record loads once
+    # across a whole block/space instead of re-querying per subnet (#483). When
+    # omitted (the single-subnet call path) we load them here as before.
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise ValueError(f"Subnet {subnet_id} not found")
@@ -252,25 +301,31 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
         reverse_zone_name=reverse_zone.name if reverse_zone else None,
     )
 
-    # All live IPs in the subnet.
-    ips_res = await db.execute(select(IPAddress).where(IPAddress.subnet_id == subnet_id))
-    ips = list(ips_res.scalars().all())
+    # All live IPs in the subnet (batched by the caller, else loaded here).
+    if preloaded_ips is not None:
+        ips = preloaded_ips
+    else:
+        ips_res = await db.execute(select(IPAddress).where(IPAddress.subnet_id == subnet_id))
+        ips = list(ips_res.scalars().all())
 
     # All auto-generated DNS records that point at IPs in this subnet.
-    if ips:
-        rec_res = await db.execute(
-            select(DNSRecord).where(
-                DNSRecord.auto_generated.is_(True),
-                DNSRecord.ip_address_id.in_([ip.id for ip in ips]),
-            )
-        )
-        records = list(rec_res.scalars().all())
+    if preloaded_recs_by_ip is not None:
+        recs_by_ip = preloaded_recs_by_ip
     else:
-        records = []
-    recs_by_ip: dict[uuid.UUID, list[DNSRecord]] = {}
-    for r in records:
-        if r.ip_address_id is not None:
-            recs_by_ip.setdefault(r.ip_address_id, []).append(r)
+        if ips:
+            rec_res = await db.execute(
+                select(DNSRecord).where(
+                    DNSRecord.auto_generated.is_(True),
+                    DNSRecord.ip_address_id.in_([ip.id for ip in ips]),
+                )
+            )
+            records = list(rec_res.scalars().all())
+        else:
+            records = []
+        recs_by_ip = {}
+        for r in records:
+            if r.ip_address_id is not None:
+                recs_by_ip.setdefault(r.ip_address_id, []).append(r)
 
     # Also pick up records that *think* they belong to a subnet IP but the IP
     # was deleted (FK is SET NULL on IPAddress delete) — these are stale.
@@ -327,7 +382,16 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
                 )
             continue
 
-        ip_a_records = [r for r in recs_by_ip.get(ip.id, []) if r.record_type == "A"]
+        # Forward record family depends on the IP: AAAA for IPv6, A for IPv4.
+        # Collect BOTH so a stale/mismatched AAAA on a v6 IP is surfaced — the
+        # classifier was A-only, so IPv6 subnets never reported missing/stale
+        # AAAA and "Sync DNS" always looked clean on them (#481).
+        forward_rtype: Literal["A", "AAAA"] = (
+            "AAAA" if ipaddress.ip_address(str(ip.address)).version == 6 else "A"
+        )
+        ip_forward_records = [
+            r for r in recs_by_ip.get(ip.id, []) if r.record_type in ("A", "AAAA")
+        ]
         ip_ptr_records = [r for r in recs_by_ip.get(ip.id, []) if r.record_type == "PTR"]
 
         # The default-named gateway placeholder (`hostname == "gateway"`) is
@@ -335,16 +399,16 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
         # ``_sync_dns_record``. Renaming the IP turns forward sync back on.
         is_default_gateway = ip.hostname == "gateway"
 
-        # ── Forward A ────────────────────────────────────────────────────────
+        # ── Forward A / AAAA ─────────────────────────────────────────────────
         if forward_zone and not is_default_gateway:
             exp_name, exp_value = _expected_a(ip.hostname, str(ip.address), forward_zone.name)
-            if not ip_a_records:
+            if not ip_forward_records:
                 report.missing.append(
                     MissingItem(
                         ip_id=ip.id,
                         ip_address=str(ip.address),
                         hostname=ip.hostname,
-                        record_type="A",
+                        record_type=forward_rtype,
                         expected_name=exp_name,
                         expected_value=exp_value,
                         zone_id=forward_zone.id,
@@ -352,14 +416,21 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
                     )
                 )
             else:
-                for r in ip_a_records:
-                    if r.zone_id != forward_zone.id or r.name != exp_name or r.value != exp_value:
+                for r in ip_forward_records:
+                    # A wrong-family record (A on a v6 IP or vice-versa) is drift
+                    # too, so diff the type alongside zone/name/value.
+                    if (
+                        r.record_type != forward_rtype
+                        or r.zone_id != forward_zone.id
+                        or r.name != exp_name
+                        or r.value != exp_value
+                    ):
                         report.mismatched.append(
                             MismatchItem(
                                 record_id=r.id,
                                 ip_id=ip.id,
                                 ip_address=str(ip.address),
-                                record_type="A",
+                                record_type=forward_rtype,
                                 zone_id=r.zone_id,
                                 zone_name=forward_zone.name if r.zone_id == forward_zone.id else "",
                                 current_name=r.name,
@@ -369,14 +440,14 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
                             )
                         )
         elif is_default_gateway:
-            # Forward A records for default-gateway-named IPs are stale by
+            # Forward A/AAAA records for default-gateway-named IPs are stale by
             # definition (see _sync_dns_record). Surface them so the user
             # can clean up.
-            for r in ip_a_records:
+            for r in ip_forward_records:
                 report.stale.append(
                     StaleItem(
                         record_id=r.id,
-                        record_type="A",
+                        record_type=r.record_type,
                         zone_id=r.zone_id,
                         zone_name=(
                             forward_zone.name
@@ -388,18 +459,18 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
                         reason="default-gateway-name",
                     )
                 )
-        elif not forward_zone and ip_a_records:
-            # Forward zone was unassigned (or inherited to null) after A
+        elif not forward_zone and ip_forward_records:
+            # Forward zone was unassigned (or inherited to null) after A/AAAA
             # records were already published. No effective zone to match
             # against → mark them stale so the user can delete them. Same
             # intent as the ``no-forward-zone`` PTR branch below: keeps
             # "Sync DNS" able to clean up after a zone disassociation even
             # though the classifier otherwise has nothing to diff against.
-            for r in ip_a_records:
+            for r in ip_forward_records:
                 report.stale.append(
                     StaleItem(
                         record_id=r.id,
-                        record_type="A",
+                        record_type=r.record_type,
                         zone_id=r.zone_id,
                         zone_name="",
                         name=r.name,

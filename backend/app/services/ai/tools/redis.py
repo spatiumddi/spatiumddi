@@ -59,7 +59,6 @@ class GetRedisStatsArgs(BaseModel):
     args_model=GetRedisStatsArgs,
     category="ops",
     default_enabled=False,
-    module="diagnostics",
 )
 async def get_redis_stats(
     db: AsyncSession,

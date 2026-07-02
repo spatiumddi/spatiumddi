@@ -34,6 +34,11 @@ router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permiss
 
 VALID_HOSTNAME_POLICIES = {"client", "server_name", "derived", "none"}
 VALID_SYNC_MODES = {"disabled", "on_lease", "on_static_only", "ipam", "learned"}
+# Fields on ScopeUpdate an explicit ``null`` may CLEAR (#475). Every other
+# nullable column keeps its ``exclude_none`` behaviour — a stray null is dropped
+# rather than applied — so a NOT-NULL column can't 500 on ``setattr(None)`` and a
+# partial-body client can't silently wipe a column it didn't mean to touch.
+NULLABLE_CLEARABLE_SCOPE_FIELDS = {"min_lease_time", "max_lease_time"}
 # DHCPv6 operating modes (issue #52). Only meaningful for ipv6 scopes.
 VALID_V6_MODES = {"stateful", "stateless", "slaac"}
 
@@ -74,11 +79,20 @@ def _normalize_options(raw: Any) -> dict[str, Any]:
 
 
 def _normalize_sync_mode(v: str | None) -> str:
-    if v in (None, "", "ipam"):
+    """Coerce a hostname→IPAM sync value to the canonical DB vocabulary
+    (``disabled`` | ``on_static_only`` | ``on_lease``).
+
+    The UI (and API) once used a separate ``none`` / ``ipam`` / ``learned``
+    vocabulary that didn't round-trip: the response echoes the stored canonical
+    value, which the old ``<select>`` couldn't render, so edits snapped back
+    (#475). The UI now speaks the canonical vocabulary directly; these legacy
+    values are still mapped in for backward-compatible API clients. Empty /
+    missing defaults to ``on_static_only`` (the model default).
+    """
+    if not v:  # None or ""
         return "on_static_only"
-    if v == "learned":
-        return "on_lease"
-    return v or "on_static_only"
+    legacy = {"none": "disabled", "ipam": "on_static_only", "learned": "on_lease"}
+    return legacy.get(v, v)
 
 
 def _validate_relay_addresses(v: list[str] | None) -> list[str]:
@@ -434,13 +448,33 @@ async def update_scope(
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
-    changes = body.model_dump(exclude_none=True)
+    # ``exclude_unset`` (not ``exclude_none``) so an explicit null can clear a
+    # nullable column (e.g. resetting min_lease_time / max_lease_time to empty),
+    # while a field the client didn't send stays untouched (#475). But keep a
+    # null only for the fields we explicitly allow to clear — otherwise an
+    # explicit null on a NOT-NULL column (name / description / is_active) would
+    # 500 on commit, and a null a partial-body client sent for an unmanaged
+    # nullable column would silently wipe it (both were dropped under
+    # ``exclude_none``).
+    changes = {
+        k: v
+        for k, v in body.model_dump(exclude_unset=True).items()
+        if v is not None or k in NULLABLE_CLEARABLE_SCOPE_FIELDS
+    }
     if "enabled" in changes:
         changes["is_active"] = changes.pop("enabled")
     if "hostname_sync_mode" in changes:
         changes["hostname_to_ipam_sync"] = _normalize_sync_mode(changes.pop("hostname_sync_mode"))
     elif "hostname_to_ipam_sync" in changes:
         changes["hostname_to_ipam_sync"] = _normalize_sync_mode(changes["hostname_to_ipam_sync"])
+    # Validate the resolved sync mode with the same guard as create (#475).
+    if "hostname_to_ipam_sync" in changes and changes[
+        "hostname_to_ipam_sync"
+    ] not in VALID_SYNC_MODES - {"ipam", "learned"}:
+        raise HTTPException(
+            status_code=422,
+            detail=f"invalid hostname sync mode: {changes['hostname_to_ipam_sync']}",
+        )
     if "options" in changes:
         changes["options"] = _normalize_options(changes["options"])
     # ``clear_pxe_profile=True`` is the explicit detach signal — Pydantic

@@ -32,7 +32,7 @@ import structlog
 
 from .cache import load_config, save_config, save_rendered_kea, save_token
 from .config import AgentConfig
-from .kea_ctrl import KeaCtrlError, config_reload
+from .kea_ctrl import KeaCtrlError, config_reload, config_test
 from .render_kea import render as render_kea
 
 log = structlog.get_logger(__name__)
@@ -56,6 +56,7 @@ def _touch_ready_marker(state_dir: Path) -> None:
         marker.touch(exist_ok=True)
     except OSError:
         log.exception("ready_marker_touch_failed", path=str(state_dir / ".ready"))
+
 
 _FAILURE_THRESHOLD = 3  # DHCP.md §6: offline after 3 consecutive failures
 _OFFLINE_RETRY_SECONDS = 60.0
@@ -148,39 +149,70 @@ class SyncLoop:
         tmp.replace(path)
 
     def _reload_socket(
-        self, socket_path: Path, daemon: str, reload_retry_timeout: float
+        self,
+        socket_path: Path,
+        config_doc: dict[str, Any],
+        daemon: str,
+        reload_retry_timeout: float,
     ) -> bool:
-        """Ask one Kea daemon to reload, retrying until its socket answers.
+        """Preflight (config-test) then reload one Kea daemon.
 
-        Returns ``True`` on a successful reload, ``False`` otherwise. A
-        failure is logged + reflected in ``heartbeat.daemon_status`` but
-        does not raise, so a v6 reload failure can't abort the v4 apply
-        (and vice-versa). The retry covers Kea's own startup window where
-        the control socket may not exist yet.
+        Returns ``True`` on a successful reload, ``False`` otherwise. Never
+        raises, so a v6 failure can't abort the v4 apply (and vice-versa). Two
+        failure modes are now distinguished (#477):
+
+        * **Config rejected** — config-test / reload answers with a non-zero
+          result. Terminal (retrying won't fix a bad render), so surface Kea's
+          *actual* error text in ``daemon_status`` and skip the reload rather
+          than disturb a running daemon with a config it will reject. This is
+          what turns an opaque "degraded" into "pool 10.0.0.0/24 is not part
+          of the subnet …".
+        * **Socket not ready** — an ``OSError`` connecting to the control
+          socket during Kea's startup window. Retry until the deadline.
         """
         deadline = time.monotonic() + reload_retry_timeout
         last_err: Exception | None = None
         while True:
             try:
+                # config-test validates WITHOUT applying and returns the real
+                # reason on rejection; only reload once it passes.
+                config_test(socket_path, config_doc)
                 config_reload(socket_path)
                 return True
             except (KeaCtrlError, OSError) as e:
+                # Retry BOTH classes through the deadline. An OSError is the
+                # control socket not being up yet; and during Kea's startup
+                # window the command channel can answer config-test with a
+                # *transient* KeaCtrlError (empty / non-JSON / not-ready) that a
+                # moment later succeeds — so a rejection is only treated as
+                # terminal once the retry window is exhausted. In the steady-
+                # state apply path reload_retry_timeout is 0, so a genuinely bad
+                # config still reports immediately without a spurious reload.
                 last_err = e
                 if time.monotonic() >= deadline:
                     break
                 log.debug(
-                    "kea_config_reload_retry",
+                    "kea_reload_socket_retry",
                     daemon=daemon,
                     error=str(e),
                     wait=_BOOTSTRAP_RELOAD_INTERVAL,
                 )
                 if self._stop.wait(_BOOTSTRAP_RELOAD_INTERVAL):
                     break
-        log.warning("kea_config_reload_failed", daemon=daemon, error=str(last_err))
-        self.heartbeat.daemon_status = {
-            "status": "degraded",
-            "reason": f"{daemon}_reload_failed: {last_err}",
-        }
+        # Deadline exhausted — report the reason that fits the last error: a
+        # config Kea rejected (surface its text) vs a socket we never reached.
+        if isinstance(last_err, KeaCtrlError):
+            log.warning("kea_config_rejected", daemon=daemon, error=str(last_err))
+            self.heartbeat.daemon_status = {
+                "status": "degraded",
+                "reason": f"{daemon}_config_rejected: {last_err}",
+            }
+        else:
+            log.warning("kea_config_reload_failed", daemon=daemon, error=str(last_err))
+            self.heartbeat.daemon_status = {
+                "status": "degraded",
+                "reason": f"{daemon}_socket_unreachable: {last_err}",
+            }
         return False
 
     def _apply_bundle(
@@ -263,10 +295,10 @@ class SyncLoop:
             # the same retry / tolerate-missing-socket logic, and the
             # heartbeat daemon_status reflects the worst of the two.
             ok4 = self._reload_socket(
-                self.cfg.kea_control_socket, "dhcp4", reload_retry_timeout
+                self.cfg.kea_control_socket, dhcp4_doc, "dhcp4", reload_retry_timeout
             )
             ok6 = self._reload_socket(
-                self.cfg.kea_control_socket_v6, "dhcp6", reload_retry_timeout
+                self.cfg.kea_control_socket_v6, dhcp6_doc, "dhcp6", reload_retry_timeout
             )
             if ok4 and ok6:
                 self.heartbeat.daemon_status = {"status": "ok"}
