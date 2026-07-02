@@ -66,3 +66,28 @@ def config_reload(socket_path: Path) -> None:
     log.info("kea_config_reload_send", socket=str(socket_path))
     send_command(socket_path, "config-reload")
     log.info("kea_config_reload_ok")
+
+
+def config_test(socket_path: Path, config_doc: dict[str, Any]) -> None:
+    """Validate a rendered config WITHOUT applying it (#477).
+
+    Kea's ``config-test`` parses + sanity-checks the config passed in
+    ``arguments`` and returns result=0 when valid, or a non-zero result with
+    ``text`` describing the exact problem (e.g. a pool outside the subnet).
+    ``send_command`` raises :class:`KeaCtrlError` carrying that ``text`` on
+    rejection, so a caller can surface Kea's real reason instead of an opaque
+    "reload failed" and never reload a config the daemon will reject.
+
+    A daemon too old to know ``config-test`` answers result=2 ("command not
+    supported"); we treat that as a soft pass so the preflight degrades to a
+    plain reload rather than blocking the apply.
+    """
+    log.info("kea_config_test_send", socket=str(socket_path))
+    try:
+        send_command(socket_path, "config-test", arguments=config_doc)
+    except KeaCtrlError as e:
+        if "result=2" in str(e):  # command unsupported → skip the preflight
+            log.info("kea_config_test_unsupported", socket=str(socket_path))
+            return
+        raise
+    log.info("kea_config_test_ok")
