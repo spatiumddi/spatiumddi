@@ -382,7 +382,9 @@ async def pull_leases_from_server(
                 # branch; revoke reads dns_record_id / hostname off the row so
                 # it must run before the row is deleted. Best-effort: a revoke
                 # failure must not block the absence-delete sweep.
-                stale_subnet = subnet_by_id.get(stale_subnet_id)
+                stale_subnet = (
+                    subnet_by_id.get(stale_subnet_id) if stale_subnet_id is not None else None
+                )
                 if stale_subnet is not None:
                     try:
                         from app.services.dns.ddns import (  # noqa: PLC0415

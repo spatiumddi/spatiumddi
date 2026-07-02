@@ -84,7 +84,7 @@ def _normalize_sync_mode(v: str | None) -> str:
     values are still mapped in for backward-compatible API clients. Empty /
     missing defaults to ``on_static_only`` (the model default).
     """
-    if v in (None, ""):
+    if not v:  # None or ""
         return "on_static_only"
     legacy = {"none": "disabled", "ipam": "on_static_only", "learned": "on_lease"}
     return legacy.get(v, v)
