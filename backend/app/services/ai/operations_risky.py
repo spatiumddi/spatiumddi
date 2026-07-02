@@ -58,6 +58,7 @@ from fastapi import HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.auth import User
 from app.services.ai.operations import (
@@ -246,6 +247,23 @@ async def _apply_delete_subnet(
     if not args.permanent:
         await _revoke_subnet_lease_mirrors(db, subnet)
 
+        # Wake DHCP agents for groups whose scopes are being trashed: soft-delete
+        # stamps the scopes deleted, changing rendered Kea config, but without a
+        # wake convergence waits for the 12s safety tick (#512). Capture the
+        # group ids BEFORE the soft-delete filter hides the scope rows.
+        from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
+        from app.models.dhcp import DHCPScope as _DHCPScope  # noqa: PLC0415
+
+        wake_group_ids = set(
+            (
+                await db.execute(
+                    select(_DHCPScope.group_id).where(_DHCPScope.subnet_id == args.subnet_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
         batch = await collect_soft_delete_batch(db, subnet)
         apply_soft_delete(batch, user.id)
         for row in batch.rows:
@@ -260,6 +278,8 @@ async def _apply_delete_subnet(
                 )
             )
         await db.commit()
+        for gid in wake_group_ids:
+            collect_wake(dhcp_group_channel(gid))
         return {"subnet_id": str(args.subnet_id), "mode": "soft_delete"}
 
     require_superadmin(user)
@@ -300,6 +320,37 @@ async def _apply_delete_subnet(
     )
     record_ids = [rid for rid in addr_result.scalars().all() if rid is not None]
     if record_ids:
+        # Enqueue a delete op per record through the record-ops chokepoint BEFORE
+        # dropping the rows. Agent-based zones re-converge via the full-zone
+        # bundle, but an agentless (Windows DNS) primary is only retracted by an
+        # explicit op — a bare sa_delete left those A/PTR records live on the
+        # server (#512).
+        from app.services.dns.record_ops import enqueue_record_op  # noqa: PLC0415
+
+        recs = (
+            (
+                await db.execute(
+                    select(DNSRecord)
+                    .where(DNSRecord.id.in_(record_ids))
+                    .options(selectinload(DNSRecord.zone))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for rec in recs:
+            if rec.zone is not None:
+                await enqueue_record_op(
+                    db,
+                    rec.zone,
+                    "delete",
+                    {
+                        "name": rec.name,
+                        "type": rec.record_type,
+                        "value": rec.value,
+                        "ttl": rec.ttl,
+                    },
+                )
         await db.execute(sa_delete(DNSRecord).where(DNSRecord.id.in_(record_ids)))
 
     await db.execute(
