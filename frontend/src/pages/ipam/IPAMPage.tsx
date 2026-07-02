@@ -8087,6 +8087,13 @@ function EditAddressModal({
     (address.custom_fields as Record<string, unknown>) ?? {},
   );
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
+  // Whether the operator actually interacted with the zone picker. The
+  // pre-select effect sets dnsZoneId programmatically (not via onChange), so
+  // this stays false until a real selection. It lets the mutation send an
+  // explicit zone (incl. null for "None") only on a deliberate change, while
+  // an untouched save omits dns_zone_id so the backend preserves the IP's
+  // current zone (#493 / bot review of #502).
+  const [dnsZoneTouched, setDnsZoneTouched] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showMacHistory, setShowMacHistory] = useState(false);
   const [pendingWarnings, setPendingWarnings] = useState<
@@ -8210,7 +8217,11 @@ function EditAddressModal({
         mac_address: macAddress || null,
         status,
         custom_fields: customFields,
-        dns_zone_id: dnsZoneId || undefined,
+        // Send the zone only on a deliberate pick: a real zone moves the
+        // record, "" (the None option) sends null to remove it, and an
+        // untouched picker omits the field so the backend keeps the current
+        // zone (#493 / bot review of #502).
+        dns_zone_id: dnsZoneTouched ? dnsZoneId || null : undefined,
         role: (role || null) as IPRole | null,
         reserved_until: reservedIso,
         force,
@@ -8333,7 +8344,10 @@ function EditAddressModal({
                 <select
                   className={inputCls}
                   value={dnsZoneId}
-                  onChange={(e) => setDnsZoneId(e.target.value)}
+                  onChange={(e) => {
+                    setDnsZoneId(e.target.value);
+                    setDnsZoneTouched(true);
+                  }}
                 >
                   <ZoneOptions
                     zones={availableZones}

@@ -6566,17 +6566,25 @@ async def update_address(
     # IP's forward_zone_id (#493). Only honour a caller-supplied zone (or an
     # explicit null = clear) when dns_zone_id is actually in the payload.
     dns_zone_explicit = "dns_zone_id" in body.model_fields_set
+    # Operator explicitly chose "None (remove DNS record)" — an empty/null
+    # dns_zone_id that was actually sent (vs omitted, which means "keep").
+    zone_cleared = dns_zone_explicit and not body.dns_zone_id
     hostname_cleared = "hostname" in changes and not ip.hostname
-    if subnet and hostname_cleared:
-        # Clearing the hostname removes the IP's DNS presence. Route through
-        # "delete" — an "update" early-returns on an empty hostname and would
-        # leave the old A/PTR records live on the server (#502).
+    if subnet and (hostname_cleared or zone_cleared):
+        # Clearing the hostname OR explicitly picking "None" removes the IP's
+        # DNS presence. Route through "delete" — an "update" with zone_id=None
+        # falls back to the subnet's effective zone (and early-returns on an
+        # empty hostname), so it would NOT actually remove the records
+        # (#502, and the bot review of the #493 fix).
         await _sync_dns_record(db, ip, subnet, action="delete")
+        if zone_cleared:
+            # Make the removal stick: without this a later unrelated edit
+            # would preserve forward_zone_id and re-create the record.
+            ip.forward_zone_id = None
     elif subnet and ("hostname" in changes or dns_zone_explicit or extras_changed):
-        if dns_zone_explicit:
-            zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
-        else:
-            zone_id = ip.forward_zone_id
+        # zone_cleared is handled above, so an explicit zone here is a real
+        # UUID; otherwise preserve the IP's current forward zone (#493).
+        zone_id = uuid.UUID(body.dns_zone_id) if dns_zone_explicit else ip.forward_zone_id
         await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update")
     elif subnet and restoring:
         await _sync_dns_record(db, ip, subnet, zone_id=ip.forward_zone_id, action="create")
