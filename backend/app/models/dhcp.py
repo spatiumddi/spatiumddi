@@ -270,7 +270,20 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     __tablename__ = "dhcp_scope"
     __table_args__ = (
-        UniqueConstraint("group_id", "subnet_id", name="uq_dhcp_scope_group_subnet"),
+        # Partial unique index (NOT a plain UniqueConstraint) so a
+        # soft-deleted scope stops occupying the (group, subnet) slot.
+        # DHCPScope is soft-deletable; with a non-partial constraint a
+        # trashed scope kept the slot, so re-creating a scope for that
+        # subnet (or the Windows lease-import auto-create) 500'd on
+        # uq_dhcp_scope_group_subnet (#474). Scoping uniqueness to live
+        # rows matches the soft-delete semantics.
+        Index(
+            "uq_dhcp_scope_group_subnet",
+            "group_id",
+            "subnet_id",
+            unique=True,
+            postgresql_where=sa_text("deleted_at IS NULL"),
+        ),
         Index("ix_dhcp_scope_group", "group_id"),
         Index("ix_dhcp_scope_subnet", "subnet_id"),
     )

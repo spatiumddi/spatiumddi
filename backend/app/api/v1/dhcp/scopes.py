@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
@@ -385,7 +386,17 @@ async def create_scope(
         relay_addresses=body.relay_addresses,
     )
     db.add(scope)
-    await db.flush()
+    # The pre-check above can't see a soft-deleted scope, and even for
+    # live rows a concurrent create can race it, so translate the DB
+    # unique-violation into a clean 409 instead of a raw 500 (#474).
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="A scope for this group+subnet already exists",
+        ) from exc
     # Push to every Windows DHCP member of the group BEFORE commit so a
     # WinRM failure rolls the DB row back.
     await push_scope_upsert(db, scope)
