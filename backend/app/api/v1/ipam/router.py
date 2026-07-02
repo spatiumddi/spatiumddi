@@ -1319,13 +1319,38 @@ async def _sync_dns_record(
     # ── Reverse PTR ─────────────────────────────────────────────────────────
     # A PTR points AT the forward FQDN. With no effective primary forward zone
     # ``fqdn`` is None (subnet resolved to no forward zone, or a stale/deleted
-    # primary-zone FK reset it above), so there is no name to point at — skip
-    # the PTR. The forward fan-out above already published to any extra zones
-    # via their own ``target_fqdn``. Without this guard ``ptr_value = fqdn +
-    # "."`` below raises TypeError (None + str) — reachable through the public
-    # create endpoint for a split-horizon IP with extra_zone_ids and no forward
-    # zone, or an IP whose primary forward zone was deleted (issue #480).
+    # primary-zone FK reset it above), so there is no name to point at. The
+    # forward fan-out above already published to any extra zones via their own
+    # ``target_fqdn``. Without this guard ``ptr_value = fqdn + "."`` below raises
+    # TypeError (None + str) — reachable through the public create endpoint for a
+    # split-horizon IP with extra_zone_ids and no forward zone, or an IP whose
+    # primary forward zone was deleted (issue #480).
     if fqdn is None:
+        # Don't just skip: retract any auto-generated PTR we previously
+        # published for this IP. When the primary forward zone was deleted /
+        # detached, the PTR now points at a name that can no longer be
+        # generated — leaving it stranded in DNS + DB. Retract it (Copilot
+        # review on #480).
+        stale_ptrs = (
+            (
+                await db.execute(
+                    select(DNSRecord).where(
+                        DNSRecord.ip_address_id == ip.id,
+                        DNSRecord.auto_generated.is_(True),
+                        DNSRecord.record_type == "PTR",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for rec in stale_ptrs:
+            old_zone = await db.get(DNSZone, rec.zone_id)
+            if old_zone is not None:
+                await _enqueue_dns_op(db, old_zone, "delete", rec.name, "PTR", rec.value, rec.ttl)
+            await db.delete(rec)
+        if stale_ptrs:
+            ip.reverse_zone_id = None
         return
     try:
         ip_obj = ipaddress.ip_address(str(ip.address))

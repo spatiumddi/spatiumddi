@@ -36,9 +36,12 @@ def test_registration_metadata() -> None:
     t = REGISTRY.get("get_redis_stats")
     assert t is not None
     # Operationally-sensitive infra telemetry → opt-in (default-disabled),
-    # module-tagged with diagnostics, read-only.
+    # read-only. No feature-module gate: ``diagnostics`` was never a real
+    # catalog module, so the tool is module=None now (availability is the
+    # default_enabled=False opt-in + the superadmin handler gate) — a bogus
+    # module id would have silently dropped it from the surface (#479).
     assert t.default_enabled is False
-    assert t.module == "diagnostics"
+    assert t.module is None
     assert t.writes is False
 
 

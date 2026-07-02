@@ -24,7 +24,7 @@ from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 
 
-async def _subnet_with_reverse_only(db: AsyncSession) -> Subnet:
+async def _subnet_with_reverse_only(db: AsyncSession) -> tuple[Subnet, DNSZone]:
     """A subnet with a linked reverse zone but NO forward zone."""
     grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
     db.add(grp)
@@ -56,14 +56,14 @@ async def _subnet_with_reverse_only(db: AsyncSession) -> Subnet:
     )
     db.add(rev)
     await db.flush()
-    return subnet
+    return subnet, rev
 
 
 @pytest.mark.asyncio
 async def test_extra_zone_ids_without_forward_zone_does_not_crash(
     db_session: AsyncSession,
 ) -> None:
-    subnet = await _subnet_with_reverse_only(db_session)
+    subnet, _rev = await _subnet_with_reverse_only(db_session)
     ip = IPAddress(
         subnet_id=subnet.id,
         address="10.80.1.50",
@@ -95,3 +95,53 @@ async def test_extra_zone_ids_without_forward_zone_does_not_crash(
         .all()
     )
     assert ptrs == []
+
+
+@pytest.mark.asyncio
+async def test_stale_ptr_is_retracted_when_forward_zone_gone(
+    db_session: AsyncSession,
+) -> None:
+    # When the primary forward zone was deleted, an IP that HAD a PTR reaches
+    # the fqdn=None path — the guard must RETRACT the now-orphaned PTR rather
+    # than leave it pointing at a name that can no longer be generated (Copilot
+    # review on #480).
+    subnet, rev = await _subnet_with_reverse_only(db_session)
+    ip = IPAddress(
+        subnet_id=subnet.id,
+        address="10.80.1.60",
+        status="allocated",
+        hostname="host",
+        extra_zone_ids=[str(uuid.uuid4())],  # fqdn=None path
+    )
+    db_session.add(ip)
+    await db_session.flush()
+    # A pre-existing auto-generated PTR, as if a forward zone once existed.
+    db_session.add(
+        DNSRecord(
+            zone_id=rev.id,
+            name="60",
+            fqdn="60.1.80.10.in-addr.arpa.",
+            record_type="PTR",
+            value="host.old-forward.example.",
+            auto_generated=True,
+            ip_address_id=ip.id,
+        )
+    )
+    await db_session.flush()
+
+    await _sync_dns_record(db_session, ip, subnet)
+    await db_session.flush()
+
+    remaining = (
+        (
+            await db_session.execute(
+                select(DNSRecord).where(
+                    DNSRecord.ip_address_id == ip.id,
+                    DNSRecord.record_type == "PTR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert remaining == []  # the stale PTR was retracted, not left orphaned
