@@ -8491,6 +8491,8 @@ async def bulk_edit_addresses(
     not_found = [i for i in body.ip_ids if i not in found_ids]
     updated = 0
     skipped: list[uuid.UUID] = []
+    # Subnets whose utilization must be recomputed after the batch (#509).
+    touched_subnets: set[uuid.UUID] = set()
 
     tags_patch = body.changes.tags
     cf_patch = body.changes.custom_fields
@@ -8567,6 +8569,17 @@ async def bulk_edit_addresses(
                 old[k] = getattr(ip, k, None)
             for k, v in scalar_changes.items():
                 setattr(ip, k, v)
+            # Mirror single-edit (#509): moving off "reserved" clears the TTL so
+            # the reservation sweeper can't later flip the row unexpectedly.
+            if "status" in scalar_changes and ip.status != "reserved":
+                ip.reserved_until = None
+            # A status change alters the allocated/available split, so the
+            # subnet (and its block rollup) utilization must be recomputed —
+            # single-edit does this; bulk-edit didn't, leaving bars + the
+            # dashboard heatmap stale until some other mutation touched the
+            # subnet (#509).
+            if "status" in scalar_changes:
+                touched_subnets.add(ip.subnet_id)
 
             if tags_patch is not None:
                 merged = dict(ip.tags or {})
@@ -8611,6 +8624,14 @@ async def bulk_edit_addresses(
                 )
             )
             updated += 1
+
+    # Recompute utilization for every subnet whose status mix changed, plus
+    # the block rollups above them (#509).
+    for sid in touched_subnets:
+        await _update_utilization(db, sid)
+        sn = subnet_cache.get(sid) or await db.get(Subnet, sid)
+        if sn is not None and sn.block_id is not None:
+            await _update_block_utilization(db, sn.block_id)
 
     await db.commit()
     logger.info(

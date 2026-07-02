@@ -9863,6 +9863,9 @@ function BulkDeleteAddressesModal({
     mutationFn: () => ipamApi.bulkDeleteAddresses({ ip_ids: ipIds, permanent }),
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+      // Refresh subnet utilization (tree dot + space-table "Used IPs") the way
+      // the single-delete path does — bulk-delete was missing this (#509).
+      qc.invalidateQueries({ queryKey: ["subnets"] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
@@ -14686,6 +14689,18 @@ export function IPAMPage() {
     queryFn: () => ipamApi.listSubnets({ space_id: activeSpaceId }),
     enabled: !!activeSpaceId,
   });
+
+  // Keep the subnet-detail header in sync with the refetched list.
+  // selectedSubnet is a snapshot set only on click/edit, so IP mutations that
+  // invalidate ["subnets"] refreshed the tree but left the header's
+  // "Allocated N / M" + utilization bar (and the Ask-AI context) stale (#509).
+  useEffect(() => {
+    if (!selectedSubnet || !detailSubnets) return;
+    const fresh = detailSubnets.find((s) => s.id === selectedSubnet.id);
+    if (fresh && JSON.stringify(fresh) !== JSON.stringify(selectedSubnet)) {
+      setSelectedSubnet(fresh);
+    }
+  }, [detailSubnets, selectedSubnet]);
 
   function selectSubnet(subnet: Subnet | null) {
     setSelectedSubnet(subnet);
