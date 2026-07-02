@@ -17,7 +17,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from jose import JWTError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from app.api.deps import DB
@@ -80,11 +80,28 @@ class AgentRegisterResponse(BaseModel):
 
 
 class AgentHeartbeatRequest(BaseModel):
+    # #482 — reject a wrong-envelope heartbeat loudly instead of validating
+    # into an all-default body (ops_ack=[] → the ACK loop runs 0× → 200 → the
+    # agent clears its ACK buffer, losing the ACKs). Mirrors the DNS heartbeat
+    # hardening (#430 D4). forbid requires this model to be a strict SUPERSET
+    # of every field any DHCP agent sends: the pid / status /
+    # lease_count_since_start telemetry below is accepted-but-unused so the
+    # current agent's body validates, and the Phase 8f-2 slot fields keep
+    # pre-Wave-C1 agents valid too.
+    model_config = ConfigDict(extra="forbid")
+
     agent_version: str | None = None
     daemon: dict[str, Any] = {}
     config: dict[str, Any] = {}
-    ops_ack: list[dict[str, Any]] = []
+    # Bound the ACK list so a malformed / hostile heartbeat can't pin memory.
+    ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
     failed_ops_count: int = 0
+    # Accepted-but-unused telemetry the current DHCP agent ships every beat
+    # (agent/dhcp/spatium_dhcp_agent/heartbeat.py). Listed so extra="forbid"
+    # doesn't 422 a real heartbeat; the handler doesn't read them today.
+    pid: int | None = None
+    status: str | None = None
+    lease_count_since_start: int | None = None
     # Phase 8f-2 — agent reports its slot state + deployment environment.
     # See DNSServer agents.py for the per-field semantics. All optional
     # so older agents keep heartbeating without a 422.

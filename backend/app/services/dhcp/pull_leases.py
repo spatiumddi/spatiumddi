@@ -18,8 +18,14 @@ that implements ``get_leases`` can plug in.
    NOT appear in the wire response is gone from the DHCP server** —
    an admin deleted it, or it was released + cleaned up on the server
    before we polled. Delete the ``DHCPLease`` row and, if we created
-   the IPAM mirror (``auto_from_lease=True``), drop that too. The
-   driver's ``get_leases`` is the ground truth; absence means deleted.
+   the IPAM mirror (``auto_from_lease=True``), drop that too — first
+   revoking any DDNS records the mirror published, so a vanished lease
+   doesn't leave an orphaned A/PTR behind (#482). The driver's
+   ``get_leases`` is the ground truth; absence means deleted, **except**
+   for a wholly-empty wire response: an empty list is indistinguishable
+   from a transient driver hiccup, so the zero-wire floor guard (#482)
+   skips the absence-delete for that poll and lets the time-based
+   ``dhcp_lease_cleanup`` expiry sweep reclaim genuinely-removed leases.
 
 The time-based ``dhcp_lease_cleanup`` sweep continues to handle leases
 that drift past ``expires_at`` without being polled (e.g., between
@@ -40,7 +46,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dhcp import get_driver, is_agentless
@@ -296,13 +302,55 @@ async def pull_leases_from_server(
     # mirror we created. Manually-allocated IPAM rows (auto_from_lease
     # False) are intentionally left alone — the operator owns those.
     wire_ips = {lease.get("ip_address") for lease in wire if lease.get("ip_address")}
-    stale_q = select(DHCPLease).where(
-        DHCPLease.server_id == server.id,
-        DHCPLease.state == "active",
+
+    # Zero-wire floor guard (#482). An empty lease response is
+    # indistinguishable from a transient driver hiccup that returned [] WITHOUT
+    # raising (e.g. Get-DhcpServerv4Scope momentarily reporting no scopes —
+    # "empty" isn't an error, so the driver's ErrorActionPreference='Stop'
+    # doesn't catch it and #426's parse-reraise doesn't fire). Rather than let
+    # a single empty poll absence-delete EVERY tracked lease + IPAM mirror,
+    # skip the sweep this cycle and let the time-based dhcp_lease_cleanup expiry
+    # sweep reclaim genuinely-removed leases once they pass expires_at.
+    # (Realistic hard failures already raise and returned above.)
+    if not wire_ips:
+        active_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(DHCPLease)
+                .where(DHCPLease.server_id == server.id, DHCPLease.state == "active")
+            )
+        ).scalar_one()
+        if active_count:
+            result.errors.append(
+                f"empty lease response with {active_count} tracked active "
+                "lease(s) — skipping absence-delete (#482); the expiry sweep "
+                "reclaims any genuinely-removed leases"
+            )
+            logger.warning(
+                "dhcp_pull_empty_wire_skip_absence_delete",
+                server=str(server.id),
+                driver=server.driver,
+                active=active_count,
+            )
+        if apply:
+            server.last_sync_at = now
+            await db.flush()
+        return result
+
+    stale_leases = list(
+        (
+            await db.execute(
+                select(DHCPLease).where(
+                    DHCPLease.server_id == server.id,
+                    DHCPLease.state == "active",
+                    ~DHCPLease.ip_address.in_(wire_ips),
+                )
+            )
+        )
+        .scalars()
+        .all()
     )
-    if wire_ips:
-        stale_q = stale_q.where(~DHCPLease.ip_address.in_(wire_ips))
-    stale_leases = list((await db.execute(stale_q)).scalars().all())
+    subnet_by_id = {s.id: s for s, _ in subnets}
     for stale in stale_leases:
         # Scope the mirror lookup to the lease's owning subnet — the same
         # discipline as the upsert/create branch above. The unscoped
@@ -327,6 +375,28 @@ async def pull_leases_from_server(
             ).scalar_one_or_none()
         if mirror is not None:
             if apply:
+                # Revoke DDNS BEFORE deleting the mirror (#482). Absence means
+                # the lease is gone from the server, so any DDNS-published
+                # forward / PTR records are stale and must be retracted — not
+                # left orphaned. Mirrors the agent /lease-events released
+                # branch; revoke reads dns_record_id / hostname off the row so
+                # it must run before the row is deleted. Best-effort: a revoke
+                # failure must not block the absence-delete sweep.
+                stale_subnet = subnet_by_id.get(stale_subnet_id)
+                if stale_subnet is not None:
+                    try:
+                        from app.services.dns.ddns import (  # noqa: PLC0415
+                            revoke_ddns_for_lease,
+                        )
+
+                        await revoke_ddns_for_lease(db, subnet=stale_subnet, ipam_row=mirror)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "dhcp_pull_ddns_revoke_failed",
+                            server=str(server.id),
+                            ip=stale.ip_address,
+                            error=str(exc),
+                        )
                 await db.delete(mirror)
             result.ipam_revoked += 1
         if apply:

@@ -131,8 +131,12 @@ async def test_pull_leases_revoke_scoped_to_lease_subnet(
     db_session.add(lease)
     await db_session.commit()
 
-    # Empty wire → the lease is now stale and gets absence-deleted.
-    _patch_pull_leases(monkeypatch, [])
+    # Non-empty wire that EXCLUDES SHARED_IP → the lease is absent and gets
+    # absence-deleted. The zero-wire floor guard (#482) skips the sweep only
+    # when the ENTIRE wire is empty, so [] would no longer delete anything.
+    _patch_pull_leases(
+        monkeypatch, [{"ip_address": "203.0.113.9", "mac_address": "aa:bb:cc:dd:ee:fd"}]
+    )
     result = await pl.pull_leases_from_server(db_session, srv, apply=True)
     await db_session.commit()
 
@@ -174,7 +178,11 @@ async def test_pull_leases_revoke_scoped_via_prefix_when_no_scope(
     db_session.add(lease)
     await db_session.commit()
 
-    _patch_pull_leases(monkeypatch, [])
+    # Non-empty wire excluding SHARED_IP so absence-delete still fires under
+    # the #482 zero-wire floor guard.
+    _patch_pull_leases(
+        monkeypatch, [{"ip_address": "203.0.113.9", "mac_address": "aa:bb:cc:dd:ee:fd"}]
+    )
     result = await pl.pull_leases_from_server(db_session, srv, apply=True)
     await db_session.commit()
 

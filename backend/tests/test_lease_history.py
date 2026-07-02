@@ -217,7 +217,18 @@ async def test_pull_leases_records_remove(
     await _make_lease(db_session, srv, ip="10.0.0.8", mac="aa:bb:cc:dd:ee:20")
     await db_session.commit()
 
-    monkeypatch.setattr(pl, "get_driver", lambda _drv: _StubDriver([]))
+    # A non-empty wire that EXCLUDES 10.0.0.8: the lease is absent and gets
+    # absence-deleted. The zero-wire floor guard (#482) only skips the sweep
+    # when the ENTIRE wire is empty, so an empty [] would no longer delete.
+    decoy = [
+        {
+            "ip_address": "10.0.0.200",
+            "mac_address": "aa:bb:cc:dd:ee:fe",
+            "hostname": "decoy",
+            "expires_at": datetime.now(UTC) + timedelta(hours=1),
+        }
+    ]
+    monkeypatch.setattr(pl, "get_driver", lambda _drv: _StubDriver(decoy))
     monkeypatch.setattr(pl, "is_agentless", lambda _drv: True)
     import app.services.dns.ddns as ddns
 
@@ -225,6 +236,7 @@ async def test_pull_leases_records_remove(
         return None
 
     monkeypatch.setattr(ddns, "apply_ddns_for_lease", _noop)
+    monkeypatch.setattr(ddns, "revoke_ddns_for_lease", _noop)
 
     await pl.pull_leases_from_server(db_session, srv, apply=True)
     await db_session.commit()
