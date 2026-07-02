@@ -580,18 +580,30 @@ async def _record_mac_history(db: AsyncSession, ip_id: uuid.UUID, mac_address: s
     )
 
 
+def _enforce_token_scope(user: Any, resource_type: str, resource_id: uuid.UUID) -> None:
+    """403 when a resource-scoped API token (#374) isn't bound to this resource.
+
+    No-op for sessions / unscoped tokens (``token_scope_allows`` returns True),
+    so normal callers are unaffected — only a resource-bound token is
+    constrained. Centralised so every by-id read/write handler gates the same
+    way and the check can't silently drift out of lockstep with
+    ``services.api_token_scopes.TOKEN_GRANT_RESOURCE_TYPES`` (#484 / #400 L4).
+    """
+    if not token_scope_allows(user, resource_type, resource_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"API token is not scoped to this {resource_type.replace('_', ' ')}",
+        )
+
+
 def _enforce_subnet_token_scope(user: Any, subnet_id: uuid.UUID) -> None:
     """403 when a resource-scoped API token (#374) isn't bound to this subnet.
 
-    No-op for sessions / unscoped tokens (``token_scope_allows`` returns True),
-    so normal callers are unaffected — only a subnet-bound token is constrained
-    to its subnet for IP create / edit / delete / next-IP / list operations.
+    Thin wrapper over :func:`_enforce_token_scope` — only a subnet-bound token
+    is constrained to its subnet for IP create / edit / delete / next-IP / list.
+    The "subnet" wording keeps the existing error message stable.
     """
-    if not token_scope_allows(user, "subnet", subnet_id):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="API token is not scoped to this subnet",
-        )
+    _enforce_token_scope(user, "subnet", subnet_id)
 
 
 # ── DHCP pool awareness ───────────────────────────────────────────────────────
@@ -2447,15 +2459,13 @@ async def create_space(body: IPSpaceCreate, current_user: CurrentUser, db: DB) -
 
 @router.get("/spaces/{space_id}", response_model=IPSpaceResponse)
 async def get_space(space_id: uuid.UUID, current_user: CurrentUser, db: DB) -> IPSpace:
-    # SECURITY TODO (#400 / L4): no per-row token-scope re-check here. This is
-    # currently safe ONLY because ``ip_space`` is NOT in
-    # ``services/api_token_scopes.TOKEN_GRANT_RESOURCE_TYPES`` (today: subnet,
-    # dns_zone), so a resource-scoped token can never bind to a space and
-    # ``token_scope_allows`` is irrelevant. IF ``ip_space`` is ever added to
-    # that vocabulary, this handler MUST gain a
-    # ``token_scope_allows(current_user, "ip_space", space_id)`` 403 gate (see
-    # ``_enforce_subnet_token_scope``) or a space-scoped token would read any
-    # space. Keep this in lockstep with the vocabulary so the two can't drift.
+    # Per-row token-scope gate (#484 / #400 L4). No-op for sessions / unscoped
+    # tokens; a resource-scoped token is constrained to its bound resource. This
+    # is defense-in-depth today (``ip_space`` isn't in TOKEN_GRANT_RESOURCE_TYPES
+    # yet, so no token binds to a space) that stays in lockstep with the
+    # vocabulary — the moment ``ip_space`` becomes grantable, a space-scoped
+    # token is already prevented from reading any other space.
+    _enforce_token_scope(current_user, "ip_space", space_id)
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
@@ -2834,15 +2844,12 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
 
 @router.get("/blocks/{block_id}", response_model=IPBlockResponse)
 async def get_block(block_id: uuid.UUID, current_user: CurrentUser, db: DB) -> dict[str, Any]:
-    # SECURITY TODO (#400 / L4): no per-row token-scope re-check here. This is
-    # currently safe ONLY because ``ip_block`` is NOT in
-    # ``services/api_token_scopes.TOKEN_GRANT_RESOURCE_TYPES`` (today: subnet,
-    # dns_zone), so a resource-scoped token can never bind to a block and
-    # ``token_scope_allows`` is irrelevant. IF ``ip_block`` is ever added to
-    # that vocabulary, this handler MUST gain a
-    # ``token_scope_allows(current_user, "ip_block", block_id)`` 403 gate (see
-    # ``_enforce_subnet_token_scope``) or a block-scoped token would read any
-    # block. Keep this in lockstep with the vocabulary so the two can't drift.
+    # Per-row token-scope gate (#484 / #400 L4). No-op for sessions / unscoped
+    # tokens; a resource-scoped token is constrained to its bound resource.
+    # Defense-in-depth today (``ip_block`` isn't in TOKEN_GRANT_RESOURCE_TYPES
+    # yet) that stays in lockstep with the vocabulary — the moment ``ip_block``
+    # becomes grantable, a block-scoped token can't read any other block.
+    _enforce_token_scope(current_user, "ip_block", block_id)
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
