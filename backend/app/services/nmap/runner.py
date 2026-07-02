@@ -107,6 +107,15 @@ class NmapArgError(ValueError):
     """Raised when operator-supplied arguments fail validation."""
 
 
+class NmapScanRowMissing(LookupError):
+    """The NmapScan row wasn't visible when the worker picked up the task.
+
+    Almost always the dispatcher committed *after* the worker started (the
+    row is flushed but the caller's transaction hasn't committed yet, #510).
+    The Celery wrapper retries a few times; if the row never appears the
+    caller's transaction rolled back and there is nothing to run."""
+
+
 _HOSTNAME_RE: Final = re.compile(
     # RFC 1123 / 952 hostname: labels of [A-Za-z0-9-] up to 63 chars,
     # joined by dots, no leading/trailing hyphen per label, total
@@ -398,8 +407,11 @@ async def run_scan(scan_id: uuid.UUID) -> None:
         async with factory() as db:
             scan = await db.get(NmapScan, scan_id)
             if scan is None:
+                # Not visible yet — signal the wrapper to retry (commit race)
+                # rather than silently no-op'ing and leaving the row stuck in
+                # "queued" forever, occupying a per-subnet profile slot (#510).
                 logger.warning("nmap_run_scan_missing", scan_id=str(scan_id))
-                return
+                raise NmapScanRowMissing(str(scan_id))
 
             # Operator cancelled before we picked it up — bow out.
             if scan.status == "cancelled":

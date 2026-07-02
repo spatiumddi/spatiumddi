@@ -20,7 +20,7 @@ Current single alembic head (before this branch): `b1f7c3a92e04`.
 - [x] #507 B19 (api) GET /subnets/{id}/effective-dns stops at root block; `_resolve_effective_dns` falls through to space → UI shows "no DNS" while records publish into space zone. `router.py` ~L4237 vs the resolver ~L317.
 - [x] #508 B20 (api,rbac) Coarse router gate: write:nat_mapping / write:custom_field can create/modify spaces/blocks/subnets (any-of gate, no per-type inline checks on structural handlers). `router.py` gate ~L78; `plans.py` gates ip_block only but creates Subnets.
 - [x] #509 B21 (api,frontend) Bulk-edit staleness: bulk_edit_addresses never recomputes utilization nor clears reserved_until on status change; FE bulk-delete misses ["subnets"] invalidation; subnet detail header snapshot never refreshed. `router.py` bulk_edit_addresses; `IPAMPage.tsx`.
-- [ ] #510 B22 (worker) Device-profiling Celery dispatch before commit — run_scan finds no row, no-ops without retry; queued scan occupies 1 of 4 per-subnet slots forever. `backend/app/services/profiling/auto_profile.py` ~L149/216; `nmap/runner.py` ~L399.
+- [x] #510 B22 (worker) Device-profiling Celery dispatch before commit — run_scan finds no row, no-ops without retry; queued scan occupies 1 of 4 per-subnet slots forever. `backend/app/services/profiling/auto_profile.py` ~L149/216; `nmap/runner.py` ~L399.
 - [ ] #511 B23 (api) NAT mappings 500 on malformed IP literals (cast to INET DataError). `backend/app/api/v1/ipam/nat.py` ~L61/290/340.
 - [ ] #512 B24 (api) Subnet soft-delete skips collect_wake for DHCP channels (12s tick); permanent delete bulk-drops DNSRecord rows without enqueue_record_op → agentless Windows DNS keeps serving. `backend/app/services/ai/operations_risky.py` ~L246/295.
 - [ ] #513 B25 (frontend) IPv6 drag-and-drop re-parent always fails — cidr.ts has no v6 containment, fails closed "does not fit inside". `frontend/src/lib/cidr.ts`; `IPAMPage.tsx` handleDragEnd.
@@ -33,3 +33,4 @@ Current single alembic head (before this branch): `b1f7c3a92e04`.
 - #505 + #506 → commit (plan-apply: kind + gateway containment + placeholder rows [reverse-zone deferred]; v6 placeholder-row gate <127 in create/update_subnet)
 - #507 + #508 → commit (effective-dns endpoint space fallthrough; per-type write gate on structural handlers + plan-apply subnet-write check)
 - #509 → commit (bulk_edit recomputes subnet+block utilization, clears reserved_until on status change; FE bulk-delete invalidates [subnets]; subnet-detail header syncs from refetched list)
+- #510 → commit (run_scan raises NmapScanRowMissing on absent row; task retries only that pre-scan case with countdown, gives up gracefully after 5 — no stuck queued row)
