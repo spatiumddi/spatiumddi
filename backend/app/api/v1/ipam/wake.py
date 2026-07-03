@@ -26,9 +26,7 @@ from pydantic import BaseModel, Field
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_permission
-from app.models.appliance import Appliance
 from app.services import wol
-from app.services.appliance import agent_cmd
 from app.services.nettools.schemas import NetToolTarget
 
 router = APIRouter(tags=["ipam"])
@@ -73,37 +71,7 @@ async def wake_address(
 
     wire = wol.WolWireRequest(mac=mac, broadcast=broadcast, port=body.port)
     target = body.target or NetToolTarget()
-
-    if target.kind == "server":
-        try:
-            await wol.send_magic_packet(wire.mac, wire.broadcast, wire.port)
-        except OSError as exc:
-            # No route to the broadcast (ENETUNREACH etc.) is the documented
-            # single-box limitation — surface it cleanly like the appliance
-            # path's 502 rather than a raw 500.
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=(
-                    f"Could not broadcast the magic packet from the server: {exc}. "
-                    "Try an appliance vantage on the target's segment."
-                ),
-            ) from exc
-        result = wol.WolResult(
-            mac=wire.mac,
-            broadcast=wire.broadcast,
-            port=wire.port,
-            sent=True,
-            ran_from="server",
-        )
-    elif target.kind == "appliance":
-        result = await _wake_via_appliance(db, current_user, wire, target)
-    else:
-        # dns_agent / dhcp_agent vantages are reserved in NetToolTarget but
-        # not wired for WoL yet — reject clearly rather than silently no-op.
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Wake-on-LAN cannot run from a {target.kind!r} vantage.",
-        )
+    result = await _run_wake(db, wire, target)
 
     write_audit(
         db,
@@ -124,48 +92,25 @@ async def wake_address(
     return result
 
 
-async def _wake_via_appliance(
-    db: DB,
-    current_user: CurrentUser,
-    wire: wol.WolWireRequest,
-    target: NetToolTarget,
-) -> wol.WolResult:
-    if target.id is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="target.id is required when target.kind is 'appliance'.",
-        )
-    appliance = await db.get(Appliance, target.id)
-    if appliance is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appliance not found.")
-    ready = agent_cmd.appliance_ready(state=appliance.state, last_seen_at=appliance.last_seen_at)
+async def _run_wake(db: DB, wire: wol.WolWireRequest, target: NetToolTarget) -> wol.WolResult:
+    """Send via the requested vantage, translating WolDispatchError → HTTP.
+    The heavy lifting (wake_from_server / wake_via_appliance) lives in the wol
+    service and is shared with POST /tools/wol; this is just the HTTP mapping."""
     try:
-        outcome = await agent_cmd.enqueue_command(
-            appliance.id,
-            "wol",
-            wire.model_dump(mode="json"),
-            ready=ready,
-            # Match the sibling nettool dispatch (tools/router.py): a busy
-            # supervisor mid-poll needs headroom or a healthy appliance 504s.
-            timeout=30.0,
-        )
-    except agent_cmd.ApplianceOffline as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Appliance {appliance.hostname!r} is offline or not approved.",
-        ) from exc
-    except TimeoutError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail=f"Appliance {appliance.hostname!r} did not send the packet in time.",
-        ) from exc
-    if outcome.error is not None or outcome.result is None:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=(
-                f"Appliance {appliance.hostname!r} could not send the magic packet: "
-                f"{outcome.error or 'no result returned'}"
-            ),
-        )
-    result = wol.WolResult.model_validate(outcome.result)
-    return result.model_copy(update={"ran_from": f"appliance:{appliance.hostname}"})
+        if target.kind == "server":
+            return await wol.wake_from_server(wire)
+        if target.kind == "appliance":
+            if target.id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="target.id is required when target.kind is 'appliance'.",
+                )
+            return await wol.wake_via_appliance(db, target.id, wire)
+    except wol.WolDispatchError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    # dns_agent / dhcp_agent vantages are reserved in NetToolTarget but not
+    # wired for WoL yet — reject clearly rather than silently no-op.
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Wake-on-LAN cannot run from a {target.kind!r} vantage.",
+    )

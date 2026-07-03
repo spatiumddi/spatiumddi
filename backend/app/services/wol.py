@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, Field, field_validator
 
 if TYPE_CHECKING:
+    import uuid as _uuid_t
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from app.models.ipam import IPAddress
@@ -142,3 +144,70 @@ async def resolve_wake_params(
     if subnet is None:
         raise WolTargetError("Subnet not found", not_found=True)
     return ip, normalize_mac(str(ip.mac_address)), broadcast_for_network(str(subnet.network))
+
+
+class WolDispatchError(Exception):
+    """A send failed. ``status`` is the HTTP status the API layer should map
+    to (kept out of the raise sites so callers translate it uniformly)."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+async def wake_from_server(wire: WolWireRequest) -> WolResult:
+    """Broadcast the magic packet from the control-plane container. Raises
+    :class:`WolDispatchError` (502) when there's no route to the broadcast —
+    the documented single-box limitation — rather than a bare OSError."""
+    try:
+        await send_magic_packet(wire.mac, wire.broadcast, wire.port)
+    except OSError as exc:
+        raise WolDispatchError(
+            f"Could not broadcast the magic packet from the server: {exc}. "
+            "Try an appliance vantage on the target's segment.",
+            502,
+        ) from exc
+    return WolResult(
+        mac=wire.mac, broadcast=wire.broadcast, port=wire.port, sent=True, ran_from="server"
+    )
+
+
+async def wake_via_appliance(
+    db: AsyncSession, appliance_id: _uuid_t.UUID, wire: WolWireRequest
+) -> WolResult:
+    """Dispatch the send to a Fleet appliance so the packet originates on the
+    target's segment. Reuses the generic nettool command channel. Raises
+    :class:`WolDispatchError` (404 / 503 / 504 / 502) on any failure."""
+    from app.models.appliance import Appliance  # noqa: PLC0415 — avoid import cycle
+    from app.services.appliance import agent_cmd  # noqa: PLC0415
+
+    appliance = await db.get(Appliance, appliance_id)
+    if appliance is None:
+        raise WolDispatchError("Appliance not found.", 404)
+    ready = agent_cmd.appliance_ready(state=appliance.state, last_seen_at=appliance.last_seen_at)
+    try:
+        outcome = await agent_cmd.enqueue_command(
+            appliance.id,
+            "wol",
+            wire.model_dump(mode="json"),
+            ready=ready,
+            # Match the sibling nettool dispatch — a busy supervisor mid-poll
+            # needs headroom or a healthy appliance 504s.
+            timeout=30.0,
+        )
+    except agent_cmd.ApplianceOffline as exc:
+        raise WolDispatchError(
+            f"Appliance {appliance.hostname!r} is offline or not approved.", 503
+        ) from exc
+    except TimeoutError as exc:
+        raise WolDispatchError(
+            f"Appliance {appliance.hostname!r} did not send the packet in time.", 504
+        ) from exc
+    if outcome.error is not None or outcome.result is None:
+        raise WolDispatchError(
+            f"Appliance {appliance.hostname!r} could not send the magic packet: "
+            f"{outcome.error or 'no result returned'}",
+            502,
+        )
+    result = WolResult.model_validate(outcome.result)
+    return result.model_copy(update={"ran_from": f"appliance:{appliance.hostname}"})

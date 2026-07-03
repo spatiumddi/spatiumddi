@@ -573,13 +573,11 @@ async def _apply_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> 
 
     enforce_operation_permission(user, _OPERATIONS["wake_host"])
     ip, mac, broadcast = await _load_wake_target(db, args)
+    # AI proposals always send from the control-plane (server) vantage.
     try:
-        await wol.send_magic_packet(mac, broadcast, args.port)
-    except OSError as exc:
-        raise ValueError(
-            f"Could not broadcast the magic packet from the server: {exc}. "
-            "The control plane may have no route to the target's segment."
-        ) from exc
+        await wol.wake_from_server(wol.WolWireRequest(mac=mac, broadcast=broadcast, port=args.port))
+    except wol.WolDispatchError as exc:
+        raise ValueError(str(exc)) from exc
     write_audit(
         db,
         user=user,

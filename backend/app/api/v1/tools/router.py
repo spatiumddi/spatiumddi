@@ -29,11 +29,12 @@ stay server-only and reject a non-server target.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dns_tools import (
@@ -62,6 +63,7 @@ from app.core.permissions import require_permission
 from app.models.appliance import Appliance
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
+from app.services import wol
 from app.services.appliance import agent_cmd
 from app.services.nettools import (
     inspect_tls_cert,
@@ -450,3 +452,81 @@ async def mac_vendor(body: MacVendorRequest, db: DB, _rl=RateLimitDefault) -> Ma
             )
         )
     return MacVendorResult(oui_enabled=oui_enabled, entries=entries)
+
+
+class WolToolRequest(BaseModel):
+    """Standalone Wake-on-LAN request (#533) — keyed on a MAC, not an IP row.
+
+    ``broadcast`` is optional: omit it to hit the local segment's limited
+    broadcast (255.255.255.255). ``target`` picks the vantage like the other
+    reachability tools."""
+
+    mac: str
+    broadcast: str | None = None
+    port: int = Field(default=9, ge=1, le=65535)
+    target: NetToolTarget | None = None
+
+    @field_validator("mac")
+    @classmethod
+    def _v_mac(cls, v: str) -> str:
+        return wol.normalize_mac(v)
+
+    @field_validator("broadcast")
+    @classmethod
+    def _v_broadcast(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
+        try:
+            return str(ipaddress.IPv4Address(v.strip()))
+        except ipaddress.AddressValueError as exc:
+            raise ValueError(f"broadcast must be an IPv4 address: {v!r}") from exc
+
+
+@router.post("/wol", response_model=wol.WolResult, dependencies=[_RequirePerm])
+async def wol_wake(
+    body: WolToolRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
+) -> wol.WolResult:
+    """Send a Wake-on-LAN magic packet to a MAC from the server or an
+    appliance vantage. Audited (`action="wake_on_lan"`)."""
+    wire = wol.WolWireRequest(
+        mac=body.mac, broadcast=body.broadcast or "255.255.255.255", port=body.port
+    )
+    target = body.target or NetToolTarget()
+    try:
+        if target.kind == "server":
+            result = await wol.wake_from_server(wire)
+        elif target.kind == "appliance":
+            if target.id is None:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    "target.id is required when target.kind is 'appliance'.",
+                )
+            result = await wol.wake_via_appliance(db, target.id, wire)
+        else:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Wake-on-LAN cannot run from a {target.kind!r} vantage.",
+            )
+    except wol.WolDispatchError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="wake_on_lan",
+            resource_type="wake_on_lan",
+            resource_id=wire.mac,
+            resource_display=wire.mac,
+            result="success",
+            new_value={
+                "mac": wire.mac,
+                "broadcast": wire.broadcast,
+                "port": wire.port,
+                "ran_from": result.ran_from,
+            },
+        )
+    )
+    await db.commit()
+    return result

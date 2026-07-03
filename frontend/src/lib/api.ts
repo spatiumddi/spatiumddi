@@ -12491,6 +12491,16 @@ export interface NetToolMacVendorResult {
   entries: NetToolMacVendorEntry[];
 }
 
+// Wake-on-LAN result (#533) — mirrors backend WolResult.
+export interface NetToolWolResult {
+  mac: string;
+  broadcast: string;
+  port: number;
+  sent: boolean;
+  ran_from: string;
+  error: string | null;
+}
+
 // Fold the routing-only ``target`` into a reachability-tool body only
 // when it points at an appliance — a "server" target (or none) is the
 // back-compatible inline run, so we omit the field entirely.
@@ -12555,6 +12565,15 @@ export const networkToolsApi = {
   macVendor: (macs: string[]) =>
     api
       .post<NetToolMacVendorResult>("/tools/mac-vendor", { macs })
+      .then((r) => r.data),
+  // Wake-on-LAN (#533) — MAC-based; broadcast optional (defaults to the local
+  // segment 255.255.255.255 server-side). Runs from the server or an appliance.
+  wol: (
+    body: { mac: string; broadcast?: string | null; port?: number },
+    target?: NetToolTarget,
+  ) =>
+    api
+      .post<NetToolWolResult>("/tools/wol", withTarget(body, target))
       .then((r) => r.data),
   // #404 — tail an appliance's nftables drop logs. Always appliance-targeted
   // (the api can't read host kernel logs); poll with the returned cursor.
