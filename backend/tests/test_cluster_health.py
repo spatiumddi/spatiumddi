@@ -45,10 +45,10 @@ def _node(name: str = "ddi1", *, ready: bool = True, cpu: str = "4", mem: str = 
             ],
             "addresses": [{"type": "InternalIP", "address": "192.168.0.199"}],
             "nodeInfo": {
-                "kubeletVersion": "v1.35.5+k3s1",
+                "kubeletVersion": "v1.35.6+k3s1",
                 "osImage": "Debian GNU/Linux 13 (trixie)",
                 "kernelVersion": "6.12.90",
-                "containerRuntimeVersion": "containerd://2.2.3-k3s1",
+                "containerRuntimeVersion": "containerd://2.2.5-k3s2",
                 "architecture": "amd64",
             },
             "capacity": {"cpu": cpu, "memory": mem, "pods": "110"},
@@ -165,7 +165,7 @@ def test_get_cluster_health_rollup(monkeypatch) -> None:
     assert snap["control_plane_nodes"] == 1
     assert snap["is_ha"] is False
     assert snap["metrics_available"] is True
-    assert snap["kubelet_version"] == "v1.35.5+k3s1"
+    assert snap["kubelet_version"] == "v1.35.6+k3s1"
 
     # Live per-node usage flowed through from the kubelet summary.
     node = snap["nodes"][0]
