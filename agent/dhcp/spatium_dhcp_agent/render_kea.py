@@ -403,9 +403,14 @@ def _reservation(res: dict[str, Any]) -> dict[str, Any]:
         norm = _normalize_mac_for_kea(str(raw_hw))
         if norm is not None:
             out["hw-address"] = norm
-    if "client_id" in res:
+    # Guard on a truthy value, not key presence: the wire ScopeDef path
+    # (``_scope_to_subnet``) always injects ``client_id`` (``None`` when the
+    # static has none), and emitting ``"client-id": null`` makes kea-dhcp4
+    # REJECT the whole config on reload ("unexpected null, expecting constant
+    # string" — issue #537). Mirrors the backend driver's ``if s.client_id``.
+    if res.get("client_id"):
         out["client-id"] = res["client_id"]
-    if "duid" in res:
+    if res.get("duid"):
         out["duid"] = res["duid"]
     if "ip_address" in res or "ip" in res:
         out["ip-address"] = res.get("ip_address") or res.get("ip")
