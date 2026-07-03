@@ -515,6 +515,114 @@ register(
 )
 
 
+# ── wake_host operation (issue #533) ───────────────────────────────────
+
+
+class WakeHostArgs(BaseModel):
+    """Args for ``wake_host`` — send a Wake-on-LAN magic packet to an IP."""
+
+    address_id: str = Field(
+        description=(
+            "UUID of the ip_address row to wake. The MAC + subnet broadcast "
+            "are resolved server-side, so resolve the IP first with find_ip "
+            "and pass its id."
+        ),
+    )
+    port: int = Field(default=9, description="UDP port for the magic packet (default 9).")
+
+
+async def _load_wake_target(db: AsyncSession, args: WakeHostArgs) -> tuple[Any, str, str]:
+    """Resolve (ip_row, mac, broadcast) or raise ValueError with a reason."""
+    import ipaddress  # noqa: PLC0415
+    import uuid as _uuid  # noqa: PLC0415
+
+    from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
+    from app.services import wol  # noqa: PLC0415
+
+    try:
+        aid = _uuid.UUID(args.address_id)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"address_id is not a valid UUID: {args.address_id!r}") from exc
+    ip = await db.get(IPAddress, aid)
+    if ip is None:
+        raise ValueError("IP address not found")
+    if not ip.mac_address:
+        raise ValueError("This IP has no MAC address on record — Wake-on-LAN needs one.")
+    subnet = await db.get(Subnet, ip.subnet_id)
+    if subnet is None:
+        raise ValueError("Subnet not found")
+    net = ipaddress.ip_network(str(subnet.network), strict=False)
+    broadcast = (
+        "255.255.255.255" if isinstance(net, ipaddress.IPv6Network) else str(net.broadcast_address)
+    )
+    return ip, wol.normalize_mac(str(ip.mac_address)), broadcast
+
+
+async def _preview_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> PreviewResult:
+    try:
+        ip, mac, broadcast = await _load_wake_target(db, args)
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Send a Wake-on-LAN magic packet to `{mac}` for `{ip.address}` "
+            f"(broadcast `{broadcast}:{args.port}`). This wakes the host only "
+            "if the packet reaches its L2 segment."
+        ),
+    )
+
+
+async def _apply_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> dict[str, Any]:
+    from app.api.v1.dhcp._audit import write_audit  # noqa: PLC0415
+    from app.services import wol  # noqa: PLC0415
+
+    enforce_operation_permission(user, _OPERATIONS["wake_host"])
+    ip, mac, broadcast = await _load_wake_target(db, args)
+    await wol.send_magic_packet(mac, broadcast, args.port)
+    write_audit(
+        db,
+        user=user,
+        action="wake_on_lan",
+        resource_type="ip_address",
+        resource_id=str(ip.id),
+        resource_display=str(ip.address),
+        new_value={
+            "mac": mac,
+            "broadcast": broadcast,
+            "port": args.port,
+            "ran_from": "server",
+            "via": "ai_proposal",
+        },
+    )
+    await db.commit()
+    return {
+        "address": str(ip.address),
+        "mac": mac,
+        "broadcast": broadcast,
+        "port": args.port,
+        "sent": True,
+        "hint": "Magic packet broadcast from the control plane.",
+    }
+
+
+register(
+    Operation(
+        name="wake_host",
+        description=(
+            "Send a Wake-on-LAN magic packet to an IP's MAC. Always go "
+            "through propose_wake_host — never call this directly."
+        ),
+        args_model=WakeHostArgs,
+        preview=_preview_wake_host,
+        apply=_apply_wake_host,
+        category="network",
+        required_permission=("write", "use_network_tools"),
+    )
+)
+
+
 # ── run_cert_probe operation (issue #118) ──────────────────────────────
 
 
