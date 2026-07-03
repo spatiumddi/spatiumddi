@@ -13299,25 +13299,27 @@ function SpaceTableView({
               Sync DNS
             </HeaderButton>
             <ExportButton scope={{ space_id: space.id }} label="Export" />
-            {/* Structural actions behind a Tools ▾ dropdown — same grammar as
-                the Block + Subnet headers (#465). */}
-            <HeaderMenu
-              items={[
-                {
-                  label: "Find Free…",
-                  icon: Search,
-                  onClick: () => setShowFindFree(true),
-                  title: "Find unused CIDRs in this space",
-                },
-                {
-                  label: "Add block…",
-                  icon: Layers,
-                  onClick: () => setShowCreateBlock(true),
-                },
-              ]}
-            />
+            {/* Add block is a primary space-level structural action (blocks are
+                the top-level child of a space), so it sits as a visible button
+                next to Add Subnet rather than hidden in a Tools ▾ dropdown
+                (#538). Find Free is a low-frequency read; promoted out too so we
+                don't leave a single-item dropdown. Ordering grammar per #465. */}
+            <HeaderButton
+              icon={Search}
+              onClick={() => setShowFindFree(true)}
+              title="Find unused CIDRs in this space"
+            >
+              Find Free…
+            </HeaderButton>
             <HeaderButton icon={Pencil} onClick={() => setShowEditSpace(true)}>
               Edit Space
+            </HeaderButton>
+            <HeaderButton
+              icon={Layers}
+              onClick={() => setShowCreateBlock(true)}
+              title="Add a top-level block to this space"
+            >
+              Add block
             </HeaderButton>
             <HeaderButton
               variant="primary"
