@@ -1107,7 +1107,7 @@ class SupervisorHeartbeatRequest(BaseModel):
     host_interfaces: list[str] | None = None
     # Issue #183 Phase 5 — operator-facing k3s metadata.
     # ``k3s_version`` is the upstream release tag the slot was baked
-    # against (e.g. ``v1.35.5+k3s1``). ``kubeconfig`` is the raw
+    # against (e.g. ``v1.35.6+k3s1``). ``kubeconfig`` is the raw
     # admin kubeconfig YAML straight off the appliance — the backend
     # rewrites ``server:`` for operator reachability + Fernet-encrypts
     # before persisting. Both ``None`` = supervisor didn't ship them
