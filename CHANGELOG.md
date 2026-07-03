@@ -20,6 +20,193 @@ the formatter handles the rest.
 
 ---
 
+## 2026.07.03-1 — 2026-07-03
+
+A **hardening + Wake-on-LAN** release. The headline new feature is
+**Wake-on-LAN** from three surfaces — a Wake button on the IP detail
+modal, a standalone tool on the Network Tools page, and a
+``propose_wake_host`` Operator Copilot proposal — each able to
+broadcast the magic packet from the control-plane vantage or dispatch
+it to a Fleet appliance on the target's own segment. Riding with it,
+two smaller UX wins (**create / edit / delete DHCP static
+reservations** directly from the Static Assignments tab, and **Add
+block** promoted to a one-click space-header button) and a large
+**bug-check sweep** across IPAM and DHCP: the one critical + all high
+IPAM findings, the medium IPAM batch, a DHCP field-triage pass, and a
+round of audit-log / agent-wire-contract fixes. On the security side,
+the long-lived JWT **refresh token moves out of ``localStorage`` into
+an HttpOnly cookie**, WoL gains the same SSRF denylist every network
+tool applies, and two IPAM authorization gaps (per-row token scope on
+space / block reads, per-type RBAC on structural handlers) are closed.
+The Operator Copilot tool registry grows by 1 (``propose_wake_host``)
+to 216 — and ~19 default-on read tools that a module-gating bug had
+been silently stripping on every install are restored.
+
+### Added
+
+* **#533 — Wake-on-LAN.** Send a WoL magic packet to bring a host up,
+  from three surfaces sharing one ``wol`` service
+  (``backend/app/services/`` — ``wake_from_server`` /
+  ``wake_via_appliance`` / ``resolve_wake_params``): a **Wake** button
+  on the IPAM IP detail modal (shown only when the IP has a MAC,
+  ``POST /api/v1/ipam/addresses/{id}/wake``), a standalone
+  **Wake-on-LAN** tool on the **Network Tools** page (MAC + optional
+  broadcast + port, ``POST /api/v1/tools/wol``, no IP row required),
+  and a ``propose_wake_host`` Operator Copilot proposal (preview →
+  Apply). Two vantages per call: **server** (the api container
+  broadcasts) or **appliance** (dispatched over the existing generic
+  nettool command channel to a Fleet appliance on the target's
+  segment, with the supervisor's new ``_run_wol`` runner re-validating
+  and sending from that segment). MAC + subnet broadcast are resolved
+  server-side; gated on ``read:use_network_tools`` like the rest of the
+  tools surface and audited (``action=wake_on_lan``).
+
+* **#472 / #473 — Create / edit / delete DHCP static reservations from
+  the Static Assignments tab.** The DHCP group's Static Assignments tab
+  was read-only and the purpose-built ``CreateStaticAssignmentModal``
+  was dead code, so a Kea reservation could only be made via the IPAM
+  Allocate flow. The tab now has a **New static assignment** button
+  (superadmin-gated to match the backend, with a scope picker when the
+  group has more than one scope) plus **Edit… / Delete…** on the
+  per-row menu, and its empty state distinguishes "no scopes yet" from
+  "no reservations yet". The IPAM Add-address modal's "No DHCP scope
+  exists" dead-end becomes an inline **Create a scope** button.
+
+* **#538 — "Add block" as a visible space-header button.** A block is
+  the top-level structural child of a space, so **Add block** is
+  promoted out of the space header's ``Tools ▾`` dropdown into a
+  first-class button next to **Add subnet** (``Find free…`` is promoted
+  with it so no single-item dropdown is left). Header-button ordering
+  grammar (#465) and narrow-viewport flex-wrap are preserved.
+
+### Fixed
+
+* **#489–#502 — critical + high IPAM review findings.** The one
+  critical: next-IP allocation built ``list(net.hosts())`` before
+  slicing, so a ``/64`` sequential or ``/8`` tried to materialize
+  billions of address objects while holding the subnet ``FOR UPDATE``
+  lock — now ``itertools.islice`` (DoS fix). Plus thirteen high-sev
+  fixes: soft-deleted subnets/blocks/spaces now free their CIDR/name in
+  the raw overlap / free-space / uniqueness queries (they bypassed the
+  ORM soft-delete filter); a hostname rename ships delete-old +
+  create-new so the stale A/AAAA RRset doesn't linger; a hostname-only
+  edit preserves ``forward_zone_id`` instead of re-homing the record;
+  ``create_subnet`` now enforces block containment; template child-carve
+  aligns up and overlap-checks; the subnet importer catches partial
+  overlaps; bulk-delete honors the ``auto_from_lease`` DDNS guard;
+  ``dns_split_horizon`` round-trips; and several frontend correctness
+  bugs (``reserved_until`` UTC drift, gap-markers over a filtered list,
+  edit modals unable to clear fields, the "None (remove DNS record)"
+  zone option).
+
+* **#503–#515 — medium IPAM review findings.** Importer robustness
+  (BIGINT ``total_ips`` clamp on v6 imports, header-casing
+  normalization, status round-trip, MAC/gateway validation → error row
+  not 500, intra-payload duplicate pre-flight); plan-apply now stamps
+  the multicast ``kind``, validates the gateway, and creates
+  placeholder rows; a version-aware placeholder gate so IPv6 subnets get
+  network/broadcast rows; ``effective-dns`` falls through to the space
+  like the record-routing path; per-type RBAC on the structural
+  handlers (see Security); bulk-edit recomputes subnet + block
+  utilization and refreshes the UI; a profiling commit-race retry so a
+  scan row isn't stranded ``queued``; NAT-mapping IP literals validated
+  → 422 not 500; subnet delete wakes DHCP on soft-delete and retracts
+  agentless DNS on permanent delete; IPv6 CIDR containment so v6
+  drag-drop re-parent works; select-all + shift-range honor the per-row
+  write gate; and a per-subnet advisory lock so a slow discovery sweep
+  isn't re-dispatched into a colliding second run.
+
+* **#475–#478, #480–#483 — DHCP field triage + agent hardening.** Scope
+  hostname→IPAM sync vocabulary converged so edits stop appearing to
+  revert (and ``update_scope`` can clear nullable lease-time fields);
+  the Kea host-reservation MAC is canonicalized before render so a
+  dotted/run-together MAC no longer makes Kea reject the whole subnet;
+  a config-test preflight before Kea reload surfaces the real rejection
+  reason; expired agent-lease GC + a manual lease-delete endpoint +
+  detached statics freed to ``available``; ``_sync_dns_record`` guards a
+  ``None`` fqdn before the reverse-PTR block (and retracts an orphaned
+  PTR); IPv6-aware DNS drift; the DHCP heartbeat gains
+  ``extra="forbid"`` + a bounded ``ops_ack`` and a zero-wire lease-pull
+  floor guard so an empty poll can't purge every tracked lease; and a
+  record-op fan-out fix so a paused primary no longer drops record ops
+  for a whole agent-based group.
+
+* **#479 — Copilot tools silently stripped by module gating.**
+  ``effective_tool_names`` gated tools on exact membership in the
+  feature-module catalog, so ~19 default-on read tools (conformity /
+  webhooks / DNS / diagnostics / appliance) shipped with module ids the
+  catalog doesn't know and were stripped from the MCP/Copilot surface on
+  every install (and ~15 ``propose_*`` tools were un-enable-able). The
+  gate now fails **open** on an unknown module id (matching
+  ``feature_modules.is_module_enabled``); known-but-disabled modules
+  stay a hard kill-switch. A CI guard asserts every ``Tool.module`` is
+  ``None`` or a real catalog id.
+
+* **#474 / #485 — soft-deleted DHCP scope no longer wedges recreation.**
+  ``uq_dhcp_scope_group_subnet`` was a plain unique constraint, but
+  ``DHCPScope`` is soft-deletable — a trashed scope kept occupying the
+  ``(group, subnet)`` slot (invisible to the ORM pre-check) and
+  recreating a scope hit the DB constraint as a raw 500. Replaced with a
+  partial unique index ``WHERE deleted_at IS NULL``; ``create_scope``
+  translates the specific violation to a friendly 409.
+
+* **#537 — Kea rejects config on a null reservation client-id.** The
+  DHCP agent's Kea renderer guarded the reservation ``client-id`` on key
+  presence, but the wire ``ScopeDef`` path always injects
+  ``client_id: None`` for a static with no client-id, emitting
+  ``"client-id": null`` — which ``kea-dhcp4`` rejects
+  (``DHCP4_CONFIG_LOAD_FAIL``), wedging config delivery. Now guards on a
+  truthy value (mirroring the control-plane driver's #375 fix, which
+  never ran on OS appliances where the agent renders Kea itself); same
+  fix on the sibling ``duid`` check.
+
+### Security
+
+* **#484 L1 — refresh token moved to an HttpOnly cookie.** The
+  long-lived JWT refresh token no longer lives in ``localStorage``
+  (XSS-stealable). It's delivered only as an ``HttpOnly`` +
+  ``SameSite=Strict`` + ``Secure`` (on https) cookie
+  (``spatium_refresh``), path-scoped to ``/api/v1/auth`` so it rides
+  only refresh + logout. The short-lived access token lives in JS memory
+  (new ``lib/authToken.ts`` store); a full reload runs one silent
+  ``/auth/refresh`` against the cookie to restore the session. OIDC/SAML
+  callbacks set the cookie and drop the refresh token from the URL
+  fragment. **Existing sessions hit one forced re-login after deploy**
+  (no cookie yet).
+
+* **#533 — SSRF denylist on the WoL broadcast target.** The magic-packet
+  broadcast was validated only as IPv4, so WoL could fire at loopback /
+  link-local / cloud-metadata ranges. Every WoL path (wire schema,
+  ``/tools/wol`` schema, ``resolve_wake_params``, and the supervisor
+  runner) now reuses the shared ``nettools.is_blocked_target`` guard;
+  legitimate broadcasts (``255.255.255.255``, RFC1918 directed
+  broadcasts) are never blocked.
+
+* **#484 / #400 L4 — per-row API-token scope on space / block reads.**
+  ``get_space`` / ``get_block`` had no ``token_scope_allows`` re-check,
+  a latent IDOR if ``ip_space`` / ``ip_block`` ever entered the
+  resource-scoped-token vocabulary. Centralized as
+  ``_enforce_token_scope`` (the subnet check now delegates to it) and
+  applied on both by-id reads — a no-op for sessions / unscoped tokens.
+
+* **#508 — per-type RBAC on IPAM structural handlers.** The router gate
+  admits an any-of grant over the whole IPAM surface (incl.
+  ``nat_mapping`` / ``custom_field``), so a peripheral grant could
+  create/mutate spaces, blocks, and subnets. A ``_require_type_write``
+  gate is added to the create/update space/block/subnet handlers, and
+  plan-apply now requires subnet write.
+
+### Migrations
+
+Two additive migrations (both create a partial unique index; downgrades
+are baselined for the shape linter). Chain order, continuing from the
+last release's head: ``b7c2f1a9d4e6`` → ``a3f9c1e7b2d4`` (#485 — DHCP
+scope ``(group, subnet)`` partial unique ``WHERE deleted_at IS NULL``)
+→ ``b1f7c3a92e04`` (#491 — ``ip_space.name`` partial unique
+``WHERE deleted_at IS NULL``).
+
+---
+
 ## 2026.06.28-1 — 2026-06-28
 
 A **migration + onboarding** release. Two headline ways to bring an
