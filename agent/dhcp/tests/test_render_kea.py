@@ -269,6 +269,24 @@ def test_render_wire_shape_reservation_from_statics(wire_bundle: dict) -> None:
     assert resv[0]["hostname"] == "printer1"
 
 
+def test_reservation_omits_client_id_when_absent(wire_bundle: dict) -> None:
+    # #537 — the wire ScopeDef path injects ``client_id: None`` for statics
+    # with no client-id; the renderer must OMIT the key entirely rather than
+    # emit ``"client-id": null``, which makes kea-dhcp4 reject the config on
+    # reload ("unexpected null, expecting constant string").
+    out = render(wire_bundle)
+    resv = out["Dhcp4"]["subnet4"][0]["reservations"]
+    assert "client-id" not in resv[0]
+
+
+def test_reservation_emits_client_id_when_present(wire_bundle: dict) -> None:
+    # A present client-id must still round-trip through the wire ScopeDef path.
+    wire_bundle["scopes"][0]["statics"][0]["client_id"] = "01:aa:bb:cc:dd"
+    out = render(wire_bundle)
+    resv = out["Dhcp4"]["subnet4"][0]["reservations"]
+    assert resv[0]["client-id"] == "01:aa:bb:cc:dd"
+
+
 def test_render_wire_shape_client_class_match_expression(wire_bundle: dict) -> None:
     out = render(wire_bundle)
     cc = out["Dhcp4"]["client-classes"]
