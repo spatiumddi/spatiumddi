@@ -421,14 +421,20 @@ async def commit_import(
         vxlan_id = row.get("vxlan_id")
         gateway = row.get("gateway") or None
         # Validate the gateway before it reaches the INET column — a malformed
-        # literal would otherwise raise a DataError → 500 mid-commit (#504).
+        # literal would otherwise raise a DataError → 500 mid-commit (#504) —
+        # and enforce the same in-subnet / same-family invariant create_subnet
+        # applies, so the importer can't land a Subnet later endpoints assume
+        # is valid (Copilot review of #504).
         if gateway is not None:
             try:
-                ipaddress.ip_address(str(gateway).strip())
+                gw_addr = ipaddress.ip_address(str(gateway).strip())
             except ValueError:
                 result_obj.errors.append(f"{canonical}: invalid gateway {gateway!r}")
                 continue
-            gateway = str(gateway).strip()
+            if gw_addr not in subnet_net:
+                result_obj.errors.append(f"{canonical}: gateway {gateway} is not within the subnet")
+                continue
+            gateway = str(gw_addr)
         custom_fields = row.get("custom_fields") or {}
 
         existing = existing_subnets.get(canonical)
