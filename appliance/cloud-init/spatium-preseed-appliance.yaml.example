@@ -1,0 +1,42 @@
+# SpatiumDDI headless install preseed — APPLIANCE (additional node).
+# Issue #549. An appliance node runs the supervisor only; it pairs with
+# an EXISTING control plane over an 8-digit pairing code, waits in
+# pending_approval until an admin approves it in the Fleet UI, then gets
+# DNS / DHCP roles assigned. Can later be promoted into the control-plane
+# cluster for HA.
+#
+# See spatium-preseed-control-plane.yaml.example for the field-by-field
+# notes shared with this file (disk safety, password handling, network,
+# k3s CIDRs). Only the appliance-specific fields are annotated here.
+spatium_preseed:
+  # control-plane vs appliance. Aliases for appliance: add-node,
+  # additional, agent, application.
+  role: appliance
+
+  confirm_wipe: true
+  target_disk: /dev/disk/by-id/ata-QEMU_HARDDISK_QM00002
+
+  hostname: dns-east-1
+  admin_user: admin
+  admin_password: "change-me-please"
+  timezone: UTC
+
+  network:
+    mode: dhcp
+
+  k3s:
+    pod_cidr: 10.42.0.0/16
+    service_cidr: 10.43.0.0/16
+
+  # ── Control-plane join (REQUIRED for role: appliance) ───────────────
+  # Where this appliance registers. Point at the control plane's URL —
+  # for a multi-node HA control plane use the MetalLB virtual IP (VIP),
+  # NOT a single node, so the appliance survives that node going down.
+  control_plane_url: https://ddi-control-1.example.net/
+
+  # 8-digit pairing code minted at the control plane
+  # (Appliance -> Pairing -> New pairing code). Dashes / spaces from the
+  # displayed 1234-5678 form are accepted; stored single-use unless the
+  # admin minted a persistent code. Treat as a short-TTL secret — kept
+  # out of the console dashboard + logs.
+  pairing_code: "12345678"

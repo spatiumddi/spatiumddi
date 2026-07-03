@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+# spatium-preseed-parse — validate a headless-install answer file and
+# emit resolved values for the spatium-install bash wizard to consume
+# (issue #549).
+#
+# The interactive installer (spatium-install) drives a whiptail wizard.
+# For fleet rollouts / PXE / CI boot-tests there's no console operator,
+# so this helper lets spatium-install run non-interactively from a
+# preseed answer file. It reuses the SAME validation rules the wizard
+# enforces (hostname RFC 1123, k3s CIDR disjoint + <= /22 + no LAN
+# overlap, pairing code = 8 digits, control-plane URL required for the
+# appliance role) so a headless install can't slip past a guard the
+# interactive path would have caught.
+#
+# Contract with spatium-install:
+#   argv: <preseed.yaml> <out-env> <out-secret-env>
+#   exit 0 — parsed OK (possibly PARTIAL — missing fields fall through
+#            to the interactive prompt in the wizard).
+#   exit 2 — a field that WAS supplied failed validation. The install
+#            must halt loudly rather than silently pick a default on
+#            an unattended run (acceptance criterion in #549).
+#   exit 3 — the file could not be read / parsed as YAML at all
+#            (malformed — a loud failure since a preseed was expected).
+#   exit 4 — the file parsed but carries NO spatium preseed content
+#            (e.g. a plain cloud-init user-data with no spatium_preseed
+#            block). Safe to ignore — the wizard falls through to a
+#            fully interactive install.
+#
+# <out-env> is a shell-sourceable file of non-secret KEY=value lines
+# plus PRESEED_HAS_<field>=1 markers telling the wizard which prompts
+# to skip. <out-secret-env> (mode 0600) carries the admin password /
+# hash and the pairing code — never echoed to the console dashboard,
+# the install log, or the non-secret env.
+#
+# Dependency-light: PyYAML (python3-yaml) + stdlib only. python3-yaml
+# is in the appliance package set (mkosi.conf).
+
+import ipaddress
+import os
+import shlex
+import stat
+import sys
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - image always ships python3-yaml
+    sys.stderr.write(
+        "spatium-preseed-parse: PyYAML not available — cannot parse preseed\n"
+    )
+    sys.exit(3)
+
+# Hard disk-size floor for the A/B partition layout — mirror
+# spatium-install's MIN_DISK_GIB pick_disk guard. Keep in sync; a
+# preseeded target_disk below this halts loudly (the interactive picker
+# would have refused + re-prompted, but a headless run has no operator).
+MIN_DISK_GIB = 32
+
+
+# Accumulated resolved values (non-secret) and secrets, written out at
+# the end only if no validation error fired.
+env: dict[str, str] = {}
+secret: dict[str, str] = {}
+# Fatal validation errors on SUPPLIED fields. Any entry here => exit 2.
+errors: list[str] = []
+# Non-fatal notes surfaced to the install log (e.g. "disk unresolved,
+# falling through to interactive").
+notes: list[str] = []
+
+
+def fail(msg: str) -> None:
+    errors.append(msg)
+
+
+def note(msg: str) -> None:
+    notes.append(msg)
+
+
+def as_bool(val, field: str):
+    """Coerce a YAML scalar to a strict bool, or record an error."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str) and val.strip().lower() in {
+        "true", "false", "yes", "no", "1", "0",
+    }:
+        return val.strip().lower() in {"true", "yes", "1"}
+    fail(f"{field} must be a boolean (true/false); got {val!r}")
+    return None
+
+
+def as_str(val) -> str:
+    """YAML may parse a bare value as int/None; normalise to a string."""
+    if val is None:
+        return ""
+    return str(val).strip()
+
+
+# ── Load ──────────────────────────────────────────────────────────────
+
+if len(sys.argv) != 4:
+    sys.stderr.write(
+        "usage: spatium-preseed-parse <preseed.yaml> <out-env> <out-secret-env>\n"
+    )
+    sys.exit(3)
+
+preseed_path, out_env, out_secret = sys.argv[1], sys.argv[2], sys.argv[3]
+
+try:
+    with open(preseed_path, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+except (OSError, yaml.YAMLError) as exc:
+    sys.stderr.write(f"spatium-preseed-parse: cannot parse {preseed_path}: {exc}\n")
+    sys.exit(3)
+
+if doc is None:
+    sys.stderr.write(f"spatium-preseed-parse: {preseed_path} is empty\n")
+    sys.exit(3)
+if not isinstance(doc, dict):
+    sys.stderr.write(
+        f"spatium-preseed-parse: {preseed_path} top level must be a mapping\n"
+    )
+    sys.exit(3)
+
+# Accept the preseed either as a top-level `spatium_preseed:` block
+# (so it can be embedded in a cloud-init user-data document alongside
+# other keys, which cloud-init ignores) or as the whole document. The
+# hyphen spelling `spatium-preseed:` is accepted as an alias.
+ps = None
+for key in ("spatium_preseed", "spatium-preseed"):
+    if isinstance(doc.get(key), dict):
+        ps = doc[key]
+        break
+if ps is None:
+    # No wrapper block — treat the document itself as the preseed, but
+    # only if it carries at least one field we recognise (guards against
+    # pointing the installer at an unrelated YAML file).
+    known = {
+        "role", "target_disk", "confirm_wipe", "hostname", "admin_user",
+        "admin_password", "admin_password_hash", "timezone", "network",
+        "k3s", "control_plane_url", "pairing_code",
+    }
+    if known & set(doc.keys()):
+        ps = doc
+    else:
+        # Parsed fine but this isn't a preseed (e.g. a plain cloud-init
+        # user-data document). Not an error — let the installer fall
+        # through to interactive.
+        sys.stderr.write(
+            f"spatium-preseed-parse: {preseed_path} has no spatium_preseed "
+            "block and no recognised preseed fields — ignoring\n"
+        )
+        sys.exit(4)
+
+# ── Role ──────────────────────────────────────────────────────────────
+# Friendly aliases map onto the two internal role values the wizard +
+# supervisor consume (control-plane / appliance).
+ROLE_ALIASES = {
+    "control-plane": "control-plane",
+    "control_plane": "control-plane",
+    "control": "control-plane",
+    "first-node": "control-plane",
+    "first": "control-plane",
+    "appliance": "appliance",
+    "add-node": "appliance",
+    "additional": "appliance",
+    "agent": "appliance",
+    "application": "appliance",
+}
+role = None
+if "role" in ps and as_str(ps.get("role")):
+    raw = as_str(ps["role"]).lower()
+    role = ROLE_ALIASES.get(raw)
+    if role is None:
+        fail(
+            f"role {raw!r} is not valid — use 'control-plane' (first node) "
+            "or 'appliance' (additional / agent node)"
+        )
+    else:
+        env["ROLE"] = role
+        env["PRESEED_HAS_ROLE"] = "1"
+
+# ── confirm_wipe ──────────────────────────────────────────────────────
+confirm_wipe = False
+if "confirm_wipe" in ps:
+    cw = as_bool(ps["confirm_wipe"], "confirm_wipe")
+    if cw is not None:
+        confirm_wipe = cw
+
+
+# ── Target disk ───────────────────────────────────────────────────────
+# Destructive-disk safety (#549 open-question 3): an unattended wipe of
+# a disk with no human in the loop is only performed when BOTH
+#   * confirm_wipe: true, AND
+#   * target_disk resolves to exactly one existing WHOLE-disk block dev.
+# Prefer a stable id (/dev/disk/by-id/... or /dev/disk/by-path/...) that
+# survives re-enumeration; a bare sdX name is accepted but noted, since
+# it can renumber between boots. A supplied-but-unresolvable disk drops
+# to the interactive picker rather than guessing (never a silent wipe).
+def resolve_disk(spec: str):
+    real = os.path.realpath(spec)
+    try:
+        st = os.stat(real)
+    except OSError:
+        return None, f"target_disk {spec!r} does not exist"
+    if not stat.S_ISBLK(st.st_mode):
+        return None, f"target_disk {spec!r} is not a block device"
+    name = os.path.basename(real)
+    # Whole disks appear under /sys/block/<name>; partitions do not.
+    if not os.path.isdir(f"/sys/block/{name}"):
+        return None, (
+            f"target_disk {spec!r} resolves to {real} which is not a whole "
+            "disk (looks like a partition)"
+        )
+    return real, None
+
+
+def disk_size_bytes(real: str):
+    """Capacity of a whole-disk /dev node via /sys/block/<name>/size
+    (512-byte sectors). Returns None if unreadable."""
+    name = os.path.basename(real)
+    try:
+        with open(f"/sys/block/{name}/size", encoding="ascii") as fh:
+            return int(fh.read().strip()) * 512
+    except (OSError, ValueError):
+        return None
+
+
+target_spec = as_str(ps.get("target_disk"))
+if target_spec:
+    real, why = resolve_disk(target_spec)
+    if real is None:
+        # Absent / ambiguous named disk — fall through to interactive
+        # (issue #549: "Refuse and drop to interactive"). Not fatal.
+        note(f"{why}; falling through to interactive disk selection")
+    elif not confirm_wipe:
+        note(
+            f"target_disk {target_spec!r} supplied but confirm_wipe is not "
+            "true — refusing unattended wipe; disk selection is interactive"
+        )
+    else:
+        # Hard size floor — the interactive picker refuses + re-prompts
+        # below MIN_DISK_GIB; a headless run has no operator, so halt
+        # loudly instead of partitioning an undersized disk (#312).
+        nbytes = disk_size_bytes(real)
+        if nbytes is not None and nbytes < MIN_DISK_GIB * 1024**3:
+            fail(
+                f"target_disk {target_spec!r} is {nbytes // 1024**3} GiB — "
+                f"below the {MIN_DISK_GIB} GiB minimum for the A/B partition "
+                "layout; pick a larger disk"
+            )
+        else:
+            env["TARGET_DISK"] = real
+            env["PRESEED_HAS_DISK"] = "1"
+            if not target_spec.startswith("/dev/disk/by-"):
+                note(
+                    f"target_disk {target_spec!r} is not a stable "
+                    f"/dev/disk/by-id or by-path id (resolved to {real}); it "
+                    "may renumber across boots — prefer a by-id path for "
+                    "fleet rollouts"
+                )
+
+# ── Hostname (RFC 1123, matching the wizard's ask_hostname) ───────────
+hostname = as_str(ps.get("hostname"))
+if hostname:
+    ok = True
+    if len(hostname) > 63:
+        fail("hostname must be 63 characters or fewer")
+        ok = False
+    elif (
+        hostname.startswith("-")
+        or hostname.endswith("-")
+        or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+               for c in hostname)
+    ):
+        fail(
+            "hostname must be alphanumeric + hyphen, not start/end with a "
+            "hyphen, and contain no spaces or dots"
+        )
+        ok = False
+    if ok:
+        env["HOSTNAME"] = hostname
+        env["PRESEED_HAS_HOSTNAME"] = "1"
+
+# ── Admin user + password ─────────────────────────────────────────────
+admin_user = as_str(ps.get("admin_user"))
+if admin_user:
+    env["ADMIN_USER"] = admin_user
+    env["PRESEED_HAS_ADMIN_USER"] = "1"
+
+pw = as_str(ps.get("admin_password"))
+pw_hash = as_str(ps.get("admin_password_hash"))
+if pw and pw_hash:
+    fail("supply only one of admin_password or admin_password_hash")
+elif pw_hash:
+    # crypt(3) hashes start with $id$ (e.g. $6$ for SHA-512, $y$ for
+    # yescrypt). Reject anything that clearly isn't one so a truncated /
+    # mis-pasted hash fails loudly instead of locking the operator out.
+    if not (pw_hash.startswith("$") and pw_hash.count("$") >= 2):
+        fail(
+            "admin_password_hash does not look like a crypt(3) hash "
+            "(expected $id$salt$hash, e.g. from `openssl passwd -6`)"
+        )
+    else:
+        secret["ADMIN_PASSWORD_HASH"] = pw_hash
+        env["PRESEED_HAS_PASSWORD"] = "1"
+elif pw:
+    secret["ADMIN_PASSWORD"] = pw
+    env["PRESEED_HAS_PASSWORD"] = "1"
+
+# ── Timezone ──────────────────────────────────────────────────────────
+tz = as_str(ps.get("timezone"))
+if tz:
+    if os.path.exists(f"/usr/share/zoneinfo/{tz}"):
+        env["TIMEZONE"] = tz
+        env["PRESEED_HAS_TIMEZONE"] = "1"
+    else:
+        fail(f"timezone {tz!r} is not a known IANA zone (/usr/share/zoneinfo)")
+
+# ── Network ───────────────────────────────────────────────────────────
+static_subnet = ""  # feeds the k3s LAN-overlap check below
+net = ps.get("network")
+if net is not None:
+    if not isinstance(net, dict):
+        fail("network must be a mapping (mode/interface/ip/prefix/gateway/dns)")
+    else:
+        mode = as_str(net.get("mode")).lower()
+        if not mode:
+            fail("network.mode is required when a network block is present")
+        elif mode not in {"dhcp", "static"}:
+            fail(f"network.mode {mode!r} must be 'dhcp' or 'static'")
+        elif mode == "dhcp":
+            env["NET_MODE"] = "dhcp"
+            env["PRESEED_HAS_NETWORK"] = "1"
+        else:  # static
+            ip = as_str(net.get("ip"))
+            prefix = as_str(net.get("prefix") if net.get("prefix") is not None else "")
+            gateway = as_str(net.get("gateway"))
+            dns = as_str(net.get("dns")) or "1.1.1.1 1.0.0.1"
+            iface = as_str(net.get("interface"))
+            static_ok = True
+            if not ip:
+                fail("network.ip is required for a static network")
+                static_ok = False
+            if not prefix:
+                fail("network.prefix is required for a static network")
+                static_ok = False
+            if not gateway:
+                fail("network.gateway is required for a static network")
+                static_ok = False
+            # The interactive wizard forces an interface pick for static;
+            # spatium-etc-render only writes the keyfile when the
+            # interface is set, else it silently falls back to DHCP. So a
+            # static preseed MUST name an interface — require it here.
+            if not iface:
+                fail(
+                    "network.interface is required for a static network "
+                    "(the NIC name, e.g. eth0 / enp1s0)"
+                )
+                static_ok = False
+            # Only IPv4 is supported end-to-end — spatium-etc-render
+            # renders an [ipv4] method=manual keyfile, so reject IPv6
+            # rather than emit a config NetworkManager will refuse.
+            if static_ok:
+                try:
+                    if ipaddress.ip_address(ip).version != 4:
+                        fail(f"network.ip {ip!r} must be an IPv4 address")
+                        static_ok = False
+                except ValueError:
+                    fail(f"network.ip {ip!r} is not a valid IPv4 address")
+                    static_ok = False
+                try:
+                    if not (0 <= int(prefix) <= 32):
+                        raise ValueError
+                except ValueError:
+                    fail(f"network.prefix {prefix!r} must be an integer 0-32")
+                    static_ok = False
+                try:
+                    if ipaddress.ip_address(gateway).version != 4:
+                        fail(f"network.gateway {gateway!r} must be IPv4")
+                        static_ok = False
+                except ValueError:
+                    fail(f"network.gateway {gateway!r} is not a valid address")
+                    static_ok = False
+            if static_ok:
+                env["NET_MODE"] = "static"
+                env["NET_INTERFACE"] = iface
+                env["NET_IP"] = ip
+                env["NET_PREFIX"] = prefix
+                env["NET_GATEWAY"] = gateway
+                env["NET_DNS"] = dns
+                env["PRESEED_HAS_NETWORK"] = "1"
+                static_subnet = f"{ip}/{prefix}"
+
+# ── k3s pod + service CIDRs (mirrors _validate_k3s_cidrs) ─────────────
+k3s = ps.get("k3s")
+if k3s is not None:
+    if not isinstance(k3s, dict):
+        fail("k3s must be a mapping (pod_cidr / service_cidr)")
+    else:
+        pod_s = as_str(k3s.get("pod_cidr")) or "10.42.0.0/16"
+        svc_s = as_str(k3s.get("service_cidr")) or "10.43.0.0/16"
+        k_ok = True
+        try:
+            pod = ipaddress.ip_network(pod_s, strict=False)
+        except ValueError as exc:
+            fail(f"k3s.pod_cidr is not a valid IPv4 network: {exc}")
+            k_ok = False
+        try:
+            svc = ipaddress.ip_network(svc_s, strict=False)
+        except ValueError as exc:
+            fail(f"k3s.service_cidr is not a valid IPv4 network: {exc}")
+            k_ok = False
+        if k_ok:
+            if pod.version != 4 or svc.version != 4:
+                fail("k3s CIDRs must be IPv4")
+                k_ok = False
+            elif pod.prefixlen > 22:
+                fail(f"k3s.pod_cidr prefix /{pod.prefixlen} too small — use /22 or wider")
+                k_ok = False
+            elif svc.prefixlen > 22:
+                fail(f"k3s.service_cidr prefix /{svc.prefixlen} too small — use /22 or wider")
+                k_ok = False
+            elif pod.overlaps(svc):
+                fail(f"k3s.pod_cidr {pod} overlaps service_cidr {svc}; must be disjoint")
+                k_ok = False
+        if k_ok and static_subnet:
+            try:
+                lan = ipaddress.ip_interface(static_subnet).network
+            except ValueError:
+                lan = None
+            if lan is not None:
+                if pod.overlaps(lan):
+                    fail(f"k3s.pod_cidr {pod} overlaps the LAN {lan}; Flannel host-gw would mask it")
+                    k_ok = False
+                elif svc.overlaps(lan):
+                    fail(f"k3s.service_cidr {svc} overlaps the LAN {lan}")
+                    k_ok = False
+        if k_ok:
+            env["K3S_POD_CIDR"] = str(pod)
+            env["K3S_SERVICE_CIDR"] = str(svc)
+            env["PRESEED_HAS_K3S"] = "1"
+
+# ── Control-plane URL + pairing code (appliance role) ─────────────────
+cp_url = as_str(ps.get("control_plane_url"))
+if cp_url and cp_url != "https://":
+    env["CONTROL_PLANE_URL"] = cp_url
+    env["PRESEED_HAS_CONTROL_URL"] = "1"
+elif cp_url == "https://":
+    fail("control_plane_url is a bare scheme with no host")
+
+code = as_str(ps.get("pairing_code"))
+if code:
+    stripped = "".join(c for c in code if c.isdigit())
+    if len(stripped) != 8 or not stripped.isdigit():
+        # Never echo the code itself — it's a secret and this message is
+        # surfaced to the install log + console on a halt.
+        fail(
+            "pairing_code must be 8 decimal digits (dashes / spaces are "
+            f"accepted as separators); got {len(stripped)} digit(s)"
+        )
+    else:
+        secret["BOOTSTRAP_PAIRING_CODE"] = stripped
+        env["PRESEED_HAS_PAIRING_CODE"] = "1"
+
+# Cross-field: the appliance role needs BOTH a control-plane URL and a
+# pairing code. If the role is explicitly appliance AND one of them was
+# supplied but the other is a supplied-and-invalid value we've already
+# failed above. A simply-absent url/code is NOT fatal here — the wizard
+# falls through to ask_application_config interactively for whatever's
+# missing. We only surface a note so a part-preseeded appliance install
+# is understandable in the log.
+if role == "appliance":
+    if "PRESEED_HAS_CONTROL_URL" not in env:
+        note("role=appliance but no control_plane_url — will prompt interactively")
+    if "PRESEED_HAS_PAIRING_CODE" not in env:
+        note("role=appliance but no pairing_code — will prompt interactively")
+
+# ── Emit ──────────────────────────────────────────────────────────────
+if errors:
+    sys.stderr.write("spatium-preseed-parse: preseed validation failed:\n")
+    for e in errors:
+        sys.stderr.write(f"  - {e}\n")
+    sys.exit(2)
+
+# Notes go to stdout so the wizard can log them; they're advisory.
+for n in notes:
+    sys.stdout.write(f"NOTE: {n}\n")
+
+
+def write_env(path: str, data: dict[str, str], mode: int) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        for k, v in data.items():
+            fh.write(f"{k}={shlex.quote(v)}\n")
+    os.chmod(path, mode)
+
+
+write_env(out_env, env, 0o644)
+write_env(out_secret, secret, 0o600)
+sys.exit(0)
