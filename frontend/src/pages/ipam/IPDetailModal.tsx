@@ -164,11 +164,16 @@ export function IPDetailModal({
       });
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: string } } })
+      // detail is a string for our HTTPExceptions but a list of objects for a
+      // Pydantic 422 — only render it when it's actually a string.
+      const detail = (err as { response?: { data?: { detail?: unknown } } })
         ?.response?.data?.detail;
       setWakeMsg({
         ok: false,
-        text: detail || "Failed to send the magic packet.",
+        text:
+          typeof detail === "string"
+            ? detail
+            : "Failed to send the magic packet.",
       });
     },
   });

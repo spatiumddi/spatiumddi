@@ -528,34 +528,27 @@ class WakeHostArgs(BaseModel):
             "and pass its id."
         ),
     )
-    port: int = Field(default=9, description="UDP port for the magic packet (default 9).")
+    port: int = Field(
+        default=9,
+        ge=1,
+        le=65535,
+        description="UDP port for the magic packet (default 9).",
+    )
 
 
 async def _load_wake_target(db: AsyncSession, args: WakeHostArgs) -> tuple[Any, str, str]:
-    """Resolve (ip_row, mac, broadcast) or raise ValueError with a reason."""
-    import ipaddress  # noqa: PLC0415
+    """Resolve (ip_row, mac, broadcast) or raise ValueError. Delegates to the
+    shared ``wol.resolve_wake_params`` so this path can't drift from the REST
+    endpoint; only the UUID parse is operation-specific."""
     import uuid as _uuid  # noqa: PLC0415
 
-    from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
     from app.services import wol  # noqa: PLC0415
 
     try:
         aid = _uuid.UUID(args.address_id)
     except (ValueError, TypeError) as exc:
         raise ValueError(f"address_id is not a valid UUID: {args.address_id!r}") from exc
-    ip = await db.get(IPAddress, aid)
-    if ip is None:
-        raise ValueError("IP address not found")
-    if not ip.mac_address:
-        raise ValueError("This IP has no MAC address on record — Wake-on-LAN needs one.")
-    subnet = await db.get(Subnet, ip.subnet_id)
-    if subnet is None:
-        raise ValueError("Subnet not found")
-    net = ipaddress.ip_network(str(subnet.network), strict=False)
-    broadcast = (
-        "255.255.255.255" if isinstance(net, ipaddress.IPv6Network) else str(net.broadcast_address)
-    )
-    return ip, wol.normalize_mac(str(ip.mac_address)), broadcast
+    return await wol.resolve_wake_params(db, aid)
 
 
 async def _preview_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> PreviewResult:
@@ -580,7 +573,13 @@ async def _apply_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> 
 
     enforce_operation_permission(user, _OPERATIONS["wake_host"])
     ip, mac, broadcast = await _load_wake_target(db, args)
-    await wol.send_magic_packet(mac, broadcast, args.port)
+    try:
+        await wol.send_magic_packet(mac, broadcast, args.port)
+    except OSError as exc:
+        raise ValueError(
+            f"Could not broadcast the magic packet from the server: {exc}. "
+            "The control plane may have no route to the target's segment."
+        ) from exc
     write_audit(
         db,
         user=user,
@@ -618,7 +617,8 @@ register(
         preview=_preview_wake_host,
         apply=_apply_wake_host,
         category="network",
-        required_permission=("write", "use_network_tools"),
+        # ``read`` matches the rest of the network-tools surface.
+        required_permission=("read", "use_network_tools"),
     )
 )
 

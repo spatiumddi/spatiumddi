@@ -18,7 +18,6 @@ the IP row, like the other active tools.
 
 from __future__ import annotations
 
-import ipaddress
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -28,7 +27,6 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_permission
 from app.models.appliance import Appliance
-from app.models.ipam import IPAddress, Subnet
 from app.services import wol
 from app.services.appliance import agent_cmd
 from app.services.nettools.schemas import NetToolTarget
@@ -36,9 +34,11 @@ from app.services.nettools.schemas import NetToolTarget
 router = APIRouter(tags=["ipam"])
 
 # WoL is a network tool — reuse the existing tools permission (already seeded
-# into the Network Editor built-in role) rather than minting a new one.
+# into the Network Editor built-in role). ``read`` matches the rest of the
+# network-tools surface (ping / nmap / dig all gate on read:use_network_tools),
+# so an operator granted read to unlock the tools page can also wake a host.
 PERMISSION = "use_network_tools"
-_RequirePerm = Depends(require_permission("write", PERMISSION))
+_RequirePerm = Depends(require_permission("read", PERMISSION))
 
 
 class WakeRequest(BaseModel):
@@ -46,17 +46,6 @@ class WakeRequest(BaseModel):
     # Optional run-from vantage. None / kind="server" ⇒ the api container
     # sends; kind="appliance" + id ⇒ dispatch to that appliance's segment.
     target: NetToolTarget | None = None
-
-
-def _broadcast_for_subnet(subnet: Subnet) -> str:
-    """Directed broadcast of the IP's subnet for IPv4; the limited broadcast
-    (255.255.255.255) for an IPv6 subnet, which has no broadcast address of
-    its own — the magic packet is L2 and the target MAC is what wakes the
-    NIC, so the local-segment broadcast still delivers it."""
-    net = ipaddress.ip_network(str(subnet.network), strict=False)
-    if isinstance(net, ipaddress.IPv6Network):
-        return "255.255.255.255"
-    return str(net.broadcast_address)
 
 
 @router.post(
@@ -70,34 +59,35 @@ async def wake_address(
     db: DB,
     current_user: CurrentUser,
 ) -> wol.WolResult:
-    ip = await db.get(IPAddress, address_id)
-    if ip is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
-    if not ip.mac_address:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="This IP has no MAC address on record — Wake-on-LAN needs one.",
-        )
-    subnet = await db.get(Subnet, ip.subnet_id)
-    if subnet is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
-
-    # Validate MAC + broadcast up front (shared with the agent wire shape).
+    # Shared resolver — same IP → (mac, broadcast) derivation the AI operation
+    # uses, so the logic + messages don't drift.
     try:
-        wire = wol.WolWireRequest(
-            mac=str(ip.mac_address),
-            broadcast=_broadcast_for_subnet(subnet),
-            port=body.port,
-        )
-    except ValueError as exc:  # bad MAC on the row
+        ip, mac, broadcast = await wol.resolve_wake_params(db, address_id)
+    except wol.WolTargetError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            status_code=(
+                status.HTTP_404_NOT_FOUND if exc.not_found else status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=str(exc),
         ) from exc
 
+    wire = wol.WolWireRequest(mac=mac, broadcast=broadcast, port=body.port)
     target = body.target or NetToolTarget()
 
     if target.kind == "server":
-        await wol.send_magic_packet(wire.mac, wire.broadcast, wire.port)
+        try:
+            await wol.send_magic_packet(wire.mac, wire.broadcast, wire.port)
+        except OSError as exc:
+            # No route to the broadcast (ENETUNREACH etc.) is the documented
+            # single-box limitation — surface it cleanly like the appliance
+            # path's 502 rather than a raw 500.
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    f"Could not broadcast the magic packet from the server: {exc}. "
+                    "Try an appliance vantage on the target's segment."
+                ),
+            ) from exc
         result = wol.WolResult(
             mac=wire.mac,
             broadcast=wire.broadcast,
@@ -155,7 +145,9 @@ async def _wake_via_appliance(
             "wol",
             wire.model_dump(mode="json"),
             ready=ready,
-            timeout=15.0,
+            # Match the sibling nettool dispatch (tools/router.py): a busy
+            # supervisor mid-poll needs headroom or a healthy appliance 504s.
+            timeout=30.0,
         )
     except agent_cmd.ApplianceOffline as exc:
         raise HTTPException(

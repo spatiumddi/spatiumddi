@@ -17,8 +17,15 @@ import asyncio
 import ipaddress
 import re
 import socket
+import uuid
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.models.ipam import IPAddress
 
 _HEX12_RE = re.compile(r"^[0-9A-Fa-f]{12}$")
 
@@ -94,3 +101,44 @@ class WolResult(BaseModel):
     sent: bool
     ran_from: str = "server"
     error: str | None = None
+
+
+class WolTargetError(ValueError):
+    """A wake target couldn't be resolved. ``not_found`` distinguishes a
+    missing row (→ 404) from a present-but-unwakeable one (→ 422)."""
+
+    def __init__(self, message: str, *, not_found: bool = False) -> None:
+        super().__init__(message)
+        self.not_found = not_found
+
+
+def broadcast_for_network(network: str) -> str:
+    """Directed broadcast of an IPv4 subnet; the limited broadcast
+    (255.255.255.255) for an IPv6 subnet, which has no broadcast of its own —
+    the magic packet is L2 and the target MAC is what wakes the NIC, so the
+    local-segment broadcast still delivers it."""
+    net = ipaddress.ip_network(network, strict=False)
+    if isinstance(net, ipaddress.IPv6Network):
+        return "255.255.255.255"
+    return str(net.broadcast_address)
+
+
+async def resolve_wake_params(
+    db: AsyncSession, address_id: uuid.UUID
+) -> tuple[IPAddress, str, str]:
+    """Load the IP, require a MAC, and derive ``(ip_row, mac, broadcast)``.
+
+    Single source of truth shared by the REST endpoint and the AI operation so
+    the resolution + error messages don't drift. Raises :class:`WolTargetError`.
+    """
+    from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415 — avoid import cycle
+
+    ip = await db.get(IPAddress, address_id)
+    if ip is None:
+        raise WolTargetError("IP address not found", not_found=True)
+    if not ip.mac_address:
+        raise WolTargetError("This IP has no MAC address on record — Wake-on-LAN needs one.")
+    subnet = await db.get(Subnet, ip.subnet_id)
+    if subnet is None:
+        raise WolTargetError("Subnet not found", not_found=True)
+    return ip, normalize_mac(str(ip.mac_address)), broadcast_for_network(str(subnet.network))
