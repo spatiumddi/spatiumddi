@@ -7,5 +7,7 @@ Type=oneshot
 # the browser before the host kills the network stack.
 ExecStartPre=/bin/sleep 10
 # Rename the trigger to .done so it doesn't re-fire on next boot.
-ExecStartPre=/bin/mv /var/lib/spatiumddi/release-state/reboot-pending /var/lib/spatiumddi/release-state/reboot-pending.done
+# ``-`` prefix (#553): tolerate an already-moved/absent trigger so this
+# oneshot never ends ``failed`` — the reboot still needs to fire.
+ExecStartPre=-/bin/mv /var/lib/spatiumddi/release-state/reboot-pending /var/lib/spatiumddi/release-state/reboot-pending.done
 ExecStart=/usr/bin/systemctl reboot

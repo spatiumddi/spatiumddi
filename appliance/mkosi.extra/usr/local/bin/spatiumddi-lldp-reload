@@ -64,6 +64,17 @@ fi
 MARKER=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
 HASH=$(sed -n '2p' "$TRIGGER" | tr -d '\r\n')
 DAEMON_ARGS=$(sed -n '3p' "$TRIGGER" | tr -d '\r\n')
+# DAEMON_ARGS is interpolated into a double-quoted assignment in the
+# shell-sourced /etc/default/lldpd; a stray `"`, `` ` ``, `$`, `;` or
+# newline would break out into command execution when lldpd's init
+# sources it (#550). lldpd flags are a small, boring charset — reject
+# anything outside it rather than trying to escape.
+if printf '%s' "$DAEMON_ARGS" | LC_ALL=C grep -q '[^A-Za-z0-9 _=./:,-]'; then
+    echo "  ✗ DAEMON_ARGS contains disallowed characters — refusing"
+    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    exit 1
+fi
 TMP_BODY=$(mktemp /tmp/spatium-lldpd.conf.XXXXXX)
 trap 'rm -f "$TMP_BODY"' EXIT
 tail -n +4 "$TRIGGER" > "$TMP_BODY"

@@ -25,7 +25,9 @@
 
 set -euo pipefail
 
-TRIGGER=/var/lib/spatiumddi/release-state/reboot-pending
+# #553 — fleet reboots use a DEDICATED trigger filename so this runner and
+# the web-UI spatiumddi-reboot.service don't both fire on a single write.
+TRIGGER=/var/lib/spatiumddi/release-state/reboot-pending-fleet
 LOG_DIR=/var/log/spatiumddi
 LOG="$LOG_DIR/reboot-agent.log"
 GRACE_SECONDS=5

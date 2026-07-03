@@ -23,6 +23,7 @@ import argparse
 import concurrent.futures
 import errno
 import json
+import math
 import os
 import re
 import select
@@ -236,7 +237,11 @@ def read_env(path: Path = ENV_FILE) -> dict[str, str]:
     if not path.exists():
         return {}
     out: dict[str, str] = {}
-    for line in path.read_text().splitlines():
+    # errors="replace" — a non-UTF-8 byte in .env must not raise
+    # UnicodeDecodeError on the 0.5 s render tick (read_env feeds
+    # render_header), which would soft-freeze on the last frame + spam
+    # journald at 2 Hz (#552).
+    for line in path.read_text(errors="replace").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -347,6 +352,24 @@ def _read_fire_state_dash(trigger_basename: str) -> tuple[str, int]:
     return parts[0], attempts
 
 
+def _metric_num(token: str, default: float = 0.0) -> float:
+    """Parse a Prometheus metric value, clamping NaN / +Inf / -Inf and
+    garbage to ``default``.
+
+    Prometheus legitimately emits ``NaN`` / ``+Inf`` for some gauges;
+    ``int(float("nan"))`` raises ValueError and ``int(float("inf"))``
+    raises OverflowError. Those parses live OUTSIDE the urlopen try/except,
+    so a single such value would crash the caller — tolerable in the
+    main-loop refresh (guarded), but fatal on the UNguarded priming
+    refresh, sending main() to exit 1 → Restart=always crash-loop with a
+    black console (#552)."""
+    try:
+        v = float(token)
+    except (ValueError, IndexError, TypeError):
+        return default
+    return v if math.isfinite(v) else default
+
+
 def fetch_etcd_health(timeout: float = 2.0) -> dict:
     """etcd health from the embedded-etcd Prometheus endpoint
     (``http://127.0.0.1:2381/metrics``, ~13 ms). stdlib urllib only — no
@@ -366,17 +389,17 @@ def fetch_etcd_health(timeout: float = 2.0) -> dict:
         # Each is a bare ``<metric> <value>`` Prometheus line; values may be
         # scientific notation (e.g. ``4.9e+06``) — float() then int() copes.
         if line.startswith("etcd_server_has_leader "):
-            out["has_leader"] = int(float(line.split()[-1]))
+            out["has_leader"] = int(_metric_num(line.split()[-1]))
         elif line.startswith("etcd_server_is_leader "):
-            out["is_leader"] = int(float(line.split()[-1]))
+            out["is_leader"] = int(_metric_num(line.split()[-1]))
         elif line.startswith("etcd_server_proposals_failed_total "):
-            out["proposals_failed"] = int(float(line.split()[-1]))
+            out["proposals_failed"] = int(_metric_num(line.split()[-1]))
         elif line.startswith("etcd_server_leader_changes_seen_total "):
-            out["leader_changes"] = int(float(line.split()[-1]))
+            out["leader_changes"] = int(_metric_num(line.split()[-1]))
         elif line.startswith("etcd_mvcc_db_total_size_in_use_in_bytes "):
-            out["db_in_use"] = float(line.split()[-1])
+            out["db_in_use"] = _metric_num(line.split()[-1])
         elif line.startswith("etcd_mvcc_db_total_size_in_bytes "):
-            out["db_size"] = float(line.split()[-1])
+            out["db_size"] = _metric_num(line.split()[-1])
     return out
 
 
@@ -453,22 +476,19 @@ def fetch_cnpg_metrics(pg_ip: str, timeout: float = 3.0) -> dict:
     }
     for line in raw.splitlines():
         if line.startswith("cnpg_backends_total{") and 'datname="spatiumddi"' in line:
-            try:
-                v = int(float(line.split()[-1]))
-            except ValueError:
-                continue
+            v = int(_metric_num(line.split()[-1]))
             if 'state="idle"' in line:
                 out["backends_idle"] += v
             elif 'state="active"' in line:
                 out["backends_active"] += v
         elif line.startswith("cnpg_backends_waiting_total "):
-            out["backends_waiting"] = int(float(line.split()[-1]))
+            out["backends_waiting"] = int(_metric_num(line.split()[-1]))
         elif line.startswith('cnpg_pg_database_size_bytes{datname="spatiumddi"}'):
-            out["db_size_bytes"] = float(line.split()[-1])
+            out["db_size_bytes"] = _metric_num(line.split()[-1])
         elif line.startswith("cnpg_pg_replication_streaming_replicas "):
-            out["streaming_replicas"] = int(float(line.split()[-1]))
+            out["streaming_replicas"] = int(_metric_num(line.split()[-1]))
         elif line.startswith("cnpg_pg_replication_in_recovery "):
-            out["in_recovery"] = int(float(line.split()[-1]))
+            out["in_recovery"] = int(_metric_num(line.split()[-1]))
     return out
 
 
@@ -1483,7 +1503,9 @@ def appliance_version_string(env: dict[str, str]) -> str:
     spddi = env.get("SPATIUMDDI_VERSION") or "?"
     if APPLIANCE_RELEASE.exists():
         try:
-            for line in APPLIANCE_RELEASE.read_text().splitlines():
+            # errors="replace" so a non-UTF-8 byte can't raise on the render
+            # tick (#552); OSError still caught for a missing/unreadable file.
+            for line in APPLIANCE_RELEASE.read_text(errors="replace").splitlines():
                 if line.startswith("APPLIANCE_VERSION="):
                     appliance = line.split("=", 1)[1].strip().strip('"')
         except OSError:
@@ -1793,7 +1815,16 @@ class KeyReader(threading.Thread):
 
             buf = b""
             while not self._stop.is_set():
-                r, _, _ = select.select([self.tty_fd], [], [], 0.1)
+                try:
+                    r, _, _ = select.select([self.tty_fd], [], [], 0.1)
+                except OSError:
+                    # bad-fd / serial hangup (IPMI SoL drop): don't let the
+                    # daemon KeyReader thread die silently — that leaves the
+                    # dashboard rendering but deaf to every F-key (incl.
+                    # F5/F6) with no visible sign (#552). Brief pause + retry;
+                    # a persistently-bad fd is a spin we can tolerate at 10 Hz.
+                    time.sleep(0.1)
+                    continue
                 if not r:
                     if buf and buf in KEY_SEQUENCES:
                         self.on_key(KEY_SEQUENCES[buf])
@@ -3882,12 +3913,34 @@ class DashboardState:
         # metrics + the etcd/api/cnpg health fetches + env re-read.
         if force or (now - self._last_data_refresh) >= DATA_REFRESH_EVERY:
             self._last_data_refresh = now
-            self.ps_rows = cluster_pods()
-            self.nodes = cluster_nodes()
-            # Phase 2 INC 4 — one kubelet Summary fetch feeds BOTH the
-            # per-pod Top-pods table AND the node-level CPU/mem/fs bars
-            # (zero extra subprocess).
-            _summary = kubelet_summary(os.uname().nodename)
+            # #552 — cluster_pods / cluster_nodes / kubelet_summary /
+            # cluster_svc_ips each fork a ~5 s-timeout kubectl and k3s_status
+            # a ~4 s systemctl+readyz. Run SERIALLY on the render thread (the
+            # old code), a *wedged* apiserver/kubelet — accepts TCP but never
+            # answers (quorum loss, memory pressure, hung stats endpoint) —
+            # froze the whole dashboard + F-key handling for ~25 s per pass,
+            # exactly when the physical-console recovery surface is needed.
+            # These five are mutually independent, so fan them out across the
+            # same pool the urllib health fetches use: wall time collapses to
+            # ~one timeout. Derived computations + the api/cnpg fetches that
+            # depend on their results run after the barrier.
+            _nodename = os.uname().nodename
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+                f_pods = ex.submit(cluster_pods)
+                f_nodes = ex.submit(cluster_nodes)
+                # One kubelet Summary fetch feeds BOTH the per-pod Top-pods
+                # table AND the node-level CPU/mem/fs bars (zero extra fork).
+                f_summary = ex.submit(kubelet_summary, _nodename)
+                # vip + api ClusterIP from ONE svc fetch.
+                f_svc = ex.submit(cluster_svc_ips)
+                f_k3s = ex.submit(k3s_status)
+                f_etcd = ex.submit(fetch_etcd_health)
+                self.ps_rows = f_pods.result()
+                self.nodes = f_nodes.result()
+                _summary = f_summary.result()
+                _svc = f_svc.result()
+                self.k3s_state = f_k3s.result()
+                self.etcd = f_etcd.result() or self.etcd
             self._set_node_pct(node_stats_from_summary(_summary))
             # INC 9 — cluster-wide Top-pods on a multi-node cluster; a
             # single-node box reuses the already-fetched local summary
@@ -3895,34 +3948,26 @@ class DashboardState:
             if len(self.nodes) > 1:
                 self.pod_stats = cluster_pod_stats(self.nodes)
             else:
-                _local = os.uname().nodename
                 self.pod_stats = {
-                    k: (c, mm, _local)
+                    k: (c, mm, _nodename)
                     for k, (c, mm) in pod_stats_from_summary(_summary).items()
                 }
-            # Phase 2 INC 4 — vip + api ClusterIP from ONE svc fetch
-            # (replaces the standalone cluster_vip() call).
-            _svc = cluster_svc_ips()
             self.vip = _svc.get("vip")
             self.api_ip = _svc.get("api")
-            self.k3s_state = k3s_status()
             # P0.5 — host-config apply health (pure file reads). Cached
             # here so render_header / overall_verdict read it off
             # ``state`` without touching disk on the render path.
             self.host_health = host_health_rollup()
-            # Phase 2 INC 4 — the four urllib health fetches run
-            # CONCURRENTLY behind a small pool so a single hung endpoint
-            # (3 s timeout each) can't serialise into a 12 s data-tier
-            # stall; wall time is ~max-single (~17 ms healthy). Each
-            # fetch already returns {} on error; keep-last-good on empty
-            # so a transient blip doesn't flap a box to "n/a".
+            # The api/cnpg urllib fetches depend on api_ip + the primary pg
+            # IP (both derived from the kubectl results above), so they run
+            # in a second pool after the barrier. Each fetch returns {} on
+            # error; keep-last-good on empty so a transient blip doesn't flap
+            # a box to "n/a".
             _pg_ip = _primary_pg_ip(self.ps_rows)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-                f_etcd = ex.submit(fetch_etcd_health)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
                 f_api = ex.submit(fetch_api_metrics, self.api_ip) if self.api_ip else None
                 f_ready = ex.submit(fetch_api_ready, self.api_ip) if self.api_ip else None
                 f_cnpg = ex.submit(fetch_cnpg_metrics, _pg_ip) if _pg_ip else None
-                self.etcd = f_etcd.result() or self.etcd
                 _api = (f_api.result() if f_api else {}) or {}
                 self.api_req_rate = _api.get("rate", self.api_req_rate)
                 self.api_active = _api.get("active", self.api_active)
@@ -4896,7 +4941,16 @@ def main() -> int:
     psutil.cpu_percent(interval=None)
 
     state = DashboardState(env, tail, args.tty)
-    state.refresh(force=True)  # prime cached vitals so first frame isn't all zeros
+    # Prime cached vitals so the first frame isn't all zeros. Guard it the
+    # same way the main loop guards refresh() (#552): a single bad metric or
+    # transient parse error here must NOT propagate out of main() → exit 1 →
+    # Restart=always crash-loop with a black console. DashboardState already
+    # holds sensible defaults, so a failed priming just means a sparse first
+    # frame that the next tick fills in.
+    try:
+        state.refresh(force=True)
+    except Exception as exc:  # noqa: BLE001 — recovery console must not die here
+        sys.stderr.write(f"spatium-console: priming refresh failed: {exc!r}\n")
 
     console = Console(soft_wrap=False, force_terminal=True, safe_box=True)
     state.term_size = console.size
@@ -4980,6 +5034,16 @@ def main() -> int:
                             live.stop()
                             try:
                                 if action == "login":
+                                    # do_login execvp's agetty and never
+                                    # returns, so the `finally` below never
+                                    # runs (#552): stop the app-log tail
+                                    # explicitly (else up to 12 apiserver log
+                                    # streams orphan into the agetty session),
+                                    # and exit the alternate screen so the
+                                    # login prompt doesn't render behind the
+                                    # frozen dashboard frame (serial/IPMI SoL).
+                                    app_tail.stop()
+                                    _prepare_tty_for_subprocess(args.tty)
                                     do_login(args.tty)  # noreturn
                                 elif action == "reboot":
                                     do_reboot(console)

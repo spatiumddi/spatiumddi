@@ -464,7 +464,18 @@ def main(argv: list[str] | None = None) -> int:
         return write_atomic(cfg, text)
 
     # LIVE mode — reconcile + spatium-upgrade-slot apply on the running host.
-    uuids = discover_live_uuids()
+    # Prefer explicit UUIDs when the caller supplies BOTH: spatium-upgrade-slot
+    # apply passes the known-good values it just probed with `blkid` directly
+    # off the device. Re-discovering here via lsblk reads the udev/blkid cache,
+    # which after a `tune2fs -U random` is only refreshed by a best-effort
+    # `udevadm trigger --settle`; if that lagged/failed, lsblk returns the
+    # STALE baked-in UUID and grub.cfg gets `root=UUID=<stale>` for the new
+    # slot → the trial reboot can't find it (#551). The direct blkid value
+    # can't be stale, so trust it when we have it.
+    if args.root_a_uuid and args.root_b_uuid:
+        uuids = {"root_a": args.root_a_uuid, "root_b": args.root_b_uuid}
+    else:
+        uuids = discover_live_uuids()
     if "root_a" not in uuids or "root_b" not in uuids:
         print(
             "ERROR: couldn't resolve both slot UUIDs via lsblk PARTLABEL "

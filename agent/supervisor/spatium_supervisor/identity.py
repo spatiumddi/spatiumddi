@@ -28,6 +28,7 @@ re-deriving it.
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -200,8 +201,13 @@ def save_session_token(state_dir: Path, token: str) -> None:
     takes over."""
     path = _identity_dir(state_dir) / SESSION_TOKEN_FILENAME
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(token + "\n")
-    tmp.chmod(0o600)
+    # #555 — set 0600 AT creation via os.open, not write_text + chmod after:
+    # the bearer token was briefly world-readable in the 0755 identity/ dir
+    # in the window before the chmod landed. O_NOFOLLOW refuses a planted
+    # symlink.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(token + "\n")
     tmp.replace(path)
 
 

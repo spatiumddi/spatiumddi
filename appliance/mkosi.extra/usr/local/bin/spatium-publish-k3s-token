@@ -25,18 +25,23 @@ DEADLINE=$(( $(date +%s) + 60 ))
 
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     if [ -r "$TOKEN_FILE" ]; then
-        tmp="$SIDECAR.new"
+        # #555 — write via a RANDOM-named temp (mktemp creates it fresh at
+        # 0600 and won't write through a symlink an attacker pre-planted at
+        # the predictable ``$SIDECAR.new`` name in the 1777 release-state
+        # dir — the token is cluster-admin-equivalent). The FINAL sidecar
+        # stays 0644 on purpose: the supervisor's unprivileged process user
+        # (uid 100 spatium, su-exec'd from root by the entrypoint) must read
+        # it through the release-state bind mount. A 0600-root sidecar is
+        # invisible to that user → read_k3s_join_token() returns None → the
+        # seed never reports its token → promote 409s. Same 0644 precedent
+        # as firstboot's /etc/spatiumddi/.env. Single-tenant box; the host
+        # filesystem is the trust boundary, not this mode.
+        tmp="$(mktemp "$SIDECAR.XXXXXX" 2>/dev/null)" || { sleep 3; continue; }
         if tr -d '\r\n' < "$TOKEN_FILE" > "$tmp" 2>/dev/null; then
-            # 0644 so the supervisor's unprivileged process user (uid 100
-            # spatium, su-exec'd from root by the entrypoint) can read it
-            # through the release-state bind mount. A 0600-root sidecar is
-            # invisible to that user → read_k3s_join_token() returns None →
-            # the seed never reports its token → promote 409s. Same 0644
-            # precedent as firstboot's /etc/spatiumddi/.env (also secrets
-            # the unprivileged supervisor must read). Single-tenant box;
-            # the host filesystem is the trust boundary, not this mode.
             chmod 0644 "$tmp"
             mv -f "$tmp" "$SIDECAR"
+        else
+            rm -f "$tmp"
         fi
         exit 0
     fi

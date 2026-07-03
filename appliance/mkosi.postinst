@@ -284,6 +284,11 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-ssh-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-resolved-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-resolved-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-resolved-reload.service"
+# #165 GUI timezone control — this runner shipped 0644 in git so its
+# ExecStart hit 203/EXEC and every tz change silently no-op'd (#550).
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-tz-reload"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-tz-reload.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-tz-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-verbose-boot-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-verbose-boot-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-verbose-boot-reload.service"

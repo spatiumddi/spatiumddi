@@ -10,10 +10,13 @@
 # Then `spatiumddi-slot-rollback.path` notices the file and runs this
 # script as root. It:
 #   1. Reads the trigger file (target slot, optional)
-#   2. Invokes /usr/local/bin/spatium-upgrade-slot commit [<slot>]
-#      which calls grub-set-default — durably flips saved_entry. The
+#   2. Invokes /usr/local/bin/spatium-upgrade-slot rollback  (no target
+#      → inactive slot) or `set-default <slot>` (explicit target), both
+#      of which call grub-set-default — durably flip saved_entry. The
 #      swap doesn't take effect until the operator reboots; the active
-#      slot keeps running until then.
+#      slot keeps running until then. (There is NO `commit` subcommand —
+#      the earlier version called one that argparse rejects, so every
+#      rollback failed, #551.)
 #   3. Renames the trigger to .done or .failed so the .path unit
 #      doesn't re-fire on the next watch.
 #
@@ -64,8 +67,13 @@ echo
 # Mark trigger as in-flight so the UI can show "applying" state.
 echo "in-flight $(date -Iseconds)" > "${TRIGGER}.state"
 
-COMMIT_ARGS=("commit")
-[ -n "$TARGET_SLOT" ] && COMMIT_ARGS+=("$TARGET_SLOT")
+# Map to the real subcommands: `rollback` targets the inactive slot with
+# no argument; `set-default <slot>` durably flips to an explicit slot.
+if [ -n "$TARGET_SLOT" ]; then
+    COMMIT_ARGS=("set-default" "$TARGET_SLOT")
+else
+    COMMIT_ARGS=("rollback")
+fi
 
 echo "  → /usr/local/bin/spatium-upgrade-slot ${COMMIT_ARGS[*]}"
 if /usr/local/bin/spatium-upgrade-slot "${COMMIT_ARGS[@]}"; then

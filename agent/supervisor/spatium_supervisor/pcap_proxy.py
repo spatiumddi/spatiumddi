@@ -70,6 +70,13 @@ import re  # noqa: E402
 
 _BPF_RE = re.compile(r"^[A-Za-z0-9_ .:\[\]()/&|!=<>+*x-]{0,1024}$")
 _IFACE_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,64}$")
+# #555 — capture_id becomes filesystem paths under _TRIGGER_DIR
+# (``{cid}.request`` / ``.pcap`` / ``.state`` / ``.cancel`` + a cleanup
+# glob), so it MUST be charset-validated like interface/bpf are — a value
+# with ``/`` or ``..`` would escape _TRIGGER_DIR. Normally a server-side
+# UUID, but a compromised/buggy control plane is exactly the threat model
+# the other validators already assume.
+_CAPTURE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
 class PcapValidationError(ValueError):
@@ -77,6 +84,9 @@ class PcapValidationError(ValueError):
 
 
 def _validate(cmd: dict[str, Any]) -> dict[str, Any]:
+    capture_id = str(cmd.get("capture_id") or "")
+    if not _CAPTURE_ID_RE.match(capture_id):
+        raise PcapValidationError(f"invalid capture_id {capture_id!r}")
     iface = (cmd.get("interface") or "any").strip() or "any"
     if not _IFACE_RE.match(iface):
         raise PcapValidationError(f"invalid interface {iface!r}")
@@ -87,7 +97,7 @@ def _validate(cmd: dict[str, Any]) -> dict[str, Any]:
             raise PcapValidationError("invalid BPF filter")
         bpf = bpf or None
     return {
-        "capture_id": str(cmd["capture_id"]),
+        "capture_id": capture_id,
         "interface": iface,
         "bpf_filter": bpf,
         "snaplen": int(cmd.get("snaplen") or 256),

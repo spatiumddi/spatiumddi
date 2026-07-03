@@ -6,6 +6,16 @@
         appliance-fetch-k3s appliance-bake-chart appliance-bake-control-chart \
         appliance-bake-metallb-chart
 
+# #553 — the appliance ISO targets list their fetch/bake steps as
+# independent prerequisites with no inter-dependencies. Under ``make -j``
+# mkosi's ``appliance`` recipe reads mkosi.extra/ while the bake targets
+# are still populating it → the ISO ships without k3s / chart / images,
+# and ``appliance-iso`` / ``appliance-slot-image`` can hit "no raw image
+# found" before the raw exists. On GNU Make 4.4+ this scopes serialisation
+# to just these targets' prerequisites; on older make the target list is
+# ignored and it applies globally — either way the race is gone.
+.NOTPARALLEL: appliance-dev-iso appliance-baked-iso appliance-iso appliance-slot-image
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 COMPOSE        = docker compose
 COMPOSE_DEV    = docker compose -f docker-compose.yml -f docker-compose.dev.yml
@@ -350,8 +360,13 @@ K3S_VERSION ?= v1.35.6+k3s1
 # never reaches github.com on first boot. Idempotent (cache-stamped
 # against K3S_VERSION). Runs ahead of ``appliance-bake-images`` in the
 # composed targets so the mkosi build sees both image sets.
+# #553 — pin ARCH to the IMAGE arch, not the build-host arch. fetch-k3s.sh
+# defaults ARCH to `uname -m`, but mkosi.conf hardcodes Architecture=x86-64;
+# on an arm64 build host that baked the -arm64 k3s binary + airgap tarball
+# into an amd64 rootfs (won't exec / won't import). Keep in lock-step with
+# mkosi.conf's Architecture.
 appliance-fetch-k3s:
-	@K3S_VERSION="$(K3S_VERSION)" bash $(APPLIANCE_DIR)/scripts/fetch-k3s.sh
+	@K3S_VERSION="$(K3S_VERSION)" ARCH=x86_64 bash $(APPLIANCE_DIR)/scripts/fetch-k3s.sh
 
 # Issue #183 Phase 3 — chart bake. Packages
 # charts/spatiumddi-appliance/ into a stable tgz at

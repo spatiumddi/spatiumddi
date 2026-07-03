@@ -112,7 +112,11 @@ echo "→ Kernel version: $KVER"
 # update-initramfs -c -k <ver> creates /boot/initrd.img-<ver> using
 # every initramfs-tools hook now present in the rootfs (including
 # /usr/share/initramfs-tools/scripts/live from the live-boot package).
-chroot "$MOUNT_DIR" update-initramfs -c -k "$KVER" 2>&1 | grep -vE "^(I:|W: Possible missing firmware)" | tail -10
+# #553 — trailing ``|| true``: under ``set -o pipefail`` the ``grep -vE``
+# returns 1 when it filters EVERY line (all output was I:/firmware noise),
+# which would abort a step that actually succeeded. The real
+# success/failure check is the initrd.img existence test just below.
+chroot "$MOUNT_DIR" update-initramfs -c -k "$KVER" 2>&1 | grep -vE "^(I:|W: Possible missing firmware)" | tail -10 || true
 
 if [ ! -f "$MOUNT_DIR/boot/initrd.img-$KVER" ]; then
     echo "update-initramfs did not produce /boot/initrd.img-$KVER" >&2

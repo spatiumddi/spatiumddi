@@ -419,7 +419,15 @@ def _reap_stale_inflight(
 
 
 _TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pending")
-_REBOOT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/reboot-pending")
+# #553 — the FLEET reboot trigger has its own filename, distinct from the
+# web-UI local-reboot trigger (``reboot-pending``, handled by
+# spatiumddi-reboot.{path,service}). Previously both wrote ``reboot-pending``
+# so both .path units fired: the agent runner (5 s) won while the web-UI
+# service's un-``-``-prefixed mv failed on the already-renamed file, ending
+# ``failed`` on every reboot. Separate filenames = one runner per trigger.
+_REBOOT_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/reboot-pending-fleet"
+)
 # Issue #386 Part B — fire-once marker. Records the last
 # ``desired_slot_image_url`` the supervisor wrote a trigger for, so a
 # failed apply (which renames the trigger to ``.failed.<ts>`` and would
@@ -1376,6 +1384,13 @@ def maybe_fire_cluster_join(
         return False
     if not server_url or not join_token:
         return False
+    # #555 — the payload is line-based (marker / server_url / join_token);
+    # a newline in either operator-influenced field would shift the lines
+    # the host runner parses. Reject control chars outright rather than
+    # smuggle a second directive into the trigger.
+    if any(c in server_url or c in join_token for c in ("\n", "\r")):
+        log.warning("supervisor.cluster_join.rejected_control_char_in_payload")
+        return False
     if _CLUSTER_JOIN_TRIGGER_FILE.exists():
         return False
     try:
@@ -1457,6 +1472,11 @@ def maybe_fire_cluster_restore(desired_restore_snapshot: str | None) -> bool:
     if detect_deployment_kind() != "appliance":
         return False
     if not desired_restore_snapshot:
+        return False
+    # #555 — line-based payload (marker / snapshot name); reject control
+    # chars so a newline can't smuggle a second directive to the runner.
+    if any(c in desired_restore_snapshot for c in ("\n", "\r")):
+        log.warning("supervisor.cluster_restore.rejected_control_char_in_snapshot")
         return False
     if _CLUSTER_RESTORE_TRIGGER_FILE.exists():
         return False

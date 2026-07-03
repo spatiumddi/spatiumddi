@@ -31,6 +31,11 @@ set -u
 
 PCAP_DIR=/var/lib/spatiumddi/release-state/pcap
 IFACE_RE='^[A-Za-z0-9_.:@-]{1,64}$'
+# #555 — capture_id becomes $PCAP_DIR/$cid.{pcap,cancel,state}; a value
+# with ``/`` or ``..`` would escape PCAP_DIR. Validate the charset here too
+# (the supervisor validates before writing the request, but this runner is
+# the authoritative host-side gate).
+CID_RE='^[A-Za-z0-9._-]{1,128}$'
 # The BPF filter is charset-validated upstream (control plane + supervisor)
 # and passed to tcpdump as a single quoted argv element here — never eval'd
 # or re-split — so it needs no re-validation in the runner.
@@ -82,6 +87,11 @@ while IFS= read -r line; do
 done < "$running"
 
 [ -z "$cid" ] && { rm -f "$running"; exit 0; }
+# Reject a traversal-bearing capture_id before it's used to build paths.
+if ! [[ "$cid" =~ $CID_RE ]]; then
+  rm -f "$running"
+  exit 0
+fi
 pcap="$PCAP_DIR/$cid.pcap"
 cancel="$PCAP_DIR/$cid.cancel"
 write_state "$cid" starting "" 0 ""

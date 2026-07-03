@@ -58,6 +58,15 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3 scripts/lint_migrations.py
 
+      # Guards the appliance host-side runner scripts (issues #550/#553):
+      # every systemd ExecStart runner must be executable in the built
+      # image (git +x OR chmod'd in mkosi.postinst) and bash -n clean.
+      # Catches the class of bug where a shipped feature is dead because
+      # its runner hit 203/EXEC. stdlib-only; runs from repo root.
+      - name: Appliance runner linter
+        working-directory: ${{ github.workspace }}
+        run: python3 scripts/lint_appliance_runners.py
+
   # The ~1900-test suite is DB-bound, so we fan it out across 4 parallel
   # jobs (free concurrent runners) via pytest-split; each job still runs
   # ``-n auto`` (4 xdist workers on a 4-vCPU runner) → ~16-way parallelism
