@@ -28,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
@@ -38,6 +38,11 @@ from app.models.ipam import Subnet
 from app.services.ipam.discovery import reconcile_subnet, sweep_subnet
 
 logger = structlog.get_logger(__name__)
+
+# Namespace for the per-subnet discovery advisory lock (#515). The second key
+# is hashtext(subnet_id); this int just separates the keyspace from any other
+# two-int advisory lock in the app.
+_DISCOVERY_LOCK_NS = 0x1DA_D15C  # "IPAM DISC"
 
 
 async def _run_subnet_discovery_async(subnet_id_str: str) -> dict[str, Any]:
@@ -49,6 +54,20 @@ async def _run_subnet_discovery_async(subnet_id_str: str) -> dict[str, Any]:
         return {"status": "skipped", "reason": "bad_subnet_id"}
     try:
         async with factory() as db:
+            # Per-subnet session advisory lock: the dispatcher gates on
+            # last_discovery_at, which is only stamped at completion, so a sweep
+            # slower than the 60s beat tick gets re-dispatched while still
+            # running — two runs then race to insert the same discovered IP and
+            # collide on uq_ip_address_subnet_address, aborting one whole commit.
+            # try-lock and bow out if another run holds it (#515). Released when
+            # engine.dispose() closes the connection in the finally below.
+            locked = await db.scalar(
+                text("SELECT pg_try_advisory_lock(:ns, hashtext(:sid))"),
+                {"ns": _DISCOVERY_LOCK_NS, "sid": subnet_id_str},
+            )
+            if not locked:
+                logger.info("ipam.discovery.already_running", subnet_id=subnet_id_str)
+                return {"status": "skipped", "reason": "already_running"}
             # Subnet.id is UUID(as_uuid=True) — pass a real UUID, not the
             # raw string, so the bind is unambiguous on asyncpg/psycopg
             # (matches the convention in the other Celery tasks).

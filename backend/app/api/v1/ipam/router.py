@@ -28,6 +28,7 @@ from app.core.permissions import (
     user_has_permission,
 )
 from app.models.audit import AuditLog
+from app.models.auth import User
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import (
@@ -103,6 +104,22 @@ router = APIRouter(
         )
     ]
 )
+
+
+def _require_type_write(current_user: User, resource_type: str) -> None:
+    """Per-type inline gate for the structural IPAM handlers (space/block/subnet
+    create + update). The router-level gate admits an any-of grant over the
+    whole IPAM surface — including peripheral types like ``nat_mapping`` and
+    ``custom_field`` — so without this a ``write:nat_mapping`` grant could
+    create or mutate core structure it holds no write on (#508). Superadmin and
+    wildcard grants pass via ``user_has_permission``."""
+    if not user_has_permission(current_user, "write", resource_type):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Permission denied: need 'write' on '{resource_type}'",
+        )
+
+
 router.include_router(io_router)
 
 # NAT mappings — operator-curated metadata cross-referenced from IPAM
@@ -2507,6 +2524,7 @@ async def list_spaces(
 
 @router.post("/spaces", response_model=IPSpaceResponse, status_code=status.HTTP_201_CREATED)
 async def create_space(body: IPSpaceCreate, current_user: CurrentUser, db: DB) -> IPSpace:
+    _require_type_write(current_user, "ip_space")
     # Pre-check the unique-name constraint so we can return a clean 409
     # instead of letting the DB raise an IntegrityError (→ 500).
     existing = await db.execute(select(IPSpace).where(IPSpace.name == body.name))
@@ -2566,6 +2584,7 @@ async def get_space(space_id: uuid.UUID, current_user: CurrentUser, db: DB) -> I
 async def update_space(
     space_id: uuid.UUID, body: IPSpaceUpdate, current_user: CurrentUser, db: DB
 ) -> IPSpace:
+    _require_type_write(current_user, "ip_space")
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
@@ -2817,6 +2836,7 @@ async def list_blocks(
 
 @router.post("/blocks", response_model=IPBlockResponse, status_code=status.HTTP_201_CREATED)
 async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -> dict[str, Any]:
+    _require_type_write(current_user, "ip_block")
     # Verify space exists
     if await db.get(IPSpace, body.space_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
@@ -2984,6 +3004,7 @@ async def get_block(block_id: uuid.UUID, current_user: CurrentUser, db: DB) -> d
 async def update_block(
     block_id: uuid.UUID, body: IPBlockUpdate, current_user: CurrentUser, db: DB
 ) -> dict[str, Any]:
+    _require_type_write(current_user, "ip_block")
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
@@ -3725,6 +3746,7 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
             status_code=status.HTTP_403_FORBIDDEN,
             detail="API token is bound to a specific subnet and cannot create new subnets",
         )
+    _require_type_write(current_user, "subnet")
     if await db.get(IPSpace, body.space_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
@@ -3846,7 +3868,16 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     # doesn't apply.
     auto_created: list[str] = []
     is_v6 = isinstance(net, ipaddress.IPv6Network)
-    if net.prefixlen < 31 and not body.skip_auto_addresses and subnet_kind != "multicast":
+    # Threshold is version-aware: a v4 /31+/32 has no network/broadcast concept
+    # (RFC 3021), and the v6 analogue is /127+/128. The old flat ``< 31`` was v4
+    # logic, so EVERY realistic v6 subnet (/48, /64, /112) fell through and got
+    # no network/gateway pseudo-rows despite the branch's IPv6 handling (#506).
+    placeholder_threshold = 127 if is_v6 else 31
+    if (
+        net.prefixlen < placeholder_threshold
+        and not body.skip_auto_addresses
+        and subnet_kind != "multicast"
+    ):
         # Network address (e.g. 10.0.1.0 / 2001:db8::)
         db.add(
             IPAddress(
@@ -4391,6 +4422,18 @@ async def get_effective_subnet_dns(
         if current.parent_block_id:
             current = await db.get(IPBlock, current.parent_block_id)
         else:
+            # Reached the root block — fall through to the space, mirroring
+            # _resolve_effective_dns (the actual record-routing path). Without
+            # this the endpoint returned empty while allocations still
+            # published into the space's zone, so the UI showed "no DNS" (#507).
+            space = await db.get(IPSpace, current.space_id)
+            if space is not None:
+                return EffectiveDnsResponse(
+                    dns_group_ids=space.dns_group_ids or [],
+                    dns_zone_id=space.dns_zone_id,
+                    dns_additional_zone_ids=space.dns_additional_zone_ids or [],
+                    inherited_from_block_id=None,
+                )
             current = None
 
     return EffectiveDnsResponse(
@@ -4453,6 +4496,7 @@ async def update_subnet(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(current_user, subnet_id)
+    _require_type_write(current_user, "subnet")
 
     old_block_id = subnet.block_id
 
@@ -4580,8 +4624,10 @@ async def update_subnet(
     # operator can't accidentally stamp placeholder rows on them.
     if body.manage_auto_addresses is not None and not subnet.kubernetes_semantics:
         net = _parse_network(str(subnet.network))
-        if net.prefixlen < 31:
-            is_v6 = isinstance(net, ipaddress.IPv6Network)
+        # Version-aware threshold (see create_subnet, #506): v4 /31+/32 and v6
+        # /127+/128 have no network/broadcast pseudo-rows.
+        is_v6 = isinstance(net, ipaddress.IPv6Network)
+        if net.prefixlen < (127 if is_v6 else 31):
             auto_statuses = {"network", "broadcast"}
             existing_result = await db.execute(
                 select(IPAddress).where(
@@ -8445,6 +8491,8 @@ async def bulk_edit_addresses(
     not_found = [i for i in body.ip_ids if i not in found_ids]
     updated = 0
     skipped: list[uuid.UUID] = []
+    # Subnets whose utilization must be recomputed after the batch (#509).
+    touched_subnets: set[uuid.UUID] = set()
 
     tags_patch = body.changes.tags
     cf_patch = body.changes.custom_fields
@@ -8521,6 +8569,17 @@ async def bulk_edit_addresses(
                 old[k] = getattr(ip, k, None)
             for k, v in scalar_changes.items():
                 setattr(ip, k, v)
+            # Mirror single-edit (#509): moving off "reserved" clears the TTL so
+            # the reservation sweeper can't later flip the row unexpectedly.
+            if "status" in scalar_changes and ip.status != "reserved":
+                ip.reserved_until = None
+            # A status change alters the allocated/available split, so the
+            # subnet (and its block rollup) utilization must be recomputed —
+            # single-edit does this; bulk-edit didn't, leaving bars + the
+            # dashboard heatmap stale until some other mutation touched the
+            # subnet (#509).
+            if "status" in scalar_changes:
+                touched_subnets.add(ip.subnet_id)
 
             if tags_patch is not None:
                 merged = dict(ip.tags or {})
@@ -8565,6 +8624,14 @@ async def bulk_edit_addresses(
                 )
             )
             updated += 1
+
+    # Recompute utilization for every subnet whose status mix changed, plus
+    # the block rollups above them (#509).
+    for sid in touched_subnets:
+        await _update_utilization(db, sid)
+        sn = subnet_cache.get(sid) or await db.get(Subnet, sid)
+        if sn is not None and sn.block_id is not None:
+            await _update_block_utilization(db, sn.block_id)
 
     await db.commit()
     logger.info(

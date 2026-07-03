@@ -21,6 +21,7 @@ auto-created as a parent (because subnets require ``block_id``).
 from __future__ import annotations
 
 import ipaddress
+import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -32,7 +33,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import AuditLog
-from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.ipam import IP_STATUSES, IPAddress, IPBlock, IPSpace, Subnet
+from app.services.ipam.resize import _total_ips
 from app.services.ipam_io.parser import ParsedPayload
 
 logger = structlog.get_logger(__name__)
@@ -375,19 +377,30 @@ async def commit_import(
     existing_blocks = await _load_existing_blocks(db, space.id)
     existing_subnets = await _load_existing_subnets(db, space.id)
 
-    # Pre-flight: if fail-strategy and any subnet conflicts, bail out early.
+    # Pre-flight: if fail-strategy and any subnet conflicts, bail out early —
+    # BEFORE the mutation loop runs any side effects. Catches both pre-existing
+    # rows and intra-payload duplicates; without the latter, the second copy of
+    # a duplicated row hit the in-loop 409 only after the first was created and
+    # its DNS records pushed live (#504).
     if strategy == "fail":
-        conflicts = [
-            row.get("network")
-            for row in payload.subnets
-            if isinstance(row.get("network"), str)
-            and _safe_canon(row["network"]) in existing_subnets
-        ]
+        conflicts: list[str] = []
+        seen_canon: set[str] = set()
+        for row in payload.subnets:
+            net = row.get("network")
+            if not isinstance(net, str):
+                continue
+            canon = _safe_canon(net)
+            if canon in existing_subnets:
+                conflicts.append(net)
+            elif canon in seen_canon:
+                conflicts.append(net)
+            else:
+                seen_canon.add(canon)
         if conflicts:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"{len(conflicts)} subnet(s) already exist; "
-                "re-run with strategy='skip' or 'overwrite'",
+                detail=f"{len(conflicts)} subnet(s) conflict (already exist or duplicated "
+                "in the file); re-run with strategy='skip' or 'overwrite'",
             )
 
     for row in payload.subnets:
@@ -407,6 +420,21 @@ async def commit_import(
         vlan_id = row.get("vlan_id")
         vxlan_id = row.get("vxlan_id")
         gateway = row.get("gateway") or None
+        # Validate the gateway before it reaches the INET column — a malformed
+        # literal would otherwise raise a DataError → 500 mid-commit (#504) —
+        # and enforce the same in-subnet / same-family invariant create_subnet
+        # applies, so the importer can't land a Subnet later endpoints assume
+        # is valid (Copilot review of #504).
+        if gateway is not None:
+            try:
+                gw_addr = ipaddress.ip_address(str(gateway).strip())
+            except ValueError:
+                result_obj.errors.append(f"{canonical}: invalid gateway {gateway!r}")
+                continue
+            if gw_addr not in subnet_net:
+                result_obj.errors.append(f"{canonical}: gateway {gateway} is not within the subnet")
+                continue
+            gateway = str(gw_addr)
         custom_fields = row.get("custom_fields") or {}
 
         existing = existing_subnets.get(canonical)
@@ -514,9 +542,10 @@ async def commit_import(
                 )
             )
 
-        total = (
-            subnet_net.num_addresses if subnet_net.prefixlen >= 31 else subnet_net.num_addresses - 2
-        )
+        # Use the shared clamped helper (mirrors the router / resize paths):
+        # a raw ``num_addresses`` for an IPv6 /64 is 2**64, which overflows the
+        # BIGINT column and 500s the whole commit (#503).
+        total = _total_ips(subnet_net)
         subnet = Subnet(
             space_id=space.id,
             block_id=parent.id,
@@ -581,8 +610,18 @@ def _safe_canon(value: str) -> str:
 # hides user mistakes.
 
 
-_VALID_ADDRESS_STATUSES = frozenset(
-    {"allocated", "reserved", "dhcp", "static_dhcp", "deprecated", "orphan"}
+# Accept every status the exporter can emit so a subnet's own export
+# round-trips cleanly (#504): operator-settable + integration-owned (via
+# IP_STATUSES) plus the network/broadcast placeholders. Rows match on
+# (subnet, address), so re-importing an integration/placeholder row updates
+# the existing row rather than creating a bogus duplicate.
+_VALID_ADDRESS_STATUSES = IP_STATUSES | frozenset({"network", "broadcast"})
+
+# Common MAC notations Postgres MACADDR accepts: 6 hex pairs (``:``/``-``/bare)
+# or 3 hex quads (Cisco ``aabb.ccdd.eeff``). Validate before flush so a
+# malformed value is an error row, not a DataError → 500 (#504).
+_MAC_RE = re.compile(
+    r"^[0-9A-Fa-f]{2}([:-]?[0-9A-Fa-f]{2}){5}$|^[0-9A-Fa-f]{4}(\.[0-9A-Fa-f]{4}){2}$"
 )
 
 
@@ -660,6 +699,8 @@ def _row_address_fields(
     if (m := row.get("mac_address")) is not None:
         m = str(m).strip() or None
         if m:
+            if not _MAC_RE.match(m):
+                return None, {}, f"Invalid MAC address {m!r}"
             fields["mac_address"] = m
     if (d := row.get("description")) is not None:
         d = str(d).strip()
@@ -826,20 +867,24 @@ async def commit_address_import(
     # permission-blocked import can't masquerade as a generic 0-created
     # success (#7).
     if strategy == "fail":
+        seen_addr: set[str] = set()
         for row in payload.addresses:
             canonical, _, err = _row_address_fields(row)
             if err or canonical is None:
                 continue
             if can_write_ip is not None and not can_write_ip(canonical):
                 continue
-            if canonical in existing:
+            # Reject pre-existing AND intra-payload duplicates up front, before
+            # the mutation loop runs any create + DNS side effect (#504).
+            if canonical in existing or canonical in seen_addr:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=(
-                        f"{canonical} already exists in {subnet.network}; "
-                        "re-run with strategy='skip' or 'overwrite'"
+                        f"{canonical} already exists in {subnet.network} or is duplicated "
+                        "in the file; re-run with strategy='skip' or 'overwrite'"
                     ),
                 )
+            seen_addr.add(canonical)
 
     allocated_delta = 0
     for row in payload.addresses:

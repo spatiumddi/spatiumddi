@@ -106,6 +106,28 @@ def _row_to_subnet(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+_ADDRESS_COLUMN_KEYS = ("address", "ip", "ip_address")
+
+
+def _norm_header(h: Any) -> str:
+    """Canonicalise a header/key: lowercase + spaces → underscores. So ``IP``,
+    ``ip`` and ``IP Address`` all collapse to a recognised column name. The
+    row-coercers already normalise this way; detection + presence checks must
+    match or a non-lowercase header silently imports zero rows (#504)."""
+    return str(h).strip().lower().replace(" ", "_")
+
+
+def _row_has_address(row: dict[str, Any]) -> bool:
+    """True if any address column (case/space-insensitive) has a non-empty
+    value — replaces exact-case ``row.get("ip")`` checks that missed ``IP``."""
+    for raw_key, value in row.items():
+        if raw_key is None:
+            continue
+        if _norm_header(raw_key) in _ADDRESS_COLUMN_KEYS and value not in (None, ""):
+            return True
+    return False
+
+
 def _row_to_address(row: dict[str, Any]) -> dict[str, Any]:
     """Coerce a generic row dict into an IPAddress dict with custom_fields.
 
@@ -153,10 +175,10 @@ def _csv_is_address_payload(headers: list[str]) -> bool:
     ``network`` column wins and the row is treated as a subnet) — the
     two formats shouldn't mix in a single file.
     """
-    norm = {h.strip().lower() for h in headers if h}
+    norm = {_norm_header(h) for h in headers if h}
     if "network" in norm:
         return False
-    return bool({"address", "ip", "ip_address"} & norm)
+    return bool(set(_ADDRESS_COLUMN_KEYS) & norm)
 
 
 def parse_csv(data: bytes) -> ParsedPayload:
@@ -168,7 +190,7 @@ def parse_csv(data: bytes) -> ParsedPayload:
         if not any((v or "").strip() for v in row.values() if isinstance(v, str)):
             continue
         if is_addresses:
-            if not any(row.get(k) for k in ("address", "ip", "ip_address")):
+            if not _row_has_address(row):
                 continue
             payload.addresses.append(_row_to_address(row))
         else:
@@ -193,7 +215,7 @@ def parse_json(data: bytes) -> ParsedPayload:
         # and route accordingly. Mixed lists aren't supported (don't do that).
         first = next((x for x in decoded if isinstance(x, dict)), None)
         is_addresses = first is not None and any(
-            k.lower() in ("address", "ip", "ip_address") for k in first.keys()
+            _norm_header(k) in _ADDRESS_COLUMN_KEYS for k in first.keys()
         )
         for item in decoded:
             if not isinstance(item, dict):
@@ -280,13 +302,13 @@ def parse_xlsx(data: bytes) -> ParsedPayload:
         ws = wb[first_sheet]
         headers_iter = ws.iter_rows(min_row=1, max_row=1, values_only=True)
         first_row = next(iter(headers_iter), ())
-        headers_norm = {(str(h).strip().lower() if h is not None else "") for h in first_row}
-        is_addresses = bool({"address", "ip", "ip_address"} & headers_norm) and (
+        headers_norm = {(_norm_header(h) if h is not None else "") for h in first_row}
+        is_addresses = bool(set(_ADDRESS_COLUMN_KEYS) & headers_norm) and (
             "network" not in headers_norm
         )
         for row in _sheet_rows(first_sheet):
             if is_addresses:
-                if not any(row.get(k) for k in ("address", "ip", "ip_address")):
+                if not _row_has_address(row):
                     continue
                 payload.addresses.append(_row_to_address(row))
             else:
@@ -296,7 +318,7 @@ def parse_xlsx(data: bytes) -> ParsedPayload:
 
     if "addresses" in wb.sheetnames:
         for row in _sheet_rows("addresses"):
-            if not any(row.get(k) for k in ("address", "ip", "ip_address")):
+            if not _row_has_address(row):
                 continue
             payload.addresses.append(_row_to_address(row))
 

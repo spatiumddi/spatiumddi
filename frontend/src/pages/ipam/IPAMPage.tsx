@@ -5397,7 +5397,12 @@ function SubnetDetail({
                             a.status !== "broadcast" &&
                             !a.auto_from_lease &&
                             // Never select a row the table is currently hiding.
-                            !(hideReserved && isPaddingRow(a)),
+                            !(hideReserved && isPaddingRow(a)) &&
+                            // Only rows the caller can actually write — matches
+                            // the per-row checkbox gate so a delegated operator
+                            // (address sets, #103) can't select rows a bulk op
+                            // would then partially 403 (#514).
+                            permitsWriteIp(a.address),
                         );
                         const allSelected =
                           selectable.length > 0 &&
@@ -5809,7 +5814,11 @@ function SubnetDetail({
                                           if (
                                             a.status === "network" ||
                                             a.status === "broadcast" ||
-                                            a.auto_from_lease
+                                            a.auto_from_lease ||
+                                            // Skip rows the caller can't write so
+                                            // a shift-range can't sweep in
+                                            // un-writable rows (#514).
+                                            !permitsWriteIp(a.address)
                                           )
                                             continue;
                                           ids.push(a.id);
@@ -9863,6 +9872,9 @@ function BulkDeleteAddressesModal({
     mutationFn: () => ipamApi.bulkDeleteAddresses({ ip_ids: ipIds, permanent }),
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+      // Refresh subnet utilization (tree dot + space-table "Used IPs") the way
+      // the single-delete path does — bulk-delete was missing this (#509).
+      qc.invalidateQueries({ queryKey: ["subnets"] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
@@ -14686,6 +14698,18 @@ export function IPAMPage() {
     queryFn: () => ipamApi.listSubnets({ space_id: activeSpaceId }),
     enabled: !!activeSpaceId,
   });
+
+  // Keep the subnet-detail header in sync with the refetched list.
+  // selectedSubnet is a snapshot set only on click/edit, so IP mutations that
+  // invalidate ["subnets"] refreshed the tree but left the header's
+  // "Allocated N / M" + utilization bar (and the Ask-AI context) stale (#509).
+  useEffect(() => {
+    if (!selectedSubnet || !detailSubnets) return;
+    const fresh = detailSubnets.find((s) => s.id === selectedSubnet.id);
+    if (fresh && JSON.stringify(fresh) !== JSON.stringify(selectedSubnet)) {
+      setSelectedSubnet(fresh);
+    }
+  }, [detailSubnets, selectedSubnet]);
 
   function selectSubnet(subnet: Subnet | null) {
     setSelectedSubnet(subnet);
