@@ -48,7 +48,7 @@ def _node(name: str = "ddi1", *, ready: bool = True, cpu: str = "4", mem: str = 
                 "kubeletVersion": "v1.35.6+k3s1",
                 "osImage": "Debian GNU/Linux 13 (trixie)",
                 "kernelVersion": "6.12.90",
-                "containerRuntimeVersion": "containerd://2.2.5-k3s2", 
+                "containerRuntimeVersion": "containerd://2.2.5-k3s2",
                 "architecture": "amd64",
             },
             "capacity": {"cpu": cpu, "memory": mem, "pods": "110"},
