@@ -913,6 +913,7 @@ def _write_owner_only(tmp: Path, payload: str) -> None:
     try:
         os.unlink(tmp)  # drop our own stale temp from a crashed prior run
     except FileNotFoundError:
+        # No stale temp to remove — the normal case; nothing to clean up.
         pass
     fd = os.open(
         tmp,

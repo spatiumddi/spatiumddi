@@ -41,6 +41,13 @@ _EXECSTART_RE = re.compile(
 )
 
 
+# Binaries fetched at build time by appliance/scripts/fetch-k3s.sh and
+# dropped into the rootfs (k3s + its kubectl/crictl/ctr symlinks). They are
+# gitignored, so they are legitimately absent from the source checkout —
+# skip them rather than flag them as missing runners.
+_BUILD_FETCHED = frozenset({"k3s", "kubectl", "crictl", "ctr"})
+
+
 def _postinst_chmodded() -> set[str]:
     if not POSTINST.is_file():
         return set()
@@ -70,8 +77,11 @@ def main() -> int:
 
     chmodded = _postinst_chmodded()
 
-    # (1) + (2) — chmod-referenced runners must exist.
+    # (1) + (2) — chmod-referenced runners must exist (build-fetched
+    # binaries excepted; they aren't in the source checkout).
     for name in sorted(chmodded):
+        if name in _BUILD_FETCHED:
+            continue
         if not (BIN_DIR / name).is_file():
             errors.append(
                 f"mkosi.postinst chmods 'usr/local/bin/{name}' but no such "
@@ -80,6 +90,8 @@ def main() -> int:
 
     # (1) — every unit ExecStart runner is executable in the built image.
     for name, unit in sorted(_execstart_runners().items()):
+        if name in _BUILD_FETCHED:
+            continue
         src = BIN_DIR / name
         if not src.is_file():
             errors.append(
@@ -89,12 +101,12 @@ def main() -> int:
             continue
         git_exec = os.access(src, os.X_OK)
         if not git_exec and name not in chmodded:
+            fix = f'chmod 0755 "$BUILDROOT/usr/local/bin/{name}"'
             errors.append(
                 f"{unit}: ExecStart runner '{name}' is NOT executable in git "
                 f"AND is NOT chmod'd 0755 in mkosi.postinst — its ExecStart "
-                f"will hit 203/EXEC in the built image. Add a 'chmod 0755 "
-                f'"$BUILDROOT/usr/local/bin/{name}"\' line to mkosi.postinst '
-                f"(and 'git update-index --chmod=+x' the file)."
+                f"will hit 203/EXEC in the built image. Add a `{fix}` line to "
+                f"mkosi.postinst (and `git update-index --chmod=+x` the file)."
             )
 
     # (3) — bash -n on every bash runner.

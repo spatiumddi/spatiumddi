@@ -3021,6 +3021,10 @@ function AddAddressModal({
   const [pendingWarnings, setPendingWarnings] = useState<
     CollisionWarning[] | null
   >(null);
+  // #516 — set once the IP row is created but the chained DHCP reservation
+  // failed (partial success). The row already exists, so re-submitting would
+  // collide; the footer switches from "Allocate" to "Close".
+  const [addressCreated, setAddressCreated] = useState(false);
   const needsDhcpScope = ipStatus === "dhcp" || ipStatus === "static_dhcp";
 
   // Scopes load unconditionally (cheap) so we can do the dynamic-pool
@@ -3213,6 +3217,7 @@ function AddAddressModal({
       if (staticError) {
         // Address created, reservation failed — keep the modal open so the
         // operator sees this; the row already exists (don't re-submit).
+        setAddressCreated(true);
         setError(
           `Address allocated, but the DHCP reservation failed: ${staticError}. ` +
             "The address row was created — close this and edit the row to retry the reservation.",
@@ -3642,26 +3647,39 @@ function AddAddressModal({
           <CollisionWarningBanner warnings={pendingWarnings} />
         )}
         <div className="flex justify-end gap-2 pt-2">
-          <button
-            onClick={onClose}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => {
-              setError(null);
-              mutation.mutate(pendingWarnings != null);
-            }}
-            disabled={!canSubmit || mutation.isPending}
-            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            {mutation.isPending
-              ? "Allocating…"
-              : pendingWarnings
-                ? "Allocate anyway"
-                : "Allocate"}
-          </button>
+          {addressCreated ? (
+            // Partial success — the IP row exists; only offer Close so the
+            // operator can't re-submit into a collision (#516).
+            <button
+              onClick={onClose}
+              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            >
+              Close
+            </button>
+          ) : (
+            <>
+              <button
+                onClick={onClose}
+                className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  setError(null);
+                  mutation.mutate(pendingWarnings != null);
+                }}
+                disabled={!canSubmit || mutation.isPending}
+                className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {mutation.isPending
+                  ? "Allocating…"
+                  : pendingWarnings
+                    ? "Allocate anyway"
+                    : "Allocate"}
+              </button>
+            </>
+          )}
         </div>
       </div>
     </Modal>
@@ -12935,7 +12953,9 @@ function cidrSize(network: string): number {
   // UsedIps whenever total_ips was null.
   const bits = network.includes(":") ? 128 : 32;
   const prefix = parseInt(network.split("/")[1] ?? String(bits));
-  if (Number.isNaN(prefix)) return 0;
+  // Clamp out-of-range prefixes (e.g. /33 on IPv4, /129 on IPv6) to 0 so a
+  // negative exponent can't feed a fractional "size" into UsedIps/UI.
+  if (Number.isNaN(prefix) || prefix < 0 || prefix > bits) return 0;
   return Math.pow(2, bits - prefix);
 }
 

@@ -484,6 +484,8 @@ def _parent_disk(part_dev: str) -> str:
         if first:
             return "/dev/" + first
     except (FileNotFoundError, OSError):
+        # lsblk missing or failed — deliberately fall through to the
+        # suffix-strip below, which needs no external tool.
         pass
     base = os.path.basename(part_dev)
     if re.search(r"\dp\d+$", base):  # nvme0n1p5 / mmcblk0p5 / loop0p1
