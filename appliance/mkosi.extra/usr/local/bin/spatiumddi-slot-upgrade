@@ -207,6 +207,19 @@ echo "  image:    $IMAGE_SRC"
 [ -n "$INSECURE" ] && echo "  insecure-tls: yes (self-served URL; bytes verified by hash)"
 echo
 
+# #551 — insecure-tls requires an out-of-band ``sha256=`` literal. A
+# ``checksum=`` sidecar is fetched over the SAME unverified channel, so it
+# is no protection (a MITM serves a matching image+sidecar). spatium-upgrade-
+# slot now rejects ``--insecure`` without ``--expected-sha256`` (exit 2);
+# catch it here with a clear message instead of a cryptic argparse abort.
+if [ -n "$INSECURE" ] && [ -z "$EXPECTED_SHA256" ]; then
+    echo "  ERROR: insecure-tls requires an out-of-band 'sha256=<hex>'"
+    echo "         directive — a 'checksum=' sidecar over the same"
+    echo "         unverified channel provides no real protection."
+    mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+    exit 1
+fi
+
 # Mark trigger as in-flight so the UI can show "applying" state. We
 # don't rename it (the .path unit fires on close-after-write, not on
 # every read) but we do touch a sibling marker + progress. From here on

@@ -407,7 +407,10 @@ export function IPDetailModal({
             <Field label="Forward DNS zone">
               {addr.forward_zone_id ? (
                 <span className="font-mono text-xs">
-                  {zoneNames[addr.forward_zone_id] ?? "—"}
+                  {/* #516 — zoneNameById is now supplied by the caller (it was
+                      previously never passed, so this always rendered "—").
+                      Fall back to the raw id if the map lacks the zone. */}
+                  {zoneNames[addr.forward_zone_id] ?? addr.forward_zone_id}
                 </span>
               ) : (
                 dash(null)
@@ -416,7 +419,7 @@ export function IPDetailModal({
             <Field label="Reverse DNS zone">
               {addr.reverse_zone_id ? (
                 <span className="font-mono text-xs">
-                  {zoneNames[addr.reverse_zone_id] ?? "—"}
+                  {zoneNames[addr.reverse_zone_id] ?? addr.reverse_zone_id}
                 </span>
               ) : (
                 dash(null)

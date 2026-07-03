@@ -6,9 +6,11 @@
 # Flow:
 #   1. Operator clicks Reboot in the OS Versions table → backend
 #      stamps ``reboot_requested=true`` on the agent's server row.
-#   2. ConfigBundle long-poll carries the field down → agent writes
-#      ``/var/lib/spatiumddi-host/release-state/reboot-pending`` via
-#      the bind-mounted release-state directory.
+#   2. ConfigBundle long-poll carries the field down → the supervisor
+#      writes ``/var/lib/spatiumddi-host/release-state/reboot-pending-fleet``
+#      via the bind-mounted release-state directory (#553 gave the fleet
+#      path its own filename so it no longer collides with the web-UI
+#      ``reboot-pending`` trigger).
 #   3. ``spatiumddi-reboot-agent.path`` notices the file and runs this
 #      script as root.
 #   4. Script:
@@ -25,7 +27,9 @@
 
 set -euo pipefail
 
-TRIGGER=/var/lib/spatiumddi/release-state/reboot-pending
+# #553 — fleet reboots use a DEDICATED trigger filename so this runner and
+# the web-UI spatiumddi-reboot.service don't both fire on a single write.
+TRIGGER=/var/lib/spatiumddi/release-state/reboot-pending-fleet
 LOG_DIR=/var/log/spatiumddi
 LOG="$LOG_DIR/reboot-agent.log"
 GRACE_SECONDS=5

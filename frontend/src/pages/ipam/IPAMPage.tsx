@@ -2817,11 +2817,13 @@ function CreateSubnetModal({
 // ─── Add Address Modal ────────────────────────────────────────────────────────
 
 const IP_STATUS_OPTIONS = [
+  "available",
   "allocated",
   "reserved",
   "dhcp",
   "static_dhcp",
   "deprecated",
+  "discovered",
 ] as const;
 
 // Double-click-to-change status badge on the IP table (sibling of
@@ -3019,6 +3021,10 @@ function AddAddressModal({
   const [pendingWarnings, setPendingWarnings] = useState<
     CollisionWarning[] | null
   >(null);
+  // #516 — set once the IP row is created but the chained DHCP reservation
+  // failed (partial success). The row already exists, so re-submitting would
+  // collide; the footer switches from "Allocate" to "Close".
+  const [addressCreated, setAddressCreated] = useState(false);
   const needsDhcpScope = ipStatus === "dhcp" || ipStatus === "static_dhcp";
 
   // Scopes load unconditionally (cheap) so we can do the dynamic-pool
@@ -3182,23 +3188,42 @@ function AddAddressModal({
       // into the DHCP side so the two stay in sync (the backend
       // `_upsert_ipam_for_static` helper will find the existing IPAM row and
       // just link / update it — no duplicate is created).
+      // #516 — the address IS already created at this point; a failing
+      // reservation must NOT surface as "Failed to allocate address" (the
+      // row exists, so re-submitting collides). Catch it separately and
+      // report it as a partial success instead.
+      let staticError: string | null = null;
       if (ipStatus === "static_dhcp" && dhcpScopeId && mac) {
-        await dhcpApi.createStatic(dhcpScopeId, {
-          ip_address: String(created.address),
-          mac_address: mac,
-          hostname: hostname || "",
-          description: description || "",
-        });
+        try {
+          await dhcpApi.createStatic(dhcpScopeId, {
+            ip_address: String(created.address),
+            mac_address: mac,
+            hostname: hostname || "",
+            description: description || "",
+          });
+        } catch (e) {
+          staticError = formatApiError(e, "DHCP reservation failed");
+        }
       }
-      return created;
+      return { created, staticError };
     },
-    onSuccess: () => {
+    onSuccess: ({ staticError }) => {
       qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
+      if (staticError) {
+        // Address created, reservation failed — keep the modal open so the
+        // operator sees this; the row already exists (don't re-submit).
+        setAddressCreated(true);
+        setError(
+          `Address allocated, but the DHCP reservation failed: ${staticError}. ` +
+            "The address row was created — close this and edit the row to retry the reservation.",
+        );
+        return;
+      }
       onClose();
     },
     onError: (err: unknown) => {
@@ -3622,26 +3647,39 @@ function AddAddressModal({
           <CollisionWarningBanner warnings={pendingWarnings} />
         )}
         <div className="flex justify-end gap-2 pt-2">
-          <button
-            onClick={onClose}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => {
-              setError(null);
-              mutation.mutate(pendingWarnings != null);
-            }}
-            disabled={!canSubmit || mutation.isPending}
-            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            {mutation.isPending
-              ? "Allocating…"
-              : pendingWarnings
-                ? "Allocate anyway"
-                : "Allocate"}
-          </button>
+          {addressCreated ? (
+            // Partial success — the IP row exists; only offer Close so the
+            // operator can't re-submit into a collision (#516).
+            <button
+              onClick={onClose}
+              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            >
+              Close
+            </button>
+          ) : (
+            <>
+              <button
+                onClick={onClose}
+                className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  setError(null);
+                  mutation.mutate(pendingWarnings != null);
+                }}
+                disabled={!canSubmit || mutation.isPending}
+                className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {mutation.isPending
+                  ? "Allocating…"
+                  : pendingWarnings
+                    ? "Allocate anyway"
+                    : "Allocate"}
+              </button>
+            </>
+          )}
         </div>
       </div>
     </Modal>
@@ -3718,13 +3756,11 @@ function SyncMenu({
   onSyncDhcp,
   onSyncAll,
   hasDhcp,
-  isPending,
 }: {
   onSyncDns: () => void;
   onSyncDhcp: () => void;
   onSyncAll: () => void;
   hasDhcp: boolean;
-  isPending: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -3747,11 +3783,10 @@ function SyncMenu({
     <div ref={ref} className="relative">
       <button
         onClick={() => setOpen((v) => !v)}
-        disabled={isPending}
         title="Sync IPAM with DNS and/or DHCP servers"
         className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
       >
-        <RefreshCw className={cn("h-3.5 w-3.5", isPending && "animate-spin")} />
+        <RefreshCw className="h-3.5 w-3.5" />
         Sync
         <ChevronDown className="h-3.5 w-3.5" />
       </button>
@@ -4335,6 +4370,27 @@ function SubnetDetail({
   onSubnetDeleted?: () => void;
 }) {
   const qc = useQueryClient();
+  // #516 — id→name map for the subnet's DNS zones so IPDetailModal can show
+  // real zone names instead of "—" (its zoneNameById prop was never passed).
+  const subnetDnsGroupIds = useMemo(
+    () => subnet.dns_group_ids ?? [],
+    [subnet.dns_group_ids],
+  );
+  const subnetZonesQuery = useQuery({
+    queryKey: ["dns-zones", "subnet-detail", subnet.id, subnetDnsGroupIds],
+    queryFn: async () => {
+      const lists = await Promise.all(
+        subnetDnsGroupIds.map((gid) => dnsApi.listZones(gid)),
+      );
+      return lists.flat();
+    },
+    enabled: subnetDnsGroupIds.length > 0,
+  });
+  const zoneNameById = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const z of subnetZonesQuery.data ?? []) m[z.id] = z.name;
+    return m;
+  }, [subnetZonesQuery.data]);
   const [showAddModal, setShowAddModal] = useState(false);
   // Optional seed for ``AddAddressModal`` — set when the operator clicks
   // a gap-marker row so the modal opens in manual mode constrained to
@@ -4816,6 +4872,9 @@ function SubnetDetail({
   const [confirmPurgeAddr, setConfirmPurgeAddr] = useState<IPAddress | null>(
     null,
   );
+  // #516 — surface delete/purge/restore failures (403/409/etc.) instead of
+  // silently swallowing them.
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const deleteAddr = useMutation({
     mutationFn: (id: string) => ipamApi.deleteAddress(id), // soft-delete → orphan
@@ -4827,6 +4886,8 @@ function SubnetDetail({
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
     },
+    onError: (e) =>
+      setActionError(formatApiError(e, "Failed to delete address.")),
   });
 
   const purgeAddr = useMutation({
@@ -4844,6 +4905,8 @@ function SubnetDetail({
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
     },
+    onError: (e) =>
+      setActionError(formatApiError(e, "Failed to purge address.")),
   });
 
   const restoreAddr = useMutation({
@@ -4856,6 +4919,8 @@ function SubnetDetail({
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
     },
+    onError: (e) =>
+      setActionError(formatApiError(e, "Failed to restore address.")),
   });
 
   // Non-editable statuses (infrastructure or orphaned addresses)
@@ -4864,6 +4929,18 @@ function SubnetDetail({
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
+      {actionError && (
+        <div className="flex items-start justify-between gap-3 border-b border-destructive/40 bg-destructive/5 px-6 py-2 text-xs text-destructive">
+          <span>{actionError}</span>
+          <button
+            type="button"
+            onClick={() => setActionError(null)}
+            className="shrink-0 font-medium hover:underline"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {/* Header */}
       <div className="border-b">
         {/* Top bar: breadcrumb + actions */}
@@ -4918,7 +4995,6 @@ function SubnetDetail({
             </HeaderButton>
             <SyncMenu
               hasDhcp={dhcpScopes.length > 0}
-              isPending={false}
               onSyncDns={() => setShowDnsSync(true)}
               onSyncDhcp={() => setShowDhcpSync(true)}
               onSyncAll={() => setShowSyncAll(true)}
@@ -6340,6 +6416,7 @@ function SubnetDetail({
         <IPDetailModal
           address={viewingAddress}
           subnet={subnet}
+          zoneNameById={zoneNameById}
           canEdit={
             !(
               viewingAddress.status === "network" ||
@@ -6472,34 +6549,30 @@ function DnsSyncModal({
         ? ipamApi.dnsSyncCommitBlock(scope.id, body)
         : ipamApi.dnsSyncCommitSpace(scope.id, body);
 
-  // Before we compute drift, make sure every subnet's reverse zone exists —
-  // otherwise "missing PTR" rows will show for subnets whose reverse zone
-  // hasn't been created yet, and the commit will fail. Backfill is
-  // idempotent, so it's safe to run on every modal open.
-  const [backfillDone, setBackfillDone] = useState(false);
+  // #516 — reverse (PTR) zones are backfilled as the FIRST step of Apply,
+  // NOT on modal open. Creating zones is a WRITE; firing it from a mount
+  // effect made this preview-then-commit surface mutate the moment it
+  // opened (surprising, and awkward with the #62 approvals story). The
+  // backfill is idempotent and still runs before the commit's PTR
+  // creation, so drift stays correct — it just happens on the operator's
+  // explicit Apply. "missing PTR" rows for a not-yet-created reverse zone
+  // are shown in the preview and created (zone + PTR) on commit.
+  const backfillFn =
+    scope.kind === "subnet"
+      ? ipamApi.backfillReverseZonesSubnet
+      : scope.kind === "block"
+        ? ipamApi.backfillReverseZonesBlock
+        : ipamApi.backfillReverseZonesSpace;
   const [backfillResult, setBackfillResult] = useState<{
     created: { subnet: string; zone: string }[];
     skipped: number;
   } | null>(null);
   const [backfillError, setBackfillError] = useState<string | null>(null);
-  useEffect(() => {
-    const fn =
-      scope.kind === "subnet"
-        ? ipamApi.backfillReverseZonesSubnet
-        : scope.kind === "block"
-          ? ipamApi.backfillReverseZonesBlock
-          : ipamApi.backfillReverseZonesSpace;
-    fn(scope.id)
-      .then((r) => setBackfillResult(r))
-      .catch((e: Error) => setBackfillError(e.message || "Backfill failed"))
-      .finally(() => setBackfillDone(true));
-  }, [scope.id, scope.kind]);
 
   const { data, isLoading, error, refetch, isFetching } = useQuery({
     queryKey: ["dns-sync-preview", scope.kind, scope.id],
     queryFn: fetchPreview,
     refetchOnMount: "always",
-    enabled: backfillDone,
   });
 
   // Per-row selection. Empty Set = nothing chosen → Apply disabled.
@@ -6526,8 +6599,19 @@ function DnsSyncModal({
   }, [data]);
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       if (!data) throw new Error("No preview");
+      // #516 — ensure reverse (PTR) zones exist before creating PTRs.
+      // Idempotent; runs here (on Apply) rather than on modal open. A
+      // failure is surfaced but non-fatal — A records still commit and any
+      // PTRs whose zone couldn't be created come back in res.errors.
+      try {
+        setBackfillError(null);
+        const r = await backfillFn(scope.id);
+        setBackfillResult(r);
+      } catch (e) {
+        setBackfillError((e as Error).message || "Backfill failed");
+      }
       // missing items keyed as `ip_id:record_type` so a single IP can have
       // both A and PTR ticked or unticked independently. Backend just needs
       // unique IP IDs to re-sync — sync_dns_record handles both records.
@@ -6617,28 +6701,21 @@ function DnsSyncModal({
         </div>
 
         <div className="flex-1 overflow-auto px-5 py-4 space-y-5">
-          {!backfillDone && (
-            <p className="text-sm text-muted-foreground">
-              Backfilling missing reverse zones…
-            </p>
+          {backfillResult && backfillResult.created.length > 0 && (
+            <div className="rounded-md border border-blue-500/40 bg-blue-500/10 px-3 py-2 text-xs">
+              Backfill created {backfillResult.created.length} reverse zone
+              {backfillResult.created.length === 1 ? "" : "s"}:{" "}
+              <span className="font-mono">
+                {backfillResult.created.map((c) => c.zone).join(", ")}
+              </span>
+            </div>
           )}
-          {backfillDone &&
-            backfillResult &&
-            backfillResult.created.length > 0 && (
-              <div className="rounded-md border border-blue-500/40 bg-blue-500/10 px-3 py-2 text-xs">
-                Backfill created {backfillResult.created.length} reverse zone
-                {backfillResult.created.length === 1 ? "" : "s"}:{" "}
-                <span className="font-mono">
-                  {backfillResult.created.map((c) => c.zone).join(", ")}
-                </span>
-              </div>
-            )}
           {backfillError && (
             <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">
               Reverse-zone backfill skipped: {backfillError}
             </div>
           )}
-          {backfillDone && isLoading && (
+          {isLoading && (
             <p className="text-sm text-muted-foreground">Computing drift…</p>
           )}
           {error && (
@@ -8055,11 +8132,13 @@ function SyncAllModal({
 // ─── Edit Address Modal ───────────────────────────────────────────────────────
 
 const ADDRESS_STATUSES = [
+  "available",
   "allocated",
   "reserved",
   "deprecated",
   "static_dhcp",
   "dhcp",
+  "discovered",
 ] as const;
 
 // Format a UTC ISO instant as a ``datetime-local`` value (local wall-clock,
@@ -9446,7 +9525,9 @@ function BulkEditAddressesModal({
         setError(
           `${res.updated_count} updated; ${res.skipped.length} skipped (system/orphan rows).`,
         );
-        setTimeout(onDone, 1200);
+        // #516 — 1.2 s was too short to read the skipped-rows report (the
+        // only place it surfaces). Give the operator time to see it.
+        setTimeout(onDone, 4500);
       } else {
         onDone();
       }
@@ -9883,7 +9964,8 @@ function BulkDeleteAddressesModal({
         setError(
           `${res.deleted_count} deleted; ${res.skipped.length} skipped (system rows).`,
         );
-        setTimeout(onDone, 1200);
+        // #516 — give the operator time to read the skipped-rows report.
+        setTimeout(onDone, 4500);
       } else {
         onDone();
       }
@@ -10435,7 +10517,21 @@ function EditSpaceModal({
       qc.invalidateQueries({ queryKey: ["spaces"] });
       onClose();
     },
+    // #516 — surface save failures (403/409/etc.) instead of leaving the
+    // modal open with zero feedback.
+    onError: (err: unknown) => {
+      const detail = (err as { response?: { data?: { detail?: unknown } } })
+        ?.response?.data?.detail;
+      setSaveError(
+        typeof detail === "string"
+          ? detail
+          : detail
+            ? JSON.stringify(detail)
+            : "Failed to save IP space.",
+      );
+    },
   });
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMutation = useMutation({
@@ -10672,6 +10768,11 @@ function EditSpaceModal({
         </div>
       )}
 
+      {saveError && (
+        <p className="mt-3 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          {saveError}
+        </p>
+      )}
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
           onClick={onClose}
@@ -10680,7 +10781,10 @@ function EditSpaceModal({
           Cancel
         </button>
         <button
-          onClick={() => saveMutation.mutate()}
+          onClick={() => {
+            setSaveError(null);
+            saveMutation.mutate();
+          }}
           disabled={!name || saveMutation.isPending}
           className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
         >
@@ -12844,8 +12948,15 @@ function flattenToTableRows(nodes: BlockNode[], depth = 0): TreeTableItem[] {
 }
 
 function cidrSize(network: string): number {
-  const prefix = parseInt(network.split("/")[1] ?? "32");
-  return Math.pow(2, 32 - prefix);
+  // #516 — pick the width from the address family. Using 32 for an IPv6
+  // network (e.g. a /48) yielded 2^(32-48) = 2^-16, feeding garbage into
+  // UsedIps whenever total_ips was null.
+  const bits = network.includes(":") ? 128 : 32;
+  const prefix = parseInt(network.split("/")[1] ?? String(bits));
+  // Clamp out-of-range prefixes (e.g. /33 on IPv4, /129 on IPv6) to 0 so a
+  // negative exponent can't feed a fractional "size" into UsedIps/UI.
+  if (Number.isNaN(prefix) || prefix < 0 || prefix > bits) return 0;
+  return Math.pow(2, bits - prefix);
 }
 
 /**
@@ -13880,84 +13991,82 @@ function BulkEditSubnetsModal({
   });
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 p-2 sm:p-4">
-      <div className="w-full max-w-[95vw] sm:max-w-md rounded-lg border bg-card p-4 sm:p-6 shadow-lg">
-        <h3 className="mb-3 text-base font-semibold">
-          Bulk edit {subnetIds.length} subnet{subnetIds.length === 1 ? "" : "s"}
-        </h3>
-        <p className="mb-3 text-xs text-muted-foreground">
-          Leave a field blank to keep it unchanged.
-        </p>
-        <div className="space-y-3 text-sm">
-          <label className="block">
-            <span className="mb-1 block text-xs text-muted-foreground">
-              Name
-            </span>
-            <input
-              className="w-full rounded border bg-background px-2 py-1"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </label>
-          <label className="block">
-            <span className="mb-1 block text-xs text-muted-foreground">
-              Description
-            </span>
-            <input
-              className="w-full rounded border bg-background px-2 py-1"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-            />
-          </label>
-          <label className="block">
-            <span className="mb-1 block text-xs text-muted-foreground">
-              Status
-            </span>
-            <select
-              className="w-full rounded border bg-background px-2 py-1"
-              value={statusVal}
-              onChange={(e) => setStatusVal(e.target.value)}
-            >
-              <option value="">—</option>
-              <option value="active">active</option>
-              <option value="deprecated">deprecated</option>
-              <option value="reserved">reserved</option>
-              <option value="quarantine">quarantine</option>
-            </select>
-          </label>
-          <label className="block">
-            <span className="mb-1 block text-xs text-muted-foreground">
-              VLAN ID
-            </span>
-            <input
-              className="w-full rounded border bg-background px-2 py-1"
-              value={vlanId}
-              onChange={(e) => setVlanId(e.target.value)}
-              inputMode="numeric"
-            />
-          </label>
-        </div>
-        {error && <p className="mt-2 text-xs text-red-600">{error}</p>}
-        <div className="mt-4 flex justify-end gap-2">
-          <button
-            onClick={onClose}
-            className="rounded border px-3 py-1 text-xs hover:bg-muted"
+    // #516 — use the shared draggable Modal (drag handle + Esc + correct
+    // backdrop) instead of a raw fixed div, per the project modal convention.
+    <Modal
+      title={`Bulk edit ${subnetIds.length} subnet${subnetIds.length === 1 ? "" : "s"}`}
+      onClose={onClose}
+    >
+      <p className="mb-3 text-xs text-muted-foreground">
+        Leave a field blank to keep it unchanged.
+      </p>
+      <div className="space-y-3 text-sm">
+        <label className="block">
+          <span className="mb-1 block text-xs text-muted-foreground">Name</span>
+          <input
+            className="w-full rounded border bg-background px-2 py-1"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-xs text-muted-foreground">
+            Description
+          </span>
+          <input
+            className="w-full rounded border bg-background px-2 py-1"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-xs text-muted-foreground">
+            Status
+          </span>
+          <select
+            className="w-full rounded border bg-background px-2 py-1"
+            value={statusVal}
+            onChange={(e) => setStatusVal(e.target.value)}
           >
-            Cancel
-          </button>
-          <button
-            disabled={mut.isPending}
-            onClick={() => {
-              setError(null);
-              mut.mutate();
-            }}
-            className="rounded bg-primary px-3 py-1 text-xs font-medium text-primary-foreground disabled:opacity-50"
-          >
-            {mut.isPending ? "Applying…" : "Apply"}
-          </button>
-        </div>
+            <option value="">—</option>
+            <option value="active">active</option>
+            <option value="deprecated">deprecated</option>
+            <option value="reserved">reserved</option>
+            <option value="quarantine">quarantine</option>
+          </select>
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-xs text-muted-foreground">
+            VLAN ID
+          </span>
+          <input
+            className="w-full rounded border bg-background px-2 py-1"
+            value={vlanId}
+            onChange={(e) => setVlanId(e.target.value)}
+            inputMode="numeric"
+          />
+        </label>
       </div>
-    </div>
+      {error && <p className="mt-2 text-xs text-red-600">{error}</p>}
+      <div className="mt-4 flex justify-end gap-2">
+        <button
+          onClick={onClose}
+          className="rounded border px-3 py-1 text-xs hover:bg-muted"
+        >
+          Cancel
+        </button>
+        <button
+          disabled={mut.isPending}
+          onClick={() => {
+            setError(null);
+            mut.mutate();
+          }}
+          className="rounded bg-primary px-3 py-1 text-xs font-medium text-primary-foreground disabled:opacity-50"
+        >
+          {mut.isPending ? "Applying…" : "Apply"}
+        </button>
+      </div>
+    </Modal>
   );
 }
 

@@ -232,8 +232,14 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
             "enabled": True,
             "controlPlaneUrl": control_plane_url,
             "agentKey": env_vars.get("DHCP_AGENT_KEY", ""),
-            "serverGroupName": env_vars.get("DHCP_AGENT_GROUP", "")
-            or env_vars.get("AGENT_GROUP", ""),
+            # #555 — NO ``AGENT_GROUP`` fallback here. ``AGENT_GROUP`` is
+            # written only for DNS roles (role_orchestrator writes
+            # ``DHCP_AGENT_GROUP`` for DHCP), so the fallback could only ever
+            # pull in a DNS group name — a node with both dns + dhcp roles but
+            # no dhcp_group_name would silently register its Kea agent into
+            # the DNS group. Absent → empty, which the backend treats as the
+            # default group.
+            "serverGroupName": env_vars.get("DHCP_AGENT_GROUP", ""),
             "networkMode": env_vars.get("DHCP_NETWORK_MODE", "host"),
         },
     }

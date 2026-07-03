@@ -25,8 +25,12 @@ fi
 find "$BUILDROOT" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 find "$BUILDROOT" -name '*.pyc' -delete 2>/dev/null || true
 
-# Stale journal logs / machine-id / random-seed — regenerated on
-# first boot, no value in baking them in.
-rm -rf "$BUILDROOT/var/log"/*   2>/dev/null || true
+# Stale log FILES / machine-id / random-seed — regenerated on first boot,
+# no value in baking them in. #553 — delete files, not directories: a bare
+# ``rm -rf /var/log/*`` also removed /var/log/journal, which mkosi.postinst
+# creates to enable PERSISTENT journald; without the dir journald silently
+# falls back to volatile logs (no cross-reboot history — exactly what you
+# want when debugging a crash-loop).
+find "$BUILDROOT/var/log" -type f -delete 2>/dev/null || true
 truncate -s0 "$BUILDROOT/etc/machine-id" 2>/dev/null || true
 rm -f "$BUILDROOT/var/lib/systemd/random-seed" 2>/dev/null || true

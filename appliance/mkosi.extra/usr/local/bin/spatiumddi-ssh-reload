@@ -72,6 +72,9 @@ SSHD_DROPIN=/etc/ssh/sshd_config.d/spatiumddi.conf
 # port-22 accept floor lives in the firewall renderer, so this only opens
 # the (possibly-non-22) configured port, source-scoped.
 NFT_DROPIN=/etc/nftables.d/50-spatium-ssh.nft
+# Master nftables config that includes the /etc/nftables.d/ drop-in glob;
+# used for the pre-reload `nft -c -f` dry-run (#550).
+NFT_MAIN=/etc/nftables.conf
 LOCK=/run/spatiumddi-ssh-reload.lock
 
 mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$(dirname "$NFT_DROPIN")"
@@ -276,6 +279,21 @@ PYEOF
             fail "failed to render ssh nft drop-in"
         fi
         chmod 0644 "$NFT_DROPIN"
+        # Dry-run the FULL ruleset with the new drop-in staged, before we
+        # reload (#550). sshd has no native source filter, so a malformed
+        # CIDR renders an invalid rule; without this check `systemctl
+        # reload nftables` fails atomically and — if the ssh PORT also
+        # changed — the new port never opens (lockout), and on the next
+        # boot the bad fragment fails the whole transactional `nft -f`
+        # (fail-open, no input filtering). Mirror the firewall runner:
+        # validate, and on failure drop the fragment before erroring so
+        # the master config still loads clean.
+        if ! nft -c -f "$NFT_MAIN" 2>/tmp/spatium-ssh-nft-check.err; then
+            sed 's/^/      /' /tmp/spatium-ssh-nft-check.err
+            rm -f "$NFT_DROPIN"
+            systemctl reload nftables.service >/dev/null 2>&1 || true
+            fail "rendered ssh nft drop-in failed nft -c -f — fragment removed"
+        fi
         nft_reload
 
         reload_sshd || true
@@ -295,6 +313,12 @@ PYEOF
             nft_reload
         fi
         # Stub authorized_keys so an operator who SSHes in sees the note.
+        # Preserve any existing content first (#550): an operator may have
+        # added keys out-of-band, and silently clobbering them here could
+        # lock them out. The .pre-unmanage.bak copy is recoverable by hand.
+        if [ -s "$AK_FILE" ]; then
+            cp -f "$AK_FILE" "${AK_FILE}.pre-unmanage.bak" 2>/dev/null || true
+        fi
         if [ -d "$(dirname "$AK_FILE")" ] || install -d -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0700 "$(dirname "$AK_FILE")" 2>/dev/null; then
             cat > "$AK_FILE" <<'EOF'
 # Managed by SpatiumDDI — SSH key management is currently off.

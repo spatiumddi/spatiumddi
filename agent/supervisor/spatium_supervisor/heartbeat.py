@@ -986,8 +986,13 @@ def heartbeat_once(
         rendered = render_env_file(target)
         # Atomic write — partial files would confuse the compose
         # subprocess below if the supervisor crashed mid-write.
+        # #555 — owner-only (0600) at creation: role-compose.env carries
+        # DNS_AGENT_KEY / DHCP_AGENT_KEY bootstrap PSKs, and a plain
+        # write_text lands it at the umask default (0644, world-readable in
+        # the 1777 release-state dir) before any chmod. Reuse the shared
+        # O_NOFOLLOW+0600 writer.
         tmp = env_path.with_suffix(".tmp")
-        tmp.write_text(rendered, encoding="utf-8")
+        appliance_state._write_owner_only(tmp, rendered)
         tmp.replace(env_path)
         log.info(
             "supervisor.heartbeat.role_env_rendered",

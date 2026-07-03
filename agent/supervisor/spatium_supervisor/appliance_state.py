@@ -419,7 +419,15 @@ def _reap_stale_inflight(
 
 
 _TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pending")
-_REBOOT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/reboot-pending")
+# #553 — the FLEET reboot trigger has its own filename, distinct from the
+# web-UI local-reboot trigger (``reboot-pending``, handled by
+# spatiumddi-reboot.{path,service}). Previously both wrote ``reboot-pending``
+# so both .path units fired: the agent runner (5 s) won while the web-UI
+# service's un-``-``-prefixed mv failed on the already-renamed file, ending
+# ``failed`` on every reboot. Separate filenames = one runner per trigger.
+_REBOOT_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/reboot-pending-fleet"
+)
 # Issue #386 Part B — fire-once marker. Records the last
 # ``desired_slot_image_url`` the supervisor wrote a trigger for, so a
 # failed apply (which renames the trigger to ``.failed.<ts>`` and would
@@ -891,8 +899,27 @@ def _write_owner_only(tmp: Path, payload: str) -> None:
     ``O_NOFOLLOW`` refuses a symlink an attacker could plant in the
     world-writable dir. The root ``.path`` runner reads as root and is
     unaffected by the tighter mode.
+
+    ``O_EXCL`` (with a best-effort unlink of our own stale temp first)
+    is required in addition to ``O_NOFOLLOW``: without it, ``O_CREAT``
+    happily opens a pre-planted *regular* file (O_NOFOLLOW only rejects
+    symlinks), the mode arg is ignored for an existing inode, and the
+    secret would be written into an attacker-owned 0644 file whose fd
+    they still hold after ``replace()``. With ``O_EXCL`` the open fails
+    closed (EEXIST) if anyone raced a file into the predictable temp
+    path; callers wrap this in ``try/except OSError`` and retry on the
+    next tick.
     """
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.unlink(tmp)  # drop our own stale temp from a crashed prior run
+    except FileNotFoundError:
+        # No stale temp to remove — the normal case; nothing to clean up.
+        pass
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(payload)
 
@@ -1376,6 +1403,13 @@ def maybe_fire_cluster_join(
         return False
     if not server_url or not join_token:
         return False
+    # #555 — the payload is line-based (marker / server_url / join_token);
+    # a newline in either operator-influenced field would shift the lines
+    # the host runner parses. Reject control chars outright rather than
+    # smuggle a second directive into the trigger.
+    if any(c in server_url or c in join_token for c in ("\n", "\r")):
+        log.warning("supervisor.cluster_join.rejected_control_char_in_payload")
+        return False
     if _CLUSTER_JOIN_TRIGGER_FILE.exists():
         return False
     try:
@@ -1457,6 +1491,11 @@ def maybe_fire_cluster_restore(desired_restore_snapshot: str | None) -> bool:
     if detect_deployment_kind() != "appliance":
         return False
     if not desired_restore_snapshot:
+        return False
+    # #555 — line-based payload (marker / snapshot name); reject control
+    # chars so a newline can't smuggle a second directive to the runner.
+    if any(c in desired_restore_snapshot for c in ("\n", "\r")):
+        log.warning("supervisor.cluster_restore.rejected_control_char_in_snapshot")
         return False
     if _CLUSTER_RESTORE_TRIGGER_FILE.exists():
         return False

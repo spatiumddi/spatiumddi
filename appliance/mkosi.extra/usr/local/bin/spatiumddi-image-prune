@@ -103,7 +103,13 @@ try:
         if img:
             inuse.add(img)
 except Exception:
-    inuse = set()
+    # #555 — if the in-use query fails we CANNOT know what's running, so an
+    # empty ``inuse`` would unprotect every image whose tag doesn't match a
+    # slot version (e.g. a HelmChartConfig image.tag dev-tag override) and
+    # rmi it → imagePullPolicy:Never pods then ErrImageNeverPull on the next
+    # restart. Bail entirely (print nothing) rather than prune blind.
+    print("", end="")
+    sys.exit(0)
 
 SP = "ghcr.io/spatiumddi/"
 remove = []

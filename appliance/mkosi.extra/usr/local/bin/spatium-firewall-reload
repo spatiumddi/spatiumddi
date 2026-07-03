@@ -82,6 +82,20 @@ write_status() {
     printf '%s\n' "$1" > "$APPLIED_STATUS"
 }
 
+# #550 — on any failure path, move the trigger aside before exiting.
+# The supervisor's maybe_fire_firewall_reload bails while
+# firewall-pending exists, so an ``exit 1`` that leaves the trigger in
+# place permanently wedges the firewall plane — even a corrected value
+# never applies until someone SSHes in to delete it by hand. Renaming
+# it to ``.failed.<ts>`` (as the other reload runners do) lets the next
+# corrected heartbeat re-write the trigger; the copy stays for forensics.
+fail_release() {
+    write_status "$1"
+    [ -f "$TRIGGER_FILE" ] \
+        && mv -f "$TRIGGER_FILE" "${TRIGGER_FILE}.failed.$(date +%s)" 2>/dev/null
+    exit 1
+}
+
 if [ ! -r "$TRIGGER_FILE" ]; then
     log "no trigger file at $TRIGGER_FILE — nothing to do"
     exit 0
@@ -90,8 +104,7 @@ fi
 HASH=$(sed -n '1p' "$TRIGGER_FILE")
 if [ -z "$HASH" ]; then
     log "trigger missing hash (line 1) — refusing to apply"
-    write_status "error:missing-hash"
-    exit 1
+    fail_release "error:missing-hash"
 fi
 
 # #285 Phase 2c — a test-apply carries ``__test__ revert_seconds=N`` on line
@@ -126,8 +139,7 @@ if ! nft -c -f "$NFT_MAIN" 2>/tmp/nft-check.err; then
     log "dry-run via $NFT_MAIN failed BEFORE swap — refusing:"
     cat /tmp/nft-check.err | sed 's/^/[spatium-firewall-reload]  /'
     rm -f "$STAGING"
-    write_status "error:dry-run-pre"
-    exit 1
+    fail_release "error:dry-run-pre"
 fi
 
 # #285 Phase 2c — snapshot the current (good) drop-in + sentinel state
@@ -152,8 +164,7 @@ if ! nft -c -f "$NFT_MAIN" 2>/tmp/nft-check.err; then
     cat /tmp/nft-check.err | sed 's/^/[spatium-firewall-reload]  /'
     # Remove the bad drop-in so the master config still loads.
     rm -f "$DROP_IN"
-    write_status "error:dry-run-post"
-    exit 1
+    fail_release "error:dry-run-post"
 fi
 
 # #285 Phase 1b — bootstrap-sentinel retire/keep. The renderer stamps a
@@ -193,16 +204,14 @@ if [ "$sentinel_action" != none ]; then
             retire) mv "$SENTINEL_RETIRED" "$SENTINEL" ;;
             restore) mv "$SENTINEL" "$SENTINEL_RETIRED" ;;
         esac
-        write_status "error:sentinel-dry-run"
-        exit 1
+        fail_release "error:sentinel-dry-run"
     fi
 fi
 
 if ! nft -f "$NFT_MAIN" 2>/tmp/nft-apply.err; then
     log "nft -f $NFT_MAIN failed — runtime apply error:"
     cat /tmp/nft-apply.err | sed 's/^/[spatium-firewall-reload]  /'
-    write_status "error:apply"
-    exit 1
+    fail_release "error:apply"
 fi
 
 mkdir -p "$(dirname "$APPLIED_HASH")"

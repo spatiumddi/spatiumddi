@@ -71,12 +71,15 @@ fi
 # value — exactly the silent-fail mode we want to avoid.
 if ! timedatectl list-timezones 2>/dev/null | grep -Fxq "$tz"; then
     log "REJECT: '$tz' is not a known IANA timezone on this host"
-    # Leave the trigger in place; the supervisor will keep re-firing
-    # it which surfaces the issue in the heartbeat's last-apply
-    # status. Write the status sidecar so the heartbeat reports an
-    # operator-readable error.
+    # Write the status sidecar so the heartbeat reports an
+    # operator-readable error, then move the trigger aside. Leaving it
+    # in place would wedge the plane forever: the supervisor bails when
+    # ``tz-pending`` exists, so a corrected value would never fire
+    # (#550). Renaming it lets the next (corrected) heartbeat re-write
+    # the trigger; the ``.failed.<ts>`` copy stays for forensics.
     printf 'state=failed\nreason=unknown_timezone\nrequested=%s\napplied_at=%s\n' \
         "$tz" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
+    mv -f "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || rm -f "$TRIGGER"
     exit 1
 fi
 
@@ -92,6 +95,8 @@ else
         log "ERROR: timedatectl set-timezone failed"
         printf 'state=failed\nreason=set_timezone_failed\nrequested=%s\napplied_at=%s\n' \
             "$tz" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
+        # Move the trigger aside so a retry isn't wedged (see #550).
+        mv -f "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || rm -f "$TRIGGER"
         exit 1
     fi
 fi

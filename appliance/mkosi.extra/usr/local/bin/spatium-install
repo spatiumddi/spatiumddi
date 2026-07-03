@@ -355,13 +355,38 @@ pick_disk() {
         return 0
     fi
     local options=()
+    # #554 — exclude EVERY disk backing the live boot medium, not just the
+    # one findmnt resolves. The old code checked only ``findmnt -no SOURCE
+    # /run/live/medium``; with ``boot=live toram`` (or a layout that
+    # unmounts the medium) that returns empty, so the boot USB — an ``sd*``
+    # device the ``grep -vE "^(sr|loop|fd|ram|zram)"`` filter does NOT
+    # exclude — appeared as a wipe target and picking it destroyed the
+    # running install media mid-install. Scan /proc/mounts for every
+    # /run/live // /lib/live mount and map each source back to its parent
+    # disk, keeping the findmnt-derived one too as belt-and-braces.
+    local -A live_disks=()
+    local _src _mnt _rest _pk
+    while read -r _src _mnt _rest; do
+        case "$_mnt" in
+            /run/live|/run/live/*|/lib/live/mount|/lib/live/mount/*)
+                case "$_src" in
+                    /dev/*)
+                        _pk=$(lsblk -no PKNAME "$_src" 2>/dev/null | head -n1)
+                        [ -z "$_pk" ] && _pk=$(basename "$_src")
+                        [ -n "$_pk" ] && live_disks["/dev/$_pk"]=1
+                        ;;
+                esac
+                ;;
+        esac
+    done < /proc/mounts
     local live_src
     live_src=$(findmnt -no SOURCE /run/live/medium 2>/dev/null || \
                findmnt -no SOURCE /lib/live/mount/medium 2>/dev/null || true)
-    # Strip partition suffix to compare against the disk node.
-    local live_disk
-    live_disk=$(lsblk -no PKNAME "$live_src" 2>/dev/null || true)
-    [ -n "$live_disk" ] && live_disk="/dev/$live_disk"
+    if [ -n "$live_src" ]; then
+        local live_disk
+        live_disk=$(lsblk -no PKNAME "$live_src" 2>/dev/null | head -n1 || true)
+        [ -n "$live_disk" ] && live_disks["/dev/$live_disk"]=1
+    fi
 
     while IFS= read -r line; do
         local name size model
@@ -369,8 +394,8 @@ pick_disk() {
         size=$(echo "$line" | awk '{print $2}')
         model=$(echo "$line" | cut -d' ' -f3- | sed 's/  */ /g')
         [ -z "$model" ] && model="(no model)"
-        # Skip the live medium itself.
-        [ "/dev/$name" = "$live_disk" ] && continue
+        # Skip any disk that backs the live boot medium.
+        [ -n "${live_disks[/dev/$name]:-}" ] && continue
         options+=("/dev/$name" "$size - $model")
     done < <(lsblk -dn -o NAME,SIZE,MODEL -r 2>/dev/null | grep -vE "^(sr|loop|fd|ram|zram)")
 
@@ -608,10 +633,85 @@ ask_user_password() {
     done
 }
 
+# #554 — validate the static-IP fields with Python's ``ipaddress`` (same
+# approach as the k3s CIDR step). Without this, a blank gateway wrote
+# ``address1=<ip>/<prefix>,`` (trailing comma) into the NetworkManager
+# keyfile → NM rejects it → the connection never loads → headless
+# appliance comes up with NO IP (console-only recovery). A typo'd
+# prefix / IP / gateway failed the same silent way. Prints the problem(s)
+# on stdout + exits 1 on any error.
+_validate_static_net() {
+    python3 - "$NET_IP" "$NET_PREFIX" "$NET_GATEWAY" "$NET_DNS" <<'PY' 2>&1
+import ipaddress
+import sys
+
+ip_s, prefix_s, gw_s, dns_s = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+errs = []
+
+prefix = None
+try:
+    prefix = int(prefix_s)
+    # Allow /1../32. /32 is a valid single-host assignment (some cloud /
+    # VPS hosts hand one out with an off-link gateway reached via an
+    # on-link route); /31 is RFC 3021 point-to-point.
+    if not 0 < prefix <= 32:
+        errs.append(f"Prefix must be between 1 and 32 (got {prefix_s!r}).")
+        prefix = None
+except ValueError:
+    errs.append(f"Prefix must be a whole number (got {prefix_s!r}).")
+
+ip = None
+try:
+    ip = ipaddress.IPv4Address(ip_s.strip())
+except ValueError:
+    errs.append(f"IP address {ip_s!r} is not a valid IPv4 address.")
+
+gw = None
+if not gw_s.strip():
+    errs.append("Gateway is required for a static install.")
+else:
+    try:
+        gw = ipaddress.IPv4Address(gw_s.strip())
+    except ValueError:
+        errs.append(f"Gateway {gw_s!r} is not a valid IPv4 address.")
+
+if ip is not None and gw is not None and prefix is not None and prefix < 32:
+    # For /32 the network is the host itself, so an off-link gateway
+    # (reached via an on-link route) is normal and expected — skip the
+    # in-subnet check. For /1../31 the gateway must be on-link.
+    net = ipaddress.ip_network(f"{ip_s.strip()}/{prefix}", strict=False)
+    if gw not in net:
+        errs.append(
+            f"Gateway {gw_s.strip()} is not inside {net} — the appliance "
+            "would not be able to reach it."
+        )
+
+for tok in dns_s.split():
+    try:
+        ipaddress.ip_address(tok)
+    except ValueError:
+        errs.append(f"DNS server {tok!r} is not a valid IP address.")
+
+if errs:
+    print("\n".join(errs))
+    sys.exit(1)
+PY
+}
+
 ask_network() {
     log "Step: ask_network"
     if [ -n "${PRESEED_HAS_NETWORK:-}" ]; then
         log "Preseed: network=$NET_MODE (skipping prompt)"
+        # Validate a preseeded static config too — a bad answer file would
+        # otherwise brick a fully-headless install with no way to recover.
+        if [ "$NET_MODE" = "static" ]; then
+            local perr
+            if ! perr=$(_validate_static_net); then
+                log "FATAL: preseed static network is invalid: $perr"
+                whiptail --msgbox "Preseed static network settings are invalid:\n\n$perr\n\nFix the answer file and reinstall." 16 72 || true
+                on_cancel
+            fi
+        fi
         return 0
     fi
     NET_MODE=$(whiptail --backtitle "$BACKTITLE" --title "Network" \
@@ -636,22 +736,34 @@ ask_network() {
             --cancel-button "Back" \
             --menu "Pick an interface:" 12 60 5 "${ifs[@]}" 3>&1 1>&2 2>&3) \
             || return 1
-        NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -address" \
-            --cancel-button "Back" \
-            --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 "$NET_IP" 3>&1 1>&2 2>&3) \
-            || return 1
-        NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -prefix" \
-            --cancel-button "Back" \
-            --inputbox "Prefix length:" 10 60 "$NET_PREFIX" 3>&1 1>&2 2>&3) \
-            || return 1
-        NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -gateway" \
-            --cancel-button "Back" \
-            --inputbox "Gateway:" 10 60 "$NET_GATEWAY" 3>&1 1>&2 2>&3) \
-            || return 1
-        NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -DNS" \
-            --cancel-button "Back" \
-            --inputbox "DNS servers (space-separated):" 10 60 "$NET_DNS" 3>&1 1>&2 2>&3) \
-            || return 1
+        # #554 — collect + validate in a loop: on a validation error re-show
+        # the four fields (pre-filled with what was entered) instead of
+        # writing an invalid keyfile. Back (Cancel) on any field still exits
+        # the step backward via ``return 1``.
+        while true; do
+            NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -address" \
+                --cancel-button "Back" \
+                --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 "$NET_IP" 3>&1 1>&2 2>&3) \
+                || return 1
+            NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -prefix" \
+                --cancel-button "Back" \
+                --inputbox "Prefix length:" 10 60 "$NET_PREFIX" 3>&1 1>&2 2>&3) \
+                || return 1
+            NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -gateway" \
+                --cancel-button "Back" \
+                --inputbox "Gateway:" 10 60 "$NET_GATEWAY" 3>&1 1>&2 2>&3) \
+                || return 1
+            NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -DNS" \
+                --cancel-button "Back" \
+                --inputbox "DNS servers (space-separated):" 10 60 "$NET_DNS" 3>&1 1>&2 2>&3) \
+                || return 1
+            local nerr
+            if nerr=$(_validate_static_net); then
+                break
+            fi
+            whiptail --backtitle "$BACKTITLE" --title "Static network — invalid" \
+                --msgbox "Please correct these before continuing:\n\n$nerr" 16 72 || true
+        done
     fi
 }
 
@@ -1493,6 +1605,19 @@ EOF
         local ROOT_A_UUID ROOT_B_UUID
         ROOT_A_UUID=$(blkid -s UUID -o value "$ROOT_A")
         ROOT_B_UUID=$(blkid -s UUID -o value "$ROOT_B")
+        # #554 — guard against an empty UUID (blkid racing the just-created
+        # filesystem). An empty value renders ``root=UUID=`` into grub.cfg —
+        # valid syntax that grub-script-check accepts but that produces an
+        # unbootable slot. Settle udev + retry once before giving up.
+        if [ -z "$ROOT_A_UUID" ] || [ -z "$ROOT_B_UUID" ]; then
+            udevadm settle 2>/dev/null || true
+            [ -z "$ROOT_A_UUID" ] && ROOT_A_UUID=$(blkid -s UUID -o value "$ROOT_A")
+            [ -z "$ROOT_B_UUID" ] && ROOT_B_UUID=$(blkid -s UUID -o value "$ROOT_B")
+        fi
+        if [ -z "$ROOT_A_UUID" ] || [ -z "$ROOT_B_UUID" ]; then
+            log "ERROR: could not read slot filesystem UUIDs (A=$ROOT_A_UUID B=$ROOT_B_UUID) — refusing to render grub with an empty root=UUID="
+            exit 1
+        fi
 
         # Write /etc/default/grub explicitly so future `update-grub`
         # runs (e.g. on kernel upgrade) get the same cmdline. We
@@ -1627,14 +1752,19 @@ EOF
         # directories on root_B so the boot-time mount units succeed.
         mkdir -p /mnt/spatium-root-b/var /mnt/spatium-root-b/home \
                  /mnt/spatium-root-b/root /mnt/spatium-root-b/boot/efi
-        umount /mnt/spatium-root-b
-        rmdir /mnt/spatium-root-b
+        umount /mnt/spatium-root-b 2>/dev/null || umount -l /mnt/spatium-root-b 2>/dev/null || true
+        rmdir /mnt/spatium-root-b 2>/dev/null || true
 
         echo "XXX"; echo "95"; echo "Unmounting..."; echo "XXX"
         for d in dev sys proc; do
             umount "$MOUNT/$d" 2>/dev/null || true
         done
-        umount "$MOUNT/boot/efi"
+        # #554 — these cleanup unmounts run AFTER the install is complete,
+        # under ``set -e``. A single busy mount (e.g. something still holding
+        # /var) would abort do_install → the EXIT trap fires → the reboot
+        # below never runs, showing "Installer exited with status N" after a
+        # SUCCESSFUL install. Make each best-effort with a lazy-unmount
+        # fallback; the imminent reboot clears anything still held.
         # Phase 8a unmount order matters:
         #   1. /home, /root            — bind mounts onto /var subdirs
         #   2. /etc (overlay)          — upper is on /var, release first
@@ -1642,12 +1772,16 @@ EOF
         #                                /var so release before /var (#276)
         #   4. /var partition          — after /etc overlay + binds + STATE
         #   5. root_A                  — last
-        umount "$MOUNT/home"
-        umount "$MOUNT/root"
-        umount "$MOUNT/etc"
-        umount "$MOUNT/var/lib/spatium-state"
-        umount "$MOUNT/var"
-        umount "$MOUNT"
+        for mp in \
+            "$MOUNT/boot/efi" \
+            "$MOUNT/home" \
+            "$MOUNT/root" \
+            "$MOUNT/etc" \
+            "$MOUNT/var/lib/spatium-state" \
+            "$MOUNT/var" \
+            "$MOUNT"; do
+            umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
+        done
         sync
 
         echo "XXX"; echo "100"; echo "Done."; echo "XXX"
@@ -2048,7 +2182,22 @@ main() {
                 # them the review screen).
                 if [ "$FULLY_UNATTENDED" = "1" ]; then
                     step="do_install"
-                elif confirm; then step="do_install"; else step="ask_application_config"; fi
+                elif confirm; then
+                    step="do_install"
+                else
+                    # #554 — Back. ask_application_config returns 0 without
+                    # showing a screen for every role EXCEPT appliance, so
+                    # routing Back through it for a control-plane install
+                    # bounced confirm→ask_application_config→confirm forever
+                    # (the operator could never get back to hostname / tz /
+                    # disk / CIDRs). Skip straight to ask_k3s_cidrs unless the
+                    # appliance role, which has a real screen there.
+                    if [ "$ROLE" = "appliance" ]; then
+                        step="ask_application_config"
+                    else
+                        step="ask_k3s_cidrs"
+                    fi
+                fi
                 ;;
             do_install)
                 do_install

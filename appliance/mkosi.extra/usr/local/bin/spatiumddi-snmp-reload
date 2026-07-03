@@ -117,27 +117,51 @@ echo "  body size: $(wc -c < "$TMP_BODY") bytes"
 
 case "$MARKER" in
     enabled)
-        # Validate syntax against snmpd -C -c (don't fall back to the
-        # system path; the operator-supplied body is the only thing
-        # under test here). ``snmpd -H`` is the help flag that exits
-        # 0 after dumping options; we use it as a quick "does snmpd
-        # exist?" check before the real syntax test.
         if ! command -v snmpd >/dev/null 2>&1; then
             echo "  ✗ snmpd binary not found — is net-snmp installed?"
             echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
             mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
             exit 1
         fi
-        # ``-t`` tests config + exits, ``-C`` ignores the default conf
-        # paths so only our staging file is checked.
-        if ! snmpd -t -C -c "$TMP_BODY" >/tmp/spatium-snmpd-validate.log 2>&1; then
-            echo "  ✗ snmpd -t failed for staged config:"
-            sed 's/^/      /' /tmp/spatium-snmpd-validate.log
-            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
-            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
-            exit 1
+        # net-snmp has NO config-test flag: ``snmpd -t`` takes a
+        # *timeout* argument, not a "test" flag — it prints "invalid
+        # option -- 't'" and exits 1 unconditionally, which is why
+        # every SNMP apply silently failed (#550). Validate instead by
+        # starting snmpd in the foreground against ONLY the staged file
+        # (``-C -c``), bound to a throwaway loopback transport so it
+        # can't collide with the live instance's :161, then killing it.
+        # A config parse/read error makes snmpd exit before it settles;
+        # a clean parse keeps it alive until we kill it.
+        SNMP_VALIDATE_LOG=/tmp/spatium-snmpd-validate.log
+        snmpd -f -C -c "$TMP_BODY" -Lf "$SNMP_VALIDATE_LOG" \
+            udp:127.0.0.1:16199 >"$SNMP_VALIDATE_LOG" 2>&1 &
+        probe_pid=$!
+        sleep 1
+        if kill -0 "$probe_pid" 2>/dev/null; then
+            # Still running → config parsed OK. Reap it.
+            kill "$probe_pid" 2>/dev/null || true
+            wait "$probe_pid" 2>/dev/null || true
+            echo "  ✓ snmpd config parse OK"
+        else
+            wait "$probe_pid" 2>/dev/null || true
+            # The probe exited early. Distinguish a genuine config
+            # rejection from an infrastructure hiccup (e.g. the
+            # throwaway port was already bound): only hard-fail when
+            # snmpd actually complained about reading/parsing the
+            # config. Otherwise let the real ``systemctl`` start below
+            # be the arbiter so we don't false-reject a valid config.
+            if grep -qiE 'error|cannot|unknown|parse|read_config|line [0-9]' \
+                    "$SNMP_VALIDATE_LOG" 2>/dev/null \
+                    && ! grep -qiE 'address already in use|bind' \
+                    "$SNMP_VALIDATE_LOG" 2>/dev/null; then
+                echo "  ✗ snmpd rejected the staged config:"
+                sed 's/^/      /' "$SNMP_VALIDATE_LOG"
+                echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+                mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+                exit 1
+            fi
+            echo "  ⚠ config probe inconclusive — relying on the real start"
         fi
-        echo "  ✓ snmpd -t passed"
 
         # Stop snmpd cleanly so the createUser lines we're about to
         # ship are read fresh on next start. Ignore failure when the

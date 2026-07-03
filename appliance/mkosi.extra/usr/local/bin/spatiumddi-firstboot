@@ -191,10 +191,21 @@ if [ ! -f "$ENV_FILE" ]; then
     INSTALL_CONTROL_PLANE_URL=""
     INSTALL_BOOTSTRAP_PAIRING_CODE=""
     if [ -f /etc/spatiumddi/role-config ]; then
-        # shellcheck disable=SC1091
-        . /etc/spatiumddi/role-config
-        INSTALL_CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-}"
-        INSTALL_BOOTSTRAP_PAIRING_CODE="${BOOTSTRAP_PAIRING_CODE:-}"
+        # #554 — PARSE, don't source. ``. role-config`` runs shell
+        # interpretation over operator-supplied values, so a
+        # CONTROL_PLANE_URL carrying ``#`` / ``&`` / space / `` ` `` /
+        # ``$(…)`` would truncate, background, or execute under set -e.
+        # role-config carries exactly three keys; extract each with sed
+        # (last occurrence wins), stripping one layer of surrounding
+        # quotes, and never evaluate the value.
+        _rc_get() {
+            sed -n "s/^$1=//p" /etc/spatiumddi/role-config | tail -n1 \
+                | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+        }
+        _RC_ROLE=$(_rc_get ROLE)
+        [ -n "$_RC_ROLE" ] && ROLE="$_RC_ROLE"
+        INSTALL_CONTROL_PLANE_URL=$(_rc_get CONTROL_PLANE_URL)
+        INSTALL_BOOTSTRAP_PAIRING_CODE=$(_rc_get BOOTSTRAP_PAIRING_CODE)
     fi
 
     BOOTSTRAP_PAIRING_CODE_VAL=""
@@ -859,6 +870,23 @@ if [ -x /usr/local/bin/spatium-upgrade-slot ] && [ -e /etc/spatiumddi/role-confi
         echo "WARN: sync-versions failed — OS Image card will show 'unknown' for slot versions"
 fi
 
+# #554 — is this a TRIAL boot (running slot != durable default)? Blocking
+# the slot commit on a host-migrate failure only matters during a trial
+# boot; on a steady-state boot there's nothing to commit, so a persistent
+# host-migrate failure should log + continue rather than exit 1 on EVERY
+# boot (which leaves the firstboot unit perpetually `failed`).
+is_trial_boot() {
+    local gbd=/boot/efi root_uuid root_dev cur saved
+    [ -f "$gbd/grub/grubenv" ] || return 1
+    root_uuid=$(awk 'BEGIN{RS=" "} /^root=UUID=/{print substr($0,11)}' /proc/cmdline 2>/dev/null | head -1)
+    [ -n "$root_uuid" ] || return 1
+    root_dev=$(blkid -U "$root_uuid" 2>/dev/null) || return 1
+    cur=$(lsblk -no PARTLABEL "$root_dev" 2>/dev/null | tr 'A-Z' 'a-z' | head -1)
+    case "$cur" in root_a) cur=slot_a ;; root_b) cur=slot_b ;; *) return 1 ;; esac
+    saved=$(grub-editenv "$gbd/grub/grubenv" list 2>/dev/null | awk -F= '/^saved_entry=/{print $2}')
+    [ -n "$saved" ] && [ "$saved" != "$cur" ]
+}
+
 # ── #395 host-migration reconcile ────────────────────────────────────────────
 # MUST run before the readyz wait so a failed grub render blocks the slot
 # commit. The current boot already loaded via grub (we're here), so a bad
@@ -867,13 +895,20 @@ fi
 # renderer's per-slot labels.
 if [ -x /usr/local/bin/spatium-host-migrate ]; then
     if ! /usr/local/bin/spatium-host-migrate; then
-        echo "ERROR: host-migration reconcile failed — NOT committing this slot." >&2
-        echo "       grub.cfg + .bak are intact; next reboot reverts (A/B one-shot)." >&2
-        # Do NOT place_deferred / commit. Mirror the not-ready tail: still
-        # release any deferred control manifest so the control plane comes up,
-        # then exit non-zero so commit_slot_if_healthy never runs.
+        echo "ERROR: host-migration reconcile failed." >&2
+        # Still release any deferred control manifest so the control plane
+        # comes up regardless.
         mv -f "${CONTROL_MANIFEST}.deferred" "$CONTROL_MANIFEST" 2>/dev/null || true
-        exit 1
+        if is_trial_boot; then
+            # Trial boot: a bad grub render risks the next reboot, so do NOT
+            # commit — exit non-zero so commit_slot_if_healthy never runs and
+            # the A/B one-shot reverts on the next reboot.
+            echo "       trial boot: NOT committing this slot; next reboot reverts." >&2
+            exit 1
+        fi
+        # Steady-state boot: nothing to commit. Log + continue so we don't
+        # leave the firstboot unit `failed` on every boot (#554).
+        echo "       steady-state boot: nothing to commit; continuing." >&2
     fi
 fi
 

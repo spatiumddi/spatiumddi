@@ -13,8 +13,6 @@ After=local-fs-pre.target var.mount
 Before=local-fs.target
 Conflicts=umount.target
 Before=umount.target
-# Reconcile runs after this mount so it sees the merged view.
-RequiredBy=spatium-etc-reconcile.service
 
 [Mount]
 What=overlay
@@ -31,3 +29,9 @@ TimeoutSec=10s
 
 [Install]
 WantedBy=local-fs.target
+# #553 — RequiredBy belongs in [Install] (it's an install-time directive,
+# silently ignored under [Unit]). Ordering still holds via
+# spatium-etc-reconcile's own After= + ConditionPathIsMountPoint, so this
+# is a correctness tidy-up rather than a behaviour change. Reconcile sees
+# the merged /etc view because it runs after this mount.
+RequiredBy=spatium-etc-reconcile.service

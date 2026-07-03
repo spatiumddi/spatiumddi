@@ -44,6 +44,8 @@ from cryptography.hazmat.primitives.serialization import (
     load_pem_private_key,
 )
 
+from . import appliance_state
+
 # File names — kept module-level so tests can reference them without
 # duplicating literals.
 PRIVATE_KEY_FILENAME = "identity.key"
@@ -200,8 +202,10 @@ def save_session_token(state_dir: Path, token: str) -> None:
     takes over."""
     path = _identity_dir(state_dir) / SESSION_TOKEN_FILENAME
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(token + "\n")
-    tmp.chmod(0o600)
+    # #555 — set 0600 AT creation (not write_text + chmod after, which left
+    # the bearer token briefly world-readable). Reuse the shared owner-only
+    # writer so the O_EXCL/O_NOFOLLOW hardening lives in exactly one place.
+    appliance_state._write_owner_only(tmp, token + "\n")
     tmp.replace(path)
 
 

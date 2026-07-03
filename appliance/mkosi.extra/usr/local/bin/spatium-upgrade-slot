@@ -273,10 +273,15 @@ def cmd_apply(args) -> int:
     # unverified image onto a block device.
     insecure = getattr(args, "insecure", False)
     expected_sha256 = (getattr(args, "expected_sha256", None) or "").strip().lower()
-    if insecure and not (expected_sha256 or args.checksum):
+    # A ``--checksum`` sidecar is fetched over the SAME channel as the image,
+    # so with TLS verification off a MITM can serve a matching malicious
+    # image+sidecar pair — it's no verification at all (#551). Only an
+    # out-of-band ``--expected-sha256`` literal makes ``--insecure`` safe.
+    if insecure and not expected_sha256:
         print(
-            "ERROR: --insecure requires --expected-sha256 or --checksum "
-            "(bytes must be verified when TLS verification is off)",
+            "ERROR: --insecure requires --expected-sha256 (an out-of-band "
+            "literal hash; a --checksum sidecar fetched over the same "
+            "unverified channel provides no real protection)",
             file=sys.stderr,
         )
         return 2
@@ -324,8 +329,7 @@ def cmd_apply(args) -> int:
 
     _write_progress("bootloader", None, "updating bootloader + slot versions")
     print("  flushing kernel buffers + re-reading filesystem metadata…")
-    subprocess.run(["partprobe", "/dev/" + os.path.basename(target_dev).rstrip("0123456789p")],
-                   check=False)
+    subprocess.run(["partprobe", _parent_disk(target_dev)], check=False)
     subprocess.run(["udevadm", "settle"], check=False)
     staged.unlink(missing_ok=True)
 
@@ -366,8 +370,19 @@ def cmd_apply(args) -> int:
     # missing or returns non-zero (pre-#395 ESP, or a render-path bug)
     # so apply never leaves grub.cfg unstamped.
     rendered = False
+    # Pass the UUIDs we KNOW (probed via blkid directly off the devices) so
+    # the renderer doesn't re-discover them through the possibly-stale
+    # udev/lsblk cache after the tune2fs UUID randomisation (#551).
+    render_cmd = ["spatium-grub-render"]
+    slot_uuids = {
+        active.get("partlabel", ""): active.get("uuid", ""),
+        inactive.get("partlabel", ""): new_uuid or inactive.get("uuid", ""),
+    }
+    ra_uuid, rb_uuid = slot_uuids.get("root_a"), slot_uuids.get("root_b")
+    if ra_uuid and rb_uuid:
+        render_cmd += ["--root-a-uuid", ra_uuid, "--root-b-uuid", rb_uuid]
     try:
-        rc = subprocess.run(["spatium-grub-render"], check=False).returncode
+        rc = subprocess.run(render_cmd, check=False).returncode
         rendered = (rc == 0)
     except FileNotFoundError:
         rendered = False
@@ -450,6 +465,34 @@ def _refresh_baked_images(target_dev: str) -> None:
         print(f"  WARN: baked-image refresh skipped ({exc})", file=sys.stderr)
 
 
+def _parent_disk(part_dev: str) -> str:
+    """Return the whole-disk device holding a partition.
+
+    ``basename(dev).rstrip("0123456789p")`` (the old inline form) is wrong
+    on exactly the media the appliance supports: ``/dev/nvme0n1p5`` →
+    ``/dev/nvme0n`` and ``/dev/mmcblk0p5`` → ``/dev/mmcblk`` (#551). Ask
+    lsblk for the real parent (``pkname``); fall back to a suffix-strip
+    that handles both the ``p<N>`` separator (nvme/mmcblk/loop) and the
+    bare-``<N>`` form (sd/vd/hd/xvd).
+    """
+    try:
+        out = subprocess.run(
+            ["lsblk", "-no", "pkname", part_dev],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        first = out.splitlines()[0].strip() if out else ""
+        if first:
+            return "/dev/" + first
+    except (FileNotFoundError, OSError):
+        # lsblk missing or failed — deliberately fall through to the
+        # suffix-strip below, which needs no external tool.
+        pass
+    base = os.path.basename(part_dev)
+    if re.search(r"\dp\d+$", base):  # nvme0n1p5 / mmcblk0p5 / loop0p1
+        return "/dev/" + re.sub(r"p\d+$", "", base)
+    return "/dev/" + re.sub(r"\d+$", "", base)  # sda5 / vdb3
+
+
 def _blkid_uuid(device: str) -> str | None:
     """Return the filesystem UUID of the given block device, or None
     if blkid fails (uninitialised filesystem, missing tool, etc.)."""
@@ -505,7 +548,13 @@ def _patch_grub_cfg_slot_uuid(partlabel: str, new_uuid: str,
         patched_count += n
         return head + new_body + tail
 
-    new_cfg = block_re.sub(replace_block, cfg, count=1)
+    # Patch EVERY menuentry for this slot, not just the first (#551): the
+    # slot has more than one entry (``--id=slot_a``, ``--id=slot_a_verbose``,
+    # the rescue entry), all keyed off the same partition. count=1 left the
+    # verbose + rescue entries pointing at the pre-upgrade UUID → unbootable
+    # when the fallback path (no spatium-grub-render) runs. The block_re is
+    # anchored to slot_id so the OTHER slot's entries are never touched.
+    new_cfg = block_re.sub(replace_block, cfg)
     if patched_count == 0:
         print(f"WARN: couldn't locate {slot_id} menuentry in {cfg_path}; "
               "grub.cfg not updated", file=sys.stderr)

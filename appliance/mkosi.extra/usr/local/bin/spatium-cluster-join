@@ -88,7 +88,14 @@ READY_TIMEOUT=180  # seconds to wait for the node to report Ready
 
 mkdir -p "$LOG_DIR" "$RELEASE_STATE"
 
-log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" | tee -a "$LOG"; }
+# NB: log to STDERR (not stdout). Several helpers below —
+# backup_and_wipe_identity in particular — return a value on stdout via
+# command substitution (identity_backup="$(backup_and_wipe_identity …)").
+# If log() wrote to stdout its lines would be captured into that value,
+# so the two-line result failed restore_identity's `[ -d "$bak" ]` guard
+# and a failed-join rollback silently never restored etcd/TLS/creds
+# (#551). tee still mirrors everything into $LOG.
+log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" | tee -a "$LOG" >&2; }
 
 # Clean the k3s runtime before a (re)start. k3s's `systemctl stop`
 # notoriously leaves orphaned containerd-shim processes behind (this is
@@ -172,7 +179,23 @@ backup_and_wipe_identity() {
     rm -f /run/flannel/subnet.env 2>/dev/null || true
     rm -rf /var/lib/cni/networks 2>/dev/null || true
     log "wiped cluster identity → $bak (k3s binary + airgap images kept)"
+    _prune_identity_backups
     printf '%s\n' "$bak"
+}
+
+# #555 — prune stale identity backups. Each one holds the etcd db + tls/
+# private keys (CA material) and lives in the 1777 release-state dir; the
+# old code left every join/leave backup forever ("a later sweep can prune"
+# — no sweep existed). Keep the newest 3 (a couple of promote/leave cycles
+# of manual-recovery headroom). log() goes to stderr so this never pollutes
+# the stdout path returned by backup_and_wipe_identity.
+_prune_identity_backups() {
+    local keep=3 d
+    ls -1dt "$IDENTITY_BAK_ROOT".*.* 2>/dev/null | tail -n +$((keep + 1)) | while read -r d; do
+        [ -d "$d" ] || continue
+        rm -rf "$d" 2>/dev/null || true
+        log "pruned stale identity backup: $d"
+    done
 }
 
 # Restore a cluster identity captured by backup_and_wipe_identity (used
@@ -234,8 +257,11 @@ do_join() {
         exit 0
     fi
 
-    # Validate before we touch anything destructive.
-    if ! printf '%s' "$server_url" | grep -qE '^https://[A-Za-z0-9.:_-]+:6443$'; then
+    # Validate before we touch anything destructive. #555 — the char class
+    # includes ``[`` and ``]`` (``]`` first, ``[`` + ``-`` last per POSIX
+    # bracket rules) so an IPv6-literal seed URL like
+    # ``https://[fd00::1]:6443`` is accepted; the old class rejected it.
+    if ! printf '%s' "$server_url" | grep -qE '^https://[]A-Za-z0-9._:[-]+:6443$'; then
         log "invalid server_url ($server_url) — refusing join"
         write_state failed "invalid server_url"
         mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true

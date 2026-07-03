@@ -125,14 +125,22 @@ if auth:
 
 # Keyrings are referenced by absolute path in the sources.list entries, so
 # they must exist at the live location BEFORE validation. Additive + safe.
+# Record the ones we CREATE new (didn't pre-exist) so the bash half can
+# clean them up if the validate fails — otherwise a failed enable leaves
+# orphaned keyrings under /etc/apt/keyrings (#550).
+new_keyrings = []
 for key_id, armour in (data.get("keyrings") or {}).items():
     safe = "".join(c for c in str(key_id) if c.isalnum() or c in "._-")
     if not safe:
         continue
     p = os.path.join(keyring_dir, f"spatiumddi-{safe}.asc")
+    if not os.path.exists(p):
+        new_keyrings.append(p)
     with open(p, "w", encoding="utf-8") as fh:
         fh.write(armour)
     os.chmod(p, 0o644)
+with open(os.path.join(stage, "new-keyrings.list"), "w", encoding="utf-8") as fh:
+    fh.write("\n".join(new_keyrings))
 
 # Emit the artifact paths + unattended flag for the bash half.
 with open(os.path.join(stage, "manifest.env"), "w", encoding="utf-8") as fh:
@@ -183,6 +191,14 @@ EOF
                 state="no-sources"
             fi
             echo "  classified as: $state (live config left untouched)"
+            # Clean up the keyrings we created this run (didn't pre-exist)
+            # so a failed enable doesn't leave orphans under the live
+            # keyring dir (#550). Pre-existing keyrings are left alone.
+            if [ -f "$STAGE/new-keyrings.list" ]; then
+                while IFS= read -r kp; do
+                    [ -n "$kp" ] && rm -f "$kp"
+                done < "$STAGE/new-keyrings.list"
+            fi
             finish "$state" "failed"
             exit 1
         fi

@@ -25,6 +25,10 @@
 #   <output-dir>/spatiumddi-appliance-slot-<version>.sha256
 
 set -eu
+# #553 — pipefail so a producer dying mid-stream in the `tar | tar` rootfs
+# copy fails the build instead of the consumer silently exiting 0 on a
+# truncated stream (which would ship a partial /usr or /etc slot image).
+set -o pipefail
 
 INPUT_RAW="${1:?input raw image path required}"
 OUT_DIR="${2:?output directory required}"
@@ -42,7 +46,15 @@ VERSION=$(basename "$INPUT_RAW" .raw | sed -E 's/^spatiumddi-appliance_//')
 [ -n "$VERSION" ] || VERSION="0.0.0"
 
 WORK=$(mktemp -d)
-trap 'for mp in "$WORK/src-mnt" "$WORK/slot-mnt"; do umount "$mp" 2>/dev/null || true; done; rm -rf "$WORK"' EXIT
+# #553 — RECURSIVE unmount, deepest-first. During the initramfs-regen
+# window /proc, /sys and /dev are bind-mounted UNDER slot-mnt; a plain
+# `umount "$WORK/slot-mnt"` returns EBUSY (submounts present) → swallowed
+# by `|| true` → the bind mounts stay live → `rm -rf "$WORK"` recurses
+# through the bind-mounted /dev (deleting /dev/null etc.) and leaks the
+# loop device. `umount -R` tears the submounts down first; `rm -rf
+# --one-file-system` is a belt-and-braces stop so rm never crosses a
+# still-mounted boundary even if an unmount failed.
+trap 'for mp in "$WORK/slot-mnt" "$WORK/src-mnt"; do umount -R "$mp" 2>/dev/null || umount "$mp" 2>/dev/null || true; done; rm -rf --one-file-system "$WORK"' EXIT
 
 mkdir -p "$WORK/src-mnt" "$WORK/slot-mnt"
 
