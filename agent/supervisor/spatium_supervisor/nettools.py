@@ -714,6 +714,56 @@ async def _run_firewall_logs(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ── wake-on-lan ──────────────────────────────────────────────────────
+
+_WOL_HEX12_RE: Final = re.compile(r"^[0-9A-Fa-f]{12}$")
+
+
+def _wol_normalize_mac(mac: str) -> str:
+    stripped = re.sub(r"[:.\-]", "", mac.strip())
+    if not _WOL_HEX12_RE.match(stripped):
+        raise NetToolArgError(f"not a valid MAC address: {mac!r}")
+    low = stripped.lower()
+    return ":".join(low[i : i + 2] for i in range(0, 12, 2))
+
+
+def _send_magic_packet(mac: str, broadcast: str, port: int) -> None:
+    mac_bytes = bytes.fromhex(_wol_normalize_mac(mac).replace(":", ""))
+    packet = b"\xff" * 6 + mac_bytes * 16  # AMD Magic Packet, 102 bytes
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(packet, (broadcast, port))
+
+
+async def _run_wol(params: dict[str, Any]) -> dict[str, Any]:
+    """Send a Wake-on-LAN magic packet from the supervisor's local vantage
+    (#533) so it originates on the target's broadcast domain. Re-validates
+    MAC + broadcast — the control plane already did; this executor is a
+    re-validation point. Returns the backend ``WolResult`` shape."""
+    mac = _wol_normalize_mac(str(params.get("mac", "")))
+    raw_bcast = str(params.get("broadcast", "")).strip()
+    try:
+        broadcast = str(ipaddress.IPv4Address(raw_bcast))
+    except ipaddress.AddressValueError as exc:
+        raise NetToolArgError(
+            f"broadcast must be an IPv4 address: {raw_bcast!r}"
+        ) from exc
+    try:
+        port = int(params.get("port", 9))
+    except (TypeError, ValueError) as exc:
+        raise NetToolArgError("port must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise NetToolArgError("port must be between 1 and 65535")
+    await asyncio.to_thread(_send_magic_packet, mac, broadcast, port)
+    return {
+        "mac": mac,
+        "broadcast": broadcast,
+        "port": port,
+        "sent": True,
+        "ran_from": "server",
+    }
+
+
 # ── dispatch ─────────────────────────────────────────────────────────
 
 # The reachability tools this executor knows how to run. Mirrors the
@@ -729,6 +779,9 @@ _RUNNERS: Final[dict[str, Any]] = {
     # #404 — appliance-diagnostic tool (not a reachability probe), dispatched
     # the same way; the backend allows it via an explicit allow-set.
     "firewall_logs": _run_firewall_logs,
+    # #533 — Wake-on-LAN. Not a reachability probe; dispatched from the IP
+    # detail modal so the packet originates on the target's segment.
+    "wol": _run_wol,
 }
 
 # True reachability probes only — keep firewall_logs out of this so the set
