@@ -515,6 +515,112 @@ register(
 )
 
 
+# ── wake_host operation (issue #533) ───────────────────────────────────
+
+
+class WakeHostArgs(BaseModel):
+    """Args for ``wake_host`` — send a Wake-on-LAN magic packet to an IP."""
+
+    address_id: str = Field(
+        description=(
+            "UUID of the ip_address row to wake. The MAC + subnet broadcast "
+            "are resolved server-side, so resolve the IP first with find_ip "
+            "and pass its id."
+        ),
+    )
+    port: int = Field(
+        default=9,
+        ge=1,
+        le=65535,
+        description="UDP port for the magic packet (default 9).",
+    )
+
+
+async def _load_wake_target(db: AsyncSession, args: WakeHostArgs) -> tuple[Any, str, str]:
+    """Resolve (ip_row, mac, broadcast) or raise ValueError. Delegates to the
+    shared ``wol.resolve_wake_params`` so this path can't drift from the REST
+    endpoint; only the UUID parse is operation-specific."""
+    import uuid as _uuid  # noqa: PLC0415
+
+    from app.services import wol  # noqa: PLC0415
+
+    try:
+        aid = _uuid.UUID(args.address_id)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"address_id is not a valid UUID: {args.address_id!r}") from exc
+    return await wol.resolve_wake_params(db, aid)
+
+
+async def _preview_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> PreviewResult:
+    try:
+        ip, mac, broadcast = await _load_wake_target(db, args)
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Send a Wake-on-LAN magic packet to `{mac}` for `{ip.address}` "
+            f"(broadcast `{broadcast}:{args.port}`). This wakes the host only "
+            "if the packet reaches its L2 segment."
+        ),
+    )
+
+
+async def _apply_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> dict[str, Any]:
+    from app.api.v1.dhcp._audit import write_audit  # noqa: PLC0415
+    from app.services import wol  # noqa: PLC0415
+
+    enforce_operation_permission(user, _OPERATIONS["wake_host"])
+    ip, mac, broadcast = await _load_wake_target(db, args)
+    # AI proposals always send from the control-plane (server) vantage.
+    try:
+        await wol.wake_from_server(wol.WolWireRequest(mac=mac, broadcast=broadcast, port=args.port))
+    except wol.WolDispatchError as exc:
+        raise ValueError(str(exc)) from exc
+    write_audit(
+        db,
+        user=user,
+        action="wake_on_lan",
+        resource_type="ip_address",
+        resource_id=str(ip.id),
+        resource_display=str(ip.address),
+        new_value={
+            "mac": mac,
+            "broadcast": broadcast,
+            "port": args.port,
+            "ran_from": "server",
+            "via": "ai_proposal",
+        },
+    )
+    await db.commit()
+    return {
+        "address": str(ip.address),
+        "mac": mac,
+        "broadcast": broadcast,
+        "port": args.port,
+        "sent": True,
+        "hint": "Magic packet broadcast from the control plane.",
+    }
+
+
+register(
+    Operation(
+        name="wake_host",
+        description=(
+            "Send a Wake-on-LAN magic packet to an IP's MAC. Always go "
+            "through propose_wake_host — never call this directly."
+        ),
+        args_model=WakeHostArgs,
+        preview=_preview_wake_host,
+        apply=_apply_wake_host,
+        category="network",
+        # ``read`` matches the rest of the network-tools surface.
+        required_permission=("read", "use_network_tools"),
+    )
+)
+
+
 # ── run_cert_probe operation (issue #118) ──────────────────────────────
 
 

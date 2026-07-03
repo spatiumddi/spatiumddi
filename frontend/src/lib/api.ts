@@ -1673,6 +1673,30 @@ export const ipamApi = {
         status: string;
       }>(`/ipam/addresses/${id}/profile`, { preset: preset ?? null })
       .then((r) => r.data),
+  /** Wake-on-LAN (#533) — send a magic packet to this IP's MAC. The
+   *  broadcast target is derived server-side from the IP's subnet. Omit
+   *  the vantage to send from the control plane; pass an appliance target
+   *  to originate the packet on that appliance's segment. */
+  wakeAddress: (
+    id: string,
+    opts?: {
+      port?: number;
+      target?: { kind: "server" | "appliance"; id?: string };
+    },
+  ) =>
+    api
+      .post<{
+        mac: string;
+        broadcast: string;
+        port: number;
+        sent: boolean;
+        ran_from: string;
+        error: string | null;
+      }>(`/ipam/addresses/${id}/wake`, {
+        port: opts?.port ?? 9,
+        target: opts?.target ?? null,
+      })
+      .then((r) => r.data),
   /** Fetch the passive DHCP fingerprint joined to this IP's MAC.
    *  404 when the IP has no MAC or no fingerprint has been captured
    *  yet — callers should swallow that and treat it as "no data". */
@@ -12467,6 +12491,16 @@ export interface NetToolMacVendorResult {
   entries: NetToolMacVendorEntry[];
 }
 
+// Wake-on-LAN result (#533) — mirrors backend WolResult.
+export interface NetToolWolResult {
+  mac: string;
+  broadcast: string;
+  port: number;
+  sent: boolean;
+  ran_from: string;
+  error: string | null;
+}
+
 // Fold the routing-only ``target`` into a reachability-tool body only
 // when it points at an appliance — a "server" target (or none) is the
 // back-compatible inline run, so we omit the field entirely.
@@ -12531,6 +12565,15 @@ export const networkToolsApi = {
   macVendor: (macs: string[]) =>
     api
       .post<NetToolMacVendorResult>("/tools/mac-vendor", { macs })
+      .then((r) => r.data),
+  // Wake-on-LAN (#533) — MAC-based; broadcast optional (defaults to the local
+  // segment 255.255.255.255 server-side). Runs from the server or an appliance.
+  wol: (
+    body: { mac: string; broadcast?: string | null; port?: number },
+    target?: NetToolTarget,
+  ) =>
+    api
+      .post<NetToolWolResult>("/tools/wol", withTarget(body, target))
       .then((r) => r.data),
   // #404 — tail an appliance's nftables drop logs. Always appliance-targeted
   // (the api can't read host kernel logs); poll with the returned cursor.

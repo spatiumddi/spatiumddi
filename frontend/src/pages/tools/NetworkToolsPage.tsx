@@ -7,6 +7,7 @@ import {
   Loader2,
   Network,
   Plug,
+  Power,
   Route,
   Search,
   ShieldCheck,
@@ -20,6 +21,7 @@ import {
   type NetToolPortTestResult,
   type NetToolTarget,
   type NetToolTlsCertResult,
+  type NetToolWolResult,
   type PropagationCheckResult,
   applianceApprovalApi,
   networkToolsApi,
@@ -38,7 +40,8 @@ type ToolId =
   | "port-test"
   | "tls-cert"
   | "dns-propagation"
-  | "mac-vendor";
+  | "mac-vendor"
+  | "wol";
 
 interface ToolDef {
   id: ToolId;
@@ -113,6 +116,13 @@ const TOOLS: ToolDef[] = [
     label: "MAC vendor",
     icon: Award,
     blurb: "Resolve OUI vendor names for a batch of MACs.",
+  },
+  {
+    id: "wol",
+    label: "Wake-on-LAN",
+    icon: Power,
+    blurb: "Send a magic packet to a MAC — from the server or an appliance.",
+    reachability: true,
   },
 ];
 
@@ -230,9 +240,9 @@ export function NetworkToolsPage() {
         </div>
         <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
           Stateless ping / traceroute / MTR / dig / whois / port-test / TLS-cert
-          / DNS-propagation / MAC-vendor utilities. Reachability tools can run
-          from the control-plane server or a Fleet appliance's vantage;
-          rate-limited per user.
+          / DNS-propagation / MAC-vendor / Wake-on-LAN utilities. Reachability
+          tools can run from the control-plane server or a Fleet appliance's
+          vantage; rate-limited per user.
         </p>
       </div>
 
@@ -355,6 +365,7 @@ function ToolPanel({
       {tool.id === "tls-cert" && <TlsCertTool target={target} />}
       {tool.id === "dns-propagation" && <PropagationTool />}
       {tool.id === "mac-vendor" && <MacVendorTool />}
+      {tool.id === "wol" && <WolTool target={target} />}
     </div>
   );
 }
@@ -1103,6 +1114,98 @@ function MacVendorTool() {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── wake-on-lan ───────────────────────────────────────────────────────
+
+function WolTool({ target }: { target?: NetToolTarget }) {
+  const [mac, setMac] = useState("");
+  const [broadcast, setBroadcast] = useState("");
+  const [port, setPort] = useState("9");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [res, setRes] = useState<NetToolWolResult | null>(null);
+
+  const ranRemote = target?.kind === "appliance";
+
+  const run = async () => {
+    if (!mac.trim()) {
+      setErr("MAC address is required");
+      return;
+    }
+    setErr(null);
+    setRes(null);
+    setBusy(true);
+    try {
+      setRes(
+        await networkToolsApi.wol(
+          {
+            mac: mac.trim(),
+            broadcast: broadcast.trim() || null,
+            port: Number(port) || 9,
+          },
+          target,
+        ),
+      );
+    } catch (e) {
+      setErr(toolError(e, ranRemote));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <label className={labelCls}>MAC address</label>
+        <input
+          className={cn(inputCls, "font-mono")}
+          value={mac}
+          onChange={(e) => setMac(e.target.value)}
+          placeholder="e.g. aa:bb:cc:dd:ee:ff"
+        />
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className={labelCls}>Broadcast (optional)</label>
+          <input
+            className={cn(inputCls, "font-mono")}
+            value={broadcast}
+            onChange={(e) => setBroadcast(e.target.value)}
+            placeholder="255.255.255.255"
+          />
+        </div>
+        <div>
+          <label className={labelCls}>Port</label>
+          <input
+            className={cn(inputCls, "font-mono")}
+            type="number"
+            min={1}
+            max={65535}
+            value={port}
+            onChange={(e) => setPort(e.target.value)}
+          />
+        </div>
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Wake-on-LAN only reaches a host on the segment the packet is broadcast
+        to — use an appliance vantage on the target's subnet for remote wakes.
+        Leave the broadcast blank to hit the local segment.
+      </p>
+      {err && <ErrorBanner msg={err} />}
+      <RunButton busy={busy} onClick={run} label="wake" />
+      {res && (
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/5 p-2 text-xs text-emerald-700 dark:text-emerald-400">
+          <Power className="h-3.5 w-3.5" />
+          Magic packet sent to <span className="font-mono">
+            {res.mac}
+          </span> via <span className="font-mono">{res.broadcast}</span>:
+          {res.port}
+          <RanFrom value={res.ran_from} />
         </div>
       )}
     </div>

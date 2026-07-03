@@ -37,6 +37,7 @@ from app.services.ai.operations import (
     CreateIPAddressArgs,
     CreateMulticastGroupArgs,
     RunNmapScanArgs,
+    WakeHostArgs,
 )
 from app.services.ai.tools.base import register_tool
 
@@ -212,6 +213,43 @@ async def propose_run_nmap_scan(
         db,
         user=user,
         operation="run_nmap_scan",
+        args=args.model_dump(),
+        preview_text=preview.preview_text,
+    )
+    return _proposal_result(proposal, preview_text=preview.preview_text)
+
+
+# ── propose_wake_host ─────────────────────────────────────────────────
+
+
+@register_tool(
+    name="propose_wake_host",
+    description=(
+        "Prepare a Wake-on-LAN proposal for an IP. The operator must "
+        "click Apply to actually send the magic packet — WoL touches the "
+        "network. Resolve the IP first with find_ip and pass its id as "
+        "address_id. Returns kind='proposal' — surface the preview and "
+        "wait for the operator's decision."
+    ),
+    args_model=WakeHostArgs,
+    writes=False,  # The propose tool is read-only; apply is the send.
+    category="network",
+)
+async def propose_wake_host(db: AsyncSession, user: User, args: WakeHostArgs) -> dict[str, Any]:
+    op = operations.get_operation("wake_host")
+    if op is None:
+        return {"error": "Operation 'wake_host' is not registered"}
+    preview = await op.preview(db, user, args)
+    if not preview.ok:
+        return {
+            "kind": "proposal_rejected",
+            "operation": "wake_host",
+            "detail": preview.detail,
+        }
+    proposal = await _persist_proposal(
+        db,
+        user=user,
+        operation="wake_host",
         args=args.model_dump(),
         preview_text=preview.preview_text,
     )

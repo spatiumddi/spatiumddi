@@ -191,6 +191,31 @@ IPAddress
 
 Returns the allocated IPAddress. Allocation is atomic (uses DB-level `SELECT ... FOR UPDATE` on the subnet row to prevent race conditions). The picker skips network/broadcast placeholders and any IP inside a dynamic DHCP pool.
 
+### Wake-on-LAN (#533)
+
+`POST /api/v1/ipam/addresses/{id}/wake`
+
+Sends a Wake-on-LAN magic packet to the IP's MAC. The MAC comes from the
+address row and the IPv4 broadcast target is derived from the IP's subnet, so
+the request body only needs an optional `port` (default 9) and an optional
+run-from `target`:
+
+```json
+{ "port": 9, "target": { "kind": "server" } }
+```
+
+- `target.kind = "server"` (default) — the control-plane container broadcasts.
+  Only wakes hosts on a segment the api container can reach (the common
+  single-box case).
+- `target.kind = "appliance"` + `target.id` — dispatch to a Fleet appliance
+  whose NIC sits on the target's segment, so the packet originates in the right
+  broadcast domain (reuses the generic nettool command channel).
+
+Gated by the `use_network_tools` permission and audited against the IP
+(`action="wake_on_lan"`). Surfaced as a **Wake** button on the IP detail modal
+(shown only when the IP has a MAC) and as the `propose_wake_host` Operator
+Copilot tool. WoL is IPv4-only — the magic packet rides a UDP broadcast.
+
 ---
 
 ## 6. Custom Fields

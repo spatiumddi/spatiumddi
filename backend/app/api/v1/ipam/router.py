@@ -144,6 +144,12 @@ from app.api.v1.ipam.plans import router as plans_router  # noqa: E402
 
 router.include_router(plans_router)
 
+# Wake-on-LAN (issue #533) — POST /api/v1/ipam/addresses/{id}/wake sends a
+# magic packet to the IP's MAC from the server or an appliance vantage.
+from app.api.v1.ipam.wake import router as wake_router  # noqa: E402
+
+router.include_router(wake_router)
+
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
 

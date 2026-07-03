@@ -6,6 +6,7 @@ import {
   Loader2,
   Pencil,
   Phone,
+  Power,
   Radar,
   Radio,
   RefreshCw,
@@ -144,6 +145,39 @@ export function IPDetailModal({
   const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
   const zoneNames = zoneNameById ?? {};
 
+  // Wake-on-LAN (#533) — self-contained like the "Re-profile now" action.
+  // Fire-and-forget: no data changes, so no query invalidation; we just
+  // surface a transient result line under the header.
+  const [wakeMsg, setWakeMsg] = useState<{ ok: boolean; text: string } | null>(
+    null,
+  );
+  const wake = useMutation({
+    mutationFn: () => ipamApi.wakeAddress(addr.id),
+    onSuccess: (data) => {
+      const via =
+        data.ran_from === "server"
+          ? "the server"
+          : data.ran_from.replace(":", " ");
+      setWakeMsg({
+        ok: true,
+        text: `Magic packet sent to ${data.mac} via ${via}.`,
+      });
+    },
+    onError: (err: unknown) => {
+      // detail is a string for our HTTPExceptions but a list of objects for a
+      // Pydantic 422 — only render it when it's actually a string.
+      const detail = (err as { response?: { data?: { detail?: unknown } } })
+        ?.response?.data?.detail;
+      setWakeMsg({
+        ok: false,
+        text:
+          typeof detail === "string"
+            ? detail
+            : "Failed to send the magic packet.",
+      });
+    },
+  });
+
   const tagEntries = Object.entries(addr.tags ?? {});
   const cfEntries = Object.entries(addr.custom_fields ?? {});
 
@@ -245,6 +279,25 @@ export function IPDetailModal({
             >
               <Radar className="h-3.5 w-3.5" /> Scan with Nmap
             </button>
+            {addr.mac_address && (
+              <button
+                type="button"
+                onClick={() => {
+                  setWakeMsg(null);
+                  wake.mutate();
+                }}
+                disabled={wake.isPending}
+                className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+                title="Send a Wake-on-LAN magic packet to this MAC"
+              >
+                {wake.isPending ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Power className="h-3.5 w-3.5" />
+                )}{" "}
+                Wake
+              </button>
+            )}
             {canEdit && (
               <button
                 type="button"
@@ -276,6 +329,19 @@ export function IPDetailModal({
 
         {/* Body */}
         <div className="space-y-5 p-4 sm:p-5">
+          {wakeMsg && (
+            <div
+              className={
+                "flex items-center gap-2 rounded-md border px-3 py-2 text-xs " +
+                (wakeMsg.ok
+                  ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                  : "border-destructive/40 bg-destructive/5 text-destructive")
+              }
+            >
+              <Power className="h-3.5 w-3.5 shrink-0" />
+              {wakeMsg.text}
+            </div>
+          )}
           {/* Identity grid */}
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field label="Hostname">{dash(addr.hostname)}</Field>
