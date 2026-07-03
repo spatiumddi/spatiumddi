@@ -20,6 +20,52 @@ the formatter handles the rest.
 
 ---
 
+## Unreleased
+
+Appliance-only work; reaches nothing in-field until it ships in a
+new appliance OS release (ISO).
+
+### Added
+
+- **Headless / unattended appliance install (#549).** The disk
+  installer `spatium-install` can now run non-interactively from a
+  **preseed answer file**, for fleet rollouts, PXE/IPMI provisioning,
+  cloud images, and CI boot-tests. On boot of the installer media it
+  looks for an answer file before launching whiptail; present fields
+  skip their prompt, a fully-preseeded run (disk + `confirm_wipe:
+  true` + all fields) installs with zero console interaction, and a
+  **partial** preseed falls through to interactive prompts for only
+  the missing fields. A field that is present but invalid **halts
+  loudly** (clear console message + non-zero exit) rather than
+  silently defaulting on a disk wipe. A new parser
+  `/usr/local/bin/spatium-preseed-parse` (PyYAML) reuses the wizard's
+  own validators — hostname RFC 1123, k3s CIDR disjoint + ≤ /22 + no
+  LAN overlap, pairing code = 8 digits, control-plane URL required for
+  the appliance role. **Destructive-disk safety**: an unattended wipe
+  needs both `confirm_wipe: true` and a `target_disk` that resolves to
+  exactly one whole disk of at least the 32 GiB A/B-layout floor
+  (prefer a stable `/dev/disk/by-id` id); a supplied-but-unresolvable
+  disk drops to the interactive picker, and an under-floor disk halts
+  loudly. Static networking requires `interface` + `ip` + `prefix` +
+  `gateway` (IPv4 only) — a missing interface would otherwise silently
+  fall back to DHCP. A URL-transport preseed retries the fetch to ride
+  out network bring-up, and discovery skips a non-preseed cloud-init
+  `user-data` on the CIDATA volume so it can't shadow a real preseed on
+  another source.
+  **Secrets**: supports `admin_password_hash` (crypt(3)) so the admin
+  cleartext stays out of the file, and keeps the password + pairing
+  code out of the console dashboard, install log, and `set -x` trace
+  log. **Transports**: kernel cmdline `spatium.preseed=<url|path>`, a
+  NoCloud `CIDATA` volume carrying `spatium-preseed.yaml`, or a file
+  on the install medium — and the same `spatium_preseed:` block can be
+  embedded in a cloud-init `user-data` document, which is how the AWS
+  (`--user-data`) and Azure (`--custom-data`) cloud-image recipes
+  deliver it. Docs + annotated control-plane / appliance examples
+  under `appliance/cloud-init/`; retires the stale pre-#183 cloud-init
+  framing in APPLIANCE.md §4.
+
+---
+
 ## 2026.07.03-1 — 2026-07-03
 
 A **hardening + Wake-on-LAN** release. The headline new feature is

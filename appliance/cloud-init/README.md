@@ -1,76 +1,246 @@
-# cloud-init NoCloud — first-boot config for the SpatiumDDI appliance
+# Headless / unattended install — SpatiumDDI appliance preseed
 
-The Phase 1 appliance image ships with the
-[NoCloud](https://cloudinit.readthedocs.io/en/latest/reference/datasources/nocloud.html)
-cloud-init datasource enabled. Drop a `user-data` + `meta-data` pair
-on a CIDATA ISO, attach it as a secondary disk, and the appliance
-configures itself on first power-on.
+Issue #549. This directory holds the **answer-file preseed** that drives
+the appliance's disk installer (`spatium-install`) non-interactively, so
+a box can install to disk with **no console operator** — for fleet
+rollouts, IPMI/PXE provisioning, cloud images, and CI boot-tests.
 
-## Build a CIDATA ISO
+> **What changed (post-#183).** The install flow is the interactive
+> **whiptail** installer `spatium-install` that partitions a disk
+> (A/B slot layout) and installs SpatiumDDI onto it. The *old*
+> `user-data.example` / `meta-data.example` in this directory only
+> configured an already-running docker-compose all-in-one (the
+> superseded pre-#183 flow) — it did **not** drive the disk installer.
+> The `spatium-preseed-*.yaml.example` files here are the current path.
+
+## How it works
+
+On boot of the **installer media** (`spatium-mode=install` in the
+kernel cmdline), `spatium-install` looks for a preseed answer file
+*before* launching the whiptail wizard. If it finds one:
+
+- Every field present in the answer file **skips** its interactive
+  prompt.
+- A **fully** preseeded run (disk + `confirm_wipe: true` + all fields)
+  runs end-to-end with **zero** console interaction — no welcome, no
+  confirm.
+- A **partial** preseed falls through to the interactive prompt for
+  **only the missing fields** (e.g. preseed everything-but-the-disk and
+  let an operator pick the target).
+- A field that is **present but invalid** (bad hostname, overlapping
+  k3s CIDRs, malformed pairing code, …) **halts loudly** with a non-zero
+  exit and a clear console message — it never silently picks a default
+  on a disk wipe.
+
+The installed system is identical to an interactively-installed one:
+the preseed only replaces the wizard's question-and-answer step, then
+hands the same values to the same `do_install`. A fully-preseeded box
+presents no setup wizard afterwards (console or web).
+
+## Answer-file schema
+
+See the annotated examples:
+
+- [`spatium-preseed-control-plane.yaml.example`](spatium-preseed-control-plane.yaml.example)
+  — first node (api + db + web UI + k3s seed).
+- [`spatium-preseed-appliance.yaml.example`](spatium-preseed-appliance.yaml.example)
+  — additional node (supervisor pairs with an existing control plane).
+
+Every field is optional; anything omitted falls through to interactive.
+Summary:
+
+| Field | Notes |
+|---|---|
+| `role` | `control-plane` (aka `first-node`) or `appliance` (aka `add-node` / `application`) |
+| `confirm_wipe` | **Must be `true`** to auto-wipe a disk unattended |
+| `target_disk` | Prefer `/dev/disk/by-id/…` or `by-path/…` (stable). Absent / unresolvable ⇒ interactive picker |
+| `hostname` | RFC 1123 (alnum + hyphen, ≤ 63) |
+| `admin_user` | default `admin` |
+| `admin_password` **or** `admin_password_hash` | plaintext, or a crypt(3) hash from `openssl passwd -6` |
+| `timezone` | IANA name, default `UTC` |
+| `network.mode` | `dhcp`, or `static` with `interface` + `ip` + `prefix` + `gateway` all required (IPv4 only; optional `dns`) |
+| `k3s.pod_cidr` / `k3s.service_cidr` | default `10.42.0.0/16` / `10.43.0.0/16`; validated ≤ /22, disjoint, no LAN overlap |
+| `control_plane_url` | **required for `role: appliance`** — the control plane URL (VIP for HA) |
+| `pairing_code` | **required for `role: appliance`** — 8-digit code from Appliance → Pairing |
+
+### Secrets
+
+`admin_password` and `pairing_code` in a plaintext answer file are the
+usual preseed tradeoff. To keep the admin cleartext out of the file, use
+`admin_password_hash` with a crypt(3) hash:
+
+```sh
+openssl passwd -6                       # prompts, prints $6$… SHA-512 hash
+# or: mkpasswd --method=sha-512
+```
+
+The pairing code is single-use / short-TTL by default (mint a fresh one
+per install). Neither secret is echoed to the console dashboard or logs,
+and both are read from a mode-`0600` file during install.
+
+## Delivery transports
+
+The same answer file is consumed regardless of how it arrives. Sources,
+first match wins:
+
+1. **Kernel cmdline** — `spatium.preseed=<url|path>` (best for PXE /
+   IPMI). A `http(s)://` value is fetched with curl; anything else is a
+   path on the installer rootfs.
+2. **NoCloud CIDATA volume** — a disk labelled `CIDATA` carrying
+   `spatium-preseed.yaml` (or `.yml`, or a cloud-init `user-data`
+   document with an embedded `spatium_preseed:` block). Best for VM /
+   Proxmox.
+3. **Install medium / rootfs** — `spatium-preseed.yaml` at
+   `/run/live/medium/`, `/`, or `/etc/` on the installer image (best for
+   sneakernet or a purpose-built ISO).
+
+### Build a NoCloud CIDATA ISO
 
 ```sh
 cd appliance/cloud-init
-cp user-data.example user-data       # edit: SSH key, release pin, hostname
-cp meta-data.example meta-data
-genisoimage -output cidata.iso -volid CIDATA -joliet -rock user-data meta-data
+cp spatium-preseed-control-plane.yaml.example spatium-preseed.yaml
+$EDITOR spatium-preseed.yaml            # set disk by-id, hostname, password
+touch meta-data                          # NoCloud requires the file to exist
+genisoimage -output cidata.iso -volid CIDATA -joliet -rock \
+    spatium-preseed.yaml meta-data
 ```
 
-`genisoimage` lives in the `cdrkit` (Debian/Ubuntu) or `cdrtools`
-(Alpine) packages. macOS:
-```sh
-hdiutil makehybrid -o cidata.iso -hfs -joliet -iso \
-        -default-volume-name CIDATA cidata-source/
-```
+`genisoimage` is in `cdrkit` (Debian/Ubuntu) or `cdrtools` (Alpine).
+macOS: `hdiutil makehybrid -o cidata.iso -hfs -joliet -iso -default-volume-name CIDATA <dir>`.
 
-## Attach to the VM
+Attach `cidata.iso` as a **second** CD/DVD/disk alongside the installer
+ISO:
 
 | Hypervisor | Recipe |
 |---|---|
-| **Proxmox** | Upload `cidata.iso` to a storage pool → VM hardware → Add → CD/DVD Drive → ISO image |
-| **libvirt / virt-manager** | Add hardware → Storage → CDROM → select cidata.iso |
+| **Proxmox** | Upload `cidata.iso` → VM hardware → Add → CD/DVD Drive → ISO image |
+| **libvirt / virt-manager** | Add hardware → Storage → CDROM → `cidata.iso` |
 | **QEMU CLI** | `-drive file=cidata.iso,if=virtio,format=raw,readonly=on` |
-| **VMware ESXi** | Datastore browser → upload → VM Edit → CD/DVD → Datastore ISO file |
-| **AWS / Azure / GCP** | Cloud-specific datasource handles user-data natively (Phase 5) |
+| **VMware ESXi** | Datastore browser → upload → VM Edit → CD/DVD → Datastore ISO |
 
-## What `user-data.example` covers
+### PXE / IPMI
 
-- **Operator account** — creates an `admin` user with `wheel` + `docker`
-  groups, sudo NOPASSWD, SSH key. Root SSH login is disabled out of
-  the box.
-- **Hostname / timezone** — applied before docker comes up.
-- **Optional release pin** (`/etc/spatiumddi/release`) — pins
-  `SPATIUMDDI_VERSION` to a CalVer tag instead of `:latest`.
-- **Optional agent.env** — placeholder for Phase 4 distributed agent
-  appliances. Phase 1 is all-in-one; this section is forward-compat.
+Append to the installer boot cmdline (alongside `spatium-mode=install`):
 
-## What happens on first boot
+```
+spatium.preseed=https://provision.example.net/spatium/ddi-control-1.yaml
+```
 
-1. cloud-init runs (`cloud-init-local.service` → `cloud-init.service`
-   → `cloud-config.service` → `cloud-final.service`), applies
-   user-data: hostname, users, write_files.
-2. The `spatiumddi-firstboot.service` systemd unit starts after
-   `cloud-final.service` and:
-   - generates `/etc/spatiumddi/.env` (POSTGRES_PASSWORD, SECRET_KEY,
-     CREDENTIAL_ENCRYPTION_KEY, DNS_AGENT_KEY, DHCP_AGENT_KEY,
-     BOOTSTRAP_PAIRING_CODE on Application installs) on first run
-     only — preserved across reboots via the `/etc` overlay →
-     `/var/persist/etc` path
-   - renders the variant-specific HelmChart manifest into
-     `/var/lib/rancher/k3s/server/manifests/spatium-bootstrap.yaml`;
-     k3s's helm-controller auto-installs the chart tarball baked at
-     `/usr/lib/spatiumddi/charts/`
-   - starts `k3s.service`; containerd auto-imports the per-image
-     tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst` so a
-     fresh boot never reaches out to ghcr.io
-   - polls `http://127.0.0.1:8000/health/live` until the api pod
-     reports ready (5 min cap)
-3. Web UI is reachable at `http://<appliance-ip>/`. Default login
-   `admin` / `admin` (forces password change on first login).
+Serve a per-host answer file from any HTTP server. This pairs well with
+the console-redirect cmdline the appliance already sets
+(`console=ttyS0,115200n8`), so an IPMI serial console shows the install
+progress with no keyboard input.
 
-Live progress:
+## Cloud images (Azure / AWS) via cloud-init user-data
+
+Public clouds hand your instance a **cloud-init user-data** document at
+first boot. Because the installer reads a top-level `spatium_preseed:`
+key directly (and cloud-init ignores that unknown key), you can put the
+preseed **inside** the user-data document. The SpatiumDDI appliance
+image ships with the NoCloud datasource; on Azure/AWS the platform
+datasource presents user-data to the same on-disk path the installer's
+CIDATA search covers.
+
+> Cloud marketplace images are a **Phase 5** deliverable. Today this
+> path is for operators building their own cloud image from the
+> appliance raw disk (`make appliance-*`) and importing it (Azure
+> Managed Image / AWS EBS snapshot + AMI). The user-data shape below is
+> what those images consume once the platform datasource is wired.
+
+### AWS EC2
+
+`target_disk` should be the stable NVMe/Xen id the instance exposes
+(e.g. `/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol…`). Pass the
+document as the instance **User data** (console → Advanced details →
+User data, or `--user-data file://user-data.yaml`):
+
+```yaml
+#cloud-config
+# Optional cloud-init directives (SSH keys, etc.) can live here too;
+# cloud-init ignores the spatium_preseed block below and the installer
+# reads it directly.
+spatium_preseed:
+  role: control-plane
+  confirm_wipe: true
+  # AWS EBS root device — use the by-id path, not /dev/xvda / /dev/nvme0n1
+  # which can renumber. `ls -l /dev/disk/by-id` on a running instance
+  # shows the stable name.
+  target_disk: /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol0abc123
+  hostname: ddi-control-1
+  admin_user: admin
+  admin_password_hash: "$6$rounds=4096$examplesalt$exhash..."
+  timezone: UTC
+  network:
+    mode: dhcp        # EC2 hands out the private IP over DHCP
+  k3s:
+    pod_cidr: 10.42.0.0/16
+    service_cidr: 10.43.0.0/16
+```
+
+```sh
+aws ec2 run-instances \
+  --image-id ami-0spatiumddi... \
+  --instance-type t3.large \
+  --user-data file://user-data.yaml \
+  ...
+```
+
+### Azure VM
+
+`target_disk` is the OS disk; use its `/dev/disk/by-id/` path (Azure
+attaches the OS disk as LUN 0). Pass the document as `--custom-data`
+(cloud-init user-data) — the CLI base64-encodes the file for you:
+
+```yaml
+#cloud-config
+spatium_preseed:
+  role: appliance
+  confirm_wipe: true
+  target_disk: /dev/disk/by-id/scsi-360022480000000000000000000000000
+  hostname: dns-west-1
+  admin_user: azureadmin
+  admin_password_hash: "$6$rounds=4096$examplesalt$exhash..."
+  timezone: UTC
+  network:
+    mode: dhcp
+  k3s:
+    pod_cidr: 10.42.0.0/16
+    service_cidr: 10.43.0.0/16
+  control_plane_url: https://ddi-control.example.net/
+  pairing_code: "12345678"
+```
+
+```sh
+az vm create \
+  --resource-group spatium-rg \
+  --name dns-west-1 \
+  --image /subscriptions/…/spatiumddi-appliance \
+  --custom-data user-data.yaml \
+  --size Standard_D2s_v5 \
+  ...
+```
+
+> **Azure caveat.** Azure's own provisioning agent also wants to set the
+> hostname + admin user from the ARM request. Keep those consistent with
+> the `spatium_preseed` values (or omit them from one side) so the two
+> don't fight. On AWS there's no such overlap — user-data is the only
+> channel.
+
+## CI boot-test leverage
+
+A fully-preseeded answer file (disk by-id + `confirm_wipe: true` + all
+fields) turns an appliance ISO into an unattended install-to-disk that
+finishes without a keypress — the basis for an automated in-VM boot test
+per release (long-wanted in #134 Phase 1). Point a throwaway QEMU VM at
+the installer ISO + a CIDATA ISO, wait for the reboot, and assert
+`/health/live` comes up.
+
+## Live progress
+
 ```sh
 ssh admin@<appliance-ip>
+sudo journalctl -u spatium-install -f          # install-time
+sudo tail -f /var/log/spatium-install.log      # step log + preseed NOTEs
+# after the install reboots into the running system:
 sudo tail -f /var/log/spatiumddi/firstboot.log
-sudo journalctl -u spatiumddi-firstboot -f      # systemd transitions
-sudo spatiumddi-stack-status
 ```

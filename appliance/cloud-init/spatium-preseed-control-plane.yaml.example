@@ -1,0 +1,67 @@
+# SpatiumDDI headless install preseed — CONTROL-PLANE (first node).
+# Issue #549. Drives `spatium-install` non-interactively at install
+# time. Copy to `spatium-preseed.yaml`, edit, and deliver it via one of
+# the transports in appliance/cloud-init/README.md (NoCloud CIDATA ISO,
+# kernel cmdline `spatium.preseed=`, or a file on the install medium).
+#
+# Every field is OPTIONAL. Anything omitted falls through to the
+# interactive whiptail prompt, so you can preseed everything-but-the-disk
+# and let an operator pick the target at the console. A field that is
+# PRESENT but invalid halts the install loudly (never a silent default).
+#
+# The block may sit at the top level of a cloud-init `user-data`
+# document too — cloud-init ignores the unknown `spatium_preseed` key,
+# and the installer reads it directly (see the Azure / AWS recipes in
+# README.md).
+spatium_preseed:
+  # ── Role ────────────────────────────────────────────────────────────
+  # control-plane = the FIRST SpatiumDDI node (api + db + web UI + k3s
+  # seed). Aliases: first-node, control.
+  role: control-plane
+
+  # ── Destructive-disk safety ─────────────────────────────────────────
+  # An unattended install WIPES this disk with no human in the loop.
+  # BOTH of these are required for the installer to auto-select + wipe:
+  #   * confirm_wipe: true
+  #   * target_disk resolving to exactly one whole disk.
+  # Prefer a STABLE id under /dev/disk/by-id or /dev/disk/by-path — a
+  # bare /dev/sda can renumber between boots. If target_disk is omitted
+  # (or unresolvable), the console disk-picker runs instead.
+  confirm_wipe: true
+  target_disk: /dev/disk/by-id/ata-QEMU_HARDDISK_QM00001
+
+  # ── Identity ────────────────────────────────────────────────────────
+  hostname: ddi-control-1          # RFC 1123: alnum + hyphen, <= 63 chars
+
+  # ── OS admin account (for SSH + sudo) ───────────────────────────────
+  admin_user: admin
+  # Supply EITHER admin_password (plaintext) OR admin_password_hash (a
+  # crypt(3) hash from e.g. `openssl passwd -6` / `mkpasswd -m sha-512`).
+  # The hash form keeps the cleartext out of the answer file. Never
+  # echoed to the console dashboard or logs.
+  admin_password: "change-me-please"
+  # admin_password_hash: "$6$rounds=4096$abcd...$..."
+
+  # ── Timezone (IANA name; default UTC) ───────────────────────────────
+  timezone: UTC
+
+  # ── Network ─────────────────────────────────────────────────────────
+  network:
+    mode: dhcp                     # dhcp | static
+    # For a static address, uncomment + fill ALL of interface/ip/prefix/
+    # gateway (all four are required for static; IPv4 only). dns is
+    # optional (defaults to 1.1.1.1 1.0.0.1):
+    # mode: static
+    # interface: eth0              # the NIC name, e.g. eth0 / enp1s0
+    # ip: 192.168.1.10
+    # prefix: 24
+    # gateway: 192.168.1.1
+    # dns: "1.1.1.1 1.0.0.1"
+
+  # ── k3s pod + service CIDRs (#302) ──────────────────────────────────
+  # Defaults match k3s upstream. Override only if your LAN already uses
+  # 10.42.x / 10.43.x. Validated: valid IPv4, <= /22, disjoint, and (on
+  # a static install) non-overlapping with the LAN subnet.
+  k3s:
+    pod_cidr: 10.42.0.0/16
+    service_cidr: 10.43.0.0/16

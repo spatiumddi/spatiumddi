@@ -99,6 +99,10 @@ TARGET_DISK=""
 HOSTNAME=""
 ADMIN_USER="admin"
 ADMIN_PASSWORD=""
+# Optional crypt(3) admin password hash (headless preseed, issue #549).
+# When set, do_install feeds it through `chpasswd -e` instead of the
+# plaintext ADMIN_PASSWORD. Mutually exclusive with ADMIN_PASSWORD.
+ADMIN_PASSWORD_HASH=""
 NET_MODE="dhcp"
 NET_INTERFACE=""
 NET_IP=""
@@ -169,6 +173,29 @@ CONTROL_PLANE_URL=""
 # control-plane admin minted. Only meaningful when ROLE=appliance.
 BOOTSTRAP_PAIRING_CODE=""
 
+# ── Headless preseed state (issue #549) ────────────────────────────────
+# When a preseed answer file is discovered + parsed, load_preseed sets
+# PRESEED_ACTIVE=1, sources the resolved wizard variables + per-field
+# PRESEED_HAS_* markers, and computes FULLY_UNATTENDED. Each ask_*
+# prompt short-circuits when its field is preseeded; welcome + the final
+# confirm are skipped entirely on a fully-unattended run. Partial
+# preseeds fall through to the interactive prompt for missing fields.
+PRESEED_ACTIVE=0
+FULLY_UNATTENDED=0
+PRESEED_SOURCE=""
+PRESEED_ENV=/run/spatium-preseed.env
+PRESEED_SECRET_ENV=/run/spatium-preseed-secret.env
+# Candidate answer files discovered by discover_preseed, in priority
+# order (parallel arrays). KIND is "explicit" (kernel cmdline value or a
+# file literally named spatium-preseed.*) or "opportunistic" (a
+# cloud-init user-data that may or may not carry a spatium_preseed
+# block). load_preseed tries them in order, skipping ones with no
+# preseed content so a plain user-data doesn't shadow a real preseed on
+# a lower-priority source.
+PRESEED_CAND_FILE=()
+PRESEED_CAND_SRC=()
+PRESEED_CAND_KIND=()
+
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
 welcome() {
@@ -189,6 +216,10 @@ Press OK to begin, or Cancel to drop to a shell." 18 70 \
 
 ask_role() {
     log "Step: ask_role"
+    if [ -n "${PRESEED_HAS_ROLE:-}" ]; then
+        log "Preseed: role=$ROLE (skipping prompt)"
+        return 0
+    fi
     # #272 UX — reframe the install role around the decision operators
     # actually make ("is this my FIRST SpatiumDDI node, or am I adding
     # one to an existing install?") instead of the jargon control-plane
@@ -259,20 +290,24 @@ ask_application_config() {
     fi
     log "Step: ask_application_config"
 
-    local default_url="${CONTROL_PLANE_URL:-https://}"
-    while true; do
-        CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
-            --title "Control plane URL" \
-            --cancel-button "Back" \
-            --inputbox "Where does this Application appliance register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nHA TIP: if the control plane is a multi-node cluster, point this at the MetalLB virtual IP (VIP), NOT a single node's IP — otherwise this appliance loses its control plane whenever that one node is down. Configure the VIP under Appliance -> Network & Host on the control plane.\n\nUse https:// in production; http:// is acceptable for lab installs." \
-            21 78 "$default_url" 3>&1 1>&2 2>&3) \
-            || return 1
-        if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
-            whiptail --msgbox "Control-plane URL is required for an Application install." 8 60 || true
-            continue
-        fi
-        break
-    done
+    if [ -n "${PRESEED_HAS_CONTROL_URL:-}" ]; then
+        log "Preseed: control_plane_url=$CONTROL_PLANE_URL (skipping prompt)"
+    else
+        local default_url="${CONTROL_PLANE_URL:-https://}"
+        while true; do
+            CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
+                --title "Control plane URL" \
+                --cancel-button "Back" \
+                --inputbox "Where does this Application appliance register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nHA TIP: if the control plane is a multi-node cluster, point this at the MetalLB virtual IP (VIP), NOT a single node's IP — otherwise this appliance loses its control plane whenever that one node is down. Configure the VIP under Appliance -> Network & Host on the control plane.\n\nUse https:// in production; http:// is acceptable for lab installs." \
+                21 78 "$default_url" 3>&1 1>&2 2>&3) \
+                || return 1
+            if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
+                whiptail --msgbox "Control-plane URL is required for an Application install." 8 60 || true
+                continue
+            fi
+            break
+        done
+    fi
 
     # Pairing code only — Application appliances never paste a long
     # bootstrap key. The supervisor generates its own Ed25519 keypair
@@ -280,6 +315,10 @@ ask_application_config() {
     # control plane stores it and waits for admin approval. The 8-digit
     # code is the only thing the operator types over an IPMI / serial
     # console.
+    if [ -n "${PRESEED_HAS_PAIRING_CODE:-}" ]; then
+        log "Preseed: pairing code supplied (skipping prompt)"
+        return 0
+    fi
     local code_val
     while true; do
         code_val=$(whiptail --backtitle "$BACKTITLE" --title "Pairing code" \
@@ -311,6 +350,10 @@ ask_application_config() {
 
 pick_disk() {
     log "Step: pick_disk"
+    if [ -n "${PRESEED_HAS_DISK:-}" ]; then
+        log "Preseed: target_disk=$TARGET_DISK (confirm_wipe authorised; skipping picker)"
+        return 0
+    fi
     local options=()
     local live_src
     live_src=$(findmnt -no SOURCE /run/live/medium 2>/dev/null || \
@@ -432,6 +475,12 @@ _control_plane_sizing_ok() {
 # costs nothing.
 confirm_partition_layout() {
     log "Step: confirm_partition_layout"
+    if [ -n "${PRESEED_HAS_DISK:-}" ]; then
+        # confirm_wipe: true in the preseed IS the wipe authorisation —
+        # don't re-prompt the layout checkbox on an unattended run.
+        log "Preseed: partition-layout confirm skipped (confirm_wipe authorised $TARGET_DISK)"
+        return 0
+    fi
     local DISK_BYTES disk_gib var_gib
     DISK_BYTES=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
     disk_gib=$((DISK_BYTES / 1024 / 1024 / 1024))
@@ -481,6 +530,10 @@ confirm_partition_layout() {
 
 ask_hostname() {
     log "Step: ask_hostname"
+    if [ -n "${PRESEED_HAS_HOSTNAME:-}" ]; then
+        log "Preseed: hostname=$HOSTNAME (skipping prompt)"
+        return 0
+    fi
     # No pre-filled default — multiple appliances on the same network
     # all named "spatiumddi" caused real-world server-name collisions
     # (the agent registers its SERVER_NAME with the control plane;
@@ -515,12 +568,24 @@ ask_hostname() {
 
 ask_user_password() {
     log "Step: ask_user_password"
-    ADMIN_USER=$(whiptail --backtitle "$BACKTITLE" --title "Admin OS user" \
-        --cancel-button "Back" \
-        --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately - change it on first login." \
-        12 70 "$ADMIN_USER" 3>&1 1>&2 2>&3) \
-        || return 1
-    [ -z "$ADMIN_USER" ] && ADMIN_USER="admin"
+    # Username prompt is skipped when the admin user is preseeded, OR
+    # when a preseeded password makes this a headless run (in which case
+    # the ADMIN_USER default of "admin" — or a preseeded value — stands).
+    if [ -z "${PRESEED_HAS_ADMIN_USER:-}" ] && [ -z "${PRESEED_HAS_PASSWORD:-}" ]; then
+        ADMIN_USER=$(whiptail --backtitle "$BACKTITLE" --title "Admin OS user" \
+            --cancel-button "Back" \
+            --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately - change it on first login." \
+            12 70 "$ADMIN_USER" 3>&1 1>&2 2>&3) \
+            || return 1
+        [ -z "$ADMIN_USER" ] && ADMIN_USER="admin"
+    else
+        log "Preseed: admin user=$ADMIN_USER (skipping username prompt)"
+    fi
+
+    if [ -n "${PRESEED_HAS_PASSWORD:-}" ]; then
+        log "Preseed: admin password supplied (skipping prompt)"
+        return 0
+    fi
 
     while true; do
         local p1 p2
@@ -545,6 +610,10 @@ ask_user_password() {
 
 ask_network() {
     log "Step: ask_network"
+    if [ -n "${PRESEED_HAS_NETWORK:-}" ]; then
+        log "Preseed: network=$NET_MODE (skipping prompt)"
+        return 0
+    fi
     NET_MODE=$(whiptail --backtitle "$BACKTITLE" --title "Network" \
         --cancel-button "Back" \
         --menu "How should the appliance configure its network?" 12 70 2 \
@@ -588,6 +657,10 @@ ask_network() {
 
 ask_timezone() {
     log "Step: ask_timezone"
+    if [ -n "${PRESEED_HAS_TIMEZONE:-}" ]; then
+        log "Preseed: timezone=$TIMEZONE (skipping prompt)"
+        return 0
+    fi
     TIMEZONE=$(whiptail --backtitle "$BACKTITLE" --title "Timezone" \
         --cancel-button "Back" \
         --inputbox "Timezone (IANA name, e.g. America/Toronto, Europe/Berlin, UTC):" \
@@ -617,6 +690,24 @@ ask_timezone() {
 # (between pod / service / operator's static-IP subnet) for free.
 ask_k3s_cidrs() {
     log "Step: ask_k3s_cidrs"
+    if [ -n "${PRESEED_HAS_K3S:-}" ]; then
+        if [ -n "${PRESEED_HAS_NETWORK:-}" ]; then
+            log "Preseed: k3s pod=$K3S_POD_CIDR svc=$K3S_SERVICE_CIDR (skipping prompt)"
+            return 0
+        fi
+        # k3s was preseeded but the network was chosen interactively, so
+        # the parser could not check the pod/service CIDRs against the
+        # operator's static LAN subnet. Re-run the same validator now
+        # that NET_* is known; if it passes we skip the prompt, if it
+        # flags an overlap the operator gets the interactive prompt to
+        # fix it (this only happens on a partial, already-interactive
+        # run — never a fully-unattended one).
+        if _validate_k3s_cidrs "$K3S_POD_CIDR" "$K3S_SERVICE_CIDR"; then
+            log "Preseed: k3s CIDRs validated against interactive network (skipping prompt)"
+            return 0
+        fi
+        log "Preseed: k3s CIDRs conflict with the interactively-chosen network — prompting"
+    fi
     while true; do
         local pod
         pod=$(whiptail --backtitle "$BACKTITLE" --title "k3s pod network" \
@@ -1262,10 +1353,24 @@ EOF
         # (Issue #183 Phase 7 — no docker group on the appliance.)
         chroot "$MOUNT" useradd -m -G sudo -s /bin/bash "$ADMIN_USER" \
             >> "$INSTALL_LOG" 2>&1 || true
-        echo "$ADMIN_USER:$ADMIN_PASSWORD" | chroot "$MOUNT" chpasswd \
-            >> "$INSTALL_LOG" 2>&1
-        echo "root:$ADMIN_PASSWORD" | chroot "$MOUNT" chpasswd \
-            >> "$INSTALL_LOG" 2>&1
+        # Set the admin + root passwords with tracing OFF so the
+        # plaintext / hash never lands in the set -x trace log. A
+        # preseed can supply a crypt(3) hash (ADMIN_PASSWORD_HASH) via
+        # `chpasswd -e` instead of the plaintext (#549); the interactive
+        # path always uses the plaintext ADMIN_PASSWORD.
+        { set +x; } 2>/dev/null
+        if [ -n "$ADMIN_PASSWORD_HASH" ]; then
+            echo "$ADMIN_USER:$ADMIN_PASSWORD_HASH" | chroot "$MOUNT" chpasswd -e \
+                >> "$INSTALL_LOG" 2>&1
+            echo "root:$ADMIN_PASSWORD_HASH" | chroot "$MOUNT" chpasswd -e \
+                >> "$INSTALL_LOG" 2>&1
+        else
+            echo "$ADMIN_USER:$ADMIN_PASSWORD" | chroot "$MOUNT" chpasswd \
+                >> "$INSTALL_LOG" 2>&1
+            echo "root:$ADMIN_PASSWORD" | chroot "$MOUNT" chpasswd \
+                >> "$INSTALL_LOG" 2>&1
+        fi
+        set -x
 
         # Disable cloud-init on the installed system (we configured
         # everything ourselves; cloud-init would just sit waiting for a
@@ -1618,12 +1723,263 @@ Press OK to reboot." 24 72
     systemctl reboot
 }
 
+# ── Headless preseed (issue #549) ──────────────────────────────────────────────
+
+# Fetch a URL to $2 with a bounded retry loop — the installer wizard can
+# reach discover_preseed before NetworkManager has finished DHCP, so a
+# single curl would lose the race and drop a URL-preseeded fleet box to
+# the interactive wizard. Retry ~6× over ~30 s (only the cmdline-URL
+# path pays this; file / CIDATA transports never call it). Returns 0 on
+# success.
+_fetch_preseed_url() {
+    local url="$1" dest="$2" attempt
+    for attempt in 1 2 3 4 5 6; do
+        if curl -fsSL --max-time 20 "$url" -o "$dest" 2>>"$INSTALL_LOG"; then
+            return 0
+        fi
+        log "Preseed: fetch attempt $attempt/6 for $url failed (network may still be coming up)"
+        sleep 5
+    done
+    return 1
+}
+
+# Append a discovered candidate to the parallel arrays.
+#   $1 local file path, $2 human source description, $3 kind
+_add_preseed_cand() {
+    PRESEED_CAND_FILE+=("$1")
+    PRESEED_CAND_SRC+=("$2")
+    PRESEED_CAND_KIND+=("$3")
+}
+
+# Collect every preseed answer-file candidate, in priority order, into
+# the PRESEED_CAND_* arrays. Sources:
+#   1. Kernel cmdline `spatium.preseed=<url|path>` (PXE/IPMI) — explicit.
+#   2. A block device labelled CIDATA (NoCloud): spatium-preseed.yaml /
+#      .yml (explicit) or a cloud-init user-data (opportunistic — only
+#      used if it actually carries a spatium_preseed block). VM/Proxmox.
+#   3. The live install medium / rootfs-baked spatium-preseed.yaml
+#      (sneakernet / CI) — explicit.
+# Returns 0 if at least one candidate was found; 1 otherwise.
+discover_preseed() {
+    local cmdval
+    cmdval=$(sed -n 's/.*spatium\.preseed=\([^ ]*\).*/\1/p' /proc/cmdline 2>/dev/null)
+    if [ -n "$cmdval" ]; then
+        case "$cmdval" in
+            http://*|https://*)
+                local dest=/run/spatium-cand-cmdline.yaml
+                if _fetch_preseed_url "$cmdval" "$dest"; then
+                    _add_preseed_cand "$dest" "kernel cmdline URL $cmdval" explicit
+                else
+                    log "Preseed: gave up fetching $cmdval from cmdline after retries"
+                fi
+                ;;
+            *)
+                if [ -f "$cmdval" ]; then
+                    _add_preseed_cand "$cmdval" "kernel cmdline path $cmdval" explicit
+                else
+                    log "Preseed: cmdline path $cmdval not found"
+                fi
+                ;;
+        esac
+    fi
+
+    # NoCloud CIDATA volume(s). Case-insensitive label match; try a few
+    # spellings operators use.
+    local dev label
+    for label in CIDATA cidata Cidata; do
+        dev=$(blkid -L "$label" 2>/dev/null || true)
+        [ -n "$dev" ] && break
+    done
+    if [ -n "$dev" ]; then
+        local mnt=/run/spatium-cidata
+        mkdir -p "$mnt"
+        if mount -o ro "$dev" "$mnt" 2>>"$INSTALL_LOG"; then
+            local cand kind dest i=0
+            for cand in spatium-preseed.yaml spatium-preseed.yml user-data; do
+                [ -f "$mnt/$cand" ] || continue
+                case "$cand" in
+                    user-data) kind=opportunistic ;;
+                    *)         kind=explicit ;;
+                esac
+                # Copy off the volume before we umount it.
+                dest="/run/spatium-cand-cidata-$i.yaml"
+                i=$((i + 1))
+                cp "$mnt/$cand" "$dest" 2>>"$INSTALL_LOG"
+                _add_preseed_cand "$dest" "CIDATA volume $dev ($cand)" "$kind"
+            done
+            umount "$mnt" 2>>"$INSTALL_LOG" || true
+        fi
+    fi
+
+    # Live install medium + rootfs-baked locations (all explicit).
+    local path
+    for path in \
+        /run/live/medium/spatium-preseed.yaml \
+        /lib/live/mount/medium/spatium-preseed.yaml \
+        /spatium-preseed.yaml \
+        /etc/spatium-preseed.yaml; do
+        [ -f "$path" ] && _add_preseed_cand "$path" "$path" explicit
+    done
+
+    [ "${#PRESEED_CAND_FILE[@]}" -gt 0 ]
+}
+
+# Recompute FULLY_UNATTENDED — true only when EVERY field the wizard
+# would prompt for is preseeded (so the run needs zero console input).
+# Missing anything leaves it 0 and the wizard shows welcome + the final
+# confirm around whatever prompts still fire.
+compute_unattended() {
+    FULLY_UNATTENDED=0
+    [ -n "${PRESEED_HAS_ROLE:-}" ]      || return 0
+    [ -n "${PRESEED_HAS_DISK:-}" ]      || return 0
+    [ -n "${PRESEED_HAS_HOSTNAME:-}" ]  || return 0
+    [ -n "${PRESEED_HAS_PASSWORD:-}" ]  || return 0
+    [ -n "${PRESEED_HAS_NETWORK:-}" ]   || return 0
+    [ -n "${PRESEED_HAS_TIMEZONE:-}" ]  || return 0
+    [ -n "${PRESEED_HAS_K3S:-}" ]       || return 0
+    if [ "$ROLE" = "appliance" ]; then
+        [ -n "${PRESEED_HAS_CONTROL_URL:-}" ]  || return 0
+        [ -n "${PRESEED_HAS_PAIRING_CODE:-}" ] || return 0
+    fi
+    FULLY_UNATTENDED=1
+}
+
+# Halt-loud helper — a preseed that WAS supplied but failed validation
+# (or couldn't be parsed) must stop the unattended run with a clear
+# message + non-zero exit, never silently pick a default on a wipe.
+preseed_halt() {
+    set +x
+    clear
+    cat <<EOF
+
+============================================================
+  SpatiumDDI headless install — PRESEED ERROR
+============================================================
+
+$1
+
+The preseed answer file was found but could not be used, so
+the install has stopped rather than guess a value on an
+unattended disk wipe.
+
+Fix the answer file and reboot the installer, or run
+'spatium-install' from this shell to install interactively.
+
+Source: ${PRESEED_SOURCE:-<unknown>}
+Log:    $INSTALL_LOG
+============================================================
+
+EOF
+    log "Preseed halt: $1"
+    exit 1
+}
+
+# Discover + parse a preseed, if present. Tries every discovered
+# candidate in priority order; the first one that carries real preseed
+# content is adopted. A candidate with a spatium block but an invalid
+# field halts loudly; a candidate with NO preseed content (e.g. a plain
+# cloud-init user-data) is skipped so it can't shadow a real preseed on
+# a lower-priority source. On success sources the resolved wizard
+# variables + PRESEED_HAS_* markers and sets PRESEED_ACTIVE=1.
+load_preseed() {
+    if ! discover_preseed; then
+        log "No preseed answer file found — interactive install"
+        return 0
+    fi
+
+    local i f src kind out rc chosen=""
+    for i in "${!PRESEED_CAND_FILE[@]}"; do
+        f="${PRESEED_CAND_FILE[$i]}"
+        src="${PRESEED_CAND_SRC[$i]}"
+        kind="${PRESEED_CAND_KIND[$i]}"
+        # The answer file may carry a plaintext admin password / pairing
+        # code — lock it down on the (tmpfs) live rootfs before parsing.
+        chmod 0600 "$f" 2>/dev/null || true
+        log "Preseed: trying candidate ($kind) $src -> $f"
+
+        out=$(python3 /usr/local/bin/spatium-preseed-parse \
+            "$f" "$PRESEED_ENV" "$PRESEED_SECRET_ENV" 2>&1)
+        rc=$?
+        printf '%s\n' "$out" >> "$INSTALL_LOG"
+        case "$rc" in
+            0)
+                PRESEED_SOURCE="$src"
+                chosen=1
+                break
+                ;;
+            2)
+                # Has a spatium block but a supplied field is invalid —
+                # halt regardless of source kind (it IS an intended
+                # preseed, just broken).
+                PRESEED_SOURCE="$src"
+                preseed_halt "Preseed validation failed:"$'\n\n'"$out"
+                ;;
+            3)
+                # Malformed YAML. An explicit spatium-preseed.yaml / a
+                # cmdline value the operator clearly meant as a preseed
+                # halts; an opportunistic user-data that just happens to
+                # be unparseable is not ours — skip it.
+                if [ "$kind" = "explicit" ]; then
+                    PRESEED_SOURCE="$src"
+                    preseed_halt "Preseed file could not be parsed:"$'\n\n'"$out"
+                fi
+                log "Preseed: skipping unparseable opportunistic $src"
+                ;;
+            4)
+                # Parsed fine but no spatium content (plain cloud-init
+                # user-data). Skip to the next candidate.
+                log "Preseed: $src has no spatium preseed content — trying next candidate"
+                ;;
+            *)
+                PRESEED_SOURCE="$src"
+                preseed_halt "Unexpected preseed parser error (rc=$rc):"$'\n\n'"$out"
+                ;;
+        esac
+    done
+
+    if [ -z "$chosen" ]; then
+        log "Preseed: no candidate carried preseed content — interactive install"
+        return 0
+    fi
+    log "Preseed source adopted: $PRESEED_SOURCE"
+
+    # Source the resolved non-secret values (ROLE / HOSTNAME / TARGET_DISK
+    # / NET_* / K3S_* / PRESEED_HAS_* markers). shellcheck can't follow
+    # the runtime path.
+    # shellcheck disable=SC1090
+    [ -f "$PRESEED_ENV" ] && . "$PRESEED_ENV"
+    # Secrets (admin password / hash, pairing code) with tracing OFF so
+    # they never reach the set -x trace log.
+    { set +x; } 2>/dev/null
+    # shellcheck disable=SC1090
+    [ -f "$PRESEED_SECRET_ENV" ] && . "$PRESEED_SECRET_ENV"
+    set -x
+
+    PRESEED_ACTIVE=1
+    compute_unattended
+    log "Preseed loaded: role=${ROLE} disk=${TARGET_DISK:-<interactive>} fully_unattended=$FULLY_UNATTENDED"
+    return 0
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
     if [ "$(id -u)" -ne 0 ]; then
         echo "Run as root." >&2
         exit 1
+    fi
+
+    # Headless preseed (issue #549) — if an answer file is present, load
+    # + validate it first. Populated fields skip their prompt below; a
+    # fully-preseeded run skips welcome + the final confirm too. A bad
+    # preseed halts loudly here rather than falling through.
+    load_preseed
+    if [ "$PRESEED_ACTIVE" = "1" ]; then
+        if [ "$FULLY_UNATTENDED" = "1" ]; then
+            log "Preseed: fully unattended — no console interaction required"
+        else
+            log "Preseed: partial — prompting interactively for missing fields"
+        fi
     fi
 
     # State-machine wizard. Each step is one function that returns:
@@ -1644,7 +2000,10 @@ main() {
                 # welcome only returns 0 — Cancel here calls on_cancel
                 # which exec's a shell (never returns). That's the
                 # explicit "I changed my mind, don't install" path.
-                welcome
+                # Skipped entirely on a fully-unattended preseed run.
+                if [ "$FULLY_UNATTENDED" != "1" ]; then
+                    welcome
+                fi
                 step="ask_role"
                 ;;
             ask_role)
@@ -1682,7 +2041,14 @@ main() {
                 if ask_application_config; then step="confirm"; else step="ask_k3s_cidrs"; fi
                 ;;
             confirm)
-                if confirm; then step="do_install"; else step="ask_application_config"; fi
+                # Fully-unattended preseed skips the final confirm —
+                # confirm_wipe:true in the answer file already authorised
+                # the destructive install. A partial preseed still shows
+                # it (the operator was prompted for something, so give
+                # them the review screen).
+                if [ "$FULLY_UNATTENDED" = "1" ]; then
+                    step="do_install"
+                elif confirm; then step="do_install"; else step="ask_application_config"; fi
                 ;;
             do_install)
                 do_install

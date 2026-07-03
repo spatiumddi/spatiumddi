@@ -781,33 +781,69 @@ trigger: tag push (CalVer)
 > reinstall to change `cluster-cidr` / `service-cidr`. The
 > partition layout permits keeping `/var` across reinstalls.
 
-### Phase 1 (pre-#183, replaced): headless via cloud-init NoCloud
+### Headless / unattended install — preseed the disk installer (#549)
 
-Phase 1 ships with `cloud-init` enabled and the NoCloud datasource
-active. Operators drop a CIDATA ISO with `user-data` + `meta-data`,
-attach it as a secondary drive, and the appliance configures itself
-on first power-on.
+> **Supersedes the stale Phase-1 framing.** The *old* cloud-init
+> NoCloud path in this directory only reconfigured an
+> already-running **pre-#183 docker-compose** all-in-one — it never
+> drove the disk installer. Post-#183 the install-to-disk step is the
+> whiptail installer `spatium-install`; #549 preseeds **that**.
 
-The `spatiumddi-firstboot.service` systemd unit runs after
-`cloud-final.service`:
+On boot of the **installer media** (`spatium-mode=install` in the
+kernel cmdline), `spatium-install` looks for a **preseed answer file**
+before launching whiptail. When one is present it runs the installer
+non-interactively:
 
-1. Generates `/etc/spatiumddi/.env` (POSTGRES_PASSWORD, SECRET_KEY,
-   CREDENTIAL_ENCRYPTION_KEY, DNS_AGENT_KEY, DHCP_AGENT_KEY,
-   BOOTSTRAP_PAIRING_CODE) on first run only — preserved across
-   reboots. ``BOOTSTRAP_PAIRING_CODE`` carries the operator-supplied
-   8-digit code from the installer through to the agent containers
-   on Phase 6 role-split agent appliances (see §9).
-2. **(Pre-#183)** `docker-compose pull` (first run) + `docker-compose up -d`.
-   **(Post-#183)** Writes the variant-specific bootstrap HelmChart
-   manifest into `/var/lib/rancher/k3s/server/manifests/`; k3s's
-   helm-controller picks it up + runs `helm install` against the
-   baked chart tarball.
-3. Polls `http://127.0.0.1:8000/health/live` for up to 5 min.
+- Every field present in the answer file skips its prompt.
+- A **fully** preseeded run (disk + `confirm_wipe: true` + all fields
+  for the chosen role) installs end-to-end with **zero** console
+  interaction — welcome + the final confirm are skipped too.
+- A **partial** preseed falls through to the interactive prompt for
+  **only the missing fields** (e.g. everything-but-the-disk).
+- A field that is **present but invalid** halts loudly (clear console
+  message + non-zero exit); it never silently defaults on a disk wipe.
 
-Default web-UI login is `admin / admin` with `force_password_change=True`.
+The parser (`/usr/local/bin/spatium-preseed-parse`, PyYAML) reuses the
+wizard's own validators — hostname RFC 1123, k3s CIDR disjoint + ≤ /22
++ no LAN overlap, pairing code = 8 digits, control-plane URL required
+for the appliance role. The resulting install is byte-for-byte what an
+interactive install produces (same `do_install`), so a fully-preseeded
+box presents **no** setup wizard afterwards (console or web) — parity
+with the interactive path by construction.
 
-Recipe + examples: `appliance/cloud-init/README.md` and
-`appliance/cloud-init/user-data.example`.
+**Destructive-disk safety.** An unattended wipe requires **both**
+`confirm_wipe: true` **and** a `target_disk` that resolves to exactly
+one whole disk. Prefer a stable `/dev/disk/by-id/…` or `by-path/…` id
+(a bare `sda` can renumber). A supplied-but-unresolvable disk drops to
+the interactive picker rather than guessing.
+
+**Secrets.** `admin_password` / `pairing_code` in a plaintext answer
+file is the usual preseed tradeoff. Use `admin_password_hash` (crypt(3),
+e.g. `openssl passwd -6`) to keep the cleartext out of the file, and
+mint a fresh single-use pairing code per install. Neither is echoed to
+the console dashboard, the install log, or the trace log.
+
+**Transports** (first match wins): kernel cmdline
+`spatium.preseed=<url|path>` (PXE/IPMI), a NoCloud `CIDATA`-labelled
+volume carrying `spatium-preseed.yaml` (VM/Proxmox), or a
+`spatium-preseed.yaml` on the install medium (sneakernet). The same
+`spatium_preseed:` block can be embedded in a cloud-init `user-data`
+document, which is how the **AWS** (`--user-data`) and **Azure**
+(`--custom-data`) cloud-image recipes deliver it.
+
+Once the installed system reboots, `spatiumddi-firstboot.service`
+runs as normal (identical to the interactive path): generates
+`/etc/spatiumddi/.env` (POSTGRES_PASSWORD, SECRET_KEY,
+CREDENTIAL_ENCRYPTION_KEY, DNS_AGENT_KEY, DHCP_AGENT_KEY,
+BOOTSTRAP_PAIRING_CODE) on first run, writes the bootstrap HelmChart
+manifest into `/var/lib/rancher/k3s/server/manifests/`, and polls
+`http://127.0.0.1:8000/health/live`. Default web-UI login is
+`admin / admin` with `force_password_change=True`.
+
+Recipe, schema table, and Azure / AWS / Proxmox / PXE examples:
+[`appliance/cloud-init/README.md`](../../appliance/cloud-init/README.md)
+plus `spatium-preseed-control-plane.yaml.example` +
+`spatium-preseed-appliance.yaml.example`.
 
 ### Future: interactive first-boot wizard (Phase 1.x)
 
