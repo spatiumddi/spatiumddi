@@ -75,6 +75,7 @@ from app.services.nettools import (
     test_port,
 )
 from app.services.nettools.runner import NetToolArgError
+from app.services.nettools.schemas import is_blocked_target
 from app.services.nettools.throttle import RateLimitDefault, RateLimitOffprem
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 
@@ -477,9 +478,17 @@ class WolToolRequest(BaseModel):
         if v is None or not v.strip():
             return None
         try:
-            return str(ipaddress.IPv4Address(v.strip()))
+            canonical = str(ipaddress.IPv4Address(v.strip()))
         except ipaddress.AddressValueError as exc:
             raise ValueError(f"broadcast must be an IPv4 address: {v!r}") from exc
+        # Same SSRF denylist as the rest of the network-tools surface — WoL
+        # must not become a way to fire UDP at loopback / link-local / metadata.
+        if is_blocked_target(canonical):
+            raise ValueError(
+                f"broadcast {canonical} is in a blocked range (loopback / "
+                "link-local / cloud-metadata) and cannot be targeted"
+            )
+        return canonical
 
 
 @router.post("/wol", response_model=wol.WolResult, dependencies=[_RequirePerm])

@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.services.nettools.schemas import is_blocked_target
+
 if TYPE_CHECKING:
     import uuid as _uuid_t
 
@@ -87,9 +89,19 @@ class WolWireRequest(BaseModel):
     @classmethod
     def _v_broadcast(cls, v: str) -> str:
         try:
-            return str(ipaddress.IPv4Address(v.strip()))
+            canonical = str(ipaddress.IPv4Address(v.strip()))
         except ipaddress.AddressValueError as exc:
             raise ValueError(f"broadcast must be an IPv4 address: {v!r}") from exc
+        # Apply the same SSRF denylist the other network tools use so WoL can't
+        # fire a UDP payload at loopback / link-local / metadata ranges (a
+        # legit broadcast — 255.255.255.255 or an RFC1918 directed broadcast —
+        # is never in a blocked range, so this doesn't reject real use).
+        if is_blocked_target(canonical):
+            raise ValueError(
+                f"broadcast {canonical} is in a blocked range (loopback / "
+                "link-local / cloud-metadata) and cannot be targeted"
+            )
+        return canonical
 
 
 class WolResult(BaseModel):
@@ -143,7 +155,12 @@ async def resolve_wake_params(
     subnet = await db.get(Subnet, ip.subnet_id)
     if subnet is None:
         raise WolTargetError("Subnet not found", not_found=True)
-    return ip, normalize_mac(str(ip.mac_address)), broadcast_for_network(str(subnet.network))
+    broadcast = broadcast_for_network(str(subnet.network))
+    # A loopback / link-local subnet would derive a blocked broadcast — refuse
+    # cleanly (422) rather than letting the wire-schema validator 500 later.
+    if is_blocked_target(broadcast):
+        raise WolTargetError(f"Subnet {subnet.network} derives a blocked broadcast ({broadcast}).")
+    return ip, normalize_mac(str(ip.mac_address)), broadcast
 
 
 class WolDispatchError(Exception):

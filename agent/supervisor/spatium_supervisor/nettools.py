@@ -748,6 +748,13 @@ async def _run_wol(params: dict[str, Any]) -> dict[str, Any]:
         raise NetToolArgError(
             f"broadcast must be an IPv4 address: {raw_bcast!r}"
         ) from exc
+    # Defence-in-depth SSRF denylist (same as every other network-reaching
+    # param here) — refuse loopback / link-local / metadata even if the
+    # control plane somehow enqueued one.
+    if _is_blocked_target(broadcast):
+        raise NetToolArgError(
+            f"broadcast {broadcast!r} is in a blocked range and cannot be targeted"
+        )
     try:
         port = int(params.get("port", 9))
     except (TypeError, ValueError) as exc:
