@@ -1673,6 +1673,30 @@ export const ipamApi = {
         status: string;
       }>(`/ipam/addresses/${id}/profile`, { preset: preset ?? null })
       .then((r) => r.data),
+  /** Wake-on-LAN (#533) — send a magic packet to this IP's MAC. The
+   *  broadcast target is derived server-side from the IP's subnet. Omit
+   *  the vantage to send from the control plane; pass an appliance target
+   *  to originate the packet on that appliance's segment. */
+  wakeAddress: (
+    id: string,
+    opts?: {
+      port?: number;
+      target?: { kind: "server" | "appliance"; id?: string };
+    },
+  ) =>
+    api
+      .post<{
+        mac: string;
+        broadcast: string;
+        port: number;
+        sent: boolean;
+        ran_from: string;
+        error: string | null;
+      }>(`/ipam/addresses/${id}/wake`, {
+        port: opts?.port ?? 9,
+        target: opts?.target ?? null,
+      })
+      .then((r) => r.data),
   /** Fetch the passive DHCP fingerprint joined to this IP's MAC.
    *  404 when the IP has no MAC or no fingerprint has been captured
    *  yet — callers should swallow that and treat it as "no data". */
