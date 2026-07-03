@@ -651,8 +651,11 @@ errs = []
 prefix = None
 try:
     prefix = int(prefix_s)
-    if not 0 < prefix < 32:
-        errs.append(f"Prefix must be between 1 and 31 (got {prefix_s!r}).")
+    # Allow /1../32. /32 is a valid single-host assignment (some cloud /
+    # VPS hosts hand one out with an off-link gateway reached via an
+    # on-link route); /31 is RFC 3021 point-to-point.
+    if not 0 < prefix <= 32:
+        errs.append(f"Prefix must be between 1 and 32 (got {prefix_s!r}).")
         prefix = None
 except ValueError:
     errs.append(f"Prefix must be a whole number (got {prefix_s!r}).")
@@ -672,7 +675,10 @@ else:
     except ValueError:
         errs.append(f"Gateway {gw_s!r} is not a valid IPv4 address.")
 
-if ip is not None and gw is not None and prefix is not None:
+if ip is not None and gw is not None and prefix is not None and prefix < 32:
+    # For /32 the network is the host itself, so an off-link gateway
+    # (reached via an on-link route) is normal and expected — skip the
+    # in-subnet check. For /1../31 the gateway must be on-link.
     net = ipaddress.ip_network(f"{ip_s.strip()}/{prefix}", strict=False)
     if gw not in net:
         errs.append(

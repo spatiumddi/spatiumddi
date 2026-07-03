@@ -899,8 +899,26 @@ def _write_owner_only(tmp: Path, payload: str) -> None:
     ``O_NOFOLLOW`` refuses a symlink an attacker could plant in the
     world-writable dir. The root ``.path`` runner reads as root and is
     unaffected by the tighter mode.
+
+    ``O_EXCL`` (with a best-effort unlink of our own stale temp first)
+    is required in addition to ``O_NOFOLLOW``: without it, ``O_CREAT``
+    happily opens a pre-planted *regular* file (O_NOFOLLOW only rejects
+    symlinks), the mode arg is ignored for an existing inode, and the
+    secret would be written into an attacker-owned 0644 file whose fd
+    they still hold after ``replace()``. With ``O_EXCL`` the open fails
+    closed (EEXIST) if anyone raced a file into the predictable temp
+    path; callers wrap this in ``try/except OSError`` and retry on the
+    next tick.
     """
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.unlink(tmp)  # drop our own stale temp from a crashed prior run
+    except FileNotFoundError:
+        pass
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(payload)
 

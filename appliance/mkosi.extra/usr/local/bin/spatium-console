@@ -2735,17 +2735,26 @@ def render_nodes(
 
 
 def reboot_pending() -> bool:
-    """P0.9 — True when a Fleet-issued reboot is queued.
+    """P0.9 — True when a reboot is queued (fleet OR web-UI).
 
-    The supervisor writes ``reboot-pending`` (sibling to
-    ``slot-upgrade-pending``) when the control plane sets
-    ``reboot_requested`` on this appliance; the host-side
-    ``spatiumddi-reboot-agent.path`` unit then reboots after a 5 s grace.
-    Surfacing it warns the on-console operator that the box is about to
-    go offline — and that pressing F5 lets them ack it gracefully rather
-    than have the machine vanish mid-keystroke. Single ``exists()``
-    check (no subprocess)."""
-    return (_RELEASE_STATE_DIR / "reboot-pending").exists()
+    Two triggers can queue a reboot, both sibling to
+    ``slot-upgrade-pending``:
+      * ``reboot-pending-fleet`` — the supervisor writes this when the
+        control plane sets ``reboot_requested`` on this appliance; the
+        host-side ``spatiumddi-reboot-agent.path`` unit reboots after a
+        5 s grace (#553 gave the fleet path its own filename so it no
+        longer collides with the web-UI trigger).
+      * ``reboot-pending`` — the backend writes this for a web-UI
+        local reboot; ``spatiumddi-reboot.path`` reboots after a 10 s
+        grace.
+    Surfacing either warns the on-console operator that the box is about
+    to go offline — and that pressing F5 lets them ack it gracefully
+    rather than have the machine vanish mid-keystroke. Plain
+    ``exists()`` checks (no subprocess)."""
+    return (
+        (_RELEASE_STATE_DIR / "reboot-pending-fleet").exists()
+        or (_RELEASE_STATE_DIR / "reboot-pending").exists()
+    )
 
 
 def upgrade_status() -> tuple[str, str] | None:

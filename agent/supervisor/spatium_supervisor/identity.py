@@ -28,7 +28,6 @@ re-deriving it.
 from __future__ import annotations
 
 import hashlib
-import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +43,8 @@ from cryptography.hazmat.primitives.serialization import (
     PublicFormat,
     load_pem_private_key,
 )
+
+from . import appliance_state
 
 # File names — kept module-level so tests can reference them without
 # duplicating literals.
@@ -201,13 +202,10 @@ def save_session_token(state_dir: Path, token: str) -> None:
     takes over."""
     path = _identity_dir(state_dir) / SESSION_TOKEN_FILENAME
     tmp = path.with_suffix(".tmp")
-    # #555 — set 0600 AT creation via os.open, not write_text + chmod after:
-    # the bearer token was briefly world-readable in the 0755 identity/ dir
-    # in the window before the chmod landed. O_NOFOLLOW refuses a planted
-    # symlink.
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(token + "\n")
+    # #555 — set 0600 AT creation (not write_text + chmod after, which left
+    # the bearer token briefly world-readable). Reuse the shared owner-only
+    # writer so the O_EXCL/O_NOFOLLOW hardening lives in exactly one place.
+    appliance_state._write_owner_only(tmp, token + "\n")
     tmp.replace(path)
 
 
