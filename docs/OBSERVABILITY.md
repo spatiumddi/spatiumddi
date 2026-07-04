@@ -752,6 +752,7 @@ Rule types shipped today:
 | `subnet_utilization` | `Subnet.utilization_percent ≥ threshold`; honours `PlatformSettings.utilization_max_prefix_{ipv4,ipv6}` so PTP / loopback subnets can't trip the alarm. |
 | `server_unreachable` | Any DNS / DHCP server whose status is `unreachable` or `error`. `server_type` filters the family. |
 | `asn_holder_drift` / `asn_whois_unreachable` / `rpki_roa_expiring` / `rpki_roa_expired` | ASN / RPKI signals from the WHOIS + ROA refresh tasks (#85). |
+| `bgp_prefix_hijack` / `bgp_more_specific_announced` | BGP prefix-hijack signals (#527) — an unexpected origin AS announcing a tracked prefix (exact) or a more-specific sub-prefix of it. Backed by the `bgp_hijack_detection` latch table (see §9.1a). Per-detection severity: `critical` when RPKI says the announcement is **invalid**, `warning` when RPKI coverage is **unknown**. Seeded disabled (external-signal rules are noisy). |
 | `domain_expiring` / `domain_nameserver_drift` / `domain_registrar_changed` / `domain_dnssec_status_changed` | Registry-side domain signals (#87). The two transition-once rules latch their value into `last_observed_value` JSONB so a single flip fires exactly one event auto-resolved after 7 d. |
 | `circuit_term_expiring` / `circuit_status_changed` | WAN circuit alerts (#93). Status-changed only fires on `suspended` / `decom` transitions and auto-resolves after 7 d. |
 | `service_term_expiring` / `service_resource_orphaned` | Service-catalog alerts (#94). Orphan-sweep walks `network_service_resource` join rows whose target was deleted. |
@@ -767,6 +768,72 @@ transition on a (policy, resource) pair opens an `AlertEvent` row
 against the named alert rule with `subject_type="conformity"` so
 operators see drift in the same dashboard. Configure the wiring in
 the policy edit modal at `/admin/conformity`.
+
+### 9.1a BGP prefix-hijack monitoring (#527)
+
+Extends the ASN subsystem with route-origin monitoring: **is someone
+else announcing your prefix?** Two tables + a beat task + the two
+alert rules above.
+
+**What's tracked.** `bgp_tracked_prefix` holds the prefixes SpatiumDDI
+watches on the public routing table (one row per `(asn, prefix)`). The
+poll auto-populates them from each public ASN's **RPKI ROAs** + the
+**RIPEstat `announced-prefixes`** feed; operators can also add
+`source="manual"` rows (never auto-pruned). `expected_origin_asn` is
+denormalised from the AS number for a fast mismatch compare, and
+`allowed_origins` is the operator allowlist of *additional* legitimate
+origins (intentional multi-origin / anycast / DDoS-scrubbing).
+
+**Detection.** `bgp_hijack_detection` is the latch/dedup state — one
+row per observed hijack, `resolved_at` NULL while active. On every
+tracked prefix the poll compares the currently-observed origin ASes
+(RIPEstat `prefix-overview` for the exact prefix, `related-prefixes`
+for more-specifics) against the expected + allowlisted set. An
+unexpected origin that is **not** covered by a valid ROA for that
+origin opens a detection (`prefix_hijack` for the exact CIDR,
+`more_specific` for a sub-prefix that wins BGP longest-match).
+
+**RPKI severity ladder** (reuses the ROA data from
+`app.tasks.rpki_roa_refresh`):
+
+* **invalid** → `critical` — a ROA covers the observed prefix but does
+  not authorise the observed origin (wrong AS, or announced length
+  exceeds `max_length`).
+* **unknown** → `warning` — no ROA covers the prefix; still a mismatch
+  against the expected origin, but RPKI can't confirm.
+* **valid** — a ROA authorises the observed origin → legitimate
+  multi-origin, never persisted as a detection.
+
+**Latch / auto-resolve.** An ongoing announcement bumps `last_seen_at`
+on the same row (one stable `AlertEvent` subject); the poll resolves
+detections whose announcement has been absent for the delist window
+(default 12 h), which auto-resolves the mirrored `AlertEvent` — the
+same latch-and-auto-resolve shape as the `domain_*` / `circuit_*`
+rules. Operators can `acknowledge` a detection (mutes the alert now)
+or `allowlist-origin` (appends the origin to the tracked prefix's
+allowlist so it never fires again).
+
+**Worker model — two delivery paths.** The **periodic RIPEstat poll**
+(`app.tasks.bgp_hijack_poll.poll_bgp_hijacks`, beat-fired hourly) is
+the reliable source of truth and the alert-latch owner — it runs on
+any standard Celery deployment, gated on
+`PlatformSettings.bgp_monitoring_enabled` (default OFF) with per-prefix
+`next_check_at` pacing (`bgp_monitoring_interval_hours`, default 6 h).
+An **optional RIS Live WebSocket consumer**
+(`python -m app.services.bgp.ris_live`, gated by the
+`BGP_RIS_LIVE_ENABLED` env flag, default OFF) is the real-time upgrade
+— it subscribes to [RIPE RIS Live](https://ris-live.ripe.net/) for the
+tracked prefixes and writes into the **same** detection table via the
+**same** `app.services.bgp.hijack_monitor` helpers, so it never
+becomes load-bearing. The feature works fully without it.
+
+**Surfaces.** Per-ASN **BGP Monitoring** tab on the ASN detail page
+(tracked prefixes + detections + `Check BGP now` + acknowledge /
+allowlist); the two alert rules appear in `/admin/alerts`
+automatically. MCP: `find_bgp_hijacks` / `count_bgp_hijacks` /
+`find_tracked_prefixes` (read, default-on) + `propose_allowlist_bgp_origin`
+(write, default-off). Feature-module: folds into the existing
+`network.asn` module (no new module).
 
 ### 9.2 Prometheus alerting rules (external)
 

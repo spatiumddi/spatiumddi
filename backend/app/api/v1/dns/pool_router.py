@@ -22,9 +22,11 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.core.agent_wake import collect_wake, dns_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.audit import AuditLog
 from app.models.dns import DNSPool, DNSPoolMember, DNSZone
+from app.models.ownership import Site
 from app.services.dns.pool_apply import apply_pool_state
 
 logger = structlog.get_logger(__name__)
@@ -42,10 +44,28 @@ VALID_RECORD_TYPES = {"A", "AAAA"}
 # ── Schemas ───────────────────────────────────────────────────────────────
 
 
+def _normalise_cidrs(raw: list[str] | None) -> list[str]:
+    """Canonicalise + validate a serving-scope CIDR list (issue #530)."""
+    out: list[str] = []
+    for c in raw or []:
+        c = str(c).strip()
+        if not c:
+            continue
+        try:
+            out.append(str(ipaddress.ip_network(c, strict=False)))
+        except ValueError as exc:
+            raise ValueError(f"invalid CIDR: {c}") from exc
+    return out
+
+
 class PoolMemberWrite(BaseModel):
     address: str
     weight: int = 1
     enabled: bool = True
+    # Geo / topology-aware steering scope (issue #530). Empty CIDRs + no
+    # site ⇒ default target (served to everyone, current behaviour).
+    serving_cidrs: list[str] = Field(default_factory=list)
+    site_id: uuid.UUID | None = None
 
     @field_validator("address")
     @classmethod
@@ -57,6 +77,11 @@ class PoolMemberWrite(BaseModel):
             raise ValueError(f"invalid IP address: {v}") from exc
         return v
 
+    @field_validator("serving_cidrs")
+    @classmethod
+    def _cidrs(cls, v: list[str]) -> list[str]:
+        return _normalise_cidrs(v)
+
 
 class PoolMemberResponse(BaseModel):
     id: uuid.UUID
@@ -64,6 +89,8 @@ class PoolMemberResponse(BaseModel):
     address: str
     weight: int
     enabled: bool
+    serving_cidrs: list[str]
+    site_id: uuid.UUID | None
     last_check_state: str
     last_check_at: datetime | None
     last_check_error: str | None
@@ -167,6 +194,14 @@ class PoolResponse(BaseModel):
     modified_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+async def _assert_site_exists(db: DB, site_id: uuid.UUID | None) -> None:
+    """404 if a member's serving-scope ``site_id`` points at no Site."""
+    if site_id is None:
+        return
+    if await db.get(Site, site_id) is None:
+        raise HTTPException(status_code=404, detail=f"Site {site_id} not found")
 
 
 def _pool_to_response(p: DNSPool) -> PoolResponse:
@@ -345,6 +380,9 @@ async def create_pool(
             detail=f"A pool already owns the record name {body.record_name!r} in this zone",
         )
 
+    for m in body.members or []:
+        await _assert_site_exists(db, m.site_id)
+
     payload = body.model_dump(exclude={"members"})
     pool = DNSPool(group_id=group_id, zone_id=zone_id, **payload)
     db.add(pool)
@@ -491,6 +529,7 @@ async def add_member(
             status_code=409,
             detail=f"Member with address {body.address!r} already exists",
         )
+    await _assert_site_exists(db, body.site_id)
     member = DNSPoolMember(pool_id=pool_id, **body.model_dump())
     db.add(member)
     await db.flush()
@@ -515,6 +554,12 @@ class PoolMemberUpdate(BaseModel):
     address: str | None = None
     weight: int | None = None
     enabled: bool | None = None
+    # Geo steering scope (issue #530). ``serving_cidrs=[]`` clears the
+    # CIDR list; ``site_id=null`` (explicitly present) clears the Site
+    # link. Both are applied only when present in the request body
+    # (tracked via ``model_fields_set``).
+    serving_cidrs: list[str] | None = None
+    site_id: uuid.UUID | None = None
 
     @field_validator("address")
     @classmethod
@@ -528,6 +573,13 @@ class PoolMemberUpdate(BaseModel):
             raise ValueError(f"invalid IP address: {v}") from exc
         return v
 
+    @field_validator("serving_cidrs")
+    @classmethod
+    def _cidrs(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        return _normalise_cidrs(v)
+
 
 @router.put("/pool-members/{member_id}", response_model=PoolMemberResponse)
 async def update_member(
@@ -537,7 +589,36 @@ async def update_member(
     if member is None:
         raise HTTPException(status_code=404, detail="Pool member not found")
 
-    payload: dict[str, Any] = body.model_dump(exclude_none=True)
+    # ``serving_cidrs`` / ``site_id`` handled separately below (they need
+    # explicit-clear semantics), so keep them out of the generic loop.
+    payload: dict[str, Any] = body.model_dump(
+        exclude_none=True, exclude={"serving_cidrs", "site_id"}
+    )
+    # Geo steering scope (issue #530) is applied separately so an
+    # explicit ``serving_cidrs=[]`` / ``site_id=null`` can CLEAR the
+    # scope (``exclude_none`` would drop those). Tracked via
+    # ``model_fields_set``. Scope changes don't touch the rendered
+    # ``DNSRecord`` rows (only their per-view placement at bundle-build
+    # time), so they don't need an ``apply_pool_state`` reconcile — but
+    # they DO change the rendered ConfigBundle (which geo view a member's
+    # record lands in), so the agent long-poll must be woken (see the
+    # ``collect_wake`` below); otherwise convergence waits up to one
+    # ``WAKE_TICK_SECONDS`` safety tick (cross-cutting pattern #2).
+    fields_set = body.model_fields_set
+    geo_scope_changed = False
+    if "site_id" in fields_set:
+        await _assert_site_exists(db, body.site_id)
+        if body.site_id != member.site_id:
+            geo_scope_changed = True
+        member.site_id = body.site_id
+    if "serving_cidrs" in fields_set:
+        new_cidrs = body.serving_cidrs or []
+        # Compare as sets — the validator already canonicalised the input,
+        # so an operator re-submitting the same list in a different order
+        # (or with dupes) doesn't spuriously wake every agent in the group.
+        if set(new_cidrs) != set(member.serving_cidrs or []):
+            geo_scope_changed = True
+        member.serving_cidrs = new_cidrs
     # Snapshot the fields the reconciler diffs on so we can decide
     # below whether to re-render the rrset. Address edits in particular
     # used to fall through silently — the DB row updated but BIND9 kept
@@ -595,11 +676,23 @@ async def update_member(
     # Reconcile on any rrset-affecting change (address or enabled);
     # weight is advisory today but cheap to include if/when weighted
     # rendering lands. Don't make the operator wait for the next
-    # health-check tick.
-    if member_changed:
+    # health-check tick. A geo-scope-only change doesn't touch the
+    # rendered ``DNSRecord`` rows (no reconcile), but it DOES shift which
+    # view each record lands in at bundle-build time, so it still needs a
+    # wake so the agent re-polls promptly (#358 / cross-cutting #2).
+    if member_changed or geo_scope_changed:
         pool = await db.get(DNSPool, member.pool_id)
         if pool is not None:
-            await apply_pool_state(db, pool)
+            if member_changed:
+                # ``apply_pool_state`` enqueues record ops which
+                # ``collect_wake`` the group channel themselves.
+                await apply_pool_state(db, pool)
+            if geo_scope_changed:
+                # No rrset change, so nothing above published a wake —
+                # do it here. ``collect_wake`` stashes the channel; the
+                # router's ``wake_publishing`` dependency publishes it
+                # after this handler's ``db.commit()``.
+                collect_wake(dns_group_channel(pool.group_id))
 
     await db.commit()
     await db.refresh(member)

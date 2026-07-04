@@ -33,6 +33,7 @@ components. Grouped by role; license + project URL for each.
 
 ── DNS / DHCP service engines ─────────────────────────────────────────────
 - ISC Kea DHCP — MPL 2.0 — https://kea.isc.org
+- radvd (IPv6 Router Advertisement Daemon) — BSD-style — https://radvd.litech.org
 - ISC BIND 9 — MPL 2.0 — https://isc.org/bind
 - PowerDNS Authoritative Server — GPL v2 — https://powerdns.com
 - PowerDNS dnsdist — GPL v2 — https://dnsdist.org

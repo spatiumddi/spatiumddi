@@ -163,6 +163,16 @@ class ScopeCreate(BaseModel):
     v6_address_mode: str = "stateful"
     ra_managed_flag: bool = True
     ra_other_flag: bool = True
+    # IPv6 Router Advertisement management (issue #524) — v6 scopes only.
+    ra_enabled: bool = False
+    ra_mo_override: bool = False
+    ra_router_lifetime: int = 1800
+    ra_max_interval: int = 600
+    ra_prefix_valid_lifetime: int = 86400
+    ra_prefix_preferred_lifetime: int = 14400
+    ra_prefix_on_link: bool = True
+    ra_prefix_autonomous: bool = True
+    ra_interface: str = ""
     # Relay-agent (giaddr) IPs (issue #337) — see DHCPScope.relay_addresses.
     relay_addresses: list[str] = Field(default_factory=list)
     tags: dict[str, Any] = Field(default_factory=dict)
@@ -221,6 +231,16 @@ class ScopeUpdate(BaseModel):
     v6_address_mode: str | None = None
     ra_managed_flag: bool | None = None
     ra_other_flag: bool | None = None
+    # IPv6 Router Advertisement management (issue #524) — v6 scopes only.
+    ra_enabled: bool | None = None
+    ra_mo_override: bool | None = None
+    ra_router_lifetime: int | None = None
+    ra_max_interval: int | None = None
+    ra_prefix_valid_lifetime: int | None = None
+    ra_prefix_preferred_lifetime: int | None = None
+    ra_prefix_on_link: bool | None = None
+    ra_prefix_autonomous: bool | None = None
+    ra_interface: str | None = None
     # Relay-agent (giaddr) IPs (issue #337). Pass a list to replace the
     # scope's relay set (empty list clears it); omit to leave unchanged.
     relay_addresses: list[str] | None = None
@@ -265,6 +285,15 @@ class ScopeResponse(BaseModel):
     v6_address_mode: str = "stateful"
     ra_managed_flag: bool = True
     ra_other_flag: bool = True
+    ra_enabled: bool = False
+    ra_mo_override: bool = False
+    ra_router_lifetime: int = 1800
+    ra_max_interval: int = 600
+    ra_prefix_valid_lifetime: int = 86400
+    ra_prefix_preferred_lifetime: int = 14400
+    ra_prefix_on_link: bool = True
+    ra_prefix_autonomous: bool = True
+    ra_interface: str = ""
     relay_addresses: list[str] = Field(default_factory=list)
     last_pushed_at: datetime | None
     tags: dict[str, Any] = Field(default_factory=dict)
@@ -299,6 +328,15 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
         v6_address_mode=getattr(scope, "v6_address_mode", "stateful") or "stateful",
         ra_managed_flag=getattr(scope, "ra_managed_flag", True),
         ra_other_flag=getattr(scope, "ra_other_flag", True),
+        ra_enabled=getattr(scope, "ra_enabled", False),
+        ra_mo_override=getattr(scope, "ra_mo_override", False),
+        ra_router_lifetime=getattr(scope, "ra_router_lifetime", 1800),
+        ra_max_interval=getattr(scope, "ra_max_interval", 600),
+        ra_prefix_valid_lifetime=getattr(scope, "ra_prefix_valid_lifetime", 86400),
+        ra_prefix_preferred_lifetime=getattr(scope, "ra_prefix_preferred_lifetime", 14400),
+        ra_prefix_on_link=getattr(scope, "ra_prefix_on_link", True),
+        ra_prefix_autonomous=getattr(scope, "ra_prefix_autonomous", True),
+        ra_interface=getattr(scope, "ra_interface", "") or "",
         relay_addresses=list(getattr(scope, "relay_addresses", None) or []),
         last_pushed_at=scope.last_pushed_at,
         tags=scope.tags or {},
@@ -397,6 +435,15 @@ async def create_scope(
         v6_address_mode=body.v6_address_mode,
         ra_managed_flag=body.ra_managed_flag,
         ra_other_flag=body.ra_other_flag,
+        ra_enabled=body.ra_enabled,
+        ra_mo_override=body.ra_mo_override,
+        ra_router_lifetime=body.ra_router_lifetime,
+        ra_max_interval=body.ra_max_interval,
+        ra_prefix_valid_lifetime=body.ra_prefix_valid_lifetime,
+        ra_prefix_preferred_lifetime=body.ra_prefix_preferred_lifetime,
+        ra_prefix_on_link=body.ra_prefix_on_link,
+        ra_prefix_autonomous=body.ra_prefix_autonomous,
+        ra_interface=body.ra_interface,
         relay_addresses=body.relay_addresses,
     )
     db.add(scope)

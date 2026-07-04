@@ -59,6 +59,7 @@ import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
 import { CreateOptionTemplateModal } from "./CreateOptionTemplateModal";
 import { CreateStaticAssignmentModal } from "./CreateStaticAssignmentModal";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { usePermissions } from "@/hooks/usePermissions";
 import { MacBlocksTab } from "./MacBlocksTab";
 import { PhoneProfilesTab } from "./PhoneProfilesTab";
@@ -343,7 +344,8 @@ type GroupTab =
   | "option-templates"
   | "mac-blocks"
   | "phone-profiles"
-  | "responders";
+  | "responders"
+  | "router-advertisements";
 
 function GroupDetailView({
   group,
@@ -368,6 +370,8 @@ function GroupDetailView({
   // groups in the sidebar doesn't bounce the operator off the tab they
   // were just working on.
   const [tab, setTab] = useSessionStateGroupTab(group.id);
+  const { enabled: moduleEnabled } = useFeatureModules();
+  const raEnabled = moduleEnabled("ipv6.router_advertisements");
   const { data: servers = [], isFetching } = useQuery({
     queryKey: ["dhcp-servers", group.id],
     queryFn: () => dhcpApi.listServers(group.id),
@@ -505,6 +509,14 @@ function GroupDetailView({
             >
               Responders
             </TabButton>
+            {raEnabled && (
+              <TabButton
+                active={tab === "router-advertisements"}
+                onClick={() => setTab("router-advertisements")}
+              >
+                Router Adverts
+              </TabButton>
+            )}
           </div>
         </div>
       )}
@@ -535,6 +547,9 @@ function GroupDetailView({
           <PhoneProfilesTab groupId={group.id} />
         )}
         {isKea && tab === "responders" && <RespondersTab groupId={group.id} />}
+        {isKea && raEnabled && tab === "router-advertisements" && (
+          <RouterAdvertisementsTab groupId={group.id} />
+        )}
       </div>
     </div>
   );
@@ -633,6 +648,179 @@ function RespondersTab({ groupId }: { groupId: string }) {
             ))}
           </tbody>
         </table>
+      </div>
+    </div>
+  );
+}
+
+// IPv6 Router Advertisements (#524). Shows the radvd config the group's
+// RA-enabled scopes render to (M/O flags, lifetimes, RDNSS/DNSSL) plus the
+// routers the passive RA sniffer has observed, with an acknowledge action
+// that allowlists an expected router so the rogue_ra alert auto-resolves.
+function RouterAdvertisementsTab({ groupId }: { groupId: string }) {
+  const qc = useQueryClient();
+  const { data: preview } = useQuery({
+    queryKey: ["ra-config", groupId],
+    queryFn: () => dhcpApi.raConfigPreview(groupId),
+  });
+  const { data: routers = [], isFetching } = useQuery({
+    queryKey: ["ra-routers", groupId],
+    queryFn: () => dhcpApi.listObservedRARouters(groupId),
+  });
+  const ack = useMutation({
+    mutationFn: (id: string) => dhcpApi.acknowledgeRARouter(groupId, id),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["ra-routers", groupId] }),
+  });
+  const badge = (c: string) =>
+    c === "rogue"
+      ? "bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300"
+      : c === "acknowledged"
+        ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300"
+        : "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300";
+  return (
+    <div className="space-y-5">
+      <div className="space-y-2">
+        <h3 className="text-sm font-medium">
+          RA configuration ({preview?.scopes.length ?? 0} subnet
+          {(preview?.scopes.length ?? 0) === 1 ? "" : "s"})
+        </h3>
+        <p className="text-xs text-muted-foreground">
+          Rendered radvd config for scopes with RA enabled. The DHCP agent runs
+          radvd from this when <code>RADVD_MANAGED=1</code>. Turn RA on per
+          scope in the scope's IPv6 settings.
+        </p>
+        {preview && preview.scopes.length > 0 ? (
+          <>
+            <div className="rounded-lg border overflow-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b bg-muted/30 text-xs">
+                    <th className="px-3 py-2 text-left font-medium">Prefix</th>
+                    <th className="px-3 py-2 text-left font-medium">Iface</th>
+                    <th className="px-3 py-2 text-left font-medium">M / O</th>
+                    <th className="px-3 py-2 text-left font-medium">
+                      Router life
+                    </th>
+                    <th className="px-3 py-2 text-left font-medium">RDNSS</th>
+                  </tr>
+                </thead>
+                <tbody className={zebraBodyCls}>
+                  {preview.scopes.map((s) => (
+                    <tr key={s.scope_id} className="border-b last:border-0">
+                      <td className="px-3 py-1.5 font-mono text-xs">
+                        {s.subnet_cidr}
+                      </td>
+                      <td className="px-3 py-1.5 text-xs">
+                        {s.interface || "(default)"}
+                      </td>
+                      <td className="px-3 py-1.5 font-mono text-xs">
+                        {s.managed_flag ? "1" : "0"} /{" "}
+                        {s.other_flag ? "1" : "0"}
+                      </td>
+                      <td className="px-3 py-1.5 text-xs">
+                        {s.router_lifetime}s
+                      </td>
+                      <td className="px-3 py-1.5 font-mono text-xs">
+                        {s.rdnss.length ? s.rdnss.join(", ") : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <details className="text-xs">
+              <summary className="cursor-pointer text-muted-foreground">
+                Show rendered radvd.conf
+              </summary>
+              <pre className="mt-2 overflow-auto rounded-lg border bg-muted/30 p-3 font-mono text-xs">
+                {preview.radvd_conf}
+              </pre>
+            </details>
+          </>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            No RA-enabled IPv6 scopes in this group yet.
+          </p>
+        )}
+      </div>
+
+      <div className="space-y-2">
+        <h3 className="text-sm font-medium">Observed routers</h3>
+        <p className="text-xs text-muted-foreground">
+          IPv6 routers seen advertising on this group's segments by the passive
+          RA sniffer (enable <code>DHCP_RA_SNIFFER_ENABLED=1</code> on the
+          agent). Unknown routers classify{" "}
+          <span className="text-rose-600">rogue</span> and fire the Rogue IPv6
+          router alert — acknowledge an expected one to allowlist it.
+        </p>
+        <div className="rounded-lg border overflow-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b bg-muted/30 text-xs">
+                <th className="px-3 py-2 text-left font-medium">Source</th>
+                <th className="px-3 py-2 text-left font-medium">MAC</th>
+                <th className="px-3 py-2 text-left font-medium">Prefixes</th>
+                <th className="px-3 py-2 text-left font-medium">M / O</th>
+                <th className="px-3 py-2 text-left font-medium">Class</th>
+                <th className="px-3 py-2 text-left font-medium">Last seen</th>
+                <th className="px-3 py-2 text-right font-medium">Actions</th>
+              </tr>
+            </thead>
+            <tbody className={zebraBodyCls}>
+              {routers.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={7}
+                    className="p-6 text-center text-sm text-muted-foreground"
+                  >
+                    {isFetching ? "Loading…" : "No routers observed."}
+                  </td>
+                </tr>
+              )}
+              {routers.map((r) => (
+                <tr key={r.id} className="border-b last:border-0">
+                  <td className="px-3 py-1.5 font-mono text-xs">
+                    {r.source_ip}
+                  </td>
+                  <td className="px-3 py-1.5 font-mono text-xs">
+                    {r.source_mac || "—"}
+                  </td>
+                  <td className="px-3 py-1.5 font-mono text-xs">
+                    {r.prefixes.length ? r.prefixes.join(", ") : "—"}
+                  </td>
+                  <td className="px-3 py-1.5 font-mono text-xs">
+                    {r.managed_flag ? "1" : "0"} / {r.other_flag ? "1" : "0"}
+                  </td>
+                  <td className="px-3 py-1.5">
+                    <span
+                      className={cn(
+                        "rounded-full px-2 py-0.5 text-xs",
+                        badge(r.classification),
+                      )}
+                    >
+                      {r.classification}
+                    </span>
+                  </td>
+                  <td className="px-3 py-1.5 text-xs text-muted-foreground">
+                    {new Date(r.last_seen_at).toLocaleString()}
+                  </td>
+                  <td className="px-3 py-1.5 text-right">
+                    {r.classification === "rogue" && (
+                      <button
+                        onClick={() => ack.mutate(r.id)}
+                        disabled={ack.isPending}
+                        className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                      >
+                        Acknowledge
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );

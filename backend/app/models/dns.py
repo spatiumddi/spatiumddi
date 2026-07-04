@@ -938,6 +938,34 @@ class DNSPoolMember(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # set regardless of health. Distinct from ``last_check_state``.
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
+    # ── Geo / topology-aware steering (issue #530) ──────────────────────
+    # A member's *serving scope*. Empty ``serving_cidrs`` AND null
+    # ``site_id`` ⇒ the member is a **default** target served to every
+    # client (the historical health-only behaviour). When a scope is
+    # set, the member is only served to clients whose resolver source IP
+    # falls inside one of ``serving_cidrs`` OR inside a subnet linked to
+    # ``site_id``. The two sources are UNIONed. Rendered on BIND9 as a
+    # synthesized ``view { match-clients … }`` block (see
+    # ``app.services.dns.pool_geo``); default members render as shared
+    # records visible in every view + a catch-all.
+    #
+    # v1 keys purely on **resolver source IP**. EDNS Client Subnet (ECS)
+    # is the future accuracy improvement for the recursive-resolver-in-
+    # the-middle case — see ``pool_geo`` module docstring. NOT implemented.
+    serving_cidrs: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
+    # Optional Site whose linked subnets contribute client CIDRs to this
+    # member's serving scope. ON DELETE SET NULL — deleting a Site just
+    # drops the association; the member reverts to whatever ``serving_cidrs``
+    # remain (default target if none).
+    site_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("site.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     # Health-check state — populated by the pool health-check task.
     # last_check_state: unknown | healthy | unhealthy
     last_check_state: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")

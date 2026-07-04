@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN, ASNRpkiRoa
 from app.models.audit import AuditLog
+from app.models.bgp_monitor import BGPHijackDetection
 from app.models.circuit import Circuit
 from app.models.dhcp import (
     DHCPLease,
@@ -47,6 +48,7 @@ from app.models.dhcp import (
     DHCPPool,
     DHCPScope,
     DHCPServer,
+    RAObservedRouter,
 )
 from app.models.dns import DNSServer, DNSZone
 from app.models.domain import Domain
@@ -74,6 +76,14 @@ RULE_TYPE_ASN_HOLDER_DRIFT = "asn_holder_drift"
 RULE_TYPE_ASN_WHOIS_UNREACHABLE = "asn_whois_unreachable"
 RULE_TYPE_RPKI_ROA_EXPIRING = "rpki_roa_expiring"
 RULE_TYPE_RPKI_ROA_EXPIRED = "rpki_roa_expired"
+# BGP prefix-hijack rule types — issue #527. Backed by the
+# ``bgp_hijack_detection`` latch table populated by
+# ``app.tasks.bgp_hijack_poll`` (+ the optional RIS Live consumer). The
+# matcher reads active (unresolved, unacknowledged) detection rows;
+# per-detection severity (critical for RPKI-invalid, warning for
+# RPKI-unknown) rides through as a severity override.
+RULE_TYPE_BGP_PREFIX_HIJACK = "bgp_prefix_hijack"
+RULE_TYPE_BGP_MORE_SPECIFIC = "bgp_more_specific_announced"
 # Domain rule types — Phase 2 of issue #87.
 RULE_TYPE_DOMAIN_EXPIRING = "domain_expiring"
 RULE_TYPE_DOMAIN_NS_DRIFT = "domain_nameserver_drift"
@@ -192,6 +202,14 @@ RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE = "unknown_mac_in_static_range"
 RULE_TYPE_ROGUE_DHCP = "rogue_dhcp"
 _ROGUE_DHCP_RECENCY_DAYS = 1
 
+# Rogue IPv6 Router-Advertisement detection — issue #524. Subject = ra_router.
+# Fires on ra_observed_router rows classified ``rogue`` (an RA source that
+# isn't on the group's expected-router allowlist), observed within
+# ``threshold_days`` (default 1). The agent's passive RA sniffer is opt-in, so
+# this only has data on segments running the sniffer.
+RULE_TYPE_ROGUE_RA = "rogue_ra"
+_ROGUE_RA_RECENCY_DAYS = 1
+
 # New-device (arpwatch) detection — issue #459. Subject = ip_mac_observation
 # (composite ``ip_id:mac``). Fires on ip_mac_history rows classified ``new``
 # (a MAC never seen before, not allowlisted, not on the known fleet) observed
@@ -215,6 +233,10 @@ RULE_TYPE_TLS_CERT_CHANGED = "tls_cert_changed"
 # Cert-rotation deviation (#118 Phase 3) — the issuing CA changed (a
 # normally-ACME cert coming back from a different issuer); transition-once.
 RULE_TYPE_TLS_CERT_ISSUER_CHANGED = "tls_cert_issuer_changed"
+# DNSBL / RBL reputation (#528) — recurring-condition latch: fires while a
+# public-facing IP is listed on ≥1 enabled blocklist, auto-resolves when the
+# sweep finds it delisted (the shared open/resolve loop handles both).
+RULE_TYPE_IP_BLOCKLISTED = "ip_blocklisted"
 # Unreachable only pages after a couple of consecutive failures so a
 # single transient handshake blip doesn't fire.
 _TLS_CERT_UNREACHABLE_MIN_FAILURES = 2
@@ -227,6 +249,8 @@ RULE_TYPES = frozenset(
         RULE_TYPE_ASN_WHOIS_UNREACHABLE,
         RULE_TYPE_RPKI_ROA_EXPIRING,
         RULE_TYPE_RPKI_ROA_EXPIRED,
+        RULE_TYPE_BGP_PREFIX_HIJACK,
+        RULE_TYPE_BGP_MORE_SPECIFIC,
         RULE_TYPE_DOMAIN_EXPIRING,
         RULE_TYPE_DOMAIN_NS_DRIFT,
         RULE_TYPE_DOMAIN_REGISTRAR_CHANGED,
@@ -251,12 +275,14 @@ RULE_TYPES = frozenset(
         RULE_TYPE_STALE_RESERVATION,
         RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE,
         RULE_TYPE_ROGUE_DHCP,
+        RULE_TYPE_ROGUE_RA,
         RULE_TYPE_NEW_MAC_SEEN,
         RULE_TYPE_TLS_CERT_EXPIRING,
         RULE_TYPE_TLS_CERT_CHAIN_INVALID,
         RULE_TYPE_TLS_CERT_UNREACHABLE,
         RULE_TYPE_TLS_CERT_CHANGED,
         RULE_TYPE_TLS_CERT_ISSUER_CHANGED,
+        RULE_TYPE_IP_BLOCKLISTED,
     }
 )
 
@@ -730,6 +756,43 @@ async def _matching_rogue_dhcp_subjects(
     return matches
 
 
+async def _matching_rogue_ra_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """ra_observed_router rows classified ``rogue`` + seen within the recency
+    window (issue #524). Auto-resolves once a router stops being seen as rogue
+    (operator allowlists it → reclassified, or it goes away)."""
+    days = rule.threshold_days if rule.threshold_days is not None else _ROGUE_RA_RECENCY_DAYS
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, days))
+    rows = (
+        (
+            await db.execute(
+                select(RAObservedRouter).where(
+                    RAObservedRouter.classification == "rogue",
+                    RAObservedRouter.last_seen_at >= cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str]] = []
+    for r in rows:
+        display = str(r.source_ip)
+        prefixes = ", ".join(r.prefixes or []) or "none advertised"
+        message = (
+            f"Unrecognised IPv6 router advertising on a managed segment: "
+            f"source {r.source_ip}"
+            f"{f', MAC {r.source_mac}' if r.source_mac else ''} "
+            f"(M={int(r.managed_flag)} O={int(r.other_flag)}, prefixes: {prefixes}). "
+            f"Not on the RA allowlist — investigate a rogue / misconfigured "
+            f"router, or acknowledge it if expected."
+        )
+        matches.append((str(r.id), display, message))
+    return matches
+
+
 async def _matching_new_mac_seen_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -1033,6 +1096,45 @@ async def _matching_rpki_roa_expired_subjects(
             f"({roa.trust_anchor}) has expired"
         )
         matches.append((str(roa.id), display, message))
+    return matches
+
+
+async def _matching_bgp_hijack_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001 — symmetry with sibling evaluators
+    detection_kind: str,
+) -> list[tuple[str, str, str, str | None]]:
+    """Every active ``bgp_hijack_detection`` of ``detection_kind``.
+
+    "Active" = ``resolved_at IS NULL`` (announcement still observed and
+    within the delist window) AND ``acknowledged = False`` (operator
+    hasn't muted it). The detection table is the latch; the poll task
+    resolves rows on delist so the standard evaluator auto-resolves the
+    ``AlertEvent`` when the subject stops matching.
+
+    Per-detection severity (``critical`` for RPKI-invalid, ``warning``
+    for RPKI-unknown) rides through as the tuple's severity override.
+    """
+    res = await db.execute(
+        select(BGPHijackDetection).where(
+            BGPHijackDetection.detection_kind == detection_kind,
+            BGPHijackDetection.resolved_at.is_(None),
+            BGPHijackDetection.acknowledged.is_(False),
+        )
+    )
+    matches: list[tuple[str, str, str, str | None]] = []
+    for row in res.scalars().all():
+        kind_label = (
+            "announcing" if detection_kind == "prefix_hijack" else "announcing more-specific"
+        )
+        display = f"{row.observed_prefix} ← AS{row.observed_origin_asn}"
+        message = (
+            f"BGP hijack: AS{row.observed_origin_asn} is {kind_label} "
+            f"{row.observed_prefix} (tracked prefix {row.tracked_prefix}, "
+            f"expected origin AS{row.expected_origin_asn}) — "
+            f"RPKI {row.rpki_status}"
+        )
+        matches.append((str(row.id), display, message, row.severity))
     return matches
 
 
@@ -2746,6 +2848,46 @@ async def seed_rogue_dhcp_alert_rule() -> None:
         await session.commit()
 
 
+async def seed_rogue_ra_alert_rule() -> None:
+    """Seed the singleton ``rogue_ra`` rule (issue #524), DISABLED by default.
+
+    Meaningful only once an operator turns on the agent's passive RA sniffer
+    (``DHCP_RA_SNIFFER_ENABLED=1``); seeding it off makes it discoverable in
+    the Alerts UI without firing on installs that never opt in. Keyed on
+    ``rule_type`` — an operator who enables / renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_ROGUE_RA)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name="Rogue IPv6 router (RA)",
+                description=(
+                    "Fires when the DHCP agent's passive RA sniffer sees a Router "
+                    "Advertisement from an IPv6 router that isn't on the RA "
+                    "allowlist — a rogue or misconfigured router on the segment. "
+                    "Auto-resolves when the router stops appearing or is "
+                    "acknowledged. Enable once the sniffer "
+                    "(DHCP_RA_SNIFFER_ENABLED) is on."
+                ),
+                rule_type=RULE_TYPE_ROGUE_RA,
+                threshold_days=_ROGUE_RA_RECENCY_DAYS,
+                severity="warning",
+                enabled=False,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def seed_new_mac_seen_alert_rule() -> None:
     """Seed the singleton ``new_mac_seen`` rule (issue #459), DISABLED by default.
 
@@ -2787,6 +2929,71 @@ async def seed_new_mac_seen_alert_rule() -> None:
                 notify_smtp=False,
             )
         )
+        await session.commit()
+
+
+async def seed_bgp_hijack_alert_rules() -> None:
+    """Seed the two ``bgp_prefix_hijack`` / ``bgp_more_specific_announced``
+    rules (issue #527), DISABLED by default.
+
+    External-signal rules over the global routing table are noisy until
+    the operator has curated the tracked-prefix + allowlist set, so they
+    seed off (matching the ``rogue_dhcp`` / ``rogue_ra`` precedent) —
+    discoverable in the Alerts UI without firing on installs that never
+    turn on BGP monitoring (``PlatformSettings.bgp_monitoring_enabled``).
+    Keyed on ``rule_type``; an operator who enables / renames one is
+    never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    seeds = (
+        (
+            RULE_TYPE_BGP_PREFIX_HIJACK,
+            "BGP prefix hijack",
+            (
+                "Fires when an unexpected origin AS is observed announcing one "
+                "of your tracked prefixes on the public routing table (RIPEstat "
+                "poll, or the optional RIS Live feed). Severity escalates to "
+                "critical when RPKI says the announcement is invalid, warning "
+                "when RPKI coverage is unknown. Auto-resolves when the "
+                "announcement delists or is acknowledged. Enable once BGP "
+                "monitoring (Settings → bgp_monitoring_enabled) is on."
+            ),
+        ),
+        (
+            RULE_TYPE_BGP_MORE_SPECIFIC,
+            "BGP more-specific announced",
+            (
+                "Fires when an unexpected origin AS announces a MORE-SPECIFIC "
+                "sub-prefix of one of your tracked prefixes — the classic "
+                "sub-prefix hijack that wins BGP best-path by longest match. "
+                "Severity escalates on RPKI-invalid. Auto-resolves when the "
+                "sub-prefix delists or is acknowledged. Enable once BGP "
+                "monitoring is on."
+            ),
+        ),
+    )
+
+    async with AsyncSessionLocal() as session:
+        for rule_type, name, description in seeds:
+            existing = await session.scalar(
+                select(AlertRule).where(AlertRule.rule_type == rule_type)
+            )
+            if existing is not None:
+                continue
+            session.add(
+                AlertRule(
+                    name=name,
+                    description=description,
+                    rule_type=rule_type,
+                    severity="warning",
+                    enabled=False,
+                    notify_syslog=True,
+                    notify_webhook=True,
+                    notify_smtp=False,
+                )
+            )
         await session.commit()
 
 
@@ -3001,6 +3208,79 @@ async def seed_tls_cert_alert_rules() -> None:
         await session.commit()
 
 
+async def _matching_ip_blocklisted_subjects(
+    db: AsyncSession, rule: AlertRule
+) -> list[tuple[str, str, str]]:
+    """Public-facing IPs currently listed on ≥1 enabled DNSBL (#528).
+
+    Recurring-condition rule — one subject per listed IP. The shared
+    open/resolve loop opens an event on first listing and auto-resolves it
+    when the IP drops out of this set (the sweep flips ``listed=False``).
+    ``subject_id`` is the IP so the latch survives list churn: the IP stays
+    a subject as long as ANY enabled list has it.
+    """
+    from app.models.dnsbl import DNSBLList, DNSBLListing  # noqa: PLC0415
+
+    rows = (
+        await db.execute(
+            select(DNSBLListing, DNSBLList.name)
+            .join(DNSBLList, DNSBLList.id == DNSBLListing.list_id)
+            .where(DNSBLListing.listed.is_(True), DNSBLList.enabled.is_(True))
+        )
+    ).all()
+    by_ip: dict[str, list[str]] = {}
+    for listing, list_name in rows:
+        by_ip.setdefault(str(listing.ip), []).append(list_name)
+
+    out: list[tuple[str, str, str]] = []
+    for ip, list_names in sorted(by_ip.items()):
+        names = ", ".join(sorted(list_names))
+        msg = (
+            f"IP {ip} is listed on {len(list_names)} DNS blocklist(s): {names}. "
+            "Mail deliverability / reputation may be affected."
+        )
+        out.append((ip, ip, msg))
+    return out
+
+
+async def seed_ip_blocklisted_alert_rule() -> None:
+    """Seed the ``ip_blocklisted`` rule (#528), DISABLED by default.
+
+    Opt-in like the other monitoring signals — surfaces the rule in the
+    Alerts UI without firing on installs that never enable the DNSBL sweep.
+    Keyed on ``rule_type``; an operator who enables / renames it is never
+    overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_IP_BLOCKLISTED)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name="IP on DNS blocklist",
+                description=(
+                    "Fires when a public-facing IP (public IPAM address, "
+                    "internet-facing subnet, NAT/PAT egress, or operator-pinned) "
+                    "is found on one or more enabled DNS blocklists (Spamhaus, "
+                    "Barracuda, SpamCop, SORBS, …). Auto-resolves when the daily "
+                    "sweep finds the IP delisted. Requires the DNSBL sweep enabled."
+                ),
+                rule_type=RULE_TYPE_IP_BLOCKLISTED,
+                severity="warning",
+                enabled=False,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     """Evaluate every enabled rule; open / resolve events as needed.
 
@@ -3079,6 +3359,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_rogue_dhcp_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "dhcp_responder"
+            elif rule.rule_type == RULE_TYPE_ROGUE_RA:
+                base = await _matching_rogue_ra_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "ra_router"
             elif rule.rule_type == RULE_TYPE_NEW_MAC_SEEN:
                 base = await _matching_new_mac_seen_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
@@ -3099,6 +3383,12 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             elif rule.rule_type == RULE_TYPE_RPKI_ROA_EXPIRED:
                 matches = await _matching_rpki_roa_expired_subjects(db, rule)
                 subject_type = "rpki_roa"
+            elif rule.rule_type == RULE_TYPE_BGP_PREFIX_HIJACK:
+                matches = await _matching_bgp_hijack_subjects(db, rule, "prefix_hijack")
+                subject_type = "bgp_hijack"
+            elif rule.rule_type == RULE_TYPE_BGP_MORE_SPECIFIC:
+                matches = await _matching_bgp_hijack_subjects(db, rule, "more_specific")
+                subject_type = "bgp_hijack"
             elif rule.rule_type == RULE_TYPE_DOMAIN_EXPIRING:
                 expiring = await _matching_domain_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
@@ -3165,6 +3455,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 delivered_webhook += dwh
                 delivered_smtp += dsm
                 continue
+            elif rule.rule_type == RULE_TYPE_IP_BLOCKLISTED:
+                listed_ips = await _matching_ip_blocklisted_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in listed_ips]
+                subject_type = "ip_blocklist"
             elif rule.rule_type == RULE_TYPE_SERVICE_RESOURCE_ORPHANED:
                 orphans = await _matching_service_resource_orphaned_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in orphans]

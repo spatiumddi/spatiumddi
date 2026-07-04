@@ -18,6 +18,7 @@ from app.services.bgp.ripestat import (
     fetch_announced_prefixes,
     fetch_as_overview,
     fetch_prefix_overview,
+    fetch_related_prefixes,
     fetch_routing_history,
 )
 
@@ -25,6 +26,7 @@ __all__ = [
     "fetch_announced_prefixes",
     "fetch_as_overview",
     "fetch_prefix_overview",
+    "fetch_related_prefixes",
     "fetch_routing_history",
     "fetch_asn_network",
     "fetch_asn_ixps",

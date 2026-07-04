@@ -35,6 +35,11 @@ from app.models.dns import (
 from app.models.settings import PlatformSettings
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
+from app.services.dns.pool_geo import (
+    build_geo_steering,
+    build_view_descriptors,
+    records_for_view,
+)
 from app.services.dns_blocklist import (
     build_effective_for_group,
     build_effective_for_view,
@@ -102,8 +107,21 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # rendered INSIDE a ``view { match-clients … }`` block and records are
     # scoped per view (``DNSRecord.view_id``; NULL = shared across all
     # views). Lower ``order`` first → BIND first-match precedence.
-    has_views = bool(views)
     ordered_views = sorted(views, key=lambda v: (v.order, v.name))
+
+    # Geo / topology-aware steering (issue #530). Synthesized geo views
+    # (one per distinct pool-member serving scope) render BEFORE the
+    # operator split-horizon views (with a catch-all appended LAST) so
+    # BIND's first-match-wins picks a specific geo view before any broad
+    # operator view swallows the geo-CIDR client — see
+    # ``build_view_descriptors``. Geo steering forces views mode on even
+    # for a group with no operator views.
+    geo = await build_geo_steering(db, server.group_id)
+    has_views = bool(views) or geo.active
+
+    # Unified, ordered list of view descriptors that both the zone loop
+    # and ``views_block`` render from. kind ∈ {operator, geo, default}.
+    view_descs = build_view_descriptors(ordered_views, geo)
 
     # ACLs
     acls_res = await db.execute(
@@ -188,31 +206,29 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             )
             continue
 
-        # Split-horizon expansion (issue #24). The zone materialises in
-        # every view it has content for: each view referenced by a scoped
-        # record PLUS the zone's own pinned ``view_id``. With no explicit
-        # scoping the zone is "global" — rendered into EVERY view with all
-        # records (also fixes the prior gap where a view-group zone with no
-        # ``view_id`` rendered in no view at all). Per view, the record set
-        # is (scoped-to-this-view) ∪ (shared, i.e. ``view_id IS NULL``).
+        # Split-horizon expansion (issue #24) composed with geo steering
+        # (issue #530). Operator views: the zone materialises in every
+        # view it has content for — each view referenced by a scoped
+        # record PLUS the zone's own pinned ``view_id``; with no explicit
+        # scoping it's "global" and renders into every operator view.
+        # Geo + catch-all views always render the zone (like a global
+        # zone) so the catch-all serves the default member set. Per-view
+        # record filtering is delegated to ``records_for_view``.
         record_view_ids = {r.view_id for r in rec_rows if r.view_id is not None}
         zone_view_ids = {z.view_id} if z.view_id is not None else set()
-        target_view_ids = record_view_ids | zone_view_ids
-        emit_views = (
-            [v for v in ordered_views if v.id in target_view_ids]
-            if target_view_ids
-            else list(ordered_views)
-        )
-        for v in emit_views:
-            recs = (
-                [r for r in rec_rows if r.view_id == v.id or r.view_id is None]
-                if target_view_ids
-                else rec_rows
-            )
+        operator_target_ids = record_view_ids | zone_view_ids
+        for vd in view_descs:
+            if (
+                vd["kind"] == "operator"
+                and operator_target_ids
+                and vd["id"] not in operator_target_ids
+            ):
+                continue
+            recs = records_for_view(rec_rows, vd, geo)
             zone_payload.append(
                 {
                     **base_zp,
-                    "view_name": v.name,
+                    "view_name": vd["name"],
                     "records": [_rec_dict(r) for r in recs],
                 }
             )
@@ -366,24 +382,24 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             int(getattr(opts, "dnsdist_dynblock_seconds", 60)) if opts else 60
         ),
     }
+    # Built from the unified descriptor list so operator split-horizon
+    # views (issue #24), synthesized geo views + the geo catch-all
+    # (issue #530) all render. Already ordered low→high so the rendered
+    # view blocks honour BIND's first-match-wins precedence.
+    # #430 — per-view query ACL overrides (allow_query / allow_query_cache).
+    # None → inherit server-options allow-query (renderer omits the line).
     views_block = [
         {
-            "id": str(v.id),
-            "name": v.name,
-            "match_clients": getattr(v, "match_clients", []) or ["any"],
-            "match_destinations": getattr(v, "match_destinations", []) or [],
-            "recursion": bool(getattr(v, "recursion", True)),
-            "order": getattr(v, "order", 0),
-            # #430 — per-view query ACL overrides. None → inherit the
-            # server-options allow-query (the agent renderer omits the line).
-            # Carried in views_block, which is part of the structural
-            # fingerprint, so editing a view ACL re-renders named.conf.
-            "allow_query": getattr(v, "allow_query", None),
-            "allow_query_cache": getattr(v, "allow_query_cache", None),
+            "id": str(vd["id"]) if vd["id"] is not None else None,
+            "name": vd["name"],
+            "match_clients": list(vd["match_clients"]) or ["any"],
+            "match_destinations": list(vd["match_destinations"]),
+            "recursion": vd["recursion"],
+            "order": vd["order"],
+            "allow_query": vd["allow_query"],
+            "allow_query_cache": vd["allow_query_cache"],
         }
-        # Ordered low→high so the rendered view blocks honour BIND's
-        # first-match-wins precedence (issue #24).
-        for v in ordered_views
+        for vd in view_descs
     ]
     acls_block = [{"id": str(a.id), "name": a.name} for a in acls]
 

@@ -222,6 +222,74 @@ async def fetch_routing_history(resource: str) -> dict[str, Any]:
     return {"available": True, "resource": resource, "events": events}
 
 
+async def fetch_related_prefixes(resource: str) -> dict[str, Any]:
+    """RIPEstat ``related-prefixes`` — more/less-specific + overlapping
+    prefixes seen in the routing table for ``resource``, each with the
+    origin AS currently announcing it.
+
+    Normalised shape::
+
+        {
+          "available": True,
+          "resource": "192.0.2.0/24",
+          "prefixes": [
+            {"prefix": "192.0.2.128/25", "origin_asn": 64500,
+             "relationship": "More Specific"},
+            ...
+          ],
+        }
+
+    Used by the hijack poll to catch sub-prefix hijacks: a more-specific
+    slice of a tracked prefix announced by an unexpected origin wins BGP
+    longest-match and blackholes / intercepts the traffic.
+    """
+    raw = await _fetch("related-prefixes", resource)
+    if not raw.get("available"):
+        return {
+            "available": False,
+            "resource": resource,
+            "error": raw.get("error", "unavailable"),
+        }
+    data = raw.get("data") or {}
+    rows = data.get("prefixes") or []
+    out_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        prefix = row.get("prefix")
+        if not prefix or not isinstance(prefix, str):
+            continue
+        origin = row.get("origin_asn")
+        # RIPEstat sometimes ships origin as a bare int, sometimes as a
+        # string ("AS64500" or "64500"); normalise to int or None.
+        origin_int = _coerce_asn(origin)
+        out_rows.append(
+            {
+                "prefix": prefix,
+                "origin_asn": origin_int,
+                "relationship": row.get("relationship"),
+            }
+        )
+    return {"available": True, "resource": resource, "prefixes": out_rows}
+
+
+def _coerce_asn(value: Any) -> int | None:
+    """Best-effort ``AS64500`` / ``"64500"`` / ``64500`` → ``64500``."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        s = value.strip().upper()
+        if s.startswith("AS"):
+            s = s[2:]
+        try:
+            return int(s)
+        except ValueError:
+            return None
+    return None
+
+
 async def fetch_as_overview(asn: int) -> dict[str, Any]:
     """RIPEstat ``as-overview`` — holder + RIR + announced summary."""
     raw = await _fetch("as-overview", f"AS{asn}")

@@ -28,6 +28,7 @@ from app.api.v1.conformity import router as conformity_router
 from app.api.v1.custom_fields.router import router as custom_fields_router
 from app.api.v1.dashboards import router as dashboards_router
 from app.api.v1.dhcp import router as dhcp_router
+from app.api.v1.dhcp.ra_routers import router as ra_routers_router
 from app.api.v1.dhcp_import.router import router as dhcp_import_router
 from app.api.v1.diagnostics import router as diagnostics_router
 from app.api.v1.dns.agents import router as dns_agents_router
@@ -36,6 +37,7 @@ from app.api.v1.dns.pool_router import router as dns_pool_router
 from app.api.v1.dns.router import router as dns_router
 from app.api.v1.dns_import.router import router as dns_import_router
 from app.api.v1.dns_tools import router as dns_tools_router
+from app.api.v1.dnsbl import router as dnsbl_router
 from app.api.v1.docker import router as docker_router
 from app.api.v1.domains import router as domains_router
 from app.api.v1.groups.router import router as groups_router
@@ -133,7 +135,15 @@ api_v1_router.include_router(
     auth_providers_router, prefix="/auth-providers", tags=["auth-providers"]
 )
 api_v1_router.include_router(backup_router, prefix="/backup", tags=["backup"])
-api_v1_router.include_router(bgp_router, prefix="/bgp", tags=["bgp"])
+api_v1_router.include_router(
+    bgp_router,
+    prefix="/bgp",
+    tags=["bgp"],
+    # Folds into the existing ASN feature module (its MCP tools are
+    # tagged module="network.asn" and its UI is a tab on the ASN detail
+    # page) — gate /bgp by the same module as /asns (non-negotiable #14).
+    dependencies=[Depends(require_module("network.asn"))],
+)
 api_v1_router.include_router(
     change_requests_router,
     prefix="/change-requests",
@@ -182,6 +192,18 @@ api_v1_router.include_router(
     tags=["dhcp-import"],
     dependencies=[Depends(require_module("dhcp.import")), Depends(wake_publishing)],
 )
+# IPv6 Router Advertisement management + rogue-RA detection (#524). Gated by
+# the ipv6.router_advertisements module. wake_publishing so an allowlist /
+# ack change that could shift agent state re-polls parked agents.
+api_v1_router.include_router(
+    ra_routers_router,
+    prefix="/dhcp/ra",
+    tags=["dhcp"],
+    dependencies=[
+        Depends(require_module("ipv6.router_advertisements")),
+        Depends(wake_publishing),
+    ],
+)
 api_v1_router.include_router(diagnostics_router, prefix="/diagnostics", tags=["diagnostics"])
 api_v1_router.include_router(
     dns_router,
@@ -215,6 +237,12 @@ api_v1_router.include_router(
     dependencies=[Depends(wake_publishing)],
 )
 api_v1_router.include_router(dns_tools_router, prefix="/dns", tags=["dns-tools"])
+api_v1_router.include_router(
+    dnsbl_router,
+    prefix="/dnsbl",
+    tags=["dnsbl"],
+    dependencies=[Depends(require_module("security.dnsbl"))],
+)
 api_v1_router.include_router(
     docker_router,
     prefix="/docker",

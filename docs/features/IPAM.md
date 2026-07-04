@@ -646,6 +646,75 @@ Example row:
 
 ---
 
+## 13a. DNSBL / RBL Reputation Monitoring (#528)
+
+SpatiumDDI already knows every public-facing IP it manages, so it can
+check them against the major DNS blocklists before a
+mail-deliverability / reputation problem is reported by users. IPv4
+only in v1 (the DNSBLs are IPv4-centric; IPv6 DNSBL is a future
+enhancement).
+
+Behind the default-enabled **`security.dnsbl`** feature module — a
+discovery toggle only: the catalog + settings UI are visible, but the
+subsystem makes **zero external DNS queries** until the operator flips
+the master sweep switch AND enables at least one list.
+
+**Curated catalog** (`dnsbl_list`). Seeded as platform rows
+(`is_builtin=True`) at startup, keyed on the unique `zone_suffix`
+(idempotent; refreshes descriptive metadata but never clobbers the
+operator-owned `enabled` flag). Seeded lists: Spamhaus ZEN
+(`zen.spamhaus.org`), Barracuda (`b.barracudacentral.org`), SpamCop
+(`bl.spamcop.net`), SORBS (`dnsbl.sorbs.net`), UCEPROTECT L1
+(`dnsbl-1.uceprotect.net`), PSBL (`psbl.surriel.com`). Each row carries
+a `return_codes` map (127.0.0.x → meaning), `requires_registration`,
+and a `qps_note` describing the list's query-rate / registration policy
+— surfaced as a badge + note in the setup UI. Every list ships
+**disabled**; the operator opts each in after reading its policy
+(Spamhaus / Barracuda need a data-feed subscription or a registered,
+non-public resolver for anything beyond trivial volume). Operators can
+also add custom lists; built-in rows can be disabled but not deleted.
+
+**Candidate set.** The daily sweep derives its candidate IPs from four
+sources (deduped; private/reserved/CGNAT and IPv6 skipped via
+`app.services.ipam.classify.is_private_ip`; source precedence
+pinned > nat_egress > internet_facing > ipam):
+- public IPv4 IPAM `ip_address` rows;
+- every IP in an `internet_facing`-classified subnet (#75);
+- NAT / hide-NAT / PAT external (egress) addresses (`nat_mapping.external_ip`);
+- operator-pinned IPs (`dnsbl_pinned_ip`).
+
+**Sweep** (`app.tasks.dnsbl_sweep.sweep_dnsbl`, beat daily at 04:30).
+Gated inside the task on the `security.dnsbl` module + the
+`PlatformSettings.dnsbl_monitoring_enabled` master switch. For each
+candidate × enabled list it issues a reversed-octet lookup
+(`4.3.2.1.zen.spamhaus.org`, A + TXT) via dnspython's async resolver,
+jitter-throttled to stay list-friendly, `autoretry_for` transient
+DB/socket errors. NXDOMAIN = not listed; an A answer = listed (TXT
+fetched for the delist reason). A resolver error is recorded as
+`check_error` and never flips a listing off (so a transient failure
+can't spuriously auto-resolve an alert). Per-`(ip, list)` latch state
+persists to `dnsbl_listing` (`listed`, `return_codes`, `txt_reason`,
+`first_listed_at`, `last_checked_at`, `resolved_at`). Optional explicit
+resolver IPs via `dnsbl_query_resolvers` (some lists refuse queries
+from large public resolvers).
+
+**Alert.** The latch-once `ip_blocklisted` AlertRule (seeded DISABLED)
+fires on first listing (naming the lists) and auto-resolves when the
+sweep finds the IP delisted, via the standard AlertEvent →
+syslog/webhook/SMTP/chat fan-out.
+
+**Surfaces.** Admin page at **Administration → DNS Blocklists**
+(`/admin/dns-blocklists`): sweep settings, per-list enable +
+registration/QPS notes, pinned-IPs list, blocklisted-IP overview. The
+IP detail modal (IPAM row-click) grows a **Reputation** panel showing
+per-list status + a manual **Check now** action
+(`POST /dnsbl/check`). REST under `/api/v1/dnsbl/*`; Operator Copilot
+tools `find_blocklisted_ips` / `count_blocklisted_ips` /
+`find_dnsbl_lists` (read, default-on) + `propose_pin_ip_for_dnsbl`
+(write proposal, default-off).
+
+---
+
 ## 14. UI Backlog (Tracked Items)
 
 Items marked ✅ are implemented. Remaining items are planned but not yet built.

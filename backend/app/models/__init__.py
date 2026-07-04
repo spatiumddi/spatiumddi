@@ -21,6 +21,7 @@ from app.models.auth import APIToken, Group, Role, User, UserSession, user_group
 from app.models.auth_provider import AuthGroupMapping, AuthProvider
 from app.models.backup import BackupTarget
 from app.models.base import Base
+from app.models.bgp_monitor import BGPHijackDetection, BGPTrackedPrefix
 from app.models.change_request import ApprovalPolicy, ChangeRequest
 from app.models.circuit import Circuit
 from app.models.cloud import CloudEndpoint
@@ -55,6 +56,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.models.dnsbl import DNSBLList, DNSBLListing, DNSBLPinnedIP
 from app.models.docker import DockerHost
 from app.models.domain import Domain
 from app.models.event_subscription import EventOutbox, EventSubscription
@@ -144,6 +146,8 @@ __all__ = [
     "ASNRpkiRoa",
     "BGPCommunity",
     "BGPPeering",
+    "BGPTrackedPrefix",
+    "BGPHijackDetection",
     "User",
     "Group",
     "Role",
@@ -170,6 +174,9 @@ __all__ = [
     "DNSTrustAnchor",
     "DNSAcl",
     "DNSAclEntry",
+    "DNSBLList",
+    "DNSBLListing",
+    "DNSBLPinnedIP",
     "DNSView",
     "DNSZone",
     "DNSRecord",

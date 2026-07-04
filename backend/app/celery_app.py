@@ -50,6 +50,7 @@ celery_app = Celery(
         "app.tasks.event_outbox",
         "app.tasks.asn_whois_refresh",
         "app.tasks.rpki_roa_refresh",
+        "app.tasks.bgp_hijack_poll",
         "app.tasks.domain_whois_refresh",
         "app.tasks.ai_digest",
         "app.tasks.audit_chain_verify",
@@ -58,6 +59,7 @@ celery_app = Celery(
         "app.tasks.change_request_expiry",
         "app.tasks.acme",
         "app.tasks.tls_certs",
+        "app.tasks.dnsbl_sweep",
     ],
 )
 
@@ -111,6 +113,7 @@ celery_app.conf.update(
         "app.tasks.event_outbox.*": {"queue": "default"},
         "app.tasks.asn_whois_refresh.*": {"queue": "default"},
         "app.tasks.rpki_roa_refresh.*": {"queue": "default"},
+        "app.tasks.bgp_hijack_poll.*": {"queue": "default"},
         "app.tasks.domain_whois_refresh.*": {"queue": "default"},
         "app.tasks.ai_digest.*": {"queue": "default"},
         "app.tasks.audit_chain_verify.*": {"queue": "default"},
@@ -317,6 +320,15 @@ celery_app.conf.update(
             "task": "app.tasks.acme.renew_due_certificates",
             "schedule": schedule(run_every=12 * 3600.0),
         },
+        # Daily DNSBL / RBL reputation sweep of every public-facing
+        # candidate IP against the enabled blocklists (issue #528). Gated
+        # inside the task on the ``security.dnsbl`` module + the
+        # ``dnsbl_monitoring_enabled`` master switch — no DNS queries fire
+        # until the operator opts in and enables at least one list.
+        "dnsbl-daily-sweep": {
+            "task": "app.tasks.dnsbl_sweep.sweep_dnsbl",
+            "schedule": crontab(hour=4, minute=30),
+        },
         # Once a day, check GitHub for the latest release tag. Gated
         # on ``PlatformSettings.github_release_check_enabled`` — so
         # operators can turn this off in air-gapped deployments
@@ -428,6 +440,14 @@ celery_app.conf.update(
         # per-row gating pattern as the ASN tick above.
         "domain-whois-refresh-tick": {
             "task": "app.tasks.domain_whois_refresh.refresh_due_domains",
+            "schedule": schedule(run_every=3600.0),
+        },
+        # Hourly tick of the BGP prefix-hijack poll (issue #527). The
+        # task no-ops unless ``PlatformSettings.bgp_monitoring_enabled``
+        # is on; per-prefix ``next_check_at`` gates against
+        # ``bgp_monitoring_interval_hours``.
+        "bgp-hijack-poll-tick": {
+            "task": "app.tasks.bgp_hijack_poll.poll_bgp_hijacks",
             "schedule": schedule(run_every=3600.0),
         },
         # Daily at 08:00 UTC, fire the Operator Copilot digest. The

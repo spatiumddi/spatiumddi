@@ -117,10 +117,11 @@ their address, and drives what the Kea driver renders into the `subnet6`:
 | `slaac` | bare subnet — **no pools, no options, no reservations** | M=0, O=0 | The router's RA does everything; DHCPv6 is not involved |
 
 The `ra_managed_flag` (M) / `ra_other_flag` (O) columns record the
-intended Router-Advertisement flags. **SpatiumDDI's Kea agent does not
-send RAs** — these are operator intent surfaced in the scope modal
-("set these on your router / radvd"), auto-suggested from the chosen
-mode (and freely overridable). The mode picker only appears on IPv6
+intended Router-Advertisement flags, auto-suggested from the chosen mode
+(and freely overridable). Historically these were pure "set this on your
+router" intent — **as of issue #524 SpatiumDDI can also emit RAs itself**
+by running radvd on the DHCP agent from control-plane-rendered config
+(opt-in per scope via `ra_enabled`; see §19). The mode picker only appears on IPv6
 scopes; v4 scopes ignore these columns and always serve addresses +
 options. Changing the mode shifts the agent ConfigBundle ETag, so the
 Kea agent re-pulls and re-renders.
@@ -958,3 +959,80 @@ see the BIOS bootfile and iPXE clients (which loop back with the
 **Admin UI.** New `/dhcp/groups/{id}/pxe` page lists profiles for a
 group with create / edit / delete + an in-line preview of the
 rendered Kea client-class block.
+
+## 19. IPv6 Router Advertisements + rogue-RA detection (issue #524)
+
+SpatiumDDI ships DHCPv6 via Kea, but Kea does not emit ICMPv6 Router
+Advertisements. This feature lets the DHCP agent run **radvd** from
+config rendered by the control plane, and passively watches the segment
+for **rogue RAs**. Both live behind the default-enabled
+`ipv6.router_advertisements` feature module (Settings → Features).
+
+### 19.1 RA management (radvd)
+
+RA config is per-IPv6-scope, opt-in via `DHCPScope.ra_enabled`. When on,
+the control plane renders a full `radvd.conf` stanza for the subnet and
+ships it in the **DHCP ConfigBundle** (`radvd_conf`, folded into the
+bundle ETag so a change wakes the agent long-poll — same path as the Kea
+config). The agent writes it to `RADVD_CONFIG_PATH` and reloads radvd
+(SIGHUP via pidfile); the last-known-good config rides the on-disk bundle
+cache, so radvd keeps advertising if the control plane is unreachable
+(non-negotiable #5).
+
+Per-scope RA columns (v6 scopes only; edited in the scope modal's IPv6
+section):
+
+| Column | Meaning |
+|---|---|
+| `ra_enabled` | Opt-in — emit RAs for this subnet |
+| `ra_mo_override` | Use `ra_managed_flag`/`ra_other_flag` verbatim instead of deriving M/O from the mode |
+| `ra_router_lifetime` | `AdvDefaultLifetime` (s); 0 = not a default route |
+| `ra_max_interval` | `AdvMaxInterval` (s) between unsolicited RAs |
+| `ra_prefix_valid_lifetime` / `ra_prefix_preferred_lifetime` | Advertised prefix lifetimes (s) |
+| `ra_prefix_on_link` / `ra_prefix_autonomous` | Per-prefix `AdvOnLink` / `AdvAutonomous` (SLAAC) |
+| `ra_interface` | Host NIC radvd advertises on (blank = agent `RADVD_DEFAULT_IFACE`) |
+
+**M/O derivation.** By default the advertised M (Managed) / O (Other)
+flags derive from the scope's `v6_address_mode`: `stateful` → (1,1),
+`stateless` → (0,1), `slaac` → (0,0). Set `ra_mo_override` to advertise
+the literal `ra_managed_flag`/`ra_other_flag` instead.
+
+**RDNSS / DNSSL.** The RA advertises RDNSS (RFC 8106 IPv6 resolvers) from
+the scope's `dns-servers` option (IPv6 only), falling back to the
+subnet's `dns_servers`; DNSSL search domains come from `domain-search` /
+`domain-name` / the subnet's `domain_name`.
+
+**Running radvd.** radvd is baked into the Kea agent image but started
+only when `RADVD_MANAGED=1` (needs `CAP_NET_RAW` + `CAP_NET_ADMIN` and
+host `net.ipv6.conf.all.forwarding=1`). The entrypoint waits for the
+agent to render a config before launching radvd. The `/dhcp/groups/{id}`
+→ **Router Adverts** tab previews the rendered `radvd.conf` + resolved
+per-subnet M/O.
+
+### 19.2 Rogue-RA detection
+
+The IPv6 twin of the rogue-DHCP probe. An opt-in passive sniffer on the
+DHCP agent (`DHCP_RA_SNIFFER_ENABLED=1`, same `CAP_NET_RAW` posture as
+the fingerprint sniffer, default OFF) uses a scapy `AsyncSniffer` for
+ICMPv6 type-134 RAs and ships each observed router (source IP + MAC,
+advertised prefixes, M/O flags, router lifetime) to
+`POST /dhcp/agents/ra-observations`.
+
+The control plane classifies each source against the group's
+**expected-router allowlist** (`ra_router_allowlist`, matched on source
+IP or MAC): on the list → `expected`, otherwise → `rogue`, upserting a
+`ra_observed_router` row per (group, source IP). The **`rogue_ra` alert
+rule** (seeded disabled, enable once the sniffer is on) fires on rows
+classified `rogue` within its recency window and rides the standard
+AlertEvent fan-out (syslog / webhook / SMTP / chat). Acknowledging a
+router from the Router Adverts tab allowlists it and reclassifies it so
+the alert auto-resolves.
+
+### 19.3 API + MCP
+
+REST (gated by the module): `GET /dhcp/ra/groups/{id}/ra-config`
+(rendered preview), `GET|POST /dhcp/ra/groups/{id}/observed-routers`
+(+`/{id}/acknowledge`), and `GET|POST|DELETE
+/dhcp/ra/groups/{id}/ra-allowlist`. Operator-Copilot tools:
+`find_ra_subnets`, `find_observed_ra_routers`, `count_rogue_ra_routers`
+(reads, default on) + `propose_allowlist_ra_router` (write proposal).

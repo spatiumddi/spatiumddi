@@ -177,6 +177,31 @@ class ScopeDef:
 
 
 @dataclass(frozen=True)
+class RAConfigDef:
+    """One IPv6 Router-Advertisement stanza for an RA-enabled subnet (#524).
+
+    The control plane resolves the M/O flags (from the scope's DHCPv6 mode
+    or the operator override) and the RDNSS/DNSSL from effective DNS
+    settings, then ships this to the DHCP agent which renders + runs radvd.
+    ``interface`` may be empty — the agent falls back to its
+    ``RADVD_DEFAULT_IFACE`` env in that case.
+    """
+
+    subnet_cidr: str
+    interface: str = ""
+    managed_flag: bool = False  # RA M flag
+    other_flag: bool = False  # RA O flag
+    router_lifetime: int = 1800
+    max_interval: int = 600
+    prefix_on_link: bool = True
+    prefix_autonomous: bool = True
+    prefix_valid_lifetime: int = 86400
+    prefix_preferred_lifetime: int = 14400
+    rdnss: tuple[str, ...] = ()  # RDNSS (RFC 8106) IPv6 resolver addresses
+    dnssl: tuple[str, ...] = ()  # DNSSL search domains
+
+
+@dataclass(frozen=True)
 class ServerOptionsDef:
     """Global server options (inherited by scopes unless overridden)."""
 
@@ -241,6 +266,12 @@ class ConfigBundle:
     # group (or by an older control plane) still serves directly-attached
     # clients. v6 is unaffected — DHCPv6 has no socket-type concept.
     dhcp_socket_type: str = "raw"
+    # IPv6 Router-Advertisement config (issue #524) — one entry per
+    # RA-enabled IPv6 subnet the server's group serves. ``radvd_conf`` is
+    # the pre-rendered radvd.conf text the agent writes verbatim; the
+    # structured ``ra_configs`` rides along for the etag + debug/MCP view.
+    ra_configs: tuple[RAConfigDef, ...] = ()
+    radvd_conf: str = ""
 
     def compute_etag(self) -> str:
         """Compute a stable SHA-256 of the bundle contents (excluding etag/timestamp)."""
@@ -257,6 +288,8 @@ class ConfigBundle:
             "phone_classes": [asdict(c) for c in self.phone_classes],
             "failover": asdict(self.failover) if self.failover else None,
             "dhcp_socket_type": self.dhcp_socket_type,
+            "ra_configs": [asdict(r) for r in self.ra_configs],
+            "radvd_conf": self.radvd_conf,
         }
         blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         return "sha256:" + hashlib.sha256(blob).hexdigest()
@@ -469,6 +502,7 @@ __all__ = [
     "PXEClassDef",
     "PhoneClassDef",
     "PoolDef",
+    "RAConfigDef",
     "RemoveReservationItem",
     "ReservationItem",
     "ReservationResult",

@@ -94,6 +94,25 @@ export function CreateScopeModal({
   );
   const [raManaged, setRaManaged] = useState(scope?.ra_managed_flag ?? true);
   const [raOther, setRaOther] = useState(scope?.ra_other_flag ?? true);
+  // IPv6 Router Advertisements (issue #524).
+  const [raEnabled, setRaEnabled] = useState(scope?.ra_enabled ?? false);
+  const [raMoOverride, setRaMoOverride] = useState(
+    scope?.ra_mo_override ?? false,
+  );
+  const [raRouterLifetime, setRaRouterLifetime] = useState(
+    String(scope?.ra_router_lifetime ?? 1800),
+  );
+  const [raValidLifetime, setRaValidLifetime] = useState(
+    String(scope?.ra_prefix_valid_lifetime ?? 86400),
+  );
+  const [raPreferredLifetime, setRaPreferredLifetime] = useState(
+    String(scope?.ra_prefix_preferred_lifetime ?? 14400),
+  );
+  const [raOnLink, setRaOnLink] = useState(scope?.ra_prefix_on_link ?? true);
+  const [raAutonomous, setRaAutonomous] = useState(
+    scope?.ra_prefix_autonomous ?? true,
+  );
+  const [raInterface, setRaInterface] = useState(scope?.ra_interface ?? "");
   // Relay-agent (giaddr) IPs (issue #337). Freeform multiline / comma
   // textarea; parsed into a list on submit. Set when a centralized DHCP
   // server serves this subnet through an upstream relay / ip-helper.
@@ -265,6 +284,15 @@ export function CreateScopeModal({
         data.v6_address_mode = v6Mode;
         data.ra_managed_flag = raManaged;
         data.ra_other_flag = raOther;
+        // IPv6 Router Advertisements (issue #524).
+        data.ra_enabled = raEnabled;
+        data.ra_mo_override = raMoOverride;
+        data.ra_router_lifetime = Number(raRouterLifetime) || 0;
+        data.ra_prefix_valid_lifetime = Number(raValidLifetime) || 0;
+        data.ra_prefix_preferred_lifetime = Number(raPreferredLifetime) || 0;
+        data.ra_prefix_on_link = raOnLink;
+        data.ra_prefix_autonomous = raAutonomous;
+        data.ra_interface = raInterface.trim();
       }
       // PXE binding (issue #51). The backend distinguishes "no
       // change" from "explicit detach" via ``clear_pxe_profile``;
@@ -520,6 +548,90 @@ export function CreateScopeModal({
                   </span>
                 </label>
               </div>
+            </div>
+
+            <div className="space-y-3 rounded-md border p-3">
+              <label className="flex items-center gap-2 text-sm font-semibold">
+                <input
+                  type="checkbox"
+                  checked={raEnabled}
+                  onChange={(e) => setRaEnabled(e.target.checked)}
+                />
+                Manage Router Advertisements (radvd)
+              </label>
+              <p className="text-[11px] text-muted-foreground">
+                When on, SpatiumDDI ships a rendered radvd.conf for this subnet
+                in the DHCP ConfigBundle so the agent can run radvd and actually
+                emit RAs (needs <code>RADVD_MANAGED=1</code> on the agent). M/O
+                flags default-derive from the DHCPv6 mode above; RDNSS/DNSSL
+                come from the scope&apos;s DNS options.
+              </p>
+              {raEnabled && (
+                <div className="space-y-3">
+                  <label className="flex items-center gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={raMoOverride}
+                      onChange={(e) => setRaMoOverride(e.target.checked)}
+                    />
+                    Override M/O flags (use the M/O checkboxes above verbatim
+                    instead of deriving from the mode)
+                  </label>
+                  <div className="grid grid-cols-2 gap-3">
+                    <Field label="Router lifetime (s)">
+                      <input
+                        type="number"
+                        className={inputCls}
+                        value={raRouterLifetime}
+                        onChange={(e) => setRaRouterLifetime(e.target.value)}
+                      />
+                    </Field>
+                    <Field label="Interface" hint="Blank = agent default NIC.">
+                      <input
+                        type="text"
+                        className={inputCls}
+                        placeholder="eth0"
+                        value={raInterface}
+                        onChange={(e) => setRaInterface(e.target.value)}
+                      />
+                    </Field>
+                    <Field label="Prefix valid lifetime (s)">
+                      <input
+                        type="number"
+                        className={inputCls}
+                        value={raValidLifetime}
+                        onChange={(e) => setRaValidLifetime(e.target.value)}
+                      />
+                    </Field>
+                    <Field label="Prefix preferred lifetime (s)">
+                      <input
+                        type="number"
+                        className={inputCls}
+                        value={raPreferredLifetime}
+                        onChange={(e) => setRaPreferredLifetime(e.target.value)}
+                      />
+                    </Field>
+                  </div>
+                  <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs">
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={raOnLink}
+                        onChange={(e) => setRaOnLink(e.target.checked)}
+                      />
+                      On-link
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={raAutonomous}
+                        onChange={(e) => setRaAutonomous(e.target.checked)}
+                      />
+                      Autonomous (SLAAC)
+                    </label>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
