@@ -23,7 +23,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
@@ -36,6 +36,68 @@ from app.models.settings import PlatformSettings
 logger = structlog.get_logger(__name__)
 
 _SINGLETON_ID = 1
+
+# Pre-filter (issue #522): only subnets that could resolve an effective DNS
+# zone/group — or fire DDNS — do any work inside ``compute_subnet_dns_drift``
+# / the DDNS re-apply. Walking every subnet ran the (multi-query) drift
+# computation for subnets with no DNS binding anywhere in their inheritance
+# chain, which is the common case on integration-mirrored / lab spaces.
+#
+# This returns a deliberate SUPERSET of the truly-eligible set — including a
+# subnet that turns out to resolve no zone is behaviour-preserving (the drift
+# computation early-returns empty for it, exactly as before); EXCLUDING one
+# that would resolve a zone would change behaviour, so we never do that. A
+# subnet is a candidate when ANY of these carries a binding:
+#   * the subnet's own dns_zone_id / dns_group_ids / dns_additional_zone_ids,
+#     or ddns_enabled;
+#   * any ancestor block (or the subnet's own block) carries one — captured
+#     via the recursive descendant walk from every DNS/DDNS-bearing block;
+#   * the containing IPSpace carries one;
+#   * a reverse DNSZone is linked to the subnet.
+# The inherit flags are intentionally ignored here (over-inclusion is safe);
+# ``_resolve_effective_dns`` / ``resolve_effective_ddns`` remain the source of
+# truth for what a candidate actually publishes.
+_CANDIDATE_SUBNET_SQL = text("""
+    WITH RECURSIVE dns_block AS (
+        SELECT id FROM ip_block
+        WHERE deleted_at IS NULL
+          AND (
+            dns_zone_id IS NOT NULL
+            OR (dns_group_ids IS NOT NULL AND dns_group_ids <> '[]'::jsonb)
+            OR (dns_additional_zone_ids IS NOT NULL
+                AND dns_additional_zone_ids <> '[]'::jsonb)
+            OR ddns_enabled = true
+          )
+    ),
+    dns_block_subtree AS (
+        SELECT id FROM dns_block
+        UNION
+        SELECT b.id FROM ip_block b
+            JOIN dns_block_subtree t ON b.parent_block_id = t.id
+        WHERE b.deleted_at IS NULL
+    )
+    SELECT s.id
+    FROM subnet s
+    JOIN ip_space sp ON sp.id = s.space_id
+    WHERE s.deleted_at IS NULL
+      AND (
+        s.block_id IN (SELECT id FROM dns_block_subtree)
+        OR s.dns_zone_id IS NOT NULL
+        OR (s.dns_group_ids IS NOT NULL AND s.dns_group_ids <> '[]'::jsonb)
+        OR (s.dns_additional_zone_ids IS NOT NULL
+            AND s.dns_additional_zone_ids <> '[]'::jsonb)
+        OR s.ddns_enabled = true
+        OR sp.dns_zone_id IS NOT NULL
+        OR (sp.dns_group_ids IS NOT NULL AND sp.dns_group_ids <> '[]'::jsonb)
+        OR (sp.dns_additional_zone_ids IS NOT NULL
+            AND sp.dns_additional_zone_ids <> '[]'::jsonb)
+        OR sp.ddns_enabled = true
+        OR EXISTS (
+            SELECT 1 FROM dns_zone z
+            WHERE z.linked_subnet_id = s.id AND z.kind = 'reverse'
+        )
+      )
+""")
 
 
 async def _auto_from_lease_ip_ids(db: Any, subnet_id: Any) -> set[Any]:
@@ -119,7 +181,9 @@ async def _run_auto_sync() -> dict[str, Any]:
                         "wait_seconds": int((interval - elapsed).total_seconds()),
                     }
 
-            subnets = list((await db.execute(select(Subnet.id))).scalars().all())
+            # Only subnets with some DNS/DDNS binding do work (issue #522) —
+            # skip the drift computation for the (common) no-binding majority.
+            subnets = list((await db.execute(_CANDIDATE_SUBNET_SQL)).scalars().all())
 
             total_created = 0
             total_updated = 0

@@ -1020,9 +1020,12 @@ async def commit_address_import(
             "the subnet or any address set you can write — nothing was imported."
         )
 
-    # Keep the subnet's utilization counters roughly honest. The periodic
-    # allocation-recount task corrects drift, but users expect the UI to
-    # reflect the new row count immediately.
+    # Keep the subnet's utilization counters roughly honest by applying the
+    # net delta here — users expect the UI to reflect the new row count
+    # immediately. This is an estimate (a re-imported existing row bumps the
+    # delta but not the true count); the hourly
+    # ``app.tasks.ipam_utilization_recount.recount_ipam_utilization`` sweep
+    # reconciles any resulting drift against the live row count.
     if allocated_delta:
         subnet.allocated_ips = (subnet.allocated_ips or 0) + allocated_delta
         if subnet.total_ips:

@@ -41,7 +41,34 @@ EXPIRY_GRACE = timedelta(minutes=5)
 EXPIRED_DELETE_GRACE = timedelta(hours=24)
 
 
-async def _resolve_lease_subnet_id(db: AsyncSession, lease: DHCPLease) -> uuid.UUID | None:
+async def _load_subnet_cache(
+    db: AsyncSession,
+) -> list[tuple[uuid.UUID, ipaddress.IPv4Network | ipaddress.IPv6Network]]:
+    """Load ``(subnet_id, parsed_network)`` for every subnet ONCE per sweep.
+
+    ``_resolve_lease_subnet_id`` used to run a full ``SELECT id, network
+    FROM subnet`` for every stale lease when it lacked a scope backlink —
+    O(stale_leases × subnets) round-trips + reparse per lease. Loading the
+    list once (and pre-parsing each CIDR) keeps the longest-prefix fallback
+    at a single query per sweep, mirroring the pull-leases path. Unparseable
+    networks are dropped up front so the per-lease loop stays clean.
+    """
+    cache: list[tuple[uuid.UUID, ipaddress.IPv4Network | ipaddress.IPv6Network]] = []
+    for sid, network in (await db.execute(select(Subnet.id, Subnet.network))).all():
+        try:
+            cache.append((sid, ipaddress.ip_network(str(network), strict=False)))
+        except (ValueError, TypeError):
+            continue
+    return cache
+
+
+async def _resolve_lease_subnet_id(
+    db: AsyncSession,
+    lease: DHCPLease,
+    subnet_cache: (
+        list[tuple[uuid.UUID, ipaddress.IPv4Network | ipaddress.IPv6Network]] | None
+    ) = None,
+) -> uuid.UUID | None:
     """Find the IPAM subnet that owns this lease's address.
 
     SpatiumDDI allows overlapping private ranges across IPSpaces/VRFs, so
@@ -49,7 +76,9 @@ async def _resolve_lease_subnet_id(db: AsyncSession, lease: DHCPLease) -> uuid.U
     mirror in multiple subnets. Scope the mirror cleanup to the lease's
     own subnet so expiring one subnet's lease can't drop another's
     mirror. Prefer the lease's scope FK (DHCPScope.subnet_id); fall back
-    to longest-prefix match when the lease has no scope backlink.
+    to longest-prefix match over ``subnet_cache`` when the lease has no
+    scope backlink. The sweep passes a cache loaded ONCE per run; the
+    single-lease delete path leaves it None and we load it on demand.
     """
     if lease.scope_id is not None:
         subnet_id = (
@@ -62,12 +91,10 @@ async def _resolve_lease_subnet_id(db: AsyncSession, lease: DHCPLease) -> uuid.U
         addr = ipaddress.ip_address(str(lease.ip_address))
     except (ValueError, TypeError):
         return None
+    if subnet_cache is None:
+        subnet_cache = await _load_subnet_cache(db)
     best: tuple[int, uuid.UUID] | None = None
-    for sid, network in (await db.execute(select(Subnet.id, Subnet.network))).all():
-        try:
-            net = ipaddress.ip_network(str(network), strict=False)
-        except (ValueError, TypeError):
-            continue
+    for sid, net in subnet_cache:
         if addr in net and (best is None or net.prefixlen > best[0]):
             best = (net.prefixlen, sid)
     return best[1] if best else None
@@ -91,6 +118,9 @@ async def _sweep() -> tuple[int, int]:
         from app.services.dns.ddns import revoke_ddns_for_lease  # noqa: PLC0415
 
         now_ts = datetime.now(UTC)
+        # Load the subnet list once for the longest-prefix fallback in
+        # _resolve_lease_subnet_id instead of re-querying per stale lease.
+        subnet_cache = await _load_subnet_cache(db)
         for lease in res.scalars().all():
             # Stamp lease history before flipping state. ``expired`` is
             # the time-based sweep label (vs ``removed`` from the
@@ -101,7 +131,7 @@ async def _sweep() -> tuple[int, int]:
             # Remove the mirrored IPAM row if auto_from_lease — but only
             # within this lease's owning subnet. An address-only lookup
             # would delete same-address mirrors in other subnets too.
-            subnet_id = await _resolve_lease_subnet_id(db, lease)
+            subnet_id = await _resolve_lease_subnet_id(db, lease, subnet_cache)
             if subnet_id is None:
                 continue
             ipam_res = await db.execute(

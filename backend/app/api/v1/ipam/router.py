@@ -12,10 +12,11 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import func, select, text
+from sqlalchemy import String, asc, desc, func, or_, select, text
+from sqlalchemy import cast as sa_cast
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -23,6 +24,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
 from app.core.permissions import (
+    is_effective_superadmin,
     require_any_resource_or_scoped,
     token_scope_allows,
     user_has_permission,
@@ -2461,6 +2463,48 @@ class IPAddressResponse(BaseModel):
     @classmethod
     def coerce_inet(cls, v: Any) -> Any:
         return str(v) if v is not None else v
+
+
+class IPAddressSearchItem(IPAddressResponse):
+    """Cross-subnet address search row (issues #517 #3 / #520).
+
+    Mirrors :class:`IPAddressResponse` and joins the parent subnet + space
+    so a global search result can render the network context and group
+    hits without a second round-trip. ``subnet_cidr`` / ``subnet_name`` /
+    ``space_name`` are populated from the JOIN; ``space_id`` is the parent
+    space UUID.
+    """
+
+    subnet_cidr: str
+    subnet_name: str | None = None
+    space_id: uuid.UUID
+    space_name: str | None = None
+
+
+class AddressSearchResponse(BaseModel):
+    """Paginated envelope for ``GET /ipam/addresses/search``.
+
+    Distinct from the per-subnet list endpoint (which stays a bare
+    ``list[IPAddressResponse]`` for backward compat) because the
+    cross-subnet surface needs the total + window echoed back for
+    client-side pagination.
+    """
+
+    items: list[IPAddressSearchItem]
+    total: int
+    limit: int
+    offset: int
+
+
+class AddressSearchIdsResponse(BaseModel):
+    """Id-only envelope for ``GET /ipam/addresses/search/ids`` — feeds the
+    frontend "select all matches → bulk-edit / bulk-delete" flow. ``ids`` is
+    capped (see ``_SEARCH_IDS_CAP``); ``capped`` is ``True`` when ``total``
+    exceeds the cap so the UI can warn that not every match was selected."""
+
+    ids: list[str]
+    total: int
+    capped: bool
 
 
 class NextIPRequest(BaseModel):
@@ -6200,27 +6244,99 @@ async def _nat_mapping_counts_for(db: AsyncSession, ips: list[IPAddress]) -> dic
     return counts
 
 
-@router.get("/subnets/{subnet_id}/addresses", response_model=list[IPAddressResponse])
-async def list_addresses(
-    subnet_id: uuid.UUID,
-    current_user: CurrentUser,
-    db: DB,
-    status_filter: str | None = None,
-    tag: list[str] = Query(default_factory=list),
-) -> list[IPAddress]:
-    if await db.get(Subnet, subnet_id) is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
-    _enforce_subnet_token_scope(current_user, subnet_id)
+# ── Address search / filter / sort shared helpers (issues #517 / #520) ─────────
+#
+# Both the per-subnet address list and the cross-subnet search endpoint share
+# the same substring / hostname / MAC / status filter grammar and the same
+# sort-key set. Keeping the WHERE-condition + ORDER-BY builders here means the
+# two surfaces can never drift apart.
 
-    query = (
-        select(IPAddress)
-        .where(IPAddress.subnet_id == subnet_id)
-        .order_by(text("CAST(address AS inet)"))
-    )
+_ADDRESS_SORT_KEYS = {"address", "hostname", "status", "mac", "last_seen", "description"}
+
+# Cap on the id-only search endpoint (#520). Aligns with the bulk-op blast
+# radius: the frontend feeds these ids straight into bulk-edit / bulk-delete.
+_SEARCH_IDS_CAP = 5000
+
+
+def _address_search_conditions(
+    *,
+    q: str | None,
+    hostname: str | None,
+    mac: str | None,
+    status_filter: str | None,
+) -> list[Any]:
+    """Build the shared WHERE conditions for an ``IPAddress`` filter.
+
+    ``q`` is a case-insensitive substring matched across the host form of
+    the address, hostname, FQDN, description and MAC. ``hostname`` / ``mac``
+    are targeted ``ILIKE %..%`` filters. All conditions AND together (and
+    with any tag filter the caller applies separately).
+    """
+    conds: list[Any] = []
     if status_filter:
-        query = query.where(IPAddress.status == status_filter)
-    query = apply_tag_filter(query, IPAddress.tags, tag)
-    rows = list((await db.execute(query)).scalars().all())
+        conds.append(IPAddress.status == status_filter)
+    if hostname:
+        conds.append(IPAddress.hostname.ilike(f"%{hostname}%"))
+    if mac:
+        conds.append(sa_cast(IPAddress.mac_address, String).ilike(f"%{mac}%"))
+    if q:
+        pat = f"%{q}%"
+        conds.append(
+            or_(
+                func.host(IPAddress.address).ilike(pat),
+                IPAddress.hostname.ilike(pat),
+                IPAddress.fqdn.ilike(pat),
+                IPAddress.description.ilike(pat),
+                sa_cast(IPAddress.mac_address, String).ilike(pat),
+            )
+        )
+    return conds
+
+
+def _address_order_by(sort: str | None, order: str) -> list[Any]:
+    """ORDER-BY clause list for the address surfaces.
+
+    Default (``sort`` unset or ``"address"``) preserves the historical
+    ``CAST(address AS inet)`` numeric ordering. Other keys sort on the
+    matching column with a stable inet tiebreak so equal keys page
+    deterministically.
+    """
+    descending = order.lower() == "desc"
+    inet_expr = text("CAST(address AS inet) DESC" if descending else "CAST(address AS inet) ASC")
+    if not sort or sort == "address":
+        return [inet_expr]
+    colmap = {
+        "hostname": IPAddress.hostname,
+        "status": IPAddress.status,
+        "mac": IPAddress.mac_address,
+        "last_seen": IPAddress.last_seen_at,
+        "description": IPAddress.description,
+    }
+    col = colmap[sort]
+    primary = desc(col) if descending else asc(col)
+    return [primary, text("CAST(address AS inet) ASC")]
+
+
+def _validate_sort_order(sort: str | None, order: str) -> None:
+    if sort is not None and sort not in _ADDRESS_SORT_KEYS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"sort must be one of: {', '.join(sorted(_ADDRESS_SORT_KEYS))}",
+        )
+    if order.lower() not in ("asc", "desc"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="order must be 'asc' or 'desc'",
+        )
+
+
+async def _enrich_addresses(db: AsyncSession, rows: list[IPAddress]) -> None:
+    """Stamp alias / NAT-mapping counts + OUI vendor onto a page of IP rows.
+
+    Mutates the ORM objects in place (the response schema reads the extra
+    attributes via ``from_attributes``). Only ever called on the returned
+    page — never the whole matching set — so the bulk lookups stay cheap.
+    """
     counts = await _alias_counts_for(db, rows)
     nat_counts = await _nat_mapping_counts_for(db, rows)
     vendors = await bulk_lookup_vendors(
@@ -6233,6 +6349,80 @@ async def list_addresses(
         vendor = vendors.get(key) if key else None
         ip.vendor = vendor  # type: ignore[attr-defined]
         ip.is_voip_phone = is_voip_phone_vendor(vendor)  # type: ignore[attr-defined]
+
+
+async def _readable_subnet_ids(
+    db: AsyncSession, user: Any, structural_conds: list[Any]
+) -> list[uuid.UUID] | None:
+    """Resolve which subnets ``user`` may READ, for cross-subnet address search.
+
+    Returns ``None`` for an effective superadmin — "no restriction", the
+    caller should skip the ``IN()`` filter entirely. Otherwise returns the
+    concrete list of subnet ids the caller can read, computed by enumerating
+    the candidate subnets (already narrowed by the structural filters) and
+    running the authoritative per-row :func:`user_has_permission` check
+    (which folds in RBAC + time-bound grants + resource-scoped API-token
+    narrowing, #374). Subnets are orders of magnitude fewer than IPs, so this
+    scales with the structural filter, not the address count — and the
+    resulting id list is pushed back into the SQL ``WHERE`` so pagination /
+    totals are computed post-permission-filter (never a post-limit slice).
+    """
+    if is_effective_superadmin(user):
+        return None
+    q = select(Subnet.id)
+    for cond in structural_conds:
+        q = q.where(cond)
+    candidate_ids = [row[0] for row in (await db.execute(q)).all()]
+    return [sid for sid in candidate_ids if user_has_permission(user, "read", "subnet", sid)]
+
+
+@router.get("/subnets/{subnet_id}/addresses", response_model=list[IPAddressResponse])
+async def list_addresses(
+    subnet_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    response: Response,
+    status_filter: str | None = None,
+    tag: list[str] = Query(default_factory=list),
+    q: str | None = None,
+    hostname: str | None = None,
+    mac: str | None = None,
+    sort: str | None = None,
+    order: str = "asc",
+    limit: int | None = Query(default=None, ge=1),
+    offset: int = Query(default=0, ge=0),
+) -> list[IPAddress]:
+    """List a subnet's IPs.
+
+    Backward compatible: with no filter / sort / paging params this returns
+    the full inet-sorted ``list[IPAddressResponse]`` as before. New optional
+    params (#517) add substring search (``q``), targeted ``hostname`` / ``mac``
+    filters, column ``sort`` + ``order``, and ``limit`` / ``offset`` windowing.
+    ``X-Total-Count`` always carries the total matching rows *before* the
+    limit/offset window (exposed to the browser via CORS ``expose_headers``).
+    """
+    if await db.get(Subnet, subnet_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    _enforce_subnet_token_scope(current_user, subnet_id)
+    _validate_sort_order(sort, order)
+
+    base = select(IPAddress).where(IPAddress.subnet_id == subnet_id)
+    for cond in _address_search_conditions(
+        q=q, hostname=hostname, mac=mac, status_filter=status_filter
+    ):
+        base = base.where(cond)
+    base = apply_tag_filter(base, IPAddress.tags, tag)
+
+    total = await db.scalar(select(func.count()).select_from(base.subquery()))
+    response.headers["X-Total-Count"] = str(total or 0)
+
+    query = base.order_by(*_address_order_by(sort, order))
+    if offset:
+        query = query.offset(offset)
+    if limit is not None:
+        query = query.limit(limit)
+    rows = list((await db.execute(query)).scalars().all())
+    await _enrich_addresses(db, rows)
     return rows
 
 
@@ -6383,6 +6573,138 @@ async def create_address(
         "ip_address_created", ip_id=str(ip.id), address=body.address, subnet_id=str(subnet_id)
     )
     return ip
+
+
+def _search_structural_conds(
+    space_id: uuid.UUID | None,
+    block_id: uuid.UUID | None,
+    subnet_id: uuid.UUID | None,
+) -> list[Any]:
+    """Subnet-level WHERE conditions for the cross-subnet search scope narrowers."""
+    conds: list[Any] = []
+    if space_id is not None:
+        conds.append(Subnet.space_id == space_id)
+    if block_id is not None:
+        conds.append(Subnet.block_id == block_id)
+    if subnet_id is not None:
+        conds.append(Subnet.id == subnet_id)
+    return conds
+
+
+# NOTE: ``/addresses/search`` + ``/addresses/search/ids`` are declared BEFORE
+# ``/addresses/{address_id}`` so the literal paths win over the UUID-path
+# route. (Starlette's ``uuid`` path convertor already refuses to match the
+# non-UUID segment ``search``, but keeping the declaration order explicit
+# guards against a future switch to a permissive path type.)
+@router.get("/addresses/search", response_model=AddressSearchResponse)
+async def search_addresses(
+    current_user: CurrentUser,
+    db: DB,
+    q: str | None = None,
+    status_filter: str | None = None,
+    tag: list[str] = Query(default_factory=list),
+    hostname: str | None = None,
+    mac: str | None = None,
+    space_id: uuid.UUID | None = None,
+    block_id: uuid.UUID | None = None,
+    subnet_id: uuid.UUID | None = None,
+    sort: str | None = None,
+    order: str = "asc",
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> AddressSearchResponse:
+    """Cross-subnet IP address search (issues #517 #3 / #520).
+
+    Same filter grammar as the per-subnet list plus ``space_id`` /
+    ``block_id`` / ``subnet_id`` scope narrowers. Only returns IPs in subnets
+    the caller may READ — the permission filter is pushed into the SQL
+    (``Subnet.id IN (readable)``) so ``total`` and the limit/offset window are
+    both computed post-permission-filter, never as a slice after the fact.
+    Each item joins the parent subnet CIDR / name + space id / name so the UI
+    can render + group hits without a second round-trip.
+    """
+    _validate_sort_order(sort, order)
+    structural = _search_structural_conds(space_id, block_id, subnet_id)
+    readable = await _readable_subnet_ids(db, current_user, structural)
+
+    def _scoped(stmt: Any) -> Any:
+        stmt = stmt.join(Subnet, Subnet.id == IPAddress.subnet_id).join(
+            IPSpace, IPSpace.id == Subnet.space_id
+        )
+        for cond in structural:
+            stmt = stmt.where(cond)
+        for cond in _address_search_conditions(
+            q=q, hostname=hostname, mac=mac, status_filter=status_filter
+        ):
+            stmt = stmt.where(cond)
+        stmt = apply_tag_filter(stmt, IPAddress.tags, tag)
+        if readable is not None:
+            stmt = stmt.where(Subnet.id.in_(readable))
+        return stmt
+
+    count_stmt = _scoped(select(IPAddress.id))
+    total = await db.scalar(select(func.count()).select_from(count_stmt.subquery())) or 0
+
+    data_stmt = (
+        _scoped(select(IPAddress, Subnet.network, Subnet.name, Subnet.space_id, IPSpace.name))
+        .order_by(*_address_order_by(sort, order))
+        .offset(offset)
+        .limit(limit)
+    )
+    result_rows = (await db.execute(data_stmt)).all()
+    ip_rows = [row[0] for row in result_rows]
+    await _enrich_addresses(db, ip_rows)
+
+    items: list[IPAddressSearchItem] = []
+    for ip, net, sub_name, sp_id, sp_name in result_rows:
+        ip.subnet_cidr = str(net)  # type: ignore[attr-defined]
+        ip.subnet_name = sub_name or None  # type: ignore[attr-defined]
+        ip.space_id = sp_id  # type: ignore[attr-defined]
+        ip.space_name = sp_name or None  # type: ignore[attr-defined]
+        items.append(IPAddressSearchItem.model_validate(ip))
+    return AddressSearchResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.get("/addresses/search/ids", response_model=AddressSearchIdsResponse)
+async def search_address_ids(
+    current_user: CurrentUser,
+    db: DB,
+    q: str | None = None,
+    status_filter: str | None = None,
+    tag: list[str] = Query(default_factory=list),
+    hostname: str | None = None,
+    mac: str | None = None,
+    space_id: uuid.UUID | None = None,
+    block_id: uuid.UUID | None = None,
+    subnet_id: uuid.UUID | None = None,
+) -> AddressSearchIdsResponse:
+    """Id-only companion to ``/addresses/search`` (issue #520).
+
+    Same filters + read-permission scoping, no sort / limit / offset. Returns
+    every matching id up to ``_SEARCH_IDS_CAP`` (``capped=True`` when the true
+    total exceeds the cap). Feeds the "select all matches → bulk-edit /
+    bulk-delete" flow — those bulk endpoints re-check per-IP token scope +
+    write delegation, so this list is a selection convenience, not an
+    authorization bypass.
+    """
+    structural = _search_structural_conds(space_id, block_id, subnet_id)
+    readable = await _readable_subnet_ids(db, current_user, structural)
+
+    stmt = select(IPAddress.id).join(Subnet, Subnet.id == IPAddress.subnet_id)
+    for cond in structural:
+        stmt = stmt.where(cond)
+    for cond in _address_search_conditions(
+        q=q, hostname=hostname, mac=mac, status_filter=status_filter
+    ):
+        stmt = stmt.where(cond)
+    stmt = apply_tag_filter(stmt, IPAddress.tags, tag)
+    if readable is not None:
+        stmt = stmt.where(Subnet.id.in_(readable))
+
+    total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    capped_stmt = stmt.order_by(text("CAST(address AS inet) ASC")).limit(_SEARCH_IDS_CAP)
+    ids = [str(row[0]) for row in (await db.execute(capped_stmt)).all()]
+    return AddressSearchIdsResponse(ids=ids, total=total, capped=total > _SEARCH_IDS_CAP)
 
 
 @router.get("/addresses/{address_id}", response_model=IPAddressResponse)
