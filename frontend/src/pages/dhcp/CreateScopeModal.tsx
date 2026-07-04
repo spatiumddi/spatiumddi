@@ -287,9 +287,19 @@ export function CreateScopeModal({
         // IPv6 Router Advertisements (issue #524).
         data.ra_enabled = raEnabled;
         data.ra_mo_override = raMoOverride;
-        data.ra_router_lifetime = Number(raRouterLifetime) || 0;
-        data.ra_prefix_valid_lifetime = Number(raValidLifetime) || 0;
-        data.ra_prefix_preferred_lifetime = Number(raPreferredLifetime) || 0;
+        // Blank → fall back to the field's default (never coerce an empty
+        // input to 0, which would render an invalid radvd config); an
+        // explicitly typed 0 is preserved.
+        const raLifetime = (v: string, dflt: number) => {
+          const t = v.trim();
+          return t === "" ? dflt : Number(t);
+        };
+        data.ra_router_lifetime = raLifetime(raRouterLifetime, 1800);
+        data.ra_prefix_valid_lifetime = raLifetime(raValidLifetime, 86400);
+        data.ra_prefix_preferred_lifetime = raLifetime(
+          raPreferredLifetime,
+          14400,
+        );
         data.ra_prefix_on_link = raOnLink;
         data.ra_prefix_autonomous = raAutonomous;
         data.ra_interface = raInterface.trim();

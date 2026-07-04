@@ -226,8 +226,16 @@ async def check_one(
                         reasons.append(str(rr).strip('"'))
             if reasons:
                 result.txt_reason = " | ".join(reasons)[:2000]
-        except dns.exception.DNSException:
-            pass
+        except dns.exception.DNSException as exc:
+            # Best-effort only — the A-record listing verdict already stands;
+            # a missing/failed TXT just means no human-readable reason string.
+            logger.debug(
+                "dnsbl_txt_lookup_failed",
+                ip=ip,
+                qname=qname,
+                zone=list_row.zone_suffix,
+                error=exc.__class__.__name__,
+            )
     return result
 
 

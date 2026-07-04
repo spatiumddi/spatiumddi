@@ -78,19 +78,33 @@ def _match_tracked(
     index: dict[int, list[BGPTrackedPrefix]],
 ) -> tuple[BGPTrackedPrefix, str] | None:
     """Find the tracked prefix that ``announced`` falls under and the
-    detection kind (exact vs more-specific)."""
+    detection kind (exact vs more-specific).
+
+    When several tracked prefixes overlap (e.g. both ``192.0.2.0/23`` and
+    ``192.0.2.0/24`` are tracked and cover the announcement), pick the
+    *most specific* covering tracked prefix deterministically — longest
+    ``prefixlen`` — so the association doesn't depend on DB/iteration
+    order. An exact match always wins because no covering supernet can
+    have a longer prefixlen than the announcement itself."""
+    best: tuple[int, BGPTrackedPrefix, str] | None = None
     for tracked in index.get(announced.version, []):
         tnet = _parse_net(str(tracked.prefix))
         if tnet is None:
             continue
         if tnet == announced:
-            return tracked, KIND_PREFIX_HIJACK
-        try:
-            covers = tnet.supernet_of(announced)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            covers = False
-        if covers and announced.prefixlen > tnet.prefixlen:
-            return tracked, KIND_MORE_SPECIFIC
+            kind = KIND_PREFIX_HIJACK
+        else:
+            try:
+                covers = tnet.supernet_of(announced)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                covers = False
+            if not (covers and announced.prefixlen > tnet.prefixlen):
+                continue
+            kind = KIND_MORE_SPECIFIC
+        if best is None or tnet.prefixlen > best[0]:
+            best = (tnet.prefixlen, tracked, kind)
+    if best is not None:
+        return best[1], best[2]
     return None
 
 

@@ -16,7 +16,6 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import app.services.bgp as bgp_pkg
 from app.core.security import create_access_token, hash_password
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN, ASNRpkiRoa
@@ -25,6 +24,7 @@ from app.models.bgp_monitor import BGPHijackDetection, BGPTrackedPrefix
 from app.models.feature_module import FeatureModule
 from app.models.settings import PlatformSettings
 from app.services import alerts as alerts_svc
+from app.services import bgp as bgp_pkg
 from app.services import feature_modules
 from app.services.bgp import hijack_monitor as hm
 from app.tasks import bgp_hijack_poll as poll_mod
@@ -654,3 +654,32 @@ async def test_poll_resolves_when_available_and_delisted(
         await db_session.execute(select(BGPHijackDetection).where(BGPHijackDetection.id == det_id))
     ).scalar_one()
     assert row.resolved_at is not None
+
+
+# ── RIS Live overlap match determinism (Copilot review) ───────────────
+
+
+async def test_ris_match_tracked_prefers_most_specific() -> None:
+    """When overlapping tracked prefixes both cover an announcement,
+    ``_match_tracked`` picks the most-specific (longest-prefixlen) one
+    regardless of iteration order; an exact match still wins."""
+    import ipaddress
+    from types import SimpleNamespace
+
+    from app.services.bgp import ris_live
+
+    t23 = SimpleNamespace(prefix="192.0.2.0/23")
+    t24 = SimpleNamespace(prefix="192.0.2.0/24")
+    announced = ipaddress.ip_network("192.0.2.0/25")
+
+    for order in ([t23, t24], [t24, t23]):
+        tracked, kind = ris_live._match_tracked(announced, {4: order, 6: []})  # type: ignore[arg-type]
+        assert tracked is t24  # most-specific covering prefix
+        assert kind == ris_live.KIND_MORE_SPECIFIC
+
+    # Exact announcement of the /24 → exact-hijack kind against the /24.
+    tracked, kind = ris_live._match_tracked(
+        ipaddress.ip_network("192.0.2.0/24"), {4: [t23, t24], 6: []}  # type: ignore[arg-type]
+    )
+    assert tracked is t24
+    assert kind == ris_live.KIND_PREFIX_HIJACK
