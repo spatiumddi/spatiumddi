@@ -87,4 +87,9 @@ async def find_apt_settings(
         "proxy_https": settings.apt_proxy_https or "",
         "no_proxy": settings.apt_proxy_no_proxy or "",
         "unattended_upgrades_enabled": bool(settings.apt_unattended_upgrades_enabled),
+        # Issue #164 — unattended-upgrades policy (the WHEN/HOW of auto-applying).
+        "unattended_allowed_origins": list(settings.apt_unattended_origins or []),
+        "unattended_blocklist": list(settings.apt_unattended_blocklist or []),
+        "unattended_automatic_reboot": bool(settings.apt_unattended_automatic_reboot),
+        "unattended_reboot_time": settings.apt_unattended_reboot_time or "02:00",
     }

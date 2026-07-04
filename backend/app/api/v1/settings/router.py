@@ -243,6 +243,11 @@ class SettingsResponse(BaseModel):
     apt_proxy_no_proxy: str = ""
     apt_auth: list[dict[str, Any]] = []
     apt_unattended_upgrades_enabled: bool = True
+    # Issue #164 — unattended-upgrades policy (non-secret).
+    apt_unattended_origins: list[str] = []
+    apt_unattended_blocklist: list[str] = []
+    apt_unattended_automatic_reboot: bool = False
+    apt_unattended_reboot_time: str = "02:00"
 
     model_config = {"from_attributes": True}
 
@@ -909,6 +914,41 @@ class SettingsUpdate(BaseModel):
     apt_proxy_no_proxy: str | None = None
     apt_auth: list[AptAuthUpdate] | None = None
     apt_unattended_upgrades_enabled: bool | None = None
+    # Issue #164 — unattended-upgrades policy.
+    apt_unattended_origins: list[str] | None = None
+    apt_unattended_blocklist: list[str] | None = None
+    apt_unattended_automatic_reboot: bool | None = None
+    apt_unattended_reboot_time: str | None = None
+
+    @field_validator("apt_unattended_reboot_time")
+    @classmethod
+    def _valid_unattended_reboot_time(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        s = v.strip()
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", s):
+            raise ValueError("reboot time must be HH:MM (24-hour), e.g. 02:00")
+        return s
+
+    @field_validator("apt_unattended_origins", "apt_unattended_blocklist")
+    @classmethod
+    def _valid_unattended_list(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        out: list[str] = []
+        for raw in v:
+            s = str(raw).strip()
+            if not s:
+                continue
+            # These land inside apt.conf double-quoted strings (the host runner
+            # escapes quotes); reject control chars + over-long entries so a
+            # value can't smuggle a newline / extra directive past the render.
+            if any(ord(c) < 0x20 for c in s) or len(s) > 200:
+                raise ValueError(
+                    "unattended origin / package entries must be printable and ≤ 200 chars"
+                )
+            out.append(s)
+        return out
 
     @field_validator("apt_proxy_http", "apt_proxy_https")
     @classmethod
@@ -1985,6 +2025,11 @@ async def update_settings(
                     "proxy_http_set": bool(settings.apt_proxy_http),
                     "proxy_https_set": bool(settings.apt_proxy_https),
                     "unattended_upgrades_enabled": bool(settings.apt_unattended_upgrades_enabled),
+                    # Issue #164 — unattended-upgrades policy summary.
+                    "unattended_origin_count": len(settings.apt_unattended_origins or []),
+                    "unattended_blocklist_count": len(settings.apt_unattended_blocklist or []),
+                    "unattended_automatic_reboot": bool(settings.apt_unattended_automatic_reboot),
+                    "unattended_reboot_time": settings.apt_unattended_reboot_time or "",
                 },
             )
         )

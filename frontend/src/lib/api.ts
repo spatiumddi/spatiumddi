@@ -3299,6 +3299,11 @@ export interface PlatformSettings {
   apt_proxy_no_proxy: string;
   apt_auth: AptAuthRedacted[];
   apt_unattended_upgrades_enabled: boolean;
+  // Issue #164 — unattended-upgrades policy (the WHEN/HOW of auto-applying).
+  apt_unattended_origins: string[];
+  apt_unattended_blocklist: string[];
+  apt_unattended_automatic_reboot: boolean;
+  apt_unattended_reboot_time: string;
 }
 
 /** One managed APT repo. No secrets — the armoured key lives in
@@ -3352,6 +3357,11 @@ export interface AptSettingsUpdate {
   apt_proxy_no_proxy?: string;
   apt_auth?: AptAuthUpdate[];
   apt_unattended_upgrades_enabled?: boolean;
+  // Issue #164 — unattended-upgrades policy.
+  apt_unattended_origins?: string[];
+  apt_unattended_blocklist?: string[];
+  apt_unattended_automatic_reboot?: boolean;
+  apt_unattended_reboot_time?: string;
 }
 
 export interface AptValidateRequest {

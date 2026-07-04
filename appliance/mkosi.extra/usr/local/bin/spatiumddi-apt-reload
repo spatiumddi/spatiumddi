@@ -39,8 +39,10 @@ PROXY_CONF=/etc/apt/apt.conf.d/95spatiumddi-proxy
 AUTH_CONF=/etc/apt/auth.conf.d/spatiumddi.conf
 KEYRING_DIR=/etc/apt/keyrings
 SOURCES_BAK=/etc/apt/sources.list.spatiumddi-bak
-# unattended-upgrades activation toggle (debian's 20auto-upgrades).
+# unattended-upgrades activation toggle (debian's 20auto-upgrades) + the
+# #164 policy file (origins / blocklist / automatic-reboot).
 AUTO_UPGRADES=/etc/apt/apt.conf.d/20auto-upgrades
+UNATTENDED_50=/etc/apt/apt.conf.d/50unattended-upgrades
 
 mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$KEYRING_DIR"
 exec >> "$LOG" 2>&1
@@ -76,16 +78,70 @@ finish() {
     mv "$TRIGGER" "${TRIGGER}.${2}.$(date +%s)"
 }
 
-set_unattended() {
-    # set_unattended <0|1> — flip Debian's periodic Update + Unattended-
-    # Upgrade keys. Idempotent; creates the file if missing.
-    local val="$1"
-    cat > "$AUTO_UPGRADES" <<EOF
-// Managed by SpatiumDDI — Settings → Appliance → APT.
-APT::Periodic::Update-Package-Lists "$val";
-APT::Periodic::Unattended-Upgrade "$val";
-EOF
-    chmod 0644 "$AUTO_UPGRADES"
+render_unattended() {
+    # #164 — render 20auto-upgrades (the periodic-timer enable) +
+    # 50unattended-upgrades (the policy: Allowed-Origins / Package-Blacklist /
+    # Automatic-Reboot / Automatic-Reboot-Time) from the blob's ``unattended``
+    # block. Runs in BOTH the enabled + disabled SOURCES branches — the policy
+    # is orthogonal to apt_managed (an operator can set a reboot policy without
+    # taking over apt sources). Validate-before-swap: stage both files, parse
+    # the merged tree with ``apt-config``, and only install live on success so
+    # a malformed policy can't break apt / the daily unattended run.
+    local uu_stage="$STAGE/uu"
+    mkdir -p "$uu_stage"
+    if ! python3 - "$BLOB" "$uu_stage/50unattended-upgrades" "$uu_stage/20auto-upgrades" <<'PYEOF'
+import json, os, sys
+
+blob_path, policy_path, timer_path = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(blob_path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    data = {}
+u = data.get("unattended") or {}
+enabled = "1" if u.get("enabled", True) else "0"
+origins = [str(o) for o in (u.get("origins") or []) if str(o).strip()]
+blocklist = [str(b) for b in (u.get("blocklist") or []) if str(b).strip()]
+auto_reboot = "true" if u.get("automatic_reboot") else "false"
+reboot_time = (str(u.get("reboot_time") or "02:00").strip() or "02:00")
+
+
+def esc(s: str) -> str:
+    # apt.conf double-quoted string: escape backslash then quote.
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+with open(timer_path, "w", encoding="utf-8") as fh:
+    fh.write("// Managed by SpatiumDDI — Settings → Appliance → APT (#164).\n")
+    fh.write(f'APT::Periodic::Update-Package-Lists "{enabled}";\n')
+    fh.write(f'APT::Periodic::Unattended-Upgrade "{enabled}";\n')
+
+lines = ["// Managed by SpatiumDDI — Settings → Appliance → APT (#164)."]
+lines.append("Unattended-Upgrade::Allowed-Origins {")
+lines += [f'    "{esc(o)}";' for o in origins]
+lines.append("};")
+lines.append("Unattended-Upgrade::Package-Blacklist {")
+lines += [f'    "{esc(b)}";' for b in blocklist]
+lines.append("};")
+lines.append(f'Unattended-Upgrade::Automatic-Reboot "{auto_reboot}";')
+lines.append(f'Unattended-Upgrade::Automatic-Reboot-Time "{esc(reboot_time)}";')
+with open(policy_path, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines) + "\n")
+PYEOF
+    then
+        echo "  ! WARN: failed to render unattended policy from blob — leaving live files untouched"
+        return 0
+    fi
+    # Syntactic validation: apt-config must parse the staged parts tree.
+    if ! apt-config -o "Dir::Etc::main=/dev/null" -o "Dir::Etc::parts=$uu_stage" \
+            dump >/dev/null 2>"$STAGE/uu-validate.log"; then
+        echo "  ! WARN: apt-config rejected the rendered unattended policy — not swapping:"
+        sed 's/^/      /' "$STAGE/uu-validate.log" | tail -10
+        return 0
+    fi
+    install -m 0644 "$uu_stage/20auto-upgrades" "$AUTO_UPGRADES"
+    install -m 0644 "$uu_stage/50unattended-upgrades" "$UNATTENDED_50"
+    echo "  ✓ unattended policy applied (20auto-upgrades + 50unattended-upgrades)"
 }
 
 case "$MARKER" in
@@ -227,7 +283,7 @@ EOF
         else
             rm -f "$AUTH_CONF"
         fi
-        set_unattended "${UNATTENDED:-1}"
+        render_unattended
 
         echo "  applied live config; confirming with live apt-get update…"
         if apt-get update > /tmp/spatium-apt-live.log 2>&1; then
@@ -259,10 +315,15 @@ EOF
         fi
         rm -f "$MANAGED_LIST" "$PROXY_CONF" "$AUTH_CONF"
         rm -f "$KEYRING_DIR"/spatiumddi-*.asc
-        # Clear the applied-hash sidecar so the disabled state is idempotent
-        # (next bundle's empty config_hash == empty applied → no re-fire).
-        : > "$HASH_SIDECAR"
-        echo "  ✓ managed apt config removed; baked repos in effect"
+        # #164 — the unattended-upgrades policy is orthogonal to source
+        # management, so it's still applied even in the sources-disabled state.
+        render_unattended
+        # Stamp the applied-hash with THIS bundle's config_hash so the disabled
+        # state stays idempotent. #164 made the disabled config_hash non-empty
+        # (it covers the unattended policy), so clearing the sidecar to empty
+        # would mismatch the non-empty bundle hash and re-fire on every tick.
+        echo "$HASH" > "$HASH_SIDECAR"
+        echo "  ✓ managed apt sources removed; baked repos in effect (unattended policy applied)"
         finish "unmanaged" "done"
         ;;
     *)
