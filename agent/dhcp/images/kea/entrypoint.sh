@@ -149,6 +149,37 @@ supervise_ctrl_agent() {
     return 0
 }
 
+# radvd (issue #524) — opt-in IPv6 Router Advertisement daemon. Only
+# runs when RADVD_MANAGED=1. The python agent renders the control-plane's
+# radvd.conf to $RADVD_CONFIG_PATH on each bundle apply; this loop waits
+# for that file to appear (radvd refuses to boot without an interface
+# stanza), then runs radvd in the foreground with a pidfile the agent
+# SIGHUPs to reload on later config changes. radvd carries the
+# net_raw+net_admin file caps so it works after the su-exec privilege drop.
+supervise_radvd() {
+    STOPPING=0
+    RADVD_CHILD=
+    # shellcheck disable=SC2064
+    trap 'STOPPING=1; [ -n "$RADVD_CHILD" ] && kill -TERM "$RADVD_CHILD" 2>/dev/null; exit 0' TERM INT
+    RADVD_CFG="${RADVD_CONFIG_PATH:-/etc/radvd/radvd.conf}"
+    RADVD_PID="${RADVD_PIDFILE:-/run/radvd/radvd.pid}"
+    while [ "$STOPPING" -eq 0 ]; do
+        if [ ! -s "$RADVD_CFG" ]; then
+            sleep 3
+            continue
+        fi
+        rm -f "$RADVD_PID" 2>/dev/null || true
+        su-exec spatium:spatium radvd -C "$RADVD_CFG" -p "$RADVD_PID" -n &
+        RADVD_CHILD=$!
+        wait "$RADVD_CHILD" || true
+        RADVD_CHILD=
+        [ "$STOPPING" -eq 1 ] && break
+        echo "radvd exited, restarting in 3s" >&2
+        sleep 3
+    done
+    return 0
+}
+
 supervise_kea &
 KEA_PID=$!
 
@@ -158,10 +189,18 @@ KEA6_PID=$!
 supervise_ctrl_agent &
 CTRL_PID=$!
 
+# radvd only when opted in — best-effort, not part of the container
+# liveness wait (a radvd flap must not take the DHCP server down).
+RADVD_PID=
+if [ "${RADVD_MANAGED:-0}" = "1" ]; then
+    supervise_radvd &
+    RADVD_PID=$!
+fi
+
 # Forward container SIGTERM to all supervisor subshells and the
 # agent. The supervisors' own traps handle the in-flight daemon.
 _term() {
-    kill -TERM "$KEA_PID" "$KEA6_PID" "$CTRL_PID" "${AGENT_PID:-0}" 2>/dev/null || true
+    kill -TERM "$KEA_PID" "$KEA6_PID" "$CTRL_PID" "${RADVD_PID:-0}" "${AGENT_PID:-0}" 2>/dev/null || true
 }
 trap _term TERM INT
 

@@ -33,6 +33,7 @@ import structlog
 from .cache import load_config, save_config, save_rendered_kea, save_token
 from .config import AgentConfig
 from .kea_ctrl import KeaCtrlError, config_reload, config_test
+from .radvd_apply import apply_radvd
 from .render_kea import render as render_kea
 
 log = structlog.get_logger(__name__)
@@ -302,6 +303,15 @@ class SyncLoop:
             )
             if ok4 and ok6:
                 self.heartbeat.daemon_status = {"status": "ok"}
+        # IPv6 Router Advertisements (issue #524) — write + reload the
+        # managed radvd.conf the control plane rendered. No-op unless
+        # RADVD_MANAGED=1; best-effort so a radvd failure never disturbs
+        # the Kea apply above.
+        try:
+            apply_radvd(inner.get("radvd_conf"))
+        except Exception:  # noqa: BLE001 — defensive; never block apply
+            log.exception("radvd_apply_failed")
+
         # Feed the peer-resolve watcher the bundle so it can track
         # hostname → IP drift and trigger a re-render if any peer's
         # IP changes. No-op when the bundle has no failover block.

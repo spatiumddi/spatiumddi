@@ -200,6 +200,30 @@ def _is_subnet_of(
     return child_net.subnet_of(parent_net)  # type: ignore[arg-type]
 
 
+# ── Formula-injection hardening (OWASP CSV injection) ──────────────────────────
+#
+# A spreadsheet treats a cell whose text starts with ``=``, ``+``, ``-`` or
+# ``@`` (or a leading TAB / CR that Excel strips before parsing) as a formula.
+# An operator-supplied hostname / description / custom-field value such as
+# ``=HYPERLINK("http://evil","click")`` would then execute when the exported
+# file is opened. Prefix any such value with a single quote so the spreadsheet
+# renders it as literal text — the apostrophe is the canonical,
+# Excel/LibreOffice-recognised escape and stays hidden in the cell display.
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitize_cell(value: Any) -> Any:
+    """Neutralise spreadsheet formula-injection in a user-controlled cell.
+
+    Only string values that begin with a formula trigger are touched; numbers,
+    ``None`` and booleans pass through unchanged so numeric columns
+    (``utilization_percent``, ``vlan_id``, …) keep their type in XLSX.
+    """
+    if isinstance(value, str) and value.startswith(_FORMULA_TRIGGERS):
+        return "'" + value
+    return value
+
+
 # ── Serialisers ────────────────────────────────────────────────────────────────
 
 
@@ -216,9 +240,9 @@ def _addresses_to_csv(addresses: list[dict[str, Any]]) -> bytes:
     writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
     writer.writeheader()
     for row in addresses:
-        out = {k: row.get(k) for k in ADDRESS_COLUMNS}
+        out = {k: _sanitize_cell(row.get(k)) for k in ADDRESS_COLUMNS}
         for k in cf_keys:
-            out[k] = (row.get("custom_fields") or {}).get(k)
+            out[k] = _sanitize_cell((row.get("custom_fields") or {}).get(k))
         writer.writerow(out)
     return buf.getvalue().encode("utf-8")
 
@@ -246,9 +270,9 @@ def _to_csv(bundle: ExportBundle) -> bytes:
     writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
     writer.writeheader()
     for row in bundle.subnets:
-        out = {k: row.get(k) for k in SUBNET_COLUMNS}
+        out = {k: _sanitize_cell(row.get(k)) for k in SUBNET_COLUMNS}
         for k in cf_keys:
-            out[k] = (row.get("custom_fields") or {}).get(k)
+            out[k] = _sanitize_cell((row.get("custom_fields") or {}).get(k))
         writer.writerow(out)
     return buf.getvalue().encode("utf-8")
 
@@ -286,9 +310,9 @@ def _to_xlsx(bundle: ExportBundle) -> bytes:
     headers = SUBNET_COLUMNS + cf_keys
     ws.append(headers)
     for row in bundle.subnets:
-        base = [row.get(k) for k in SUBNET_COLUMNS]
+        base = [_sanitize_cell(row.get(k)) for k in SUBNET_COLUMNS]
         cf = row.get("custom_fields") or {}
-        ws.append(base + [cf.get(k) for k in cf_keys])
+        ws.append(base + [_sanitize_cell(cf.get(k)) for k in cf_keys])
 
     # Blocks sheet
     blocks_ws = wb.create_sheet("blocks")
@@ -300,9 +324,9 @@ def _to_xlsx(bundle: ExportBundle) -> bytes:
             [
                 b.get("id"),
                 b.get("parent_block_id"),
-                b.get("network"),
-                b.get("name"),
-                b.get("description"),
+                _sanitize_cell(b.get("network")),
+                _sanitize_cell(b.get("name")),
+                _sanitize_cell(b.get("description")),
                 b.get("utilization_percent"),
             ]
         )
@@ -320,9 +344,9 @@ def _to_xlsx(bundle: ExportBundle) -> bytes:
                     addr_cf_keys.append(k)
         addr_ws.append(ADDRESS_COLUMNS + addr_cf_keys)
         for a in bundle.addresses:
-            base = [a.get(k) for k in ADDRESS_COLUMNS]
+            base = [_sanitize_cell(a.get(k)) for k in ADDRESS_COLUMNS]
             cf = a.get("custom_fields") or {}
-            addr_ws.append(base + [cf.get(k) for k in addr_cf_keys])
+            addr_ws.append(base + [_sanitize_cell(cf.get(k)) for k in addr_cf_keys])
 
     buf = io.BytesIO()
     wb.save(buf)

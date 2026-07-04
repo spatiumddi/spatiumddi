@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv as _csv
 import io
 import json
 
@@ -10,13 +11,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import hash_password
 from app.models.auth import User
-from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.ipam_io import (
     commit_import,
     export_subtree,
     parse_payload,
     preview_import,
 )
+from app.services.ipam_io.export import _sanitize_cell
 from app.services.ipam_io.parser import ParsedPayload
 
 
@@ -216,3 +218,129 @@ async def test_csv_roundtrip(db_session: AsyncSession) -> None:
     parsed = parse_payload(data, "rt.csv", "text/csv")
     parsed_nets = sorted(str(s["network"]) for s in parsed.subnets)
     assert parsed_nets == sorted(nets)
+
+
+# ── Formula-injection hardening (#523) ─────────────────────────────────────────
+
+
+def test_sanitize_cell_prefixes_dangerous_values() -> None:
+    # Every OWASP CSV-injection trigger gets the leading apostrophe.
+    assert _sanitize_cell("=1+1") == "'=1+1"
+    assert _sanitize_cell("+1") == "'+1"
+    assert _sanitize_cell("-1") == "'-1"
+    assert _sanitize_cell("@SUM(A1)") == "'@SUM(A1)"
+    assert _sanitize_cell("\ttab") == "'\ttab"
+    assert _sanitize_cell("\rcr") == "'\rcr"
+    # Safe strings + non-strings pass through untouched so numeric columns
+    # keep their type.
+    assert _sanitize_cell("safe") == "safe"
+    assert _sanitize_cell("10.0.0.0/24") == "10.0.0.0/24"
+    assert _sanitize_cell(None) is None
+    assert _sanitize_cell(42) == 42
+    assert _sanitize_cell(True) is True
+
+
+@pytest.mark.asyncio
+async def test_export_csv_sanitizes_subnet_cells(db_session: AsyncSession) -> None:
+    space = await _seed_space(db_session, "Inject")
+    block = IPBlock(space_id=space.id, network="10.9.0.0/16", name="b")
+    db_session.add(block)
+    await db_session.flush()
+    db_session.add(
+        Subnet(
+            space_id=space.id,
+            block_id=block.id,
+            network="10.9.1.0/24",
+            name="=cmd|'/c calc'!A0",
+            description="+evil",
+            total_ips=254,
+            custom_fields={"note": "-danger"},
+        )
+    )
+    await db_session.flush()
+
+    data, _, _ = await export_subtree(db_session, space_id=space.id, format="csv")
+    rows = list(_csv.DictReader(io.StringIO(data.decode())))
+    row = rows[0]
+    assert row["name"].startswith("'=")
+    assert row["description"].startswith("'+")
+    assert row["note"].startswith("'-")
+
+
+@pytest.mark.asyncio
+async def test_export_csv_sanitizes_address_cells(db_session: AsyncSession) -> None:
+    space = await _seed_space(db_session, "InjectAddr")
+    block = IPBlock(space_id=space.id, network="10.10.0.0/16", name="b")
+    db_session.add(block)
+    await db_session.flush()
+    subnet = Subnet(
+        space_id=space.id, block_id=block.id, network="10.10.1.0/24", name="s", total_ips=254
+    )
+    db_session.add(subnet)
+    await db_session.flush()
+    db_session.add(
+        IPAddress(
+            subnet_id=subnet.id,
+            address="10.10.1.5",
+            status="allocated",
+            hostname="@SUM(1)",
+            description="=danger",
+            custom_fields={"owner": "-x"},
+        )
+    )
+    await db_session.flush()
+
+    # include_addresses on a subnet scope emits the addresses-only CSV.
+    data, _, _ = await export_subtree(
+        db_session, subnet_id=subnet.id, format="csv", include_addresses=True
+    )
+    rows = list(_csv.DictReader(io.StringIO(data.decode())))
+    row = rows[0]
+    assert row["hostname"].startswith("'@")
+    assert row["description"].startswith("'=")
+    assert row["owner"].startswith("'-")
+
+
+@pytest.mark.asyncio
+async def test_export_xlsx_sanitizes_cells(db_session: AsyncSession) -> None:
+    from openpyxl import load_workbook
+
+    space = await _seed_space(db_session, "InjectXlsx")
+    block = IPBlock(space_id=space.id, network="10.11.0.0/16", name="=blkname")
+    db_session.add(block)
+    await db_session.flush()
+    subnet = Subnet(
+        space_id=space.id,
+        block_id=block.id,
+        network="10.11.1.0/24",
+        name="=cmd()",
+        total_ips=254,
+    )
+    db_session.add(subnet)
+    await db_session.flush()
+    db_session.add(
+        IPAddress(
+            subnet_id=subnet.id,
+            address="10.11.1.5",
+            status="allocated",
+            hostname="+evil",
+        )
+    )
+    await db_session.flush()
+
+    data, _, _ = await export_subtree(
+        db_session, space_id=space.id, format="xlsx", include_addresses=True
+    )
+    wb = load_workbook(io.BytesIO(data))
+
+    subnets_ws = wb["subnets"]
+    name_col = [c.value for c in subnets_ws[1]].index("name")
+    assert str(subnets_ws[2][name_col].value).startswith("'=")
+
+    blocks_ws = wb["blocks"]
+    b_name_col = [c.value for c in blocks_ws[1]].index("name")
+    assert str(blocks_ws[2][b_name_col].value).startswith("'=")
+
+    addr_ws = wb["addresses"]
+    host_col = [c.value for c in addr_ws[1]].index("hostname")
+    assert str(addr_ws[2][host_col].value).startswith("'+")

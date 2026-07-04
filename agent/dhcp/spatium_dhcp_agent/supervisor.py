@@ -27,6 +27,7 @@ from .log_shipper import LogShipper
 from .mac_sighting import MacSightingShipper
 from .metrics import MetricsPoller
 from .peer_resolve import PeerResolveWatcher
+from .ra_sniffer import RASnifferShipper
 from .sync import SyncLoop
 
 log = structlog.get_logger(__name__)
@@ -49,7 +50,9 @@ def run(cfg: AgentConfig) -> int:
         cfg, token_ref, heartbeat, ha_poller=ha_poller, peer_watcher=peer_watcher
     )
     peer_watcher.set_apply_fn(
-        lambda bundle, reload_kea=True: syncer._apply_bundle(bundle, reload_kea=reload_kea)
+        lambda bundle, reload_kea=True: syncer._apply_bundle(
+            bundle, reload_kea=reload_kea
+        )
     )
     leases = LeaseWatcher(cfg, token_ref, heartbeat)
     metrics = MetricsPoller(cfg, token_ref)
@@ -89,6 +92,16 @@ def run(cfg: AgentConfig) -> int:
         mac_sighting_shipper = MacSightingShipper(cfg, token_ref)
         log.info("dhcp_mac_sighting_enabled")
 
+    # Passive IPv6 Router-Advertisement sniffer (issue #524) — opt-in for the
+    # same CAP_NET_RAW + scapy reasons as fingerprinting. Observes ICMPv6
+    # type-134 RAs and ships them so the control plane can flag unknown routers
+    # (rogue_ra alert).
+    ra_sniffer_enabled = os.environ.get("DHCP_RA_SNIFFER_ENABLED", "0") == "1"
+    ra_sniffer_shipper: RASnifferShipper | None = None
+    if ra_sniffer_enabled:
+        ra_sniffer_shipper = RASnifferShipper(cfg, token_ref)
+        log.info("dhcp_ra_sniffer_enabled")
+
     threads = [
         threading.Thread(target=syncer.run, name="sync", daemon=True),
         threading.Thread(target=heartbeat.run, name="heartbeat", daemon=True),
@@ -118,6 +131,14 @@ def run(cfg: AgentConfig) -> int:
                 daemon=True,
             )
         )
+    if ra_sniffer_shipper is not None:
+        threads.append(
+            threading.Thread(
+                target=ra_sniffer_shipper.run,
+                name="ra-sniffer",
+                daemon=True,
+            )
+        )
     for t in threads:
         t.start()
 
@@ -139,6 +160,8 @@ def run(cfg: AgentConfig) -> int:
             rogue_probe.stop()
         if mac_sighting_shipper is not None:
             mac_sighting_shipper.stop()
+        if ra_sniffer_shipper is not None:
+            ra_sniffer_shipper.stop()
 
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)

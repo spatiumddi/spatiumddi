@@ -359,6 +359,10 @@ services:
     cap_add:
       - NET_BIND_SERVICE
       - NET_RAW
+      # Add NET_ADMIN when running radvd (RADVD_MANAGED=1, issue #524) so
+      # the agent can emit IPv6 Router Advertisements. Also needs host
+      # net.ipv6.conf.all.forwarding=1. Harmless when radvd is off.
+      # - NET_ADMIN
 
   # ── DHCP agent (secondary, HA peer) ───────────────────────────────────
   # Only starts with `--profile dhcp-ha`. Pair it with dhcp-kea in a

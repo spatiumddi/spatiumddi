@@ -176,6 +176,37 @@ def token_scope_allows(user: User, resource_type: str, resource_id: str | UUID |
     return False
 
 
+def token_scoped_resource_ids(user: User, resource_type: str) -> set[str] | None:
+    """Resource IDs a resource-scoped token is bound to for ``resource_type``.
+
+    Companion to :func:`token_scope_allows` for *list* endpoints (issue #523):
+    a by-id read gates with ``token_scope_allows``, but a list must instead
+    narrow its result set to the bound instances or a subnet-scoped token can
+    enumerate the whole tree via ``GET /subnets`` / ``/blocks`` / ``/spaces``.
+    Returns:
+
+    * ``None`` — the caller carries no resource grants (session / plain token),
+      OR holds a wildcard grant covering this ``resource_type`` (any instance).
+      List endpoints run unfiltered, exactly as before.
+    * a (possibly empty) ``set`` of resource-id strings — a resource-scoped
+      token; only these instances are visible. An empty set means the token is
+      bound only to *other* resource types and sees none of this one.
+    """
+    grants = _token_grants_for(user)
+    if not grants:
+        return None
+    ids: set[str] = set()
+    for g in grants:
+        if not _resource_type_matches(g.get("resource_type", ""), resource_type):
+            continue
+        rid = g.get("resource_id")
+        if rid is None or rid == "" or rid == "*":
+            # Wildcard grant on this type → every instance is in scope.
+            return None
+        ids.add(str(rid))
+    return ids
+
+
 def is_effective_superadmin(user: User) -> bool:
     """Whether the user is a superadmin for gate-style checks.
 
@@ -728,5 +759,6 @@ __all__ = [
     "require_permission",
     "require_resource_permission",
     "token_scope_allows",
+    "token_scoped_resource_ids",
     "user_has_permission",
 ]

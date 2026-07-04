@@ -202,6 +202,17 @@ class Settings(BaseSettings):
     # TLS context. Matches the compose service name on the appliance.
     appliance_frontend_container: str = "spatiumddi-frontend"
 
+    # BGP prefix-hijack monitoring (issue #527). The periodic RIPEstat
+    # poll (``app.tasks.bgp_hijack_poll``) is the reliable source of
+    # truth and runs on any standard Celery deployment — gated by the
+    # ``PlatformSettings.bgp_monitoring_enabled`` DB toggle, not by env.
+    # This flag opts into the OPTIONAL long-running RIS Live WebSocket
+    # consumer (``python -m app.services.bgp.ris_live``), the real-time
+    # upgrade. Default OFF — a persistent WS doesn't fit the worker
+    # model and the feature never depends on it.
+    bgp_ris_live_enabled: bool = False
+    bgp_ris_live_url: str = "wss://ris-live.ripe.net/v1/ws/"
+
     @property
     def cors_origins_list(self) -> list[str]:
         """``cors_origins`` parsed into a list. ``"*"`` (the default)

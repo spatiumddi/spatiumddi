@@ -27,6 +27,7 @@ from app.core.permissions import (
     is_effective_superadmin,
     require_any_resource_or_scoped,
     token_scope_allows,
+    token_scoped_resource_ids,
     user_has_permission,
 )
 from app.models.audit import AuditLog
@@ -643,6 +644,29 @@ def _enforce_subnet_token_scope(user: Any, subnet_id: uuid.UUID) -> None:
     The "subnet" wording keeps the existing error message stable.
     """
     _enforce_token_scope(user, "subnet", subnet_id)
+
+
+def _token_subnet_scope_uuids(user: Any) -> set[uuid.UUID] | None:
+    """Subnet UUIDs a subnet-scoped token may enumerate, or ``None`` for none.
+
+    The list-endpoint counterpart to :func:`_enforce_subnet_token_scope` (#523):
+    ``GET /subnets`` / ``/blocks`` / ``/spaces`` narrow to only the subnet(s) a
+    resource-scoped token (#374) is bound to — plus their parent block / space —
+    so a subnet-bound token can't read the whole tree via list even though the
+    by-id reads are already gated. ``None`` = no filtering (session / plain
+    token / subnet-wildcard grant); an empty set = a token scoped only to other
+    resource types (e.g. ``dns_zone``), which sees no subnets at all.
+    """
+    scoped = token_scoped_resource_ids(user, "subnet")
+    if scoped is None:
+        return None
+    out: set[uuid.UUID] = set()
+    for rid in scoped:
+        try:
+            out.add(uuid.UUID(str(rid)))
+        except (ValueError, TypeError):
+            continue
+    return out
 
 
 # ── DHCP pool awareness ───────────────────────────────────────────────────────
@@ -2516,9 +2540,17 @@ class NextIPRequest(BaseModel):
     custom_fields: dict[str, Any] = {}
     tags: dict[str, Any] = {}
     dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
+    # Issue #25 — split-horizon publishing. Additional zone UUIDs to publish
+    # A/AAAA records into beyond the singular primary. Mirrors
+    # ``IPAddressCreate.extra_zone_ids`` so next-IP allocation reaches parity
+    # with manual create (#523). Empty list = one record.
+    extra_zone_ids: list[str] = []
     aliases: list[AliasInput] = []
     role: str | None = None
     reserved_until: datetime | None = None
+    # Planned decommission date (issue #46). Null = no scheduled decom.
+    # Mirrors ``IPAddressCreate.decom_date`` (#523).
+    decom_date: date | None = None
     # See IPAddressCreate.force.
     force: bool = False
 
@@ -2568,6 +2600,13 @@ async def list_spaces(
     if customer_id is not None:
         query = query.where(IPSpace.customer_id == customer_id)
     query = apply_tag_filter(query, IPSpace.tags, tag)
+    # Subnet-scoped token (#523): only surface the space(s) that parent the
+    # subnet(s) the token is bound to, matching the by-id scope gate.
+    scoped_subnets = _token_subnet_scope_uuids(current_user)
+    if scoped_subnets is not None:
+        query = query.where(
+            IPSpace.id.in_(select(Subnet.space_id).where(Subnet.id.in_(scoped_subnets)))
+        )
     result = await db.execute(query)
     return list(result.scalars().all())
 
@@ -2874,6 +2913,17 @@ async def list_blocks(
     if site_id is not None:
         query = query.where(IPBlock.site_id == site_id)
     query = apply_tag_filter(query, IPBlock.tags, tag)
+    # Subnet-scoped token (#523): only surface the block(s) that parent the
+    # subnet(s) the token is bound to, matching the by-id scope gate.
+    scoped_subnets = _token_subnet_scope_uuids(current_user)
+    if scoped_subnets is not None:
+        query = query.where(
+            IPBlock.id.in_(
+                select(Subnet.block_id)
+                .where(Subnet.id.in_(scoped_subnets))
+                .where(Subnet.block_id.isnot(None))
+            )
+        )
     result = await db.execute(query)
     blocks = list(result.scalars().all())
     space_vrf_cache: dict[uuid.UUID, uuid.UUID | None] = {}
@@ -3781,6 +3831,12 @@ async def list_subnets(
     if site_id is not None:
         query = query.where(Subnet.site_id == site_id)
     query = apply_tag_filter(query, Subnet.tags, tag)
+    # Subnet-scoped token (#523): narrow to the bound subnet(s) so a
+    # subnet-scoped token can't enumerate the whole tree via list — mirrors the
+    # by-id gate ``_enforce_subnet_token_scope`` already applies on GET /{id}.
+    scoped_subnets = _token_subnet_scope_uuids(current_user)
+    if scoped_subnets is not None:
+        query = query.where(Subnet.id.in_(scoped_subnets))
     result = await db.execute(query)
     return list(result.scalars().all())
 
@@ -7977,7 +8033,21 @@ async def preview_next_ip(
                 "for sequential address stamping."
             ),
         )
-    chosen = await _pick_next_available_ip(db, subnet, strategy=strategy, mac_address=mac_address)
+    # Mirror ``allocate_next_ip``'s address-set delegation (#103) so the
+    # previewed candidate is the same one the commit path would hand out
+    # (#523). A caller without subnet-wide write is constrained to their
+    # writable ranges; without that, the preview could show an IP the
+    # commit then skips or 403s.
+    subnet_writable = user_has_permission(current_user, "write", "subnet", subnet_id)
+    set_ranges = await _load_writable_set_ranges(db, current_user, subnet_id)
+    allowed_ranges = None if subnet_writable else set_ranges
+    chosen = await _pick_next_available_ip(
+        db,
+        subnet,
+        strategy=strategy,
+        mac_address=mac_address,
+        allowed_ranges=allowed_ranges,
+    )
     return NextIPPreview(address=str(chosen) if chosen else None, strategy=strategy)
 
 
@@ -8074,6 +8144,21 @@ async def allocate_next_ip(
             detail=(f"No write permission on subnet or any address set covering {chosen}"),
         )
 
+    # Public-facing safety guard (issue #25) — parity with create_address
+    # (#523). Runs after the pick because the check keys off the concrete
+    # candidate address (private IP published into a public-facing zone). Same
+    # ``force`` gate + ``_collision_http_exc`` shape so the frontend's
+    # confirm-and-resubmit path lights up identically.
+    if not body.force:
+        public_warnings = await _check_public_facing_warnings(
+            db,
+            address=str(chosen),
+            forward_zone_id=effective_zone,
+            extra_zone_ids=body.extra_zone_ids,
+        )
+        if public_warnings:
+            raise _collision_http_exc(public_warnings)
+
     ip = IPAddress(
         subnet_id=subnet_id,
         address=str(chosen),
@@ -8085,6 +8170,8 @@ async def allocate_next_ip(
         tags=body.tags,
         role=body.role,
         reserved_until=body.reserved_until,
+        extra_zone_ids=body.extra_zone_ids,
+        decom_date=body.decom_date,
         created_by_user_id=current_user.id,
     )
     db.add(ip)

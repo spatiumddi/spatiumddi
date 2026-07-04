@@ -129,3 +129,86 @@ async def test_space_and_block_scoped_tokens_bound_to_their_own(
     bh = {"Authorization": f"Bearer {block_tok}"}
     assert (await client.get(f"/api/v1/ipam/blocks/{block_a.id}", headers=bh)).status_code == 200
     assert (await client.get(f"/api/v1/ipam/blocks/{block_b.id}", headers=bh)).status_code == 403
+
+
+# ── #523: list endpoints honour subnet-token scope ────────────────────────────
+
+
+async def _space_block_subnet(db: AsyncSession, network: str) -> tuple[IPSpace, IPBlock, Subnet]:
+    space, block = await _space_and_block(db)
+    subnet = Subnet(space_id=space.id, block_id=block.id, network=network, name="s")
+    db.add(subnet)
+    await db.flush()
+    return space, block, subnet
+
+
+@pytest.mark.asyncio
+async def test_unscoped_session_lists_everything(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # Regression guard: a normal session sees every space/block/subnet — the
+    # #523 filter is a no-op for non-token callers.
+    _, token = await _make_user(db_session)
+    await _space_block_subnet(db_session, "10.0.0.0/24")
+    await _space_block_subnet(db_session, "10.1.0.0/24")
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {token}"}
+    assert len((await client.get("/api/v1/ipam/spaces", headers=hdr)).json()) >= 2
+    assert len((await client.get("/api/v1/ipam/blocks", headers=hdr)).json()) >= 2
+    assert len((await client.get("/api/v1/ipam/subnets", headers=hdr)).json()) >= 2
+
+
+@pytest.mark.asyncio
+async def test_subnet_scoped_token_lists_only_its_subtree(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # A subnet-scoped token may only enumerate its bound subnet + that
+    # subnet's parent block + space — not the whole tree (#523). Previously
+    # the list endpoints leaked every row.
+    owner, _ = await _make_user(db_session)
+    space_a, block_a, subnet_a = await _space_block_subnet(db_session, "10.0.0.0/24")
+    space_b, block_b, subnet_b = await _space_block_subnet(db_session, "10.1.0.0/24")
+    raw = await _make_token(
+        db_session,
+        owner,
+        [{"action": "read", "resource_type": "subnet", "resource_id": str(subnet_a.id)}],
+    )
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {raw}"}
+
+    subnets = (await client.get("/api/v1/ipam/subnets", headers=hdr)).json()
+    assert {s["id"] for s in subnets} == {str(subnet_a.id)}
+
+    blocks = (await client.get("/api/v1/ipam/blocks", headers=hdr)).json()
+    assert {b["id"] for b in blocks} == {str(block_a.id)}
+
+    spaces = (await client.get("/api/v1/ipam/spaces", headers=hdr)).json()
+    assert {s["id"] for s in spaces} == {str(space_a.id)}
+
+    # And the other subtree is invisible.
+    assert str(subnet_b.id) not in {s["id"] for s in subnets}
+    assert str(block_b.id) not in {b["id"] for b in blocks}
+    assert str(space_b.id) not in {s["id"] for s in spaces}
+
+
+@pytest.mark.asyncio
+async def test_dns_zone_scoped_token_denied_on_ipam_lists(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # A token scoped to a different resource type (dns_zone) never reaches the
+    # IPAM list handlers at all — the router-level ``require_any_resource_or_scoped``
+    # coarse gate 403s it because none of its grants cover an IPAM resource type.
+    # (Belt to the #523 filter's braces: even the empty-set branch of
+    # ``_token_subnet_scope_uuids`` is unreachable for a dns_zone-only token.)
+    owner, _ = await _make_user(db_session)
+    await _space_block_subnet(db_session, "10.2.0.0/24")
+    raw = await _make_token(
+        db_session,
+        owner,
+        [{"action": "read", "resource_type": "dns_zone", "resource_id": str(uuid.uuid4())}],
+    )
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {raw}"}
+    assert (await client.get("/api/v1/ipam/subnets", headers=hdr)).status_code == 403
+    assert (await client.get("/api/v1/ipam/blocks", headers=hdr)).status_code == 403
+    assert (await client.get("/api/v1/ipam/spaces", headers=hdr)).status_code == 403

@@ -27,6 +27,7 @@ from app.drivers.dhcp.base import (
     PhoneClassDef,
     PoolDef,
     PXEClassDef,
+    RAConfigDef,
     ScopeDef,
     ServerOptionsDef,
     StaticAssignmentDef,
@@ -42,6 +43,8 @@ from app.models.dhcp import (
     DHCPServerGroup,
 )
 from app.models.ipam import Subnet
+from app.services.dhcp.radvd import build_ra_config, render_radvd_conf
+from app.services.feature_modules import is_module_enabled
 
 
 async def _resolve_failover(
@@ -261,6 +264,24 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
     pxe_classes = await _assemble_pxe_classes(db, scope_rows)
     phone_classes = await _assemble_phone_classes(db, scope_rows)
 
+    # IPv6 Router Advertisements (issue #524) — one radvd stanza per
+    # RA-enabled IPv6 subnet in the group. The rendered radvd.conf ships in
+    # the bundle for the DHCP agent to write + run radvd. Gated on the
+    # ``ipv6.router_advertisements`` feature module (non-negotiable #14): when
+    # the operator toggles the module off we ship an empty ra_configs /
+    # radvd_conf so the ETag shifts and the agent stops radvd (feature goes
+    # dormant) rather than continuing to advertise the last-good config.
+    ra_configs: list[RAConfigDef] = []
+    if await is_module_enabled(db, "ipv6.router_advertisements"):
+        for sc in scope_rows:
+            subnet = subnet_map.get(sc.subnet_id)
+            if subnet is None:
+                continue
+            ra = build_ra_config(sc, subnet)
+            if ra is not None:
+                ra_configs.append(ra)
+    radvd_conf = render_radvd_conf(ra_configs)
+
     failover = await _resolve_failover(db, server, group)
     # Issue #365 — Kea socket type. ``direct`` (default) → ``raw`` sockets
     # so Kea hears broadcast DISCOVERs from directly-attached clients;
@@ -282,6 +303,8 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         generated_at=datetime.now(UTC),
         failover=failover,
         dhcp_socket_type=dhcp_socket_type,
+        ra_configs=tuple(ra_configs),
+        radvd_conf=radvd_conf,
     )
     bundle.etag = bundle.compute_etag()
     return bundle

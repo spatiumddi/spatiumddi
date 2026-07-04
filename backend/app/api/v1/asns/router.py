@@ -944,4 +944,332 @@ async def delete_asn_community(community_id: uuid.UUID, db: DB, user: CurrentUse
     await db.commit()
 
 
+# ══════════════════════════════════════════════════════════════════════
+# BGP prefix-hijack monitoring (issue #527)
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TrackedPrefixRead(BaseModel):
+    id: uuid.UUID
+    asn_id: uuid.UUID
+    prefix: str
+    expected_origin_asn: int
+    source: str
+    enabled: bool
+    allowed_origins: list[int]
+    last_seen_origins: list[int] | None
+    last_checked_at: datetime | None
+    next_check_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+    @field_validator("prefix", mode="before")
+    @classmethod
+    def _coerce_prefix(cls, v: Any) -> Any:
+        return str(v) if v is not None else v
+
+
+class TrackedPrefixCreate(BaseModel):
+    prefix: str = Field(..., description="IPv4/IPv6 CIDR to monitor.")
+    enabled: bool = True
+    allowed_origins: list[int] = Field(default_factory=list)
+
+    @field_validator("prefix")
+    @classmethod
+    def _v_prefix(cls, v: str) -> str:
+        import ipaddress as _ip  # noqa: PLC0415
+
+        try:
+            return str(_ip.ip_network(v.strip(), strict=False))
+        except ValueError as exc:
+            raise ValueError(f"invalid prefix: {exc}") from exc
+
+
+class HijackDetectionRead(BaseModel):
+    id: uuid.UUID
+    asn_id: uuid.UUID
+    tracked_prefix_id: uuid.UUID | None
+    tracked_prefix: str
+    observed_prefix: str
+    expected_origin_asn: int
+    observed_origin_asn: int
+    detection_kind: str
+    rpki_status: str
+    severity: str
+    source: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    resolved_at: datetime | None
+    acknowledged: bool
+    detail: dict[str, Any] | None
+    notes: str
+
+    model_config = {"from_attributes": True}
+
+    @field_validator("tracked_prefix", "observed_prefix", mode="before")
+    @classmethod
+    def _coerce_prefix(cls, v: Any) -> Any:
+        return str(v) if v is not None else v
+
+
+@router.get("/bgp/tracked-prefixes", response_model=list[TrackedPrefixRead])
+async def list_tracked_prefixes(
+    db: DB,
+    _: CurrentUser,
+    asn_id: uuid.UUID | None = Query(default=None),
+    enabled: bool | None = Query(default=None),
+) -> list[TrackedPrefixRead]:
+    """List the prefixes SpatiumDDI monitors on the public routing table."""
+    from app.models.bgp_monitor import BGPTrackedPrefix  # noqa: PLC0415
+
+    stmt = select(BGPTrackedPrefix)
+    if asn_id is not None:
+        stmt = stmt.where(BGPTrackedPrefix.asn_id == asn_id)
+    if enabled is not None:
+        stmt = stmt.where(BGPTrackedPrefix.enabled.is_(enabled))
+    stmt = stmt.order_by(BGPTrackedPrefix.prefix)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [TrackedPrefixRead.model_validate(r) for r in rows]
+
+
+@router.post(
+    "/{asn_id:uuid}/bgp/tracked-prefixes",
+    response_model=TrackedPrefixRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_tracked_prefix(
+    asn_id: uuid.UUID, body: TrackedPrefixCreate, db: DB, user: CurrentUser
+) -> TrackedPrefixRead:
+    """Manually add a tracked prefix for an AS (``source="manual"``).
+    Manual rows are never auto-pruned by the reconcile sweep."""
+    from app.models.bgp_monitor import BGPTrackedPrefix  # noqa: PLC0415
+
+    asn = await db.get(ASN, asn_id)
+    if asn is None:
+        raise HTTPException(status_code=404, detail="ASN not found")
+
+    # CIDR equality is dialect-fiddly; compare in Python over this AS's
+    # (bounded) tracked-prefix set.
+    existing_rows = (
+        (await db.execute(select(BGPTrackedPrefix).where(BGPTrackedPrefix.asn_id == asn_id)))
+        .scalars()
+        .all()
+    )
+    if any(str(r.prefix) == body.prefix for r in existing_rows):
+        raise HTTPException(status_code=409, detail="prefix already tracked for this ASN")
+
+    row = BGPTrackedPrefix(
+        asn_id=asn_id,
+        prefix=body.prefix,
+        expected_origin_asn=int(asn.number),
+        source="manual",
+        enabled=body.enabled,
+        allowed_origins=[int(o) for o in body.allowed_origins],
+    )
+    db.add(row)
+    await db.flush()
+    write_audit(
+        db,
+        user=user,
+        action="create",
+        resource_type="bgp_tracked_prefix",
+        resource_id=str(row.id),
+        resource_display=f"AS{asn.number} {body.prefix}",
+        new_value={"prefix": body.prefix, "source": "manual"},
+    )
+    await db.commit()
+    await db.refresh(row)
+    return TrackedPrefixRead.model_validate(row)
+
+
+@router.delete("/bgp/tracked-prefixes/{prefix_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_tracked_prefix(prefix_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
+    from app.models.bgp_monitor import BGPTrackedPrefix  # noqa: PLC0415
+
+    row = await db.get(BGPTrackedPrefix, prefix_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="tracked prefix not found")
+    display = str(row.prefix)
+    await db.delete(row)
+    write_audit(
+        db,
+        user=user,
+        action="delete",
+        resource_type="bgp_tracked_prefix",
+        resource_id=str(prefix_id),
+        resource_display=display,
+    )
+    await db.commit()
+
+
+@router.get("/bgp/hijacks", response_model=list[HijackDetectionRead])
+async def list_bgp_hijacks(
+    db: DB,
+    _: CurrentUser,
+    asn_id: uuid.UUID | None = Query(default=None),
+    detection_kind: str | None = Query(default=None),
+    active_only: bool = Query(default=True),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> list[HijackDetectionRead]:
+    """List prefix-hijack detections, newest first."""
+    from app.models.bgp_monitor import BGPHijackDetection  # noqa: PLC0415
+
+    stmt = select(BGPHijackDetection)
+    if asn_id is not None:
+        stmt = stmt.where(BGPHijackDetection.asn_id == asn_id)
+    if detection_kind is not None:
+        stmt = stmt.where(BGPHijackDetection.detection_kind == detection_kind)
+    if active_only:
+        stmt = stmt.where(BGPHijackDetection.resolved_at.is_(None))
+    stmt = stmt.order_by(BGPHijackDetection.last_seen_at.desc()).limit(limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [HijackDetectionRead.model_validate(r) for r in rows]
+
+
+@router.post("/bgp/hijacks/{detection_id:uuid}/acknowledge", response_model=HijackDetectionRead)
+async def acknowledge_bgp_hijack(
+    detection_id: uuid.UUID, db: DB, user: CurrentUser
+) -> HijackDetectionRead:
+    """Acknowledge a detection — suppresses the alert (the matcher skips
+    acknowledged rows) without waiting for the announcement to delist."""
+    from app.models.bgp_monitor import BGPHijackDetection  # noqa: PLC0415
+
+    row = await db.get(BGPHijackDetection, detection_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="detection not found")
+    row.acknowledged = True
+    write_audit(
+        db,
+        user=user,
+        action="acknowledge",
+        resource_type="bgp_hijack_detection",
+        resource_id=str(detection_id),
+        resource_display=f"{row.observed_prefix} ← AS{row.observed_origin_asn}",
+    )
+    await db.commit()
+    await db.refresh(row)
+    return HijackDetectionRead.model_validate(row)
+
+
+@router.post(
+    "/bgp/hijacks/{detection_id:uuid}/allowlist-origin", response_model=HijackDetectionRead
+)
+async def allowlist_bgp_hijack_origin(
+    detection_id: uuid.UUID, db: DB, user: CurrentUser
+) -> HijackDetectionRead:
+    """Mark the observed origin as an EXPECTED additional origin for the
+    tracked prefix (intentional multi-origin / anycast / scrubbing) —
+    appends it to the tracked prefix's ``allowed_origins`` so future
+    announcements from that origin don't fire, and acknowledges this
+    detection."""
+    from app.models.bgp_monitor import BGPHijackDetection, BGPTrackedPrefix  # noqa: PLC0415
+
+    row = await db.get(BGPHijackDetection, detection_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="detection not found")
+
+    if row.tracked_prefix_id is not None:
+        tracked = await db.get(BGPTrackedPrefix, row.tracked_prefix_id)
+        if tracked is not None:
+            allowed = list(tracked.allowed_origins or [])
+            if int(row.observed_origin_asn) not in allowed:
+                allowed.append(int(row.observed_origin_asn))
+                tracked.allowed_origins = allowed
+    row.acknowledged = True
+    write_audit(
+        db,
+        user=user,
+        action="allowlist_origin",
+        resource_type="bgp_hijack_detection",
+        resource_id=str(detection_id),
+        resource_display=f"{row.observed_prefix} ← AS{row.observed_origin_asn}",
+        new_value={"allowlisted_origin": int(row.observed_origin_asn)},
+    )
+    await db.commit()
+    await db.refresh(row)
+    return HijackDetectionRead.model_validate(row)
+
+
+class RefreshBgpResult(BaseModel):
+    asn_id: uuid.UUID
+    asn_number: int
+    prefixes_added: int
+    prefixes_evaluated: int
+    detections_opened: int
+    detections_resolved: int
+
+
+@router.post("/{asn_id:uuid}/refresh-bgp", response_model=RefreshBgpResult)
+async def refresh_asn_bgp(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> RefreshBgpResult:
+    """Synchronous "Check BGP now" for one AS — reconciles tracked
+    prefixes then evaluates every enabled one against the live routing
+    table. Same detection state machine as the scheduled poll; driven by
+    an operator click. Returns 400 for private ASNs (no public routing
+    presence to check)."""
+    from datetime import UTC as _UTC  # noqa: PLC0415
+    from datetime import datetime as _dt  # noqa: PLC0415
+
+    from app.models.bgp_monitor import BGPTrackedPrefix  # noqa: PLC0415
+    from app.services.bgp.hijack_monitor import (  # noqa: PLC0415
+        evaluate_tracked_prefix,
+        refresh_tracked_prefixes_for_asn,
+        resolve_stale_detections,
+    )
+
+    asn = await db.get(ASN, asn_id)
+    if asn is None:
+        raise HTTPException(status_code=404, detail="ASN not found")
+    if asn.kind == "private":
+        raise HTTPException(status_code=400, detail="private ASN — no public routing presence")
+
+    now = _dt.now(_UTC)
+    added = await refresh_tracked_prefixes_for_asn(db, asn, now=now)
+    await db.flush()
+
+    rows = (
+        (
+            await db.execute(
+                select(BGPTrackedPrefix).where(
+                    BGPTrackedPrefix.asn_id == asn_id,
+                    BGPTrackedPrefix.enabled.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    evaluated = 0
+    opened = 0
+    for tracked in rows:
+        summary = await evaluate_tracked_prefix(db, tracked, now=now)
+        evaluated += 1
+        opened += summary["opened"]
+        tracked.next_check_at = now
+    resolved = await resolve_stale_detections(db, asn_id=asn_id, now=now)
+
+    write_audit(
+        db,
+        user=user,
+        action="refresh_bgp",
+        resource_type="asn",
+        resource_id=str(asn_id),
+        resource_display=f"AS{asn.number}",
+        new_value={
+            "prefixes_added": added,
+            "prefixes_evaluated": evaluated,
+            "detections_opened": opened,
+            "detections_resolved": resolved,
+        },
+    )
+    await db.commit()
+    return RefreshBgpResult(
+        asn_id=asn_id,
+        asn_number=int(asn.number),
+        prefixes_added=added,
+        prefixes_evaluated=evaluated,
+        detections_opened=opened,
+        detections_resolved=resolved,
+    )
+
+
 __all__ = ["router"]

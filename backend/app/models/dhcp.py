@@ -335,6 +335,55 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
 
+    # ── IPv6 Router Advertisement management (issue #524) ───────────
+    # Opt-in per IPv6 scope. When ``ra_enabled`` is on, the DHCP
+    # ConfigBundle carries a rendered radvd.conf stanza for this
+    # subnet so the DHCP agent can run radvd and actually emit RAs
+    # (previously ``ra_managed_flag`` / ``ra_other_flag`` were pure
+    # "set this upstream" intent). v4 scopes ignore all of these.
+    #
+    # M/O flags: by default derived from ``v6_address_mode``
+    # (stateful → M=1,O=1 / stateless → M=0,O=1 / slaac → M=0,O=0).
+    # Set ``ra_mo_override`` to use ``ra_managed_flag`` /
+    # ``ra_other_flag`` literally instead.
+    ra_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    ra_mo_override: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    # AdvDefaultLifetime — how long clients treat this router as a
+    # default gateway (seconds). 0 disables the router as a default
+    # route (prefix-only RA). Default 1800 (radvd default).
+    ra_router_lifetime: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1800, server_default=sa_text("1800")
+    )
+    # Max interval between unsolicited RAs (AdvMaxInterval, seconds).
+    ra_max_interval: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=600, server_default=sa_text("600")
+    )
+    # Advertised prefix lifetimes (seconds).
+    ra_prefix_valid_lifetime: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=86400, server_default=sa_text("86400")
+    )
+    ra_prefix_preferred_lifetime: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=14400, server_default=sa_text("14400")
+    )
+    # Per-prefix flags (AdvOnLink / AdvAutonomous). Autonomous=on lets
+    # hosts SLAAC an address from the prefix; turn it off for a
+    # DHCPv6-stateful-only subnet.
+    ra_prefix_on_link: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+    ra_prefix_autonomous: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+    # Host interface radvd advertises on. Empty = the agent's
+    # ``RADVD_DEFAULT_IFACE`` env default (single-NIC common case).
+    ra_interface: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=""
+    )
+
     lease_time: Mapped[int] = mapped_column(Integer, nullable=False, default=86400)
     min_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -969,6 +1018,94 @@ class DHCPResponderAllowlist(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+class RAObservedRouter(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """An IPv6 router observed emitting a Router Advertisement (issue #524).
+
+    The IPv6 twin of :class:`DHCPObservedResponder`. The DHCP agent's opt-in
+    passive RA sniffer (ICMPv6 type 134) ships every RA it sees; the control
+    plane upserts one row per ``(group, source_ip)`` and classifies it.
+    ``classification`` ∈ ``expected`` (source is on the router allowlist) /
+    ``acknowledged`` (operator allowlisted it after the fact) / ``rogue``
+    (unknown router — the ``rogue_ra`` alert fires on these).
+    """
+
+    __tablename__ = "ra_observed_router"
+    # RAs are sourced from a router's link-local (fe80::) address, unique only
+    # per-link — routers commonly share fe80::1 across segments. Keying identity
+    # on ``source_ip`` alone would let an allowlisted fe80::1 on segment A mask a
+    # genuine rogue fe80::1 (different physical router / MAC) on segment B. So
+    # ``source_mac`` is part of the identity: two physically distinct routers
+    # sharing a link-local IP get distinct rows. A NULL source_mac observation
+    # is its own bucket (Postgres treats NULLs as distinct in a UNIQUE index, so
+    # the upsert lookup in ra_detection handles NULL explicitly).
+    __table_args__ = (
+        UniqueConstraint("group_id", "source_ip", "source_mac", name="uq_ra_observed_group_ip_mac"),
+        Index("ix_ra_observed_router_group", "group_id"),
+        Index("ix_ra_observed_router_last_seen", "last_seen_at"),
+    )
+
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    reported_by_server_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Link-local (usually fe80::…) source of the RA.
+    source_ip: Mapped[str] = mapped_column(INET, nullable=False)
+    source_mac: Mapped[str | None] = mapped_column(MACADDR, nullable=True)
+    # Advertised prefixes (list of CIDR strings) + the M/O flags + router
+    # lifetime observed on the wire.
+    prefixes: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    managed_flag: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    other_flag: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    router_lifetime: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    iface: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # expected | acknowledged | rogue
+    classification: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="rogue", server_default="rogue"
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=sa_text("now()")
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=sa_text("now()")
+    )
+
+
+class RARouterAllowlist(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """An operator-approved IPv6 RA source router (issue #524).
+
+    Suppresses the rogue classification for a known upstream router. A row
+    matches an observed RA when its ``source_ip`` OR ``source_mac`` equals an
+    allowlist entry in the same group.
+    """
+
+    __tablename__ = "ra_router_allowlist"
+    __table_args__ = (Index("ix_ra_router_allowlist_group", "group_id"),)
+
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
+    source_mac: Mapped[str | None] = mapped_column(MACADDR, nullable=True)
+    note: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+
+
 __all__ = [
     "DHCPServerGroup",
     "DHCPServer",
@@ -988,4 +1125,6 @@ __all__ = [
     "DHCPLeaseHistory",
     "DHCPObservedResponder",
     "DHCPResponderAllowlist",
+    "RAObservedRouter",
+    "RARouterAllowlist",
 ]

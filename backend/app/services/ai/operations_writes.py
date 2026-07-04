@@ -1727,3 +1727,81 @@ register(
         category="ipam",
     )
 )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BGP prefix-hijack — allowlist an expected additional origin (#527)
+# ══════════════════════════════════════════════════════════════════════
+
+
+class AllowlistBgpOriginArgs(BaseModel):
+    detection_id: uuid.UUID
+
+
+async def _preview_allowlist_bgp_origin(
+    db: AsyncSession, user: User, args: AllowlistBgpOriginArgs
+) -> PreviewResult:
+    from app.models.bgp_monitor import BGPHijackDetection  # noqa: PLC0415
+
+    row = await db.get(BGPHijackDetection, args.detection_id)
+    if row is None:
+        return PreviewResult(ok=False, detail="detection not found")
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Allowlist AS{row.observed_origin_asn} as an expected origin for "
+            f"tracked prefix {row.tracked_prefix} (observed announcing "
+            f"{row.observed_prefix}) and acknowledge this detection. Future "
+            f"announcements from AS{row.observed_origin_asn} will no longer fire."
+        ),
+    )
+
+
+async def _apply_allowlist_bgp_origin(
+    db: AsyncSession, user: User, args: AllowlistBgpOriginArgs
+) -> dict[str, Any]:
+    from app.models.bgp_monitor import (  # noqa: PLC0415
+        BGPHijackDetection,
+        BGPTrackedPrefix,
+    )
+
+    row = await db.get(BGPHijackDetection, args.detection_id)
+    if row is None:
+        raise ValueError("detection not found")
+    if row.tracked_prefix_id is not None:
+        tracked = await db.get(BGPTrackedPrefix, row.tracked_prefix_id)
+        if tracked is not None:
+            allowed = list(tracked.allowed_origins or [])
+            if int(row.observed_origin_asn) not in allowed:
+                allowed.append(int(row.observed_origin_asn))
+                tracked.allowed_origins = allowed
+    row.acknowledged = True
+    write_audit(
+        db,
+        user=user,
+        action="allowlist_origin",
+        resource_type="bgp_hijack_detection",
+        resource_id=str(row.id),
+        resource_display=f"{row.observed_prefix} <- AS{row.observed_origin_asn}",
+        new_value={"via": "ai_proposal", "allowlisted_origin": int(row.observed_origin_asn)},
+    )
+    await db.commit()
+    return {
+        "id": str(row.id),
+        "allowlisted_origin": int(row.observed_origin_asn),
+        "acknowledged": True,
+    }
+
+
+register(
+    Operation(
+        name="allowlist_bgp_origin",
+        description="Allowlist an expected additional origin AS for a tracked prefix (#527).",
+        args_model=AllowlistBgpOriginArgs,
+        preview=_preview_allowlist_bgp_origin,
+        apply=_apply_allowlist_bgp_origin,
+        category="network",
+        required_permission=("write", "manage_asns"),
+    )
+)

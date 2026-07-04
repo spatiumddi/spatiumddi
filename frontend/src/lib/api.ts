@@ -4532,6 +4532,10 @@ export interface DNSPoolMember {
   address: string;
   weight: number;
   enabled: boolean;
+  // Geo / topology-aware steering scope (issue #530). Empty CIDRs + null
+  // site ⇒ default target served to everyone.
+  serving_cidrs: string[];
+  site_id: string | null;
   last_check_state: "unknown" | "healthy" | "unhealthy";
   last_check_at: string | null;
   last_check_error: string | null;
@@ -4545,6 +4549,8 @@ export interface DNSPoolMemberWrite {
   address: string;
   weight?: number;
   enabled?: boolean;
+  serving_cidrs?: string[];
+  site_id?: string | null;
 }
 
 export interface DNSPool {
@@ -5183,7 +5189,15 @@ export const dnsApi = {
       .then((r) => r.data),
   updatePoolMember: (
     memberId: string,
-    data: { address?: string; weight?: number; enabled?: boolean },
+    data: {
+      address?: string;
+      weight?: number;
+      enabled?: boolean;
+      // Geo / topology-aware steering scope (issue #530). `[]` clears
+      // the CIDR list; `null` clears the Site link.
+      serving_cidrs?: string[];
+      site_id?: string | null;
+    },
   ) =>
     api
       .put<DNSPoolMember>(`/dns/pool-members/${memberId}`, data)
@@ -6582,6 +6596,19 @@ export interface DHCPScope {
   v6_address_mode?: "stateful" | "stateless" | "slaac";
   ra_managed_flag?: boolean;
   ra_other_flag?: boolean;
+  // IPv6 Router Advertisement management (issue #524). When ra_enabled,
+  // the DHCP ConfigBundle carries a rendered radvd.conf so the agent runs
+  // radvd and actually emits RAs. M/O flags default-derived from
+  // v6_address_mode unless ra_mo_override uses ra_managed_flag/ra_other_flag.
+  ra_enabled?: boolean;
+  ra_mo_override?: boolean;
+  ra_router_lifetime?: number;
+  ra_max_interval?: number;
+  ra_prefix_valid_lifetime?: number;
+  ra_prefix_preferred_lifetime?: number;
+  ra_prefix_on_link?: boolean;
+  ra_prefix_autonomous?: boolean;
+  ra_interface?: string;
   // DHCP relay-agent (giaddr) IPs (issue #337). When non-empty, Kea
   // renders relay.ip-addresses on the subnet so a centralized server
   // selects this scope for relayed traffic from a remote, non-attached
@@ -6946,6 +6973,38 @@ export const dhcpApi = {
       )
       .then((r) => r.data),
 
+  // IPv6 Router Advertisements + rogue-RA (#524).
+  raConfigPreview: (groupId: string) =>
+    api
+      .get<RAConfigPreview>(`/dhcp/ra/groups/${groupId}/ra-config`)
+      .then((r) => r.data),
+  listObservedRARouters: (groupId: string, classification?: string) =>
+    api
+      .get<RAObservedRouter[]>(`/dhcp/ra/groups/${groupId}/observed-routers`, {
+        params: classification ? { classification } : undefined,
+      })
+      .then((r) => r.data),
+  acknowledgeRARouter: (groupId: string, routerId: string, note = "") =>
+    api
+      .post<RAObservedRouter>(
+        `/dhcp/ra/groups/${groupId}/observed-routers/${routerId}/acknowledge`,
+        { note },
+      )
+      .then((r) => r.data),
+  listRAAllowlist: (groupId: string) =>
+    api
+      .get<RARouterAllowlist[]>(`/dhcp/ra/groups/${groupId}/ra-allowlist`)
+      .then((r) => r.data),
+  createRAAllowlist: (
+    groupId: string,
+    body: { source_ip?: string; source_mac?: string; note?: string },
+  ) =>
+    api
+      .post<RARouterAllowlist>(`/dhcp/ra/groups/${groupId}/ra-allowlist`, body)
+      .then((r) => r.data),
+  deleteRAAllowlist: (groupId: string, entryId: string) =>
+    api.delete(`/dhcp/ra/groups/${groupId}/ra-allowlist/${entryId}`),
+
   listStatics: (scopeId: string, params?: { tag?: string[] }) =>
     api
       .get<DHCPStaticAssignment[]>(`/dhcp/scopes/${scopeId}/statics`, {
@@ -7274,6 +7333,54 @@ export interface DHCPObservedResponder {
   classification: string; // "expected" | "acknowledged" | "rogue"
   first_seen_at: string;
   last_seen_at: string;
+}
+
+/** An IPv6 router observed emitting a Router Advertisement (#524). */
+export interface RAObservedRouter {
+  id: string;
+  group_id: string;
+  source_ip: string;
+  source_mac: string | null;
+  prefixes: string[];
+  managed_flag: boolean;
+  other_flag: boolean;
+  router_lifetime: number | null;
+  iface: string | null;
+  classification: string; // "expected" | "acknowledged" | "rogue"
+  first_seen_at: string;
+  last_seen_at: string;
+}
+
+/** An operator-approved expected RA source router (#524). */
+export interface RARouterAllowlist {
+  id: string;
+  group_id: string;
+  source_ip: string | null;
+  source_mac: string | null;
+  note: string;
+}
+
+/** One RA-enabled scope's resolved radvd config (#524). */
+export interface RAScopeConfig {
+  scope_id: string;
+  subnet_id: string;
+  subnet_cidr: string;
+  interface: string;
+  managed_flag: boolean;
+  other_flag: boolean;
+  router_lifetime: number;
+  prefix_valid_lifetime: number;
+  prefix_preferred_lifetime: number;
+  prefix_on_link: boolean;
+  prefix_autonomous: boolean;
+  rdnss: string[];
+  dnssl: string[];
+}
+
+export interface RAConfigPreview {
+  group_id: string;
+  scopes: RAScopeConfig[];
+  radvd_conf: string;
 }
 
 export interface DHCPClientClass {
@@ -12809,6 +12916,54 @@ export interface BGPPeeringUpdate {
   description?: string;
 }
 
+// ── BGP prefix-hijack monitoring (issue #527) ──────────────────────
+export type BGPTrackedPrefixSource = "roa" | "announced" | "both" | "manual";
+
+export interface BGPTrackedPrefix {
+  id: string;
+  asn_id: string;
+  prefix: string;
+  expected_origin_asn: number;
+  source: BGPTrackedPrefixSource;
+  enabled: boolean;
+  allowed_origins: number[];
+  last_seen_origins: number[] | null;
+  last_checked_at: string | null;
+  next_check_at: string | null;
+}
+
+export type BGPHijackKind = "prefix_hijack" | "more_specific";
+export type BGPHijackRpkiStatus = "invalid" | "unknown" | "valid";
+
+export interface BGPHijackDetection {
+  id: string;
+  asn_id: string;
+  tracked_prefix_id: string | null;
+  tracked_prefix: string;
+  observed_prefix: string;
+  expected_origin_asn: number;
+  observed_origin_asn: number;
+  detection_kind: BGPHijackKind;
+  rpki_status: BGPHijackRpkiStatus;
+  severity: AlertSeverity;
+  source: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  resolved_at: string | null;
+  acknowledged: boolean;
+  detail: Record<string, unknown> | null;
+  notes: string;
+}
+
+export interface BGPRefreshResult {
+  asn_id: string;
+  asn_number: number;
+  prefixes_added: number;
+  prefixes_evaluated: number;
+  detections_opened: number;
+  detections_resolved: number;
+}
+
 export const asnsApi = {
   list: (params?: ASNListQuery) =>
     api.get<ASNListResponse>("/asns", { params }).then((r) => r.data),
@@ -12864,6 +13019,42 @@ export const asnsApi = {
       .patch<BGPCommunity>(`/asns/communities/${id}`, data)
       .then((r) => r.data),
   deleteCommunity: (id: string) => api.delete(`/asns/communities/${id}`),
+
+  // BGP prefix-hijack monitoring (issue #527).
+  listTrackedPrefixes: (params?: { asn_id?: string; enabled?: boolean }) =>
+    api
+      .get<BGPTrackedPrefix[]>("/asns/bgp/tracked-prefixes", { params })
+      .then((r) => r.data),
+  createTrackedPrefix: (
+    asnId: string,
+    data: { prefix: string; enabled?: boolean; allowed_origins?: number[] },
+  ) =>
+    api
+      .post<BGPTrackedPrefix>(`/asns/${asnId}/bgp/tracked-prefixes`, data)
+      .then((r) => r.data),
+  deleteTrackedPrefix: (prefixId: string) =>
+    api.delete(`/asns/bgp/tracked-prefixes/${prefixId}`),
+  listHijacks: (params?: {
+    asn_id?: string;
+    detection_kind?: BGPHijackKind;
+    active_only?: boolean;
+    limit?: number;
+  }) =>
+    api
+      .get<BGPHijackDetection[]>("/asns/bgp/hijacks", { params })
+      .then((r) => r.data),
+  acknowledgeHijack: (detectionId: string) =>
+    api
+      .post<BGPHijackDetection>(`/asns/bgp/hijacks/${detectionId}/acknowledge`)
+      .then((r) => r.data),
+  allowlistHijackOrigin: (detectionId: string) =>
+    api
+      .post<BGPHijackDetection>(
+        `/asns/bgp/hijacks/${detectionId}/allowlist-origin`,
+      )
+      .then((r) => r.data),
+  refreshBgp: (id: string) =>
+    api.post<BGPRefreshResult>(`/asns/${id}/refresh-bgp`).then((r) => r.data),
 };
 
 // ── BGP communities ────────────────────────────────────────────────
@@ -13477,6 +13668,124 @@ export const tlsCertsApi = {
       .then((r) => r.data),
   probeNow: (id: string) =>
     api.post<TLSCertTarget>(`/tls-certs/${id}/probe`).then((r) => r.data),
+};
+
+// ── DNSBL / RBL reputation monitoring (issue #528) ────────────────
+//
+// Curated blocklist catalog (per-list enable + custom lists), pinned IPs,
+// blocklisted-IP overview, on-demand per-IP check, and the master sweep
+// settings. Distinct from `dnsBlocklistApi` above (DNS *domain* blocklists).
+
+export interface DNSBLList {
+  id: string;
+  name: string;
+  zone_suffix: string;
+  category: string;
+  description: string;
+  homepage_url: string | null;
+  enabled: boolean;
+  return_codes: Record<string, string>;
+  requires_registration: boolean;
+  qps_note: string;
+  is_builtin: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DNSBLPinnedIP {
+  id: string;
+  ip: string;
+  note: string;
+  ip_address_id: string | null;
+  created_at: string;
+}
+
+export interface DNSBLListingItem {
+  id: string;
+  ip: string;
+  list_id: string;
+  list_name: string | null;
+  listed: boolean;
+  source: string;
+  return_codes: string[];
+  txt_reason: string | null;
+  check_error: string | null;
+  first_listed_at: string | null;
+  last_checked_at: string | null;
+  resolved_at: string | null;
+}
+
+export interface DNSBLListingList {
+  items: DNSBLListingItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface DNSBLByIPEntry {
+  list_id: string;
+  list_name: string;
+  zone_suffix: string;
+  listed: boolean;
+  checked: boolean;
+  return_codes: string[];
+  txt_reason: string | null;
+  check_error: string | null;
+  first_listed_at: string | null;
+  last_checked_at: string | null;
+}
+
+export interface DNSBLByIP {
+  ip: string;
+  listed_count: number;
+  entries: DNSBLByIPEntry[];
+}
+
+export interface DNSBLSettings {
+  dnsbl_monitoring_enabled: boolean;
+  dnsbl_check_interval_hours: number;
+  dnsbl_query_resolvers: string[] | null;
+  dnsbl_sweep_last_run_at: string | null;
+}
+
+export const dnsblApi = {
+  listLists: () => api.get<DNSBLList[]>("/dnsbl/lists").then((r) => r.data),
+  createList: (data: Partial<DNSBLList>) =>
+    api.post<DNSBLList>("/dnsbl/lists", data).then((r) => r.data),
+  updateList: (id: string, data: Partial<DNSBLList>) =>
+    api.put<DNSBLList>(`/dnsbl/lists/${id}`, data).then((r) => r.data),
+  deleteList: (id: string) => api.delete(`/dnsbl/lists/${id}`),
+  listPinned: () =>
+    api.get<DNSBLPinnedIP[]>("/dnsbl/pinned").then((r) => r.data),
+  addPinned: (data: { ip: string; note?: string }) =>
+    api.post<DNSBLPinnedIP>("/dnsbl/pinned", data).then((r) => r.data),
+  deletePinned: (id: string) => api.delete(`/dnsbl/pinned/${id}`),
+  listListings: (params?: {
+    listed_only?: boolean;
+    list_id?: string;
+    source?: string;
+    search?: string;
+    limit?: number;
+    offset?: number;
+  }) =>
+    api
+      .get<DNSBLListingList>("/dnsbl/listings", { params })
+      .then((r) => r.data),
+  byIp: (ip: string) =>
+    api.get<DNSBLByIP>(`/dnsbl/listings/by-ip/${ip}`).then((r) => r.data),
+  checkNow: (ip: string) =>
+    api
+      .post<{
+        ip: string;
+        checked: number;
+        listed: number;
+        source?: string;
+      }>("/dnsbl/check", { ip })
+      .then((r) => r.data),
+  getSettings: () =>
+    api.get<DNSBLSettings>("/dnsbl/settings").then((r) => r.data),
+  updateSettings: (data: Partial<DNSBLSettings>) =>
+    api.put<DNSBLSettings>("/dnsbl/settings", data).then((r) => r.data),
 };
 
 // ── Multicast groups (issue #126 Phase 1) ─────────────────────────

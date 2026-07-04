@@ -927,3 +927,121 @@ split: each address that lands in a split-horizon subnet emits one
 record per zone that survives the override filter. DDNS for DHCP
 leases follows the same path.
 
+
+## 17. GSLB pools (health-checked) + geo / topology-aware steering (issue #530)
+
+DNS **pools** (GSLB-lite) map one DNS name (e.g. `www` →
+`www.example.com`) to a set of A / AAAA target IPs and flip each
+target in / out of the served record set based on a periodic health
+check. Members render as regular `DNSRecord` rows (one per healthy +
+enabled member, carrying `pool_member_id`) so BIND9 / PowerDNS /
+Windows DNS render unchanged. Config lives on `DNSPool` +
+`DNSPoolMember`; the reconciler is `app.services.dns.pool_apply`.
+
+> **This is not a load balancer.** DNS is cached client-side, so a
+> member dropping out doesn't take effect until the pool `ttl`
+> expires — clients may keep hitting a dead / distant box for up to
+> `ttl` seconds. Keep the TTL short (default 30 s). See the
+> **TTL-race caveat** below.
+
+### 17.1 Serving scope — steering one name to the nearest datacenter
+
+By default every client gets the same healthy rrset. **Geo steering**
+(issue #530) adds client-location awareness so one name resolves to
+the nearest datacenter. Each pool member carries an optional
+**serving scope**:
+
+* `serving_cidrs` — a JSONB list of client CIDRs (`203.0.113.0/24`,
+  `10.1.0.0/16`, …).
+* `site_id` — an optional FK to a Network → **Site**. The site's
+  linked subnets (`subnet.site_id`) contribute their CIDRs to the
+  member's scope. `ON DELETE SET NULL` — deleting the Site just drops
+  the association.
+
+The two sources are **UNIONed**. A member with an empty scope
+(`serving_cidrs == []` and `site_id IS NULL`) is a **default** target
+served to everyone (the historical behaviour). A member with a scope
+is served **only** to clients whose resolver source IP falls inside
+that scope.
+
+Result: a client from CIDR X resolves to `{geo members scoped to X} ∪
+{default members}`; a client matching no geo scope resolves to
+`{default members}`. Health-check gating composes cleanly — an
+unhealthy member is never advertised regardless of scope.
+
+**No-blackhole guarantee.** A pool where *every* member is geo-scoped
+(the "each site serves its own region, no global fallback" config) has
+no default members, so a client matching no geo CIDR would otherwise get
+NODATA for a name that has healthy targets. To prevent that, an all-geo
+pool's members are also served as a **union fallback** into the non-geo
+views (operator views + the `spatium-geo-default` catch-all) — so an
+unmatched client resolves to the union of all healthy members instead of
+an empty rrset. A pool that has at least one default member keeps the
+strict behaviour (geo members only in their geo view).
+
+### 17.2 Rendering — synthesized BIND9 geo views
+
+The mechanism is a BIND9 `view { match-clients … }` block: a "geo
+view" == a view with a client-subnet match list. At ConfigBundle-build
+time (`app.services.dns.pool_geo`) the control plane:
+
+1. resolves each member's scope, groups members by distinct scope, and
+   synthesizes one geo view per scope (`spatium-geo-1 …
+   spatium-geo-N`, `match-clients` = the scope's CIDRs), ordered
+   **before** any operator-defined split-horizon views (§2). BIND
+   evaluates `view` blocks top-to-bottom, first-match-wins, so a
+   geo-CIDR client must reach its geo view *before* a broad operator
+   view (an `internal` view matching `10.0.0.0/8`, or any `any`/empty
+   match) swallows the query and strips the geo member. Geo scopes are
+   the more-specific match, so geo-first is most-specific-first in the
+   common case (caveat: a narrow operator view — e.g. a `/32` mgmt host
+   — that a broader geo view would shadow; split the geo scope if that
+   bites);
+2. appends a catch-all `spatium-geo-default` view (`match-clients {
+   any; }`) **last**, so a client matching no specific geo view *and*
+   no operator view still resolves;
+3. scopes each geo-member's record into its own geo view, while
+   default members (and every non-pool record) render as **shared**
+   records visible in every view — reusing the same per-view record
+   routing as the split-horizon path (`DNSRecord.view_id IS NULL` =
+   shared). An all-geo pool's members are additionally rendered into
+   the non-geo views as the no-blackhole union fallback (§17.1).
+
+No `DNSView` / `DNSAcl` rows are persisted — geo views are a pure
+render-time concern, kept out of the operator-managed split-horizon
+view catalog so the two features don't collide in the admin UI. Geo
+steering forces views mode on even for a group with no operator views;
+the incremental RFC 2136 path can't target a view, so with geo active
+the whole group re-renders view-correctly on each change (same as
+split-horizon).
+
+The Pools tab member editor exposes both scope inputs (client CIDRs +
+Site picker) per member; scoped members show a `geo` chip. The
+`list_dns_pools` MCP tool surfaces `serving_cidrs` + `site_id` on each
+member so the Operator Copilot can answer "which datacenter does the
+EU client get for www?".
+
+### 17.3 Source-IP semantics (v1) and the ECS stretch goal
+
+v1 keys purely on the **resolver source IP** — the address BIND sees
+the query arriving from. When a recursive resolver sits between the
+end client and the authoritative server (the common public-internet
+case), that source IP is the *resolver's*, not the end client's, so
+steering follows the resolver's location.
+
+**EDNS Client Subnet (ECS, RFC 7871) is the future accuracy
+improvement** and is deliberately **not implemented** in v1: it
+carries a prefix of the real client's address so the authoritative
+server can steer on the client rather than the resolver. Wiring it
+needs `match-clients` driven off the ECS option rather than the
+TCP/UDP source address, and is tracked as a stretch goal.
+
+### 17.4 TTL-race caveat
+
+As with all DNS-based steering, geo steering is subject to the pool
+TTL cache window: a client that already cached an answer keeps using
+it until the TTL expires, even after it crosses into a different geo
+scope (e.g. a roaming laptop that moves between sites). Keep the pool
+TTL short. This is the same caveat as the base pool feature — DNS
+steering is a coarse, cache-bounded mechanism, not a per-request load
+balancer.

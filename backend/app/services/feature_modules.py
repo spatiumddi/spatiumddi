@@ -131,6 +131,18 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Network",
         description="Named IP ranges within a subnet carrying their own RBAC scope, so edit of a slice (e.g. .50–.99) can be delegated without subnet-wide write.",
     ),
+    # IPv6 Router Advertisements — radvd management + rogue-RA detection
+    # (issue #524). Default-enabled for discovery: the per-scope RA config
+    # editor + the observed-router view appear. Emitting RAs still requires
+    # the operator to opt a scope in (ra_enabled) AND run radvd on the agent
+    # (RADVD_MANAGED=1); the passive rogue-RA sniffer is separately gated on
+    # DHCP_RA_SNIFFER_ENABLED + CAP_NET_RAW.
+    ModuleSpec(
+        id="ipv6.router_advertisements",
+        label="IPv6 Router Advertisements",
+        group="Network",
+        description="Manage IPv6 Router Advertisements (radvd) per subnet — M/O flags derived from the DHCPv6 mode, RDNSS/DNSSL from DNS settings, prefix + router lifetimes — plus passive rogue-RA detection with an expected-router allowlist and a rogue_ra alert. Discovery toggle only; emitting RAs needs a per-scope opt-in and radvd on the DHCP agent, and the sniffer needs DHCP_RA_SNIFFER_ENABLED.",
+    ),
     # AI — operator copilot, gated as a whole.
     ModuleSpec(
         id="ai.copilot",
@@ -336,6 +348,17 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Security",
         description="Alert the moment a previously-unseen MAC address appears on the network (arpwatch-style), across DHCP leases, SNMP ARP/FDB, and an opt-in L2 sniffer. Maintain an allowlist of trusted MACs (or OUI prefixes for VMs/containers), acknowledge or block from a review queue, and fire a real-time device.first_seen event. Default-off: enable, run a baseline import to mark the existing fleet as known, then arm.",
         default_enabled=False,
+    ),
+    # Security — DNSBL / RBL reputation monitoring (#528). Default-ENABLED
+    # as a DISCOVERY toggle: the catalog + settings UI are visible so
+    # operators find the feature, but the module makes ZERO off-prem DNS
+    # queries until the operator flips the master ``dnsbl_monitoring_enabled``
+    # sweep switch AND enables at least one blocklist.
+    ModuleSpec(
+        id="security.dnsbl",
+        label="DNSBL / RBL reputation monitoring",
+        group="Security",
+        description="Check every public-facing IP SpatiumDDI knows (public IPAM addresses, internet-facing subnets, NAT/PAT egress addresses, and operator-pinned IPs) against the major DNS blocklists (Spamhaus ZEN, Barracuda, SpamCop, SORBS, …) on a daily reversed-octet sweep — catching mail-deliverability / reputation problems before users report them. Discovery toggle only: no external DNS queries run until you enable the sweep (Settings → dnsbl_monitoring_enabled) and turn on at least one list.",
     ),
 )
 

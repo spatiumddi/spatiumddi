@@ -156,6 +156,17 @@ The driver:
 - `named.conf` includes `named.conf.spatiumddi`
 - Changes: regenerate `named.conf.spatiumddi` → SCP → `rndc reconfig`
 
+**Geo-steering views (issue #530).** GSLB pool members that carry a
+*serving scope* (client CIDRs and/or a Site) render as synthesized
+`view { match-clients … }` blocks — a "geo view". The driver renders
+these exactly like operator split-horizon views (`ViewData` +
+per-`view_name` `ZoneData`); the geo synthesis lives in the bundle
+builders (`app.services.dns.pool_geo`), so the driver itself needs no
+special-casing. A catch-all `spatium-geo-default` view (`match-clients
+{ any; }`) renders last so non-matching clients get the default member
+set. v1 steers on **resolver source IP**; ECS (RFC 7871) is a
+documented future improvement. See DNS.md §17.
+
 ### Serial Number Management
 
 Zone serial follows `YYYYMMDDnn` format:

@@ -201,6 +201,22 @@ class DHCPOfferBatch(BaseModel):
     offers: list[DHCPOfferEntry]
 
 
+class RAObservationEntry(BaseModel):
+    """One ICMPv6 Router Advertisement the agent's RA sniffer observed (#524)."""
+
+    source_ip: str
+    source_mac: str | None = None
+    prefixes: list[str] = Field(default_factory=list)
+    managed_flag: bool = False
+    other_flag: bool = False
+    router_lifetime: int | None = None
+    iface: str | None = None
+
+
+class RAObservationBatch(BaseModel):
+    observations: list[RAObservationEntry] = Field(default_factory=list, max_length=200)
+
+
 # ── Auth ────────────────────────────────────────────────────────────────────
 
 
@@ -608,6 +624,11 @@ async def agent_config_longpoll(
                             if bundle.failover is not None
                             else None
                         ),
+                        # IPv6 Router Advertisements (issue #524) — the
+                        # pre-rendered radvd.conf the agent writes + runs
+                        # radvd from when RADVD_MANAGED=1. Empty string when
+                        # no scope in the group has ``ra_enabled`` set.
+                        "radvd_conf": bundle.radvd_conf,
                     },
                     "pending_ops": pending_ops,
                     # Phase 8f-3 — fleet upgrade intent the operator set
@@ -1375,4 +1396,44 @@ async def agent_dhcp_offers(
         for o in capped
     ]
     counts = await record_offers(db, server, offers)
+    return counts
+
+
+@router.post("/ra-observations")
+async def agent_ra_observations(
+    body: RAObservationBatch,
+    db: DB,
+    auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, int]:
+    """Ingest observed IPv6 Router Advertisements from the agent's RA sniffer (#524).
+
+    The agent's opt-in passive sniffer ships every ICMPv6 type-134 RA it sees;
+    we classify each source router against the group's expected-router allowlist
+    and upsert a ``ra_observed_router`` row. The ``rogue_ra`` alert fires on rows
+    that classify ``rogue``. No-op (zero writes) when the RA module is off, so an
+    agent left sniffing costs nothing server-side until the operator opts in.
+    Capped at 200 observations per request. No audit row — high-volume telemetry.
+    """
+    from app.services.dhcp.ra_detection import ObservedRA, record_observations
+    from app.services.feature_modules import is_module_enabled
+
+    server, _ = auth
+    if not body.observations:
+        return {"expected": 0, "acknowledged": 0, "rogue": 0, "skipped": 0}
+    if not await is_module_enabled(db, "ipv6.router_advertisements"):
+        return {"expected": 0, "acknowledged": 0, "rogue": 0, "skipped": 0}
+
+    observations = [
+        ObservedRA(
+            source_ip=o.source_ip,
+            source_mac=o.source_mac,
+            prefixes=list(o.prefixes or []),
+            managed_flag=o.managed_flag,
+            other_flag=o.other_flag,
+            router_lifetime=o.router_lifetime,
+            iface=o.iface,
+        )
+        for o in body.observations[:200]
+    ]
+    counts = await record_observations(db, server, observations)
     return counts

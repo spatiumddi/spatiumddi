@@ -64,14 +64,22 @@ RUN apk upgrade --no-cache \
       tini su-exec setpriv \
       python3 py3-pip libpcap \
       libcap \
+      radvd \
       ca-certificates tzdata \
       'libcrypto3>=3.5.7-r0' 'libssl3>=3.5.7-r0' \
  && setcap cap_net_bind_service,cap_net_raw=+ep /usr/sbin/kea-dhcp4 \
  && setcap cap_net_bind_service,cap_net_raw=+ep /usr/sbin/kea-dhcp6 \
+ # radvd (issue #524) — opt-in IPv6 Router Advertisement daemon, started
+ # by the entrypoint only when RADVD_MANAGED=1. Needs CAP_NET_RAW to open
+ # the ICMPv6 raw socket + CAP_NET_ADMIN to send RAs; as a file cap so it
+ # survives the su-exec drop to the unprivileged spatium user.
+ && setcap cap_net_raw,cap_net_admin=+ep /usr/sbin/radvd \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
  && mkdir -p /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea \
+      /etc/radvd /run/radvd \
  && chown -R spatium:spatium /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea \
+      /etc/radvd /run/radvd \
  && { \
       echo "alpine_release=$(cat /etc/alpine-release)"; \
       apk info -v 2>/dev/null \
@@ -96,7 +104,11 @@ ENV CACHE_DIR=/var/lib/spatium-dhcp-agent \
     KEA_CONFIG_PATH_V6=/etc/kea/kea-dhcp6.conf \
     KEA_CONTROL_SOCKET_V6=/run/kea/kea6-ctrl-socket \
     PYTHONPATH=/usr/local/lib/python3.12/site-packages \
-    LOG_LEVEL=INFO
+    LOG_LEVEL=INFO \
+    RADVD_MANAGED=0 \
+    RADVD_CONFIG_PATH=/etc/radvd/radvd.conf \
+    RADVD_PIDFILE=/run/radvd/radvd.pid \
+    RADVD_DEFAULT_IFACE=eth0
 
 VOLUME ["/var/lib/spatium-dhcp-agent", "/var/lib/kea"]
 # DHCPv4 server

@@ -22,6 +22,7 @@ import { cn } from "@/lib/utils";
 import { CommunitiesTab } from "./CommunitiesTab";
 import { PeeringsTab } from "./PeeringsTab";
 import { BgpFootprintTab } from "./BgpFootprintTab";
+import { BgpMonitorTab } from "./BgpMonitorTab";
 
 import { errMsg, humanTime } from "./_shared";
 
@@ -29,6 +30,7 @@ type Tab =
   | "whois"
   | "rpki"
   | "footprint"
+  | "monitor"
   | "bgp"
   | "communities"
   | "ipam"
@@ -253,6 +255,7 @@ export function AsnDetailPage() {
     ["whois", "WHOIS"],
     ["rpki", "RPKI ROAs"],
     ["footprint", "BGP Footprint"],
+    ["monitor", "BGP Monitoring"],
     ["bgp", "BGP Peering"],
     ["communities", "Communities"],
     ["ipam", "IP Spaces / Blocks"],
@@ -502,6 +505,8 @@ export function AsnDetailPage() {
         {tab === "footprint" && (
           <BgpFootprintTab asnNumber={asn.number} kind={asn.kind} />
         )}
+
+        {tab === "monitor" && <BgpMonitorTab asnId={id} asnKind={asn.kind} />}
 
         {tab === "bgp" && <PeeringsTab asnId={id} />}
 

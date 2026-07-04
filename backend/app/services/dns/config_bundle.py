@@ -38,6 +38,11 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.services.dns.pool_geo import (
+    build_geo_steering,
+    build_view_descriptors,
+    records_for_view,
+)
 from app.services.dns_blocklist import (
     EffectiveBlocklist,
     build_effective_for_group,
@@ -162,15 +167,23 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         .scalars()
         .all()
     )
+    # Geo / topology-aware steering (issue #530). Synthesized geo views
+    # render BEFORE operator split-horizon views, with a catch-all last
+    # (see ``build_view_descriptors``). Build the unified descriptor list
+    # once and derive both the ViewData tuple (for the named.conf ``view``
+    # blocks) and the per-view zone record scoping from it.
+    ordered_view_rows = sorted(view_rows, key=lambda v: (v.order, v.name))
+    geo = await build_geo_steering(db, server.group_id)
+    view_descs = build_view_descriptors(ordered_view_rows, geo)
     views = tuple(
         ViewData(
-            name=v.name,
-            match_clients=tuple(v.match_clients or ()),
-            match_destinations=tuple(v.match_destinations or ()),
-            recursion=v.recursion,
-            order=v.order,
+            name=vd["name"],
+            match_clients=tuple(vd["match_clients"]),
+            match_destinations=tuple(vd["match_destinations"]),
+            recursion=vd["recursion"],
+            order=vd["order"],
         )
-        for v in view_rows
+        for vd in view_descs
     )
 
     # Zones + records
@@ -186,11 +199,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         .all()
     )
 
-    # Stable view ordering — lower ``order`` first, matching BIND's
-    # first-match-wins view semantics so the rendered named.conf view
-    # blocks land in the right precedence.
-    ordered_views = sorted(view_rows, key=lambda v: (v.order, v.name))
-    has_views = bool(view_rows)
+    # Views mode is on when the group has operator split-horizon views OR
+    # any synthesized geo view (issue #530).
+    has_views = bool(view_rows) or geo.active
 
     def _record_data(r: DNSRecord) -> RecordData:
         return RecordData(
@@ -251,33 +262,27 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             zones.append(_zone_data(z, tuple(_record_data(r) for r in all_records), None))
             continue
 
-        # Split-horizon (issue #24). A record with ``view_id IS NULL`` is
-        # SHARED across every view it appears in; a record scoped to view X
-        # renders only in X. The zone must materialise in every view it has
-        # content for:
-        #   * each view referenced by a scoped record, plus
-        #   * the zone's own ``view_id`` (its pinned/home view), if any.
-        # When the zone has NO explicit scoping at all, it's a "global"
-        # zone — render it into EVERY view (visible everywhere) with all
-        # records. This also fixes the latent gap where a view-group zone
-        # with no ``view_id`` previously rendered in NO view at all.
+        # Split-horizon (issue #24) composed with geo steering (#530).
+        # Operator views: the zone materialises in each view referenced by
+        # a scoped record PLUS its own pinned ``view_id``; with no explicit
+        # scoping it's a "global" zone rendered into every operator view.
+        # Geo + catch-all views always render the zone (like a global one)
+        # so the catch-all serves the default member set. Per-view record
+        # filtering (operator scope ∪ shared/default, geo-member isolation)
+        # is delegated to ``records_for_view``.
         record_view_ids = {r.view_id for r in all_records if r.view_id is not None}
         zone_view_ids = {z.view_id} if z.view_id is not None else set()
-        target_view_ids = record_view_ids | zone_view_ids
+        operator_target_ids = record_view_ids | zone_view_ids
 
-        if target_view_ids:
-            emit_views = [v for v in ordered_views if v.id in target_view_ids]
-        else:
-            emit_views = list(ordered_views)
-
-        for v in emit_views:
-            if target_view_ids:
-                recs = tuple(
-                    _record_data(r) for r in all_records if r.view_id == v.id or r.view_id is None
-                )
-            else:
-                recs = tuple(_record_data(r) for r in all_records)
-            zones.append(_zone_data(z, recs, v.name))
+        for vd in view_descs:
+            if (
+                vd["kind"] == "operator"
+                and operator_target_ids
+                and vd["id"] not in operator_target_ids
+            ):
+                continue
+            recs = tuple(_record_data(r) for r in records_for_view(all_records, vd, geo))
+            zones.append(_zone_data(z, recs, vd["name"]))
 
     # Blocklists: one RPZ zone per view if views present, plus group-level.
     blocklists: list[EffectiveBlocklistData] = []

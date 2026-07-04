@@ -707,6 +707,90 @@ register(
 )
 
 
+# ── pin_ip_for_dnsbl operation (issue #528) ────────────────────────────
+
+
+class PinIPForDNSBLArgs(BaseModel):
+    """Args for ``pin_ip_for_dnsbl`` — pin one IP for reputation monitoring."""
+
+    ip: str = Field(description="IPv4 address to pin for DNSBL/RBL monitoring")
+    note: str = Field(default="", description="Optional operator note for the pin")
+
+
+async def _preview_pin_ip_for_dnsbl(
+    db: AsyncSession, user: User, args: PinIPForDNSBLArgs
+) -> PreviewResult:
+    from app.models.dnsbl import DNSBLPinnedIP  # noqa: PLC0415
+
+    bare = str(args.ip).split("/")[0].strip()
+    try:
+        addr = ipaddress.ip_address(bare)
+    except ValueError:
+        return PreviewResult(ok=False, detail=f"invalid IP {args.ip!r}")
+    if not isinstance(addr, ipaddress.IPv4Address):
+        return PreviewResult(ok=False, detail="DNSBL monitoring is IPv4-only in v1")
+    existing = await db.scalar(select(DNSBLPinnedIP).where(DNSBLPinnedIP.ip == str(addr)))
+    if existing is not None:
+        return PreviewResult(ok=False, detail=f"{addr} is already pinned")
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Pin **{addr}** for DNSBL / RBL reputation monitoring. The next "
+            "daily sweep (and any on-demand check) will test it against every "
+            "enabled blocklist."
+        ),
+    )
+
+
+async def _apply_pin_ip_for_dnsbl(
+    db: AsyncSession, user: User, args: PinIPForDNSBLArgs
+) -> dict[str, Any]:
+    from app.models.audit import AuditLog  # noqa: PLC0415
+    from app.models.dnsbl import DNSBLPinnedIP  # noqa: PLC0415
+
+    enforce_operation_permission(user, _OPERATIONS["pin_ip_for_dnsbl"])
+
+    addr = str(ipaddress.ip_address(str(args.ip).split("/")[0].strip()))
+    existing = await db.scalar(select(DNSBLPinnedIP).where(DNSBLPinnedIP.ip == addr))
+    if existing is not None:
+        return {"id": str(existing.id), "ip": addr, "already_pinned": True}
+    row = DNSBLPinnedIP(ip=addr, note=args.note)
+    db.add(row)
+    await db.flush()
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=getattr(user, "auth_source", "local") or "local",
+            action="create",
+            resource_type="dnsbl",
+            resource_id=str(row.id),
+            resource_display=addr,
+            result="success",
+            new_value={"ip": addr, "via": "ai_proposal"},
+        )
+    )
+    await db.commit()
+    return {"id": str(row.id), "ip": addr, "already_pinned": False}
+
+
+register(
+    Operation(
+        name="pin_ip_for_dnsbl",
+        description=(
+            "Pin an IP for DNSBL / RBL reputation monitoring. Always go "
+            "through propose_pin_ip_for_dnsbl — never call this directly."
+        ),
+        args_model=PinIPForDNSBLArgs,
+        preview=_preview_pin_ip_for_dnsbl,
+        apply=_apply_pin_ip_for_dnsbl,
+        category="security",
+        required_permission=("write", "dnsbl"),
+    )
+)
+
+
 # ── run_packet_capture operation (issue #59) ───────────────────────────
 
 
@@ -3599,5 +3683,109 @@ register(
         apply=_apply_block_mac,
         category="dhcp",
         required_permission=("write", "dhcp_mac_block"),
+    )
+)
+
+
+class AllowlistRARouterArgs(BaseModel):
+    """Args for the ``allowlist_ra_router`` operation (issue #524)."""
+
+    group_id: UUID = Field(description="DHCP server group the RA was seen in")
+    source_ip: str | None = Field(
+        default=None, description="Expected RA source IPv6 (usually a link-local fe80::…)"
+    )
+    source_mac: str | None = Field(default=None, description="Expected RA source MAC")
+    note: str = Field(default="", description="Why this router is expected")
+
+
+async def _preview_allowlist_ra_router(
+    db: AsyncSession, user: User, args: AllowlistRARouterArgs
+) -> PreviewResult:
+    from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
+
+    if not args.source_ip and not args.source_mac:
+        return PreviewResult(ok=False, detail="Provide a source_ip or source_mac")
+    grp = await db.get(DHCPServerGroup, args.group_id)
+    if grp is None:
+        return PreviewResult(ok=False, detail=f"DHCP server group {args.group_id} not found.")
+    target = args.source_ip or args.source_mac
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Add {target} to group `{grp.name}`'s expected-RA-router allowlist — "
+            f"it stops classifying as a rogue RA and the rogue_ra alert auto-resolves."
+        ),
+    )
+
+
+async def _apply_allowlist_ra_router(
+    db: AsyncSession, user: User, args: AllowlistRARouterArgs
+) -> dict[str, Any]:
+    from app.api.v1.dhcp._audit import write_audit  # noqa: PLC0415
+    from app.models.dhcp import RAObservedRouter, RARouterAllowlist  # noqa: PLC0415
+
+    enforce_operation_permission(user, _OPERATIONS["allowlist_ra_router"])
+    if not args.source_ip and not args.source_mac:
+        raise ValueError("Provide a source_ip or source_mac")
+
+    entry = RARouterAllowlist(
+        group_id=args.group_id,
+        source_ip=args.source_ip or None,
+        source_mac=args.source_mac or None,
+        note=args.note,
+        created_by_user_id=user.id,
+    )
+    db.add(entry)
+    reclassified = 0
+    if args.source_ip:
+        rogue = (
+            (
+                await db.execute(
+                    select(RAObservedRouter).where(
+                        RAObservedRouter.group_id == args.group_id,
+                        RAObservedRouter.source_ip == args.source_ip,
+                        RAObservedRouter.classification == "rogue",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for r in rogue:
+            r.classification = "acknowledged"
+            reclassified += 1
+    await db.flush()
+    write_audit(
+        db,
+        user=user,
+        action="create",
+        resource_type="ra_router_allowlist",
+        resource_id=str(entry.id),
+        resource_display=str(args.source_ip or args.source_mac or ""),
+        new_value={
+            "source_ip": args.source_ip,
+            "source_mac": args.source_mac,
+            "reclassified_count": reclassified,
+            "via": "ai_proposal",
+        },
+    )
+    await db.commit()
+    return {"id": str(entry.id), "reclassified_count": reclassified}
+
+
+register(
+    Operation(
+        name="allowlist_ra_router",
+        description=(
+            "Add an IPv6 router (by source IP or MAC) to a DHCP group's "
+            "expected-RA-router allowlist so it stops classifying as a rogue RA. "
+            "Always route via propose_allowlist_ra_router."
+        ),
+        args_model=AllowlistRARouterArgs,
+        preview=_preview_allowlist_ra_router,
+        apply=_apply_allowlist_ra_router,
+        category="dhcp",
+        required_permission=("write", "dhcp_server"),
     )
 )

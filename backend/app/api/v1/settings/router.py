@@ -129,6 +129,9 @@ class SettingsResponse(BaseModel):
     asn_whois_interval_hours: int = 24
     rpki_roa_source: str = "cloudflare"
     rpki_roa_refresh_interval_hours: int = 4
+    # BGP prefix-hijack monitoring (issue #527).
+    bgp_monitoring_enabled: bool = False
+    bgp_monitoring_interval_hours: int = 6
     # VRF strict-RD validation toggle (issue #86 phase 2). When False
     # (default), ASN-portion mismatches between the VRF's RD/RT and
     # its linked ASN row produce warnings; when True they are 422.
@@ -823,6 +826,8 @@ class SettingsUpdate(BaseModel):
     asn_whois_interval_hours: int | None = None
     rpki_roa_source: str | None = None
     rpki_roa_refresh_interval_hours: int | None = None
+    bgp_monitoring_enabled: bool | None = None
+    bgp_monitoring_interval_hours: int | None = None
     # VRF strict-RD validation toggle (issue #86 phase 2).
     vrf_strict_rd_validation: bool | None = None
     # Operator Copilot daily digest (issue #90 Phase 2).
@@ -1291,7 +1296,11 @@ class SettingsUpdate(BaseModel):
             cleaned.append(host)
         return cleaned
 
-    @field_validator("asn_whois_interval_hours", "rpki_roa_refresh_interval_hours")
+    @field_validator(
+        "asn_whois_interval_hours",
+        "rpki_roa_refresh_interval_hours",
+        "bgp_monitoring_interval_hours",
+    )
     @classmethod
     def validate_asn_rpki_interval(cls, v: int | None) -> int | None:
         if v is None:

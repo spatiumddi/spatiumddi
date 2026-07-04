@@ -543,9 +543,12 @@ class ListDNSPoolsArgs(BaseModel):
         "zone_id, record_name + record_type, ttl, enabled, "
         "hc_type / interval / threshold settings, last_checked_at, "
         "and the per-member breakdown (address / weight / enabled / "
-        "last_check_state / last_check_error). Use for 'is the "
-        "www pool healthy?', 'which member of the api pool is "
-        "down?', or 'what's the TTL on the gslb pool?'."
+        "last_check_state / last_check_error, plus the geo-steering "
+        "serving scope: serving_cidrs + site_id — empty/null means the "
+        "member is a default target served to everyone). Use for 'is "
+        "the www pool healthy?', 'which member of the api pool is "
+        "down?', 'what's the TTL on the gslb pool?', or 'which datacenter "
+        "does the eu client get for www?'."
     ),
     args_model=ListDNSPoolsArgs,
     category="dns",
@@ -599,6 +602,9 @@ async def list_dns_pools(
                     "last_check_state": m.last_check_state,
                     "last_check_at": (m.last_check_at.isoformat() if m.last_check_at else None),
                     "last_check_error": m.last_check_error,
+                    # Geo / topology-aware steering scope (issue #530).
+                    "serving_cidrs": list(m.serving_cidrs or []),
+                    "site_id": str(m.site_id) if m.site_id else None,
                 }
                 for m in p.members
             ],

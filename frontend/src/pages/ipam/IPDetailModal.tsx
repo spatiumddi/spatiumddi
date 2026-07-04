@@ -10,12 +10,14 @@ import {
   Radar,
   Radio,
   RefreshCw,
+  ShieldAlert,
   ShieldCheck,
   Trash2,
   X,
 } from "lucide-react";
 
 import {
+  dnsblApi,
   ipamApi,
   multicastApi,
   nmapApi,
@@ -550,8 +552,137 @@ export function IPDetailModal({
           <MulticastMembershipsSection addressId={addr.id} />
 
           <CertsSection addressId={addr.id} />
+
+          {/* Reputation — DNSBL / RBL listing status (issue #528). Hidden
+              when the security.dnsbl module is off or the IP isn't IPv4. */}
+          <ReputationSection address={addr.address} canEdit={canEdit} />
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── Reputation (DNSBL / RBL) ──────────────────────────────────────
+//
+// Per-IP DNS blocklist status across every enabled list, with a manual
+// "Check now" action. IPv4-only (v1). Hidden when the security.dnsbl
+// feature module is disabled.
+
+function ReputationSection({
+  address,
+  canEdit,
+}: {
+  address: string;
+  canEdit: boolean;
+}) {
+  const qc = useQueryClient();
+  const { enabled } = useFeatureModules();
+  const dnsblEnabled = enabled("security.dnsbl");
+  const bareIp = (address || "").split("/")[0];
+  const isIPv4 = bareIp.includes(".") && !bareIp.includes(":");
+
+  const q = useQuery({
+    queryKey: ["dnsbl", "by-ip", bareIp],
+    queryFn: () => dnsblApi.byIp(bareIp),
+    enabled: dnsblEnabled && isIPv4,
+    staleTime: 30_000,
+  });
+
+  const check = useMutation({
+    mutationFn: () => dnsblApi.checkNow(bareIp),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dnsbl", "by-ip", bareIp] });
+      qc.invalidateQueries({ queryKey: ["dnsbl-listings"] });
+    },
+  });
+
+  if (!dnsblEnabled || !isIPv4) return null;
+
+  const data = q.data;
+  const entries = data?.entries ?? [];
+
+  return (
+    <div>
+      <div className="mb-1 flex items-center justify-between">
+        <div className="flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+          {data && data.listed_count > 0 ? (
+            <ShieldAlert className="h-3 w-3 text-rose-500" />
+          ) : (
+            <ShieldCheck className="h-3 w-3" />
+          )}{" "}
+          Reputation
+        </div>
+        {canEdit && (
+          <button
+            type="button"
+            onClick={() => check.mutate()}
+            disabled={check.isPending}
+            className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:opacity-60"
+          >
+            {check.isPending ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3 w-3" />
+            )}
+            Check now
+          </button>
+        )}
+      </div>
+
+      {entries.length === 0 ? (
+        <div className="rounded border border-dashed px-2 py-1.5 text-[11px] text-muted-foreground">
+          No blocklists are enabled. Enable lists in Administration → DNS
+          Blocklists to check this IP.
+        </div>
+      ) : (
+        <div className="space-y-1">
+          {data && data.listed_count > 0 && (
+            <div className="text-[11px] font-medium text-rose-600">
+              Listed on {data.listed_count} of {entries.length} blocklist(s).
+            </div>
+          )}
+          <ul className="divide-y rounded border text-[11px]">
+            {entries.map((e) => (
+              <li
+                key={e.list_id}
+                className="flex items-start justify-between gap-2 px-2 py-1"
+              >
+                <div className="min-w-0">
+                  <div className="font-medium">{e.list_name}</div>
+                  {e.txt_reason && (
+                    <div className="truncate text-muted-foreground">
+                      {e.txt_reason}
+                    </div>
+                  )}
+                  {e.check_error && (
+                    <div className="truncate text-amber-600">
+                      {e.check_error}
+                    </div>
+                  )}
+                </div>
+                <span
+                  className={cn(
+                    "shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium",
+                    e.listed
+                      ? "bg-rose-500/15 text-rose-600"
+                      : e.checked
+                        ? "bg-emerald-500/15 text-emerald-600"
+                        : "bg-muted text-muted-foreground",
+                  )}
+                >
+                  {e.listed
+                    ? e.return_codes.length
+                      ? `Listed (${e.return_codes.join(", ")})`
+                      : "Listed"
+                    : e.checked
+                      ? "Clean"
+                      : "Not checked"}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }

@@ -368,6 +368,20 @@ class PlatformSettings(Base):
         Integer, nullable=False, default=24, server_default=sa_text("24")
     )
 
+    # BGP prefix-hijack monitoring (issue #527). When enabled, the beat
+    # task ``app.tasks.bgp_hijack_poll`` queries RIPEstat for the current
+    # announcements of each tracked prefix and opens
+    # ``bgp_hijack_detection`` rows on origin-AS mismatch. Default OFF —
+    # the feature ships discoverable but silent (external-signal rules
+    # are noisy; operators opt in). ``interval_hours`` is the per-prefix
+    # ``next_check_at`` cadence, clamped 1..168 in the task.
+    bgp_monitoring_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    bgp_monitoring_interval_hours: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=6, server_default=sa_text("6")
+    )
+
     # TLS certificate monitoring (#118) — default probe cadence per
     # target (a target may override via tls_cert_target.interval_hours).
     # Read every dispatch run so cadence changes take effect without
@@ -375,6 +389,30 @@ class PlatformSettings(Base):
     tls_cert_check_interval_hours: Mapped[int] = mapped_column(
         Integer, nullable=False, default=6, server_default=sa_text("6")
     )
+
+    # DNSBL / RBL reputation monitoring (#528). ``enabled`` is the master
+    # sweep gate — default OFF so the module ships discoverable (the
+    # catalog + settings UI show) but makes NO off-prem DNS queries until
+    # the operator opts in and enables at least one list. The
+    # ``interval_hours`` is the daily-ish sweep cadence, read every run so
+    # UI changes take effect without restarting beat; clamped 6..168 in
+    # the task.
+    dnsbl_monitoring_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    dnsbl_check_interval_hours: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=24, server_default=sa_text("24")
+    )
+    # Timestamp of the most recent sweep pass — surfaced read-only in the
+    # DNSBL admin UI ("Last run"). NULL until the first sweep.
+    dnsbl_sweep_last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Optional explicit resolver IPs for the reversed-octet queries. NULL =
+    # use the host's system resolver. A JSON list of dotted-quad strings —
+    # some DNSBLs (Spamhaus) return "query blocked" from big public
+    # resolvers, so an operator may point at a local recursive resolver.
+    dnsbl_query_resolvers: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
 
     # VRF cross-cutting validation gate (Phase 2 of issue #86). When
     # False (default), an ``ASN:N`` route-distinguisher whose ASN

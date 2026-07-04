@@ -63,6 +63,7 @@ import { IPAMTemplatesPage } from "@/pages/admin/IPAMTemplatesPage";
 import { ApiTokensPage } from "@/pages/admin/ApiTokensPage";
 import { SessionsPage } from "@/pages/admin/SessionsPage";
 import { AlertsPage } from "@/pages/admin/AlertsPage";
+import { DNSBLPage } from "@/pages/admin/DNSBLPage";
 import { AuthProvidersPage } from "@/pages/admin/AuthProvidersPage";
 import { DomainsPage } from "@/pages/admin/DomainsPage";
 import { DomainDetailPage } from "@/pages/admin/DomainDetailPage";
@@ -208,6 +209,7 @@ export default function App() {
         <Route path="admin/api-tokens" element={<ApiTokensPage />} />
         <Route path="admin/sessions" element={<SessionsPage />} />
         <Route path="admin/alerts" element={<AlertsPage />} />
+        <Route path="admin/dns-blocklists" element={<DNSBLPage />} />
         <Route path="admin/domains" element={<DomainsPage />} />
         <Route path="admin/domains/:id" element={<DomainDetailPage />} />
         <Route path="admin/webhooks" element={<WebhooksPage />} />

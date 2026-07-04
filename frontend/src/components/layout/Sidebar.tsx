@@ -30,6 +30,7 @@ import {
   Settings,
   Tags,
   ShieldCheck,
+  ShieldAlert,
   ShieldQuestion,
   ScrollText,
   BellRing,
@@ -296,6 +297,12 @@ const adminConfigurationNav = [
 
 const adminNotificationsNav = [
   { label: "Alerts", icon: BellRing, to: "/admin/alerts" },
+  {
+    label: "DNS Blocklists",
+    icon: ShieldAlert,
+    to: "/admin/dns-blocklists",
+    module: "security.dnsbl",
+  },
   {
     label: "Change Requests",
     icon: GitPullRequest,

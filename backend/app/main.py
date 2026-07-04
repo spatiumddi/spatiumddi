@@ -250,6 +250,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "site"},
             {"action": "admin", "resource_type": "provider"},
             {"action": "admin", "resource_type": "tls_cert"},
+            {"action": "admin", "resource_type": "dnsbl"},
         ],
     ),
     "Auditor": (
@@ -443,6 +444,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_rogue_dhcp_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("rogue_dhcp_alert_rule_seed_skipped", reason=str(exc))
+    # Rogue IPv6 RA alert rule — singleton, DISABLED by default (issue #524).
+    # Fires only on segments running the agent's passive RA sniffer.
+    try:
+        from app.services.alerts import seed_rogue_ra_alert_rule  # noqa: PLC0415
+
+        await seed_rogue_ra_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("rogue_ra_alert_rule_seed_skipped", reason=str(exc))
     # New-device (arpwatch) alert rule — singleton, DISABLED by default (issue
     # #459). Fires on never-before-seen MACs once new-device watch is on.
     try:
@@ -459,6 +468,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_tls_cert_alert_rules()
     except Exception as exc:  # noqa: BLE001
         logger.debug("tls_cert_alert_rules_seed_skipped", reason=str(exc))
+    # BGP prefix-hijack alert rules — two, DISABLED by default (issue
+    # #527). Fire only once BGP monitoring (bgp_monitoring_enabled) is on
+    # and the operator has curated tracked prefixes.
+    try:
+        from app.services.alerts import seed_bgp_hijack_alert_rules  # noqa: PLC0415
+
+        await seed_bgp_hijack_alert_rules()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("bgp_hijack_alert_rules_seed_skipped", reason=str(exc))
+    # DNSBL / RBL reputation catalog + alert rule (issue #528). The catalog
+    # seeds the curated blocklists as platform rows (all disabled); the
+    # ip_blocklisted alert rule seeds disabled. No off-prem calls at seed time.
+    try:
+        from app.services.dnsbl import seed_dnsbl_catalog  # noqa: PLC0415
+
+        await seed_dnsbl_catalog()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dnsbl_catalog_seed_skipped", reason=str(exc))
+    try:
+        from app.services.alerts import seed_ip_blocklisted_alert_rule  # noqa: PLC0415
+
+        await seed_ip_blocklisted_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("ip_blocklisted_alert_rule_seed_skipped", reason=str(exc))
     # Appliance Web UI cert bootstrap (issue #134, Phase 4b.5). On
     # appliance installs without an active row in appliance_certificate,
     # generate a self-signed default + deploy it to /etc/nginx/certs

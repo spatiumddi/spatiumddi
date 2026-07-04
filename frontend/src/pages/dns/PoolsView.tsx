@@ -12,11 +12,13 @@ import {
 } from "lucide-react";
 import {
   dnsApi,
+  sitesApi,
   type DNSPool,
   type DNSPoolMember,
   type DNSPoolWrite,
   type DNSServerGroup,
   type DNSZone,
+  type SiteRead,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 
@@ -271,9 +273,31 @@ function MemberRow({ member }: { member: DNSPoolMember }) {
     ) : (
       <Clock className="h-3.5 w-3.5 text-amber-500" />
     );
+  const scoped =
+    (member.serving_cidrs?.length ?? 0) > 0 || member.site_id != null;
+  const scopeTitle = scoped
+    ? `Geo-scoped — served only to ${[
+        ...(member.serving_cidrs ?? []),
+        member.site_id ? "site clients" : "",
+      ]
+        .filter(Boolean)
+        .join(", ")}`
+    : "Default target — served to everyone";
   return (
     <tr className="border-t">
-      <td className="py-1.5 font-mono">{member.address}</td>
+      <td className="py-1.5 font-mono">
+        <span className="inline-flex items-center gap-1.5">
+          {member.address}
+          {scoped && (
+            <span
+              title={scopeTitle}
+              className="rounded bg-sky-500/15 px-1 py-0.5 text-[9px] font-medium uppercase tracking-wider text-sky-600 dark:text-sky-400"
+            >
+              geo
+            </span>
+          )}
+        </span>
+      </td>
       <td className="py-1.5">
         <div className="flex items-center gap-1.5">
           {stateIcon}
@@ -316,6 +340,19 @@ interface MemberDraft {
   address: string;
   weight: number;
   enabled: boolean;
+  // Geo / topology-aware steering scope (issue #530). ``servingCidrs`` is
+  // the raw comma/space/newline-separated text the operator types; parsed
+  // to a string[] on submit. Empty scope + no site ⇒ default target.
+  servingCidrs: string;
+  siteId: string | null;
+}
+
+/** Parse the free-text CIDR box into a clean list. */
+function parseCidrs(raw: string): string[] {
+  return raw
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 export function PoolModal({
@@ -361,9 +398,18 @@ export function PoolModal({
       address: m.address,
       weight: m.weight,
       enabled: m.enabled,
+      servingCidrs: (m.serving_cidrs ?? []).join(", "),
+      siteId: m.site_id,
     })),
   );
   const [error, setError] = useState<string | null>(null);
+
+  // Sites for the per-member serving-scope picker (issue #530).
+  const { data: siteList } = useQuery({
+    queryKey: ["sites", "pool-geo-picker"],
+    queryFn: () => sitesApi.list({ limit: 500 }),
+  });
+  const sites: SiteRead[] = siteList?.items ?? [];
 
   const mut = useMutation({
     mutationFn: async () => {
@@ -403,15 +449,22 @@ export function PoolModal({
             await dnsApi.deletePoolMember(id);
           } else {
             const d = desired.get(id)!;
+            const dCidrs = parseCidrs(d.servingCidrs);
+            const scopeChanged =
+              dCidrs.join(",") !== (m.serving_cidrs ?? []).join(",") ||
+              (d.siteId ?? null) !== (m.site_id ?? null);
             if (
               d.address !== m.address ||
               d.enabled !== m.enabled ||
-              d.weight !== m.weight
+              d.weight !== m.weight ||
+              scopeChanged
             ) {
               await dnsApi.updatePoolMember(id, {
                 address: d.address,
                 enabled: d.enabled,
                 weight: d.weight,
+                serving_cidrs: dCidrs,
+                site_id: d.siteId,
               });
             }
           }
@@ -421,6 +474,8 @@ export function PoolModal({
             address: m.address,
             weight: m.weight,
             enabled: m.enabled,
+            serving_cidrs: parseCidrs(m.servingCidrs),
+            site_id: m.siteId,
           });
         }
         return updated;
@@ -431,6 +486,8 @@ export function PoolModal({
           address: m.address,
           weight: m.weight,
           enabled: m.enabled,
+          serving_cidrs: parseCidrs(m.servingCidrs),
+          site_id: m.siteId,
         })),
       });
       return created;
@@ -447,7 +504,16 @@ export function PoolModal({
   });
 
   function addMember() {
-    setMembers((prev) => [...prev, { address: "", weight: 1, enabled: true }]);
+    setMembers((prev) => [
+      ...prev,
+      {
+        address: "",
+        weight: 1,
+        enabled: true,
+        servingCidrs: "",
+        siteId: null,
+      },
+    ]);
   }
   function removeMember(idx: number) {
     setMembers((prev) => prev.filter((_, i) => i !== idx));
@@ -687,50 +753,99 @@ export function PoolModal({
           <legend className="px-1 text-xs font-medium text-muted-foreground">
             Members
           </legend>
+          <p className="mb-2 text-[11px] text-muted-foreground">
+            Leave <em>Serving scope</em> empty for a default target (served to
+            everyone). Set client CIDRs and/or a Site to steer that member only
+            to clients whose resolver source IP matches — a geo view. Clients
+            matching no scope get just the default members.{" "}
+            <span className="text-amber-600 dark:text-amber-400">
+              Steering keys on the resolver source IP (not the end client) and
+              is subject to the pool TTL cache window.
+            </span>
+          </p>
           {members.length === 0 && (
             <p className="text-xs italic text-muted-foreground">
               No members. Add at least one.
             </p>
           )}
-          <div className="space-y-2">
+          <div className="space-y-3">
             {members.map((m, idx) => (
-              <div key={idx} className="flex items-center gap-2">
-                <input
-                  required
-                  value={m.address}
-                  onChange={(e) =>
-                    updateMember(idx, { address: e.target.value })
-                  }
-                  className={inputCls + " font-mono"}
-                  placeholder={
-                    recordType === "AAAA" ? "2001:db8::1" : "10.0.0.10"
-                  }
-                />
-                {/* Weight is advisory today — the basic A/AAAA
-                    rrset rendering doesn't honour it. Hidden from
-                    the form until weighted-record-set support
-                    actually lands; the value is still shipped at
-                    its default ``1`` so the field is round-trip
-                    safe and re-surfacing the input later doesn't
-                    break existing rows. */}
-                <label className="flex items-center gap-1 text-xs">
+              <div key={idx} className="rounded-md border bg-muted/20 p-2">
+                <div className="flex items-center gap-2">
                   <input
-                    type="checkbox"
-                    checked={m.enabled}
+                    required
+                    value={m.address}
                     onChange={(e) =>
-                      updateMember(idx, { enabled: e.target.checked })
+                      updateMember(idx, { address: e.target.value })
+                    }
+                    className={inputCls + " font-mono"}
+                    placeholder={
+                      recordType === "AAAA" ? "2001:db8::1" : "10.0.0.10"
                     }
                   />
-                  enabled
-                </label>
-                <button
-                  type="button"
-                  onClick={() => removeMember(idx)}
-                  className="rounded p-1 text-muted-foreground hover:text-destructive"
-                  title="Remove"
-                >
-                  <X className="h-4 w-4" />
-                </button>
+                  {/* Weight is advisory today — the basic A/AAAA
+                      rrset rendering doesn't honour it. Hidden from
+                      the form until weighted-record-set support
+                      actually lands; the value is still shipped at
+                      its default ``1`` so the field is round-trip
+                      safe and re-surfacing the input later doesn't
+                      break existing rows. */}
+                  <label className="flex items-center gap-1 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={m.enabled}
+                      onChange={(e) =>
+                        updateMember(idx, { enabled: e.target.checked })
+                      }
+                    />
+                    enabled
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => removeMember(idx)}
+                    className="rounded p-1 text-muted-foreground hover:text-destructive"
+                    title="Remove"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <div className="space-y-1">
+                    <label className="block text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                      Serving scope — client CIDRs
+                    </label>
+                    <input
+                      value={m.servingCidrs}
+                      onChange={(e) =>
+                        updateMember(idx, { servingCidrs: e.target.value })
+                      }
+                      className={inputCls + " font-mono text-xs"}
+                      placeholder="e.g. 203.0.113.0/24, 10.1.0.0/16"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="block text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                      Serving scope — Site
+                    </label>
+                    <select
+                      value={m.siteId ?? ""}
+                      onChange={(e) =>
+                        updateMember(idx, {
+                          siteId: e.target.value || null,
+                        })
+                      }
+                      className={inputCls + " text-xs"}
+                    >
+                      <option value="">— none (default) —</option>
+                      {sites.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.name}
+                          {s.code ? ` (${s.code})` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
               </div>
             ))}
           </div>
