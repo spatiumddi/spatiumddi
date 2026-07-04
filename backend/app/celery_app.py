@@ -9,6 +9,7 @@ celery_app = Celery(
     backend=settings.celery_result_backend,
     include=[
         "app.tasks.ipam_dns_sync",
+        "app.tasks.ipam_utilization_recount",
         "app.tasks.dns",
         "app.tasks.dns_pull",
         "app.tasks.dhcp_health",
@@ -71,6 +72,7 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_routes={
         "app.tasks.ipam_dns_sync.*": {"queue": "ipam"},
+        "app.tasks.ipam_utilization_recount.*": {"queue": "ipam"},
         "app.tasks.dns.*": {"queue": "dns"},
         "app.tasks.dns_pull.*": {"queue": "dns"},
         "app.tasks.dhcp_health.*": {"queue": "dhcp"},
@@ -152,6 +154,17 @@ celery_app.conf.update(
         "ipam-dns-auto-sync": {
             "task": "app.tasks.ipam_dns_sync.auto_sync_ipam_dns",
             "schedule": schedule(run_every=60.0),
+        },
+        # Every hour, recount cached IPAM utilization counters
+        # (``Subnet.allocated_ips`` / ``utilization_percent`` + the
+        # recursive ``IPBlock`` rollups) against the live row counts,
+        # correcting drift from the estimate-a-delta code paths (address
+        # importer, bulk integration reconcilers). Issue #521. Idempotent
+        # + always-safe — it only touches derived counters, so there's no
+        # opt-out gate; a converged install writes (and audits) nothing.
+        "ipam-utilization-recount": {
+            "task": "app.tasks.ipam_utilization_recount.recount_ipam_utilization",
+            "schedule": schedule(run_every=3600.0),
         },
         # Every 60 s, dispatch IP-discovery sweeps for subnets whose
         # per-subnet interval has elapsed (issue #23). Per-subnet gating

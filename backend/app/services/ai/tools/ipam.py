@@ -17,7 +17,7 @@ import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
-from sqlalchemy import cast, func, literal, or_, select
+from sqlalchemy import String, cast, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -651,6 +651,134 @@ async def find_ip(db: AsyncSession, user: User, args: FindIPArgs) -> dict[str, A
             }
         )
     return {"matches": out}
+
+
+# ── find_ip_addresses (cross-subnet search) ───────────────────────────
+
+
+class FindIPAddressesArgs(BaseModel):
+    q: str | None = Field(
+        default=None,
+        description=(
+            "Case-insensitive substring matched across the address, hostname, "
+            "FQDN, description and MAC. Use for open-ended 'find any IP that "
+            "mentions X' questions."
+        ),
+    )
+    hostname: str | None = Field(default=None, description="Substring match on hostname only.")
+    mac: str | None = Field(default=None, description="Substring match on the MAC address.")
+    status: str | None = Field(
+        default=None,
+        description="Exact status filter (e.g. 'allocated', 'reserved', 'static_dhcp', 'orphan').",
+    )
+    space_id: str | None = Field(
+        default=None, description="Restrict to one IP space — UUID or case-insensitive name."
+    )
+    subnet_id: str | None = Field(default=None, description="Restrict to one subnet UUID.")
+    limit: int = Field(default=100, ge=1, le=500, description="Max rows to return (1–500).")
+
+
+@register_tool(
+    name="find_ip_addresses",
+    description=(
+        "Search IP addresses ACROSS every subnet by substring (``q``), "
+        "hostname, MAC or status — the cross-subnet companion to ``find_ip`` "
+        "(which needs an exact address). Returns each hit's address, "
+        "hostname, MAC, status, and which subnet + space it lives in. Use "
+        "for 'find all IPs named web-*', 'which IPs have MAC prefix aa:bb', "
+        "'list reserved IPs in the DMZ space', etc. Only returns IPs in "
+        "subnets you can read."
+    ),
+    args_model=FindIPAddressesArgs,
+    category="ipam",
+)
+async def find_ip_addresses(
+    db: AsyncSession, user: User, args: FindIPAddressesArgs
+) -> dict[str, Any]:
+    from app.core.permissions import (  # noqa: PLC0415 — avoid import cycle
+        is_effective_superadmin,
+        user_has_permission,
+    )
+
+    structural: list[Any] = []
+    if args.space_id:
+        space_uuid = await _resolve_space_ref(db, args.space_id)
+        if space_uuid is None:
+            return {"error": f"no IP space matches {args.space_id!r}."}
+        structural.append(Subnet.space_id == space_uuid)
+    if args.subnet_id:
+        try:
+            structural.append(Subnet.id == uuid.UUID(args.subnet_id))
+        except ValueError:
+            return {"error": f"subnet_id {args.subnet_id!r} is not a valid UUID."}
+
+    # Read-permission scope pushed into SQL so the capped page is drawn from
+    # only the readable set (never a post-limit slice). Superadmin skips it.
+    readable: list[uuid.UUID] | None = None
+    if not is_effective_superadmin(user):
+        idq = select(Subnet.id)
+        for cond in structural:
+            idq = idq.where(cond)
+        cand = [r[0] for r in (await db.execute(idq)).all()]
+        readable = [s for s in cand if user_has_permission(user, "read", "subnet", s)]
+
+    stmt = (
+        select(IPAddress, Subnet.network, Subnet.name, IPSpace.name)
+        .join(Subnet, Subnet.id == IPAddress.subnet_id)
+        .join(IPSpace, IPSpace.id == Subnet.space_id)
+    )
+    for cond in structural:
+        stmt = stmt.where(cond)
+    if args.status:
+        stmt = stmt.where(IPAddress.status == args.status)
+    if args.hostname:
+        stmt = stmt.where(IPAddress.hostname.ilike(f"%{args.hostname}%"))
+    if args.mac:
+        stmt = stmt.where(cast(IPAddress.mac_address, String).ilike(f"%{args.mac}%"))
+    if args.q:
+        pat = f"%{args.q}%"
+        stmt = stmt.where(
+            or_(
+                func.host(IPAddress.address).ilike(pat),
+                IPAddress.hostname.ilike(pat),
+                IPAddress.fqdn.ilike(pat),
+                IPAddress.description.ilike(pat),
+                cast(IPAddress.mac_address, String).ilike(pat),
+            )
+        )
+    if readable is not None:
+        stmt = stmt.where(Subnet.id.in_(readable))
+    stmt = stmt.order_by(IPAddress.address).limit(args.limit)
+
+    rows = (await db.execute(stmt)).all()
+    ip_objs = [r[0] for r in rows]
+    vendors = await bulk_lookup_vendors(
+        db, [str(ip.mac_address) if ip.mac_address else None for ip in ip_objs]
+    )
+    matches: list[dict[str, Any]] = []
+    for ip, net, sub_name, sp_name in rows:
+        mac_key = normalize_mac_key(str(ip.mac_address)) if ip.mac_address else None
+        vendor = vendors.get(mac_key) if mac_key else None
+        matches.append(
+            {
+                "id": str(ip.id),
+                "address": str(ip.address),
+                "hostname": ip.hostname,
+                "fqdn": ip.fqdn,
+                "mac_address": str(ip.mac_address) if ip.mac_address else None,
+                "mac_vendor": vendor,
+                "is_voip_phone": is_voip_phone_vendor(vendor),
+                "status": ip.status,
+                "role": ip.role,
+                "description": ip.description,
+                "subnet_id": str(ip.subnet_id),
+                "subnet_cidr": str(net),
+                "subnet_name": sub_name or None,
+                "space_name": sp_name or None,
+                "tags": ip.tags or {},
+            }
+        )
+    return {"matches": matches, "returned": len(matches), "capped": len(matches) >= args.limit}
 
 
 # ── find_by_tag ───────────────────────────────────────────────────────
