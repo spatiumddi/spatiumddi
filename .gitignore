@@ -61,3 +61,6 @@ appliance/mkosi.extra/usr/local/share/spatiumddi/images/
 appliance/mkosi.extra/usr/lib/spatiumddi/docker-overlay.img
 appliance/mkosi.extra/usr/lib/spatiumddi/docker-overlay.manifest
 appliance/mkosi.extra/usr/lib/spatiumddi/docker-overlay.version
+
+# Ad-hoc agent working notes (should never be committed)
+scratchpad-*.md
