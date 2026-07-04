@@ -554,12 +554,23 @@ function SortLabel({
   className?: string;
 }) {
   const active = state?.key === sortKey;
+  // Reflect the current sort state + what a click does next (cycle is
+  // asc → desc → cleared) so screen readers and tooltips aren't blind to it.
+  const sortedDesc = active
+    ? `sorted ${state?.dir === "asc" ? "ascending" : "descending"}`
+    : "not sorted";
+  const nextDesc = !active
+    ? "sort ascending"
+    : state?.dir === "asc"
+      ? "sort descending"
+      : "clear the sort";
+  const a11yLabel = `${label} — ${sortedDesc}. Activate to ${nextDesc}.`;
   return (
     <button
       type="button"
       onClick={() => onSort(sortKey)}
-      title={`Sort by ${label}`}
-      aria-label={`Sort by ${label}`}
+      title={a11yLabel}
+      aria-label={a11yLabel}
       className={cn(
         "inline-flex items-center gap-1 hover:text-foreground",
         active ? "text-primary" : "",
@@ -4869,25 +4880,42 @@ function SubnetDetail({
           return "";
       }
     };
+    // Precompute one sort key per row so the comparator does no parsing
+    // (``Date.parse`` / ``ipStringToInt``) — O(n) key extraction instead of
+    // the O(n log n) parsing a comparator-side parse would cost on a large
+    // subnet. ``num`` carries the numeric key (last_seen epoch / address int,
+    // NaN for a non-v4 address), ``str`` the string key.
+    const decorated = filteredAddresses.map((addr) => {
+      let num: number | null = null;
+      let str = "";
+      if (key === "last_seen") {
+        num = addr.last_seen_at ? Date.parse(addr.last_seen_at) : null;
+      } else if (key === "address") {
+        const ai = ipStringToInt(String(addr.address));
+        num = Number.isFinite(ai) ? ai : NaN;
+        str = String(addr.address);
+      } else {
+        str = strOf(addr);
+      }
+      return { addr, num, str };
+    });
     // Directional compare (a<b ⇒ negative). ``last_seen`` nulls always
     // sort last irrespective of direction (handled before the mul).
-    return [...filteredAddresses].sort((a, b) => {
+    decorated.sort((a, b) => {
       if (key === "last_seen") {
-        const at = a.last_seen_at ? Date.parse(a.last_seen_at) : null;
-        const bt = b.last_seen_at ? Date.parse(b.last_seen_at) : null;
-        if (at === null && bt === null) return 0;
-        if (at === null) return 1;
-        if (bt === null) return -1;
-        return mul * (at - bt);
+        if (a.num === null && b.num === null) return 0;
+        if (a.num === null) return 1;
+        if (b.num === null) return -1;
+        return mul * (a.num - b.num);
       }
       if (key === "address") {
-        const ai = ipStringToInt(String(a.address));
-        const bi = ipStringToInt(String(b.address));
-        if (Number.isFinite(ai) && Number.isFinite(bi)) return mul * (ai - bi);
-        return mul * String(a.address).localeCompare(String(b.address));
+        if (Number.isFinite(a.num) && Number.isFinite(b.num))
+          return mul * ((a.num as number) - (b.num as number));
+        return mul * a.str.localeCompare(b.str);
       }
-      return mul * strOf(a).localeCompare(strOf(b));
+      return mul * a.str.localeCompare(b.str);
     });
+    return decorated.map((d) => d.addr);
   }, [filteredAddresses, sortState, dnsDrift, subnetHasDnsZone]);
 
   // Interleave DHCP pool boundary markers with the IP rows so the user
