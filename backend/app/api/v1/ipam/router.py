@@ -6413,15 +6413,22 @@ async def list_addresses(
         base = base.where(cond)
     base = apply_tag_filter(base, IPAddress.tags, tag)
 
-    total = await db.scalar(select(func.count()).select_from(base.subquery()))
-    response.headers["X-Total-Count"] = str(total or 0)
-
     query = base.order_by(*_address_order_by(sort, order))
     if offset:
         query = query.offset(offset)
     if limit is not None:
         query = query.limit(limit)
     rows = list((await db.execute(query)).scalars().all())
+
+    # X-Total-Count carries the match total *before* the window. When no window
+    # is applied (the default, backward-compatible per-subnet call) the returned
+    # rows ARE the full match set, so skip the extra COUNT(*) on that hot path.
+    if limit is None and not offset:
+        total = len(rows)
+    else:
+        total = await db.scalar(select(func.count()).select_from(base.subquery())) or 0
+    response.headers["X-Total-Count"] = str(total)
+
     await _enrich_addresses(db, rows)
     return rows
 

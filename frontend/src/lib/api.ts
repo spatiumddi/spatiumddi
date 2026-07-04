@@ -1698,20 +1698,6 @@ export const ipamApi = {
         params,
       })
       .then((r) => r.data),
-  /** Same as {@link listAddresses} but also returns the ``X-Total-Count``
-   *  header (total matching rows BEFORE limit/offset) so the UI can
-   *  paginate server-side. axios's ``.then(r => r.data)`` drops headers,
-   *  so this variant reads the header explicitly. */
-  listAddressesPaged: (
-    subnetId: string,
-    params?: AddressQueryParams,
-  ): Promise<{ items: IPAddress[]; total: number }> =>
-    api
-      .get<IPAddress[]>(`/ipam/subnets/${subnetId}/addresses`, { params })
-      .then((r) => ({
-        items: r.data,
-        total: Number(r.headers["x-total-count"] ?? r.data.length),
-      })),
   /** Cross-subnet IP search (issue #520). Results are permission-scoped
    *  server-side — only IPs in subnets the caller can read come back. */
   searchAddresses: (params: AddressSearchParams) =>

@@ -14920,6 +14920,11 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
 
   const runSearch = () => {
     setOffset(0);
+    // Clear any prior selection — a stale selection from the previous query
+    // would otherwise stay live under a new result set, so a bulk delete/edit
+    // would act on IPs the operator is no longer looking at.
+    setSelected(new Set());
+    setSelectAllError(null);
     setApplied({ q: qDraft.trim(), status: statusDraft });
   };
 
@@ -14956,6 +14961,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
     const map = new Map<
       string,
       {
+        id: string;
         cidr: string;
         name: string | null;
         space: string | null;
@@ -14966,6 +14972,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
       const key = it.subnet_id;
       if (!map.has(key))
         map.set(key, {
+          id: it.subnet_id,
           cidr: it.subnet_cidr,
           name: it.subnet_name,
           space: it.space_name,
@@ -15099,7 +15106,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
                 </p>
               ) : (
                 grouped.map((g) => (
-                  <div key={g.cidr} className="border-b last:border-0">
+                  <div key={g.id} className="border-b last:border-0">
                     <div className="sticky top-0 flex items-center gap-2 bg-muted/60 px-3 py-1 text-xs font-medium backdrop-blur">
                       <Network className="h-3 w-3 text-blue-500" />
                       <span className="font-mono">{g.cidr}</span>
