@@ -782,6 +782,64 @@ export interface IPAddress {
   modified_at?: string;
 }
 
+/** A cross-subnet search hit (issue #520). Extends {@link IPAddress}
+ *  with the joined subnet + space identity so the UI can render + group
+ *  results that span many subnets. Returned by ``GET
+ *  /ipam/addresses/search``. */
+export interface IPAddressSearchItem extends IPAddress {
+  subnet_cidr: string;
+  subnet_name: string | null;
+  space_id: string;
+  space_name: string | null;
+}
+
+/** Envelope for ``GET /ipam/addresses/search`` (issue #520). */
+export interface AddressSearchResponse {
+  items: IPAddressSearchItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** Envelope for ``GET /ipam/addresses/search/ids`` — used by the
+ *  "select all N matches" cross-subnet bulk flow. ``ids`` is capped at
+ *  5000 server-side; ``capped`` is true when ``total`` exceeded that. */
+export interface AddressSearchIdsResponse {
+  ids: string[];
+  total: number;
+  capped: boolean;
+}
+
+/** Optional query params for the per-subnet address list + the
+ *  cross-subnet search (issue #517 / #519 / #520). All fields are
+ *  optional; an empty object reproduces the legacy full-list behavior. */
+export interface AddressQueryParams {
+  q?: string;
+  hostname?: string;
+  mac?: string;
+  status_filter?: string;
+  /** Repeatable ``k:v`` tag filters. */
+  tag?: string[];
+  sort?:
+    | "address"
+    | "hostname"
+    | "status"
+    | "mac"
+    | "last_seen"
+    | "description";
+  order?: "asc" | "desc";
+  limit?: number;
+  offset?: number;
+}
+
+/** Cross-subnet search params — {@link AddressQueryParams} plus the
+ *  scope narrowers. */
+export interface AddressSearchParams extends AddressQueryParams {
+  space_id?: string;
+  block_id?: string;
+  subnet_id?: string;
+}
+
 /** Joined view of the ``dhcp_fingerprint`` row (passive-layer Phase 2)
  *  that matches an IP's MAC. Surfaced in the IP detail modal's "Device
  *  profile" section under a "Raw signature" disclosure. */
@@ -1634,9 +1692,39 @@ export const ipamApi = {
       )
       .then((r) => r.data),
 
-  listAddresses: (subnetId: string) =>
+  listAddresses: (subnetId: string, params?: AddressQueryParams) =>
     api
-      .get<IPAddress[]>(`/ipam/subnets/${subnetId}/addresses`)
+      .get<IPAddress[]>(`/ipam/subnets/${subnetId}/addresses`, {
+        params,
+      })
+      .then((r) => r.data),
+  /** Same as {@link listAddresses} but also returns the ``X-Total-Count``
+   *  header (total matching rows BEFORE limit/offset) so the UI can
+   *  paginate server-side. axios's ``.then(r => r.data)`` drops headers,
+   *  so this variant reads the header explicitly. */
+  listAddressesPaged: (
+    subnetId: string,
+    params?: AddressQueryParams,
+  ): Promise<{ items: IPAddress[]; total: number }> =>
+    api
+      .get<IPAddress[]>(`/ipam/subnets/${subnetId}/addresses`, { params })
+      .then((r) => ({
+        items: r.data,
+        total: Number(r.headers["x-total-count"] ?? r.data.length),
+      })),
+  /** Cross-subnet IP search (issue #520). Results are permission-scoped
+   *  server-side — only IPs in subnets the caller can read come back. */
+  searchAddresses: (params: AddressSearchParams) =>
+    api
+      .get<AddressSearchResponse>(`/ipam/addresses/search`, { params })
+      .then((r) => r.data),
+  /** Gather the ids of every match (capped at 5000) for the "select all
+   *  N matches → bulk edit/delete" flow. */
+  searchAddressIds: (
+    params: Omit<AddressSearchParams, "sort" | "order" | "limit" | "offset">,
+  ) =>
+    api
+      .get<AddressSearchIdsResponse>(`/ipam/addresses/search/ids`, { params })
       .then((r) => r.data),
   createAddress: (
     data: Partial<IPAddress> & {
