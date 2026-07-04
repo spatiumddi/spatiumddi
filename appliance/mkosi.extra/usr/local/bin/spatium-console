@@ -4278,8 +4278,14 @@ def do_cancel_reboot(console: Console) -> None:
     for name in ("reboot-pending", "reboot-pending-fleet"):
         try:
             (_RELEASE_STATE_DIR / name).unlink()
-        except OSError:
+        except FileNotFoundError:
+            # Expected: the reboot service may have already renamed the
+            # trigger to .done before we stopped it — nothing to remove.
             pass
+        except OSError as exc:
+            # Non-fatal — the service is already stopped, so the reboot is
+            # cancelled regardless of whether the trigger file lingers.
+            console.print(f"[dim](left {name}: {exc})[/dim]")
     console.print("[green]Reboot cancelled.[/green]\n")
     time.sleep(1.5)
 
