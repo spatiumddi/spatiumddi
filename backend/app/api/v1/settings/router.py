@@ -941,9 +941,10 @@ class SettingsUpdate(BaseModel):
             if not s:
                 continue
             # These land inside apt.conf double-quoted strings (the host runner
-            # escapes quotes); reject control chars + over-long entries so a
-            # value can't smuggle a newline / extra directive past the render.
-            if any(ord(c) < 0x20 for c in s) or len(s) > 200:
+            # escapes quotes); reject control chars — C0 (< 0x20) AND ASCII DEL
+            # (0x7f) — plus over-long entries so a value can't smuggle a newline
+            # / extra directive past the render.
+            if any(ord(c) < 0x20 or ord(c) == 0x7F for c in s) or len(s) > 200:
                 raise ValueError(
                     "unattended origin / package entries must be printable and ≤ 200 chars"
                 )

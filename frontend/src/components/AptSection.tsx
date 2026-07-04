@@ -185,6 +185,13 @@ export function AptSection({
         })),
       );
       setSources(updated.apt_sources || []);
+      // #164 — re-sync the unattended policy fields from the server response
+      // so backend normalisation (dropped-empty origins, stripped whitespace)
+      // is reflected instead of the operator's raw textarea input.
+      setUuOrigins((updated.apt_unattended_origins || []).join("\n"));
+      setUuBlocklist((updated.apt_unattended_blocklist || []).join("\n"));
+      setUuAutoReboot(updated.apt_unattended_automatic_reboot);
+      setUuRebootTime(updated.apt_unattended_reboot_time || "02:00");
       setSaveErr(null);
       setTouched(false);
       setSavedAt(Date.now());

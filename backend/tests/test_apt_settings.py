@@ -209,6 +209,13 @@ async def test_put_rejects_control_char_in_origin(client: AsyncClient, db_sessio
         json={"apt_unattended_origins": ['o=Debian\nUnattended-Upgrade::Foo "1"']},
     )
     assert r.status_code == 422
+    # ASCII DEL (0x7f) is a control char too and must be rejected (Copilot review).
+    r2 = await client.put(
+        "/api/v1/settings",
+        headers=_hdr(token),
+        json={"apt_unattended_blocklist": ["nvidia-\x7f"]},
+    )
+    assert r2.status_code == 422
 
 
 def test_render_auth_conf_skips_entries_without_password() -> None:
