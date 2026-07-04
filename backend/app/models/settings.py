@@ -49,6 +49,15 @@ DEFAULT_APT_SOURCES: list[dict] = [
     },
 ]
 
+# Issue #164 — default Allowed-Origins for unattended-upgrades: security
+# only, the locked-down appliance default. apt expands ``${distro_id}`` /
+# ``${distro_codename}`` at runtime, so this stays correct across Debian
+# point releases + a future base-OS bump. Empty list = nothing eligible =
+# effectively no auto-upgrades even with the timer on (per #164 acceptance).
+DEFAULT_UNATTENDED_ORIGINS: list[str] = [
+    "${distro_id}:${distro_codename}-security",
+]
+
 
 class PlatformSettings(Base):
     """Singleton settings table — always exactly one row with id=1."""
@@ -521,6 +530,34 @@ class PlatformSettings(Base):
     )
     apt_unattended_upgrades_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+    # Issue #164 — unattended-upgrades POLICY (the WHEN/HOW), orthogonal to
+    # ``apt_managed`` (the WHERE, #155). These render
+    # /etc/apt/apt.conf.d/50unattended-upgrades and apply even when the
+    # operator has NOT taken over apt sources; ``apt_unattended_upgrades_
+    # enabled`` above stays the master timer toggle (20auto-upgrades).
+    apt_unattended_origins: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: list(DEFAULT_UNATTENDED_ORIGINS),
+        server_default=sa_text(
+            "'" + json.dumps(DEFAULT_UNATTENDED_ORIGINS).replace("'", "''") + "'::jsonb"
+        ),
+    )
+    # Glob patterns never auto-upgraded (Unattended-Upgrade::Package-Blacklist).
+    apt_unattended_blocklist: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    # Reboot after an upgrade that needs one. Default False — a surprise
+    # reboot is the wrong default for a DDI appliance serving DNS / DHCP.
+    apt_unattended_automatic_reboot: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    # HH:MM (24h) for Unattended-Upgrade::Automatic-Reboot-Time. apt supports
+    # a single reboot time, not a window (the #164 sketch's window_end has no
+    # apt analogue), so we model the one value apt actually honours.
+    apt_unattended_reboot_time: Mapped[str] = mapped_column(
+        String(5), nullable=False, default="02:00", server_default=sa_text("'02:00'")
     )
 
     # ── Appliance timezone (issue #165) ─────────────────────────────

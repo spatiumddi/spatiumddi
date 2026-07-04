@@ -1563,14 +1563,16 @@ def maybe_fire_apt_reload(bundle_block: object) -> bool:
     multiple rendered files + keyring map don't fit the SNMP single-body
     shape) the host runner parses with python3:
 
-        line 1:   ``enabled`` | ``disabled`` marker
-        line 2:   config_hash (sha256 hex, blank when unmanaged)
+        line 1:   ``enabled`` | ``disabled`` marker (SOURCES management)
+        line 2:   config_hash (sha256 hex; covers the unattended policy too,
+                  so it's non-blank even when apt sources are unmanaged)
         line 3+:  JSON {sources_list, proxy_conf, auth_conf, keyrings,
-                  unattended_upgrades_enabled}
+                  unattended_upgrades_enabled, unattended}
 
-    An empty config_hash (apt_managed off) only fires a disable trigger
-    if a non-empty config was previously applied — handled by the
-    ``config_hash == applied_hash`` short-circuit inside the guard.
+    The ``config_hash == applied_hash`` short-circuit inside the guard means a
+    #164 unattended-policy change re-fires the trigger even with apt_managed
+    off (the marker stays ``disabled`` for sources; the runner still renders
+    the unattended files from the ``unattended`` blob).
     """
     if detect_deployment_kind() != "appliance":
         return False
@@ -1587,6 +1589,10 @@ def maybe_fire_apt_reload(bundle_block: object) -> bool:
             "unattended_upgrades_enabled": bool(
                 bundle_block.get("unattended_upgrades_enabled", True)
             ),
+            # #164 — the unattended-upgrades POLICY block (origins / blocklist /
+            # automatic-reboot / reboot-time). Always present so the runner can
+            # render 50unattended-upgrades even when apt sources are unmanaged.
+            "unattended": bundle_block.get("unattended") or {},
         }
     )
     payload = (

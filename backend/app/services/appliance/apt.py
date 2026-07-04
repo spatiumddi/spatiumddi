@@ -161,31 +161,64 @@ def _decrypt(token: Any) -> str | None:
         return None
 
 
+def unattended_block(settings: PlatformSettings) -> dict[str, Any]:
+    """Issue #164 — the unattended-upgrades POLICY block.
+
+    Always shipped (independent of ``apt_managed``) so an operator can set a
+    reboot / origins / blocklist policy WITHOUT taking over apt sources; the
+    host runner renders /etc/apt/apt.conf.d/{20auto-upgrades,
+    50unattended-upgrades} from it. ``enabled`` is the master periodic-timer
+    toggle (``apt_unattended_upgrades_enabled``); an empty ``origins`` list
+    means nothing is eligible, i.e. effectively no auto-upgrades even with the
+    timer on (per the #164 acceptance criteria)."""
+    return {
+        "enabled": bool(settings.apt_unattended_upgrades_enabled),
+        "origins": [
+            str(o).strip() for o in (settings.apt_unattended_origins or []) if str(o).strip()
+        ],
+        "blocklist": [
+            str(b).strip() for b in (settings.apt_unattended_blocklist or []) if str(b).strip()
+        ],
+        "automatic_reboot": bool(settings.apt_unattended_automatic_reboot),
+        "reboot_time": (str(settings.apt_unattended_reboot_time or "02:00").strip() or "02:00"),
+    }
+
+
 def apt_bundle(settings: PlatformSettings) -> dict[str, Any]:
     """Build the ``apt_settings`` block the supervisor ConfigBundle ships.
 
-    When ``apt_managed`` is False the block is the disabled shape
-    (``enabled=False``, empty hash) — the host runner then removes the
-    managed drop-in so Debian's baked ``sources.list`` takes back over.
-    The ``config_hash`` covers every rendered artifact so any change
-    shifts it and the supervisor re-fires the host trigger.
+    When ``apt_managed`` is False the block is the disabled shape for SOURCES
+    (``enabled=False``, empty rendered files) — the host runner removes the
+    managed drop-in so Debian's baked ``sources.list`` takes back over. The
+    unattended-upgrades POLICY (#164) always rides along regardless, and the
+    ``config_hash`` covers it too so a policy change re-fires the host trigger
+    even when sources are unmanaged. The hash covers every rendered artifact so
+    any change shifts it.
     """
+    unattended = unattended_block(settings)
+
     if not settings.apt_managed:
+        # Sources unmanaged, but the unattended policy still ships + drives its
+        # own hash so a #164 policy change re-fires even with apt_managed off.
+        config_hash = hashlib.sha256(
+            json.dumps({"unattended": unattended}, sort_keys=True).encode("utf-8"),
+            usedforsecurity=False,
+        ).hexdigest()
         return {
             "enabled": False,
-            "config_hash": "",
+            "config_hash": config_hash,
             "sources_list": "",
             "proxy_conf": "",
             "auth_conf": "",
             "keyrings": {},
-            "unattended_upgrades_enabled": bool(settings.apt_unattended_upgrades_enabled),
+            "unattended_upgrades_enabled": unattended["enabled"],
+            "unattended": unattended,
         }
 
     sources_list = render_sources_list(settings)
     proxy_conf = render_proxy_conf(settings)
     auth_conf = render_auth_conf(settings)
     keyrings = apt_keyrings(settings)
-    unattended = bool(settings.apt_unattended_upgrades_enabled)
 
     # Change-detection fingerprint. NOT computed over the decrypted secrets
     # (auth_conf cleartext / keyring armour) — instead over the stable
@@ -205,7 +238,7 @@ def apt_bundle(settings: PlatformSettings) -> dict[str, Any]:
             "sources_list": sources_list,
             "proxy_conf": proxy_conf,
             "secret_material": secret_material,
-            "unattended_upgrades_enabled": unattended,
+            "unattended": unattended,
         },
         sort_keys=True,
     )
@@ -217,5 +250,6 @@ def apt_bundle(settings: PlatformSettings) -> dict[str, Any]:
         "proxy_conf": proxy_conf,
         "auth_conf": auth_conf,
         "keyrings": keyrings,
-        "unattended_upgrades_enabled": unattended,
+        "unattended_upgrades_enabled": unattended["enabled"],
+        "unattended": unattended,
     }

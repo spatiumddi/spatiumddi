@@ -95,6 +95,20 @@ export function AptSection({
   const [unattended, setUnattended] = useState(
     values.apt_unattended_upgrades_enabled,
   );
+  // Issue #164 — unattended-upgrades policy. Origins / blocklist are edited as
+  // newline-separated textareas and split to arrays on save.
+  const [uuOrigins, setUuOrigins] = useState(
+    (values.apt_unattended_origins || []).join("\n"),
+  );
+  const [uuBlocklist, setUuBlocklist] = useState(
+    (values.apt_unattended_blocklist || []).join("\n"),
+  );
+  const [uuAutoReboot, setUuAutoReboot] = useState(
+    values.apt_unattended_automatic_reboot,
+  );
+  const [uuRebootTime, setUuRebootTime] = useState(
+    values.apt_unattended_reboot_time || "02:00",
+  );
   const [touched, setTouched] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
@@ -141,6 +155,16 @@ export function AptSection({
         apt_proxy_no_proxy: noProxy,
         apt_auth: buildAuthUpdate(),
         apt_unattended_upgrades_enabled: unattended,
+        apt_unattended_origins: uuOrigins
+          .split("\n")
+          .map((s) => s.trim())
+          .filter(Boolean),
+        apt_unattended_blocklist: uuBlocklist
+          .split("\n")
+          .map((s) => s.trim())
+          .filter(Boolean),
+        apt_unattended_automatic_reboot: uuAutoReboot,
+        apt_unattended_reboot_time: uuRebootTime.trim(),
       }),
     onSuccess: (updated) => {
       qc.setQueryData(["settings"], updated);
@@ -161,6 +185,13 @@ export function AptSection({
         })),
       );
       setSources(updated.apt_sources || []);
+      // #164 — re-sync the unattended policy fields from the server response
+      // so backend normalisation (dropped-empty origins, stripped whitespace)
+      // is reflected instead of the operator's raw textarea input.
+      setUuOrigins((updated.apt_unattended_origins || []).join("\n"));
+      setUuBlocklist((updated.apt_unattended_blocklist || []).join("\n"));
+      setUuAutoReboot(updated.apt_unattended_automatic_reboot);
+      setUuRebootTime(updated.apt_unattended_reboot_time || "02:00");
       setSaveErr(null);
       setTouched(false);
       setSavedAt(Date.now());
@@ -586,6 +617,74 @@ export function AptSection({
             mark();
           }}
           disabled={ro}
+        />
+      </Field>
+
+      {/* ── Unattended-upgrades policy (issue #164) ── */}
+      <div className="space-y-2 border-t pt-3">
+        <div className="text-sm font-medium">Unattended-upgrades policy</div>
+        <div className="text-xs text-muted-foreground">
+          Controls what the daily unattended run installs and whether it
+          reboots. Applies even without managed APT sources. An empty
+          allowed-origins list means nothing is auto-upgraded.
+        </div>
+        <label className="block text-xs font-medium">
+          Allowed origins (one per line)
+        </label>
+        <textarea
+          className={cn(inputCls, "w-full font-mono text-xs")}
+          rows={3}
+          placeholder={"${distro_id}:${distro_codename}-security"}
+          value={uuOrigins}
+          disabled={ro}
+          onChange={(e) => {
+            setUuOrigins(e.target.value);
+            mark();
+          }}
+        />
+        <label className="block text-xs font-medium">
+          Package blocklist — globs never auto-upgraded (one per line)
+        </label>
+        <textarea
+          className={cn(inputCls, "w-full font-mono text-xs")}
+          rows={2}
+          placeholder={"linux-image-*\nnvidia-*"}
+          value={uuBlocklist}
+          disabled={ro}
+          onChange={(e) => {
+            setUuBlocklist(e.target.value);
+            mark();
+          }}
+        />
+      </div>
+
+      <Field
+        label="Automatic reboot after upgrades"
+        description="Reboot automatically when an installed update requires it. Off by default — a surprise reboot is risky for a DDI appliance serving DNS / DHCP."
+      >
+        <Toggle
+          checked={uuAutoReboot}
+          onChange={(v) => {
+            setUuAutoReboot(v);
+            mark();
+          }}
+          disabled={ro}
+        />
+      </Field>
+
+      <Field
+        label="Reboot time"
+        description="HH:MM (24-hour) for the automatic reboot, when enabled."
+      >
+        <input
+          className={cn(inputCls, "w-28")}
+          placeholder="02:00"
+          value={uuRebootTime}
+          disabled={ro || !uuAutoReboot}
+          onChange={(e) => {
+            setUuRebootTime(e.target.value);
+            mark();
+          }}
         />
       </Field>
 

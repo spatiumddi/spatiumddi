@@ -24,6 +24,7 @@ from app.services.appliance.apt import (
     render_auth_conf,
     render_proxy_conf,
     render_sources_list,
+    unattended_block,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -56,6 +57,14 @@ def _shim(**kw) -> PlatformSettings:
     s.apt_proxy_no_proxy = kw.get("no_proxy", "")
     s.apt_auth = kw.get("auth", [])
     s.apt_unattended_upgrades_enabled = kw.get("unattended", True)
+    # Issue #164 — unattended-upgrades policy (defaults mirror the model's
+    # server_defaults so a shim behaves like a fresh row).
+    s.apt_unattended_origins = kw.get(
+        "unattended_origins", ["${distro_id}:${distro_codename}-security"]
+    )
+    s.apt_unattended_blocklist = kw.get("unattended_blocklist", [])
+    s.apt_unattended_automatic_reboot = kw.get("unattended_automatic_reboot", False)
+    s.apt_unattended_reboot_time = kw.get("unattended_reboot_time", "02:00")
     return s
 
 
@@ -103,13 +112,110 @@ def test_render_proxy_conf_includes_no_proxy_direct() -> None:
 def test_apt_bundle_disabled_when_unmanaged() -> None:
     b = apt_bundle(_shim(managed=False))
     assert b["enabled"] is False
-    assert b["config_hash"] == ""
-    # Managed flips it on with a stable non-empty hash.
+    # #164 — the sources-disabled bundle still carries the unattended policy,
+    # so its hash is non-empty (a policy change re-fires even with apt_managed
+    # off). It is deterministic for a fixed policy.
+    assert len(b["config_hash"]) == 64
+    assert "unattended" in b
+    assert apt_bundle(_shim(managed=False))["config_hash"] == b["config_hash"]
+    # Managed flips sources on with its own stable non-empty hash.
     b2 = apt_bundle(_shim(managed=True))
     assert b2["enabled"] is True
     assert len(b2["config_hash"]) == 64
     # Deterministic — same settings → same hash.
     assert apt_bundle(_shim(managed=True))["config_hash"] == b2["config_hash"]
+
+
+# ── (a2) unattended-upgrades policy (#164) ──────────────────────────
+
+
+def test_unattended_block_shape_and_normalisation() -> None:
+    u = unattended_block(
+        _shim(
+            unattended=True,
+            unattended_origins=["  origin=Debian  ", "", "o=x"],
+            unattended_blocklist=["linux-image-*", "  "],
+            unattended_automatic_reboot=True,
+            unattended_reboot_time="03:15",
+        )
+    )
+    assert u["enabled"] is True
+    # Blank entries dropped, surrounding whitespace stripped.
+    assert u["origins"] == ["origin=Debian", "o=x"]
+    assert u["blocklist"] == ["linux-image-*"]
+    assert u["automatic_reboot"] is True
+    assert u["reboot_time"] == "03:15"
+
+
+def test_apt_bundle_hash_tracks_unattended_policy_when_unmanaged() -> None:
+    # apt_managed off both times — only the unattended policy differs, and the
+    # config_hash must still shift so the supervisor re-fires the host trigger.
+    a = apt_bundle(_shim(managed=False, unattended_reboot_time="02:00"))["config_hash"]
+    b = apt_bundle(_shim(managed=False, unattended_reboot_time="04:30"))["config_hash"]
+    assert a != b
+    # And the managed-shape hash also folds the policy in.
+    c = apt_bundle(_shim(managed=True, unattended_automatic_reboot=False))["config_hash"]
+    d = apt_bundle(_shim(managed=True, unattended_automatic_reboot=True))["config_hash"]
+    assert c != d
+
+
+async def test_put_get_unattended_policy_roundtrip(client: AsyncClient, db_session):
+    _, token = await _superadmin(db_session)
+    h = _hdr(token)
+    r = await client.put(
+        "/api/v1/settings",
+        headers=h,
+        json={
+            "apt_unattended_upgrades_enabled": True,
+            "apt_unattended_origins": ["${distro_id}:${distro_codename}-security", "o=Debian"],
+            "apt_unattended_blocklist": ["linux-image-*"],
+            "apt_unattended_automatic_reboot": True,
+            "apt_unattended_reboot_time": "03:30",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["apt_unattended_origins"] == [
+        "${distro_id}:${distro_codename}-security",
+        "o=Debian",
+    ]
+    assert body["apt_unattended_blocklist"] == ["linux-image-*"]
+    assert body["apt_unattended_automatic_reboot"] is True
+    assert body["apt_unattended_reboot_time"] == "03:30"
+    # The bundle carries the policy through to the host trigger.
+    settings = await db_session.get(PlatformSettings, 1)
+    assert settings is not None
+    u = apt_bundle(settings)["unattended"]
+    assert u["automatic_reboot"] is True
+    assert u["reboot_time"] == "03:30"
+    assert "o=Debian" in u["origins"]
+
+
+async def test_put_rejects_bad_reboot_time(client: AsyncClient, db_session):
+    _, token = await _superadmin(db_session)
+    r = await client.put(
+        "/api/v1/settings",
+        headers=_hdr(token),
+        json={"apt_unattended_reboot_time": "25:99"},
+    )
+    assert r.status_code == 422
+
+
+async def test_put_rejects_control_char_in_origin(client: AsyncClient, db_session):
+    _, token = await _superadmin(db_session)
+    r = await client.put(
+        "/api/v1/settings",
+        headers=_hdr(token),
+        json={"apt_unattended_origins": ['o=Debian\nUnattended-Upgrade::Foo "1"']},
+    )
+    assert r.status_code == 422
+    # ASCII DEL (0x7f) is a control char too and must be rejected (Copilot review).
+    r2 = await client.put(
+        "/api/v1/settings",
+        headers=_hdr(token),
+        json={"apt_unattended_blocklist": ["nvidia-\x7f"]},
+    )
+    assert r2.status_code == 422
 
 
 def test_render_auth_conf_skips_entries_without_password() -> None:
