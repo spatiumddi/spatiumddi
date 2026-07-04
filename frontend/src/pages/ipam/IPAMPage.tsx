@@ -12287,15 +12287,21 @@ function BlockDetailView({
                       title:
                         "Move this block (and everything under it) to a different IP space.",
                     },
-                    {
-                      label: "Add child block…",
-                      icon: Layers,
-                      onClick: () => setShowCreateChildBlock(true),
-                    },
                   ]}
                 />
                 <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
                   Edit
+                </HeaderButton>
+                {/* Blocks can nest inside blocks, so "Add child block" is a
+                    visible structural action next to New Subnet rather than
+                    buried in the Tools ▾ dropdown — mirrors the space header's
+                    "Add block" grammar (#538). */}
+                <HeaderButton
+                  icon={Layers}
+                  onClick={() => setShowCreateChildBlock(true)}
+                  title="Add a block inside this block"
+                >
+                  Add child block
                 </HeaderButton>
                 <HeaderButton
                   variant="primary"
