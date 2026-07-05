@@ -3,17 +3,19 @@
 Shared by the operator-facing ``GET /looking-glass/routes/for-ip`` endpoint
 and the ``find_bgp_route_for_ip`` MCP tool — one implementation, two
 callers, so the LPM-by-single-IP semantics can't drift between the two
-surfaces.
+surfaces. The actual LPM + tie-break now lives in
+``app.services.looking_glass.reachability.find_covering_routes`` (issue
+#566 Phase 6 hoisted it out so the multicast reachability cross-reference
+could share it too); this module keeps its own thin ``(route, alt_count)``
+wrapper so its two existing callers don't need to change shape.
 """
 
 from __future__ import annotations
 
-import ipaddress
-
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.bgp_looking_glass import BGPLGRoute
+from app.services.looking_glass.reachability import find_covering_routes
 
 
 async def best_route_for_ip(db: AsyncSession, ip: str) -> tuple[BGPLGRoute, int] | None:
@@ -24,39 +26,10 @@ async def best_route_for_ip(db: AsyncSession, ip: str) -> tuple[BGPLGRoute, int]
     tie-break: longest prefix wins; among ties prefer the best path, then
     order by peer id.
     """
-    try:
-        ip_obj = ipaddress.ip_address(ip)
-    except ValueError:
+    routes = await find_covering_routes(db, ip)
+    if not routes:
         return None
-
-    rows = (
-        (
-            await db.execute(
-                select(BGPLGRoute).where(
-                    BGPLGRoute.prefix.op(">>=")(str(ip_obj)),
-                    BGPLGRoute.withdrawn_at.is_(None),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    covering: list[tuple[ipaddress._BaseNetwork, BGPLGRoute]] = []
-    for row in rows:
-        try:
-            net = ipaddress.ip_network(str(row.prefix), strict=False)
-        except ValueError:
-            continue
-        if net.version != ip_obj.version or ip_obj not in net:
-            continue
-        covering.append((net, row))
-
-    if not covering:
-        return None
-
-    covering.sort(key=lambda t: (-t[0].prefixlen, 0 if t[1].is_best else 1, str(t[1].peer_id)))
-    return covering[0][1], len(covering) - 1
+    return routes[0], len(routes) - 1
 
 
 __all__ = ["best_route_for_ip"]

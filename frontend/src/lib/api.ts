@@ -13107,7 +13107,14 @@ export interface BGPCommunityUpdate {
 // this is the real internal routing table, mounted at
 // ``/looking-glass`` (not ``/bgp``).
 
-export type BGPLGAddressFamily = "ipv4-unicast" | "ipv6-unicast";
+// vpnv4/vpnv6 (issue #566 Phase 6) — MP-BGP VPNv4/VPNv6 (RFC 4364). EVPN
+// stays out of scope. Not yet exercised against a live gobgpd VPNv4/VPNv6
+// session — see the collector's own "verified live" convention.
+export type BGPLGAddressFamily =
+  | "ipv4-unicast"
+  | "ipv6-unicast"
+  | "vpnv4"
+  | "vpnv6";
 
 // idle | connect | active | opensent | openconfirm | established (GoBGP FSM).
 export type BGPLGSessionState =
@@ -13241,6 +13248,9 @@ export interface BGPLGRoute {
   communities: string[];
   large_communities: string[];
   ext_communities: string[];
+  /** Route Distinguisher (RFC 4364) — non-empty only for vpnv4/vpnv6
+   *  paths; part of the row's identity server-side (issue #566 Phase 6). */
+  route_distinguisher: string;
   rpki_status: BGPLGRpkiStatus;
   is_best: boolean;
   matched_block_id: string | null;
@@ -13309,6 +13319,31 @@ export interface BGPLGDashboardSummary {
   routes_flapping: number;
 }
 
+// GET /looking-glass/multicast-reachability (issue #566 Phase 6) —
+// read-only cross-reference of PIM rendezvous-point addresses + multicast
+// group producer source subnets against the learned RIB. Computed live,
+// nothing persisted.
+export interface MulticastDomainReachability {
+  domain_id: string;
+  domain_name: string;
+  rp_address: string;
+  covering_route: BGPLGRoute | null;
+}
+
+export interface MulticastGroupReachability {
+  group_id: string;
+  group_name: string;
+  group_address: string;
+  source_subnet_id: string;
+  source_subnet: string;
+  covering_route: BGPLGRoute | null;
+}
+
+export interface MulticastReachabilityResponse {
+  domains: MulticastDomainReachability[];
+  groups: MulticastGroupReachability[];
+}
+
 export const lookingGlassApi = {
   // Collectors — agent-registration identity rows (one per GoBGP daemon).
   // Registration itself is agent-side; operators only read the list here.
@@ -13361,6 +13396,14 @@ export const lookingGlassApi = {
   getDashboardSummary: () =>
     api
       .get<BGPLGDashboardSummary>("/looking-glass/dashboard-summary")
+      .then((r) => r.data),
+  /** Multicast PIM-RP + producer-subnet reachability against the learned
+   *  RIB (issue #566 Phase 6) — read-only, computed on demand. */
+  getMulticastReachability: () =>
+    api
+      .get<MulticastReachabilityResponse>(
+        "/looking-glass/multicast-reachability",
+      )
       .then((r) => r.data),
 };
 

@@ -116,6 +116,13 @@ class RouteEntry(BaseModel):
     communities: list[str] = Field(default_factory=list)
     large_communities: list[str] = Field(default_factory=list)
     ext_communities: list[str] = Field(default_factory=list)
+    # Route Distinguisher (RFC 4364) — vpnv4/vpnv6 paths only. Optional
+    # because the collector-side GoBGP RIB poll doesn't populate this yet
+    # (issue #566 Phase 6 lands the API + ingest-side identity/matching;
+    # the agent's VPNv4/VPNv6 wire support is a follow-up). ``None``/absent
+    # is treated as "" (plain ipv4-unicast/ipv6-unicast path) by
+    # ``routes_ingest.ingest_routes``.
+    route_distinguisher: str | None = None
     is_best: bool = False
 
 

@@ -24,10 +24,15 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
-# v1 address-family scope — VPNv4/VPNv6/EVPN are a later phase (issue #566
-# plan §3.4/§6). Reject anything else at the API boundary rather than
-# silently accepting a family the collector daemon can't render.
-_VALID_ADDRESS_FAMILIES = frozenset({"ipv4-unicast", "ipv6-unicast"})
+# v1 scope — EVPN is a later phase; VPNv4/VPNv6 landed in Phase 6 (issue
+# #566). Reject anything else at the API boundary rather than silently
+# accepting a family the collector daemon can't render. Note: the
+# collector-side GoBGP config render + RIB poll (agent/looking-glass/) is a
+# follow-up — this widening lands the API + control-plane VRF RT-matching
+# (app.services.looking_glass.vrf_match) now so peers can be configured and
+# ext_communities-carrying routes cross-checked against VRF import/export
+# targets ahead of the agent-side wire work.
+_VALID_ADDRESS_FAMILIES = frozenset({"ipv4-unicast", "ipv6-unicast", "vpnv4", "vpnv6"})
 
 # ``import_filter`` shape: {"mode": "accept_all"} or
 # {"mode": "scope", "prefixes": [...]}. See ``BGPLGPeer.import_filter``.
@@ -64,7 +69,7 @@ def _validate_address_families(v: list[str]) -> list[str]:
         raise ValueError(
             f"unsupported address_families {bad}; only "
             f"{sorted(_VALID_ADDRESS_FAMILIES)} are supported in this phase "
-            "(VPNv4/VPNv6/EVPN deferred)"
+            "(EVPN deferred)"
         )
     return v
 
@@ -306,6 +311,9 @@ class RouteRead(BaseModel):
     communities: list[str]
     large_communities: list[str]
     ext_communities: list[str]
+    # Route Distinguisher (RFC 4364) — non-empty only for vpnv4/vpnv6 paths;
+    # part of the row's identity server-side (issue #566 Phase 6).
+    route_distinguisher: str
     rpki_status: str
     is_best: bool
     matched_block_id: uuid.UUID | None
@@ -369,3 +377,60 @@ class LookingGlassDashboardSummary(BaseModel):
     peers_down: int
     routes_rpki_invalid: int
     routes_flapping: int
+
+
+# ── VRF Route-Target cross-check (issue #566 Phase 6) ──────────────────
+
+
+class VrfRtMatchRow(BaseModel):
+    """One of a VRF's own import/export route targets that actually shows up
+    on at least one currently-active learned route matched to that VRF."""
+
+    route_target: str
+    kind: str  # "import" | "export"
+    matched_route_count: int
+
+
+class VrfRtMatchSummary(BaseModel):
+    """``GET /looking-glass/vrf-rt-matches/{vrf_id}`` — feeds the VRF detail
+    page's "Learned VPN Routes" tab RT cross-check. ``matched_route_count``
+    is every active route currently linked to this VRF (via
+    ``BGPLGRoute.matched_vrf_id``, which Phase 6 sets from a Route-Target
+    match when one exists — see ``app.services.looking_glass.vrf_match`` —
+    falling back to the IPAM-effective VRF otherwise); ``route_targets``
+    breaks that count down by which of the VRF's own RTs were actually seen
+    in a matched route's ``ext_communities``."""
+
+    vrf_id: uuid.UUID
+    vrf_name: str
+    matched_route_count: int
+    route_targets: list[VrfRtMatchRow]
+
+
+# ── Multicast <-> BGP reachability cross-reference (issue #566 Phase 6) ──
+
+
+class DomainReachability(BaseModel):
+    domain_id: uuid.UUID
+    domain_name: str
+    rp_address: str
+    covering_route: RouteRead | None
+
+
+class GroupSourceReachability(BaseModel):
+    group_id: uuid.UUID
+    group_name: str
+    group_address: str
+    source_subnet_id: uuid.UUID
+    source_subnet: str
+    covering_route: RouteRead | None
+
+
+class MulticastReachabilityResponse(BaseModel):
+    """``GET /looking-glass/multicast-reachability`` — read-only, computed on
+    demand (no persisted columns; see
+    ``app.services.looking_glass.reachability.multicast_bgp_reachability``).
+    """
+
+    domains: list[DomainReachability]
+    groups: list[GroupSourceReachability]

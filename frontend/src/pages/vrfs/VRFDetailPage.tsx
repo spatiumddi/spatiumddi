@@ -12,7 +12,10 @@ import {
 import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { BgpRouteMiniTable } from "@/components/network/bgp-route-table";
+import {
+  BgpRouteMiniTable,
+  type VrfRtContext,
+} from "@/components/network/bgp-route-table";
 import { VRFEditorModal } from "./VRFsPage";
 
 type Tab = "spaces" | "blocks" | "routes";
@@ -50,14 +53,18 @@ function RtChips({ values }: { values: string[] }) {
   );
 }
 
-// Issue #566 Phase 3 — "matched_vrf_id" means "the VRF assigned to
-// whichever IPAM block/space this route's prefix falls under" (the
-// effective-VRF walk in backend/app/services/looking_glass/ipam_link.py),
-// NOT an RD/RT match against this VRF's import/export targets — there's
-// no VPNv4/VPNv6 AFI data to parse yet (ext_communities parsing is a
-// deferred later phase). Don't imply a match/no-match badge against the
-// RTs above; this panel just lists routes whose matched IPAM footprint
-// happens to sit in this VRF.
+// Issue #566 Phase 3 introduced "matched_vrf_id" meaning "the VRF assigned
+// to whichever IPAM block/space this route's prefix falls under" (the
+// effective-VRF walk in backend/app/services/looking_glass/ipam_link.py).
+// Phase 6 adds a second, DISTINCT way a route ends up with this VRF's id:
+// a direct Route-Target cross-check against ``ext_communities`` for
+// vpnv4/vpnv6 paths (backend/app/services/looking_glass/vrf_match.py),
+// which takes precedence over the IPAM walk when a route carries a
+// Route Distinguisher. This panel doesn't need to tell the two apart at
+// the query level (both set ``matched_vrf_id``) — it just renders the
+// RT cross-check columns (via ``vrfRtContext``) whenever a row happens to
+// carry ``ext_communities``/``route_distinguisher``; plain ipv4/ipv6-unicast
+// routes matched purely by IPAM footprint show "—" in those columns.
 function VrfRoutesPanel({ vrf }: { vrf: VRF }) {
   const { data, isLoading } = useQuery({
     queryKey: ["bgp-lg-routes-by-vrf", vrf.id],
@@ -82,13 +89,20 @@ function VrfRoutesPanel({ vrf }: { vrf: VRF }) {
       </div>
     );
   }
+  const rtContext: VrfRtContext = {
+    importTargets: vrf.import_targets,
+    exportTargets: vrf.export_targets,
+  };
   return (
     <div className="space-y-2">
       <p className="text-xs text-muted-foreground">
         Every active BGP Looking Glass route whose matched IPAM block or space
-        carries this VRF.
+        carries this VRF, or (issue #566 Phase 6) whose VPNv4/VPNv6 Route Target
+        matched this VRF's import/export lists directly. The "Route targets"
+        column highlights which of this VRF's RTs a route's extended communities
+        hit.
       </p>
-      <BgpRouteMiniTable items={items} />
+      <BgpRouteMiniTable items={items} vrfRtContext={rtContext} />
     </div>
   );
 }

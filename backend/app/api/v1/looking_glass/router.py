@@ -33,6 +33,16 @@ Endpoints:
   Dashboard's "Looking Glass health" card (issue #566 Phase 5). See
   ``LookingGlassDashboardSummary`` for why this is its own shape rather than
   the Integrations dashboard tab's ``IntegrationPanel``.
+* ``/vrf-rt-matches/{vrf_id}`` — issue #566 Phase 6. Which of a VRF's own
+  import/export route targets actually appear on a currently-active route
+  matched to that VRF (``matched_vrf_id``, which the VPNv4/VPNv6
+  Route-Target cross-check in ``app.services.looking_glass.vrf_match`` now
+  populates ahead of the plain IPAM-effective match). Feeds the VRF detail
+  page's "Learned VPN Routes" tab.
+* ``/multicast-reachability`` — issue #566 Phase 6, read-only. Cross-checks
+  PIM domain rendezvous-point addresses and multicast-group producer
+  source subnets against the learned RIB. See
+  ``app.services.looking_glass.reachability.multicast_bgp_reachability``.
 
 Every write handler writes an ``AuditLog`` row before ``commit()`` per
 CLAUDE.md non-negotiable #4.
@@ -60,14 +70,19 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.bgp_looking_glass import BGPLGPeer, BGPLGRoute, LookingGlassCollector
 from app.models.network import NetworkDevice
+from app.models.vrf import VRF
 from app.services.bgp.hijack_monitor import RPKI_INVALID
 from app.services.looking_glass.as_path_query import as_path_regexp_clause
 from app.services.looking_glass.reverse_lookup import best_route_for_ip
+from app.services.looking_glass.vrf_match import normalize_rt
 
 from .schemas import (
     CollectorRead,
     CollectorUpdate,
+    DomainReachability,
+    GroupSourceReachability,
     LookingGlassDashboardSummary,
+    MulticastReachabilityResponse,
     PeerCreate,
     PeerRead,
     PeerUpdate,
@@ -75,6 +90,8 @@ from .schemas import (
     RouteListResponse,
     RouteRead,
     SessionRead,
+    VrfRtMatchRow,
+    VrfRtMatchSummary,
 )
 
 router = APIRouter(
@@ -611,4 +628,103 @@ async def dashboard_summary(db: DB, _: CurrentUser) -> LookingGlassDashboardSumm
         peers_down=peers_down,
         routes_rpki_invalid=rpki_invalid,
         routes_flapping=flapping,
+    )
+
+
+# ── VRF Route-Target cross-check (issue #566 Phase 6) ───────────────────
+
+
+@router.get("/vrf-rt-matches/{vrf_id}", response_model=VrfRtMatchSummary)
+async def get_vrf_rt_matches(vrf_id: uuid.UUID, db: DB, _: CurrentUser) -> VrfRtMatchSummary:
+    """Which of a VRF's own import/export route targets actually show up on
+    a currently-active learned route matched to that VRF. Feeds the VRF
+    detail page's "Learned VPN Routes" tab RT cross-check — the routes
+    themselves are already reachable via ``GET /looking-glass/routes
+    ?matched_vrf_id=<vrf_id>`` (Phase 3); this endpoint answers "which RTs
+    are actually being hit" without the caller having to walk every
+    matched route's ``ext_communities`` client-side.
+    """
+    vrf = await db.get(VRF, vrf_id)
+    if vrf is None:
+        raise HTTPException(status_code=404, detail="VRF not found")
+
+    import_set = set(vrf.import_targets or [])
+    export_set = set(vrf.export_targets or [])
+
+    rows = (
+        (
+            await db.execute(
+                select(BGPLGRoute.ext_communities).where(
+                    BGPLGRoute.matched_vrf_id == vrf.id,
+                    BGPLGRoute.withdrawn_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    counts: dict[tuple[str, str], int] = {}
+    for ext_communities in rows:
+        hits: set[tuple[str, str]] = set()
+        for raw in ext_communities or []:
+            norm = normalize_rt(str(raw))
+            if norm in import_set:
+                hits.add((norm, "import"))
+            if norm in export_set:
+                hits.add((norm, "export"))
+        for key in hits:
+            counts[key] = counts.get(key, 0) + 1
+
+    route_targets = [
+        VrfRtMatchRow(route_target=rt, kind=kind, matched_route_count=n)
+        for (rt, kind), n in sorted(counts.items())
+    ]
+    return VrfRtMatchSummary(
+        vrf_id=vrf.id,
+        vrf_name=vrf.name,
+        matched_route_count=len(rows),
+        route_targets=route_targets,
+    )
+
+
+# ── Multicast BGP reachability cross-reference (issue #566 Phase 6) ─────
+
+
+@router.get("/multicast-reachability", response_model=MulticastReachabilityResponse)
+async def get_multicast_reachability(db: DB, _: CurrentUser) -> MulticastReachabilityResponse:
+    """Read-only cross-reference of multicast PIM RP addresses / producer
+    source subnets against the learned RIB. See
+    ``app.services.looking_glass.reachability.multicast_bgp_reachability``.
+
+    Sits under this router's ``network.looking_glass`` module gate but does
+    NOT also check ``network.multicast`` — reading multicast rows when that
+    module is toggled off is harmless (module-off only hides a surface, it
+    never deletes data, same as every other feature-module precedent in
+    this codebase).
+    """
+    from app.services.looking_glass.reachability import multicast_bgp_reachability
+
+    result = await multicast_bgp_reachability(db)
+    return MulticastReachabilityResponse(
+        domains=[
+            DomainReachability(
+                domain_id=d.domain_id,
+                domain_name=d.domain_name,
+                rp_address=d.rp_address,
+                covering_route=_route_to_read(d.covering_route) if d.covering_route else None,
+            )
+            for d in result.domains
+        ],
+        groups=[
+            GroupSourceReachability(
+                group_id=g.group_id,
+                group_name=g.group_name,
+                group_address=g.group_address,
+                source_subnet_id=g.source_subnet_id,
+                source_subnet=g.source_subnet,
+                covering_route=_route_to_read(g.covering_route) if g.covering_route else None,
+            )
+            for g in result.groups
+        ],
     )

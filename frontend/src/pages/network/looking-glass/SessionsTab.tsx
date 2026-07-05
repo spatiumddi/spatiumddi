@@ -255,7 +255,15 @@ export function SessionsTab({
 const AF_OPTIONS: { value: BGPLGAddressFamily; label: string }[] = [
   { value: "ipv4-unicast", label: "IPv4 unicast" },
   { value: "ipv6-unicast", label: "IPv6 unicast" },
+  { value: "vpnv4", label: "VPNv4" },
+  { value: "vpnv6", label: "VPNv6" },
 ];
+
+// vpnv4/vpnv6 (issue #566 Phase 6, MP-BGP / RFC 4364) haven't been
+// exercised against a live gobgpd VPNv4/VPNv6 session the way plain
+// ipv4/ipv6-unicast peering has — flag them as advanced/unverified so an
+// operator enabling one for the first time knows what to expect.
+const VPN_FAMILIES: BGPLGAddressFamily[] = ["vpnv4", "vpnv6"];
 
 export function PeerFormModal({
   existing,
@@ -487,7 +495,7 @@ export function PeerFormModal({
         </div>
 
         <Field label="Address families">
-          <div className="flex gap-4">
+          <div className="flex flex-wrap gap-4">
             {AF_OPTIONS.map((af) => (
               <label
                 key={af.value}
@@ -502,6 +510,14 @@ export function PeerFormModal({
               </label>
             ))}
           </div>
+          {families.some((f) => VPN_FAMILIES.includes(f)) && (
+            <p className="mt-1.5 text-xs text-muted-foreground">
+              Advanced — VPNv4/VPNv6 (MP-BGP L3VPN) support is new and hasn't
+              been verified against a live VPNv4/VPNv6 session yet. Route
+              Distinguisher + Route-Target cross-check against VRFs is on the
+              Routes tab of each matched VRF once routes start flowing.
+            </p>
+          )}
         </Field>
 
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">

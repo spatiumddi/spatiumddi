@@ -27,8 +27,12 @@ Three tables:
   Absence-reconcile marks a route ``withdrawn_at`` (NOT a hard delete) when it
   drops out of the peer's feed — mirroring the DHCP ``pull_leases`` shape, with
   the same zero-wire floor guard on the ingest side. ``matched_*_id`` FKs link a
-  learned route to the IPAM block / subnet / space / ASN / VRF it falls under
-  (populated by a later phase; the columns ship now so no migration is needed).
+  learned route to the IPAM block / subnet / space / ASN / VRF it falls under,
+  populated at ingest by ``app.services.looking_glass.ipam_link`` (Phase 3) and,
+  for ``matched_vrf_id`` specifically, overridden by a Route-Target cross-check
+  against ``vrf.import_targets``/``export_targets`` when the route's
+  ``ext_communities`` carry a hit (``app.services.looking_glass.vrf_match``,
+  Phase 6) — see that module for the precedence rule.
   ``rpki_status`` reuses ``derive_rpki_status()`` from the #527 hijack monitor.
 
 Distinct from #527 (public-table hijack monitor) and from the MetalLB VIP
@@ -157,7 +161,10 @@ class BGPLGPeer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     # Address families to negotiate, e.g. ["ipv4-unicast", "ipv6-unicast"].
-    # VPNv4/VPNv6/EVPN are a later phase — v1 defaults to unicast.
+    # vpnv4/vpnv6 accepted since issue #566 Phase 6 (see
+    # app.services.looking_glass.vrf_match for the VRF Route-Target
+    # cross-check that reads a matching route's ext_communities). EVPN
+    # remains a later phase.
     address_families: Mapped[list] = mapped_column(
         JSONB,
         nullable=False,
@@ -223,12 +230,24 @@ class BGPLGRoute(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     Absence-reconcile sets ``withdrawn_at`` (never a hard delete) when the route
     drops out of the peer's feed. ``matched_*_id`` FKs link the route to the
-    IPAM object it falls under (populated by a later phase; columns ship now).
+    IPAM object it falls under (populated at ingest; see the module docstring).
     """
 
     __tablename__ = "bgp_lg_route"
     __table_args__ = (
-        UniqueConstraint("peer_id", "prefix", "next_hop", name="uq_bgp_lg_route"),
+        # ``route_distinguisher`` joined the identity in issue #566 Phase 6 —
+        # a VPNv4/VPNv6 path's RD (RFC 4364) is the whole reason two VRFs can
+        # originate the SAME customer prefix without collision; without it
+        # here, two different VRFs' overlapping prefixes learned via the
+        # same peer + next-hop (an ordinary shape — the PE's own loopback is
+        # the next-hop for every VRF it serves) would silently overwrite
+        # each other on this constraint. '' (not NULL) for plain
+        # ipv4-unicast/ipv6-unicast routes — Postgres treats every NULL as
+        # distinct in a UNIQUE constraint, so a nullable column here would
+        # silently defeat the existing dedup semantics for ordinary routes.
+        UniqueConstraint(
+            "peer_id", "prefix", "next_hop", "route_distinguisher", name="uq_bgp_lg_route"
+        ),
         Index("ix_bgp_lg_route_peer", "peer_id"),
         Index("ix_bgp_lg_route_origin_asn", "origin_asn"),
         Index("ix_bgp_lg_route_prefix", "prefix"),
@@ -246,6 +265,13 @@ class BGPLGRoute(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_bgp_lg_route_matched_asn", "matched_asn_id"),
         Index("ix_bgp_lg_route_matched_vrf", "matched_vrf_id"),
         Index("ix_bgp_lg_route_last_flap_at", "last_flap_at"),
+        # Supports the VRF "Learned VPN Routes" tab / admin debug queries
+        # filtering to VPN-carrying rows specifically.
+        Index(
+            "ix_bgp_lg_route_rd",
+            "route_distinguisher",
+            postgresql_where=sa_text("route_distinguisher != ''"),
+        ),
     )
 
     peer_id: Mapped[uuid.UUID] = mapped_column(
@@ -274,9 +300,28 @@ class BGPLGRoute(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     large_communities: Mapped[list] = mapped_column(
         JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
     )
-    # Extended communities carry RD/RT for the deferred VPNv4/VPNv6 phase.
+    # Extended communities carry the Route Target for VPNv4/VPNv6 routes;
+    # matched against vrf.import_targets/export_targets at ingest (and by the
+    # periodic re-resolve sweep) to populate matched_vrf_id — see
+    # app.services.looking_glass.vrf_match (issue #566 Phase 6). This match
+    # takes precedence over the plain IPAM-effective-VRF match (see
+    # app.services.looking_glass.ipam_link) when a Route Target hit is
+    # found. Note: this column does NOT carry the Route Distinguisher — RD
+    # is part of the VPN-IPv4/VPN-IPv6 NLRI (RFC 4364), not an extended
+    # community; it lives in the dedicated ``route_distinguisher`` column
+    # below.
     ext_communities: Mapped[list] = mapped_column(
         JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    # Route Distinguisher for VPNv4/VPNv6 paths (RFC 4364) — part of the
+    # NLRI, not an extended community. '' (not NULL) for plain
+    # ipv4-unicast/ipv6-unicast routes (see the migration docstring and
+    # uq_bgp_lg_route above for why NULL would silently break dedup).
+    # Participates in route identity because RD's entire purpose is
+    # letting two VRFs originate the same customer prefix without
+    # collision (issue #566 Phase 6).
+    route_distinguisher: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=sa_text("''")
     )
 
     # valid | invalid | unknown — reuses derive_rpki_status() at ingest.

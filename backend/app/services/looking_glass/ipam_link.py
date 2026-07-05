@@ -19,14 +19,17 @@ pushes.
   (e.g. advertising a whole ``/16`` containing many ``/24`` subnets) can
   match an enclosing **block** but no single subnet — that's intentional,
   an aggregate doesn't "belong to" one leaf subnet.
-* ``matched_vrf_id`` is NOT RD-based VRF matching. ``ext_communities``
-  (which would carry RD/RT for a real VPNv4/VPNv6 match) is an explicitly
-  deferred later phase — there is no VPN AFI/SAFI data to parse yet.
-  ``matched_vrf_id`` here means "the VRF assigned to whichever IPAM
-  block/space this prefix falls under" (first non-NULL ``vrf_id`` walking
-  block -> parent_block_id chain -> space), the only VRF signal available
-  pre-VPNv4. A future VPNv4 phase must not assume this field already means
-  RD-matched.
+* ``resolve_route_links``'s ``vrf_id`` is NOT RT-based VRF matching — it
+  means "the VRF assigned to whichever IPAM block/space this prefix falls
+  under" (first non-NULL ``vrf_id`` walking block -> parent_block_id chain
+  -> space). Issue #566 Phase 6 adds a separate Route-Target cross-check
+  (``app.services.looking_glass.vrf_match.match_vrf_for_route``, matched
+  against a route's ``ext_communities``) that callers overlay on TOP of
+  this result — a Route-Target hit takes precedence over this
+  IPAM-effective value for the route's persisted ``matched_vrf_id``. This
+  function itself is unaware of that overlay; see ``routes_ingest.py`` and
+  ``app.tasks.looking_glass.reresolve_route_links`` for where the
+  precedence is actually applied.
 * ``matched_asn_id`` is a raw ``origin_asn == ASN.number`` match, NOT "the
   ASN assigned to the matched IPAM object." A route whose origin AS has no
   tracked ``ASN`` row gets ``matched_asn_id = None`` even if its prefix

@@ -1,10 +1,16 @@
-"""BGP Looking Glass tests — issue #566 Phase 1+2.
+"""BGP Looking Glass tests — issue #566 Phase 1+2 (+ Phase 6 additions).
 
 Covers the correctness-critical RIB reconcile (``ingest_routes`` — the
 zero-wire floor guard, absence-withdraw, idempotency, re-announce), the peer
 CRUD surface (Fernet ``md5_password`` never echoed, audit row written), the
 feature-module gate, the routes search filters, and the agent register +
 routes-push end-to-end path.
+
+Phase 6 additions (bottom of file): vpnv4/vpnv6 address-family acceptance,
+the VRF Route-Target cross-check (``matched_vrf_id`` precedence over the
+plain IPAM-effective match, the re-resolve sweep, the
+``/vrf-rt-matches/{vrf_id}`` endpoint), and the multicast <-> BGP
+reachability cross-reference.
 """
 
 from __future__ import annotations
@@ -21,9 +27,21 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.bgp_looking_glass import BGPLGPeer, BGPLGRoute, LookingGlassCollector
 from app.models.feature_module import FeatureModule
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.multicast import MulticastDomain, MulticastGroup, MulticastMembership
+from app.models.vrf import VRF
 from app.services import feature_modules
+from app.services.ai.tools.bgp_lg import (
+    FindMulticastBgpReachabilityArgs,
+    FindVrfLearnedRoutesArgs,
+    find_multicast_bgp_reachability,
+    find_vrf_learned_routes,
+)
+from app.services.looking_glass import ipam_link
 from app.services.looking_glass.config_bundle import build_lg_config_bundle
+from app.services.looking_glass.reachability import multicast_bgp_reachability
 from app.services.looking_glass.routes_ingest import ingest_routes
+from app.tasks.looking_glass import _reresolve_route_links_async
 
 # ── helpers ────────────────────────────────────────────────────────────
 
@@ -512,3 +530,379 @@ async def test_disabled_collector_bundle_is_empty(db_session: AsyncSession) -> N
     await db_session.flush()
     bundle = await build_lg_config_bundle(db_session, col)
     assert bundle.peers == ()
+
+
+# ── Phase 6 — vpnv4/vpnv6 address families ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_peer_accepts_vpnv4_rejects_evpn(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    col = await _make_collector(db_session)
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/looking-glass/peers",
+        headers=hdr,
+        json={
+            "name": "vpn-peer",
+            "collector_id": str(col.id),
+            "local_asn": 65000,
+            "peer_asn": 65001,
+            "peer_address": "192.0.2.20",
+            "address_families": ["vpnv4", "vpnv6"],
+        },
+    )
+    assert resp.status_code in (200, 201), resp.text
+    assert resp.json()["address_families"] == ["vpnv4", "vpnv6"]
+
+    resp = await client.post(
+        "/api/v1/looking-glass/peers",
+        headers=hdr,
+        json={
+            "name": "evpn-peer",
+            "collector_id": str(col.id),
+            "local_asn": 65000,
+            "peer_asn": 65001,
+            "peer_address": "192.0.2.21",
+            "address_families": ["evpn"],
+        },
+    )
+    assert resp.status_code == 422, resp.text
+
+
+# ── Phase 6 — route_distinguisher joins route identity ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_rd_identity_no_collision(db_session: AsyncSession) -> None:
+    """Two VRFs' overlapping (prefix, next_hop) must NOT collide when their
+    route_distinguisher differs — the core correctness fix behind widening
+    uq_bgp_lg_route to include route_distinguisher (issue #566 Phase 6)."""
+    col = await _make_collector(db_session)
+    peer = await _make_peer(db_session, col)
+
+    result = await ingest_routes(
+        db_session,
+        peer,
+        [
+            _route("10.50.0.0/24", origin_asn=65001, route_distinguisher="65001:1"),
+            _route("10.50.0.0/24", origin_asn=65001, route_distinguisher="65001:2"),
+        ],
+        snapshot=True,
+    )
+    assert result.imported == 2  # NOT silently overwritten into one row
+
+    rows = (
+        (
+            await db_session.execute(
+                select(BGPLGRoute).where(
+                    BGPLGRoute.peer_id == peer.id, BGPLGRoute.prefix == "10.50.0.0/24"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert {r.route_distinguisher for r in rows} == {"65001:1", "65001:2"}
+
+
+@pytest.mark.asyncio
+async def test_rd_ingest_idempotent(db_session: AsyncSession) -> None:
+    col = await _make_collector(db_session)
+    peer = await _make_peer(db_session, col)
+    wire = [_route("10.51.0.0/24", origin_asn=65001, route_distinguisher="65001:1")]
+
+    r1 = await ingest_routes(db_session, peer, wire, snapshot=True)
+    assert r1.imported == 1 and r1.refreshed == 0
+
+    r2 = await ingest_routes(db_session, peer, wire, snapshot=True)
+    assert r2.imported == 0 and r2.refreshed == 1  # re-ingest refreshes, doesn't duplicate
+
+
+# ── Phase 6 — VRF Route-Target cross-check ───────────────────────────────
+
+
+async def _make_vrf(db: AsyncSession, **kw) -> VRF:
+    vrf = VRF(
+        name=kw.pop("name", f"vrf-{uuid.uuid4().hex[:8]}"),
+        import_targets=kw.pop("import_targets", []),
+        export_targets=kw.pop("export_targets", []),
+        **kw,
+    )
+    db.add(vrf)
+    await db.flush()
+    return vrf
+
+
+@pytest.mark.asyncio
+async def test_vrf_rt_match_sets_matched_vrf_id(db_session: AsyncSession) -> None:
+    col = await _make_collector(db_session)
+    peer = await _make_peer(db_session, col)
+    vrf = await _make_vrf(db_session, import_targets=["65001:100"])
+
+    result = await ingest_routes(
+        db_session,
+        peer,
+        [
+            _route("10.0.0.0/24", origin_asn=65001, ext_communities=["65001:100"]),
+            # Vendor-style "target:" label prefix — exercises normalize_rt.
+            _route("10.0.1.0/24", origin_asn=65001, ext_communities=["target:65001:100"]),
+            # No matching RT at all.
+            _route("10.0.2.0/24", origin_asn=65001, ext_communities=["65099:1"]),
+        ],
+        snapshot=True,
+    )
+    assert result.imported == 3
+
+    rows = {
+        str(r.prefix): r.matched_vrf_id
+        for r in (await db_session.execute(select(BGPLGRoute).where(BGPLGRoute.peer_id == peer.id)))
+        .scalars()
+        .all()
+    }
+    assert rows["10.0.0.0/24"] == vrf.id
+    assert rows["10.0.1.0/24"] == vrf.id
+    assert rows["10.0.2.0/24"] is None
+
+
+@pytest.mark.asyncio
+async def test_vrf_rt_match_precedence_over_ipam_effective(db_session: AsyncSession) -> None:
+    """A Route-Target hit against VRF B wins even when the route's prefix
+    falls inside an IPAM block/space whose vrf_id points at a different
+    VRF A (the plain IPAM-effective match)."""
+    col = await _make_collector(db_session)
+    peer = await _make_peer(db_session, col)
+    vrf_a = await _make_vrf(db_session, name="vrf-a-ipam")
+    vrf_b = await _make_vrf(db_session, name="vrf-b-rt", import_targets=["65001:200"])
+
+    space = IPSpace(name=f"space-{uuid.uuid4().hex[:8]}", vrf_id=vrf_a.id)
+    db_session.add(space)
+    await db_session.flush()
+    block = IPBlock(space_id=space.id, name="b", network="10.9.0.0/16", vrf_id=vrf_a.id)
+    db_session.add(block)
+    await db_session.flush()
+    ipam_link._clear_cache_for_test()  # force a fresh IPAM scan for this test's fixtures
+
+    await ingest_routes(
+        db_session,
+        peer,
+        [_route("10.9.1.0/24", origin_asn=65001, ext_communities=["65001:200"])],
+        snapshot=True,
+    )
+    row = (
+        await db_session.execute(select(BGPLGRoute).where(BGPLGRoute.peer_id == peer.id))
+    ).scalar_one()
+    assert row.matched_block_id == block.id  # IPAM linkage still resolved…
+    assert row.matched_vrf_id == vrf_b.id  # …but the RT match wins over vrf_a.
+
+
+@pytest.mark.asyncio
+async def test_reresolve_sweep_applies_vrf_rt_match(db_session: AsyncSession) -> None:
+    """A VRF created AFTER a route's last ingest still converges via the
+    periodic re-resolve sweep — same precedence rule as ingest time."""
+    col = await _make_collector(db_session)
+    peer = await _make_peer(db_session, col)
+    await ingest_routes(
+        db_session,
+        peer,
+        [_route("10.20.0.0/24", origin_asn=65001, ext_communities=["65005:300"])],
+        snapshot=True,
+    )
+    row = (
+        await db_session.execute(select(BGPLGRoute).where(BGPLGRoute.peer_id == peer.id))
+    ).scalar_one()
+    assert row.matched_vrf_id is None  # no VRF existed yet at ingest time
+
+    vrf = await _make_vrf(db_session, import_targets=["65005:300"])
+    await db_session.commit()  # the sweep opens its own engine/connection
+
+    stats = await _reresolve_route_links_async()
+    assert stats["checked"] >= 1
+    assert stats["changed"] >= 1
+
+    await db_session.refresh(row)
+    assert row.matched_vrf_id == vrf.id
+
+
+@pytest.mark.asyncio
+async def test_vrf_rt_matches_endpoint(client: AsyncClient, db_session: AsyncSession) -> None:
+    _, token = await _make_admin(db_session)
+    col = await _make_collector(db_session)
+    peer = await _make_peer(db_session, col)
+    vrf = await _make_vrf(db_session, import_targets=["65001:100"], export_targets=["65001:200"])
+    await ingest_routes(
+        db_session,
+        peer,
+        [
+            _route("10.30.0.0/24", origin_asn=65001, ext_communities=["65001:100"]),
+            _route("10.30.1.0/24", origin_asn=65001, ext_communities=["65001:100"]),
+            _route("10.30.2.0/24", origin_asn=65001, ext_communities=["65001:200"]),
+        ],
+        snapshot=True,
+    )
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.get(f"/api/v1/looking-glass/vrf-rt-matches/{vrf.id}", headers=hdr)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["matched_route_count"] == 3
+    by_rt = {
+        (row["route_target"], row["kind"]): row["matched_route_count"]
+        for row in body["route_targets"]
+    }
+    assert by_rt[("65001:100", "import")] == 2
+    assert by_rt[("65001:200", "export")] == 1
+
+    # 404 for an unknown VRF id.
+    resp = await client.get(f"/api/v1/looking-glass/vrf-rt-matches/{uuid.uuid4()}", headers=hdr)
+    assert resp.status_code == 404
+
+
+# ── Phase 6 — multicast <-> BGP reachability cross-reference ─────────────
+
+
+@pytest.mark.asyncio
+async def test_multicast_bgp_reachability_domain_rp(db_session: AsyncSession) -> None:
+    col = await _make_collector(db_session)
+    peer = await _make_peer(db_session, col)
+    domain = MulticastDomain(
+        name=f"dom-{uuid.uuid4().hex[:8]}",
+        pim_mode="sparse",
+        rendezvous_point_address="192.168.50.1",
+    )
+    db_session.add(domain)
+    await db_session.flush()
+
+    # No covering route yet.
+    result = await multicast_bgp_reachability(db_session)
+    unreachable = next(d for d in result.domains if d.domain_id == domain.id)
+    assert unreachable.covering_route is None
+
+    await ingest_routes(
+        db_session, peer, [_route("192.168.50.0/24", origin_asn=65001)], snapshot=True
+    )
+    result = await multicast_bgp_reachability(db_session)
+    reachable = next(d for d in result.domains if d.domain_id == domain.id)
+    assert reachable.covering_route is not None
+    assert str(reachable.covering_route.prefix) == "192.168.50.0/24"
+
+
+@pytest.mark.asyncio
+async def test_multicast_bgp_reachability_group_source_subnet(
+    db_session: AsyncSession,
+) -> None:
+    col = await _make_collector(db_session)
+    peer = await _make_peer(db_session, col)
+    space = IPSpace(name=f"mc-space-{uuid.uuid4().hex[:8]}")
+    db_session.add(space)
+    await db_session.flush()
+    block = IPBlock(space_id=space.id, name="b", network="10.40.0.0/16")
+    db_session.add(block)
+    await db_session.flush()
+    subnet = Subnet(space_id=space.id, block_id=block.id, name="s", network="10.40.1.0/24")
+    db_session.add(subnet)
+    await db_session.flush()
+    ip = IPAddress(subnet_id=subnet.id, address="10.40.1.5", status="allocated")
+    db_session.add(ip)
+    await db_session.flush()
+
+    mgroup = MulticastGroup(space_id=space.id, address="239.1.1.1", name="mg")
+    db_session.add(mgroup)
+    await db_session.flush()
+    db_session.add(MulticastMembership(group_id=mgroup.id, ip_address_id=ip.id, role="producer"))
+    await db_session.flush()
+
+    # A /32 route sitting on the subnet's base address must NOT count as
+    # covering the WHOLE subnet (negative case).
+    await ingest_routes(db_session, peer, [_route("10.40.1.0/32", origin_asn=65001)], snapshot=True)
+    result = await multicast_bgp_reachability(db_session)
+    group_result = next(g for g in result.groups if g.group_id == mgroup.id)
+    assert group_result.covering_route is None
+
+    # A route covering the whole /24 counts.
+    await ingest_routes(
+        db_session, peer, [_route("10.40.0.0/16", origin_asn=65001)], snapshot=False
+    )
+    result = await multicast_bgp_reachability(db_session)
+    group_result = next(g for g in result.groups if g.group_id == mgroup.id)
+    assert group_result.covering_route is not None
+    assert str(group_result.covering_route.prefix) == "10.40.0.0/16"
+
+
+@pytest.mark.asyncio
+async def test_multicast_reachability_endpoint(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    col = await _make_collector(db_session)
+    peer = await _make_peer(db_session, col)
+    domain = MulticastDomain(
+        name=f"dom-{uuid.uuid4().hex[:8]}",
+        pim_mode="sparse",
+        rendezvous_point_address="192.168.60.1",
+    )
+    db_session.add(domain)
+    await db_session.flush()
+    await ingest_routes(
+        db_session, peer, [_route("192.168.60.0/24", origin_asn=65001)], snapshot=True
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/v1/looking-glass/multicast-reachability",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    dom = next(d for d in body["domains"] if d["domain_id"] == str(domain.id))
+    assert dom["covering_route"]["prefix"] == "192.168.60.0/24"
+
+
+# ── Phase 6 — Operator Copilot tools ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_find_vrf_learned_routes_tool(db_session: AsyncSession) -> None:
+    user, _ = await _make_admin(db_session)
+    col = await _make_collector(db_session)
+    peer = await _make_peer(db_session, col)
+    vrf = await _make_vrf(db_session, import_targets=["65001:900"])
+    await ingest_routes(
+        db_session,
+        peer,
+        [_route("10.60.0.0/24", origin_asn=65001, ext_communities=["65001:900"])],
+        snapshot=True,
+    )
+
+    out = await find_vrf_learned_routes(db_session, user, FindVrfLearnedRoutesArgs(vrf_id=vrf.id))
+    assert out["count"] == 1
+    assert out["routes"][0]["prefix"] == "10.60.0.0/24"
+
+
+@pytest.mark.asyncio
+async def test_find_multicast_bgp_reachability_tool(db_session: AsyncSession) -> None:
+    user, _ = await _make_admin(db_session)
+    col = await _make_collector(db_session)
+    peer = await _make_peer(db_session, col)
+    domain = MulticastDomain(
+        name=f"dom-{uuid.uuid4().hex[:8]}",
+        pim_mode="sparse",
+        rendezvous_point_address="192.168.70.1",
+    )
+    db_session.add(domain)
+    await db_session.flush()
+    await ingest_routes(
+        db_session, peer, [_route("192.168.70.0/24", origin_asn=65001)], snapshot=True
+    )
+
+    out = await find_multicast_bgp_reachability(
+        db_session, user, FindMulticastBgpReachabilityArgs()
+    )
+    dom = next(d for d in out["domains"] if d["domain_id"] == str(domain.id))
+    assert dom["reachable"] is True
+    assert dom["covering_route"]["prefix"] == "192.168.70.0/24"

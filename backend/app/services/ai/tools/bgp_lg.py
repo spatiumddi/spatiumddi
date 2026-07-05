@@ -45,6 +45,7 @@ def _route_dict(row: BGPLGRoute) -> dict[str, Any]:
         "communities": list(row.communities or []),
         "large_communities": list(row.large_communities or []),
         "ext_communities": list(row.ext_communities or []),
+        "route_distinguisher": row.route_distinguisher,
         "rpki_status": row.rpki_status,
         "is_best": row.is_best,
         "matched_block_id": str(row.matched_block_id) if row.matched_block_id else None,
@@ -293,10 +294,10 @@ class FindBgpRouteForIpArgs(BaseModel):
 async def find_bgp_route_for_ip(
     db: AsyncSession, user: User, args: FindBgpRouteForIpArgs
 ) -> dict[str, Any]:
-    from app.services.looking_glass.reverse_lookup import best_route_for_ip  # noqa: PLC0415
+    from app.services.looking_glass.reachability import find_covering_routes  # noqa: PLC0415
 
-    result = await best_route_for_ip(db, args.ip)
-    if result is None:
+    routes = await find_covering_routes(db, args.ip)
+    if not routes:
         try:
             ipaddress.ip_address(args.ip)
             note = "no covering route in the current RIB"
@@ -304,11 +305,10 @@ async def find_bgp_route_for_ip(
             note = "not a valid IP address"
         return {"ip": args.ip, "found": False, "note": note}
 
-    best, alt_count = result
-    out = _route_dict(best)
+    out = _route_dict(routes[0])
     out["ip"] = args.ip
     out["found"] = True
-    out["alternate_paths_count"] = alt_count
+    out["alternate_paths_count"] = len(routes) - 1
     return out
 
 
@@ -352,6 +352,96 @@ async def find_bgp_lg_sessions(
     return {
         "sessions": [_session_dict(peer, collector_name) for peer, collector_name in rows],
         "count": len(rows),
+    }
+
+
+# ── find_vrf_learned_routes ──────────────────────────────────────────
+
+
+class FindVrfLearnedRoutesArgs(BaseModel):
+    vrf_id: UUID = Field(description="The VRF to find learned VPNv4/VPNv6 routes for.")
+    include_withdrawn: bool = Field(default=False)
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+@register_tool(
+    name="find_vrf_learned_routes",
+    description=(
+        "List BGP Looking Glass routes matched to a VRF by Route-Target "
+        "cross-check (issue #566 Phase 6) — the routes whose "
+        "extended-community route target fell in the VRF's import/export "
+        "lists at ingest (falling back to whichever route just happens to "
+        "fall under the VRF's IPAM block/space when there's no RT hit). "
+        "Use for 'what routes has this VRF learned?' or 'is this VRF "
+        "actually receiving any VPN routes?' questions."
+    ),
+    args_model=FindVrfLearnedRoutesArgs,
+    category="network",
+    module=_MODULE,
+    default_enabled=True,
+)
+async def find_vrf_learned_routes(
+    db: AsyncSession, user: User, args: FindVrfLearnedRoutesArgs
+) -> dict[str, Any]:
+    stmt = select(BGPLGRoute).where(BGPLGRoute.matched_vrf_id == args.vrf_id)
+    if not args.include_withdrawn:
+        stmt = stmt.where(BGPLGRoute.withdrawn_at.is_(None))
+    stmt = stmt.order_by(BGPLGRoute.prefix).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"routes": [_route_dict(r) for r in rows], "count": len(rows)}
+
+
+# ── find_multicast_bgp_reachability ───────────────────────────────────
+
+
+class FindMulticastBgpReachabilityArgs(BaseModel):
+    """No filters — the underlying tables (PIM domains, multicast groups)
+    are small; this is a whole-fleet snapshot."""
+
+
+@register_tool(
+    name="find_multicast_bgp_reachability",
+    description=(
+        "Cross-reference multicast PIM domains' rendezvous-point addresses "
+        "and multicast groups' producer source subnets against the BGP "
+        "Looking Glass learned RIB (issue #566 Phase 6) — is the RP / "
+        "source actually reachable per the current routing table? Use for "
+        "'is our multicast RP reachable?' or 'is this source subnet "
+        "actually being routed?' sanity checks."
+    ),
+    args_model=FindMulticastBgpReachabilityArgs,
+    category="network",
+    module=_MODULE,
+    default_enabled=True,
+)
+async def find_multicast_bgp_reachability(
+    db: AsyncSession, user: User, args: FindMulticastBgpReachabilityArgs
+) -> dict[str, Any]:
+    from app.services.looking_glass.reachability import multicast_bgp_reachability  # noqa: PLC0415
+
+    result = await multicast_bgp_reachability(db)
+    return {
+        "domains": [
+            {
+                "domain_id": str(d.domain_id),
+                "domain_name": d.domain_name,
+                "rp_address": d.rp_address,
+                "covering_route": _route_dict(d.covering_route) if d.covering_route else None,
+                "reachable": d.covering_route is not None,
+            }
+            for d in result.domains
+        ],
+        "groups": [
+            {
+                "group_id": str(g.group_id),
+                "group_name": g.group_name,
+                "group_address": g.group_address,
+                "source_subnet": g.source_subnet,
+                "covering_route": _route_dict(g.covering_route) if g.covering_route else None,
+                "reachable": g.covering_route is not None,
+            }
+            for g in result.groups
+        ],
     }
 
 

@@ -7,9 +7,13 @@ guard, differing only in the withdrawal semantics:
 
 **Semantics — set-reconcile (upsert + absence-withdraw):**
 
- * The route identity key is ``(prefix, next_hop)`` — BGP allows multiple
-   paths per prefix (unlike DHCP's ``(server_id, ip)``), so a prefix with
-   two next-hops is two rows.
+ * The route identity key is ``(prefix, next_hop, route_distinguisher)`` —
+   BGP allows multiple paths per prefix (unlike DHCP's ``(server_id, ip)``),
+   so a prefix with two next-hops is two rows. ``route_distinguisher``
+   joined the key in issue #566 Phase 6: a VPNv4/VPNv6 path's RD (RFC 4364)
+   is the whole reason two VRFs can originate the SAME customer prefix
+   without collision — plain ipv4-unicast/ipv6-unicast paths always carry
+   ``""`` here, so this is a no-op widening for the pre-Phase-6 shape.
  * Upsert one ``BGPLGRoute`` per wire path: new keys insert with
    ``first_seen_at=now``; existing keys refresh the mutable attributes
    (``as_path`` / ``local_pref`` / ``med`` / communities / ``is_best`` /
@@ -27,6 +31,14 @@ guard, differing only in the withdrawal semantics:
    re-resolve sweep (``app.tasks.looking_glass.reresolve_route_links``)
    re-runs the same matcher over every active route so an IPAM edit made
    between RIB pushes still converges within a few minutes.
+ * ``matched_vrf_id`` specifically gets a second, higher-priority pass
+   (issue #566 Phase 6): a route's ``ext_communities`` are cross-checked
+   against every VRF's ``import_targets``/``export_targets`` via
+   ``app.services.looking_glass.vrf_match``. A Route-Target hit overrides
+   the plain IPAM-effective VRF from ``resolve_route_links`` — real
+   VPNv4/VPNv6 signal beats "whichever IPAM block this prefix happens to
+   fall under." Routes with no ext_communities RT hit keep the
+   IPAM-effective value (or ``None``) exactly as before.
  * **Absence-withdraw (full snapshot only):** every tracked row for this
    peer with ``withdrawn_at IS NULL`` that is NOT in the wire set has left
    the peer's feed — set ``withdrawn_at=now()``, bump ``flap_count``, and
@@ -64,6 +76,7 @@ from app.services.looking_glass.ipam_link import (
     get_resolution_cache,
     resolve_route_links,
 )
+from app.services.looking_glass.vrf_match import build_vrf_rt_index, match_vrf_for_route
 
 logger = structlog.get_logger(__name__)
 
@@ -101,12 +114,13 @@ async def ingest_routes(
     #    DataError at flush and 500 the WHOLE push. Parse-and-skip instead so
     #    one bad path can't discard a good snapshot. ip_network(strict=True)
     #    matches Postgres CIDR strictness (rejects non-network host bits).
-    #  * Dedup on the ``(prefix, next_hop)`` identity: two wire entries with
-    #    the same key would both take the insert branch (``by_key`` is built
-    #    once from the DB and not updated mid-loop) and collide on
-    #    ``uq_bgp_lg_route``. Normalising through ipaddress also canonicalises
-    #    the strings so they match the DB round-trip. Last write wins.
-    deduped: dict[tuple[str, str], dict[str, Any]] = {}
+    #  * Dedup on the ``(prefix, next_hop, route_distinguisher)`` identity:
+    #    two wire entries with the same key would both take the insert
+    #    branch (``by_key`` is built once from the DB and not updated
+    #    mid-loop) and collide on ``uq_bgp_lg_route``. Normalising through
+    #    ipaddress also canonicalises the strings so they match the DB
+    #    round-trip. Last write wins.
+    deduped: dict[tuple[str, str, str], dict[str, Any]] = {}
     for r in wire:
         prefix_raw, next_hop_raw = r.get("prefix"), r.get("next_hop")
         if not prefix_raw or not next_hop_raw:
@@ -117,7 +131,13 @@ async def ingest_routes(
         except ValueError:
             result.errors.append(f"skipped malformed route {prefix_raw!r} via {next_hop_raw!r}")
             continue
-        deduped[(prefix, next_hop)] = {**r, "prefix": prefix, "next_hop": next_hop}
+        rd = str(r.get("route_distinguisher") or "")
+        deduped[(prefix, next_hop, rd)] = {
+            **r,
+            "prefix": prefix,
+            "next_hop": next_hop,
+            "route_distinguisher": rd,
+        }
     valid = list(deduped.values())
     result.wire_routes = len(valid)
 
@@ -127,8 +147,8 @@ async def ingest_routes(
     existing_rows = list(
         (await db.execute(select(BGPLGRoute).where(BGPLGRoute.peer_id == peer.id))).scalars().all()
     )
-    by_key: dict[tuple[str, str], BGPLGRoute] = {
-        (str(r.prefix), str(r.next_hop)): r for r in existing_rows
+    by_key: dict[tuple[str, str, str], BGPLGRoute] = {
+        (str(r.prefix), str(r.next_hop), r.route_distinguisher): r for r in existing_rows
     }
 
     # ── Zero-wire floor guard (#482) ────────────────────────────────────
@@ -166,17 +186,30 @@ async def ingest_routes(
     # count for no benefit.)
     link_cache = await get_resolution_cache(db)
 
+    # ── VRF Route-Target reverse index — one preload for the whole
+    # snapshot (issue #566 Phase 6). Not TTL-cached — VRF counts are small
+    # and each ingest call already only builds this once. See
+    # vrf_match.py's module docstring for the precedence rule.
+    vrf_rt_index = await build_vrf_rt_index(db)
+
     # ── Upsert every wire path ───────────────────────────────────────────
-    wire_keys: set[tuple[str, str]] = set()
+    wire_keys: set[tuple[str, str, str]] = set()
     for r in valid:
         prefix = str(r["prefix"])
         next_hop = str(r["next_hop"])
-        wire_keys.add((prefix, next_hop))
+        rd = str(r.get("route_distinguisher") or "")
+        wire_keys.add((prefix, next_hop, rd))
         origin = r.get("origin_asn")
         rpki = rpki_cache.get((prefix, int(origin)), "unknown") if origin is not None else "unknown"
         links = resolve_route_links(link_cache, prefix, origin)
+        ext_communities = list(r.get("ext_communities") or [])
+        # Route-Target cross-check takes precedence over the plain
+        # IPAM-effective VRF when it matches (issue #566 Phase 6 — see the
+        # ingest_routes docstring above).
+        vpn_matched_vrf_id = match_vrf_for_route(ext_communities, vrf_rt_index)
+        matched_vrf_id = vpn_matched_vrf_id if vpn_matched_vrf_id is not None else links.vrf_id
 
-        row = by_key.get((prefix, next_hop))
+        row = by_key.get((prefix, next_hop, rd))
         if row is None:
             if apply:
                 db.add(
@@ -186,18 +219,19 @@ async def ingest_routes(
                         origin_asn=origin,
                         as_path=list(r.get("as_path") or []),
                         next_hop=next_hop,
+                        route_distinguisher=rd,
                         local_pref=r.get("local_pref"),
                         med=r.get("med"),
                         communities=list(r.get("communities") or []),
                         large_communities=list(r.get("large_communities") or []),
-                        ext_communities=list(r.get("ext_communities") or []),
+                        ext_communities=ext_communities,
                         rpki_status=rpki,
                         is_best=bool(r.get("is_best", False)),
                         matched_block_id=links.block_id,
                         matched_subnet_id=links.subnet_id,
                         matched_space_id=links.space_id,
                         matched_asn_id=links.asn_id,
-                        matched_vrf_id=links.vrf_id,
+                        matched_vrf_id=matched_vrf_id,
                         first_seen_at=now,
                         last_seen_at=now,
                     )
@@ -211,14 +245,14 @@ async def ingest_routes(
                 row.med = r.get("med")
                 row.communities = list(r.get("communities") or [])
                 row.large_communities = list(r.get("large_communities") or [])
-                row.ext_communities = list(r.get("ext_communities") or [])
+                row.ext_communities = ext_communities
                 row.rpki_status = rpki
                 row.is_best = bool(r.get("is_best", False))
                 row.matched_block_id = links.block_id
                 row.matched_subnet_id = links.subnet_id
                 row.matched_space_id = links.space_id
                 row.matched_asn_id = links.asn_id
-                row.matched_vrf_id = links.vrf_id
+                row.matched_vrf_id = matched_vrf_id
                 row.last_seen_at = now
                 # Re-announce of a previously-withdrawn path — clear the marker.
                 row.withdrawn_at = None
