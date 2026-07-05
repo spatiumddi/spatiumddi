@@ -9395,6 +9395,22 @@ export interface FleetAgentRow {
   reboot_requested_at: string | null;
 }
 
+// issue #566 decision D1 — MetalLB BGP mode (export path: advertise the
+// VIP to upstream routers). One entry per BGPPeer / BGPAdvertisement CR.
+export interface MetalLBBgpPeer {
+  my_asn: number;
+  peer_asn: number;
+  peer_address: string;
+  peer_port?: number | null;
+  hold_time?: string | null;
+}
+
+export interface MetalLBBgpAdvertisement {
+  ip_address_pools: string[];
+  communities?: string[];
+  aggregation_length?: number | null;
+}
+
 // #272 Phase 7c — cluster-wide MetalLB / control-plane-VIP config.
 export interface MetalLBConfig {
   enabled: boolean;
@@ -9405,6 +9421,13 @@ export interface MetalLBConfig {
   // bind9/powerdns :53; dhcp_relay_vip fronts the Kea relay→server :67.
   dns_vip?: string;
   dhcp_relay_vip?: string;
+  // issue #566 decision D1 — BGP mode. Layered on top of the same
+  // MetalLB install; requires `enabled: true`. bgp_advertisements is
+  // auto-derived server-side when omitted (see the backend cross-field
+  // validator), so the form only needs to manage bgp_peers.
+  bgp_enabled?: boolean;
+  bgp_peers?: MetalLBBgpPeer[];
+  bgp_advertisements?: MetalLBBgpAdvertisement[];
   // #272 — live readiness from the GET (best-effort; absent/zero when
   // kubeapi is unreachable). Not sent on PUT.
   controller_ready?: boolean;
@@ -9771,6 +9794,7 @@ export interface SupervisorCapabilities {
   can_run_dns_bind9?: boolean;
   can_run_dns_powerdns?: boolean;
   can_run_dhcp?: boolean;
+  can_run_looking_glass?: boolean;
   can_run_observer?: boolean;
   has_baked_images?: boolean;
   baked_images_version?: string;
@@ -12620,7 +12644,7 @@ export const pcapApi = {
 // Fleet appliance's supervisor. The matching result carries
 // ``ran_from`` ("server" or "appliance:<hostname>").
 export interface NetToolTarget {
-  kind: "server" | "appliance";
+  kind: "server" | "appliance" | "bgp_lg_collector";
   id: string;
 }
 
@@ -12693,10 +12717,13 @@ export interface NetToolWolResult {
 }
 
 // Fold the routing-only ``target`` into a reachability-tool body only
-// when it points at an appliance — a "server" target (or none) is the
-// back-compatible inline run, so we omit the field entirely.
+// when it points somewhere other than the control-plane server — a
+// "server" target (or none) is the back-compatible inline run, so we
+// omit the field entirely. ``appliance`` and ``bgp_lg_collector`` (#566
+// Phase 4 — ping/traceroute from a Looking Glass collector's vantage)
+// both ride the wire the same way.
 function withTarget<T extends object>(body: T, target?: NetToolTarget): T {
-  if (target && target.kind === "appliance") {
+  if (target && target.kind !== "server") {
     return { ...body, target };
   }
   return body;
@@ -13092,6 +13119,476 @@ export interface BGPCommunityUpdate {
   outbound_action?: string;
   tags?: Record<string, unknown>;
 }
+
+// ── BGP Looking Glass (issue #566) ─────────────────────────────────
+//
+// A receive-only BGP collector: a per-appliance-node GoBGP daemon peers
+// passively with the operator's edge/core routers and turns the live
+// Adj-RIB-In into an operator surface. Distinct from ``bgpApi`` (the
+// RIPEstat public-data proxy) and ``asnsApi``'s BGP sub-namespaces
+// (peering / community catalog / #527 public-table hijack monitor) —
+// this is the real internal routing table, mounted at
+// ``/looking-glass`` (not ``/bgp``).
+
+// vpnv4/vpnv6 (issue #566 Phase 6) — MP-BGP VPNv4/VPNv6 (RFC 4364). EVPN
+// stays out of scope. Not yet exercised against a live gobgpd VPNv4/VPNv6
+// session — see the collector's own "verified live" convention.
+export type BGPLGAddressFamily =
+  | "ipv4-unicast"
+  | "ipv6-unicast"
+  | "vpnv4"
+  | "vpnv6";
+
+// idle | connect | active | opensent | openconfirm | established (GoBGP FSM).
+export type BGPLGSessionState =
+  | "idle"
+  | "connect"
+  | "active"
+  | "opensent"
+  | "openconfirm"
+  | "established";
+
+export type BGPLGRpkiStatus = "valid" | "invalid" | "unknown";
+
+export interface BGPLGImportFilter {
+  mode: "accept_all" | "scope";
+  prefixes?: string[];
+}
+
+export interface BGPLGCollector {
+  id: string;
+  name: string;
+  description: string;
+  host: string | null;
+  status: string;
+  enabled: boolean;
+  agent_id: string | null;
+  agent_registered: boolean;
+  agent_version: string | null;
+  last_seen_ip: string | null;
+  last_seen_at: string | null;
+  last_health_check_at: string | null;
+  appliance_id: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface BGPLGPeerCreate {
+  name: string;
+  collector_id: string;
+  local_asn: number;
+  peer_asn: number;
+  peer_address: string;
+  matched_asn_id?: string | null;
+  peer_router_id?: string | null;
+  address_families?: BGPLGAddressFamily[];
+  /** Plaintext MD5 password — Fernet-encrypted server-side, never echoed
+   *  back. See ``BGPLGPeer.md5_password_set``. */
+  md5_password?: string | null;
+  max_prefixes?: number;
+  import_filter?: BGPLGImportFilter;
+  enabled?: boolean;
+  description?: string;
+}
+
+/** Partial update. ``md5_password``: non-empty rotates, ``""`` clears,
+ *  omitted (default) leaves the stored ciphertext untouched. */
+export interface BGPLGPeerUpdate {
+  name?: string;
+  collector_id?: string;
+  local_asn?: number;
+  peer_asn?: number;
+  peer_address?: string;
+  matched_asn_id?: string | null;
+  peer_router_id?: string | null;
+  address_families?: BGPLGAddressFamily[];
+  md5_password?: string | null;
+  max_prefixes?: number;
+  import_filter?: BGPLGImportFilter;
+  enabled?: boolean;
+  description?: string;
+}
+
+export interface BGPLGPeer {
+  id: string;
+  name: string;
+  collector_id: string;
+  local_asn: number;
+  peer_asn: number;
+  peer_address: string;
+  matched_asn_id: string | null;
+  peer_router_id: string | null;
+  address_families: BGPLGAddressFamily[];
+  md5_password_set: boolean;
+  max_prefixes: number;
+  import_filter: BGPLGImportFilter;
+  enabled: boolean;
+  description: string;
+  // Runtime state (collector-reported via heartbeat).
+  session_state: BGPLGSessionState;
+  uptime_started_at: string | null;
+  prefixes_received: number;
+  prefixes_accepted: number;
+  last_state_change: string | null;
+  last_flap_at: string | null;
+  rpki_invalid_count: number;
+  down_since: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+/** One row per configured peer, joined with its owning collector — the
+ *  Sessions-tab feed (``GET /looking-glass/sessions``). */
+export interface BGPLGSession {
+  peer_id: string;
+  peer_name: string;
+  collector_id: string;
+  collector_name: string;
+  collector_status: string;
+  local_asn: number;
+  peer_asn: number;
+  peer_address: string;
+  enabled: boolean;
+  session_state: BGPLGSessionState;
+  uptime_started_at: string | null;
+  prefixes_received: number;
+  prefixes_accepted: number;
+  last_state_change: string | null;
+  last_flap_at: string | null;
+  rpki_invalid_count: number;
+  down_since: string | null;
+}
+
+export interface BGPLGRoute {
+  id: string;
+  peer_id: string;
+  prefix: string;
+  origin_asn: number | null;
+  as_path: number[];
+  next_hop: string;
+  local_pref: number | null;
+  med: number | null;
+  communities: string[];
+  large_communities: string[];
+  ext_communities: string[];
+  /** Route Distinguisher (RFC 4364) — non-empty only for vpnv4/vpnv6
+   *  paths; part of the row's identity server-side (issue #566 Phase 6). */
+  route_distinguisher: string;
+  rpki_status: BGPLGRpkiStatus;
+  is_best: boolean;
+  matched_block_id: string | null;
+  matched_subnet_id: string | null;
+  matched_space_id: string | null;
+  matched_asn_id: string | null;
+  matched_vrf_id: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  withdrawn_at: string | null;
+  flap_count: number;
+  detail: Record<string, unknown> | null;
+  created_at: string;
+  modified_at: string;
+}
+
+/** Server-paginated envelope for ``GET /looking-glass/routes`` — mirrors
+ *  ``AddressSearchResponse`` (``GET /ipam/addresses/search``). */
+export interface BGPLGRouteListResponse {
+  items: BGPLGRoute[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface BGPLGRouteQuery {
+  /** Contains-or-within CIDR match (not an exact-prefix lookup). */
+  prefix?: string;
+  origin_asn?: number;
+  /** Matches against either ``communities`` or ``large_communities``. */
+  community?: string;
+  rpki_status?: BGPLGRpkiStatus;
+  peer_id?: string;
+  matched_block_id?: string;
+  matched_subnet_id?: string;
+  matched_space_id?: string;
+  matched_asn_id?: string;
+  matched_vrf_id?: string;
+  best_path_only?: boolean;
+  /** Withdrawn routes are hidden by default. */
+  withdrawn?: boolean;
+  /** AS-path regex ('_' boundary convention), matched against the
+   *  space-joined AS path — e.g. '_65001_' (anywhere) or '65001_$'-style
+   *  (near the end, i.e. toward the origin AS). See the Query tab's
+   *  ``show route regexp`` command (#566 Phase 4). */
+  as_path_regexp?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** GET /looking-glass/routes/for-ip — reverse LPM-by-address lookup. */
+export interface BGPLGRouteForIpResponse {
+  ip: string;
+  found: boolean;
+  route: BGPLGRoute | null;
+  alternate_paths_count: number;
+}
+
+/** GET /looking-glass/dashboard-summary — single-shot rollup backing the
+ *  Dashboard's "Looking Glass health" card. */
+export interface BGPLGDashboardSummary {
+  peers_total: number;
+  peers_established: number;
+  peers_down: number;
+  routes_rpki_invalid: number;
+  routes_flapping: number;
+}
+
+// GET /looking-glass/multicast-reachability (issue #566 Phase 6) —
+// read-only cross-reference of PIM rendezvous-point addresses + multicast
+// group producer source subnets against the learned RIB. Computed live,
+// nothing persisted.
+export interface MulticastDomainReachability {
+  domain_id: string;
+  domain_name: string;
+  rp_address: string;
+  covering_route: BGPLGRoute | null;
+}
+
+export interface MulticastGroupReachability {
+  group_id: string;
+  group_name: string;
+  group_address: string;
+  source_subnet_id: string;
+  source_subnet: string;
+  covering_route: BGPLGRoute | null;
+}
+
+export interface MulticastReachabilityResponse {
+  domains: MulticastDomainReachability[];
+  groups: MulticastGroupReachability[];
+}
+
+// GET /looking-glass/peers/{peer_id}/detail — the rich rollup backing the
+// Sessions-tab peer detail modal (issue #566).
+export interface BGPLGPeerDetailCollector {
+  id: string;
+  name: string;
+  host: string | null;
+  status: string;
+  last_seen_ip: string | null;
+  agent_version: string | null;
+  enabled: boolean;
+}
+
+export interface BGPLGPeerDetailMatchedAsn {
+  id: string;
+  number: number;
+  name: string;
+}
+
+export interface BGPLGPeerDetailRouter {
+  id: string;
+  name: string;
+}
+
+export interface BGPLGPeerDetailRpkiBreakdown {
+  valid: number;
+  invalid: number;
+  unknown: number;
+}
+
+export interface BGPLGPeerDetailOriginAsnCount {
+  asn: number;
+  count: number;
+}
+
+export interface BGPLGPeerDetailCommunityCount {
+  value: string;
+  count: number;
+}
+
+export interface BGPLGPeerDetailRouteStats {
+  active_total: number;
+  withdrawn_total: number;
+  best_count: number;
+  rpki: BGPLGPeerDetailRpkiBreakdown;
+  top_origin_asns: BGPLGPeerDetailOriginAsnCount[];
+  top_communities: BGPLGPeerDetailCommunityCount[];
+  /** True when at least one active route carries a non-empty RD —
+   *  i.e. this peer has VPNv4/VPNv6 (RFC 4364) paths, not just plain
+   *  ipv4/ipv6-unicast. */
+  has_vpn_routes: boolean;
+  /** First ~8 active routes, for the modal's preview mini-table. */
+  sample_routes: BGPLGRoute[];
+}
+
+export interface BGPLGPeerDetailAlert {
+  severity: string;
+  message: string;
+  rule_type: string;
+  fired_at: string;
+}
+
+export interface BGPLGPeerDetail {
+  peer: BGPLGPeer;
+  collector: BGPLGPeerDetailCollector;
+  matched_asn: BGPLGPeerDetailMatchedAsn | null;
+  peer_router: BGPLGPeerDetailRouter | null;
+  route_stats: BGPLGPeerDetailRouteStats;
+  active_alerts: BGPLGPeerDetailAlert[];
+}
+
+// GET /looking-glass/routes/detail — the rich per-prefix rollup backing
+// the Routes-tab detail modal (issue #566). Distinct from
+// ``getRoute()``/``/routes/by-prefix`` (a flat ``BGPLGRoute[]``): every
+// path here is enriched with its peer + collector name, and the response
+// carries a server-computed summary + covering IPAM/ASN/VRF context.
+export interface BGPLGRouteDetailPath {
+  route_id: string;
+  peer_id: string;
+  peer_name: string;
+  collector_name: string;
+  origin_asn: number | null;
+  next_hop: string;
+  local_pref: number | null;
+  med: number | null;
+  as_path: number[];
+  communities: string[];
+  large_communities: string[];
+  ext_communities: string[];
+  route_distinguisher: string;
+  rpki_status: BGPLGRpkiStatus;
+  is_best: boolean;
+  first_seen_at: string;
+  last_seen_at: string;
+  flap_count: number;
+  withdrawn_at: string | null;
+  matched_subnet_id: string | null;
+  matched_block_id: string | null;
+  matched_space_id: string | null;
+  matched_asn_id: string | null;
+  matched_vrf_id: string | null;
+}
+
+export interface BGPLGRouteDetailRpkiBreakdown {
+  valid: number;
+  invalid: number;
+  unknown: number;
+}
+
+/** The headline server-computed rollup the detail modal's banner leads
+ *  with. ``multi_origin`` (more than one origin ASN) is the hijack/leak
+ *  signal; ``anycast_candidate`` (more than one peer/router) alone is the
+ *  normal anycast/multi-homed shape. Both can be true at once. */
+export interface BGPLGRouteDetailSummary {
+  path_count: number;
+  peer_count: number;
+  distinct_origin_asns: number[];
+  multi_origin: boolean;
+  anycast_candidate: boolean;
+  rpki: BGPLGRouteDetailRpkiBreakdown;
+  /** Origin ASN (as a string key) -> tracked ASN row's name, only for
+   *  origins that match a row in the ASN catalog. */
+  origin_names: Record<string, string>;
+}
+
+export interface BGPLGRouteDetailIpamContext {
+  subnet_id: string | null;
+  subnet_name: string | null;
+  block_id: string | null;
+  block_name: string | null;
+  space_id: string | null;
+  space_name: string | null;
+  asn_id: string | null;
+  asn_number: number | null;
+  asn_name: string | null;
+  vrf_id: string | null;
+  vrf_name: string | null;
+}
+
+export interface BGPLGRouteDetail {
+  prefix: string;
+  paths: BGPLGRouteDetailPath[];
+  summary: BGPLGRouteDetailSummary;
+  ipam: BGPLGRouteDetailIpamContext;
+}
+
+export const lookingGlassApi = {
+  // Collectors — agent-registration identity rows (one per GoBGP daemon).
+  // Registration itself is agent-side; operators only read the list here.
+  listCollectors: () =>
+    api.get<BGPLGCollector[]>("/looking-glass/collectors").then((r) => r.data),
+
+  // Peers — configured receive-only BGP sessions.
+  listPeers: (params?: { collector_id?: string }) =>
+    api
+      .get<BGPLGPeer[]>("/looking-glass/peers", { params })
+      .then((r) => r.data),
+  createPeer: (data: BGPLGPeerCreate) =>
+    api.post<BGPLGPeer>("/looking-glass/peers", data).then((r) => r.data),
+  updatePeer: (id: string, data: BGPLGPeerUpdate) =>
+    api
+      .patch<BGPLGPeer>(`/looking-glass/peers/${id}`, data)
+      .then((r) => r.data),
+  deletePeer: (id: string) => api.delete(`/looking-glass/peers/${id}`),
+
+  // Sessions — read-only per-peer runtime-state rollup (collector + peer
+  // joined). Not paginated — peer counts are bounded (a handful per
+  // collector), unlike the RIB.
+  listSessions: (params?: { collector_id?: string }) =>
+    api
+      .get<BGPLGSession[]>("/looking-glass/sessions", { params })
+      .then((r) => r.data),
+
+  // Routes — the learned RIB, server-paginated + filterable (the RIB can
+  // hold thousands of rows, unlike peers/sessions/collectors).
+  searchRoutes: (params?: BGPLGRouteQuery) =>
+    api
+      .get<BGPLGRouteListResponse>("/looking-glass/routes", { params })
+      .then((r) => r.data),
+  /** All paths for one *exact* prefix, across every peer — distinct from
+   *  ``searchRoutes({prefix})``'s contains-or-within match. */
+  getRoute: (prefix: string) =>
+    api
+      .get<BGPLGRoute[]>("/looking-glass/routes/by-prefix", {
+        params: { prefix },
+      })
+      .then((r) => r.data),
+  /** Reverse LPM-by-address lookup — "what route covers this IP?" */
+  routeForIp: (ip: string) =>
+    api
+      .get<BGPLGRouteForIpResponse>("/looking-glass/routes/for-ip", {
+        params: { ip },
+      })
+      .then((r) => r.data),
+  /** Single-shot rollup for the Dashboard's Looking Glass health card. */
+  getDashboardSummary: () =>
+    api
+      .get<BGPLGDashboardSummary>("/looking-glass/dashboard-summary")
+      .then((r) => r.data),
+  /** Multicast PIM-RP + producer-subnet reachability against the learned
+   *  RIB (issue #566 Phase 6) — read-only, computed on demand. */
+  getMulticastReachability: () =>
+    api
+      .get<MulticastReachabilityResponse>(
+        "/looking-glass/multicast-reachability",
+      )
+      .then((r) => r.data),
+  /** Rich rollup backing the Sessions-tab peer detail modal — collector,
+   *  matched ASN/router, RIB stats, open bgp_lg_* alerts. */
+  getPeerDetail: (peerId: string) =>
+    api
+      .get<BGPLGPeerDetail>(`/looking-glass/peers/${peerId}/detail`)
+      .then((r) => r.data),
+  /** Rich rollup backing the Routes-tab detail modal — every path for the
+   *  exact prefix across every peer, enriched with peer/collector names +
+   *  a server-computed multi-origin/anycast summary + IPAM context. */
+  getRouteDetail: (prefix: string, params?: { withdrawn?: boolean }) =>
+    api
+      .get<BGPLGRouteDetail>("/looking-glass/routes/detail", {
+        params: { prefix, ...params },
+      })
+      .then((r) => r.data),
+};
 
 // ── Logical ownership entities (issue #91) ─────────────────────────
 //

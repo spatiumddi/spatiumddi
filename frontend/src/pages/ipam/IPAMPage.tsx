@@ -61,6 +61,7 @@ import {
   vrfsApi,
   multicastApi,
   addressSetsApi,
+  lookingGlassApi,
   IP_ROLE_OPTIONS,
   SUBNET_ROLES,
   SUBNET_ROLE_LABELS,
@@ -110,6 +111,9 @@ import {
   SiteChip,
   SitePicker,
 } from "@/components/ownership/pickers";
+import { BgpAdvertisedChip } from "@/components/network/bgp-lg-chips";
+import { BgpRouteMiniTable } from "@/components/network/bgp-route-table";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 import {
   MODAL_BACKDROP_CLS,
   useDraggableModal,
@@ -4601,8 +4605,9 @@ function SubnetDetail({
     onError: (e) => setInlineEditError(formatApiError(e)),
   });
   const [activeSubnetTab, setActiveSubnetTab] = useState<
-    "addresses" | "dhcp" | "aliases" | "nat" | "trend" | "address-sets"
+    "addresses" | "dhcp" | "aliases" | "nat" | "trend" | "address-sets" | "bgp"
   >("addresses");
+  const { enabled: featureEnabled } = useFeatureModules();
   const [natModalIp, setNatModalIp] = useState<IPAddress | null>(null);
   const [selectedIpIds, setSelectedIpIds] = useState<Set<string>>(new Set());
   // Shift-click range select. ``onChange`` doesn't carry shiftKey, so we
@@ -5457,6 +5462,20 @@ function SubnetDetail({
           >
             Trend
           </button>
+          {featureEnabled("network.looking_glass") && (
+            <button
+              onClick={() => setActiveSubnetTab("bgp")}
+              className={cn(
+                "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
+                activeSubnetTab === "bgp"
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground",
+              )}
+              title="BGP routes learned for this subnet's CIDR"
+            >
+              BGP
+            </button>
+          )}
           {activeSubnetTab === "addresses" && selectedIpIds.size > 0 && (
             <div className="ml-auto flex items-center gap-2 py-1">
               <span className="text-xs font-medium text-muted-foreground">
@@ -5504,6 +5523,12 @@ function SubnetDetail({
       {activeSubnetTab === "nat" && (
         <div className="flex-1 overflow-auto">
           <NatSubnetPanel subnetId={subnet.id} />
+        </div>
+      )}
+
+      {activeSubnetTab === "bgp" && (
+        <div className="flex-1 overflow-auto">
+          <BgpSubnetPanel subnetId={subnet.id} />
         </div>
       )}
 
@@ -9045,6 +9070,39 @@ function NatRowsTable({
   );
 }
 
+function BgpSubnetPanel({ subnetId }: { subnetId: string }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ["bgp-lg-routes-by-subnet", subnetId],
+    queryFn: () =>
+      lookingGlassApi.searchRoutes({
+        matched_subnet_id: subnetId,
+        withdrawn: false,
+        limit: 200,
+      }),
+    staleTime: 15_000,
+  });
+
+  if (isLoading) {
+    return <p className="px-6 py-4 text-sm text-muted-foreground">Loading…</p>;
+  }
+  const items = data?.items ?? [];
+  if (items.length === 0) {
+    return (
+      <p className="px-6 py-4 text-sm text-muted-foreground">
+        No active BGP route covers this subnet's CIDR.
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-2 p-2">
+      <p className="px-3 pt-1 text-xs text-muted-foreground">
+        Every active BGP Looking Glass route matched to this subnet.
+      </p>
+      <BgpRouteMiniTable items={items} />
+    </div>
+  );
+}
+
 function NatSubnetPanel({ subnetId }: { subnetId: string }) {
   const { data = [], isLoading } = useQuery({
     queryKey: ["subnet-nat-mappings", subnetId],
@@ -10356,6 +10414,7 @@ function SubnetRow({
           </div>
           <CustomerChip customerId={subnet.customer_id} />
           <SiteChip siteId={subnet.site_id} />
+          <BgpAdvertisedChip spaceId={subnet.space_id} subnetId={subnet.id} />
           <UtilizationDot
             percent={subnet.utilization_percent}
             uncountable={isUncountable(subnet.total_ips)}
@@ -11916,6 +11975,10 @@ function BlockTreeRow({
               />
               <CustomerChip customerId={node.block.customer_id} />
               <SiteChip siteId={node.block.site_id} />
+              <BgpAdvertisedChip
+                spaceId={node.block.space_id}
+                blockId={node.block.id}
+              />
             </button>
           </div>
         </ContextMenuTrigger>
@@ -12655,8 +12718,9 @@ function BlockDetailView({
       </div>
       <div className="flex-1 overflow-auto">
         {space && (
-          <div className="px-6 pt-3">
+          <div className="space-y-3 px-6 pt-3">
             <MulticastGroupsPanel space={space} block={block} />
+            <BgpBlockPanel block={block} />
           </div>
         )}
         {(() => {
@@ -13277,6 +13341,45 @@ function isMulticastCidr(cidr: string): boolean {
   // IPv4: first octet 224..239 lies inside 224.0.0.0/4
   const first = parseInt(base.split(".")[0] ?? "0", 10);
   return first >= 224 && first <= 239;
+}
+
+function BgpBlockPanel({ block }: { block: IPBlock }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ["bgp-lg-routes-by-block", block.id],
+    queryFn: () =>
+      lookingGlassApi.searchRoutes({
+        matched_block_id: block.id,
+        withdrawn: false,
+        limit: 200,
+      }),
+    staleTime: 15_000,
+  });
+  if (isLoading) return null;
+  const items = data?.items ?? [];
+  if (items.length === 0) return null;
+
+  return (
+    <div className="mb-3 rounded-md border bg-sky-50/40 dark:bg-sky-950/20">
+      <div className="flex items-center justify-between gap-3 border-b px-4 py-2">
+        <div className="flex items-center gap-2 text-sm font-semibold">
+          BGP Routes
+          <span className="text-xs font-normal text-muted-foreground">
+            {items.length} route{items.length === 1 ? "" : "s"} covering{" "}
+            {block.network}
+          </span>
+        </div>
+        <Link
+          to="/network/looking-glass"
+          className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-xs font-medium hover:bg-muted"
+        >
+          Open Looking Glass →
+        </Link>
+      </div>
+      <div className="p-2">
+        <BgpRouteMiniTable items={items} />
+      </div>
+    </div>
+  );
 }
 
 function MulticastGroupsPanel({

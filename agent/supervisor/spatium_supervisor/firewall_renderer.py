@@ -153,6 +153,11 @@ class FirewallProfile:
 _ROLE_PORTS_TCP: dict[str, list[int]] = {
     "dns-bind9": [53],
     "dns-powerdns": [53],
+    # BGP (#566). The collector normally DIALS the router (outbound, allowed
+    # by default egress), but opening inbound tcp/179 lets the router initiate
+    # the session (passive collector) and keeps firewall drift-detection aware
+    # of the port for the looking-glass role.
+    "looking-glass": [179],
 }
 _ROLE_PORTS_UDP: dict[str, list[int]] = {
     "dns-bind9": [53],

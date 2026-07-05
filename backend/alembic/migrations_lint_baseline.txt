@@ -61,6 +61,8 @@ backend/alembic/versions/4c9e1f82a3b7_add_dns_schema.py:drop_table:195
 backend/alembic/versions/4c9e1f82a3b7_add_dns_schema.py:drop_table:196
 backend/alembic/versions/4c9e1f82a3b7_add_dns_schema.py:drop_table:197
 backend/alembic/versions/4c9e1f82a3b7_add_dns_schema.py:drop_table:198
+backend/alembic/versions/531494dbf44c_bgp_lg_alerts_dashboard.py:drop_column:71
+backend/alembic/versions/531494dbf44c_bgp_lg_alerts_dashboard.py:drop_column:73
 backend/alembic/versions/5443d2756647_approvals_protect_controls.py:drop_column:40
 backend/alembic/versions/5d2a8f91c4e6_add_dns_settings_and_fix_session_timeout.py:drop_column:39
 backend/alembic/versions/5d2a8f91c4e6_add_dns_settings_and_fix_session_timeout.py:drop_column:40
@@ -376,6 +378,9 @@ backend/alembic/versions/c9f2e1a4d7b6_dnsbl_monitoring.py:drop_table:199
 backend/alembic/versions/c9f2e1a4d7b6_dnsbl_monitoring.py:drop_table:201
 backend/alembic/versions/c9f2e1a4d7b6_dnsbl_monitoring.py:drop_table:203
 backend/alembic/versions/c9f2a83b04d7_appliance_certificate.py:drop_table:90
+backend/alembic/versions/cb279a6afd70_bgp_looking_glass_collector_peers_.py:drop_table:291
+backend/alembic/versions/cb279a6afd70_bgp_looking_glass_collector_peers_.py:drop_table:297
+backend/alembic/versions/cb279a6afd70_bgp_looking_glass_collector_peers_.py:drop_table:304
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_column:107
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_column:110
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_table:112
@@ -649,3 +654,7 @@ backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:d
 backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:drop_column:52
 backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:drop_column:53
 backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:drop_column:54
+backend/alembic/versions/f7883fa6d413_bgp_lg_route_distinguisher.py:drop_column:69
+backend/alembic/versions/1440e72b9297_metallb_bgp_mode.py:drop_column:73
+backend/alembic/versions/1440e72b9297_metallb_bgp_mode.py:drop_column:74
+backend/alembic/versions/1440e72b9297_metallb_bgp_mode.py:drop_column:75

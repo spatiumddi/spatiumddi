@@ -1,0 +1,68 @@
+name: spatiumddi-agent-looking-glass
+
+# ── Standalone BGP Looking Glass collector compose file ───────────────
+#
+# For running the receive-only GoBGP collector on a machine *without*
+# the SpatiumDDI control plane — the same distributed-deployment shape
+# as docker-compose.agent-dhcp.yml / docker-compose.agent-dns.yml:
+#
+#   * Control plane (api, db, redis, frontend, worker) runs on one VM
+#     via ``docker-compose.yml``.
+#   * This compose file runs on a VM with a real routable NIC that can
+#     reach the operator's edge/core routers over BGP (TCP/179),
+#     pointing at the control plane's API URL.
+#
+# RECEIVE-ONLY: this collector never advertises a route back to your
+# network — see agent/looking-glass/spatium_lg_agent/gobgp.py's module
+# docstring for the enforcement details.
+#
+# Quickstart:
+#
+#   export CONTROL_PLANE_URL=https://spatium.example.com
+#   export LG_AGENT_KEY=$(openssl rand -hex 32)
+#
+#   # Register the key on the control plane first (Settings → Agent
+#   # Keys) so the collector can bootstrap.
+#
+#   docker compose -f docker-compose.agent-looking-glass.yml up -d
+#
+# ──────────────────────────────────────────────────────────────────────
+
+services:
+
+  looking-glass:
+    image: ghcr.io/spatiumddi/looking-glass:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    hostname: ${LG_HOSTNAME:-looking-glass}
+    # BGP needs the real routable interface — a bridged network only
+    # sees relayed/NATed traffic, and the operator's router needs to
+    # dial (or accept a dial from) this collector's real IP on TCP/179.
+    network_mode: host
+    environment:
+      # ── Required ──────────────────────────────────────────────────
+      # URL of the SpatiumDDI control plane API.
+      CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:?CONTROL_PLANE_URL required}
+      # Pre-shared key registered on the control plane first.
+      LG_AGENT_KEY: ${LG_AGENT_KEY:?LG_AGENT_KEY required}
+
+      # ── Registration ──────────────────────────────────────────────
+      SERVER_NAME: ${LG_HOSTNAME:-looking-glass}
+
+      # ── TLS ───────────────────────────────────────────────────────
+      # Flip to 0 once your control plane has a trusted cert. Default
+      # is 1 for lab / self-signed testing.
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "${SPATIUM_INSECURE_SKIP_TLS_VERIFY:-1}"
+      # TLS_CA_PATH: /etc/ssl/spatium-ca.crt
+
+      # ── Tuning (optional, defaults shown) ─────────────────────────
+      # LOG_LEVEL: INFO
+      # HEARTBEAT_INTERVAL: "30"
+      # LONGPOLL_TIMEOUT: "30"
+      # RIB_POLL_INTERVAL: "30"
+    volumes:
+      - lg_agent_state:/var/lib/spatium-lg-agent
+      # Optional: mount a CA bundle to verify the control plane.
+      # - /etc/ssl/certs:/etc/ssl/certs:ro
+
+volumes:
+  lg_agent_state:

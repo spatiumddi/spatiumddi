@@ -444,6 +444,11 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     __table_args__ = (
         Index("ix_subnet_network", "network"),
         Index("ix_subnet_decom_date", "decom_date"),
+        Index(
+            "ix_subnet_bgp_should_advertise",
+            "bgp_should_advertise",
+            postgresql_where=sa_text("bgp_should_advertise = true"),
+        ),
         # Subnets cannot overlap within the same IP space (enforced at application layer)
     )
 
@@ -667,6 +672,17 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     # so existing rows are not retroactively misclassified. Values:
     # ``data`` / ``voice`` / ``management`` / ``guest``.
     subnet_role: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    # BGP Looking Glass "should be advertised" flag (issue #566 Phase
+    # 5). Pure operator intent — the collector is receive-only and
+    # never advertises anything; this just marks "the network is
+    # SUPPOSED to be carrying this prefix over BGP somewhere" so the
+    # bgp_lg_missing_advertisement alert has an owned-intent signal to
+    # check the live RIB against. Indexed (partial, WHERE true) so the
+    # alert's scan stays cheap regardless of subnet-table size.
+    bgp_should_advertise: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
 
     # Kubernetes integration provenance. When set, the subnet was auto-
     # created by the Kubernetes reconciler for this cluster; the FK

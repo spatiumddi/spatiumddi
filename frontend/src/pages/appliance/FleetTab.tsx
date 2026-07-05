@@ -139,6 +139,8 @@ function capabilityChips(caps: SupervisorCapabilities): {
   if (caps.can_run_dns_powerdns)
     out.push({ key: "powerdns", label: "PowerDNS" });
   if (caps.can_run_dhcp) out.push({ key: "dhcp", label: "DHCP" });
+  if (caps.can_run_looking_glass)
+    out.push({ key: "looking-glass", label: "Looking Glass" });
   if (caps.can_run_observer) out.push({ key: "observer", label: "Observer" });
   return out;
 }
@@ -180,6 +182,12 @@ function serviceChips(row: ApplianceRow): {
     });
   if (roles.includes("dhcp"))
     out.push({ key: "dhcp", label: "DHCP", status: serviceStatus });
+  if (roles.includes("looking-glass"))
+    out.push({
+      key: "looking-glass",
+      label: "Looking Glass",
+      status: serviceStatus,
+    });
   if (roles.includes("observer"))
     out.push({ key: "observer", label: "Observer", status: "neutral" });
   return out;
@@ -2364,6 +2372,7 @@ function ApplianceDrilldownModal({
             <CapRow label="DNS — BIND9" on={!!caps.can_run_dns_bind9} />
             <CapRow label="DNS — PowerDNS" on={!!caps.can_run_dns_powerdns} />
             <CapRow label="DHCP" on={!!caps.can_run_dhcp} />
+            <CapRow label="Looking Glass" on={!!caps.can_run_looking_glass} />
             <CapRow label="Observer" on={!!caps.can_run_observer} />
           </div>
           <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
@@ -2580,6 +2589,11 @@ const ROLE_OPTIONS: { value: string; label: string; capKey?: string }[] = [
     capKey: "can_run_dns_powerdns",
   },
   { value: "dhcp", label: "DHCP", capKey: "can_run_dhcp" },
+  {
+    value: "looking-glass",
+    label: "Looking Glass",
+    capKey: "can_run_looking_glass",
+  },
   { value: "observer", label: "Observer", capKey: "can_run_observer" },
 ];
 
@@ -4987,6 +5001,7 @@ const _ROLE_PORT_KEYS: Record<string, string[]> = {
   "dns-bind9": ["udp_53", "tcp_53"],
   "dns-powerdns": ["udp_53", "tcp_53"],
   dhcp: ["udp_67"],
+  "looking-glass": ["tcp_179"],
 };
 
 function _formatPortKey(key: string): string {

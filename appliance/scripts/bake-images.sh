@@ -52,6 +52,10 @@ IMAGES=(
     "ghcr.io/spatiumddi/dns-bind9"
     "ghcr.io/spatiumddi/dns-powerdns"
     "ghcr.io/spatiumddi/dhcp-kea"
+    # Issue #566 — BGP Looking Glass collector (GoBGP). Baked into
+    # every slot per decision D3 (can_run_looking_glass hardcodes
+    # True the same way DNS/DHCP do — not a conditional/optional add).
+    "ghcr.io/spatiumddi/looking-glass"
     # Phase 11 (#183) — control-plane images for the AIO + Core
     # install variants. Application-role appliances don't run these
     # pods, but baking them keeps the slot consistent across all
@@ -102,13 +106,6 @@ OBSERVABILITY_IMAGES=(
 # appVersion. Baked so multi-node HA promotion works in air-gapped
 # environments with zero outbound pulls — same as every other image.
 #
-# L2 (native) mode only: ``metallb.speaker.frr.enabled=false`` AND
-# ``metallb.frrk8s.enabled=false`` in charts/spatiumddi-metallb/
-# values.yaml (the 0.15.3 chart defaults speaker.frr.enabled TRUE), so
-# the quay.io/metallb/frr-k8s + quay.io/frrouting/frr images are
-# intentionally NOT baked. If/when BGP mode lands (Phase 10), enable
-# frrk8s + add those two images here.
-#
 # KEEP these refs in lock-step with the metallb.controller.image /
 # metallb.speaker.image pins + the metallb dependency version in
 # charts/spatiumddi-metallb (#286 moved MetalLB into its own wrapper
@@ -121,9 +118,25 @@ OBSERVABILITY_IMAGES=(
 # work (its speaker probe hits /healthz:17472, which v0.15.3 doesn't
 # serve → crashloop), so charts/spatiumddi-metallb pins the 0.15.3 chart
 # end-to-end. Bump back to the chart default once #3063 is fixed upstream.
+#
+# #566 decision D1 — BGP mode (frr-k8s backend). Bake all three images
+# the frr-k8s DaemonSet's pod spec pulls unconditionally: the FRR daemon
+# itself (GPL v2 — flag distinctly in NOTICE), the frr-k8s reconciler
+# (Apache 2.0), and the kube-rbac-proxy metrics sidecar (present TWICE
+# per pod, same image, Apache 2.0) that the vendored charts/frr-k8s
+# templates/controller.yaml wires in unconditionally. Tags verified
+# against charts/frr-k8s/values.yaml inside the vendored
+# metallb-0.15.3.tgz (frr-k8s@0.0.21) — keep in lock-step with the
+# charts/spatiumddi-metallb/values.yaml `metallb.frr-k8s.frrk8s.image` /
+# `.frr.image` pins. ``metallb.speaker.frr.enabled`` stays FALSE (the
+# in-speaker FRR sidecar is mutually exclusive with the frr-k8s backend
+# and unused either way) so no image is baked for that path.
 METALLB_IMAGES=(
     "quay.io/metallb/controller:v0.15.3"
     "quay.io/metallb/speaker:v0.15.3"
+    "quay.io/metallb/frr-k8s:v0.0.21"
+    "quay.io/frrouting/frr:10.4.1"
+    "gcr.io/kubebuilder/kube-rbac-proxy:v0.12.0"
 )
 
 # CloudNativePG (#272 / #277) — PostgreSQL is CNPG on every appliance

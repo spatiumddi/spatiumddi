@@ -429,7 +429,7 @@ function CommandOutput({ res }: { res: NetToolCommandResult }) {
 
 // ── ping / traceroute / mtr ───────────────────────────────────────────
 
-function CommandTool({
+export function CommandTool({
   kind,
   target,
 }: {
@@ -441,7 +441,10 @@ function CommandTool({
   const [err, setErr] = useState<string | null>(null);
   const [res, setRes] = useState<NetToolCommandResult | null>(null);
 
-  const ranRemote = target?.kind === "appliance";
+  // Generalised beyond "appliance" so a bgp_lg_collector vantage (#566
+  // Phase 4 — ping/traceroute from a Looking Glass collector) also gets
+  // the friendly remote-error copy in ``toolError`` below.
+  const ranRemote = !!target && target.kind !== "server";
 
   const run = async () => {
     if (!host.trim()) {

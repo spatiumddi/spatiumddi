@@ -23,6 +23,7 @@ components. Grouped by role; license + project URL for each.
 - Flannel (CNI) — Apache 2.0 — https://github.com/flannel-io/flannel
 - Helm — Apache 2.0 — https://helm.sh
 - MetalLB (L2 load balancer / control-plane VIP) — Apache 2.0 — https://metallb.io
+- FRRouting (BGP daemon, via MetalLB's frr-k8s backend) — GPL v2 — https://frrouting.org
 - CloudNativePG (PostgreSQL operator) — Apache 2.0 — https://cloudnative-pg.io
 
 ── Data services ──────────────────────────────────────────────────────────
@@ -31,12 +32,13 @@ components. Grouped by role; license + project URL for each.
 - Prometheus (+ client libs) — Apache 2.0 — https://prometheus.io
 - node-exporter / kube-state-metrics — Apache 2.0 — https://prometheus.io
 
-── DNS / DHCP service engines ─────────────────────────────────────────────
+── DNS / DHCP / routing service engines ────────────────────────────────────
 - ISC Kea DHCP — MPL 2.0 — https://kea.isc.org
 - radvd (IPv6 Router Advertisement Daemon) — BSD-style — https://radvd.litech.org
 - ISC BIND 9 — MPL 2.0 — https://isc.org/bind
 - PowerDNS Authoritative Server — GPL v2 — https://powerdns.com
 - PowerDNS dnsdist — GPL v2 — https://dnsdist.org
+- GoBGP (BGP Looking Glass collector, issue #566) — Apache 2.0 — https://github.com/osrg/gobgp
 
 ── Backend (Python) ───────────────────────────────────────────────────────
 - Python — PSF License — https://python.org

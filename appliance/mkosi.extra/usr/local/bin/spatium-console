@@ -106,7 +106,9 @@ ROLE_SERVICES = {
 # of these is actually in ``docker ps`` onto the base
 # ``ROLE_SERVICES["application"]`` list rather than rendering a
 # permanent ``(not running)`` row for every unassigned role.
-SUPERVISOR_DYNAMIC_SERVICES = ("dns-bind9", "dns-powerdns", "dhcp-kea")
+# #566 — ``looking-glass`` (BGP Looking Glass collector) joins the
+# DNS/DHCP roles here.
+SUPERVISOR_DYNAMIC_SERVICES = ("dns-bind9", "dns-powerdns", "dhcp-kea", "looking-glass")
 
 # Supervisor's role-compose.env on the host (the dashboard reads it
 # read-only to discover the watchdog-expected services so a
@@ -121,6 +123,7 @@ _PROFILE_TO_SERVICE_DASH: dict[str, str] = {
     "dns-bind9": "dns-bind9",
     "dns-powerdns": "dns-powerdns",
     "dhcp": "dhcp-kea",
+    "looking-glass": "looking-glass",
 }
 
 

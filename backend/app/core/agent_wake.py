@@ -100,6 +100,10 @@ def dhcp_server_channel(server_id: uuid.UUID | str) -> str:
     return _ch("dhcp", "server", str(server_id))
 
 
+def looking_glass_collector_channel(collector_id: uuid.UUID | str) -> str:
+    return _ch("looking_glass", "collector", str(collector_id))
+
+
 def appliance_channel(appliance_id: uuid.UUID | str) -> str:
     """Per-appliance channel for the heartbeat-gated supervisor signals
     (#358 Phase 1): fleet OS/slot upgrade, reboot, role assignment, and
@@ -134,6 +138,15 @@ def dhcp_wake_channels(server: Any) -> list[str]:
         channels.append(dhcp_group_channel(server.server_group_id))
     channels.append(HOSTCONFIG_ALL)
     return channels
+
+
+def looking_glass_wake_channels(collector: Any) -> list[str]:
+    """Channel a Looking Glass collector's config long-poll subscribes to:
+    just its own collector row. A wake here means a peer was created /
+    edited / deleted and the collector should re-fetch its peer set. LG
+    has no group fan-out (peers hang directly off the collector).
+    """
+    return [looking_glass_collector_channel(collector.id)]
 
 
 def appliance_wake_channels(appliance: Any) -> list[str]:

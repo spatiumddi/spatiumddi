@@ -427,6 +427,40 @@ services:
       - NET_BIND_SERVICE
       - NET_RAW  # #365 — raw sockets for direct-attached DHCP (see dhcp-kea)
 
+  # ── BGP Looking Glass collector (receive-only, issue #566) ────────────
+  # Only starts with `--profile looking-glass`. Builds the GoBGP collector
+  # image from source. Receive-only — never advertises a route back. Peers
+  # are configured under Network → Looking Glass. Uses host networking so
+  # the BGP session originates from the host's real NIC; it therefore
+  # reaches the API on the published host port, not the `api` bridge alias.
+  looking-glass:
+    profiles: ["looking-glass"]
+    image: spatiumddi-looking-glass:dev
+    build:
+      context: .
+      dockerfile: agent/looking-glass/images/gobgp/Dockerfile
+    restart: unless-stopped
+    hostname: ${LG_HOSTNAME:-looking-glass}
+    network_mode: host
+    environment:
+      # ── Required ──────────────────────────────────────────────────
+      CONTROL_PLANE_URL: http://127.0.0.1:${API_PORT:-8000}
+      LG_AGENT_KEY: ${LG_AGENT_KEY:-changeme-lg-agent-key}
+      # ── Registration ──────────────────────────────────────────────
+      SERVER_NAME: ${LG_HOSTNAME:-looking-glass}
+      # ── TLS ───────────────────────────────────────────────────────
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
+      # ── Tuning (optional, defaults shown) ─────────────────────────
+      # LOG_LEVEL: INFO
+      # HEARTBEAT_INTERVAL: "30"
+      # LONGPOLL_TIMEOUT: "30"
+      # RIB_POLL_INTERVAL: "30"
+    volumes:
+      - lg_agent_state:/var/lib/spatium-lg-agent
+    depends_on:
+      api:
+        condition: service_started
+
 
 networks:
   spatiumddi:
@@ -443,5 +477,7 @@ volumes:
   dhcp_kea_leases:
   dhcp_kea_state_2:
   dhcp_kea_leases_2:
+  # Looking Glass collector last-known-good config cache (issue #566).
+  lg_agent_state:
   spatium_backups:
   spatium_slot_images:

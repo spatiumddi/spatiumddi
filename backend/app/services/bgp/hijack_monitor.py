@@ -30,6 +30,7 @@ RPKI status semantics (reusing the ROA data already pulled by
 from __future__ import annotations
 
 import ipaddress
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -132,6 +133,64 @@ async def derive_rpki_status(
             return RPKI_VALID
 
     return RPKI_INVALID if covering else RPKI_UNKNOWN
+
+
+async def derive_rpki_status_batch(
+    db: AsyncSession,
+    pairs: Iterable[tuple[str, int]],
+) -> dict[tuple[str, int], str]:
+    """Classify many ``(prefix, origin)`` announcements in ONE ROA load.
+
+    ``derive_rpki_status`` issues one covering-ROA query per call; a pushed
+    BGP RIB snapshot has thousands of distinct announcements, so calling it
+    per-prefix means thousands of serial round-trips inside the ingest
+    transaction. This loads the ROA table once and matches every pair in
+    memory with byte-identical semantics to the single-shot function.
+    """
+    wanted = {(str(p), int(o)) for p, o in pairs}
+    if not wanted:
+        return {}
+
+    rows = (
+        await db.execute(
+            select(ASNRpkiRoa.prefix, ASNRpkiRoa.max_length, ASN.number).join(
+                ASN, ASNRpkiRoa.asn_id == ASN.id
+            )
+        )
+    ).all()
+    # Pre-parse the ROA set once.
+    roas: list[tuple[Any, int, int]] = []
+    for roa_prefix, max_length, asn_number in rows:
+        net = _parse_net(str(roa_prefix))
+        if net is None:
+            continue
+        roas.append((net, int(asn_number), int(max_length)))
+
+    out: dict[tuple[str, int], str] = {}
+    for prefix, origin in wanted:
+        obs = _parse_net(prefix)
+        if obs is None:
+            out[(prefix, origin)] = RPKI_UNKNOWN
+            continue
+        covering = False
+        status = RPKI_UNKNOWN
+        for net, roa_origin, max_length in roas:
+            if net.version != obs.version:
+                continue
+            try:
+                contains = net.supernet_of(obs)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                contains = False
+            if not contains:
+                continue
+            covering = True
+            if roa_origin == origin and obs.prefixlen <= max_length:
+                status = RPKI_VALID
+                break
+        if status != RPKI_VALID:
+            status = RPKI_INVALID if covering else RPKI_UNKNOWN
+        out[(prefix, origin)] = status
+    return out
 
 
 def expected_origin_set(tracked: BGPTrackedPrefix) -> set[int]:

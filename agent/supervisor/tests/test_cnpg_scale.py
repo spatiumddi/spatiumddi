@@ -116,3 +116,60 @@ def test_dataplane_vip_overrides_empty_disables(monkeypatch) -> None:
     assert "useMetalLBVIP: false" in vals
     assert 'vip: ""' in vals
     assert 'relayVIP: ""' in vals
+
+
+# ── issue #566 decision D1 — MetalLB BGP mode overrides ────────────────
+
+
+def test_metallb_bgp_overrides_render(monkeypatch) -> None:
+    # No existing HelmChartConfig (404) → create POST carrying the values.
+    rec = _Recorder(404, "")
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    changed, err = k8s_api.apply_metallb_overrides(
+        metallb_enabled=True,
+        pool_addresses=["192.168.0.240/32"],
+        bgp_enabled=True,
+        bgp_peers=[
+            {
+                "my_asn": 65000,
+                "peer_asn": 65001,
+                "peer_address": "203.0.113.1",
+                "peer_port": 1179,
+                "hold_time": "90s",
+            }
+        ],
+        bgp_advertisements=[{"ip_address_pools": ["spatium-control-plane"]}],
+    )
+
+    assert (changed, err) == (True, None)
+    body = next(json.loads(b) for m, _, b in rec.calls if m == "POST" and b)
+    vals = body["spec"]["valuesContent"]
+    assert "frrk8s:\n    enabled: true" in vals
+    assert "bgp:\n    enabled: true" in vals
+    assert '"myASN": 65000' in vals
+    assert '"peerASN": 65001' in vals
+    assert '"peerAddress": "203.0.113.1"' in vals
+    assert '"peerPort": 1179' in vals
+    assert '"holdTime": "90s"' in vals
+    assert '"ipAddressPools": ["spatium-control-plane"]' in vals
+
+
+def test_metallb_bgp_overrides_disabled_shape(monkeypatch) -> None:
+    # No peers / bgp_enabled=False (default) — L2-only shape, matching
+    # today's behavior unchanged. Also the shape a heartbeat renders
+    # when the operator hasn't configured BGP at all.
+    rec = _Recorder(404, "")
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    changed, err = k8s_api.apply_metallb_overrides(
+        metallb_enabled=True, pool_addresses=["192.168.0.240/32"]
+    )
+
+    assert (changed, err) == (True, None)
+    body = next(json.loads(b) for m, _, b in rec.calls if m == "POST" and b)
+    vals = body["spec"]["valuesContent"]
+    assert "frrk8s:\n    enabled: false" in vals
+    assert "bgp:\n    enabled: false" in vals
+    assert "peers: []" in vals
+    assert "advertisements: []" in vals

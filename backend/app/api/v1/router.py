@@ -45,6 +45,8 @@ from app.api.v1.groups.time_bound_grants import router as time_bound_grants_rout
 from app.api.v1.ipam.router import router as ipam_router
 from app.api.v1.kubernetes import router as kubernetes_router
 from app.api.v1.logs import logs_router
+from app.api.v1.looking_glass.agents import router as looking_glass_agents_router
+from app.api.v1.looking_glass.router import router as looking_glass_router
 from app.api.v1.metrics import router as metrics_router
 from app.api.v1.multicast import router as multicast_router
 from app.api.v1.netbox_import.router import router as netbox_import_router
@@ -270,6 +272,24 @@ api_v1_router.include_router(
     dependencies=[Depends(require_module("integrations.kubernetes"))],
 )
 api_v1_router.include_router(logs_router, prefix="/logs", tags=["logs"])
+# BGP Looking Glass (#566). Operator CRUD carries wake_publishing so a peer
+# config change wakes the parked collector long-poll; the agent router (which
+# holds that long-poll) is included without it, mirroring dns-agents.
+api_v1_router.include_router(
+    looking_glass_router,
+    prefix="/looking-glass",
+    tags=["looking-glass"],
+    dependencies=[
+        Depends(require_module("network.looking_glass")),
+        Depends(wake_publishing),
+    ],
+)
+api_v1_router.include_router(
+    looking_glass_agents_router,
+    prefix="/looking-glass",
+    tags=["looking-glass-agents"],
+    dependencies=[Depends(require_module("network.looking_glass"))],
+)
 api_v1_router.include_router(metrics_router, prefix="/metrics", tags=["metrics"])
 api_v1_router.include_router(
     multicast_router,

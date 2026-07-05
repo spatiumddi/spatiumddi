@@ -10,6 +10,7 @@ import {
   Radar,
   Radio,
   RefreshCw,
+  Route as RouteIcon,
   ShieldAlert,
   ShieldCheck,
   Trash2,
@@ -19,6 +20,7 @@ import {
 import {
   dnsblApi,
   ipamApi,
+  lookingGlassApi,
   multicastApi,
   nmapApi,
   tlsCertsApi,
@@ -38,6 +40,7 @@ import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { IPNetworkTab } from "./IPNetworkTab";
 import { SeenDot } from "./SeenDot";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { RpkiPill } from "@/components/network/bgp-route-table";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -551,6 +554,11 @@ export function IPDetailModal({
               the network.multicast feature module is disabled. */}
           <MulticastMembershipsSection addressId={addr.id} />
 
+          {/* Covering BGP route (issue #566 Phase 3). Hidden when the
+              network.looking_glass module is off or nothing in the
+              active RIB covers this address. */}
+          <BgpRouteLookupSection address={addr.address} />
+
           <CertsSection addressId={addr.id} />
 
           {/* Reputation — DNSBL / RBL listing status (issue #528). Hidden
@@ -761,6 +769,47 @@ function MulticastMembershipsSection({ addressId }: { addressId: string }) {
             ))}
           </tbody>
         </table>
+      </div>
+    </div>
+  );
+}
+
+/** Reverse LPM-by-address lookup — "what BGP route covers this exact
+ *  IP?" (issue #566 Phase 3). Self-hides when the network.looking_glass
+ *  module is off or nothing in the active RIB covers the address. */
+function BgpRouteLookupSection({ address }: { address: string }) {
+  const { enabled } = useFeatureModules();
+  const lgEnabled = enabled("network.looking_glass");
+
+  const q = useQuery({
+    queryKey: ["bgp-lg-route-for-ip", address],
+    queryFn: () => lookingGlassApi.routeForIp(address),
+    enabled: lgEnabled,
+    staleTime: 30_000,
+  });
+
+  if (!lgEnabled) return null;
+  if (!q.data?.found || !q.data.route) return null;
+  const r = q.data.route;
+
+  return (
+    <div>
+      <div className="mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+        <RouteIcon className="h-3 w-3" /> BGP route
+      </div>
+      <div className="space-y-1 rounded-md border px-3 py-2 text-xs">
+        <div className="flex items-center justify-between">
+          <span className="font-mono">{r.prefix}</span>
+          <RpkiPill status={r.rpki_status} />
+        </div>
+        <div className="text-muted-foreground">
+          Origin {r.origin_asn == null ? "—" : `AS${r.origin_asn}`} via{" "}
+          {r.next_hop}
+          {q.data.alternate_paths_count > 0 &&
+            ` · +${q.data.alternate_paths_count} more path${
+              q.data.alternate_paths_count === 1 ? "" : "s"
+            }`}
+        </div>
       </div>
     </div>
   );

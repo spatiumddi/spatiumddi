@@ -65,7 +65,17 @@ class LifecycleResult:
 # Service names the appliance can run. Match the chart's component
 # names (``app.kubernetes.io/component`` labels). The watchdog uses
 # this set to enumerate "which pods should I expect".
-SUPERVISED_SERVICES: tuple[str, ...] = ("dns-bind9", "dns-powerdns", "dhcp-kea")
+#
+# #566 — ``looking-glass`` (the BGP Looking Glass / GoBGP collector)
+# uses an identity profile↔component mapping, same as the DNS roles
+# (only ``dhcp``'s profile token diverges from its ``dhcp-kea``
+# component name).
+SUPERVISED_SERVICES: tuple[str, ...] = (
+    "dns-bind9",
+    "dns-powerdns",
+    "dhcp-kea",
+    "looking-glass",
+)
 
 log = structlog.get_logger(__name__)
 
@@ -89,6 +99,7 @@ _PROFILE_TO_HELM_KEY = {
     "dns-bind9": "dnsBind9",
     "dns-powerdns": "dnsPowerdns",
     "dhcp": "dhcpKea",
+    "looking-glass": "lookingGlass",
 }
 
 # Phase 10 (#183) — every role the chart templates have a per-role
@@ -105,6 +116,9 @@ _ROLE_LABEL_KEYS = {
     "dns-bind9": "spatium.io/role-dns-bind9",
     "dns-powerdns": "spatium.io/role-dns-powerdns",
     "dhcp": "spatium.io/role-dhcp",
+    # #566 — BGP Looking Glass collector (GoBGP). Same per-role
+    # node-label gating shape as DNS/DHCP (non-negotiable #16).
+    "looking-glass": "spatium.io/role-looking-glass",
     # #272 — gate the umbrella chart's frontend / api / worker / beat /
     # postgres / redis workloads onto the control-plane variant (never
     # an appliance). Multi-node HA selects between control-plane members
@@ -122,10 +136,11 @@ _ROLE_LABEL_KEYS = {
 # Two variants, and only ``control-plane`` is forced:
 #   * control-plane — forces the control-plane label so the umbrella
 #     workloads (api / frontend / db / redis / worker / beat) never
-#     lose their node. DNS/DHCP are NOT forced here AND NOT auto-
-#     assigned at register — the operator enables them per node via
-#     the Fleet role toggle (so the data plane is always a deliberate
-#     fleet decision, and a promoted control-plane node can shed them).
+#     lose their node. DNS/DHCP/looking-glass are NOT forced here AND
+#     NOT auto-assigned at register — the operator enables them per
+#     node via the Fleet role toggle (so the data plane is always a
+#     deliberate fleet decision, and a promoted control-plane node can
+#     shed them).
 #   * appliance — nothing forced. Operator-assigned roles only.
 # Forcing DNS/DHCP here would re-add the labels every tick and make the
 # Fleet toggle a no-op, so they must stay out of every forced set.
@@ -241,6 +256,17 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
             # default group.
             "serverGroupName": env_vars.get("DHCP_AGENT_GROUP", ""),
             "networkMode": env_vars.get("DHCP_NETWORK_MODE", "host"),
+        },
+        # #566 — BGP Looking Glass collector (GoBGP). ``enabled: True``
+        # unconditionally, same release-ownership-not-scheduling-scope
+        # convention as every other role block above — pod scheduling
+        # is gated purely by the ``spatium.io/role-looking-glass`` node
+        # label. No group/serverGroupName concept (LG peers aren't
+        # grouped like DNS/DHCP server groups).
+        "lookingGlass": {
+            "enabled": True,
+            "controlPlaneUrl": control_plane_url,
+            "agentKey": env_vars.get("LG_AGENT_KEY", ""),
         },
     }
     return values

@@ -3789,3 +3789,239 @@ register(
         required_permission=("write", "dhcp_server"),
     )
 )
+
+
+# ── create_lg_peer (issue #566 — BGP Looking Glass) ─────────────────────
+#
+# Creates a configured, receive-only bgp_lg_peer session on a collector.
+# The hard safety invariant (no export policy — the collector never
+# advertises back to the peer) lives in the daemon's rendered config, not
+# here; this operation only validates + persists the session row.
+
+_LG_ASN_MIN = 1
+_LG_ASN_MAX = 4_294_967_295
+# v1 only negotiates unicast AFI/SAFIs — VPNv4/VPNv6/EVPN are a later
+# phase (issue #566 §6). Rejecting anything else here keeps a bad
+# address_families value from reaching the GoBGP config renderer.
+_LG_ADDRESS_FAMILIES = frozenset({"ipv4-unicast", "ipv6-unicast"})
+
+
+class CreateLgPeerArgs(BaseModel):
+    """Args for the ``create_lg_peer`` operation."""
+
+    collector_id: UUID = Field(description="The looking_glass_collector this session runs on.")
+    name: str = Field(description="Operator-facing label for the peer session.")
+    local_asn: int = Field(description="The collector's own AS number for this session.")
+    peer_asn: int = Field(description="The remote router's AS number.")
+    peer_address: str = Field(description="The remote router's IP address (v4 or v6).")
+    peer_router_id: UUID | None = Field(
+        default=None,
+        description="Optional link to an existing network_device (SNMP-polled inventory) row.",
+    )
+    address_families: list[str] | None = Field(
+        default=None,
+        description=(
+            "AFI/SAFIs to negotiate. Defaults to ['ipv4-unicast']. Supported "
+            "today: ipv4-unicast, ipv6-unicast (VPNv4/EVPN are a later phase)."
+        ),
+    )
+    max_prefixes: int | None = Field(
+        default=None,
+        description=(
+            "Hard prefix-limit cap rendered into the GoBGP peer config as a "
+            "safety guard. Defaults to 10000; raise for a full-table feed."
+        ),
+    )
+    md5_password: str | None = Field(
+        default=None,
+        description=(
+            "Optional TCP-MD5 session password. Fernet-encrypted at rest; "
+            "never returned in plaintext by any read surface."
+        ),
+    )
+    import_filter: dict[str, Any] | None = Field(
+        default=None,
+        description="Route acceptance scope. Defaults to {'mode': 'accept_all'}.",
+    )
+    enabled: bool = Field(default=True)
+    description: str = Field(default="", description="Free-form note.")
+
+
+async def _validate_lg_peer_args(
+    db: AsyncSession, args: CreateLgPeerArgs
+) -> tuple[Any, str | None]:
+    """Shared validation for preview + apply. Returns ``(collector, error)``
+    — ``error`` is a human-readable rejection reason, or ``None`` when the
+    args are clean. No writes."""
+    from app.models.bgp_looking_glass import LookingGlassCollector  # noqa: PLC0415
+    from app.models.network import NetworkDevice  # noqa: PLC0415
+
+    collector = await db.get(LookingGlassCollector, args.collector_id)
+    if collector is None:
+        return None, f"Collector {args.collector_id} not found."
+
+    for label, number in (("local_asn", args.local_asn), ("peer_asn", args.peer_asn)):
+        if not (_LG_ASN_MIN <= number <= _LG_ASN_MAX):
+            return None, (
+                f"{label} must be between {_LG_ASN_MIN} and {_LG_ASN_MAX} (32-bit AS range)."
+            )
+
+    try:
+        ipaddress.ip_address(args.peer_address)
+    except ValueError:
+        return None, f"Invalid peer_address {args.peer_address!r}."
+
+    families = args.address_families or ["ipv4-unicast"]
+    unsupported = [af for af in families if af not in _LG_ADDRESS_FAMILIES]
+    if unsupported:
+        return None, (
+            f"Unsupported address_families {unsupported} — v1 only supports "
+            f"{sorted(_LG_ADDRESS_FAMILIES)}."
+        )
+
+    if args.max_prefixes is not None and args.max_prefixes <= 0:
+        return None, "max_prefixes must be a positive integer."
+
+    if args.peer_router_id is not None:
+        device = await db.get(NetworkDevice, args.peer_router_id)
+        if device is None:
+            return None, f"Network device {args.peer_router_id} not found."
+
+    return collector, None
+
+
+async def _preview_create_lg_peer(
+    db: AsyncSession, user: User, args: CreateLgPeerArgs
+) -> PreviewResult:
+    from app.models.bgp_looking_glass import BGPLGPeer  # noqa: PLC0415
+
+    collector, error = await _validate_lg_peer_args(db, args)
+    if error is not None:
+        return PreviewResult(ok=False, detail=error)
+
+    # Conflict probe — do NOT reject in preview; surface as a hint (BGP
+    # allows multiple sessions to the same address is unusual but not
+    # invalid, so this stays informational like create_dhcp_static's
+    # collision suffix).
+    existing = (
+        await db.execute(
+            select(BGPLGPeer).where(
+                BGPLGPeer.collector_id == args.collector_id,
+                BGPLGPeer.peer_address == args.peer_address,
+            )
+        )
+    ).scalar_one_or_none()
+    suffix = ""
+    if existing is not None:
+        suffix = (
+            f" — note: this collector already has a peer for {args.peer_address} "
+            f"({existing.name!r}); this creates a second session, not a replacement"
+        )
+
+    families = args.address_families or ["ipv4-unicast"]
+    max_prefixes = args.max_prefixes or 10000
+    parts = [
+        f"Create receive-only BGP Looking Glass peer `{args.name}` on collector "
+        f"`{collector.name}`",
+        f"peer_asn={args.peer_asn}",
+        f"peer_address={args.peer_address}",
+        f"address_families={families}",
+        f"max_prefixes={max_prefixes}",
+        f"md5_password={'set' if args.md5_password else 'not set'}",
+    ]
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            ", ".join(parts) + suffix + ". SpatiumDDI never advertises routes "
+            "back to this peer (receive-only, no export policy)."
+        ),
+    )
+
+
+async def _apply_create_lg_peer(
+    db: AsyncSession, user: User, args: CreateLgPeerArgs
+) -> dict[str, Any]:
+    from app.api.v1.dhcp._audit import write_audit  # noqa: PLC0415
+    from app.core.agent_wake import looking_glass_collector_channel, publish_wake  # noqa: PLC0415
+    from app.core.crypto import encrypt_str  # noqa: PLC0415
+    from app.models.bgp_looking_glass import BGPLGPeer  # noqa: PLC0415
+
+    # SECURITY (#400, C2): RBAC backstop — matches the Looking Glass peers
+    # router's require_resource_permission("bgp_lg_peer") write gate.
+    enforce_operation_permission(user, _OPERATIONS["create_lg_peer"])
+
+    collector, error = await _validate_lg_peer_args(db, args)
+    if error is not None:
+        raise ValueError(error)
+
+    row = BGPLGPeer(
+        name=args.name,
+        collector_id=collector.id,
+        local_asn=args.local_asn,
+        peer_asn=args.peer_asn,
+        peer_address=args.peer_address,
+        peer_router_id=args.peer_router_id,
+        address_families=args.address_families or ["ipv4-unicast"],
+        max_prefixes=args.max_prefixes or 10000,
+        import_filter=args.import_filter or {"mode": "accept_all"},
+        enabled=args.enabled,
+        description=args.description or "",
+        md5_password_encrypted=encrypt_str(args.md5_password) if args.md5_password else None,
+    )
+    db.add(row)
+    await db.flush()
+
+    write_audit(
+        db,
+        user=user,
+        action="create",
+        resource_type="bgp_lg_peer",
+        resource_id=str(row.id),
+        resource_display=f"{args.name} ({args.peer_address})",
+        new_value={
+            "collector_id": str(collector.id),
+            "peer_asn": args.peer_asn,
+            "peer_address": args.peer_address,
+            "address_families": row.address_families,
+            "max_prefixes": row.max_prefixes,
+            "md5_password_set": bool(args.md5_password),
+            "via": "ai_proposal",
+        },
+    )
+    await db.commit()
+    await db.refresh(row)
+    # Cross-cutting pattern #2 — wake the collector's ConfigBundle long-poll
+    # so the new session is rendered without waiting for the belt-and-braces
+    # tick. Uses publish_wake directly (not collect_wake): the /api/v1/ai
+    # router has no wake_publishing dependency, so the collect_wake bucket is
+    # never opened and would silently no-op — mirrors the DNS-record op above.
+    await publish_wake(looking_glass_collector_channel(collector.id))
+    return {
+        "id": str(row.id),
+        "collector_id": str(collector.id),
+        "name": row.name,
+        "peer_asn": row.peer_asn,
+        "peer_address": args.peer_address,
+        "md5_password_set": bool(row.md5_password_encrypted),
+    }
+
+
+register(
+    Operation(
+        name="create_lg_peer",
+        description=(
+            "Create a BGP Looking Glass peer session — a configured, "
+            "receive-only BGP session on a collector. SpatiumDDI never "
+            "advertises routes back to the peer (no export policy). Always "
+            "route via propose_create_lg_peer — this touches the operator's "
+            "live BGP config on the collector's next apply, so operator "
+            "approval is required."
+        ),
+        args_model=CreateLgPeerArgs,
+        preview=_preview_create_lg_peer,
+        apply=_apply_create_lg_peer,
+        category="network",
+        required_permission=("write", "bgp_lg_peer"),
+    )
+)

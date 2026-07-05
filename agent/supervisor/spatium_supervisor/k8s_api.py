@@ -606,20 +606,75 @@ def apply_control_plane_overrides(
 
 
 def apply_metallb_overrides(
-    *, metallb_enabled: bool, pool_addresses: list[str]
+    *,
+    metallb_enabled: bool,
+    pool_addresses: list[str],
+    bgp_enabled: bool = False,
+    bgp_peers: list[dict] | None = None,
+    bgp_advertisements: list[dict] | None = None,
 ) -> tuple[bool, str | None]:
-    """Durably set the MetalLB overrides (enabled + L2 pool) on the
-    spatium-metallb HelmChartConfig (#272).
+    """Durably set the MetalLB overrides (L2 pool + BGP mode) on the
+    spatium-metallb HelmChartConfig (#272 / #566).
 
     MetalLB moved out of the spatium-bootstrap chart into its own
     spatium-metallb chart (deployed in the metallb-system namespace), so
     the override targets that chart's HelmChartConfig now. The value
     paths are unchanged (``metallb.enabled`` + ``metallb.ipPool
-    .addresses``) — the wrapper chart reads the same keys."""
+    .addresses``) — the wrapper chart reads the same keys.
+
+    ``bgp_peers`` / ``bgp_advertisements`` are plain dicts in the
+    snake_case shape the PlatformSettings JSONB columns store
+    (``my_asn`` / ``peer_asn`` / ``peer_address`` / ``peer_port`` /
+    ``hold_time`` and ``ip_address_pools`` / ``communities`` /
+    ``aggregation_length``) — translated here to the chart's camelCase
+    BGPPeer/BGPAdvertisement CR field names (myASN/peerASN/peerAddress/
+    peerPort/holdTime, ipAddressPools/communities/aggregationLength).
+    ``frrk8s.enabled`` is driven by the SAME ``bgp_enabled`` flag as
+    ``bgp.enabled`` — the chart's speaker/controller only wire up to
+    frr-k8s when frrk8s.enabled is true, and BGP peers/advertisements
+    are inert without it. ``speaker.frr.enabled`` is NEVER written here
+    — it stays the chart's baked ``false`` (mutually exclusive with
+    frrk8s.enabled; the chart's own template hard-``fail``s if both are
+    true).
+
+    MUST render every MetalLB-related key in ONE combined body —
+    ``_helmchartconfig_upsert`` replaces the whole valuesContent string,
+    so calling this (or a sibling function targeting the same
+    HelmChartConfig) twice per tick would have the second call blank
+    out the first's keys."""
     pool_json = json.dumps([a.strip() for a in pool_addresses if a and a.strip()])
+
+    def _peer(p: dict) -> dict:
+        out: dict = {
+            "myASN": p["my_asn"],
+            "peerASN": p["peer_asn"],
+            "peerAddress": p["peer_address"],
+        }
+        if p.get("peer_port"):
+            out["peerPort"] = p["peer_port"]
+        if p.get("hold_time"):
+            out["holdTime"] = p["hold_time"]
+        return out
+
+    def _adv(a: dict) -> dict:
+        out: dict = {
+            "ipAddressPools": a.get("ip_address_pools") or ["spatium-control-plane"]
+        }
+        if a.get("communities"):
+            out["communities"] = a["communities"]
+        if a.get("aggregation_length"):
+            out["aggregationLength"] = a["aggregation_length"]
+        return out
+
+    peers_json = json.dumps([_peer(p) for p in (bgp_peers or [])])
+    adv_json = json.dumps([_adv(a) for a in (bgp_advertisements or [])])
     values = (
         f"metallb:\n  enabled: {'true' if metallb_enabled else 'false'}\n"
         f"  ipPool:\n    addresses: {pool_json}\n"
+        f"  frrk8s:\n    enabled: {'true' if bgp_enabled else 'false'}\n"
+        f"  bgp:\n    enabled: {'true' if bgp_enabled else 'false'}\n"
+        f"    peers: {peers_json}\n"
+        f"    advertisements: {adv_json}\n"
     )
     return _helmchartconfig_upsert("spatium-metallb", values)
 

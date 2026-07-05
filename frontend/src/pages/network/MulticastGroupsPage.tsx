@@ -4,6 +4,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListPlus, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
 
 import { MulticastDomainsTab } from "./MulticastDomainsPage";
+import { MulticastReachabilityTab } from "./MulticastReachabilityTab";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 import {
   customersApi,
   ipamApi,
@@ -970,8 +972,17 @@ export function MulticastGroupsPage() {
   const [showNew, setShowNew] = useState(false);
   const [showBulk, setShowBulk] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const tab: "groups" | "domains" =
-    searchParams.get("tab") === "domains" ? "domains" : "groups";
+  const { enabled: featureEnabled } = useFeatureModules();
+  // BGP Looking Glass reachability cross-check (issue #566 Phase 6) is
+  // only meaningful when the Looking Glass module is on — no RIB to
+  // cross-reference against otherwise.
+  const lgEnabled = featureEnabled("network.looking_glass");
+  const tab: "groups" | "domains" | "reachability" =
+    searchParams.get("tab") === "domains"
+      ? "domains"
+      : searchParams.get("tab") === "reachability" && lgEnabled
+        ? "reachability"
+        : "groups";
 
   // Keep ``?space=<uuid>`` in the URL in sync with the dropdown.
   useEffect(() => {
@@ -986,7 +997,7 @@ export function MulticastGroupsPage() {
     );
   }, [spaceFilter, setSearchParams]);
 
-  function selectTab(next: "groups" | "domains") {
+  function selectTab(next: "groups" | "domains" | "reachability") {
     setSearchParams(
       (prev) => {
         const params = new URLSearchParams(prev);
@@ -1105,9 +1116,18 @@ export function MulticastGroupsPage() {
             onClick={() => selectTab("domains")}
             label="Domains"
           />
+          {lgEnabled && (
+            <TabPill
+              active={tab === "reachability"}
+              onClick={() => selectTab("reachability")}
+              label="BGP Reachability"
+            />
+          )}
         </div>
 
-        {tab === "domains" ? (
+        {tab === "reachability" && lgEnabled ? (
+          <MulticastReachabilityTab />
+        ) : tab === "domains" ? (
           <MulticastDomainsTab />
         ) : (
           <GroupsTabBody

@@ -60,11 +60,13 @@ log = structlog.get_logger(__name__)
 # Compose-profile-name → chart-component name. ``COMPOSE_PROFILES``
 # in role-compose.env carries profile values; pod labels carry the
 # chart component. ``dhcp`` profile maps to ``dhcp-kea`` component;
-# everything else is identity.
+# everything else is identity. ``looking-glass`` (#566) is identity,
+# same as the DNS roles.
 _PROFILE_TO_SERVICE: dict[str, str] = {
     "dns-bind9": "dns-bind9",
     "dns-powerdns": "dns-powerdns",
     "dhcp": "dhcp-kea",
+    "looking-glass": "looking-glass",
 }
 
 

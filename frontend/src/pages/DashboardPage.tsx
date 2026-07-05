@@ -25,6 +25,7 @@ import {
   Lock,
   Network,
   Plug,
+  Radio,
   RefreshCw,
   Route,
   Server,
@@ -57,6 +58,7 @@ import {
   dashboardsApi,
   tlsCertsApi,
   newDeviceApi,
+  lookingGlassApi,
   type IPSpace,
   type Subnet,
   type DNSServer,
@@ -871,6 +873,126 @@ function SubnetDecomCard() {
   );
 }
 
+// ── Looking Glass health card ────────────────────────────────────────────────
+
+function LookingGlassHealthCard() {
+  const { enabled, ready } = useFeatureModules();
+  const moduleOn = ready && enabled("network.looking_glass");
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ["lg-dashboard-summary"],
+    queryFn: () => lookingGlassApi.getDashboardSummary(),
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+    enabled: moduleOn,
+  });
+
+  // When the module is off the gated endpoint 404s — render nothing (the
+  // grid just collapses) instead of a red error card, matching the other
+  // module-gated summary cards on this tab.
+  if (!moduleOn) return null;
+
+  const inner = (() => {
+    if (isLoading) {
+      return (
+        <div className="mt-3 space-y-2">
+          {[1, 2, 3].map((i) => (
+            <div
+              key={i}
+              className="h-4 animate-pulse rounded bg-muted"
+              style={{ width: `${60 + i * 10}%` }}
+            />
+          ))}
+        </div>
+      );
+    }
+    if (isError) {
+      return (
+        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
+          Failed to load Looking Glass data.
+        </p>
+      );
+    }
+    if (!data || data.peers_total === 0) {
+      return (
+        <div className="mt-3 flex-1 flex flex-col justify-between">
+          <p className="text-xs text-muted-foreground">
+            No Looking Glass peers configured.
+          </p>
+          <Link
+            to="/network/looking-glass"
+            className="mt-2 text-[11px] text-primary hover:underline"
+          >
+            Configure a peer →
+          </Link>
+        </div>
+      );
+    }
+    return (
+      <div className="mt-3 flex-1 flex flex-col justify-between gap-2">
+        <div className="space-y-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
+            {data.peers_established > 0 && (
+              <span className="flex items-center gap-1 text-[11px]">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                <span className="text-emerald-700 dark:text-emerald-400">
+                  {data.peers_established} established
+                </span>
+              </span>
+            )}
+            {data.peers_down > 0 && (
+              <span className="flex items-center gap-1 text-[11px]">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-red-500" />
+                <span className="text-red-600 dark:text-red-400">
+                  {data.peers_down} down
+                </span>
+              </span>
+            )}
+          </div>
+          {(data.routes_rpki_invalid > 0 || data.routes_flapping > 0) && (
+            <div className="flex flex-wrap gap-1">
+              {data.routes_rpki_invalid > 0 && (
+                <StatusChip
+                  tone="red"
+                  label={`${data.routes_rpki_invalid} RPKI-invalid`}
+                />
+              )}
+              {data.routes_flapping > 0 && (
+                <StatusChip
+                  tone="amber"
+                  label={`${data.routes_flapping} flapping`}
+                />
+              )}
+            </div>
+          )}
+        </div>
+        <Link
+          to="/network/looking-glass"
+          className="text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          View all →
+        </Link>
+      </div>
+    );
+  })();
+
+  return (
+    <div className="rounded-lg border bg-card p-4 flex flex-col">
+      <div className="flex items-center justify-between">
+        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          Looking Glass
+        </p>
+        <Radio className="h-3.5 w-3.5 text-muted-foreground" />
+      </div>
+      {!isLoading && !isError && data && data.peers_total > 0 && (
+        <p className="mt-1.5 text-2xl font-bold tabular-nums">
+          {data.peers_total}
+        </p>
+      )}
+      {inner}
+    </div>
+  );
+}
+
 // ── Page ────────────────────────────────────────────────────────────────────
 
 type DashboardTab =
@@ -1379,6 +1501,7 @@ export function DashboardPage() {
             <VrfSummaryCard />
             <DomainsSummaryCard />
             <SubnetDecomCard />
+            <LookingGlassHealthCard />
           </div>
         )}
 

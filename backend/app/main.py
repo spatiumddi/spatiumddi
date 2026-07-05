@@ -486,6 +486,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_bgp_hijack_alert_rules()
     except Exception as exc:  # noqa: BLE001
         logger.debug("bgp_hijack_alert_rules_seed_skipped", reason=str(exc))
+    # BGP Looking Glass troubleshooting alert rules — six, DISABLED by
+    # default (issue #566 Phase 5). Fire only once peers are configured
+    # (session_down / rpki_invalid_route / route_flap / a peer's own
+    # feed) and, for unexpected_origin / more_specific, at least one
+    # BGPTrackedPrefix owned-prefix row exists via the #527 UI; for
+    # missing_advertisement, at least one Subnet has
+    # bgp_should_advertise=true.
+    try:
+        from app.services.alerts import seed_bgp_lg_alert_rules  # noqa: PLC0415
+
+        await seed_bgp_lg_alert_rules()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("bgp_lg_alert_rules_seed_skipped", reason=str(exc))
     # DNSBL / RBL reputation catalog + alert rule (issue #528). The catalog
     # seeds the curated blocklists as platform rows (all disabled); the
     # ip_blocklisted alert rule seeds disabled. No off-prem calls at seed time.

@@ -5,13 +5,14 @@ into a docker-compose env file the supervisor uses to bring up /
 down the service containers:
 
 * ``COMPOSE_PROFILES`` carries the subset of
-  ``dns-bind9`` / ``dns-powerdns`` / ``dhcp`` the supervisor needs
-  to start.
-* ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` / ``AGENT_GROUP`` /
-  ``CONTROL_PLANE_URL`` carry the service-container env so the
-  dns-bind9 / dhcp-kea agent sidecar can register against the
-  control plane's per-service ``/dns/agents/register`` /
-  ``/dhcp/agents/register`` endpoints without operator input.
+  ``dns-bind9`` / ``dns-powerdns`` / ``dhcp`` / ``looking-glass`` the
+  supervisor needs to start.
+* ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` / ``LG_AGENT_KEY`` /
+  ``AGENT_GROUP`` / ``CONTROL_PLANE_URL`` carry the service-container
+  env so the dns-bind9 / dhcp-kea / looking-glass agent sidecar can
+  register against the control plane's per-service
+  ``/dns/agents/register`` / ``/dhcp/agents/register`` /
+  ``/looking-glass/agents/register`` endpoints without operator input.
 * ``DHCP_NETWORK_MODE`` toggles ``network_mode: host`` (default)
   vs ``ports: ["67:67/udp"]`` (bridged, for relay deployments).
   The compose template selects between two service definitions
@@ -43,7 +44,10 @@ log = structlog.get_logger(__name__)
 # Roles the supervisor knows how to start a service container for.
 # ``observer`` + ``custom`` are reserved (no compose profile yet);
 # the supervisor recognises them on heartbeat but does nothing.
-_SERVICE_ROLES = {"dns-bind9", "dns-powerdns", "dhcp"}
+# ``looking-glass`` (#566) joined DNS/DHCP here — the BGP Looking
+# Glass collector is a real service container (GoBGP), not a
+# supervisor-side-only role like observer.
+_SERVICE_ROLES = {"dns-bind9", "dns-powerdns", "dhcp", "looking-glass"}
 
 
 # Issue #237 — values from the heartbeat response land in a docker-
@@ -182,6 +186,19 @@ def compute_target_env(role_assignment: dict[str, Any] | None) -> TargetEnv:
         env_lines.append(f"DHCP_NETWORK_MODE={dhcp_network_mode}")
         if dhcp_agent_key:
             env_lines.append(f"DHCP_AGENT_KEY={dhcp_agent_key}")
+
+    # Looking Glass (BGP collector, #566) — no group concept (LG peers
+    # aren't grouped like DNS/DHCP server groups; peer config itself
+    # rides the collector's own ConfigBundle long-poll, not this env
+    # file). Only the bootstrap PSK is needed here so the GoBGP
+    # sidecar can register against ``/looking-glass/agents/register``
+    # without operator input — same shape + validation as DNS/DHCP.
+    lg_agent_key = _safe_env_value(
+        "lg_agent_key", role_assignment.get("lg_agent_key"), _AGENT_KEY_RE
+    )
+    if "looking-glass" in roles:
+        if lg_agent_key:
+            env_lines.append(f"LG_AGENT_KEY={lg_agent_key}")
 
     return TargetEnv(env_lines=env_lines, profiles=profiles)
 

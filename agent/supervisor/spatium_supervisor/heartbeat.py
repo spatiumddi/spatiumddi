@@ -142,7 +142,18 @@ def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
 # to be sending heartbeats, the images are there. Hardcoded to True
 # instead of probing /var/run/docker.sock (which doesn't exist
 # anymore — the appliance is k3s-only).
-_CAPABILITY_FLAGS = ("can_run_dns_bind9", "can_run_dns_powerdns", "can_run_dhcp")
+#
+# Issue #566 — ``can_run_looking_glass`` (the BGP Looking Glass
+# collector, GoBGP) joins this tuple rather than getting its own
+# bespoke always-true literal (like ``can_run_observer`` below): it
+# has a real service container (the ``looking-glass`` image), baked
+# into every slot per decision D3, so it belongs alongside DNS/DHCP.
+_CAPABILITY_FLAGS = (
+    "can_run_dns_bind9",
+    "can_run_dns_powerdns",
+    "can_run_dhcp",
+    "can_run_looking_glass",
+)
 
 
 def _detect_storage_type() -> str:
@@ -223,9 +234,10 @@ def _capabilities_payload() -> dict[str, Any]:
     capability reporting"):
 
     * ``can_run_dns_bind9`` / ``can_run_dns_powerdns`` /
-      ``can_run_dhcp`` — hardcoded ``True`` post-Phase-7. The slot's
-      containerd content store is preloaded with every service
-      image; if we're heartbeating, the images are there.
+      ``can_run_dhcp`` / ``can_run_looking_glass`` — hardcoded
+      ``True`` post-Phase-7 (looking-glass joins under #566). The
+      slot's containerd content store is preloaded with every
+      service image; if we're heartbeating, the images are there.
     * ``can_run_observer`` — always true. The observer role is a
       pure supervisor-side metrics/log shipper with no separate
       service container, so any approved supervisor can run it.
@@ -805,6 +817,12 @@ def heartbeat_once(
         ml_vip = body_out.get("desired_control_plane_vip") or ""
         # #285 Phase 6 — source-scope the VIP path too (loadBalancerSourceRanges).
         web_ui_cidrs = body_out.get("web_ui_allowed_cidrs") or []
+        # #566 decision D1 — BGP mode (export path: advertise the VIP to
+        # upstream routers). Folded into the SAME apply_metallb_overrides
+        # call below (one combined HelmChartConfig body).
+        ml_bgp_enabled = bool(body_out.get("desired_metallb_bgp_enabled"))
+        ml_bgp_peers = body_out.get("desired_metallb_bgp_peers") or []
+        ml_bgp_advertisements = body_out.get("desired_metallb_bgp_advertisements") or []
 
         cp_changed, cp_err = k8s_api.apply_control_plane_overrides(
             cp_size, str(ml_vip), web_ui_allowed_cidrs=list(web_ui_cidrs)
@@ -840,13 +858,18 @@ def heartbeat_once(
             )
 
         bs_changed, bs_err = k8s_api.apply_metallb_overrides(
-            metallb_enabled=ml_enabled, pool_addresses=list(ml_pool)
+            metallb_enabled=ml_enabled,
+            pool_addresses=list(ml_pool),
+            bgp_enabled=ml_bgp_enabled,
+            bgp_peers=list(ml_bgp_peers),
+            bgp_advertisements=list(ml_bgp_advertisements),
         )
         if bs_changed:
             log.info(
                 "supervisor.heartbeat.metallb_overrides_applied",
                 enabled=ml_enabled,
                 pool=list(ml_pool),
+                bgp_enabled=ml_bgp_enabled,
             )
         elif bs_err:
             log.warning("supervisor.heartbeat.metallb_overrides_failed", error=bs_err)

@@ -1,0 +1,114 @@
+{{- /* Issue #566 — BGP Looking Glass collector (GoBGP).
+       DaemonSet, same shape as dns-bind9.yaml / dhcp-kea.yaml:
+       ``hostNetwork: true`` so the collector's BGP TCP/179 session
+       originates from the node's real routable IP — a router has no
+       route to a pod-CNI IP. Receive-only: the collector never
+       advertises a route back to the operator's network (see
+       agent/looking-glass/ + docs/features/LOOKING_GLASS.md for the
+       invariant enforced in the rendered GoBGP config).
+
+       Phase 10 wave 2 convention — ``.enabled`` is release-ownership
+       scope (bootstrap=false, appliance=true), NOT role-scope. The
+       supervisor's spatiumddi-appliance HelmChart sets
+       ``lookingGlass.enabled=true``; pod scheduling is gated purely
+       by the ``spatium.io/role-looking-glass=true`` node label —
+       role swap = pure label flip, no chart upgrade.
+
+       No Service: the collector is receive-only and peers OUT to the
+       operator's routers (or accepts inbound sessions the router
+       initiates) — nothing in-cluster needs to route TO it. No extra
+       Linux capabilities: TCP/179 is a normal socket, unlike Kea's
+       raw-broadcast read path. */}}
+{{- if .Values.lookingGlass.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: looking-glass
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: looking-glass
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: looking-glass
+  # #566 — RollingUpdate, NOT OnDelete, mirroring dns-bind9.yaml /
+  # dhcp-kea.yaml: OnDelete strands a pod on a stale pre-URL-known
+  # spec forever; RollingUpdate auto-rolls on template/env change.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        app.kubernetes.io/name: looking-glass
+        app.kubernetes.io/component: looking-glass
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+        # Phase 10 (#183) per-role scheduling label pattern, extended
+        # to the Looking Glass role under #566. Pod stays Pending
+        # until the supervisor's role-apply path labels the node with
+        # ``spatium.io/role-looking-glass=true``.
+        spatium.io/role-looking-glass: "true"
+      # The collector's BGP session must originate from the node's
+      # real routable IP so the operator's router has a return path —
+      # same rationale as dns-bind9.yaml / dhcp-kea.yaml.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # A live BGP session holding a full RIB benefits from a
+      # deliberate drain grace, same family as DHCP's 60s (a GoBGP
+      # graceful-restart/notification exchange takes longer than a
+      # DNS query flush).
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: looking-glass
+          image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.lookingGlass.image.repository) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            # spatium_lg_agent.config.AgentConfig.from_env() contract
+            # (agent/looking-glass/): CONTROL_PLANE_URL + LG_AGENT_KEY.
+            # #292 / #409 precedence — see dns-bind9.yaml for the full
+            # in-cluster-vs-external-URL rationale.
+            - name: CONTROL_PLANE_URL
+              value: {{ .Values.lookingGlass.controlPlaneUrl | default .Values.lookingGlass.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
+            {{- if .Values.lookingGlass.controlPlaneUrl }}
+            - name: SPATIUM_INSECURE_SKIP_TLS_VERIFY
+              value: "1"
+            {{- end }}
+            - name: LG_AGENT_KEY
+              value: {{ .Values.lookingGlass.agentKey | quote }}
+            {{- with .Values.global.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # ``.ready`` is stamped by the agent's sync loop after the
+          # first successful ConfigBundle fetch + GoBGP peer apply —
+          # same convention as the DNS/DHCP agents. Persists across
+          # restarts on the hostPath volume so a warm-restart pod is
+          # Ready immediately.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -f /var/lib/spatium-lg-agent/.ready"
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+          volumeMounts:
+            # #5 — the cached ConfigBundle (peer set + max-prefix +
+            # AF) is what lets the collector keep its BGP sessions
+            # alive from last-known-good config when the control
+            # plane is unreachable.
+            - name: agent-state
+              mountPath: /var/lib/spatium-lg-agent
+      # Per-node hostPath, NOT a shared RWO PVC and NOT emptyDir — see
+      # dns-bind9.yaml / dhcp-kea.yaml for the full rationale.
+      volumes:
+        - name: agent-state
+          hostPath:
+            path: /var/lib/spatiumddi/agents/looking-glass/state
+            type: DirectoryOrCreate
+{{- end }}
