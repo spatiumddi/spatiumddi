@@ -58,7 +58,20 @@ from app.models.dhcp import (
     DHCPStaticAssignment,
 )
 from app.models.ipam import IPAddress, Subnet
+from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
 from app.services.dhcp.lease_history import record_lease_history
+
+
+def _refresh_lease_owned_row(
+    row: IPAddress, lease: dict[str, Any], mac: str, now: datetime
+) -> None:
+    """Refresh an auto-from-lease mirror row from the wire lease."""
+    row.mac_address = mac
+    if lease.get("hostname"):
+        row.hostname = lease.get("hostname")
+    row.last_seen_at = now
+    row.last_seen_method = "dhcp"
+
 
 logger = structlog.get_logger(__name__)
 
@@ -236,7 +249,7 @@ async def pull_leases_from_server(
 
         if ipam_row is None:
             if apply:
-                ipam_row = IPAddress(
+                candidate = IPAddress(
                     subnet_id=containing.id,
                     address=ip,
                     status="dhcp",
@@ -246,18 +259,31 @@ async def pull_leases_from_server(
                     last_seen_method="dhcp",
                     auto_from_lease=True,
                 )
-                db.add(ipam_row)
-                await db.flush()  # assign PK so _sync_dns_record can reference it
-            result.ipam_created += 1
+                # #564 — insert inside a savepoint so a concurrent Kea
+                # agent lease-event / static-reservation writer racing
+                # on the same (subnet_id, address) doesn't 500 the whole
+                # sync on uq_ip_address_subnet_address. The helper flush
+                # also assigns the PK so _sync_dns_record can reference
+                # it below.
+                ipam_row, created = await insert_ipam_mirror_row(db, candidate)
+                if created:
+                    result.ipam_created += 1
+                elif ipam_row.auto_from_lease:
+                    # Lost the race to a lease-owned row — refresh it
+                    # like the elif path below.
+                    _refresh_lease_owned_row(ipam_row, lease, mac, now)
+                    result.ipam_refreshed += 1
+                else:
+                    # Lost the race to a manual/static row — leave it
+                    # alone and skip DDNS, mirroring the manual branch.
+                    continue
+            else:
+                result.ipam_created += 1
         elif ipam_row.auto_from_lease:
             # Only refresh rows we own. Manually-allocated rows are left
             # alone — the lease + IPAM coexist.
             if apply:
-                ipam_row.mac_address = mac
-                if lease.get("hostname"):
-                    ipam_row.hostname = lease.get("hostname")
-                ipam_row.last_seen_at = now
-                ipam_row.last_seen_method = "dhcp"
+                _refresh_lease_owned_row(ipam_row, lease, mac, now)
             result.ipam_refreshed += 1
         else:
             # Manual allocation — skip DDNS entirely. Whatever hostname

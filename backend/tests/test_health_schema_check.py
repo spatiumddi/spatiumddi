@@ -1,7 +1,11 @@
-"""Schema-at-head readiness check (#299 phase 1).
+"""Schema-at-head readiness check (#299 phase 1 / #565).
 
-Covers the new ``_check_schema_ready`` helper + its integration into
-``/health/ready``:
+The comparison core lives in ``app.core.schema_check`` (extracted in
+#565 so the Celery worker/beat share it); ``app.api.health.
+_check_schema_ready`` is a thin ``("ok"|"error", detail)`` wrapper over
+``schema_at_head`` folded into ``/health/ready``.
+
+Covers:
 
 * ``alembic_version`` at the bundled head → readiness check says ``ok``.
 * ``alembic_version`` table missing → check says ``error`` with the
@@ -20,7 +24,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from unittest.mock import patch
 
 import pytest
 from httpx import AsyncClient
@@ -28,6 +31,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import ProgrammingError
 
 from app.api import health as health_module
+from app.core import schema_check as schema_module
 from app.db import AsyncSessionLocal
 
 
@@ -35,13 +39,13 @@ from app.db import AsyncSessionLocal
 def _reset_head_cache() -> None:
     """Clear the module-level head cache before every test.
 
-    ``_expected_alembic_head`` caches the result of
+    ``expected_alembic_head`` caches the result of
     ``ScriptDirectory.get_current_head()`` to avoid re-walking the
     versions directory on every probe; the cache survives across
     tests in the same worker without this fixture.
     """
-    health_module._head_cache.head = None
-    health_module._head_cache.error = None
+    schema_module._head_cache.head = None
+    schema_module._head_cache.error = None
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +63,7 @@ async def _seed_alembic_version() -> AsyncIterator[None]:
     let individual tests mutate it (DELETE row, UPDATE to fake
     revision, etc.) to exercise the failure modes.
     """
-    expected, _ = health_module._expected_alembic_head()
+    expected, _ = schema_module.expected_alembic_head()
     async with AsyncSessionLocal() as s:
         await s.execute(
             text(
@@ -86,7 +90,7 @@ async def _seed_alembic_version() -> AsyncIterator[None]:
 async def test_schema_check_ok_when_at_head() -> None:
     """The check_schema_ready helper returns ok when version_num
     matches the bundled head."""
-    expected, err = health_module._expected_alembic_head()
+    expected, err = schema_module.expected_alembic_head()
     assert err is None
     assert expected is not None  # alembic.ini + versions/ are bundled
 
@@ -102,7 +106,7 @@ async def test_schema_check_ok_when_at_head() -> None:
 async def test_schema_check_reports_mismatch() -> None:
     """When alembic_version says a non-head revision, the check
     returns error + names both versions."""
-    expected, _ = health_module._expected_alembic_head()
+    expected, _ = schema_module.expected_alembic_head()
     assert expected is not None
 
     # Mutate alembic_version to a fake revision and assert the helper
@@ -130,7 +134,7 @@ async def test_schema_check_reports_missing_row() -> None:
     """alembic_version table exists but is empty — common right after
     a migrate failure or a botched ``alembic stamp``. The helper
     reports the missing row explicitly so operators see the cause."""
-    expected, _ = health_module._expected_alembic_head()
+    expected, _ = schema_module.expected_alembic_head()
     assert expected is not None
 
     async with AsyncSessionLocal() as s:
@@ -182,8 +186,8 @@ async def test_schema_check_reports_missing_table() -> None:
     async def _fake_session_factory() -> AsyncIterator[_FakeSession]:
         yield _FakeSession()
 
-    with patch.object(health_module, "AsyncSessionLocal", _fake_session_factory):
-        verdict, detail = await health_module._check_schema_ready()
+    _result = await schema_module.schema_at_head(session_factory=_fake_session_factory)
+    verdict, detail = ("ok" if _result.ok else "error"), _result.detail
     assert verdict == "error"
     assert "schema not initialised" in detail
     assert "alembic_version" in detail
@@ -214,8 +218,8 @@ async def test_schema_check_reports_other_programming_error() -> None:
     async def _fake_session_factory() -> AsyncIterator[_FakeSession]:
         yield _FakeSession()
 
-    with patch.object(health_module, "AsyncSessionLocal", _fake_session_factory):
-        verdict, detail = await health_module._check_schema_ready()
+    _result = await schema_module.schema_at_head(session_factory=_fake_session_factory)
+    verdict, detail = ("ok" if _result.ok else "error"), _result.detail
     assert verdict == "error"
     # NOT "schema not initialised" — operator needs to see "permission
     # denied" or similar, not be sent down the migrate path.
@@ -244,8 +248,8 @@ async def test_schema_check_reports_generic_exception() -> None:
     async def _fake_session_factory() -> AsyncIterator[_FakeSession]:
         yield _FakeSession()
 
-    with patch.object(health_module, "AsyncSessionLocal", _fake_session_factory):
-        verdict, detail = await health_module._check_schema_ready()
+    _result = await schema_module.schema_at_head(session_factory=_fake_session_factory)
+    verdict, detail = ("ok" if _result.ok else "error"), _result.detail
     assert verdict == "error"
     assert "schema check failed" in detail
     assert "timed out" in detail
@@ -256,7 +260,7 @@ async def test_readiness_endpoint_503_on_schema_mismatch(client: AsyncClient) ->
     """End-to-end: the readiness endpoint folds the schema check into
     its rollup. Postgres is up + Redis is up but schema is behind →
     503 with the schema-specific detail in the ``checks`` block."""
-    expected, _ = health_module._expected_alembic_head()
+    expected, _ = schema_module.expected_alembic_head()
     assert expected is not None
 
     async with AsyncSessionLocal() as s:

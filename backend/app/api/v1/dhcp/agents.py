@@ -49,6 +49,7 @@ from app.services.dhcp.agent_token import (
     verify_agent_token,
 )
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/agents", tags=["dhcp-agents"])
@@ -887,6 +888,14 @@ async def agent_lease_events(
         (row.subnet_id, row.address): row for row in ipam_existing
     }
 
+    def _apply_lease_fields(row: IPAddress, ev: Any, lease: Any) -> None:
+        """Stamp lease state onto a mirror row we own (auto/available)."""
+        row.hostname = (ev.hostname or row.hostname or "")[:253]
+        row.mac_address = ev.mac_address
+        row.status = "dhcp"
+        row.auto_from_lease = True
+        row.dhcp_lease_id = str(lease.id) if lease.id else None
+
     # ── IPAM mirror pass ────────────────────────────────────────────────
     for ev in events:
         subnet = subnet_for_ip.get(ev.ip_address)
@@ -898,7 +907,7 @@ async def agent_lease_events(
         is_active = ev.state == "active"
         if is_active:
             if ipam_row is None:
-                ipam_row = IPAddress(
+                candidate = IPAddress(
                     subnet_id=subnet.id,
                     address=ev.ip_address,
                     hostname=(ev.hostname or "")[:253],
@@ -907,14 +916,20 @@ async def agent_lease_events(
                     auto_from_lease=True,
                     dhcp_lease_id=str(lease.id) if lease.id else None,
                 )
-                db.add(ipam_row)
+                # #564 — a concurrent Sync-DHCP / static-reservation
+                # writer may have already committed this
+                # (subnet_id, address) pair. Insert inside a savepoint
+                # so a unique-violation self-heals into the incumbent
+                # row instead of 500-ing on uq_ip_address_subnet_address.
+                ipam_row, created = await insert_ipam_mirror_row(db, candidate)
                 ipam_by_key[(subnet.id, ev.ip_address)] = ipam_row
+                # A fresh insert already carries the right fields; only a
+                # race-lost incumbent we own gets the same update a
+                # pre-existing row would take (never a manual/static row).
+                if not created and (ipam_row.status == "available" or ipam_row.auto_from_lease):
+                    _apply_lease_fields(ipam_row, ev, lease)
             elif ipam_row.status in ("available",) or ipam_row.auto_from_lease:
-                ipam_row.hostname = (ev.hostname or ipam_row.hostname or "")[:253]
-                ipam_row.mac_address = ev.mac_address
-                ipam_row.status = "dhcp"
-                ipam_row.auto_from_lease = True
-                ipam_row.dhcp_lease_id = str(lease.id) if lease.id else None
+                _apply_lease_fields(ipam_row, ev, lease)
             # else: manual/static — leave it alone
 
             # New-device watch: record the MAC sighting for this lease,
@@ -1089,16 +1104,29 @@ async def agent_mac_sightings(
             continue
         row = by_key.get((subnet.id, s.ip_address))
         if row is None:
-            row = IPAddress(
-                subnet_id=subnet.id,
-                address=s.ip_address,
-                status="discovered",
-                mac_address=s.mac_address,
-                last_seen_at=now,
-                last_seen_method="l2_sniff",
+            # #564 — a concurrent lease-event / Sync-DHCP writer may have
+            # already committed this (subnet_id, address). Insert inside a
+            # savepoint so the unique-violation self-heals into the
+            # incumbent instead of poisoning the whole sightings batch on
+            # the shared flush below.
+            row, created = await insert_ipam_mirror_row(
+                db,
+                IPAddress(
+                    subnet_id=subnet.id,
+                    address=s.ip_address,
+                    status="discovered",
+                    mac_address=s.mac_address,
+                    last_seen_at=now,
+                    last_seen_method="l2_sniff",
+                ),
             )
-            db.add(row)
             by_key[(subnet.id, s.ip_address)] = row
+            if not created:
+                # Lost the race — just bump the sighting timestamp on the
+                # incumbent (don't clobber its status/mac; the observation
+                # below records the MAC either way).
+                row.last_seen_at = now
+                row.last_seen_method = "l2_sniff"
         else:
             row.last_seen_at = now
             row.last_seen_method = "l2_sniff"

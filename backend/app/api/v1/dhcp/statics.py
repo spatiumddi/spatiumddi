@@ -17,6 +17,7 @@ from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.ipam import IPAddress, Subnet
+from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
 from app.services.dhcp.windows_writethrough import push_static_change
 from app.services.tags import apply_tag_filter
 
@@ -98,8 +99,14 @@ async def _upsert_ipam_for_static(
     )
     row = res.scalar_one_or_none()
     if row is None:
-        row = IPAddress(subnet_id=scope.subnet_id, address=ip_str, status="static_dhcp")
-        db.add(row)
+        # #564 — a concurrent Kea agent lease-event / Sync-DHCP writer
+        # may have already mirrored a dynamic lease at this IP. Insert
+        # inside a savepoint so the unique-violation self-heals into the
+        # incumbent row (which we then overwrite to static_dhcp — the
+        # static is the source of truth) instead of 500-ing on
+        # uq_ip_address_subnet_address.
+        candidate = IPAddress(subnet_id=scope.subnet_id, address=ip_str, status="static_dhcp")
+        row, _created = await insert_ipam_mirror_row(db, candidate)
     row.hostname = st.hostname or row.hostname
     row.mac_address = str(st.mac_address)
     row.status = "static_dhcp"
