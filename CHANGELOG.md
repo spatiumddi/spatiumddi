@@ -20,14 +20,95 @@ the formatter handles the rest.
 
 ---
 
-## Unreleased
+## 2026.07.04-1 — 2026-07-04
 
-Appliance-only work; reaches nothing in-field until it ships in a
-new appliance OS release (ISO).
+A **network-intelligence + IPAM-at-scale** release. Four new
+control-plane features land together: **GeoDNS / topology-aware GSLB
+steering** (per-pool-member serving scope so a GSLB pool answers
+differently by client CIDR or Site), **IPv6 Router Advertisements**
+(``radvd`` rendered per RA-enabled DHCP scope + a rogue-RA passive
+sniffer), **BGP prefix-hijack detection** (RIPEstat + RIS Live watching
+your ASNs' prefixes for hijacks and more-specifics), and **DNSBL / RBL
+reputation monitoring** (a daily sweep of egress / public / pinned IPs
+against a curated blocklist catalog, surfaced in a Reputation panel on
+the IP detail modal). Riding with them, an **IPAM-at-scale** pass makes
+the address table survive a busy ``/16`` — server-side pagination +
+search, a **cross-subnet IP search**, row-windowing with sortable
+columns, and an hourly utilization-recount sweep — plus two DHCP
+reliability fixes (an idempotent lease→IPAM mirror insert that no longer
+races the unique index, and a **Celery schema-behind-head guard** so a
+worker deployed ahead of ``migrate`` fails loudly instead of logging the
+same error thousands of times). On the appliance side: **headless /
+unattended install** via a cloud-init preseed, an **unattended-upgrades
+policy** surface, two console operator-UX wins, a seven-issue bug sweep
+across the host-config runners, and a k3s ``v1.35.6`` bump. The Operator
+Copilot tool registry grows by 13 (GeoDNS, IPv6 RA, BGP hijack, DNSBL,
+and cross-subnet IP search) to 229.
 
 ### Added
 
-- **Headless / unattended appliance install (#549).** The disk
+* **#530 — GeoDNS / topology-aware GSLB steering.** A GSLB pool member
+  gains an optional **serving scope** — a list of client CIDRs and/or a
+  ``Site`` — so a pool can answer differently depending on where the
+  query came from. Scoped members render as BIND9 **geo views**
+  composed on top of the operator's existing split-horizon views: geo
+  views are evaluated **before** operator views, and a union fallback
+  guarantees a scoped-only pool never blackholes a client outside every
+  scope. Ships as a model + render change (member serving-scope columns
+  via migration ``a3d7f1c9e6b2``) — no new MCP tools.
+
+* **#524 — IPv6 Router Advertisements.** A DHCP scope can now emit
+  **RAs** — ``radvd`` config is rendered per RA-enabled scope and shipped
+  in the DHCP ``ConfigBundle`` (the agent starts ``radvd`` on the wire,
+  stops it on disable), behind the ``ipv6.router_advertisements`` feature
+  module (default-on discovery toggle — RA emission still needs per-scope
+  opt-in + ``RADVD_MANAGED``, and the sniffer is gated on
+  ``DHCP_RA_SNIFFER_ENABLED``). A companion **rogue-RA
+  passive sniffer** watches for unexpected Router Advertisements with a
+  ``(group, source_ip, source_mac)`` identity and a **seeded-disabled**
+  ``rogue_ra`` alert. The DHCP-agent compose gains a commented
+  ``NET_ADMIN`` cap + ``net.ipv6.conf.all.forwarding=1`` note (harmless
+  when RA is off). Migration ``b7e4d1a92c30``; MCP tools for the RA
+  config + rogue-RA sightings.
+
+* **#527 — BGP prefix-hijack detection.** Watches your ASNs' announced
+  prefixes for hijacks and unexpected more-specifics: a **RIPEstat**
+  poll is the source of truth, with an optional **RIS Live** streaming
+  consumer for near-real-time detection. Fires ``bgp_prefix_hijack`` /
+  ``bgp_more_specific`` alerts (RPKI-invalid vs -unknown drives
+  severity), keeps evidence on a pruned victim prefix via ``SET NULL`` on
+  the detection FK, refreshes on a cadence gate, and resolves stale
+  detections outage-safely. Behind the ``network.asn`` feature module;
+  migration ``a1c7f3e9b284``; MCP tools for tracked prefixes +
+  detections.
+
+* **#528 — DNSBL / RBL reputation monitoring.** A curated blocklist
+  catalog + a daily sweep over NAT-egress / public / ``internet_facing``
+  / pinned IPs, with an ``ip_blocklisted`` **latch** alert that
+  auto-resolves on delist or de-scope, surfaced in a **Reputation
+  panel** on the IP detail modal. Behind the ``security.dnsbl`` feature
+  module (default-on discovery toggle — no external DNS queries until the
+  ``dnsbl_monitoring_enabled`` sweep switch is on and at least one list is
+  enabled); migration ``c9f2e1a4d7b6``; MCP tools for the reputation
+  state.
+
+* **#517 / #519 / #520 — IPAM address search, pagination + cross-subnet
+  search.** ``GET /ipam/subnets/{id}/addresses`` gains optional
+  ``q`` / ``hostname`` / ``mac`` / ``sort`` / ``order`` / ``limit`` /
+  ``offset`` + an ``X-Total-Count`` header (backward-compatible — the
+  bare-list response is unchanged). A new
+  ``GET /ipam/addresses/search`` (paginated envelope with joined
+  subnet/space context) + ``…/search/ids`` (capped id list for
+  select-all-matches) power a new **cross-subnet IP search** modal —
+  results grouped by subnet/space, with "select all matches" feeding the
+  existing bulk-edit / bulk-delete plumbing. The IP table now **windows**
+  rows (``ADDRESS_ROW_CAP=500`` with a "show all" opt-in so a busy
+  ``/16`` doesn't mount 65k rows), renders a mobile card list **or** the
+  desktop table (not both), and gains **clickable sortable column
+  headers** (asc → desc → cleared). New MCP read tool
+  ``find_ip_addresses``.
+
+* **#549 — headless / unattended appliance install.** The disk
   installer `spatium-install` can now run non-interactively from a
   **preseed answer file**, for fleet rollouts, PXE/IPMI provisioning,
   cloud images, and CI boot-tests. On boot of the installer media it
@@ -63,6 +144,117 @@ new appliance OS release (ISO).
   deliver it. Docs + annotated control-plane / appliance examples
   under `appliance/cloud-init/`; retires the stale pre-#183 cloud-init
   framing in APPLIANCE.md §4.
+
+* **#164 — appliance unattended-upgrades policy.** Extends the APT
+  host-config plane (#155) with the **when / how** of auto-applying
+  updates, orthogonal to ``apt_managed`` (the **where**): an operator can
+  set a reboot policy without taking over apt sources. New
+  ``platform_settings.apt_unattended_*`` columns (migration
+  ``c9d4a1e8b672``): ``apt_unattended_origins`` (Allowed-Origins;
+  **security-only default** = the locked-down baseline),
+  ``apt_unattended_blocklist`` (Package-Blacklist globs), and
+  ``apt_unattended_automatic_reboot`` + ``apt_unattended_reboot_time``
+  (HH:MM). The ``apt_bundle`` now always carries the unattended block and
+  folds it into ``config_hash`` so a policy change re-fires the host
+  trigger even with ``apt_managed`` off; the ``spatiumddi-apt-reload``
+  runner stages, validates via ``apt-config``, and installs both
+  ``20auto-upgrades`` and ``50unattended-upgrades``. Surfaced on the
+  ``find_apt_settings`` MCP tool + an **Unattended-upgrades policy**
+  sub-section on the APT settings form, and rides the existing APT
+  trigger / heartbeat / ``apt_state`` Fleet chip.
+
+* **#556 — console operator-UX (headless recovery dashboard).** Two
+  wins for the physical-console dashboard: a **control-plane
+  reachability chip** (appliance role) — a ≤ 2 s TCP probe of
+  ``CONTROL_PLANE_URL`` fanned out in the data-tier pool so an operator
+  can tell "network-partitioned" from "unapproved" — and **cancel
+  pending reboot (F9)**, which stops the reboot service mid-grace and
+  removes the trigger, aborting a queued web-UI / Fleet reboot from the
+  console (the footer shows F9 only while a reboot is pending).
+
+### Changed
+
+* **#523 / #521 / #522 — IPAM API symmetry + utilization recount +
+  sweep perf.** Subnet-token scoping on the address list endpoints,
+  preview/commit next-IP delegation parity, an ``allocate_next_ip``
+  public-facing guard + ``extra_zone_ids`` / ``decom_date`` support, and
+  CSV/XLSX formula-injection hardening on address export. A new **hourly
+  idempotent utilization-recount** task (``ipam_utilization_recount``)
+  recomputes ``Subnet.allocated_ips`` + block rollups via grouped SQL so
+  a drifted counter self-heals. Two sweep-task perf fixes:
+  ``dhcp_lease_cleanup`` loads the subnet cache once per sweep, and
+  ``ipam_dns_sync`` pre-filters to zone-bound subnets via a CTE.
+
+* **#516 — IPAM frontend polish.** A grab-bag: separated static-DHCP
+  chained-create error reporting (partial success now shows only
+  **Close** so the operator can't re-submit into a collision), resolved
+  ``IPDetailModal`` zone names, ``onError`` toasts on space/subnet
+  mutations, ``BulkEditSubnetsModal`` migrated to the shared ``Modal``,
+  ``DnsSyncModal`` backfills on **Apply** not open, ``available`` /
+  ``discovered`` status options, a readable skipped-rows import report,
+  and IPv6-aware ``cidrSize`` (out-of-range prefixes clamp to 0).
+
+* **#548 — k3s ``v1.35.5+k3s1`` → ``v1.35.6+k3s1``.** Patch bump of the
+  pinned k3s the slot image bakes (Kubernetes 1.35.5 → 1.35.6, Go
+  1.25.11) — no API removals, no manifest/chart edits. Pulls in the
+  klipper-helm CVE fix, containerd ``v2.2.5-k3s2``, runc ``v1.4.2``, and
+  etcd ``v3.6.12-k3s1`` (forward patch, multi-node rolling stays
+  compatible). The Traefik-v40 ingress-nginx-provider breaking change
+  does **not** apply — the appliance disables bundled Traefik and uses
+  nginx + MetalLB. Reaches field appliances via the next OS release +
+  A/B slot upgrade (or a fresh install), not an in-place swap.
+
+### Fixed
+
+* **#564 — DHCP lease→IPAM mirror-row insert raced the unique index.**
+  Concurrent writers (the Kea agent ``/lease-events``, the Sync-DHCP
+  poll, static-reservation mirroring, and the l2-sniff new-device-watch
+  path) each did an unguarded ``SELECT``-then-``INSERT`` on
+  ``uq_ip_address_subnet_address``, so the loser hit a 500 whose
+  ``PendingRollbackError`` tail poisoned the rest of the batch. A new
+  shared ``insert_ipam_mirror_row()`` inserts inside a ``SAVEPOINT`` and
+  self-heals a unique-violation into the committed incumbent (matching
+  the guard style in ``unifi/reconcile.py`` + ``ipam_discovery.py``),
+  wired into all four mirror-insert sites.
+
+* **#565 — Celery ran silently against a schema behind the bundled
+  head.** The api gates ``/health/ready`` on the DB schema being at the
+  bundled Alembic head, but the worker/beat had no equivalent and failed
+  tasks silently when code was deployed ahead of ``migrate`` (one
+  operator logged the same ``UndefinedColumnError`` ~2440× in a tight
+  loop). The version-vs-head comparison is extracted into a
+  framework-agnostic ``app.core.schema_check.schema_at_head()`` shared by
+  ``health.py`` and Celery; added ``worker_ready`` / ``beat_init``
+  startup checks, a 5-min periodic task that opens/auto-resolves a
+  **schema-behind-head** alert on drift, and an opt-in
+  ``STRICT_SCHEMA_CHECK`` ``task_prerun`` gate that ``Reject(requeue=True)``s
+  tasks while behind (default off; mirrors ``STRICT_SECRET_KEY``).
+
+* **#550–#555 — appliance host-config + install bug sweep.** The seven
+  open bug-labelled issues from the 2026-07-03 appliance audit: a
+  ``tz-reload`` runner shipped ``0644`` (203/EXEC — feature dead), an
+  ``snmp-reload`` validated with the non-existent ``snmpd -t`` flag, the
+  A/B ``slot-rollback`` called a non-existent ``commit`` subcommand, the
+  recovery console froze ~25 s per refresh on a wedged cluster (blocking
+  ``kubectl``/``systemctl`` calls now fan into the thread pool), the
+  installer failed to validate static-network fields + had a
+  control-plane-confirm dead loop, and a round of supervisor / host-script
+  hardening (pcap ``capture_id`` path-traversal guard, owner-only session
+  tokens, IPv6 seed URLs on cluster-join). Adds
+  ``scripts/lint_appliance_runners.py`` (wired into CI) which asserts
+  every systemd ``ExecStart`` runner is executable in the built image and
+  ``bash -n`` clean — it catches the ``tz-reload`` 203/EXEC class.
+
+### Migrations
+
+Five additive migrations, chaining linearly from the last release's head
+``b1f7c3a92e04``: → ``c9d4a1e8b672`` (#164 — ``apt_unattended_*`` policy
+columns) → ``a3d7f1c9e6b2`` (#530 — ``dns_pool_member`` geo/topology
+serving-scope columns) → ``b7e4d1a92c30`` (#524 — IPv6 RA management +
+rogue-RA detection) → ``a1c7f3e9b284`` (#527 — BGP prefix-hijack: tracked
+prefixes + detections tables + ``platform_settings`` columns) →
+``c9f2e1a4d7b6`` (#528 — DNSBL / RBL reputation monitoring). New-table
+downgrades are baselined for the shape linter.
 
 ---
 
