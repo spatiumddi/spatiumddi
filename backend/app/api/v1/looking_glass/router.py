@@ -26,9 +26,12 @@ Endpoints:
   the ``matched_{block,subnet,space,asn,vrf}_id`` linkage columns populated by
   ``app.services.looking_glass.ipam_link`` (issue #566 Phase 3). ``/routes``
   (list), ``/routes/by-prefix?prefix=`` (all paths for one exact prefix, the
-  CIDR passed as a query param so its slash / IPv6 colons encode cleanly), and
-  ``/routes/for-ip?ip=`` (reverse LPM-by-single-address, Phase 3) are distinct
-  URL shapes so there's no route collision.
+  CIDR passed as a query param so its slash / IPv6 colons encode cleanly),
+  ``/routes/detail?prefix=`` (the same all-paths set, enriched with peer/
+  collector names + a server-computed summary/IPAM-context rollup — backs the
+  Routes-tab detail modal), and ``/routes/for-ip?ip=`` (reverse
+  LPM-by-single-address, Phase 3) are distinct URL shapes so there's no route
+  collision.
 * ``/dashboard-summary`` — single-shot peer/route rollup backing the main
   Dashboard's "Looking Glass health" card (issue #566 Phase 5). See
   ``LookingGlassDashboardSummary`` for why this is its own shape rather than
@@ -71,6 +74,7 @@ from app.models.asn import ASN
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.bgp_looking_glass import BGPLGPeer, BGPLGRoute, LookingGlassCollector
+from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.models.network import NetworkDevice
 from app.models.vrf import VRF
 from app.services.bgp.hijack_monitor import RPKI_INVALID
@@ -97,6 +101,10 @@ from .schemas import (
     PeerDetailRpkiBreakdown,
     PeerRead,
     PeerUpdate,
+    RouteDetailIpamContext,
+    RouteDetailPath,
+    RouteDetailResponse,
+    RouteDetailSummary,
     RouteForIpResponse,
     RouteListResponse,
     RouteRead,
@@ -752,6 +760,162 @@ async def get_route(
     q = q.order_by(BGPLGRoute.peer_id)
     rows = (await db.execute(q)).scalars().all()
     return [_route_to_read(r) for r in rows]
+
+
+def _pick_matched_id(paths: list[RouteDetailPath], attr: str) -> uuid.UUID | None:
+    """Prefer the current best path's linkage; fall back to the first path
+    carrying a non-NULL value for this ``matched_*_id`` attribute. See
+    ``RouteDetailIpamContext``'s docstring for why paths can legitimately
+    disagree (VPNv4/VPNv6 per-route Route-Target VRF matching)."""
+    for path in paths:
+        if path.is_best and getattr(path, attr) is not None:
+            return getattr(path, attr)  # type: ignore[no-any-return]
+    for path in paths:
+        value = getattr(path, attr)
+        if value is not None:
+            return value  # type: ignore[no-any-return]
+    return None
+
+
+async def _build_route_ipam_context(
+    db: AsyncSession, paths: list[RouteDetailPath]
+) -> RouteDetailIpamContext:
+    ctx = RouteDetailIpamContext(
+        subnet_id=_pick_matched_id(paths, "matched_subnet_id"),
+        block_id=_pick_matched_id(paths, "matched_block_id"),
+        space_id=_pick_matched_id(paths, "matched_space_id"),
+        asn_id=_pick_matched_id(paths, "matched_asn_id"),
+        vrf_id=_pick_matched_id(paths, "matched_vrf_id"),
+    )
+    if ctx.subnet_id is not None:
+        subnet = await db.get(Subnet, ctx.subnet_id)
+        if subnet is not None:
+            ctx.subnet_name = subnet.name or str(subnet.network)
+    if ctx.block_id is not None:
+        block = await db.get(IPBlock, ctx.block_id)
+        if block is not None:
+            ctx.block_name = block.name or str(block.network)
+    if ctx.space_id is not None:
+        space = await db.get(IPSpace, ctx.space_id)
+        if space is not None:
+            ctx.space_name = space.name
+    if ctx.asn_id is not None:
+        asn = await db.get(ASN, ctx.asn_id)
+        if asn is not None:
+            ctx.asn_number = asn.number
+            ctx.asn_name = asn.name
+    if ctx.vrf_id is not None:
+        vrf = await db.get(VRF, ctx.vrf_id)
+        if vrf is not None:
+            ctx.vrf_name = vrf.name
+    return ctx
+
+
+@router.get("/routes/detail", response_model=RouteDetailResponse)
+async def get_route_detail(
+    db: DB,
+    _: CurrentUser,
+    prefix: str = Query(..., description="exact CIDR, e.g. 10.0.0.0/24 or 2001:db8::/32"),
+    withdrawn: bool = Query(False, description="include withdrawn paths"),
+) -> RouteDetailResponse:
+    """The rich per-prefix rollup backing the Routes-tab detail modal
+    (issue #566).
+
+    Same exact-prefix scope as ``/routes/by-prefix`` — every path across
+    every peer — but each path is enriched with its announcing peer +
+    collector name (avoiding an N-round-trip client-side join against
+    ``/peers``/``/collectors``), and a server-computed ``summary`` surfaces
+    the two headline signals up front:
+
+    * ``multi_origin`` — more than one *origin* ASN announcing this exact
+      prefix. This is the hijack/route-leak signal regardless of how many
+      peers/routers see it.
+    * ``anycast_candidate`` — the same prefix learned from more than one
+      router/peer. Combined with a single origin ASN this is the normal
+      anycast/multi-homed shape; combined with ``multi_origin`` it's a
+      stronger corroboration that this is either broad anycast or a
+      widely-visible hijack.
+
+    ``ipam`` carries the covering IPAM subnet/block/space plus the ASN/VRF
+    a path resolved against, so the modal can deep-link straight into IPAM
+    without a second lookup.
+    """
+    net = _parse_prefix(prefix)
+    q = (
+        select(BGPLGRoute, BGPLGPeer, LookingGlassCollector)
+        .join(BGPLGPeer, BGPLGPeer.id == BGPLGRoute.peer_id)
+        .join(LookingGlassCollector, LookingGlassCollector.id == BGPLGPeer.collector_id)
+        .where(BGPLGRoute.prefix == net)
+    )
+    if not withdrawn:
+        q = q.where(BGPLGRoute.withdrawn_at.is_(None))
+    q = q.order_by(LookingGlassCollector.name, BGPLGPeer.name)
+    rows = (await db.execute(q)).all()
+
+    paths = [
+        RouteDetailPath(
+            route_id=r.id,
+            peer_id=p.id,
+            peer_name=p.name,
+            collector_name=c.name,
+            origin_asn=r.origin_asn,
+            next_hop=str(r.next_hop),
+            local_pref=r.local_pref,
+            med=r.med,
+            as_path=list(r.as_path or []),
+            communities=list(r.communities or []),
+            large_communities=list(r.large_communities or []),
+            ext_communities=list(r.ext_communities or []),
+            route_distinguisher=r.route_distinguisher,
+            rpki_status=r.rpki_status,
+            is_best=r.is_best,
+            first_seen_at=r.first_seen_at,
+            last_seen_at=r.last_seen_at,
+            flap_count=r.flap_count,
+            withdrawn_at=r.withdrawn_at,
+            matched_subnet_id=r.matched_subnet_id,
+            matched_block_id=r.matched_block_id,
+            matched_space_id=r.matched_space_id,
+            matched_asn_id=r.matched_asn_id,
+            matched_vrf_id=r.matched_vrf_id,
+        )
+        for r, p, c in rows
+    ]
+
+    peer_count = len({path.peer_id for path in paths})
+    distinct_origin_asns = sorted(
+        {path.origin_asn for path in paths if path.origin_asn is not None}
+    )
+
+    rpki_counter: Counter[str] = Counter(path.rpki_status for path in paths)
+    rpki = PeerDetailRpkiBreakdown(
+        valid=rpki_counter.get("valid", 0),
+        invalid=rpki_counter.get(RPKI_INVALID, 0),
+        unknown=rpki_counter.get("unknown", 0),
+    )
+
+    origin_names: dict[int, str] = {}
+    if distinct_origin_asns:
+        asn_rows = (
+            await db.execute(
+                select(ASN.number, ASN.name).where(ASN.number.in_(distinct_origin_asns))
+            )
+        ).all()
+        origin_names = {int(number): name for number, name in asn_rows}
+
+    summary = RouteDetailSummary(
+        path_count=len(paths),
+        peer_count=peer_count,
+        distinct_origin_asns=distinct_origin_asns,
+        multi_origin=len(distinct_origin_asns) > 1,
+        anycast_candidate=peer_count > 1,
+        rpki=rpki,
+        origin_names=origin_names,
+    )
+
+    ipam = await _build_route_ipam_context(db, paths)
+
+    return RouteDetailResponse(prefix=net, paths=paths, summary=summary, ipam=ipam)
 
 
 @router.get("/routes/for-ip", response_model=RouteForIpResponse)

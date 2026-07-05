@@ -12,6 +12,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Field, errMsg, inputCls } from "../_shared";
+import { RouteDetailModal } from "./RouteDetailModal";
 
 const SEARCH_PAGE_SIZE = 100;
 
@@ -157,6 +158,7 @@ export function RoutesTab({
   });
   const [offset, setOffset] = useState(0);
   const [sort, setSort] = useState<RouteSortState | null>(null);
+  const [viewingPrefix, setViewingPrefix] = useState<string | null>(null);
 
   // The tab is remounted fresh on every navigation into it (see
   // LookingGlassPage's conditional render), so a plain useState
@@ -408,14 +410,18 @@ export function RoutesTab({
                   <tr
                     key={r.id}
                     className={cn(
-                      "border-b last:border-0 hover:bg-muted/20",
+                      "cursor-pointer border-b last:border-0 hover:bg-muted/20",
                       r.withdrawn_at && "opacity-50",
                     )}
+                    onClick={() => setViewingPrefix(r.prefix)}
                   >
                     <td className="px-3 py-2 align-top font-mono">
                       {r.prefix}
                     </td>
-                    <td className="px-3 py-2 align-top font-mono">
+                    <td
+                      className="px-3 py-2 align-top font-mono"
+                      onClick={(e) => r.matched_asn_id && e.stopPropagation()}
+                    >
                       {r.origin_asn == null ? (
                         "—"
                       ) : r.matched_asn_id ? (
@@ -507,6 +513,13 @@ export function RoutesTab({
             Next →
           </button>
         </div>
+      )}
+
+      {viewingPrefix && (
+        <RouteDetailModal
+          prefix={viewingPrefix}
+          onClose={() => setViewingPrefix(null)}
+        />
       )}
     </div>
   );

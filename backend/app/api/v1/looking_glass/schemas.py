@@ -523,3 +523,99 @@ class PeerDetailResponse(BaseModel):
     peer_router: PeerDetailRouter | None
     route_stats: PeerDetailRouteStats
     active_alerts: list[PeerDetailAlert]
+
+
+# ── Route detail rollup (issue #566 — Routes-tab detail modal) ─────────
+
+
+class RouteDetailPath(BaseModel):
+    """One peer's Adj-RIB-In path for the prefix, enriched with the
+    announcing peer + collector name so the modal's comparison table
+    doesn't need a second round-trip per row."""
+
+    route_id: uuid.UUID
+    peer_id: uuid.UUID
+    peer_name: str
+    collector_name: str
+    origin_asn: int | None
+    next_hop: str
+    local_pref: int | None
+    med: int | None
+    as_path: list[int]
+    communities: list[str]
+    large_communities: list[str]
+    ext_communities: list[str]
+    route_distinguisher: str
+    rpki_status: str
+    is_best: bool
+    first_seen_at: datetime
+    last_seen_at: datetime
+    flap_count: int
+    withdrawn_at: datetime | None
+    matched_subnet_id: uuid.UUID | None
+    matched_block_id: uuid.UUID | None
+    matched_space_id: uuid.UUID | None
+    matched_asn_id: uuid.UUID | None
+    matched_vrf_id: uuid.UUID | None
+
+    @field_validator("next_hop", mode="before")
+    @classmethod
+    def _coerce_next_hop(cls, v: Any) -> Any:
+        # asyncpg returns INET columns as ipaddress.IPv4Address/IPv6Address.
+        return str(v) if v is not None else v
+
+
+class RouteDetailSummary(BaseModel):
+    """Server-computed rollup over every path returned for the prefix — the
+    headline signal the modal leads with. ``anycast_candidate`` (same
+    prefix, multiple routers, single origin) and ``multi_origin`` (more
+    than one origin ASN announcing it) are mutually informative but NOT
+    mutually exclusive: an anycast deployment is multi-homed by design
+    (``anycast_candidate``), while ``multi_origin`` on its own — regardless
+    of peer count — is the hijack/leak signal."""
+
+    path_count: int
+    peer_count: int
+    distinct_origin_asns: list[int]
+    multi_origin: bool
+    anycast_candidate: bool
+    rpki: PeerDetailRpkiBreakdown
+    # origin ASN -> tracked ASN row's name, only for origins that match a
+    # row in the ASN catalog (unmatched origins are simply absent here).
+    origin_names: dict[int, str]
+
+
+class RouteDetailIpamContext(BaseModel):
+    """The covering IPAM object(s) for this prefix, plus the ASN/VRF a path
+    resolved against — read off the ``matched_*_id`` columns already
+    populated at ingest by ``app.services.looking_glass.ipam_link`` (and,
+    for ``vrf_id``, by the Phase 6 Route-Target cross-check). Preference is
+    given to the current best path's linkage when paths disagree (VPNv4/
+    VPNv6's per-route-target VRF match can legitimately differ path to
+    path); falls back to the first path carrying a non-NULL value."""
+
+    subnet_id: uuid.UUID | None = None
+    subnet_name: str | None = None
+    block_id: uuid.UUID | None = None
+    block_name: str | None = None
+    space_id: uuid.UUID | None = None
+    space_name: str | None = None
+    asn_id: uuid.UUID | None = None
+    asn_number: int | None = None
+    asn_name: str | None = None
+    vrf_id: uuid.UUID | None = None
+    vrf_name: str | None = None
+
+
+class RouteDetailResponse(BaseModel):
+    """``GET /looking-glass/routes/detail`` — the rich per-prefix rollup
+    backing the Routes-tab detail modal (issue #566). Unlike
+    ``GET /routes/by-prefix`` (a flat ``list[RouteRead]``), this composes
+    every active (or, with ``?withdrawn=true``, every) path for the exact
+    prefix with peer/collector names, a server-computed summary the modal
+    leads its banner with, and the covering IPAM/ASN/VRF context."""
+
+    prefix: str
+    paths: list[RouteDetailPath]
+    summary: RouteDetailSummary
+    ipam: RouteDetailIpamContext

@@ -13437,6 +13437,81 @@ export interface BGPLGPeerDetail {
   active_alerts: BGPLGPeerDetailAlert[];
 }
 
+// GET /looking-glass/routes/detail — the rich per-prefix rollup backing
+// the Routes-tab detail modal (issue #566). Distinct from
+// ``getRoute()``/``/routes/by-prefix`` (a flat ``BGPLGRoute[]``): every
+// path here is enriched with its peer + collector name, and the response
+// carries a server-computed summary + covering IPAM/ASN/VRF context.
+export interface BGPLGRouteDetailPath {
+  route_id: string;
+  peer_id: string;
+  peer_name: string;
+  collector_name: string;
+  origin_asn: number | null;
+  next_hop: string;
+  local_pref: number | null;
+  med: number | null;
+  as_path: number[];
+  communities: string[];
+  large_communities: string[];
+  ext_communities: string[];
+  route_distinguisher: string;
+  rpki_status: BGPLGRpkiStatus;
+  is_best: boolean;
+  first_seen_at: string;
+  last_seen_at: string;
+  flap_count: number;
+  withdrawn_at: string | null;
+  matched_subnet_id: string | null;
+  matched_block_id: string | null;
+  matched_space_id: string | null;
+  matched_asn_id: string | null;
+  matched_vrf_id: string | null;
+}
+
+export interface BGPLGRouteDetailRpkiBreakdown {
+  valid: number;
+  invalid: number;
+  unknown: number;
+}
+
+/** The headline server-computed rollup the detail modal's banner leads
+ *  with. ``multi_origin`` (more than one origin ASN) is the hijack/leak
+ *  signal; ``anycast_candidate`` (more than one peer/router) alone is the
+ *  normal anycast/multi-homed shape. Both can be true at once. */
+export interface BGPLGRouteDetailSummary {
+  path_count: number;
+  peer_count: number;
+  distinct_origin_asns: number[];
+  multi_origin: boolean;
+  anycast_candidate: boolean;
+  rpki: BGPLGRouteDetailRpkiBreakdown;
+  /** Origin ASN (as a string key) -> tracked ASN row's name, only for
+   *  origins that match a row in the ASN catalog. */
+  origin_names: Record<string, string>;
+}
+
+export interface BGPLGRouteDetailIpamContext {
+  subnet_id: string | null;
+  subnet_name: string | null;
+  block_id: string | null;
+  block_name: string | null;
+  space_id: string | null;
+  space_name: string | null;
+  asn_id: string | null;
+  asn_number: number | null;
+  asn_name: string | null;
+  vrf_id: string | null;
+  vrf_name: string | null;
+}
+
+export interface BGPLGRouteDetail {
+  prefix: string;
+  paths: BGPLGRouteDetailPath[];
+  summary: BGPLGRouteDetailSummary;
+  ipam: BGPLGRouteDetailIpamContext;
+}
+
 export const lookingGlassApi = {
   // Collectors — agent-registration identity rows (one per GoBGP daemon).
   // Registration itself is agent-side; operators only read the list here.
@@ -13503,6 +13578,15 @@ export const lookingGlassApi = {
   getPeerDetail: (peerId: string) =>
     api
       .get<BGPLGPeerDetail>(`/looking-glass/peers/${peerId}/detail`)
+      .then((r) => r.data),
+  /** Rich rollup backing the Routes-tab detail modal — every path for the
+   *  exact prefix across every peer, enriched with peer/collector names +
+   *  a server-computed multi-origin/anycast summary + IPAM context. */
+  getRouteDetail: (prefix: string, params?: { withdrawn?: boolean }) =>
+    api
+      .get<BGPLGRouteDetail>("/looking-glass/routes/detail", {
+        params: { prefix, ...params },
+      })
       .then((r) => r.data),
 };
 
