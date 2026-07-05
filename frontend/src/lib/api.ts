@@ -13367,6 +13367,76 @@ export interface MulticastReachabilityResponse {
   groups: MulticastGroupReachability[];
 }
 
+// GET /looking-glass/peers/{peer_id}/detail — the rich rollup backing the
+// Sessions-tab peer detail modal (issue #566).
+export interface BGPLGPeerDetailCollector {
+  id: string;
+  name: string;
+  host: string | null;
+  status: string;
+  last_seen_ip: string | null;
+  agent_version: string | null;
+  enabled: boolean;
+}
+
+export interface BGPLGPeerDetailMatchedAsn {
+  id: string;
+  number: number;
+  name: string;
+}
+
+export interface BGPLGPeerDetailRouter {
+  id: string;
+  name: string;
+}
+
+export interface BGPLGPeerDetailRpkiBreakdown {
+  valid: number;
+  invalid: number;
+  unknown: number;
+}
+
+export interface BGPLGPeerDetailOriginAsnCount {
+  asn: number;
+  count: number;
+}
+
+export interface BGPLGPeerDetailCommunityCount {
+  value: string;
+  count: number;
+}
+
+export interface BGPLGPeerDetailRouteStats {
+  active_total: number;
+  withdrawn_total: number;
+  best_count: number;
+  rpki: BGPLGPeerDetailRpkiBreakdown;
+  top_origin_asns: BGPLGPeerDetailOriginAsnCount[];
+  top_communities: BGPLGPeerDetailCommunityCount[];
+  /** True when at least one active route carries a non-empty RD —
+   *  i.e. this peer has VPNv4/VPNv6 (RFC 4364) paths, not just plain
+   *  ipv4/ipv6-unicast. */
+  has_vpn_routes: boolean;
+  /** First ~8 active routes, for the modal's preview mini-table. */
+  sample_routes: BGPLGRoute[];
+}
+
+export interface BGPLGPeerDetailAlert {
+  severity: string;
+  message: string;
+  rule_type: string;
+  fired_at: string;
+}
+
+export interface BGPLGPeerDetail {
+  peer: BGPLGPeer;
+  collector: BGPLGPeerDetailCollector;
+  matched_asn: BGPLGPeerDetailMatchedAsn | null;
+  peer_router: BGPLGPeerDetailRouter | null;
+  route_stats: BGPLGPeerDetailRouteStats;
+  active_alerts: BGPLGPeerDetailAlert[];
+}
+
 export const lookingGlassApi = {
   // Collectors — agent-registration identity rows (one per GoBGP daemon).
   // Registration itself is agent-side; operators only read the list here.
@@ -13427,6 +13497,12 @@ export const lookingGlassApi = {
       .get<MulticastReachabilityResponse>(
         "/looking-glass/multicast-reachability",
       )
+      .then((r) => r.data),
+  /** Rich rollup backing the Sessions-tab peer detail modal — collector,
+   *  matched ASN/router, RIB stats, open bgp_lg_* alerts. */
+  getPeerDetail: (peerId: string) =>
+    api
+      .get<BGPLGPeerDetail>(`/looking-glass/peers/${peerId}/detail`)
       .then((r) => r.data),
 };
 

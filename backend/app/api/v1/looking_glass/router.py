@@ -53,11 +53,12 @@ from __future__ import annotations
 import ipaddress
 import re
 import uuid
+from collections import Counter
 from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -65,6 +66,7 @@ from app.api.deps import DB, CurrentUser
 from app.core.agent_wake import collect_wake, looking_glass_collector_channel
 from app.core.crypto import encrypt_str
 from app.core.permissions import require_resource_permission
+from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN
 from app.models.audit import AuditLog
 from app.models.auth import User
@@ -84,6 +86,15 @@ from .schemas import (
     LookingGlassDashboardSummary,
     MulticastReachabilityResponse,
     PeerCreate,
+    PeerDetailAlert,
+    PeerDetailCollector,
+    PeerDetailCommunityCount,
+    PeerDetailMatchedAsn,
+    PeerDetailOriginAsnCount,
+    PeerDetailResponse,
+    PeerDetailRouter,
+    PeerDetailRouteStats,
+    PeerDetailRpkiBreakdown,
     PeerRead,
     PeerUpdate,
     RouteForIpResponse,
@@ -296,6 +307,177 @@ async def get_peer(peer_id: uuid.UUID, db: DB, _: CurrentUser) -> PeerRead:
     if p is None:
         raise HTTPException(status_code=404, detail="Peer not found")
     return _peer_to_read(p)
+
+
+@router.get("/peers/{peer_id}/detail", response_model=PeerDetailResponse)
+async def get_peer_detail(peer_id: uuid.UUID, db: DB, _: CurrentUser) -> PeerDetailResponse:
+    """Rich rollup backing the Sessions-tab peer detail modal (issue #566).
+
+    Composes the peer's own config + runtime state (``PeerRead`` already
+    carries every session-state field) with its collector, its matched
+    ASN/router links (when set), an aggregate view over its learned RIB
+    (``bgp_lg_route`` rows for this peer), and any open ``bgp_lg_*`` alerts
+    that reference it — either directly (``bgp_lg_session_down``, subject
+    type ``bgp_lg_peer``) or via one of its routes (every other
+    ``bgp_lg_*`` rule type, subject type ``bgp_lg_route``).
+    """
+    p = await db.get(BGPLGPeer, peer_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="Peer not found")
+
+    collector = await db.get(LookingGlassCollector, p.collector_id)
+    if collector is None:
+        # FK is NOT NULL + CASCADE — a peer never outlives its collector.
+        raise HTTPException(status_code=500, detail="Peer's collector is missing")
+
+    matched_asn: PeerDetailMatchedAsn | None = None
+    if p.matched_asn_id is not None:
+        asn = await db.get(ASN, p.matched_asn_id)
+        if asn is not None:
+            matched_asn = PeerDetailMatchedAsn(id=asn.id, number=asn.number, name=asn.name)
+
+    peer_router: PeerDetailRouter | None = None
+    if p.peer_router_id is not None:
+        device = await db.get(NetworkDevice, p.peer_router_id)
+        if device is not None:
+            peer_router = PeerDetailRouter(id=device.id, name=device.name)
+
+    # ── Route-stats rollup ───────────────────────────────────────────
+    active_where = (BGPLGRoute.peer_id == p.id, BGPLGRoute.withdrawn_at.is_(None))
+
+    active_total = (
+        await db.execute(select(func.count()).select_from(BGPLGRoute).where(*active_where))
+    ).scalar_one()
+    withdrawn_total = (
+        await db.execute(
+            select(func.count())
+            .select_from(BGPLGRoute)
+            .where(BGPLGRoute.peer_id == p.id, BGPLGRoute.withdrawn_at.is_not(None))
+        )
+    ).scalar_one()
+    best_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(BGPLGRoute)
+            .where(*active_where, BGPLGRoute.is_best.is_(True))
+        )
+    ).scalar_one()
+    has_vpn_routes = (
+        await db.execute(
+            select(func.count())
+            .select_from(BGPLGRoute)
+            .where(*active_where, BGPLGRoute.route_distinguisher != "")
+        )
+    ).scalar_one() > 0
+
+    rpki_rows = (
+        await db.execute(
+            select(BGPLGRoute.rpki_status, func.count())
+            .where(*active_where)
+            .group_by(BGPLGRoute.rpki_status)
+        )
+    ).all()
+    rpki_counts = {status: n for status, n in rpki_rows}
+    rpki = PeerDetailRpkiBreakdown(
+        valid=rpki_counts.get("valid", 0),
+        invalid=rpki_counts.get(RPKI_INVALID, 0),
+        unknown=rpki_counts.get("unknown", 0),
+    )
+
+    origin_rows = (
+        await db.execute(
+            select(BGPLGRoute.origin_asn, func.count())
+            .where(*active_where, BGPLGRoute.origin_asn.is_not(None))
+            .group_by(BGPLGRoute.origin_asn)
+            .order_by(func.count().desc())
+            .limit(5)
+        )
+    ).all()
+    top_origin_asns = [
+        PeerDetailOriginAsnCount(asn=asn, count=n) for asn, n in origin_rows if asn is not None
+    ]
+
+    # Community counting done in Python over the fetched rows — this
+    # peer's active RIB is small (per-peer scope, not the whole table), so
+    # unnest-in-SQL would be needless ceremony for a correctness-equivalent
+    # result.
+    community_rows = (
+        await db.execute(
+            select(BGPLGRoute.communities, BGPLGRoute.large_communities).where(*active_where)
+        )
+    ).all()
+    community_counter: Counter[str] = Counter()
+    for communities, large_communities in community_rows:
+        for c in communities or []:
+            community_counter[str(c)] += 1
+        for c in large_communities or []:
+            community_counter[str(c)] += 1
+    top_communities = [
+        PeerDetailCommunityCount(value=v, count=n) for v, n in community_counter.most_common(8)
+    ]
+
+    sample_rows = (
+        (
+            await db.execute(
+                select(BGPLGRoute).where(*active_where).order_by(BGPLGRoute.prefix).limit(8)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    route_stats = PeerDetailRouteStats(
+        active_total=active_total,
+        withdrawn_total=withdrawn_total,
+        best_count=best_count,
+        rpki=rpki,
+        top_origin_asns=top_origin_asns,
+        top_communities=top_communities,
+        has_vpn_routes=has_vpn_routes,
+        sample_routes=[_route_to_read(r) for r in sample_rows],
+    )
+
+    # ── Active bgp_lg_* alerts referencing this peer or its routes ────
+    route_ids = (
+        (await db.execute(select(BGPLGRoute.id).where(BGPLGRoute.peer_id == p.id))).scalars().all()
+    )
+    subject_match = [
+        and_(AlertEvent.subject_type == "bgp_lg_peer", AlertEvent.subject_id == str(p.id))
+    ]
+    if route_ids:
+        route_id_strs = [str(rid) for rid in route_ids]
+        subject_match.append(
+            and_(
+                AlertEvent.subject_type == "bgp_lg_route", AlertEvent.subject_id.in_(route_id_strs)
+            )
+        )
+
+    alert_rows = (
+        await db.execute(
+            select(
+                AlertEvent.severity, AlertEvent.message, AlertRule.rule_type, AlertEvent.fired_at
+            )
+            .join(AlertRule, AlertRule.id == AlertEvent.rule_id)
+            .where(
+                AlertEvent.resolved_at.is_(None),
+                AlertRule.rule_type.like("bgp_lg_%"),
+                or_(*subject_match),
+            )
+            .order_by(AlertEvent.fired_at.desc())
+        )
+    ).all()
+    active_alerts = [
+        PeerDetailAlert(severity=severity, message=message, rule_type=rule_type, fired_at=fired_at)
+        for severity, message, rule_type, fired_at in alert_rows
+    ]
+
+    return PeerDetailResponse(
+        peer=_peer_to_read(p),
+        collector=PeerDetailCollector.model_validate(collector),
+        matched_asn=matched_asn,
+        peer_router=peer_router,
+        route_stats=route_stats,
+        active_alerts=active_alerts,
+    )
 
 
 @router.patch("/peers/{peer_id}", response_model=PeerRead)

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { Check } from "lucide-react";
@@ -135,18 +135,40 @@ const EMPTY_FILTERS: AppliedFilters = {
   withdrawn: false,
 };
 
-export function RoutesTab() {
+export function RoutesTab({
+  initialPeerId,
+}: {
+  /** Pre-select the Peer filter — set when the tab is reached via the
+   *  Sessions-tab peer detail modal's "View all routes" deep link
+   *  (``?tab=routes&peer=<id>``). */
+  initialPeerId?: string;
+}) {
   const [prefixDraft, setPrefixDraft] = useState("");
   const [originAsnDraft, setOriginAsnDraft] = useState("");
   const [communityDraft, setCommunityDraft] = useState("");
   const [rpkiDraft, setRpkiDraft] = useState<BGPLGRpkiStatus | "">("");
-  const [peerIdDraft, setPeerIdDraft] = useState("");
+  const [peerIdDraft, setPeerIdDraft] = useState(initialPeerId ?? "");
   const [bestPathOnlyDraft, setBestPathOnlyDraft] = useState(false);
   const [withdrawnDraft, setWithdrawnDraft] = useState(false);
 
-  const [applied, setApplied] = useState<AppliedFilters>(EMPTY_FILTERS);
+  const [applied, setApplied] = useState<AppliedFilters>({
+    ...EMPTY_FILTERS,
+    peerId: initialPeerId ?? "",
+  });
   const [offset, setOffset] = useState(0);
   const [sort, setSort] = useState<RouteSortState | null>(null);
+
+  // The tab is remounted fresh on every navigation into it (see
+  // LookingGlassPage's conditional render), so a plain useState
+  // initializer normally suffices — but guard with an effect too in
+  // case a future caller keeps the tab mounted across peer changes.
+  useEffect(() => {
+    if (!initialPeerId) return;
+    setPeerIdDraft(initialPeerId);
+    setApplied((prev) => ({ ...prev, peerId: initialPeerId }));
+    setOffset(0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialPeerId]);
 
   function runSearch() {
     setOffset(0);

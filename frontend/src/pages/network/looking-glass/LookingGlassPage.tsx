@@ -51,6 +51,9 @@ export function LookingGlassPage() {
       : searchParams.get("tab") === "query"
         ? "query"
         : "sessions";
+  // Set only when the Routes tab was reached via the peer-detail modal's
+  // "View all routes" link — pre-filters RoutesTab's Peer picker.
+  const routesPeerFilter = searchParams.get("peer") ?? undefined;
 
   const [showPeerModal, setShowPeerModal] = useState(false);
   const [editingPeer, setEditingPeer] = useState<BGPLGPeer | null>(null);
@@ -69,6 +72,22 @@ export function LookingGlassPage() {
         const params = new URLSearchParams(prev);
         if (next === "sessions") params.delete("tab");
         else params.set("tab", next);
+        // A manual tab-pill click starts fresh — the peer filter only
+        // makes sense as a one-shot deep link from the detail modal.
+        params.delete("peer");
+        return params;
+      },
+      { replace: true },
+    );
+  }
+
+  // Deep-link from the peer detail modal's "View all routes" button.
+  function viewPeerRoutes(peerId: string) {
+    setSearchParams(
+      (prev) => {
+        const params = new URLSearchParams(prev);
+        params.set("tab", "routes");
+        params.set("peer", peerId);
         return params;
       },
       { replace: true },
@@ -165,9 +184,13 @@ export function LookingGlassPage() {
 
       <div className="flex-1 overflow-auto p-6">
         {tab === "sessions" ? (
-          <SessionsTab collectors={collectors} onEdit={openEditPeer} />
+          <SessionsTab
+            collectors={collectors}
+            onEdit={openEditPeer}
+            onViewRoutes={viewPeerRoutes}
+          />
         ) : tab === "routes" ? (
-          <RoutesTab />
+          <RoutesTab initialPeerId={routesPeerFilter} />
         ) : (
           <QueryTab collectors={collectors} />
         )}

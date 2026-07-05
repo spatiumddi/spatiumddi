@@ -22,9 +22,13 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Field, errMsg, humanDuration, humanTime, inputCls } from "../_shared";
+import { PeerDetailModal } from "./PeerDetailModal";
 
 // Established = green, the transitional FSM states = amber, Idle = rose.
-const STATE_COLOR: Partial<Record<BGPLGSessionState, string>> = {
+// Exported so PeerDetailModal's header chip reuses the exact same
+// mapping instead of a second copy that could drift.
+// eslint-disable-next-line react-refresh/only-export-components
+export const STATE_COLOR: Partial<Record<BGPLGSessionState, string>> = {
   established: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400",
   active: "bg-amber-500/15 text-amber-700 dark:text-amber-400",
   connect: "bg-amber-500/15 text-amber-700 dark:text-amber-400",
@@ -32,7 +36,7 @@ const STATE_COLOR: Partial<Record<BGPLGSessionState, string>> = {
   openconfirm: "bg-amber-500/15 text-amber-700 dark:text-amber-400",
   idle: "bg-rose-500/15 text-rose-700 dark:text-rose-400",
 };
-const FALLBACK_STATE_COLOR =
+export const FALLBACK_STATE_COLOR =
   "bg-zinc-100 text-zinc-700 dark:bg-zinc-500/15 dark:text-zinc-300";
 
 function Pill({ text, cls }: { text: string; cls: string }) {
@@ -51,12 +55,17 @@ function Pill({ text, cls }: { text: string; cls: string }) {
 export function SessionsTab({
   collectors,
   onEdit,
+  onViewRoutes,
 }: {
   collectors: BGPLGCollector[];
   onEdit: (peer: BGPLGPeer) => void;
+  /** Deep-links into the Routes tab, pre-filtered to one peer — passed
+   *  through to the peer detail modal's "View all routes" link. */
+  onViewRoutes: (peerId: string) => void;
 }) {
   const qc = useQueryClient();
   const [deleteTarget, setDeleteTarget] = useState<BGPLGPeer | null>(null);
+  const [viewingPeerId, setViewingPeerId] = useState<string | null>(null);
 
   // Session-state rows are live telemetry — poll modestly so a flap shows up
   // without the operator hammering Refresh.
@@ -152,7 +161,8 @@ export function SessionsTab({
               return (
                 <tr
                   key={s.peer_id}
-                  className="border-b last:border-0 hover:bg-muted/20"
+                  className="cursor-pointer border-b last:border-0 hover:bg-muted/20"
+                  onClick={() => setViewingPeerId(s.peer_id)}
                 >
                   <td className="px-3 py-2 align-top">
                     <div className="font-medium">{s.peer_name}</div>
@@ -167,6 +177,7 @@ export function SessionsTab({
                     {peer?.matched_asn_id ? (
                       <Link
                         to={`/network/asns/${peer.matched_asn_id}`}
+                        onClick={(e) => e.stopPropagation()}
                         className="hover:text-primary hover:underline"
                       >
                         AS{s.peer_asn}
@@ -205,7 +216,10 @@ export function SessionsTab({
                       "0"
                     )}
                   </td>
-                  <td className="px-3 py-2 align-top text-right">
+                  <td
+                    className="px-3 py-2 align-top text-right"
+                    onClick={(e) => e.stopPropagation()}
+                  >
                     {peer && (
                       <div className="flex justify-end gap-1">
                         <button
@@ -248,6 +262,25 @@ export function SessionsTab({
         onClose={() => setDeleteTarget(null)}
         onConfirm={() => deleteTarget && deleteM.mutate(deleteTarget.id)}
       />
+
+      {viewingPeerId && (
+        <PeerDetailModal
+          peerId={viewingPeerId}
+          onClose={() => setViewingPeerId(null)}
+          onEdit={(peer) => {
+            setViewingPeerId(null);
+            onEdit(peer);
+          }}
+          onDelete={(peer) => {
+            setViewingPeerId(null);
+            setDeleteTarget(peer);
+          }}
+          onViewRoutes={(peerId) => {
+            setViewingPeerId(null);
+            onViewRoutes(peerId);
+          }}
+        />
+      )}
     </div>
   );
 }

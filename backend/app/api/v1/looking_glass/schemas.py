@@ -434,3 +434,92 @@ class MulticastReachabilityResponse(BaseModel):
 
     domains: list[DomainReachability]
     groups: list[GroupSourceReachability]
+
+
+# ── Peer detail rollup (issue #566 — Sessions-tab detail modal) ────────
+
+
+class PeerDetailCollector(BaseModel):
+    """Slim collector rollup for the peer detail modal — a subset of
+    ``CollectorRead`` (drops the registration bookkeeping fields the modal
+    has no use for)."""
+
+    id: uuid.UUID
+    name: str
+    host: str | None
+    status: str
+    last_seen_ip: str | None
+    agent_version: str | None
+    enabled: bool
+
+    model_config = {"from_attributes": True}
+
+
+class PeerDetailMatchedAsn(BaseModel):
+    id: uuid.UUID
+    number: int
+    name: str
+
+
+class PeerDetailRouter(BaseModel):
+    id: uuid.UUID
+    name: str
+
+
+class PeerDetailRpkiBreakdown(BaseModel):
+    valid: int = 0
+    invalid: int = 0
+    unknown: int = 0
+
+
+class PeerDetailOriginAsnCount(BaseModel):
+    asn: int
+    count: int
+
+
+class PeerDetailCommunityCount(BaseModel):
+    value: str
+    count: int
+
+
+class PeerDetailRouteStats(BaseModel):
+    """Rollup over this peer's ``bgp_lg_route`` rows."""
+
+    active_total: int
+    withdrawn_total: int
+    best_count: int
+    rpki: PeerDetailRpkiBreakdown
+    top_origin_asns: list[PeerDetailOriginAsnCount]
+    top_communities: list[PeerDetailCommunityCount]
+    # True when at least one active route carries a non-empty
+    # ``route_distinguisher`` — i.e. this peer has VPNv4/VPNv6 (RFC 4364)
+    # paths in its RIB, not just plain ipv4/ipv6-unicast.
+    has_vpn_routes: bool
+    # First ~8 active routes, for the modal's preview table.
+    sample_routes: list[RouteRead]
+
+
+class PeerDetailAlert(BaseModel):
+    """One open ``AlertEvent`` whose rule references this peer or one of
+    its learned routes (``bgp_lg_*`` rule types only)."""
+
+    severity: str
+    message: str
+    rule_type: str
+    fired_at: datetime
+
+
+class PeerDetailResponse(BaseModel):
+    """``GET /looking-glass/peers/{peer_id}/detail`` — the rich rollup
+    backing the Sessions-tab peer detail modal. Composes the peer's own
+    config + runtime state (``peer``, already carrying every session-state
+    field — see ``PeerRead``) with its collector, matched ASN/router links,
+    an aggregate view over its learned RIB, and any open ``bgp_lg_*``
+    alerts that reference it."""
+
+    peer: PeerRead
+    collector: PeerDetailCollector
+    matched_asn: PeerDetailMatchedAsn | None
+    peer_router: PeerDetailRouter | None
+    route_stats: PeerDetailRouteStats
+    active_alerts: list[PeerDetailAlert]
