@@ -45,6 +45,7 @@ import {
   Wifi,
   Waypoints,
   Radio,
+  Binoculars,
   Shuffle,
   Trash2,
   History,
@@ -176,6 +177,12 @@ const networkInfrastructureNav = [
     icon: Cable,
     to: "/network/devices",
     module: "network.device",
+  },
+  {
+    label: "Looking Glass",
+    icon: Binoculars,
+    to: "/network/looking-glass",
+    module: "network.looking_glass",
   },
   {
     label: "Multicast",

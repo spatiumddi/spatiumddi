@@ -142,7 +142,18 @@ def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
 # to be sending heartbeats, the images are there. Hardcoded to True
 # instead of probing /var/run/docker.sock (which doesn't exist
 # anymore — the appliance is k3s-only).
-_CAPABILITY_FLAGS = ("can_run_dns_bind9", "can_run_dns_powerdns", "can_run_dhcp")
+#
+# Issue #566 — ``can_run_looking_glass`` (the BGP Looking Glass
+# collector, GoBGP) joins this tuple rather than getting its own
+# bespoke always-true literal (like ``can_run_observer`` below): it
+# has a real service container (the ``looking-glass`` image), baked
+# into every slot per decision D3, so it belongs alongside DNS/DHCP.
+_CAPABILITY_FLAGS = (
+    "can_run_dns_bind9",
+    "can_run_dns_powerdns",
+    "can_run_dhcp",
+    "can_run_looking_glass",
+)
 
 
 def _detect_storage_type() -> str:
@@ -223,9 +234,10 @@ def _capabilities_payload() -> dict[str, Any]:
     capability reporting"):
 
     * ``can_run_dns_bind9`` / ``can_run_dns_powerdns`` /
-      ``can_run_dhcp`` — hardcoded ``True`` post-Phase-7. The slot's
-      containerd content store is preloaded with every service
-      image; if we're heartbeating, the images are there.
+      ``can_run_dhcp`` / ``can_run_looking_glass`` — hardcoded
+      ``True`` post-Phase-7 (looking-glass joins under #566). The
+      slot's containerd content store is preloaded with every
+      service image; if we're heartbeating, the images are there.
     * ``can_run_observer`` — always true. The observer role is a
       pure supervisor-side metrics/log shipper with no separate
       service container, so any approved supervisor can run it.

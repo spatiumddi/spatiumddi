@@ -116,6 +116,27 @@ dhcpKea:
   # different pool than DNS.
   relayVIPPool: ""
 
+# Looking Glass — receive-only BGP collector (GoBGP). Issue #566. Peers
+# passively with the operator's edge/core routers over the node's real
+# routable IP (hostNetwork, like DNS/DHCP) and never advertises a route
+# back — see agent/looking-glass/ + docs/features/LOOKING_GLASS.md for
+# the collector daemon + the hard receive-only invariant.
+lookingGlass:
+  enabled: false
+  image:
+    repository: ghcr.io/spatiumddi/looking-glass
+  # Same precedence + rationale as dnsBind9.controlPlaneUrl /
+  # inClusterApiUrl above: external operator-facing URL (Application
+  # appliance, self-signed) takes priority over the in-cluster Service
+  # default.
+  controlPlaneUrl: ""
+  inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
+  agentKey: ""
+  # #566 — per-node hostPath state under /var/lib/spatiumddi/agents/
+  # looking-glass/ (agent cache — cached ConfigBundle + peer config the
+  # collector re-applies from if the control plane is unreachable, non-
+  # negotiable #5), NOT a PVC. See dnsBind9 for the full rationale.
+
 # #272 Phase 5 — DNS resolver VIP (default off, full wiring is Phase 10).
 # When ``useMetalLBVIP: true`` the bind9 + powerdns Pods DROP
 # hostNetwork:53 and sit behind a single L2 LoadBalancer Service at

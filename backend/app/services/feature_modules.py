@@ -125,6 +125,18 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Network",
         description="Multicast group registry — addresses + producer/consumer memberships for SMPTE 2110 / Dante / NDI / market-data deployments. Niche but high-value when operators need it.",
     ),
+    # BGP Looking Glass (#566) — a receive-only GoBGP collector peers with the
+    # operator's routers and mirrors the live Adj-RIB-In, linking every learned
+    # prefix / origin ASN / community back into IPAM. Default-ENABLED for
+    # discovery: the Sessions/Routes surface appears, but the collector does
+    # NOTHING until an operator configures a peer (the only secret is the
+    # Fernet-encrypted MD5 password). Receive-only — never advertises.
+    ModuleSpec(
+        id="network.looking_glass",
+        label="BGP Looking Glass",
+        group="Network",
+        description="Receive-only BGP collector that peers with your routers and surfaces the live routing table — every learned prefix, origin ASN and community linked back into IPAM / the ASN + community catalogs, RPKI-validated. Never advertises routes to your network. Discovery toggle only; the collector does nothing until you configure a peer.",
+    ),
     ModuleSpec(
         id="ipam.address_sets",
         label="Address sets",

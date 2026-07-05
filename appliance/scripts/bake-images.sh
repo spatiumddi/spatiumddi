@@ -52,6 +52,10 @@ IMAGES=(
     "ghcr.io/spatiumddi/dns-bind9"
     "ghcr.io/spatiumddi/dns-powerdns"
     "ghcr.io/spatiumddi/dhcp-kea"
+    # Issue #566 — BGP Looking Glass collector (GoBGP). Baked into
+    # every slot per decision D3 (can_run_looking_glass hardcodes
+    # True the same way DNS/DHCP do — not a conditional/optional add).
+    "ghcr.io/spatiumddi/looking-glass"
     # Phase 11 (#183) — control-plane images for the AIO + Core
     # install variants. Application-role appliances don't run these
     # pods, but baking them keeps the slot consistent across all

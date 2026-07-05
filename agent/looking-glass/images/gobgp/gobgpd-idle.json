@@ -1,0 +1,16 @@
+{
+  "global": {
+    "config": {
+      "as": 4200000000,
+      "router-id": "192.0.2.1",
+      "port": 179
+    },
+    "apply-policy": {
+      "config": {
+        "default-import-policy": "accept-route",
+        "default-export-policy": "reject-route"
+      }
+    }
+  },
+  "neighbors": []
+}

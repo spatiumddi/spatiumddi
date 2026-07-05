@@ -376,6 +376,9 @@ backend/alembic/versions/c9f2e1a4d7b6_dnsbl_monitoring.py:drop_table:199
 backend/alembic/versions/c9f2e1a4d7b6_dnsbl_monitoring.py:drop_table:201
 backend/alembic/versions/c9f2e1a4d7b6_dnsbl_monitoring.py:drop_table:203
 backend/alembic/versions/c9f2a83b04d7_appliance_certificate.py:drop_table:90
+backend/alembic/versions/cb279a6afd70_bgp_looking_glass_collector_peers_.py:drop_table:291
+backend/alembic/versions/cb279a6afd70_bgp_looking_glass_collector_peers_.py:drop_table:297
+backend/alembic/versions/cb279a6afd70_bgp_looking_glass_collector_peers_.py:drop_table:304
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_column:107
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_column:110
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_table:112

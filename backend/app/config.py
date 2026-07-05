@@ -101,6 +101,9 @@ class Settings(BaseSettings):
     dhcp_agent_key: str = ""
     dhcp_agent_token_ttl_hours: int = 24
     dhcp_agent_longpoll_timeout: int = 30
+
+    # BGP Looking Glass collector agent (#566)
+    lg_agent_key: str = ""
     dhcp_require_agent_approval: bool = False
     dhcp_sync_interval_seconds: int = 60
     dhcp_lease_sync_interval_minutes: int = 5

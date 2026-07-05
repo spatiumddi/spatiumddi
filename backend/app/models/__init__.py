@@ -21,6 +21,7 @@ from app.models.auth import APIToken, Group, Role, User, UserSession, user_group
 from app.models.auth_provider import AuthGroupMapping, AuthProvider
 from app.models.backup import BackupTarget
 from app.models.base import Base
+from app.models.bgp_looking_glass import BGPLGPeer, BGPLGRoute, LookingGlassCollector
 from app.models.bgp_monitor import BGPHijackDetection, BGPTrackedPrefix
 from app.models.change_request import ApprovalPolicy, ChangeRequest
 from app.models.circuit import Circuit
@@ -148,6 +149,9 @@ __all__ = [
     "BGPPeering",
     "BGPTrackedPrefix",
     "BGPHijackDetection",
+    "LookingGlassCollector",
+    "BGPLGPeer",
+    "BGPLGRoute",
     "User",
     "Group",
     "Role",

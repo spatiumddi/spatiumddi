@@ -27,6 +27,9 @@ appliance's *local* k3s, deploying the per-role service workloads:
 - `dnsBind9` — Deployment + Service. BIND9 authoritative DNS.
 - `dnsPowerdns` — Deployment + Service. PowerDNS alternative.
 - `dhcpKea` — DaemonSet with `hostNetwork: true`. Kea DHCPv4/v6.
+- `lookingGlass` — DaemonSet with `hostNetwork: true`. Receive-only
+  BGP collector (GoBGP, issue #566) — see
+  `docs/features/LOOKING_GLASS.md`.
 - `supervisor` — DaemonSet, privileged. The reconciler itself.
 
 Each role is gated on a `<role>.enabled` flag. Mutual exclusion

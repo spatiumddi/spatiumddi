@@ -203,6 +203,7 @@ class SupervisorCapabilities(BaseModel):
     can_run_dns_bind9: bool = False
     can_run_dns_powerdns: bool = False
     can_run_dhcp: bool = False
+    can_run_looking_glass: bool = False
     can_run_observer: bool = False
     has_baked_images: bool = False
     baked_images_version: str | None = None
@@ -1215,6 +1216,13 @@ class SupervisorRoleAssignment(BaseModel):
     dhcp_group_name: str | None = None
     dhcp_network_mode: str | None = None  # host / bridged
     dhcp_agent_key: str | None = None
+    # #566 — platform-level Looking Glass collector PSK (mirror of
+    # ``settings.lg_agent_key``). Populated only when the ``looking-glass``
+    # role is assigned; the supervisor writes ``LG_AGENT_KEY=<this>`` into
+    # role-compose.env so the collector container can register against
+    # ``/api/v1/looking-glass/agents/register`` without operator-side .env
+    # edits. There is no group concept for the collector (like DNS/DHCP).
+    lg_agent_key: str | None = None
     # #170 Wave C3 — operator-pasted nft fragment rendered after the
     # role-driven mgmt + per-role blocks. NULL / empty → role-driven
     # rules only.
@@ -2260,6 +2268,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
     assigned_roles = list(row.assigned_roles or [])
     dns_role_assigned = "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
     dhcp_role_assigned = "dhcp" in assigned_roles
+    lg_role_assigned = "looking-glass" in assigned_roles
 
     dns_engine: str | None = None
     if "dns-bind9" in assigned_roles:
@@ -2292,6 +2301,9 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
     dhcp_agent_key: str | None = None
     if dhcp_role_assigned:
         dhcp_agent_key = app_settings.dhcp_agent_key or None
+    lg_agent_key: str | None = None
+    if lg_role_assigned:
+        lg_agent_key = app_settings.lg_agent_key or None
 
     return SupervisorRoleAssignment(
         roles=assigned_roles,
@@ -2303,6 +2315,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
         dhcp_group_name=dhcp_group_name,
         dhcp_network_mode=dhcp_network_mode,
         dhcp_agent_key=dhcp_agent_key,
+        lg_agent_key=lg_agent_key,
         firewall_extra=row.firewall_extra,
         kubeapi_expose_cidrs=list(row.kubeapi_expose_cidrs or []),
     )
@@ -3189,7 +3202,7 @@ async def rekey_appliance(
 # ── Admin: role assignment + tags (#170 Wave C2) ──────────────────
 
 
-_VALID_ROLES = {"dns-bind9", "dns-powerdns", "dhcp", "observer", "custom"}
+_VALID_ROLES = {"dns-bind9", "dns-powerdns", "dhcp", "looking-glass", "observer", "custom"}
 _DNS_ROLES = {"dns-bind9", "dns-powerdns"}
 
 
@@ -3205,8 +3218,8 @@ class ApplianceRolesUpdate(BaseModel):
     roles: list[str] | None = Field(
         default=None,
         description=(
-            "Subset of dns-bind9 / dns-powerdns / dhcp / observer / "
-            "custom. dns-bind9 and dns-powerdns are mutually exclusive."
+            "Subset of dns-bind9 / dns-powerdns / dhcp / looking-glass / "
+            "observer / custom. dns-bind9 and dns-powerdns are mutually exclusive."
         ),
     )
     dns_group_id: uuid.UUID | None = None
@@ -3279,6 +3292,7 @@ async def update_appliance_roles(
                 "dns-bind9": "can_run_dns_bind9",
                 "dns-powerdns": "can_run_dns_powerdns",
                 "dhcp": "can_run_dhcp",
+                "looking-glass": "can_run_looking_glass",
                 "observer": "can_run_observer",
             }.get(r)
             if cap_key is not None and not caps.get(cap_key, False):

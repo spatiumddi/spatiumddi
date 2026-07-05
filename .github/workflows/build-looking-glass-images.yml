@@ -1,0 +1,96 @@
+name: Build Looking Glass Agent Images
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*"
+    paths:
+      - "agent/looking-glass/**"
+      - ".github/workflows/build-looking-glass-images.yml"
+  pull_request:
+    paths:
+      - "agent/looking-glass/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [gobgp]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/spatiumddi/looking-glass
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=short
+
+      - name: Build (PR — single-arch, load locally for Trivy)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: agent/looking-glass/images/${{ matrix.flavor }}/Dockerfile
+          # Single-arch on PR: ``--load`` only accepts one platform,
+          # and the runner is amd64. Release builds (push branch) do
+          # the multi-arch manifest list.
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ghcr.io/spatiumddi/looking-glass:pr-scan
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=looking-glass-${{ matrix.flavor }}
+          cache-to: type=gha,mode=max,scope=looking-glass-${{ matrix.flavor }}
+
+      - name: Build and push (main / tag — multi-arch, push to ghcr)
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: agent/looking-glass/images/${{ matrix.flavor }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=looking-glass-${{ matrix.flavor }}
+          cache-to: type=gha,mode=max,scope=looking-glass-${{ matrix.flavor }}
+
+      - name: Trivy scan
+        if: github.event_name == 'pull_request'
+        uses: aquasecurity/trivy-action@master
+        with:
+          # Reference the locally-loaded image from the PR build step
+          # above — same fix as build-dns-images.yml/build-dhcp-images.yml:
+          # a ``ghcr.io/...:${{ github.sha }}`` reference never resolves
+          # (metadata-action emits ``sha-<short>``, not raw full SHAs, and
+          # on PR nothing gets pushed) so Trivy 404s with MANIFEST_UNKNOWN.
+          image-ref: ghcr.io/spatiumddi/looking-glass:pr-scan
+          format: table
+          severity: HIGH,CRITICAL
+          # Fail the PR on any HIGH/CRITICAL CVE that has a fix available —
+          # `ignore-unfixed: true` keeps us unblocked on vulns that have no
+          # upstream patch yet (base image issues we can't fix locally).
+          exit-code: "1"
+          ignore-unfixed: true

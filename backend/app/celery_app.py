@@ -14,6 +14,7 @@ celery_app = Celery(
         "app.tasks.ipam_utilization_recount",
         "app.tasks.dns",
         "app.tasks.dns_pull",
+        "app.tasks.looking_glass",
         "app.tasks.dhcp_health",
         "app.tasks.dhcp_lease_cleanup",
         "app.tasks.dhcp_mac_blocks",
@@ -136,6 +137,12 @@ celery_app.conf.update(
         # stayed ``status='active'`` forever).
         "dns-agent-stale-sweep": {
             "task": "app.tasks.dns.agent_stale_sweep",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Every 60s, flip a Looking Glass collector to ``unreachable`` when its
+        # heartbeat has gone silent past the staleness window (#566).
+        "lg-collector-stale-sweep": {
+            "task": "app.tasks.looking_glass.collector_stale_sweep",
             "schedule": schedule(run_every=60.0),
         },
         # Every 60s, fan-out health checks to every registered DNS server.
