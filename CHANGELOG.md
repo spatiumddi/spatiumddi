@@ -75,7 +75,7 @@ and cross-subnet IP search) to 229.
   prefixes for hijacks and unexpected more-specifics: a **RIPEstat**
   poll is the source of truth, with an optional **RIS Live** streaming
   consumer for near-real-time detection. Fires ``bgp_prefix_hijack`` /
-  ``bgp_more_specific`` alerts (RPKI-invalid vs -unknown drives
+  ``bgp_more_specific_announced`` alerts (RPKI-invalid vs -unknown drives
   severity), keeps evidence on a pruned victim prefix via ``SET NULL`` on
   the detection FK, refreshes on a cadence gate, and resolves stale
   detections outage-safely. Behind the ``network.asn`` feature module;

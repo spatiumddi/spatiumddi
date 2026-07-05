@@ -289,14 +289,15 @@ These predate the envelope convention; the client filters/sorts these
 in the browser or via query params on the specific endpoint.
 
 **Exception — address listing (#517, 2026.07.04-1).**
-`GET /ipam/subnets/{id}/addresses` stays backward-compatible (still a
-bare `list[IPAddressResponse]`) but now accepts optional
+`GET /api/v1/ipam/subnets/{id}/addresses` stays backward-compatible
+(still a bare `list[IPAddressResponse]`) but now accepts optional
 `q` / `hostname` / `mac` / `sort` / `order` / `limit` / `offset`, and
 sets an `X-Total-Count` response header (CORS-exposed) when the result
 is windowed. For **cross-subnet** address queries use the envelope
-endpoints `GET /ipam/addresses/search` (paginated, joined subnet/space
-context) and `GET /ipam/addresses/search/ids` (a capped id list for
-select-all-matches). Both are permission-scoped in SQL.
+endpoints `GET /api/v1/ipam/addresses/search` (paginated, joined
+subnet/space context) and `GET /api/v1/ipam/addresses/search/ids`
+(a capped id list for select-all-matches). Both are permission-scoped
+in SQL.
 
 ---
 
