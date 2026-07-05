@@ -94,6 +94,13 @@ build: build-supervisor
 	docker build -t spatiumddi-dns-bind9:dev -f agent/dns/images/bind9/Dockerfile .
 	docker build -t spatiumddi-dns-powerdns:dev -f agent/dns/images/powerdns/Dockerfile .
 	docker build -t spatiumddi-dhcp-kea:dev -f agent/dhcp/images/kea/Dockerfile .
+	# #573 — the BGP Looking Glass collector (#566) is in bake-images.sh's
+	# IMAGES set but the PROD compose pins its ``image:`` with no ``build:``,
+	# so — exactly like the DNS/DHCP agents above — it needs an explicit
+	# build here or ``make build`` leaves ``spatiumddi-looking-glass:dev``
+	# stale and the baked ISO ships an old collector (or trips the #272 >24h
+	# stale-source guard when nothing rebuilt it recently).
+	docker build -t spatiumddi-looking-glass:dev -f agent/looking-glass/images/gobgp/Dockerfile .
 	# #272 Phase 1 — retag compose-built images under the canonical
 	# ``ghcr.io/spatiumddi/<name>:dev`` form so
 	# ``appliance/scripts/bake-images.sh``'s resolve_source_tag picks
@@ -118,7 +125,8 @@ build: build-supervisor
 	    "frontend:spatiumddi-frontend" \
 	    "dns-bind9:dns-bind9" \
 	    "dns-powerdns:dns-powerdns" \
-	    "dhcp-kea:dhcp-kea"; do \
+	    "dhcp-kea:dhcp-kea" \
+	    "looking-glass:looking-glass"; do \
 	  compose="$${pair%%:*}"; target="$${pair##*:}"; \
 	  if docker image inspect "spatiumddi-$$compose:dev" >/dev/null 2>&1; then \
 	    docker tag "spatiumddi-$$compose:dev" "ghcr.io/spatiumddi/$$target:dev"; \
