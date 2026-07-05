@@ -16,6 +16,7 @@ sessions on the collector's next apply.
 from __future__ import annotations
 
 import ipaddress
+import re
 from typing import Any
 from uuid import UUID
 
@@ -26,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.auth import User
 from app.models.bgp_looking_glass import BGPLGPeer, BGPLGRoute, LookingGlassCollector
 from app.services.ai.tools.base import register_tool
+from app.services.looking_glass.as_path_query import as_path_regexp_clause
 
 _MODULE = "network.looking_glass"
 
@@ -96,6 +98,14 @@ class FindBgpRoutesArgs(BaseModel):
             "the route's standard/large/extended community lists."
         ),
     )
+    as_path_regexp: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "AS-path regex (Cisco/Juniper '_' boundary convention) matched "
+            "against the space-joined AS path, e.g. '_65001_'."
+        ),
+    )
     rpki_status: str | None = Field(
         default=None, description="'valid' | 'invalid' | 'unknown' (from ROA coverage at ingest)."
     )
@@ -142,6 +152,15 @@ async def find_bgp_routes(db: AsyncSession, user: User, args: FindBgpRoutesArgs)
                 BGPLGRoute.ext_communities.contains([args.community]),
             )
         )
+    if args.as_path_regexp:
+        try:
+            stmt = stmt.where(as_path_regexp_clause(args.as_path_regexp))
+        except re.error:
+            return {
+                "routes": [],
+                "count": 0,
+                "note": f"invalid as_path_regexp {args.as_path_regexp!r}",
+            }
     if args.rpki_status:
         stmt = stmt.where(BGPLGRoute.rpki_status == args.rpki_status)
     if args.best_path_only:

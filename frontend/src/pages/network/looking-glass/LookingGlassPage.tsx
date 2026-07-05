@@ -10,8 +10,9 @@ import { cn } from "@/lib/utils";
 
 import { PeerFormModal, SessionsTab } from "./SessionsTab";
 import { RoutesTab } from "./RoutesTab";
+import { QueryTab } from "./QueryTab";
 
-type LGTab = "sessions" | "routes";
+type LGTab = "sessions" | "routes" | "query";
 
 function TabPill({
   active,
@@ -45,7 +46,11 @@ export function LookingGlassPage() {
 
   const [searchParams, setSearchParams] = useSearchParams();
   const tab: LGTab =
-    searchParams.get("tab") === "routes" ? "routes" : "sessions";
+    searchParams.get("tab") === "routes"
+      ? "routes"
+      : searchParams.get("tab") === "query"
+        ? "query"
+        : "sessions";
 
   const [showPeerModal, setShowPeerModal] = useState(false);
   const [editingPeer, setEditingPeer] = useState<BGPLGPeer | null>(null);
@@ -150,14 +155,21 @@ export function LookingGlassPage() {
             onClick={() => selectTab("routes")}
             label="Routes"
           />
+          <TabPill
+            active={tab === "query"}
+            onClick={() => selectTab("query")}
+            label="Query"
+          />
         </div>
       </div>
 
       <div className="flex-1 overflow-auto p-6">
         {tab === "sessions" ? (
           <SessionsTab collectors={collectors} onEdit={openEditPeer} />
-        ) : (
+        ) : tab === "routes" ? (
           <RoutesTab />
+        ) : (
+          <QueryTab collectors={collectors} />
         )}
       </div>
 

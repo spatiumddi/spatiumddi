@@ -16,14 +16,19 @@ The router itself is module-gated at the ``include_router`` site in
 ``app/api/v1/router.py`` via ``require_module("tools.network")`` (404s
 the whole surface when the feature module is off).
 
-Agent-perspective dispatch (this PR): every *reachability* tool (ping /
-traceroute / dig / port-test / tls-cert) accepts an optional ``target``.
-``target`` omitted or ``kind="server"`` runs inline on the api container
-exactly as before (``ran_from="server"``). ``kind="appliance"`` resolves
-the Fleet appliance row, re-validates server-side, and dispatches the
+Agent-perspective dispatch: every *reachability* tool (ping / traceroute /
+dig / port-test / tls-cert) accepts an optional ``target``. ``target``
+omitted or ``kind="server"`` runs inline on the api container exactly as
+before (``ran_from="server"``). ``kind="appliance"`` resolves the Fleet
+appliance row, re-validates server-side, and dispatches the
 already-validated job to the supervisor over the outbound poll channel
-(``ran_from="appliance:<name>"``). whois / mac-vendor / dns-propagation
-stay server-only and reject a non-server target.
+(``ran_from="appliance:<name>"``). ``kind="bgp_lg_collector"`` (#566
+Phase 4) resolves a ``LookingGlassCollector`` row to the ``Appliance`` it
+runs on and dispatches through the exact same channel, labelled
+``ran_from="looking_glass:<collector-name>"`` — see
+``_resolve_lg_collector_vantage`` / ``_dispatch_reachability``. whois /
+mac-vendor / dns-propagation stay server-only and reject a non-server
+target.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import time
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -62,6 +68,7 @@ from app.api.v1.tools.schemas import (
 from app.core.permissions import require_permission
 from app.models.appliance import Appliance
 from app.models.audit import AuditLog
+from app.models.bgp_looking_glass import LookingGlassCollector
 from app.models.settings import PlatformSettings
 from app.services import wol
 from app.services.appliance import agent_cmd
@@ -106,6 +113,11 @@ async def _dispatch_to_appliance[ResultT: BaseModel](
     db: DB,
     current_user: CurrentUser,
     allowed: frozenset[str] = agent_cmd.REACHABILITY_TOOLS,
+    appliance: Appliance | None = None,
+    vantage_label: str | None = None,
+    audit_resource_type: str = "appliance",
+    audit_resource_id: uuid.UUID | None = None,
+    audit_resource_display: str | None = None,
 ) -> ResultT:
     """Run a reachability tool FROM a Fleet appliance's vantage.
 
@@ -115,7 +127,11 @@ async def _dispatch_to_appliance[ResultT: BaseModel](
        guarantees this — only reachability endpoints call us — but we
        re-check so a future caller can't dispatch a server-only tool.)
        → 400.
-    b. Resolve the ``Appliance`` row. Unknown id → 404.
+    b. Resolve the ``Appliance`` row. Unknown id → 404. Skipped when
+       ``appliance`` is already supplied by the caller — see
+       ``_resolve_lg_collector_vantage`` (#566 Phase 4), which resolves a
+       collector-kind target to its owning appliance before calling in
+       here.
     c. RE-VALIDATE the request server-side through the SAME Pydantic
        schema the endpoint used (which re-runs ``assert_target_allowed``
        on every network-reaching field). We NEVER trust the supervisor
@@ -124,7 +140,12 @@ async def _dispatch_to_appliance[ResultT: BaseModel](
        → 502.
 
     Every appliance-targeted run is audit-logged (non-negotiable #4)
-    with the tool, the target appliance id+name, and the target host.
+    with the tool, the target host, and — by default — the appliance's
+    id/hostname. A caller dispatching on behalf of a different resource
+    (e.g. a Looking Glass collector) can override ``audit_resource_*`` /
+    ``vantage_label`` so the audit row + ``ran_from`` stamp describe the
+    resource the operator actually asked for, while the dispatch itself
+    still targets the resolved ``Appliance``.
     """
     # (a) dispatch gate — reachability tools by default; callers pass an
     # explicit allow-set for appliance-diagnostic tools (e.g. firewall_logs).
@@ -133,16 +154,18 @@ async def _dispatch_to_appliance[ResultT: BaseModel](
             status.HTTP_400_BAD_REQUEST,
             f"Tool {tool!r} cannot be run from an appliance vantage.",
         )
-    if target.id is None:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "target.id is required when target.kind is 'appliance'.",
-        )
 
-    # (b) resolve the appliance row.
-    appliance = await db.get(Appliance, target.id)
+    # (b) resolve the appliance row, unless the caller already resolved it
+    # (e.g. from a bgp_lg_collector target via _resolve_lg_collector_vantage).
     if appliance is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+        if target.id is None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "target.id is required when target.kind is 'appliance'.",
+            )
+        appliance = await db.get(Appliance, target.id)
+        if appliance is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
 
     # (c) re-validate the params server-side through the same schema.
     # The request that reached this handler was already validated by
@@ -173,11 +196,15 @@ async def _dispatch_to_appliance[ResultT: BaseModel](
             user_display_name=current_user.display_name,
             auth_source=current_user.auth_source,
             action="tools.run_from_appliance",
-            resource_type="appliance",
-            resource_id=str(appliance.id),
-            resource_display=appliance.hostname,
+            resource_type=audit_resource_type,
+            resource_id=str(audit_resource_id or appliance.id),
+            resource_display=audit_resource_display or appliance.hostname,
             result="success",
-            new_value={"tool": tool, "target_host": target_host},
+            new_value={
+                "tool": tool,
+                "target_host": target_host,
+                **({"appliance": appliance.hostname} if audit_resource_type != "appliance" else {}),
+            },
         )
     )
     await db.commit()
@@ -211,7 +238,101 @@ async def _dispatch_to_appliance[ResultT: BaseModel](
 
     result = result_model.model_validate(outcome.result)
     # Stamp the vantage label so the UI can show where it ran.
-    return result.model_copy(update={"ran_from": f"appliance:{appliance.hostname}"})
+    return result.model_copy(
+        update={"ran_from": vantage_label or f"appliance:{appliance.hostname}"}
+    )
+
+
+async def _resolve_lg_collector_vantage(
+    db: DB, collector_id: uuid.UUID | None
+) -> tuple[LookingGlassCollector, Appliance]:
+    """Resolve a ``bgp_lg_collector`` target to the ``Appliance`` it runs
+    on (#566 Phase 4).
+
+    The collector container runs ``network_mode: host`` / ``hostNetwork:
+    true`` (shares the node's network namespace with the supervisor), so
+    dispatching to its owning appliance's supervisor is an exact vantage
+    match, not an approximation.
+
+    Raises:
+        400 — ``collector_id`` missing, or the collector exists but isn't
+          appliance-managed (a standalone docker-compose/K8s collector has
+          no inbound command channel — see the Phase 4 spec's Part A3
+          decision; run from Server instead).
+        404 — collector not found, or its ``appliance_id`` FK is somehow
+          dangling (shouldn't happen — ``ON DELETE CASCADE`` — defensive
+          only).
+    """
+    if collector_id is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "target.id is required when target.kind is 'bgp_lg_collector'.",
+        )
+    collector = await db.get(LookingGlassCollector, collector_id)
+    if collector is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Collector not found.")
+    if collector.appliance_id is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Collector {collector.name!r} is not appliance-managed "
+            "(standalone docker/K8s deployment) and has no dispatchable "
+            "vantage — run from Server instead.",
+        )
+    appliance = await db.get(Appliance, collector.appliance_id)
+    if appliance is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "The collector's owning appliance was not found.",
+        )
+    return collector, appliance
+
+
+async def _dispatch_reachability[ResultT: BaseModel](
+    *,
+    tool: str,
+    body: BaseModel,
+    request_model: type[BaseModel],
+    result_model: type[ResultT],
+    db: DB,
+    current_user: CurrentUser,
+) -> ResultT | None:
+    """Dispatch a reachability tool off-server if ``body.target`` asks for
+    it; returns ``None`` when the caller should run the tool inline
+    (server vantage — today's default behaviour).
+
+    Centralises the ``appliance`` vs ``bgp_lg_collector`` branch (#566
+    Phase 4) so each reachability handler (ping/traceroute/dig/port-test/
+    tls-cert) doesn't hand-roll it.
+    """
+    target: NetToolTarget | None = getattr(body, "target", None)
+    if _server_target(target):
+        return None
+    assert target is not None
+    if target.kind == "bgp_lg_collector":
+        collector, appliance = await _resolve_lg_collector_vantage(db, target.id)
+        return await _dispatch_to_appliance(
+            tool=tool,
+            params=body.model_dump(mode="json"),
+            request_model=request_model,
+            result_model=result_model,
+            target=NetToolTarget(kind="appliance", id=appliance.id),
+            db=db,
+            current_user=current_user,
+            appliance=appliance,
+            vantage_label=f"looking_glass:{collector.name}",
+            audit_resource_type="looking_glass_collector",
+            audit_resource_id=collector.id,
+            audit_resource_display=collector.name,
+        )
+    return await _dispatch_to_appliance(
+        tool=tool,
+        params=body.model_dump(mode="json"),
+        request_model=request_model,
+        result_model=result_model,
+        target=target,
+        db=db,
+        current_user=current_user,
+    )
 
 
 # ── subprocess tools (default budget) ───────────────────────────────
@@ -239,17 +360,16 @@ def _reject_non_server(tool: str, target: NetToolTarget | None) -> None:
 async def ping(
     body: HostRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> CommandResult:
-    if not _server_target(body.target):
-        assert body.target is not None  # narrowed by _server_target
-        return await _dispatch_to_appliance(
-            tool="ping",
-            params=body.model_dump(mode="json"),
-            request_model=HostRequest,
-            result_model=CommandResult,
-            target=body.target,
-            db=db,
-            current_user=current_user,
-        )
+    dispatched = await _dispatch_reachability(
+        tool="ping",
+        body=body,
+        request_model=HostRequest,
+        result_model=CommandResult,
+        db=db,
+        current_user=current_user,
+    )
+    if dispatched is not None:
+        return dispatched
     try:
         return await run_ping(body.host)
     except NetToolArgError as exc:
@@ -260,17 +380,16 @@ async def ping(
 async def traceroute(
     body: HostRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> CommandResult:
-    if not _server_target(body.target):
-        assert body.target is not None
-        return await _dispatch_to_appliance(
-            tool="traceroute",
-            params=body.model_dump(mode="json"),
-            request_model=HostRequest,
-            result_model=CommandResult,
-            target=body.target,
-            db=db,
-            current_user=current_user,
-        )
+    dispatched = await _dispatch_reachability(
+        tool="traceroute",
+        body=body,
+        request_model=HostRequest,
+        result_model=CommandResult,
+        db=db,
+        current_user=current_user,
+    )
+    if dispatched is not None:
+        return dispatched
     try:
         return await run_traceroute(body.host)
     except NetToolArgError as exc:
@@ -294,17 +413,16 @@ async def mtr(body: HostRequest, _rl=RateLimitDefault) -> CommandResult:
 async def dig(
     body: DigRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> CommandResult:
-    if not _server_target(body.target):
-        assert body.target is not None
-        return await _dispatch_to_appliance(
-            tool="dig",
-            params=body.model_dump(mode="json"),
-            request_model=DigRequest,
-            result_model=CommandResult,
-            target=body.target,
-            db=db,
-            current_user=current_user,
-        )
+    dispatched = await _dispatch_reachability(
+        tool="dig",
+        body=body,
+        request_model=DigRequest,
+        result_model=CommandResult,
+        db=db,
+        current_user=current_user,
+    )
+    if dispatched is not None:
+        return dispatched
     try:
         return await run_dig(body.name, body.record_type, body.server)
     except NetToolArgError as exc:
@@ -329,17 +447,16 @@ async def whois(body: WhoisRequest, _rl=RateLimitOffprem) -> CommandResult:
 async def port_test(
     body: PortTestRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> PortTestResult:
-    if not _server_target(body.target):
-        assert body.target is not None
-        return await _dispatch_to_appliance(
-            tool="port-test",
-            params=body.model_dump(mode="json"),
-            request_model=PortTestRequest,
-            result_model=PortTestResult,
-            target=body.target,
-            db=db,
-            current_user=current_user,
-        )
+    dispatched = await _dispatch_reachability(
+        tool="port-test",
+        body=body,
+        request_model=PortTestRequest,
+        result_model=PortTestResult,
+        db=db,
+        current_user=current_user,
+    )
+    if dispatched is not None:
+        return dispatched
     return await test_port(body.host, body.port, body.protocol, body.timeout_seconds)
 
 
@@ -347,17 +464,16 @@ async def port_test(
 async def tls_cert(
     body: TlsCertRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> TlsCertResult:
-    if not _server_target(body.target):
-        assert body.target is not None
-        return await _dispatch_to_appliance(
-            tool="tls-cert",
-            params=body.model_dump(mode="json"),
-            request_model=TlsCertRequest,
-            result_model=TlsCertResult,
-            target=body.target,
-            db=db,
-            current_user=current_user,
-        )
+    dispatched = await _dispatch_reachability(
+        tool="tls-cert",
+        body=body,
+        request_model=TlsCertRequest,
+        result_model=TlsCertResult,
+        db=db,
+        current_user=current_user,
+    )
+    if dispatched is not None:
+        return dispatched
     return await inspect_tls_cert(body.host, body.port, body.server_name, body.timeout_seconds)
 
 

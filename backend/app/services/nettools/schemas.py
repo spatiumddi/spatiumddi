@@ -186,12 +186,20 @@ def validate_host_or_cidr(value: str) -> str:
 # ``kind="appliance"`` dispatches the (server-re-validated) job to a
 # supervisor-managed Fleet appliance over the existing outbound poll
 # channel and labels the result ``ran_from="appliance:<name>"``.
+# ``kind="bgp_lg_collector"`` (#566 Phase 4) resolves ``id`` to a
+# ``LookingGlassCollector`` row and dispatches to the appliance it runs on
+# (the collector container shares the node's network namespace via
+# ``network_mode: host`` / ``hostNetwork: true``), labelling the result
+# ``ran_from="looking_glass:<collector-name>"``. Rejected with a 400 when
+# the collector isn't appliance-managed (standalone docker/K8s deployment
+# — no dispatchable command channel).
 #
 # The ``Literal`` already lists ``dns_agent`` / ``dhcp_agent`` so the
 # wire shape is forward-compatible: the DNS / DHCP service-container
 # vantage is a deferred follow-up (the router rejects those kinds until
 # their dispatch path lands), but a client serialising one today won't
-# fail validation. Only ``server`` + ``appliance`` are wired in this PR.
+# fail validation. Only ``server`` + ``appliance`` + ``bgp_lg_collector``
+# are wired today.
 
 
 class NetToolTarget(BaseModel):
@@ -199,10 +207,13 @@ class NetToolTarget(BaseModel):
 
     ``id`` identifies the appliance (or, later, the DNS/DHCP agent) row
     when ``kind != "server"``; it's ignored — and may be omitted — for
-    ``kind="server"``.
+    ``kind="server"``. ``kind="bgp_lg_collector"`` (#566 Phase 4) resolves
+    ``id`` to a ``LookingGlassCollector`` row and dispatches to the
+    appliance it runs on — see ``app.api.v1.tools.router
+    ._resolve_lg_collector_vantage``.
     """
 
-    kind: Literal["server", "appliance", "dns_agent", "dhcp_agent"] = "server"
+    kind: Literal["server", "appliance", "dns_agent", "dhcp_agent", "bgp_lg_collector"] = "server"
     id: uuid.UUID | None = None
 
 

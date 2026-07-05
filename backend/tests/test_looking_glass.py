@@ -266,6 +266,64 @@ async def test_routes_search_filters(client: AsyncClient, db_session: AsyncSessi
     assert len(items) == 1 and items[0]["prefix"] == "10.0.1.0/24"
 
 
+@pytest.mark.asyncio
+async def test_routes_as_path_regexp_filter(client: AsyncClient, db_session: AsyncSession) -> None:
+    """#566 Phase 4 — the ``_`` boundary-token AS-path regexp filter."""
+    _, token = await _make_admin(db_session)
+    col = await _make_collector(db_session)
+    peer = await _make_peer(db_session, col)
+    await ingest_routes(
+        db_session,
+        peer,
+        [
+            # 65001 appears as origin (last hop).
+            _route("10.0.0.0/24", origin_asn=65001, as_path=[65003, 65001]),
+            # 65001 appears mid-path only, not as origin.
+            _route("10.0.1.0/24", origin_asn=65002, as_path=[65001, 65002]),
+            # 65001 doesn't appear at all.
+            _route("10.0.2.0/24", origin_asn=65004, as_path=[65004]),
+        ],
+        snapshot=True,
+    )
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {token}"}
+
+    # "_65001_" — anywhere in the path — matches the first two routes.
+    resp = await client.get("/api/v1/looking-glass/routes?as_path_regexp=_65001_", headers=hdr)
+    assert resp.status_code == 200, resp.text
+    prefixes = {r["prefix"] for r in resp.json()["items"]}
+    assert prefixes == {"10.0.0.0/24", "10.0.1.0/24"}
+
+    # A pattern with no matches at all.
+    resp = await client.get("/api/v1/looking-glass/routes?as_path_regexp=_65999_", headers=hdr)
+    assert resp.status_code == 200
+    assert resp.json()["items"] == []
+
+    # "_65001$" — origin (last hop) only — matches ONLY the route where 65001
+    # is the origin, not the one where it's mid-path. Regression: the rendered
+    # path text must be trimmed/collapsed so the trailing "]" space doesn't
+    # defeat the "$" anchor.
+    resp = await client.get("/api/v1/looking-glass/routes?as_path_regexp=_65001$", headers=hdr)
+    assert resp.status_code == 200, resp.text
+    assert {r["prefix"] for r in resp.json()["items"]} == {"10.0.0.0/24"}
+
+    # "^65001" — first hop only — matches ONLY the route starting with 65001.
+    resp = await client.get("/api/v1/looking-glass/routes?as_path_regexp=^65001", headers=hdr)
+    assert resp.status_code == 200
+    assert {r["prefix"] for r in resp.json()["items"]} == {"10.0.1.0/24"}
+
+
+@pytest.mark.asyncio
+async def test_routes_as_path_regexp_malformed_422(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A malformed regexp (unbalanced paren) 422s instead of 500ing."""
+    _, token = await _make_admin(db_session)
+    hdr = {"Authorization": f"Bearer {token}"}
+    resp = await client.get("/api/v1/looking-glass/routes?as_path_regexp=(unbalanced", headers=hdr)
+    assert resp.status_code == 422, resp.text
+
+
 # ── agent register + routes push (end-to-end, real JWT) ─────────────────
 
 

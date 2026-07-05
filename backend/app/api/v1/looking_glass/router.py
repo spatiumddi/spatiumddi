@@ -41,6 +41,7 @@ CLAUDE.md non-negotiable #4.
 from __future__ import annotations
 
 import ipaddress
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -60,6 +61,7 @@ from app.models.auth import User
 from app.models.bgp_looking_glass import BGPLGPeer, BGPLGRoute, LookingGlassCollector
 from app.models.network import NetworkDevice
 from app.services.bgp.hijack_monitor import RPKI_INVALID
+from app.services.looking_glass.as_path_query import as_path_regexp_clause
 from app.services.looking_glass.reverse_lookup import best_route_for_ip
 
 from .schemas import (
@@ -444,6 +446,15 @@ async def list_routes(
     prefix: str | None = Query(None, description="contains-or-within CIDR match"),
     origin_asn: int | None = None,
     community: str | None = Query(None, description="matches communities or large_communities"),
+    as_path_regexp: str | None = Query(
+        None,
+        max_length=128,
+        description=(
+            "AS-path regex (Cisco/Juniper '_' boundary convention), matched "
+            "against the space-joined AS path — e.g. '_65001_' (anywhere) or "
+            "'65001_$' (origin). See as_path_query.translate_as_path_regexp."
+        ),
+    ),
     rpki_status: str | None = None,
     peer_id: uuid.UUID | None = None,
     matched_block_id: uuid.UUID | None = None,
@@ -461,6 +472,9 @@ async def list_routes(
     Mirrors ``GET /ipam/addresses/search``'s ``{items,total}`` envelope —
     the RIB is "low thousands" scoped per issue #566's v1 design, so
     server-side pagination (not client windowing) is the right shape.
+    ``as_path_regexp`` (#566 Phase 4) matches the Cisco/Juniper ``_``
+    boundary-token convention against the space-joined AS path — see
+    ``app.services.looking_glass.as_path_query``.
     """
     q = select(BGPLGRoute)
 
@@ -478,6 +492,11 @@ async def list_routes(
                 BGPLGRoute.large_communities.contains([community]),
             )
         )
+    if as_path_regexp:
+        try:
+            q = q.where(as_path_regexp_clause(as_path_regexp))
+        except re.error as exc:
+            raise HTTPException(status_code=422, detail=f"invalid as_path_regexp: {exc}") from exc
     if rpki_status:
         q = q.where(BGPLGRoute.rpki_status == rpki_status)
     if peer_id is not None:

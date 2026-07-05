@@ -20,12 +20,15 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.tools.schemas import CommandResult, PortTestResult, TlsCertResult
 from app.core.security import create_access_token, hash_password
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
+from app.models.audit import AuditLog
 from app.models.auth import Group, Role, User
+from app.models.bgp_looking_glass import LookingGlassCollector
 from app.models.feature_module import FeatureModule
 from app.services import feature_modules
 from app.services.appliance import agent_cmd
@@ -118,6 +121,24 @@ async def _make_appliance(
     db.add(appliance)
     await db.flush()
     return appliance
+
+
+async def _make_lg_collector(
+    db: AsyncSession, *, appliance_id: uuid.UUID | None = None
+) -> LookingGlassCollector:
+    """Create a Looking Glass collector row (#566 Phase 4 vantage tests).
+    ``appliance_id=None`` (the default) is a standalone / non-appliance-
+    managed collector — no dispatchable vantage."""
+    collector = LookingGlassCollector(
+        name=f"col-{uuid.uuid4().hex[:6]}",
+        agent_id=uuid.uuid4().hex,
+        agent_registered=True,
+        status="active",
+        appliance_id=appliance_id,
+    )
+    db.add(collector)
+    await db.flush()
+    return collector
 
 
 async def test_ping_200_with_perm(client: AsyncClient, db_session: AsyncSession) -> None:
@@ -464,3 +485,109 @@ async def test_server_target_explicit_still_runs_inline(
     assert r.status_code == 200, r.text
     assert r.json()["ran_from"] == "server"
     mock_enqueue.assert_not_awaited()
+
+
+# ── bgp_lg_collector vantage (#566 Phase 4) ──────────────────────────
+
+
+async def test_bgp_lg_collector_target_not_appliance_managed_400(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A standalone (non-appliance-managed) collector has no dispatchable
+    vantage — reject with a clear 400 rather than silently running on the
+    server or 500ing on a missing appliance."""
+    _, token = await _make_superadmin(db_session)
+    collector = await _make_lg_collector(db_session)  # appliance_id=None
+    with (
+        patch("app.api.v1.tools.router.agent_cmd.enqueue_command", AsyncMock()) as mock_enqueue,
+        patch(
+            "app.services.nettools.throttle.make_async_redis",
+            return_value=_no_limit_redis(),
+        ),
+    ):
+        r = await client.post(
+            "/api/v1/tools/ping",
+            json={
+                "host": "1.1.1.1",
+                "target": {"kind": "bgp_lg_collector", "id": str(collector.id)},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert r.status_code == 400, r.text
+    assert "not appliance-managed" in r.json()["detail"]
+    mock_enqueue.assert_not_awaited()
+
+
+async def test_bgp_lg_collector_target_unknown_collector_404(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_superadmin(db_session)
+    with patch(
+        "app.services.nettools.throttle.make_async_redis",
+        return_value=_no_limit_redis(),
+    ):
+        r = await client.post(
+            "/api/v1/tools/traceroute",
+            json={
+                "host": "1.1.1.1",
+                "target": {"kind": "bgp_lg_collector", "id": str(uuid.uuid4())},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert r.status_code == 404, r.text
+
+
+async def test_bgp_lg_collector_target_dispatches_and_labels_ran_from(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An appliance-managed collector dispatches through the exact same
+    ``agent_cmd`` channel as an ``appliance`` target, but the result is
+    labelled with the collector's vantage and the audit row's resource is
+    the collector (not the appliance)."""
+    _, token = await _make_superadmin(db_session)
+    appliance = await _make_appliance(db_session)
+    collector = await _make_lg_collector(db_session, appliance_id=appliance.id)
+
+    supervisor_result = agent_cmd.NetToolResult(
+        request_id="x",
+        result={"tool": "ping", "argv": ["ping"], "available": True, "exit_code": 0},
+    )
+    with (
+        patch(
+            "app.api.v1.tools.router.agent_cmd.enqueue_command",
+            AsyncMock(return_value=supervisor_result),
+        ) as mock_enqueue,
+        patch(
+            "app.services.nettools.throttle.make_async_redis",
+            return_value=_no_limit_redis(),
+        ),
+    ):
+        r = await client.post(
+            "/api/v1/tools/ping",
+            json={
+                "host": "1.1.1.1",
+                "target": {"kind": "bgp_lg_collector", "id": str(collector.id)},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["available"] is True
+    assert body["ran_from"] == f"looking_glass:{collector.name}"
+
+    # Dispatched to the collector's owning appliance.
+    mock_enqueue.assert_awaited_once()
+    call = mock_enqueue.await_args
+    assert call.args[0] == appliance.id
+
+    # Audit row's resource is the collector, not the appliance — but the
+    # appliance hostname is still captured for traceability.
+    row = (
+        await db_session.execute(
+            select(AuditLog).where(AuditLog.action == "tools.run_from_appliance")
+        )
+    ).scalar_one()
+    assert row.resource_type == "looking_glass_collector"
+    assert row.resource_id == str(collector.id)
+    assert row.resource_display == collector.name
+    assert row.new_value["appliance"] == appliance.hostname

@@ -12621,7 +12621,7 @@ export const pcapApi = {
 // Fleet appliance's supervisor. The matching result carries
 // ``ran_from`` ("server" or "appliance:<hostname>").
 export interface NetToolTarget {
-  kind: "server" | "appliance";
+  kind: "server" | "appliance" | "bgp_lg_collector";
   id: string;
 }
 
@@ -12694,10 +12694,13 @@ export interface NetToolWolResult {
 }
 
 // Fold the routing-only ``target`` into a reachability-tool body only
-// when it points at an appliance — a "server" target (or none) is the
-// back-compatible inline run, so we omit the field entirely.
+// when it points somewhere other than the control-plane server — a
+// "server" target (or none) is the back-compatible inline run, so we
+// omit the field entirely. ``appliance`` and ``bgp_lg_collector`` (#566
+// Phase 4 — ping/traceroute from a Looking Glass collector's vantage)
+// both ride the wire the same way.
 function withTarget<T extends object>(body: T, target?: NetToolTarget): T {
-  if (target && target.kind === "appliance") {
+  if (target && target.kind !== "server") {
     return { ...body, target };
   }
   return body;
@@ -13279,6 +13282,11 @@ export interface BGPLGRouteQuery {
   best_path_only?: boolean;
   /** Withdrawn routes are hidden by default. */
   withdrawn?: boolean;
+  /** AS-path regex ('_' boundary convention), matched against the
+   *  space-joined AS path — e.g. '_65001_' (anywhere) or '65001_$'-style
+   *  (near the end, i.e. toward the origin AS). See the Query tab's
+   *  ``show route regexp`` command (#566 Phase 4). */
+  as_path_regexp?: string;
   limit?: number;
   offset?: number;
 }
