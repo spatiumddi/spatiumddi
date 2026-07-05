@@ -19,10 +19,12 @@ import {
 import { HeaderButton } from "@/components/ui/header-button";
 import { RdapPanel } from "@/components/network/rdap-panel";
 import { cn } from "@/lib/utils";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { CommunitiesTab } from "./CommunitiesTab";
 import { PeeringsTab } from "./PeeringsTab";
 import { BgpFootprintTab } from "./BgpFootprintTab";
 import { BgpMonitorTab } from "./BgpMonitorTab";
+import { LearnedRoutesTab } from "./LearnedRoutesTab";
 
 import { errMsg, humanTime } from "./_shared";
 
@@ -31,6 +33,7 @@ type Tab =
   | "rpki"
   | "footprint"
   | "monitor"
+  | "learned"
   | "bgp"
   | "communities"
   | "ipam"
@@ -129,6 +132,7 @@ export function AsnDetailPage() {
   const { id = "" } = useParams<{ id: string }>();
   const qc = useQueryClient();
   const [tab, setTab] = useState<Tab>("whois");
+  const { enabled: featureEnabled } = useFeatureModules();
 
   const {
     data: asn,
@@ -256,6 +260,13 @@ export function AsnDetailPage() {
     ["rpki", "RPKI ROAs"],
     ["footprint", "BGP Footprint"],
     ["monitor", "BGP Monitoring"],
+    // Learned Routes (issue #566 Phase 3) — the internal Looking Glass
+    // RIB view, next to BGP Monitoring's external hijack-detection view.
+    // Hidden when network.looking_glass is off, unlike the tabs above
+    // which all sit behind this page's own network.asn module.
+    ...(featureEnabled("network.looking_glass")
+      ? ([["learned", "Learned Routes"]] as Array<[Tab, string]>)
+      : []),
     ["bgp", "BGP Peering"],
     ["communities", "Communities"],
     ["ipam", "IP Spaces / Blocks"],
@@ -507,6 +518,10 @@ export function AsnDetailPage() {
         )}
 
         {tab === "monitor" && <BgpMonitorTab asnId={id} asnKind={asn.kind} />}
+
+        {tab === "learned" && (
+          <LearnedRoutesTab asnNumber={asn.number} asnId={id} />
+        )}
 
         {tab === "bgp" && <PeeringsTab asnId={id} />}
 

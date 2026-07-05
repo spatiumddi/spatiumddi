@@ -19,6 +19,14 @@ guard, differing only in the withdrawal semantics:
    the #527 hijack monitor, deduped per distinct ``(prefix, origin_asn)``
    so a full snapshot makes one ROA lookup per unique announcement, not
    one per path.
+ * ``matched_{block,subnet,space,asn,vrf}_id`` are resolved at ingest via
+   ``app.services.looking_glass.ipam_link.resolve_route_links`` against a
+   TTL-cached preload of the IPAM tree + ASN catalog (issue #566 Phase 3).
+   This is the write path the columns were shipped for in Phase 1 — see
+   that module for the containment/inheritance semantics. A periodic
+   re-resolve sweep (``app.tasks.looking_glass.reresolve_route_links``)
+   re-runs the same matcher over every active route so an IPAM edit made
+   between RIB pushes still converges within a few minutes.
  * **Absence-withdraw (full snapshot only):** every tracked row for this
    peer with ``withdrawn_at IS NULL`` that is NOT in the wire set has left
    the peer's feed — set ``withdrawn_at=now()`` and bump ``flap_count``.
@@ -49,6 +57,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.bgp_looking_glass import BGPLGPeer, BGPLGRoute
 from app.services.bgp.hijack_monitor import derive_rpki_status_batch
+from app.services.looking_glass.ipam_link import (
+    get_resolution_cache,
+    resolve_route_links,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -145,6 +157,12 @@ async def ingest_routes(
     }
     rpki_cache = await derive_rpki_status_batch(db, rpki_pairs)
 
+    # ── IPAM / ASN / VRF linkage — one preload for the whole snapshot ────
+    # (TTL-cached — see ipam_link.py's module docstring for why a fresh
+    # subnet+block+space+ASN scan per ingest call would scale with peer
+    # count for no benefit.)
+    link_cache = await get_resolution_cache(db)
+
     # ── Upsert every wire path ───────────────────────────────────────────
     wire_keys: set[tuple[str, str]] = set()
     for r in valid:
@@ -153,6 +171,7 @@ async def ingest_routes(
         wire_keys.add((prefix, next_hop))
         origin = r.get("origin_asn")
         rpki = rpki_cache.get((prefix, int(origin)), "unknown") if origin is not None else "unknown"
+        links = resolve_route_links(link_cache, prefix, origin)
 
         row = by_key.get((prefix, next_hop))
         if row is None:
@@ -171,6 +190,11 @@ async def ingest_routes(
                         ext_communities=list(r.get("ext_communities") or []),
                         rpki_status=rpki,
                         is_best=bool(r.get("is_best", False)),
+                        matched_block_id=links.block_id,
+                        matched_subnet_id=links.subnet_id,
+                        matched_space_id=links.space_id,
+                        matched_asn_id=links.asn_id,
+                        matched_vrf_id=links.vrf_id,
                         first_seen_at=now,
                         last_seen_at=now,
                     )
@@ -187,6 +211,11 @@ async def ingest_routes(
                 row.ext_communities = list(r.get("ext_communities") or [])
                 row.rpki_status = rpki
                 row.is_best = bool(r.get("is_best", False))
+                row.matched_block_id = links.block_id
+                row.matched_subnet_id = links.subnet_id
+                row.matched_space_id = links.space_id
+                row.matched_asn_id = links.asn_id
+                row.matched_vrf_id = links.vrf_id
                 row.last_seen_at = now
                 # Re-announce of a previously-withdrawn path — clear the marker.
                 row.withdrawn_at = None

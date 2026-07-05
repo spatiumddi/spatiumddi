@@ -13271,11 +13271,24 @@ export interface BGPLGRouteQuery {
   community?: string;
   rpki_status?: BGPLGRpkiStatus;
   peer_id?: string;
+  matched_block_id?: string;
+  matched_subnet_id?: string;
+  matched_space_id?: string;
+  matched_asn_id?: string;
+  matched_vrf_id?: string;
   best_path_only?: boolean;
   /** Withdrawn routes are hidden by default. */
   withdrawn?: boolean;
   limit?: number;
   offset?: number;
+}
+
+/** GET /looking-glass/routes/for-ip — reverse LPM-by-address lookup. */
+export interface BGPLGRouteForIpResponse {
+  ip: string;
+  found: boolean;
+  route: BGPLGRoute | null;
+  alternate_paths_count: number;
 }
 
 export const lookingGlassApi = {
@@ -13317,6 +13330,13 @@ export const lookingGlassApi = {
     api
       .get<BGPLGRoute[]>("/looking-glass/routes/by-prefix", {
         params: { prefix },
+      })
+      .then((r) => r.data),
+  /** Reverse LPM-by-address lookup — "what route covers this IP?" */
+  routeForIp: (ip: string) =>
+    api
+      .get<BGPLGRouteForIpResponse>("/looking-glass/routes/for-ip", {
+        params: { ip },
       })
       .then((r) => r.data),
 };

@@ -145,6 +145,14 @@ celery_app.conf.update(
             "task": "app.tasks.looking_glass.collector_stale_sweep",
             "schedule": schedule(run_every=60.0),
         },
+        # Every 5 min, re-run the IPAM/ASN/VRF matcher over every active
+        # Looking Glass route — catches IPAM edits made between RIB
+        # pushes that a route's own re-announce wouldn't otherwise
+        # trigger a fresh resolve for (#566 Phase 3).
+        "lg-route-reresolve-sweep": {
+            "task": "app.tasks.looking_glass.reresolve_route_links",
+            "schedule": schedule(run_every=300.0),
+        },
         # Every 60s, fan-out health checks to every registered DNS server.
         "dns-health-sweep": {
             "task": "app.tasks.dns.check_all_dns_servers_health",

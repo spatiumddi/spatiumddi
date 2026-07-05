@@ -22,10 +22,13 @@ Endpoints:
   instead of waiting for the 12s safety tick.
 * ``/sessions`` — read-only per-peer runtime-state rollup (collector +
   peer joined), the Sessions-tab feed.
-* ``/routes`` — the learned RIB, server-paginated + filterable. ``/routes``
-  (list) and ``/routes/by-prefix?prefix=`` (all paths for one exact prefix,
-  the CIDR passed as a query param so its slash / IPv6 colons encode cleanly)
-  are distinct URL shapes so there's no route collision.
+* ``/routes`` — the learned RIB, server-paginated + filterable, including by
+  the ``matched_{block,subnet,space,asn,vrf}_id`` linkage columns populated by
+  ``app.services.looking_glass.ipam_link`` (issue #566 Phase 3). ``/routes``
+  (list), ``/routes/by-prefix?prefix=`` (all paths for one exact prefix, the
+  CIDR passed as a query param so its slash / IPv6 colons encode cleanly), and
+  ``/routes/for-ip?ip=`` (reverse LPM-by-single-address, Phase 3) are distinct
+  URL shapes so there's no route collision.
 
 Every write handler writes an ``AuditLog`` row before ``commit()`` per
 CLAUDE.md non-negotiable #4.
@@ -52,6 +55,7 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.bgp_looking_glass import BGPLGPeer, BGPLGRoute, LookingGlassCollector
 from app.models.network import NetworkDevice
+from app.services.looking_glass.reverse_lookup import best_route_for_ip
 
 from .schemas import (
     CollectorRead,
@@ -59,6 +63,7 @@ from .schemas import (
     PeerCreate,
     PeerRead,
     PeerUpdate,
+    RouteForIpResponse,
     RouteListResponse,
     RouteRead,
     SessionRead,
@@ -435,6 +440,11 @@ async def list_routes(
     community: str | None = Query(None, description="matches communities or large_communities"),
     rpki_status: str | None = None,
     peer_id: uuid.UUID | None = None,
+    matched_block_id: uuid.UUID | None = None,
+    matched_subnet_id: uuid.UUID | None = None,
+    matched_space_id: uuid.UUID | None = None,
+    matched_asn_id: uuid.UUID | None = None,
+    matched_vrf_id: uuid.UUID | None = None,
     best_path_only: bool = False,
     withdrawn: bool = Query(False, description="include withdrawn routes (hidden by default)"),
     limit: int = Query(default=100, ge=1, le=1000),
@@ -466,6 +476,16 @@ async def list_routes(
         q = q.where(BGPLGRoute.rpki_status == rpki_status)
     if peer_id is not None:
         q = q.where(BGPLGRoute.peer_id == peer_id)
+    if matched_block_id is not None:
+        q = q.where(BGPLGRoute.matched_block_id == matched_block_id)
+    if matched_subnet_id is not None:
+        q = q.where(BGPLGRoute.matched_subnet_id == matched_subnet_id)
+    if matched_space_id is not None:
+        q = q.where(BGPLGRoute.matched_space_id == matched_space_id)
+    if matched_asn_id is not None:
+        q = q.where(BGPLGRoute.matched_asn_id == matched_asn_id)
+    if matched_vrf_id is not None:
+        q = q.where(BGPLGRoute.matched_vrf_id == matched_vrf_id)
     if best_path_only:
         q = q.where(BGPLGRoute.is_best.is_(True))
     if not withdrawn:
@@ -508,3 +528,24 @@ async def get_route(
     q = q.order_by(BGPLGRoute.peer_id)
     rows = (await db.execute(q)).scalars().all()
     return [_route_to_read(r) for r in rows]
+
+
+@router.get("/routes/for-ip", response_model=RouteForIpResponse)
+async def get_route_for_ip(
+    db: DB,
+    _: CurrentUser,
+    ip: str = Query(..., description="A single IP address, v4 or v6."),
+) -> RouteForIpResponse:
+    """Reverse longest-prefix-match: which active route covers this one IP
+    address? Feeds the IP detail modal's "covering BGP route" section
+    (issue #566 Phase 3). Shares its LPM implementation with the
+    ``find_bgp_route_for_ip`` MCP tool via ``reverse_lookup.best_route_for_ip``
+    so the two surfaces can't drift.
+    """
+    result = await best_route_for_ip(db, ip)
+    if result is None:
+        return RouteForIpResponse(ip=ip, found=False)
+    route, alt_count = result
+    return RouteForIpResponse(
+        ip=ip, found=True, route=_route_to_read(route), alternate_paths_count=alt_count
+    )

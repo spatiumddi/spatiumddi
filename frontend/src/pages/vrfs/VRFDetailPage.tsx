@@ -2,12 +2,20 @@ import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, Loader2, Pencil, Route as RouteIcon } from "lucide-react";
-import { asnsApi, ipamApi, vrfsApi } from "@/lib/api";
+import {
+  asnsApi,
+  ipamApi,
+  lookingGlassApi,
+  vrfsApi,
+  type VRF,
+} from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { BgpRouteMiniTable } from "@/components/network/bgp-route-table";
 import { VRFEditorModal } from "./VRFsPage";
 
-type Tab = "spaces" | "blocks";
+type Tab = "spaces" | "blocks" | "routes";
 
 function Card({
   title,
@@ -38,6 +46,49 @@ function RtChips({ values }: { values: string[] }) {
           {v}
         </span>
       ))}
+    </div>
+  );
+}
+
+// Issue #566 Phase 3 — "matched_vrf_id" means "the VRF assigned to
+// whichever IPAM block/space this route's prefix falls under" (the
+// effective-VRF walk in backend/app/services/looking_glass/ipam_link.py),
+// NOT an RD/RT match against this VRF's import/export targets — there's
+// no VPNv4/VPNv6 AFI data to parse yet (ext_communities parsing is a
+// deferred later phase). Don't imply a match/no-match badge against the
+// RTs above; this panel just lists routes whose matched IPAM footprint
+// happens to sit in this VRF.
+function VrfRoutesPanel({ vrf }: { vrf: VRF }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ["bgp-lg-routes-by-vrf", vrf.id],
+    queryFn: () =>
+      lookingGlassApi.searchRoutes({
+        matched_vrf_id: vrf.id,
+        withdrawn: false,
+        limit: 200,
+      }),
+    staleTime: 15_000,
+  });
+  if (isLoading) {
+    return <p className="p-6 text-sm text-muted-foreground">Loading…</p>;
+  }
+  const items = data?.items ?? [];
+  if (items.length === 0) {
+    return (
+      <div className="flex flex-col items-center gap-2 p-10 text-center">
+        <p className="text-sm text-muted-foreground">
+          No BGP routes matched to this VRF's IPAM footprint.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-muted-foreground">
+        Every active BGP Looking Glass route whose matched IPAM block or space
+        carries this VRF.
+      </p>
+      <BgpRouteMiniTable items={items} />
     </div>
   );
 }
@@ -80,6 +131,7 @@ export function VRFDetailPage() {
   const { id = "" } = useParams<{ id: string }>();
   const [tab, setTab] = useState<Tab>("spaces");
   const [showEdit, setShowEdit] = useState(false);
+  const { enabled: featureEnabled } = useFeatureModules();
 
   const {
     data: vrf,
@@ -177,6 +229,9 @@ export function VRFDetailPage() {
             [
               ["spaces", `IP Spaces (${spaces.length})`],
               ["blocks", `IP Blocks (${blocks.length})`],
+              ...(featureEnabled("network.looking_glass")
+                ? [["routes", "Routes"] as [Tab, string]]
+                : []),
             ] as Array<[Tab, string]>
           ).map(([key, label]) => (
             <button
@@ -347,6 +402,8 @@ export function VRFDetailPage() {
             )}
           </div>
         )}
+
+        {tab === "routes" && <VrfRoutesPanel vrf={vrf} />}
       </div>
 
       {showEdit && (

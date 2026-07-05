@@ -340,3 +340,16 @@ class RouteListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class RouteForIpResponse(BaseModel):
+    """``GET /looking-glass/routes/for-ip`` — reverse LPM-by-address lookup.
+
+    Mirrors the ``find_bgp_route_for_ip`` MCP tool's response shape (see
+    ``app.services.ai.tools.bgp_lg``) so the two surfaces stay in sync.
+    """
+
+    ip: str
+    found: bool
+    route: RouteRead | None = None
+    alternate_paths_count: int = 0

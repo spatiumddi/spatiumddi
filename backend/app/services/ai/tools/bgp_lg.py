@@ -45,6 +45,11 @@ def _route_dict(row: BGPLGRoute) -> dict[str, Any]:
         "ext_communities": list(row.ext_communities or []),
         "rpki_status": row.rpki_status,
         "is_best": row.is_best,
+        "matched_block_id": str(row.matched_block_id) if row.matched_block_id else None,
+        "matched_subnet_id": str(row.matched_subnet_id) if row.matched_subnet_id else None,
+        "matched_space_id": str(row.matched_space_id) if row.matched_space_id else None,
+        "matched_asn_id": str(row.matched_asn_id) if row.matched_asn_id else None,
+        "matched_vrf_id": str(row.matched_vrf_id) if row.matched_vrf_id else None,
         "first_seen_at": row.first_seen_at.isoformat() if row.first_seen_at else None,
         "last_seen_at": row.last_seen_at.isoformat() if row.last_seen_at else None,
         "withdrawn_at": row.withdrawn_at.isoformat() if row.withdrawn_at else None,
@@ -269,42 +274,23 @@ class FindBgpRouteForIpArgs(BaseModel):
 async def find_bgp_route_for_ip(
     db: AsyncSession, user: User, args: FindBgpRouteForIpArgs
 ) -> dict[str, Any]:
-    try:
-        ip_obj = ipaddress.ip_address(args.ip)
-    except ValueError:
-        return {"ip": args.ip, "found": False, "note": "not a valid IP address"}
+    from app.services.looking_glass.reverse_lookup import best_route_for_ip  # noqa: PLC0415
 
-    stmt = select(BGPLGRoute).where(
-        BGPLGRoute.prefix.op(">>=")(str(ip_obj)),
-        BGPLGRoute.withdrawn_at.is_(None),
-    )
-    rows = (await db.execute(stmt)).scalars().all()
-
-    covering = []
-    for row in rows:
+    result = await best_route_for_ip(db, args.ip)
+    if result is None:
         try:
-            net = ipaddress.ip_network(str(row.prefix), strict=False)
+            ipaddress.ip_address(args.ip)
+            note = "no covering route in the current RIB"
         except ValueError:
-            continue
-        if net.version != ip_obj.version:
-            continue
-        if ip_obj not in net:
-            continue
-        covering.append((net, row))
+            note = "not a valid IP address"
+        return {"ip": args.ip, "found": False, "note": note}
 
-    if not covering:
-        return {"ip": args.ip, "found": False, "note": "no covering route in the current RIB"}
-
-    # Deterministic tie-break: longest prefix wins; among ties prefer the
-    # best path, then order by peer id so the result never depends on
-    # iteration/DB order (mirrors the RIS Live _match_tracked() precedent).
-    covering.sort(key=lambda t: (-t[0].prefixlen, 0 if t[1].is_best else 1, str(t[1].peer_id)))
-    net, best = covering[0]
-    result = _route_dict(best)
-    result["ip"] = args.ip
-    result["found"] = True
-    result["alternate_paths_count"] = len(covering) - 1
-    return result
+    best, alt_count = result
+    out = _route_dict(best)
+    out["ip"] = args.ip
+    out["found"] = True
+    out["alternate_paths_count"] = alt_count
+    return out
 
 
 # ── find_bgp_lg_sessions ─────────────────────────────────────────────
