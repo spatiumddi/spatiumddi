@@ -8,7 +8,7 @@
 # global default-export-policy is always "reject-route" and no
 # export-policy-list is ever populated, so the daemon can receive routes
 # from every configured peer but can never advertise one back.
-ARG GOBGP_VERSION=4.5.0
+ARG GOBGP_VERSION=4.7.0
 
 FROM alpine:3.22 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
@@ -18,34 +18,40 @@ COPY agent/looking-glass/spatium_lg_agent /src/spatium_lg_agent
 COPY agent/looking-glass/README.md /src/README.md
 RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packages .
 
-# ── GoBGP binaries ──────────────────────────────────────────────────────
-# No apk/apt package exists upstream (GoBGP is not packaged by Alpine or
-# Debian), so fetch the official prebuilt release tarball straight from
-# GitHub Releases and verify it against a pinned SHA-256 for both
-# amd64 + arm64 (docker buildx sets TARGETARCH automatically per platform
-# in the multi-arch build below). gobgp/gobgpd are statically-linked
-# pure-Go binaries (verified via `file`/`ldd` during development — no
-# dynamic deps), so they drop straight into an Alpine (musl) runtime with
-# no compatibility shims needed.
+# ── GoBGP binaries — built from source ──────────────────────────────────
+# GoBGP ships no apk/apt package, and its prebuilt release binaries are
+# compiled with whatever Go toolchain upstream had at release time — so the
+# embedded ``stdlib`` carries every Go CVE disclosed AFTER that build (Trivy
+# scans the Go version baked into the binary and fails HIGH/CRITICAL). We
+# therefore build gobgp/gobgpd from the pinned source tag with the CURRENT Go
+# toolchain, which keeps the embedded stdlib on the latest patch (CVE-clean)
+# independent of GoBGP's own release cadence. gobgp/gobgpd are pure-Go, so
+# CGO_ENABLED=0 yields fully static binaries that drop straight into the
+# Alpine (musl) runtime with no shims.
 #
-# Bump GOBGP_VERSION + both SHA256 pins together from
-# https://github.com/osrg/gobgp/releases/download/v<version>/gobgp_<version>_checksums.txt
-FROM alpine:3.22 AS gobgp-fetch
+# ``--platform=$BUILDPLATFORM`` + GOOS/GOARCH from the buildx TARGET* args
+# cross-compiles with the native toolchain (fast, no QEMU) for both
+# linux/amd64 + linux/arm64. Bump GOBGP_VERSION (a git tag from
+# https://github.com/osrg/gobgp/tags) + the golang base image together; the
+# repo's committed go.sum verifies every module checksum during the build.
+FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS gobgp-build
 ARG GOBGP_VERSION
+ARG TARGETOS
 ARG TARGETARCH
-RUN apk add --no-cache curl
-WORKDIR /fetch
-RUN set -eu; \
-    case "${TARGETARCH}" in \
-      amd64) SHA256="e098e1d47db93463506e3dc5bb49bb93c9347837e8bf5e2d202c1fe7016385c7" ;; \
-      arm64) SHA256="0f83a928848c8c6a01304f6336205b1e4cd29f0f2d24568f6305bf8314dc8717" ;; \
-      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    URL="https://github.com/osrg/gobgp/releases/download/v${GOBGP_VERSION}/gobgp_${GOBGP_VERSION}_linux_${TARGETARCH}.tar.gz"; \
-    curl -fsSL -o gobgp.tar.gz "${URL}"; \
-    echo "${SHA256}  gobgp.tar.gz" | sha256sum -c -; \
-    tar xzf gobgp.tar.gz gobgp gobgpd; \
-    chmod +x gobgp gobgpd
+RUN apk add --no-cache git
+WORKDIR /src
+RUN git clone --depth 1 --branch "v${GOBGP_VERSION}" https://github.com/osrg/gobgp .
+# Bump vulnerable transitive deps above the versions gobgp pins so Trivy
+# (HIGH/CRITICAL) stays green. gobgp v4.7.0 pins golang.org/x/net v0.48,
+# which carries several HIGH CVEs (html XSS, IDNA punycode privilege
+# escalation, HTTP/2 DoS — fixed in 0.55). Re-check + drop/bump this pin
+# when GoBGP's own go.mod moves past it.
+RUN go get golang.org/x/net@v0.56.0
+ENV CGO_ENABLED=0
+RUN GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
+      go build -trimpath -ldflags="-s -w" -o /out/gobgpd ./cmd/gobgpd \
+ && GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
+      go build -trimpath -ldflags="-s -w" -o /out/gobgp ./cmd/gobgp
 
 FROM alpine:3.22 AS runtime
 # ``libcap`` brings in ``setcap`` so gobgpd can bind BGP's privileged
@@ -73,8 +79,8 @@ RUN apk upgrade --no-cache \
  && chown -R spatium:spatium /var/lib/spatium-lg-agent /etc/gobgp
 
 COPY --from=agent-build /install /usr/local
-COPY --from=gobgp-fetch /fetch/gobgp /usr/local/bin/gobgp
-COPY --from=gobgp-fetch /fetch/gobgpd /usr/local/bin/gobgpd
+COPY --from=gobgp-build /out/gobgp /usr/local/bin/gobgp
+COPY --from=gobgp-build /out/gobgpd /usr/local/bin/gobgpd
 RUN setcap cap_net_bind_service=+ep /usr/local/bin/gobgpd
 COPY agent/looking-glass/images/gobgp/gobgpd-idle.json /etc/gobgp/gobgpd.json
 COPY agent/looking-glass/images/gobgp/entrypoint.sh /usr/local/bin/spatium-lg-entrypoint
