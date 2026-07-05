@@ -4,6 +4,7 @@ import { Link } from "react-router-dom";
 import { Pencil, Trash2 } from "lucide-react";
 
 import {
+  applianceApprovalApi,
   asnsApi,
   lookingGlassApi,
   networkApi,
@@ -14,6 +15,7 @@ import {
   type BGPLGPeerCreate,
   type BGPLGPeerUpdate,
   type BGPLGSessionState,
+  type MetalLBBgpPeer,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
@@ -328,6 +330,29 @@ export function PeerFormModal({
     staleTime: 60_000,
   });
 
+  // issue #566 decision D1 — MetalLB BGP mode ships its own "peer
+  // address + ASN" concept (the export path: advertise our VIP to a
+  // router); this is a pure UI convenience prefilling THIS form's
+  // fields from one, since the same physical router is plausibly both
+  // a MetalLB BGP-mode upstream and a Looking Glass (import) peer. Zero
+  // backend coupling — same React Query key as NetworkTab so it's
+  // already warm if the operator visited Network & Host first. Only on
+  // add (never on edit) and never overwrites `name` (MetalLB peers
+  // aren't named).
+  const metallbQ = useQuery({
+    queryKey: ["appliance", "metallb"],
+    queryFn: applianceApprovalApi.getMetalLBConfig,
+    staleTime: 30_000,
+    enabled: !isEdit,
+  });
+  const metallbBgpPeers = metallbQ.data?.bgp_peers ?? [];
+
+  function prefillFromMetalLB(p: MetalLBBgpPeer) {
+    setLocalAsn(String(p.my_asn));
+    setPeerAsn(String(p.peer_asn));
+    setPeerAddress(p.peer_address);
+  }
+
   function toggleFamily(af: BGPLGAddressFamily) {
     setFamilies((prev) =>
       prev.includes(af) ? prev.filter((f) => f !== af) : [...prev, af],
@@ -423,6 +448,22 @@ export function PeerFormModal({
         {err && (
           <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             {err}
+          </div>
+        )}
+
+        {!isEdit && metallbBgpPeers.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            <span>Prefill from a configured MetalLB BGP peer:</span>
+            {metallbBgpPeers.map((p, i) => (
+              <button
+                key={i}
+                type="button"
+                onClick={() => prefillFromMetalLB(p)}
+                className="rounded-md border px-2 py-1 font-mono hover:bg-muted"
+              >
+                {p.peer_address} (AS{p.peer_asn})
+              </button>
+            ))}
           </div>
         )}
 

@@ -550,6 +550,26 @@ place_metallb_crds() {
     fi
 }
 
+# Issue #566 decision D1 — pre-load the frr-k8s CRDs (frrk8s.metallb.io
+# group: FRRConfiguration / FRRNodeState / BGPSessionState) the SAME
+# way place_metallb_crds pre-loads the metallb.io group above. BGP mode
+# starts disabled (frrk8s.enabled=false) and is turned on later by the
+# seed supervisor writing the spatium-metallb HelmChartConfig once an
+# operator configures a BGP peer; the frr-k8s subchart's OWN nested
+# CRDs dependency stays off (frr-k8s.crds.enabled=false in
+# charts/spatiumddi-metallb/values.yaml) to avoid a double-owner
+# conflict, so without this pre-load enabling BGP mode later 404s with
+# "no matches for kind FRRConfiguration".
+place_metallb_frrk8s_crds() {
+    local src=/usr/local/share/spatiumddi/frrk8s-crds.yaml
+    if [ -r "$src" ]; then
+        install -m 0644 "$src" "$K3S_MANIFESTS_DIR/spatium-metallb-frrk8s-crds.yaml"
+        echo "Placed frr-k8s CRDs at $K3S_MANIFESTS_DIR/spatium-metallb-frrk8s-crds.yaml"
+    else
+        echo "WARN: $src missing — frr-k8s CRDs not pre-loaded; enabling MetalLB BGP mode later will fail."
+    fi
+}
+
 # Renders the control-plane HelmChart CR for the control-plane
 # role. Args:
 #   $1 — chart_content_b64
@@ -742,6 +762,8 @@ case "$APPLIANCE_ROLE_VAL" in
         # control-plane node; CRDs are cluster-scoped so doing it here
         # covers any node later promoted into the cluster).
         place_metallb_crds
+        # #566 decision D1 — same reasoning, frrk8s.metallb.io group.
+        place_metallb_frrk8s_crds
         # #272 — render the spatium-metallb HelmChart (MetalLB in its own
         # metallb-system namespace). Applied always but starts DISABLED;
         # the seed supervisor enables it + writes the pool via the

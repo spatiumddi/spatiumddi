@@ -930,6 +930,33 @@ class PlatformSettings(Base):
         String(64), nullable=False, default="", server_default=sa_text("''")
     )
 
+    # ── MetalLB BGP mode (issue #566 decision D1) ───────────────────
+    # Distinct from the L2/ARP ``metallb_enabled`` above — BGP mode is
+    # an ADDITIONAL export path (advertise the control-plane VIP + any
+    # data-plane VIPs to real upstream routers via BGP) layered on top
+    # of the same MetalLB install. Requires ``metallb_enabled=True``
+    # (BGP peers/advertisements without a running MetalLB are inert).
+    # Applied by the seed supervisor via the SAME apply_metallb_overrides
+    # call as the L2 pool (one combined HelmChartConfig valuesContent —
+    # see k8s_api.py comment). Activates the GPL-v2 FRRouting image via
+    # MetalLB's frr-k8s backend — see NOTICE.
+    metallb_bgp_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    # List of {"my_asn": int, "peer_asn": int, "peer_address": str,
+    # "peer_port": int|None, "hold_time": str|None} dicts — one BGPPeer
+    # CR per entry (chart already renders this; see metallb-bgp.yaml).
+    metallb_bgp_peers: Mapped[list[dict]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    # List of {"ip_address_pools": [str], "communities": [str]|None,
+    # "aggregation_length": int|None} dicts — one BGPAdvertisement CR
+    # per entry. Empty list + bgp_enabled=True is invalid (validated at
+    # the API layer, not the DB) — nothing gets advertised.
+    metallb_bgp_advertisements: Mapped[list[dict]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+
     # ── Embedded ACME client — Let's Encrypt for the Web UI (issue #438) ─
     # SpatiumDDI acting as an ACME client against a public CA to issue a
     # CA-trusted TLS cert for the appliance Web UI, solving DNS-01 through

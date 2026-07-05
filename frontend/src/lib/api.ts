@@ -9395,6 +9395,22 @@ export interface FleetAgentRow {
   reboot_requested_at: string | null;
 }
 
+// issue #566 decision D1 — MetalLB BGP mode (export path: advertise the
+// VIP to upstream routers). One entry per BGPPeer / BGPAdvertisement CR.
+export interface MetalLBBgpPeer {
+  my_asn: number;
+  peer_asn: number;
+  peer_address: string;
+  peer_port?: number | null;
+  hold_time?: string | null;
+}
+
+export interface MetalLBBgpAdvertisement {
+  ip_address_pools: string[];
+  communities?: string[];
+  aggregation_length?: number | null;
+}
+
 // #272 Phase 7c — cluster-wide MetalLB / control-plane-VIP config.
 export interface MetalLBConfig {
   enabled: boolean;
@@ -9405,6 +9421,13 @@ export interface MetalLBConfig {
   // bind9/powerdns :53; dhcp_relay_vip fronts the Kea relay→server :67.
   dns_vip?: string;
   dhcp_relay_vip?: string;
+  // issue #566 decision D1 — BGP mode. Layered on top of the same
+  // MetalLB install; requires `enabled: true`. bgp_advertisements is
+  // auto-derived server-side when omitted (see the backend cross-field
+  // validator), so the form only needs to manage bgp_peers.
+  bgp_enabled?: boolean;
+  bgp_peers?: MetalLBBgpPeer[];
+  bgp_advertisements?: MetalLBBgpAdvertisement[];
   // #272 — live readiness from the GET (best-effort; absent/zero when
   // kubeapi is unreachable). Not sent on PUT.
   controller_ready?: boolean;

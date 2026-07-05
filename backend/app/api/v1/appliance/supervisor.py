@@ -1347,6 +1347,13 @@ class SupervisorHeartbeatResponse(BaseModel):
     # hostNetwork data plane (single-node default).
     desired_dns_vip: str = ""
     desired_dhcp_relay_vip: str = ""
+    # #566 decision D1 — BGP mode. Acted on only by the seed via the
+    # SAME apply_metallb_overrides call as the L2 pool (one combined
+    # HelmChartConfig body — see k8s_api.py). Empty/false = L2-only
+    # MetalLB (today's behaviour, unchanged).
+    desired_metallb_bgp_enabled: bool = False
+    desired_metallb_bgp_peers: list[dict] = Field(default_factory=list)
+    desired_metallb_bgp_advertisements: list[dict] = Field(default_factory=list)
     # #272 Phase 9 — dead-node replacement. Hostnames of k8s Nodes the
     # SEED should evict (delete the Node → k3s removes the etcd member).
     # Populated from rows flagged ``evict_requested``; only the
@@ -2039,6 +2046,10 @@ async def supervisor_heartbeat(
     # #272 Phase 10 — data-plane resolver VIPs (only the seed acts).
     dns_vip = (cfg_row.dns_vip or "") if cfg_row else ""
     dhcp_relay_vip = (cfg_row.dhcp_relay_vip or "") if cfg_row else ""
+    # #566 decision D1 — BGP mode (only the seed acts).
+    metallb_bgp_enabled = bool(cfg_row.metallb_bgp_enabled) if cfg_row else False
+    metallb_bgp_peers = list(cfg_row.metallb_bgp_peers or []) if cfg_row else []
+    metallb_bgp_advertisements = list(cfg_row.metallb_bgp_advertisements or []) if cfg_row else []
     # Issue #165 — operator-set timezone. Empty string = no override.
     desired_timezone = (cfg_row.timezone or "") if cfg_row else ""
     # #393 — appliance console mode (grubenv-driven, applies next reboot).
@@ -2199,6 +2210,9 @@ async def supervisor_heartbeat(
         desired_control_plane_vip=metallb_vip,
         desired_dns_vip=dns_vip,
         desired_dhcp_relay_vip=dhcp_relay_vip,
+        desired_metallb_bgp_enabled=metallb_bgp_enabled,
+        desired_metallb_bgp_peers=metallb_bgp_peers,
+        desired_metallb_bgp_advertisements=metallb_bgp_advertisements,
         evict_node_names=evict_names,
         desired_timezone=desired_timezone,
         desired_console_mode=desired_console_mode,
@@ -4158,6 +4172,44 @@ def _vip_in_pool(vip: str, pool: list[str]) -> bool:
     return False
 
 
+# issue #566 decision D1 — BGP mode. ``_ASN_MIN``/``_ASN_MAX`` mirror
+# ``looking_glass/schemas.py``'s local copy (kept separate rather than
+# imported — zero code coupling between the two BGP surfaces per
+# docs/features/LOOKING_GLASS.md's "share only the UI concept" framing).
+_ASN_MIN, _ASN_MAX = 1, 4_294_967_295
+
+
+class MetalLBBgpPeer(BaseModel):
+    """One BGPPeer CR — a router SpatiumDDI advertises the VIP to."""
+
+    my_asn: int
+    peer_asn: int
+    peer_address: str
+    peer_port: int | None = None
+    hold_time: str | None = None  # e.g. "90s" — passed through verbatim to the CR
+
+    @field_validator("my_asn", "peer_asn")
+    @classmethod
+    def _v_asn(cls, v: int) -> int:
+        if not (_ASN_MIN <= v <= _ASN_MAX):
+            raise ValueError(f"AS number must be between {_ASN_MIN} and {_ASN_MAX}")
+        return v
+
+    @field_validator("peer_address")
+    @classmethod
+    def _v_addr(cls, v: str) -> str:
+        ipaddress.ip_address(v.strip())  # raises ValueError -> 422
+        return v.strip()
+
+
+class MetalLBBgpAdvertisement(BaseModel):
+    """One BGPAdvertisement CR — the pool(s)/attributes advertised."""
+
+    ip_address_pools: list[str] = Field(default_factory=lambda: ["spatium-control-plane"])
+    communities: list[str] = Field(default_factory=list)
+    aggregation_length: int | None = None
+
+
 class MetalLBConfigResponse(BaseModel):
     """Cluster-wide MetalLB / control-plane-VIP config + live status."""
 
@@ -4169,6 +4221,12 @@ class MetalLBConfigResponse(BaseModel):
     # :53; ``dhcp_relay_vip`` fronts the Kea relay→server :67 forward.
     dns_vip: str = ""
     dhcp_relay_vip: str = ""
+    # issue #566 decision D1 — BGP mode (export path: advertise the VIP
+    # to upstream routers). Layered on top of the same MetalLB install;
+    # requires ``enabled=True``.
+    bgp_enabled: bool = False
+    bgp_peers: list[MetalLBBgpPeer] = Field(default_factory=list)
+    bgp_advertisements: list[MetalLBBgpAdvertisement] = Field(default_factory=list)
     # #272 — live readiness, best-effort from the spatium-namespace pod
     # list (reuses the api's existing pod-read RBAC). All zero/false when
     # kubeapi is unreachable (docker/k8s control plane) or MetalLB is off.
@@ -4226,6 +4284,9 @@ def _metallb_response(row: PlatformSettings) -> MetalLBConfigResponse:
         control_plane_vip=row.control_plane_vip or "",
         dns_vip=row.dns_vip or "",
         dhcp_relay_vip=row.dhcp_relay_vip or "",
+        bgp_enabled=row.metallb_bgp_enabled,
+        bgp_peers=row.metallb_bgp_peers or [],
+        bgp_advertisements=row.metallb_bgp_advertisements or [],
         controller_ready=controller_ready,
         speakers_ready=speakers_ready,
         speakers_total=speakers_total,
@@ -4247,6 +4308,10 @@ class MetalLBConfigUpdate(BaseModel):
     # #272 Phase 10 — data-plane resolver VIPs (optional; same pool).
     dns_vip: str = ""
     dhcp_relay_vip: str = ""
+    # issue #566 decision D1 — BGP mode (optional; export path).
+    bgp_enabled: bool = False
+    bgp_peers: list[MetalLBBgpPeer] = Field(default_factory=list)
+    bgp_advertisements: list[MetalLBBgpAdvertisement] = Field(default_factory=list)
 
     @field_validator("pool_addresses")
     @classmethod
@@ -4319,6 +4384,24 @@ class MetalLBConfigUpdate(BaseModel):
                     f"{label} {vip} is not inside the address pool "
                     "(widen metallb_pool_addresses to include every VIP)"
                 )
+        # issue #566 decision D1 — BGP mode. An "export" path layered on
+        # top of the same MetalLB install: requires MetalLB itself on +
+        # at least one peer, since there's nothing to advertise-to
+        # otherwise. Activates the GPL-v2 FRRouting image via MetalLB's
+        # frr-k8s backend once applied — see NOTICE.
+        if self.bgp_enabled:
+            if not self.enabled:
+                raise ValueError("BGP mode requires MetalLB to be enabled")
+            if not self.bgp_peers:
+                raise ValueError("at least one BGP peer is required when bgp_enabled")
+            if not self.bgp_advertisements:
+                # Auto-derive the same "advertise the control-plane VIP
+                # pool" default the plain-VIP path already assumes, so a
+                # v1 operator only has to type peer info — mirrors the
+                # auto-derived /32 pool convenience above.
+                self.bgp_advertisements = [
+                    MetalLBBgpAdvertisement(ip_address_pools=["spatium-control-plane"])
+                ]
         return self
 
 
@@ -4376,18 +4459,27 @@ async def put_metallb_config(
         "control_plane_vip": row.control_plane_vip or "",
         "dns_vip": row.dns_vip or "",
         "dhcp_relay_vip": row.dhcp_relay_vip or "",
+        "bgp_enabled": row.metallb_bgp_enabled,
+        "bgp_peers": list(row.metallb_bgp_peers or []),
+        "bgp_advertisements": list(row.metallb_bgp_advertisements or []),
     }
     row.metallb_enabled = body.enabled
     row.metallb_pool_addresses = body.pool_addresses
     row.control_plane_vip = body.control_plane_vip
     row.dns_vip = body.dns_vip
     row.dhcp_relay_vip = body.dhcp_relay_vip
+    row.metallb_bgp_enabled = body.bgp_enabled
+    row.metallb_bgp_peers = [p.model_dump() for p in body.bgp_peers]
+    row.metallb_bgp_advertisements = [a.model_dump() for a in body.bgp_advertisements]
     new = {
         "enabled": body.enabled,
         "pool_addresses": body.pool_addresses,
         "control_plane_vip": body.control_plane_vip,
         "dns_vip": body.dns_vip,
         "dhcp_relay_vip": body.dhcp_relay_vip,
+        "bgp_enabled": body.bgp_enabled,
+        "bgp_peers": row.metallb_bgp_peers,
+        "bgp_advertisements": row.metallb_bgp_advertisements,
     }
     db.add(
         AuditLog(

@@ -655,3 +655,6 @@ backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:d
 backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:drop_column:53
 backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:drop_column:54
 backend/alembic/versions/f7883fa6d413_bgp_lg_route_distinguisher.py:drop_column:69
+backend/alembic/versions/1440e72b9297_metallb_bgp_mode.py:drop_column:73
+backend/alembic/versions/1440e72b9297_metallb_bgp_mode.py:drop_column:74
+backend/alembic/versions/1440e72b9297_metallb_bgp_mode.py:drop_column:75

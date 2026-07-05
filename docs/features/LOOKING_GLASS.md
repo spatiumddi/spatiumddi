@@ -225,14 +225,21 @@ advertised — each origin ASN and community clickable back into SpatiumDDI.
   the operator's own routers and shows what that specific router's Adj-RIB-In
   actually contains. They share no code — the hijack monitor never opens a BGP
   session; the Looking Glass never talks to RIPEstat.
-- **The MetalLB VIP advertiser (BGP mode)** is a *separate, deferred* piece of
-  work: lighting up `frrk8s.enabled=true` on `charts/spatiumddi-metallb/` so
-  MetalLB can *advertise* the control-plane VIP to upstream routers via FRRouting
-  (GPL v2). That is an **export** path (SpatiumDDI → router); the Looking Glass is
-  an **import** path (router → SpatiumDDI) and requires none of the FRR/GPL-v2
-  surface. The two features share only the UI concept of "a peer address + ASN" —
-  zero code. See `charts/spatiumddi-metallb/values.yaml`'s `bgp:` block for the
-  current (gated-off) state of that work.
+- **The MetalLB VIP advertiser (BGP mode)** is a *separate* piece of work
+  (issue #566 decision D1): lighting up `frrk8s.enabled=true` on
+  `charts/spatiumddi-metallb/` so MetalLB can *advertise* the control-plane VIP
+  (and optionally data-plane VIPs) to upstream routers via FRRouting (GPL v2).
+  That is an **export** path (SpatiumDDI → router); the Looking Glass is an
+  **import** path (router → SpatiumDDI) and requires none of the FRR/GPL-v2
+  surface. The two features share only the UI concept of "a peer address + ASN"
+  — zero code (the Sessions tab's Add-peer modal offers a one-directional,
+  UI-only prefill button sourced from a configured MetalLB BGP peer, nothing
+  more). Configured from Fleet → Network & Host (`MetalLBConfigCard`'s
+  "BGP mode" disclosure) — see `backend/app/models/settings.py`'s
+  `metallb_bgp_enabled` / `metallb_bgp_peers` / `metallb_bgp_advertisements`
+  columns and `charts/spatiumddi-metallb/values.yaml`'s `bgp:` + `frr-k8s:`
+  blocks for the chart-level wiring. Stays opt-in — both `frrk8s.enabled` and
+  `bgp.enabled` default `false` until an operator configures a peer.
 
 ## Scope (Phase 1 + 2, this cut)
 

@@ -70,13 +70,91 @@ metallb:
     # does exactly that. Flip true only for generic LB auto-assignment.
     autoAssign: false
 
-  # ── BGP (spec-only, Phase 5 runway) ───────────────────────────────
+  # ── BGP (issue #566 decision D1 — light-up) ───────────────────────
   # No behavior change while ``enabled: false``. Real peering needs an
-  # FRR backend (frrk8s.enabled=true + baking the frr images).
+  # FRR backend — the seed supervisor flips BOTH this AND
+  # ``frrk8s.enabled`` above together (apply_metallb_overrides) the
+  # instant an operator configures a BGP peer via Fleet → Network &
+  # Host, so the two flags never drift apart in practice.
   bgp:
     enabled: false
     peers: []
     advertisements: []
+
+  # ── frr-k8s subchart config (issue #566 decision D1 — BGP mode) ────
+  # NOTE the hyphen: this is a DIFFERENT key from `frrk8s:` above, and
+  # it MUST live nested inside this `metallb:` block (same indent as
+  # `frrk8s:` / `speaker:` / `bgp:`), NOT as a top-level sibling of
+  # `metallb:` — Helm only threads subchart overrides through a chart's
+  # OWN values scope. Our wrapper Chart.yaml depends on `metallb`
+  # (unaliased), so wrapper `metallb.*` becomes the metallb chart's own
+  # `.Values.*`; the metallb chart's OWN Chart.yaml then depends on
+  # `frr-k8s` (also unaliased), so ITS `.Values.frr-k8s.*` — i.e. our
+  # `metallb.frr-k8s.*` — is what reaches the nested frr-k8s dependency.
+  # A top-level (0-indent) `frr-k8s:` key here never reaches it at all
+  # (verified empirically via `helm template` — every field silently
+  # fell back to the frr-k8s chart's own bundled defaults, including
+  # `crds.enabled: true`, re-introducing the double-owner CRD conflict
+  # §0c exists to avoid).
+  #
+  # `frrk8s:` (no hyphen, above) is the metallb chart's own "am I
+  # frrk8s-backed" flag; `frr-k8s:` (hyphen) is the values block for the
+  # nested frr-k8s dependency chart itself (matches its Chart.yaml
+  # `name:`).
+  #
+  # A SECOND, easy-to-miss nesting quirk lives one level further down:
+  # the frr-k8s chart's OWN values.yaml has a top-level `crds:` key
+  # (its nested CRDs sub-subchart, gated by `condition: crds.enabled`
+  # in ITS Chart.yaml — reached at exactly `frr-k8s.crds.enabled` from
+  # here) but puts image/nodeSelector/frr-image config under its OWN
+  # internal (also no-hyphen) `frrk8s:` key instead of at its top level
+  # — verified against the vendored tarball's
+  # `charts/frr-k8s/templates/controller.yaml`, which reads
+  # `.Values.frrk8s.image.repository` / `.Values.frrk8s.nodeSelector` /
+  # `.Values.frrk8s.frr.image...`. So from OUR root values.yaml, the
+  # working paths are `metallb.frr-k8s.crds.enabled` (no extra nesting)
+  # but `metallb.frr-k8s.frrk8s.nodeSelector` /
+  # `metallb.frr-k8s.frrk8s.image.*` /
+  # `metallb.frr-k8s.frrk8s.frr.image.*` (one extra `frrk8s:` level) —
+  # confirmed empirically via `helm template` after the first attempt
+  # (image/nodeSelector at `frr-k8s.*` directly) silently no-op'd and
+  # every field rendered as the chart's own bundled default instead.
+  #
+  # Gated off in step with `frrk8s.enabled` above — the frr-k8s
+  # DaemonSet only actually deploys when BOTH `metallb.enabled` AND
+  # `metallb.frrk8s.enabled` are true (see the metallb chart's
+  # speaker.yaml / controller.yaml
+  # `{{- if or .Values.frrk8s.enabled .Values.frrk8s.external }}` gates),
+  # so leaving this block populated while frrk8s.enabled stays false is
+  # inert.
+  frr-k8s:
+    # CRDs (frrconfigurations / frrnodestates / bgpsessionstates,
+    # frrk8s.metallb.io group) are pre-loaded outside Helm exactly like
+    # the metallb.io CRDs above — same "no double-owner conflict" reason.
+    crds:
+      enabled: false
+    # frr-k8s chart's OWN internal `frrk8s:` key (see the long comment
+    # above) — nodeSelector / image / frr-image config all live here,
+    # NOT at this block's top level.
+    frrk8s:
+      # Same control-plane-only placement as the speaker/controller
+      # above (non-negotiable #16) — BGP is a control-plane concern.
+      nodeSelector:
+        spatium.io/role-control-plane: "true"
+      # Explicit image tags, locked to what the vendored 0.15.3 metallb
+      # package's frr-k8s@0.0.21 subchart defaults to (verified by
+      # inspecting charts/frr-k8s/values.yaml + Chart.yaml inside the
+      # tarball) — pin explicitly so a `helm dependency update` re-fetch
+      # that silently changes upstream defaults can't drift the pin
+      # unnoticed. KEEP in lock-step with
+      # appliance/scripts/bake-images.sh ``METALLB_IMAGES``.
+      image:
+        repository: quay.io/metallb/frr-k8s
+        tag: v0.0.21
+      frr:
+        image:
+          repository: quay.io/frrouting/frr
+          tag: 10.4.1
 
 # Cross-namespace pod-read for the control-plane api SA so the
 # Network & Host MetalLB status card works now that MetalLB is in

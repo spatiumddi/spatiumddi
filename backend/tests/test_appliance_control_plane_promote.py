@@ -447,6 +447,149 @@ async def test_metallb_non_superadmin_refused(
     assert resp.status_code == 403
 
 
+# ── BGP mode (issue #566 decision D1) ────────────────────────────────
+
+
+async def test_metallb_bgp_requires_enabled(db_session: AsyncSession, client: AsyncClient) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": False,
+            "pool_addresses": [],
+            "control_plane_vip": "",
+            "bgp_enabled": True,
+            "bgp_peers": [{"my_asn": 65000, "peer_asn": 65001, "peer_address": "203.0.113.1"}],
+        },
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 422
+    assert "BGP mode requires MetalLB" in resp.text
+
+
+async def test_metallb_bgp_requires_peers(db_session: AsyncSession, client: AsyncClient) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": True,
+            "pool_addresses": [],
+            "control_plane_vip": "192.168.0.241",
+            "bgp_enabled": True,
+            "bgp_peers": [],
+        },
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 422
+    assert "at least one BGP peer is required" in resp.text
+
+
+async def test_metallb_bgp_invalid_asn(db_session: AsyncSession, client: AsyncClient) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": True,
+            "pool_addresses": [],
+            "control_plane_vip": "192.168.0.241",
+            "bgp_enabled": True,
+            "bgp_peers": [{"my_asn": 0, "peer_asn": 65001, "peer_address": "203.0.113.1"}],
+        },
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 422
+
+    resp2 = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": True,
+            "pool_addresses": [],
+            "control_plane_vip": "192.168.0.241",
+            "bgp_enabled": True,
+            "bgp_peers": [
+                {
+                    "my_asn": 65000,
+                    "peer_asn": 4_294_967_296,
+                    "peer_address": "203.0.113.1",
+                }
+            ],
+        },
+        headers=_hdr(token),
+    )
+    assert resp2.status_code == 422
+
+
+async def test_metallb_bgp_put_and_get(db_session: AsyncSession, client: AsyncClient) -> None:
+    token = await _admin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": True,
+            "pool_addresses": [],
+            "control_plane_vip": "192.168.0.241",
+            "bgp_enabled": True,
+            "bgp_peers": [
+                {
+                    "my_asn": 65000,
+                    "peer_asn": 65001,
+                    "peer_address": "203.0.113.1",
+                    "peer_port": 1179,
+                    "hold_time": "90s",
+                }
+            ],
+        },
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["bgp_enabled"] is True
+    assert body["bgp_peers"] == [
+        {
+            "my_asn": 65000,
+            "peer_asn": 65001,
+            "peer_address": "203.0.113.1",
+            "peer_port": 1179,
+            "hold_time": "90s",
+        }
+    ]
+    # bgp_advertisements auto-derived since none were supplied.
+    assert body["bgp_advertisements"] == [
+        {
+            "ip_address_pools": ["spatium-control-plane"],
+            "communities": [],
+            "aggregation_length": None,
+        }
+    ]
+
+    got = await client.get(_METALLB_URL, headers=_hdr(token))
+    got_body = got.json()
+    assert got_body["bgp_enabled"] is True
+    assert got_body["bgp_peers"][0]["peer_address"] == "203.0.113.1"
+
+
+async def test_metallb_bgp_non_superadmin_refused(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session, superadmin=False, username="plainuser")
+    await db_session.commit()
+    resp = await client.put(
+        _METALLB_URL,
+        json={
+            "enabled": True,
+            "pool_addresses": [],
+            "control_plane_vip": "192.168.0.241",
+            "bgp_enabled": True,
+            "bgp_peers": [{"my_asn": 65000, "peer_asn": 65001, "peer_address": "203.0.113.1"}],
+        },
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 403
+
+
 # ── data-plane resolver VIPs (Phase 10) ──────────────────────────────
 
 

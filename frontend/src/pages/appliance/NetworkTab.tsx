@@ -16,6 +16,7 @@ import {
   authApi,
   formatApiError,
   settingsApi,
+  type MetalLBBgpPeer,
   type MetalLBConfig,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -350,6 +351,12 @@ function MetalLBConfigCard() {
   const [dhcpRelayVip, setDhcpRelayVip] = useState("");
   const [dirty, setDirty] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  // issue #566 decision D1 — BGP mode (export path). Repeatable peer
+  // rows; bgp_advertisements is auto-derived server-side so the form
+  // only manages peers.
+  const [bgpEnabled, setBgpEnabled] = useState(false);
+  const [bgpPeers, setBgpPeers] = useState<MetalLBBgpPeer[]>([]);
+  const [showBgp, setShowBgp] = useState(false);
 
   // Seed the form from the server once it loads (and re-seed after a
   // save) — but never clobber in-progress operator edits.
@@ -361,6 +368,8 @@ function MetalLBConfigCard() {
       setVip(data.control_plane_vip ?? "");
       setDnsVip(data.dns_vip ?? "");
       setDhcpRelayVip(data.dhcp_relay_vip ?? "");
+      setBgpEnabled(data.bgp_enabled ?? false);
+      setBgpPeers(data.bgp_peers ?? []);
       // Auto-reveal the Advanced pool field when the saved pool is a
       // real range (not just the auto-derived <vip>/32) so editing an
       // existing custom pool isn't hidden behind the disclosure. A
@@ -372,6 +381,8 @@ function MetalLBConfigCard() {
         pool.length > 1 || (pool.length === 1 && !autoPool.includes(pool[0]));
       if (isCustom || data.dns_vip || data.dhcp_relay_vip)
         setShowAdvanced(true);
+      if (data.bgp_enabled || (data.bgp_peers ?? []).length > 0)
+        setShowBgp(true);
     }
   }, [data, dirty]);
 
@@ -417,6 +428,12 @@ function MetalLBConfigCard() {
       // pool-only edit can't silently drop a configured resolver VIP.
       dns_vip: dnsVip.trim(),
       dhcp_relay_vip: dhcpRelayVip.trim(),
+      // issue #566 decision D1 — BGP mode. Sent unconditionally (same
+      // "no auto-derive" treatment as the data-plane VIPs above) —
+      // bgp_advertisements is auto-derived server-side, so the form
+      // never needs an advertisements sub-editor for v1.
+      bgp_enabled: bgpEnabled,
+      bgp_peers: bgpPeers,
     });
   };
 
@@ -600,6 +617,139 @@ function MetalLBConfigCard() {
                       so it outlives a single Kea node. Kea keeps{" "}
                       <code>hostNetwork</code>:67 for direct-attached broadcast
                       — this VIP only fronts the relay→server unicast forward.
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* issue #566 decision D1 — BGP mode. Export path: advertise
+              the VIP to upstream routers over BGP. Layered on top of the
+              same MetalLB install; hidden by default like Advanced. */}
+            <div className="flex flex-col gap-1">
+              <button
+                type="button"
+                onClick={() => setShowBgp((v) => !v)}
+                className="self-start text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+              >
+                {showBgp ? "▾" : "▸"} BGP mode — advertise to upstream routers
+              </button>
+              {showBgp && (
+                <div className="flex flex-col gap-3">
+                  <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-800 dark:text-amber-300">
+                    BGP mode activates FRRouting (GPL v2) inside the cluster via
+                    MetalLB's frr-k8s backend — a distinct component from the
+                    Apache-2.0 MetalLB images already running. See NOTICE.
+                  </div>
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={bgpEnabled}
+                      onChange={(e) => {
+                        setBgpEnabled(e.target.checked);
+                        setDirty(true);
+                      }}
+                    />
+                    Enable BGP — advertise the VIP pool to upstream routers
+                  </label>
+                  <div className="flex flex-col gap-2">
+                    {bgpPeers.map((peer, i) => (
+                      <div
+                        key={i}
+                        className="grid grid-cols-1 gap-2 rounded-md border p-2 sm:grid-cols-[2fr_1fr_1fr_auto]"
+                      >
+                        <div className="flex flex-col gap-1">
+                          <span className="text-[11px] text-muted-foreground">
+                            Peer address
+                          </span>
+                          <input
+                            value={peer.peer_address}
+                            onChange={(e) => {
+                              const next = [...bgpPeers];
+                              next[i] = {
+                                ...peer,
+                                peer_address: e.target.value,
+                              };
+                              setBgpPeers(next);
+                              setDirty(true);
+                            }}
+                            placeholder="203.0.113.1"
+                            className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
+                          />
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          <span className="text-[11px] text-muted-foreground">
+                            Peer ASN
+                          </span>
+                          <input
+                            value={peer.peer_asn}
+                            onChange={(e) => {
+                              const next = [...bgpPeers];
+                              next[i] = {
+                                ...peer,
+                                peer_asn: Number(e.target.value) || 0,
+                              };
+                              setBgpPeers(next);
+                              setDirty(true);
+                            }}
+                            placeholder="65001"
+                            className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
+                          />
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          <span className="text-[11px] text-muted-foreground">
+                            My ASN
+                          </span>
+                          <input
+                            value={peer.my_asn}
+                            onChange={(e) => {
+                              const next = [...bgpPeers];
+                              next[i] = {
+                                ...peer,
+                                my_asn: Number(e.target.value) || 0,
+                              };
+                              setBgpPeers(next);
+                              setDirty(true);
+                            }}
+                            placeholder="65000"
+                            className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setBgpPeers(bgpPeers.filter((_, j) => j !== i));
+                            setDirty(true);
+                          }}
+                          className="self-end rounded-md border px-2 py-1 text-xs text-muted-foreground hover:text-destructive"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const last = bgpPeers[bgpPeers.length - 1];
+                        const nextPeer: MetalLBBgpPeer = {
+                          my_asn: last?.my_asn ?? 0,
+                          peer_asn: 0,
+                          peer_address: "",
+                        };
+                        setBgpPeers([...bgpPeers, nextPeer]);
+                        setDirty(true);
+                      }}
+                      className="self-start rounded-md border px-2 py-1 text-xs hover:bg-muted"
+                    >
+                      + Add peer
+                    </button>
+                    <span className="text-[11px] text-muted-foreground">
+                      One BGPPeer session per row. The advertised pool defaults
+                      to the control-plane VIP (widen the Advanced pool above
+                      for more). <strong>Firewall</strong>: the frr-k8s BGP
+                      session listens on tcp/179 on every control-plane node —
+                      open tcp/179 on your upstream router / any path-transiting
+                      firewall for this peer.
                     </span>
                   </div>
                 </div>

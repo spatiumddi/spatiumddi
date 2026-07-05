@@ -817,6 +817,12 @@ def heartbeat_once(
         ml_vip = body_out.get("desired_control_plane_vip") or ""
         # #285 Phase 6 — source-scope the VIP path too (loadBalancerSourceRanges).
         web_ui_cidrs = body_out.get("web_ui_allowed_cidrs") or []
+        # #566 decision D1 — BGP mode (export path: advertise the VIP to
+        # upstream routers). Folded into the SAME apply_metallb_overrides
+        # call below (one combined HelmChartConfig body).
+        ml_bgp_enabled = bool(body_out.get("desired_metallb_bgp_enabled"))
+        ml_bgp_peers = body_out.get("desired_metallb_bgp_peers") or []
+        ml_bgp_advertisements = body_out.get("desired_metallb_bgp_advertisements") or []
 
         cp_changed, cp_err = k8s_api.apply_control_plane_overrides(
             cp_size, str(ml_vip), web_ui_allowed_cidrs=list(web_ui_cidrs)
@@ -852,13 +858,18 @@ def heartbeat_once(
             )
 
         bs_changed, bs_err = k8s_api.apply_metallb_overrides(
-            metallb_enabled=ml_enabled, pool_addresses=list(ml_pool)
+            metallb_enabled=ml_enabled,
+            pool_addresses=list(ml_pool),
+            bgp_enabled=ml_bgp_enabled,
+            bgp_peers=list(ml_bgp_peers),
+            bgp_advertisements=list(ml_bgp_advertisements),
         )
         if bs_changed:
             log.info(
                 "supervisor.heartbeat.metallb_overrides_applied",
                 enabled=ml_enabled,
                 pool=list(ml_pool),
+                bgp_enabled=ml_bgp_enabled,
             )
         elif bs_err:
             log.warning("supervisor.heartbeat.metallb_overrides_failed", error=bs_err)
