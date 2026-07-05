@@ -394,6 +394,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_audit_chain_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("audit_chain_alert_rule_seed_skipped", reason=str(exc))
+    # schema-behind-head alert rule — singleton, enabled by default
+    # (issue #565). Fires when the Celery worker/beat finds the DB
+    # schema behind the bundled Alembic head. Idempotent seed.
+    try:
+        from app.services.alerts import seed_schema_behind_head_alert_rule  # noqa: PLC0415
+
+        await seed_schema_behind_head_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("schema_behind_head_alert_rule_seed_skipped", reason=str(exc))
     # cluster-upgrade-failed alert rule — singleton, enabled by default
     # (issue #296 Phase F). Fires when the rolling-upgrade orchestrator
     # flips a SystemUpgradeRun to ``state='failed'``.

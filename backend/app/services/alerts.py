@@ -100,6 +100,13 @@ RULE_TYPE_SERVICE_RESOURCE_ORPHANED = "service_resource_orphaned"
 # without exploding into N near-identical rule_type rows.
 RULE_TYPE_COMPLIANCE_CHANGE = "compliance_change"
 RULE_TYPE_AUDIT_CHAIN_BROKEN = "audit_chain_broken"
+# Issue #565 — the Celery worker/beat found the DB schema behind the
+# bundled Alembic head ("code deployed before migrate ran"). Subject =
+# the platform (a single singleton event). Managed directly by the
+# ``app.tasks.schema_check`` periodic task (like ``audit_chain_broken``
+# above), not the generic evaluator — the task opens/resolves the
+# event itself off the version-vs-head comparison.
+RULE_TYPE_SCHEMA_BEHIND_HEAD = "schema_behind_head"
 # Voice-VLAN client-count drop — issue #112 phase 2. Counts active
 # DHCP leases on every subnet tagged ``subnet_role='voice'``; fires
 # when the count drops below ``threshold_percent`` (reused as a raw
@@ -261,6 +268,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_SERVICE_RESOURCE_ORPHANED,
         RULE_TYPE_COMPLIANCE_CHANGE,
         RULE_TYPE_AUDIT_CHAIN_BROKEN,
+        RULE_TYPE_SCHEMA_BEHIND_HEAD,
         RULE_TYPE_VOICE_LEASE_COUNT_BELOW,
         RULE_TYPE_K3S_API_CERT_EXPIRING,
         RULE_TYPE_STALE_IP_COUNT,
@@ -2600,6 +2608,51 @@ async def seed_audit_chain_alert_rule() -> None:
                     "that finds the chain back in sync."
                 ),
                 rule_type=RULE_TYPE_AUDIT_CHAIN_BROKEN,
+                severity="critical",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=True,
+            )
+        )
+        await session.commit()
+
+
+_SCHEMA_BEHIND_HEAD_RULE_NAME = "schema-behind-head"
+
+
+async def seed_schema_behind_head_alert_rule() -> None:
+    """Seed the singleton ``schema-behind-head`` rule (issue #565).
+
+    Enabled by default — a worker running against a DB behind the
+    bundled migrations is a real "code deployed before migrate ran"
+    footgun that every deployment wants surfaced loudly instead of a
+    silent background retry loop. Keyed on ``name`` (one rule per
+    platform); an operator who disables / renames it is never
+    overridden by a later boot.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _SCHEMA_BEHIND_HEAD_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_SCHEMA_BEHIND_HEAD_RULE_NAME,
+                description=(
+                    "Fires when the Celery worker/beat finds the database schema "
+                    "behind the Alembic head bundled in the running image — i.e. "
+                    "the app was deployed before 'alembic upgrade head' ran, so "
+                    "background tasks fail against missing tables/columns. "
+                    "Auto-resolves on the next check that finds the schema back "
+                    "at head. Set STRICT_SCHEMA_CHECK=true to also refuse to "
+                    "process tasks while behind."
+                ),
+                rule_type=RULE_TYPE_SCHEMA_BEHIND_HEAD,
                 severity="critical",
                 enabled=True,
                 notify_syslog=True,

@@ -1,3 +1,5 @@
+import importlib
+
 from celery import Celery
 from celery.schedules import crontab, schedule
 
@@ -60,6 +62,7 @@ celery_app = Celery(
         "app.tasks.acme",
         "app.tasks.tls_certs",
         "app.tasks.dnsbl_sweep",
+        "app.tasks.schema_check",
     ],
 )
 
@@ -121,6 +124,7 @@ celery_app.conf.update(
         "app.tasks.change_request_expiry.*": {"queue": "default"},
         "app.tasks.acme.*": {"queue": "default"},
         "app.tasks.tls_certs.*": {"queue": "default"},
+        "app.tasks.schema_check.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60 s, mark DNS agents as ``unreachable`` if their
@@ -555,6 +559,18 @@ celery_app.conf.update(
             "task": "app.tasks.tls_certs.prune_probes",
             "schedule": crontab(hour=3, minute=50),
         },
+        # Every 5 min, re-check that the DB schema is at the Alembic
+        # head bundled in this image (issue #565). Opens/resolves the
+        # ``schema-behind-head`` alert on drift. Complements the api's
+        # /health/ready gate — the worker/beat had no equivalent, so a
+        # "code deployed before migrate ran" window failed background
+        # tasks silently. The startup check (worker_ready/beat_init)
+        # catches the cold-boot case; this periodic tick catches a
+        # later divergence (stale image / mid-rollout).
+        "schema-at-head-check": {
+            "task": "app.tasks.schema_check.check_schema_at_head",
+            "schedule": schedule(run_every=300.0),
+        },
     },
 )
 
@@ -583,6 +599,16 @@ if settings.celery_broker_url.startswith(("sentinel://", "redis+sentinel://")):
 # worker``. ``task_revoked`` and ``task_unknown`` are deliberately
 # *not* hooked — those are operational signals, not bugs.
 from celery.signals import task_failure  # noqa: E402
+
+# Schema-at-head signal registration (issue #565). ``app.tasks.
+# schema_check`` connects ``worker_ready`` / ``beat_init`` /
+# ``task_prerun`` handlers at import time. The ``include=[…]`` list only
+# imports task modules in the *worker* bootstrap — beat loads the config
+# (schedule) but not the task modules — so import it here explicitly to
+# guarantee the startup check + strict gate register in every process.
+# Use import_module (not a bound ``import … as _x``) so static analysis
+# doesn't flag a side-effect-only import as unused.
+importlib.import_module("app.tasks.schema_check")
 
 
 @task_failure.connect

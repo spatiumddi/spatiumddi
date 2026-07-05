@@ -127,6 +127,16 @@ class Settings(BaseSettings):
     # warning regardless of this flag. See #216.
     strict_secret_key: bool = False
 
+    # #565 — when ``True``, the Celery worker refuses to process tasks
+    # while the DB schema is behind the bundled Alembic head (mirrors
+    # ``strict_secret_key``'s opt-in shape). Default ``False`` so a
+    # transient mid-rollout window (code up before ``alembic upgrade
+    # head`` finishes) doesn't hard-stop the worker — the schema drift
+    # is logged loudly + raised as an ``AlertEvent`` regardless. Set to
+    # ``True`` in environments where a stale-schema task run is worse
+    # than a deferred one.
+    strict_schema_check: bool = False
+
     # #296 Phase B — slot-image mirror config.
     #
     # ``slot_image_mirror_url`` — when set, the slot-image upload +
