@@ -1,3 +1,5 @@
+import importlib
+
 from celery import Celery
 from celery.schedules import crontab, schedule
 
@@ -604,7 +606,9 @@ from celery.signals import task_failure  # noqa: E402
 # imports task modules in the *worker* bootstrap — beat loads the config
 # (schedule) but not the task modules — so import it here explicitly to
 # guarantee the startup check + strict gate register in every process.
-from app.tasks import schema_check as _schema_check  # noqa: E402,F401
+# Use import_module (not a bound ``import … as _x``) so static analysis
+# doesn't flag a side-effect-only import as unused.
+importlib.import_module("app.tasks.schema_check")
 
 
 @task_failure.connect
