@@ -54,6 +54,45 @@ pod-CNI address. Per-node hostPath state (`/var/lib/spatiumddi/agents/looking-gl
 caches the last-known-good peer config so sessions stay up when the control plane
 is briefly unreachable (non-negotiable #5).
 
+## Configuring the collector
+
+The collector is configured exactly like the BIND9 / Kea agents — a shared
+`LG_AGENT_KEY` pre-shared key plus one of three deploy shapes. Generate the key
+once (`openssl rand -hex 32`) and use the **same** value on the control plane and
+every collector.
+
+**1. Same host as the control plane (Docker Compose).** Set `LG_AGENT_KEY` in
+`.env` and turn on the `looking-glass` profile — the mirror of `COMPOSE_PROFILES=dns,dhcp`:
+
+```bash
+# .env
+LG_AGENT_KEY=<openssl rand -hex 32>
+LG_HOSTNAME=core-collector-1          # optional friendly name
+
+COMPOSE_PROFILES=looking-glass docker compose up -d
+#   …or add `looking-glass` alongside your existing profiles.
+```
+
+The service (`looking-glass` in `docker-compose.yml`) runs with
+`network_mode: host` so BGP originates from the host's real NIC, and reaches the
+API at `http://127.0.0.1:${API_PORT}`.
+
+**2. A separate VM (standalone collector).** Use
+`docker-compose.agent-looking-glass.yml` — the mirror of the standalone
+`docker-compose.agent-dns-bind9.yml` / `agent-dhcp.yml`. Set `CONTROL_PLANE_URL`,
+`LG_AGENT_KEY`, and `LG_HOSTNAME` in that host's `.env`, then
+`docker compose -f docker-compose.agent-looking-glass.yml up -d`.
+
+**3. On the k3s appliance (a node role).** Assign the **looking-glass** role to a
+node from *Fleet* — same as assigning the BIND9 or Kea role. The supervisor
+injects `LG_AGENT_KEY`, stamps the per-node `spatium.io/role-looking-glass` label,
+and the DaemonSet (`charts/spatiumddi-appliance/templates/looking-glass.yaml`,
+`hostNetwork: true`) schedules onto that node. Nothing to hand-edit — the key and
+the TCP/179 nftables opening are wired by the role assignment.
+
+Whichever shape you use, the collector self-registers and shows up under *Network
+→ Looking Glass* as a collector row; then add peers to it as below.
+
 ## Peering a router with the collector
 
 You configure **your** router to peer with the collector and advertise your routing
@@ -152,17 +191,38 @@ router bgp 64500
 
 ### FRRouting (FRR / vtysh)
 
+> **Modern FRR (≥ 7.4) enforces RFC 8212** (`bgp ebgp-requires-policy` is on by
+> default), so an eBGP session advertises **nothing** without an *explicit
+> outbound policy* — removing your `out` filter makes it send zero routes, not
+> every route. To advertise your whole table, attach a **permit-all** prefix-list.
+> Note the `le 32`: a bare `permit 0.0.0.0/0` matches only the default route;
+> `0.0.0.0/0 le 32` matches a prefix of **any** length.
+
 ```
+! Permit-all outbound so the collector sees your entire table (RFC 8212).
+ip prefix-list LG-ALLOW-ALL seq 5 permit 0.0.0.0/0 le 32
+!
 router bgp 64500
  neighbor 192.0.2.10 remote-as 65000
  neighbor 192.0.2.10 description SpatiumDDI-LookingGlass
  neighbor 192.0.2.10 password <md5-secret>            ! optional
  address-family ipv4 unicast
   neighbor 192.0.2.10 activate
+  neighbor 192.0.2.10 prefix-list LG-ALLOW-ALL out    ! advertise the whole RIB
   neighbor 192.0.2.10 send-community all
   ! iBGP full-table: neighbor 192.0.2.10 route-reflector-client
  exit-address-family
+!
+! IPv6 peers need their own catch-all under `address-family ipv6 unicast`:
+!   ipv6 prefix-list LG-ALLOW-ALL6 seq 5 permit ::/0 le 128
+!   neighbor 2001:db8::10 prefix-list LG-ALLOW-ALL6 out
 ```
+
+After changing an outbound policy, re-advertise the existing table with
+`clear bgp 192.0.2.10 soft out`. (The blunt alternative to the permit-all list
+is `no bgp ebgp-requires-policy` under `router bgp` — it reverts to advertising
+best paths with no explicit policy, but an allow-all list is the cleaner, more
+intentional form.)
 
 ### BIRD 2.x
 

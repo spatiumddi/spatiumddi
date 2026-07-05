@@ -407,6 +407,48 @@ services:
       - NET_BIND_SERVICE
       - NET_RAW  # #365 — raw sockets for direct-attached DHCP (see dhcp-kea)
 
+  # ── BGP Looking Glass collector (receive-only, issue #566) ────────────
+  # Only starts with `--profile looking-glass`. Peers with your edge/core
+  # routers and ingests their Adj-RIB-In — it NEVER advertises a route back
+  # (default-export reject-route + per-peer max-prefix cap). Configure peers
+  # under Network → Looking Glass. For a collector on a *separate* VM use
+  # docker-compose.agent-looking-glass.yml instead.
+  looking-glass:
+    profiles: ["looking-glass"]
+    image: ghcr.io/spatiumddi/looking-glass:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    hostname: ${LG_HOSTNAME:-looking-glass}
+    # BGP needs the host's real routable interface — a router has no route
+    # to a bridged/NATed container IP, and TCP/179 must originate from the
+    # host IP the peer expects. Because of host networking the collector
+    # reaches the API on the published host port, not the `api` bridge alias.
+    network_mode: host
+    environment:
+      # ── Required ──────────────────────────────────────────────────
+      # API on the same host, via its published port (see api `ports:`).
+      CONTROL_PLANE_URL: http://127.0.0.1:${API_PORT:-8000}
+      # Pre-shared key exchanged for a rotating JWT on first join.
+      LG_AGENT_KEY: ${LG_AGENT_KEY:-changeme-lg-agent-key}
+
+      # ── Registration ──────────────────────────────────────────────
+      # Collector name (LookingGlassCollector row); unique per collector.
+      SERVER_NAME: ${LG_HOSTNAME:-looking-glass}
+
+      # ── TLS ───────────────────────────────────────────────────────
+      # Loopback to the same-host API — TLS verify off is fine.
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
+
+      # ── Tuning (optional, defaults shown) ─────────────────────────
+      # LOG_LEVEL: INFO
+      # HEARTBEAT_INTERVAL: "30"
+      # LONGPOLL_TIMEOUT: "30"
+      # RIB_POLL_INTERVAL: "30"
+    volumes:
+      - lg_agent_state:/var/lib/spatium-lg-agent
+    depends_on:
+      api:
+        condition: service_started
+
 networks:
   spatiumddi:
     driver: bridge
@@ -422,6 +464,10 @@ volumes:
   dhcp_kea_leases:
   dhcp_kea_state_2:
   dhcp_kea_leases_2:
+  # Looking Glass collector last-known-good config cache (issue #566) —
+  # keeps BGP sessions up when the control plane is briefly unreachable
+  # (non-negotiable #5). Only used by the `looking-glass` profile.
+  lg_agent_state:
   # Backup local-volume target (issue #117). Uncomment when using
   # a Backup Target with kind ``local_volume``; see the comments
   # on the api + worker services. Safe to leave commented for
