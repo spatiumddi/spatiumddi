@@ -11,11 +11,10 @@ accepts their routing table, and turns the live Adj-RIB-In into an operator surf
 where every prefix, origin ASN, and BGP community is a clickable link back into
 IPAM / the ASN catalog / the community catalog.
 
-> **This document is a stub.** Full data-model, API, and UI documentation lands
-> alongside the feature's Phase 1+2 implementation (see `CLAUDE.md`'s roadmap for
-> current status). This page exists now so the receive-only invariant and the
-> collector's relationship to the two adjacent BGP surfaces is written down before
-> the feature ships.
+> **Documentation is in progress.** The receive-only invariant, the collector
+> architecture, and the router/firewall peering examples below are current for the
+> Phase 1+2 cut; the full data-model / API / UI reference lands as later phases
+> ship (see `CLAUDE.md`'s roadmap and issue #566 for status).
 
 ---
 
@@ -54,6 +53,168 @@ session originates from the node's real routable IP — a router has no route to
 pod-CNI address. Per-node hostPath state (`/var/lib/spatiumddi/agents/looking-glass/`)
 caches the last-known-good peer config so sessions stay up when the control plane
 is briefly unreachable (non-negotiable #5).
+
+## Peering a router with the collector
+
+You configure **your** router to peer with the collector and advertise your routing
+table to it. The collector is receive-only — it accepts your routes and never sends
+one back, so no inbound filtering/route-map is needed on your side to protect the
+router. The collector normally **initiates** the TCP session outbound to the router,
+so the router only has to (a) have the collector configured as a BGP neighbor and
+(b) permit inbound TCP/179 from the collector's IP (see [Firewall](#firewall-tcp179)).
+
+**Fill in these three values** (from the peer you create under *Network → Looking
+Glass → Add peer*):
+
+| Placeholder | Where it comes from | Example |
+|---|---|---|
+| Collector IP | the appliance node's routable IP (the collector uses `hostNetwork`) | `192.0.2.10` |
+| Collector ASN | the peer's **Local ASN** field | `65000` |
+| Your router ASN | the peer's **Peer ASN** field | `64500` |
+| MD5 secret | the peer's optional **MD5 password** field | *(omit if unset)* |
+
+> **eBGP vs iBGP.** The simplest setup is **eBGP** — give the collector a private
+> ASN (e.g. `65000`) different from your router's, and the router advertises its
+> best paths automatically. If you want the collector to see **every** path (not
+> just the best) or you run it inside your own AS, use **iBGP** and mark the
+> collector a **route-reflector-client** so the router reflects its full RIB; add
+> **add-path / additional-paths send** to expose non-best paths. Either way, enable
+> **send-community** so the Routes grid can render your communities.
+
+### Cisco IOS / IOS-XE
+
+```
+router bgp 64500
+ neighbor 192.0.2.10 remote-as 65000
+ neighbor 192.0.2.10 description SpatiumDDI-LookingGlass
+ neighbor 192.0.2.10 password <md5-secret>          ! optional; must match the peer
+ address-family ipv4 unicast
+  neighbor 192.0.2.10 activate
+  neighbor 192.0.2.10 send-community both            ! so communities show in the LG
+  ! full-table visibility (optional): neighbor 192.0.2.10 additional-paths send
+ exit-address-family
+```
+
+### Cisco IOS-XR
+
+IOS-XR denies eBGP advertisement by default, so attach a pass route-policy outbound:
+
+```
+route-policy PASS
+  pass
+end-policy
+!
+router bgp 64500
+ neighbor 192.0.2.10
+  remote-as 65000
+  description SpatiumDDI-LookingGlass
+  password encrypted <md5-secret>                    ! optional
+  address-family ipv4 unicast
+   route-policy PASS out
+   send-community-ebgp
+```
+
+### Juniper Junos
+
+```
+protocols {
+    bgp {
+        group spatiumddi-lg {
+            type external;                            ## iBGP: set `type internal` + cluster
+            local-as 64500;
+            peer-as 65000;
+            export send-table;                        ## advertise your routes to the collector
+            neighbor 192.0.2.10 {
+                description "SpatiumDDI Looking Glass (receive-only)";
+                authentication-key "<md5-secret>";    ## optional
+            }
+        }
+    }
+}
+policy-options {
+    policy-statement send-table {
+        term all { then accept; }                     ## scope to taste
+    }
+}
+```
+
+### Arista EOS
+
+```
+router bgp 64500
+   neighbor 192.0.2.10 remote-as 65000
+   neighbor 192.0.2.10 description SpatiumDDI-LookingGlass
+   neighbor 192.0.2.10 password <md5-secret>          ! optional
+   neighbor 192.0.2.10 send-community
+   address-family ipv4
+      neighbor 192.0.2.10 activate
+```
+
+### FRRouting (FRR / vtysh)
+
+```
+router bgp 64500
+ neighbor 192.0.2.10 remote-as 65000
+ neighbor 192.0.2.10 description SpatiumDDI-LookingGlass
+ neighbor 192.0.2.10 password <md5-secret>            ! optional
+ address-family ipv4 unicast
+  neighbor 192.0.2.10 activate
+  neighbor 192.0.2.10 send-community all
+  ! iBGP full-table: neighbor 192.0.2.10 route-reflector-client
+ exit-address-family
+```
+
+### BIRD 2.x
+
+```
+protocol bgp spatiumddi_lg {
+    local as 64500;
+    neighbor 192.0.2.10 as 65000;
+    password "<md5-secret>";                          # optional
+    ipv4 {
+        import none;                                  # the collector never sends us routes
+        export all;                                   # advertise our table to the collector
+    };
+}
+```
+
+Other platforms (Nokia SR OS, MikroTik RouterOS 7, VyOS, …) follow the same shape:
+a normal BGP neighbor pointing at the collector IP/ASN, an outbound policy that
+advertises your table, `send-community`, and an inbound firewall rule for TCP/179.
+
+### Firewall (TCP/179)
+
+The collector dials the router, so the **router side** must accept inbound TCP/179
+from the collector's IP (allow both directions if you'd rather the router initiate).
+
+```
+! Cisco IOS extended ACL
+ip access-list extended BGP-LG
+ permit tcp host 192.0.2.10 any eq bgp
+ permit tcp host 192.0.2.10 eq bgp any
+
+! Cisco ASA
+access-list OUTSIDE_IN extended permit tcp host 192.0.2.10 host <router-ip> eq bgp
+```
+
+```bash
+# Linux firewall in the path — nftables
+nft add rule inet filter input ip saddr 192.0.2.10 tcp dport 179 accept
+# …or iptables
+iptables -A INPUT -p tcp -s 192.0.2.10 --dport 179 -j ACCEPT
+```
+
+On the **SpatiumDDI appliance** side there is nothing to do: assigning the
+`looking-glass` role opens TCP/179 automatically through the per-role nftables
+drop-in (`spatium.io/role-looking-glass`). On a standalone Docker/K8s collector the
+container uses host networking, so TCP/179 is governed by the host's own firewall.
+
+### Verify
+
+Once the router config + firewall are in place, *Network → Looking Glass → Sessions*
+shows the peer transition to **Established** (green) within a few seconds, its
+prefix counters climb, and the *Routes* tab fills with the prefixes the router
+advertised — each origin ASN and community clickable back into SpatiumDDI.
 
 ## Relationship to two adjacent BGP surfaces (don't conflate)
 
