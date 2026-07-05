@@ -13315,7 +13315,9 @@ export const lookingGlassApi = {
    *  ``searchRoutes({prefix})``'s contains-or-within match. */
   getRoute: (prefix: string) =>
     api
-      .get<BGPLGRoute[]>(`/looking-glass/routes/${prefix}`)
+      .get<BGPLGRoute[]>("/looking-glass/routes/by-prefix", {
+        params: { prefix },
+      })
       .then((r) => r.data),
 };
 

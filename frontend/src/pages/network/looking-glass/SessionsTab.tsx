@@ -380,7 +380,10 @@ export function PeerFormModal({
       matched_asn_id: matchedAsnId || null,
       peer_router_id: peerRouterId || null,
       address_families: families,
-      max_prefixes: Number(maxPrefixes) || 10000,
+      // Only default an EMPTY field to 10000. An explicit 0 / invalid value
+      // must reach the backend (which rejects max_prefixes < 1 with 422)
+      // rather than being silently coerced up to the default cap.
+      max_prefixes: maxPrefixes.trim() === "" ? 10000 : Number(maxPrefixes),
       import_filter: buildImportFilter(),
       enabled,
       description,

@@ -23,9 +23,9 @@ Endpoints:
 * ``/sessions`` — read-only per-peer runtime-state rollup (collector +
   peer joined), the Sessions-tab feed.
 * ``/routes`` — the learned RIB, server-paginated + filterable. ``/routes``
-  (list) and ``/routes/{prefix:path}`` (all paths for one exact prefix) are
-  distinct URL shapes (different segment counts) so there's no route
-  collision regardless of declaration order.
+  (list) and ``/routes/by-prefix?prefix=`` (all paths for one exact prefix,
+  the CIDR passed as a query param so its slash / IPv6 colons encode cleanly)
+  are distinct URL shapes so there's no route collision.
 
 Every write handler writes an ``AuditLog`` row before ``commit()`` per
 CLAUDE.md non-negotiable #4.
@@ -484,14 +484,18 @@ async def list_routes(
     )
 
 
-@router.get("/routes/{prefix:path}", response_model=list[RouteRead])
+@router.get("/routes/by-prefix", response_model=list[RouteRead])
 async def get_route(
-    prefix: str,
     db: DB,
     _: CurrentUser,
+    prefix: str = Query(..., description="exact CIDR, e.g. 10.0.0.0/24 or 2001:db8::/32"),
     withdrawn: bool = Query(False, description="include withdrawn paths"),
 ) -> list[RouteRead]:
     """All paths for one exact prefix, across every peer.
+
+    ``prefix`` is a query parameter (not a path segment) so the CIDR slash +
+    IPv6 colons encode cleanly through proxies — a path-param ``{prefix:path}``
+    would need raw slashes that some proxies / %2F-decoders mangle.
 
     Distinct from the ``prefix`` filter on ``GET /routes`` (which is a
     contains-or-within match): this is an exact-prefix lookup, feeding the

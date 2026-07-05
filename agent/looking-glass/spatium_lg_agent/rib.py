@@ -229,7 +229,10 @@ def _parse_path(
                 try:
                     communities.append(_decode_community(int(c)))
                 except (TypeError, ValueError):
-                    pass
+                    # Skip a non-integer/garbage community value rather than
+                    # drop the whole route; the rest of its attributes are
+                    # still worth ingesting.
+                    continue
         elif t == _ATTR_LARGE_COMMUNITY:
             for lc in attr.get("large_communities") or []:
                 decoded = _decode_large_community(lc) if isinstance(lc, dict) else None

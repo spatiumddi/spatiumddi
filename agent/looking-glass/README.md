@@ -6,8 +6,8 @@ collector container image (`ghcr.io/spatiumddi/looking-glass`).
 The BGP Looking Glass collector is a **receive-only** BGP speaker: it
 peers passively with the operator's edge/core routers, accepts their
 routing table, and never advertises a route back. See
-[`docs/features/`](../../docs/features/) (Looking Glass doc, once it
-lands) and `spatium_lg_agent/gobgp.py`'s module docstring for the full
+[`docs/features/LOOKING_GLASS.md`](../../docs/features/LOOKING_GLASS.md)
+and `spatium_lg_agent/gobgp.py`'s module docstring for the full
 receive-only enforcement writeup — that file is the single review gate
 for anything that touches how gobgpd's config is rendered.
 

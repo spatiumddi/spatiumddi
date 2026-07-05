@@ -47,6 +47,7 @@ def load_or_create_agent_id(state_dir: Path) -> str:
     try:
         os.chmod(path, 0o600)
     except PermissionError:
+        # Volume-mount owner may differ; the 0600 hardening is best-effort.
         pass
     return aid
 
@@ -66,6 +67,8 @@ def save_token(state_dir: Path, token: str) -> None:
     try:
         os.chmod(tmp, 0o600)
     except (PermissionError, FileNotFoundError):
+        # Best-effort 0600 (volume-mount owner may differ); a racing
+        # save_token may already have moved the tmp out from under us.
         pass
     try:
         tmp.replace(path)
@@ -95,6 +98,8 @@ def _chmod_600(path: Path) -> None:
     try:
         os.chmod(path, 0o600)
     except (PermissionError, FileNotFoundError):
+        # Best-effort (volume-mount owner may differ); a concurrent writer
+        # may have already replaced the file. See docstring above.
         pass
 
 
