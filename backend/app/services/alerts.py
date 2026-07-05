@@ -40,7 +40,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN, ASNRpkiRoa
 from app.models.audit import AuditLog
-from app.models.bgp_monitor import BGPHijackDetection
+from app.models.bgp_looking_glass import BGPLGPeer, BGPLGRoute, LookingGlassCollector
+from app.models.bgp_monitor import BGPHijackDetection, BGPTrackedPrefix
 from app.models.circuit import Circuit
 from app.models.dhcp import (
     DHCPLease,
@@ -65,6 +66,11 @@ from app.models.tls_cert import (
 )
 from app.models.vrf import VRF
 from app.services import audit_forward
+from app.services.bgp.hijack_monitor import (
+    RPKI_INVALID,
+    expected_origin_set,
+    severity_for_rpki,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -84,6 +90,21 @@ RULE_TYPE_RPKI_ROA_EXPIRED = "rpki_roa_expired"
 # RPKI-unknown) rides through as a severity override.
 RULE_TYPE_BGP_PREFIX_HIJACK = "bgp_prefix_hijack"
 RULE_TYPE_BGP_MORE_SPECIFIC = "bgp_more_specific_announced"
+# BGP Looking Glass internal-RIB alert family — issue #566 Phase 5.
+# Companion to the #527 public-table hijack monitor above: that watches
+# the public routing table via RIPEstat/RIS Live, these watch the
+# operator's OWN live table via the receive-only Looking Glass
+# collector (bgp_lg_peer / bgp_lg_route). unexpected_origin and
+# more_specific deliberately reuse the SAME BGPTrackedPrefix config
+# table #527 already has (an operator's "prefixes I own + expected
+# origin ASN" list, curated once at /asns/{id}/tracked-prefixes) —
+# both the external and internal monitors read it.
+RULE_TYPE_BGP_LG_SESSION_DOWN = "bgp_lg_session_down"
+RULE_TYPE_BGP_LG_RPKI_INVALID_ROUTE = "bgp_lg_rpki_invalid_route"
+RULE_TYPE_BGP_LG_UNEXPECTED_ORIGIN = "bgp_lg_unexpected_origin"
+RULE_TYPE_BGP_LG_MORE_SPECIFIC = "bgp_lg_more_specific"
+RULE_TYPE_BGP_LG_ROUTE_FLAP = "bgp_lg_route_flap"
+RULE_TYPE_BGP_LG_MISSING_ADVERTISEMENT = "bgp_lg_missing_advertisement"
 # Domain rule types — Phase 2 of issue #87.
 RULE_TYPE_DOMAIN_EXPIRING = "domain_expiring"
 RULE_TYPE_DOMAIN_NS_DRIFT = "domain_nameserver_drift"
@@ -258,6 +279,12 @@ RULE_TYPES = frozenset(
         RULE_TYPE_RPKI_ROA_EXPIRED,
         RULE_TYPE_BGP_PREFIX_HIJACK,
         RULE_TYPE_BGP_MORE_SPECIFIC,
+        RULE_TYPE_BGP_LG_SESSION_DOWN,
+        RULE_TYPE_BGP_LG_RPKI_INVALID_ROUTE,
+        RULE_TYPE_BGP_LG_UNEXPECTED_ORIGIN,
+        RULE_TYPE_BGP_LG_MORE_SPECIFIC,
+        RULE_TYPE_BGP_LG_ROUTE_FLAP,
+        RULE_TYPE_BGP_LG_MISSING_ADVERTISEMENT,
         RULE_TYPE_DOMAIN_EXPIRING,
         RULE_TYPE_DOMAIN_NS_DRIFT,
         RULE_TYPE_DOMAIN_REGISTRAR_CHANGED,
@@ -386,6 +413,29 @@ _ORPHAN_RESOURCE_MODELS: dict[str, Any] = {
 # operator-noteworthy. ``active`` ↔ ``pending`` flips during
 # commissioning are routine and don't fire.
 _CIRCUIT_STATUS_CHANGE_DESTS: frozenset[str] = frozenset({"suspended", "decom"})
+
+# BGP Looking Glass alert-family constants (issue #566 Phase 5).
+# Fixed windows, not operator-tunable columns — same precedent as
+# _FIREWALL_STALE_GRACE / _DNS_ANOMALY_WINDOW above.
+#
+# session_down: a peer flapping momentarily (TCP reset, brief
+# reconnect) shouldn't page; only a sustained down state does. Anchored
+# on BGPLGPeer.down_since, which THIS module stamps (see
+# _matching_bgp_lg_session_down_subjects) — mirrors
+# _FIREWALL_STALE_GRACE's stalled_since pattern exactly.
+_BGP_LG_SESSION_DOWN_GRACE = timedelta(minutes=2)
+
+# route_flap: a route counts as "flapping" once its lifetime
+# withdraw-count crosses the floor AND the most recent flap was within
+# this trailing window — so a route that flapped a lot long ago but has
+# been stable since ages out instead of paging forever.
+_BGP_LG_FLAP_WINDOW = timedelta(minutes=10)
+_BGP_LG_FLAP_COUNT_DEFAULT = 5
+
+# Defensive cap mirroring _IP_HYGIENE_MAX_EVENTS — a freshly-enabled
+# rule against a large RIB shouldn't open thousands of AlertEvents in
+# one 60s tick. Logs a warning when truncated (no silent cap).
+_BGP_LG_MAX_EVENTS = 500
 
 # Default consecutive-failure threshold for ``asn_whois_unreachable``.
 _ASN_WHOIS_UNREACHABLE_THRESHOLD = 3
@@ -1143,6 +1193,256 @@ async def _matching_bgp_hijack_subjects(
             f"RPKI {row.rpki_status}"
         )
         matches.append((str(row.id), display, message, row.severity))
+    return matches
+
+
+async def _matching_bgp_lg_session_down_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001 — symmetry with sibling evaluators
+    now: datetime,
+) -> list[tuple[str, str, str]]:
+    """``bgp_lg_session_down`` — an enabled peer whose session is not
+    Established, sustained past a grace window.
+
+    Grace is anchored on ``BGPLGPeer.down_since``, a watermark THIS
+    function stamps on first non-established observation and clears the
+    moment the session re-establishes — mirrors
+    ``_matching_firewall_apply_stalled_subjects``'s ``stalled_since``
+    pattern exactly. A converged session auto-resolves via
+    ``evaluate_all``'s standard "subject no longer matches" diff; no
+    explicit resolve logic needed here.
+    """
+    rows = (
+        await db.execute(
+            select(BGPLGPeer, LookingGlassCollector)
+            .join(LookingGlassCollector, LookingGlassCollector.id == BGPLGPeer.collector_id)
+            .where(BGPLGPeer.enabled.is_(True))
+        )
+    ).all()
+
+    matches: list[tuple[str, str, str]] = []
+    for peer, collector in rows:
+        if peer.session_state == "established":
+            if peer.down_since is not None:
+                peer.down_since = None
+            continue
+        if peer.down_since is None:
+            peer.down_since = now  # first observation — start the grace clock
+            continue
+        if (now - peer.down_since) <= _BGP_LG_SESSION_DOWN_GRACE:
+            continue
+        collector_note = (
+            f"collector '{collector.name}' is also reporting {collector.status}"
+            if collector.status != "active"
+            else f"collector '{collector.name}' is reporting normally"
+        )
+        display = f"{peer.name} (AS{peer.peer_asn} @ {peer.peer_address})"
+        message = (
+            f"BGP Looking Glass session '{peer.name}' to AS{peer.peer_asn} "
+            f"({peer.peer_address}) has been {peer.session_state} since "
+            f"{peer.down_since.isoformat()} — last known {peer.prefixes_received} "
+            f"prefixes received; {collector_note}."
+        )
+        matches.append((str(peer.id), display, message))
+    return matches
+
+
+async def _matching_bgp_lg_rpki_invalid_route_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+) -> list[tuple[str, str, str, str | None]]:
+    """``bgp_lg_rpki_invalid_route`` — every active learned route whose
+    RPKI status is ``invalid`` (computed at ingest via
+    ``derive_rpki_status_batch``, no re-validation needed here). Always
+    rides in at ``critical`` severity via a severity override — RPKI
+    invalidity on YOUR OWN table is the strongest possible in-network
+    leak/misconfig signal (mirrors ``severity_for_rpki``'s "invalid ⇒
+    critical" mapping from the #527 hijack monitor)."""
+    rows = (
+        await db.execute(
+            select(BGPLGRoute, BGPLGPeer)
+            .join(BGPLGPeer, BGPLGPeer.id == BGPLGRoute.peer_id)
+            .where(BGPLGRoute.rpki_status == RPKI_INVALID, BGPLGRoute.withdrawn_at.is_(None))
+            .limit(_BGP_LG_MAX_EVENTS)
+        )
+    ).all()
+    matches: list[tuple[str, str, str, str | None]] = []
+    for route, peer in rows:
+        display = f"{route.prefix} ← AS{route.origin_asn}"
+        message = (
+            f"RPKI-invalid route in the Looking Glass RIB: {route.prefix} originated by "
+            f"AS{route.origin_asn}, learned from peer '{peer.name}' (AS{peer.peer_asn}) — "
+            f"no covering ROA authorises this origin/length."
+        )
+        matches.append((str(route.id), display, message, severity_for_rpki(RPKI_INVALID)))
+    if len(rows) >= _BGP_LG_MAX_EVENTS:
+        logger.warning("bgp_lg_rpki_invalid_route_truncated", cap=_BGP_LG_MAX_EVENTS)
+    return matches
+
+
+async def _matching_bgp_lg_unexpected_origin_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+) -> list[tuple[str, str, str]]:
+    """``bgp_lg_unexpected_origin`` — an owned tracked prefix (exact
+    CIDR match against ``BGPTrackedPrefix``) learned in the live RIB
+    with an origin ASN outside ``expected_origin_set(tracked)``. Same
+    "internal hijack / fat-fingered redistribute / route leak" shape as
+    #527's exact-prefix detector, reading the internal RIB instead of
+    RIPEstat."""
+    rows = (
+        await db.execute(
+            select(BGPLGRoute, BGPTrackedPrefix, BGPLGPeer)
+            .join(BGPTrackedPrefix, BGPTrackedPrefix.prefix == BGPLGRoute.prefix)
+            .join(BGPLGPeer, BGPLGPeer.id == BGPLGRoute.peer_id)
+            .where(
+                BGPTrackedPrefix.enabled.is_(True),
+                BGPLGRoute.withdrawn_at.is_(None),
+                BGPLGRoute.origin_asn.is_not(None),
+            )
+            .limit(_BGP_LG_MAX_EVENTS)
+        )
+    ).all()
+    matches: list[tuple[str, str, str]] = []
+    for route, tracked, peer in rows:
+        if route.origin_asn in expected_origin_set(tracked):
+            continue
+        display = (
+            f"{route.prefix} ← AS{route.origin_asn} (expected AS{tracked.expected_origin_asn})"
+        )
+        message = (
+            f"Tracked prefix {tracked.prefix} is learned with unexpected origin "
+            f"AS{route.origin_asn} (expected AS{tracked.expected_origin_asn}) via peer "
+            f"'{peer.name}' — possible internal leak or misconfigured redistribution."
+        )
+        matches.append((str(route.id), display, message))
+    return matches
+
+
+async def _matching_bgp_lg_more_specific_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+) -> list[tuple[str, str, str]]:
+    """``bgp_lg_more_specific`` — a route STRICTLY more specific
+    (Postgres ``<<``, contained-and-not-equal) than an owned tracked
+    aggregate, with an unexpected origin. The classic internal
+    sub-prefix leak that wins BGP best-path over your aggregate via
+    longest-match. Same origin-allowlist semantics as
+    ``_matching_bgp_lg_unexpected_origin_subjects`` — only the
+    containment operator differs (exact ``==`` there, strict ``<<``
+    here)."""
+    rows = (
+        await db.execute(
+            select(BGPLGRoute, BGPTrackedPrefix, BGPLGPeer)
+            .join(BGPTrackedPrefix, BGPLGRoute.prefix.op("<<")(BGPTrackedPrefix.prefix))
+            .join(BGPLGPeer, BGPLGPeer.id == BGPLGRoute.peer_id)
+            .where(
+                BGPTrackedPrefix.enabled.is_(True),
+                BGPLGRoute.withdrawn_at.is_(None),
+                BGPLGRoute.origin_asn.is_not(None),
+            )
+            .limit(_BGP_LG_MAX_EVENTS)
+        )
+    ).all()
+    matches: list[tuple[str, str, str]] = []
+    for route, tracked, peer in rows:
+        if route.origin_asn in expected_origin_set(tracked):
+            continue
+        display = f"{route.prefix} (more-specific of {tracked.prefix}) ← AS{route.origin_asn}"
+        message = (
+            f"More-specific {route.prefix} of owned aggregate {tracked.prefix} learned with "
+            f"unexpected origin AS{route.origin_asn} (expected AS{tracked.expected_origin_asn}) "
+            f"via peer '{peer.name}' — this sub-prefix wins best-path over your aggregate."
+        )
+        matches.append((str(route.id), display, message))
+    return matches
+
+
+async def _matching_bgp_lg_route_flap_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str]]:
+    """``bgp_lg_route_flap`` — an active route whose lifetime flap count
+    (``BGPLGRoute.flap_count``, bumped once per absence-withdraw in
+    ``routes_ingest.py``) has crossed ``rule.threshold_percent`` (reused
+    as a raw flap-count floor — same int-as-count convention as
+    ``voice_lease_count_below`` / ``stale_ip_count``), AND the most
+    recent flap (``last_flap_at``) is within the trailing
+    ``_BGP_LG_FLAP_WINDOW``. The recency gate is what makes this a
+    "currently unstable" predicate rather than a permanent scar —
+    once no new flap lands for the window, the route drops out of the
+    match set and the AlertEvent auto-resolves via the standard diff.
+    """
+    threshold = rule.threshold_percent or _BGP_LG_FLAP_COUNT_DEFAULT
+    since = now - _BGP_LG_FLAP_WINDOW
+    rows = (
+        await db.execute(
+            select(BGPLGRoute, BGPLGPeer)
+            .join(BGPLGPeer, BGPLGPeer.id == BGPLGRoute.peer_id)
+            .where(
+                BGPLGRoute.flap_count >= threshold,
+                BGPLGRoute.last_flap_at.is_not(None),
+                BGPLGRoute.last_flap_at >= since,
+            )
+            .limit(_BGP_LG_MAX_EVENTS)
+        )
+    ).all()
+    matches: list[tuple[str, str, str]] = []
+    win_min = int(_BGP_LG_FLAP_WINDOW.total_seconds() // 60)
+    for route, peer in rows:
+        display = f"{route.prefix} via {peer.name}"
+        message = (
+            f"Route {route.prefix} via peer '{peer.name}' (AS{peer.peer_asn}) has flapped "
+            f"{route.flap_count} times, most recently {route.last_flap_at.isoformat()} "
+            f"(threshold {threshold} within the trailing ~{win_min} min) — unstable path."
+        )
+        matches.append((str(route.id), display, message))
+    return matches
+
+
+async def _matching_bgp_lg_missing_advertisement_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+) -> list[tuple[str, str, str]]:
+    """``bgp_lg_missing_advertisement`` — a subnet flagged
+    ``bgp_should_advertise`` with NO active learned route covering it
+    (Postgres ``>>=``, contains-or-equal) across ANY peer.
+
+    Deliberately does NOT wait on Phase 3's ``matched_subnet_id``
+    resolution — that FK is populated by a longest-prefix-match
+    reconcile that may not exist yet. This does the CIDR containment
+    check directly against ``BGPLGRoute.prefix`` so the alert works
+    whether or not Phase 3 has landed. ``Subnet``'s global soft-delete
+    query filter (``app.db._filter_soft_deleted``) already excludes
+    trashed subnets — no explicit ``deleted_at`` predicate needed.
+    """
+    covering_exists = (
+        select(BGPLGRoute.id)
+        .where(BGPLGRoute.withdrawn_at.is_(None), BGPLGRoute.prefix.op(">>=")(Subnet.network))
+        .correlate(Subnet)
+        .exists()
+    )
+    rows = (
+        (
+            await db.execute(
+                select(Subnet)
+                .where(Subnet.bgp_should_advertise.is_(True), ~covering_exists)
+                .limit(_BGP_LG_MAX_EVENTS)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str]] = []
+    for subnet in rows:
+        display = f"{subnet.network} ({subnet.name})" if subnet.name else str(subnet.network)
+        message = (
+            f"Subnet {subnet.network} is flagged 'should advertise via BGP' but no active "
+            f"Looking Glass peer is currently learning a covering route — check redistribution "
+            f"on your edge routers."
+        )
+        matches.append((str(subnet.id), display, message))
     return matches
 
 
@@ -3050,6 +3350,121 @@ async def seed_bgp_hijack_alert_rules() -> None:
         await session.commit()
 
 
+async def seed_bgp_lg_alert_rules() -> None:
+    """Seed the six ``bgp_lg_*`` rules (issue #566 Phase 5), DISABLED by
+    default — the Looking Glass collector needs an operator-configured
+    peer (and, for unexpected_origin/more_specific, at least one
+    BGPTrackedPrefix owned-prefix row from the #527 UI) before any of
+    these mean anything. Discoverable-but-off, matching the
+    bgp_prefix_hijack / bgp_more_specific_announced precedent
+    (``seed_bgp_hijack_alert_rules`` above). Keyed on ``rule_type``; an
+    operator who enables/renames one is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    seeds: tuple[tuple[str, str, str, int | None], ...] = (
+        (
+            RULE_TYPE_BGP_LG_SESSION_DOWN,
+            "BGP Looking Glass session down",
+            (
+                "Fires when a configured Looking Glass peer session drops out of "
+                "Established for longer than a short grace window. Shows the last "
+                "known prefix count and cross-references the owning collector's "
+                "own health. Auto-resolves the moment the session re-establishes. "
+                "Enable once you've configured at least one peer under "
+                "Network → BGP Looking Glass."
+            ),
+            None,
+        ),
+        (
+            RULE_TYPE_BGP_LG_RPKI_INVALID_ROUTE,
+            "BGP Looking Glass RPKI-invalid route",
+            (
+                "Fires when a route in YOUR live routing table (not the public "
+                "table — see the separate BGP prefix hijack rule for that) has an "
+                "RPKI status of invalid: a ROA covers the prefix but does not "
+                "authorise the observed origin/length. Always critical severity. "
+                "Auto-resolves when the route withdraws or its RPKI status "
+                "changes. The strongest in-network leak/misconfig signal."
+            ),
+            None,
+        ),
+        (
+            RULE_TYPE_BGP_LG_UNEXPECTED_ORIGIN,
+            "BGP Looking Glass unexpected origin",
+            (
+                "Fires when one of your tracked/owned prefixes (configured under "
+                "an ASN's Tracked Prefixes — the same list the BGP prefix hijack "
+                "rule reads) is learned in your OWN live table with an origin ASN "
+                "outside the expected/allowlisted set. Catches internal leaks and "
+                "fat-fingered redistribution before they reach the public table. "
+                "Requires at least one enabled tracked prefix to ever fire."
+            ),
+            None,
+        ),
+        (
+            RULE_TYPE_BGP_LG_MORE_SPECIFIC,
+            "BGP Looking Glass more-specific announced",
+            (
+                "Fires when a route strictly more-specific than one of your "
+                "tracked/owned aggregates is learned in your live table with an "
+                "unexpected origin ASN — the classic internal sub-prefix leak "
+                "that wins best-path over your aggregate via longest-match. "
+                "Requires at least one enabled tracked prefix to ever fire."
+            ),
+            None,
+        ),
+        (
+            RULE_TYPE_BGP_LG_ROUTE_FLAP,
+            "BGP Looking Glass route flap",
+            (
+                "Fires when a learned route's flap count (announce/withdraw "
+                "churn) crosses the configured threshold (Threshold %, reused "
+                "here as a raw flap-count floor — default 5) with the most "
+                "recent flap inside the trailing ~10 minutes. Auto-resolves once "
+                "the route stops flapping for that window."
+            ),
+            _BGP_LG_FLAP_COUNT_DEFAULT,
+        ),
+        (
+            RULE_TYPE_BGP_LG_MISSING_ADVERTISEMENT,
+            "BGP Looking Glass missing advertisement",
+            (
+                "Fires when a subnet flagged 'should advertise via BGP' "
+                "(Subnet.bgp_should_advertise) has no active learned route "
+                "covering it across any configured peer — catches 'why is this "
+                "network unreachable' before the tickets come in. Requires "
+                "flagging at least one subnet as bgp_should_advertise=true to "
+                "ever fire."
+            ),
+            None,
+        ),
+    )
+
+    async with AsyncSessionLocal() as session:
+        for rule_type, name, description, default_threshold in seeds:
+            existing = await session.scalar(
+                select(AlertRule).where(AlertRule.rule_type == rule_type)
+            )
+            if existing is not None:
+                continue
+            session.add(
+                AlertRule(
+                    name=name,
+                    description=description,
+                    rule_type=rule_type,
+                    severity="warning",
+                    enabled=False,
+                    notify_syslog=True,
+                    notify_webhook=True,
+                    notify_smtp=False,
+                    threshold_percent=default_threshold,
+                )
+            )
+        await session.commit()
+
+
 async def seed_builtin_compliance_alert_rules() -> None:
     """Insert the three disabled compliance-change rules on first
     boot. Idempotent — only inserts a row when no rule with the same
@@ -3442,6 +3857,29 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             elif rule.rule_type == RULE_TYPE_BGP_MORE_SPECIFIC:
                 matches = await _matching_bgp_hijack_subjects(db, rule, "more_specific")
                 subject_type = "bgp_hijack"
+            elif rule.rule_type == RULE_TYPE_BGP_LG_SESSION_DOWN:
+                base = await _matching_bgp_lg_session_down_subjects(db, rule, now)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "bgp_lg_peer"
+            elif rule.rule_type == RULE_TYPE_BGP_LG_RPKI_INVALID_ROUTE:
+                matches = await _matching_bgp_lg_rpki_invalid_route_subjects(db, rule)
+                subject_type = "bgp_lg_route"
+            elif rule.rule_type == RULE_TYPE_BGP_LG_UNEXPECTED_ORIGIN:
+                base = await _matching_bgp_lg_unexpected_origin_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "bgp_lg_route"
+            elif rule.rule_type == RULE_TYPE_BGP_LG_MORE_SPECIFIC:
+                base = await _matching_bgp_lg_more_specific_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "bgp_lg_route"
+            elif rule.rule_type == RULE_TYPE_BGP_LG_ROUTE_FLAP:
+                base = await _matching_bgp_lg_route_flap_subjects(db, rule, now)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "bgp_lg_route"
+            elif rule.rule_type == RULE_TYPE_BGP_LG_MISSING_ADVERTISEMENT:
+                base = await _matching_bgp_lg_missing_advertisement_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "subnet"
             elif rule.rule_type == RULE_TYPE_DOMAIN_EXPIRING:
                 expiring = await _matching_domain_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]

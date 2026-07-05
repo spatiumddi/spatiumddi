@@ -29,7 +29,10 @@ guard, differing only in the withdrawal semantics:
    between RIB pushes still converges within a few minutes.
  * **Absence-withdraw (full snapshot only):** every tracked row for this
    peer with ``withdrawn_at IS NULL`` that is NOT in the wire set has left
-   the peer's feed — set ``withdrawn_at=now()`` and bump ``flap_count``.
+   the peer's feed — set ``withdrawn_at=now()``, bump ``flap_count``, and
+   stamp ``last_flap_at=now()`` (issue #566 Phase 5 — the recency
+   dimension the ``bgp_lg_route_flap`` alert needs so a route that flapped
+   a lot long ago but has been stable since doesn't page forever).
    Withdrawn rows are **never hard-deleted** — ``withdrawn_at`` is the
    designed history marker (the UI / alerts read it).
 
@@ -228,6 +231,7 @@ async def ingest_routes(
                 if apply:
                     row.withdrawn_at = now
                     row.flap_count = (row.flap_count or 0) + 1
+                    row.last_flap_at = now
                 result.withdrawn += 1
 
     if apply:

@@ -13291,6 +13291,16 @@ export interface BGPLGRouteForIpResponse {
   alternate_paths_count: number;
 }
 
+/** GET /looking-glass/dashboard-summary — single-shot rollup backing the
+ *  Dashboard's "Looking Glass health" card. */
+export interface BGPLGDashboardSummary {
+  peers_total: number;
+  peers_established: number;
+  peers_down: number;
+  routes_rpki_invalid: number;
+  routes_flapping: number;
+}
+
 export const lookingGlassApi = {
   // Collectors — agent-registration identity rows (one per GoBGP daemon).
   // Registration itself is agent-side; operators only read the list here.
@@ -13338,6 +13348,11 @@ export const lookingGlassApi = {
       .get<BGPLGRouteForIpResponse>("/looking-glass/routes/for-ip", {
         params: { ip },
       })
+      .then((r) => r.data),
+  /** Single-shot rollup for the Dashboard's Looking Glass health card. */
+  getDashboardSummary: () =>
+    api
+      .get<BGPLGDashboardSummary>("/looking-glass/dashboard-summary")
       .then((r) => r.data),
 };
 

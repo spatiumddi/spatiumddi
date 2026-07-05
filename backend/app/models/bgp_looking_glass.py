@@ -245,6 +245,7 @@ class BGPLGRoute(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_bgp_lg_route_matched_space", "matched_space_id"),
         Index("ix_bgp_lg_route_matched_asn", "matched_asn_id"),
         Index("ix_bgp_lg_route_matched_vrf", "matched_vrf_id"),
+        Index("ix_bgp_lg_route_last_flap_at", "last_flap_at"),
     )
 
     peer_id: Mapped[uuid.UUID] = mapped_column(
@@ -316,6 +317,15 @@ class BGPLGRoute(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     flap_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=sa_text("0")
     )
+    # Timestamp of the most recent absence-withdraw bump on this row
+    # (issue #566 Phase 5) — lets bgp_lg_route_flap require a RECENT
+    # flap, not just a lifetime count, so a route that flapped a lot
+    # months ago but has been stable since doesn't page forever. Stamped
+    # by routes_ingest.py's absence-withdraw branch alongside
+    # flap_count. Distinct from BGPLGPeer.last_flap_at (a peer SESSION
+    # flap, different model/table) — this is a per-route
+    # announce/withdraw flap.
+    last_flap_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Vendor-attribute escape hatch (mirrors BGPHijackDetection.detail).
     detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 

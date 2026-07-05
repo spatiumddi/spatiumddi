@@ -353,3 +353,19 @@ class RouteForIpResponse(BaseModel):
     found: bool
     route: RouteRead | None = None
     alternate_paths_count: int = 0
+
+
+class LookingGlassDashboardSummary(BaseModel):
+    """Single-shot rollup for the Dashboard's Looking Glass health card
+    (issue #566 Phase 5). Deliberately NOT shaped like the Integrations
+    dashboard tab's ``IntegrationPanel`` (``api/v1/dashboards/integrations.py``)
+    — that shape keys off pull-reconciler fields
+    (``last_synced_at``/``sync_interval_seconds``) that
+    ``LookingGlassCollector`` doesn't have (it's agent-push-registered,
+    like DNSServer/DHCPServer)."""
+
+    peers_total: int
+    peers_established: int
+    peers_down: int
+    routes_rpki_invalid: int
+    routes_flapping: int

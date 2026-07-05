@@ -29,6 +29,10 @@ Endpoints:
   CIDR passed as a query param so its slash / IPv6 colons encode cleanly), and
   ``/routes/for-ip?ip=`` (reverse LPM-by-single-address, Phase 3) are distinct
   URL shapes so there's no route collision.
+* ``/dashboard-summary`` — single-shot peer/route rollup backing the main
+  Dashboard's "Looking Glass health" card (issue #566 Phase 5). See
+  ``LookingGlassDashboardSummary`` for why this is its own shape rather than
+  the Integrations dashboard tab's ``IntegrationPanel``.
 
 Every write handler writes an ``AuditLog`` row before ``commit()`` per
 CLAUDE.md non-negotiable #4.
@@ -55,11 +59,13 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.bgp_looking_glass import BGPLGPeer, BGPLGRoute, LookingGlassCollector
 from app.models.network import NetworkDevice
+from app.services.bgp.hijack_monitor import RPKI_INVALID
 from app.services.looking_glass.reverse_lookup import best_route_for_ip
 
 from .schemas import (
     CollectorRead,
     CollectorUpdate,
+    LookingGlassDashboardSummary,
     PeerCreate,
     PeerRead,
     PeerUpdate,
@@ -548,4 +554,42 @@ async def get_route_for_ip(
     route, alt_count = result
     return RouteForIpResponse(
         ip=ip, found=True, route=_route_to_read(route), alternate_paths_count=alt_count
+    )
+
+
+@router.get("/dashboard-summary", response_model=LookingGlassDashboardSummary)
+async def dashboard_summary(db: DB, _: CurrentUser) -> LookingGlassDashboardSummary:
+    """Single-shot rollup backing the Dashboard's Looking Glass health
+    card. Peers/sessions are cheap to enumerate in full (bounded, like
+    ``list_sessions``); route counts use ``func.count()`` so the
+    "low-thousands" RIB is never pulled client-side just to compute a
+    KPI number.
+    """
+    peers = (await db.execute(select(BGPLGPeer).where(BGPLGPeer.enabled.is_(True)))).scalars().all()
+    peers_total = len(peers)
+    peers_established = sum(1 for p in peers if p.session_state == "established")
+    peers_down = peers_total - peers_established
+
+    rpki_invalid = (
+        await db.execute(
+            select(func.count())
+            .select_from(BGPLGRoute)
+            .where(BGPLGRoute.rpki_status == RPKI_INVALID, BGPLGRoute.withdrawn_at.is_(None))
+        )
+    ).scalar_one()
+
+    flapping = (
+        await db.execute(
+            select(func.count())
+            .select_from(BGPLGRoute)
+            .where(BGPLGRoute.flap_count >= 1, BGPLGRoute.withdrawn_at.is_(None))
+        )
+    ).scalar_one()
+
+    return LookingGlassDashboardSummary(
+        peers_total=peers_total,
+        peers_established=peers_established,
+        peers_down=peers_down,
+        routes_rpki_invalid=rpki_invalid,
+        routes_flapping=flapping,
     )
