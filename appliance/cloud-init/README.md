@@ -1,5 +1,20 @@
 # cloud-init NoCloud — first-boot config for the SpatiumDDI appliance
 
+> **Installer ISO vs. disk image — two different headless paths.**
+> This README covers preseeding the **disk-image** path: boot the
+> mkosi-built raw/qcow2 directly as the VM's disk and let cloud-init
+> apply `user-data`. That path keeps mkosi's simple partition layout —
+> **no A/B slots, no STATE partition, no `/etc` overlay**, so slot
+> upgrades and HA promotion are not available on it.
+>
+> If you want a headless install that produces the full HA-capable
+> 6-partition A/B layout, use the **installer ISO's unattended mode**
+> instead: a flat `spatium-install.conf` answer file on a `SPATIUM`
+> (or this same `CIDATA`) seed drives the whole wizard non-interactively.
+> See [`spatium-install.conf.example`](spatium-install.conf.example) in
+> this directory and the "Unattended install" section of
+> [`docs/deployment/APPLIANCE.md`](../../docs/deployment/APPLIANCE.md).
+
 The Phase 1 appliance image ships with the
 [NoCloud](https://cloudinit.readthedocs.io/en/latest/reference/datasources/nocloud.html)
 cloud-init datasource enabled. Drop a `user-data` + `meta-data` pair

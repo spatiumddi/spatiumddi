@@ -781,6 +781,72 @@ trigger: tag push (CalVer)
 > reinstall to change `cluster-cidr` / `service-cidr`. The
 > partition layout permits keeping `/var` across reinstalls.
 
+### Unattended install (headless, HA-capable) — the installer ISO answer file
+
+The **installer ISO** runs completely non-interactively when it finds a
+flat `key: value` **answer file** (`spatium-install.conf`). This is the
+headless path that produces the real 6-partition A/B / STATE layout —
+the same bytes an interactive install writes — so the resulting box is
+slot-upgradeable and HA-promotable. (Contrast with the cloud-init
+disk-image path below, which keeps mkosi's simple partition layout: no
+A/B slots, no STATE partition, no `/etc` overlay.)
+
+**Answer-file discovery**, in priority order:
+
+1. `spatium.answers=<auto|/dev/X|/path|URL>` kernel-cmdline token —
+   the ISO ships an "Install SpatiumDDI (unattended, from seed disk /
+   URL)" GRUB entry with `spatium.answers=auto`; press `e` in GRUB to
+   point it at `http://…` for PXE/netboot.
+2. A block device labelled `SPATIUM` carrying `spatium-install.conf`.
+3. A NoCloud `CIDATA` seed carrying `spatium-install.conf` — so one
+   seed ISO can serve both this path and the cloud-init path.
+
+The default "Install SpatiumDDI to disk" entry auto-detects seeds too;
+the dedicated entry just makes the intent explicit.
+
+**Build a seed** (full field reference in
+[`appliance/cloud-init/spatium-install.conf.example`](../../appliance/cloud-init/spatium-install.conf.example)):
+
+```sh
+cd appliance/cloud-init
+cp spatium-install.conf.example spatium-install.conf
+# edit: confirm_wipe: true, role, target_disk, hostname, admin_password
+genisoimage -output seed.iso -volid SPATIUM -joliet -rock spatium-install.conf
+```
+
+Attach `seed.iso` as a second CD/disk next to the installer ISO and
+boot. The install runs with zero keystrokes, streams its step messages
+to the console (serial included) + `/var/log/spatium-install.log`, and
+reboots into first boot.
+
+**Safety gates** — all enforced before anything touches a disk:
+
+- `confirm_wipe: true` must be present **verbatim**; an
+  accidentally-attached seed can never erase a machine.
+- Every field is validated with the same rules the interactive prompts
+  enforce (role, hostname shape, static-network addresses,
+  pairing-code format, k3s CIDR overlap, the 32 GiB A/B disk floor).
+  The control-plane soft-sizing warning (#312) logs instead of
+  blocking.
+- On **any** validation failure the installer prints a diagnostic and
+  falls back to the interactive wizard — parked at the Welcome screen
+  on a truly headless box. Nothing is written.
+
+**Pre-flight from any machine** (no root, nothing touched):
+
+```sh
+spatium-install --check-answers spatium-install.conf
+```
+
+The same lint runs in CI-portable pytest form at
+`appliance/tests/test_unattended_install.py`.
+
+`role: appliance` installs need `control_plane_url` +
+`bootstrap_pairing_code` (mint at `https://<control-plane>/appliance` →
+Pairing) and come up in `pending_approval` on the Fleet tab, exactly
+like an interactive install. `target_disk: auto` picks the first disk
+that clears the 32 GiB floor.
+
 ### Phase 1 (pre-#183, replaced): headless via cloud-init NoCloud
 
 Phase 1 ships with `cloud-init` enabled and the NoCloud datasource

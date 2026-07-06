@@ -1,0 +1,80 @@
+# spatium-install.conf — SpatiumDDI unattended installer answer file.
+#
+# Drives the INSTALLER ISO completely non-interactively, producing the
+# same 6-partition A/B / STATE / HA-capable layout as the interactive
+# whiptail wizard. (Contrast with user-data.example in this directory,
+# which preseeds the cloud-init DISK-IMAGE path — that path has no A/B
+# slots and no STATE partition.)
+#
+# Flat `key: value` lines only — no nesting, no YAML features. Values
+# may be bare or quoted. Missing optional keys keep the installer's
+# defaults. Lint a file on any machine (no root needed) with:
+#
+#   spatium-install --check-answers spatium-install.conf
+#
+# Deliver it one of three ways:
+#
+#   (a) Seed disk (auto-detected): write this file as
+#       `spatium-install.conf` onto a volume labelled SPATIUM and
+#       attach it to the VM next to the installer ISO:
+#
+#         genisoimage -output seed.iso -volid SPATIUM -joliet -rock \
+#                     spatium-install.conf
+#
+#       (macOS: hdiutil makehybrid -o seed.iso -iso -joliet \
+#               -default-volume-name SPATIUM seed-dir/)
+#       A NoCloud CIDATA volume carrying a spatium-install.conf also
+#       works, so one seed ISO can serve both provisioning paths.
+#
+#   (b) Kernel cmdline: pick the "Install SpatiumDDI (unattended)"
+#       GRUB entry, or append `spatium.answers=<dev|path|url>` to the
+#       standard Install entry — e.g.
+#       spatium.answers=http://10.0.0.5/answers.conf for PXE/netboot.
+#
+#   (c) Rescue shell: `spatium-install` picks the file up from an
+#       attached seed automatically, or point at any path with
+#       spatium.answers=/path/to/file.
+#
+# SAFETY: the installer ERASES target_disk. It refuses to run (and
+# falls back to the interactive wizard) unless confirm_wipe is exactly
+# `true` — an accidentally-attached seed disk can never wipe a box.
+
+# ── Required ─────────────────────────────────────────────────────────
+confirm_wipe: false            # MUST be `true` for the install to proceed
+role: control-plane            # control-plane | appliance
+                               #   control-plane — the FIRST node: api + db +
+                               #     web UI + k3s seed (DNS/DHCP enabled later
+                               #     per node from the Fleet UI)
+                               #   appliance — additional node: pairs with an
+                               #     existing control plane, approved + given
+                               #     roles in the Fleet UI (promotable to
+                               #     control-plane for HA)
+target_disk: /dev/vda          # or `auto` = first disk ≥ 32 GiB (A/B floor)
+hostname: spatium-cp-1         # unique per appliance (alnum + hyphen, ≤ 63)
+admin_password: "ChangeMe!12345"   # OS login (SSH + sudo) for admin_user + root
+
+# ── Optional ─────────────────────────────────────────────────────────
+# admin_user: admin            # OS-level admin username (default: admin)
+# timezone: UTC                # IANA name, e.g. America/Toronto
+
+# ── Network (default: dhcp) ──────────────────────────────────────────
+network_mode: dhcp             # dhcp | static
+# network_interface: eth0      # required for static
+# network_ip: 10.3.3.139       # required for static
+# network_prefix: 24           # required for static (1-32)
+# network_gateway: 10.3.3.1    # required for static
+# network_dns: 1.1.1.1 1.0.0.1 # space-separated (default shown)
+
+# ── k3s CIDRs (defaults match k3s upstream; change only on a LAN that
+#    already uses these ranges — see issue #302) ──────────────────────
+# k3s_pod_cidr: 10.42.0.0/16
+# k3s_service_cidr: 10.43.0.0/16
+
+# ── Appliance role only (role: appliance) ────────────────────────────
+# control_plane_url: https://spatium-cp-1.example.com
+#                              # point multi-node control planes at the
+#                              # MetalLB VIP, not a single node's IP
+# bootstrap_pairing_code: "12345678"
+#                              # 8 digits; mint at
+#                              # https://<control-plane>/appliance → Pairing
+#                              # (dashes/spaces from the UI display are OK)

@@ -187,6 +187,19 @@ menuentry "Install SpatiumDDI to disk" {
     initrd /live/initrd.img
 }
 
+# Unattended install (issue #134 headless gap). Functionally the
+# default Install entry already auto-detects an answer file on an
+# attached SPATIUM / CIDATA seed disk; this entry makes the intent
+# explicit and is the natural place to edit (press `e` in GRUB) a
+# spatium.answers=http://… pointer for PXE/netboot installs. The
+# installer refuses to run unattended unless the answer file carries
+# confirm_wipe: true, and falls back to the interactive wizard on any
+# validation failure. See appliance/cloud-init/spatium-install.conf.example.
+menuentry "Install SpatiumDDI (unattended, from seed disk / URL)" {
+    linux /live/vmlinuz $common $quietkbd spatium-mode=install spatium.answers=auto
+    initrd /live/initrd.img
+}
+
 # spatium-mode=live boots the OS from CD/USB WITHOUT starting the
 # SpatiumDDI stack (k3s + firstboot are gated ``!boot=live``) — it's a
 # rescue / diagnostics environment, NOT a product demo. Used to recover

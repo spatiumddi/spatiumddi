@@ -45,7 +45,7 @@ users:
 #
 # Drop the file below (mode 0600 — the pairing code is sensitive even
 # before firstboot transcribes it into .env) and the firstboot script
-# wires COMPOSE_PROFILES=supervisor,agent automatically. Mint a code
+# reads it to pick the role + pairing config on first boot. Mint a code
 # at https://<control-plane>/appliance → Pairing → 'New pairing code'.
 #
 # write_files:

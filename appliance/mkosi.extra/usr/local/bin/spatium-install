@@ -24,6 +24,7 @@
 # rootfs (date, tty, id, cat, command, ls) so the logger itself
 # can't fail in a way the diagnostic forgets to record.
 {
+{
     printf '[%s] LAUNCH\n'      "$(date -Iseconds 2>/dev/null || echo '?')"
     printf '  pid=%s ppid=%s\n' "$$" "$PPID"
     printf '  tty=%s\n'         "$(tty 2>/dev/null || echo '?')"
@@ -36,7 +37,10 @@
     printf '  rsync=%s\n'       "$(command -v rsync 2>/dev/null || echo MISSING)"
     printf '  varlog=%s\n'      "$(ls -ld /var/log 2>&1)"
     printf -- '----\n'
-} >> /var/log/spatium-install-launch.log 2>&1 || true
+} >> /var/log/spatium-install-launch.log 2>&1
+# The outer group silences the redirect-open error itself (permission
+# denied when --check-answers runs unprivileged on a dev machine).
+} 2>/dev/null || true
 
 # pipefail + nounset for the wizard, but NOT -e: whiptail returns
 # non-zero on Cancel/Esc and we want to handle that explicitly with
@@ -46,11 +50,17 @@
 set -uo pipefail
 
 BACKTITLE="SpatiumDDI Appliance Installer 0.1.0"
-INSTALL_LOG=/var/log/spatium-install.log
+# SPATIUM_INSTALL_LOG override + the /dev/null fallback below exist for
+# the host-portable `--check-answers` mode (and its pytest suite in
+# appliance/tests/), which runs this script on machines where /var/log
+# isn't writable by the caller.
+INSTALL_LOG="${SPATIUM_INSTALL_LOG:-/var/log/spatium-install.log}"
 MOUNT=/mnt/target
 
-mkdir -p /var/log
-: > "$INSTALL_LOG"
+mkdir -p /var/log 2>/dev/null || true
+if ! : 2>/dev/null > "$INSTALL_LOG"; then
+    INSTALL_LOG=/dev/null
+fi
 # Log to file only — NOT stdout. The do_install brace group below
 # pipes stdout to whiptail's --gauge protocol parser, which expects
 # only "XXX" / percentage / prompt-text lines. If log() tee'd to
@@ -63,8 +73,12 @@ log() { echo "[$(date -Iseconds)] $*" >> "$INSTALL_LOG"; }
 # unexpectedly, this captures every command + variable expansion so
 # we can pinpoint the exact line. Doesn't pollute the user-facing
 # install log.
-TRACE_LOG=/var/log/spatium-install-trace.log
-: > "$TRACE_LOG"
+TRACE_LOG="${SPATIUM_INSTALL_TRACE_LOG:-/var/log/spatium-install-trace.log}"
+if ! : 2>/dev/null > "$TRACE_LOG"; then
+    # Same host-portable fallback as INSTALL_LOG above — a failed
+    # `exec 19>` would kill a non-interactive bash outright.
+    TRACE_LOG=/dev/null
+fi
 exec 19> "$TRACE_LOG"
 # Export so the gauge subshell pipeline below inherits the same
 # trace fd. Without export, the subshell's BASH_XTRACEFD defaults
@@ -75,7 +89,12 @@ exec 19> "$TRACE_LOG"
 # fights with set -x output.
 export BASH_XTRACEFD=19
 PS4='+ ${BASH_SOURCE##*/}:${LINENO}: ${FUNCNAME[0]:-main}() '
-set -x
+# No trace in --check-answers mode: it's a host-portable lint (also
+# driven by appliance/tests/), and on bash < 4.1 (macOS dev machines)
+# BASH_XTRACEFD is not honoured so the trace would spew to stderr.
+if [ "${1:-}" != "--check-answers" ]; then
+    set -x
+fi
 
 log "===== spatium-install wizard started at $(date -Iseconds) ====="
 
@@ -647,8 +666,31 @@ ask_k3s_cidrs() {
 
 # Helper: validate the two CIDRs typed by ask_k3s_cidrs. Returns 0 on
 # success; on fail, shows a whiptail msgbox describing the problem +
-# returns 1 so the caller re-prompts.
+# returns 1 so the caller re-prompts. The actual check lives in
+# _k3s_cidr_error so the unattended validator can reuse it without
+# the whiptail wrapper.
 _validate_k3s_cidrs() {
+    local err
+    err=$(_k3s_cidr_error "$1" "$2")
+    if [ -z "$err" ]; then
+        return 0
+    fi
+    if [ "$UNATTENDED" = 1 ] || [ "$CHECK_MODE" = 1 ]; then
+        # Belt-and-braces — the unattended path calls _k3s_cidr_error
+        # directly; never pop a dialog on a headless install.
+        log "k3s CIDR validation failed: $err"
+        echo "ERROR: $err" >&2
+        return 1
+    fi
+    whiptail --backtitle "$BACKTITLE" --title "k3s networking — invalid" \
+        --msgbox "$err\n\nPress OK to fix." 14 72 || true
+    return 1
+}
+
+# Prints the validation error for a pod/service CIDR pair (empty output
+# = valid). Reads NET_MODE/NET_IP/NET_PREFIX to cross-check the
+# operator's static LAN subnet.
+_k3s_cidr_error() {
     local pod="$1" svc="$2"
     # Hand off to Python — ``ipaddress`` does parsing, prefix-len
     # checking, and overlap detection in three idiomatic lines. The
@@ -659,8 +701,7 @@ _validate_k3s_cidrs() {
     if [ "$NET_MODE" = "static" ] && [ -n "$NET_IP" ] && [ -n "$NET_PREFIX" ]; then
         static_subnet="$NET_IP/$NET_PREFIX"
     fi
-    local err
-    err=$(python3 - "$pod" "$svc" "$static_subnet" <<'PY' 2>&1
+    python3 - "$pod" "$svc" "$static_subnet" <<'PY' 2>&1
 import ipaddress
 import sys
 pod_s, svc_s, static_s = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -711,13 +752,6 @@ if static_s:
         )
         sys.exit(1)
 PY
-)
-    if [ -z "$err" ]; then
-        return 0
-    fi
-    whiptail --backtitle "$BACKTITLE" --title "k3s networking — invalid" \
-        --msgbox "$err\n\nPress OK to fix." 14 72 || true
-    return 1
 }
 
 # Helper: compute the cluster-dns IP from the chosen service CIDR.
@@ -731,6 +765,432 @@ import sys
 net = ipaddress.ip_network(sys.argv[1], strict=False)
 print(str(net.network_address + 10))
 PY
+}
+
+# ── Unattended install (issue #134 headless gap) ─────────────────────────────
+#
+# The installer ISO can run completely non-interactively: it reads a
+# flat ``key: value`` answer file (``spatium-install.conf``) from
+#   1. a ``spatium.answers=<auto|/dev/X|/path|URL>`` kernel-cmdline
+#      token (edit the GRUB entry, or use the shipped "unattended"
+#      menuentry), or
+#   2. a block device labelled ``SPATIUM`` (a tiny ISO / vfat seed), or
+#   3. a NoCloud ``CIDATA`` seed that carries a spatium-install.conf,
+# maps it onto the same wizard variables the whiptail prompts set,
+# validates every field with the same rules, and only then runs
+# do_install. The disk-ERASE step is gated on an explicit
+# ``confirm_wipe: true`` in the file — an accidentally-attached seed
+# can never nuke a box. On ANY validation failure the installer prints
+# a diagnostic and falls back to the interactive wizard (parked at the
+# Welcome screen on a truly headless box — safe, non-destructive).
+#
+# The answer file uses the exact flat shape spatium-etc-render's
+# spatium-config.yaml already uses, and the same dependency-free sed
+# parser, so there is no YAML library anywhere in the boot path.
+#
+# Offline pre-flight from any machine (no root, no appliance):
+#   spatium-install --check-answers <file>
+#
+# Example answer file: appliance/cloud-init/spatium-install.conf.example
+# (repo) — shipped on the ISO at /usr/share/doc/spatiumddi/.
+
+UNATTENDED=0
+CHECK_MODE=0
+ANSWER_FILE=""
+ANSWER_STAGED=/run/spatium-install-answers.conf
+
+# Flat ``key: value`` reader for the answer file. Same shape as
+# spatium-etc-render's get_cfg, plus inline-comment handling (the
+# example file annotates values with trailing ``# …``): a quoted value
+# keeps everything inside the quotes verbatim (so passwords may contain
+# ``#``); an unquoted value is cut at the first whitespace-``#``. First
+# match wins; missing key = empty.
+get_answer() {
+    [ -f "$ANSWER_FILE" ] || return 0
+    local raw
+    raw=$(sed -n "s/^$1:[[:space:]]*//p" "$ANSWER_FILE" | head -1)
+    case "$raw" in
+        '"'*'"'*)
+            raw=${raw#'"'}
+            raw=${raw%%'"'*}
+            ;;
+        "'"*"'"*)
+            raw=${raw#"'"}
+            raw=${raw%%"'"*}
+            ;;
+        *)
+            raw=${raw%%[[:space:]]\#*}
+            raw=$(printf '%s' "$raw" | sed 's/[[:space:]]*$//')
+            ;;
+    esac
+    printf '%s\n' "$raw"
+}
+
+# Copies the answer file out of a mounted seed dir into the staged
+# path. ISO9660 without Rock Ridge upper-cases file names, so check
+# both spellings (the docs recommend genisoimage -rock, which keeps
+# lower-case).
+_stage_answer_from_dir() {
+    local dir="$1" f
+    for f in spatium-install.conf SPATIUM-INSTALL.CONF; do
+        if [ -f "$dir/$f" ]; then
+            cp "$dir/$f" "$ANSWER_STAGED"
+            chmod 0600 "$ANSWER_STAGED"
+            ANSWER_FILE="$ANSWER_STAGED"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_stage_answer_from_device() {
+    local dev="$1" mnt=/run/spatium-answers rc=1
+    [ -b "$dev" ] || return 1
+    mkdir -p "$mnt"
+    mount -o ro "$dev" "$mnt" 2>>"$INSTALL_LOG" || return 1
+    if _stage_answer_from_dir "$mnt"; then
+        rc=0
+    fi
+    umount "$mnt" 2>>"$INSTALL_LOG" || true
+    return $rc
+}
+
+# Sets ANSWER_FILE and returns 0 when an answer source is found.
+# Priority: cmdline token > SPATIUM label > CIDATA label. The staged
+# copy lives on tmpfs so the seed can be unmounted (and detached)
+# before do_install repartitions anything.
+discover_answer_file() {
+    local tok
+    tok=$(tr ' ' '\n' < /proc/cmdline 2>/dev/null \
+          | sed -n 's/^spatium\.answers=//p' | head -1)
+    case "$tok" in
+        http://*|https://*)
+            log "Unattended: fetching answer file from $tok"
+            if curl -fsSL --connect-timeout 15 -o "$ANSWER_STAGED" "$tok" \
+                    2>>"$INSTALL_LOG"; then
+                chmod 0600 "$ANSWER_STAGED"
+                ANSWER_FILE="$ANSWER_STAGED"
+                return 0
+            fi
+            log "Unattended: fetch FAILED for $tok — falling back to interactive"
+            return 1
+            ;;
+        /dev/*)
+            if _stage_answer_from_device "$tok"; then
+                log "Unattended: answer file staged from $tok"
+                return 0
+            fi
+            log "Unattended: no spatium-install.conf on $tok — falling back to interactive"
+            return 1
+            ;;
+        ""|auto)
+            # No explicit pointer — scan for a labelled seed below.
+            ;;
+        *)
+            # A plain filesystem path (useful from the rescue shell).
+            if [ -f "$tok" ]; then
+                cp "$tok" "$ANSWER_STAGED"
+                chmod 0600 "$ANSWER_STAGED"
+                ANSWER_FILE="$ANSWER_STAGED"
+                log "Unattended: answer file staged from path $tok"
+                return 0
+            fi
+            log "Unattended: answer path $tok not found — falling back to interactive"
+            return 1
+            ;;
+    esac
+
+    # Label scan. A dedicated SPATIUM seed wins over a NoCloud CIDATA
+    # seed (the latter may exist for other tooling; we only consume it
+    # when it actually carries our file). blkid -L matches exactly, so
+    # the install ISO itself (volid SPATIUMDDI) never matches.
+    local label dev
+    for label in SPATIUM CIDATA; do
+        dev=$(blkid -L "$label" 2>/dev/null || true)
+        [ -n "$dev" ] || continue
+        if _stage_answer_from_device "$dev"; then
+            log "Unattended: answer file staged from $dev (LABEL=$label)"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Maps answer-file keys onto the wizard state variables. Optional keys
+# keep the wizard defaults declared at the top of this script; required
+# keys (role / hostname / admin_password / target_disk / confirm_wipe)
+# are enforced by validate_unattended, not defaulted here.
+load_answers() {
+    local v
+    ROLE=$(get_answer role)
+    HOSTNAME=$(get_answer hostname)
+    ADMIN_USER=$(get_answer admin_user)
+    [ -z "$ADMIN_USER" ] && ADMIN_USER="admin"
+    ADMIN_PASSWORD=$(get_answer admin_password)
+    TARGET_DISK=$(get_answer target_disk)
+    NET_MODE=$(get_answer network_mode)
+    [ -z "$NET_MODE" ] && NET_MODE="dhcp"
+    NET_INTERFACE=$(get_answer network_interface)
+    NET_IP=$(get_answer network_ip)
+    v=$(get_answer network_prefix);   [ -n "$v" ] && NET_PREFIX="$v"
+    NET_GATEWAY=$(get_answer network_gateway)
+    v=$(get_answer network_dns);      [ -n "$v" ] && NET_DNS="$v"
+    v=$(get_answer timezone);         [ -n "$v" ] && TIMEZONE="$v"
+    v=$(get_answer k3s_pod_cidr);     [ -n "$v" ] && K3S_POD_CIDR="$v"
+    v=$(get_answer k3s_service_cidr); [ -n "$v" ] && K3S_SERVICE_CIDR="$v"
+    CONTROL_PLANE_URL=$(get_answer control_plane_url)
+    BOOTSTRAP_PAIRING_CODE=$(get_answer bootstrap_pairing_code)
+    return 0
+}
+
+# SPATIUM_FAKE_DISK_BYTES is a test-only seam for the host-portable
+# pytest suite (appliance/tests/test_unattended_install.py) — CI
+# machines have no spare block device to exercise the size-floor gate
+# against. Never set it on a real install.
+_disk_size_bytes() {
+    if [ -n "${SPATIUM_FAKE_DISK_BYTES:-}" ]; then
+        echo "$SPATIUM_FAKE_DISK_BYTES"
+        return 0
+    fi
+    blockdev --getsize64 "$1" 2>/dev/null || echo 0
+}
+
+# ``target_disk: auto`` — first non-live disk that clears the A/B
+# floor. Same lsblk scan + live-medium exclusion as pick_disk, minus
+# the menu.
+_first_disk_over_floor() {
+    local live_src live_disk name
+    live_src=$(findmnt -no SOURCE /run/live/medium 2>/dev/null || \
+               findmnt -no SOURCE /lib/live/mount/medium 2>/dev/null || true)
+    live_disk=$(lsblk -no PKNAME "$live_src" 2>/dev/null || true)
+    [ -n "$live_disk" ] && live_disk="/dev/$live_disk"
+    local MIN_BYTES=$((MIN_DISK_GIB * 1024 * 1024 * 1024))
+    while IFS= read -r name; do
+        [ "/dev/$name" = "$live_disk" ] && continue
+        if [ "$(_disk_size_bytes "/dev/$name")" -ge "$MIN_BYTES" ]; then
+            echo "/dev/$name"
+            return 0
+        fi
+    done < <(lsblk -dn -o NAME -r 2>/dev/null | grep -vE "^(sr|loop|fd|ram|zram)")
+    return 1
+}
+
+# Static-network field validation (empty output = valid). Python's
+# ipaddress for the same reason as _k3s_cidr_error. Reports the first
+# problem it finds.
+_static_net_error() {
+    python3 - "$1" "$2" "$3" "$4" <<'PY' 2>&1
+import ipaddress
+import sys
+ip_s, prefix_s, gw_s, dns_s = sys.argv[1:5]
+if not ip_s:
+    print("network_ip is required for network_mode: static")
+    sys.exit(0)
+try:
+    ipaddress.IPv4Address(ip_s)
+except ValueError:
+    print(f"network_ip '{ip_s}' is not a valid IPv4 address")
+    sys.exit(0)
+try:
+    p = int(prefix_s)
+    if not 1 <= p <= 32:
+        raise ValueError
+except ValueError:
+    print(f"network_prefix '{prefix_s}' must be an integer 1-32")
+    sys.exit(0)
+if not gw_s:
+    print("network_gateway is required for network_mode: static")
+    sys.exit(0)
+try:
+    ipaddress.IPv4Address(gw_s)
+except ValueError:
+    print(f"network_gateway '{gw_s}' is not a valid IPv4 address")
+    sys.exit(0)
+for d in dns_s.split():
+    try:
+        ipaddress.IPv4Address(d)
+    except ValueError:
+        print(f"network_dns entry '{d}' is not a valid IPv4 address")
+        sys.exit(0)
+PY
+}
+
+# Non-interactive mirror of every prompt-time validation rule. Prints
+# all problems (not just the first) so one lint round fixes the file.
+# Warnings never block; errors return 1. In --check-answers mode the
+# machine-specific checks (disk present / interface present) downgrade
+# to notes, since the linting machine isn't the install target.
+validate_unattended() {
+    local errors=() warns=()
+
+    local confirm
+    confirm=$(get_answer confirm_wipe)
+    if [ "$confirm" != "true" ]; then
+        errors+=("confirm_wipe must be exactly 'true' — the install ERASES target_disk and refuses to run without this explicit consent")
+    fi
+
+    case "$ROLE" in
+        control-plane|appliance) ;;
+        "") errors+=("role is required (control-plane | appliance)") ;;
+        *)  errors+=("role '$ROLE' is not valid (control-plane | appliance)") ;;
+    esac
+
+    if [ -z "$HOSTNAME" ]; then
+        errors+=("hostname is required — give each appliance a unique name")
+    else
+        case "$HOSTNAME" in
+            *[!a-zA-Z0-9-]*|-*|*-)
+                errors+=("hostname '$HOSTNAME' must be alphanumeric + hyphen, no leading/trailing hyphen, no dots or spaces") ;;
+        esac
+        if [ "${#HOSTNAME}" -gt 63 ]; then
+            errors+=("hostname must be 63 characters or fewer")
+        fi
+    fi
+
+    case "$ADMIN_USER" in
+        ""|-*|*[!a-zA-Z0-9_-]*)
+            errors+=("admin_user '$ADMIN_USER' is not a valid unix username") ;;
+    esac
+    if [ -z "$ADMIN_PASSWORD" ]; then
+        errors+=("admin_password is required (OS login for SSH + sudo)")
+    fi
+
+    # Target disk + the A/B size floor (MIN_DISK_GIB). The soft
+    # control-plane sizing warning (#312) logs instead of blocking —
+    # there is no operator present to acknowledge it.
+    local MIN_BYTES=$((MIN_DISK_GIB * 1024 * 1024 * 1024))
+    if [ -z "$TARGET_DISK" ]; then
+        errors+=("target_disk is required (a /dev node, or 'auto' for the first disk ≥ ${MIN_DISK_GIB} GiB)")
+    elif [ "$TARGET_DISK" = "auto" ]; then
+        if [ "$CHECK_MODE" = 1 ]; then
+            warns+=("target_disk: auto — resolved to the first ≥ ${MIN_DISK_GIB} GiB disk at install time")
+        else
+            errors+=("target_disk: auto did not match any disk ≥ ${MIN_DISK_GIB} GiB on this machine")
+        fi
+    elif [ -b "$TARGET_DISK" ] || [ -n "${SPATIUM_FAKE_DISK_BYTES:-}" ]; then
+        local bytes
+        bytes=$(_disk_size_bytes "$TARGET_DISK")
+        if [ "$bytes" -lt "$MIN_BYTES" ]; then
+            errors+=("target_disk $TARGET_DISK is $((bytes / 1024 / 1024 / 1024)) GiB — the A/B partition layout needs at least ${MIN_DISK_GIB} GiB")
+        elif [ "$ROLE" = "control-plane" ] && \
+             [ "$bytes" -lt $((REC_CP_DISK_GIB * 1024 * 1024 * 1024)) ]; then
+            warns+=("target_disk is under the recommended ${REC_CP_DISK_GIB} GiB for the control-plane role — first boot may hit kubelet DiskPressure (issue #312)")
+        fi
+    elif [ "$CHECK_MODE" = 1 ]; then
+        warns+=("target_disk $TARGET_DISK is not present on this machine — the ${MIN_DISK_GIB} GiB size floor will be checked at install time")
+    else
+        errors+=("target_disk $TARGET_DISK is not a block device on this machine")
+    fi
+
+    case "$NET_MODE" in
+        dhcp) ;;
+        static)
+            if [ -z "$NET_INTERFACE" ]; then
+                errors+=("network_interface is required for network_mode: static (e.g. eth0 / enp1s0)")
+            elif [ "$CHECK_MODE" != 1 ] && [ ! -e "/sys/class/net/$NET_INTERFACE" ]; then
+                errors+=("network_interface '$NET_INTERFACE' not found on this machine ($(ls /sys/class/net 2>/dev/null | tr '\n' ' '))")
+            fi
+            local net_err
+            net_err=$(_static_net_error "$NET_IP" "$NET_PREFIX" "$NET_GATEWAY" "$NET_DNS")
+            [ -n "$net_err" ] && errors+=("$net_err")
+            ;;
+        *) errors+=("network_mode '$NET_MODE' is not valid (dhcp | static)") ;;
+    esac
+
+    if [ "$ROLE" = "appliance" ]; then
+        case "$CONTROL_PLANE_URL" in
+            http://*|https://*) ;;
+            "") errors+=("control_plane_url is required for role: appliance (where this node registers)") ;;
+            *)  errors+=("control_plane_url '$CONTROL_PLANE_URL' must start with http:// or https://") ;;
+        esac
+        # Same separator-strip the interactive prompt applies — the
+        # frontend displays codes as ``1234-5678``.
+        local code
+        code=$(echo "$BOOTSTRAP_PAIRING_CODE" | tr -cd '0-9')
+        if [[ "$code" =~ ^[0-9]{8}$ ]]; then
+            BOOTSTRAP_PAIRING_CODE="$code"
+        else
+            errors+=("bootstrap_pairing_code must be 8 decimal digits (dashes / spaces accepted as separators); required for role: appliance — mint one at https://<control-plane>/appliance → Pairing")
+        fi
+    fi
+
+    local cidr_err
+    cidr_err=$(_k3s_cidr_error "$K3S_POD_CIDR" "$K3S_SERVICE_CIDR")
+    [ -n "$cidr_err" ] && errors+=("$cidr_err")
+
+    if [ -n "$TIMEZONE" ] && [ ! -e "/usr/share/zoneinfo/$TIMEZONE" ]; then
+        warns+=("timezone '$TIMEZONE' not found in the zoneinfo db — install falls back to UTC")
+    fi
+
+    # ``${arr[@]+...}`` guards the empty-array-under-set-u expansion
+    # (bash < 4.4 treats "${arr[@]}" on an empty array as unbound).
+    local w e
+    for w in ${warns[@]+"${warns[@]}"}; do
+        echo "WARN: $w"
+        log "Unattended validate WARN: $w"
+    done
+    if [ "${#errors[@]}" -gt 0 ]; then
+        echo "" >&2
+        echo "The answer file failed validation:" >&2
+        for e in ${errors[@]+"${errors[@]}"}; do
+            echo "  ERROR: $e" >&2
+            log "Unattended validate ERROR: $e"
+        done
+        return 1
+    fi
+    return 0
+}
+
+# The unattended front-end: load → resolve auto-disk → validate →
+# do_install. Returns 1 (without touching any disk) when validation
+# refuses, so main() falls through to the interactive wizard.
+run_unattended() {
+    UNATTENDED=1
+    load_answers
+
+    if [ "$TARGET_DISK" = "auto" ]; then
+        local resolved
+        if resolved=$(_first_disk_over_floor); then
+            log "Unattended: target_disk auto → $resolved"
+            TARGET_DISK="$resolved"
+        fi
+        # Unresolved → validate_unattended reports it as an error.
+    fi
+
+    if ! validate_unattended; then
+        UNATTENDED=0
+        echo "" >&2
+        echo "Unattended install refused — nothing was written to disk." >&2
+        echo "Fix the answer file (errors above) and reboot, or continue" >&2
+        echo "interactively at the console. Pre-flight an answer file on" >&2
+        echo "any machine with: spatium-install --check-answers <file>" >&2
+        log "Unattended install refused; falling back to the interactive wizard"
+        # Leave the diagnostic on screen long enough for a serial
+        # console watcher before whiptail repaints the terminal.
+        sleep 8
+        return 1
+    fi
+
+    log "Unattended install: role=$ROLE disk=$TARGET_DISK host=$HOSTNAME net=$NET_MODE tz=$TIMEZONE"
+    echo "Starting unattended SpatiumDDI install: role=$ROLE disk=$TARGET_DISK host=$HOSTNAME"
+    do_install
+}
+
+# Unattended stand-in for the whiptail --gauge sink: consumes the
+# gauge protocol on stdin, echoes the human step messages to the
+# console + log, drops the XXX / bare-percentage protocol lines.
+_gauge_to_console() {
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            XXX|[0-9]|[0-9][0-9]|100) : ;;
+            *)
+                echo "[unattended] $line"
+                log "gauge: $line"
+                ;;
+        esac
+    done
+    return 0
 }
 
 confirm() {
@@ -1547,8 +2007,14 @@ EOF
 
         echo "XXX"; echo "100"; echo "Done."; echo "XXX"
         sleep 1
-    } | whiptail --backtitle "$BACKTITLE" --title "Installing SpatiumDDI" \
-        --gauge "Starting installation…" 12 76 0
+    } | if [ "$UNATTENDED" = 1 ]; then
+        # Headless install — no TTY to draw a gauge on. The step
+        # messages go to the console (serial watchers) + install log.
+        _gauge_to_console
+    else
+        whiptail --backtitle "$BACKTITLE" --title "Installing SpatiumDDI" \
+            --gauge "Starting installation…" 12 76 0
+    fi
     # Notes on the --gauge args:
     #   * Initial text MUST be non-empty. newt-based whiptail (Debian)
     #     skips drawing the message line entirely when the initial text
@@ -1573,6 +2039,24 @@ EOF
         [ -b "$dev" ] || continue
         eject "$dev" >> "$INSTALL_LOG" 2>&1 || true
     done
+
+    # Unattended: no Done dialog to acknowledge — print the summary
+    # for serial-console watchers and reboot. The ATA EJECT above
+    # already unmapped the ISO on most hypervisors; the seed disk is
+    # read-only + already staged to tmpfs, so it can stay attached.
+    if [ "$UNATTENDED" = 1 ]; then
+        log "Install complete (unattended). Rebooting."
+        echo ""
+        echo "SpatiumDDI is installed on $TARGET_DISK (unattended)."
+        echo "Detach the install ISO so the BIOS boots from disk."
+        echo "First boot takes 2-5 min while the stack comes up; then:"
+        echo "  Web UI:  http://<appliance IP>/"
+        echo "  Login:   admin / admin   (change forced on first login)"
+        echo "Rebooting in 5 seconds..."
+        sleep 5
+        systemctl reboot
+        return 0
+    fi
 
     # Title kept short (4 chars) so it doesn't collide with the 36-char
     # BACKTITLE on the dialog top frame — whiptail renders backtitle on
@@ -1621,9 +2105,41 @@ Press OK to reboot." 24 72
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
+    # Offline answer-file pre-flight — runs on any machine (dev
+    # workstation, CI), no root, touches nothing. Clear the on_failure
+    # EXIT trap first: its drop-to-shell recovery path is for the live
+    # installer, not for a lint that intentionally exits non-zero.
+    if [ "${1:-}" = "--check-answers" ]; then
+        trap - EXIT
+        CHECK_MODE=1
+        if [ -z "${2:-}" ] || [ ! -f "${2:-}" ]; then
+            echo "usage: spatium-install --check-answers <answer-file>" >&2
+            exit 2
+        fi
+        ANSWER_FILE="$2"
+        load_answers
+        if validate_unattended; then
+            echo "OK: $2 is a valid spatium-install answer file (role=$ROLE)."
+            exit 0
+        fi
+        exit 1
+    fi
+
     if [ "$(id -u)" -ne 0 ]; then
         echo "Run as root." >&2
         exit 1
+    fi
+
+    # Unattended install (issue #134) — an answer file delivered via
+    # the spatium.answers= cmdline token or a SPATIUM / CIDATA seed
+    # disk takes the whole wizard out of the loop. A validation refusal
+    # returns 1 WITHOUT touching any disk, and we fall through to the
+    # interactive wizard below.
+    if discover_answer_file; then
+        log "Unattended: answer file at $ANSWER_FILE — attempting unattended install"
+        if run_unattended; then
+            return 0
+        fi
     fi
 
     # State-machine wizard. Each step is one function that returns:
