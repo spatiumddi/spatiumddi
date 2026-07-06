@@ -304,11 +304,9 @@ function PickGroupZoneModal({
     enabled: !!groupId,
   });
 
-  // Pools render regular A/AAAA records — only forward primary /
-  // secondary zones can host them. Conditional-forwarder zones, reverse
-  // (in-addr.arpa / ip6.arpa) zones — which hold PTR records, not
-  // A/AAAA — and Tailscale-synthesised zones are hidden from the picker
-  // (issue #571).
+// Pools render regular A/AAAA records — they must target a forward-lookup zone.
+// Conditional-forwarder zones (zone_type === "forward"), reverse zones (kind === "reverse"),
+// and Tailscale-synthesised zones are hidden from the picker (issue #571).
   const eligibleZones = zones.filter(
     (z) =>
       z.zone_type !== "forward" &&
