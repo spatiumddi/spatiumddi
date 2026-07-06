@@ -57,11 +57,21 @@ _CODE_TO_NAME: dict[int, str] = {
 }
 
 
+# Legacy / alternate option names that collapse onto a canonical name.
+# The frontend historically sent option 6 as the IANA name
+# ``domain-name-servers`` while the canonical stored vocabulary (and the
+# Kea driver's option-name map) is ``dns-servers`` (#583). Normalise on
+# write so new rows store canonically, and recognise the alias on read so
+# already-persisted rows still resolve to code 6 in ``_scope_to_response``
+# rather than falling through to code 0 / the custom-options bucket.
+_OPTION_NAME_ALIASES: dict[str, str] = {"domain-name-servers": "dns-servers"}
+
+
 def _normalize_options(raw: Any) -> dict[str, Any]:
     if raw is None:
         return {}
     if isinstance(raw, dict):
-        return raw
+        return {_OPTION_NAME_ALIASES.get(str(k), str(k)): v for k, v in raw.items()}
     if isinstance(raw, list):
         out: dict[str, Any] = {}
         for entry in raw:
@@ -73,6 +83,7 @@ def _normalize_options(raw: Any) -> dict[str, Any]:
                 name = f"option-{code}" if code else None
             if not name:
                 continue
+            name = _OPTION_NAME_ALIASES.get(name, name)
             out[name] = entry.get("value")
         return out
     return {}
@@ -264,6 +275,11 @@ class ScopeUpdate(BaseModel):
 
 
 _NAME_TO_CODE = {v: k for k, v in _CODE_TO_NAME.items()}
+# Existing rows may still be stored under the legacy alias (#583); map it
+# to code 6 on readback so the DNS Servers field populates on edit.
+for _alias, _canon in _OPTION_NAME_ALIASES.items():
+    if _canon in _NAME_TO_CODE:
+        _NAME_TO_CODE[_alias] = _NAME_TO_CODE[_canon]
 
 
 class ScopeResponse(BaseModel):
@@ -295,6 +311,10 @@ class ScopeResponse(BaseModel):
     ra_prefix_autonomous: bool = True
     ra_interface: str = ""
     relay_addresses: list[str] = Field(default_factory=list)
+    # PXE / iPXE profile binding (issue #51). Echoed so the scope edit
+    # form can pre-select the bound profile — without it the picker always
+    # reset to "(none)" and a save silently detached the profile (#583).
+    pxe_profile_id: uuid.UUID | None = None
     last_pushed_at: datetime | None
     tags: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
@@ -338,6 +358,7 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
         ra_prefix_autonomous=getattr(scope, "ra_prefix_autonomous", True),
         ra_interface=getattr(scope, "ra_interface", "") or "",
         relay_addresses=list(getattr(scope, "relay_addresses", None) or []),
+        pxe_profile_id=scope.pxe_profile_id,
         last_pushed_at=scope.last_pushed_at,
         tags=scope.tags or {},
         created_at=scope.created_at,
