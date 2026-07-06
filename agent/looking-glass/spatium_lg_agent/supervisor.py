@@ -36,6 +36,24 @@ def run(cfg: AgentConfig) -> int:
 
     proc = gobgp.start_daemon(cfg)
 
+    # Wait for gobgpd's gRPC to answer before the sync thread fires its first
+    # apply_config() (→ reload() → SIGHUP). A SIGHUP that lands during gobgpd's
+    # startup window — before it installs its SIGHUP handler — hits the default
+    # disposition (terminate) and kills the daemon, which then surfaces ~1s
+    # later as a bogus lg_gobgpd_exited crashloop (issue #576).
+    ready = gobgp.wait_until_ready(cfg, proc)
+    if not ready and not gobgp.daemon_running(proc):
+        # gobgpd exited during startup — a genuine config/bind failure, already
+        # logged by wait_until_ready. Don't start the worker threads against a
+        # dead daemon (avoidable secondary error logs) or wait a full poll tick
+        # to notice: exit now so the container restarts + re-bootstraps from the
+        # cached PSK (non-negotiable #5). A False return with gobgpd still alive
+        # means it was merely slow to answer gRPC within the timeout — proceed,
+        # since --config-auto-reload delivers the config via gobgpd's own file
+        # watch and the 1s daemon_running poll below still guards it.
+        log.error("lg_gobgpd_exited")
+        return 2
+
     heartbeat = HeartbeatClient(cfg, token_ref)
     rib = RibPoller(cfg, token_ref, heartbeat)
     syncer = SyncLoop(cfg, token_ref, heartbeat, rib, proc)
