@@ -128,7 +128,13 @@ OBSERVABILITY_IMAGES=(
 # against charts/frr-k8s/values.yaml inside the vendored
 # metallb-0.15.3.tgz (frr-k8s@0.0.21) — keep in lock-step with the
 # charts/spatiumddi-metallb/values.yaml `metallb.frr-k8s.frrk8s.image` /
-# `.frr.image` pins. ``metallb.speaker.frr.enabled`` stays FALSE (the
+# `.frr.image` pins, and `metallb.frr-k8s.prometheus.rbacProxy.*` for the
+# kube-rbac-proxy sidecar. #575 — kube-rbac-proxy moved off the sunset
+# `gcr.io/kubebuilder` mirror (now 404, which broke this bake + any
+# non-airgap frr-k8s pull) to its upstream home `quay.io/brancz`; the chart
+# override and the bake entry below MUST match so the baked image name is
+# exactly what the frr-k8s pod pulls.
+# ``metallb.speaker.frr.enabled`` stays FALSE (the
 # in-speaker FRR sidecar is mutually exclusive with the frr-k8s backend
 # and unused either way) so no image is baked for that path.
 METALLB_IMAGES=(
@@ -136,7 +142,10 @@ METALLB_IMAGES=(
     "quay.io/metallb/speaker:v0.15.3"
     "quay.io/metallb/frr-k8s:v0.0.21"
     "quay.io/frrouting/frr:10.4.1"
-    "gcr.io/kubebuilder/kube-rbac-proxy:v0.12.0"
+    # #575 — was gcr.io/kubebuilder/kube-rbac-proxy (sunset → 404); same image,
+    # maintained registry. Keep in lock-step with charts/spatiumddi-metallb
+    # values.yaml `metallb.frr-k8s.prometheus.rbacProxy.repository`.
+    "quay.io/brancz/kube-rbac-proxy:v0.12.0"
 )
 
 # CloudNativePG (#272 / #277) — PostgreSQL is CNPG on every appliance
