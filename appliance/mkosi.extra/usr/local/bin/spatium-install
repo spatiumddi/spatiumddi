@@ -23,20 +23,32 @@
 # Uses only shell builtins + utilities present in every Debian
 # rootfs (date, tty, id, cat, command, ls) so the logger itself
 # can't fail in a way the diagnostic forgets to record.
-{
-    printf '[%s] LAUNCH\n'      "$(date -Iseconds 2>/dev/null || echo '?')"
-    printf '  pid=%s ppid=%s\n' "$$" "$PPID"
-    printf '  tty=%s\n'         "$(tty 2>/dev/null || echo '?')"
-    printf '  uid=%s\n'         "$(id -u 2>/dev/null || echo '?')"
-    printf '  bash=%s\n'        "${BASH_VERSION:-?}"
-    printf '  pwd=%s\n'         "$(pwd 2>/dev/null || echo '?')"
-    printf '  cmdline=%s\n'     "$(tr '\n' ' ' </proc/cmdline 2>/dev/null)"
-    printf '  whiptail=%s\n'    "$(command -v whiptail 2>/dev/null || echo MISSING)"
-    printf '  sgdisk=%s\n'      "$(command -v sgdisk 2>/dev/null || echo MISSING)"
-    printf '  rsync=%s\n'       "$(command -v rsync 2>/dev/null || echo MISSING)"
-    printf '  varlog=%s\n'      "$(ls -ld /var/log 2>&1)"
-    printf -- '----\n'
-} >> /var/log/spatium-install-launch.log 2>&1 || true
+#
+# Skipped entirely in the host-portable `--check-preseed` / `--help`
+# modes (issue #581) so the offline lint truly touches nothing — no
+# /var/log write — and can run unprivileged on any dev / CI box. The
+# nested brace + `2>/dev/null` on the real-install path also silences the
+# redirect-open error itself if /var/log is not writable.
+case "${1:-}" in
+    --check-preseed|--help|-h) : ;;
+    *)
+    { {
+        printf '[%s] LAUNCH\n'      "$(date -Iseconds 2>/dev/null || echo '?')"
+        printf '  pid=%s ppid=%s\n' "$$" "$PPID"
+        printf '  tty=%s\n'         "$(tty 2>/dev/null || echo '?')"
+        printf '  uid=%s\n'         "$(id -u 2>/dev/null || echo '?')"
+        printf '  bash=%s\n'        "${BASH_VERSION:-?}"
+        printf '  pwd=%s\n'         "$(pwd 2>/dev/null || echo '?')"
+        printf '  cmdline=%s\n'     "$(tr '\n' ' ' </proc/cmdline 2>/dev/null)"
+        printf '  whiptail=%s\n'    "$(command -v whiptail 2>/dev/null || echo MISSING)"
+        printf '  sgdisk=%s\n'      "$(command -v sgdisk 2>/dev/null || echo MISSING)"
+        printf '  rsync=%s\n'       "$(command -v rsync 2>/dev/null || echo MISSING)"
+        printf '  varlog=%s\n'      "$(ls -ld /var/log 2>&1)"
+        printf -- '----\n'
+    } >> /var/log/spatium-install-launch.log 2>&1
+    } 2>/dev/null || true
+    ;;
+esac
 
 # pipefail + nounset for the wizard, but NOT -e: whiptail returns
 # non-zero on Cancel/Esc and we want to handle that explicitly with
@@ -46,11 +58,17 @@
 set -uo pipefail
 
 BACKTITLE="SpatiumDDI Appliance Installer 0.1.0"
-INSTALL_LOG=/var/log/spatium-install.log
+# The SPATIUM_INSTALL_LOG override + the /dev/null fallback below exist
+# for the host-portable `--check-preseed` linter (issue #581) and its
+# pytest suite, which run this script unprivileged on machines where
+# /var/log isn't writable by the caller.
+INSTALL_LOG="${SPATIUM_INSTALL_LOG:-/var/log/spatium-install.log}"
 MOUNT=/mnt/target
 
-mkdir -p /var/log
-: > "$INSTALL_LOG"
+mkdir -p /var/log 2>/dev/null || true
+if ! : 2>/dev/null > "$INSTALL_LOG"; then
+    INSTALL_LOG=/dev/null
+fi
 # Log to file only — NOT stdout. The do_install brace group below
 # pipes stdout to whiptail's --gauge protocol parser, which expects
 # only "XXX" / percentage / prompt-text lines. If log() tee'd to
@@ -63,8 +81,12 @@ log() { echo "[$(date -Iseconds)] $*" >> "$INSTALL_LOG"; }
 # unexpectedly, this captures every command + variable expansion so
 # we can pinpoint the exact line. Doesn't pollute the user-facing
 # install log.
-TRACE_LOG=/var/log/spatium-install-trace.log
-: > "$TRACE_LOG"
+TRACE_LOG="${SPATIUM_INSTALL_TRACE_LOG:-/var/log/spatium-install-trace.log}"
+if ! : 2>/dev/null > "$TRACE_LOG"; then
+    # Same host-portable fallback as INSTALL_LOG above (issue #581) — a
+    # failed `exec 19>` would kill a non-interactive bash outright.
+    TRACE_LOG=/dev/null
+fi
 exec 19> "$TRACE_LOG"
 # Export so the gauge subshell pipeline below inherits the same
 # trace fd. Without export, the subshell's BASH_XTRACEFD defaults
@@ -75,7 +97,14 @@ exec 19> "$TRACE_LOG"
 # fights with set -x output.
 export BASH_XTRACEFD=19
 PS4='+ ${BASH_SOURCE##*/}:${LINENO}: ${FUNCNAME[0]:-main}() '
-set -x
+# No bash trace in the host-portable `--check-preseed` / `--help` modes
+# (issue #581): the lint runs unprivileged and its machine-readable
+# output must not be polluted by set -x spew, and on bash < 4.1
+# BASH_XTRACEFD isn't honoured so the trace would go to stderr.
+case "${1:-}" in
+    --check-preseed|--help|-h) ;;
+    *) set -x ;;
+esac
 
 log "===== spatium-install wizard started at $(date -Iseconds) ====="
 
@@ -848,10 +877,13 @@ ask_k3s_cidrs() {
     done
 }
 
-# Helper: validate the two CIDRs typed by ask_k3s_cidrs. Returns 0 on
-# success; on fail, shows a whiptail msgbox describing the problem +
-# returns 1 so the caller re-prompts.
-_validate_k3s_cidrs() {
+# Pure validation core for a pod/service CIDR pair — prints the problem
+# on stdout (empty output = valid), reading NET_MODE/NET_IP/NET_PREFIX to
+# cross-check the operator's static LAN subnet. Split out of
+# _validate_k3s_cidrs (issue #581) so the headless `--check-preseed`
+# linter can reuse the EXACT rule the interactive wizard enforces,
+# without the whiptail dialog.
+_k3s_cidr_error() {
     local pod="$1" svc="$2"
     # Hand off to Python — ``ipaddress`` does parsing, prefix-len
     # checking, and overlap detection in three idiomatic lines. The
@@ -862,8 +894,7 @@ _validate_k3s_cidrs() {
     if [ "$NET_MODE" = "static" ] && [ -n "$NET_IP" ] && [ -n "$NET_PREFIX" ]; then
         static_subnet="$NET_IP/$NET_PREFIX"
     fi
-    local err
-    err=$(python3 - "$pod" "$svc" "$static_subnet" <<'PY' 2>&1
+    python3 - "$pod" "$svc" "$static_subnet" <<'PY' 2>&1
 import ipaddress
 import sys
 pod_s, svc_s, static_s = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -914,7 +945,16 @@ if static_s:
         )
         sys.exit(1)
 PY
-)
+}
+
+# Helper: validate the two CIDRs typed by ask_k3s_cidrs. Returns 0 on
+# success; on fail, shows a whiptail msgbox describing the problem +
+# returns 1 so the caller re-prompts. The check itself lives in
+# _k3s_cidr_error (issue #581) so the `--check-preseed` linter can reuse
+# it without popping a dialog.
+_validate_k3s_cidrs() {
+    local err
+    err=$(_k3s_cidr_error "$1" "$2")
     if [ -z "$err" ]; then
         return 0
     fi
@@ -2008,6 +2048,159 @@ EOF
     exit 1
 }
 
+# ── Offline preseed linter — `--check-preseed` (issue #581) ────────────────────
+#
+# Usage text, printed by `--help` (to stdout) and shared with the usage
+# error path (which prints its own one-liner to stderr).
+usage() {
+    cat <<'EOF'
+spatium-install — SpatiumDDI appliance disk installer
+
+Usage:
+  spatium-install
+      Run the interactive install wizard (must be root). Also picks up a
+      headless preseed answer file automatically when one is present
+      (spatium.preseed= cmdline, a CIDATA seed, or a rootfs-baked
+      spatium-preseed.yaml) — see docs for the format.
+
+  spatium-install --check-preseed <preseed.yaml>
+      Offline-lint a headless preseed answer file (issue #549 format)
+      WITHOUT installing anything. Runs unprivileged, reads only the
+      given file, and touches no disk / whiptail / /run. Reports every
+      problem it finds in one pass. Exit status:
+        0  the preseed is valid (a real headless install would accept it)
+        1  the preseed is invalid (errors printed to stderr)
+        2  usage error (missing / unreadable file)
+      Machine-specific checks (does target_disk exist / clear the size
+      floor on THIS box) are reported as warnings, so the same file lints
+      identically on a dev laptop and the real appliance.
+
+  spatium-install --help
+      Show this help.
+EOF
+}
+
+# Host-portable pre-flight for a #549 preseed answer file. It parses the
+# file with the SAME helper the real headless install uses
+# (spatium-preseed-parse) so the lint can never diverge from what an
+# unattended boot actually accepts, then re-runs the interactive wizard's
+# own rules (_validate_static_net + _k3s_cidr_error) against the resolved
+# values.
+#
+# That second layer matters: the parser's built-in static-network check
+# is looser than _validate_static_net (it does NOT enforce
+# gateway-in-subnet or validate the DNS list). On a real install
+# ask_network re-validates a preseeded static block and halts — but only
+# at install time, after the operator has already committed the boot. The
+# linter surfaces the same problem offline, before any disk is touched,
+# on any machine — which is the whole point of a pre-flight.
+check_preseed() {
+    local file="$1"
+    local -a errors=() warns=()
+    local line
+
+    local parser
+    parser="$(dirname "$0")/spatium-preseed-parse"
+    [ -f "$parser" ] || parser="/usr/local/bin/spatium-preseed-parse"
+    if [ ! -f "$parser" ]; then
+        echo "ERROR: spatium-preseed-parse not found next to $0 or in /usr/local/bin" >&2
+        return 2
+    fi
+
+    # Reuse the real parser. Its two output files (non-secret env + secret
+    # env) go to tempfiles we own and delete; the secret file may carry an
+    # admin password / pairing code, so it's 0600.
+    local tmp_env tmp_secret out rc
+    tmp_env=$(mktemp 2>/dev/null) || { echo "ERROR: cannot create tempfile" >&2; return 2; }
+    tmp_secret=$(mktemp 2>/dev/null) || { rm -f "$tmp_env"; echo "ERROR: cannot create tempfile" >&2; return 2; }
+    chmod 0600 "$tmp_secret" 2>/dev/null || true
+
+    out=$(python3 "$parser" "$file" "$tmp_env" "$tmp_secret" 2>&1)
+    rc=$?
+
+    case "$rc" in
+        0) : ;;  # parsed OK — resolved values are in $tmp_env / $tmp_secret
+        2)
+            # A supplied field failed the parser's own validation. The
+            # parser accumulates + prints EVERY such error already, one
+            # per `  - ` line — lift them verbatim.
+            while IFS= read -r line; do
+                case "$line" in
+                    "  - "*) errors+=("${line#  - }") ;;
+                esac
+            done <<<"$out"
+            [ "${#errors[@]}" -eq 0 ] && errors+=("preseed validation failed: $out")
+            ;;
+        3) errors+=("preseed file is not valid YAML / could not be read: $out") ;;
+        4) errors+=("no spatium preseed content — the file has no spatium_preseed block and no recognised preseed field; is this the right file?") ;;
+        *) errors+=("unexpected spatium-preseed-parse error (rc=$rc): $out") ;;
+    esac
+
+    # Advisory parser NOTES (e.g. an absent target_disk, a bare sdX name)
+    # become WARNINGS — they never fail the lint.
+    while IFS= read -r line; do
+        case "$line" in
+            "NOTE: "*) warns+=("${line#NOTE: }") ;;
+        esac
+    done <<<"$out"
+
+    local role_display="<interactive>" unattended="no"
+    if [ "$rc" -eq 0 ]; then
+        # Load the resolved values + PRESEED_HAS_* markers exactly as
+        # load_preseed would, then apply the interactive wizard's rules on
+        # top. shellcheck can't follow the runtime source.
+        # shellcheck disable=SC1090
+        [ -f "$tmp_env" ] && . "$tmp_env"
+        # shellcheck disable=SC1090
+        [ -f "$tmp_secret" ] && . "$tmp_secret"
+
+        # Static network — reuse the interactive prompt's own helper,
+        # which is stricter than the parser (gateway-in-subnet + DNS).
+        if [ -n "${PRESEED_HAS_NETWORK:-}" ] && [ "${NET_MODE:-}" = "static" ]; then
+            local nerr
+            if ! nerr=$(_validate_static_net); then
+                while IFS= read -r line; do
+                    [ -n "$line" ] && errors+=("network: $line")
+                done <<<"$nerr"
+            fi
+        fi
+
+        # k3s CIDRs — reuse the shared _k3s_cidr_error core (belt-and-
+        # braces: the parser already validates k3s, so this only fires if
+        # the two implementations ever drift).
+        if [ -n "${PRESEED_HAS_K3S:-}" ]; then
+            local kerr
+            kerr=$(_k3s_cidr_error "${K3S_POD_CIDR}" "${K3S_SERVICE_CIDR}")
+            [ -n "$kerr" ] && errors+=("k3s: $kerr")
+        fi
+
+        [ -n "${PRESEED_HAS_ROLE:-}" ] && role_display="$ROLE"
+        compute_unattended
+        [ "$FULLY_UNATTENDED" = "1" ] && unattended="yes"
+    fi
+
+    rm -f "$tmp_env" "$tmp_secret"
+
+    local i
+    for ((i = 0; i < ${#warns[@]}; i++)); do
+        echo "WARN: ${warns[$i]}"
+    done
+
+    if [ "${#errors[@]}" -gt 0 ]; then
+        {
+            echo ""
+            echo "The preseed answer file failed validation:"
+            for ((i = 0; i < ${#errors[@]}; i++)); do
+                echo "  ERROR: ${errors[$i]}"
+            done
+        } >&2
+        return 1
+    fi
+
+    echo "OK: $file is a valid spatium preseed (role=$role_display, fully-unattended=$unattended)."
+    return 0
+}
+
 # Discover + parse a preseed, if present. Tries every discovered
 # candidate in priority order; the first one that carries real preseed
 # content is adopted. A candidate with a spatium block but an invalid
@@ -2098,6 +2291,28 @@ load_preseed() {
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
+    # Non-install command modes (issue #581). These run BEFORE the root
+    # check so an operator can lint an answer file or read the help on any
+    # workstation. Clear the on_failure EXIT trap first: its drop-to-shell
+    # recovery is for the live installer, not a CLI that intentionally
+    # exits non-zero.
+    case "${1:-}" in
+        -h|--help)
+            trap - EXIT
+            usage
+            exit 0
+            ;;
+        --check-preseed)
+            trap - EXIT
+            if [ -z "${2:-}" ] || [ ! -f "${2:-}" ]; then
+                echo "usage: spatium-install --check-preseed <preseed.yaml>" >&2
+                exit 2
+            fi
+            check_preseed "$2"
+            exit $?
+            ;;
+    esac
+
     if [ "$(id -u)" -ne 0 ]; then
         echo "Run as root." >&2
         exit 1
