@@ -218,20 +218,22 @@ if [ ! -f "$ENV_FILE" ]; then
             ROLE=appliance
             DNS_AGENT_KEY_VAL=""
             DHCP_AGENT_KEY_VAL=""
+            LG_AGENT_KEY_VAL=""
             BOOTSTRAP_PAIRING_CODE_VAL="$INSTALL_BOOTSTRAP_PAIRING_CODE"
             CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
             AGENT_GROUP_VAL="default"
             ;;
         *)
-            # control-plane (or legacy full-stack / frontend-core). DNS
-            # + DHCP are OFF at install; the operator enables them per
-            # node via the Fleet role toggle. The agent keys are still
-            # generated here so the api can validate agent registrations
-            # once those roles ARE enabled (the api needs the key
-            # server-side, the role pods need it client-side).
+            # control-plane (or legacy full-stack / frontend-core). DNS,
+            # DHCP + Looking Glass are OFF at install; the operator enables
+            # them per node via the Fleet role toggle. The agent keys are
+            # still generated here so the api can validate agent
+            # registrations once those roles ARE enabled (the api needs the
+            # key server-side, the role pods need it client-side).
             ROLE=control-plane
             DNS_AGENT_KEY_VAL=$(gen_hex 24)
             DHCP_AGENT_KEY_VAL=$(gen_hex 24)
+            LG_AGENT_KEY_VAL=$(gen_hex 24)
             # #272 — leave CONTROL_PLANE_URL EMPTY on the control-plane
             # node. Two reasons it must stay empty:
             #   1. The supervisor's self-bootstrap path (mints the seed's
@@ -263,6 +265,7 @@ SECRET_KEY=$(gen_hex 32)
 CREDENTIAL_ENCRYPTION_KEY=$(gen_fernet)
 DNS_AGENT_KEY=${DNS_AGENT_KEY_VAL}
 DHCP_AGENT_KEY=${DHCP_AGENT_KEY_VAL}
+LG_AGENT_KEY=${LG_AGENT_KEY_VAL}
 BOOTSTRAP_PAIRING_CODE=${BOOTSTRAP_PAIRING_CODE_VAL}
 CONTROL_PLANE_URL=${CONTROL_PLANE_URL_VAL}
 AGENT_GROUP=${AGENT_GROUP_VAL}
@@ -409,14 +412,31 @@ APPLIANCE_ROLE_VAL=$(_env_get APPLIANCE_ROLE)
 APPLIANCE_ROLE_VAL="${APPLIANCE_ROLE_VAL:-control-plane}"
 
 # Agent pre-shared keys + in-cluster API service URL for the AIO
-# control-plane node. The DNS + DHCP role pods need them to
-# register against the local control plane, AND the api pod needs
-# them server-side to validate incoming agent registrations
-# (otherwise the api returns 503 "DNS_AGENT_KEY is not configured
-# on the control plane"). Both come from /etc/spatiumddi/.env which
+# control-plane node. The DNS / DHCP / Looking Glass role pods need
+# them to register against the local control plane, AND the api pod
+# needs them server-side to validate incoming agent registrations
+# (otherwise the api returns 503 "<X>_AGENT_KEY is not configured
+# on the control plane"). All come from /etc/spatiumddi/.env which
 # firstboot writes (or carries over) on every boot.
 DNS_AGENT_KEY_VAL=$(_env_get DNS_AGENT_KEY)
 DHCP_AGENT_KEY_VAL=$(_env_get DHCP_AGENT_KEY)
+LG_AGENT_KEY_VAL=$(_env_get LG_AGENT_KEY)
+# Backfill for boxes provisioned before LG_AGENT_KEY existed (issue #576).
+# It's the first agent key added after GA, so an already-installed
+# control-plane appliance that slot-upgrades into a Looking-Glass build has
+# no LG_AGENT_KEY line in its persistent (/var) .env — the first-boot
+# generation block above is skipped because .env already exists, and without
+# this the api would render LG_AGENT_KEY="" and every LG registration 503s.
+# Mint one once and PERSIST it (not just set the var): the api env must be
+# stable across boots or a fresh random key each boot would orphan an
+# already-registered collector. _env_get's ``tail -1`` makes the append
+# authoritative. Control-plane only — data-plane (appliance/application)
+# nodes intentionally keep it empty and receive it from the supervisor at
+# role-assign time.
+if [ -z "$LG_AGENT_KEY_VAL" ] && [ "$APPLIANCE_ROLE_VAL" = "control-plane" ]; then
+    LG_AGENT_KEY_VAL=$(gen_hex 24)
+    printf 'LG_AGENT_KEY=%s\n' "$LG_AGENT_KEY_VAL" >> "$ENV_FILE"
+fi
 # In-cluster service DNS for the api. Matches the umbrella chart's
 # release name (``spatium-control``) + the workload suffix the
 # template ``include "spatiumddi.fullname"`` produces. ClusterFirstWithHostNet
@@ -645,15 +665,20 @@ spec:
         - name: APPLIANCE_MODE
           value: "true"
         # Agent pre-shared keys — the api validates incoming
-        # registrations from DNS/DHCP agents against these. Without
-        # them the api returns 503 "DNS_AGENT_KEY is not configured
-        # on the control plane" and the role pods crash-loop.
+        # registrations from DNS / DHCP / Looking Glass agents against
+        # these. Without them the api returns 503 "<X>_AGENT_KEY is not
+        # configured on the control plane" and the role pods crash-loop.
         # Sourced from /etc/spatiumddi/.env which firstboot stamps
-        # on first boot.
+        # on first boot. LG_AGENT_KEY additionally feeds
+        # settings.lg_agent_key, which the supervisor ships in its
+        # heartbeat role-assignment so the running collector DaemonSet
+        # gets the matching client-side key (issue #576).
         - name: DNS_AGENT_KEY
           value: "${DNS_AGENT_KEY_VAL}"
         - name: DHCP_AGENT_KEY
           value: "${DHCP_AGENT_KEY_VAL}"
+        - name: LG_AGENT_KEY
+          value: "${LG_AGENT_KEY_VAL}"
         # #272 HA — stable identity for the self-signed Web UI cert.
         # The api Deployment runs N replicas (one per control-plane
         # node), all sharing one cluster TLS Secret. WITHOUT these the
