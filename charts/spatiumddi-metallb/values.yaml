@@ -133,6 +133,18 @@ metallb:
     # the metallb.io CRDs above — same "no double-owner conflict" reason.
     crds:
       enabled: false
+    # #575 — the frr-k8s controller wires a kube-rbac-proxy sidecar (twice
+    # per pod) whose image defaults to `gcr.io/kubebuilder/kube-rbac-proxy`,
+    # which Google sunset (now 404 — broke the bake + any non-airgap pull).
+    # Repoint to kube-rbac-proxy's maintained upstream home, quay.io/brancz
+    # (same image, same v0.12.0 tag). NOTE `rbacProxy` lives at the frr-k8s
+    # chart's TOP level under `prometheus:` (controller.yaml:397/423 read
+    # `.Values.prometheus.rbacProxy.*`), NOT under the `frrk8s:` block below.
+    # KEEP in lock-step with appliance/scripts/bake-images.sh METALLB_IMAGES.
+    prometheus:
+      rbacProxy:
+        repository: quay.io/brancz/kube-rbac-proxy
+        tag: v0.12.0
     # frr-k8s chart's OWN internal `frrk8s:` key (see the long comment
     # above) — nodeSelector / image / frr-image config all live here,
     # NOT at this block's top level.
