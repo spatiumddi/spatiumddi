@@ -66,6 +66,7 @@ import signal
 import socket
 import subprocess
 import threading
+import time
 from typing import Any
 
 import structlog
@@ -378,6 +379,46 @@ def start_daemon(cfg: AgentConfig) -> subprocess.Popen[bytes]:
     )
     log.info("gobgpd_started", pid=proc.pid)
     return proc
+
+
+def wait_until_ready(
+    cfg: AgentConfig,
+    proc: subprocess.Popen[bytes] | None = None,
+    timeout: float = 30.0,
+    interval: float = 0.25,
+) -> bool:
+    """Block until gobgpd's gRPC API answers a real request.
+
+    Gates the sync thread's first ``apply_config`` (→ :func:`reload` → SIGHUP)
+    on gobgpd being fully up. gobgpd installs its ``signal.Notify(SIGHUP)``
+    reload handler partway through startup; a SIGHUP that lands *before* then
+    hits the default disposition — **terminate** — and kills the daemon. The
+    bootstrap-from-cache apply fires within a few ms of :func:`start_daemon`,
+    so on a slow host that SIGHUP beats the handler and gobgpd dies with no
+    output ~1s in (issue #576 — reproduced on the k3s appliance; Docker won the
+    race locally, which is why this only surfaced in the field). A successful
+    ``gobgp neighbor`` call proves the gRPC server is serving requests, by which
+    point the signal handler is installed and any SIGHUP is safe.
+
+    Returns ``True`` once ready. Returns ``False`` if gobgpd exits during
+    startup (a genuine config/bind failure — surfaced immediately) or the
+    timeout elapses; the caller proceeds regardless — ``--config-auto-reload``
+    still delivers the config via gobgpd's own file watch, and the supervisor's
+    ``daemon_running`` check catches a truly dead daemon on its next tick.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            log.error("gobgpd_exited_during_startup", returncode=proc.returncode)
+            return False
+        try:
+            run_gobgp_cli(cfg, "neighbor", timeout=5.0)
+            log.info("gobgpd_ready")
+            return True
+        except GoBGPCliError:
+            time.sleep(interval)
+    log.warning("gobgpd_ready_timeout", timeout=timeout)
+    return False
 
 
 def daemon_running(proc: subprocess.Popen[bytes] | None) -> bool:

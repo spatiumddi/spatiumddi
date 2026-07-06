@@ -36,6 +36,13 @@ def run(cfg: AgentConfig) -> int:
 
     proc = gobgp.start_daemon(cfg)
 
+    # Wait for gobgpd's gRPC to answer before the sync thread fires its first
+    # apply_config() (→ reload() → SIGHUP). A SIGHUP that lands during gobgpd's
+    # startup window — before it installs its SIGHUP handler — hits the default
+    # disposition (terminate) and kills the daemon, which then surfaces ~1s
+    # later as a bogus lg_gobgpd_exited crashloop (issue #576).
+    gobgp.wait_until_ready(cfg, proc)
+
     heartbeat = HeartbeatClient(cfg, token_ref)
     rib = RibPoller(cfg, token_ref, heartbeat)
     syncer = SyncLoop(cfg, token_ref, heartbeat, rib, proc)

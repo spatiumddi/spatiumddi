@@ -66,6 +66,18 @@ spec:
         - name: looking-glass
           image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.lookingGlass.image.repository) }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          # gobgpd binds the privileged BGP port :179 as the non-root
+          # ``spatium`` user via a file capability (``setcap
+          # cap_net_bind_service`` on the binary). Under k8s that file cap is
+          # only honoured with NET_BIND_SERVICE in the container's capability
+          # set and ``no_new_privs`` off; the empty default securityContext
+          # left it fragile across runtimes (issue #576). Grant it explicitly
+          # — the k8s-native way to let a non-root process bind a well-known
+          # port, matching the Dockerfile's documented intent.
+          securityContext:
+            allowPrivilegeEscalation: true
+            capabilities:
+              add: ["NET_BIND_SERVICE"]
           env:
             # spatium_lg_agent.config.AgentConfig.from_env() contract
             # (agent/looking-glass/): CONTROL_PLANE_URL + LG_AGENT_KEY.
