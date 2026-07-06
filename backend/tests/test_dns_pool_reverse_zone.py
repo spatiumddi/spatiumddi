@@ -75,7 +75,7 @@ async def test_pool_create_rejected_on_reverse_zone(
 
 
 @pytest.mark.asyncio
-async def test_pool_create_allowed_on_forward_zone(
+async def test_pool_create_allowed_on_forward_lookup_zone(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     token = await _token(db_session)
