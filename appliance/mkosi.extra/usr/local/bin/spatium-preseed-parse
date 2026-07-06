@@ -195,7 +195,17 @@ if "confirm_wipe" in ps:
 # survives re-enumeration; a bare sdX name is accepted but noted, since
 # it can renumber between boots. A supplied-but-unresolvable disk drops
 # to the interactive picker rather than guessing (never a silent wipe).
+# Test-only seam (issue #581): the `spatium-install --check-preseed`
+# linter + its host-portable pytest suite have no spare 32 GiB block
+# device to point the size-floor gate at, so when SPATIUM_FAKE_DISK_BYTES
+# is set we treat target_disk as a present whole disk of exactly that
+# many bytes. Inert on a real install (the env var is never set there).
+_FAKE_DISK_BYTES = os.environ.get("SPATIUM_FAKE_DISK_BYTES")
+
+
 def resolve_disk(spec: str):
+    if _FAKE_DISK_BYTES is not None:
+        return spec, None
     real = os.path.realpath(spec)
     try:
         st = os.stat(real)
@@ -216,6 +226,11 @@ def resolve_disk(spec: str):
 def disk_size_bytes(real: str):
     """Capacity of a whole-disk /dev node via /sys/block/<name>/size
     (512-byte sectors). Returns None if unreadable."""
+    if _FAKE_DISK_BYTES is not None:
+        try:
+            return int(_FAKE_DISK_BYTES)
+        except ValueError:
+            return None
     name = os.path.basename(real)
     try:
         with open(f"/sys/block/{name}/size", encoding="ascii") as fh:
