@@ -304,11 +304,16 @@ function PickGroupZoneModal({
     enabled: !!groupId,
   });
 
-  // Pools render regular A/AAAA records — only primary / secondary
-  // zones can host them. Forward + Tailscale-synthesised zones are
-  // hidden from the picker.
+  // Pools render regular A/AAAA records — only forward primary /
+  // secondary zones can host them. Conditional-forwarder zones, reverse
+  // (in-addr.arpa / ip6.arpa) zones — which hold PTR records, not
+  // A/AAAA — and Tailscale-synthesised zones are hidden from the picker
+  // (issue #571).
   const eligibleZones = zones.filter(
-    (z) => z.zone_type !== "forward" && !z.tailscale_tenant_id,
+    (z) =>
+      z.zone_type !== "forward" &&
+      z.kind !== "reverse" &&
+      !z.tailscale_tenant_id,
   );
 
   const group = groups.find((g) => g.id === groupId);
@@ -362,7 +367,8 @@ function PickGroupZoneModal({
           </select>
           {groupId && eligibleZones.length === 0 && (
             <p className="text-[11px] text-muted-foreground">
-              No primary or secondary zones in this group. Forward zones and
+              No eligible forward zones in this group. Conditional-forwarder
+              zones, reverse (in-addr.arpa / ip6.arpa) zones, and
               Tailscale-synthesised zones can&apos;t host pools.
             </p>
           )}
