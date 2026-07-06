@@ -371,6 +371,12 @@ async def create_pool(
         raise HTTPException(status_code=404, detail="Zone not found")
     if zone.zone_type == "forward":
         raise HTTPException(status_code=400, detail="Pools are not supported on forward zones")
+    # Pools render A/AAAA records, which only belong in a forward zone.
+    # Reverse (in-addr.arpa / ip6.arpa) zones hold PTR records, so a pool
+    # there could never render a valid record — reject it defensively
+    # rather than relying on the UI picker filter alone (issue #571).
+    if zone.kind == "reverse":
+        raise HTTPException(status_code=400, detail="Pools are not supported on reverse zones")
     clash = await db.execute(
         select(DNSPool).where(DNSPool.zone_id == zone_id, DNSPool.record_name == body.record_name)
     )
