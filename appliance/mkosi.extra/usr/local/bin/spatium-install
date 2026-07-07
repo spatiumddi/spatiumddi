@@ -1867,6 +1867,24 @@ EOF
     # render Unicode box-drawing chars at all. Plain indented text +
     # the `*** … ***` attention rule scans cleanly on tty1, in serial
     # consoles, and over SSH.
+    #
+    # #549 headless follow-up — GATE this msgbox on FULLY_UNATTENDED, the
+    # same as welcome + the final confirm are gated in main()'s state
+    # machine. A fully-preseeded install has no operator on tty1 to press
+    # OK, so showing it unconditionally hangs the run FOREVER: the disk is
+    # already partitioned, rsynced, grub-installed, answer-injected and
+    # synced, and the media ATA-ejected — but `systemctl reboot` below is
+    # never reached, so the appliance completes its install correctly yet
+    # never boots into it. (Hypervisor-side workarounds can't rescue this:
+    # the install ISO is the live boot medium, so its tray stays LOCKED —
+    # `eject /dev/sr0` above fails and a "tray-open" completion signal can
+    # never fire; and whiptail on tty1 ignores an injected Enter/ACPI on a
+    # headless guest.) The msgbox's "remove the install media" advice is
+    # moot when unattended (the eject already fired; hypervisors honor the
+    # ATA EJECT) and there is no human to read it. Interactive + partial-
+    # preseed installs still show it (an operator was prompted for
+    # something, so give them the review + media reminder).
+    if [ "${FULLY_UNATTENDED:-0}" != "1" ]; then
     whiptail --backtitle "$BACKTITLE" --title "Done" \
         --msgbox "\
 SpatiumDDI is installed on $TARGET_DISK.
@@ -1892,6 +1910,9 @@ the SpatiumDDI container images.
    Login:   admin / admin   (change forced on first login)
 
 Press OK to reboot." 24 72
+    else
+        log "Fully unattended: install complete on $TARGET_DISK — skipping the interactive Done prompt and rebooting straight into the installed system."
+    fi
 
     log "Install complete. Rebooting."
     systemctl reboot
