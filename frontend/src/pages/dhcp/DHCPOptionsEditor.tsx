@@ -34,8 +34,13 @@ const STANDARD_OPTIONS: StandardDef[] = [
     hint: "Default gateway(s) for clients on this scope.",
   },
   {
+    // Canonical SpatiumDDI option name is ``dns-servers`` — this is what
+    // the backend stores + what the Kea driver's option-name map keys on
+    // (both v4 → ``domain-name-servers`` and v6 → option 23). Sending the
+    // IANA name ``domain-name-servers`` here bypassed that map and, worse,
+    // read back as code 0 so the field rendered empty on edit (#583).
     code: 6,
-    name: "domain-name-servers",
+    name: "dns-servers",
     label: "DNS Servers (option 6)",
     kind: "ip-list",
     max: 3,
