@@ -81,6 +81,7 @@ from app.api.v1.version import router as version_router
 from app.api.v1.vlans.router import router as vlans_router
 from app.api.v1.vrfs import router as vrfs_router
 from app.api.v1.webhooks import router as webhooks_router
+from app.api.v1.wol_schedules import router as wake_scheduler_router
 from app.core.agent_wake import wake_publishing
 from app.services.feature_modules import require_module
 
@@ -420,5 +421,15 @@ api_v1_router.include_router(
     prefix="/vrfs",
     tags=["vrfs"],
     dependencies=[Depends(require_module("network.vrf"))],
+)
+# Scheduled Wake-on-LAN (#586). Package is ``wol_schedules`` but the wire
+# prefix is ``wake-scheduler`` (the cross-surface contract with the frontend
+# api client + MCP tools). NO wake_publishing — a magic packet mutates no
+# DNS/DHCP agent ConfigBundle, so there is no parked long-poll to wake.
+api_v1_router.include_router(
+    wake_scheduler_router,
+    prefix="/wake-scheduler",
+    tags=["wake-scheduler"],
+    dependencies=[Depends(require_module("tools.wake_scheduler"))],
 )
 api_v1_router.include_router(webhooks_router, prefix="/webhooks", tags=["webhooks"])

@@ -45,6 +45,7 @@ import { NmapToolsPage } from "@/pages/nmap/NmapToolsPage";
 import { PacketCapturePage } from "@/pages/pcap/PacketCapturePage";
 import { NetworkToolsPage } from "@/pages/tools/NetworkToolsPage";
 import { CidrCalculatorPage } from "@/pages/tools/CidrCalculatorPage";
+import { WakeSchedulesPage } from "@/pages/tools/WakeSchedulesPage";
 import { NewDevicesPage } from "@/pages/security/NewDevicesPage";
 import { SubnetPlannerListPage } from "@/pages/ipam/SubnetPlannerListPage";
 import { SubnetPlannerEditorPage } from "@/pages/ipam/SubnetPlannerEditorPage";
@@ -162,6 +163,7 @@ export default function App() {
         <Route path="tools/pcap" element={<PacketCapturePage />} />
         <Route path="tools/network" element={<NetworkToolsPage />} />
         <Route path="tools/cidr" element={<CidrCalculatorPage />} />
+        <Route path="tools/wake-schedules" element={<WakeSchedulesPage />} />
         <Route path="security/new-devices" element={<NewDevicesPage />} />
         <Route path="dhcp" element={<DHCPPage />} />
         <Route path="dhcp/groups/:groupId/pxe" element={<PXEProfilesPage />} />

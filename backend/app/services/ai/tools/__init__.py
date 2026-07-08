@@ -57,6 +57,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     vendor,
     webhooks,
     whois,
+    wol_scheduler,
 )
 from app.services.ai.tools.base import (
     REGISTRY,

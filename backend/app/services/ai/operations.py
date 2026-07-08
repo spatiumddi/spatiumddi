@@ -27,7 +27,7 @@ from __future__ import annotations
 import ipaddress
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
 
@@ -617,6 +617,512 @@ register(
         category="network",
         # ``read`` matches the rest of the network-tools surface.
         required_permission=("read", "use_network_tools"),
+    )
+)
+
+
+# ── Scheduled Wake-on-LAN operations (issue #586, Phase 1) ─────────────
+#
+# Three write operations backing the propose_* tools in
+# ``services/ai/tools/wol_scheduler.py``: create a schedule, fire one now,
+# and toggle enabled. The resolver + runner + #533 send path are reused
+# verbatim from the shipped Phase-1 service layer
+# (``app.services.wol_scheduler`` + ``app.services.wol``); these ops add
+# only the preview / apply proposal glue. Every mutation audits via the
+# shared ``write_audit`` helper (or the runner's own audit) before commit
+# (non-negotiable #4). Phase-1 gate is built-in blackout dates + term
+# range only — NO external calendar.
+
+
+class WolSelectorArgs(BaseModel):
+    """Target selector for a Wake-on-LAN schedule (resolver storage shape)."""
+
+    mode: Literal["address_tags", "subnet", "subnet_tags", "hosts"] = Field(
+        description=(
+            "How targets are matched: 'address_tags' (IPs carrying the given "
+            "tags), 'subnet' (every host in the given subnet_ids), "
+            "'subnet_tags' (hosts in subnets carrying the tags), or 'hosts' "
+            "(the explicit address_ids)."
+        )
+    )
+    tags: list[str] = Field(
+        default_factory=list,
+        description="Tag filters (key or key:value, ANDed) for the tag modes.",
+    )
+    subnet_ids: list[str] = Field(
+        default_factory=list,
+        description="Subnet UUIDs for the 'subnet' / 'subnet_tags' modes.",
+    )
+    address_ids: list[str] = Field(
+        default_factory=list,
+        description="IP-address UUIDs for the 'hosts' mode.",
+    )
+
+    def to_jsonb(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "tags": list(self.tags),
+            "subnet_ids": [str(s) for s in self.subnet_ids],
+            "address_ids": [str(a) for a in self.address_ids],
+        }
+
+
+class CreateWolScheduleArgs(BaseModel):
+    """Args for ``create_wol_schedule``."""
+
+    name: str = Field(min_length=1, max_length=255, description="Schedule name.")
+    description: str | None = Field(default=None, description="Optional free-text note.")
+    enabled: bool = Field(
+        default=True, description="Whether the schedule is active (swept by the beat task)."
+    )
+    selector: WolSelectorArgs
+    schedule_cron: str | None = Field(
+        default=None,
+        description=(
+            "5-field cron expression (minute hour dom month dow) evaluated in "
+            "the given timezone. Omit / null for a manual-only schedule that "
+            "never fires automatically (run it via propose_run_wol_schedule_now)."
+        ),
+    )
+    timezone: str = Field(
+        default="UTC",
+        description="IANA timezone the cron walks (DST-safe), e.g. 'America/New_York'.",
+    )
+    blackout_dates: list[str] | None = Field(
+        default=None,
+        description="ISO YYYY-MM-DD dates that suppress the scheduled wake (holidays).",
+    )
+    active_from: str | None = Field(
+        default=None, description="ISO date — schedule is inactive before this day."
+    )
+    active_until: str | None = Field(
+        default=None, description="ISO date — schedule is inactive after this day."
+    )
+    vantage_kind: Literal["server", "appliance"] = Field(
+        default="server",
+        description=(
+            "Where the magic packet originates: control-plane 'server' or a "
+            "Fleet 'appliance' NIC (prefer an on-segment appliance)."
+        ),
+    )
+    vantage_appliance_id: str | None = Field(
+        default=None,
+        description="Appliance UUID — required when vantage_kind is 'appliance'.",
+    )
+    repeat_count: int = Field(
+        default=2, ge=1, le=10, description="How many identical packets per host."
+    )
+    repeat_interval_ms: int = Field(default=100, ge=0, le=10_000)
+    stagger_ms: int = Field(default=0, ge=0, le=60_000)
+    port: int = Field(default=9, ge=1, le=65535)
+
+
+class RunWolScheduleNowArgs(BaseModel):
+    """Args for ``run_wol_schedule_now``."""
+
+    schedule_id: str = Field(description="UUID of the wol_schedule to fire immediately.")
+
+
+class SetWolScheduleEnabledArgs(BaseModel):
+    """Args for ``set_wol_schedule_enabled``."""
+
+    schedule_id: str = Field(description="UUID of the wol_schedule to enable/disable.")
+    enabled: bool = Field(description="True to enable (resume sweeping), False to pause.")
+
+
+async def _load_scoped_wol_user(db: AsyncSession, user_id: UUID) -> User | None:
+    """Load a user with groups → roles eager-loaded for the resolver's sync
+    RBAC walk (mirrors the REST router's ``_load_scoped_user``)."""
+    from sqlalchemy.orm import selectinload  # noqa: PLC0415
+
+    from app.models.auth import Group  # noqa: PLC0415
+
+    return (
+        await db.execute(
+            select(User)
+            .options(selectinload(User.groups).selectinload(Group.roles))
+            .where(User.id == user_id)
+        )
+    ).scalar_one_or_none()
+
+
+def _normalise_blackouts(values: list[str] | None) -> list[str] | None:
+    if values is None:
+        return None
+    out: list[str] = []
+    for raw in values:
+        try:
+            out.append(date.fromisoformat(str(raw).strip()).isoformat())
+        except ValueError as exc:
+            raise ValueError(f"blackout date {raw!r} is not an ISO YYYY-MM-DD date") from exc
+    return out
+
+
+def _parse_iso_date(value: str | None, field_name: str) -> date | None:
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(str(value).strip())
+    except ValueError as exc:
+        raise ValueError(f"{field_name} {value!r} is not an ISO YYYY-MM-DD date") from exc
+
+
+async def _resolve_wol_count(
+    db: AsyncSession, user: User, selector: dict[str, Any]
+) -> tuple[int, int]:
+    """Best-effort (wake_count, mac_less_count) for a selector — scoped to the
+    caller's read permission. Raises ValueError on an invalid selector."""
+    from app.services.wol_scheduler import (  # noqa: PLC0415
+        SKIP_NO_MAC,
+        InvalidSelector,
+        resolve_wol_targets,
+    )
+
+    principal = await _load_scoped_wol_user(db, user.id) or user
+    try:
+        resolved = await resolve_wol_targets(db, principal, selector)
+    except InvalidSelector as exc:
+        raise ValueError(str(exc)) from exc
+    mac_less = sum(1 for s in resolved.skipped if s.reason == SKIP_NO_MAC)
+    return len(resolved.wakes), mac_less
+
+
+async def _preview_create_wol_schedule(
+    db: AsyncSession, user: User, args: CreateWolScheduleArgs
+) -> PreviewResult:
+    from app.services.wol_scheduler import (  # noqa: PLC0415
+        InvalidCronExpression,
+        InvalidTimezone,
+        validate_cron,
+        validate_timezone,
+    )
+
+    try:
+        validate_timezone(args.timezone)
+    except InvalidTimezone as exc:
+        return PreviewResult(ok=False, detail=str(exc))
+
+    cron = args.schedule_cron.strip() if args.schedule_cron else None
+    if cron:
+        try:
+            validate_cron(cron)
+        except InvalidCronExpression as exc:
+            return PreviewResult(ok=False, detail=str(exc))
+
+    try:
+        blackouts = _normalise_blackouts(args.blackout_dates)
+        active_from = _parse_iso_date(args.active_from, "active_from")
+        active_until = _parse_iso_date(args.active_until, "active_until")
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
+
+    if active_from is not None and active_until is not None and active_from > active_until:
+        return PreviewResult(ok=False, detail="active_from must be on or before active_until")
+    if args.vantage_kind == "appliance" and not args.vantage_appliance_id:
+        return PreviewResult(
+            ok=False, detail="vantage_appliance_id is required when vantage_kind is 'appliance'"
+        )
+
+    try:
+        wake_count, mac_less = await _resolve_wol_count(db, user, args.selector.to_jsonb())
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
+
+    cadence = f"cron `{cron}` ({args.timezone})" if cron else "manual-only (no automatic fire)"
+    vantage_desc = args.vantage_kind + (
+        f" `{args.vantage_appliance_id}`" if args.vantage_kind == "appliance" else ""
+    )
+    lines = [
+        f"Create Wake-on-LAN schedule **{args.name}** — {cadence}.",
+        f"Targets ({args.selector.mode}): **{wake_count}** host(s) would wake"
+        + (f", {mac_less} skipped (no known MAC)" if mac_less else "")
+        + ".",
+        f"Vantage: {vantage_desc}; {args.repeat_count}× packet(s), port {args.port}.",
+    ]
+    if blackouts:
+        lines.append(f"Blackout dates: {', '.join(blackouts)}.")
+    if active_from is not None or active_until is not None:
+        lines.append(
+            f"Active term: {active_from or '—'} … {active_until or '—'} "
+            "(fires only inside this range)."
+        )
+    lines.append(
+        "Nothing fires until you Apply this proposal"
+        + ("" if args.enabled else " and enable the schedule")
+        + "."
+    )
+    return PreviewResult(ok=True, detail="ready", preview_text="\n".join(lines))
+
+
+async def _apply_create_wol_schedule(
+    db: AsyncSession, user: User, args: CreateWolScheduleArgs
+) -> dict[str, Any]:
+    from app.api.v1.dhcp._audit import write_audit  # noqa: PLC0415
+    from app.models.wol_schedule import WolSchedule  # noqa: PLC0415
+    from app.services.wol_scheduler import (  # noqa: PLC0415
+        InvalidCronExpression,
+        InvalidTimezone,
+        compute_next_run,
+    )
+
+    enforce_operation_permission(user, _OPERATIONS["create_wol_schedule"])
+
+    cron = args.schedule_cron.strip() if args.schedule_cron else None
+    try:
+        blackouts = _normalise_blackouts(args.blackout_dates)
+        active_from = _parse_iso_date(args.active_from, "active_from")
+        active_until = _parse_iso_date(args.active_until, "active_until")
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+    vantage = {
+        "kind": args.vantage_kind,
+        "id": args.vantage_appliance_id if args.vantage_kind == "appliance" else None,
+    }
+    row = WolSchedule(
+        name=args.name,
+        description=args.description,
+        enabled=args.enabled,
+        target_selector=args.selector.to_jsonb(),
+        schedule_cron=cron,
+        timezone=args.timezone,
+        blackout_dates=blackouts,
+        active_from=active_from,
+        active_until=active_until,
+        vantage=vantage,
+        repeat_count=args.repeat_count,
+        repeat_interval_ms=args.repeat_interval_ms,
+        stagger_ms=args.stagger_ms,
+        port=args.port,
+        created_by_user_id=user.id,
+    )
+    if cron:
+        try:
+            row.next_run_at = compute_next_run(cron, args.timezone, after=datetime.now(UTC))
+        except (InvalidCronExpression, InvalidTimezone) as exc:
+            raise ValueError(str(exc)) from exc
+
+    db.add(row)
+    await db.flush()
+    write_audit(
+        db,
+        user=user,
+        action="create",
+        resource_type="wol_schedule",
+        resource_id=str(row.id),
+        resource_display=row.name,
+        new_value={
+            "name": row.name,
+            "enabled": row.enabled,
+            "target_selector": row.target_selector,
+            "schedule_cron": row.schedule_cron,
+            "timezone": row.timezone,
+            "vantage": row.vantage,
+            "via": "ai_proposal",
+        },
+    )
+    await db.commit()
+    await db.refresh(row)
+    return {
+        "id": str(row.id),
+        "name": row.name,
+        "enabled": row.enabled,
+        "schedule_cron": row.schedule_cron,
+        "timezone": row.timezone,
+        "next_run_at": row.next_run_at.isoformat() if row.next_run_at else None,
+        "hint": "Schedule created." + ("" if row.enabled else " It is disabled until enabled."),
+    }
+
+
+async def _preview_run_wol_schedule_now(
+    db: AsyncSession, user: User, args: RunWolScheduleNowArgs
+) -> PreviewResult:
+    from app.models.wol_schedule import WolSchedule  # noqa: PLC0415
+
+    try:
+        sid = UUID(args.schedule_id)
+    except ValueError:
+        return PreviewResult(ok=False, detail=f"invalid schedule_id {args.schedule_id!r}")
+    sched = await db.get(WolSchedule, sid)
+    if sched is None:
+        return PreviewResult(ok=False, detail=f"schedule {args.schedule_id} not found")
+
+    try:
+        wake_count, mac_less = await _resolve_wol_count(db, user, sched.target_selector or {})
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
+
+    vantage_kind = (sched.vantage or {}).get("kind", "server")
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Fire Wake-on-LAN schedule **{sched.name}** now — the built-in "
+            f"holiday gate is bypassed for a manual run. **{wake_count}** host(s) "
+            f"would be sent a magic packet"
+            + (f", {mac_less} skipped (no known MAC)" if mac_less else "")
+            + f" from the {vantage_kind} vantage."
+        ),
+    )
+
+
+async def _apply_run_wol_schedule_now(
+    db: AsyncSession, user: User, args: RunWolScheduleNowArgs
+) -> dict[str, Any]:
+    enforce_operation_permission(user, _OPERATIONS["run_wol_schedule_now"])
+    try:
+        sid = UUID(args.schedule_id)
+    except ValueError as exc:
+        raise ValueError(f"invalid schedule_id {args.schedule_id!r}") from exc
+
+    # Scope the manual run against the caller's read permission (matches the
+    # REST run-now); the shared runner writes its own wol_run + audit + commit.
+    principal = await _load_scoped_wol_user(db, user.id) or user
+    from app.tasks.wol_scheduler import run_schedule_now  # noqa: PLC0415
+
+    try:
+        summary = await run_schedule_now(
+            sid,
+            trigger="manual",
+            actor_id=user.id,
+            actor_display=user.display_name,
+            apply_gate=False,
+            resolve_user=principal,
+            db=db,
+        )
+    except KeyError as exc:
+        raise ValueError(f"schedule {args.schedule_id} not found") from exc
+    return summary
+
+
+async def _preview_set_wol_schedule_enabled(
+    db: AsyncSession, user: User, args: SetWolScheduleEnabledArgs
+) -> PreviewResult:
+    from app.models.wol_schedule import WolSchedule  # noqa: PLC0415
+
+    try:
+        sid = UUID(args.schedule_id)
+    except ValueError:
+        return PreviewResult(ok=False, detail=f"invalid schedule_id {args.schedule_id!r}")
+    sched = await db.get(WolSchedule, sid)
+    if sched is None:
+        return PreviewResult(ok=False, detail=f"schedule {args.schedule_id} not found")
+
+    state = "enabled" if args.enabled else "disabled"
+    if sched.enabled == args.enabled:
+        return PreviewResult(
+            ok=True,
+            detail="ready",
+            preview_text=f"Schedule **{sched.name}** is already {state} — no change.",
+            idempotent=True,
+        )
+    verb = "Enable" if args.enabled else "Disable"
+    tail = (
+        " Its next fire is recomputed from the cron on enable."
+        if args.enabled and sched.schedule_cron
+        else " It will no longer be swept by the scheduler." if not args.enabled else ""
+    )
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=f"{verb} Wake-on-LAN schedule **{sched.name}**.{tail}",
+    )
+
+
+async def _apply_set_wol_schedule_enabled(
+    db: AsyncSession, user: User, args: SetWolScheduleEnabledArgs
+) -> dict[str, Any]:
+    from app.api.v1.dhcp._audit import write_audit  # noqa: PLC0415
+    from app.models.wol_schedule import WolSchedule  # noqa: PLC0415
+    from app.services.wol_scheduler import (  # noqa: PLC0415
+        InvalidCronExpression,
+        InvalidTimezone,
+        compute_next_run,
+    )
+
+    enforce_operation_permission(user, _OPERATIONS["set_wol_schedule_enabled"])
+    try:
+        sid = UUID(args.schedule_id)
+    except ValueError as exc:
+        raise ValueError(f"invalid schedule_id {args.schedule_id!r}") from exc
+    sched = await db.get(WolSchedule, sid)
+    if sched is None:
+        raise ValueError(f"schedule {args.schedule_id} not found")
+
+    old = sched.enabled
+    sched.enabled = args.enabled
+    # Re-enabling with a cron re-derives the next fire so it resumes on cadence.
+    if args.enabled and sched.schedule_cron:
+        try:
+            sched.next_run_at = compute_next_run(
+                sched.schedule_cron, sched.timezone, after=datetime.now(UTC)
+            )
+        except (InvalidCronExpression, InvalidTimezone):
+            sched.next_run_at = None
+
+    write_audit(
+        db,
+        user=user,
+        action="update",
+        resource_type="wol_schedule",
+        resource_id=str(sched.id),
+        resource_display=sched.name,
+        changed_fields=["enabled"],
+        old_value={"enabled": old},
+        new_value={"enabled": args.enabled, "via": "ai_proposal"},
+    )
+    await db.commit()
+    await db.refresh(sched)
+    return {
+        "id": str(sched.id),
+        "name": sched.name,
+        "enabled": sched.enabled,
+        "next_run_at": sched.next_run_at.isoformat() if sched.next_run_at else None,
+    }
+
+
+register(
+    Operation(
+        name="create_wol_schedule",
+        description=(
+            "Create a scheduled Wake-on-LAN job. Always go through "
+            "propose_create_wol_schedule — never call this directly."
+        ),
+        args_model=CreateWolScheduleArgs,
+        preview=_preview_create_wol_schedule,
+        apply=_apply_create_wol_schedule,
+        category="network",
+        required_permission=("write", "use_network_tools"),
+    )
+)
+
+register(
+    Operation(
+        name="run_wol_schedule_now",
+        description=(
+            "Fire a Wake-on-LAN schedule immediately (holiday gate bypassed). "
+            "Always go through propose_run_wol_schedule_now."
+        ),
+        args_model=RunWolScheduleNowArgs,
+        preview=_preview_run_wol_schedule_now,
+        apply=_apply_run_wol_schedule_now,
+        category="network",
+        required_permission=("write", "use_network_tools"),
+    )
+)
+
+register(
+    Operation(
+        name="set_wol_schedule_enabled",
+        description=(
+            "Enable or disable a Wake-on-LAN schedule. Always go through "
+            "propose_set_wol_schedule_enabled."
+        ),
+        args_model=SetWolScheduleEnabledArgs,
+        preview=_preview_set_wol_schedule_enabled,
+        apply=_apply_set_wol_schedule_enabled,
+        category="network",
+        required_permission=("write", "use_network_tools"),
     )
 )
 

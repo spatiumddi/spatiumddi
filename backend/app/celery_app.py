@@ -64,6 +64,7 @@ celery_app = Celery(
         "app.tasks.tls_certs",
         "app.tasks.dnsbl_sweep",
         "app.tasks.schema_check",
+        "app.tasks.wol_scheduler",
     ],
 )
 
@@ -126,6 +127,7 @@ celery_app.conf.update(
         "app.tasks.acme.*": {"queue": "default"},
         "app.tasks.tls_certs.*": {"queue": "default"},
         "app.tasks.schema_check.*": {"queue": "default"},
+        "app.tasks.wol_scheduler.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60 s, mark DNS agents as ``unreachable`` if their
@@ -531,6 +533,16 @@ celery_app.conf.update(
         # next tick.
         "backup-target-sweep": {
             "task": "app.tasks.backup_sweep.sweep_backup_targets",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Every 60 s, fire any Scheduled Wake-on-LAN schedule whose
+        # ``next_run_at`` (denormalised UTC) is now in the past (issue #586
+        # Phase 1). The sweep + the per-schedule ``last_run_status`` mutex +
+        # the runner's ``next_run_at`` re-stamp keep a double-tick from
+        # double-firing. The task self-gates on the ``tools.wake_scheduler``
+        # feature module, so this cron is harmless when the module is off.
+        "wol-schedule-sweep": {
+            "task": "app.tasks.wol_scheduler.sweep_wol_schedules",
             "schedule": schedule(run_every=60.0),
         },
         # Every 60 s, soft-revoke time-bound RBAC grants whose

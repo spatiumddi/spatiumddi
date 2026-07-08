@@ -216,6 +216,282 @@ Gated by the `use_network_tools` permission and audited against the IP
 (shown only when the IP has a MAC) and as the `propose_wake_host` Operator
 Copilot tool. WoL is IPv4-only — the magic packet rides a UDP broadcast.
 
+### Scheduled Wake-on-LAN (#586, Phase 1)
+
+The one-shot **Wake** button above sends a single magic packet on demand.
+**Scheduled Wake-on-LAN** layers a recurring, tag-targeted job on top of the
+same #533 send path — the schedule owns *when*, *which hosts*, and *how*; the
+actual packet dispatch is the shipped `app.services.wol` code unchanged.
+
+Lives behind the default-enabled `tools.wake_scheduler` feature module
+(disable it and the router prefix, sidebar entry, and MCP tools all drop out —
+non-negotiable #14). REST surface is mounted at `/api/v1/wake-scheduler`
+(the Python package is `wol_schedules`; the wire prefix is `wake-scheduler`,
+the cross-surface contract shared with the frontend and MCP layers). Every
+handler is gated by the `wake_scheduler` permission (`read` / `write` /
+`delete`) and every mutation is audited (non-negotiables #3, #4). Operator
+Copilot gets read tools (`find_wol_schedules`, …) plus a `propose_*` write
+that lands in the standard preview → apply flow (non-negotiable #13).
+
+#### Schedules
+
+A `wol_schedule` row carries the recurrence, the target selector, the built-in
+holiday gate, and the send knobs:
+
+- `name` / `description` / `enabled`.
+- `schedule_cron` — a standard cron expression, or **NULL** for a
+  manual-only schedule (never swept by the beat task; fires only via
+  **Run now**).
+- `timezone` — an IANA zone (e.g. `America/Toronto`). The cron walks the
+  operator's **wall clock** in this zone, so a `0 7 * * 1-5` "07:00 on
+  weekdays" job stays at 07:00 local across DST transitions rather than
+  drifting an hour twice a year.
+- `next_run_at` — denormalised UTC, the beat sweep's due-query key. A
+  Celery beat task polls for due schedules, re-checks the holiday gate at
+  fire time, dispatches, and recomputes `next_run_at` from the cron +
+  timezone.
+
+Each fire (scheduled **or** manual) writes a `wol_run` history row — including
+gated skips, so "skipped because holiday" stays visible — with per-host
+`wol_run_target` children recording `sent` / `skipped` / `failed`, the
+resolved MAC and its `mac_source` (`ip` / `history` / `lease`), the segment
+broadcast, and the vantage the packet left from. Run history uses
+`ON DELETE SET NULL` on the schedule FK so deleting a schedule doesn't erase
+the audit trail of what it did.
+
+#### Targeting modes
+
+The `target_selector` JSONB picks the host set at fire time (resolved fresh on
+every run, so newly-tagged hosts are picked up automatically). Four modes:
+
+| Mode | Selector shape | Wakes |
+|---|---|---|
+| `address_tags` | `{ "mode": "address_tags", "tags": ["wake:nightly"] }` | Every IP address carrying **all** the listed tags |
+| `subnet_tags` | `{ "mode": "subnet_tags", "tags": ["env:lab"] }` | Every host in every subnet carrying the listed tags |
+| `subnet` | `{ "mode": "subnet", "subnet_ids": [<uuid>, …] }` | Every host in the named subnets |
+| `hosts` | `{ "mode": "hosts", "address_ids": [<uuid>, …] }` | An explicit list of IP addresses |
+
+Resolution is **permission-scoped to the schedule's creator** (non-negotiable
+#3): a schedule can only wake hosts in subnets its owner may `read`, so a
+tag-match can't be used to reach across a tenancy boundary. Multicast subnets
+and soft-deleted subnets are excluded (they hold no host MACs); addresses with
+no resolvable MAC are recorded as a per-host `no_mac` skip rather than
+silently dropped. Use **Preview targets** on the schedule modal to see the
+resolved host set (and skip reasons) before saving or running.
+
+#### Built-in holiday gate (Phase 1)
+
+Phase 1 ships a **built-in** blackout/term gate only — there is deliberately no
+external calendar integration:
+
+- `blackout_dates` — a list of ISO `YYYY-MM-DD` dates. A fire whose **local**
+  calendar date (evaluated in the schedule's `timezone`) is a member is
+  skipped with `skip_reason = "holiday"`.
+- `active_from` / `active_until` — an optional term range. A fire whose local
+  date falls outside `[active_from, active_until]` is skipped with
+  `skip_reason = "off_term"` (e.g. a classroom lab that should only wake
+  during the school term).
+
+The gate is evaluated on the local date so a 07:00-local wake on a blackout day
+is correctly suppressed regardless of the UTC offset. Skipped runs are still
+recorded as `wol_run` rows so the skip is auditable.
+
+> **Phase 2 (deferred):** external-calendar gating via subscribed **iCal /
+> CalDAV** feeds (so a schedule can honour an org holiday calendar or a
+> room-booking system) is a follow-up and is **not** in Phase 1. Phase 1's
+> holiday awareness is the built-in `blackout_dates` + term-range fields only.
+
+#### Vantage
+
+A schedule inherits the #533 vantage choice — where the magic packet
+originates:
+
+- **Server vantage** (`{ "kind": "server" }`, default) — the control-plane
+  container broadcasts. Reaches only segments the api container can reach
+  directly, unless the target router forwards a directed broadcast (see the
+  router matrix below).
+- **Fleet-appliance vantage** (`{ "kind": "appliance", "id": <uuid> }`) —
+  dispatch to a Fleet appliance whose NIC sits on the target's segment, so the
+  packet originates in the right broadcast domain (reuses the generic nettool
+  command channel). **This is the preferred path** when an appliance is on the
+  segment — it needs no router changes at all.
+
+#### Stagger safety note
+
+`stagger_ms` inserts a per-host delay between sends within a run (on top of the
+`repeat_count` / `repeat_interval_ms` per-host retry burst). Waking a large tag
+set with `stagger_ms = 0` fires every magic packet back-to-back, which can spike
+inrush current on a rack (dozens of machines powering on simultaneously) and
+micro-burst the broadcast domain. Set a non-zero stagger (e.g. a few hundred ms)
+for large fleets so hosts wake in a ramp rather than all at once.
+
+#### Scope caveat — wake only
+
+Wake-on-LAN **only wakes**. There is no "scheduled shutdown" counterpart, and
+Phase 1 does not add one — WoL is a layer-2 magic packet with no reverse
+operation, and an orderly shutdown needs an authenticated in-guest agent
+(SSH / IPMI / ACPI) that is out of scope here. Schedules turn machines **on**;
+turning them off is the operator's / OS's responsibility.
+
+### Directed-broadcast router matrix (server vantage across an L3 boundary)
+
+**Prefer a Fleet appliance on the target segment — it needs none of this.**
+When the wake is dispatched to an appliance whose NIC is on the target subnet,
+the magic packet is broadcast locally and no router configuration is required.
+
+The snippets below are the **fallback** for when there is *no* on-segment
+appliance and the packet must travel from the **server vantage** across a
+routed boundary. In that case delivery depends on the target router
+**forwarding a directed broadcast** to the subnet's broadcast address. That is
+disabled by default on virtually all modern gear — it is the classic
+smurf-amplification vector — so server-vantage cross-subnet wakes silently fail
+until the operator enables it.
+
+Enabling directed broadcast is a **security downgrade**. Every snippet below
+therefore scopes the forwarding to **our single sender only**, via an ACL /
+firewall filter pinned to `<sender-ip>` → the target subnet. **Never** widen
+the source to `any` — that re-opens the smurf reflector. The schedule modal
+renders these auto-filled from what the job already knows, in an expandable
+"Router setup help" block shown only for a server-vantage + remote/L3 target.
+
+Templated fields (auto-filled by the UI, shown as placeholders here):
+
+| Placeholder | Meaning |
+|---|---|
+| `<sender-ip>` | The server/appliance vantage's source IP (the *only* permitted source) |
+| `<target-cidr>` | The target subnet in CIDR (rendered as network + wildcard/mask per vendor) |
+| `<target-directed-broadcast>` | The subnet's directed-broadcast address (computed via `wol.broadcast_for_network`) |
+| `<wol-port>` | The schedule's UDP port (default `9`; some stacks also use `7`) |
+
+Worked example used below: `<sender-ip> = 10.0.0.5`, target subnet
+`192.168.10.0/24` → `<target-cidr> = 192.168.10.0/24`,
+`<target-directed-broadcast> = 192.168.10.255`, `<wol-port> = 9`.
+
+#### Cisco IOS / IOS-XE
+
+```
+access-list 110 permit udp host 10.0.0.5 192.168.10.0 0.0.0.255 eq 9
+!
+interface Vlan10
+ ip directed-broadcast 110
+```
+
+`host 10.0.0.5` = `<sender-ip>`; `192.168.10.0 0.0.0.255` = `<target-cidr>` as
+network + wildcard mask; `eq 9` = `<wol-port>`. The ACL scopes
+`ip directed-broadcast` on the target's downstream interface to only our
+sender → the subnet, so it is not left open as a smurf reflector.
+
+#### Juniper Junos
+
+```
+firewall {
+    family inet {
+        filter WOL-ONLY {
+            term permit-wol {
+                from {
+                    source-address {
+                        10.0.0.5/32;
+                    }
+                    destination-address {
+                        192.168.10.255/32;
+                    }
+                    protocol udp;
+                    destination-port [ 7 9 ];
+                }
+                then accept;
+            }
+            term default {
+                then accept;   # or your normal policy
+            }
+        }
+    }
+}
+```
+
+`10.0.0.5/32` = `<sender-ip>`; `192.168.10.255/32` =
+`<target-directed-broadcast>`; ports `7 9` = WoL. Junos also needs the
+receiving IRB/interface for the target subnet to permit the directed broadcast
+(`set interfaces irb unit <n> family inet targeted-broadcast`) alongside the
+filter — the filter authorises the traffic, `targeted-broadcast` converts the
+inbound directed-broadcast into a link-layer broadcast on egress.
+
+#### Arista EOS
+
+```
+ip access-list WOL-ONLY
+   10 permit udp host 10.0.0.5 192.168.10.0/24 eq 9
+!
+interface Vlan10
+   ip directed-broadcast WOL-ONLY
+```
+
+IOS-like: `host 10.0.0.5` = `<sender-ip>`, `192.168.10.0/24` = `<target-cidr>`,
+`eq 9` = `<wol-port>`. `ip directed-broadcast <acl>` on the SVI facing the
+target subnet forwards directed broadcasts only for ACL-matched traffic.
+
+#### MikroTik RouterOS
+
+```
+/ip firewall filter
+add chain=forward action=accept protocol=udp \
+    src-address=10.0.0.5 dst-address=192.168.10.255 \
+    dst-port=9 comment="WOL directed-broadcast (single sender)"
+/interface ethernet switch
+# RouterOS drops directed broadcasts by default; the forward-accept rule
+# above pins src-address=<sender-ip> (10.0.0.5) to the subnet's
+# directed-broadcast dst-address=<target-directed-broadcast> (192.168.10.255)
+# on dst-port=<wol-port> (9). Keep src-address pinned — never 0.0.0.0/0.
+```
+
+`src-address=10.0.0.5` = `<sender-ip>`; `dst-address=192.168.10.255` =
+`<target-directed-broadcast>`; `dst-port=9` = `<wol-port>`. On CHR / routers
+that also need the broadcast re-broadcast onto the LAN segment, ensure the
+target bridge/interface is not filtering the directed broadcast in the bridge
+firewall.
+
+#### VyOS / EdgeOS
+
+```
+set firewall name WOL-ONLY rule 10 action accept
+set firewall name WOL-ONLY rule 10 protocol udp
+set firewall name WOL-ONLY rule 10 source address 10.0.0.5
+set firewall name WOL-ONLY rule 10 destination address 192.168.10.255
+set firewall name WOL-ONLY rule 10 destination port 9
+!
+# Enable directed-broadcast relay on the interface facing the target subnet:
+set interfaces ethernet eth1 ip enable-directed-broadcast
+```
+
+`source address 10.0.0.5` = `<sender-ip>`; `destination address
+192.168.10.255` = `<target-directed-broadcast>`; `destination port 9` =
+`<wol-port>`. `enable-directed-broadcast` on the egress interface converts the
+routed directed broadcast into a link-layer broadcast; the firewall rule pins
+it to our single sender. Apply the `WOL-ONLY` ruleset to the appropriate
+`in`/`local` direction for your topology.
+
+#### pfSense / OPNsense
+
+Both are FreeBSD/`pf`-based and disable directed-broadcast forwarding by
+default. Add a **single-source** firewall pass rule on the interface the wake
+enters from:
+
+```
+# Firewall → Rules → <WAN/vantage interface> → Add
+Action:            Pass
+Protocol:          UDP
+Source:            10.0.0.5/32            # <sender-ip> — Single host, never "any"
+Destination:       192.168.10.255/32     # <target-directed-broadcast>
+Destination port:  9                     # <wol-port>
+```
+
+Then allow the directed broadcast to be forwarded onto the LAN. On FreeBSD this
+is the `net.inet.ip.directed-broadcast=1` sysctl (System → Advanced →
+System Tunables), scoped in practice by the source-pinned pass rule above.
+Several SpatiumDDI integrations already mirror OPNsense/pfSense, so the target
+subnet + directed-broadcast address are typically already known to the platform
+and pre-filled into this snippet. Keep the source pinned to `<sender-ip>/32` —
+a rule with `Source: any` re-opens the smurf reflector.
+
 ---
 
 ## 6. Custom Fields

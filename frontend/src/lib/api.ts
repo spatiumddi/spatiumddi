@@ -15181,3 +15181,232 @@ export const factoryResetApi = {
       .post<FactoryResetExecuteResponse>("/system/factory-reset/execute", body)
       .then((r) => r.data),
 };
+
+// ── Scheduled Wake-on-LAN (#586 Phase 1) ─────────────────────────────
+// Mirrors backend/app/api/v1/wol_schedules/schemas.py. The Python package
+// is ``wol_schedules`` but the wire prefix is ``/wake-scheduler`` — that
+// prefix is the cross-surface contract shared with the MCP tools + runner.
+// Phase 1's holiday gate is the built-in ``blackout_dates`` + ``active_from``
+// / ``active_until`` + ``timezone`` (no external iCal / CalDAV — that's
+// Phase 2, deliberately absent).
+
+/** Selector mode — mirrors ``resolver.VALID_MODES``. */
+export type WolSelectorMode =
+  | "address_tags"
+  | "subnet"
+  | "subnet_tags"
+  | "hosts";
+
+/**
+ * The stored ``target_selector``. Only the list relevant to ``mode`` is
+ * consulted by the resolver, but all four fields are carried so the operator
+ * can flip modes without losing the other selections. ``tags`` use the
+ * ``key`` / ``key:value`` grammar (ANDed).
+ */
+export interface WolTargetSelector {
+  mode: WolSelectorMode;
+  tags: string[];
+  subnet_ids: string[];
+  address_ids: string[];
+}
+
+/**
+ * Send-from vantage — a magic packet only originates from the control-plane
+ * server or a Fleet appliance NIC, so Phase 1 restricts ``kind`` to those two
+ * (validated server-side). ``id`` is required when ``kind === "appliance"``.
+ */
+export interface WolVantage {
+  kind: "server" | "appliance";
+  id: string | null;
+}
+
+export interface WolSchedule {
+  id: string;
+  name: string;
+  description: string | null;
+  enabled: boolean;
+  target_selector: WolTargetSelector;
+  /** NULL / empty cron == manual-only (never swept by the beat task). */
+  schedule_cron: string | null;
+  timezone: string; // IANA, e.g. "UTC"
+  blackout_dates: string[] | null; // ISO YYYY-MM-DD
+  active_from: string | null; // ISO date — term-range gate
+  active_until: string | null;
+  vantage: WolVantage;
+  repeat_count: number;
+  repeat_interval_ms: number;
+  stagger_ms: number;
+  port: number;
+  last_run_at: string | null;
+  last_run_status: string | null;
+  last_run_skip_reason: string | null;
+  last_target_count: number | null;
+  next_run_at: string | null;
+  created_by_user_id: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface WolScheduleCreate {
+  name: string;
+  description?: string | null;
+  enabled?: boolean;
+  target_selector: WolTargetSelector;
+  schedule_cron?: string | null;
+  timezone?: string;
+  blackout_dates?: string[] | null;
+  active_from?: string | null;
+  active_until?: string | null;
+  vantage?: WolVantage | null;
+  repeat_count?: number;
+  repeat_interval_ms?: number;
+  stagger_ms?: number;
+  port?: number;
+}
+
+/**
+ * PATCH body — every field optional. Send only the changed keys;
+ * ``model_dump(exclude_unset=True)`` server-side distinguishes "leave
+ * unchanged" from an explicit ``null`` on the nullable columns.
+ */
+export interface WolScheduleUpdate {
+  name?: string;
+  description?: string | null;
+  enabled?: boolean;
+  target_selector?: WolTargetSelector;
+  schedule_cron?: string | null;
+  timezone?: string;
+  blackout_dates?: string[] | null;
+  active_from?: string | null;
+  active_until?: string | null;
+  vantage?: WolVantage | null;
+  repeat_count?: number;
+  repeat_interval_ms?: number;
+  stagger_ms?: number;
+  port?: number;
+}
+
+/** A host that WOULD be sent a magic packet (preview). */
+export interface WolWakeTarget {
+  ip_address_id: string | null;
+  address: string | null;
+  mac: string;
+  subnet_id: string | null;
+  broadcast: string;
+  mac_source: string;
+  hostname?: string | null;
+}
+
+/** A matched input that would NOT be sent, with a reason (preview). */
+export interface WolSkippedTarget {
+  reason: string;
+  ip_address_id?: string | null;
+  address?: string | null;
+  subnet_id?: string | null;
+}
+
+/** Body for the unsaved ``POST /preview-targets`` (create-modal live count). */
+export interface WolTargetPreviewRequest {
+  target_selector: WolTargetSelector;
+}
+
+export interface WolTargetPreview {
+  matched_count: number;
+  wake_count: number;
+  skipped_count: number;
+  /** Per-host skips whose reason is ``no_mac`` — "N hosts have no known MAC". */
+  mac_less_count: number;
+  sample: WolWakeTarget[];
+  skipped_sample: WolSkippedTarget[];
+  /** Only populated for a saved-schedule preview (unsaved has no cron/gate). */
+  next_run_at: string | null;
+  gate_verdict: string | null;
+}
+
+export interface WolRun {
+  id: string;
+  schedule_id: string | null;
+  trigger: string;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  skip_reason: string | null;
+  target_count: number;
+  sent_count: number;
+  skipped_count: number;
+  failed_count: number;
+  triggered_by_user_id: string | null;
+  error: string | null;
+  created_at: string;
+}
+
+export interface WolRunTarget {
+  id: string;
+  run_id: string;
+  ip_address_id: string | null;
+  address: string | null;
+  mac: string | null;
+  subnet_id: string | null;
+  broadcast: string | null;
+  vantage: WolVantage | null;
+  mac_source: string | null;
+  sent: boolean;
+  skip_reason: string | null;
+  error: string | null;
+  created_at: string;
+}
+
+/** A run plus its per-host ``wol_run_target`` outcomes. */
+export interface WolRunDetail extends WolRun {
+  targets: WolRunTarget[];
+}
+
+export const wakeSchedulesApi = {
+  list: (enabled?: boolean) =>
+    api
+      .get<WolSchedule[]>("/wake-scheduler/schedules", {
+        params: enabled === undefined ? undefined : { enabled },
+      })
+      .then((r) => r.data),
+  get: (id: string) =>
+    api.get<WolSchedule>(`/wake-scheduler/schedules/${id}`).then((r) => r.data),
+  create: (body: WolScheduleCreate) =>
+    api
+      .post<WolSchedule>("/wake-scheduler/schedules", body)
+      .then((r) => r.data),
+  update: (id: string, body: WolScheduleUpdate) =>
+    api
+      .patch<WolSchedule>(`/wake-scheduler/schedules/${id}`, body)
+      .then((r) => r.data),
+  remove: (id: string) =>
+    api.delete<void>(`/wake-scheduler/schedules/${id}`).then((r) => r.data),
+  /** Fire a saved schedule immediately (bypasses the built-in holiday gate). */
+  runNow: (id: string) =>
+    api
+      .post<WolRun>(`/wake-scheduler/schedules/${id}/run-now`)
+      .then((r) => r.data),
+  /**
+   * Resolve an *unsaved* selector against the caller's read scope — the
+   * create modal's live match count.
+   */
+  previewTargets: (body: WolTargetPreviewRequest) =>
+    api
+      .post<WolTargetPreview>("/wake-scheduler/preview-targets", body)
+      .then((r) => r.data),
+  /**
+   * Resolve a *saved* schedule's selector + its next fire + the built-in
+   * gate verdict at that fire.
+   */
+  previewScheduleTargets: (id: string) =>
+    api
+      .post<WolTargetPreview>(`/wake-scheduler/schedules/${id}/preview-targets`)
+      .then((r) => r.data),
+  listRuns: (params?: {
+    schedule_id?: string;
+    status?: string;
+    limit?: number;
+  }) =>
+    api.get<WolRun[]>("/wake-scheduler/runs", { params }).then((r) => r.data),
+  getRun: (id: string) =>
+    api.get<WolRunDetail>(`/wake-scheduler/runs/${id}`).then((r) => r.data),
+};
