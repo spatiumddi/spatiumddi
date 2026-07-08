@@ -130,6 +130,30 @@ class WolSchedule(Base):
     stagger_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=9, server_default="9")
 
+    # ── Post-wake liveness verify + retry (Phase 3 — issue #586) ─────────
+    # After a run dispatches wakes, an optional chained Celery task
+    # (app.tasks.wol_scheduler.verify_wol_run) probes each SENT host for
+    # liveness and re-wakes non-responders up to a bound. v1 probes from the
+    # control-plane SERVER vantage (ping) regardless of the wake vantage — see
+    # verify.py for the appliance-vantage-verify deferral rationale.
+    verify_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    # Grace between dispatch (and between retry passes) and the liveness probe.
+    verify_wait_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60, server_default="60"
+    )
+    # Number of *re-wake* passes after the first probe (total probe passes ≤
+    # verify_retries + 1). 0 == probe once, never re-wake.
+    verify_retries: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    # 'ping'-only in v1 (kept as a column so a future TCP/agent method needs
+    # no migration).
+    verify_method: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="ping", server_default="'ping'"
+    )
+
     # ── Last-run mirror (denormalised for the list view) ────────────────
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # ok | partial | skipped | failed | in_progress
@@ -339,6 +363,36 @@ class WolRun(Base):
         Integer, nullable=False, default=0, server_default="0"
     )
 
+    # ── Post-wake verify rollup (Phase 3 — issue #586) ──────────────────
+    # verify_state lifecycle: none (verify off / never scheduled) → pending
+    # (verify enqueued, awaiting the claim) → verifying (a probe pass holds the
+    # mutex) → done (finalised, terminal). verified_count / unverified_count are
+    # the SENT-target liveness rollup written at finalise.
+    verify_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="none", server_default="'none'"
+    )
+    verified_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    unverified_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+
+    # Verify mutex lease + attempt anchor (crash-recovery for the verify state
+    # machine — the schedule mutex's ``in_progress_since`` equivalent).
+    # ``verify_claimed_at`` is stamped on every transition INTO ``pending`` (the
+    # arm / re-wake reset / reaper reset) AND into ``verifying`` (the claim); the
+    # sweep's verify reaper reclaims rows whose lease is older than
+    # ``VERIFY_CLAIM_LEASE_SECONDS``. ``verify_attempt`` is the run-level attempt
+    # anchor — the claim keys on it so a stale ``acks_late`` redelivery of
+    # attempt N no-ops once a re-wake has advanced the row to N+1.
+    verify_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    verify_attempt: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+
     # NULL for beat-fired system runs.
     triggered_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -394,5 +448,18 @@ class WolRunTarget(Base):
     # per-host skip enum — NULL when sent == true.
     skip_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # ── Post-wake verify outcome (Phase 3 — issue #586) ─────────────────
+    # verified tri-state: NULL == not-yet/not-checked (verify off, or a
+    # skipped/failed/address-less target never probed) · False == probed and
+    # DOWN (a re-wake candidate) · True == probed and UP.
+    verified: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 'ping' (server vantage) in v1 — records how the target was probed.
+    verify_method: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 1 == original dispatch; each re-wake pass bumps it.
+    wake_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
 
     run: Mapped[WolRun] = relationship("WolRun", back_populates="targets")

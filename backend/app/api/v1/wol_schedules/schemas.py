@@ -164,8 +164,20 @@ class WakeScheduleCreate(BaseModel):
     vantage: NetToolTarget | None = None
     repeat_count: int = Field(default=2, ge=1, le=10)
     repeat_interval_ms: int = Field(default=100, ge=0, le=10_000)
+    # ``stagger_ms == 0`` means "auto" — the runner ramps a large fleet via
+    # ``auto_stagger_ms`` so a same-second all-at-once fire can't power-inrush /
+    # PXE-thundering-herd. Any positive value is an explicit operator override
+    # that always wins verbatim. See the ``suggested_stagger_ms`` on preview.
     stagger_ms: int = Field(default=0, ge=0, le=60_000)
     port: int = Field(default=9, ge=1, le=65535)
+
+    # Post-wake liveness verify + bounded retry (Phase 3 — issue #586).
+    verify_enabled: bool = False
+    verify_wait_seconds: int = Field(default=60, ge=5, le=3600)
+    # Number of *re-wake* passes after the first probe (0 == probe once, never
+    # re-wake); total probe passes ≤ verify_retries + 1.
+    verify_retries: int = Field(default=1, ge=0, le=10)
+    verify_method: Literal["ping"] = "ping"
 
     @field_validator("timezone")
     @classmethod
@@ -249,6 +261,12 @@ class WakeScheduleUpdate(BaseModel):
     stagger_ms: int | None = Field(default=None, ge=0, le=60_000)
     port: int | None = Field(default=None, ge=1, le=65535)
 
+    # Verify config (Phase 3). All optional — omit == leave unchanged.
+    verify_enabled: bool | None = None
+    verify_wait_seconds: int | None = Field(default=None, ge=5, le=3600)
+    verify_retries: int | None = Field(default=None, ge=0, le=10)
+    verify_method: Literal["ping"] | None = None
+
     @field_validator("timezone")
     @classmethod
     def _check_tz(cls, v: str | None) -> str | None:
@@ -309,6 +327,10 @@ class WakeScheduleRead(BaseModel):
     repeat_interval_ms: int
     stagger_ms: int
     port: int
+    verify_enabled: bool
+    verify_wait_seconds: int
+    verify_retries: int
+    verify_method: str
     last_run_at: datetime | None
     last_run_status: str | None
     last_run_skip_reason: str | None
@@ -361,6 +383,10 @@ class TargetPreviewRead(BaseModel):
     mac_less_count: int
     sample: list[WakeTargetRead]
     skipped_sample: list[SkippedTargetRead]
+    # Stagger auto-tune (Phase 3): the suggested inter-host gap (ms) for the
+    # resolved ``wake_count`` when ``stagger_ms`` is left at 0/auto. The modal
+    # surfaces this so the operator sees "waking N hosts → suggest ~X ms".
+    suggested_stagger_ms: int = 0
     # Only populated for a saved-schedule preview (unsaved has no cron/gate).
     next_run_at: datetime | None = None
     gate_verdict: str | None = None
@@ -378,6 +404,12 @@ class WakeRunRead(BaseModel):
     sent_count: int
     skipped_count: int
     failed_count: int
+    # Post-wake verify rollup (Phase 3). ``verify_state``:
+    # none|pending|verifying|done. ``verified_count`` / ``unverified_count`` are
+    # the SENT-target liveness split, populated at verify finalise.
+    verify_state: str
+    verified_count: int
+    unverified_count: int
     triggered_by_user_id: uuid.UUID | None
     error: str | None
     created_at: datetime
@@ -396,6 +428,13 @@ class WakeRunTargetRead(BaseModel):
     sent: bool
     skip_reason: str | None
     error: str | None
+    # Post-wake verify outcome (Phase 3). ``verified`` tri-state: NULL ==
+    # not-yet/not-checked · False == probed DOWN · True == probed UP.
+    # ``wake_attempts`` is 1 for the original dispatch, +1 per re-wake pass.
+    verified: bool | None
+    verified_at: datetime | None
+    verify_method: str | None
+    wake_attempts: int
     created_at: datetime
 
 

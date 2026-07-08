@@ -75,6 +75,7 @@ from app.services.wol_scheduler.schedule import (
     InvalidTimezone,
     compute_next_run,
 )
+from app.services.wol_scheduler.verify import auto_stagger_ms
 
 from .schemas import (
     CalendarEventRead,
@@ -120,6 +121,10 @@ _NON_NULLABLE_FIELDS = frozenset(
         "repeat_interval_ms",
         "stagger_ms",
         "port",
+        "verify_enabled",
+        "verify_wait_seconds",
+        "verify_retries",
+        "verify_method",
     }
 )
 
@@ -149,6 +154,10 @@ def _to_schedule_read(row: WolSchedule) -> WakeScheduleRead:
         repeat_interval_ms=row.repeat_interval_ms,
         stagger_ms=row.stagger_ms,
         port=row.port,
+        verify_enabled=row.verify_enabled,
+        verify_wait_seconds=row.verify_wait_seconds,
+        verify_retries=row.verify_retries,
+        verify_method=row.verify_method,
         last_run_at=row.last_run_at,
         last_run_status=row.last_run_status,
         last_run_skip_reason=row.last_run_skip_reason,
@@ -203,6 +212,9 @@ def _to_run_read(row: WolRun) -> WakeRunRead:
         sent_count=row.sent_count,
         skipped_count=row.skipped_count,
         failed_count=row.failed_count,
+        verify_state=row.verify_state,
+        verified_count=row.verified_count,
+        unverified_count=row.unverified_count,
         triggered_by_user_id=row.triggered_by_user_id,
         error=row.error,
         created_at=row.created_at,
@@ -223,6 +235,10 @@ def _to_run_target_read(row: WolRunTarget) -> WakeRunTargetRead:
         sent=row.sent,
         skip_reason=row.skip_reason,
         error=row.error,
+        verified=row.verified,
+        verified_at=row.verified_at,
+        verify_method=row.verify_method,
+        wake_attempts=row.wake_attempts,
         created_at=row.created_at,
     )
 
@@ -259,6 +275,9 @@ def _resolved_to_preview(
         wake_count=len(resolved.wakes),
         skipped_count=len(resolved.skipped),
         mac_less_count=mac_less,
+        # Auto-tune suggestion for the resolved wake count (override=0 → raw
+        # suggestion). 0 for a small set == "no artificial delay needed".
+        suggested_stagger_ms=auto_stagger_ms(len(resolved.wakes), 0),
         sample=[
             WakeTargetRead(
                 ip_address_id=w.ip_address_id,
@@ -413,6 +432,10 @@ async def create_schedule(
         repeat_interval_ms=body.repeat_interval_ms,
         stagger_ms=body.stagger_ms,
         port=body.port,
+        verify_enabled=body.verify_enabled,
+        verify_wait_seconds=body.verify_wait_seconds,
+        verify_retries=body.verify_retries,
+        verify_method=body.verify_method,
         created_by_user_id=current_user.id,
     )
     _compute_next(row)

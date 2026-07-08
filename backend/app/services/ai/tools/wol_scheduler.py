@@ -94,8 +94,16 @@ def _schedule_detail(row: WolSchedule) -> dict[str, Any]:
             "active_until": row.active_until.isoformat() if row.active_until else None,
             "repeat_count": row.repeat_count,
             "repeat_interval_ms": row.repeat_interval_ms,
+            # stagger_ms == 0 means "auto" (the runner ramps large fleets); any
+            # positive value is an explicit operator override.
             "stagger_ms": row.stagger_ms,
             "port": row.port,
+            # Post-wake verify config (Phase 3): whether a run probes SENT hosts
+            # for liveness after firing, how long it waits, and the re-wake bound.
+            "verify_enabled": row.verify_enabled,
+            "verify_wait_seconds": row.verify_wait_seconds,
+            "verify_retries": row.verify_retries,
+            "verify_method": row.verify_method,
             "created_by_user_id": (str(row.created_by_user_id) if row.created_by_user_id else None),
             "created_at": row.created_at.isoformat(),
             "modified_at": row.modified_at.isoformat(),
@@ -117,6 +125,13 @@ def _run_summary(row: WolRun) -> dict[str, Any]:
         "sent_count": row.sent_count,
         "skipped_count": row.skipped_count,
         "failed_count": row.failed_count,
+        # Post-wake liveness verify rollup (Phase 3) — distinct from send
+        # success. verify_state: none|pending|verifying|done. verified_count /
+        # unverified_count are the SENT-target liveness split (did the fleet
+        # actually come UP?), populated once verify finalises.
+        "verify_state": row.verify_state,
+        "verified_count": row.verified_count,
+        "unverified_count": row.unverified_count,
         "error": row.error,
     }
 
@@ -259,9 +274,11 @@ class FindWolRunsArgs(BaseModel):
     description=(
         "List Wake-on-LAN execution history — one row per fire (scheduled OR "
         "manual), INCLUDING gated-skip runs so 'skipped because holiday' is "
-        "visible. Carries per-run sent/skipped/failed counts + skip_reason. "
-        "Most recent first. Answers 'did the lab wake last night?', 'show wake "
-        "failures'. Read-only."
+        "visible. Carries per-run sent/skipped/failed counts + skip_reason AND "
+        "the post-wake liveness rollup (verify_state + verified_count / "
+        "unverified_count) — so 'did last night's wake actually bring the fleet "
+        "UP?' is answerable, not just 'did it send?'. Most recent first. "
+        "Read-only."
     ),
     args_model=FindWolRunsArgs,
     category="network",
@@ -299,7 +316,9 @@ class PreviewWolScheduleTargetsArgs(BaseModel):
         "(hosts with no known MAC), a capped host sample LIMITED to the "
         "CALLER's own readable subnets (a host in a subnet you can't read is "
         "counted but never sampled), next_run_at and gate_verdict (null = "
-        "would fire, 'holiday'/'off_term' = suppressed). Read-only."
+        "would fire, 'holiday'/'off_term' = suppressed), plus a "
+        "suggested_stagger_ms (the ms inter-host gap to avoid a large-fleet "
+        "power-inrush / PXE thundering-herd). Read-only."
     ),
     args_model=PreviewWolScheduleTargetsArgs,
     category="network",
@@ -314,6 +333,7 @@ async def preview_wol_schedule_targets(
     from app.services.wol_scheduler import (  # noqa: PLC0415
         SKIP_NO_MAC,
         InvalidSelector,
+        auto_stagger_ms,
         gate_verdict,
         load_gate_calendar_events,
         resolve_wol_targets,
@@ -376,6 +396,11 @@ async def preview_wol_schedule_targets(
         "wake_count": len(resolved.wakes),
         "skipped_count": len(resolved.skipped),
         "mac_less_count": mac_less,
+        # Stagger auto-tune suggestion for this wake count (Phase 3): the ms gap
+        # to space a large fleet's wakes so it can't power-inrush / PXE-herd. 0
+        # == small enough to fire all-at-once. Advisory — the schedule's own
+        # stagger_ms (if > 0) overrides.
+        "suggested_stagger_ms": auto_stagger_ms(len(resolved.wakes), 0),
         "sample_scoped_to_caller": True,
         "next_run_at": row.next_run_at.isoformat() if row.next_run_at else None,
         "gate_verdict": verdict,

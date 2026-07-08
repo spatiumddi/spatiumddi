@@ -65,6 +65,12 @@ from app.services.wol_scheduler.schedule import (
     validate_cron,
     validate_timezone,
 )
+from app.services.wol_scheduler.verify import (
+    VERIFY_METHOD_PING,
+    auto_stagger_ms,
+    probe_liveness,
+    verify_run_targets,
+)
 
 __all__ = [
     # schedule
@@ -106,4 +112,9 @@ __all__ = [
     # dispatch
     "dispatch_wol_targets",
     "DispatchOutcome",
+    # verify (Phase 3)
+    "probe_liveness",
+    "verify_run_targets",
+    "auto_stagger_ms",
+    "VERIFY_METHOD_PING",
 ]

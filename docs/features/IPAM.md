@@ -216,12 +216,17 @@ Gated by the `use_network_tools` permission and audited against the IP
 (shown only when the IP has a MAC) and as the `propose_wake_host` Operator
 Copilot tool. WoL is IPv4-only — the magic packet rides a UDP broadcast.
 
-### Scheduled Wake-on-LAN (#586, Phase 1)
+### Scheduled Wake-on-LAN (#586, Phases 1–3)
 
 The one-shot **Wake** button above sends a single magic packet on demand.
 **Scheduled Wake-on-LAN** layers a recurring, tag-targeted job on top of the
 same #533 send path — the schedule owns *when*, *which hosts*, and *how*; the
 actual packet dispatch is the shipped `app.services.wol` code unchanged.
+
+Phase 1 shipped the recurring tag-targeted schedule + built-in holiday/term gate;
+Phase 2 layered an external iCal / CalDAV calendar gate; Phase 3 adds **post-wake
+liveness verify + bounded retry**, **stagger auto-tuning** for large fleets, and the
+**FOG / PXE re-image runbook** below.
 
 Lives behind the default-enabled `tools.wake_scheduler` feature module
 (disable it and the router prefix, sidebar entry, and MCP tools all drop out —
@@ -370,6 +375,61 @@ module as Phase 1 (no new module). Deleting a calendar `SET NULL`s the
 `calendar_id` on any schedule referencing it — the schedule falls back to its
 built-in gate rather than erroring.
 
+#### Post-wake verify + retry (Phase 3)
+
+A wake that *sent* isn't proof a host *came up*. When `verify_enabled` is set, a
+run chains a non-blocking liveness check after it dispatches, probes each host
+that was actually sent a packet, and re-wakes the ones that didn't answer — up to
+a bound. This turns "did we fire?" into "did the fleet actually power on?".
+
+Per-schedule config (all on `wol_schedule`):
+
+- `verify_enabled` (default `false`) — arm the post-wake check.
+- `verify_wait_seconds` (default `60`, range 5–3600) — grace between the dispatch
+  (and between each retry pass) and the probe, so a host has time to POST + bring
+  its NIC up before it's pinged.
+- `verify_retries` (default `1`, range 0–10) — number of **re-wake** passes after
+  the first probe. Total probe passes ≤ `verify_retries + 1`; `0` == probe once,
+  never re-wake.
+- `verify_method` (`ping`-only in v1) — kept as a column so a future TCP/agent
+  probe method needs no migration.
+
+How it runs (chained, bounded, idempotent — non-negotiables #9):
+
+1. `run_wol_schedule` dispatches as usual, then — if `verify_enabled` and at least
+   one packet went out — enqueues `verify_wol_run(run_id, attempt=1)` with a
+   `verify_wait_seconds` countdown. The dispatch task never blocks on the probe.
+2. Each verify pass atomically claims the run (`verify_state` `pending → verifying`
+   via a conditional `UPDATE … WHERE verify_state='pending'`), so a double-delivery
+   of the same attempt is a no-op and a re-fire after `done` is a no-op.
+3. It pings the still-unverified **sent** targets. A host that answers is stamped
+   `verified=true` and its `IPAddress.last_seen_at` / `last_seen_method='ping'` are
+   updated (the same Seen infra discovery uses). A non-responder is `verified=false`.
+4. If non-responders remain **and** `attempt ≤ verify_retries`, it re-wakes **only**
+   those hosts (reusing the Phase-1 dispatch path), bumps their `wake_attempts`,
+   releases the run back to `pending`, and re-enqueues the next attempt. Otherwise
+   it finalises: `verify_state='done'`, rolls up `verified_count` /
+   `unverified_count`, and writes one `wol_run_verified` audit row.
+
+Read surfaces: `wol_run.verify_state` (`none` → `pending` → `verifying` → `done`) +
+`verified_count` / `unverified_count` on the run; per-host `wol_run_target.verified`
+(tri-state: `null` = not-yet/not-checked · `false` = probed down · `true` = probed
+up), `verified_at`, `verify_method`, `wake_attempts`. The `find_wol_runs` MCP tool
+surfaces the rollup so the copilot can answer "did last night's wake bring the fleet
+up?" — distinct from "did it send?".
+
+**v1 verifies from the SERVER vantage only**, regardless of the schedule's *wake*
+vantage. The appliance command channel (`agent_cmd`) is an in-memory, per-replica
+dispatch the **api** process owns; the verify task runs in the **Celery worker**, and
+there is no worker→supervisor result-return path today. So for an appliance-vantage
+wake, verify still pings from the control plane: correct when the api/worker can reach
+the target segment (routed ICMP / directed broadcast), and a false-negative
+(unverified) — never a false wake — when it can't. `verify_method` records `"ping"`
+so the surface is honest about how it checked. **Appliance-vantage verify** (a
+worker→supervisor result channel) is the named Phase-3 follow-up, alongside the
+deferred [auto-resolve on-segment appliance from the target subnet] and the
+[scheduled-shutdown companion] below.
+
 #### Vantage
 
 A schedule inherits the #533 vantage choice — where the magic packet
@@ -385,22 +445,67 @@ originates:
   command channel). **This is the preferred path** when an appliance is on the
   segment — it needs no router changes at all.
 
-#### Stagger safety note
+#### Stagger auto-tuning (Phase 3)
 
 `stagger_ms` inserts a per-host delay between sends within a run (on top of the
-`repeat_count` / `repeat_interval_ms` per-host retry burst). Waking a large tag
-set with `stagger_ms = 0` fires every magic packet back-to-back, which can spike
-inrush current on a rack (dozens of machines powering on simultaneously) and
-micro-burst the broadcast domain. Set a non-zero stagger (e.g. a few hundred ms)
-for large fleets so hosts wake in a ramp rather than all at once.
+`repeat_count` / `repeat_interval_ms` per-host retry burst). Firing every magic
+packet back-to-back can spike inrush current on a rack (dozens of machines powering
+on simultaneously) and micro-burst the broadcast domain / a PXE boot server.
+
+As of Phase 3 the default `stagger_ms = 0` means **auto**: the runner ramps a large
+resolved fleet so a same-second all-at-once fire can't inrush / PXE-thundering-herd,
+while a small set still fires immediately. The bands (`auto_stagger_ms`):
+
+| resolved wake count | stagger | approx wakes/sec |
+|---|---|---|
+| ≤ 20 | 0 (all at once) | — |
+| 21 – 100 | 50 ms | ~20/s |
+| 101 – 256 | 100 ms | ~10/s |
+| > 256 (up to the 512 fan-out cap) | 150 ms | ~6–7/s |
+
+Any **positive** `stagger_ms` is an explicit operator override that always wins
+verbatim — auto never touches it. So `0` = "let the platform decide", and a specific
+value = "use exactly this ramp". The `preview-targets` surface returns a
+`suggested_stagger_ms` (the auto value for the resolved count) so the create modal can
+show "waking N hosts → suggest ~X ms" as the operator edits the selector; the
+`preview_wol_schedule_targets` MCP tool returns it too.
 
 #### Scope caveat — wake only
 
 Wake-on-LAN **only wakes**. There is no "scheduled shutdown" counterpart, and
-Phase 1 does not add one — WoL is a layer-2 magic packet with no reverse
-operation, and an orderly shutdown needs an authenticated in-guest agent
-(SSH / IPMI / ACPI) that is out of scope here. Schedules turn machines **on**;
-turning them off is the operator's / OS's responsibility.
+none of Phases 1–3 add one — WoL is a layer-2 magic packet with no reverse
+operation, and an orderly shutdown needs an authenticated out-of-band path
+(BMC / Redfish / IPMI) or in-guest agent (SSH / ACPI) that is out of scope here.
+The **scheduled-shutdown companion** (BMC/Redfish/IPMI power-off) is a deferred
+follow-up the issue flags as "investigate" — a separate feature, not this pass.
+Schedules turn machines **on**; turning them off is the operator's / OS's
+responsibility.
+
+#### FOG / PXE re-image runbook (Phase 3)
+
+A scheduled wake pairs cleanly with the shipped **DHCP PXE profiles** (#51:
+`pxe_profile` + `DHCPScope.pxe_profile_id`, iPXE-vs-BIOS client-class match) to drive
+lab / classroom re-imaging with a tool like [FOG](https://fogproject.org/). The flow:
+
+1. **Tag the machines** to re-image (e.g. `wake:reimage`) so a `subnet_tags` /
+   `address_tags` selector resolves exactly that set.
+2. **Point the scope's PXE profile at FOG.** With a `pxe_profile` on the target
+   DHCP scope, PXE-booting hosts get the FOG bootfile (BIOS) or the FOG iPXE script
+   (iPXE) via the shipped client-class match — see `docs/features/DHCP.md` PXE
+   profiles.
+3. **Wake at the imaging window.** A schedule with cron `0 2 L * *` (02:00 on the
+   last day of the term — combined with the built-in `active_until` gate) wakes the
+   tagged fleet; a manual-only schedule + `run-now` works for an ad-hoc re-image.
+4. **Hosts PXE-boot into FOG** and image per the FOG task queued for each host.
+
+Operational notes: leave `stagger_ms = 0` (auto) or set a non-trivial explicit stagger
+so a lab-full of machines doesn't PXE-thundering-herd the TFTP / HTTP boot server all
+in the same second (the auto bands above already ramp a large set). Turn on
+**post-wake verify** so you can confirm the fleet actually powered on before the
+imaging window closes — `unverified_count > 0` on the run means some hosts never came
+up (dead PSU, WoL disabled in BIOS, wrong segment). This runbook **pairs with** but
+does **not** implement the deferred scheduled-shutdown companion (above): re-image jobs
+that need the machines off afterward still rely on the OS / FOG task to power them down.
 
 ### Directed-broadcast router matrix (server vantage across an L3 boundary)
 

@@ -15253,6 +15253,16 @@ export interface WolSchedule {
   repeat_interval_ms: number;
   stagger_ms: number;
   port: number;
+  /**
+   * Post-wake liveness verify + retry (Phase 3). When ``verify_enabled``, a
+   * chained task probes each SENT host (server-vantage ping) after
+   * ``verify_wait_seconds`` and re-wakes non-responders up to ``verify_retries``
+   * extra passes. ``verify_method`` is ``"ping"`` in v1.
+   */
+  verify_enabled: boolean;
+  verify_wait_seconds: number;
+  verify_retries: number;
+  verify_method: string;
   last_run_at: string | null;
   last_run_status: string | null;
   last_run_skip_reason: string | null;
@@ -15286,6 +15296,11 @@ export interface WolScheduleCreate {
   repeat_interval_ms?: number;
   stagger_ms?: number;
   port?: number;
+  /** Post-wake verify + retry (Phase 3). */
+  verify_enabled?: boolean;
+  verify_wait_seconds?: number;
+  verify_retries?: number;
+  verify_method?: "ping";
 }
 
 /**
@@ -15311,6 +15326,11 @@ export interface WolScheduleUpdate {
   repeat_interval_ms?: number;
   stagger_ms?: number;
   port?: number;
+  /** Post-wake verify + retry (Phase 3). */
+  verify_enabled?: boolean;
+  verify_wait_seconds?: number;
+  verify_retries?: number;
+  verify_method?: "ping";
 }
 
 /** A host that WOULD be sent a magic packet (preview). */
@@ -15345,6 +15365,12 @@ export interface WolTargetPreview {
   mac_less_count: number;
   sample: WolWakeTarget[];
   skipped_sample: WolSkippedTarget[];
+  /**
+   * Stagger auto-tune (Phase 3): suggested inter-host gap (ms) for the resolved
+   * ``wake_count`` when the operator leaves ``stagger_ms`` at 0/auto. Surfaced
+   * as a hint next to the send options ("waking N hosts → suggest ~X ms").
+   */
+  suggested_stagger_ms: number;
   /** Only populated for a saved-schedule preview (unsaved has no cron/gate). */
   next_run_at: string | null;
   gate_verdict: string | null;
@@ -15362,6 +15388,16 @@ export interface WolRun {
   sent_count: number;
   skipped_count: number;
   failed_count: number;
+  /**
+   * Post-wake verify rollup (Phase 3). ``verify_state``:
+   * ``none`` (verify off / never scheduled) → ``pending`` (verify enqueued) →
+   * ``verifying`` (a probe pass holds the mutex) → ``done`` (finalised).
+   * ``verified_count`` / ``unverified_count`` split the SENT targets by whether
+   * they answered a liveness probe, populated at finalise.
+   */
+  verify_state: string;
+  verified_count: number;
+  unverified_count: number;
   triggered_by_user_id: string | null;
   error: string | null;
   created_at: string;
@@ -15380,6 +15416,16 @@ export interface WolRunTarget {
   sent: boolean;
   skip_reason: string | null;
   error: string | null;
+  /**
+   * Post-wake verify outcome (Phase 3). ``verified`` tri-state: ``null`` ==
+   * not-yet / not-checked · ``false`` == probed DOWN (a re-wake candidate) ·
+   * ``true`` == probed UP. ``wake_attempts`` is 1 for the original dispatch, +1
+   * per re-wake pass.
+   */
+  verified: boolean | null;
+  verified_at: string | null;
+  verify_method: string | null;
+  wake_attempts: number;
   created_at: string;
 }
 

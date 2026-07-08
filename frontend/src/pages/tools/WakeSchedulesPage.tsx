@@ -1,11 +1,14 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  ArrowDownCircle,
+  ArrowUpCircle,
   ChevronDown,
   ChevronRight,
   Clipboard,
   ClipboardCheck,
   Loader2,
+  MinusCircle,
   Pencil,
   Play,
   Plus,
@@ -38,6 +41,7 @@ import {
   type WolVantage,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { humanTime } from "@/pages/network/_shared";
 
 // ─────────────────────────────────────────────────────────────────────
 // Scheduled Wake-on-LAN (#586 Phase 1) — Tools page.
@@ -162,6 +166,87 @@ function StatusChip({ status }: { status: string | null }) {
       )}
     >
       {status.replace(/_/g, " ")}
+    </span>
+  );
+}
+
+// ── Post-wake verify chip (Phase 3) ───────────────────────────────────
+// Reuses the Seen visual language (emerald = up, rose = down, grey =
+// not-checked) but with an up/down arrow so liveness reads at a glance and
+// does not rely on colour alone (WCAG 1.4.1). ``verified`` is a tri-state:
+//   true  → probed UP   (came up after the wake)
+//   false → probed DOWN  (a re-wake candidate / never answered)
+//   null  → not checked  (verify off, or a skipped/address-less target)
+function VerifyChip({
+  verified,
+  verifiedAt,
+  verifyMethod,
+}: {
+  verified: boolean | null;
+  verifiedAt?: string | null;
+  verifyMethod?: string | null;
+}) {
+  const via = verifyMethod ? ` via ${verifyMethod}` : "";
+  const when = verifiedAt ? ` ${humanTime(verifiedAt)}` : "";
+  if (verified === null || verified === undefined) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 text-[11px] text-muted-foreground"
+        title="Liveness not checked"
+      >
+        <MinusCircle className="h-3.5 w-3.5" />
+        not checked
+      </span>
+    );
+  }
+  if (verified) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-600 dark:text-emerald-400"
+        title={`Came up${when}${via}`}
+      >
+        <ArrowUpCircle className="h-3.5 w-3.5" />
+        up
+      </span>
+    );
+  }
+  return (
+    <span
+      className="inline-flex items-center gap-1 text-[11px] font-medium text-rose-600 dark:text-rose-400"
+      title={`Did not answer the liveness probe${when}${via}`}
+    >
+      <ArrowDownCircle className="h-3.5 w-3.5" />
+      down
+    </span>
+  );
+}
+
+// Compact verify rollup for a run row ("3↑ / 1↓" style). Only shown once a
+// verify pass has run (verify_state !== "none").
+function VerifyRollup({ run }: { run: WolRun }) {
+  if (run.verify_state === "none") {
+    return <span className="text-muted-foreground">—</span>;
+  }
+  const pending =
+    run.verify_state === "pending" || run.verify_state === "verifying";
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 text-[11px]"
+      title={
+        pending
+          ? "Post-wake verify in progress…"
+          : `${run.verified_count} up · ${run.unverified_count} did not confirm live`
+      }
+    >
+      {pending && <Loader2 className="h-3 w-3 animate-spin text-blue-500" />}
+      <span className="inline-flex items-center gap-0.5 text-emerald-600 dark:text-emerald-400">
+        <ArrowUpCircle className="h-3 w-3" />
+        {run.verified_count}
+      </span>
+      <span className="inline-flex items-center gap-0.5 text-rose-600 dark:text-rose-400">
+        <ArrowDownCircle className="h-3 w-3" />
+        {run.unverified_count}
+      </span>
     </span>
   );
 }
@@ -621,6 +706,14 @@ function HistoryTab() {
   const runsQ = useQuery({
     queryKey: ["wol-runs"],
     queryFn: () => wakeSchedulesApi.listRuns({ limit: 100 }),
+    // Poll while any visible run's post-wake verify is still in flight so the
+    // History rollup self-converges without a manual Refresh.
+    refetchInterval: (q) =>
+      (q.state.data ?? []).some(
+        (r) => r.verify_state === "pending" || r.verify_state === "verifying",
+      )
+        ? 5000
+        : false,
   });
   const [openRunId, setOpenRunId] = useState<string | null>(null);
   const rows = runsQ.data ?? [];
@@ -654,13 +747,14 @@ function HistoryTab() {
               <th className="px-3 py-2 font-medium">Sent</th>
               <th className="px-3 py-2 font-medium">Skipped</th>
               <th className="px-3 py-2 font-medium">Failed</th>
+              <th className="px-3 py-2 font-medium">Verify</th>
             </tr>
           </thead>
           <tbody>
             {runsQ.isLoading && (
               <tr>
                 <td
-                  colSpan={8}
+                  colSpan={9}
                   className="px-3 py-8 text-center text-muted-foreground"
                 >
                   <Loader2 className="mx-auto h-5 w-5 animate-spin" />
@@ -670,7 +764,7 @@ function HistoryTab() {
             {!runsQ.isLoading && rows.length === 0 && (
               <tr>
                 <td
-                  colSpan={8}
+                  colSpan={9}
                   className="px-3 py-8 text-center text-muted-foreground"
                 >
                   No runs recorded yet.
@@ -707,6 +801,12 @@ function RunRow({
     queryKey: ["wol-run", run.id],
     queryFn: () => wakeSchedulesApi.getRun(run.id),
     enabled: open,
+    // Poll while this run's verify is non-terminal so the expanded per-host
+    // outcome converges in-place.
+    refetchInterval: (q) => {
+      const state = q.state.data?.verify_state;
+      return state === "pending" || state === "verifying" ? 5000 : false;
+    },
   });
 
   return (
@@ -744,10 +844,13 @@ function RunRow({
         <td className="px-3 py-2 text-rose-600 dark:text-rose-400">
           {run.failed_count}
         </td>
+        <td className="px-3 py-2">
+          <VerifyRollup run={run} />
+        </td>
       </tr>
       {open && (
         <tr className="border-b bg-muted/20">
-          <td colSpan={8} className="px-3 py-3">
+          <td colSpan={9} className="px-3 py-3">
             {run.error && (
               <div className="mb-2 rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-xs text-rose-600 dark:text-rose-400">
                 {run.error}
@@ -765,6 +868,7 @@ function RunRow({
                       <th className="px-2 py-1 font-medium">Broadcast</th>
                       <th className="px-2 py-1 font-medium">MAC source</th>
                       <th className="px-2 py-1 font-medium">Result</th>
+                      <th className="px-2 py-1 font-medium">Verify</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -784,11 +888,30 @@ function RunRow({
                           {t.sent ? (
                             <span className="text-emerald-600 dark:text-emerald-400">
                               sent
+                              {t.wake_attempts > 1 && (
+                                <span
+                                  className="ml-1 text-muted-foreground"
+                                  title={`Re-woken — ${t.wake_attempts} wake attempts`}
+                                >
+                                  ×{t.wake_attempts}
+                                </span>
+                              )}
                             </span>
                           ) : (
                             <span className="text-rose-600 dark:text-rose-400">
                               {t.skip_reason ?? t.error ?? "not sent"}
                             </span>
+                          )}
+                        </td>
+                        <td className="px-2 py-1">
+                          {t.sent ? (
+                            <VerifyChip
+                              verified={t.verified}
+                              verifiedAt={t.verified_at}
+                              verifyMethod={t.verify_method}
+                            />
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
                           )}
                         </td>
                       </tr>
@@ -1324,7 +1447,7 @@ function CalendarModal({
 // ─────────────────────────────────────────────────────────────────────
 // Create / edit modal
 // ─────────────────────────────────────────────────────────────────────
-type ModalTab = "target" | "schedule" | "holiday" | "send";
+type ModalTab = "target" | "schedule" | "holiday" | "send" | "verify";
 
 const browserTz = (() => {
   try {
@@ -1409,6 +1532,17 @@ function WolScheduleModal({
   // Router-help only — the vantage's source IP. Never persisted.
   const [senderIp, setSenderIp] = useState("");
 
+  // Phase 3 — post-wake liveness verify + retry.
+  const [verifyEnabled, setVerifyEnabled] = useState(
+    existing?.verify_enabled ?? false,
+  );
+  const [verifyWaitSeconds, setVerifyWaitSeconds] = useState(
+    existing?.verify_wait_seconds ?? 60,
+  );
+  const [verifyRetries, setVerifyRetries] = useState(
+    existing?.verify_retries ?? 1,
+  );
+
   const [error, setError] = useState<string | null>(null);
   const ianaList = useIanaTimezones();
   const tzValid = ianaList.includes(timezone.trim());
@@ -1458,6 +1592,10 @@ function WolScheduleModal({
         repeat_interval_ms: repeatIntervalMs,
         stagger_ms: staggerMs,
         port,
+        verify_enabled: verifyEnabled,
+        verify_wait_seconds: verifyWaitSeconds,
+        verify_retries: verifyRetries,
+        verify_method: "ping",
       };
       return existing
         ? wakeSchedulesApi.update(existing.id, body)
@@ -1491,6 +1629,25 @@ function WolScheduleModal({
   };
   const sendValid = Object.values(sendErrors).every((e) => e === null);
 
+  // Post-wake verify ranges mirror the backend schema (verify_wait_seconds
+  // 5–3600, verify_retries 0–10). Only enforced when verify is enabled.
+  const verifyErrors = {
+    verifyWaitSeconds:
+      Number.isInteger(verifyWaitSeconds) &&
+      verifyWaitSeconds >= 5 &&
+      verifyWaitSeconds <= 3600
+        ? null
+        : "Must be 5–3600.",
+    verifyRetries:
+      Number.isInteger(verifyRetries) &&
+      verifyRetries >= 0 &&
+      verifyRetries <= 10
+        ? null
+        : "Must be 0–10.",
+  };
+  const verifyValid =
+    !verifyEnabled || Object.values(verifyErrors).every((e) => e === null);
+
   // Calendar gate: a non-'none' mode needs a calendar picked (mirrors the
   // server-side model_validator), and any match regex must compile.
   const calendarMatchError = useMemo(() => {
@@ -1510,6 +1667,7 @@ function WolScheduleModal({
     name.trim().length > 0 &&
     tzValid &&
     sendValid &&
+    verifyValid &&
     calendarValid &&
     !save.isPending;
 
@@ -1549,6 +1707,7 @@ function WolScheduleModal({
             { key: "schedule", label: "Schedule" },
             { key: "holiday", label: "Holiday gate" },
             { key: "send", label: "Send options" },
+            { key: "verify", label: "Verify" },
           ]}
           active={tab}
           onChange={setTab}
@@ -1615,6 +1774,19 @@ function WolScheduleModal({
             subnetIds={subnetIds}
             mode={mode}
             errors={sendErrors}
+          />
+        )}
+
+        {tab === "verify" && (
+          <VerifyStep
+            verifyEnabled={verifyEnabled}
+            setVerifyEnabled={setVerifyEnabled}
+            verifyWaitSeconds={verifyWaitSeconds}
+            setVerifyWaitSeconds={setVerifyWaitSeconds}
+            verifyRetries={verifyRetries}
+            setVerifyRetries={setVerifyRetries}
+            vantage={vantage}
+            errors={verifyErrors}
           />
         )}
 
@@ -2216,6 +2388,125 @@ function CalendarGateSection({
   );
 }
 
+// ── Post-wake verify step (Phase 3) ───────────────────────────────────
+function VerifyStep({
+  verifyEnabled,
+  setVerifyEnabled,
+  verifyWaitSeconds,
+  setVerifyWaitSeconds,
+  verifyRetries,
+  setVerifyRetries,
+  vantage,
+  errors,
+}: {
+  verifyEnabled: boolean;
+  setVerifyEnabled: (b: boolean) => void;
+  verifyWaitSeconds: number;
+  setVerifyWaitSeconds: (n: number) => void;
+  verifyRetries: number;
+  setVerifyRetries: (n: number) => void;
+  vantage: WolVantage;
+  errors: {
+    verifyWaitSeconds: string | null;
+    verifyRetries: string | null;
+  };
+}) {
+  // Total probe passes = 1 + verifyRetries (the first probe, then one per
+  // retry). Worst-case wall clock ≈ (1 + retries) × wait.
+  const totalPasses = 1 + verifyRetries;
+  return (
+    <div className="space-y-4">
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={verifyEnabled}
+          onChange={(e) => setVerifyEnabled(e.target.checked)}
+        />
+        Verify hosts came up after the wake
+      </label>
+      <p className="text-[11px] text-muted-foreground">
+        After the wake dispatches, a background pass pings each host that was
+        sent a magic packet. Hosts that don&apos;t answer are re-woken up to the
+        retry bound. Responders stamp the IPAM &ldquo;last seen&rdquo; timestamp
+        (method <span className="font-mono">ping</span>), so the verify doubles
+        as a liveness refresh.
+      </p>
+
+      <div
+        className={cn(
+          "grid gap-3 sm:grid-cols-2",
+          !verifyEnabled && "pointer-events-none opacity-50",
+        )}
+      >
+        <div>
+          <label className={labelCls}>Wait before probing (seconds)</label>
+          <input
+            type="number"
+            min={5}
+            max={3600}
+            disabled={!verifyEnabled}
+            className={cn(
+              inputCls,
+              errors.verifyWaitSeconds &&
+                "border-destructive focus:ring-destructive",
+            )}
+            value={verifyWaitSeconds}
+            onChange={(e) => setVerifyWaitSeconds(Number(e.target.value))}
+          />
+          {errors.verifyWaitSeconds ? (
+            <p className="mt-1 text-[11px] text-destructive">
+              {errors.verifyWaitSeconds}
+            </p>
+          ) : (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Grace for the host to POST + bring up its NIC before the first
+              ping (and between retry passes).
+            </p>
+          )}
+        </div>
+        <div>
+          <label className={labelCls}>Re-wake retries</label>
+          <input
+            type="number"
+            min={0}
+            max={10}
+            disabled={!verifyEnabled}
+            className={cn(
+              inputCls,
+              errors.verifyRetries &&
+                "border-destructive focus:ring-destructive",
+            )}
+            value={verifyRetries}
+            onChange={(e) => setVerifyRetries(Number(e.target.value))}
+          />
+          {errors.verifyRetries ? (
+            <p className="mt-1 text-[11px] text-destructive">
+              {errors.verifyRetries}
+            </p>
+          ) : (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Extra wake passes for non-responders. 0 = probe once, never
+              re-wake. {totalPasses} probe pass
+              {totalPasses === 1 ? "" : "es"} total.
+            </p>
+          )}
+        </div>
+      </div>
+
+      {verifyEnabled && vantage.kind === "appliance" && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300">
+          <strong>Server-vantage probe.</strong> The wake is sent from a Fleet
+          appliance, but v1 verify pings from the control-plane server
+          regardless of the wake vantage. If the server can&apos;t reach the
+          target segment directly, a live host reads as{" "}
+          <span className="font-mono">down</span> (a false negative) — never a
+          false wake. Appliance-vantage verify is a tracked follow-up.
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Send options step ─────────────────────────────────────────────────
 function SendStep({
   vantage,
@@ -2447,6 +2738,36 @@ function SendStep({
             {Math.round((preview.wake_count * staggerMs) / 1000)}s.
           </span>
         )}
+        {preview && preview.suggested_stagger_ms > 0 && staggerMs === 0 && (
+          <span className="mt-1 block">
+            Leaving stagger at <strong>0</strong> auto-ramps this fleet — the
+            server will apply <strong>~{preview.suggested_stagger_ms}ms</strong>{" "}
+            between hosts.{" "}
+            <button
+              type="button"
+              className="underline underline-offset-2 hover:opacity-80"
+              onClick={() => setStaggerMs(preview.suggested_stagger_ms)}
+            >
+              Set {preview.suggested_stagger_ms}ms
+            </button>
+          </span>
+        )}
+        {preview &&
+          preview.suggested_stagger_ms > 0 &&
+          staggerMs > 0 &&
+          staggerMs < preview.suggested_stagger_ms && (
+            <span className="mt-1 block">
+              For {preview.wake_count} hosts we suggest at least{" "}
+              <strong>~{preview.suggested_stagger_ms}ms</strong> between hosts.{" "}
+              <button
+                type="button"
+                className="underline underline-offset-2 hover:opacity-80"
+                onClick={() => setStaggerMs(preview.suggested_stagger_ms)}
+              >
+                Use {preview.suggested_stagger_ms}ms
+              </button>
+            </span>
+          )}
       </div>
 
       {showRouterHelp && (
